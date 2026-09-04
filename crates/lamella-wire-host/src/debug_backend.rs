@@ -8,9 +8,9 @@ use crate::{UsbTransport, parse_usb_target};
 use lamella_debug_backend::{
     DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
 };
-use lamella_runner::RunResult;
 use lamella_runner::debug::{self, reason};
-use lamella_wire::{Capabilities, Frame as WireFrame, ProfileIdentity, Transport, TransportError};
+use lamella_runner::exec;
+use lamella_wire::{Capabilities, Frame as WireFrame, TargetIdentity, Transport, TransportError};
 use std::time::{Duration, Instant};
 
 /// Packs a wire `(method_id, offset)` location into the seam's opaque address.
@@ -23,37 +23,73 @@ fn unpack(address: u64) -> (u32, u32) {
     ((address >> 32) as u32, address as u32)
 }
 
-/// A display name for a Lamella Link `board_model` code, or `None` for UNKNOWN / a model the registry does not
-/// name. DERIVES from [`lamella_wire::board_model::name`] -- the ONE canonical value -> name map -- so it cannot
+/// A display name for a Lamella Link `product_model` code, or `None` for UNKNOWN / a model the registry does not
+/// name. DERIVES from [`lamella_wire::product_model::name`] -- the ONE canonical value -> name map -- so it cannot
 /// drift from the registry. (Hand-mirroring it drifted twice: "SAM E54" for canonical "SAME54", and four boards
 /// missing entirely.) UNKNOWN maps to `None` rather than the canonical "custom board" because [`identity_line`]
 /// uses `None` to stay silent on a target with nothing to identify.
-fn board_model_name(model: u16) -> Option<&'static str> {
-    if model == lamella_wire::board_model::UNKNOWN {
+fn product_model_name(model: u16) -> Option<&'static str> {
+    if model == lamella_wire::product_model::UNKNOWN {
         return None;
     }
-    lamella_wire::board_model::name(model)
+    lamella_wire::product_model::name(model)
 }
 
-/// The connect line the debug console shows for a target's self-reported [`ProfileIdentity`]: the board name
-/// (from its `board_model`) and, when the firmware fills it, the chip IDCODE (+ device id). `None` when there
-/// is nothing to identify (UNKNOWN board + no chip id), so a pre-chip-id target stays silent.
-fn identity_line(profile: &ProfileIdentity) -> Option<String> {
-    let board = board_model_name(profile.board_model);
-    let has_chip = profile.chip_idcode != 0;
-    if board.is_none() && !has_chip {
+/// The connect line the debug console shows for a target's self-reported identity: the product
+/// name, the chip identity when the firmware fills it, and which firmware build is answering.
+/// `None` when there is nothing to identify at all, so a target with nothing to declare stays
+/// silent rather than printing a line of unknowns.
+fn identity_line(identity: &TargetIdentity) -> Option<String> {
+    let board = product_model_name(identity.product_model);
+    let chip = chip_identity(identity);
+    let firmware = identity.firmware_version != [0, 0];
+    if board.is_none() && chip.is_none() && !firmware {
         return None;
     }
     let mut line = String::from("Lamella Link: ");
-    line.push_str(board.unwrap_or("unrecognized board"));
-    if has_chip {
-        line.push_str(&format!(", chip IDCODE {:#010x}", profile.chip_idcode));
-        if profile.chip_devid != 0 {
-            line.push_str(&format!(" (devid {:#010x})", profile.chip_devid));
-        }
+    line.push_str(board.unwrap_or("unrecognized product"));
+    if let Some(chip) = chip {
+        line.push_str(&chip);
+    }
+    if firmware {
+        line.push_str(&format!(
+            ", firmware {}.{}",
+            identity.firmware_version[0], identity.firmware_version[1]
+        ));
     }
     line.push('\n');
     Some(line)
+}
+
+/// The chip half of the connect line, read according to the scheme the identity declares.
+///
+/// A debug-port code names a PORT CLASS and is shared across unrelated parts, so it is printed
+/// beside the vendor register that separates them rather than alone: a reader who takes a part
+/// name from the port code by itself takes the wrong one, confidently.
+fn chip_identity(identity: &TargetIdentity) -> Option<String> {
+    let word = |at: usize| {
+        identity
+            .chip_id
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()))
+    };
+    match identity.chip_id_kind {
+        lamella_wire::chip_id_kind::DEBUG_PORT_AND_DEVICE_ID => {
+            let port = word(0)?;
+            let mut out = format!(", chip IDCODE {port:#010x}");
+            if let Some(devid) = word(4).filter(|d| *d != 0) {
+                out.push_str(&format!(" (devid {devid:#010x})"));
+            }
+            Some(out)
+        }
+        lamella_wire::chip_id_kind::RISCV_MVENDOR_MARCH_MIMP => Some(format!(
+            ", chip vendor {:#010x} arch {:#010x} impl {:#010x}",
+            word(0)?,
+            word(4)?,
+            word(8)?
+        )),
+        _ => None,
+    }
 }
 
 /// The carrier a [`WireHostBackend`] drives: a serial port (USB-CDC / UART / a debug-probe VCP), or --
@@ -194,7 +230,7 @@ pub struct WireHostBackend {
     image: Vec<u8>,
     timeout: Duration,
     seq: u16,
-    /// A debug session is live on the target (between `DBG_IMAGE` and Done/Trap/detach).
+    /// A debug session is live on the target (between the start and Done/Trap/detach).
     session_live: bool,
     /// A resume is in flight: [`DebugBackend::poll`] watches for its stop event.
     running: bool,
@@ -202,6 +238,12 @@ pub struct WireHostBackend {
     frames: Vec<(u32, u32)>,
     exit_code: i32,
     pending_output: Option<String>,
+    /// The DEBUGGER's channel: what a program writes for a tool rather than for its user.
+    ///
+    /// Kept apart from the program's own output all the way across, because a client shows the two
+    /// in separate panes and only the TARGET knows which is which. The output event names its
+    /// stream, and this is the end that keeps them apart afterwards.
+    pending_debug_output: Option<String>,
 }
 
 impl WireHostBackend {
@@ -275,7 +317,7 @@ impl WireHostBackend {
         {
             return Err(TransportError::Closed);
         }
-        let pending_output = session.profile.as_ref().and_then(identity_line);
+        let pending_output = identity_line(&session.identity);
         Ok(Self {
             transport,
             image,
@@ -286,6 +328,7 @@ impl WireHostBackend {
             frames: Vec::new(),
             exit_code: 0,
             pending_output,
+            pending_debug_output: None,
             srcmap: None,
             user_bps: Vec::new(),
         })
@@ -331,12 +374,39 @@ impl WireHostBackend {
         while Instant::now() < deadline {
             match self.transport.poll() {
                 Ok(Some(frame)) if frame.msg_type == msg_type => return Some(frame),
-                Ok(Some(_)) => {}
+                Ok(Some(frame)) => self.absorb(&frame),
                 Ok(None) => std::thread::sleep(Duration::from_millis(2)),
                 Err(_) => return None,
             }
         }
         None
+    }
+
+    /// Folds a frame that is not the one being waited for into backend state.
+    ///
+    /// Output is the whole of it, and it has to happen at EVERY place a frame is taken off the
+    /// wire rather than only where output is expected. Output arrives UNSOLICITED, during a
+    /// resume that has not answered yet, so a loop that drops what it is not waiting for drops
+    /// the program's output -- and that failure is silent, because a program that printed nothing
+    /// and a host that discarded what it printed look identical.
+    fn absorb(&mut self, frame: &WireFrame) {
+        use lamella_wire::msg::output;
+        if frame.msg_type != debug::EVT_OUTPUT || frame.payload.len() < 2 {
+            return;
+        }
+        let text = String::from_utf8_lossy(&frame.payload[2..]);
+        if text.is_empty() {
+            return;
+        }
+        let sink = if frame.payload[0] == output::DEBUG {
+            &mut self.pending_debug_output
+        } else {
+            &mut self.pending_output
+        };
+        match sink {
+            Some(held) => held.push_str(&text),
+            None => *sink = Some(text.into_owned()),
+        }
     }
 
     /// Folds an `EVT_STOPPED` into backend state and the seam's [`Stop`].
@@ -347,24 +417,13 @@ impl WireHostBackend {
                 self.session_live = false;
                 self.running = false;
                 self.frames.clear();
-                let tail = frame.payload.get(9..).unwrap_or(&[]);
-                let text = if let Some(result) = RunResult::decode(tail) {
-                    self.exit_code = result.exit;
-                    if !result.stdout.is_empty() {
-                        self.pending_output = Some(result.stdout.clone());
-                    }
-                    result.stdout
-                } else {
-                    String::new()
-                };
+                if let Some(exit) = frame.payload.get(9..13) {
+                    self.exit_code = i32::from_le_bytes(exit.try_into().unwrap_or_default());
+                }
                 if why == reason::DONE {
                     Stop::Done
                 } else {
-                    Stop::Fault(if text.is_empty() {
-                        "unhandled trap on the target".to_string()
-                    } else {
-                        text
-                    })
+                    Stop::Fault("unhandled trap on the target".to_string())
                 }
             }
             _ => {
@@ -435,6 +494,13 @@ impl WireHostBackend {
     /// root) and decodes the `DBG_CHILDREN` reply into `(name, value)` pairs. The names are the
     /// target's runtime type metadata (`fieldN`, `[i]`, a box's `value`). An unresolvable
     /// selector (e.g. the target resumed since the slot was read) decodes as the empty list.
+    ///
+    /// The request carries a RANGE and the reply says how many children the value has, so a large
+    /// aggregate is expandable at all: a hundred-thousand-element array is about 1.3 MB whole, which
+    /// no frame can carry and which is therefore lost entirely rather than truncated. The range
+    /// costs the selector nothing, because it was already stateless -- the target re-walks it from
+    /// the frame root every time, so a window is a slice of a fresh answer rather than a cursor
+    /// anything has to remember.
     pub fn expand(
         &mut self,
         frame_index: u16,
@@ -442,7 +508,21 @@ impl WireHostBackend {
         root_slot: u16,
         path: &[u16],
     ) -> Option<Vec<(String, WireValue)>> {
-        let mut payload = Vec::with_capacity(6 + path.len() * 2);
+        self.expand_range(frame_index, root_is_argument, root_slot, path, 0, Self::EXPAND_PAGE)
+    }
+
+    /// One page of children, starting at `first_child`. [`Self::expand`] is this over the first
+    /// page; the count the reply carries is how a caller knows whether to ask for another.
+    pub fn expand_range(
+        &mut self,
+        frame_index: u16,
+        root_is_argument: bool,
+        root_slot: u16,
+        path: &[u16],
+        first_child: u16,
+        max_children: u16,
+    ) -> Option<Vec<(String, WireValue)>> {
+        let mut payload = Vec::with_capacity(10 + path.len() * 2);
         payload.extend_from_slice(&frame_index.to_le_bytes());
         payload.push(u8::from(root_is_argument));
         payload.extend_from_slice(&root_slot.to_le_bytes());
@@ -450,11 +530,19 @@ impl WireHostBackend {
         for step in path.iter().take(255) {
             payload.extend_from_slice(&step.to_le_bytes());
         }
+        payload.extend_from_slice(&first_child.to_le_bytes());
+        payload.extend_from_slice(&max_children.to_le_bytes());
         let seq = self.next_seq();
         self.transport.send(debug::DBG_EXPAND, seq, &payload).ok()?;
         let frame = self.await_type(debug::DBG_CHILDREN)?;
         decode_children(&frame.payload)
     }
+
+    /// How many children one expansion asks for by default.
+    ///
+    /// A variables pane shows a screenful and a person scrolls, so a page is what a first request
+    /// wants; asking for everything is what makes an ordinary act -- expanding an array -- fail.
+    const EXPAND_PAGE: u16 = 256;
 }
 
 /// One decoded `<val>` from a `DBG_VARS`/`DBG_CHILDREN` payload (the wire encoding is
@@ -586,11 +674,15 @@ pub fn decode_vars(payload: &[u8]) -> Option<(Vec<WireValue>, Vec<WireValue>)> {
 }
 
 /// Decodes a `DBG_CHILDREN` payload into `(name, value)` pairs. `None` on a malformed payload.
+///
+/// The payload opens with the value's TOTAL child count and then the count in this page, so a caller
+/// can tell a value with four children from a page of four out of forty thousand. This returns the
+/// page; [`children_total`] reads the total from the same bytes.
 #[must_use]
 pub fn decode_children(payload: &[u8]) -> Option<Vec<(String, WireValue)>> {
-    let bytes = payload.get(0..2)?;
+    let bytes = payload.get(2..4)?;
     let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-    let mut at = 2;
+    let mut at = 4;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let len = *payload.get(at)? as usize;
@@ -600,6 +692,17 @@ pub fn decode_children(payload: &[u8]) -> Option<Vec<(String, WireValue)>> {
         out.push((name, decode_value(payload, &mut at)?));
     }
     Some(out)
+}
+
+/// How many children the expanded value has in total, from the same `DBG_CHILDREN` payload.
+///
+/// It is what tells a caller that a page is a page. Without it, a host asking for the first
+/// 256 elements of an array gets 256 back and has no way to distinguish that from an array of
+/// exactly 256 -- so it either stops early or asks forever.
+#[must_use]
+pub fn children_total(payload: &[u8]) -> Option<u16> {
+    let bytes = payload.get(0..2)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 /// Closing the host closes the session it opened.
@@ -631,7 +734,8 @@ impl DebugBackend for WireHostBackend {
             return false;
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_ATTACH, seq, &[]).is_err() {
+        let start = [exec::exec_source::DEPLOYED, exec::exec_flags::START_HALTED];
+        if self.transport.send(exec::EXEC, seq, &start).is_err() {
             return false;
         }
         let Some(stop) = self.await_type(debug::EVT_STOPPED) else {
@@ -659,7 +763,11 @@ impl DebugBackend for WireHostBackend {
         }
         match self.transport.poll() {
             Ok(Some(frame)) if frame.msg_type == debug::EVT_STOPPED => self.on_stopped(&frame),
-            Ok(_) => Stop::Running,
+            Ok(Some(frame)) => {
+                self.absorb(&frame);
+                Stop::Running
+            }
+            Ok(None) => Stop::Running,
             Err(_) => Stop::Fault("the wire dropped".to_string()),
         }
     }
@@ -688,7 +796,7 @@ impl DebugBackend for WireHostBackend {
             return Stop::Done;
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_STEP, seq, &[]).is_err() {
+        if self.transport.send(debug::DBG_STEP, seq, &[debug::step_mode::IN]).is_err() {
             return Stop::Fault("the wire dropped".to_string());
         }
         match self.await_type(debug::EVT_STOPPED) {
@@ -835,6 +943,10 @@ impl DebugBackend for WireHostBackend {
     fn take_output(&mut self) -> Option<String> {
         self.pending_output.take()
     }
+
+    fn take_debug_output(&mut self) -> Option<String> {
+        self.pending_debug_output.take()
+    }
 }
 
 #[cfg(test)]
@@ -866,6 +978,7 @@ mod tests {
             frames: Vec::new(),
             exit_code: 0,
             pending_output: None,
+            pending_debug_output: None,
         };
         (backend, shared)
     }
@@ -928,24 +1041,35 @@ mod tests {
 
     #[test]
     fn identity_line_names_board_and_chip() {
-        use lamella_wire::ProfileIdentity;
-        let mut p = ProfileIdentity::new(1, 0, "serve");
-        p.board_model = 6;
-        p.chip_idcode = 0x0bc11477;
-        let line = super::identity_line(&p).unwrap();
+        use lamella_wire::{TargetIdentity, chip_id_kind};
+
+        let arm = |model: u16, port: u32| {
+            TargetIdentity { product_model: model, ..TargetIdentity::default() }
+                .with_chip_id(chip_id_kind::DEBUG_PORT_AND_DEVICE_ID, &port.to_le_bytes())
+        };
+
+        let line = super::identity_line(&arm(6, 0x0bc11477)).unwrap();
         assert!(line.contains("ATSAMW25 Xplained Pro") && line.contains("0x0bc11477"), "{line}");
 
-        let mut p = ProfileIdentity::new(1, 0, "serve");
-        p.board_model = 4;
-        assert_eq!(super::identity_line(&p).unwrap(), "Lamella Link: SAM E54 Xplained Pro\n");
+        let bare = TargetIdentity { product_model: 4, ..TargetIdentity::default() };
+        assert_eq!(super::identity_line(&bare).unwrap(), "Lamella Link: SAM E54 Xplained Pro\n");
 
-        assert!(super::identity_line(&ProfileIdentity::new(1, 0, "serve")).is_none());
+        assert!(super::identity_line(&TargetIdentity::default()).is_none());
 
-        let mut p = ProfileIdentity::new(1, 0, "serve");
-        p.board_model = 0xffff;
-        p.chip_idcode = 0x2ba01477;
-        let line = super::identity_line(&p).unwrap();
-        assert!(line.contains("unrecognized board") && line.contains("0x2ba01477"), "{line}");
+        let line = super::identity_line(&arm(0xffff, 0x2ba01477)).unwrap();
+        assert!(line.contains("unrecognized product") && line.contains("0x2ba01477"), "{line}");
+
+        let dated = TargetIdentity { firmware_version: [9734, 0], ..TargetIdentity::default() };
+        assert_eq!(super::identity_line(&dated).unwrap(), "Lamella Link: unrecognized product, firmware 9734.0\n");
+
+        let mut riscv_id = Vec::new();
+        for word in [0x0000_0489u32, 0x8000_0001, 0x0000_0007] {
+            riscv_id.extend_from_slice(&word.to_le_bytes());
+        }
+        let riscv = TargetIdentity::default()
+            .with_chip_id(chip_id_kind::RISCV_MVENDOR_MARCH_MIMP, &riscv_id);
+        let line = super::identity_line(&riscv).unwrap();
+        assert!(line.contains("vendor 0x00000489") && line.contains("impl 0x00000007"), "{line}");
     }
 
     #[test]
@@ -982,6 +1106,7 @@ mod tests {
         assert_eq!(args, vec![WireValue::ByRef { kind: 0, a: 0, b: 3, c: 0 }]);
 
         let mut kids = Vec::new();
+        kids.extend_from_slice(&40_000u16.to_le_bytes());
         kids.extend_from_slice(&2u16.to_le_bytes());
         kids.push(6);
         kids.extend_from_slice(b"field0");
@@ -992,6 +1117,8 @@ mod tests {
         kids.push(0x04);
         kids.extend_from_slice(&1.5f64.to_le_bytes());
         let children = decode_children(&kids).expect("the payload decodes");
+        assert_eq!(children.len(), 2, "this page");
+        assert_eq!(super::children_total(&kids), Some(40_000), "and what it is a page of");
         assert_eq!(children[0], ("field0".to_string(), WireValue::Int64(-9)));
         assert_eq!(children[1], ("[1]".to_string(), WireValue::Float(1.5)));
 

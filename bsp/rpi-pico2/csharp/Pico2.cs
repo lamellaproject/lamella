@@ -11,7 +11,7 @@ namespace Lamella.Boards.RaspberryPi
 {
     public sealed class Pico2
     {
-        /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
+        /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = Pico2Bindings.BOARD_MODEL;
 
         /// <summary>Constructs the board and ensures its clock tree is up (idempotent) -- so

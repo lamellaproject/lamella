@@ -543,12 +543,13 @@ fn collect_bindings(body: &[Stmt], items: &mut Vec<CompletionItem>) {
                     items.push(CompletionItem::new(bound, CompletionKind::Module, module));
                 }
             }
-            StmtKind::ImportFrom { module, names } => {
+            StmtKind::ImportFrom { module, level, names } => {
+                let written = format!("{}{module}", ".".repeat(*level as usize));
                 for (name, bound) in names {
                     let detail = if name == bound {
-                        format!("from {module}")
+                        format!("from {written}")
                     } else {
-                        format!("from {module} import {name}")
+                        format!("from {written} import {name}")
                     };
                     items.push(CompletionItem::new(bound, CompletionKind::Local, &detail));
                 }
@@ -585,12 +586,7 @@ fn child_blocks(kind: &StmtKind) -> Vec<&[Stmt]> {
         | StmtKind::ForIter { body, orelse, .. }
         | StmtKind::AsyncFor { body, orelse, .. } => alloc::vec![body.as_slice(), orelse.as_slice()],
         StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => alloc::vec![body.as_slice()],
-        StmtKind::Try {
-            body,
-            handlers,
-            orelse,
-            finalbody,
-        } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             let mut blocks = alloc::vec![body.as_slice(), orelse.as_slice(), finalbody.as_slice()];
             blocks.extend(handlers.iter().map(|h| h.body.as_slice()));
             blocks

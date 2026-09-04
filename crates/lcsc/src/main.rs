@@ -14,7 +14,7 @@ struct Options {
     references: Vec<String>,
     emit_debug: bool,
     /// The lexer dialect knobs (9.4.2): identifier folding and the csc typed-reference
-    /// operators. Both default off -- raw identifiers (matching csc) and strict ISO-1.
+    /// operators. Both default off -- raw identifiers, matching csc.
     lex: LexOptions,
 }
 
@@ -97,7 +97,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             lex.typedref = true;
         } else if matches!(arg.as_str(), "/native-interop" | "--native-interop") {
             lex.native_interop = true;
-        } else if let Some(version) = strip_option(arg, &["/langversion:", "--langversion="]) {
+        } else if let Some(version) =
+            strip_option(arg, &["/langversion:", "--langversion=", "--langversion:"])
+        {
             match LanguageVersion::parse_flag(version) {
                 Ok(selected) => lex.version = selected,
                 Err(LanguageVersionError::Unsupported) => {
@@ -131,7 +133,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 }
 
 const USAGE: &str = "\
-lcsc -- the Lamella C# compiler (C# 1.0 / ECMA-334 first edition).
+lcsc -- the Lamella C# compiler.
 
 usage: lcsc <source.cs>... [options]
 
@@ -139,7 +141,20 @@ usage: lcsc <source.cs>... [options]
                           (each is its own PDB document).
   /out:<path>             output assembly path (default: the first source's name, .dll).
   /reference:<dll>        reference a metadata assembly (repeatable; also -r:, --reference=).
+                          NOTHING IS REFERENCED IMPLICITLY: every assembly a compilation uses is
+                          named here, including the core library. csc auto-references one and
+                          takes /nostdlib to stop it, so csc's /nostdlib is permanently in effect
+                          here and the flag itself is not accepted -- it would never do anything,
+                          and a flag that never does anything claims there is a mode it turns off.
+                          This is what lets a corlib compile as an ordinary compilation.
+  /target:<kind>          accepted and ignored: the output kind follows from the sources and
+                          /out. Present so a csc-shaped command line is not rejected over it.
+  /nologo                 accepted and ignored; there is no banner to suppress.
   /define:A;B             seed #if preprocessor symbols (9.5.3); ';' or ',' separated, repeatable.
+  /langversion:<v>        the C# dialect to compile as: a number (1, 2, 7.2, 11), an ISO name
+                          (ISO-1, ISO-2), or latest / latestmajor / default. Selecting a dialect
+                          says which constructs are PERMITTED; one this build does not produce is
+                          refused by name (LAM0001). Also --langversion=<v>, --langversion:<v>.
   /debug-                 suppress the Portable PDB (it is emitted by default).
   /normalize-identifiers  fold identifiers to NFC (ECMA-334 9.4.2; off by default, to match csc).
   /unsafe                 permit unsafe code (pointers, stackalloc, fixed); off by default, as
@@ -410,12 +425,7 @@ mod tests {
             LanguageVersion::SELECTABLE_MAX,
             "the driver ships the product rung"
         );
-        assert_ne!(
-            LanguageVersion::DEFAULT,
-            LanguageVersion::SELECTABLE_MAX,
-            "the conformance default and the product ceiling answer different questions"
-        );
-        assert_eq!(LanguageVersion::DEFAULT, LanguageVersion::CSharp1);
+        assert!(LanguageVersion::DEFAULT.is_selectable());
 
         for v in ["/langversion:12", "/langversion:14", "/langversion:preview"] {
             let args = [String::from("App.cs"), String::from(v)];

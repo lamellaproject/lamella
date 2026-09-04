@@ -67,6 +67,36 @@ namespace System
             [Lamella.Runtime.RuntimeProvided] get { return null; }
         }
 
+        public string AssemblyQualifiedName
+        {
+            get
+            {
+                string full = FullName;
+                if ((object)full == null) return null;
+                System.Reflection.Assembly owner = Assembly;
+                if ((object)owner == null) return full;
+                return full + ", " + owner.FullName;
+            }
+        }
+
+        public bool IsSubclassOf(Type c)
+        {
+            if ((object)c == null) throw new ArgumentNullException("c");
+            if (HandleEquals(this, c)) return false;
+            Type walk = BaseType;
+            while ((object)walk != null)
+            {
+                if (HandleEquals(walk, c)) return true;
+                walk = walk.BaseType;
+            }
+            return HandleEquals(c, typeof(object));
+        }
+
+        public override string ToString()
+        {
+            return FullName;
+        }
+
         [Lamella.Runtime.RuntimeProvided] public System.Reflection.FieldInfo GetField(string name) { return null; }
 
         [Lamella.Runtime.RuntimeProvided] public System.Reflection.MethodInfo GetMethod(string name) { return null; }
@@ -76,6 +106,64 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public System.Reflection.MethodInfo[] GetMethods(System.Reflection.BindingFlags bindingAttr) { return null; }
 
         [Lamella.Runtime.RuntimeProvided] public System.Reflection.ConstructorInfo GetConstructor(Type[] types) { return null; }
+
+        public System.Reflection.FieldInfo[] GetFields()
+        {
+            return GetFields(
+                System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Static);
+        }
+
+        public System.Reflection.MethodInfo[] GetMethods()
+        {
+            return GetMethods(
+                System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Static);
+        }
+
+        public System.Reflection.FieldInfo GetField(string name, System.Reflection.BindingFlags bindingAttr)
+        {
+            System.Reflection.FieldInfo[] fields = GetFields(bindingAttr);
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (fields[i].Name == name) return fields[i];
+            }
+            return null;
+        }
+
+        public System.Reflection.MethodInfo GetMethod(string name, System.Reflection.BindingFlags bindingAttr)
+        {
+            System.Reflection.MethodInfo[] methods = GetMethods(bindingAttr);
+            for (int i = 0; i < methods.Length; i++)
+            {
+                if (methods[i].Name == name) return methods[i];
+            }
+            return null;
+        }
+
+        public System.Reflection.MethodInfo GetMethod(string name, Type[] types)
+        {
+            if (types == null) return null;
+            System.Reflection.MethodInfo[] methods = GetMethods(
+                System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.Static);
+            for (int i = 0; i < methods.Length; i++)
+            {
+                if (methods[i].Name != name) continue;
+                System.Reflection.ParameterInfo[] parameters = methods[i].GetParameters();
+                if (parameters.Length != types.Length) continue;
+                bool matched = true;
+                for (int j = 0; j < parameters.Length; j++)
+                {
+                    if (parameters[j].ParameterType != types[j]) { matched = false; break; }
+                }
+                if (matched) return methods[i];
+            }
+            return null;
+        }
 
         [Lamella.Runtime.RuntimeProvided] internal object[] GetPropertyCustomAttributes(string name, bool inherit) { return null; }
 

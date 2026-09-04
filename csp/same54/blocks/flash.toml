@@ -1,0 +1,40 @@
+# BLOCK: the SAM D5x/E5x non-volatile memory controller (NVMCTRL), stated only as far as the facts
+# consumers outside the controller need. Its command set, its bank swapping and its SmartEEPROM are
+# not described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 128-BIT QUAD-WORD -- 16 BYTES -- AND THE PART OFFERS A LARGER ONE, NOT A
+# SMALLER. Table 25-2 gives the main banks a write granularity of `Quad-Word or Page`: a page is
+# 512 bytes and is the bulk mode, and the quad-word is the smallest operation the array performs.
+#
+# AND THE ONE THAT WILL BE MISREAD: WMODE OFFERS A `DOUBLE WORD` MODE AND IT IS NOT AN 8-BYTE
+# WRITE UNIT. The datasheet's own description of ADW says the command it triggers is WQW -- write
+# quad word -- at the quad-word addressed by ADDR, and requires `The other double-word inside the
+# page buffer must be all one`. So ADW changes WHEN the quad-word write fires, not what the array
+# commits: the other half is still programmed, with ones. A consumer reading the mode list and
+# concluding 8 would place a record that a torn write can split, on a part where the manual gave
+# the correct number in a table two chapters earlier.
+#
+# THE ERASE UNIT ON THE MAIN BANKS IS A BLOCK, NOT A PAGE, AND IS SIXTEEN PAGES. That is 512 times
+# the write unit. It is not declared here; it is mentioned because a consumer that dedicates `one
+# erase unit` to a record on this part is dedicating 8 Kbytes.
+
+[table]
+kind = "block"
+family = "same54"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 16
+sources = [
+    "erased_value: SAM D5x/E5x Family datasheet DS60001507F section 25.6.6.6 `Erase`, which covers the block and page commands over the NVM main address space: `Erasing the block/page sets all bits to 1`",
+    "write_unit: SAM D5x/E5x Family datasheet DS60001507F Table 25-2 `Erase and Write granularity`: BANKA and BANKB take erase granularity `Block` and write granularity `Quad-Word or Page`; the AUX space takes `Page` and `Quad-Word`",
+    "write_unit: SAM D5x/E5x Family datasheet DS60001507F section 25.6.12 `Error Correction Code (ECC)`: `The NVM physical block fetches 128-bit quad-word`, which puts the quad-word at 16 bytes",
+    "write_unit: SAM D5x/E5x Family datasheet DS60001507F section 25.6.6.5, the WMODE descriptions: both ADW and AQW trigger the WQW command at the quad-word addressed by ADDR, and ADW requires the other double-word in the page buffer to be all ones",
+]
+notes = [
+    "A page is 512 bytes -- the datasheet's Flash Memory Parameters section says it is `applicable to all the device part numbers listed in the Configuration Summary` -- and a block is sixteen pages. Neither is stated as a value here: the page is the LARGER write granularity rather than the unit a placement rule needs, and the block is an erase fact.",
+    "ECC is checked on a 64-bit basis inside the 128-bit quad-word the physical block fetches, so a double-word can be reported as the faulty half of a quad-word. That is a READ-side granularity and has no bearing on what one write commits.",
+    "Data reaches the array through a PAGE BUFFER. The width of the accesses that fill it is not the size of the operation that commits a unit.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

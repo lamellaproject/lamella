@@ -16,7 +16,7 @@ board = "atsamd10-xmini"
 vendor = "microchip"
 family = "samd10"
 part = "atsamd10d14am"
-board_model = 38
+product_model = 38
 sources = [
     "ATSAMD10 Xplained Mini user guide Atmel-42387, mEDBG wiring table: the bridge's USART TxD pairs with PA11/RxD and its RxD with PA10/TxD, both SERCOM0",
     "SAM D10 datasheet Atmel-42242H table 6-1: PA10 and PA11 reach SERCOM0/PAD[2] and SERCOM0/PAD[3] at peripheral function C",

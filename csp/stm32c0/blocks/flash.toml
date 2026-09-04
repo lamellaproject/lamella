@@ -1,0 +1,37 @@
+# BLOCK: the STM32C0 embedded-flash controller, stated only as far as the facts consumers outside
+# the controller need. Its unlock sequence, its page geometry and its command bits are not described
+# here -- they are read and owned in the driver.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 64-BIT DOUBLE WORD AND IT IS NOT A CHOICE. RM0490 is flat about it: only a
+# double word can be programmed, a byte or half-word write sets SIZERR, and a double word at an
+# address that is not double-word aligned sets PGAERR. So the unit carries an alignment requirement
+# rather than a preference.
+#
+# THIS IS NOT THE STM32F0's CONTROLLER, WHICH IS THE MISTAKE THE FAMILY INVITES. Both are
+# Cortex-M0-class ST parts with a 2 Kbyte flash page, and the page size is the only thing they share
+# here: the F0 programs a HALF-WORD, two bytes, and the C0 programs eight. Four times the unit, on
+# the family a reader is most likely to reach for a value from.
+#
+# AND A UNIT IS WRITE-ONCE BETWEEN ERASES. The controller enforces it rather than advising it:
+# PROGERR is raised when a double word to be programmed does not currently read as erased, and the
+# only exception is writing all zeros, which carries no information.
+
+[table]
+kind = "block"
+family = "stm32c0"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 8
+sources = [
+    "erased_value: STM32C0 series reference manual RM0490 Rev 6 section 4.7.4, the FLASH_SR PROGERR description: set by hardware `when a double-word address to be programmed contains a value different from 0xFFFF FFFF before programming, except if the data to write is 0x0000 0000` -- the controller defining erased in the register that decides whether a write may proceed",
+    "write_unit: RM0490 Rev 6 section 4.3.7 `FLASH main memory programming sequences`: `The flash memory is programmed 64 bits at a time` and `It is only possible to program a double word (2 x 32-bit data)`",
+    "write_unit: RM0490 Rev 6 section 4.3.7: a byte or half-word write sets SIZERR, and a double word not aligned with a double-word address sets PGAERR",
+]
+notes = [
+    "The erase unit is not this number and is not declared here. RM0490 erases by PAGE and the page is 2 Kbytes -- 256 times the write unit -- with a 512-byte subpage that is a PCROP protection granularity rather than an erase one.",
+    "PNB, the page-number field of FLASH_CR, is seven bits wide, so the controller addresses 128 pages. At 2 Kbytes each that is 256 Kbytes, which is exactly the largest main flash any sub-family's boundary table allows.",
+    "A unit is write-once between erases and the controller enforces it: RM0490 section 4.7.4 raises PROGERR on a program to a double word that is not erased, with an all-zero write as the only exception. A placement rule that writes a record and then writes its validating value into the same unit does not work here.",
+    "This block declares no registers. The register map of this controller is read and owned in the driver that sequences it, and a partial transcription here would be a second spelling of somebody else's source.",
+]

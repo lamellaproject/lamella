@@ -65,7 +65,8 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 /// build writes. It costs four bytes a module and buys the ability to add source positions later
 /// without moving this number. It shipped EMPTY and now carries line tables, which is the
 /// reservation paying out rather than a second format change.
-pub const FORMAT_VERSION: u16 = 28;
+///
+pub const FORMAT_VERSION: u16 = 29;
 
 /// The capability bits an artifact's header carries: what its bytecode REQUIRES of the runtime that
 /// loads it. A reader that does not implement a required capability refuses the artifact by name
@@ -120,11 +121,25 @@ pub const SUPPORTED_FEATURES: FeatureFlags = FeatureFlags::FIRST_LIGHT;
 /// compiler be told about the ones the runtime already enforces, so a developer hears about them
 /// while typing instead of when the program runs.
 ///
-/// Deliberately short. `bundled-stdlib` and the GC tier are real knobs and are ABSENT, because
-/// neither changes what the front end accepts or what an editor should offer -- one is the caller's
-/// import resolver and the other is invisible to the language. Minting a name before there is a
-/// consequence for it is what this lane argued against for [`FeatureFlags`]' bits, and the argument
-/// does not change because the enum is a different one. Adding a variant is additive.
+/// # What earns a variant, and it is not "is it a knob"
+///
+/// **A capability belongs here exactly when the knob removes something a BUNDLE CANNOT SUPPLY.**
+/// That is the sharp form of "there must be a consequence", and it sorts the real knobs cleanly:
+///
+/// * `float`, `complex`, `introspection` and `threading` gate NATIVE code -- the type, the arithmetic,
+///   the per-type name lists, the `_thread` seam. Nothing a host can put in an artifact substitutes
+///   for them, so a program that reaches for one is wrong before it is written and the front end is
+///   the only place that can say so.
+/// * `bundled-stdlib`, `asyncio-sync` and `asyncio-streams` gate PYTHON SOURCE carried in the image.
+///   A host-compiled bundle carries the compiled module itself, so the knob decides what a device
+///   can compile FOR ITSELF and not what it can run -- the caller's import resolver already answers
+///   that, and a capability here would refuse programs that work.
+/// * The GC tier is not per-construct at all: `gc-none` fails every allocation, which is nearly
+///   every construct, so refusing them one at a time says nothing a reader can act on.
+///
+/// Minting a name before there is a consequence for it is what this lane argued against for
+/// [`FeatureFlags`]' bits, and the argument does not change because the enum is a different one.
+/// Adding a variant is additive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Capability {
@@ -140,6 +155,15 @@ pub enum Capability {
     /// method stays callable and only the ASKING goes away, so this gates what an editor offers and
     /// refuses nothing at compile time.
     Introspection,
+    /// The `_thread` seam the `threading` module is written over (the `threading` feature): green
+    /// threads, `join`, and the lock / event primitives.
+    ///
+    /// **The only NATIVE module in this runtime that a cargo feature can remove**, which is what
+    /// distinguishes it from every other module knob: `threading.py` is ordinary source a bundle can
+    /// carry, but its first line is `import _thread`, and no artifact can supply that. So a program
+    /// that imports `threading` against an image without this capability is one the front end can
+    /// see is wrong, and the interpreter would otherwise answer at the import.
+    Threading,
 }
 
 impl Capability {
@@ -149,7 +173,7 @@ impl Capability {
     /// profile for every caller and narrows it silently. The guard below is what makes that a
     /// compile error rather than a behavior change.
     pub const ALL: &'static [Capability] =
-        &[Capability::Float, Capability::Complex, Capability::Introspection];
+        &[Capability::Float, Capability::Complex, Capability::Introspection, Capability::Threading];
 
     /// Which capabilities cannot be provided without which others, as `(dependent, prerequisite)`.
     ///
@@ -174,6 +198,7 @@ impl Capability {
             Capability::Float => "float",
             Capability::Complex => "complex",
             Capability::Introspection => "introspection",
+            Capability::Threading => "threading",
         }
     }
 
@@ -183,6 +208,7 @@ impl Capability {
             Capability::Float => 0x0001,
             Capability::Complex => 0x0002,
             Capability::Introspection => 0x0004,
+            Capability::Threading => 0x0008,
         }
     }
 }
@@ -201,9 +227,10 @@ const fn _every_capability_is_in_all(capability: Capability) -> usize {
         Capability::Float => 0,
         Capability::Complex => 1,
         Capability::Introspection => 2,
+        Capability::Threading => 3,
     }
 }
-const _: () = assert!(Capability::ALL.len() == 3, "a capability was added without extending ALL");
+const _: () = assert!(Capability::ALL.len() == 4, "a capability was added without extending ALL");
 
 impl core::fmt::Display for Capability {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -362,6 +389,8 @@ pub enum Knob {
     /// The collector engine, so an arena holds a program's live set rather than its total
     /// allocation.
     GcEngine,
+    /// The `_thread` seam the `threading` module is written over.
+    Threading,
 }
 
 impl Knob {
@@ -372,6 +401,7 @@ impl Knob {
         Knob::Introspection,
         Knob::BundledStdlib,
         Knob::GcEngine,
+        Knob::Threading,
     ];
 
     /// The cargo feature this knob is spelled with on `lamella-py-runtime` -- the SAME string in
@@ -385,6 +415,7 @@ impl Knob {
             Knob::Introspection => "introspection",
             Knob::BundledStdlib => "bundled-stdlib",
             Knob::GcEngine => "gc-collect",
+            Knob::Threading => "threading",
         }
     }
 
@@ -399,6 +430,7 @@ impl Knob {
             Knob::Float => Some(Capability::Float),
             Knob::Complex => Some(Capability::Complex),
             Knob::Introspection => Some(Capability::Introspection),
+            Knob::Threading => Some(Capability::Threading),
             Knob::BundledStdlib | Knob::GcEngine => None,
         }
     }
@@ -422,6 +454,7 @@ impl Knob {
             Knob::Introspection => 3_616,
             Knob::BundledStdlib => 0,
             Knob::GcEngine => 9_724,
+            Knob::Threading => 1_656,
         }
     }
 
@@ -441,10 +474,11 @@ const fn _every_knob_is_in_all(knob: Knob) -> usize {
         Knob::Introspection => 2,
         Knob::BundledStdlib => 3,
         Knob::GcEngine => 4,
+        Knob::Threading => 5,
     }
 }
 const _: () = assert!(
-    Knob::ALL.len() == 5,
+    Knob::ALL.len() == 6,
     "a knob was added without extending ALL"
 );
 
@@ -472,19 +506,19 @@ impl NamedProfile {
     pub const ALL: &'static [NamedProfile] = &[
         NamedProfile {
             name: "no-float",
-            knobs: &[],
+            knobs: &[Knob::Threading],
             doc: "The smallest tier: no float, so no complex either. For parts that cannot afford \
                   soft float at all.",
         },
         NamedProfile {
             name: "base",
-            knobs: &[Knob::Float],
+            knobs: &[Knob::Float, Knob::Threading],
             doc: "Float, and nothing optional beyond it. The tier a device runs a host-compiled \
                   bundle on.",
         },
         NamedProfile {
             name: "serve",
-            knobs: &[Knob::Float, Knob::GcEngine],
+            knobs: &[Knob::Float, Knob::GcEngine, Knob::Threading],
             doc: "The tier a host hands arbitrary programs to. The collector is a correctness \
                   requirement here rather than a default: a bounded live set must run indefinitely.",
         },
@@ -734,52 +768,63 @@ impl CodeFlags {
     }
 }
 
-/// The built-in exception hierarchy, `(name, base-name)` pairs -- the ONE definition every
+/// The built-in exception hierarchy, `(name, direct-bases)` pairs -- the ONE definition every
 /// engine derives from: the interpreter builds its exception classes from this table, and a
 /// static lowering derives per-type tags and subtype closures from it, so `except LookupError:`
 /// catches an `IndexError` identically everywhere.
 ///
-/// Invariants: each entry's base appears EARLIER in the table (`""` marks the root,
-/// `BaseException`); the table is APPEND-ONLY (new types are added at the end, existing entries
+/// Invariants: every base of an entry appears EARLIER in the table (the root, `BaseException`, has
+/// an empty base list); the table is APPEND-ONLY (new types are added at the end, existing entries
 /// are never reordered or renamed, so derived artifacts stay stable).
+///
+/// The base list is a LIST because one built-in genuinely has two bases: `ExceptionGroup` derives
+/// from both `BaseExceptionGroup` and `Exception`, which is what makes `except Exception:` take a
+/// group of ordinary errors while `except BaseExceptionGroup:` still takes the same object. Neither
+/// edge is decoration: dropping the second base would let `except Exception:` miss a `TaskGroup`
+/// failure, and dropping the first would make the `except*` desugar double-wrap a real group. A
+/// single base could not express it without ALSO putting `BaseExceptionGroup` under `Exception`,
+/// which is the divergence that silently swallows a `CancelledError`-carrying group.
 ///
 /// `GeneratorExit` derives from `BaseException` (NOT `Exception`), so `except Exception:` around
 /// a `yield` does not swallow a generator's `close()`.
-pub const EXCEPTION_HIERARCHY: &[(&str, &str)] = &[
-    ("BaseException", ""),
-    ("Exception", "BaseException"),
-    ("ArithmeticError", "Exception"),
-    ("ZeroDivisionError", "ArithmeticError"),
-    ("OverflowError", "ArithmeticError"),
-    ("LookupError", "Exception"),
-    ("IndexError", "LookupError"),
-    ("KeyError", "LookupError"),
-    ("AttributeError", "Exception"),
-    ("NameError", "Exception"),
-    ("UnboundLocalError", "NameError"),
-    ("TypeError", "Exception"),
-    ("ValueError", "Exception"),
-    ("AssertionError", "Exception"),
-    ("RuntimeError", "Exception"),
-    ("RecursionError", "RuntimeError"),
-    ("NotImplementedError", "RuntimeError"),
-    ("StopIteration", "Exception"),
-    ("ImportError", "Exception"),
-    ("ModuleNotFoundError", "ImportError"),
-    ("OSError", "Exception"),
-    ("TimeoutError", "OSError"),
-    ("GeneratorExit", "BaseException"),
-    ("SystemExit", "BaseException"),
-    ("FileNotFoundError", "OSError"),
-    ("FileExistsError", "OSError"),
-    ("IsADirectoryError", "OSError"),
-    ("NotADirectoryError", "OSError"),
-    ("PermissionError", "OSError"),
-    ("MemoryError", "Exception"),
-    ("StopAsyncIteration", "Exception"),
-    ("UnicodeError", "ValueError"),
-    ("UnicodeEncodeError", "UnicodeError"),
-    ("BlockingIOError", "OSError"),
+pub const EXCEPTION_HIERARCHY: &[(&str, &[&str])] = &[
+    ("BaseException", &[]),
+    ("Exception", &["BaseException"]),
+    ("ArithmeticError", &["Exception"]),
+    ("ZeroDivisionError", &["ArithmeticError"]),
+    ("OverflowError", &["ArithmeticError"]),
+    ("LookupError", &["Exception"]),
+    ("IndexError", &["LookupError"]),
+    ("KeyError", &["LookupError"]),
+    ("AttributeError", &["Exception"]),
+    ("NameError", &["Exception"]),
+    ("UnboundLocalError", &["NameError"]),
+    ("TypeError", &["Exception"]),
+    ("ValueError", &["Exception"]),
+    ("AssertionError", &["Exception"]),
+    ("RuntimeError", &["Exception"]),
+    ("RecursionError", &["RuntimeError"]),
+    ("NotImplementedError", &["RuntimeError"]),
+    ("StopIteration", &["Exception"]),
+    ("ImportError", &["Exception"]),
+    ("ModuleNotFoundError", &["ImportError"]),
+    ("OSError", &["Exception"]),
+    ("TimeoutError", &["OSError"]),
+    ("GeneratorExit", &["BaseException"]),
+    ("SystemExit", &["BaseException"]),
+    ("FileNotFoundError", &["OSError"]),
+    ("FileExistsError", &["OSError"]),
+    ("IsADirectoryError", &["OSError"]),
+    ("NotADirectoryError", &["OSError"]),
+    ("PermissionError", &["OSError"]),
+    ("MemoryError", &["Exception"]),
+    ("StopAsyncIteration", &["Exception"]),
+    ("UnicodeError", &["ValueError"]),
+    ("UnicodeEncodeError", &["UnicodeError"]),
+    ("BlockingIOError", &["OSError"]),
+    ("EOFError", &["Exception"]),
+    ("BaseExceptionGroup", &["BaseException"]),
+    ("ExceptionGroup", &["BaseExceptionGroup", "Exception"]),
 ];
 
 /// The AOT exception TAG of a Python exception `name`: FNV-1a-32 over `"python." + name`, the high
@@ -933,14 +978,15 @@ impl UnaryOp {
 /// # Op-tag registry
 ///
 /// The wire tag for each op -- the leading `u8` in `encode_op` and the matching `decode`
-/// arm. The binary encoding is stable and versioned; a reader rejects an unknown tag. Tags
-/// 22 and 23 are unused (a historical gap).
+/// arm. The binary encoding is stable and versioned; a reader rejects an unknown tag. Tags 22 and
+/// 23 were a historical gap and now carry the two `del` forms that had no tag; a new op takes the
+/// next number above the highest, which is why [`Op::DeleteName`] is 60 and not 24.
 ///
 /// | tag(s) | ops | group |
 /// |-------:|-----|-------|
 /// |   0-13 | LoadConst, LoadFast, StoreFast, LoadGlobal, LoadAttr, Binary, Compare, PopTop, Jump, PopJumpIfFalse, Call, Return, Unary, Subscript | core |
 /// |  14-21 | BuildSlice, BuildList, BuildTuple, BuildDict, GetIter, ForIter, Setitem, Contains | containers + iteration |
-/// |  22-23 | (free) | |
+/// |  22-23 | DeleteGlobal, DeleteDeref | del: `global` / `nonlocal` names |
 /// |  24-29 | Raise, MatchExc, LoadExc, PopExcept, Reraise, DeleteFast | exceptions |
 /// |  30-32 | MakeFunction, BuildClass, SetAttr | classes |
 /// |     33 | UnpackSequence | tuple-unpacking |
@@ -962,6 +1008,7 @@ impl UnaryOp {
 /// |     57 | BuildClassKw | class keyword arguments |
 /// |     58 | Await | async |
 /// |     59 | ListGrow | growable lists |
+/// |     60 | DeleteName | del: class-body namespace |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -1263,6 +1310,24 @@ pub enum Op {
     /// name declared `global` inside a function, whose write must reach the module namespace rather
     /// than a frame local.
     StoreGlobal(u32),
+    /// Unbind `names[idx]` in the CURRENT module's globals -- the delete counterpart of
+    /// [`Op::StoreGlobal`] (CPython's `DELETE_GLOBAL`). Emitted for `del x` on a name declared
+    /// `global` inside a function, whose deletion must reach the module namespace rather than a
+    /// frame local. A `NameError` if the name is not bound there, which is what makes this
+    /// different from a silent no-op.
+    DeleteGlobal(u32),
+    /// Empty the cell at deref index `idx` -- the delete counterpart of [`Op::StoreDeref`], in the
+    /// same deref index space as [`Op::LoadDeref`]. Emitted for `del v` on a name declared
+    /// `nonlocal`. The cell keeps existing (every closure holds the same box); what is removed is
+    /// its VALUE, so a later [`Op::LoadDeref`] through any holder raises rather than reading a
+    /// stale one.
+    DeleteDeref(u32),
+    /// Unbind `names[idx]` in the active class-body namespace -- the delete counterpart of
+    /// [`Op::StoreName`] (CPython's `DELETE_NAME`). Emitted for `del x` in a `class` body. A
+    /// `NameError` if the name is not bound in that namespace; unlike [`Op::LoadName`] it does NOT
+    /// fall back outward, because deleting a name a class body only READ would unbind it somewhere
+    /// the statement does not name.
+    DeleteName(u32),
 }
 
 /// A compile-time constant in a code object's constant pool. Every value the running
@@ -2345,6 +2410,18 @@ fn put_op(buf: &mut Vec<u8>, op: &Op, wide: &[[u32; 2]]) {
             buf.push(53);
             put_u32(buf, *name);
         }
+        Op::DeleteGlobal(name) => {
+            buf.push(22);
+            put_u32(buf, *name);
+        }
+        Op::DeleteDeref(i) => {
+            buf.push(23);
+            put_u32(buf, *i);
+        }
+        Op::DeleteName(name) => {
+            buf.push(60);
+            put_u32(buf, *name);
+        }
     }
 }
 
@@ -2970,6 +3047,9 @@ impl<'a> Reader<'a> {
             51 => Op::ImportName(self.u32()?),
             52 => Op::ImportFrom(self.u32()?),
             53 => Op::StoreGlobal(self.u32()?),
+            22 => Op::DeleteGlobal(self.u32()?),
+            23 => Op::DeleteDeref(self.u32()?),
+            60 => Op::DeleteName(self.u32()?),
             54 => Op::YieldFrom,
             55 => Op::ImportStar,
             58 => Op::Await,
@@ -3494,7 +3574,7 @@ mod tests {
         let source = Source::Shared(Rc::from(bytes.into_boxed_slice()));
         let (deferred, _) = Bundle::decode_deferred(&source).expect("deferred decode");
         let table = &deferred.entry.functions;
-        assert!(table.len() > 0, "the fixture must define at least one function");
+        assert!(!table.is_empty(), "the fixture must define at least one function");
 
         let names: Vec<&str> = table.names().collect();
         let first = names[0];
@@ -3931,7 +4011,7 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == "StopAsyncIteration")
             .map(|(_, base)| *base);
-        assert_eq!(base, Some("Exception"));
+        assert_eq!(base, Some(&["Exception"][..]));
     }
 
     #[test]
@@ -4018,11 +4098,15 @@ mod tests {
     fn a_named_profile_derives_its_compiler_visible_profile() {
         let serve = NamedProfile::by_name("serve").expect("serve exists");
         assert!(serve.has(Knob::GcEngine));
-        assert_eq!(serve.profile(), Profile::BARE.with(Capability::Float));
+        assert_eq!(
+            serve.profile(),
+            Profile::BARE.with(Capability::Float).with(Capability::Threading)
+        );
         assert!(!serve.profile().supports(Capability::Complex));
 
         let bare = NamedProfile::by_name("no-float").expect("no-float exists");
-        assert_eq!(bare.profile(), Profile::BARE);
+        assert_eq!(bare.profile(), Profile::BARE.with(Capability::Threading));
+        assert!(!bare.profile().supports(Capability::Float));
 
         for profile in NamedProfile::ALL {
             for capability in Capability::ALL {
@@ -4044,12 +4128,12 @@ mod tests {
 
     #[test]
     fn a_profiles_price_is_the_sum_of_the_knobs_it_turns_on() {
-        assert_eq!(NamedProfile::by_name("no-float").unwrap().flash_cost_bytes(), 0);
-        assert_eq!(NamedProfile::by_name("base").unwrap().flash_cost_bytes(), 0);
+        assert_eq!(NamedProfile::by_name("no-float").unwrap().flash_cost_bytes(), 1_656);
+        assert_eq!(NamedProfile::by_name("base").unwrap().flash_cost_bytes(), 1_656);
         assert_eq!(
             NamedProfile::by_name("serve").unwrap().flash_cost_bytes(),
-            9_724,
-            "serve is the baseline plus the collector"
+            9_724 + 1_656,
+            "serve is the baseline plus the collector plus the thread seam"
         );
         assert_eq!(
             NamedProfile::by_name("floor").unwrap().flash_cost_bytes(),
@@ -4067,9 +4151,9 @@ mod tests {
             (Capability::Introspection, Capability::Complex),
         ];
         let closed = Profile::close_over_prerequisites(Capability::Introspection.bit(), up);
+        let chain = Capability::Float.bit() | Capability::Complex.bit() | Capability::Introspection.bit();
         assert_eq!(
-            closed,
-            Profile::FULL.0,
+            closed, chain,
             "taking the end of a chain takes the whole chain, not just the next link"
         );
 
@@ -4077,10 +4161,7 @@ mod tests {
             (Capability::Introspection, Capability::Complex),
             (Capability::Complex, Capability::Float),
         ];
-        let fallen = Profile::close_over_dependents(
-            Profile::FULL.0 & !Capability::Float.bit(),
-            down,
-        );
+        let fallen = Profile::close_over_dependents(chain & !Capability::Float.bit(), down);
         assert_eq!(
             fallen,
             Profile::BARE.0,

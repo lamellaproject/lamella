@@ -48,11 +48,44 @@ fn eval_in(source_line: &str, tools: &Toolchain, work: &TempProgram) -> Result<S
         .map_err(|error| format!("cannot parse compiled assembly: {error:?}"))?;
     let program = load(&assembly).map_err(|error| format!("cannot load: {error}"))?;
 
-    let mut vm = Vm::new();
+    let mut vm = host_vm();
     match run(&program.module, &mut vm, program.entry, Vec::new()) {
         Ok(_) => Ok(vm.output_string()),
         Err(trap) => Err(format!("trap: {trap}")),
     }
+}
+
+/// A monotonic millisecond reader for the interpreter's clock seam: milliseconds since the first
+/// call, which is all a deadline needs.
+///
+/// The runtime is `no_std` and has no platform underneath it, so a clock can only come from whatever
+/// embeds it. This crate IS the host driver, so this is that clock.
+fn host_now_millis() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// The OS-thread sleep half of the clock seam -- what the reactor blocks in when only timers pend.
+fn host_sleep_millis(millis: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+}
+
+/// A `Vm` with the host clock installed -- the only way this crate makes one.
+///
+/// A `Vm` without a clock is not a slower `Vm`, it is one that answers differently, and every
+/// difference is silent: `Thread.Sleep` returns at once, `Environment.TickCount` stays at 0, and
+/// every timed wait -- `Monitor.Wait(obj, ms)`, `WaitHandle.WaitOne(ms)`, `Thread.Join(ms)` --
+/// reports a timeout it never measured, which is worse than not offering the member at all.
+///
+/// The interpreter is `no_std` and has no platform underneath it, so a clock can only come from
+/// whatever embeds it. This crate is a host driver, so it is that embedder, and every `Vm` it
+/// builds is built here rather than by a bare constructor.
+fn host_vm() -> Vm {
+    let mut vm = Vm::new();
+    vm.set_clock(host_now_millis, host_sleep_millis);
+    vm
 }
 
 /// Wraps a single C# expression as a minimal compilable program that prints it.
@@ -219,7 +252,7 @@ impl Session {
             fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let assembly =
             Assembly::read(&bytes).map_err(|error| format!("cannot read metadata: {error:?}"))?;
-        let module = load_library(&assembly).map_err(|error| format!("cannot load: {error}"))?;
+        let mut module = load_library(&assembly).map_err(|error| format!("cannot load: {error}"))?;
 
         let ctor = find_method(&module, "__Repl..ctor")
             .ok_or_else(|| "assembly defines no __Repl..ctor".to_owned())?;
@@ -231,11 +264,10 @@ impl Session {
             .ok_or_else(|| "__Repl has no recorded field layout".to_owned())?
             .to_vec();
 
-        let root_slot = module.static_field_defaults().len();
-        let mut storage = module.static_field_defaults().to_vec();
-        storage.push(Value::Null);
+        let root_slot = module.reserve_static_slot(Value::Null);
+        let storage = module.static_field_defaults().to_vec();
 
-        let mut vm = Vm::new();
+        let mut vm = host_vm();
         vm.init_statics(&storage);
         let instance = vm.heap_mut().alloc_instance(type_id, fields);
         vm.set_static_field(root_slot, Value::Object(instance));
@@ -467,7 +499,7 @@ impl IncrementalSession {
         let root_slot = module.reserve_static_slot(Value::Null);
         let storage = module.static_field_defaults().to_vec();
 
-        let mut vm = Vm::new();
+        let mut vm = host_vm();
         vm.init_statics(&storage);
         let instance = vm.heap_mut().alloc_instance(type_id, fields);
         vm.set_static_field(root_slot, Value::Object(instance));
@@ -806,7 +838,7 @@ impl ReplSession {
             .map_err(|error| format!("cannot read compiled assembly: {error}"))?;
         let assembly =
             Assembly::read(&bytes).map_err(|error| format!("cannot read metadata: {error:?}"))?;
-        let module = load_library(&assembly).map_err(|error| format!("cannot load: {error}"))?;
+        let mut module = load_library(&assembly).map_err(|error| format!("cannot load: {error}"))?;
 
         let ctor = find_method(&module, "__Repl..ctor")
             .ok_or_else(|| "emitted assembly defines no __Repl..ctor".to_owned())?;
@@ -831,11 +863,10 @@ impl ReplSession {
             }
         }
 
-        let root_slot = module.static_field_defaults().len();
-        let mut storage = module.static_field_defaults().to_vec();
-        storage.push(Value::Null);
+        let root_slot = module.reserve_static_slot(Value::Null);
+        let storage = module.static_field_defaults().to_vec();
 
-        let mut vm = Vm::new();
+        let mut vm = host_vm();
         vm.init_statics(&storage);
         let instance = vm.heap_mut().alloc_instance(type_id, fields);
         vm.set_static_field(root_slot, Value::Object(instance));

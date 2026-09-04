@@ -138,15 +138,16 @@ public sealed class Rp2350SpiDriver : SpiDriver
         Mmio.Write32(_cr1, Rp2350SpiLayout.SSPCR1_SSE);
     }
 
-    /// <summary>The whole-burst full-duplex primitive: each byte transmits (null = zeros) while
-    /// its echo lands (null = discarded). The PL022 reports no per-transfer errors; 0 = done.</summary>
-    public override int TransferFullDuplex(byte[] writeBuffer, byte[] readBuffer, int count)
+    /// <summary>The whole-burst full-duplex primitive: each byte transmits (empty = zeros) while
+    /// its echo lands (empty = discarded). The PL022 reports no per-transfer errors; 0 = done.</summary>
+    public override int TransferFullDuplex(System.ReadOnlySpan<byte> writeBuffer,
+                                           System.Span<byte> readBuffer, int count)
     {
         for (int i = 0; i < count; i++)
         {
-            int tx = writeBuffer != null ? writeBuffer[i] : 0;
+            int tx = !writeBuffer.IsEmpty ? writeBuffer[i] : 0;
             int rx = TransferByte(tx);
-            if (readBuffer != null) readBuffer[i] = (byte)rx;
+            if (!readBuffer.IsEmpty) readBuffer[i] = (byte)rx;
         }
         return 0;
     }

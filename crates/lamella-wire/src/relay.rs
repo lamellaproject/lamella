@@ -1,4 +1,5 @@
-//! Passing frames between two carriers, for a target a host cannot reach directly.
+//! Passing frames between two carriers, for a target a host cannot reach directly. It forwards
+//! without interpreting and without reframing, so a message type it has never heard of crosses.
 
 use crate::{Frame, Transport, TransportError};
 

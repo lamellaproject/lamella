@@ -1,5 +1,22 @@
 # BOARD binding: the SAM4S Xplained -- the plain Xplained, NOT the Xplained Pro that is this
-# family's other board. Identity-first, like its sibling: no peripheral bindings yet, because the
+# family's other board.
+#
+# THIS BOARD CAN BE PROGRAMMED AND CANNOT BE DEBUGGED, AND THAT SPLIT IS THE POINT OF IT. Its
+# on-board debugger is a SAM3U4C running J-Link OB, whose protocol is not published, and the part's
+# SWD and JTAG signals reach test points with no header for a cable to land on. So no external
+# debugger reaches this silicon. What DOES reach it is the part's own boot ROM, whose monitor
+# protocol is published in the datasheet, over a USB port that belongs to the part rather than to
+# the bridge -- described in the carrier section below.
+#
+# SO IT IS AN INTERPRETER-ONLY BOARD, in the sense a hobbyist board is: a program is deployed to
+# it, and a program running on it is debugged by the language runtime it is running under rather
+# than by halting the core from outside. A breakpoint on this board is the interpreter's rather than
+# the processor's, because nothing here reaches the processor's.
+#
+# THE TWO USB CONNECTORS BELONG TO DIFFERENT CHIPS, WHICH IS WHAT MAKES BOTH HALVES WORK AT ONCE:
+# the part's own port carries the deploy, and the bridge's virtual COM port carries the console the
+# interpreter talks over. Nothing about the console requires speaking the debugger's protocol -- a
+# CDC virtual COM port is an ordinary serial port whatever else the chip presenting it does. Identity-first, like its sibling: no peripheral bindings yet, because the
 # SAM4S family has no generated driver. What this file adds beyond identity is the board's control
 # lines, which need no driver -- a control pin rides no alternate function.
 #
@@ -20,24 +37,68 @@ board = "sam4s-xpld"
 vendor = "atmel"
 family = "sam4s"
 part = "atsam4s16c"
-board_model = 24            # lamella_wire::board_model::SAM4S_XPLAINED
+product_model = 24          # lamella_wire::product_model::SAM4S_XPLAINED
 sources = [
     "SAM4S Xplained board schematic revision B (SAM4S-XPLD_SCH_REVB, sheets 1, 4 and 5 of 5), from the kit files the vendor publishes for ATSAM4S-XPLD: sheet 4 the MCU, sheet 5 the user LEDs and buttons, sheet 1 the pin assignment summary.",
     "SAM4S Xplained board documentation, hardware description: the board is equipped with a SAM4S16C device in LQFP100 package, and a SAM3U4C device in LQFP package is present to provide the JTAG and UART functions.",
     "SAM4S Series datasheet (Atmel-11100) ordering information, for the package and memory sizes the part id resolves to.",
+    "SAM4S Xplained board documentation, driver installation: the software a host needs is the J-Link software package from Segger, installed with the J-Link-OB CDC driver option checked, and connecting J21 mounts a CDC UART device.",
+    "SAM4S Xplained board documentation, USB device: J21 is a micro-B receptacle on the SAM3U4's high-speed UDPHS port; J20 is a micro-B receptacle on the SAM4S16's full-speed UDP port, and the J20 connector table gives its data pins as PB10_DDM and PB11_DDP.",
+    "SAM4S Xplained board documentation, jumpers: closing the erase jumper at power-on asserts ERASE and clears GPNVM bit 1, so the part boots its internal ROM and answers a SAM-BA connection on J20 or J21 that can program the flash and GPNVM bit 1; the jumper is opened again for the flashing sequence.",
+    "SAM4S Xplained board documentation, memory: the SAM4S16C embeds 16 KB of ROM carrying bootloader routines over UART and USB together with in-application programming routines.",
+    "SAM4S Xplained board documentation, pins connections: the JTAG and UART signals are available at test points only -- TP16 UTXD0, TP17 URXD0, TP18 TDI, TP19 TMS, TP20 TCK, TP21 TDO.",
+    "SAM4S Xplained board documentation, user buttons: the reset button drives NRST on the SAM4S16 alone, and the J-Link OB device cannot be reset by it.",
+    "Schematic revision B sheet 4: pin 87 is PB12_PWML1_ERASE, and the PB12 net runs to jumper JP25 whose other side is VDDIO-4S. Sheet 4 also names the debug pins on the part -- PB4_TWD1_PWMH2_TDI, PB5_TWCK1_PWML0_TDO, PB6_TMS_SWDIO, PB7_TCK_SWCLK -- and TP28 on JTAGSEL.",
+    "SAM4S Series datasheet (Atmel-11100) section 8.1.3.11: the SAM-BA Boot is a default boot program that programs the on-chip flash in situ, supports serial communication over the UART and USB, and is in ROM mapped at address 0x0 when GPNVM bit 1 is set to 0.",
+    "Atmel-11100 section 8.1.3.12 and its GPNVM1 boot-mode table: setting GPNVM1 selects boot from flash and clearing it selects boot from ROM, and asserting ERASE clears GPNVM1 and thereby selects boot from ROM by default.",
+    "Atmel-11100 section 24: the boot program detects a source clock from the main oscillator or the XIN pin and allows USB activation only when the frequency is one of the supported external frequencies, of which 12.000 MHz is one; otherwise it uses the internal 12 MHz RC oscillator and does not allow USB. It initializes UART0 at 115200 baud, 8, n, 1.",
+    "Atmel-11100 section 24.5.3: the boot program's USB device uses Atmel's vendor id 0x03EB with product id 0x6124, and its communication endpoints are a 64-byte bulk OUT endpoint 1 and a 64-byte bulk IN endpoint 2, endpoint 0 being enumeration.",
+    "Atmel-11100 Table 24-2 and section 24.5.1: the monitor's bulk primitives are Send a file (S) to an address and Receive a file (R) of a stated byte count from an address, alongside byte, halfword and word reads and writes and Go; over UART0 the send and receive commands are framed with Xmodem.",
+    "Schematic revision B sheet 3, titled JLINK-OB Interface: connector J22, a TC2050-IDC footprint drawn in the block labeled INNER JTAG (SAM3U Section), carries TMS-3U, TCK-3U, TDI-3U, TDO-3U and NRST-3U.",
 ]
 notes = [
     "TWO FOOTPRINTS ON THIS BOARD ARE DELIBERATELY EMPTY, and both are marked DNP on the schematic: MN7, an AT25DF321 serial flash, and the QTouch slider. They are not absent features -- they are present footprints with nothing in them, which is a different thing for anything that probes. Neither gets a row here, because a row states what the board HAS.",
+    "THE SCHEMATIC'S OWN DEFAULT-JUMPER TABLE NAMES A JUMPER THAT NO SHEET DRAWS. Sheet 1 lists two defaults -- JP7 closed for Power SAM4S16 on page 2, and JP15 open for SAM4S16 ERASE on page 4 -- but the only erase jumper drawn anywhere in the document is JP25, on sheet 4, tying PB12_PWML1_ERASE to VDDIO-4S; JP15 appears in that table and nowhere else. The erase jumper is JP25, which is also the designator the board documentation uses. Recorded because a reader who takes the designator from the summary table alone looks for a jumper the board does not have.",
     "The board also carries an external SRAM on the static memory bus (MN3, an IS66WV51216DBLL: 512K x 16, with A0-A18, D0-D15 and the four strobes wired to the MCU). It is NOT stated as a memory region yet: a region names the controller that brings it up, and this family places no static memory controller instance. That row lands with the controller.",
 ]
 
 # --- the carrier -----------------------------------------------------------------------------
 #
-# THE BRIDGE IS NOT THE SIBLING'S EITHER. The Xplained Pro carries an EDBG; this board carries a
-# SAM3U4C, which its documentation describes both as a JTAGICE bridge and as running J-Link OB
-# firmware with a CDC virtual COM port. What the host sees therefore depends on what is programmed
-# into that SAM3U rather than on the copper alone, and the carrier is stated as the bridged VCP it
-# presents in either case.
+# THE BRIDGE IS NOT THE SIBLING'S, AND NEITHER IS ITS USB IDENTITY. The Xplained Pro carries an
+# EDBG answering vendor id 0x03EB; this board carries a SAM3U4C, and the board's own documentation
+# settles what that SAM3U runs by naming the software a host must install for it: the J-Link
+# package from Segger, with its J-Link-OB CDC driver. So the virtual port this carrier names is a
+# Segger USB device. AN ATMEL VENDOR ID WOULD BE THE WRONG VENDOR HERE rather than an unverified
+# guess, which is why this carrier states no vid/pid pair at all where its sibling boards state
+# one. The pair a kit answers is a property of the debugger, and this board's debugger is not the
+# family's.
+#
+# THE TWO USB RECEPTACLES BELONG TO DIFFERENT CHIPS, which is the board's most consequential fact.
+# J21 is the SAM3U4's own high-speed port -- the J-Link OB and this carrier's CDC. J20 is the
+# SAM4S16's own full-speed device port, its data pins PB10 and PB11, and it reaches the part with
+# no bridge in between.
+#
+# SO THE BOARD HAS A PROGRAMMING ROUTE THAT USES NO DEBUGGER AT ALL. Jumper JP25 ties PB12 --
+# the part's ERASE pin -- to VDDIO-4S. Closed at power-on it asserts ERASE, which clears GPNVM bit
+# 1, and clearing GPNVM bit 1 is what maps the ROM at address 0 -- so the part boots its own 16 KB
+# ROM rather than flash and answers SAM-BA over J20. The jumper is opened again before the flashing
+# sequence. That ROM bootloader is reachable over UART0 as well, at 115200 8N1.
+#
+# AND ON THAT ROUTE THE BOARD DOES HAVE A USB IDENTITY TO STATE, BUT IT IS THE PART'S OWN AND NOT A
+# DEBUGGER'S: the ROM enumerates as 0x03EB / 0x6124, an endpoint pair of one 64-byte bulk OUT and
+# one 64-byte bulk IN. It appears only while the part is booting the ROM, so it is not this board's
+# console carrier and is not stated as one. Its precondition is met here: the ROM allows USB only
+# when it detects an external crystal at one of the frequencies it supports, and this board fits a
+# 12.000 MHz crystal, which is on that list. Without such a crystal the ROM falls back to its
+# internal 12 MHz RC and refuses USB, leaving only the UART.
+#
+# AND THE DEBUG SIGNALS REACH TEST POINTS AND NOTHING ELSE. The part's JTAG port is PB4 TDI,
+# PB5 TDO, PB6 TMS (which is SWDIO), PB7 TCK (which is SWCLK), and the board brings them out as
+# TP18, TP21, TP19 and TP20. There is no debug header: the four I/O expansion headers name none of
+# the four, their pin tables reaching PB0-PB3, PB10, PB11 and PB13 only. The one debug-shaped
+# connector on the board, J22, is drawn on the sheet titled JLINK-OB Interface inside a block
+# labeled INNER JTAG (SAM3U Section) and carries only -3U signals: it programs the debugger, not
+# the target.
 #
 # The reset button is worth one sentence because it is asymmetric: pressing it drives NRST on the
 # SAM4S16 only. The bridge is not reset by it, so a wedged bridge and a wedged target are cleared

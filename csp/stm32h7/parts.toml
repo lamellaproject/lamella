@@ -81,10 +81,12 @@ part = "stm32h747xi"
 package = "240-ball TFBGA"
 flash = 0x200000
 ram = 0x80000
+dp_idcode = 0x6BA02477
+identity_source = "Read from an Arduino GIGA R1 WiFi, whose fitted part is this row, through a CMSIS-DAP probe and again through an ST-Link. 0x6ba02477 is Arm's SW-DP for this class and names no part. The reading that names an ST die is DBGMCU_IDCODE, at the Cortex address 0xE0042000 on this line; no probe has read one from this part."
 pins = [
     "PC13",
-    "PE3",
-    "PI12",
+    "PE3", "PE4", "PE5",
+    "PI4", "PI5", "PI6", "PI7", "PI12",
     "PJ13",
     "PK5", "PK6", "PK7",
 ]

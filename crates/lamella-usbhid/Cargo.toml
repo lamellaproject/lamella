@@ -16,10 +16,21 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_HumanInterfaceDevice",
+    # DEVPROPKEY / DEVPROPTYPE. The HID usage page and usage are device-interface PROPERTIES, so
+    # enumeration can tell a probe from a keyboard without opening either of them -- and opening a
+    # probe is what disturbs the board wired to it.
+    "Win32_Devices_Properties",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `poll(2)`, so a read can honour its timeout. Without it the hidraw read blocks forever when no
+# report is queued -- which is exactly the state `Device::drained` reads in, so every open hung.
+# The sibling `lamella-usbbulk` takes the same dependency on this platform for the same kind of
+# reason; nothing else here needs libc, and the rest of the backend stays `std::fs` only.
+libc = "0.2"
 
 [lints]
 workspace = true

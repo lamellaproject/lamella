@@ -179,8 +179,30 @@ class socket:
         if self._handle is not None:
             raise OSError("socket is already connected")
         addr, port = _split_address(address)
+        if getattr(self, "_timeout", None) == 0:
+            # >>> A NON-BLOCKING CONNECT STARTS AND REPORTS ITSELF UNFINISHED, which is CPython's
+            # behaviour (`BlockingIOError`, EINPROGRESS / WSAEWOULDBLOCK) and not a limitation of this
+            # runtime. The caller waits for WRITABILITY and then calls `connect_check`; that is what
+            # `asyncio.open_connection` does, and it is the only way a connect does not stop
+            # everything else the program is doing. <<<
+            #
+            # It has to be decided HERE rather than inside the seam: a socket's mode is keyed by its
+            # handle, and the blocking `tcp_connect` below does not return one until the wait it would
+            # have skipped is already over.
+            self._handle = _socket.tcp_connect_start(addr, port)
+            self._apply_pending_timeout()
+            if not _socket.connect_check(self._handle):
+                raise BlockingIOError("connect in progress")
+            return
         self._handle = _socket.tcp_connect(addr, port)
         self._apply_pending_timeout()
+
+    def connect_check(self):
+        # Whether a connect started on a non-blocking socket has finished: True connected, False still
+        # connecting, and it RAISES if the connect failed. What a caller runs after waiting for
+        # writability; CPython spells the same question `getsockopt(SOL_SOCKET, SO_ERROR)`, which this
+        # runtime has no socket-option surface for.
+        return _socket.connect_check(self._require())
 
     def send(self, data):
         # The count actually written, which MAY BE SHORT. CPython says the same, and `sendall` is the

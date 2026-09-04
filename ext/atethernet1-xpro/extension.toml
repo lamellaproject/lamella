@@ -1,0 +1,78 @@
+# EXTENSION binding: the Ethernet1 Xplained Pro, a KSZ8851SNL 10/100 Ethernet controller on an
+# Xplained Pro extension board. Every line names a SIGNAL of the ../standards/xplained-pro.toml
+# standard and never a host pad; which pad a signal reaches is the HOST's fact.
+#
+# THE WHOLE MAC AND PHY ARE ON THIS BOARD, WHICH IS THE POINT OF IT. The KSZ8851SNL is a single
+# part carrying a 10/100 physical-layer transceiver, a MAC and an SPI slave, so a host reaches a
+# complete Ethernet interface over four SPI wires and needs no RMII pins, no PHY management and no
+# MAC of its own. That is what makes it usable beside a host that already has an Ethernet MAC:
+# the two interfaces share nothing but the CPU.
+#
+#
+# SEVEN SIGNALS, AND EVERY ONE OF THEM CARRIES A DOCUMENTED ACTIVE LEVEL. The guide states the
+# polarity of the reset, the interrupt, the chip select and the power-management event in words, so
+# no level here is inferred from a name -- which matters most for PME and INTRN, two active-low
+# INPUTS whose names suggest nothing about which way a host should read them. The other eleven
+# header pins are unconnected.
+
+[table]
+kind = "extension"
+extension = "atethernet1-xpro"
+vendor = "microchip"
+standard = "xplained-pro"
+kit_identifier = 2258
+sources = [
+    "Atmel Ethernet1 Xplained Pro user guide Atmel-42226A, Table 1-3 (Ethernet1 Xplained Pro Specific Extension Header): pin 1 ID, 2 GND, 3 NC, 4 NC, 5 PME power management event active low, 6 nRST reset line for Ethernet active low, 7 NC, 8 NC, 9 INTRN interrupt request from Ethernet active low, 10 NC, 11 NC, 12 NC, 13 NC, 14 NC, 15 SPI_SS_A Ethernet chip select connected to the CSN pin, 16 SPI_MOSI connected to SI, 17 SPI_MISO connected to SO, 18 SPI_SCK connected to SCLK, 19 GND, 20 VCC target supply voltage.",
+    "Atmel-42226A section 'Ethernet Controller' and Table 1-4 (Ethernet Controller Connections), which states the same seven signals with fuller descriptions: PME is asserted when one of the wake-on-LAN events is detected by the KSZ8851SNL; SPI_SS_A is an active-low input pin for the SPI interface; SO is a tri-stated output when CSN is negated; and the SCLK clock speed can run up to 40 MHz. Two tables, one connector, and they agree.",
+    "Atmel-42226A section 'Ethernet Controller': the board features a single-port Ethernet controller consisting of a 10/100 physical layer transceiver, a MAC and a Serial Peripheral Interface, and the part number is the KSZ8851SNL.",
+    "Atmel-42226A section 'Identifying Product ID and Revision': the kit identifier for Ethernet1 Xplained Pro is 2258, and a kit's serial number string is nnnnrrssssssssss where n is the product identifier, r the revision and s the serial number.",
+    "Atmel-42226A section 'Getting Started': the board is designed to be connected to the header marked EXT1 and is compatible with all Xplained Pro EXT headers.",
+]
+notes = [
+    "ELEVEN OF THE TWENTY PINS ARE UNCONNECTED, and that is conformance rather than a gap. A board needing one bus and three control lines uses seven signals, and the standard states in words that all pins are not always connected on all extension headers.",
+    "THE MAXIMUM SPI CLOCK IS A PROPERTY OF THIS BOARD AND IS STATED AT 40 MHz, and it is deliberately NOT a field here. A bus rate is negotiated between a controller's prescaler and the slowest device on the wire, so writing it as an extension fact would be the first half of a number a driver must compute anyway. It is in the source string, where a driver author reads it.",
+    "The guide's ID chip table gives example content rather than this board's values -- its example serial begins 1774, which is a different kit's identifier. The FIELD SET is what that table establishes; the kit identifier above is the value the guide states in prose for this board.",
+]
+
+# --- the bus -----------------------------------------------------------------------------------
+
+[[buses]]
+role = "eth-spi"
+kind = "spi"
+ss = "spi_ss_a"
+mosi = "spi_mosi"
+miso = "spi_miso"
+sck = "spi_sck"
+source = "Atmel-42226A Table 1-3 pins 15 to 18, cross-checked against Table 1-4, which names the controller pin each reaches: CSN, SI, SO and SCLK."
+
+# --- control lines -----------------------------------------------------------------------------
+
+[[devices]]
+name = "nrst"
+kind = "gpio-out"
+signal = "gpio2"
+active = "low"
+source = "Atmel-42226A Table 1-3 pin 6 and Table 1-4: reset line for Ethernet, active low."
+
+[[devices]]
+name = "intrn"
+kind = "gpio-in"
+signal = "irq"
+active = "low"
+source = "Atmel-42226A Table 1-3 pin 9 and Table 1-4: interrupt request from Ethernet, active low -- an active-low signal to the host CPU to indicate that an interrupt status bit is set."
+
+[[devices]]
+name = "pme"
+kind = "gpio-in"
+signal = "gpio1"
+active = "low"
+source = "Atmel-42226A Table 1-3 pin 5 and Table 1-4: Power Management Event, active low. It is asserted when one of the wake-on-LAN events is detected by the KSZ8851SNL. An INPUT to the host: the controller drives it."
+
+# --- what is on the board, reached over a bus ---------------------------------------------------
+
+[[devices]]
+name = "ethernet"
+kind = "spi-device"
+bus = "eth-spi"
+part = "ksz8851snl"
+source = "Atmel-42226A section 'Ethernet Controller': a single-port controller consisting of a 10/100 physical layer transceiver, a MAC and a Serial Peripheral Interface, part number KSZ8851SNL from Micrel, INC."

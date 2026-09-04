@@ -133,6 +133,67 @@ enum StdlibFn {
     SocketSetTimeout,
     /// `_socket.get_timeout(socket)` -- `None`, `0.0`, or the timeout in seconds.
     SocketGetTimeout,
+    /// `_sys.stderr_write(text)` -- append to the error stream. No newline is added.
+    SysStderrWrite,
+    /// `_sys.is_coroutine_function(f)` -- whether `f` is an `async def`, read off its code object.
+    /// Native because nothing in Python can ask: an `async def` and a `def` are indistinguishable as
+    /// VALUES, and the only way to tell them apart from Python is to call one.
+    SysIsCoroutineFunction,
+    /// `_reactor.park_io(id, fd, writable)` -- park waiter `id` until socket `fd` is ready, and arm
+    /// the backend to notice it. The counterpart to `park` for the other thing there is to wait for.
+    ///
+    /// APPENDED, beside the `_sys` entries rather than beside `_reactor`'s, and the misplacement is
+    /// deliberate. These discriminants are IMPLICIT (`id()` is `self as u32`) while `from_id` is a
+    /// hand-written mirror of them, so **a variant inserted mid-enum renumbers every variant after
+    /// it while the mirror keeps the old numbers** -- and every id still maps to SOMETHING, so the
+    /// coverage guard stays green while `block_point` resolves to a different function entirely.
+    /// Measured: inserting this one beside `ReactorPark` moved eighteen variants and turned
+    /// `_reactor.block_point()` into a call that answered an int.
+    ReactorParkIo,
+    /// `_socket.tcp_connect_start(addr, port)` -- opens the socket and returns its handle WITHOUT
+    /// waiting for the handshake. The first half of a two-phase connect; `connect_check` is the
+    /// second.
+    SocketTcpConnectStart,
+    /// `_socket.connect_check(socket)` -- True once connected, False while still connecting, and it
+    /// RAISES when the connect failed. Never waits.
+    SocketConnectCheck,
+    /// `_thread.start_new_thread(callable, args)` -- asks the scheduler to run `callable(*args)` as a
+    /// new green thread, answering its id. Refuses loudly at the thread cap.
+    #[cfg(feature = "threading")]
+    ThreadStart,
+    /// `_thread.get_ident()` -- the running thread's id. `0` is the main thread.
+    #[cfg(feature = "threading")]
+    ThreadIdent,
+    /// `_thread.active_count()` -- how many threads have not finished, including this one.
+    #[cfg(feature = "threading")]
+    ThreadActiveCount,
+    /// `_thread.join(id)` -- blocks the running thread until thread `id` finishes. Returns `None`,
+    /// and returns AT ONCE when `id` names a thread that has already finished or never existed.
+    ///
+    /// APPENDED AT THE END, and every future variant must be too: `from_id` is a hand-written
+    /// table of offsets, so inserting a variant mid-enum renumbers every one after it while the
+    /// table keeps the old numbers -- two builtins quietly swapping bodies.
+    #[cfg(feature = "threading")]
+    ThreadJoin,
+    /// `_thread.acquire_lock(cell, waiters, blocking)` -- the ATOMIC test-and-set a Python lock
+    /// cannot write for itself. `cell` is a one-element list holding `owner_id + 1`, or `0` when the
+    /// lock is free; `waiters` is the FIFO queue of thread ids. Answers `True` when the caller holds
+    /// the lock (now, or by hand-off once it is woken) and `False` only for a non-blocking call that
+    /// would have had to wait.
+    #[cfg(feature = "threading")]
+    ThreadAcquireLock,
+    /// `_thread.release_lock(cell, waiters)` -- hands the lock to the longest-waiting thread and
+    /// wakes it, or marks the lock free when nobody is waiting. `RuntimeError` on an unheld lock.
+    #[cfg(feature = "threading")]
+    ThreadReleaseLock,
+    /// `_thread.wait_flag(cell, waiters)` -- returns `True` at once if `cell[0]` is already set;
+    /// otherwise queues the running thread and parks it. The test and the park are ONE call, which
+    /// is what closes the lost-wakeup window a Python `if not flag: park()` leaves open.
+    #[cfg(feature = "threading")]
+    ThreadWaitFlag,
+    /// `_thread.wake_all(waiters)` -- makes every queued thread runnable and empties the queue.
+    #[cfg(feature = "threading")]
+    ThreadWakeAll,
     /// NOT A FUNCTION. One past the last real variant, so the coverage guard below can count them
     /// without naming which one is last.
     ///
@@ -226,6 +287,27 @@ impl StdlibFn {
             64 => SocketUdpRecvFrom,
             65 => SocketSetTimeout,
             66 => SocketGetTimeout,
+            67 => SysStderrWrite,
+            68 => SysIsCoroutineFunction,
+            69 => ReactorParkIo,
+            70 => SocketTcpConnectStart,
+            71 => SocketConnectCheck,
+            #[cfg(feature = "threading")]
+            72 => ThreadStart,
+            #[cfg(feature = "threading")]
+            73 => ThreadIdent,
+            #[cfg(feature = "threading")]
+            74 => ThreadActiveCount,
+            #[cfg(feature = "threading")]
+            75 => ThreadJoin,
+            #[cfg(feature = "threading")]
+            76 => ThreadAcquireLock,
+            #[cfg(feature = "threading")]
+            77 => ThreadReleaseLock,
+            #[cfg(feature = "threading")]
+            78 => ThreadWaitFlag,
+            #[cfg(feature = "threading")]
+            79 => ThreadWakeAll,
             _ => return None,
         })
     }
@@ -275,6 +357,8 @@ impl StdlibFn {
             TimeMonotonicNs => "monotonic_ns",
             TimeSleepNs => "sleep_ns",
             TimeClockIsSet => "clock_is_set",
+            SysStderrWrite => "stderr_write",
+            SysIsCoroutineFunction => "is_coroutine_function",
             SocketResolve => "resolve",
             SocketTcpConnect => "tcp_connect",
             SocketTcpListen => "tcp_listen",
@@ -299,6 +383,25 @@ impl StdlibFn {
             FsKind => "kind",
             WeakrefRef => "ref",
             ReactorPark => "park",
+            ReactorParkIo => "park_io",
+            #[cfg(feature = "threading")]
+            ThreadStart => "start_new_thread",
+            #[cfg(feature = "threading")]
+            ThreadIdent => "get_ident",
+            #[cfg(feature = "threading")]
+            ThreadActiveCount => "active_count",
+            #[cfg(feature = "threading")]
+            ThreadJoin => "join",
+            #[cfg(feature = "threading")]
+            ThreadAcquireLock => "acquire_lock",
+            #[cfg(feature = "threading")]
+            ThreadReleaseLock => "release_lock",
+            #[cfg(feature = "threading")]
+            ThreadWaitFlag => "wait_flag",
+            #[cfg(feature = "threading")]
+            ThreadWakeAll => "wake_all",
+            SocketTcpConnectStart => "tcp_connect_start",
+            SocketConnectCheck => "connect_check",
             ReactorUnpark => "unpark",
             ReactorBlockPoint => "block_point",
             ReactorNowMs => "now_ms",
@@ -469,6 +572,9 @@ pub fn build_module(name: &str, model: &mut ObjectModel) -> Option<Result<Value,
         "weakref" => Some(build_weakref_module(model)),
         "_reactor" => Some(build_reactor_module(model)),
         "_socket" => Some(build_socket_module(model)),
+        "_sys" => Some(build_sys_seam_module(model)),
+        #[cfg(feature = "threading")]
+        "_thread" => Some(build_thread_module(model)),
         _ => None,
     }
 }
@@ -485,7 +591,145 @@ pub fn build_module(name: &str, model: &mut ObjectModel) -> Option<Result<Value,
 fn build_reactor_module(model: &mut ObjectModel) -> Result<Value, Trap> {
     use StdlibFn::*;
     let mut entries: Vec<(Value, Value)> = Vec::new();
-    for f in [ReactorPark, ReactorUnpark, ReactorBlockPoint, ReactorNowMs] {
+    for f in [ReactorPark, ReactorParkIo, ReactorUnpark, ReactorBlockPoint, ReactorNowMs] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+#[cfg(feature = "threading")]
+/// The value a lock cell holds while thread `id` owns it: the id PLUS ONE, so `0` can mean FREE.
+///
+/// One function rather than the same expression at each of the three sites that needs it -- the
+/// encoding is a contract between them, and a site that spelled it differently would hand the lock
+/// to a thread that does not exist.
+#[cfg(feature = "threading")]
+fn owner_token(id: u32) -> Value {
+    i32::try_from(id.saturating_add(1))
+        .ok()
+        .and_then(Value::fixnum)
+        .unwrap_or(Value::NONE)
+}
+
+/// The `fixnum` zero a free lock cell and a clear event flag both hold.
+#[cfg(feature = "threading")]
+fn cell_zero() -> Value {
+    Value::fixnum(0).unwrap_or(Value::NONE)
+}
+
+/// A thread id as a Python int -- what a waiter list holds. NOT [`owner_token`], which is the id
+/// plus one: a waiter list has no FREE value to reserve `0` for.
+#[cfg(feature = "threading")]
+fn thread_id_value(id: u32) -> Value {
+    i32::try_from(id).ok().and_then(Value::fixnum).unwrap_or(Value::NONE)
+}
+
+/// The thread id a waiter list entry names, or `None` if it holds something else.
+#[cfg(feature = "threading")]
+fn waiter_id(model: &ObjectModel, entry: Value) -> Option<u32> {
+    model.as_i128(entry).and_then(|n| u32::try_from(n).ok())
+}
+
+/// The message the three cell-taking seam functions share. One string, because the caller they are
+/// diagnosing is `threading.py` in every case and it is the SHAPE that is wrong, not the callee.
+#[cfg(feature = "threading")]
+const NOT_A_LOCK_CELL: &str = "expected a one-element list and a waiter list";
+
+/// `_thread.acquire_lock` -- see [`StdlibFn::ThreadAcquireLock`].
+#[cfg(feature = "threading")]
+fn thread_acquire_lock(
+    model: &mut ObjectModel,
+    cell: Value,
+    waiters: Value,
+    blocking: bool,
+) -> Result<Value, Trap> {
+    let Some(held) = model.slot_get(cell) else {
+        return Err(model.raise_named_exception("TypeError", NOT_A_LOCK_CELL));
+    };
+    let me = model.current_thread_id();
+    if held == cell_zero() {
+        model.slot_set(cell, owner_token(me))?;
+        return Ok(Value::TRUE);
+    }
+    if !blocking {
+        return Ok(Value::FALSE);
+    }
+    model.list_append(waiters, thread_id_value(me))?;
+    model.request_block(crate::interp::BlockReason::Lock);
+    Ok(Value::TRUE)
+}
+
+/// `_thread.release_lock` -- see [`StdlibFn::ThreadReleaseLock`].
+#[cfg(feature = "threading")]
+fn thread_release_lock(model: &mut ObjectModel, cell: Value, waiters: Value) -> Result<Value, Trap> {
+    let Some(held) = model.slot_get(cell) else {
+        return Err(model.raise_named_exception("TypeError", NOT_A_LOCK_CELL));
+    };
+    if held == cell_zero() {
+        return Err(model.raise_named_exception("RuntimeError", "release unlocked lock"));
+    }
+    match model.list_pop_front(waiters) {
+        Some(next) => {
+            let Some(id) = waiter_id(model, next) else { return Err(Trap::Malformed) };
+            model.slot_set(cell, owner_token(id))?;
+            model.wake_thread(id);
+        }
+        None => model.slot_set(cell, cell_zero())?,
+    }
+    Ok(Value::NONE)
+}
+
+/// `_thread.wait_flag` -- see [`StdlibFn::ThreadWaitFlag`].
+///
+/// >>> THE TEST AND THE PARK ARE ONE CALL, WHICH IS THE WHOLE POINT. Written in Python as
+/// `if not flag: park()` the flag can be set between the two ops -- the setter wakes an empty queue,
+/// the waiter then parks, and nothing will ever wake it again. That is a lost wakeup, and it is rare
+/// enough to reach a device. <<<
+#[cfg(feature = "threading")]
+fn thread_wait_flag(model: &mut ObjectModel, cell: Value, waiters: Value) -> Result<Value, Trap> {
+    let Some(flag) = model.slot_get(cell) else {
+        return Err(model.raise_named_exception("TypeError", NOT_A_LOCK_CELL));
+    };
+    if flag != cell_zero() {
+        return Ok(Value::TRUE);
+    }
+    let me = model.current_thread_id();
+    model.list_append(waiters, thread_id_value(me))?;
+    model.request_block(crate::interp::BlockReason::Event);
+    Ok(Value::FALSE)
+}
+
+/// `_thread.wake_all` -- see [`StdlibFn::ThreadWakeAll`].
+#[cfg(feature = "threading")]
+fn thread_wake_all(model: &mut ObjectModel, waiters: Value) -> Result<Value, Trap> {
+    for entry in model.list_take_all(waiters) {
+        if let Some(id) = waiter_id(model, entry) {
+            model.wake_thread(id);
+        }
+    }
+    Ok(Value::NONE)
+}
+
+#[cfg(feature = "threading")]
+/// Builds `_thread`: the raw green-thread seam the `threading` module is written over.
+///
+/// Native because a thread is a suspended CALL STACK, and nothing in Python can ask for one: the
+/// driver keeps the whole chain on an explicit stack, and only the scheduler can hold a second.
+fn build_thread_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    use StdlibFn::*;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in [
+        ThreadStart,
+        ThreadIdent,
+        ThreadActiveCount,
+        ThreadJoin,
+        ThreadAcquireLock,
+        ThreadReleaseLock,
+        ThreadWaitFlag,
+        ThreadWakeAll,
+    ] {
         let key = model.new_str(f.python_name())?;
         entries.push((key, Value::builtin_ref(f.id())));
     }
@@ -520,6 +764,23 @@ fn build_struct_seam_module(model: &mut ObjectModel) -> Result<Value, Trap> {
     use StdlibFn::*;
     let mut entries: Vec<(Value, Value)> = Vec::new();
     for f in [StructPackFloat, StructUnpackFloat] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+/// Builds `_sys`: the seam `sys` needs from the embedder, which today is the error stream.
+///
+/// Native for the same reason `_time` is: a STREAM belongs to whoever the program is running
+/// inside. A host buffers it and drains it at the end; a firmware frames each write with the stream
+/// number the wire carries, so `EVT_OUTPUT` says which of the two it is. Python cannot express
+/// either, and `sys.py` builds CPython's `sys.stderr` shape on top of this.
+fn build_sys_seam_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    use StdlibFn::*;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in [SysStderrWrite, SysIsCoroutineFunction] {
         let key = model.new_str(f.python_name())?;
         entries.push((key, Value::builtin_ref(f.id())));
     }
@@ -735,6 +996,8 @@ fn build_socket_module(model: &mut ObjectModel) -> Result<Value, Trap> {
     for f in [
         SocketResolve,
         SocketTcpConnect,
+        SocketTcpConnectStart,
+        SocketConnectCheck,
         SocketTcpListen,
         SocketAccept,
         SocketRecv,
@@ -916,6 +1179,16 @@ pub fn call_stdlib(
             }
             Ok(Value::from_bool(model.clock_is_set()))
         }
+        SysStderrWrite => {
+            let [text] = args else { return Err(Trap::TypeError) };
+            let text = String::from(model.str_text(*text)?);
+            model.write_stderr(&text);
+            Ok(Value::NONE)
+        }
+        SysIsCoroutineFunction => {
+            let [func] = args else { return Err(Trap::TypeError) };
+            Ok(Value::from_bool(model.function_is_coroutine(*func).unwrap_or(false)))
+        }
         SocketResolve => {
             let [host] = args else { return Err(Trap::TypeError) };
             let host = String::from(model.str_text(*host)?);
@@ -926,6 +1199,24 @@ pub fn call_stdlib(
                 addrs.push(model.new_bytes(addr)?);
             }
             model.new_list(addrs)
+        }
+        SocketTcpConnectStart => {
+            let [addr, port] = args else { return Err(Trap::TypeError) };
+            let (addr, port) = (addr_arg(model, *addr)?, port_arg(model, *port)?);
+            match net_call(model, |b| b.tcp_connect(&addr, port))? {
+                Some(handle) => Ok(handle_value(handle)),
+                None => Err(net_error(model, "connect")),
+            }
+        }
+        SocketConnectCheck => {
+            let [socket] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            let Some(backend) = model.net_backend() else { return Err(no_network(model)) };
+            match backend.connect_check(socket) {
+                NetResult::Ready(()) => Ok(Value::TRUE),
+                NetResult::WouldBlock => Ok(Value::FALSE),
+                NetResult::Error => Err(net_error(model, "connect")),
+            }
         }
         SocketTcpConnect => {
             let [addr, port] = args else { return Err(Trap::TypeError) };
@@ -1182,6 +1473,85 @@ pub fn call_stdlib(
             };
             let id = u32::try_from(id).map_err(|_| Trap::TypeError)?;
             model.park_waiter(id, u64::try_from(deadline).unwrap_or(0));
+            Ok(Value::NONE)
+        }
+        #[cfg(feature = "threading")]
+        ThreadStart => {
+            let [callable, args] = args else { return Err(Trap::TypeError) };
+            if !model.is_tuple(*args) && !model.is_list(*args) {
+                let message = "2nd arg must be a tuple";
+                return Err(model.raise_named_exception("TypeError", message));
+            }
+            let id = model.spawn_thread(*callable, *args)?;
+            Ok(Value::fixnum(i32::try_from(id).unwrap_or(0)).unwrap_or(Value::NONE))
+        }
+        #[cfg(feature = "threading")]
+        ThreadIdent => {
+            if !args.is_empty() {
+                return Err(Trap::TypeError);
+            }
+            let id = model.current_thread_id();
+            Ok(Value::fixnum(i32::try_from(id).unwrap_or(0)).unwrap_or(Value::NONE))
+        }
+        #[cfg(feature = "threading")]
+        ThreadActiveCount => {
+            if !args.is_empty() {
+                return Err(Trap::TypeError);
+            }
+            let live = model.active_thread_count();
+            Ok(Value::fixnum(i32::try_from(live).unwrap_or(1)).unwrap_or(Value::NONE))
+        }
+        #[cfg(feature = "threading")]
+        ThreadJoin => {
+            let [ident] = args else { return Err(Trap::TypeError) };
+            let Some(target) = model.as_i128(*ident) else {
+                let message = "join() takes a thread id";
+                return Err(model.raise_named_exception("TypeError", message));
+            };
+            if u128::try_from(target).ok() == Some(u128::from(model.current_thread_id())) {
+                let message = "cannot join current thread";
+                return Err(model.raise_named_exception("RuntimeError", message));
+            }
+            if let Ok(target) = u32::try_from(target) {
+                model.request_join(target);
+            }
+            Ok(Value::NONE)
+        }
+        #[cfg(feature = "threading")]
+        ThreadAcquireLock => {
+            let [cell, waiters, blocking] = args else { return Err(Trap::TypeError) };
+            thread_acquire_lock(model, *cell, *waiters, *blocking == Value::TRUE)
+        }
+        #[cfg(feature = "threading")]
+        ThreadReleaseLock => {
+            let [cell, waiters] = args else { return Err(Trap::TypeError) };
+            thread_release_lock(model, *cell, *waiters)
+        }
+        #[cfg(feature = "threading")]
+        ThreadWaitFlag => {
+            let [cell, waiters] = args else { return Err(Trap::TypeError) };
+            thread_wait_flag(model, *cell, *waiters)
+        }
+        #[cfg(feature = "threading")]
+        ThreadWakeAll => {
+            let [waiters] = args else { return Err(Trap::TypeError) };
+            thread_wake_all(model, *waiters)
+        }
+        ReactorParkIo => {
+            let [id, socket, writable] = args else {
+                return Err(Trap::TypeError);
+            };
+            let (Some(id), Some(socket)) = (model.as_i128(*id), model.as_i128(*socket)) else {
+                let message = "park_io() takes a waiter id, a socket handle and a writable flag";
+                return Err(model.raise_named_exception("TypeError", message));
+            };
+            let id = u32::try_from(id).map_err(|_| Trap::TypeError)?;
+            let socket = u32::try_from(socket).map_err(|_| Trap::TypeError)?;
+            let interest = if *writable == Value::TRUE { Interest::Write } else { Interest::Read };
+            if let Some(backend) = model.net_backend() {
+                backend.register(socket, interest);
+            }
+            model.park_waiter_on_socket(id, socket);
             Ok(Value::NONE)
         }
         ReactorUnpark => {

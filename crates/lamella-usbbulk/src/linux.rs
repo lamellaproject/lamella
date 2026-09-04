@@ -28,6 +28,9 @@ struct Found {
     pid: u16,
     serial: Option<String>,
     product: Option<String>,
+    /// The vendor-class interface's own name, from sysfs `.../interface` -- the `iInterface`
+    /// string the kernel read at enumeration. Reading a file, so no device is opened.
+    interface_name: Option<String>,
     interface: u8,
     ep_in: u8,
     ep_out: u8,
@@ -122,13 +125,14 @@ fn scan() -> Vec<Found> {
                 continue;
             }
             let (ep_in, ep_out) = bulk_endpoints(&iface.path());
-            if ep_in != 0 && ep_out != 0 {
+            {
                 out.push(Found {
                     node: format!("/dev/bus/usb/{busnum:03}/{devnum:03}"),
                     vid,
                     pid,
                     serial: serial.clone(),
                     product: product.clone(),
+                    interface_name: read_string(&iface.path().join("interface")),
                     interface: read_hex8(&iface.path().join("bInterfaceNumber")).unwrap_or(0),
                     ep_in,
                     ep_out,
@@ -148,6 +152,7 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
             product_id: f.pid,
             serial_number: f.serial,
             product: f.product,
+            interface_name: f.interface_name,
         })
         .collect())
 }
@@ -196,6 +201,13 @@ impl Device {
             serial,
             |f| f.serial.as_deref(),
         )?;
+        if f.ep_in == 0 || f.ep_out == 0 {
+            return Err(Error::Os(format!(
+                "{:04x}:{:04x} has a vendor-class interface but no bulk IN/OUT pair, so this \
+                 transport cannot drive it",
+                f.vid, f.pid
+            )));
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)

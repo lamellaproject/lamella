@@ -21,7 +21,7 @@ use lamella_net_core::{
 use smoltcp::iface::{Config, Interface, SocketHandle as SmolHandle, SocketSet};
 use smoltcp::phy::Device;
 use smoltcp::socket::{dhcpv4, dns, tcp, udp};
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint,
     IpListenEndpoint, Ipv4Address,
@@ -188,7 +188,11 @@ impl<D: Device> SmoltcpNet<D> {
         let mut gateway_addr: Option<[u8; 4]> = None;
         match &config.ip {
             IpSetup::Dhcp => {
-                dhcp = Some(sockets.add(dhcpv4::Socket::new()));
+                let mut socket = dhcpv4::Socket::new();
+                let mut retry = dhcpv4::RetryConfig::default();
+                retry.discover_timeout = Duration::from_secs(4);
+                socket.set_retry_config(retry);
+                dhcp = Some(sockets.add(socket));
             }
             IpSetup::Static { addr, prefix_len, gateway, dns } => {
                 let ip = IpAddress::Ipv4(Ipv4Address::from(*addr));

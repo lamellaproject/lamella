@@ -13,9 +13,9 @@ pub struct Label(u32);
 
 /// The shape of a patch site: how the bytes at a reference encode their target.
 ///
-/// Only the absolute 32-bit data word is modelled so far; the Thumb branch and
-/// `MOVW`/`MOVT` forms, whose immediates are split across the encoding, are
-/// added as their instructions are.
+/// The absolute 32-bit data word is the one shape modelled here. The Thumb
+/// branch and `MOVW`/`MOVT` forms split their immediates across the encoding,
+/// so each arrives with the instruction that needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RelocKind {
     /// A full 32-bit little-endian word holding the target address.

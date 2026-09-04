@@ -21,3 +21,7 @@ notes = "The array base pin (GPIO0). Per-pin CTRL stride is 8 (GPIOn_CTRL = 0x04
 [constants]
 GPIO_CTRL_STRIDE = 8
 FUNCSEL_UART = 2
+# F5 on both banks. RP2040 datasheet Table 281/283 and the SIO function description: "The SIO
+# function (F5) must be selected for the processors to drive a GPIO, but the input is always
+# connected" -- which is why a driver routes the function to write and need not to read.
+FUNCSEL_SIO = 5

@@ -21,6 +21,10 @@ lamella-net-core = { path = "../lamella-net-core" }
 # sibling language runtime writes too, and one definition is the only way two writers stay identical.
 lamella-wtf8 = { path = "../lamella-wtf8" }
 lamella-token = { path = "../lamella-token" }
+# The 96-bit System.Decimal kernel. A leaf like the reactor and the WTF-8 codec, and for the same
+# reason with a sharper edge: a compiled program on a device links the SAME arithmetic without a
+# value stack to unpack, so an implementation that lived here would have to exist twice.
+lamella-decimal = { path = "../lamella-decimal", default-features = false }
 # Accurate no_std transcendental math (sqrt/sin/cos/pow/log/exp), behind `math-transcendental`.
 # A MUSL/fdlibm port (the accurate option; a fast/approximate alternative is a future knob).
 libm = { version = "0.2.16", optional = true }
@@ -75,7 +79,7 @@ finalizers = ["gc"]
 # float arithmetic / comparison, ckfinite) and the float BCL (Double.ToString, the Math double
 # overloads). Off => the no-float tier: those opcodes trap and the float code is compiled out --
 # for the smallest targets that have no FPU and use no float. A capability-profile knob.
-float = []
+float = ["lamella-decimal/float"]
 # Code loading (the `code_loading` capability knob), three levels over the one ManagedBody seam.
 # Default (both features OFF) = `on_use`: keep the raw CIL and decode a method body lazily on first
 # call, so an uncalled method never decodes -- lighter resident RAM and faster startup. `code-preload`

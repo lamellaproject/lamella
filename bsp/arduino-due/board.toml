@@ -12,7 +12,7 @@ board = "due"
 vendor = "arduino"
 family = "sam3x"
 part = "atsam3x8e"
-board_model = 15            # lamella_wire::board_model::ARDUINO_DUE
+product_model = 15          # lamella_wire::product_model::ARDUINO_DUE
 sources = [
     "Arduino Due schematic: the programming port's ATmega16U2 bridges the SAM3X UART -- RX0 = PA8, TX0 = PA9; 12 MHz crystal on XIN/XOUT",
     "the board's resident Atmel boot code programs CKGR_MOR.MOSCSEL = 1 (crystal selected, MOSCXTS = 1), CKGR_PLLAR = 0x200D3F01 (DIVA 1, MULA 13 = x14), PMC_MCKR = 0x00000012 (CSS = PLLA_CLK, PRES = CLK_2, PLLADIV2 = 0) -- the chain below, as the vendor programs it",

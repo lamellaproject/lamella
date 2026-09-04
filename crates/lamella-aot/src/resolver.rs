@@ -230,6 +230,37 @@ pub struct DescQualifiers {
     pub string: Option<u32>,
 }
 
+/// The AMBIENT `System.String` descriptor: one data word holding the address of `System.String`'s
+/// canonical descriptor, or 0 when this build cannot name the type.
+///
+/// **THE RUNTIME ARCHIVE CANNOT SPELL A DESCRIPTOR SYMBOL, WHICH IS WHY THIS EXISTS.**
+/// [`descriptor_symbol`] qualifies a reference-owned handle with the OWNING build's fnv1a32 hash, so
+/// `System.String`'s symbol name varies per image and a `no_std` archive compiled once cannot
+/// reference it. This name does not vary. The seams that allocate a string -- `Substring`,
+/// `Char.ToString`, `Double.ToString` -- read the word and write it into the object header, which is
+/// how a string they produce comes to dispatch like one a literal produces.
+///
+/// **EMITTED UNCONDITIONALLY, INCLUDING AS 0.** Each runtime-support archive is one crate built with
+/// `lto = true`, so an image that pulls in any of its objects may pull the reference to this symbol
+/// whether or not it uses a string seam; laying the word only when `System.String` resolves would
+/// turn that into an undefined-symbol link failure in, for instance, a Python-only image. One word
+/// is cheaper than the question.
+///
+/// **IT LIVES HERE, BESIDE [`DescQualifiers`], BECAUSE IT IS ONE NAME FOR TWO BACKENDS.** The ARM
+/// and RISC-V emitters each lay the word into their own object; the two archives each declare the
+/// same `extern` and read it. A per-backend copy of the string would be a second place for the name
+/// to drift, which is the failure this constant exists to remove rather than to reproduce.
+pub(crate) const STRING_TYPEDESC_SYMBOL: &str = "__lamella_string_typedesc";
+
+/// The runtime seams that ALLOCATE a `System.String` and therefore need [`STRING_TYPEDESC_SYMBOL`]
+/// to hold a real descriptor. Named here so a host refusal can say which one forced the build to
+/// need it.
+pub(crate) const STRING_ALLOCATING_SEAMS: [&str; 3] = [
+    "lamella_string_substring",
+    "lamella_char_to_string",
+    "lamella_double_to_string",
+];
+
 /// The canonical symbol for `handle`'s descriptor under `qualifiers` (see [`DescQualifiers`]).
 /// A reference-owned handle names the OWNER's token, so the symbol matches what the owning
 /// library's own build emits. Panics on a reference handle with no attached hash -- that is a
@@ -298,6 +329,15 @@ pub struct MetadataResolver<'a> {
     /// by [`Self::rebased_on_reference`], where `assembly` becomes the definition's OWNER while the
     /// arguments remain the CALLER's. `None` everywhere else, which is every ordinary resolver.
     argument_assembly: Option<&'a Assembly<'a>>,
+    /// The reference list that goes WITH [`Self::argument_assembly`] -- the caller's own, untruncated.
+    ///
+    /// **A WORLD IS AN ASSEMBLY *AND* ITS REFERENCES, AND CARRYING ONLY THE FIRST HALF IS WHAT MADE
+    /// THE GENERIC STATIC BAND UNREADABLE FROM A REBASED VIEW.** `rebased_on_reference` truncates
+    /// `references` to the owner's own (`[..ordinal]`), which is right for reading the owner's CIL
+    /// and wrong for anything that has to be read back in the caller's world -- the band is numbered
+    /// against the MODULE's region, so it needs the module's list to find that region's base at all.
+    /// `None` everywhere else, which is every ordinary resolver.
+    argument_references: Option<Vec<&'a Assembly<'a>>>,
     /// The METHOD type arguments in force while lowering a generic method's monomorphized body --
     /// what `!!n` substitutes to. Separate from `type_arguments` because the two axes are separate:
     /// `Pick<int>` called inside `Box<string>` resolves `!!0` to `int` and `!0` to `string`, and one
@@ -410,6 +450,7 @@ impl<'a> MetadataResolver<'a> {
             type_arguments: Vec::new(),
             layout_arguments: Vec::new(),
             argument_assembly: None,
+            argument_references: None,
             method_arguments: Vec::new(),
             mono: crate::generics::MonoPlan::default(),
             box_target_tokens: box_target_tokens(assembly),
@@ -455,6 +496,7 @@ impl<'a> MetadataResolver<'a> {
             type_arguments: Vec::new(),
             layout_arguments: Vec::new(),
             argument_assembly: Some(self.assembly),
+            argument_references: Some(self.references.clone()),
             method_arguments: Vec::new(),
             mono: self.mono.clone(),
             box_target_tokens: box_target_tokens(owner),
@@ -529,6 +571,17 @@ impl<'a> MetadataResolver<'a> {
     /// hazard this family exists to close.
     pub(crate) fn argument_world(&self) -> &'a Assembly<'a> {
         self.argument_assembly.unwrap_or(self.assembly)
+    }
+
+    /// The reference list of the world [`Self::argument_world`] names -- the other half of it.
+    ///
+    /// For an ordinary resolver this is just `references`. For a rebased one it is the CALLER's
+    /// full list rather than the owner's truncated one, which is what lets a lookup keyed to the
+    /// module (the generic static band) be answered from inside a body lowered next door.
+    pub(crate) fn argument_world_references(&self) -> &[&'a Assembly<'a>] {
+        self.argument_references
+            .as_deref()
+            .unwrap_or(&self.references)
     }
 
     /// The METHOD type arguments in force while lowering one generic method's monomorphized body --
@@ -654,6 +707,7 @@ impl<'a> MetadataResolver<'a> {
         Some(CallInfo {
             args: signature.parameters.len() + usize::from(signature.has_this),
             has_result,
+            has_this: signature.has_this,
             result_type,
             target: CallTarget::Internal(index),
         })
@@ -802,6 +856,7 @@ impl<'a> MetadataResolver<'a> {
         Some(CallInfo {
             args: signature.parameters.len() + usize::from(signature.has_this),
             has_result,
+            has_this: signature.has_this,
             result_type,
             target,
         })
@@ -854,6 +909,7 @@ impl<'a> MetadataResolver<'a> {
         Some(CallInfo {
             args: signature.parameters.len() + usize::from(signature.has_this),
             has_result,
+            has_this: signature.has_this,
             result_type,
             target: CallTarget::Internal(index),
         })
@@ -1037,6 +1093,7 @@ impl<'a> MetadataResolver<'a> {
             type_arguments: Vec::new(),
             layout_arguments: Vec::new(),
             argument_assembly: None,
+            argument_references: None,
             method_arguments: Vec::new(),
             mono: crate::generics::MonoPlan::default(),
             box_target_tokens: box_target_tokens(assembly),
@@ -1094,6 +1151,13 @@ impl<'a> MetadataResolver<'a> {
     fn is_exception_type(&self, type_token: Token) -> bool {
         let mut current = type_token;
         for _ in 0..64 {
+            if current.table() == table::TYPE_SPEC {
+                let Some(definition) = generic_base_definition(self.assembly, current) else {
+                    return false;
+                };
+                current = definition;
+                continue;
+            }
             let Some((namespace, name)) = self.assembly.type_token_full_name(current) else {
                 return false;
             };
@@ -1111,6 +1175,49 @@ impl<'a> MetadataResolver<'a> {
                 return false;
             }
             current = base;
+        }
+        false
+    }
+
+    /// Whether `type_def`'s base chain reaches the instantiation spelled `spelling` -- the subtype
+    /// test for a CONSTRUCTED catch type, where a name comparison cannot work because the link that
+    /// names the base is a `TypeSpec` and a `TypeSpec` has no name.
+    ///
+    /// Compared by CLOSED SPELLING through the one speller, so it agrees with the tag the throw side
+    /// mints for the same type rather than by a second reading of the same rule.
+    ///
+    fn chain_reaches_instantiation(&self, type_def: TypeDef<'a>, spelling: &str) -> bool {
+        let mut current = type_def.extends();
+        for _ in 0..64 {
+            if current.row() == 0 {
+                return false;
+            }
+            match current.table() {
+                table::TYPE_SPEC => {
+                    if self
+                        .assembly
+                        .type_spec_signature(current)
+                        .and_then(|sig| crate::generics::spell_sig(self.assembly, &sig))
+                        .is_some_and(|spelled| spelled == spelling)
+                    {
+                        return true;
+                    }
+                    let Some(definition) = generic_base_definition(self.assembly, current) else {
+                        return false;
+                    };
+                    let Some(base_def) = self.assembly.type_def(definition.row()) else {
+                        return false;
+                    };
+                    current = base_def.extends();
+                }
+                table::TYPE_DEF => {
+                    let Some(base_def) = self.assembly.type_def(current.row()) else {
+                        return false;
+                    };
+                    current = base_def.extends();
+                }
+                _ => return false,
+            }
         }
         false
     }
@@ -1146,8 +1253,7 @@ impl<'a> MetadataResolver<'a> {
         if !self.is_exception_type(*definition) {
             return None;
         }
-        let closed = self.closed_spec_signature(type_token)?;
-        let spelled = crate::generics::spell_sig(self.assembly, &closed)?;
+        let spelled = self.spelled_spec(type_token)?;
         let tag = exception_tag_for_name("", &spelled);
         (tag != 0).then_some(tag)
     }
@@ -1165,7 +1271,7 @@ impl<'a> MetadataResolver<'a> {
         let chain = assembly_base_chain(self.assembly, type_def);
         let mut slots: Vec<VSlot<'a>> = Vec::new();
         if let Some(root) = chain.last() {
-            let base = root.extends();
+            let base = root.type_def.extends();
             if base.row() != 0 && base.table() != table::TYPE_DEF {
                 if let Some((base_ns, base_name)) = self.assembly.type_token_full_name(base) {
                     if let Some((_, reference, ref_td)) =
@@ -1174,9 +1280,27 @@ impl<'a> MetadataResolver<'a> {
                         slots = reference_vtable_slots(&self.references, reference, ref_td);
                     }
                 }
+                else if let Some(definition) = generic_base_definition(self.assembly, base) {
+                    if let Some((spelled, arguments)) =
+                        composed_base_instantiation(self.assembly, base, &root.in_force)
+                    {
+                        if let Some((base_ns, base_name)) =
+                            self.assembly.type_token_full_name(definition)
+                        {
+                            if let Some((_, reference, ref_td)) =
+                                self.find_reference_type(&base_ns, &base_name)
+                            {
+                                slots = self.referenced_instantiation_slots(
+                                    reference, ref_td, &spelled, &arguments,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
-        for td in chain.into_iter().rev() {
+        for link in chain.into_iter().rev() {
+            let td = link.type_def;
             let declaring = self.declaring_full_name(td);
             for method in td.methods() {
                 if !method.is_virtual() {
@@ -1187,6 +1311,7 @@ impl<'a> MetadataResolver<'a> {
                 let key = slot_key(self.assembly, &method, rid);
                 let newslot = method.flags() & 0x0100 != 0;
                 for (key, impl_) in self.slots_for(declaring.as_deref(), &method, rid, key) {
+                    let impl_ = self.instantiated_slot_impl(link.through.as_deref(), &method, impl_);
                     if !newslot {
                         if let Some(entry) = slots
                             .iter_mut()
@@ -1201,6 +1326,44 @@ impl<'a> MetadataResolver<'a> {
             }
         }
         slots
+    }
+
+    /// An inherited slot's implementation, REBOUND to the monomorphized body when the link that
+    /// declared it was reached through a constructed generic base.
+    ///
+    /// `class Derived : Base<int>` inherits `` Base`1 ``'s virtuals. The SLOT is the definition's --
+    /// a slot key is the open signature -- but the address in it has to be
+    /// `` Base`1[System.Int32] ``'s body, which the plan numbers past `max_rid`. A definition's rid
+    /// left in that slot names a function never lowered for these arguments.
+    ///
+    /// **UNRESOLVED KEEPS THE CALLER'S ANSWER, AND THAT IS THE SAFE DIRECTION.** No spelling, an
+    /// undecodable signature, or a plan carrying no such body all leave the slot exactly as the
+    /// caller built it. Only an EXACT (instantiation, name, parameters) hit rebinds, and the
+    /// parameters compare with no substitution on either side because both are the definition's,
+    /// still spelled with `!n` (ECMA-335 II.22.25).
+    ///
+    /// A slot [`Self::slots_for`] already resolved to a [`SlotImpl::Mono`] -- the generic METHOD
+    /// axis -- is left alone: that axis already asked the plan, and asking twice would answer the
+    /// type axis over the method one.
+    fn instantiated_slot_impl(
+        &self,
+        through: Option<&str>,
+        method: &lamella_metadata::Method<'a>,
+        impl_: SlotImpl,
+    ) -> SlotImpl {
+        let SlotImpl::Rid(rid) = impl_ else {
+            return impl_;
+        };
+        let resolved = through
+            .zip(method.name())
+            .zip(decodable_signature(method))
+            .and_then(|((instantiation, name), signature)| {
+                self.mono.index_of(instantiation, name, &signature.parameters)
+            });
+        match resolved {
+            Some(index) => SlotImpl::Mono(index),
+            None => SlotImpl::Rid(rid),
+        }
     }
 
     /// The full name of a this-assembly type, spelled by the ONE function that spells the name a
@@ -1519,8 +1682,18 @@ impl<'a> MetadataResolver<'a> {
             .instantiations()
             .into_iter()
             .filter_map(|(name, spec)| {
-                let layout = self.instantiated_reference_layout(spec)?;
+                let layout = self.instantiated_reference_layout_named(name, spec)?;
                 let (vtable, itable) = self.instantiation_dispatch(name, spec)?;
+                let base = self
+                    .instantiated_parent_named(name, spec)
+                    .and_then(|(owner, type_def, arguments)| {
+                        let layout_args = caller_resolved_arguments(
+                            &arguments,
+                            self.argument_world(),
+                            &self.references,
+                        )?;
+                        self.base_edge(owner, type_def.extends(), &layout_args)
+                    });
                 let mut words = alloc::vec![
                     layout.size,
                     layout.reference_offsets.len() as u32,
@@ -1533,7 +1706,7 @@ impl<'a> MetadataResolver<'a> {
                     type_tag: exception_tag_for_name("", name),
                     vtable,
                     itable,
-                    base: None,
+                    base,
                     words: Some(words.into_boxed_slice()),
                     exported: false,
                     full_name: Some(alloc::boxed::Box::from(name)),
@@ -1562,8 +1735,8 @@ impl<'a> MetadataResolver<'a> {
         self.mono
             .instantiations()
             .into_iter()
-            .filter(|(_, spec)| {
-                self.instantiated_parent(*spec)
+            .filter(|(name, spec)| {
+                self.instantiated_parent_named(name, *spec)
                     .is_some_and(|(_, type_def, _)| !type_def.is_value_type())
             })
             .filter(|(name, _)| {
@@ -1622,37 +1795,117 @@ impl<'a> MetadataResolver<'a> {
     ///
     /// `None` for every one of those, and the caller turns it into a build error rather than an
     /// image.
+    /// The monomorphized body index for a slot INHERITED from a generic base -- looked up under
+    /// the BASE's instantiation spelling rather than the derived one's.
+    ///
+    /// **A RID IS A ROW, AND A ROW BELONGS TO THE TYPE THAT DECLARES IT.** `Derived<int>`'s vtable
+    /// carries a slot for `Base<T>.Corners`, whose rid names a method of `` Base`1 ``. Asked under
+    /// `` Derived`1[System.Int32] `` the plan holds no such body, and the fallback then maps the rid
+    /// through this assembly's FUNCTION INDEX -- which names whatever happens to sit at that row and
+    /// links, so the dispatch reaches an unrelated body instead of failing.
+    ///
+    /// The arguments come from [`Self::cross_class_chain`], which composes each base's out of the
+    /// ones in force, so `class D<T> : B<T>` and `class D<T> : B<int>` are spelled differently and
+    /// correctly rather than both taking the derived type's list.
+    ///
+    /// `None` for a NON-generic base -- its slot's body IS an ordinary function at that rid and the
+    /// caller's existing fallback is right for it -- and for a base declared in another assembly,
+    /// whose spelling would be read out of the wrong world.
+    fn inherited_instantiation_index(&self, chain: &[ChainLink<'a>], rid: u32) -> Option<u32> {
+        for link in chain {
+            if link.arguments.is_empty() || !core::ptr::eq(link.assembly, self.assembly) {
+                continue;
+            }
+            let Some(method) = link.type_def.methods().find(|method| method.rid() == rid) else {
+                continue;
+            };
+            let open = SigType::GenericInst {
+                definition: alloc::boxed::Box::new(SigType::Class(link.type_def.token())),
+                arguments: (0..link.arguments.len() as u32).map(SigType::Var).collect(),
+            };
+            let spelled = crate::generics::spell_sig_across(
+                self.assembly,
+                self.argument_world(),
+                &open,
+                &link.arguments,
+            )?;
+            return self
+                .mono
+                .index_of(&spelled, method.name()?, &decodable_params(&method)?);
+        }
+        None
+    }
+
+    /// The vtable slots a REFERENCE-OWNED instantiation lays, with every implementation RESOLVED.
+    ///
+    /// [`reference_vtable_slots`] names **every** slot by the symbol its owning object exports,
+    /// which is right for one INHERITED from a base -- an ordinary non-generic method the library
+    /// lowered and exported -- and wrong for one the OPEN DEFINITION ITSELF declares. The library
+    /// lowering SKIPS an open definition's bodies, because an open body's `!0` sizes nothing, so no
+    /// such symbol is exported and only the PLAN holds the body. Left alone the slot would name an
+    /// undefined symbol; rebound it reaches the monomorphized body for THIS instantiation.
+    ///
+    /// The definition's own methods are matched by the same `(name, parameter key)` pair the
+    /// numbering walk itself uses to decide that an override REPLACES an inherited slot, rather
+    /// than by a second rule.
+    ///
+    /// **IT NEVER RETURNS A [`SlotImpl::Rid`], AND THAT IS THE INVARIANT ITS SECOND CALLER NEEDS.**
+    /// A rid here indexes the OWNER's `MethodDef` table. A caller that resolved it against THIS
+    /// assembly's function table would land on whatever sits at that row here -- an unrelated
+    /// method, or a `stub()` that returns -- and BOTH LINK. So the rebind happens here, where the
+    /// owner is still in hand, and a body the plan does not carry keeps the extern symbol rather
+    /// than becoming an index into the wrong table.
+    fn referenced_instantiation_slots(
+        &self,
+        owner: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+        name: &str,
+        arguments: &[SigType],
+    ) -> Vec<VSlot<'a>> {
+        let mut slots = reference_vtable_slots(&self.references, owner, type_def);
+        let inherited_chain = self.cross_class_chain(owner, type_def, arguments);
+        for slot in &mut slots {
+            let Some(method) = type_def.methods().find(|method| {
+                method.is_virtual()
+                    && method.name() == slot.name
+                    && slot_key(owner, method, method.rid()) == slot.key
+            }) else {
+                continue;
+            };
+            let resolved = method
+                .name()
+                .zip(decodable_params(&method))
+                .and_then(|(method_name, params)| self.mono.index_of(name, method_name, &params))
+                .or_else(|| self.inherited_instantiation_index(&inherited_chain, method.rid()));
+            if let Some(index) = resolved {
+                slot.impl_ = SlotImpl::Mono(index);
+            }
+        }
+        slots
+    }
+
     fn instantiation_dispatch(
         &self,
         name: &str,
         spec: Token,
     ) -> Option<(Vec<VtableEntry>, Vec<(u32, VtableEntry)>)> {
-        let (owner, type_def, arguments) = self.instantiated_parent(spec)?;
+        let (owner, type_def, arguments) = self.instantiated_parent_named(name, spec)?;
         let own = core::ptr::eq(owner, self.assembly);
-        let mut slots = if own {
+        let slots = if own {
             self.vtable_methods(type_def)
         } else {
-            reference_vtable_slots(&self.references, owner, type_def)
+            self.referenced_instantiation_slots(owner, type_def, name, &arguments)
         };
-        if !own {
-            for slot in &mut slots {
-                let declared = type_def.methods().find(|method| {
-                    method.is_virtual()
-                        && method.name() == slot.name
-                        && slot_key(owner, method, method.rid()) == slot.key
-                });
-                if let Some(method) = declared {
-                    slot.impl_ = SlotImpl::Rid(method.rid());
-                }
-            }
-        }
+        let inherited_chain = self.cross_class_chain(owner, type_def, &arguments);
         let resolve = |rid: u32| -> Option<u32> {
             match type_def.methods().find(|method| method.rid() == rid) {
                 Some(method) => {
                     self.mono
                         .index_of(name, method.name()?, &decodable_params(&method)?)
                 }
-                None => own.then(|| self.function_index(rid)).flatten(),
+                None => self
+                    .inherited_instantiation_index(&inherited_chain, rid)
+                    .or_else(|| own.then(|| self.function_index(rid)).flatten()),
             }
         };
         let vtable = slot_entries(&slots, &resolve)?;
@@ -1890,10 +2143,11 @@ impl<'a> MetadataResolver<'a> {
                 }
             }
         }
-        let links: Vec<(&'a Assembly<'a>, TypeDef<'a>)> = self
+        let links: Vec<(&'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> = self
             .cross_class_chain(reference, type_def, &[])
             .into_iter()
-            .map(|link| (link.assembly, link.type_def))
+            .rev()
+            .map(|link| (link.assembly, link.type_def, link.arguments))
             .collect();
         self.fold_explicit_itable_entries(
             &links,
@@ -1902,11 +2156,19 @@ impl<'a> MetadataResolver<'a> {
                     return None;
                 };
                 let method = link_type.methods().find(|method| method.rid() == rid)?;
-                let key = slot_key(link, &method, rid);
-                let slot = impls
-                    .iter()
-                    .find(|slot| slot.name == method.name() && slot.key == key)?;
-                slot_entry(slot, &|rid| Some(rid))
+                if !method.is_virtual() {
+                    return None;
+                }
+                let owner = link.type_token_name(link_type.token());
+                let owner_namespace: String =
+                    owner.as_ref().map(|n| n.namespace.into()).unwrap_or_default();
+                let owner_name: String = owner.as_ref().map(|n| n.name.into()).unwrap_or_default();
+                Some(VtableEntry::Extern(reference_method_symbol(
+                    link,
+                    &owner_namespace,
+                    &owner_name,
+                    &method,
+                )))
             },
             &mut entries,
         );
@@ -1926,23 +2188,93 @@ impl<'a> MetadataResolver<'a> {
         self.assembly
             .type_defs()
             .map(|type_def| {
-                let base = type_def.extends();
-                let base_handle = if base.row() == 0 {
-                    None
-                } else if base.table() == table::TYPE_DEF {
-                    Some(TypeHandle(base.0))
-                } else {
-                    let qualified = self.qualified_type_handle(base);
-                    reference_handle_parts(qualified).is_some().then_some(qualified)
-                };
-                (TypeHandle(type_def.token().0), base_handle)
+                let base = self.base_edge(self.assembly, type_def.extends(), &[]);
+                (TypeHandle(type_def.token().0), base)
             })
             .collect()
     }
 
-    /// Every interface token `type_def` answers for, deduplicated: its own `InterfaceImpl` rows, its
-    /// BASES' rows (a derived class inherits them), and the rows of each interface reached (an interface
-    /// may extend others, and implementing IA implements what IA extends).
+    /// ONE PLACE A BASE-POINTER EDGE IS DECIDED, for a type whose `extends` is `base` read in
+    /// `owner`'s world with `arguments` in force.
+    ///
+    /// **THE EMITTED CHAIN IS WHAT `castclass`'s SCAN WALKS**, and two readings of this rule would be
+    /// two chains: [`Self::base_handles`] lays the edge for an ordinary TypeDef and
+    /// [`Self::instantiation_descriptors`] for an instantiation, so both ask here rather than each
+    /// deciding for itself.
+    ///
+    /// # A generic base's edge is the INSTANTIATION's, never the DEFINITION's
+    ///
+    /// `class Derived : Base<int>` spells its base as a `TypeSpec` (II.22.37 admits one), and the
+    /// honest edge points at `` Base`1[System.Int32] ``'s descriptor. Pointing at `` Base`1 ``'s own
+    /// would reach `System.Object` correctly and make `o is Base<string>` true for a `Derived :
+    /// Base<int>` the day a constructed target reaches this scan -- **a collapse arriving through
+    /// the chain rather than through the tag, and worse than the gap it closes.**
+    ///
+    /// # `None` terminates the chain, and that is the SAFE direction
+    ///
+    /// A short chain REFUSES a valid cast, which is loud and lands as `InvalidCastException`. A
+    /// wrong edge ACCEPTS an invalid one, which is silent. So every case this cannot decide exactly
+    /// -- a base whose instantiation is not in the plan and therefore has no descriptor to point at,
+    /// a TypeDef base in another assembly's token space -- answers `None` rather than approximately.
+    fn base_edge(
+        &self,
+        owner: &'a Assembly<'a>,
+        base: Token,
+        arguments: &[SigType],
+    ) -> Option<TypeHandle> {
+        if base.row() == 0 {
+            return None;
+        }
+        if base.table() == table::TYPE_DEF && core::ptr::eq(owner, self.assembly) {
+            return Some(TypeHandle(base.0));
+        }
+        if base.table() == table::TYPE_SPEC {
+            let signature = owner.type_spec_signature(base)?;
+            let name = if arguments.is_empty() {
+                crate::generics::spell_sig(owner, &signature)?
+            } else {
+                crate::generics::spell_sig_across(
+                    owner,
+                    self.argument_world(),
+                    &signature,
+                    arguments,
+                )?
+            };
+            return self
+                .mono
+                .instantiations()
+                .iter()
+                .any(|(carried, _)| *carried == name)
+                .then(|| crate::generics::instantiation_handle(&name));
+        }
+        let qualified = self.qualified_type_handle(base);
+        reference_handle_parts(qualified).is_some().then_some(qualified)
+    }
+
+    /// Every interface token `type_def` answers for, deduplicated, each paired with the type
+    /// ARGUMENTS ITS OWN ROW MUST CLOSE UNDER: its own `InterfaceImpl` rows, its BASES' rows (a
+    /// derived class inherits them), and the rows of each interface reached (an interface may extend
+    /// others, and implementing IA implements what IA extends).
+    ///
+    /// **THE ARGUMENTS ARE PER-TOKEN BECAUSE A ROW IS SPELLED WHERE IT WAS DECLARED.**
+    /// `` Bag`1<T> : IBox`1<!0> `` puts an OPEN signature in the row, and `!0` means the parameter of
+    /// `Bag` -- not of whatever inherited it. Returning bare tokens forced the one caller to close
+    /// every row under the arguments of the type it was BUILDING, which for `class IntBag : Bag<int>`
+    /// is EMPTY: [`Self::interface_link`] declines what it cannot close, so the row was dropped and
+    /// the derived type answered for no interface at all. The composition that closes it is the one
+    /// [`assembly_base_chain`] already performs for slot binding, which is why this walks that chain
+    /// rather than keeping a second one of its own.
+    ///
+    /// **AN INTERFACE EXTENDING A GENERIC INTERFACE IS NOT IN THE CLOSURE.** The drain follows only
+    /// `TypeDef` entries, so the rows an `` IBox`1<T> : IOther`1<!0> `` declares are never read, and
+    /// a caller must not read "every interface token" as covering that shape.
+    ///
+    /// **AND IT COSTS NOTHING, BECAUSE A C# COMPILER WRITES THE FLATTENED TRANSITIVE SET INTO THE
+    /// IMPLEMENTING TYPE'S OWN ROWS.** A class reaching `IBase<int>` only through `IDerived<int>`
+    /// still carries a row naming `IBase<int>` directly, so the closure never needs the extends
+    /// edge. That is a property of the PRODUCER rather than of this walk, so
+    /// `tests/generic_interface_extends.rs` asserts it: a producer that stopped flattening would
+    /// make this limit reachable, and the failure is a `callvirt` finding no itable entry.
     ///
     /// Bounded against a malformed cyclic base or interface graph rather than trusting the metadata.
     ///
@@ -1950,37 +2282,42 @@ impl<'a> MetadataResolver<'a> {
     /// ordinary type and the OWNER's for an instantiation of a definition declared next door. Every
     /// token read here -- a base row, an interface row -- indexes that assembly's tables and means
     /// nothing in any other, so it is a parameter rather than `self.assembly`.
-    fn interface_closure(&self, assembly: &'a Assembly<'a>, type_def: TypeDef<'a>) -> Vec<Token> {
-        let mut queue: Vec<Token> = type_def.interfaces().collect();
-        let mut base = type_def.extends();
-        for _ in 0..64 {
-            if base.row() == 0 || base.table() != table::TYPE_DEF {
-                break;
+    ///
+    /// `arguments` are the ones in force at `type_def` itself -- an instantiation's, or empty for an
+    /// ordinary type -- and seed the composition down the chain.
+    fn interface_closure(
+        &self,
+        assembly: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+        arguments: &[SigType],
+    ) -> Vec<(Token, Vec<SigType>)> {
+        let mut queue: Vec<(Token, Vec<SigType>)> = Vec::new();
+        for link in assembly_base_chain_under(assembly, type_def, arguments) {
+            for token in link.type_def.interfaces() {
+                queue.push((token, link.in_force.clone()));
             }
-            let Some(base_def) = assembly.type_def(base.row()) else {
-                break;
-            };
-            queue.extend(base_def.interfaces());
-            base = base_def.extends();
         }
-        let mut closed: Vec<Token> = Vec::new();
+        let mut closed: Vec<(Token, Vec<SigType>)> = Vec::new();
         let mut i = 0;
         let mut budget = 256;
-        while let Some(&token) = queue.get(i) {
+        while let Some((token, in_force)) = queue.get(i).cloned() {
             i += 1;
             budget -= 1;
             if budget == 0 {
                 break;
             }
-            if closed.iter().any(|t| t.0 == token.0) {
+            if closed
+                .iter()
+                .any(|(t, args)| t.0 == token.0 && *args == in_force)
+            {
                 continue;
             }
-            closed.push(token);
             if token.table() == table::TYPE_DEF {
                 if let Some(iface) = assembly.type_def(token.row()) {
-                    queue.extend(iface.interfaces());
+                    queue.extend(iface.interfaces().map(|t| (t, Vec::new())));
                 }
             }
+            closed.push((token, in_force));
         }
         closed
     }
@@ -2004,8 +2341,12 @@ impl<'a> MetadataResolver<'a> {
         &self,
         assembly: &'a Assembly<'a>,
         declaration: Token,
+        arguments: &[SigType],
     ) -> Option<(String, u32)> {
         let declared = assembly.resolve_method(declaration)?;
+        if declared.declaring_type.is_none() {
+            return self.constructed_interface_dispatch(assembly, declaration, &declared, arguments);
+        }
         let interface = declared.declaring_type?;
         let is_interface = match assembly.find_type(interface.namespace, interface.name) {
             Some(td) => td.is_interface(),
@@ -2021,6 +2362,57 @@ impl<'a> MetadataResolver<'a> {
         let signature = declared.signature.as_ref()?;
         let tag = interface_method_tag(assembly, &interface, declared.name?, &signature.parameters)?;
         Some((joined_full_name(&interface), tag))
+    }
+
+    /// [`Self::explicit_interface_dispatch`]'s CONSTRUCTED-INTERFACE arm: the `MethodImpl`
+    /// declaration for `int IBox<int>.Get()` is a `MemberRef` parented by a `TypeSpec`, and a
+    /// `TypeSpec` carries a SIGNATURE rather than a name.
+    ///
+    /// **AN INTERFACE IDENTITY IS DERIVED IN THREE PLACES AND ALL THREE SPELL IT THE SAME WAY.**
+    /// [`InterfaceIdentity`] names the other two -- the itable side closing an `InterfaceImpl`
+    /// row, and the call site closing the `TypeSpec` its `MemberRef` is parented by -- and requires
+    /// that they produce the same bytes. This is the `MethodImpl` side, and it reaches the identity
+    /// through that same one speller, so the three agree by construction rather than by three
+    /// implementations that match today.
+    ///
+    /// **DECLINED RATHER THAN GUESSED when the row is written in ANOTHER assembly**, because
+    /// closing a spec reads THIS resolver's instantiation against THIS resolver's tables: a tag
+    /// spelled out of the wrong world would be a WRONG entry where the bug being fixed is a MISSING
+    /// one, and a wrong entry dispatches somewhere plausible instead of trapping.
+    fn constructed_interface_dispatch(
+        &self,
+        assembly: &'a Assembly<'a>,
+        declaration: Token,
+        declared: &ResolvedMethod<'a>,
+        arguments: &[SigType],
+    ) -> Option<(String, u32)> {
+        if !core::ptr::eq(assembly, self.assembly) || declaration.table() != table::MEMBER_REF {
+            return None;
+        }
+        let parent = assembly.member_ref(declaration.row())?.parent();
+        if parent.table() != table::TYPE_SPEC {
+            return None;
+        }
+        let (interface_assembly, interface, _) = self.instantiated_parent(parent)?;
+        if !interface.is_interface() {
+            return None;
+        }
+        let signature = assembly.type_spec_signature(parent)?;
+        let closed = if arguments.is_empty() {
+            signature
+        } else {
+            crate::generics::substitute_sig(&signature, arguments).unwrap_or(signature)
+        };
+        let identity = InterfaceIdentity::instantiated(self.assembly, &closed)?;
+        let spelled = identity.type_name();
+        let signature = declared.signature.as_ref()?;
+        let tag = interface_method_tag(
+            interface_assembly,
+            &spelled,
+            declared.name?,
+            &signature.parameters,
+        )?;
+        Some((joined_full_name(&spelled), tag))
     }
 
     /// Folds every EXPLICIT (`MethodImpl`) interface implementation reachable from a type into
@@ -2057,21 +2449,22 @@ impl<'a> MetadataResolver<'a> {
     /// the parts that must not differ, so they live here rather than at each call site.
     fn fold_explicit_itable_entries(
         &self,
-        links: &[(&'a Assembly<'a>, TypeDef<'a>)],
+        links: &[(&'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)],
         body_impl: &dyn Fn(&'a Assembly<'a>, TypeDef<'a>, Token) -> Option<VtableEntry>,
         entries: &mut Vec<(u32, VtableEntry)>,
     ) {
         let mut reimplemented: Vec<String> = Vec::new();
-        for &(assembly, type_def) in links {
+        for (assembly, type_def, in_force) in links {
             for (body, declaration) in type_def.method_impls() {
-                let Some((interface, tag)) = self.explicit_interface_dispatch(assembly, declaration)
+                let Some((interface, tag)) =
+                    self.explicit_interface_dispatch(assembly, declaration, in_force)
                 else {
                     continue;
                 };
                 if reimplemented.iter().any(|name| *name == interface) {
                     continue;
                 }
-                let Some(implementation) = body_impl(assembly, type_def, body) else {
+                let Some(implementation) = body_impl(assembly, *type_def, body) else {
                     continue;
                 };
                 match entries.iter_mut().find(|(other, _)| *other == tag) {
@@ -2252,9 +2645,9 @@ impl<'a> MetadataResolver<'a> {
     ) -> Vec<(u32, VtableEntry)> {
         {
             let mut entries: Vec<(u32, VtableEntry)> = Vec::new();
-            for iface_token in self.interface_closure(assembly, type_def) {
+            for (iface_token, in_force) in self.interface_closure(assembly, type_def, arguments) {
                 let Some((iface_assembly, iface, identity)) =
-                    self.interface_link(assembly, iface_token, arguments)
+                    self.interface_link(assembly, iface_token, &in_force)
                 else {
                     continue;
                 };
@@ -2279,10 +2672,11 @@ impl<'a> MetadataResolver<'a> {
                     }
                 }
             }
-            let chain: Vec<(&'a Assembly<'a>, TypeDef<'a>)> = assembly_base_chain(assembly, type_def)
-                .into_iter()
-                .map(|td| (assembly, td))
-                .collect();
+            let chain: Vec<(&'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> =
+                assembly_base_chain_under(assembly, type_def, arguments)
+                    .into_iter()
+                    .map(|link| (assembly, link.type_def, link.in_force))
+                    .collect();
             self.fold_explicit_itable_entries(
                 &chain,
                 &|link, _, body| {
@@ -2565,6 +2959,37 @@ fn instantiated_slot_key(assembly: &Assembly, key: &str, arguments: &[SigType]) 
     alloc::format!("{key}<{}>", spelled.join(","))
 }
 
+/// The stable EXTERN SYMBOL a referenced assembly's object exports for `method`, declared on
+/// `owner_namespace::owner_name`.
+///
+/// **ONE SPELLING, BECAUSE TWO CONSUMERS HAVE TO AGREE ON IT EXACTLY AND NEITHER CAN CHECK THE
+/// OTHER.** [`reference_vtable_slots_seeded`] mints it into a vtable slot and the itable's explicit
+/// fold has to name the same string for the same method; they are in different functions, and a
+/// symbol that differs by one character is a LINK error at best and a silently different function at
+/// worst. Spelled here so a change reaches both.
+///
+fn reference_method_symbol(
+    assembly: &Assembly,
+    owner_namespace: &str,
+    owner_name: &str,
+    method: &lamella_metadata::Method<'_>,
+) -> String {
+    let sig = decodable_signature(method);
+    let params = sig
+        .as_ref()
+        .map(|sig| sig.parameters.clone())
+        .unwrap_or_default();
+    let return_type = sig.map(|sig| sig.return_type).unwrap_or(SigType::Void);
+    extern_method_symbol(
+        owner_namespace,
+        owner_name,
+        method.name().unwrap_or(""),
+        &params,
+        &return_type,
+        &|token| assembly.type_token_name(token).map(|n| joined_full_name(&n)),
+    )
+}
+
 fn slot_key(assembly: &Assembly, method: &lamella_metadata::Method<'_>, rid: u32) -> String {
     match decodable_signature(method) {
         Some(sig) => param_key(assembly, sig.generic_param_count, &sig.parameters),
@@ -2591,24 +3016,116 @@ fn slot_key(assembly: &Assembly, method: &lamella_metadata::Method<'_>, rid: u32
 /// in the base's numbering and lands past the end of the derived type's table. There is no
 /// signal: the walk cannot distinguish "reached the top" from "could not go further", which is why
 /// an unfollowable base ends it rather than being skipped over.
-fn assembly_base_chain<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) -> Vec<TypeDef<'x>> {
+fn assembly_base_chain<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) -> Vec<BaseLink<'x>> {
+    assembly_base_chain_under(assembly, type_def, &[])
+}
+
+/// [`assembly_base_chain`] with the arguments in force AT `type_def` supplied, for a caller building
+/// an INSTANTIATION rather than an ordinary type.
+///
+/// **THE SEED IS WHAT MAKES THE HEAD'S OWN ROWS CLOSABLE, AND IT COMPOSES DOWN FROM THERE.**
+/// A caller building `` Bag`1[System.Int32] `` reads rows spelled in `` Bag`1 ``'s token space -- an
+/// `` IBox`1<!0> `` interface row, a `` Mid`1<!0> `` base -- and neither closes under an empty list.
+/// Seeding `[System.Int32]` closes the head's rows and, because the walk already composes each link
+/// through the last, every link below it as well. `&[]` is the ordinary type's answer and is what
+/// [`assembly_base_chain`] passes.
+/// The canonical spelling and CLOSED arguments of a constructed base, composed under the arguments
+/// in force at the link that spells it: `` Derived : Base<int> : Mid`1<!0> `` writes its far edge
+/// open, and it closes only under what the near link supplied.
+fn composed_base_instantiation(
+    assembly: &Assembly<'_>,
+    base: Token,
+    in_force: &[SigType],
+) -> Option<(String, Vec<SigType>)> {
+    let SigType::GenericInst {
+        definition,
+        arguments,
+    } = assembly.type_spec_signature(base)?
+    else {
+        return None;
+    };
+    let closed: Vec<SigType> = arguments
+        .iter()
+        .map(|argument| crate::generics::substitute_sig(argument, in_force))
+        .collect::<Option<_>>()?;
+    let spelled = crate::generics::spell_sig(
+        assembly,
+        &SigType::GenericInst {
+            definition,
+            arguments: closed.clone(),
+        },
+    )?;
+    Some((spelled, closed))
+}
+
+fn assembly_base_chain_under<'x>(
+    assembly: &'x Assembly<'x>,
+    type_def: TypeDef<'x>,
+    arguments: &[SigType],
+) -> Vec<BaseLink<'x>> {
     let mut chain = Vec::new();
     let mut current = Some(type_def);
+    let mut through: Option<String> = None;
+    let mut in_force: Vec<SigType> = arguments.to_vec();
     for _ in 0..64 {
         let Some(td) = current else {
             break;
         };
-        chain.push(td);
+        chain.push(BaseLink {
+            type_def: td,
+            through: through.take(),
+            in_force: in_force.clone(),
+        });
         let base = td.extends();
         current = match base.table() {
-            table::TYPE_DEF if base.row() != 0 => assembly.type_def(base.row()),
-            table::TYPE_SPEC => generic_base_definition(assembly, base)
-                .filter(|token| token.table() == table::TYPE_DEF)
-                .and_then(|token| assembly.type_def(token.row())),
+            table::TYPE_DEF if base.row() != 0 => {
+                in_force = Vec::new();
+                assembly.type_def(base.row())
+            }
+            table::TYPE_SPEC => {
+                let composed = composed_base_instantiation(assembly, base, &in_force);
+                match composed {
+                    Some((spelled, closed)) => {
+                        through = Some(spelled);
+                        in_force = closed;
+                    }
+                    None => {
+                        through = None;
+                        in_force = Vec::new();
+                    }
+                }
+                generic_base_definition(assembly, base)
+                    .filter(|token| token.table() == table::TYPE_DEF)
+                    .and_then(|token| assembly.type_def(token.row()))
+            }
             _ => None,
         };
     }
     chain
+}
+
+/// ONE LINK OF AN `extends` CHAIN, and the instantiation that REACHED it.
+///
+/// **A GENERIC BASE IS TWO FACTS AND A WALK NEEDS BOTH.** `class Derived : Base<int>` reaches
+/// `` Base`1 ``, which is the right answer for slot NUMBERING -- a slot key is the OPEN signature,
+/// so arguments do not enter it -- while the IMPLEMENTATION that belongs in such a slot is
+/// `` Base`1[System.Int32] ``'s monomorphized body. The definition answers the first question and
+/// only the spelling answers the second, so both travel.
+struct BaseLink<'x> {
+    type_def: TypeDef<'x>,
+    /// The CLOSED spelling of the `TypeSpec` this link was reached through, or `None` for a plain
+    /// `TypeDef` edge, for the chain's own head, and for a spec that does not spell exactly.
+    through: Option<String>,
+    /// The type ARGUMENTS in force AT this link -- what a signature written in THIS link's token
+    /// space substitutes under. EMPTY for a non-generic link.
+    ///
+    /// **A LINK'S OWN ROWS ARE SPELLED IN ITS OWN TOKEN SPACE, WHICH IS NOT THE DERIVED TYPE'S.**
+    /// `` Bag`1<T> : IBox`1<!0> `` writes `!0` meaning `Bag`'s parameter; a consumer holding only
+    /// the arguments of the type it is BUILDING closes that under `IntBag`'s -- which is empty,
+    /// because `IntBag` is not generic -- and the row is declined. The spelling in `through` answers
+    /// "which body", and this answers "under what"; the two are different questions about one link
+    /// and both are computed by the same composition, so both travel.
+    in_force: Vec<SigType>,
 }
 
 /// Whether a CLOSED signature denotes a REFERENCE type -- decided from the signature's own element
@@ -2676,6 +3193,14 @@ fn generic_base_definition(assembly: &Assembly<'_>, base: Token) -> Option<Token
 /// referenced corlib's for a cross-assembly `new ThreadStart(...)`): its `extends` chain reaches
 /// `System.MulticastDelegate`/`System.Delegate`. The walk is bounded so a malformed cyclic base
 /// cannot loop.
+///
+/// **A CHAIN HOP THAT IS A `TypeSpec` ANSWERS `false`**, because `type_token_name` names no
+/// constructed type -- so a delegate reached only through a constructed generic base would be judged
+/// not-a-delegate, and its `Invoke` would keep the stub that `delegate_invoke_synthesis` exists to
+/// replace. The shape does not arise: a delegate's base is always the NON-generic
+/// `System.MulticastDelegate`, including for a generic delegate, and C# forbids deriving from
+/// `Delegate`/`MulticastDelegate` explicitly -- so the chain is one hop by construction and there is
+/// nowhere for a spec to appear.
 pub(crate) fn is_delegate_type_of<'x>(assembly: &'x Assembly<'x>, type_def: &TypeDef<'x>) -> bool {
     let mut current = type_def.extends();
     for _ in 0..64 {
@@ -2731,7 +3256,7 @@ fn reference_vtable_slots_seeded<'x>(
     let mut slots: Vec<VSlot<'x>> = Vec::new();
     if depth < 64 {
         if let Some(root) = chain.last() {
-            let base = root.extends();
+            let base = root.type_def.extends();
             if base.row() != 0 && base.table() != table::TYPE_DEF {
                 if let Some(base_name) = assembly.type_token_name(base) {
                     if let Some((owner, base_td)) = references.iter().find_map(|reference| {
@@ -2745,7 +3270,8 @@ fn reference_vtable_slots_seeded<'x>(
             }
         }
     }
-    for td in chain.into_iter().rev() {
+    for link in chain.into_iter().rev() {
+        let td = link.type_def;
         let owner = assembly.type_token_name(td.token());
         let owner_namespace: String = owner.as_ref().map(|n| n.namespace.into()).unwrap_or_default();
         let owner_name: String = owner.as_ref().map(|n| n.name.into()).unwrap_or_default();
@@ -2755,20 +3281,8 @@ fn reference_vtable_slots_seeded<'x>(
             }
             let name = method.name();
             let key = slot_key(assembly, &method, method.rid());
-            let sig = decodable_signature(&method);
-            let params = sig
-                .as_ref()
-                .map(|sig| sig.parameters.clone())
-                .unwrap_or_default();
-            let return_type = sig.map(|sig| sig.return_type).unwrap_or(SigType::Void);
-            let symbol = extern_method_symbol(
-                &owner_namespace,
-                &owner_name,
-                name.unwrap_or(""),
-                &params,
-                &return_type,
-                &|token| assembly.type_token_name(token).map(|n| joined_full_name(&n)),
-            );
+            let symbol =
+                reference_method_symbol(assembly, &owner_namespace, &owner_name, &method);
             let newslot = method.flags() & 0x0100 != 0;
             if !newslot {
                 if let Some(entry) = slots
@@ -3174,6 +3688,29 @@ impl<'a> MetadataResolver<'a> {
     /// because a spelling is an IDENTITY and `` Box`1[!0] `` is not one.
     ///
     /// It is [`Self::close_arguments`] one level out: that one closes the arguments a consumer
+    /// The canonical SPELLING of a `TypeSpec`, with each side decoded in its own world.
+    ///
+    /// **THE ONE SPELLER FOR AN INSTANTIATION NAMED BY A ROW, BECAUSE SUBSTITUTING FIRST AND
+    /// SPELLING SECOND READS BOTH SIDES THROUGH ONE ASSEMBLY.** A `TypeSpec` in a body lowered from
+    /// next door is the OWNER's, while the arguments in force are the CALLER's -- so closing the
+    /// spec and then spelling the result asks `self.assembly` to name a token that belongs to the
+    /// other world. It answers a wrong name, or (the corlib case, which has no `TypeRef` table at
+    /// all) no name, and the caller then refuses a program that is correct.
+    ///
+    /// `spell_sig_across` is exactly this pair and is byte-for-byte [`crate::generics::spell_sig`]
+    /// when the two worlds are the same, so an ordinary one-world build is untouched. The fallback
+    /// is for a spec that carries no parameter at all, where there is nothing to substitute.
+    fn spelled_spec(&self, spec: Token) -> Option<String> {
+        let open = self.assembly.type_spec_signature(spec)?;
+        crate::generics::spell_sig_across(
+            self.assembly,
+            self.argument_world(),
+            &open,
+            &self.type_arguments,
+        )
+        .or_else(|| crate::generics::spell_sig(self.assembly, &open))
+    }
+
     /// substitutes WITH, this one closes the whole constructed type a consumer NAMES.
     fn closed_spec_signature(&self, spec: Token) -> Option<SigType> {
         let signature = self.assembly.type_spec_signature(spec)?;
@@ -3181,6 +3718,89 @@ impl<'a> MetadataResolver<'a> {
             return Some(signature);
         }
         crate::generics::substitute_sig(&signature, &self.type_arguments)
+    }
+
+    /// [`Self::cast_subtype_handles`]'s CONSTRUCTED-TARGET arm: every handle a `castclass` or
+    /// `isinst` against `` B`1[System.Int32] `` must accept.
+    ///
+    /// **AN INSTANTIATION IS ITS OWN TYPE AND THE SET IS KEYED BY ITS SPELLING, NOT BY A NAME.**
+    /// `` B`1[System.Int32] `` and `` B`1[System.String] `` share a definition and are two different
+    /// types: a `D : B<int>` must be accepted by the first and REFUSED by the second, which a
+    /// name-keyed comparison cannot express at all. Every spelling here comes from
+    /// [`crate::generics::spell_sig`] -- the same speller [`assembly_base_chain_under`] uses for the
+    /// `through` it records -- so the two sides match by construction rather than by agreement.
+    ///
+    /// Three populations answer, and each needs the one below it to be non-vacuous:
+    ///
+    /// 1. THE INSTANTIATION ITSELF, and only if the plan carries a descriptor for it. An object can
+    ///    only bear that descriptor if one was emitted, so a target outside the plan contributes no
+    ///    exact match rather than a handle pointing at nothing -- the guard [`Self::base_edge`]
+    ///    makes for the same reason.
+    /// 2. ORDINARY types whose `extends` chain REACHES it. `class D : B<int>` and, through composed
+    ///    arguments, `class Deep : Mid<int>` where `` Mid`1<T> : B`1<!0> ``.
+    /// 3. PLANNED INSTANTIATIONS whose chain reaches it -- `` D`1[System.Int32] `` for a
+    ///    `class D<U> : B<U>`, whose base closes only under ITS OWN arguments. Seeding the walk with
+    ///    them is the whole difference, and without this population `o is B<int>` is false for a
+    ///    `new D<int>()`, which is the commonest shape a real collection takes.
+    ///
+    /// The chain walk is [`assembly_base_chain_under`] rather than a fourth hand-rolled one, so a
+    /// correction to how arguments compose down a chain reaches this too.
+    fn constructed_cast_subtype_handles(&self, target: Token) -> Vec<TypeHandle> {
+        let Some(closed) = self.closed_spec_signature(target) else {
+            return Vec::new();
+        };
+        let Some(spelled) = crate::generics::spell_sig(self.assembly, &closed) else {
+            return Vec::new();
+        };
+        let reaches = |type_def: TypeDef<'_>, seed: &[SigType]| {
+            assembly_base_chain_under(self.assembly, type_def, seed)
+                .iter()
+                .any(|link| link.through.as_deref() == Some(spelled.as_str()))
+        };
+
+        let mut handles: Vec<TypeHandle> = Vec::new();
+        let planned = self.mono.instantiations();
+        if planned.iter().any(|(carried, _)| *carried == spelled) {
+            handles.push(crate::generics::instantiation_handle(&spelled));
+        }
+        for type_def in self.assembly.type_defs() {
+            if reaches(type_def, &[]) {
+                let handle = TypeHandle(type_def.token().0);
+                if !handles.contains(&handle) {
+                    handles.push(handle);
+                }
+            }
+        }
+        for (carried, spec) in planned {
+            if carried == spelled {
+                continue;
+            }
+            let Some(SigType::GenericInst {
+                definition,
+                arguments,
+            }) = self.assembly.type_spec_signature(spec)
+            else {
+                continue;
+            };
+            let (SigType::Class(definition_token) | SigType::ValueType(definition_token)) =
+                *definition
+            else {
+                continue;
+            };
+            if definition_token.table() != table::TYPE_DEF {
+                continue;
+            }
+            let Some(definition_def) = self.assembly.type_def(definition_token.row()) else {
+                continue;
+            };
+            if reaches(definition_def, &arguments) {
+                let handle = crate::generics::instantiation_handle(carried);
+                if !handles.contains(&handle) {
+                    handles.push(handle);
+                }
+            }
+        }
+        handles
     }
 
     /// What a TYPE OPERAND denotes once this resolver's instantiation is applied, for the ONE operand
@@ -3312,6 +3932,34 @@ impl<'a> MetadataResolver<'a> {
     ///
     /// The definition is found BY NAME, through the same [`Self::find_reference_type`] every other
     /// cross-assembly lookup uses -- a `TypeSpec`'s definition token may be a `TypeRef` into corlib,
+    /// [`Self::instantiated_parent`] for an instantiation named by the PLAN rather than by a row.
+    ///
+    /// **AN INSTANTIATION THE CLOSURE FOUND IS SPELLED NOWHERE IN THIS MODULE'S TABLES**, so its
+    /// `spec` decodes to nothing and every descriptor question asked through the row answers `None`
+    /// -- which gives such a type BODIES AND NO DESCRIPTOR. It builds, it links, and then a
+    /// `callvirt` on it dispatches through a vtable that was never laid.
+    ///
+    /// The row is tried first, so every instantiation the module spells takes exactly the path it
+    /// already took. Only when there is no row does this fall back to the definition and arguments
+    /// the plan carries, resolving the definition BY NAME -- this assembly's own `TypeDef` first,
+    /// then the references, which is the one cross-assembly rule.
+    fn instantiated_parent_named(
+        &self,
+        name: &str,
+        spec: Token,
+    ) -> Option<(&'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> {
+        if let Some(resolved) = self.instantiated_parent(spec) {
+            return Some(resolved);
+        }
+        let (definition, arguments) = self.mono.carried(name)?;
+        let (namespace, simple) = definition.rsplit_once('.').unwrap_or(("", definition));
+        if let Some(type_def) = self.assembly.find_type(namespace, simple) {
+            return Some((self.assembly, type_def, arguments.to_vec()));
+        }
+        let (ordinal, type_def) = Assembly::find_in_references(&self.references, namespace, simple)?;
+        Some((self.references[ordinal], type_def, arguments.to_vec()))
+    }
+
     /// and a token is meaningless outside its own assembly.
     fn instantiated_parent(
         &self,
@@ -3394,6 +4042,37 @@ impl<'a> MetadataResolver<'a> {
     /// descriptor that was not there. MEASURED, one variable changed -- a program whose generic
     /// definition gained one `virtual` BUILT CLEANLY and then HARD FAULTED on an emulated
     /// Cortex-M0 where the same program without it answered 42. A refusal on the way to an emitter's
+    /// [`Self::instantiated_reference_layout`] for the DESCRIPTOR path, which may be asked about an
+    /// instantiation no row spells -- see [`Self::instantiated_parent_named`]. Every other caller
+    /// holds a real row (a `MemberRef` parent, a cast target) and keeps the row-only entry point.
+    fn instantiated_reference_layout_named(
+        &self,
+        name: &str,
+        spec: Token,
+    ) -> Option<ReferenceLayout> {
+        let (owner, type_def, arguments) = self.instantiated_parent_named(name, spec)?;
+        if type_def.is_value_type() {
+            return None;
+        }
+        let layout_args =
+            caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+        let chain = self.cross_class_chain(owner, type_def, &layout_args);
+        let mut size = 0u32;
+        let mut reference_offsets = Vec::new();
+        for link in &chain {
+            let layout = self.link_layout(link)?;
+            for offset in &layout.reference_offsets {
+                reference_offsets.push(size + offset);
+            }
+            size = (size + layout.size).next_multiple_of(4);
+        }
+        Some(ReferenceLayout {
+            handle: crate::generics::instantiation_handle(name),
+            size,
+            reference_offsets,
+        })
+    }
+
     /// INPUT stops a product being made; only a refusal where the build can FAIL stops the build.
     fn instantiated_reference_layout(&self, spec: Token) -> Option<ReferenceLayout> {
         let (owner, type_def, arguments) = self.instantiated_parent(spec)?;
@@ -3412,8 +4091,7 @@ impl<'a> MetadataResolver<'a> {
             }
             size = (size + layout.size).next_multiple_of(4);
         }
-        let spec_type = self.closed_spec_signature(spec)?;
-        let name = crate::generics::spell_sig(self.assembly, &spec_type)?;
+        let name = self.spelled_spec(spec)?;
         Some(ReferenceLayout {
             handle: crate::generics::instantiation_handle(&name),
             size,
@@ -3829,6 +4507,7 @@ impl CallResolver for MetadataResolver<'_> {
             args,
             has_result,
             result_type,
+            has_this: signature.has_this,
             target,
         })
     }
@@ -4046,6 +4725,15 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return false;
         };
+        if token.table() == table::MEMBER_REF
+            && let Some(member) = self.assembly.member_ref(token.row())
+            && member.parent().table() == table::TYPE_SPEC
+        {
+            return self
+                .assembly
+                .type_spec_signature(member.parent())
+                .is_some_and(|sig| is_reference_signature(&sig));
+        }
         let declaring = match token.table() {
             table::MEMBER_REF => self
                 .assembly
@@ -4355,7 +5043,7 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         match token.table() {
-            table::FIELD => static_field_slots(self.assembly)
+            table::FIELD => static_field_slots(self.assembly, &self.references)
                 .into_iter()
                 .find(|(row, _, _)| *row == token.row())
                 .map(|(_, slot, _)| {
@@ -4373,19 +5061,24 @@ impl CallResolver for MetadataResolver<'_> {
             {
                 let member = self.assembly.member_ref(token.row())?;
                 let signature = self.assembly.type_spec_signature(member.parent())?;
-                let closed = self
-                    .apply_instantiation(&signature)
-                    .unwrap_or(signature);
-                let name = crate::generics::spell_sig(self.assembly, &closed)?;
-                let field_name = member.name()?;
-                let slot = band_slot_of(self.assembly, &self.mono, &name, &|row| {
-                    field_row_is_named(self.assembly, row, field_name)
+                let name = crate::generics::spell_sig_across(
+                    self.assembly,
+                    self.argument_world(),
+                    &signature,
+                    &self.type_arguments,
+                )
+                .or_else(|| {
+                    crate::generics::spell_sig(self.assembly, &signature)
                 })?;
-                let owner = self
-                    .reference_owner
-                    .as_ref()
-                    .map_or(StaticOwner::Own, |o| StaticOwner::Reference(o.ordinal));
-                Some((owner, slot * 4))
+                let field_name = member.name()?;
+                let slot = band_slot_of(
+                    self.argument_world(),
+                    &self.mono,
+                    &name,
+                    field_name,
+                    self.argument_world_references(),
+                )?;
+                Some((StaticOwner::Own, slot * 4))
             }
             table::MEMBER_REF => {
                 let member = self.assembly.member_ref(token.row())?;
@@ -4401,7 +5094,7 @@ impl CallResolver for MetadataResolver<'_> {
                     .find(|f| f.name() == Some(field_name))?
                     .token()
                     .row();
-                let slot = static_field_slots(owner)
+                let slot = static_field_slots(owner, &self.references[..usize::from(ordinal)])
                     .into_iter()
                     .find(|(row, _, _)| *row == field_row)
                     .map(|(_, slot, _)| slot)?;
@@ -4530,7 +5223,20 @@ impl CallResolver for MetadataResolver<'_> {
             return Vec::new();
         };
         if let Some(tag) = self.instantiation_exception_tag(catch_token) {
-            return alloc::vec![tag];
+            let mut tags = alloc::vec![tag];
+            let Some(catch_spelling) = self.spelled_spec(catch_token) else {
+                return tags;
+            };
+            for type_def in self.assembly.type_defs() {
+                if !self.chain_reaches_instantiation(type_def, &catch_spelling) {
+                    continue;
+                }
+                let subtype_tag = self.assembly.exception_tag(type_def.token());
+                if subtype_tag != 0 && !tags.contains(&subtype_tag) {
+                    tags.push(subtype_tag);
+                }
+            }
+            return tags;
         }
         let Some(catch_name) = self.assembly.type_token_name(catch_token) else {
             return Vec::new();
@@ -4542,6 +5248,13 @@ impl CallResolver for MetadataResolver<'_> {
             for _ in 0..64 {
                 if current.row() == 0 {
                     break;
+                }
+                if current.table() == table::TYPE_SPEC {
+                    let Some(definition) = generic_base_definition(self.assembly, current) else {
+                        break;
+                    };
+                    current = definition;
+                    continue;
                 }
                 let Some(name) = self.assembly.type_token_name(current) else {
                     break;
@@ -4595,6 +5308,13 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         let target = self.type_token_of(*token)?;
+        if target.table() == table::TYPE_SPEC {
+            let (owner, type_def, _) = self.instantiated_parent(target)?;
+            if !core::ptr::eq(owner, self.assembly) || !self.is_exception_type(type_def.token()) {
+                return None;
+            }
+            return self.instantiated_reference_layout(target);
+        }
         if !self.is_exception_type(target) {
             return None;
         }
@@ -4616,6 +5336,9 @@ impl CallResolver for MetadataResolver<'_> {
         let Some(target) = self.type_token_of(*token) else {
             return Vec::new();
         };
+        if target.table() == table::TYPE_SPEC {
+            return self.constructed_cast_subtype_handles(target);
+        }
         let Some(target_name) = self.assembly.type_token_name(target) else {
             return Vec::new();
         };
@@ -4626,6 +5349,13 @@ impl CallResolver for MetadataResolver<'_> {
             for _ in 0..64 {
                 if current.row() == 0 {
                     break;
+                }
+                if current.table() == table::TYPE_SPEC {
+                    let Some(definition) = generic_base_definition(self.assembly, current) else {
+                        break;
+                    };
+                    current = definition;
+                    continue;
                 }
                 let Some(name) = self.assembly.type_token_name(current) else {
                     break;
@@ -4738,7 +5468,8 @@ impl CallResolver for MetadataResolver<'_> {
         let Some(signature) = self.assembly.type_spec_signature(*token) else {
             return false;
         };
-        let Some(closed) = self.apply_instantiation(&signature) else {
+        let closed = self.apply_instantiation(&signature);
+        let Some(closed) = closed else {
             return false;
         };
         is_reference_signature(&closed)
@@ -4749,6 +5480,24 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         let handle = self.qualified_type_handle(*token);
+        if let Some(closed) = self.closed_operand_sig(*token) {
+            if let Some((namespace, name)) = primitive_sig_name(&closed) {
+                let boxed = self
+                    .assembly
+                    .find_type(namespace, name)
+                    .map(|type_def| TypeHandle(type_def.token().0))
+                    .or_else(|| {
+                        self.find_reference_type(namespace, name)
+                            .map(|(ordinal, _, td)| reference_handle(ordinal, td.token().0))
+                    })?;
+                let size = primitive_value_size(namespace, name)?;
+                return Some(ReferenceLayout {
+                    handle: boxed,
+                    size,
+                    reference_offsets: Vec::new(),
+                });
+            }
+        }
         if let Some(size) = self
             .assembly
             .type_token_name(*token)
@@ -5014,6 +5763,7 @@ impl CallResolver for MetadataResolver<'_> {
         Some(CallInfo {
             args: signature.parameters.len() + 1,
             has_result,
+            has_this: true,
             result_type: has_result
                 .then(|| {
                     mir_type(
@@ -5089,6 +5839,7 @@ fn mir_type_across<'x>(
         SigType::R8 => MirType::F64,
         SigType::IntPtr | SigType::UIntPtr => MirType::NativeInt,
         SigType::Pointer(_) => MirType::NativeInt,
+        SigType::ByRef(_) => MirType::ManagedPtr,
         SigType::Class(_) | SigType::Object | SigType::String => MirType::ObjectRef,
         SigType::SzArray(_) | SigType::Array { .. } => MirType::ObjectRef,
         SigType::GenericInst { definition, .. } if matches!(**definition, SigType::Class(_)) => {
@@ -5125,36 +5876,60 @@ fn mir_type_across<'x>(
 /// drift, or the collector walks the wrong words. Each entry carries its WIDTH IN WORDS: an
 /// `int64`/`double` static reserves TWO, everything else one.
 ///
-/// The width predicate is [`mir_type`] -- the SAME function [`CallResolver::field_type`] types the
-/// `ldsfld`/`stsfld` value with -- so the reservation and the lowering cannot disagree about which
-/// static is 64-bit. That matters in three directions, and each is safe:
-/// * an OWN-assembly static reads the same signature blob through the same function, so the two
-///   answers are identical by construction (this covers an enum with a `long` underlying type,
-///   which `mir_type` folds to `I64` for both);
-/// * a CROSS-assembly `long`/`double` encodes as the same primitive in the MemberRef blob, so the
-///   two agree there too;
-/// * a CROSS-assembly ENUM static resolves in the owner but not through the referencing
-///   assembly's TypeRef, where `field_type` already answers `None` and the lowering refuses LOUD --
-///   so the owner reserving two words leaves a HOLE, never an overlap.
+/// The width predicate is [`mir_type_across`], the SAME function [`CallResolver::field_type`] types
+/// the `ldsfld`/`stsfld` value with, READ WITH THE SAME REFERENCES -- so the reservation and the
+/// lowering cannot disagree about a static's width. **The references are load-bearing:** without
+/// them a `SigType::ValueType` naming a cross-assembly struct answers `None`, which is
+/// indistinguishable here from a scalar and takes the one-word path.
 ///
-/// A struct-typed static still gets ONE word and its lowering still moves one: that truncation is
-/// unchanged here and wants the multi-word static copy the two backends do not emit yet.
+/// **A VALUE TYPE RESERVES ITS OWN SIZE, ROUNDED UP TO WORDS**, and a sub-word struct still takes a
+/// whole one -- `div_ceil` rather than `size / 4`, because a zero-word reservation would alias the
+/// static declared after it. A reservation narrower than the lowering's copy is an OVERLAP, not a
+/// hole: the read spills into the neighbour and two reads of one constant can disagree.
+///
+/// **THE WIDTH AND THE GC ROOT RECORD ARE ONE CHANGE.** `build::assembly_statics` enumerates a
+/// static as a root from its DECLARED type, and a `ValueType` is not in that match -- so a struct
+/// static's interior references are enumerated there explicitly, from its layout's
+/// `reference_offsets`. Reserving the words without enumerating the roots gives the collector
+/// storage it does not walk, which is a collected-while-live object rather than a wrong read.
 ///
 /// Slot 0 (region offset 0) is RESERVED, because offset 0 is the MIR-level EH-tag marker
 /// (`cil::G_EXCEPTION_TAG_OFFSET`) and a field slot there would alias every throw/catch.
-pub(crate) fn static_field_slots(assembly: &Assembly) -> Vec<(u32, u32, u32)> {
+/// HOW MANY REGION WORDS ONE STATIC RESERVES, for every band that lays statics.
+///
+/// **THERE IS ONE OF THESE BECAUSE THERE WAS BRIEFLY TWO.** The non-generic band
+/// ([`static_field_slots`]) and the generic band ([`generic_static_slots`]) each carried their own
+/// copy of this decision, and a repair applied to one of them left the other reserving a single
+/// word for a struct -- the shape where a reservation narrower than the lowering's copy spills into
+/// the neighbouring static. A width rule with two implementations gains its next case in one of
+/// them, so this is the only place the question is answered.
+///
+/// `None`, or a signature this cannot type, keeps ONE word: that is what a scalar needs, and for an
+/// unresolvable token the lowering refuses LOUD, so the word is a hole rather than an overlap.
+fn static_slot_words<'x>(
+    signature: Option<&SigType>,
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+) -> u32 {
+    match signature
+        .and_then(|sig| mir_type_across(sig, assembly, None, references, &TargetLayout::ilp32()))
+    {
+        Some(MirType::I64 | MirType::F64) => 2,
+        Some(MirType::ValueType { size, .. }) => size.div_ceil(4).max(1),
+        _ => 1,
+    }
+}
+
+pub(crate) fn static_field_slots<'x>(
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+) -> Vec<(u32, u32, u32)> {
     let mut slots = Vec::new();
     let mut next = 1u32;
     for type_def in assembly.type_defs() {
         for field in type_def.fields() {
             if field.is_static() && !field.is_literal() {
-                let words = match field
-                    .signature()
-                    .and_then(|sig| mir_type(&sig, assembly, &TargetLayout::ilp32()))
-                {
-                    Some(MirType::I64 | MirType::F64) => 2,
-                    _ => 1,
-                };
+                let words = static_slot_words(field.signature().as_ref(), assembly, references);
                 slots.push((field.token().row(), next, words));
                 next += words;
             }
@@ -5180,8 +5955,11 @@ pub(crate) fn static_field_slots(assembly: &Assembly) -> Vec<(u32, u32, u32)> {
 /// they are assigned HERE rather than by the caller because the region size and the offsets written
 /// into it must come from one walk -- writing that condition twice is how this backend's two
 /// `mir_type` twins drifted.
-pub(crate) fn precise_init_types(assembly: &Assembly) -> Vec<(u32, u32, u32)> {
-    let mut next = static_field_slots(assembly)
+pub(crate) fn precise_init_types<'x>(
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+) -> Vec<(u32, u32, u32)> {
+    let mut next = static_field_slots(assembly, references)
         .iter()
         .map(|(_, slot, words)| slot + words)
         .max()
@@ -5279,22 +6057,40 @@ pub(crate) fn type_init_thunk_symbol(assembly: &Assembly, type_row: u32) -> Opti
 /// initializing itself would write into a neighbor's statics, and the two assemblies would disagree
 /// silently rather than fail to link.
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
-pub(crate) fn static_region_words(assembly: &Assembly, plan: &crate::generics::MonoPlan) -> u32 {
-    generic_static_slots(assembly, plan)
+pub(crate) fn static_region_words<'x>(
+    assembly: &'x Assembly<'x>,
+    plan: &crate::generics::MonoPlan,
+    references: &[&'x Assembly<'x>],
+) -> u32 {
+    generic_static_slots(assembly, plan, references)
         .last()
         .map_or_else(
-            || non_generic_region_words(assembly),
+            || non_generic_region_words(assembly, references),
             |(_, _, slot, words, _)| slot + words,
         )
 }
 
 /// The static-field slots a MONOMORPHIZED INSTANTIATION owns, as
-/// `(canonical instantiation spelling, field row, slot, words)`.
+/// `(canonical instantiation spelling, field NAME, slot, words, holds-a-reference)`.
+///
+/// **THE KEY IS TWO NAMES, AND NEITHER IS A ROW, BECAUSE A ROW BELONGS TO AN ASSEMBLY.** The
+/// spelling is assembly-independent -- the same reason the plan itself is carried across a rebase --
+/// and a field NAME is unique within the type that declares it, so the pair names one variable from
+/// either side of an assembly boundary. Keyed by row instead, the same band read from the module and
+/// from a rebased view of the owner compares numbers minted in two different tables.
 ///
 /// **A GENERIC TYPE HAS ONE FIELD ROW AND N INSTANTIATIONS, AND THEY ARE N DIFFERENT STORAGE
 /// LOCATIONS.** `Cmp<int>.Count` and `Cmp<string>.Count` are unrelated variables, so
 /// [`static_field_slots`]' dense per-ROW numbering cannot express them: it would hand every
 /// instantiation the same word. This is the second numbering, keyed by the pair.
+///
+/// **IT IS THE MODULE'S BAND, IN THE MODULE'S WORLD, AND EVERY CALLER MUST HAND IT THAT WORLD.**
+/// `spec` is a `TypeSpec` row of the module being BUILT -- the module is what spells the
+/// instantiation -- so handing this function a resolver REBASED onto a definition's owner reads a
+/// caller token against the owner's tables. **That is not a lookup miss.** A row number carries no
+/// assembly with it, so the same number read next door names whatever happens to sit there: a
+/// different type, or nothing, and which of the two is luck. The DEFINITION's tables are re-entered
+/// deliberately, per entry, once the module has decoded the spec.
 ///
 /// **IT IS APPENDED, NOT INTERLEAVED, AND THAT IS THE WHOLE OF THE COMPATIBILITY ARGUMENT.** It
 /// starts past the fields AND past the precise-init flags, so every slot those two already
@@ -5308,47 +6104,86 @@ pub(crate) fn static_region_words(assembly: &Assembly, plan: &crate::generics::M
 /// being built, and the emitter and the collector read them from this one function.
 ///
 #[must_use]
-pub(crate) fn generic_static_slots(
-    assembly: &Assembly,
+pub(crate) fn generic_static_slots<'x>(
+    assembly: &'x Assembly<'x>,
     plan: &crate::generics::MonoPlan,
-) -> Vec<(String, u32, u32, u32, bool)> {
+    references: &[&'x Assembly<'x>],
+) -> Vec<(String, String, u32, u32, bool)> {
     let mut out = Vec::new();
-    let mut next = non_generic_region_words(assembly);
+    let mut next = non_generic_region_words(assembly, references);
     for (name, spec) in plan.instantiations() {
-        let Some(SigType::GenericInst {
-            definition,
-            arguments,
-        }) = assembly.type_spec_signature(spec)
-        else {
-            continue;
+        let carried = plan.carried(name);
+        let (definition_token, arguments) = match (
+            assembly.type_spec_signature(spec),
+            carried,
+        ) {
+            (
+                Some(SigType::GenericInst {
+                    definition,
+                    arguments,
+                }),
+                _,
+            ) => match definition.as_ref() {
+                SigType::Class(token) | SigType::ValueType(token) => (*token, arguments),
+                _ => continue,
+            },
+            (_, Some((definition, carried_arguments))) => {
+                let (namespace, simple) = definition.rsplit_once('.').unwrap_or(("", definition));
+                let Some(token) = assembly
+                    .find_type(namespace, simple)
+                    .map(|type_def| type_def.token())
+                    .or_else(|| {
+                        Assembly::find_in_references(references, namespace, simple)
+                            .map(|(_, type_def)| type_def.token())
+                    })
+                else {
+                    continue;
+                };
+                (token, carried_arguments.to_vec())
+            }
+            _ => continue,
         };
-        let (SigType::Class(token) | SigType::ValueType(token)) = definition.as_ref() else {
-            continue;
-        };
-        if token.table() != table::TYPE_DEF {
-            continue;
-        }
-        let Some(type_def) = assembly.type_def(token.row()) else {
-            continue;
+        let token = &definition_token;
+        let (declaring, declaring_references, type_def) = match token.table() {
+            table::TYPE_DEF => {
+                let Some(type_def) = assembly.type_def(token.row()) else {
+                    continue;
+                };
+                (assembly, references, type_def)
+            }
+            table::TYPE_REF => {
+                let Some(type_name) = assembly.type_token_name(*token) else {
+                    continue;
+                };
+                let Some((ordinal, type_def)) =
+                    Assembly::find_in_references(references, type_name.namespace, type_name.name)
+                else {
+                    continue;
+                };
+                (references[ordinal], &references[..ordinal], type_def)
+            }
+            _ => continue,
         };
         for field in type_def.fields() {
             if !field.is_static() || field.is_literal() {
                 continue;
             }
+            let Some(field_name) = field.name() else {
+                continue;
+            };
             let signature = field.signature();
-            let words = match signature
-                .as_ref()
-                .and_then(|sig| mir_type(sig, assembly, &TargetLayout::ilp32()))
-            {
-                Some(MirType::I64 | MirType::F64) => 2,
-                _ => 1,
+            let words = match signature.as_ref() {
+                Some(SigType::Var(index)) => arguments
+                    .get(*index as usize)
+                    .map_or(1, |argument| static_slot_words(Some(argument), assembly, references)),
+                other => static_slot_words(other, declaring, declaring_references),
             };
             let is_reference = signature
                 .as_ref()
                 .is_some_and(|sig| signature_is_reference(sig, &arguments));
             out.push((
                 alloc::string::String::from(name),
-                field.token().row(),
+                alloc::string::String::from(field_name),
                 next,
                 words,
                 is_reference,
@@ -5368,13 +6203,16 @@ pub(crate) fn generic_static_slots(
 /// [`generic_static_slots`], which every code model reaches through `static_field_offset` -- so a
 /// `#[cfg]` here is not a smaller wasm build, it is a wasm build that does not compile. Measured by
 /// the code-model matrix the moment it was written that way.
-fn non_generic_region_words(assembly: &Assembly) -> u32 {
-    let fields = static_field_slots(assembly)
+pub(crate) fn non_generic_region_words<'x>(
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+) -> u32 {
+    let fields = static_field_slots(assembly, references)
         .iter()
         .map(|(_, slot, words)| slot + words)
         .max()
         .unwrap_or(1);
-    precise_init_types(assembly)
+    precise_init_types(assembly, references)
         .last()
         .map_or(fields, |(_, _, slot)| slot + 1)
 }
@@ -5406,28 +6244,22 @@ fn signature_is_reference(sig: &SigType, arguments: &[SigType]) -> bool {
     }
 }
 
-/// The band slot of a static field row under a named instantiation -- the shared half of the two
+/// The band slot of a named static field under a named instantiation -- the shared half of the two
 /// lookups [`MetadataResolver::static_field_offset`] makes, so the key is compared one way.
-fn band_slot_of(
-    assembly: &Assembly,
+///
+/// `assembly` and `references` are the MODULE's, never a rebased view's -- see
+/// [`generic_static_slots`] for what a caller token read against the owner's tables produces.
+fn band_slot_of<'x>(
+    assembly: &'x Assembly<'x>,
     plan: &crate::generics::MonoPlan,
     instantiation: &str,
-    matches: &dyn Fn(u32) -> bool,
+    field_name: &str,
+    references: &[&'x Assembly<'x>],
 ) -> Option<u32> {
-    generic_static_slots(assembly, plan)
+    generic_static_slots(assembly, plan, references)
         .into_iter()
-        .find(|(name, row, _, _, _)| name == instantiation && matches(*row))
+        .find(|(name, field, _, _, _)| name == instantiation && field == field_name)
         .map(|(_, _, slot, _, _)| slot)
-}
-
-/// Whether the field at `row` is named `field_name`. A row is only ever compared against the
-/// definition that declares it, so the walk is over this assembly's own tables.
-fn field_row_is_named(assembly: &Assembly, row: u32, field_name: &str) -> bool {
-    assembly.type_defs().any(|type_def| {
-        type_def
-            .fields()
-            .any(|field| field.token().row() == row && field.name() == Some(field_name))
-    })
 }
 
 /// A type's dotted full name (`namespace.name`, or just `name` in the global namespace) -- what a
@@ -6124,8 +6956,8 @@ fn is_string_op_equality(method: &ResolvedMethod) -> bool {
 }
 
 /// Whether a resolved method is a fixed-arity `System.String::Concat(string, ...)` -- the 2-, 3-, or
-/// 4-string overloads `a + b`, `a + b + c`, `a + b + c + d` emit. The front end chains it pairwise.
-/// (The `Concat(string[])` params-array and `Concat(object...)` overloads are not yet recognized.)
+/// 4-string overloads `a + b`, `a + b + c`, `a + b + c + d` emit. The front end flattens a `+`
+/// chain into ONE call at the arity of its pieces, so these three cover a chain of up to four.
 fn is_string_concat(method: &ResolvedMethod) -> bool {
     matches!(intrinsic_of(method), Some(Intrinsic::StringConcat))
 }

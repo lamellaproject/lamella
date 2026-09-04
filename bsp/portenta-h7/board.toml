@@ -38,7 +38,7 @@ board = "portenta-h7"
 vendor = "arduino"
 family = "stm32h7"
 part = "stm32h747xi"
-board_model = 35            # lamella_wire::board_model::ARDUINO_PORTENTA_H7
+product_model = 35          # lamella_wire::product_model::ARDUINO_PORTENTA_H7
 sources = [
     "Arduino Portenta H7 Collective Datasheet (SKU ABX00042-ABX00045-ABX00046, modified 06/08/2026), description and comparison table: the family runs on two processors; the table separates Portenta H7 (ABX00042), Portenta H7 Lite (ABX00045) and Portenta H7 Lite Connected (ABX00046) by security element and connectivity only, and gives all three 8 MB SDRAM and 16 MB QSPI flash. Section 3.1 gives the USB-C connector and section 3.2 the high density connectors, whose pinout carries SWDIO and SWCK",
     "Arduino Portenta H7 full pinout (ABX00042): the RGB LED table gives three rows -- red / A8 / LEDR, green / C7 / LEDG and blue / D7 / LEDB -- where the middle column is the microcontroller's BALL designator rather than a pin name",

@@ -11,23 +11,12 @@ use alloc::vec::Vec;
 /// The current protocol version this build implements. A peer advertises a [`ProtocolRange`] around it.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Identity + descriptors for the native driverless-WinUSB Lamella Link carrier (the fast
-/// interpreter-flash path): the shared VID/PID + WinUSB interface GUID + bulk endpoints, plus the
-/// BOS / Microsoft OS 2.0 / WebUSB descriptor bytes a firmware embeds so Windows auto-loads
-/// `winusb.sys` (no INF) and a browser can claim it. One home so firmware, host, and browser cannot
-/// drift.
 pub mod usb;
 
-/// Which carrier owns the one debug session a target has to give, when several can reach it at
-/// once. A pure decision -- no carrier, no input or output -- so the rule can be tested whole.
 pub mod session;
 
-/// Which pairing keys a target accepts, and when a replacement displaces the key it replaces.
-/// The rotation policy only -- no cryptography, which the caller supplies as a verifier.
 pub mod pairing;
 
-/// Carrying frames between two carriers, for a target a host cannot open directly. Forwards
-/// without interpreting and without reframing, so a message type it has never heard of crosses.
 pub mod relay;
 
 /// Identity for the TCP carrier -- the port a target serving Lamella Link listens on by default.
@@ -64,41 +53,59 @@ const CRC_LEN: usize = 2;
 /// exists.
 pub const MAX_PAYLOAD: usize = u16::MAX as usize;
 
-/// Message type bytes. The Debug (`0x10+`) and REPL (`0x20+`) ranges are reserved.
-pub mod msg {
-    /// Host -> target: a [`super::Hello`] (version range + capabilities).
-    pub const HELLO: u8 = 0x01;
-    /// Target -> host: a [`super::HelloAck`] (the chosen version + the target's capabilities).
-    pub const HELLO_ACK: u8 = 0x02;
-    /// Target -> host: a [`super::Nak`] (no compatible version).
-    pub const NAK: u8 = 0x03;
-    /// Either way: an error response (e.g. an unknown command), payload = a reason byte + text.
-    pub const ERROR: u8 = 0x04;
-    /// Liveness probe.
-    pub const PING: u8 = 0x05;
-    /// Liveness reply.
-    pub const PONG: u8 = 0x06;
-    /// Target -> host, unsolicited: the session this carrier held has been taken by another one.
-    /// The payload is the new holder's [`super::session::ChannelClass`] as one byte.
-    ///
-    /// # Why the loser is told rather than left to find out
-    ///
-    /// A target that can be reached on several carriers at once has one session to give, and a
-    /// carrier can lose it while its host believes it still has it. Without this, that host
-    /// discovers the loss from its next operation being refused -- or, if it was only listening,
-    /// never discovers it at all and simply reports a target that went quiet.
-    ///
-    /// Naming the new holder's CLASS is the useful part: *a cable took it* tells a remote user
-    /// that somebody is at the board, which is a situation to wait out rather than a fault to
-    /// investigate.
-    pub const SESSION_REVOKED: u8 = 0x07;
+/// The payload every Lamella Link target must be able to absorb in ONE frame, whether or not it
+/// advertises a larger one through [`HelloAck::max_inbound_payload`].
+///
+/// # Why the protocol states a floor rather than leaving it to the sender
+///
+/// A byte-stream target drains its carrier into a fixed ring from an interrupt, and a full ring
+/// DROPS. A frame larger than that ring cannot be assembled by a target that is busy while it
+/// arrives, however patient either end is: the reader waits for bytes that were discarded while it
+/// was being told about them. Nothing times out that a longer timeout would fix, and the host reads
+/// the result as a target that stopped answering -- which sends somebody to look at the cable.
+///
+/// Without a floor a sender has two options and both are wrong. It can send what the wire allows
+/// and hang on the smallest board, or it can guess the smallest ring in the tree -- a number with
+/// no owner, no reason attached, and no way to be right about a board added later. A floor makes
+/// the small case a REQUIREMENT a target has to meet rather than a limit each sender has to
+/// rediscover, and it is what makes [`HelloAck::max_inbound_payload`] safe to leave unset.
+///
+/// 240 bytes, which is 249 on the wire and so fits the smallest receive ring any serve firmware in
+/// this tree uses, with room left over. It is deliberately round rather than the exact 247 that
+/// ring allows: this is a number that goes into a conformance sentence somebody has to implement
+/// against, not one derived at a call site.
+pub const MIN_INBOUND_PAYLOAD: usize = 240;
+
+/// The largest payload a receiver holding a `buffer`-byte assembly buffer can take, accounting for
+/// the framing the payload arrives wrapped in.
+///
+/// # Why the arithmetic is here rather than at the caller
+///
+/// The framing overhead is not public and should not be. A firmware that subtracted its own idea of
+/// the header size would be silently wrong the day the header changes -- and silently wrong here
+/// means OVER-advertising, which is the failure this whole mechanism exists to prevent. So a target
+/// states the number it actually knows, which is how big its ring is, and the layer that owns the
+/// header does the subtraction.
+///
+/// Saturating rather than underflowing: a buffer too small to hold any frame carries no payload,
+/// which is a true answer, and a panic in a `const` initializer on a firmware is not a diagnosis
+/// anybody gets to read.
+#[must_use]
+pub const fn max_payload_for_buffer(buffer: usize) -> usize {
+    buffer.saturating_sub(HEADER_LEN + CRC_LEN)
 }
 
-/// What an [`msg::ERROR`] carries: why a frame was refused.
+pub mod msg;
+
+pub mod arch;
+
+pub mod surface;
+
+/// What an [`crate::msg::ERROR`] carries: why a frame was refused.
 ///
 /// # Why a refusal is a message rather than a silence
 ///
-/// [`msg::ERROR`] is the answer to a message type a target does not implement. Without one, such a
+/// [`crate::msg::ERROR`] is the answer to a message type a target does not implement. Without one, such a
 /// message is simply dropped and the host waits out its timeout -- and a timeout cannot be told apart from a board that
 /// has stopped answering, which is the single most expensive ambiguity in bringing a target up. The
 /// three explanations for silence are "I do not implement that", "I crashed", and "the cable is bad",
@@ -113,9 +120,9 @@ pub mod msg {
 /// [`error::UNKNOWN_MESSAGE_TYPE`] it is the one byte that was not understood, which is the whole of the
 /// useful information and needs no strings on a target counting flash.
 ///
-/// # A refusal is NOT a [`Nak`]
+/// # A refusal is NOT a [`HelloNak`]
 ///
-/// [`msg::NAK`] answers a [`Hello`] whose version range does not overlap: the session cannot begin at
+/// [`msg::HELLO_NAK`] answers a [`Hello`] whose version range does not overlap: the session cannot begin at
 /// all. A refusal happens inside a session that negotiated fine, about one frame. Keeping them apart
 /// matters because the remedies are opposite -- one says use a different protocol version, the other
 /// says this target does not do that thing and the rest of the session is unaffected.
@@ -195,7 +202,8 @@ fn crc16(data: &[u8]) -> u16 {
 /// corrupted length is also caught).
 ///
 /// `None` when `payload` exceeds [`MAX_PAYLOAD`] -- such a payload has no representation on this
-/// wire, and there is nothing this function can return that would be one.
+/// wire, and there is nothing this function can return that would be one -- or when `msg_type` is
+/// one of the two bytes that are permanently not message types ([`msg::is_valid_type`]).
 ///
 /// # Why this refuses instead of truncating
 ///
@@ -210,12 +218,12 @@ fn crc16(data: &[u8]) -> u16 {
 /// possibly diagnose it.
 ///
 /// It is reachable rather than theoretical. Callers that stream (the deploy, bundle and
-/// module-firmware ops) chunk and are fine, but a target building a `RUN_RESULT` from a deployed
+/// module-firmware ops) chunk and are fine, but a target building one reply out of a deployed
 /// program's console output does not chunk -- a chatty program on a roomy part is one path to a
 /// payload this cannot carry.
 #[must_use]
 pub fn encode_frame(msg_type: u8, seq: u16, payload: &[u8]) -> Option<Vec<u8>> {
-    if payload.len() > MAX_PAYLOAD {
+    if payload.len() > MAX_PAYLOAD || !msg::is_valid_type(msg_type) {
         return None;
     }
     let len = payload.len();
@@ -232,16 +240,55 @@ pub fn encode_frame(msg_type: u8, seq: u16, payload: &[u8]) -> Option<Vec<u8>> {
 
 /// Accumulates carrier bytes and yields whole frames, resynchronizing on the SYNC magic after garbage
 /// or a CRC failure. A byte-stream transport (USB-CDC / UART) pushes received bytes here.
-#[derive(Default)]
 pub struct FrameReader {
     buf: Vec<u8>,
+    /// The largest payload a header may claim before it is treated as garbage. See
+    /// [`FrameReader::with_max_payload`].
+    max_payload: usize,
+}
+
+impl Default for FrameReader {
+    /// A reader that will wait for any length the protocol allows.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameReader {
-    /// A new, empty reader.
+    /// A new, empty reader that will wait for any length the protocol allows.
     #[must_use]
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self { buf: Vec::new(), max_payload: MAX_PAYLOAD }
+    }
+
+    /// A reader that treats a header claiming more than `max_payload` bytes as garbage and
+    /// resynchronizes at once, instead of waiting for a frame that size to arrive.
+    ///
+    /// # Why a bounded reader exists
+    ///
+    /// The length is two bytes read out of the stream, and the CRC that would reject them cannot be
+    /// checked until the whole declared frame has arrived. So **one corrupted length byte makes an
+    /// unbounded reader wait for up to 65,535 bytes**, swallowing every real frame that follows into
+    /// the same buffer until the count is satisfied. At 115200 baud that is about six seconds of a
+    /// link that looks dead; on anything slower it is minutes.
+    ///
+    /// It is worse than a stall, because the cost compounds: [`FrameReader::push`] sizes its reserve
+    /// through a scan of the buffer, so every byte appended to a stalled reader costs more than the
+    /// last. On a polled UART that feedback is enough to turn keeping up into overrunning -- **the
+    /// stall causes the corruption that keeps it stalled** -- and the loop breaks only when
+    /// something outside the reader resets it.
+    ///
+    /// A target usually knows what it can be sent. A firmware whose largest inbound frame is a
+    /// handshake turns six seconds of swallowed stream into one discarded byte by saying so.
+    /// **[`FrameReader::new`] is unchanged**: a host, or a target that really does receive deployed
+    /// images, keeps the full range by saying nothing.
+    ///
+    /// A `max_payload` at or above [`MAX_PAYLOAD`] is simply no bound, and is not an error: the
+    /// length field is a `u16`, so no header can claim more than that however large a number this
+    /// is given.
+    #[must_use]
+    pub fn with_max_payload(max_payload: usize) -> Self {
+        Self { buf: Vec::new(), max_payload }
     }
 
     /// Append received carrier bytes. Growth is RESERVE-EXACT to the frame length the
@@ -257,6 +304,16 @@ impl FrameReader {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// Whether a header's declared length is one this reader could ever complete.
+    ///
+    /// ONE definition, because two places act on it -- what to reserve toward, and what to discard --
+    /// and a rule with two implementations gains its next case in one of them. They must agree
+    /// exactly: a reader that reserved toward a length it then discarded would pay the cost of the
+    /// frame it refused.
+    fn believable_length(&self, len: usize) -> bool {
+        len <= self.max_payload
+    }
+
     /// Where the frame currently being assembled ends in `buf` (its sync offset plus the
     /// header-declared full frame length), or `0` when no header is readable yet -- the
     /// exact capacity [`FrameReader::push`] reserves toward.
@@ -267,12 +324,24 @@ impl FrameReader {
         if self.buf.len() < sync + HEADER_LEN {
             return 0;
         }
+        if !msg::is_valid_type(self.buf[sync + 4]) {
+            return 0;
+        }
         let len = u16::from_le_bytes([self.buf[sync + 2], self.buf[sync + 3]]) as usize;
+        if !self.believable_length(len) {
+            return 0;
+        }
         sync + HEADER_LEN + len + CRC_LEN
     }
 
     /// Pull the next complete, CRC-valid frame, or `None` if more bytes are needed. Leading garbage and
     /// a CRC-failed frame are discarded (resync on the next SYNC).
+    ///
+    /// A header whose TYPE byte is one of the two that can never be a message type
+    /// ([`msg::is_valid_type`]) is discarded as soon as the header is readable, rather than after
+    /// waiting for the payload it claims. That matters because both of those bytes are what unwritten
+    /// memory reads as: a run of erased flash or zeroed RAM arriving on a carrier can otherwise
+    /// declare a long payload and hold the reader waiting for bytes nothing will send.
     pub fn next_frame(&mut self) -> Option<Frame> {
         loop {
             match find_sync(&self.buf) {
@@ -290,7 +359,15 @@ impl FrameReader {
             if self.buf.len() < HEADER_LEN {
                 return None;
             }
+            if !msg::is_valid_type(self.buf[4]) {
+                self.buf.drain(0..1);
+                continue;
+            }
             let len = u16::from_le_bytes([self.buf[2], self.buf[3]]) as usize;
+            if !self.believable_length(len) {
+                self.buf.drain(0..1);
+                continue;
+            }
             let frame_len = HEADER_LEN + len + CRC_LEN;
             if self.buf.len() < frame_len {
                 return None;
@@ -347,101 +424,180 @@ impl Default for ProtocolRange {
 
 /// Optional protocol features, advertised independently of the version so a feature is a new bit rather
 /// than a version bump. A session uses the INTERSECTION of the host's and target's capabilities.
+///
+/// # Why the word is sixty-four bits wide, and grouped
+///
+/// The asymmetry decides the width: a word that FILLS is a protocol version bump on a settled
+/// protocol, and a word that never fills costs four extra bytes once per session. The extra masking
+/// on a narrow part is a handshake cost, not a hot-loop one.
+///
+/// A bit sits in the family of the MESSAGE BLOCK it gates, with room left in each family. That is
+/// not tidiness: it makes a family a MASK, so "any debug capability at all" or "every artifact kind"
+/// is one test rather than a list that has to be kept in step with this one. Bits scattered by the
+/// order features happened to land in cannot be masked, and the grouping immediately moves one bit
+/// out of the family its old name implied and into the one whose op it actually gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Capabilities(pub u32);
+pub struct Capabilities(pub u64);
 
 impl Capabilities {
-    /// Halt / resume / read memory.
-    pub const DEBUG_BASIC: u32 = 1 << 0;
-    /// Set / clear line breakpoints.
-    pub const BREAKPOINTS: u32 = 1 << 1;
-    /// Single-step (in / over / out).
-    pub const STEPPING: u32 = 1 << 2;
-    /// Write target memory.
-    pub const MEM_WRITE: u32 = 1 << 3;
-    /// Inspect managed locals / frames.
-    pub const LOCALS: u32 = 1 << 4;
-    /// Run a host-compiled program (or delta).
-    pub const REPL_RUN: u32 = 1 << 5;
-    /// Parse and interpret source on-device.
-    pub const REPL_SOURCE: u32 = 1 << 6;
-    /// Evaluate against an AOT-deployed target.
-    pub const AOT_ATTACH: u32 = 1 << 7;
-    /// Run a host-BAKED flash image (`RUN_IMAGE`) -- a PE-less constrained target sets this
-    /// instead of [`Capabilities::REPL_RUN`]; the host bakes each submission and ships the image.
-    pub const BAKED_IMAGE: u32 = 1 << 8;
-    /// Debug the PERSISTENTLY DEPLOYED image in place (a 0-byte debug attach instead of
-    /// re-sending the image over the wire) -- deploy-capable targets only.
-    pub const DEBUG_ATTACH: u32 = 1 << 9;
-    /// The `HELLO_ACK` profile identity carries the STRUCTURED board/chip fields
-    /// ([`ProfileIdentity::board_model`] / `chip_idcode` / `chip_devid`), so a host can
-    /// identify the hardware without parsing a display name. The fields may still read
-    /// `0` = unknown (a custom board reports no model; a firmware may not know its ids).
-    pub const PROFILE_CHIPID: u32 = 1 << 10;
-    /// On-device TELEMETRY / live-signal SCOPE (the `lamella_runner::telemetry` 0x40 message
-    /// range). RESERVED: no firmware advertises this bit and no host may rely on it. First of
-    /// the reserved 11-31 capability band.
-    pub const TELEMETRY: u32 = 1 << 11;
-    /// The target holds a RESIDENT corlib in flash, so it accepts a bare program assembly and
-    /// resolves that program's corlib references out of the resident copy -- a program reaches the
-    /// board as its own kilobytes instead of as an image carrying a corlib with it.
-    ///
-    /// # Presence is only half the question, and the other half is why this bit is not enough alone
-    ///
-    /// A host must also know it is the corlib the program was compiled against. Getting that wrong is
-    /// SILENT: a corlib declaring a seam the firmware compiled out still loads, and the method keeps a
-    /// placeholder body that returns zero. **So [`ProfileIdentity::hash`] covers the resident corlib's
-    /// contents**, and a host that recorded that hash for a firmware it trusts can compare and be sure.
-    /// This bit says the path exists; the hash says it is the right one.
-    pub const RESIDENT_CORLIB: u32 = 1 << 13;
-    /// The target implements the BUNDLE message types (`lamella_runner::bundle`) -- an artifact it
-    /// loads through a different front end than a baked image.
-    ///
-    /// **Advertised by the micro:bit v2 Python serve (`microbit-v2-py`), which sets this bit and no
-    /// other**: that tier has no CIL runtime, no baked image and no source-level debugger, so a bit
-    /// set there that nothing implements would turn a clean refusal into a request accepted and then
-    /// unanswerable.
-    ///
-    /// **This is what a host should gate on, in preference to sending the op and reading the answer.**
-    /// Both work -- an unimplemented type is refused with [`msg::ERROR`] naming it (see [`error`]) rather
-    /// than dropped -- but this bit arrives in the `HELLO_ACK` a session already exchanges, so gating on
-    /// it costs no round-trip and no wait, and it says what a target CAN do rather than one thing at a
-    /// time.
-    pub const BUNDLE: u32 = 1 << 12;
-    /// The target answers a memory READ and WRITE (`lamella_runner::live`) **while a deployed app
-    /// is still running** -- the on-target half of a host-side REPL evaluating against a live
-    /// program, rather than against a stopped one.
-    ///
-    /// # Why this is a separate bit from [`DEBUG_BASIC`] and [`MEM_WRITE`]
-    ///
-    /// Those two describe the same two verbs on the HALTED debug channel, where the program is
-    /// stopped at a known point and its state is at rest. This bit says the verbs are answered with
-    /// the program in motion, which is a different promise about a different situation: what a host
-    /// reads may be mid-update, and what it writes lands in a program that did not expect it.
-    ///
-    /// The distinction is not academic on a controller. Halting a live one is an EVENT -- a motor
-    /// keeps turning, a valve stays where it was -- so "inspect a running system" and "poke a
-    /// stopped one" are separate products, and a host must be able to tell which it is talking to.
-    /// A target that only sets [`DEBUG_BASIC`] can still be inspected; it just has to be stopped
-    /// first, and the host has to say so.
-    pub const LIVE_MEMORY: u32 = 1 << 14;
-    /// The target serves the interpreter a MONOTONIC CLOCK that was checked to be MOVING at boot,
-    /// so a program on it can measure elapsed time -- `DateTime`, `Environment.TickCount`,
-    /// `Thread.Sleep` and every timeout built on them.
+
+    /// The identity in the `HELLO_ACK` carries the STRUCTURED product and chip fields, so a host can
+    /// identify the hardware without parsing a display name. The fields may still read `0` =
+    /// unknown: a custom board reports no model, and a firmware may not know its own chip ids.
+    pub const PROFILE_CHIPID: u64 = 1 << 0;
+    /// The target serves the interpreter a MONOTONIC CLOCK that was checked to be MOVING at boot, so
+    /// a program on it can measure elapsed time -- dates, tick counts, sleeps, and every timeout
+    /// built on them.
     ///
     /// # Why a capability bit and not a silence
     ///
-    /// This is the one seam whose failure has no error to report. A clock is a plain
-    /// `fn() -> u64`: a source that never advances returns a perfectly well-formed answer, and every
-    /// caller believes it. A self-timing benchmark on such a board reported **0 ms** for thousands
-    /// of iterations of real work while its checksum gate PASSED -- the computation right, the
-    /// duration nonsense, nothing anywhere in error. **A capability that is present but dead is
-    /// worse than one that is absent, because absent can be reported.** This bit is the reporting.
+    /// This is the one seam whose failure has no error to report. A clock is a plain function
+    /// returning a number: a source that never advances returns a perfectly well-formed answer, and
+    /// every caller believes it. A self-timing benchmark on such a board reports zero milliseconds
+    /// for thousands of iterations of real work while its own checksum check passes -- the
+    /// computation right, the duration nonsense, nothing anywhere in error. A capability that is
+    /// present but dead is worse than one that is absent, because absent can be reported. This bit
+    /// is the reporting.
     ///
-    /// It says nothing about ACCURACY. The scale is the board's own core-clock figure, so a
-    /// firmware on an untrimmed RC oscillator sets this bit and still delivers that oscillator's
-    /// tolerance. The promise is that time PASSES, which is the property a frozen counter breaks.
-    pub const MONOTONIC_CLOCK: u32 = 1 << 15;
+    /// It says nothing about ACCURACY. The scale is the board's own core-clock figure, so a firmware
+    /// on an untrimmed oscillator sets this bit and still delivers that oscillator's tolerance. The
+    /// promise is that time PASSES, which is the property a frozen counter breaks.
+    pub const MONOTONIC_CLOCK: u64 = 1 << 1;
+
+
+    /// Halt, resume and read memory.
+    pub const DEBUG_BASIC: u64 = 1 << 8;
+    /// Set and clear breakpoints.
+    pub const BREAKPOINTS: u64 = 1 << 9;
+    /// Step in, over and out.
+    pub const STEPPING: u64 = 1 << 10;
+    /// Inspect managed locals and frames.
+    pub const LOCALS: u64 = 1 << 11;
+    /// Write target memory.
+    pub const MEM_WRITE: u64 = 1 << 12;
+    /// Attach to a program that is ALREADY RUNNING on an interpreted tier, and leave it running.
+    ///
+    /// Two attach bits rather than one, because they are two AGENTS and not two modes of one. An
+    /// interpreted agent drives the interpreter's own session -- its offsets, its frames, its
+    /// locals. A native agent drives the core: hardware comparators, a native unwinder, a map from
+    /// machine addresses back to the code a person wrote. A firmware can carry either without the
+    /// other and most carry exactly one; with a single bit, a board that can debug its own
+    /// interpreter would have to claim it can debug native code or deny it can debug anything.
+    pub const ATTACH_INTERPRETED: u64 = 1 << 13;
+    /// Attach to a program that is ALREADY RUNNING as native machine code, and leave it running.
+    ///
+    /// Sharper on this side than on the interpreted one: on a board with no debug port, attaching to
+    /// a running native program is not one way in, it is the way in.
+    pub const ATTACH_NATIVE: u64 = 1 << 14;
+
+
+    /// Load and run an assembly. The first of the four ARTIFACT-KIND bits, which are contiguous so
+    /// [`Capabilities::ARTIFACT_KINDS`] can ask about all of them at once.
+    pub const REPL_RUN: u64 = 1 << 24;
+    /// Load and run a host-BAKED image -- the path for a target that cannot parse an assembly, where
+    /// the host bakes each submission and ships the image.
+    pub const BAKED_IMAGE: u64 = 1 << 25;
+    /// Load and run a Python bundle.
+    ///
+    /// A host should gate on this in preference to sending the op and reading the answer. Both work
+    /// -- an unimplemented type is refused by name rather than dropped -- but this bit arrives in a
+    /// handshake the session already exchanges, so gating on it costs no round trip and it says what
+    /// a target CAN do rather than one thing at a time.
+    pub const BUNDLE: u64 = 1 << 26;
+    /// Load and run ECMAScript bytecode.
+    pub const JS: u64 = 1 << 27;
+    /// Parse and interpret SOURCE on the device, rather than only artifacts a host compiled.
+    pub const REPL_SOURCE: u64 = 1 << 28;
+    /// The target holds a RESIDENT class library in flash, so it accepts a bare program assembly and
+    /// resolves that program's library references out of the resident copy -- a program reaches the
+    /// board as its own kilobytes instead of as an image carrying a library with it.
+    ///
+    /// # Presence is only half the question
+    ///
+    /// A host must also know it is the library the program was compiled against, and getting that
+    /// wrong is SILENT: a library declaring a seam the firmware compiled out still loads, and the
+    /// method keeps a placeholder body that returns zero. So the identity carries a content hash of
+    /// the resident surface, and a host that recorded that hash for a firmware it trusts can compare
+    /// and be sure. This bit says the path exists; the hash says it is the right one.
+    pub const RESIDENT_CORLIB: u64 = 1 << 29;
+    /// Start the PERSISTENTLY DEPLOYED artifact halted, in place -- a debug session over an artifact
+    /// already in flash, with nothing sent over the wire to begin it.
+    ///
+    /// The name states what it does. It was once named for attaching, which it never did: it BOOTS
+    /// the deployed artifact, so a program that had been running for hours was replaced by a fresh
+    /// copy of itself at its entry point. Attaching to something already running is
+    /// [`Capabilities::ATTACH_INTERPRETED`] and [`Capabilities::ATTACH_NATIVE`], which are different bits because they are a
+    /// different thing.
+    pub const DEBUG_BOOT_DEPLOYED: u64 = 1 << 30;
+
+
+    /// On-device telemetry: the host subscribes to device signals and the target streams samples
+    /// asynchronously. RESERVED -- no firmware advertises this bit and no host may rely on it.
+    pub const TELEMETRY: u64 = 1 << 40;
+    /// The target answers a memory read and write WHILE a deployed program is still running -- the
+    /// on-target half of a host evaluating against a live program rather than a stopped one.
+    ///
+    /// # Why this is a separate bit from [`Capabilities::DEBUG_BASIC`] and [`Capabilities::MEM_WRITE`]
+    ///
+    /// Those two describe the same two verbs on the HALTED channel, where the program is stopped at
+    /// a known point and its state is at rest. This bit says the verbs are answered with the program
+    /// in motion, which is a different promise about a different situation: what a host reads may be
+    /// mid-update, and what it writes lands in a program that did not expect it.
+    ///
+    /// The distinction is not academic on a controller. Halting a live one is an EVENT -- a motor
+    /// keeps turning, a valve stays where it was -- so inspecting a running system and poking a
+    /// stopped one are separate products, and a host must be able to tell which it is talking to. A
+    /// target that only sets [`Capabilities::DEBUG_BASIC`] can still be inspected; it just has to be stopped
+    /// first, and the host has to say so.
+    pub const LIVE_MEMORY: u64 = 1 << 41;
+
+
+    /// The target can hand off to the silicon vendor's own bootloader, after which it is no longer
+    /// speaking this protocol.
+    pub const HW_BOOTLOADER: u64 = 1 << 48;
+    /// The target can hand off to an INSTALLED Lamella bootloader on the same transport.
+    ///
+    /// Answered from what is installed, never from what the firmware was built to support: the
+    /// question a host is asking is whether the handoff will land somewhere, and a build-time answer
+    /// to that is a guess about a different board's flash.
+    pub const SW_BOOTLOADER: u64 = 1 << 49;
+    /// The target accepts a firmware image over the wire. Firmware flashing is a compile-in
+    /// capability of this protocol rather than a separate product, which is what lets a board with
+    /// two firmware slots write the other one with no bootloader present at all.
+    pub const FW_UPDATE: u64 = 1 << 50;
+    /// The target permits activating an installed image whose version is LOWER than the running one.
+    ///
+    /// Compile-in, and never settable over the wire. Going back to an image already installed and
+    /// already verified is not an install, so the monotonic check that exists to stop an attacker
+    /// re-installing a signed old image gates the WRITE and not the activation -- but an attacker
+    /// holding such an image plus an activation op gets the same outcome with the write removed,
+    /// which is why the permission is built in rather than asked for. Selecting a HIGHER or equal
+    /// version is an ordinary update and needs nothing.
+    pub const FW_ROLLBACK: u64 = 1 << 51;
+    /// The target accepts a deliberately unsigned firmware image. Compile-in, and never settable
+    /// over the wire, for the same reason as [`Capabilities::FW_ROLLBACK`].
+    pub const UNSIGNED_FW: u64 = 1 << 52;
+
+
+    /// Everything in the SESSION family: what the handshake carries, and what the board is.
+    pub const FAMILY_SESSION: u64 = 0x0000_0000_0000_00FF;
+    /// Everything in the DEBUG family. `caps & FAMILY_DEBUG != 0` is "can this board be debugged at
+    /// all", which is what a tool asks before offering to try.
+    pub const FAMILY_DEBUG: u64 = 0x0000_0000_00FF_FF00;
+    /// Everything in the LOAD, DEPLOY and EXEC family.
+    pub const FAMILY_ARTIFACT: u64 = 0x0000_00FF_FF00_0000;
+    /// Everything in the PROFILE, TELEMETRY and LIVE family.
+    pub const FAMILY_OBSERVE: u64 = 0x0000_FF00_0000_0000;
+    /// Everything in the DEVICE and FIRMWARE family.
+    pub const FAMILY_DEVICE: u64 = 0x00FF_0000_0000_0000;
+
+    /// The four ARTIFACT-KIND bits together: an assembly, a baked image, a Python bundle,
+    /// ECMAScript bytecode.
+    ///
+    /// They are contiguous so this mask exists at all. "Which kinds of artifact does this board
+    /// take" is the question a host asks before offering to build one, and answering it from four
+    /// scattered bits means four tests that have to be kept in step with a fifth kind arriving.
+    pub const ARTIFACT_KINDS: u64 = Self::REPL_RUN | Self::BAKED_IMAGE | Self::BUNDLE | Self::JS;
 
     /// Every named bit, with a short human label -- so a host tool can PRINT a capability set
     /// instead of a hexadecimal number.
@@ -454,28 +610,35 @@ impl Capabilities {
     /// [`Capabilities::describe`] reports a set bit with no entry here as `unknown bit N` rather than
     /// dropping it, so a capability added without a label is VISIBLE in the output instead of absent
     /// from it. A name that is missing should cost a reader one puzzled moment, never a wrong answer.
-    pub const NAMED: &'static [(u32, &'static str)] = &[
+    pub const NAMED: &'static [(u64, &'static str)] = &[
+        (Self::PROFILE_CHIPID, "PROFILE_CHIPID"),
+        (Self::MONOTONIC_CLOCK, "MONOTONIC_CLOCK"),
         (Self::DEBUG_BASIC, "DEBUG_BASIC"),
         (Self::BREAKPOINTS, "BREAKPOINTS"),
         (Self::STEPPING, "STEPPING"),
-        (Self::MEM_WRITE, "MEM_WRITE"),
         (Self::LOCALS, "LOCALS"),
+        (Self::MEM_WRITE, "MEM_WRITE"),
+        (Self::ATTACH_INTERPRETED, "ATTACH_INTERPRETED"),
+        (Self::ATTACH_NATIVE, "ATTACH_NATIVE"),
         (Self::REPL_RUN, "REPL_RUN"),
-        (Self::REPL_SOURCE, "REPL_SOURCE"),
-        (Self::AOT_ATTACH, "AOT_ATTACH"),
         (Self::BAKED_IMAGE, "BAKED_IMAGE"),
-        (Self::DEBUG_ATTACH, "DEBUG_ATTACH"),
-        (Self::PROFILE_CHIPID, "PROFILE_CHIPID"),
-        (Self::TELEMETRY, "TELEMETRY"),
         (Self::BUNDLE, "BUNDLE"),
+        (Self::JS, "JS"),
+        (Self::REPL_SOURCE, "REPL_SOURCE"),
         (Self::RESIDENT_CORLIB, "RESIDENT_CORLIB"),
+        (Self::DEBUG_BOOT_DEPLOYED, "DEBUG_BOOT_DEPLOYED"),
+        (Self::TELEMETRY, "TELEMETRY"),
         (Self::LIVE_MEMORY, "LIVE_MEMORY"),
-        (Self::MONOTONIC_CLOCK, "MONOTONIC_CLOCK"),
+        (Self::HW_BOOTLOADER, "HW_BOOTLOADER"),
+        (Self::SW_BOOTLOADER, "SW_BOOTLOADER"),
+        (Self::FW_UPDATE, "FW_UPDATE"),
+        (Self::FW_ROLLBACK, "FW_ROLLBACK"),
+        (Self::UNSIGNED_FW, "UNSIGNED_FW"),
     ];
 
     /// Whether this set includes `flag`.
     #[must_use]
-    pub fn has(self, flag: u32) -> bool {
+    pub fn has(self, flag: u64) -> bool {
         self.0 & flag == flag
     }
 
@@ -492,7 +655,7 @@ impl Capabilities {
                 unnamed &= !bit;
             }
         }
-        for index in 0..u32::BITS {
+        for index in 0..u64::BITS {
             if unnamed & (1 << index) != 0 {
                 parts.push(alloc::format!("unknown bit {index}"));
             }
@@ -506,7 +669,7 @@ impl Capabilities {
     /// The capabilities present in BOTH sets (what a session can use).
     ///
     /// **This answers "what may we DO", never "what is the target".** Some bits describe the
-    /// target alone -- whether its clock moves, whether it holds a resident corlib, what chip it
+    /// target alone -- whether its clock moves, whether it holds a resident library, what chip it
     /// says it is -- and intersecting one of those with the host's own offer can only subtract a
     /// true fact. Read [`Negotiated::target_caps`] for those; the loss is silent otherwise, because
     /// it happens before any caller sees the value.
@@ -526,10 +689,13 @@ pub struct Hello {
 }
 
 impl Hello {
-    /// `min(2) | max(2) | caps(4)`, little-endian.
+    /// Encoded size: `min(2) | max(2) | caps(8)`.
+    const ENCODED_LEN: usize = 12;
+
+    /// `min(2) | max(2) | caps(8)`, little-endian.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(8);
+        let mut payload = Vec::with_capacity(Self::ENCODED_LEN);
         payload.extend_from_slice(&self.range.min.to_le_bytes());
         payload.extend_from_slice(&self.range.max.to_le_bytes());
         payload.extend_from_slice(&self.caps.0.to_le_bytes());
@@ -539,170 +705,369 @@ impl Hello {
     /// Decode, tolerating a longer payload (a newer peer's trailing fields are skipped).
     #[must_use]
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        if payload.len() < 8 {
-            return None;
-        }
+        let caps = payload.get(4..Self::ENCODED_LEN)?;
         Some(Self {
             range: ProtocolRange {
                 min: u16::from_le_bytes([payload[0], payload[1]]),
                 max: u16::from_le_bytes([payload[2], payload[3]]),
             },
-            caps: Capabilities(u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])),
+            caps: Capabilities(u64::from_le_bytes(caps.try_into().ok()?)),
         })
     }
 }
 
-/// The RESIDENT-PROFILE identity a target may append to its `HELLO_ACK` -- the board telling the
-/// IDE what it is, so a host scopes completion/validation to exactly
-/// the surface the target carries and keys a cached manifest without a second round-trip.
+/// One resident runtime a target carries, and everything a host needs to decide whether a program
+/// it compiled will resolve against it.
 ///
-/// `abi` is the intrinsic-ABI LEVEL (bumped only when an existing intrinsic's semantics change
-/// incompatibly); `hash` is the CONTENT hash of the resident surface -- the intrinsic-registry
-/// fingerprint, which already differs per profile build, folded with a resident corlib's content
-/// hash once Tier-2 targets carry one. `name` is a short display / manifest-cache hint
-/// ("netmf-v4_4", "kernel-floor"), capped at [`Self::NAME_CAP`] bytes so the identity stays a
-/// fixed-size `Copy` value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProfileIdentity {
-    /// The intrinsic-ABI level.
+/// One record per resident runtime rather than one per board, because a board can hold more than one
+/// -- and can hold two of the SAME kind at different levels, which is why the level and the hash sit
+/// here rather than beside the product model.
+///
+/// # Four fields, four questions, and none of them substitutes for another
+///
+/// ```text
+/// lib_version       which contract was this library built against
+/// lib_file_version  which BUILD of that contract, so two boards can be ORDERED
+/// hash              is this the exact build my program was compiled against
+/// caps              a per-runtime capability claim, reserved
+/// ```
+///
+/// The HASH stays authoritative and the version is never the compatibility test. A library is built
+/// per profile with capability symbols on or off, so two builds can share a version and differ in
+/// bytes -- and that difference is the one whose consequence is SILENT, because a seam compiled out
+/// keeps a placeholder body that answers zero. Only the hash sees it.
+///
+/// What the versions add is the DIRECTION and the MESSAGE. A hash is a content digest, so a host
+/// that finds a mismatch can honestly say only *these differ* -- which tells a person nothing about
+/// what to do next. A version orders them, so the sentence becomes *the board is older, update it*
+/// or *your toolchain is older, update that*. The three outcomes:
+///
+/// ```text
+/// hash equal                       proceed, silently
+/// hash differs, versions differ    orderable -- name which side is behind
+/// hash differs, versions equal     same contract level, different build
+/// ```
+///
+/// The third row is the ordinary case, because a version states a COMPATIBILITY LEVEL rather than
+/// counting builds: it moves when the contract moves, so it is stable for long stretches by design,
+/// and a host reading it as a build counter would call every capability-symbol difference a match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Surface {
+    /// Which runtime this is (see [`msg::tier`]). `0` is not a value: erased flash and zeroed RAM
+    /// both present as one.
+    pub tier: u8,
+    /// That runtime's ABI level, bumped only when an existing seam's semantics change
+    /// incompatibly.
     pub abi: u16,
-    /// The content hash of the resident surface: the intrinsic registry, **and the resident corlib's
-    /// bytes when the target holds one** ([`Capabilities::RESIDENT_CORLIB`]).
+    /// The CONTENT hash of the resident surface -- this runtime's own registry fingerprint, folded
+    /// with the resident library's content hash on a target that holds one.
     ///
-    /// The corlib belongs in here because it IS part of the resident surface, and leaving it out made
-    /// this field unable to tell apart two firmwares that differ only in the corlib they carry -- which
-    /// is exactly the difference a host must not get wrong, since a mismatched corlib does not fail to
-    /// load, it returns zero from a seam the firmware compiled out. A target with no resident corlib
-    /// reports the registry's fingerprint alone, unchanged.
+    /// The library belongs in here because it IS part of the resident surface: without it this field
+    /// cannot tell apart two firmwares that differ only in the library they carry, which is exactly
+    /// the difference a host must not get wrong. A target with no resident library reports the
+    /// registry's fingerprint alone.
     pub hash: u64,
-    /// The BOARD model code from [`board_model`] -- the product the firmware was built for,
-    /// so a host names it without parsing a string. `0` = unknown (a custom board).
-    pub board_model: u16,
-    /// The chip's debug-port IDCODE (the SW-DP `DPIDR` the silicon answers to a probe) --
-    /// the same value a probe-side identify reads, so the host's chip registry serves both
-    /// paths. Known per chip family at firmware build time. `0` = unknown.
-    pub chip_idcode: u32,
-    /// The vendor DEVICE-ID register value (the family's DSU DID / DBGMCU_IDCODE / CHIP_ID
-    /// style die id), read by the firmware from its own silicon at boot where the read is
-    /// implemented. Distinguishes SKUs a shared `DPIDR` cannot. `0` = unknown.
-    pub chip_devid: u32,
-    name_len: u8,
-    name: [u8; Self::NAME_CAP],
+    /// The resident library's own declared version -- the GENERATION of the contract it implements,
+    /// read out of the resident image rather than from a firmware constant.
+    ///
+    /// A constant would be a second spelling that goes stale the first time the library moves, and
+    /// the spelling that goes stale is the one nobody is looking at. A runtime with no managed
+    /// library reports all zeros, which is also what an assembly declaring no version reports.
+    pub lib_version: [u16; 4],
+    /// The resident library's own declared FILE version -- which BUILD of that generation.
+    ///
+    /// A separate field from [`Surface::lib_version`] and never spliced into it. A file version
+    /// carries its own leading pair, so folding the two into one four-part number discards that pair
+    /// and produces a number present in neither -- a tool printing it would print a fiction. The
+    /// leading pair repeating the generation is a free consistency check worth asserting on: a build
+    /// where the two disagree is broken.
+    pub lib_file_version: [u16; 4],
+    /// RESERVED per-runtime capability claim, and it must be zero.
+    ///
+    /// Capabilities are per-BOARD and residency is per-RUNTIME, so the board-level word cannot say
+    /// *this runtime is debuggable and that one is not* on a board holding both. Two bytes reserved
+    /// here is what keeps the precise statement reachable without a version bump; zero means no
+    /// per-runtime claim, use the board-level word.
+    pub caps: u16,
 }
 
-impl ProfileIdentity {
-    /// Maximum profile-name length on the wire (bytes; names are ASCII by convention).
-    pub const NAME_CAP: usize = 16;
-    /// Encoded size: `abi(2) | hash(8) | name_len(1)` before the name bytes.
-    const FIXED_LEN: usize = 11;
-    /// Encoded size of the board/chip identity tail: `board_model(2) | chip_idcode(4) |
-    /// chip_devid(4)`, after the name bytes ([`Capabilities::PROFILE_CHIPID`]).
-    const CHIP_LEN: usize = 10;
+impl Surface {
+    /// Encoded size, every field at its natural alignment:
+    ///
+    /// ```text
+    /// hash: u64                   @ 0
+    /// lib_version: [u16; 4]       @ 8
+    /// lib_file_version: [u16; 4]  @ 16
+    /// abi: u16                    @ 24
+    /// caps: u16                   @ 26    RESERVED, must be zero
+    /// tier: u8                    @ 28
+    /// reserved: [u8; 3]           @ 29    RESERVED, must be zero
+    /// ```
+    ///
+    /// # Why the order, and it is not about the size being round
+    ///
+    /// Widest first is what makes the record COPYABLE. Ordered by declaration it was internally
+    /// misaligned -- a `u16` at offset 1 and a `u64` at offset 3 -- so no implementation on either
+    /// side could ever lay a structure over it, and byte-wise decoding was forced rather than
+    /// chosen. Padding alone would have bought a tidy stride and nothing else. This buys a record
+    /// either end can copy whole on every part in this set, including the ones that fault on an
+    /// unaligned 64-bit read.
+    pub const ENCODED_LEN: usize = 32;
 
-    /// Build an identity; a `name` past [`Self::NAME_CAP`] bytes is truncated at a char boundary.
-    /// The board/chip fields start `0` = unknown; [`Self::with_chip`] fills them.
-    #[must_use]
-    pub fn new(abi: u16, hash: u64, name: &str) -> Self {
-        let mut take = name.len().min(Self::NAME_CAP);
-        while !name.is_char_boundary(take) {
-            take -= 1;
+    fn encode_into(&self, payload: &mut Vec<u8>) {
+        payload.extend_from_slice(&self.hash.to_le_bytes());
+        for part in self.lib_version {
+            payload.extend_from_slice(&part.to_le_bytes());
         }
-        let mut buf = [0u8; Self::NAME_CAP];
-        buf[..take].copy_from_slice(&name.as_bytes()[..take]);
-        Self {
-            abi,
-            hash,
-            board_model: 0,
-            chip_idcode: 0,
-            chip_devid: 0,
-            name_len: take as u8,
-            name: buf,
+        for part in self.lib_file_version {
+            payload.extend_from_slice(&part.to_le_bytes());
         }
+        payload.extend_from_slice(&self.abi.to_le_bytes());
+        payload.extend_from_slice(&self.caps.to_le_bytes());
+        payload.push(self.tier);
+        payload.extend_from_slice(&[0u8; 3]);
     }
 
-    /// The identity with its board/chip fields filled (each `0` = unknown stays honest --
-    /// a custom board passes `board_model::UNKNOWN` and still names its silicon).
+    /// `None` when the record is short, or when either RESERVED field is nonzero.
+    ///
+    /// Refusing a nonzero reserved field is what makes it reservable at all. A decoder that
+    /// tolerated one would let a later firmware put meaning there and be silently misread by every
+    /// host built before it -- which is the same failure as never having reserved the bytes, arriving
+    /// later and harder to find.
+    fn decode_from(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; Self::ENCODED_LEN] = bytes.get(..Self::ENCODED_LEN)?.try_into().ok()?;
+        let caps = u16::from_le_bytes([bytes[26], bytes[27]]);
+        if caps != 0 || bytes[29..32] != [0, 0, 0] {
+            return None;
+        }
+        let quad = |at: usize| {
+            [
+                u16::from_le_bytes([bytes[at], bytes[at + 1]]),
+                u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]),
+                u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]),
+                u16::from_le_bytes([bytes[at + 6], bytes[at + 7]]),
+            ]
+        };
+        Some(Self {
+            hash: u64::from_le_bytes(bytes[0..8].try_into().ok()?),
+            lib_version: quad(8),
+            lib_file_version: quad(16),
+            abi: u16::from_le_bytes([bytes[24], bytes[25]]),
+            caps,
+            tier: bytes[28],
+        })
+    }
+
+    /// The version field this record leaves ALL-ZERO although the target's own claims say it must
+    /// have one -- `"lib_version"` or `"lib_file_version"` -- or `None` when the record is
+    /// consistent with what the target says it holds.
+    ///
+    /// `resident_library` is the target's own claim to hold a resident managed library
+    /// ([`Capabilities::RESIDENT_CORLIB`] on the same acknowledgement), which is what makes the two
+    /// cases different bytes.
+    ///
+    /// # Why all-zero cannot simply mean "no version"
+    ///
+    /// It has to mean that for most surfaces: a Python or ECMAScript surface has no managed library
+    /// and a native one resolves nothing, so all-zero is correct and expected for them, and it is
+    /// also what an assembly declaring no version reports. **But a target that says it holds a
+    /// resident library and then reports no version for it is describing a read that failed**, and
+    /// without this rule that is the same eight bytes as a target that honestly has nothing to
+    /// state. The absence is then read as a stated value -- a host compares versions, finds two
+    /// zeros, and concludes the board matches whatever it is holding.
+    ///
+    /// **A reader that meets `Some` should refuse the record and name the field**, because the
+    /// repair is a firmware fix and no comparison built on the value can be right. It is not a
+    /// reason to stop talking to the board: everything else in the identity is still true.
     #[must_use]
-    pub fn with_chip(mut self, board_model: u16, chip_idcode: u32, chip_devid: u32) -> Self {
-        self.board_model = board_model;
-        self.chip_idcode = chip_idcode;
-        self.chip_devid = chip_devid;
+    pub fn unreadable_version(&self, resident_library: bool) -> Option<&'static str> {
+        if self.tier != msg::tier::CIL || !resident_library {
+            return None;
+        }
+        if self.lib_version == [0; 4] {
+            return Some("lib_version");
+        }
+        if self.lib_file_version == [0; 4] {
+            return Some("lib_file_version");
+        }
+        None
+    }
+}
+
+/// What is at the far end of the wire: the product, what it can run, which firmware build is
+/// answering, which silicon it is, and every runtime resident on it.
+///
+/// It is UNCONDITIONAL -- every `HELLO_ACK` carries one -- and `0` means unknown throughout, so a
+/// custom board with nothing to declare costs eleven bytes and never has to lie. A display NAME is
+/// deliberately not here: it lives in the profile manifest, where it has no length limit to be
+/// truncated by.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct TargetIdentity {
+    /// The PRODUCT code from [`product_model`]. `0` = unknown.
+    pub product_model: u16,
+    /// What machine code this target runs, from [`arch`]. `0` = unknown.
+    pub arch: u16,
+    /// Which FIRMWARE BUILD is answering, as `[days, build]`: days since the start of the year 2000,
+    /// then which build of that day, counting from zero. `[0, 0]` = unknown.
+    ///
+    /// # Why the firmware needs a field of its own
+    ///
+    /// A hash cannot supply it. Both of [`Surface::hash`]'s inputs are content the firmware SERVES
+    /// rather than the firmware itself, so a fix that leaves the seam registry alone -- a framing
+    /// repair, a scheduler fix, a flash-driver correction -- produces a byte-identical hash. Two
+    /// firmware builds differing in a shipped defect are indistinguishable without this.
+    ///
+    /// And it cannot be fixed by hashing MORE: folding the firmware image's own digest into
+    /// [`Surface::hash`] would destroy what that field is for, since it has to stay equal to the
+    /// value a host recorded for the library a program was compiled against, and must not move when
+    /// an unrelated runtime fix ships. Two facts, two fields.
+    ///
+    /// Version-shaped rather than digest-shaped, because the sentence a person needs is *yours is
+    /// older, reflash* and a digest cannot order two builds. It is the same day-and-build scheme the
+    /// resident library's file version uses, so a build system carries ONE date scheme rather than
+    /// two, and it deliberately carries no leading generation pair: one number, one question.
+    pub firmware_version: [u16; 2],
+    /// Which chip-identity scheme [`TargetIdentity::chip_id`] follows (see [`chip_id_kind`]).
+    /// `0` = none offered.
+    pub chip_id_kind: u8,
+    /// The chip's identity bytes under [`TargetIdentity::chip_id_kind`], opaque to this layer.
+    ///
+    /// Kind and length rather than a pair of fixed fields, because the identity a part answers is
+    /// not one shape: some architectures answer a debug-port code and a vendor device id, others a
+    /// vendor, an architecture and an implementation register, and a part reached over neither
+    /// answers nothing at all. A shape borrowed from one architecture makes the others report
+    /// zeros that read as unknown.
+    pub chip_id: Vec<u8>,
+    /// Every runtime resident on this target, in the target's own order. EMPTY means no resident
+    /// interpreter -- a bootloader, or a target running native code -- and WHICH of those it is, is
+    /// read from the capability word rather than from this count.
+    pub surfaces: Vec<Surface>,
+}
+
+/// Which scheme a [`TargetIdentity::chip_id`] follows. Codes are wire values: append-only, never
+/// renumbered.
+pub mod chip_id_kind {
+    /// No chip identity offered.
+    pub const NONE: u8 = 0;
+    /// An eight-byte identity: the debug port's own identification code, then the vendor's device
+    /// id register, both little-endian.
+    ///
+    /// Both are needed and neither is enough. A debug-port code names a PORT CLASS and is shared
+    /// across unrelated parts, so a tool naming a part from it alone will name the wrong one
+    /// confidently; the vendor register is what separates them, and which register that is differs
+    /// per family.
+    pub const DEBUG_PORT_AND_DEVICE_ID: u8 = 1;
+    /// A twelve-byte identity: the vendor, architecture and implementation registers a RISC-V core
+    /// answers, each little-endian.
+    pub const RISCV_MVENDOR_MARCH_MIMP: u8 = 2;
+}
+
+impl TargetIdentity {
+    /// Encoded size before the variable parts: `product_model(2) | arch(2) | firmware_version(4) |
+    /// chip_id_kind(1) | chip_id_len(1)`.
+    const FIXED_LEN: usize = 10;
+
+    /// The first surface record whose version fields contradict `resident_library` -- the target's
+    /// own claim to hold a resident managed library -- as `(tier, field name)`.
+    ///
+    /// ONE walk, because both ends ask it: a target checks what it is about to advertise and a host
+    /// checks what it was told, and a second copy of the rule would gain its next case in one of
+    /// them. See [`Surface::unreadable_version`] for what it decides and why.
+    #[must_use]
+    pub fn unreadable_surface_version(&self, resident_library: bool) -> Option<(u8, &'static str)> {
+        self.surfaces.iter().find_map(|surface| {
+            surface.unreadable_version(resident_library).map(|field| (surface.tier, field))
+        })
+    }
+
+    /// The identity with its chip fields filled.
+    #[must_use]
+    pub fn with_chip_id(mut self, kind: u8, id: &[u8]) -> Self {
+        self.chip_id_kind = kind;
+        self.chip_id = id.to_vec();
         self
     }
 
-    /// The profile name.
+    /// The identity with one more resident runtime appended.
     #[must_use]
-    pub fn name(&self) -> &str {
-        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("")
+    pub fn with_surface(mut self, surface: Surface) -> Self {
+        self.surfaces.push(surface);
+        self
     }
 
     fn encode_into(&self, payload: &mut Vec<u8>) {
-        payload.extend_from_slice(&self.abi.to_le_bytes());
-        payload.extend_from_slice(&self.hash.to_le_bytes());
-        payload.push(self.name_len);
-        payload.extend_from_slice(&self.name[..self.name_len as usize]);
-        payload.extend_from_slice(&self.board_model.to_le_bytes());
-        payload.extend_from_slice(&self.chip_idcode.to_le_bytes());
-        payload.extend_from_slice(&self.chip_devid.to_le_bytes());
-    }
-
-    /// Decode from `bytes` as a message TAIL (the `HELLO_ACK` shape): the board/chip fields
-    /// are read when present and stay `0` = unknown when a pre-chip-id target sent only the
-    /// shorter identity. `None` if the fixed head or the declared name is not fully present.
-    fn decode_from(bytes: &[u8]) -> Option<Self> {
-        let (identity, consumed) = Self::decode_head(bytes, false)?;
-        match bytes.get(consumed..consumed + Self::CHIP_LEN) {
-            Some(_) => Some(Self::decode_head(bytes, true)?.0),
-            None => Some(identity),
+        payload.extend_from_slice(&self.product_model.to_le_bytes());
+        payload.extend_from_slice(&self.arch.to_le_bytes());
+        for part in self.firmware_version {
+            payload.extend_from_slice(&part.to_le_bytes());
+        }
+        payload.push(self.chip_id_kind);
+        let id_len = self.chip_id.len().min(u8::MAX as usize);
+        payload.push(id_len as u8);
+        payload.extend_from_slice(&self.chip_id[..id_len]);
+        let count = self.surfaces.len().min(u8::MAX as usize);
+        payload.push(count as u8);
+        for surface in &self.surfaces[..count] {
+            surface.encode_into(payload);
         }
     }
 
-    /// Decode the identity head, `with_chip` selecting whether the board/chip tail is part of
-    /// the layout (a versioned container like [`ProfileManifest`] knows; a message tail
-    /// detects by length). Returns the identity and the bytes consumed.
-    fn decode_head(bytes: &[u8], with_chip: bool) -> Option<(Self, usize)> {
-        if bytes.len() < Self::FIXED_LEN {
-            return None;
+    /// Decode from the start of `bytes`, returning the identity and how many bytes it took.
+    ///
+    /// `None` on a truncated identity rather than a partial one. The identity is unconditional, so
+    /// a payload that does not carry a whole one is a malformed message rather than a target with
+    /// less to say -- and a target with nothing to say has an all-zero identity to send.
+    fn decode_from(bytes: &[u8]) -> Option<(Self, usize)> {
+        let head = bytes.get(..Self::FIXED_LEN)?;
+        let chip_id_len = head[9] as usize;
+        let mut at = Self::FIXED_LEN;
+        let chip_id = bytes.get(at..at + chip_id_len)?.to_vec();
+        at += chip_id_len;
+        let count = *bytes.get(at)? as usize;
+        at += 1;
+        let mut surfaces = Vec::with_capacity(count);
+        for _ in 0..count {
+            surfaces.push(Surface::decode_from(bytes.get(at..)?)?);
+            at += Surface::ENCODED_LEN;
         }
-        let abi = u16::from_le_bytes([bytes[0], bytes[1]]);
-        let hash = u64::from_le_bytes(bytes[2..10].try_into().ok()?);
-        let name_len = (bytes[10] as usize).min(Self::NAME_CAP);
-        let name_bytes = bytes.get(Self::FIXED_LEN..Self::FIXED_LEN + name_len)?;
-        let mut name = [0u8; Self::NAME_CAP];
-        name[..name_len].copy_from_slice(name_bytes);
-        let mut consumed = Self::FIXED_LEN + name_len;
-        let (board_model, chip_idcode, chip_devid) = if with_chip {
-            let tail = bytes.get(consumed..consumed + Self::CHIP_LEN)?;
-            consumed += Self::CHIP_LEN;
-            (
-                u16::from_le_bytes([tail[0], tail[1]]),
-                u32::from_le_bytes([tail[2], tail[3], tail[4], tail[5]]),
-                u32::from_le_bytes([tail[6], tail[7], tail[8], tail[9]]),
-            )
-        } else {
-            (0, 0, 0)
-        };
         Some((
             Self {
-                abi,
-                hash,
-                board_model,
-                chip_idcode,
-                chip_devid,
-                name_len: name_len as u8,
-                name,
+                product_model: u16::from_le_bytes([head[0], head[1]]),
+                arch: u16::from_le_bytes([head[2], head[3]]),
+                firmware_version: [
+                    u16::from_le_bytes([head[4], head[5]]),
+                    u16::from_le_bytes([head[6], head[7]]),
+                ],
+                chip_id_kind: head[8],
+                chip_id,
+                surfaces,
             },
-            consumed,
+            at,
         ))
     }
 }
 
-/// Known BOARD model codes for [`ProfileIdentity::board_model`] -- the products the in-tree
-/// serve firmwares are built for. The host registries (Studio's `boards.js`, Code's device UI)
-/// mirror these codes to display names; `0` stays "unknown" so a custom board never lies.
-/// Codes are wire values: append-only, never renumber.
-pub mod board_model {
-    /// Unknown / custom board (the chip fields may still identify the silicon).
+/// Known PRODUCT codes for [`TargetIdentity::product_model`] -- the products the in-tree serve
+/// firmwares are built for. Host registries mirror these codes to display names; `0` stays
+/// "unknown" so a custom board never lies. Codes are wire values: append-only, never renumber.
+///
+/// # Why the field is a PRODUCT and not a board
+///
+/// The value space already holds things that are not boards. One value is a MODULE rather than a
+/// board with headers, and its own fact table opens by saying so: its debug signals leave through
+/// its connectors, so whether a debug port is reachable at all is a property of the carrier it is
+/// seated in, and every carrier is the same value here. The field also has to carry products that
+/// are not development boards and named virtual targets, and it is the discriminator of LAST
+/// RESORT -- on some parts nothing a debug port can read separates the products a single value
+/// covers, so a model number is the only thing that can tell them apart, and it has to be told
+/// rather than discovered.
+///
+/// Naming it for the target instead was the other candidate, and it loses on a collision: "target"
+/// already means the far end of the wire, a compiler's architecture triple, and a row in a flashing
+/// table. Beside a field named [`TargetIdentity::arch`], a target model reads as *which model of
+/// target architecture*, and that misreading is silent.
+pub mod product_model {
+    /// Unknown / custom product (the chip fields may still identify the silicon).
     pub const UNKNOWN: u16 = 0;
     /// BBC micro:bit v1 (nRF51822).
     pub const MICROBIT_V1: u16 = 1;
@@ -882,7 +1247,51 @@ pub mod board_model {
     /// more GPIO ports and a USART1 the other line does not have.
     pub const NUCLEO_L053R8: u16 = 41;
 
-    /// The display name for a `board_model` wire value, or `None` for an unrecognized code. This is the one
+    /// AutomationDirect / FACTS Engineering P1AM-100 (ATSAMD21G18A, Cortex-M0+, 256 KB flash /
+    /// 32 KB SRAM) -- an industrial PLC CPU in the Arduino MKR form factor. Its strata are
+    /// `csp/samd21` and the part is the one the MKR boards carry, but the board is not one of
+    /// them: its real outputs are P1000 modules on a backplane, reached over a SPI link to a
+    /// separate base controller, so nothing this part drives is a rack channel.
+    pub const P1AM_100: u16 = 42;
+
+    /// Arduino Opta WiFi (AFX00002) -- an industrial PLC on an STM32H747XI, the same part the
+    /// Portenta H7 and the GIGA carry. The part is shared and the board is not: its four outputs
+    /// are Finder relays rated 250 VAC at 10 A, so a pad here energizes a coil rather than lighting
+    /// something, and the three Opta variants differ in fitted parts that no register can see.
+    pub const ARDUINO_OPTA_WIFI: u16 = 43;
+
+    /// ST NUCLEO-L073RZ (STM32L073RZT6, Cortex-M0+, 192 KB flash / 20 KB SRAM). Its strata are
+    /// `csp/stm32l073`, NOT `csp/stm32l053`: both are RM0367's STM32L0x3 line, and the manual
+    /// splits that line into categories whose silicon differs -- this one has GPIOE, a whole port
+    /// the other lacks, and a dual-bank NVM where the other is single bank. The two parts bond the
+    /// same 51 pads in this package, so a pad list cannot tell them apart.
+    pub const NUCLEO_L073RZ: u16 = 44;
+
+    /// Microchip SAM E51 Curiosity Nano (EV76S68A, ATSAME51J20A, Cortex-M4F, 1 MB flash /
+    /// 256 KB SRAM). Its strata are `csp/same54`, which is the D5x/E5x family rather than one
+    /// part: this board carries the 64-pin package of it, so port A is bonded as the Xplained
+    /// Pro's is and port B is cut to twenty-two pads with ports C and D absent entirely. The
+    /// debugger is an nEDBG rather than an EDBG, which changes the USB product id and not the
+    /// carrier.
+    pub const SAME51_CURIOSITY_NANO: u16 = 45;
+
+    /// Microchip SAM D21 Curiosity Nano (SAMD21-CNANO, ATSAMD21G17D, Cortex-M0+, 128 KB flash /
+    /// 16 KB SRAM). Its strata are `csp/samd21`, and the part is the same 48-pin G package as the
+    /// Xplained Pro family's `atsamd21g18a` with half the flash and half the SRAM. The debugger is
+    /// an nEDBG, as the E51 Curiosity Nano's is. Its 32.768 kHz crystal is NOT connected as the
+    /// board ships, which is the opposite of the E51 Nano and is a board fact rather than a part
+    /// one.
+    pub const SAMD21_CURIOSITY_NANO: u16 = 46;
+
+    /// Microchip SAM R21 Xplained Pro (ATSAMR21-XPRO, ATSAMR21G18A, Cortex-M0+, 256 KB flash /
+    /// 32 KB SRAM). Its strata are `csp/samr21`, which is a family of its own rather than a SAM
+    /// D21 part row: the die carries an AT86RF233 transceiver in the same package, and the radio
+    /// takes a SERCOM, four pads of control and status lines, and its own 16 MHz crystal off the
+    /// top of the D21's budget. The visible figure is the I/O count -- 28 pins on a 48-pin part
+    /// where a SAM D21 G has 38. The debugger is an EDBG and the carrier is its CDC virtual port.
+    pub const SAMR21_XPLAINED_PRO: u16 = 47;
+
+    /// The display name for a `product_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
     /// surfaces picks it up.
@@ -931,61 +1340,130 @@ pub mod board_model {
             NUCLEO_L011K4 => "NUCLEO-L011K4",
             NUCLEO_U5A5ZJ_Q => "NUCLEO-U5A5ZJ-Q",
             NUCLEO_L053R8 => "NUCLEO-L053R8",
+            P1AM_100 => "P1AM-100",
+            ARDUINO_OPTA_WIFI => "Arduino Opta WiFi",
+            NUCLEO_L073RZ => "NUCLEO-L073RZ",
+            SAME51_CURIOSITY_NANO => "SAM E51 Curiosity Nano",
+            SAMD21_CURIOSITY_NANO => "SAM D21 Curiosity Nano",
+            SAMR21_XPLAINED_PRO => "SAM R21 Xplained Pro",
             _ => return None,
         })
     }
 }
 
-/// The target's `HELLO_ACK`: the negotiated version + the target's capabilities, optionally
-/// followed by its resident-profile identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The target's `HELLO_ACK`: the negotiated version, the target's capabilities, and what the target
+/// IS.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelloAck {
     /// The negotiated protocol version (the top of the overlapping range).
     pub chosen: u16,
     /// The capabilities the target offers.
     pub caps: Capabilities,
-    /// The target's resident-profile identity, when it advertises one (a pre-identity target, or
-    /// a truncated tail, decodes as `None` -- the handshake itself never depends on it).
-    pub profile: Option<ProfileIdentity>,
+    /// What the target is. Unconditional -- a target with nothing to declare sends an all-zero
+    /// identity, which reads as unknown rather than as absent.
+    pub identity: TargetIdentity,
+    /// The most payload this target can absorb in ONE frame over the carrier this handshake
+    /// crossed, or `None` when it did not say -- in which case a sender uses
+    /// [`MIN_INBOUND_PAYLOAD`], which every target must meet.
+    ///
+    /// # Why it rides the handshake rather than the profile manifest
+    ///
+    /// It is a property of the SESSION's carrier, not of the board. One firmware on one board
+    /// accepts a payload over TCP that its own serial port drops, so a per-board fact cannot carry
+    /// this number correctly however it is cached. The manifest is also fetched only on a cache
+    /// miss, and a sender needs this BEFORE its first large frame rather than after; a handshake is
+    /// the one exchange that has already happened by then, over the carrier in question.
+    ///
+    /// # Why a field and not a capability bit
+    ///
+    /// A bit cannot carry a number, and the number is the whole content: a target saying only that
+    /// it has a limit leaves the sender exactly where it started. It is an `Option` rather than a
+    /// zero-means-unknown value because zero is a legal thing to compute from a tiny buffer, and a
+    /// target that genuinely can take nothing must not read as one that declined to say.
+    pub max_inbound_payload: Option<u16>,
 }
 
 impl HelloAck {
-    /// `chosen(2) | caps(4)`, little-endian, then (when present) the profile identity
-    /// `abi(2) | hash(8) | name_len(1) | name`. An old host's decode skips the tail.
+    /// Encoded size before the identity: `chosen(2) | caps(8)`.
+    const FIXED_LEN: usize = 10;
+
+    /// This acknowledgement, declaring the most payload the target can absorb in one frame.
+    ///
+    /// Takes the number in payload bytes -- [`max_payload_for_buffer`] converts a ring size into
+    /// one -- and clamps to what the wire's `u16` length field can express, because a target
+    /// roomier than the protocol still cannot be sent more than the protocol carries.
+    #[must_use]
+    pub fn with_max_inbound_payload(mut self, payload_bytes: usize) -> Self {
+        self.max_inbound_payload = Some(payload_bytes.min(MAX_PAYLOAD) as u16);
+        self
+    }
+
+    /// `chosen(2) | caps(8)`, little-endian, then the identity, then the trailing fields.
+    ///
+    /// # Why the extension point is a tail rather than a wider identity
+    ///
+    /// [`TargetIdentity`] is a settled record with a fixed field order, and widening it moves every
+    /// byte after the inserted field on both sides at once. A tail moves nothing: this message's
+    /// decoder already skipped whatever followed the identity, so a build predating a trailing
+    /// field ignores it by the rule it was already written to rather than by luck.
+    ///
+    /// **Trailing fields are therefore APPEND-ONLY.** A reader stops at the first one it does not
+    /// know, so removing or reordering one silently re-points every field after it -- and silently
+    /// is the operative word, because the bytes still decode.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(6 + ProfileIdentity::FIXED_LEN + ProfileIdentity::NAME_CAP);
+        let mut payload = Vec::with_capacity(Self::FIXED_LEN + TargetIdentity::FIXED_LEN);
         payload.extend_from_slice(&self.chosen.to_le_bytes());
         payload.extend_from_slice(&self.caps.0.to_le_bytes());
-        if let Some(profile) = &self.profile {
-            profile.encode_into(&mut payload);
+        self.identity.encode_into(&mut payload);
+        if let Some(max_inbound) = self.max_inbound_payload {
+            payload.extend_from_slice(&max_inbound.to_le_bytes());
         }
         payload
     }
 
-    /// Decode, tolerating a longer payload (a newer peer's trailing fields are skipped) and an
-    /// absent/short identity tail (`profile` = `None`).
+    /// Decode, tolerating a longer payload (a newer peer's trailing fields are skipped).
+    ///
+    /// A trailing field that is absent decodes as `None` rather than failing: a payload ending
+    /// early is what a peer built against an earlier revision of this message sends, and it is a
+    /// complete answer to every question that revision could ask.
     #[must_use]
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        if payload.len() < 6 {
-            return None;
-        }
+        let caps = payload.get(2..Self::FIXED_LEN)?;
+        let (identity, identity_len) =
+            TargetIdentity::decode_from(payload.get(Self::FIXED_LEN..)?)?;
+        let tail = Self::FIXED_LEN + identity_len;
+        let max_inbound_payload =
+            payload.get(tail..tail + 2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
         Some(Self {
             chosen: u16::from_le_bytes([payload[0], payload[1]]),
-            caps: Capabilities(u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]])),
-            profile: ProfileIdentity::decode_from(&payload[6..]),
+            caps: Capabilities(u64::from_le_bytes(caps.try_into().ok()?)),
+            identity,
+            max_inbound_payload,
         })
+    }
+
+    /// The first surface record in this acknowledgement whose version fields contradict the
+    /// capabilities beside them, as `(tier, field name)`; `None` when every record is consistent.
+    ///
+    /// A target-side reading of [`TargetIdentity::unreadable_surface_version`]: this is where both
+    /// facts are in hand on the way OUT. A host reads the same rule off its [`Negotiated`].
+    #[must_use]
+    pub fn unreadable_surface_version(&self) -> Option<(u8, &'static str)> {
+        self.identity
+            .unreadable_surface_version(self.caps.has(Capabilities::RESIDENT_CORLIB))
     }
 }
 
-/// The target's `NAK`: no version overlap; reports the target's own range so the host can diagnose.
+/// The target's `HELLO_NAK`: no version overlap; it reports the target's own range so the host can
+/// say which side has to move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Nak {
-    /// The target's own supported range (so the host can diagnose the mismatch).
+pub struct HelloNak {
+    /// The target's own supported range.
     pub target_range: ProtocolRange,
 }
 
-impl Nak {
+impl HelloNak {
     /// `min(2) | max(2)`, little-endian.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -1010,7 +1488,7 @@ impl Nak {
     }
 }
 
-/// The highest version both ranges support, or `None` if the ranges are disjoint (-> a `NAK`).
+/// The highest version both ranges support, or `None` if the ranges are disjoint (-> a `HELLO_NAK`).
 pub fn negotiate(host: ProtocolRange, target: ProtocolRange) -> Option<u16> {
     let lo = host.min.max(target.min);
     let hi = host.max.min(target.max);
@@ -1018,7 +1496,7 @@ pub fn negotiate(host: ProtocolRange, target: ProtocolRange) -> Option<u16> {
 }
 
 /// The negotiated session parameters the host uses after a successful handshake.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Negotiated {
     /// The negotiated protocol version.
     pub version: u16,
@@ -1039,22 +1517,91 @@ pub struct Negotiated {
     /// caller can look, so no amount of care at the call site can recover the answer. A tool asking
     /// what a board IS reads this; a tool asking what it may DO reads [`Self::caps`].
     pub target_caps: Capabilities,
-    /// The target's resident-profile identity, when it advertised one.
-    pub profile: Option<ProfileIdentity>,
+    /// What the target is.
+    pub identity: TargetIdentity,
+    /// What the target advertised as the most payload it can absorb in one frame, exactly as sent
+    /// -- `None` when it did not say. Send by [`Self::inbound_payload_limit`]; this is the raw
+    /// advertisement, for a tool reporting what a board claimed rather than what to do about it.
+    pub max_inbound_payload: Option<u16>,
 }
 
-/// The target's reply to a `HELLO`: accept with the negotiated version + the target's capabilities, or
-/// reject with the target's range. The target attaches its [`ProfileIdentity`] afterwards (the
-/// negotiation itself never depends on it).
-pub fn target_respond(host: &Hello, target_range: ProtocolRange, target_caps: Capabilities) -> Result<HelloAck, Nak> {
+impl Negotiated {
+    /// The most payload one frame may carry TO the target on this session: what it advertised, or
+    /// [`MIN_INBOUND_PAYLOAD`] when it advertised nothing.
+    ///
+    /// Never below the floor even when a target advertises less, because the floor is a
+    /// REQUIREMENT rather than a default. A target declaring three bytes has misreported itself,
+    /// and clamping up keeps one misdeclaration from stalling every transfer into chunks too small
+    /// to make progress -- the sender is wrong about that board either way, and this is the wrong
+    /// that terminates.
+    #[must_use]
+    pub fn inbound_payload_limit(&self) -> usize {
+        self.max_inbound_payload
+            .map_or(MIN_INBOUND_PAYLOAD, |advertised| usize::from(advertised).max(MIN_INBOUND_PAYLOAD))
+    }
+
+    /// The most DATA one chunked op may carry to this target in one frame:
+    /// [`Self::inbound_payload_limit`] less the `(offset, total)` header
+    /// ([`msg::CHUNK_HEADER_LEN`]) every chunk puts ahead of its bytes.
+    ///
+    /// # This is a carrier bound and NOT the whole answer
+    ///
+    /// A caller must still round DOWN to whatever its destination requires -- an image path wants
+    /// each chunk to start on the target's flash write unit, and that is a property of the board's
+    /// flash controller rather than of the wire the chunk arrived over. Two facts with two
+    /// different lifetimes: this one is per-session, that one is per-board.
+    #[must_use]
+    pub fn max_chunk_data(&self) -> usize {
+        self.inbound_payload_limit().saturating_sub(msg::CHUNK_HEADER_LEN)
+    }
+    /// The first surface record whose version fields contradict what the TARGET claimed about
+    /// itself, as `(tier, field name)`; `None` when every record is consistent.
+    ///
+    /// Read against [`Self::target_caps`] and never against [`Self::caps`]: whether a board holds a
+    /// resident library is a property of the board, and the intersection can only subtract -- a host
+    /// that does not claim [`Capabilities::RESIDENT_CORLIB`] for itself would find every board
+    /// consistent, which is exactly the case this check exists to catch.
+    #[must_use]
+    pub fn unreadable_surface_version(&self) -> Option<(u8, &'static str)> {
+        self.identity
+            .unreadable_surface_version(self.target_caps.has(Capabilities::RESIDENT_CORLIB))
+    }
+}
+
+/// The target's reply to a `HELLO`: accept with the negotiated version, the target's capabilities
+/// and the target's identity, or reject with the target's range.
+///
+/// The identity is an argument rather than something a caller attaches afterwards, because it is
+/// unconditional: an acknowledgement is not complete without one, and a firmware that forgot to
+/// attach it would advertise itself as an unknown product on unknown silicon with no resident
+/// runtime -- a well-formed answer that is entirely wrong.
+///
+/// `max_inbound_payload` is what this carrier can absorb in one frame -- pass
+/// [`Transport::max_inbound_payload`] straight through. It is a REQUIRED argument, and `None` is
+/// how a carrier declines rather than something a caller can leave out, because four different
+/// handshakes in this tree build an acknowledgement and a rule with several implementations gains
+/// its next case in none of them. A site that forgets this one does not compile.
+pub fn target_respond(
+    host: &Hello,
+    target_range: ProtocolRange,
+    target_caps: Capabilities,
+    identity: TargetIdentity,
+    max_inbound_payload: Option<usize>,
+) -> Result<HelloAck, HelloNak> {
     match negotiate(host.range, target_range) {
-        Some(chosen) => Ok(HelloAck { chosen, caps: target_caps, profile: None }),
-        None => Err(Nak { target_range }),
+        Some(chosen) => {
+            let ack = HelloAck { chosen, caps: target_caps, identity, max_inbound_payload: None };
+            Ok(match max_inbound_payload {
+                Some(bytes) => ack.with_max_inbound_payload(bytes),
+                None => ack,
+            })
+        }
+        None => Err(HelloNak { target_range }),
     }
 }
 
 /// The host's session parameters from the target's `HELLO_ACK`: the chosen version + the capability
-/// INTERSECTION (only what both sides offer) + the target's RAW advertisement + the target's profile
+/// INTERSECTION (only what both sides offer) + the target's RAW advertisement + the target's
 /// identity as advertised.
 ///
 /// Both capability sets are kept because they answer different questions -- see
@@ -1066,41 +1613,58 @@ pub fn host_finish(ack: &HelloAck, host_caps: Capabilities) -> Negotiated {
         version: ack.chosen,
         caps: host_caps.intersect(ack.caps),
         target_caps: ack.caps,
-        profile: ack.profile,
+        identity: ack.identity.clone(),
+        max_inbound_payload: ack.max_inbound_payload,
     }
 }
 
-/// The full resident-profile MANIFEST a target returns for a `GET_PROFILE` request (the message
-/// ids live beside the serve loop in `lamella-runner`): the identity plus the complete resident
-/// surface -- today the intrinsic-id list; a Tier-2 target grows a resident-assembly section in a
-/// later manifest version. A host asks only when [`ProfileIdentity::hash`] misses its cache.
+/// The full resident-profile MANIFEST a target returns for a profile request: the identity a
+/// handshake already carried, plus everything that does not fit in one -- the resident library's
+/// capability-symbol bitmap, the profile's display name, and the complete list of runtime seams the
+/// target registers.
+///
+/// A host asks only when the identity's hash misses its cache, which is the identity-and-manifest
+/// split: the cheap answer rides every handshake, and the expensive one is fetched once per distinct
+/// firmware.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileManifest {
     /// The same identity the `HELLO_ACK` advertises.
-    pub identity: ProfileIdentity,
-    /// Every intrinsic id this target registers, in registry order.
+    pub identity: TargetIdentity,
+    /// Which capability symbols the resident library was built with (see [`surface`]).
+    ///
+    /// This is what makes the version beside it safe to publish. A version states which GENERATION a
+    /// library was built against and deliberately says nothing about how much of that generation is
+    /// present, because a library is built down per profile -- so without this, the version is a
+    /// claim nothing can check. With it, a host answers *does this board have what my program needs*
+    /// before a deploy, instead of meeting an unresolved reference in a board's console after one.
+    pub surface: u64,
+    /// The profile's display name, with no length limit -- which is what it is doing here rather
+    /// than in the handshake, where a fixed-size identity would have to truncate it.
+    pub name: alloc::string::String,
+    /// Every runtime seam this target registers, in registry order.
     pub intrinsic_ids: Vec<u32>,
 }
 
 impl ProfileManifest {
-    /// Manifest layout version. v2 added the identity's board/chip tail
-    /// (`board_model(2) | chip_idcode(4) | chip_devid(4)` between the name and the count);
-    /// v1 manifests (pre-chip-id targets) still decode, their chip fields reading `0`.
-    pub const VERSION: u8 = 2;
+    /// Manifest layout version.
+    ///
+    /// A decoder refuses any other value rather than reading the bytes into these fields, because a
+    /// different layout describes a different identity shape and a tolerated mismatch is a wrong
+    /// answer instead of a refusal.
+    pub const VERSION: u8 = 1;
 
-    /// `version(1) | abi(2) | hash(8) | name_len(1) | name | board_model(2) |
-    /// chip_idcode(4) | chip_devid(4) | count(2) | count x id(4)`, LE.
+    /// `version(1) | identity | surface(8) | name_len(2) | name | count(2) | count x id(4)`, LE.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(
-            1 + ProfileIdentity::FIXED_LEN
-                + ProfileIdentity::NAME_CAP
-                + ProfileIdentity::CHIP_LEN
-                + 2
-                + self.intrinsic_ids.len() * 4,
+            1 + TargetIdentity::FIXED_LEN + 8 + 2 + self.name.len() + 2 + self.intrinsic_ids.len() * 4,
         );
         payload.push(Self::VERSION);
         self.identity.encode_into(&mut payload);
+        payload.extend_from_slice(&self.surface.to_le_bytes());
+        let name_len = self.name.len().min(u16::MAX as usize);
+        payload.extend_from_slice(&(name_len as u16).to_le_bytes());
+        payload.extend_from_slice(&self.name.as_bytes()[..name_len]);
         let count = self.intrinsic_ids.len().min(u16::MAX as usize);
         payload.extend_from_slice(&(count as u16).to_le_bytes());
         for id in &self.intrinsic_ids[..count] {
@@ -1109,26 +1673,29 @@ impl ProfileManifest {
         payload
     }
 
-    /// Decode, tolerating a longer payload; `None` on an unknown version or a truncated list.
-    /// A v1 payload (a pre-chip-id target) decodes with its chip fields at `0` = unknown.
+    /// Decode, tolerating a longer payload; `None` on an unknown version, a name that is not UTF-8,
+    /// or a truncated list.
     #[must_use]
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        let with_chip = match payload.first() {
-            Some(1) => false,
-            Some(&Self::VERSION) => true,
-            _ => return None,
-        };
-        let (identity, consumed) = ProfileIdentity::decode_head(payload.get(1..)?, with_chip)?;
-        let ids_at = 1 + consumed;
-        let count_bytes = payload.get(ids_at..ids_at + 2)?;
-        let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
+        if payload.first() != Some(&Self::VERSION) {
+            return None;
+        }
+        let (identity, consumed) = TargetIdentity::decode_from(payload.get(1..)?)?;
+        let mut at = 1 + consumed;
+        let surface = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+        at += 8;
+        let name_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
+        let name = core::str::from_utf8(payload.get(at..at + name_len)?).ok()?.into();
+        at += name_len;
+        let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
         let mut intrinsic_ids = Vec::with_capacity(count);
         for index in 0..count {
-            let at = ids_at + 2 + index * 4;
-            let bytes = payload.get(at..at + 4)?;
-            intrinsic_ids.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            let at = at + index * 4;
+            intrinsic_ids.push(u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?));
         }
-        Some(Self { identity, intrinsic_ids })
+        Some(Self { identity, surface, name, intrinsic_ids })
     }
 }
 
@@ -1182,6 +1749,27 @@ pub enum TransportError {
         /// The message type whose payload would not decode.
         msg_type: u8,
     },
+    /// The two ends share no protocol version, so no session began: the target answered
+    /// [`msg::HELLO_NAK`] with the range it supports.
+    ///
+    /// # Why this is not [`Closed`](Self::Closed)
+    ///
+    /// It was, and that made the protocol's one deliberate incompatibility signal unreadable. The
+    /// handshake is DESIGNED to detect this -- both ends carry a range and [`negotiate`] reports no
+    /// overlap -- and the target's `HELLO_NAK` names the range it can speak, which is the whole
+    /// content of the answer. Reporting it as a closed link discarded that and pointed the reader at
+    /// the cable, which is the one place the fault is not.
+    ///
+    /// **The remedy is a build, not a reconnect**: one end has to change, and these two numbers are
+    /// what say which. A host newer than the target means the target needs reflashing; a target
+    /// newer than the host means the tools need updating.
+    VersionMismatch {
+        /// The lowest protocol version the target can speak.
+        target_min: u16,
+        /// The highest protocol version the target can speak. Equal to `target_min` for a target
+        /// that supports exactly one, which every in-tree firmware does today.
+        target_max: u16,
+    },
 }
 
 /// The carrier seam, at the FRAME level: a byte carrier (USB-CDC / UART) implements it over the
@@ -1192,6 +1780,30 @@ pub trait Transport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError>;
     /// Return the next received frame, or `None` if none is ready yet.
     fn poll(&mut self) -> Result<Option<Frame>, TransportError>;
+
+    /// The most payload THIS carrier can absorb in one frame, or `None` for no limit worth
+    /// declaring. A target's handshake advertises it ([`HelloAck::max_inbound_payload`]).
+    ///
+    /// # Why the carrier answers rather than the firmware
+    ///
+    /// The limit is a property of the receive path, and a board commonly has more than one. A SAM
+    /// E54 serves this protocol over USB, over an EDBG serial port and over Ethernet at the same
+    /// time, from one firmware and one serve loop -- and its serial ring is the only one of the
+    /// three that constrains anything. A firmware-wide answer would have to be the smallest of
+    /// them, which penalizes every other carrier for the worst one; the object that owns the ring
+    /// is the object that knows.
+    ///
+    /// `None` -- the default -- means this carrier declines to declare one, and a sender then uses
+    /// [`MIN_INBOUND_PAYLOAD`]. That is the SAFE reading and it is why this could be added without
+    /// touching a single existing carrier: a transport that says nothing is sent the floor, which
+    /// every target must accept anyway. Declaring is how a roomy carrier earns bigger frames, not
+    /// how a small one stays safe.
+    ///
+    /// Answer in PAYLOAD bytes, from [`max_payload_for_buffer`] -- the framing overhead is not
+    /// public, and a carrier subtracting its own idea of it would over-declare on the day it moves.
+    fn max_inbound_payload(&self) -> Option<usize> {
+        None
+    }
 
     /// Send one logical frame ONLY if the carrier can take it now.
     ///
@@ -1286,11 +1898,11 @@ mod tests {
         assert_eq!(Capabilities(Capabilities::BAKED_IMAGE).describe(), "BAKED_IMAGE");
         assert_eq!(
             Capabilities(Capabilities::MONOTONIC_CLOCK | Capabilities::BAKED_IMAGE).describe(),
-            "BAKED_IMAGE | MONOTONIC_CLOCK"
+            "MONOTONIC_CLOCK | BAKED_IMAGE"
         );
         assert_eq!(
-            Capabilities(Capabilities::BAKED_IMAGE | (1 << 31)).describe(),
-            "BAKED_IMAGE | unknown bit 31"
+            Capabilities(Capabilities::BAKED_IMAGE | (1 << 63)).describe(),
+            "BAKED_IMAGE | unknown bit 63"
         );
         assert_eq!(Capabilities(1 << 20).describe(), "unknown bit 20");
     }
@@ -1299,17 +1911,48 @@ mod tests {
     /// one capability under two names; a multi-bit entry would claim a set it does not have.
     #[test]
     fn the_capability_name_table_is_one_distinct_bit_per_row() {
-        let mut seen = 0u32;
+        let mut seen = 0u64;
         for (bit, name) in Capabilities::NAMED {
             assert_eq!(bit.count_ones(), 1, "{name} must be exactly one bit");
             assert_eq!(seen & bit, 0, "{name} duplicates a bit already named");
             seen |= bit;
         }
+    }
+
+    /// EVERY named bit sits in exactly one family, and the families do not overlap.
+    ///
+    /// This is what replaced a contiguity check, and it is the assertion the grouping actually
+    /// needs: bits are no longer packed from zero, so contiguity would now fail on correct code
+    /// while saying nothing about the property that matters. A bit outside every family is one that
+    /// no family mask can see, and a mask that silently misses a bit answers "this board cannot be
+    /// debugged" about a board that can.
+    #[test]
+    fn every_named_capability_sits_in_exactly_one_family() {
+        let families = [
+            ("SESSION", Capabilities::FAMILY_SESSION),
+            ("DEBUG", Capabilities::FAMILY_DEBUG),
+            ("ARTIFACT", Capabilities::FAMILY_ARTIFACT),
+            ("OBSERVE", Capabilities::FAMILY_OBSERVE),
+            ("DEVICE", Capabilities::FAMILY_DEVICE),
+        ];
+        let mut union = 0u64;
+        for (name, mask) in families {
+            assert_eq!(mask.count_ones(), 8 * (mask.count_ones() / 8), "{name} is a whole-byte span");
+            assert_eq!(union & mask, 0, "{name} overlaps a family already declared");
+            union |= mask;
+        }
+        for (bit, name) in Capabilities::NAMED {
+            let homes = families.iter().filter(|(_, mask)| bit & mask != 0).count();
+            assert_eq!(homes, 1, "{name} must sit in exactly one family, not {homes}");
+        }
+        let kinds = Capabilities::ARTIFACT_KINDS;
+        assert_eq!(kinds.count_ones(), 4, "four artifact kinds");
         assert_eq!(
-            seen.count_ones(),
-            32 - seen.leading_zeros(),
-            "the named bits should be contiguous from bit 0; a gap means a constant went unnamed"
+            kinds.count_ones(),
+            64 - kinds.leading_zeros() - kinds.trailing_zeros(),
+            "the artifact-kind bits must be contiguous or the mask is not the set"
         );
+        assert_eq!(kinds & Capabilities::FAMILY_ARTIFACT, kinds, "and they live in their own family");
     }
 
     #[test]
@@ -1384,80 +2027,402 @@ mod tests {
         assert_eq!(frame.payload, vec![0xAB]);
     }
 
-    #[test]
-    fn hello_ack_profile_identity_round_trips_and_stays_optional() {
-        let bare = HelloAck { chosen: 1, caps: Capabilities(0x107), profile: None };
-        let bytes = bare.encode();
-        assert_eq!(bytes.len(), 6, "no identity -> the pre-identity 6-byte ack");
-        assert_eq!(HelloAck::decode(&bytes), Some(bare));
+    /// A fixture identity with something in every field, so a decoder that drops one is caught by
+    /// the round trip rather than by a reader noticing later.
+    fn an_identity() -> TargetIdentity {
+        TargetIdentity {
+            product_model: product_model::SAMW25_XPLAINED_PRO,
+            arch: arch::THUMBV6M,
+            firmware_version: [9734, 0],
+            ..TargetIdentity::default()
+        }
+        .with_chip_id(chip_id_kind::DEBUG_PORT_AND_DEVICE_ID, &0x0bc1_1477u32.to_le_bytes())
+        .with_surface(Surface {
+            tier: msg::tier::CIL,
+            abi: 1,
+            hash: 0xDEAD_BEEF_0BAD_F00D,
+            lib_version: [1, 0, 0, 0],
+            lib_file_version: [1, 0, 9734, 0],
+            caps: 0,
+        })
+    }
 
-        let identity = ProfileIdentity::new(1, 0xDEAD_BEEF_0BAD_F00D, "netmf-v4_4");
-        let ack = HelloAck { profile: Some(identity), ..bare };
+    #[test]
+    fn the_ack_carries_the_whole_identity_and_every_field_survives() {
+        let identity = an_identity();
+        let ack = HelloAck {
+            chosen: 1,
+            caps: Capabilities(Capabilities::PROFILE_CHIPID | Capabilities::RESIDENT_CORLIB),
+            identity: identity.clone(),
+            max_inbound_payload: None,
+        };
         let bytes = ack.encode();
-        let back = HelloAck::decode(&bytes).expect("an extended ack decodes");
-        assert_eq!(back.profile, Some(identity));
-        assert_eq!(back.profile.expect("present").name(), "netmf-v4_4");
+        let back = HelloAck::decode(&bytes).expect("an ack decodes");
+        assert_eq!(back, ack, "every field round-trips");
+        assert_eq!(back.identity.product_model, product_model::SAMW25_XPLAINED_PRO);
+        assert_eq!(back.identity.chip_id, 0x0bc1_1477u32.to_le_bytes());
+        assert_eq!(back.identity.surfaces.len(), 1);
+
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 1);
-        assert_eq!(bytes[2..6], 0x107u32.to_le_bytes());
-        let truncated = HelloAck::decode(&bytes[..8]).expect("still an ack");
-        assert_eq!(truncated.profile, None);
+        assert_eq!(bytes[2..10], ack.caps.0.to_le_bytes());
     }
 
+    /// The buffer conversion is proved against the ENCODER, not against a restatement of it.
+    ///
+    /// A test asserting `max_payload_for_buffer(256) == 247` would pass whatever both sides did,
+    /// because it computes the same subtraction the function does -- the arithmetic checking
+    /// itself. What has to be true is that a payload of the returned size FRAMES into the buffer
+    /// it was measured for, and that one more byte does not. That is a statement about
+    /// `encode_frame`, so `encode_frame` is what answers it.
     #[test]
-    fn profile_identity_name_truncates_at_the_cap() {
-        let identity = ProfileIdentity::new(1, 7, "a-very-long-profile-name-indeed");
-        assert_eq!(identity.name().len(), ProfileIdentity::NAME_CAP);
-        assert!("a-very-long-profile-name-indeed".starts_with(identity.name()));
+    fn the_buffer_conversion_answers_what_actually_fits_a_ring() {
+        for ring in [64usize, 256, 512, 4096] {
+            let payload = max_payload_for_buffer(ring);
+            let frame = encode_frame(msg::PING, 1, &alloc::vec![0xA5u8; payload])
+                .expect("a payload sized to the ring frames");
+            assert_eq!(frame.len(), ring, "a ring of {ring} is filled exactly, not approximately");
+
+            let one_more = encode_frame(msg::PING, 1, &alloc::vec![0xA5u8; payload + 1])
+                .expect("one byte more still frames");
+            assert!(
+                one_more.len() > ring,
+                "a ring of {ring} cannot hold {payload} + 1 bytes of payload",
+            );
+        }
     }
 
+    /// A buffer too small to hold any frame at all reports zero rather than underflowing.
+    ///
+    /// Reachable from a firmware that hands over the size of something that is not a receive ring,
+    /// and the alternative on a release build is a wrapped `usize` -- an advertisement of about
+    /// four billion bytes, which is the worst possible direction for this number to be wrong in.
     #[test]
-    fn board_chip_identity_rides_the_ack_and_degrades_to_unknown() {
-        let identity = ProfileIdentity::new(1, 42, "kernel-floor").with_chip(
-            board_model::SAMW25_XPLAINED_PRO,
-            0x0bc1_1477,
-            0xDEAD_0001,
+    fn a_buffer_smaller_than_the_framing_carries_no_payload() {
+        for tiny in [0usize, 1, 8] {
+            assert_eq!(max_payload_for_buffer(tiny), 0, "{tiny} bytes cannot hold a frame");
+        }
+    }
+
+    /// The floor fits the smallest receive ring in this tree, which is the only property that makes
+    /// it safe to send to a target that has advertised nothing.
+    #[test]
+    fn the_floor_frames_into_the_smallest_ring_any_serve_uses() {
+        const SMALLEST_SERVE_RING: usize = 256;
+        let frame = encode_frame(msg::PING, 1, &alloc::vec![0u8; MIN_INBOUND_PAYLOAD])
+            .expect("the floor is a carryable payload");
+        assert!(
+            frame.len() <= SMALLEST_SERVE_RING,
+            "the floor is {} on the wire and the smallest ring is {SMALLEST_SERVE_RING}",
+            frame.len(),
         );
-        let ack = HelloAck { chosen: 1, caps: Capabilities(Capabilities::PROFILE_CHIPID), profile: Some(identity) };
-        let back = HelloAck::decode(&ack.encode()).expect("decodes");
-        let profile = back.profile.expect("identity present");
-        assert_eq!(profile.board_model, board_model::SAMW25_XPLAINED_PRO);
-        assert_eq!(profile.chip_idcode, 0x0bc1_1477);
-        assert_eq!(profile.chip_devid, 0xDEAD_0001);
-        assert_eq!(profile, identity);
-
-        let mut old_wire = ack.encode();
-        old_wire.truncate(old_wire.len() - ProfileIdentity::CHIP_LEN);
-        let old = HelloAck::decode(&old_wire).expect("still an ack").profile.expect("identity present");
-        assert_eq!((old.board_model, old.chip_idcode, old.chip_devid), (0, 0, 0));
-        assert_eq!(old.name(), "kernel-floor");
-
-        let mut ragged = ack.encode();
-        ragged.truncate(ragged.len() - 3);
-        let ragged = HelloAck::decode(&ragged).expect("still an ack").profile.expect("present");
-        assert_eq!(ragged.chip_idcode, 0);
+        assert!(
+            MIN_INBOUND_PAYLOAD <= max_payload_for_buffer(SMALLEST_SERVE_RING),
+            "the floor must not exceed what that ring can take",
+        );
     }
 
+    /// A target that declares a limit round-trips it, and one that declares none says so.
     #[test]
-    fn profile_manifest_v1_still_decodes_with_unknown_chip() {
-        let mut v1 = vec![1u8];
-        v1.extend_from_slice(&7u16.to_le_bytes());
-        v1.extend_from_slice(&99u64.to_le_bytes());
-        v1.push(2);
-        v1.extend_from_slice(b"kf");
-        v1.extend_from_slice(&2u16.to_le_bytes());
-        v1.extend_from_slice(&10u32.to_le_bytes());
-        v1.extend_from_slice(&11u32.to_le_bytes());
-        let manifest = ProfileManifest::decode(&v1).expect("a v1 manifest decodes");
-        assert_eq!(manifest.identity.abi, 7);
-        assert_eq!(manifest.identity.name(), "kf");
-        assert_eq!(manifest.identity.chip_idcode, 0, "v1 carries no chip identity");
-        assert_eq!(manifest.intrinsic_ids, vec![10, 11]);
+    fn the_inbound_limit_round_trips_and_absent_is_a_separate_answer() {
+        let declared = HelloAck {
+            chosen: 1,
+            caps: Capabilities(0),
+            identity: an_identity(),
+            max_inbound_payload: None,
+        }
+        .with_max_inbound_payload(max_payload_for_buffer(512));
+        let back = HelloAck::decode(&declared.encode()).expect("an ack decodes");
+        assert_eq!(back.max_inbound_payload, Some(503), "a 512-byte ring, less the framing");
+        assert_eq!(back, declared, "every field round-trips");
+
+        let silent = HelloAck {
+            chosen: 1,
+            caps: Capabilities(0),
+            identity: an_identity(),
+            max_inbound_payload: None,
+        };
+        let quiet = HelloAck::decode(&silent.encode()).expect("an ack decodes");
+        assert_eq!(quiet.max_inbound_payload, None, "silence is not a zero");
+    }
+
+    /// A target roomier than the wire still advertises only what the wire can carry.
+    ///
+    /// The `LEN` field is a `u16`, so a target with a megabyte of buffer that advertised it would
+    /// be describing frames this protocol has no way to express -- and the number would arrive
+    /// TRUNCATED rather than large, which is the shape that lies quietly.
+    #[test]
+    fn an_advertisement_is_clamped_to_what_the_wire_can_express() {
+        let roomy = HelloAck {
+            chosen: 1,
+            caps: Capabilities(0),
+            identity: TargetIdentity::default(),
+            max_inbound_payload: None,
+        }
+        .with_max_inbound_payload(1_048_576);
+        assert_eq!(roomy.max_inbound_payload, Some(MAX_PAYLOAD as u16));
+    }
+
+    /// BOTH DIRECTIONS OF THE VERSION SKEW, which is the property that let this field be added
+    /// after the message-type space was settled.
+    ///
+    /// An older peer's acknowledgement simply ends after the identity, and a newer one's carries
+    /// two bytes an older reader was already skipping. Neither is a decode failure and neither
+    /// changes what the identity says -- so the two builds interoperate, each getting the answer
+    /// its own version can act on.
+    #[test]
+    fn an_ack_decodes_across_a_build_that_predates_the_trailing_field() {
+        let identity = an_identity();
+        let modern = HelloAck {
+            chosen: 1,
+            caps: Capabilities(0),
+            identity: identity.clone(),
+            max_inbound_payload: None,
+        }
+        .with_max_inbound_payload(503);
+        let with_tail = modern.encode();
+
+        let without_tail = &with_tail[..with_tail.len() - 2];
+        let old_target = HelloAck::decode(without_tail).expect("an older ack still decodes");
+        assert_eq!(old_target.max_inbound_payload, None);
+        assert_eq!(old_target.identity, identity, "the identity is untouched by the tail");
+
+        let (as_old_host_sees_it, consumed) =
+            TargetIdentity::decode_from(&with_tail[HelloAck::FIXED_LEN..])
+                .expect("the identity decodes out of a tail-bearing payload");
+        assert_eq!(as_old_host_sees_it, identity, "an older host reads the same board");
+        assert_eq!(
+            HelloAck::FIXED_LEN + consumed + 2,
+            with_tail.len(),
+            "the tail is the only thing after the identity",
+        );
+    }
+
+    /// What a host SENDS by: the floor when nothing was advertised, the advertisement when there
+    /// was one, and the floor again when a target under-declares.
+    #[test]
+    fn a_session_sends_by_the_advertisement_or_by_the_floor() {
+        fn session(max_inbound_payload: Option<u16>) -> Negotiated {
+            host_finish(
+                &HelloAck {
+                    chosen: 1,
+                    caps: Capabilities(0),
+                    identity: TargetIdentity::default(),
+                    max_inbound_payload,
+                },
+                Capabilities(0),
+            )
+        }
+
+        assert_eq!(
+            session(None).inbound_payload_limit(),
+            MIN_INBOUND_PAYLOAD,
+            "a target that said nothing is sent the floor",
+        );
+        assert_eq!(
+            session(Some(4087)).inbound_payload_limit(),
+            4087,
+            "a roomy target is sent what it asked for",
+        );
+        assert_eq!(
+            session(Some(3)).inbound_payload_limit(),
+            MIN_INBOUND_PAYLOAD,
+            "an under-declaration does not stall a transfer into chunks that cannot progress",
+        );
+        assert_eq!(session(None).max_chunk_data(), MIN_INBOUND_PAYLOAD - msg::CHUNK_HEADER_LEN);
+    }
+
+    /// A chunk sized by `max_chunk_data` FRAMES within what the target said it can take -- proved
+    /// by encoding one, rather than by re-deriving the subtraction that produced it.
+    #[test]
+    fn a_chunk_sized_for_a_session_fits_the_ring_it_was_sized_from() {
+        for ring in [256usize, 512, 4096] {
+            let advertised = max_payload_for_buffer(ring);
+            let session = host_finish(
+                &HelloAck {
+                    chosen: 1,
+                    caps: Capabilities(0),
+                    identity: TargetIdentity::default(),
+                    max_inbound_payload: None,
+                }
+                .with_max_inbound_payload(advertised),
+                Capabilities(0),
+            );
+
+            let mut payload = alloc::vec![0u8; msg::CHUNK_HEADER_LEN];
+            payload.extend_from_slice(&alloc::vec![0xA5u8; session.max_chunk_data()]);
+            let frame = encode_frame(msg::DEPLOY_IMAGE, 1, &payload).expect("a chunk frames");
+            assert_eq!(
+                frame.len(),
+                ring,
+                "a full chunk to a {ring}-byte ring lands inside it, not one byte over",
+            );
+        }
+    }
+
+    /// A target with nothing to declare still sends an identity, and it decodes as UNKNOWN rather
+    /// than as absent.
+    ///
+    /// That is the whole of what "unconditional" buys: a host has one shape to parse, and the
+    /// difference between *a custom board* and *a board that did not answer* stops being a length
+    /// comparison. The all-zero form is eleven bytes.
+    #[test]
+    fn an_identity_with_nothing_to_declare_is_still_an_identity() {
+        let ack = HelloAck {
+            chosen: 1,
+            caps: Capabilities(0),
+            identity: TargetIdentity::default(),
+            max_inbound_payload: None,
+        };
+        let bytes = ack.encode();
+        assert_eq!(bytes.len(), 10 + 11, "the head, then the smallest identity");
+        let back = HelloAck::decode(&bytes).expect("an ack decodes");
+        assert_eq!(back.identity.product_model, product_model::UNKNOWN);
+        assert_eq!(back.identity.arch, arch::UNKNOWN);
+        assert_eq!(back.identity.chip_id_kind, chip_id_kind::NONE);
+        assert!(back.identity.surfaces.is_empty(), "no resident interpreter");
+    }
+
+    /// A truncated identity is a DECODE FAILURE, not a shorter identity.
+    ///
+    /// The tolerant reading was correct while the identity was optional and a peer might genuinely
+    /// have had none to send. It is wrong now: every field has an unknown value it can carry, so a
+    /// payload that stops mid-identity is a framing defect, and reporting it as a board that knows
+    /// less about itself would hide the defect behind a plausible answer.
+    #[test]
+    fn a_truncated_identity_fails_rather_than_shrinking() {
+        let ack = HelloAck {
+            chosen: 1,
+            caps: Capabilities(0),
+            identity: an_identity(),
+            max_inbound_payload: None,
+        };
+        let bytes = ack.encode();
+        for cut in 1..bytes.len() {
+            assert_eq!(HelloAck::decode(&bytes[..cut]), None, "a payload cut at {cut} is not an ack");
+        }
+        assert!(HelloAck::decode(&bytes).is_some(), "and the whole payload is");
+    }
+
+    /// A board holding TWO runtimes of the SAME kind at different levels -- the case a capability
+    /// bit per runtime could not describe, and the reason the level and the hash sit on the record.
+    #[test]
+    fn several_resident_runtimes_ride_one_identity() {
+        let identity = an_identity().with_surface(Surface {
+            tier: msg::tier::CIL,
+            abi: 2,
+            hash: 0x0102_0304_0506_0708,
+            lib_version: [2, 0, 0, 0],
+            lib_file_version: [2, 0, 9734, 1],
+            caps: 0,
+        });
+        let ack =
+            HelloAck { chosen: 1, caps: Capabilities(0), identity, max_inbound_payload: None };
+        let back = HelloAck::decode(&ack.encode()).expect("decodes");
+        assert_eq!(back.identity.surfaces.len(), 2);
+        assert_eq!(back.identity.surfaces[0].abi, 1);
+        assert_eq!(back.identity.surfaces[1].abi, 2);
+        assert_eq!(back.identity.surfaces[1].lib_file_version, [2, 0, 9734, 1]);
+    }
+
+    /// The two version fields are SEPARATE on the wire, and the record is the size it says it is.
+    ///
+    /// Splicing them into one four-part number was refused for a reason a size check cannot state
+    /// but a reader here should not have to rediscover: a file version carries its own leading pair,
+    /// so a splice drops that pair and yields a number present in neither field.
+    #[test]
+    fn a_surface_record_is_thirty_two_bytes_and_keeps_its_two_versions_apart() {
+        let surface = Surface {
+            tier: msg::tier::CIL,
+            abi: 0x1234,
+            hash: 0x1122_3344_5566_7788,
+            lib_version: [2, 0, 0, 0],
+            lib_file_version: [12, 5, 9734, 7],
+            caps: 0,
+        };
+        let mut bytes = Vec::new();
+        surface.encode_into(&mut bytes);
+        assert_eq!(bytes.len(), Surface::ENCODED_LEN);
+        assert_eq!(Surface::ENCODED_LEN, 32);
+        let back = Surface::decode_from(&bytes).expect("decodes");
+        assert_eq!(back, surface);
+        assert_eq!(back.lib_version, [2, 0, 0, 0], "the generation is untouched");
+        assert_eq!(back.lib_file_version, [12, 5, 9734, 7], "and so is the build's own leading pair");
+    }
+
+    /// EVERY FIELD AT ITS NATURAL ALIGNMENT, asserted by OFFSET rather than by size.
+    ///
+    /// The size is what a reader checks and it is not the property: any 32-byte arrangement passes
+    /// a size assertion, including one that puts the 64-bit field at offset 3 again. What the layout
+    /// is for is that either end can copy the record whole -- on parts that fault on an unaligned
+    /// 64-bit read, that is the difference between a `memcpy` and a hard fault -- and only the
+    /// offsets say so.
+    #[test]
+    fn every_surface_field_lands_at_its_natural_alignment() {
+        let surface = Surface {
+            hash: 0x1122_3344_5566_7788,
+            lib_version: [0x0102, 0x0304, 0x0506, 0x0708],
+            lib_file_version: [0x1112, 0x1314, 0x1516, 0x1718],
+            abi: 0xABCD,
+            caps: 0,
+            tier: msg::tier::PYTHON,
+        };
+        let mut bytes = Vec::new();
+        surface.encode_into(&mut bytes);
+        assert_eq!(bytes.len(), 32);
+
+        assert_eq!(bytes[0..8], 0x1122_3344_5566_7788u64.to_le_bytes(), "hash at 0, 8-aligned");
+        assert_eq!(bytes[8..10], 0x0102u16.to_le_bytes(), "lib_version at 8");
+        assert_eq!(bytes[16..18], 0x1112u16.to_le_bytes(), "lib_file_version at 16");
+        assert_eq!(bytes[24..26], 0xABCDu16.to_le_bytes(), "abi at 24, 2-aligned");
+        assert_eq!(bytes[26..28], [0, 0], "caps at 26, reserved");
+        assert_eq!(bytes[28], msg::tier::PYTHON, "tier at 28");
+        assert_eq!(bytes[29..32], [0, 0, 0], "and three reserved bytes to the boundary");
+    }
+
+    /// A NONZERO reserved field is REFUSED, both of them.
+    ///
+    /// Tolerating one is the same as never having reserved the bytes: a later firmware puts meaning
+    /// there and every host built before it reads the record as though nothing had changed. The
+    /// refusal is what makes the bytes claimable later.
+    #[test]
+    fn a_nonzero_reserved_field_is_refused_rather_than_ignored() {
+        let surface = Surface { tier: msg::tier::CIL, abi: 1, ..Surface::default() };
+        let mut bytes = Vec::new();
+        surface.encode_into(&mut bytes);
+        assert!(Surface::decode_from(&bytes).is_some(), "the all-zero reserved form decodes");
+
+        let mut caps_set = bytes.clone();
+        caps_set[26] = 1;
+        assert_eq!(Surface::decode_from(&caps_set), None, "a per-surface caps claim is refused");
+
+        for at in 29..32 {
+            let mut padded = bytes.clone();
+            padded[at] = 0xFF;
+            assert_eq!(Surface::decode_from(&padded), None, "byte {at} is reserved and must be zero");
+        }
+    }
+
+    /// A board carries the identity it was FLASHED with, so both eras have to be findable.
+    ///
+    /// The failure this guards is not a wrong answer, it is an ABSENCE: a scan matching only the
+    /// current vendor id does not report an older board as older, it does not report it at all --
+    /// and a board nobody lists is a board nobody reprograms.
+    #[test]
+    fn a_link_is_recognized_under_either_vendor_id_it_has_ever_had() {
+        use usb::{LEGACY_VID, LinkIdentity, PID, VID, identify};
+        assert_eq!(identify(VID, PID), Some(LinkIdentity::Current));
+        assert_eq!(identify(LEGACY_VID, PID), Some(LinkIdentity::Legacy));
+        assert_ne!(VID, LEGACY_VID, "two eras, or this test proves nothing");
+        assert_eq!(identify(LEGACY_VID, PID + 1), None, "another device under the shared id");
+        assert_eq!(identify(VID + 1, PID), None, "another vendor entirely");
     }
 
     #[test]
     fn profile_manifest_round_trips_and_fails_loud_on_damage() {
         let manifest = ProfileManifest {
-            identity: ProfileIdentity::new(1, 42, "kernel-floor"),
+            identity: an_identity(),
+            surface: surface::NETFX_1_1 | surface::NETFX_2_0 | surface::FLOAT | surface::GENERICS,
+            name: "kernel-floor".into(),
             intrinsic_ids: vec![0x811c_9dc5, 1, 2, 3],
         };
         let bytes = manifest.encode();
@@ -1468,6 +2433,375 @@ mod tests {
             "a truncated id list is a decode failure, not a short list"
         );
         assert_eq!(ProfileManifest::decode(&[9]), None, "an unknown version is rejected");
+        assert_eq!(
+            ProfileManifest::decode(&[2]),
+            None,
+            "and so is any OTHER version, whose bytes describe a different identity shape"
+        );
+    }
+
+    /// The profile name lives here precisely because it has no cap, so a name past any cap a fixed
+    /// identity would have imposed must survive whole.
+    #[test]
+    fn the_profile_name_is_not_capped_in_the_manifest() {
+        let long = "a-profile-name-far-longer-than-any-fixed-identity-field-would-have-carried";
+        let manifest = ProfileManifest {
+            identity: TargetIdentity::default(),
+            surface: 0,
+            name: long.into(),
+            intrinsic_ids: Vec::new(),
+        };
+        let back = ProfileManifest::decode(&manifest.encode()).expect("decodes");
+        assert_eq!(back.name, long);
+    }
+
+    /// Every top-level message type declared in the type space, scraped from the source rather than
+    /// listed here, as `(name, byte)`.
+    ///
+    /// A message type sits at file top level and a payload enumeration sits indented inside a
+    /// module, which is what the indentation test distinguishes: the two spaces legitimately reuse
+    /// small numbers, and folding them together would report collisions that are not collisions.
+    fn declared_message_types() -> Vec<(&'static str, u8)> {
+        let mut found = Vec::new();
+        for line in include_str!("msg.rs").lines() {
+            let Some(rest) = line.strip_prefix("pub const ") else { continue };
+            let Some((name, value)) = rest.split_once(": u8 = ") else { continue };
+            let literal = value.split_once(';').expect("a terminating semicolon").0.trim();
+            let byte = literal
+                .strip_prefix("0x")
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .unwrap_or_else(|| panic!("{name} = {literal}: a message type is a hexadecimal byte"));
+            found.push((name, byte));
+        }
+        found
+    }
+
+    /// A HOST AND A TARGET THAT SHARE NO VERSION PRODUCE AN ANSWER, AND THE ANSWER NAMES THE RANGE.
+    ///
+    /// This is the protocol's one deliberate incompatibility signal. The `HELLO_NAK` carries the
+    /// target's own range so a host can say WHICH END has to move -- a fact that is useless if it is
+    /// not carried all the way to a person, which is what `TransportError::VersionMismatch` is for.
+    #[test]
+    fn no_shared_version_is_a_nak_that_names_the_target_range() {
+        let host = Hello { range: ProtocolRange { min: 4, max: 6 }, caps: Capabilities::default() };
+        let target = ProtocolRange { min: 1, max: 1 };
+        let nak = target_respond(&host, target, Capabilities::default(), an_identity(), None)
+            .expect_err("4..6 and 1..1 do not overlap");
+        assert_eq!(nak.target_range, target, "the refusal names what the target CAN speak");
+
+        let back = HelloNak::decode(&nak.encode()).expect("a NAK decodes");
+        assert_eq!(back.target_range, target);
+    }
+
+    /// AND THE OVERLAPPING CASE STILL NEGOTIATES, so the test above is about disjoint ranges rather
+    /// than about a handshake that stopped working.
+    #[test]
+    fn an_overlapping_range_still_chooses_the_highest_common_version() {
+        let host = Hello { range: ProtocolRange { min: 1, max: 3 }, caps: Capabilities::default() };
+        let ack = target_respond(
+            &host,
+            ProtocolRange { min: 2, max: 5 },
+            Capabilities::default(),
+            an_identity(),
+            None,
+        )
+        .expect("2..3 overlaps");
+        assert_eq!(ack.chosen, 3, "the highest both can speak");
+    }
+
+    /// Every architecture declared in `arch.rs`, scraped from the source rather than listed here,
+    /// as `(name, value)`.
+    fn declared_arch_values() -> Vec<(&'static str, u16)> {
+        let mut found = Vec::new();
+        for line in include_str!("arch.rs").lines() {
+            let Some(rest) = line.strip_prefix("pub const ") else { continue };
+            let Some((name, value)) = rest.split_once(": u16 = ") else { continue };
+            let literal = value.split_once(';').expect("a terminating semicolon").0.trim();
+            let code: u16 = literal
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} = {literal}: an arch code is a decimal u16"));
+            found.push((name, code));
+        }
+        found
+    }
+
+    /// AN ARCHITECTURE IS DECLARED IN THREE PLACES AND ALL THREE MUST CARRY IT: the constant, the
+    /// display table, and the target-triple table.
+    ///
+    /// This is [`arch`]'s own documented hazard with nothing checking it. That module says a typo in
+    /// a triple "is a target that silently reports `UNKNOWN`" -- and the same is true of an omission,
+    /// which is the likelier mistake: a value added to the constants and to one table reads as done
+    /// at every site a reviewer looks at. `UNKNOWN` is the one value that must NOT appear in either
+    /// table, because it is the answer for a target that did not say.
+    #[test]
+    fn every_architecture_is_declared_in_all_three_places() {
+        for (name, code) in declared_arch_values() {
+            if code == arch::UNKNOWN {
+                assert!(
+                    arch::name(code).is_none(),
+                    "UNKNOWN must not be nameable -- it is the absence of an answer",
+                );
+                continue;
+            }
+            assert!(
+                arch::NAMED.iter().any(|(value, _)| *value == code),
+                "{name} ({code}) is declared but NAMED does not carry it",
+            );
+            let triple = arch::TARGET_TRIPLES.iter().find(|(value, _)| *value == code);
+            let (_, triple) = triple
+                .unwrap_or_else(|| panic!("{name} ({code}) is declared but TARGET_TRIPLES does not carry it"));
+            assert_eq!(
+                arch::from_target_triple(triple),
+                code,
+                "{name}: the triple {triple} does not resolve back to it",
+            );
+        }
+    }
+
+    /// NEITHER TABLE HAS A ROW NOTHING DECLARES, and no two architectures share a code.
+    ///
+    /// The mirror of the test above: that one catches a value missing from a table, this one catches
+    /// a table row whose constant was renamed or deleted, and a collision -- which on an append-only
+    /// wire registry is the mistake that cannot be undone once a board has shipped reporting it.
+    #[test]
+    fn the_arch_tables_declare_nothing_extra_and_no_code_is_claimed_twice() {
+        let declared = declared_arch_values();
+        for (code, label) in arch::NAMED {
+            assert!(
+                declared.iter().any(|(_, value)| value == code),
+                "NAMED carries {label} ({code}) which no constant declares",
+            );
+        }
+        for (code, triple) in arch::TARGET_TRIPLES {
+            assert!(
+                declared.iter().any(|(_, value)| value == code),
+                "TARGET_TRIPLES carries {triple} ({code}) which no constant declares",
+            );
+        }
+        for (index, (name, code)) in declared.iter().enumerate() {
+            for (other, other_code) in &declared[index + 1..] {
+                assert_ne!(code, other_code, "{name} and {other} both claim arch code {code}");
+            }
+        }
+    }
+
+    /// A HOST BUILD, AND ANY TRIPLE THIS TREE DOES NOT BUILD FOR, RESOLVES TO `UNKNOWN`.
+    ///
+    /// `UNKNOWN` is a value with a meaning -- *this target did not say* -- and the lookup must reach
+    /// it by falling through rather than by matching anything. The near-miss is the case worth
+    /// stating: `thumbv8m.base` and `thumbv8m.main` differ by four characters and are different
+    /// machines, so a prefix-matching lookup would answer confidently and wrongly.
+    #[test]
+    fn an_unbuilt_triple_resolves_to_unknown_rather_than_a_near_neighbour() {
+        for stranger in [
+            "x86_64-pc-windows-msvc",
+            "thumbv8m.base",
+            "thumbv8m.base-none-eabihf",
+            "thumbv6m",
+            "",
+        ] {
+            assert_eq!(
+                arch::from_target_triple(stranger),
+                arch::UNKNOWN,
+                "{stranger} is not a triple this tree builds for",
+            );
+        }
+        assert_eq!(arch::from_target_triple("thumbv8m.base-none-eabi"), arch::THUMBV8M_BASE);
+        assert_eq!(arch::from_target_triple("thumbv8m.main-none-eabi"), arch::THUMBV8M_MAIN);
+    }
+
+    /// NO TWO MESSAGE TYPES CLAIM ONE BYTE, and none claims a byte that can never be one.
+    ///
+    /// This is the failure the whole allocation is arranged to prevent, and it is invisible in a
+    /// file of constant declarations: two ops on one byte do not fail loudly, they make a host and a
+    /// target exchange nothing and time out, which reads as a broken cable.
+    #[test]
+    fn no_two_message_types_claim_the_same_byte() {
+        let types = declared_message_types();
+        assert!(
+            types.len() >= 60,
+            "only {} message types were read out of the source -- the reader is broken, not the table",
+            types.len()
+        );
+        for (index, (name, byte)) in types.iter().enumerate() {
+            assert!(msg::is_valid_type(*byte), "{name} claims {byte:#04x}, which is never a type");
+            for (other, other_byte) in types.iter().skip(index + 1) {
+                assert_ne!(byte, other_byte, "{name} and {other} both claim {byte:#04x}");
+            }
+        }
+    }
+
+    /// The enumeration and the declarations agree, in BOTH directions.
+    ///
+    /// A type declared and left out of the table is one no host can print and no gate above can see;
+    /// a table row with no declaration behind it is a name for something that does not exist. The
+    /// table is read by tools, so either half being wrong is a wrong answer somewhere else.
+    #[test]
+    fn the_message_table_names_exactly_what_the_source_declares() {
+        let declared = declared_message_types();
+        for (name, byte) in &declared {
+            assert_eq!(
+                msg::name(*byte),
+                Some(*name),
+                "{name} ({byte:#04x}) is declared but the table does not name it"
+            );
+        }
+        assert_eq!(declared.len(), msg::ALL.len(), "the table has a row nothing declares");
+    }
+
+    /// Every allocated type sits inside a declared block, and the blocks do not overlap.
+    ///
+    /// A byte outside every block is one nobody would find by looking at the map, which is how a
+    /// second op gets minted onto it later.
+    #[test]
+    fn every_message_type_sits_in_exactly_one_block() {
+        for window in msg::BLOCKS.windows(2) {
+            let ((_, _, prev_last), (name, first, _)) = (window[0], window[1]);
+            assert!(prev_last < first, "{name} starts inside the block before it");
+        }
+        for (byte, name) in msg::ALL {
+            let homes = msg::BLOCKS.iter().filter(|(_, first, last)| byte >= first && byte <= last).count();
+            assert_eq!(homes, 1, "{name} ({byte:#04x}) must sit in exactly one block, not {homes}");
+        }
+    }
+
+    /// THE MIRROR: a deploy op is its load op plus 0x10, for every artifact and for the discard.
+    ///
+    /// It is what makes adding a language ONE number in each half at the same offset, and a reader
+    /// can convert between the two halves by arithmetic rather than by a table. Stated in the map
+    /// and true of nothing unless something checks it -- the pairs sit sixteen bytes apart in the
+    /// source, which is exactly far enough that an eye slides over a mismatch.
+    #[test]
+    fn a_deploy_op_is_its_load_op_plus_the_block_offset() {
+        const MIRROR: u8 = 0x10;
+        let pairs = [
+            (msg::LOAD_PE, msg::DEPLOY_PE, "PE"),
+            (msg::LOAD_IMAGE, msg::DEPLOY_IMAGE, "IMAGE"),
+            (msg::LOAD_BUNDLE, msg::DEPLOY_BUNDLE, "BUNDLE"),
+            (msg::LOAD_JS, msg::DEPLOY_JS, "JS"),
+            (msg::LOAD_CLEAR, msg::DEPLOY_CLEAR, "CLEAR"),
+        ];
+        for (load, deploy, name) in pairs {
+            assert_eq!(deploy, load + MIRROR, "{name}: the deploy op is not its load op mirrored");
+        }
+        assert!(
+            msg::XFER_RESULT + MIRROR != msg::DEPLOY_STATUS,
+            "the shared controls are not part of the mirror"
+        );
+    }
+
+    /// The two bytes that are never message types are refused at BOTH ends: an encoder will not
+    /// produce one, and a reader steps over one rather than waiting for the payload it claims.
+    ///
+    /// The waiting is the part worth a test. Both bytes are what unwritten memory reads as, so a run
+    /// of erased flash on a carrier declares a payload of up to 65,535 bytes -- and a reader that
+    /// waited for it would swallow every real frame behind it into the same buffer.
+    #[test]
+    fn the_two_impossible_type_bytes_are_refused_at_both_ends() {
+        assert_eq!(encode_frame(0x00, 1, &[]), None, "zeroed RAM is not a message");
+        assert_eq!(encode_frame(0xFF, 1, &[]), None, "erased flash is not a message");
+
+        let good = encode_frame(msg::PING, 9, &[0x11]).expect("a 1-byte payload frames");
+        for impossible in [0x00u8, 0xFF] {
+            let mut stream = alloc::vec![SYNC[0], SYNC[1]];
+            stream.extend_from_slice(&60_000u16.to_le_bytes());
+            stream.extend_from_slice(&[impossible, 0, 0]);
+            let mut reader = FrameReader::new();
+            reader.push(&stream);
+            reader.push(&good);
+            let frame = reader
+                .next_frame()
+                .expect("the real frame is reachable without waiting for a payload nothing will send");
+            assert_eq!(frame.seq, 9, "type {impossible:#04x} was stepped over, not waited for");
+        }
+    }
+
+    /// THE STALL A BOUND EXISTS FOR. A header claiming a payload the reader will never be sent must
+    /// be discarded AT ONCE -- not waited for, and not waited for while every real frame behind it
+    /// is swallowed into the same buffer.
+    #[test]
+    fn a_bounded_reader_refuses_an_unbelievable_length_without_waiting_for_it() {
+        let mut stream = alloc::vec![SYNC[0], SYNC[1]];
+        stream.extend_from_slice(&60_000u16.to_le_bytes());
+        stream.extend_from_slice(&[msg::PING, 0, 0]);
+        let good = encode_frame(msg::PING, 7, &[0x11]).expect("a 1-byte payload frames");
+
+        let mut reader = FrameReader::with_max_payload(64);
+        reader.push(&stream);
+        reader.push(&good);
+        let frame = reader.next_frame().expect("the real frame is reachable immediately");
+        assert_eq!(frame.seq, 7, "the bogus header was stepped over, not waited for");
+        assert_eq!(frame.payload, vec![0x11]);
+    }
+
+    /// THE CONTROL FOR IT. An unbounded reader is unchanged, which is correct for a host that really
+    /// can be sent a 60,000-byte frame. If this ever starts behaving like the bounded case, the
+    /// bound has leaked into the default and every deploy would break.
+    #[test]
+    fn the_default_reader_still_waits_for_a_long_frame() {
+        let mut stream = alloc::vec![SYNC[0], SYNC[1]];
+        stream.extend_from_slice(&60_000u16.to_le_bytes());
+        stream.extend_from_slice(&[msg::PING, 0, 0]);
+        let good = encode_frame(msg::PING, 7, &[0x11]).expect("a 1-byte payload frames");
+
+        let mut reader = FrameReader::new();
+        reader.push(&stream);
+        reader.push(&good);
+        assert!(
+            reader.next_frame().is_none(),
+            "an unbounded reader waits for the 60,000 bytes it was promised"
+        );
+    }
+
+    /// The boundary, stated rather than left to a reader of the comparison: a payload exactly at the
+    /// bound is a frame, and one byte more is garbage.
+    ///
+    /// There is deliberately no arm here for a bound ABOVE the wire's own cap. It cannot be
+    /// observed: the length field is a `u16`, so no header reaches such a bound, and a test asserting
+    /// that a frame still decodes would pass whatever the constructor did with the number. A guard
+    /// that cannot go red is not a guard, and one written anyway would report a property nothing
+    /// holds.
+    #[test]
+    fn the_bound_is_inclusive() {
+        let payload = [0xA5u8; 16];
+        let framed = encode_frame(msg::PING, 3, &payload).expect("16 bytes frames");
+
+        let mut exact = FrameReader::with_max_payload(16);
+        exact.push(&framed);
+        assert_eq!(exact.next_frame().map(|f| f.seq), Some(3), "16 <= 16 is accepted");
+
+        let mut tight = FrameReader::with_max_payload(15);
+        tight.push(&framed);
+        assert!(tight.next_frame().is_none(), "16 > 15 is discarded");
+    }
+
+    /// The surface bitmap: one distinct bit per symbol, and the era bits are exactly the era mask.
+    #[test]
+    fn the_surface_bitmap_is_one_distinct_bit_per_symbol() {
+        let mut seen = 0u64;
+        for (bit, symbol) in surface::NAMED {
+            assert_eq!(bit.count_ones(), 1, "{symbol} must be exactly one bit");
+            assert_eq!(seen & bit, 0, "{symbol} duplicates a bit already named");
+            seen |= bit;
+        }
+        assert_eq!(
+            surface::NETFX_MASK.count_ones(),
+            4,
+            "the era mask is the four era bits and nothing else"
+        );
+        assert_eq!(surface::NETFX_MASK & !seen, 0, "and every one of them is a named symbol");
+    }
+
+    /// The subset check, in the direction that decides whether a program will run.
+    #[test]
+    fn a_board_missing_a_symbol_is_named_rather_than_merely_refused() {
+        let program = surface::FLOAT | surface::GENERICS | surface::NETFX_2_0;
+        let board = surface::FLOAT | surface::NETFX_2_0;
+        assert!(!surface::accepts(program, board));
+        assert_eq!(surface::missing(program, board), surface::GENERICS);
+        assert_eq!(surface::bit_of("LAMELLA_SURFACE_GENERICS"), Some(surface::GENERICS));
+        assert!(surface::accepts(board, program), "a program needing less runs on a board with more");
+        assert_eq!(surface::missing(program, program), 0);
     }
 
     #[test]
@@ -1504,7 +2838,8 @@ mod tests {
         let frame = target.poll().unwrap().expect("HELLO arrived");
         assert_eq!(frame.msg_type, msg::HELLO);
         let received = Hello::decode(&frame.payload).unwrap();
-        let ack = target_respond(&received, target_range, target_caps).expect("a compatible version");
+        let ack = target_respond(&received, target_range, target_caps, an_identity(), None)
+            .expect("a compatible version");
         target.send(msg::HELLO_ACK, frame.seq, &ack.encode()).unwrap();
         host.feed(&target.take_sent());
 
@@ -1526,7 +2861,14 @@ mod tests {
     #[test]
     fn incompatible_versions_nak() {
         let host = Hello { range: ProtocolRange { min: 5, max: 6 }, caps: Capabilities::default() };
-        let err = target_respond(&host, ProtocolRange::single(1), Capabilities::default());
-        assert_eq!(err, Err(Nak { target_range: ProtocolRange::single(1) }));
+        let err = target_respond(
+            &host,
+            ProtocolRange::single(1),
+            Capabilities::default(),
+            TargetIdentity::default(),
+            None,
+        );
+        assert_eq!(err, Err(HelloNak { target_range: ProtocolRange::single(1) }));
     }
 }
+

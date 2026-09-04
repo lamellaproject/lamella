@@ -8,7 +8,7 @@ kind = "board"
 board = "samw25-xpro"
 vendor = "microchip"
 module = "samw25"
-board_model = 6
+product_model = 6
 sources = [
     "SAM W25 Xplained Pro user guide 42463A (kit identity); the VCP routing is this board's own SERCOM4/PB10/PB11 wiring, which supersedes that guide's VCP table",
 ]

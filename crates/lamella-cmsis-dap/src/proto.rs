@@ -175,6 +175,7 @@ pub fn swj_clock(hz: u32) -> [u8; 5] {
     [cmd::SWJ_CLOCK, b[0], b[1], b[2], b[3]]
 }
 
+
 /// The `DAP_SWJ_Pins` bit for the target reset line (nRESET). Bit 7 in the CMSIS-DAP pin mask;
 /// driving it low asserts reset (holds the core), high releases it.
 pub const PIN_NRESET: u8 = 1 << 7;
@@ -188,6 +189,27 @@ pub const PIN_SWCLK: u8 = 1 << 0;
 /// against a target's pull-up and reading the result back tests whether the probe's level shifters
 /// are actually driving, which no amount of reading alone can establish.
 pub const PIN_SWDIO: u8 = 1 << 1;
+
+/// Encodes `DAP_ResetTarget`: reset this target by whatever means THIS PROBE has for it.
+///
+/// **THE VENDOR-DEFINED RESET, AND IT EXISTS BECAUSE THE GENERIC PIN ROUTE DOES NOT REACH EVERY
+/// BOARD.** [`swj_pins`] drives named SWJ pins directly, which works only where the probe wires
+/// nRESET to one of them and is willing to drive it. A debugger whose reset reaches the target by
+/// any other path -- a dedicated line, a device-specific sequence, a companion MCU -- implements
+/// that path here instead, and answers `DAP_SWJ_Pins` for reset with nothing at all.
+///
+/// The reply's second byte is a STATUS and its third is `Execute`. **BIT 0 of `Execute` is the
+/// probe saying it ran a device-specific sequence**; clear means it has none and the caller
+/// should fall back to [`swj_pins`]. Test the BIT rather than comparing the byte to 1 -- a probe
+/// setting any other bit would otherwise be read as having done nothing. **So a `DAP_OK` here
+/// does not by itself mean a target was reset**, which is why the helper that sends this reports
+/// the flag rather than swallowing it.
+///
+/// NOTE: it has NO capability bit, so it cannot be feature-probed before use. A probe that does
+/// not implement it answers [`INVALID_COMMAND`], which surfaces as `DapError::Unsupported`.
+pub fn reset_target() -> [u8; 1] {
+    [cmd::RESET_TARGET]
+}
 
 /// Encodes `DAP_SWJ_Pins`: drive the pins named in `select` to the levels in `output`, then wait up
 /// to `wait_us` microseconds for them to settle (the reply reports the pins' resulting input levels).

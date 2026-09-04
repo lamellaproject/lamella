@@ -47,6 +47,8 @@ public sealed class Nrf52833GpioDriver : GpioDriver
 
     protected override void ClosePin(int pinNumber)
     {
+        if (IsReserved(pinNumber)) return;
+
         Mmio.Write32(PortBase(pinNumber) + DIRCLR, PinMask(pinNumber));
         Mmio.Write32(PinCnfAddress(pinNumber), 0x2);
     }

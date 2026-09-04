@@ -1,0 +1,165 @@
+# BLOCK layout: the SAM D5x/E5x PORT, the I/O pin controller. Offsets are GROUP-relative; the four
+# group bases (porta, portb, portc, portd) live in ../instances.toml, 0x80 apart.
+#
+# PMUX AND PINCFG ARE PER-PIN ARRAYS and the offsets below are the n = 0 element:
+#   PMUX[n]   = group_base + 0x30 + n        (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
+#   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group, 0..31)
+# The manual states both bounds -- up to 16 PMUX registers per group, one per pair, and up to 32
+# PINCFG registers, one per line.
+#
+# THE PIN CONFIGURATION SUMMARY IS THE WHOLE DRIVER CONTRACT AND IT IS ONE TABLE. Four bits across
+# three registers decide what a pin is, and the manual gives every combination:
+#
+#   DIR  INEN  PULLEN  OUT   configuration
+#    0    0     0      X     Reset or analog I/O: ALL DIGITAL DISABLED
+#    0    0     1      0     pull-down, input disabled
+#    0    0     1      1     pull-up, input disabled
+#    0    1     0      X     input
+#    0    1     1      0     input with pull-down
+#    0    1     1      1     input with pull-up
+#    1    0     X      X     output, input disabled
+#    1    1     X      X     output, input enabled
+#
+# TWO THINGS IN THAT TABLE SURPRISE EVERY FIRST DRIVER WRITTEN AGAINST THIS BLOCK:
+#
+# CLEARING DIR DOES NOT MAKE AN INPUT. The reset row is DIR = 0 with INEN = 0, and the manual calls
+# it "all digital disabled" -- the input buffer is off, so IN never samples the pin and reads back
+# zero forever with nothing reporting why. An input needs INEN SET as well as DIR cleared, and that
+# bit is in a different register from the direction.
+#
+# AND THE PULL DIRECTION LIVES IN OUT, THE OUTPUT-VALUE REGISTER. PULLEN turns a pull on; which way
+# it pulls is the OUT bit for that pin -- 1 is up, 0 is down. So configuring an input pull-up writes
+# the same bit a driver otherwise uses to drive a pin high, for an entirely different reason, and a
+# driver that reads OUT to report "what am I driving" is reading a pull selection on any input pin.
+#
+# THE RESET STATE IS THEREFORE NOT "INPUT". It is the all-digital-disabled row, which is the same
+# shape the STM32H7's analog reset has and the opposite of the STM32F42x's. Returning a pin to reset
+# means clearing DIR, INEN and PULLEN, not just clearing DIR.
+
+[table]
+kind = "block"
+family = "same54"
+block = "port"
+sources = [
+    "SAM D5x/E5x Family Data Sheet DS60001507F section 32.8, register descriptions, each stating its own offset: 32.8.1 DIR 0x00, 32.8.2 DIRCLR 0x04, 32.8.3 DIRSET 0x08, 32.8.4 DIRTGL 0x0C, 32.8.5 OUT 0x10, 32.8.6 OUTCLR 0x14, 32.8.7 OUTSET 0x18, 32.8.8 OUTTGL 0x1C, 32.8.9 IN 0x20, 32.8.10 CTRL 0x24, 32.8.11 WRCONFIG 0x28, 32.8.12 EVCTRL 0x2C, 32.8.13 PMUX 0x30 + n*0x01 for n = 0..15, 32.8.14 PINCFG 0x40 + n*0x01 for n = 0..31.",
+    "DS60001507F section 32.7 register summary, which states the group spacing in words: the I/O pins are assembled in pin groups of up to 32, group 0 is the PA pins and group 1 the PB pins, and each group has its own PORT registers with a 0x80 address spacing.",
+    "DS60001507F section 32.8.14: PINCFG carries PMUXEN at bit 0, INEN at bit 1, PULLEN at bit 2 and DRVSTR at bit 6, all reset to 0. PMUXEN enables the peripheral multiplexer selection; INEN controls the input buffer and writing zero to it prevents read-back of the physical pin state whether the pin is an input or an output; PULLEN enables the internal pull resistor of a pin configured as an input; DRVSTR selects stronger drive on a pin configured as an output.",
+    "DS60001507F section 32.6.3.1, Table 32-2 (Pin Configurations Summary): the eight DIR / INEN / PULLEN / OUT combinations and what each configures, including the reset row where all digital is disabled and the two rows where OUT selects the pull direction.",
+    "DS60001507F section 32.8.13: PMUXO occupies bits 7:4 and PMUXE bits 3:0, selecting the peripheral function for the odd and even pin of each pair. The value table gives 0x0 = A through 0xD = N, with 0xE and 0xF reserved.",
+    "DS60001507F section 6.1: a pin is a general purpose I/O by default; enabling a peripheral function needs PINCFGn.PMUXEN written to 1, and the selection of peripheral functions A to N is made in PMUXn.PMUXE/O.",
+    "DS60001507F section 32.6.1: during reset all PORT lines are configured as inputs with input buffers, output buffers and pull disabled.",
+]
+notes = [
+    "THE REGISTER SUMMARY TABLE AND THE PER-REGISTER SECTIONS AGREE, AND THAT WAS CHECKED RATHER THAN ASSUMED. Each register occupies four rows of the summary table, one per byte lane, carrying its name and offset only on the first -- a shape that can walk the offset column out of step with the name column when the table is linearized. Every offset here was taken from the per-register section that states its own, and the summary agrees register for register.",
+    "FOURTEEN PERIPHERAL FUNCTIONS, A THROUGH N, WHERE THE SAMD21's SAME BLOCK HAS EIGHT. The nibble is four bits wide on both, and this family fills 0x0 to 0xD of it. A constant set carried across from the smaller family would name only A through H and leave six real functions with no spelling, which is a silence rather than an error.",
+    "EVCTRL AT 0x2C HAS NO COUNTERPART IN THE SAMD21's PORT, whose registers run WRCONFIG at 0x28 straight to PMUX at 0x30. The two blocks agree on every other offset, which is exactly the arrangement somebody folds into one shared block -- and the fold would drop this register silently, because nothing else in the map moves.",
+    "DIRTGL AND OUTTGL ARE HARDWARE TOGGLES AND ARE WORTH STATING FOR THAT ALONE. Inverting a bit through them is one write with no read, so it cannot lose a concurrent write to another pin of the group -- which a read-then-write toggle can, and which is what a driver falls back to on a block that has no such register.",
+]
+
+[registers.DIR]
+offset = 0x00
+width = 32
+fields = { DIR = [0, 32] }
+notes = "The direction word, readable: 1 = output. A driver reporting a pin's CURRENT mode reads this rather than shadowing it, so a pin another driver configured is described honestly. Clearing a bit here does NOT produce an input on its own -- see the block header."
+
+[registers.DIRCLR]
+offset = 0x04
+width = 32
+fields = { DIRCLR = [0, 32] }
+notes = "Write 1s to clear direction bits. Atomic per pin, so no read-modify-write races with an interrupt handler driving another pin of the same group."
+
+[registers.DIRSET]
+offset = 0x08
+width = 32
+fields = { DIRSET = [0, 32] }
+notes = "Write 1s to make pins outputs."
+
+[registers.DIRTGL]
+offset = 0x0C
+width = 32
+fields = { DIRTGL = [0, 32] }
+notes = "Write 1s to invert direction bits. Rarely what a driver wants and stated so the map is the manual's."
+
+[registers.OUT]
+offset = 0x10
+width = 32
+fields = { OUT = [0, 32] }
+notes = "The output drive level, readable. LOAD-BEARING BEYOND WRITING A LEVEL: with PINCFG.PULLEN set on an input pin, this bit SELECTS THE PULL DIRECTION -- 1 is pull-up, 0 is pull-down -- so a driver offering input-with-pull-up cannot be written without it, and a driver reading it to report what it is driving is reading a pull selection on every input pin."
+
+[registers.OUTCLR]
+offset = 0x14
+width = 32
+fields = { OUTCLR = [0, 32] }
+notes = "Write 1s to drive pins low, or to select pull-down on an input with PULLEN set."
+
+[registers.OUTSET]
+offset = 0x18
+width = 32
+fields = { OUTSET = [0, 32] }
+notes = "Write 1s to drive pins high, or to select pull-up on an input with PULLEN set."
+
+[registers.OUTTGL]
+offset = 0x1C
+width = 32
+fields = { OUTTGL = [0, 32] }
+notes = "Write 1s to invert output levels. A HARDWARE TOGGLE: one write, no read, and no race with another writer to the same group -- which a read-then-write toggle has."
+
+[registers.IN]
+offset = 0x20
+width = 32
+fields = { IN = [0, 32] }
+notes = "The input samples. Only pins whose PINCFG.INEN is set are sampled; a pin with the input buffer off reads zero here whatever is on the pad, and that is the reset state."
+
+[registers.CTRL]
+offset = 0x24
+width = 32
+fields = { SAMPLING = [0, 32] }
+notes = "Continuous input sampling: a 1 makes the corresponding pin sampled every clock rather than on demand. Costs power and buys a read with no synchronization delay; nothing here writes it."
+
+[registers.WRCONFIG]
+offset = 0x28
+width = 32
+fields = { PINMASK = [0, 16], PMUX = [24, 4], PMUXEN = [16, 1], INEN = [17, 1], PULLEN = [18, 1], DRVSTR = [22, 1], WRPMUX = [28, 1], WRPINCFG = [30, 1], HWSEL = [31, 1] }
+notes = "Configures up to sixteen pins in one write: PINMASK selects them, HWSEL picks the low or high half of the group, and WRPMUX and WRPINCFG say which of the two configurations the write applies. Write-only. It exists to avoid the per-pin loop a bring-up would otherwise do; nothing here uses it, and a driver that did would still need the per-pin registers to READ a configuration back."
+
+[registers.EVCTRL]
+offset = 0x2C
+width = 32
+fields = { }
+notes = "Event input control: four identical bytes, each mapping one event input to a pin id and an action. NO COUNTERPART IN THE SAMD21's PORT, which is the register a fold of the two blocks would lose. No fields stated because nothing has read them; the register is placed so the map is this family's rather than the smaller family's."
+
+[registers.PMUX0]
+offset = 0x30
+width = 8
+fields = { PMUXE = [0, 4], PMUXO = [4, 4] }
+notes = "Element 0 of the per-pin-pair mux array; see the block header for the element derivation. PMUXE selects the function of the EVEN pin of the pair and PMUXO the odd one, and neither takes effect until that pin's PINCFG.PMUXEN is set."
+
+[registers.PINCFG0]
+offset = 0x40
+width = 8
+fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
+notes = "Element 0 of the per-pin config array; see the block header for the element derivation. DRVSTR at bit 6 is stated even though no driver here writes it, because the gap between bit 2 and bit 6 is where a reader assumes a field that is not there."
+
+# Function-letter values for the PMUX nibbles. THIS FAMILY DEFINES FOURTEEN, A THROUGH N -- the
+# manual's own value table, 0x0 to 0xD, with 0xE and 0xF reserved and deliberately unnamed here.
+[constants]
+FUNC_A = 0
+FUNC_B = 1
+FUNC_C = 2
+FUNC_D = 3
+FUNC_E = 4
+FUNC_F = 5
+FUNC_G = 6
+FUNC_H = 7
+FUNC_I = 8
+FUNC_J = 9
+FUNC_K = 10
+FUNC_L = 11
+FUNC_M = 12
+FUNC_N = 13
+# The four bits Table 32-2 decides a pin's configuration with, as masks a driver applies to the
+# per-pin PINCFG byte. The direction and output bits are whole-word registers and need no constant.
+PINCFG_PMUXEN = 1
+PINCFG_INEN = 2
+PINCFG_PULLEN = 4
+PINCFG_DRVSTR = 64

@@ -78,6 +78,36 @@ pub enum InterpolationPart {
     },
 }
 
+/// Which position a `ref` operand was written in, for the sake of the diagnostic a BAD operand
+/// draws there.
+///
+/// **ONE OPERAND, FOUR POSITIONS, THREE DIFFERENT CODES -- MEASURED AGAINST csc AT 7.3, NOT
+/// REASONED.** The same non-ref property `P`:
+///
+/// | position | code |
+/// |---|---|
+/// | `ref int r = ref P;` and `M(ref P)` | `CS0206` |
+/// | `r = ref P;` (ref REASSIGNMENT) | `CS1510` |
+/// | `return ref P;` | `CS8156` |
+///
+/// and a `readonly` field in the same three: `CS0192`, `CS0191`, `CS8160`.
+///
+/// **THE POSITION RIDES THE NODE BECAUSE ONLY THE PARSER KNOWS IT.** The binder builds one
+/// `BoundExprKind::Ref` for every position -- which is right, since they all mean *the address of*
+/// -- so a check written there cannot tell them apart, and one written at each consumer is a list
+/// of sites for the next position to be forgotten from. A first cut did exactly that and made
+/// `return ref P` report `CS0206` where csc reports `CS8156`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefPosition {
+    /// A `ref`/`out` ARGUMENT at a call site, and a `ref` LOCAL's initializer. csc answers these
+    /// two identically at every operand tested.
+    Argument,
+    /// The right-hand side of a ref REASSIGNMENT, `r = ref e` (C# 7.3).
+    Reassignment,
+    /// `return ref e;`.
+    Return,
+}
+
 /// The kind of an [`Expr`], with any child expressions (ECMA-334 1st ed, 14).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExprKind {
@@ -126,6 +156,27 @@ pub enum ExprKind {
         /// The accessed member's name.
         name: Box<str>,
     },
+    /// A NULL-CONDITIONAL ACCESS `receiver?.name`, `receiver?[index]` and everything chained
+    /// after it (C# 6.0): the receiver is evaluated once, and the whole of `access` is skipped
+    /// when it is null.
+    ///
+    /// **`access` IS THE WHOLE REMAINING CHAIN, NOT THE ONE MEMBER, AND THAT IS THE SEMANTICS
+    /// RATHER THAN A CONVENIENCE.** `a?.B.C.D` evaluates NONE of `B`, `C` or `D` when `a` is null
+    /// -- measured: a receiver-null `nul?.Inner.Val` touches neither property, where a per-member
+    /// reading would evaluate `.Inner` on null and throw. So the parser hands the rest of the
+    /// postfix chain to this node rather than wrapping this node in it.
+    ///
+    /// `access` is rooted at a [`ExprKind::ConditionalReceiver`] standing for the tested value.
+    ConditionalAccess {
+        /// The expression tested for null, evaluated exactly once.
+        receiver: Box<Expr>,
+        /// The chain applied when it is not null, rooted at [`ExprKind::ConditionalReceiver`].
+        access: Box<Expr>,
+    },
+    /// The placeholder at the root of a [`ExprKind::ConditionalAccess`]'s `access`: the receiver's
+    /// value, already tested and already unwrapped. It never appears anywhere else, and binding
+    /// one outside a conditional access is a compiler defect rather than a source error.
+    ConditionalReceiver,
     /// An invocation `receiver(arguments)` (14.5.5).
     Invocation {
         /// The expression being invoked.
@@ -165,9 +216,23 @@ pub enum ExprKind {
     Await(Box<Expr>),
     /// A `ref`/`out` argument (17.5.1): the address of a variable, passed to a byref
     /// parameter. `out` additionally means the callee assigns the variable.
+    ///
+    /// **AND THE `ref` OF `return ref e;` (C# 7.0), WHICH IS THE SAME NODE BECAUSE IT DENOTES THE
+    /// SAME THING**: the address of a variable rather than its value. The two positions consume it
+    /// identically -- the binder produces one `BoundExprKind::Ref` for both, and the emitter takes
+    /// an address for both through one function -- so a second variant would be two spellings of
+    /// one meaning, and the second one is where a case gets forgotten. What differs is the
+    /// DIAGNOSTIC each position reports, and the position decides it rather than the node:
+    /// a `ref` return in a by-value method is `CS8149`, which no argument can be.
+    ///
+    /// `out` is always `false` in the return position -- `return out e;` is not a form.
     RefArgument {
         /// `true` for `out`, `false` for `ref`.
         out: bool,
+        /// Which of the four positions this `ref` was written in. The node is the same in all
+        /// four; the DIAGNOSTIC for a bad operand is not, and only the parser knows which site it
+        /// is. See [`RefPosition`].
+        position: RefPosition,
         /// The variable whose address is passed.
         operand: Box<Expr>,
     },
@@ -201,6 +266,37 @@ pub enum ExprKind {
         left: Box<Expr>,
         /// The right operand -- evaluated only when the left one is null.
         right: Box<Expr>,
+    },
+    /// A THROW EXPRESSION, `throw e` in expression position (C# 7.0).
+    ///
+    /// **It is parsed far more widely than it is PERMITTED, and that is csc's shape rather than a
+    /// looseness here.** The parser admits one wherever an expression is parsed at null-coalescing
+    /// precedence or lower, which is why `f(throw e)` and `(throw e)` reach the binder at all --
+    /// csc refuses both as `CS8115`, a message about the CONTEXT, and it can only say that about
+    /// something it parsed. As the operand of a binary operator it is not admitted by either
+    /// compiler, and both say `CS1525` there instead.
+    Throw(Box<Expr>),
+    /// A LAMBDA EXPRESSION (C# 3.0): `x => x + 1`, `(a, b) => a * b`, `() => 0`,
+    /// `(int x) => x`, `x => { return x; }`.
+    ///
+    /// **IT HAS NO TYPE OF ITS OWN AND THAT IS THE WHOLE DIFFICULTY.** A lambda is converted to a
+    /// DELEGATE type supplied by its context (14.5.11), and until that context is known neither its
+    /// parameter types nor its return type exist -- so the parser records the shape and nothing
+    /// else, and the binder types it against the target. An IMPLICITLY typed parameter list
+    /// (`x => ...`) carries a `TypeRef` only when the source wrote one.
+    Lambda {
+        /// The parameters as written. A parameter whose type the source omitted has `ty: None`,
+        /// and the binder fills it from the target delegate's signature.
+        ///
+        /// **ALL OR NONE (14.5.11).** C# does not permit a parameter list that mixes explicit
+        /// and implicit types, and the check belongs to the binder rather than here: the parser's
+        /// answer is what was written.
+        parameters: Vec<LambdaParameter>,
+        /// The body: an expression (`x => x + 1`) or a block (`x => { return x + 1; }`).
+        body: Box<LambdaBody>,
+        /// Whether the list was written parenthesized. `x => ...` and `(x) => ...` are the same
+        /// lambda; the flag exists because a diagnostic about the list points at different spans.
+        parenthesized: bool,
     },
     /// A conditional `condition ? when_true : when_false` (14.13).
     Conditional {
@@ -458,6 +554,25 @@ pub enum TypeRefKind {
     /// An unsafe pointer type (III.1.1.5): `T*`. `int**` nests a `Pointer` whose element is
     /// another `Pointer`. The pointed-to type is the element.
     Pointer(Box<TypeRef>),
+    /// A BY-REFERENCE return type: the `ref` of `ref T M()`, `ref T this[int i]` and
+    /// `ref T P { get; }` (C# 7.0), and `ref readonly T` (C# 7.2). The referent is the element.
+    ///
+    /// **[`Parser::parse_type`](crate::parser::Parser) NEVER PRODUCES ONE**, so a local, a type
+    /// argument, an array element and a parameter's type cannot reach this variant however the
+    /// source is spelled -- there is no arm to reach. It is built by `parse_member_type` alone.
+    ///
+    /// `Property` is what lets `bind_type` answer for all three in one arm, the way a `ref`
+    /// PARAMETER is `TypeSymbol::ByRef` by the time anything downstream sees it.
+    ///
+    /// `is_readonly` is the `ref readonly T` form, whose metadata is `T&` plus a `modreq` on
+    /// `System.Runtime.InteropServices.InAttribute` -- a different signature from a plain `ref T`,
+    /// which is why the two are one variant with a flag rather than two spellings of one type.
+    ByRef {
+        /// The type being returned by reference.
+        referent: Box<TypeRef>,
+        /// Whether it was written `ref readonly`.
+        is_readonly: bool,
+    },
     /// A placeholder for a type that could not be parsed, emitted with a
     /// diagnostic for recovery.
     Error,
@@ -829,7 +944,7 @@ pub enum MemberInitializerValue {
     Nested(Initializer),
 }
 
-/// A `using` directive (16.3): import a namespace or define an alias.
+/// A `using` directive (16.3): import a namespace, import a type's statics, or define an alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsingDirective {
     /// What the directive imports.
@@ -843,6 +958,14 @@ pub struct UsingDirective {
 pub enum UsingKind {
     /// `using A.B.C ;` -- bring a namespace's members into scope.
     Namespace(QualifiedName),
+    /// `using static A.B ;` (C# 6.0) -- bring one TYPE's directly declared static members and
+    /// nested types into scope, nameable without qualification (ECMA-334 6th ed, 13.5.4).
+    ///
+    /// **The operand is a `type_name`, not a namespace**, which is the whole difference from
+    /// [`UsingKind::Namespace`] and the reason it is a separate variant rather than a flag: csc
+    /// reports `CS7007` for `using static System;`, naming the mistake, where a namespace import
+    /// of the same text is correct.
+    Static(QualifiedName),
     /// `using X = A.B.C ;` -- an alias for a namespace or type.
     Alias {
         /// The alias identifier.
@@ -1132,6 +1255,20 @@ pub enum Modifier {
     /// two-token peek, must scan a full type, because `async Task<int> M()` puts arbitrarily many
     /// tokens between the modifier and the name that proves it is one.
     Async,
+    /// `ref` on a STRUCT declaration (C# 7.2): `ref struct S { }`, and `readonly ref struct`
+    /// with `readonly` first -- `ref readonly struct` is CS1031 under csc, measured.
+    ///
+    /// **A `ref struct` IS A STRUCT AND IS MODELLED AS ONE**, for the reason
+    /// [`TypeDecl::record`] gives: a fourth [`TypeKind`] would make every existing
+    /// [`TypeKind::Struct`] arm wrong by omission, when a ref struct IS-A struct at nearly all
+    /// of them and only the sites that enforce the by-ref-like restrictions may ask.
+    ///
+    /// POSITIONAL, not contextual: `ref` is a keyword everywhere, but it is a MODIFIER only
+    /// immediately before `struct` or before `partial struct`. `ref class` and `ref interface`
+    /// are CS1031 under csc -- it does not take `ref` as a modifier there either -- and a
+    /// `ref`-returning member (`ref int P => ...`) must keep parsing as one. See
+    /// `Parser::ref_is_a_modifier_here`.
+    Ref,
 }
 
 /// A member of a type (17.2). Fields, methods, and constructors land first;
@@ -1227,6 +1364,14 @@ pub enum Member {
         /// The explicitly implemented interface for `int I.P { ... }` (20.4.1), naming
         /// its accessors `I.get_P`/`I.set_P`. `None` for an ordinary property.
         explicit_interface: Option<TypeRef>,
+        /// The AUTO-PROPERTY INITIALIZER's expression, `int P { get; set; } = 5;` (C# 6.0), else
+        /// `None`.
+        ///
+        /// It initializes the BACKING FIELD and not the property, which is what lets a getter-only
+        /// auto-property carry one -- there is no setter to call -- and what keeps a virtual setter
+        /// from running before the derived constructor has. So it is stored beside the accessors
+        /// rather than inside one, and lowers exactly where a field initializer does.
+        initializer: Option<Expr>,
         /// The member's attributes (24.2).
         attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
@@ -1360,6 +1505,71 @@ impl Member {
     }
 }
 
+/// Whether a property declaration is an AUTOMATICALLY IMPLEMENTED PROPERTY -- one the compiler
+/// backs with a synthesized field and synthesized accessors, rather than one the program wrote a
+/// body for.
+///
+/// **THREE ANSWERS DEPEND ON THIS AND THEY MUST BE THE SAME ANSWER**: the binder registers the
+/// backing field in its model, the emitter's token pre-pass reserves the `FieldDef` row, and
+/// emission writes it. A `TypeDef`'s field range runs to where the next type's begins (II.22.37),
+/// so two of them disagreeing does not lose a field -- it shifts every field token after it. That
+/// is why this lives in the syntax crate, which both of the others already depend on, rather than
+/// being asked twice.
+///
+/// **THE GETTER IS REQUIRED AND THE SETTER IS NOT.** `{ get; }` is C# 6.0's readonly auto-property,
+/// whose backing field is `initonly`; `{ get; set; }` is C# 3.0's. `{ set; }` is neither -- csc
+/// answers CS8051, and a property with nothing to read it back through has no field to synthesize.
+/// A half-written `{ get; set { ... } }` is not one either: an accessor with a body is the
+/// program's implementation, and generating a field beside it would give the property two.
+///
+/// `is_interface` is the DECLARING type's kind, which the member alone cannot say. An interface
+/// property, like an `abstract` or `extern` one, is bodyless because it declares only a contract.
+#[must_use]
+pub fn is_auto_property(
+    modifiers: &[Modifier],
+    getter: Option<&Accessor>,
+    setter: Option<&Accessor>,
+    is_interface: bool,
+) -> bool {
+    if is_interface
+        || modifiers
+            .iter()
+            .any(|modifier| matches!(modifier, Modifier::Abstract | Modifier::Extern))
+    {
+        return false;
+    }
+    let Some(getter) = getter else {
+        return false;
+    };
+    getter.body.is_none() && setter.is_none_or(|setter| setter.body.is_none())
+}
+
+/// The metadata name of an auto-property's backing field: csc's `<Name>k__BackingField`, and
+/// `<IHas.N>k__BackingField` for an explicit interface implementation -- measured.
+///
+/// **NOT A LEGAL C# IDENTIFIER, ON PURPOSE.** The angle brackets are what keep it from colliding
+/// with anything the program can declare, and copying csc's spelling exactly is what lets a
+/// debugger, a serializer or a reflection-based tool recognize the field for what it is. It is also
+/// what lets the binder hold the field under a name no source expression can reach, so an
+/// initializer can be lowered onto it without the name becoming part of the language.
+///
+/// The interface qualifier is not decoration either: a type may explicitly implement `N` from two
+/// different interfaces AND declare its own `N`, which is three distinct auto-properties whose
+/// backing fields would otherwise share one name.
+#[must_use]
+pub fn auto_property_backing_field_name(
+    explicit_interface: Option<&TypeRef>,
+    property: &str,
+) -> String {
+    match explicit_interface {
+        Some(interface) => alloc::format!(
+            "<{}>k__BackingField",
+            explicit_interface_member_name(interface, property)
+        ),
+        None => alloc::format!("<{property}>k__BackingField"),
+    }
+}
+
 /// The name an explicit interface member implementation carries in metadata and in
 /// the symbol model: the interface's source spelling, a dot, then the member -- e.g.
 /// `I.M` or `System.IComparable.CompareTo`. csc names the `MethodDef` this way, and
@@ -1452,6 +1662,13 @@ fn write_type_ref(text: &mut String, ty: &TypeRef) {
         TypeRefKind::Pointer(element) => {
             write_type_ref(text, element);
             text.push('*');
+        }
+        TypeRefKind::ByRef {
+            referent,
+            is_readonly,
+        } => {
+            text.push_str(if *is_readonly { "ref readonly " } else { "ref " });
+            write_type_ref(text, referent);
         }
         TypeRefKind::Unbound { parts, arity } => {
             for (index, part) in parts.iter().enumerate() {
@@ -1653,6 +1870,36 @@ pub struct Parameter {
     pub span: Span,
 }
 
+/// One parameter of a lambda expression (14.5.11).
+///
+/// **SEPARATE FROM [`Parameter`] BECAUSE THE TYPE IS OPTIONAL AND THAT IS THE POINT.** A method
+/// parameter always has a written type; a lambda's may be inferred from the target delegate, and
+/// modelling that as a `TypeRef` with a placeholder would make "inferred" indistinguishable from a
+/// type named by an identifier the binder happens not to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LambdaParameter {
+    /// The written type, or `None` when the source left it to be inferred.
+    pub ty: Option<TypeRef>,
+    /// The parameter name.
+    pub name: Box<str>,
+    /// The byte range the parameter covers.
+    pub span: Span,
+}
+
+/// A lambda's body (14.5.11): a single expression, or a block.
+///
+/// The two are not interchangeable at the binder. An expression body's value IS the return value,
+/// so it must convert to the delegate's return type; a block body returns through `return`
+/// statements, and a block lambda converted to a `void`-returning delegate must have none that
+/// carry a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LambdaBody {
+    /// `x => expr`.
+    Expression(Expr),
+    /// `x => { statements }`.
+    Block(Stmt),
+}
+
 /// A parameter-passing modifier (17.5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterModifier {
@@ -1671,6 +1918,14 @@ pub struct CatchClause {
     pub exception_type: Option<TypeRef>,
     /// The bound exception variable's name, if any.
     pub name: Option<Box<str>>,
+    /// The EXCEPTION FILTER's condition -- `catch (E e) when (cond)`, C# 6.0 -- else `None`.
+    ///
+    /// It is a condition on whether this handler runs AT ALL, which is what separates it from an
+    /// `if` at the top of the body: a filter that answers false leaves the exception travelling and
+    /// the stack UNWOUND PAST NOTHING, so an outer handler still sees the original throw point.
+    /// The exception variable is in scope here, which is the whole reason the clause is worth
+    /// writing.
+    pub filter: Option<Expr>,
     /// The handler block.
     pub body: Box<Stmt>,
     /// The `catch (...)` clause header's span, for a debug build's sequence point on it.

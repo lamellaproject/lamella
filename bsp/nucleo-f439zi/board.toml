@@ -25,7 +25,7 @@ board = "nucleo-f439zi"
 vendor = "st"
 family = "stm32f42x"
 part = "stm32f439zi"
-board_model = 29            # lamella_wire::board_model::NUCLEO_F439ZI
+product_model = 29          # lamella_wire::product_model::NUCLEO_F439ZI
 sources = [
     "UM1974 Rev 11 (STM32 Nucleo-144 boards, MB1137): user LD1 is a green LED connected to the STM32 I/O PB0 with SB120 ON and SB119 OFF, LD2 a blue LED on PB7, LD3 a red LED on PB14, and the section states outright that these user LEDs are on when the I/O is HIGH and off when it is LOW; B1 USER is connected to PC13 by default with SB173 ON and SB180 OFF; the USART3 interface on PD8 and PD9 carries the virtual COM port. Its product summary and product history name this board's part STM32F439ZIT6 on board MB1137-F439ZI-B01.",
     "MB1137 schematic revision B-01, from ST's Nucleo-144 CAD pack. Sheet 2 (MCU): PB7 through SB139 and R31 680R into LD2's anode with its cathode at ground; PB14 through SB118 and R30 1K into LD3; PC13 through SB173 and R59 330R to the B1 USER switch, whose far side is VDD, with R58 220K to ground. Sheet 6 (extension connectors): PB0 through SB120 into R34 10K, with R33 200K to ground, feeding the non-inverting input of U7, a TSV631AILT amplifier powered from +3V3_PER and wired as a unity-gain follower -- its inverting input is tied to its own output, and that output drives R32 510R into LD1's anode with the cathode at ground.",

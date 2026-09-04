@@ -98,6 +98,19 @@ pub struct DeviceInfo {
     pub serial_number: Option<String>,
     /// Product string, if the OS reported one.
     pub product: Option<String>,
+    /// The vendor-class INTERFACE's own name (`iInterface`), where the OS publishes it.
+    ///
+    /// **THIS IS WHAT LETS A CALLER RECOGNIZE A PROBE BY THE SPECIFICATION RATHER THAN BY ITS
+    /// VENDOR.** CMSIS-DAP v2 requires this string to contain `CMSIS-DAP`, which is how a debug
+    /// interface is told apart from any other vendor-class interface -- a phone, a radio dongle, a
+    /// Lamella Link board -- without a hand-kept list of vendor ids that goes stale the first time
+    /// somebody ships a probe nobody wrote down.
+    ///
+    /// Every backend reads it from the OS's own device tree, so it costs no handle: the interface
+    /// node's bus-reported name on Windows, `kUSBString` on macOS, `.../interface` in sysfs on
+    /// Linux. `None` means the OS did not publish one, which is not the same as "not a probe" --
+    /// see `lamella-probe`, where that distinction is made.
+    pub interface_name: Option<String>,
 }
 
 /// Lists every connected vendor-bulk device -- a CMSIS-DAP v2 probe OR e.g. a Lamella Link board (both

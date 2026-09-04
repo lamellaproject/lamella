@@ -4,7 +4,7 @@
 # WOULD BE WITH ONE, which is a result rather than an oversight. Everything below -- the LED pins,
 # the virtual COM port's two cells, the operating point, the clock-enable routing -- is true of the
 # board whichever core is running, because the two cores share one pin map, one peripheral set and
-# one memory map. What is NOT board truth is which core an image is built for, and `board_model`
+# one memory map. What is NOT board truth is which core an image is built for, and `product_model`
 # does not move for it: a NUCLEO-H755ZI-Q is one physical thing whatever is executing on it. The
 # core an image selected is a property of the image.
 #
@@ -25,7 +25,7 @@ board = "nucleo-h755zi-q"
 vendor = "st"
 family = "stm32h7"
 part = "stm32h755zi"
-board_model = 32            # lamella_wire::board_model::NUCLEO_H755ZI_Q
+product_model = 32          # lamella_wire::product_model::NUCLEO_H755ZI_Q
 sources = [
     "UM2408 Rev 6 (STM32H7 Nucleo-144 boards, MB1363) Table 1: the NUCLEO-H755ZI-Q's board reference is MB1363 and its target STM32 is the STM32H755ZIT6, with Ethernet and cryptography as its differentiating features. Its codification section reads the -Q suffix as the STM32 having an internal SMPS function.",
     "UM2408 Rev 6 section 7.6 (LEDs): user LD1 is a green LED connected to PB0 with SB65 OFF and SB54 ON, or to PA5 with SB65 ON and SB54 OFF, corresponding to the ST Zio D13; user LD2 is a yellow LED connected to PE1; user LD3 is a red LED connected to PB14; and the section states outright that these user LEDs are on when the I/O is HIGH value and off when the I/O is LOW. Caution: LD3 cannot be used if Zio D65 is used, in which case R75 must be removed.",

@@ -8,9 +8,13 @@ BOARD_VENDOR = "Microchip"
 # Role handles: the ONLY peripheral names an app sees. The value of a
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
 # below, never through a surface-private enum.
+EXT1_ADC_P = "ext1-adc-p"
+EXT1_I2C = "ext1-i2c"
 
 CARRIER = {
     "kind": "edbg-vcp",
+    "usb_vid": 0x03EB,
+    "usb_pid": 0x2111,
 }
 
 # Per-role descriptor dicts, grouped by the role each belongs to.
@@ -22,25 +26,89 @@ CARRIER = {
 # it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
 # name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
+    "ext1-adc-p": {
+        "kind": "adc",
+        "driver_family": "same54-adc",
+        "instance": "adc1",
+        "adc_base": 0x43002000,
+        "gclk_pchctrl_reg": 0x40001D24,
+        "gclk_pchctrl_value": 0x40,
+        "apb_mask_reg": 0x40000820,
+        "apb_mask": 0x100,
+        "calib_reg": 0x43002048,
+        "nvm_calib_area": 0x800080,
+        "nvm_calib_lsb": 16,
+        "pmux_reg": 0x410080B2,
+        "pmux_mask": 0xF,
+        "pmux_value": 0x1,
+        "pincfg_reg": 0x410080C4,
+        "muxpos": 6,
+        "reference_uv": 3300000,
+    },
+    "ext1-i2c": {
+        "kind": "i2c",
+        "driver_family": "same54-sercom",
+        "instance": "sercom3",
+        "sercom_base": 0x41014000,
+        "gclk_pchctrl_reg": 0x40001CE0,
+        "gclk_pchctrl_value": 0x40,
+        "apb_mask_reg": 0x40000818,
+        "apb_mask": 0x400,
+        "pmux_reg": 0x4100803B,
+        "pmux_pair": 0x22,
+        "pincfg_sda_reg": 0x41008056,
+        "pincfg_scl_reg": 0x41008057,
+        "core_clock_hz": 48000000,
+    },
 }
 
 # The chip's instance map: every block this family places, with its base address and
 # the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
 # touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
 # controller, a reset controller -- and those are one per chip, so they are stated once here.
-# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+# Each row carries whatever this family's record declares -- a base always, and per-instance
+# facts like a clock channel or a bus-enable bit where the family states them. Register offsets
+# and bit encodings belong to the driver that knows the block, not here.
 INSTANCES = {
-    "mclk": {"block": "mclk", "base": 0x40000800},
-    "gclk": {"block": "gclk", "base": 0x40001C00},
-    "sercom2": {"block": "sercom", "base": 0x41012000},
-    "gmac": {"block": "gmac", "base": 0x42000800},
+    "mclk": {"block": "mclk", "base": 0x40000800, "apb_mask_offset": 0x14, "apb_bit": 0x2},
+    "gclk": {"block": "gclk", "base": 0x40001C00, "apb_mask_offset": 0x14, "apb_bit": 0x7},
+    "sercom0": {"block": "sercom", "base": 0x40003000, "gclk_core_id": 0x7, "apb_mask_offset": 0x14, "apb_bit": 0xC},
+    "sercom1": {"block": "sercom", "base": 0x40003400, "gclk_core_id": 0x8, "apb_mask_offset": 0x14, "apb_bit": 0xD},
+    "sercom2": {"block": "sercom", "base": 0x41012000, "gclk_core_id": 0x17, "apb_mask_offset": 0x18, "apb_bit": 0x9},
+    "sercom3": {"block": "sercom", "base": 0x41014000, "gclk_core_id": 0x18, "apb_mask_offset": 0x18, "apb_bit": 0xA},
+    "sercom4": {"block": "sercom", "base": 0x43000000, "gclk_core_id": 0x22, "apb_mask_offset": 0x20, "apb_bit": 0x0},
+    "sercom5": {"block": "sercom", "base": 0x43000400, "gclk_core_id": 0x23, "apb_mask_offset": 0x20, "apb_bit": 0x1},
+    "sercom6": {"block": "sercom", "base": 0x43000800, "gclk_core_id": 0x24, "apb_mask_offset": 0x20, "apb_bit": 0x2},
+    "sercom7": {"block": "sercom", "base": 0x43000C00, "gclk_core_id": 0x25, "apb_mask_offset": 0x20, "apb_bit": 0x3},
+    "adc0": {"block": "adc", "base": 0x43001C00, "gclk_core_id": 0x28, "apb_mask_offset": 0x20, "apb_bit": 0x7, "nvm_calib_lsb": 0x2},
+    "adc1": {"block": "adc", "base": 0x43002000, "gclk_core_id": 0x29, "apb_mask_offset": 0x20, "apb_bit": 0x8, "nvm_calib_lsb": 0x10},
+    "gmac": {"block": "gmac", "base": 0x42000800, "apb_mask_offset": 0x1C, "apb_bit": 0x2},
+    "porta": {"block": "port", "base": 0x41008000, "apb_mask_offset": 0x18, "apb_bit": 0x4},
+    "portb": {"block": "port", "base": 0x41008080, "apb_mask_offset": 0x18, "apb_bit": 0x4},
+    "portc": {"block": "port", "base": 0x41008100, "apb_mask_offset": 0x18, "apb_bit": 0x4},
+    "portd": {"block": "port", "base": 0x41008180, "apb_mask_offset": 0x18, "apb_bit": 0x4},
 }
 
 PLANS = {
+    "dfll48m-48mhz": {"default": True, "source": "dfll48m", "gclk0_hz": 48000000},
 }
 
 # On-board devices + module control lines: PORT group base + pin index + mask + polarity.
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
+    "led0": {"kind": "gpio-out", "port_base": 0x41008100, "pin": 18, "mask": 0x40000, "active_low": True},
+    "button0": {"kind": "gpio-in", "port_base": 0x41008080, "pin": 31, "mask": 0x80000000, "active_low": True},
+}
+
+# The sockets a removable module plugs into. The socket is board truth -- it is on the
+# schematic and identical on every unit -- and what is plugged into it is not, so no entry here
+# names a module. "buses" holds the roles a socket brings out whole; "pins" holds the single
+# lines, each under the standard's own name for that position. Which of a socket's protocols an
+# attached module speaks is a property of the module, so a board that offers several states all
+# of them and chooses none.
+CONNECTORS = {
+    "ext1": {"standard": "xplained-pro", "buses": {}, "pins": {"adc_p": {"port_base": 0x41008080, "pin": 4, "mask": 0x10}, "adc_n": {"port_base": 0x41008080, "pin": 5, "mask": 0x20}, "gpio1": {"port_base": 0x41008000, "pin": 6, "mask": 0x40}, "gpio2": {"port_base": 0x41008000, "pin": 7, "mask": 0x80}, "pwm_p": {"port_base": 0x41008080, "pin": 8, "mask": 0x100}, "pwm_n": {"port_base": 0x41008080, "pin": 9, "mask": 0x200}, "irq": {"port_base": 0x41008080, "pin": 7, "mask": 0x80}, "spi_ss_b": {"port_base": 0x41008000, "pin": 27, "mask": 0x8000000}, "i2c_sda": {"port_base": 0x41008000, "pin": 22, "mask": 0x400000}, "i2c_scl": {"port_base": 0x41008000, "pin": 23, "mask": 0x800000}, "uart_rx": {"port_base": 0x41008000, "pin": 5, "mask": 0x20}, "uart_tx": {"port_base": 0x41008000, "pin": 4, "mask": 0x10}, "spi_ss_a": {"port_base": 0x41008080, "pin": 28, "mask": 0x10000000}, "spi_mosi": {"port_base": 0x41008080, "pin": 27, "mask": 0x8000000}, "spi_miso": {"port_base": 0x41008080, "pin": 29, "mask": 0x20000000}, "spi_sck": {"port_base": 0x41008080, "pin": 26, "mask": 0x4000000}}},
+    "ext2": {"standard": "xplained-pro", "buses": {}, "pins": {"adc_p": {"port_base": 0x41008080, "pin": 0, "mask": 0x1}, "adc_n": {"port_base": 0x41008000, "pin": 3, "mask": 0x8}, "gpio1": {"port_base": 0x41008080, "pin": 1, "mask": 0x2}, "gpio2": {"port_base": 0x41008080, "pin": 6, "mask": 0x40}, "pwm_p": {"port_base": 0x41008080, "pin": 14, "mask": 0x4000}, "pwm_n": {"port_base": 0x41008080, "pin": 15, "mask": 0x8000}, "irq": {"port_base": 0x41008180, "pin": 0, "mask": 0x1}, "spi_ss_b": {"port_base": 0x41008080, "pin": 2, "mask": 0x4}, "i2c_sda": {"port_base": 0x41008180, "pin": 8, "mask": 0x100}, "i2c_scl": {"port_base": 0x41008180, "pin": 9, "mask": 0x200}, "uart_rx": {"port_base": 0x41008080, "pin": 17, "mask": 0x20000}, "uart_tx": {"port_base": 0x41008080, "pin": 16, "mask": 0x10000}, "spi_ss_a": {"port_base": 0x41008100, "pin": 6, "mask": 0x40}, "spi_mosi": {"port_base": 0x41008100, "pin": 4, "mask": 0x10}, "spi_miso": {"port_base": 0x41008100, "pin": 7, "mask": 0x80}, "spi_sck": {"port_base": 0x41008100, "pin": 5, "mask": 0x20}}},
+    "ext3": {"standard": "xplained-pro", "buses": {}, "pins": {"adc_p": {"port_base": 0x41008100, "pin": 2, "mask": 0x4}, "adc_n": {"port_base": 0x41008100, "pin": 3, "mask": 0x8}, "gpio1": {"port_base": 0x41008100, "pin": 1, "mask": 0x2}, "gpio2": {"port_base": 0x41008100, "pin": 10, "mask": 0x400}, "pwm_p": {"port_base": 0x41008180, "pin": 10, "mask": 0x400}, "pwm_n": {"port_base": 0x41008180, "pin": 11, "mask": 0x800}, "irq": {"port_base": 0x41008100, "pin": 30, "mask": 0x40000000}, "spi_ss_b": {"port_base": 0x41008100, "pin": 31, "mask": 0x80000000}, "i2c_sda": {"port_base": 0x41008180, "pin": 8, "mask": 0x100}, "i2c_scl": {"port_base": 0x41008180, "pin": 9, "mask": 0x200}, "uart_rx": {"port_base": 0x41008100, "pin": 23, "mask": 0x800000}, "uart_tx": {"port_base": 0x41008100, "pin": 22, "mask": 0x400000}, "spi_ss_a": {"port_base": 0x41008100, "pin": 14, "mask": 0x4000}, "spi_mosi": {"port_base": 0x41008100, "pin": 4, "mask": 0x10}, "spi_miso": {"port_base": 0x41008100, "pin": 7, "mask": 0x80}, "spi_sck": {"port_base": 0x41008100, "pin": 5, "mask": 0x20}}},
 }

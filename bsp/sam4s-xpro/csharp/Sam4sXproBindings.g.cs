@@ -7,5 +7,7 @@ namespace Lamella.Generated
 
         public const int BOARD_MODEL = 3;
         public const string BOARD_VENDOR = "Microchip";
+        public const uint CARRIER_USB_VID = 0x03EB;
+        public const uint CARRIER_USB_PID = 0x2111;
     }
 }

@@ -56,13 +56,19 @@ FACTS = {
 # the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
 # touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
 # controller, a reset controller -- and those are one per chip, so they are stated once here.
-# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+# Each row carries whatever this family's record declares -- a base always, and per-instance
+# facts like a clock channel or a bus-enable bit where the family states them. Register offsets
+# and bit encodings belong to the driver that knows the block, not here.
 INSTANCES = {
     "usart3": {"block": "usart", "base": 0x40004800, "rcc_en_off": 0xE8, "rcc_en_bit": 0x12},
+    "gpioa": {"block": "gpio", "base": 0x58020000, "rcc_en_off": 0xE0, "rcc_en_bit": 0x0},
     "gpiob": {"block": "gpio", "base": 0x58020400, "rcc_en_off": 0xE0, "rcc_en_bit": 0x1},
     "gpioc": {"block": "gpio", "base": 0x58020800, "rcc_en_off": 0xE0, "rcc_en_bit": 0x2},
     "gpiod": {"block": "gpio", "base": 0x58020C00, "rcc_en_off": 0xE0, "rcc_en_bit": 0x3},
     "gpioe": {"block": "gpio", "base": 0x58021000, "rcc_en_off": 0xE0, "rcc_en_bit": 0x4},
+    "gpiof": {"block": "gpio", "base": 0x58021400, "rcc_en_off": 0xE0, "rcc_en_bit": 0x5},
+    "gpiog": {"block": "gpio", "base": 0x58021800, "rcc_en_off": 0xE0, "rcc_en_bit": 0x6},
+    "gpioh": {"block": "gpio", "base": 0x58021C00, "rcc_en_off": 0xE0, "rcc_en_bit": 0x7},
     "gpioi": {"block": "gpio", "base": 0x58022000, "rcc_en_off": 0xE0, "rcc_en_bit": 0x8},
     "gpioj": {"block": "gpio", "base": 0x58022400, "rcc_en_off": 0xE0, "rcc_en_bit": 0x9},
     "gpiok": {"block": "gpio", "base": 0x58022800, "rcc_en_off": 0xE0, "rcc_en_bit": 0xA},

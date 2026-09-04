@@ -1,0 +1,20 @@
+[package]
+name = "lamella-decimal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The 96-bit System.Decimal kernel: the arithmetic, comparison, and floating-point conversions whose intermediates exceed 96 bits. no_std and allocation-free, so the interpreter and a compiled bare-metal image share one implementation rather than two that can disagree."
+publish = false
+
+[features]
+# The double conversions (`Decimal(double)` and `(double)dec`). Off leaves a decimal tier with no
+# floating point in it at all, which is a legal shape: decimal arithmetic itself never touches a
+# double, and a build with no float surface should not carry the conversion or the soft-float
+# helpers it reaches for.
+default = ["float"]
+float = []
+
+[lints]
+workspace = true

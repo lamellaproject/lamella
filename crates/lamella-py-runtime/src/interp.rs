@@ -8,7 +8,7 @@ use lamella_gc::Ref;
 use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Functions, Op, UnaryOp};
 
 use crate::bigint::BigInt;
-use crate::object::{DescriptorRead, DictViewKind, InlineCache, ObjectModel};
+use crate::object::{DescriptorRead, DictViewKind, HashUse, InlineCache, ObjectModel};
 #[cfg(feature = "gc-collect")]
 use crate::object::FinalizerSkip;
 use crate::trap::Trap;
@@ -65,10 +65,15 @@ pub struct Frame {
     /// `StoreDeref` / `LoadClosure` index it; empty for a function with no cell/free variables. Each
     /// slot is a `Cell` (a heap object), so all are GC roots (traced by [`Frame::trace`]).
     derefs: Vec<Value>,
-    /// The active class-body namespace dict while executing a `class` body (`SetupClassNamespace`
-    /// sets it, `StoreName`/`LoadName` target it, `BuildClass` consumes it), else `None`. A GC root
-    /// while set (traced by [`Frame::trace`]) so building the namespace cannot free it.
-    class_namespace: Option<Value>,
+    /// The class-body namespace dicts currently open, innermost LAST (`SetupClassNamespace` pushes,
+    /// `StoreName`/`LoadName` target the top, `BuildClass` pops). Empty outside a class body. GC roots
+    /// while open (traced by [`Frame::trace`]) so building a namespace cannot free it.
+    ///
+    /// >>> A STACK AND NOT ONE SLOT, because class bodies NEST: `class Outer:` containing
+    /// `class Inner:` runs the inner body while the outer's namespace is still open and still needs
+    /// every name already bound in it. With a single slot the inner `SetupClassNamespace` overwrote
+    /// the outer's, and everything the outer had defined before the nested class was lost. <<<
+    class_namespace: Vec<Value>,
     /// What the caller is owed when this frame returns, when that is something other than the value
     /// the frame returns -- an imported module, or the instance a `__init__` was called on. `None` for
     /// an ordinary call, which is most frames. **A GC root while set** (traced by [`Frame::trace`]):
@@ -85,6 +90,21 @@ pub struct Frame {
     /// reads it is decided by where the ip points. Two flags could only ever disagree, and the way
     /// they would disagree is a throw forwarded into the wrong sub.
     delegating: bool,
+}
+
+impl Frame {
+    /// Whether this generator/coroutine frame has run any of its body yet. See the throw case in
+    /// [`resume_generator`], which is the reason the question exists.
+    fn started(&self) -> bool {
+        self.ip != 0 || self.delegating
+    }
+
+    /// Whether this frame is suspended mid-DELEGATION -- inside an `await` or a `yield from` rather
+    /// than at a plain `yield`. See [`ObjectModel::generator_is_delegating`] for why an async
+    /// generator cannot work without the distinction.
+    pub(crate) fn is_delegating(&self) -> bool {
+        self.delegating
+    }
 }
 
 impl Frame {
@@ -107,7 +127,7 @@ impl Frame {
             caches,
             handled: Vec::new(),
             derefs: Vec::new(),
-            class_namespace: None,
+            class_namespace: Vec::new(),
             completes: None,
             delegating: false,
         }
@@ -123,7 +143,7 @@ impl Frame {
         self.caches.clear();
         self.handled.clear();
         self.derefs.clear();
-        self.class_namespace = None;
+        self.class_namespace.clear();
         self.completes = None;
         self.delegating = false;
     }
@@ -201,7 +221,7 @@ impl Frame {
         for entry in self.handled.iter_mut() {
             Value::trace_slot(&mut entry.exception, visit);
         }
-        if let Some(namespace) = self.class_namespace.as_mut() {
+        for namespace in self.class_namespace.iter_mut() {
             Value::trace_slot(namespace, visit);
         }
         match self.completes.as_mut() {
@@ -992,7 +1012,6 @@ pub(crate) fn elems_contain(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
-    model.require_hashable(needle)?;
     for &e in elements {
         if elem_eq(needle, e, functions, model, depth)? {
             return Ok(true);
@@ -1185,7 +1204,7 @@ pub(crate) fn dedup_pairs(
 ) -> Result<Vec<(Value, Value)>, Trap> {
     let mut out: Vec<(Value, Value)> = Vec::new();
     for (key, value) in pairs {
-        model.require_hashable(key)?;
+        model.require_hashable_as(key, HashUse::DictKey)?;
         let mut found = None;
         for (idx, (k, _)) in out.iter().enumerate() {
             if elem_eq(key, *k, functions, model, depth)? {
@@ -1695,14 +1714,18 @@ fn float_compare(op: CmpOp, a: Value, b: Value, model: &ObjectModel) -> Option<R
     if !model.is_float(a) && !model.is_float(b) {
         return None;
     }
-    let (x, y) = (model.as_f64(a)?, model.as_f64(b)?);
+    if model.as_f64(a).is_none() || model.as_f64(b).is_none() {
+        return None;
+    }
+    use core::cmp::Ordering;
+    let ordering = model.compare_numeric(a, b);
     let result = match op {
-        CmpOp::Lt => x < y,
-        CmpOp::Le => x <= y,
-        CmpOp::Eq => x == y,
-        CmpOp::Ne => x != y,
-        CmpOp::Gt => x > y,
-        CmpOp::Ge => x >= y,
+        CmpOp::Lt => ordering == Some(Ordering::Less),
+        CmpOp::Le => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+        CmpOp::Eq => ordering == Some(Ordering::Equal),
+        CmpOp::Ne => ordering != Some(Ordering::Equal),
+        CmpOp::Gt => ordering == Some(Ordering::Greater),
+        CmpOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
         CmpOp::Is | CmpOp::IsNot => unreachable!("is/is not handled in the Op::Compare path"),
     };
     Some(Ok(Value::from_bool(result)))
@@ -1714,6 +1737,121 @@ fn float_compare(op: CmpOp, a: Value, b: Value, model: &ObjectModel) -> Option<R
 #[cfg(not(feature = "float"))]
 fn float_compare(_op: CmpOp, _a: Value, _b: Value, _model: &ObjectModel) -> Option<Result<Value, Trap>> {
     None
+}
+
+/// `BaseExceptionGroup.split(condition)` -- the `(matched, rest)` partition PEP 654's `except*` is
+/// written in terms of, and the reason `except*` can be a pure desugar with no new opcode.
+///
+/// **The residual is the point.** A handler takes the part it matched and RE-RAISES `rest`, so a
+/// partition that computed only the matched half would turn a partly-handled group into a swallowed
+/// one -- silent, and the failure mode with no tell at all. Both halves are built here, together,
+/// out of the same walk.
+///
+/// Three behaviours were measured against CPython 3.14.6 rather than read off the PEP:
+///
+/// * **A group that matches AS A WHOLE is returned unchanged**, with its identity intact, and `rest`
+///   is `None`. `eg.split(ExceptionGroup)` and `eg.split(Exception)` both take this path, because the
+///   condition is asked about the GROUP before it is asked about any member.
+/// * **Nesting is preserved.** A member that is itself a group is recursed into, and each half comes
+///   back wearing the same shape it went in with -- so a handler can still see which sub-group a
+///   failure came from.
+/// * **An empty half is `None`, not an empty group**, which is what makes "is there anything left to
+///   re-raise" a single `is None` test. It also has to be: a group with no members cannot be built.
+///
+/// Each half is derived through the group's OWN `derive` (looked up as an attribute, so a subclass
+/// override is found), then given the original's `__cause__` / `__context__` / `__suppress_context__`
+/// -- which `derive` alone does not copy.
+fn split_exception_group(
+    group: Value,
+    condition: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<(Option<Value>, Option<Value>), Trap> {
+    if depth > MAX_CALL_DEPTH {
+        return Err(Trap::RecursionError);
+    }
+    if group_condition_matches(condition, group, functions, model, depth)? {
+        return Ok((Some(group), None));
+    }
+    let Some(members) = model.group_members(group) else {
+        return Err(Trap::TypeError);
+    };
+    let mut matched: Vec<Value> = Vec::new();
+    let mut rest: Vec<Value> = Vec::new();
+    for member in members {
+        if model.is_exception_group(member) {
+            let (m, r) = split_exception_group(member, condition, functions, model, depth + 1)?;
+            matched.extend(m);
+            rest.extend(r);
+        } else if group_condition_matches(condition, member, functions, model, depth)? {
+            matched.push(member);
+        } else {
+            rest.push(member);
+        }
+    }
+    let matched = derive_group_half(group, &matched, functions, model, depth)?;
+    let rest = derive_group_half(group, &rest, functions, model, depth)?;
+    Ok((matched, rest))
+}
+
+/// One half of a [`split_exception_group`]: `None` for an empty one, else the group's own `derive`
+/// called with the members, carrying the original's chaining metadata across.
+fn derive_group_half(
+    group: Value,
+    members: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let list = model.new_list(members.to_vec())?;
+    let derive = model.py_getattr_instance(group, "derive")?;
+    let half = call_value(derive, &[list], functions, model, depth + 1)?;
+    model.copy_group_metadata(group, half)?;
+    Ok(Some(half))
+}
+
+/// Whether `exception` satisfies a `split` / `subgroup` condition: an exception TYPE, a tuple of
+/// them, or a CALLABLE taking the exception and answering a bool. The callable form is the reason
+/// this lives on the interpreter side at all -- testing a member can run Python.
+fn group_condition_matches(
+    condition: Value,
+    exception: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    if model.is_exception_class(condition) {
+        return Ok(model.is_instance_of(exception, condition));
+    }
+    if model.is_tuple(condition) {
+        let elements = model.seq_value(condition).cloned().unwrap_or_default();
+        if elements.is_empty() || !elements.iter().all(|&e| model.is_exception_class(e)) {
+            return Err(group_condition_type_error(model));
+        }
+        return Ok(elements.iter().any(|&e| model.is_instance_of(exception, e)));
+    }
+    let builtin_type = condition
+        .as_builtin_id()
+        .and_then(crate::builtins::Builtin::from_id)
+        .is_some_and(crate::builtins::Builtin::is_type);
+    let callable = crate::builtins::value_is_callable(condition, model)
+        || model.find_dunder(condition, "__call__").is_some();
+    if model.is_class(condition) || builtin_type || !callable {
+        return Err(group_condition_type_error(model));
+    }
+    let verdict = call_value(condition, &[exception], functions, model, depth + 1)?;
+    py_truthy_dyn(verdict, functions, model, depth)
+}
+
+/// CPython's wording for a `split` / `subgroup` condition that is none of the three accepted shapes.
+fn group_condition_type_error(model: &mut ObjectModel) -> Trap {
+    let message =
+        "expected an exception type, a tuple of exception types, or a callable (other than a class)";
+    model.raise_named_exception("TypeError", message)
 }
 
 /// The maximum nesting of intra-module calls before the interpreter reports
@@ -1944,6 +2082,17 @@ enum Flow {
 enum DriveOutcome {
     Returned(Value),
     Yielded(Value),
+    /// The op budget ran out with the frame stack INTACT -- what makes `threading` preemptive.
+    ///
+    /// The stack is left exactly as it stood, so resuming is calling the driver again with the same
+    /// `frames`. That is the whole mechanism: a thread is a `Vec<Frame>`, and switching is choosing a
+    /// different one.
+    ///
+    /// **Only ever produced by the OUTERMOST loop.** A nested drive (a dunder, a `__new__`, a
+    /// generator resume) runs on a stack whose caller's frames it cannot see, so suspending there
+    /// would hand back half a thread; the budget is not even counted there. That is the same
+    /// condition the safe point uses and for the same reason.
+    Preempted,
 }
 
 /// Which code a [`Frame`] runs, held as an index rather than a borrow so a suspended frame (a
@@ -2060,6 +2209,22 @@ fn find_handler(exc_table: &[ExcEntry], ip: u32) -> Option<ExcEntry> {
 /// else a module-level global (a class or other top-level binding), else a built-in, else a built-in
 /// exception class (so `except IndexError` / `raise ValueError` find the type). `None` if unbound (a
 /// `NameError` at the use site). Shared by `LoadGlobal` and the outer fallback of `LoadName`.
+/// The source name behind a deref index, for a diagnostic that has to say which variable.
+///
+/// One index space covers two pools: `[0 .. cellvars.len())` are this frame's OWN cells and the rest
+/// are the cells it CAPTURED, so the split has to be applied rather than assumed. Reading the wrong
+/// pool would name a real, unrelated variable instead of failing -- the same shape as a substituted
+/// signature read against the wrong table.
+fn deref_name(code: &CodeObject, idx: u32) -> Option<&str> {
+    let idx = idx as usize;
+    let own = code.cellvars.len();
+    if idx < own {
+        code.cellvars.get(idx)
+    } else {
+        code.freevars.get(idx - own)
+    }
+}
+
 fn resolve_global(name: &str, functions: &Functions, model: &mut ObjectModel) -> Option<Value> {
     if let Some(pyfunc) = model.current_module_global(name).filter(|&g| model.is_py_function(g)) {
         Some(pyfunc)
@@ -2196,10 +2361,10 @@ fn new_suspended_call(
 ) -> Result<Value, Trap> {
     let module = pending.module;
     let suspended = new_planned_frame(pending, functions, model)?;
-    if pending.is_coroutine {
-        model.new_coroutine(suspended, module)
-    } else {
-        model.new_generator(suspended, module)
+    match (pending.is_generator, pending.is_coroutine) {
+        (true, true) => model.new_async_generator(suspended, module),
+        (_, true) => model.new_coroutine(suspended, module),
+        _ => model.new_generator(suspended, module),
     }
 }
 
@@ -2339,6 +2504,38 @@ pub(crate) fn call_value(
         let method_id = model.bound_method_id(callee);
         if method_id == crate::object::CALL_DUNDER {
             call_value(receiver, args, functions, model, depth)
+        } else if method_id == crate::object::EXC_GROUP_SPLIT
+            || method_id == crate::object::EXC_GROUP_SUBGROUP
+        {
+            let [condition] = args else {
+                let name = if method_id == crate::object::EXC_GROUP_SPLIT {
+                    "split"
+                } else {
+                    "subgroup"
+                };
+                let given = args.len();
+                let message = alloc::format!(
+                    "BaseExceptionGroup.{name}() takes exactly one argument ({given} given)"
+                );
+                return Err(model.raise_named_exception("TypeError", &message));
+            };
+            let (matched, rest) = split_exception_group(receiver, *condition, functions, model, depth)?;
+            if method_id == crate::object::EXC_GROUP_SUBGROUP {
+                return Ok(matched.unwrap_or(Value::NONE));
+            }
+            let pair = alloc::vec![matched.unwrap_or(Value::NONE), rest.unwrap_or(Value::NONE)];
+            model.new_tuple(pair)
+        } else if method_id == crate::object::EXC_GROUP_DERIVE {
+            let [members] = args else {
+                let given = args.len();
+                let message = alloc::format!(
+                    "BaseExceptionGroup.derive() takes exactly one argument ({given} given)"
+                );
+                return Err(model.raise_named_exception("TypeError", &message));
+            };
+            let message = model.group_message(receiver).unwrap_or(Value::NONE);
+            let elements = model.group_derive_members(*members)?;
+            model.new_exception_group(message, &elements)
         } else if method_id == crate::object::NEXT_DUNDER {
             match py_next_value(receiver, functions, model, depth)? {
                 Some(value) => Ok(value),
@@ -2377,6 +2574,8 @@ pub(crate) fn call_value(
             }
         } else if model.is_builtin_dunder_method(method_id) {
             model.call_bound_method(callee, args)
+        } else if model.is_async_generator(receiver) {
+            call_async_generator_method(receiver, method_id, args, model)
         } else if model.is_generator(receiver) || model.is_coroutine(receiver) {
             call_generator_method(receiver, method_id, args, functions, model, depth)
         } else if model.is_set(receiver) || model.is_frozenset(receiver) {
@@ -2971,6 +3170,18 @@ pub(crate) const GEN_THROW: u32 = 1;
 pub(crate) const GEN_CLOSE: u32 = 2;
 pub(crate) const GEN_NEXT: u32 = 3;
 
+pub(crate) const AGEN_AITER: u32 = 0;
+pub(crate) const AGEN_ANEXT: u32 = 1;
+pub(crate) const AGEN_ASEND: u32 = 2;
+pub(crate) const AGEN_ATHROW: u32 = 3;
+pub(crate) const AGEN_ACLOSE: u32 = 4;
+
+const AGEN_STEP_ANEXT: u32 = 0;
+const AGEN_STEP_ASEND: u32 = 1;
+const AGEN_STEP_ATHROW: u32 = 2;
+const AGEN_STEP_ACLOSE: u32 = 3;
+const AGEN_STEP_RESUMED: u32 = 4;
+
 /// The method id for a generator method `name` (`gen.send`/`.throw`/`.close`/`.__next__`), or
 /// `None`. Getattr binds these to the generator; [`call_generator_method`] dispatches them.
 pub(crate) fn generator_method_id(name: &str) -> Option<u32> {
@@ -2994,6 +3205,118 @@ pub(crate) fn coroutine_method_id(name: &str) -> Option<u32> {
         "throw" => Some(GEN_THROW),
         "close" => Some(GEN_CLOSE),
         _ => None,
+    }
+}
+
+/// The method id for an async generator method `name`, or `None`.
+///
+/// **Neither the generator's set nor the coroutine's**, and the differences are the ones a program
+/// sees. No `__next__` and no `send`: an async generator is not an iterator, so `for x in agen` and
+/// `next(agen)` are refused, exactly as CPython refuses them. The `a`-prefixed three are its own,
+/// and each returns an AWAITABLE rather than doing the work -- the `await` in front is what performs
+/// the step.
+pub(crate) fn async_generator_method_id(name: &str) -> Option<u32> {
+    match name {
+        "__aiter__" => Some(AGEN_AITER),
+        "__anext__" => Some(AGEN_ANEXT),
+        "asend" => Some(AGEN_ASEND),
+        "athrow" => Some(AGEN_ATHROW),
+        "aclose" => Some(AGEN_ACLOSE),
+        _ => None,
+    }
+}
+
+/// `agen.__aiter__()` / `.__anext__()` / `.asend(v)` / `.athrow(e)` / `.aclose()`.
+///
+/// **Four of the five do no work.** They package a pending step and hand it back, because that is
+/// what the surface means: `__anext__()` returns an AWAITABLE and the `await` in front of it performs
+/// the step. Doing the work here instead would be the one shape that cannot support an async
+/// generator that awaits anything -- there would be nowhere for its `await` to suspend to.
+fn call_async_generator_method(
+    agen: Value,
+    method_id: u32,
+    args: &[Value],
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    match method_id {
+        AGEN_AITER => {
+            if args.is_empty() {
+                Ok(agen)
+            } else {
+                Err(Trap::TypeError)
+            }
+        }
+        AGEN_ANEXT => match args {
+            [] => model.new_agen_step(agen, AGEN_STEP_ANEXT, Value::NONE),
+            _ => Err(Trap::TypeError),
+        },
+        AGEN_ASEND => match args {
+            [value] => model.new_agen_step(agen, AGEN_STEP_ASEND, *value),
+            _ => Err(Trap::TypeError),
+        },
+        AGEN_ATHROW => match args {
+            [raised] => {
+                let exc = model.raise_value(*raised)?;
+                model.new_agen_step(agen, AGEN_STEP_ATHROW, exc)
+            }
+            _ => Err(Trap::TypeError),
+        },
+        AGEN_ACLOSE => match args {
+            [] => model.new_agen_step(agen, AGEN_STEP_ACLOSE, Value::NONE),
+            _ => Err(Trap::TypeError),
+        },
+        _ => Err(Trap::AttributeError),
+    }
+}
+
+/// One step of an async generator, driven by the `await` in front of the awaitable that named it.
+///
+/// >>> **THE WHOLE DIFFICULTY IS THAT THE BODY SUSPENDS TWO WAYS AND BOTH LOOK THE SAME FROM
+/// OUTSIDE.** `yield x` produces an ITEM -- the value this `await` must evaluate to, ending the step.
+/// `await f()` inside the body produces something the EVENT LOOP has to wait on, which must keep
+/// travelling outward exactly as it does from an ordinary coroutine. Both leave the frame suspended
+/// with a value in hand. The frame itself is what tells them apart: an `await` leaves it DELEGATING
+/// and a plain `yield` does not. <<<
+///
+/// So `Returned` ends the await with the item, and `Yielded` passes the wait outward -- the same two
+/// outcomes every other delegation has, decided by a different question.
+fn advance_agen_step(
+    step: Value,
+    action: DelegateAction,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<DelegateStep, Trap> {
+    let agen = model.agen_step_target(step);
+    let kind = model.agen_step_kind(step);
+    let resume = if kind == AGEN_STEP_RESUMED {
+        match action {
+            DelegateAction::Send(value) => Resume::Send(value),
+            DelegateAction::Throw(exc) => Resume::Throw(exc),
+        }
+    } else {
+        model.set_agen_step_kind(step, AGEN_STEP_RESUMED);
+        match kind {
+            AGEN_STEP_ANEXT => Resume::Send(Value::NONE),
+            AGEN_STEP_ASEND => Resume::Send(model.agen_step_value(step)),
+            AGEN_STEP_ATHROW => Resume::Throw(model.agen_step_value(step)),
+            AGEN_STEP_ACLOSE => Resume::Close,
+            _ => return Err(Trap::Malformed),
+        }
+    };
+    let closing = kind == AGEN_STEP_ACLOSE;
+    let value = resume_generator(agen, resume, functions, model, depth + 1)?;
+    if value.is_stop() {
+        model.take_generator_return();
+        if closing {
+            return Ok(DelegateStep::Returned(Value::NONE));
+        }
+        return Err(model.raise_named_exception("StopAsyncIteration", ""));
+    }
+    if model.generator_is_delegating(agen) {
+        Ok(DelegateStep::Yielded(value))
+    } else {
+        Ok(DelegateStep::Returned(value))
     }
 }
 
@@ -3023,6 +3346,13 @@ fn resume_generator(
             };
         }
     };
+    if let (Resume::Throw(exc), false) = (&resume, frame.started()) {
+        let exc = *exc;
+        drop(frame);
+        model.end_generator_resume(generator);
+        model.set_pending_exception(exc);
+        return Err(Trap::Raised);
+    }
     let outcome = drive_taken_generator(generator, frame, resume, functions, model, depth);
     model.end_generator_resume(generator);
     outcome
@@ -3089,6 +3419,7 @@ fn drive_taken_generator(
     let outcome = drive(&mut frames, entry, gen_functions, model, depth + 1);
     model.set_current_module(saved_module);
     match outcome {
+        Ok(DriveOutcome::Preempted) => Err(Trap::Malformed),
         Ok(DriveOutcome::Yielded(value)) => {
             let suspended = frames.pop().ok_or(Trap::Malformed)?;
             if close_mode {
@@ -3207,6 +3538,9 @@ fn advance_delegate(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<DelegateStep, Trap> {
+    if model.is_agen_step(sub) {
+        return advance_agen_step(sub, action, functions, model, depth);
+    }
     if resumable {
         let resume = match action {
             DelegateAction::Send(value) => Resume::Send(value),
@@ -3249,6 +3583,9 @@ fn resolve_awaitable(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    if model.is_agen_step(awaitable) {
+        return Ok(awaitable);
+    }
     if model.is_coroutine(awaitable) {
         if !model.has_suspended_frame(awaitable) {
             let message = "cannot reuse already awaited coroutine";
@@ -3681,6 +4018,258 @@ fn new_frame(
 /// The explicit stack is bounded by [`MAX_CALL_DEPTH`] frames -> a catchable `RecursionError`;
 /// `depth` bounds the native callback recursion.
 #[allow(clippy::too_many_arguments)]
+/// The largest number of green threads the scheduler will run, matching `MAX_THREADS` in BOTH
+/// `tools/runtime/runtime-support{,-riscv}`.
+///
+/// **The two tiers must accept the SAME programs.** AOT threads carry preallocated native stacks at
+/// a fixed RAM address, so four is a hard property of that tier; interpreter green threads are heap
+/// objects with no natural cap, and an uncapped interpreter would run programs the AOT tier refuses
+/// -- the preview inverting in the deploy direction, which is the failure this whole design is shaped
+/// against.
+#[cfg(feature = "threading")]
+pub(crate) const MAX_THREADS: usize = 4;
+
+/// How many ops a thread runs before the scheduler switches, when more than one is live.
+///
+/// **Ops, not wall clock.** A device may have no clock at all, and an op count is identical on every
+/// board -- so an interleaving is reproducible rather than a property of how fast the part is. The
+/// value trades switch overhead against responsiveness; it is deliberately the same order as the
+/// CIL tier's documented 256-1024 so the two tiers interleave comparably.
+pub(crate) const THREAD_QUANTUM_OPS: u32 = 256;
+
+/// One green thread: a suspended call stack and what it is waiting for.
+///
+/// **A thread IS its `Vec<Frame>`**, which is the whole reason this tier can host threads at all --
+/// the driver already keeps the entire call chain there rather than on the native stack, so
+/// suspending one is not copying anything.
+struct PyThread {
+    /// The scheduler's own numbering; `0` is the main thread. Never reused while a thread is live.
+    id: u32,
+    frames: Vec<Frame>,
+    state: PyThreadState,
+    /// What the thread's function returned, once it has finished.
+    result: Option<Value>,
+}
+
+#[derive(PartialEq, Eq)]
+enum PyThreadState {
+    /// Runnable.
+    Ready,
+    #[cfg(feature = "threading")]
+    /// Blocked in `join`, waiting for the thread with this id to finish. Made `Ready` again by the
+    /// scheduler at the moment that thread goes `Done` -- so the wake is a consequence of the event
+    /// rather than a poll, and a joiner never runs to discover nothing has changed.
+    Joining(u32),
+    #[cfg(feature = "threading")]
+    /// Parked on something a Python object owns -- a `threading.Lock` it must be HANDED, or an
+    /// `Event` that must be set. Made `Ready` by an explicit wake from the seam that released or set
+    /// it; the reason is carried only so a deadlock report can say what the thread was waiting for.
+    Blocked(BlockReason),
+    /// Finished; `result` holds what it returned.
+    Done,
+}
+
+#[cfg(feature = "threading")]
+/// What a parked thread is waiting for, for the deadlock report's benefit.
+///
+/// The runtime deliberately knows no more than this: a lock's owner and its queue of waiters are an
+/// ordinary Python list on the lock object, so the runtime holds no lock table and a program that
+/// builds locks in a loop leaks nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockReason {
+    /// `threading.Lock.acquire` / `RLock.acquire` on a lock somebody else holds.
+    Lock,
+    /// `threading.Event.wait` before the flag is set.
+    Event,
+}
+
+#[cfg(feature = "threading")]
+impl BlockReason {
+    /// How the deadlock report names this wait.
+    fn describe(self) -> &'static str {
+        match self {
+            BlockReason::Lock => "waiting to acquire a lock",
+            BlockReason::Event => "waiting for an event to be set",
+        }
+    }
+}
+
+/// Runs a program with green threads: the entry stack is thread 0, and the scheduler rotates.
+///
+/// >>> THE COLLECTION RULE IS THE ONE THING HERE THAT IS NOT OBVIOUS. A safe point inside a driver
+/// loop can only see ITS OWN frames, so once more than one thread is live it defers rather than
+/// collects, and this loop performs the collection at a SWITCH -- the point where every stack is
+/// consistent and reachable. Collecting inline with several threads live would reclaim a thread's
+/// locals while it was merely not running. <<<
+///
+/// A program that never starts a thread runs as one slice of one thread, sets no quantum, and takes
+/// none of the paths below that a single thread cannot reach.
+fn run_scheduled(
+    entry: &CodeObject,
+    functions: &Functions,
+    first: Frame,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let mut threads: Vec<PyThread> = alloc::vec![PyThread {
+        id: 0,
+        frames: alloc::vec![first],
+        state: PyThreadState::Ready,
+        result: None,
+    }];
+    let mut cursor = 0usize;
+    loop {
+        materialize_spawns(&mut threads, functions, model)?;
+        #[cfg(feature = "threading")]
+        for id in model.take_pending_wakes() {
+            for thread in threads.iter_mut() {
+                if thread.id == id && matches!(thread.state, PyThreadState::Blocked(_)) {
+                    thread.state = PyThreadState::Ready;
+                }
+            }
+        }
+        model.set_live_thread_count(live_count(&threads));
+        let Some(index) = next_ready_thread(&threads, cursor) else {
+            #[cfg(feature = "threading")]
+            if live_count(&threads) > 0 {
+                report_deadlock(&threads, model);
+                return Err(Trap::Deadlock);
+            }
+            break;
+        };
+        if live_count(&threads) > 1 {
+            model.set_thread_quantum(THREAD_QUANTUM_OPS);
+        }
+        model.set_current_thread_id(threads[index].id);
+        let outcome = drive(&mut threads[index].frames, entry, functions, model, depth);
+        match outcome? {
+            DriveOutcome::Returned(value) => {
+                #[cfg(feature = "threading")]
+                let finished = threads[index].id;
+                threads[index].state = PyThreadState::Done;
+                threads[index].result = Some(value);
+                #[cfg(feature = "threading")]
+                for thread in threads.iter_mut() {
+                    if thread.state == PyThreadState::Joining(finished) {
+                        thread.state = PyThreadState::Ready;
+                    }
+                }
+                cursor = index + 1;
+            }
+            DriveOutcome::Preempted => {
+                #[cfg(feature = "threading")]
+                if let Some(reason) = model.take_pending_block() {
+                    threads[index].state = PyThreadState::Blocked(reason);
+                }
+                #[cfg(feature = "threading")]
+                if let Some(target) = model.take_pending_join() {
+                    materialize_spawns(&mut threads, functions, model)?;
+                    let pending = threads
+                        .iter()
+                        .any(|thread| thread.id == target && thread.state != PyThreadState::Done);
+                    if pending {
+                        threads[index].state = PyThreadState::Joining(target);
+                    }
+                }
+                cursor = index + 1;
+            }
+            DriveOutcome::Yielded(_) => return Err(Trap::Malformed),
+        }
+        #[cfg(feature = "gc-collect")]
+        if model.take_deferred_collect() {
+            model.collect(&mut |visit| {
+                for thread in threads.iter_mut() {
+                    for frame in thread.frames.iter_mut() {
+                        frame.trace(visit);
+                    }
+                }
+            });
+        }
+    }
+    model.set_live_thread_count(0);
+    Ok(threads.into_iter().next().and_then(|t| t.result).unwrap_or(Value::NONE))
+}
+
+/// Materializes every thread asked for since the last drain, giving each the stack it needs to run.
+///
+/// **The scheduler is the only party that can do this**, which is why the seam raises a request
+/// instead: a driver loop cannot reach the thread table it is being driven from. Same split the C#
+/// tier uses, for the same reason.
+fn materialize_spawns(
+    threads: &mut Vec<PyThread>,
+    functions: &Functions,
+    model: &mut ObjectModel,
+) -> Result<(), Trap> {
+    for (id, callable, args) in model.take_pending_spawns() {
+        let frame = new_thread_frame(callable, args, functions, model)?;
+        threads.push(PyThread { id, frames: alloc::vec![frame], state: PyThreadState::Ready, result: None });
+    }
+    Ok(())
+}
+
+/// The first frame of a spawned thread: `callable(*args)`, resolved the way a call site resolves it.
+///
+/// A thread's target must be a plain Python function. A builtin has no frame to suspend, and a
+/// bound method or a callable instance would need a call the scheduler cannot make on somebody's
+/// behalf -- so those are refused BY NAME here rather than started and then found unrunnable.
+fn new_thread_frame(
+    callable: Value,
+    args: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+) -> Result<Frame, Trap> {
+    let argv: Vec<Value> = model.seq_value(args).cloned().unwrap_or_default();
+    let home = model.function_home(callable);
+    let (index, cells) = if let Some(index) = callable.as_function_index() {
+        (index, Vec::new())
+    } else if model.is_py_function(callable) {
+        (model.py_function_index(callable), model.py_function_cells(callable))
+    } else {
+        return Err(Trap::Malformed);
+    };
+    let home_funcs = model.managed_functions_rc(home);
+    let code_funcs: &Functions = home_funcs.as_deref().unwrap_or(functions);
+    let code = code_funcs.get(index as usize).ok_or(Trap::Malformed)?.clone();
+    new_frame(&code, CodeId::Func(index), &argv, false, &cells, home, model)
+}
+
+/// How many threads have not finished.
+fn live_count(threads: &[PyThread]) -> u32 {
+    threads.iter().filter(|t| t.state != PyThreadState::Done).count() as u32
+}
+
+/// The next runnable thread at or after `start`, round-robin. `None` when none is runnable.
+fn next_ready_thread(threads: &[PyThread], start: usize) -> Option<usize> {
+    let count = threads.len();
+    (0..count)
+        .map(|offset| (start + offset) % count)
+        .find(|&index| threads[index].state == PyThreadState::Ready)
+}
+
+/// Reports a join deadlock on `sys.stderr`, naming every blocked thread and what it is waiting for.
+///
+/// >>> THE BARE TRAP NAMES THE FAILURE WITHOUT LOCATING IT. "Deadlock" tells its reader that the
+/// program stopped and nothing about which wait did not end; the cycle is two or three lines and it
+/// is the whole diagnosis. Same conclusion the ahead-of-time tier reached -- it prints a marker
+/// before halting rather than spinning a scheduler that can never progress again. <<<
+#[cfg(feature = "threading")]
+fn report_deadlock(threads: &[PyThread], model: &mut ObjectModel) {
+    model
+        .write_stderr("threading: every live thread is waiting for another one; none can run again\n");
+    for thread in threads {
+        let id = thread.id;
+        match thread.state {
+            PyThreadState::Joining(target) => {
+                model.write_stderr(&alloc::format!("  thread {id} is joining thread {target}\n"));
+            }
+            PyThreadState::Blocked(reason) => {
+                model.write_stderr(&alloc::format!("  thread {id} is {}\n", reason.describe()));
+            }
+            PyThreadState::Ready | PyThreadState::Done => {}
+        }
+    }
+}
+
 fn run_frames(
     entry: &CodeObject,
     functions: &Functions,
@@ -3695,19 +4284,20 @@ fn run_frames(
         return Err(Trap::RecursionError);
     }
     let saved_module = model.set_current_module(module_id);
-    let mut frames: Vec<Frame> = Vec::new();
     let outcome = match new_frame(entry, CodeId::Entry, args, is_module, cells, module_id, model) {
+        Ok(frame) if !model.is_driving() => run_scheduled(entry, functions, frame, model, depth),
         Ok(frame) => {
-            frames.push(frame);
-            drive(&mut frames, entry, functions, model, depth)
+            let mut frames: Vec<Frame> = alloc::vec![frame];
+            match drive(&mut frames, entry, functions, model, depth) {
+                Ok(DriveOutcome::Returned(value)) => Ok(value),
+                Ok(DriveOutcome::Preempted | DriveOutcome::Yielded(_)) => Err(Trap::Malformed),
+                Err(trap) => Err(trap),
+            }
         }
         Err(trap) => Err(trap),
     };
     model.set_current_module(saved_module);
-    match outcome? {
-        DriveOutcome::Returned(value) => Ok(value),
-        DriveOutcome::Yielded(_) => Err(Trap::Malformed),
-    }
+    outcome
 }
 
 /// Runs the explicit frame stack `frames` (seeded by the caller) until its bottom frame returns
@@ -3728,20 +4318,22 @@ fn drive(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<DriveOutcome, Trap> {
-    #[cfg(feature = "gc-collect")]
     let outermost = model.enter_drive();
-    #[cfg(not(feature = "gc-collect"))]
-    let outermost = false;
     let outcome = drive_frames(frames, entry, functions, model, depth, outermost);
-    #[cfg(feature = "gc-collect")]
     model.leave_drive();
     outcome
 }
 
-/// The loop itself. `outermost` says whether this is the only driver loop running, which is what the
-/// safe point requires; [`drive`] is the only caller and computes it. Without the collector there is no
-/// safe point, so nothing reads it.
-#[cfg_attr(not(feature = "gc-collect"), allow(unused_variables))]
+/// The loop itself. `outermost` says whether this is the only driver loop running -- the fact the
+/// collector's safe point requires AND the fact a thread switch requires, for the same reason:
+/// `frames` is every frame there is only when nothing is driving underneath. [`drive`] is the only
+/// caller and computes it.
+///
+/// **Read on EVERY tier, not only where the collector is on.** It gates the preemption budget and
+/// the park check below, both of which `threading` needs and neither of which is a `gc-collect`
+/// construct -- so a build with the collector compiled out still takes turns. That property is
+/// asserted by `tests/preemption_without_the_collector.rs`, which compiles only when the feature is
+/// off, because nothing in a default build can fail when it stops holding.
 fn drive_frames(
     frames: &mut Vec<Frame>,
     entry: &CodeObject,
@@ -3753,14 +4345,29 @@ fn drive_frames(
     let mut current_module = u16::MAX;
     let mut home_funcs: Option<Rc<Functions>> = None;
     let mut home_body: Option<Rc<CodeObject>> = None;
+    let mut budget = if outermost { model.take_thread_quantum() } else { None };
     loop {
         #[cfg(feature = "gc-collect")]
         if outermost && model.under_memory_pressure() {
-            model.collect(&mut |visit| {
-                for frame in frames.iter_mut() {
-                    frame.trace(visit);
-                }
-            });
+            if model.live_thread_count() <= 1 {
+                model.collect(&mut |visit| {
+                    for frame in frames.iter_mut() {
+                        frame.trace(visit);
+                    }
+                });
+            } else {
+                model.request_collect();
+            }
+        }
+        if let Some(remaining) = budget.as_mut() {
+            if *remaining == 0 {
+                return Ok(DriveOutcome::Preempted);
+            }
+            *remaining -= 1;
+        }
+        #[cfg(feature = "threading")]
+        if outermost && model.has_pending_park() {
+            return Ok(DriveOutcome::Preempted);
         }
         #[cfg(feature = "gc-collect")]
         if outermost && model.has_pending_finalizers() && push_next_finalizer(frames, functions, model)
@@ -3803,14 +4410,22 @@ fn drive_frames(
                 frame.push(value);
             }
             Op::LoadFast(idx) => {
-                let value = if frame.is_module {
+                let loaded = if frame.is_module {
                     let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
                     match model.current_module_global(name) {
-                        Some(value) => value,
-                        None => frame.load_local(idx as usize)?,
+                        Some(value) => Ok(value),
+                        None => frame.load_local(idx as usize),
                     }
                 } else {
-                    frame.load_local(idx as usize)?
+                    frame.load_local(idx as usize)
+                };
+                let value = match loaded {
+                    Ok(value) => value,
+                    Err(Trap::UnboundLocal) => {
+                        let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
+                        return Err(model.unbound_local_error(name));
+                    }
+                    Err(trap) => return Err(trap),
                 };
                 frame.push(value);
             }
@@ -3824,13 +4439,23 @@ fn drive_frames(
             }
             Op::LoadGlobal(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
-                let value = resolve_global(name, functions, model).ok_or(Trap::NameError)?;
+                let value = match resolve_global(name, functions, model) {
+                    Some(value) => value,
+                    None => return Err(model.name_error(name)),
+                };
                 frame.push(value);
             }
             Op::StoreGlobal(name_idx) => {
                 let value = frame.pop()?;
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
                 model.set_current_module_global(name, value);
+            }
+            Op::DeleteGlobal(name_idx) => {
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                if !model.delete_current_module_global(name) {
+                    let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                    return Err(model.name_error(name));
+                }
             }
             Op::LoadAttr { site } => {
                 let [name, cache] = *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
@@ -4001,9 +4626,23 @@ fn drive_frames(
                     let result = call_value(method, &[element], functions, model, depth + 1)?;
                     model.py_truthy(result)?.unwrap_or(false)
                 } else if model.is_set(container) || model.is_frozenset(container) {
+                    model.require_hashable_as(element, HashUse::SetElement)?;
                     let elems = model.set_value(container).ok_or(Trap::TypeError)?.clone();
                     elems_contain(element, &elems, functions, model, depth)?
                 } else if model.is_dict_view(container) {
+                    match model.dict_view_kind(container) {
+                        Some(DictViewKind::Keys) => {
+                            model.require_hashable_as(element, HashUse::DictKey)?;
+                        }
+                        Some(DictViewKind::Items) => {
+                            let key = model
+                                .seq_value(element)
+                                .and_then(|xs| xs.first().copied())
+                                .unwrap_or(element);
+                            model.require_hashable_as(key, HashUse::DictKey)?;
+                        }
+                        _ => {}
+                    }
                     let elems = model.dict_view_elems(container)?.unwrap_or_default();
                     elems_contain(element, &elems, functions, model, depth)?
                 } else if model.is_deque(container) {
@@ -4146,7 +4785,10 @@ fn drive_frames(
             }
             Op::MakeFunction { func, flags } => {
                 let name = code.names.get(func as usize).ok_or(Trap::Malformed)?;
-                let index = functions.position(name).ok_or(Trap::NameError)? as u32;
+                let Some(index) = functions.position(name) else {
+                    return Err(model.name_error(name));
+                };
+                let index = index as u32;
                 let home = model.current_module();
                 if flags == 0 {
                     frame.push(Value::function_ref_in_module(home, index));
@@ -4348,23 +4990,36 @@ fn drive_frames(
             }
             Op::SetupClassNamespace => {
                 let namespace = model.new_dict(Vec::new())?;
-                frame.class_namespace = Some(namespace);
+                frame.class_namespace.push(namespace);
             }
             Op::StoreName(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
                 let value = frame.pop()?;
-                let namespace = frame.class_namespace.ok_or(Trap::Malformed)?;
+                let namespace = frame.class_namespace.last().copied().ok_or(Trap::Malformed)?;
                 let key = model.new_str(name)?;
                 model.py_setitem(namespace, key, value)?;
+            }
+            Op::DeleteName(name_idx) => {
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                let namespace = frame.class_namespace.last().copied().ok_or(Trap::Malformed)?;
+                if model.dict_get_str(namespace, name).is_none() {
+                    return Err(model.name_error(name));
+                }
+                let key = model.new_str(name)?;
+                model.py_delitem(namespace, key)?;
             }
             Op::LoadName(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
                 let from_namespace = frame
                     .class_namespace
-                    .and_then(|namespace| model.dict_get_str(namespace, name));
+                    .last()
+                    .and_then(|namespace| model.dict_get_str(*namespace, name));
                 let value = match from_namespace {
                     Some(value) => value,
-                    None => resolve_global(name, functions, model).ok_or(Trap::NameError)?,
+                    None => match resolve_global(name, functions, model) {
+                        Some(value) => value,
+                        None => return Err(model.name_error(name)),
+                    },
                 };
                 frame.push(value);
             }
@@ -4380,8 +5035,23 @@ fn drive_frames(
             Op::ImportFrom(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
                 let module = frame.peek()?;
-                let value = model.import_from(module, name)?;
-                frame.push(value);
+                if let Some(value) = model.module_member(module, name) {
+                    frame.push(value);
+                } else if let Some(dotted) = model.submodule_path(module, name) {
+                    match begin_import(&dotted, model)? {
+                        ImportOutcome::Ready(_) => {
+                            let value = model.import_from(module, name)?;
+                            frame.push(value);
+                        }
+                        ImportOutcome::RunBody { module_id, mut completion } => {
+                            completion.handback = ImportHandback::ReenterImport;
+                            return Ok(Flow::ImportBody { module_id, completion });
+                        }
+                    }
+                } else {
+                    let value = model.import_from(module, name)?;
+                    frame.push(value);
+                }
             }
             Op::ImportStar => {
                 let module = frame.pop()?;
@@ -4392,7 +5062,7 @@ fn drive_frames(
                     Some(Const::KwNames(names)) => names.clone(),
                     _ => return Err(Trap::Malformed),
                 };
-                let namespace = match frame.class_namespace.take() {
+                let namespace = match frame.class_namespace.pop() {
                     Some(namespace) => namespace,
                     None => frame.pop()?,
                 };
@@ -4425,7 +5095,7 @@ fn drive_frames(
                 frame.push(class);
             }
             Op::BuildClass => {
-                let namespace = match frame.class_namespace.take() {
+                let namespace = match frame.class_namespace.pop() {
                     Some(namespace) => namespace,
                     None => frame.pop()?,
                 };
@@ -4564,12 +5234,25 @@ fn drive_frames(
             }
             Op::LoadDeref(idx) => {
                 let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
-                frame.push(model.cell_get(cell)?);
+                let value = model.cell_get(cell)?;
+                if value.is_unbound() {
+                    let name = deref_name(code, idx).ok_or(Trap::Malformed)?;
+                    return Err(model.free_variable_error(name));
+                }
+                frame.push(value);
             }
             Op::StoreDeref(idx) => {
                 let value = frame.pop()?;
                 let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
                 model.cell_set(cell, value)?;
+            }
+            Op::DeleteDeref(idx) => {
+                let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
+                if model.cell_get(cell)?.is_unbound() {
+                    let name = deref_name(code, idx).ok_or(Trap::Malformed)?;
+                    return Err(model.free_variable_error(name));
+                }
+                model.cell_set(cell, Value::UNBOUND)?;
             }
             Op::LoadClosure(idx) => {
                 let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
@@ -4795,6 +5478,97 @@ mod tests {
         assert!(f2.locals.iter().all(|v| v.is_unbound()));
         assert_eq!(f2.locals.capacity(), cap);
         assert!(model.take_pooled_frame().is_none());
+    }
+
+    /// >>> THE PREEMPTION MECHANISM, AND THE PROPERTY THAT MAKES IT A THREAD SWITCH RATHER THAN A
+    /// PAUSE: a stack interrupted and resumed computes what it would have computed uninterrupted.
+    /// <<<
+    ///
+    /// `threading` is preemptive here: a Python thread gives up the interpreter whether or not it
+    /// cooperates. This is that giving-up, at its smallest -- run a counting loop to completion once,
+    /// then run the SAME program on a one-op budget, handing the budget back on every `Preempted`
+    /// until it finishes.
+    ///
+    /// **Both answers must be identical and the second must have taken many slices.** The second half
+    /// is what stops this passing vacuously -- a budget that never fired would give the same answer
+    /// in one slice and look exactly like success.
+    #[test]
+    fn a_preempted_stack_resumes_to_the_same_answer() {
+        let ops = vec![
+            Op::LoadConst(0),
+            Op::StoreFast(0),
+            Op::LoadConst(0),
+            Op::StoreFast(1),
+            Op::LoadFast(1),
+            Op::LoadConst(1),
+            Op::Compare(CmpOp::Lt),
+            Op::PopJumpIfFalse(17),
+            Op::LoadFast(0),
+            Op::LoadFast(1),
+            Op::Binary(BinOp::Add),
+            Op::StoreFast(0),
+            Op::LoadFast(1),
+            Op::LoadConst(2),
+            Op::Binary(BinOp::Add),
+            Op::StoreFast(1),
+            Op::Jump(4),
+            Op::LoadFast(0),
+            Op::Return,
+        ];
+        let consts = vec![Const::Int(0), Const::Int(20), Const::Int(1)];
+        let c = code(2, 0, consts, vec![], 0, ops);
+        let functions = Functions::default();
+
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let whole = run(&c, &functions, &[], &mut model).unwrap();
+
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let mut frames: Vec<Frame> = Vec::new();
+        frames.push(new_frame(&c, CodeId::Entry, &[], false, &[], 0, &mut model).unwrap());
+        let mut slices = 0;
+        let sliced = loop {
+            model.set_thread_quantum(1);
+            match drive(&mut frames, &c, &functions, &mut model, 0).unwrap() {
+                DriveOutcome::Preempted => {
+                    slices += 1;
+                    assert!(slices < 10_000, "the loop never finished under a budget");
+                }
+                DriveOutcome::Returned(value) => break value,
+                DriveOutcome::Yielded(_) => panic!("a plain function cannot yield"),
+            }
+        };
+
+        assert_eq!(model.as_i128(whole), Some(190));
+        assert_eq!(model.as_i128(sliced), model.as_i128(whole));
+        assert!(slices > 50, "expected many slices on a one-op budget, got {slices}");
+    }
+
+    /// A budget applies to ONE drive and does not leak into the next.
+    ///
+    /// Not tidiness: the next drive may be a NESTED one (a dunder, a `__new__`), which cannot be
+    /// preempted at all -- so a budget that survived would suspend a stack whose caller's frames it
+    /// cannot see. Taking it at the top of the drive makes that impossible rather than unlikely.
+    #[test]
+    fn a_quantum_is_consumed_by_the_drive_it_was_set_for() {
+        let mut model = no_objects();
+        model.set_thread_quantum(4);
+        assert_eq!(model.take_thread_quantum(), Some(4));
+        assert_eq!(model.take_thread_quantum(), None, "a quantum must not survive its slice");
+    }
+
+    /// The outermost-loop fact the switch point needs is maintained on EVERY tier, not only where the
+    /// collector is on.
+    ///
+    /// A build with the collector off must still be able to preempt: a configuration that accepts a
+    /// thread and then cannot switch it is the one shape this design refuses to ship.
+    #[test]
+    fn the_outermost_drive_is_counted_without_the_collector() {
+        let mut model = no_objects();
+        assert!(model.enter_drive(), "the first drive is the outermost one");
+        assert!(!model.enter_drive(), "a nested drive is not");
+        model.leave_drive();
+        model.leave_drive();
+        assert!(model.enter_drive(), "the counter returns to zero on the way out");
     }
 
     #[test]
@@ -5098,6 +5872,89 @@ mod tests {
         model.set_global("count", Value::fixnum(42).unwrap());
         let result = run_module(&body, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(42));
+    }
+
+
+    #[test]
+    fn delete_global_unbinds_the_module_name_and_a_later_read_raises() {
+        use Op::*;
+        let names = || vec![String::from("g")];
+        let consts = || vec![Const::Int(1)];
+        let bound = code(0, 0, consts(), names(), 0, vec![LoadConst(0), StoreGlobal(0), LoadGlobal(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let got = run(&bound, &Functions::default(), &[], &mut model).unwrap();
+        assert_eq!(got.as_fixnum(), Some(1));
+
+        let deleted = code(0, 0, consts(), names(), 0, vec![LoadConst(0), StoreGlobal(0), DeleteGlobal(0), LoadGlobal(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&deleted, &Functions::default(), &[], &mut model), Err(Trap::NameError));
+    }
+
+    #[test]
+    fn deleting_an_unbound_global_raises_rather_than_succeeding_quietly() {
+        use Op::*;
+        let co = code(0, 0, vec![Const::Int(0)], vec![String::from("g")], 0, vec![DeleteGlobal(0), LoadConst(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&co, &Functions::default(), &[], &mut model), Err(Trap::NameError));
+    }
+
+    #[test]
+    fn delete_deref_empties_the_shared_cell_and_a_read_through_it_raises() {
+        use Op::*;
+        let args = [Value::fixnum(5).unwrap()];
+        let mut ok = code(1, 1, Vec::new(), Vec::new(), 0, vec![LoadDeref(0), Return]);
+        ok.cellvars = ["v0"].into_iter().collect();
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let got = run(&ok, &Functions::default(), &args, &mut model).unwrap();
+        assert_eq!(got.as_fixnum(), Some(5));
+
+        let mut co = code(1, 1, Vec::new(), Vec::new(), 0, vec![DeleteDeref(0), LoadDeref(0), Return]);
+        co.cellvars = ["v0"].into_iter().collect();
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&co, &Functions::default(), &args, &mut model), Err(Trap::NameError));
+    }
+
+    #[test]
+    fn reading_a_cell_that_was_never_filled_raises_instead_of_pushing_the_sentinel() {
+        use Op::*;
+        let mut co = code(1, 0, Vec::new(), Vec::new(), 0, vec![LoadDeref(0), Return]);
+        co.cellvars = ["v0"].into_iter().collect();
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&co, &Functions::default(), &[], &mut model), Err(Trap::NameError));
+    }
+
+    #[test]
+    fn deleting_an_already_empty_cell_raises() {
+        use Op::*;
+        let mut co = code(1, 0, Vec::new(), Vec::new(), 0, vec![DeleteDeref(0), Return]);
+        co.cellvars = ["v0"].into_iter().collect();
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&co, &Functions::default(), &[], &mut model), Err(Trap::NameError));
+    }
+
+    #[test]
+    fn delete_name_unbinds_in_the_class_body_namespace() {
+        use Op::*;
+        let consts = || vec![Const::Int(1)];
+        let names = || vec![String::from("x")];
+        let ok = code(0, 0, consts(), names(), 0, vec![SetupClassNamespace, LoadConst(0), StoreName(0), LoadName(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let got = run(&ok, &Functions::default(), &[], &mut model).unwrap();
+        assert_eq!(got.as_fixnum(), Some(1));
+
+        let co = code(0, 0, consts(), names(), 0, vec![SetupClassNamespace, LoadConst(0), StoreName(0), DeleteName(0), LoadName(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&co, &Functions::default(), &[], &mut model), Err(Trap::NameError));
+    }
+
+    #[test]
+    fn delete_name_does_not_reach_outward_to_a_global_the_body_can_only_read() {
+        use Op::*;
+        let co = code(0, 0, Vec::new(), vec![String::from("x")], 0, vec![SetupClassNamespace, DeleteName(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        model.set_global("x", Value::fixnum(7).unwrap());
+        assert_eq!(run(&co, &Functions::default(), &[], &mut model), Err(Trap::NameError));
+        assert_eq!(model.current_module_global("x").and_then(|v| v.as_fixnum()), Some(7));
     }
 
     #[test]

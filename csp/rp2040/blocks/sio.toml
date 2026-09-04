@@ -1,0 +1,56 @@
+# BLOCK layout: the RP2040 single-cycle IO block's user-bank GPIO registers -- the CPU's direct
+# pin drive. Offsets are instance-base-relative (the `sio` instance row at 0xd0000000).
+#
+# THESE OFFSETS ARE NOT THE RP2350's AND THE TWO MUST NEVER BE SHARED. The RP2350 interleaves a
+# second bank (GP32..47) into the same map, which moves every register after GPIO_IN: its GPIO_OE
+# is at 0x30 where this part's is at 0x20, and this part's 0x30 is GPIO_HI_OUT -- the QSPI bank.
+# A driver built on the sibling's offsets would drive the flash pins while asking for an output
+# enable.
+#
+# The QSPI-bank rows (GPIO_HI_*, 0x030..0x04c) and the inter-core FIFO and spinlock rows are
+# deliberately absent: nothing reaches them, and a block table states what is evidenced rather
+# than what the map contains.
+
+[table]
+kind = "block"
+family = "rp2040"
+block = "sio"
+sources = ["RP2040 datasheet 2.3.1.7 Table 16 (List of SIO registers), cross-checked against each register's own section 2.3.1.7"]
+notes = [
+    "OUT/OE have dedicated SET/CLR/XOR views -- atomic bit operations, no read-modify-write.",
+    "A pin reaches the SIO only through IO_BANK0 funcsel 5; the input is always connected, so a read works whatever function is selected.",
+]
+
+[registers.GPIO_IN]
+offset = 0x004
+width = 32
+notes = "All 30 user-bank GPIO values in one read. GPIO_HI_IN at 0x008 is the QSPI bank and is a different set of pins."
+
+[registers.GPIO_OUT]
+offset = 0x010
+width = 32
+
+[registers.GPIO_OUT_SET]
+offset = 0x014
+width = 32
+
+[registers.GPIO_OUT_CLR]
+offset = 0x018
+width = 32
+
+[registers.GPIO_OUT_XOR]
+offset = 0x01C
+width = 32
+notes = "The atomic hardware toggle."
+
+[registers.GPIO_OE]
+offset = 0x020
+width = 32
+
+[registers.GPIO_OE_SET]
+offset = 0x024
+width = 32
+
+[registers.GPIO_OE_CLR]
+offset = 0x028
+width = 32

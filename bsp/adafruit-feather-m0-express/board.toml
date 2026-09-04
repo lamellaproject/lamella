@@ -13,7 +13,7 @@ board = "feather-m0-express"
 vendor = "adafruit"
 family = "samd21"
 part = "atsamd21g18a"
-board_model = 16            # lamella_wire::board_model::FEATHER_M0_EXPRESS
+product_model = 16          # lamella_wire::product_model::FEATHER_M0_EXPRESS
 sources = [
     "Adafruit Feather M0 Express guide (product 3403): 'ATSAMD21G18 @ 48MHz with 3.3V logic/power', 'Pin #13 red LED for general purpose blinking', 'The NeoPixel is connected to pin #8', '32.768 KHz crystal for clock generation & RTC'",
     "Adafruit ArduinoCore-samd variants/feather_m0_express/variant.cpp pin descriptor table: Arduino D13 = PORTA 17, D8 = PORTA 6, D0/D1 = PORTA 11/10 on SERCOM0",

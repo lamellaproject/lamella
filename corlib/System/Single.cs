@@ -99,9 +99,9 @@ namespace System
         private static bool ParseValidate(string s)
         {
             int end = s.Length;
-            while (end > 0 && Char.IsWhiteSpace(s[end - 1])) end = end - 1;
+            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
             int i = 0;
-            while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1;
+            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
             if (i >= end) return false;
 
             string core = s.Substring(i, end - i);
@@ -117,6 +117,7 @@ namespace System
                 char c = s[i];
                 if (c >= '0' && c <= '9') { sawDigit = true; i = i + 1; continue; }
                 if (c == '.') { if (sawDot) return false; sawDot = true; i = i + 1; continue; }
+                if (c == ',') { if (sawDot || !sawDigit) return false; i = i + 1; continue; }
                 if (c == 'e' || c == 'E') break;
                 return false;
             }

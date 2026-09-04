@@ -1,0 +1,40 @@
+# BLOCK: the CH32V003's on-chip flash, stated only as far as the facts consumers outside the flash
+# controller need. Its option bytes, its unlock key sequences and its read protection are not
+# described here.
+#
+# THIS PART HAS TWO PROGRAMMING MODES AND THEY DISAGREE ABOUT THE UNIT. The reference manual gives
+# both, one after the other:
+#
+#   standard  a single 2-byte program, and erase by 1 KB sector or whole chip. The default.
+#   fast      a single 64-byte page program AND a 64-byte page erase, after a second unlock.
+#             The manual marks this one "(recommended)".
+#
+# SIXTY-FOUR IS DECLARED, AND THE CHOICE IS NOT A PREFERENCE. The two failure modes are not
+# symmetric. A consumer that sizes a region from 2 and then meets a driver programming 64 bytes at a
+# time has its neighbour overwritten; one that sizes from 64 and meets a 2-byte driver has merely
+# spent more space than it needed. So the LARGER unit is the safe declaration whichever mode a
+# driver later chooses -- and the manual recommends the mode that makes it 64 anyway.
+#
+# AND A WORKING PROGRAMMING FLOW LANDS ON THE SAME TWO NUMBERS. The WCH-LinkE fast-program flow uses
+# a 64-byte USB data packet and a 1024-byte program pack -- exactly the fast mode's 64-byte page and
+# 1 KB sector erase. A value the manual states and an independent implementation arrives at is a
+# stronger fact than either on its own.
+
+[table]
+kind = "block"
+family = "ch32v003"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 64
+sources = [
+    "write_unit: CH32V003 Reference Manual, the flash programming section: `Fast programming: This method uses page operation (recommended). After a specific sequence of unlocking, it performs a single 64-byte programming and 64-byte erasing, 1K-byte erasing`",
+    "write_unit: the same section's alternative, recorded because it is the DEFAULT mode and gives a different answer: `Standard programming: This mode is the default programming mode (compatible mode). In this mode, the CPU performs programming in single 2-byte mode and performs erase and whole erase operation in single 1K byte`",
+    "write_unit: corroborated by the WCH-LinkE fast-program parameters for this family -- a 64-byte data packet and a 1024-byte program pack -- which fall on the two fast-mode granularities",
+]
+notes = [
+    "The 2-byte standard-mode unit is real and is not superseded. A driver that programs in standard mode commits 2 bytes at a time; this file declares 64 because a consumer sizing a region cannot be wrong in the direction that corrupts.",
+    "Fast mode needs TWO unlocks, not one: the ordinary LOCK is cleared through FLASH_KEYR and a second FLOCK through FLASH_MODEKEYR. A driver that clears only the first finds fast programming refused rather than slow.",
+    "Both unlock sequences use the same two keys an STM32 uses, 0x45670123 then 0xCDEF89AB. That is a coincidence of a widely-copied interface and not evidence that any other STM32 flash fact transfers to this part.",
+    "The ERASE unit is not declared here. Fast mode erases 64 bytes and standard mode 1 KB, so a single number would be wrong for one of them, and nothing consumes it yet.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

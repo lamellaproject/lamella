@@ -12,7 +12,7 @@ board = "sam4l8-xpro"
 vendor = "atmel"
 family = "sam4l"
 part = "atsam4lc8c"
-board_model = 27            # lamella_wire::board_model::SAM4L8_XPLAINED_PRO
+product_model = 27          # lamella_wire::product_model::SAM4L8_XPLAINED_PRO
 sources = [
     "SAM4L8 Xplained Pro user guide (Atmel-42103): the mechanical buttons section and its pin table (SW0 on PC24; a button drives the I/O line to GND), and the LED section and its pin table (one yellow LED0 on PC07, activated by driving the connected I/O line to GND).",
     "SAM4L8 Xplained Pro design documentation (the vendor's published CAD package for this board), which names the fitted part ATSAM4LC8CA.",
@@ -31,6 +31,10 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG bridge's VCP.
+usb_vid = 0x03EB            # the debugger's own USB identity, read off this kit rather than
+usb_pid = 0x2111            # inherited from a sibling. THE PAIR NARROWS TO A KIT AND NEVER TO A
+                            # BOARD: several Xplained Pro kits answer 0x2111, so anything that must
+                            # reach THIS board settles the rest on the probe's serial.
 baud = 115200
 default = true              # this board states no [[plans]] row, so the carrier names no
                             # operating point.

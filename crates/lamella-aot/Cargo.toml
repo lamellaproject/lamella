@@ -26,6 +26,7 @@ lamella-elf = { path = "../lamella-elf" }
 
 [dev-dependencies]
 lamella-flash-format = { path = "../lamella-flash-format" }
+lamella-wasm-interp = { path = "../lamella-wasm-interp" }
 lamella-link = { path = "../lamella-link" }
 lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }

@@ -60,6 +60,48 @@ impl Selector {
         }
     }
 
+    /// The selector a tool should build from an OPTIONAL serial the user supplied: that name if
+    /// there is one, otherwise [`from_environment`](Self::from_environment), otherwise
+    /// [`any`](Self::any).
+    ///
+    /// # Why this is one function rather than three calls written out at each site
+    ///
+    /// The rungs are not interchangeable and every tool that reaches a probe needs all three.
+    /// Written out at each call site, the two ways it degrades are both silent:
+    ///
+    /// - **a baked-in default OVERRIDES the environment.** A call site that defaults to one probe's
+    ///   serial makes exporting the variable do nothing, so the tool goes to a device the operator
+    ///   did not name -- the failure the variable exists to prevent, produced by the convenience
+    ///   meant to save typing.
+    /// - **[`any`](Self::any) alone SKIPS the environment.** Building `any()` when no serial was
+    ///   passed refuses where two probes are attached, instead of taking the one that was named.
+    ///   `any()` does NOT resolve the variable, and a comment claiming otherwise cannot fail the
+    ///   way a call can.
+    ///
+    /// An EMPTY or whitespace-only `requested` falls through to the environment rather than
+    /// matching a probe whose serial is blank: it is what an unset shell variable expands to on a
+    /// command line, so treating it as a name would turn a typo into a selection.
+    #[must_use]
+    pub fn named_or_environment(requested: Option<&str>) -> Self {
+        Self::named_or(requested, Self::from_environment())
+    }
+
+    /// The DECISION half of [`Selector::named_or_environment`], with the environment's answer
+    /// supplied as a VALUE.
+    ///
+    /// Split out for the same reason [`choose`] is: the rung that matters is the FALLBACK, and a
+    /// test can only reach it by supplying what it falls back to. Reading a process-global variable
+    /// inside the decision would make the one case worth pinning -- that a blank name does not
+    /// shadow a named probe -- unreachable without mutating the environment of every other test in
+    /// the binary.
+    #[must_use]
+    pub fn named_or(requested: Option<&str>, environment: Selector) -> Self {
+        match requested {
+            Some(serial) if !serial.trim().is_empty() => Self::by_serial(serial.trim()),
+            _ => environment,
+        }
+    }
+
     /// Matches the probe with this serial number.
     #[must_use]
     pub fn by_serial(serial: impl Into<String>) -> Self {
@@ -90,14 +132,26 @@ impl Selector {
     }
 
     /// Whether `candidate` satisfies every constraint this selector carries.
+    ///
+    /// **THE SERIAL IS COMPARED CASE-INSENSITIVELY.** The same serial reaches us in either case
+    /// depending on which layer reported it -- a micro:bit's DAPLink presents a CMSIS-DAP v1 HID
+    /// interface AND a WebUSB v2 bulk one, and the HID side spells it lowercase where the bulk side
+    /// spells it uppercase.
+    ///
+    /// **A CASE-SENSITIVE FILTER HERE REFUSES A BOARD THAT IS SITTING THERE ON ITS OWN**, and it
+    /// refuses it in a way the operator cannot fix: they named the probe correctly, in the case one
+    /// backend reports, and the ladder answers `NotFound`. A refusal that names no remedy reads as
+    /// broken hardware, which is worse than the ambiguity [`distinct`] guards against.
     #[must_use]
     pub fn matches(&self, candidate: &Candidate) -> bool {
         self.vendor_id.is_none_or(|v| v == candidate.vendor_id)
             && self.product_id.is_none_or(|p| p == candidate.product_id)
-            && self
-                .serial
-                .as_deref()
-                .is_none_or(|s| candidate.serial.as_deref() == Some(s))
+            && self.serial.as_deref().is_none_or(|s| {
+                candidate
+                    .serial
+                    .as_deref()
+                    .is_some_and(|found| found.eq_ignore_ascii_case(s))
+            })
     }
 }
 
@@ -156,10 +210,14 @@ pub fn distinct_names(candidates: &[Candidate]) -> Vec<String> {
 /// A composite device presents several interfaces sharing one vid/pid/serial; counting interfaces
 /// would call one attached probe ambiguous and refuse it.
 fn distinct<'a>(matched: &[&'a Candidate]) -> Vec<&'a Candidate> {
-    let mut seen: Vec<(u16, u16, Option<&str>)> = Vec::new();
+    let mut seen: Vec<(u16, u16, Option<String>)> = Vec::new();
     let mut out = Vec::new();
     for candidate in matched {
-        let identity = (candidate.vendor_id, candidate.product_id, candidate.serial.as_deref());
+        let identity = (
+            candidate.vendor_id,
+            candidate.product_id,
+            candidate.serial.as_ref().map(|serial| serial.to_ascii_uppercase()),
+        );
         if seen.contains(&identity) {
             continue;
         }
@@ -191,6 +249,76 @@ mod tests {
 
     fn two_alike() -> Vec<Candidate> {
         vec![probe(0x2e8a, 0x000c, Some("AAAA1111")), probe(0x2e8a, 0x000c, Some("BBBB2222"))]
+    }
+
+    /// The three rungs, and the ORDER, which is what every hand-written copy of this got wrong in
+    /// one of two directions.
+    ///
+    /// A baked-in default is a name, so it beat the environment and sent four tools to a probe
+    /// nobody had asked for. `Selector::any()` is no name at all, so it SKIPPED the environment and
+    /// refused a two-probe bench that had already named one. Neither failure is visible at the call
+    /// site; both are visible here.
+    #[test]
+    fn a_named_probe_beats_the_environment_and_no_name_falls_through_to_it() {
+        let from_env = Selector::by_serial("FROM-THE-ENVIRONMENT");
+
+        let named = Selector::named_or(Some("ON-THE-COMMAND-LINE"), from_env.clone());
+        assert_eq!(
+            named.serial.as_deref(),
+            Some("ON-THE-COMMAND-LINE"),
+            "an explicit name is the top rung -- it is the operator saying which board"
+        );
+
+        let unnamed = Selector::named_or(None, from_env.clone());
+        assert_eq!(
+            unnamed.serial.as_deref(),
+            Some("FROM-THE-ENVIRONMENT"),
+            "no name means the environment, NOT `any()` -- this is the rung `any()` skipped"
+        );
+
+        let nothing = Selector::named_or(None, Selector::any());
+        assert!(nothing.serial.is_none() && nothing.vendor_id.is_none());
+    }
+
+    /// An EMPTY name is not a name. `--probe "$LAMELLA_PROBE_SERIAL"` with the variable unset
+    /// expands to one empty argument, and taking that as a serial would look for a probe whose
+    /// serial is the empty string -- a refusal whose message names a probe the operator never
+    /// mentioned, produced by the shell rather than by anything they typed.
+    #[test]
+    fn a_blank_name_does_not_shadow_the_environment() {
+        let from_env = Selector::by_serial("FROM-THE-ENVIRONMENT");
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                Selector::named_or(Some(blank), from_env.clone()).serial.as_deref(),
+                Some("FROM-THE-ENVIRONMENT"),
+                "{blank:?} is not a probe name"
+            );
+        }
+        assert_eq!(
+            Selector::named_or(Some("  MC0201  "), from_env).serial.as_deref(),
+            Some("MC0201")
+        );
+    }
+
+    /// The ladder must SURVIVE a family narrowing, because that is how it is actually called: a
+    /// tool that knows it wants an EDBG builds the selector and then adds the vendor and product
+    /// ids. If the narrowing replaced the serial, "the sole attached probe of that model" would
+    /// quietly become "any probe of that model", which may be several boards.
+    #[test]
+    fn narrowing_to_a_family_keeps_the_rung_the_ladder_chose() {
+        let picked = Selector::named_or(Some("MC0201"), Selector::any()).with_vid_pid(0x03eb, 0x2175);
+        assert_eq!(picked.serial.as_deref(), Some("MC0201"));
+        assert_eq!((picked.vendor_id, picked.product_id), (Some(0x03eb), Some(0x2175)));
+
+        let one_of_two = two_alike();
+        let candidates: Vec<Candidate> = one_of_two.to_vec();
+        let selector = Selector::named_or(Some("BBBB2222"), Selector::any())
+            .with_vid_pid(0x2e8a, 0x000c);
+        assert_eq!(
+            choose(&candidates, &selector),
+            Selection::Unique(Some("BBBB2222".to_string())),
+            "and the whole point: it picks ONE of two identical probes"
+        );
     }
 
     #[test]
@@ -274,7 +402,44 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_bench_is_not_found_rather_than_ambiguous() {
+    fn no_attached_probe_is_not_found_rather_than_ambiguous() {
         assert_eq!(choose(&[], &Selector::any()), Selection::NotFound);
+    }
+
+    #[test]
+    fn a_serial_named_in_either_case_selects_the_probe() {
+        let attached = [probe(0x0d28, 0x0204, Some("9901000052284E45"))];
+
+        for named in ["9901000052284E45", "9901000052284e45", "9901000052284E45".to_lowercase().as_str()] {
+            assert_eq!(
+                choose(&attached, &Selector::by_serial(named)),
+                Selection::Unique(Some(String::from("9901000052284E45"))),
+                "naming {named} must select the attached probe"
+            );
+        }
+
+        assert_eq!(
+            choose(&attached, &Selector::by_serial("9901000052284E46")),
+            Selection::NotFound,
+            "a different serial must still be refused"
+        );
+    }
+
+    #[test]
+    fn one_probe_reported_in_two_cases_is_one_probe() {
+        let attached = [
+            probe(0x0d28, 0x0204, Some("9901000052284e45")),
+            probe(0x0d28, 0x0204, Some("9901000052284E45")),
+        ];
+        assert_eq!(
+            choose(&attached, &Selector::any()),
+            Selection::Unique(Some("9901000052284e45".to_owned())),
+            "one physical probe, however its backends spelled the serial"
+        );
+        let two = [
+            probe(0x0d28, 0x0204, Some("9901000052284e45")),
+            probe(0x0d28, 0x0204, Some("9906000052284e45")),
+        ];
+        assert!(matches!(choose(&two, &Selector::any()), Selection::Ambiguous(names) if names.len() == 2));
     }
 }

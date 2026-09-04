@@ -296,7 +296,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
         pos: 0,
         line: 1,
         indents: vec![0],
-        bracket_depth: 0,
+        open_brackets: Vec::new(),
         tokens: Vec::new(),
     };
     lexer.run()?;
@@ -338,12 +338,48 @@ impl StrBuf {
     }
 }
 
+/// Whether `c` may BEGIN an identifier, per PEP 3131: `xid_start`, plus the underscore.
+///
+/// The underscore is named separately because Unicode does not consider it an identifier start --
+/// Python adds it, and `_` alone is a legal name.
+fn is_identifier_start(c: char) -> bool {
+    c == '_' || c.is_ascii_alphabetic() || lamella_unicode::is_xid_start(c as u32)
+}
+
+/// Whether `c` may CONTINUE an identifier, per PEP 3131: `xid_continue`, which already includes the
+/// underscore and the ASCII digits.
+///
+/// The ASCII test is first because it answers for nearly every character in nearly every program,
+/// and the table lookup is a binary search over ranges.
+fn is_identifier_continue(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric() || lamella_unicode::is_xid_continue(c as u32)
+}
+
+/// The closer that matches an opening bracket.
+///
+/// Total over the three characters [`Lexer::open_brackets`] can hold, which is the only place it is
+/// called from -- nothing else can reach it with a fourth.
+fn matching(opener: char) -> char {
+    match opener {
+        '(' => ')',
+        '[' => ']',
+        _ => '}',
+    }
+}
+
 struct Lexer {
     chars: Vec<char>,
     pos: usize,
     line: u32,
     indents: Vec<u32>,
-    bracket_depth: u32,
+    /// The brackets currently open, innermost last, each with the line it opened on.
+    ///
+    /// A stack rather than a depth count, because two diagnostics need more than "are we inside
+    /// brackets" -- which is all implicit line joining itself asks. An unclosed bracket must be
+    /// reported at the line it OPENED on, since that is the line to edit and it can be arbitrarily
+    /// far from where the input ran out; and a closer can only be known to mismatch by comparing it
+    /// against the opener it was meant to match.
+    open_brackets: Vec<(char, u32)>,
     tokens: Vec<Token>,
 }
 
@@ -362,6 +398,12 @@ impl Lexer {
                 break;
             }
             self.scan_logical_line()?;
+        }
+        if let Some((opener, opened)) = self.open_brackets.last().copied() {
+            return Err(LexError {
+                line: opened,
+                message: format!("{opener:?} was never closed"),
+            });
         }
         self.finish();
         Ok(())
@@ -519,7 +561,7 @@ impl Lexer {
                     }
                 }
                 Some('\n') | Some('\r') => {
-                    if self.bracket_depth > 0 {
+                    if !self.open_brackets.is_empty() {
                         self.consume_newline();
                     } else {
                         self.push(Tok::Newline);
@@ -545,7 +587,7 @@ impl Lexer {
                 StrKind::Bytes => self.lex_bytes(raw, triple),
                 StrKind::FString => self.lex_fstring(raw, triple),
             }
-        } else if c == '_' || c.is_ascii_alphabetic() {
+        } else if is_identifier_start(c) {
             self.lex_name();
             Ok(())
         } else {
@@ -956,7 +998,7 @@ impl Lexer {
                         parts.push(FStringPart::Literal(core::mem::take(&mut literal).finish()));
                     }
                     self.pos += 1;
-                    let (text, conversion, spec, debug) = self.scan_fstring_expr(quote)?;
+                    let (text, conversion, spec, debug) = self.scan_fstring_expr()?;
                     parts.push(FStringPart::Expr {
                         text,
                         conversion,
@@ -986,13 +1028,22 @@ impl Lexer {
         }
     }
 
-    /// Capture the raw source of a replacement field, from just after `{` to the matching
-    /// `}` (tracking `()`/`[]`/`{}` nesting). A top-level `=` that is not part of a comparison
-    /// operator makes it a `{expr=}` self-documenting field: the returned `debug` string is the
-    /// literal to emit before the value -- the expression source through the `=` and any trailing
-    /// whitespace, up to a conversion/spec/`}`. First light does not handle a `}` inside a string
-    /// within the field.
-    fn scan_fstring_expr(&mut self, quote: char) -> Result<FStringField, LexError> {
+    /// Capture the raw source of a replacement field, from just after `{` to the matching `}`.
+    ///
+    /// A field holds Python SOURCE, so this tracks `()`/`[]`/`{}` nesting AND consumes any string
+    /// inside it whole, which is what makes a `}` or a `{` in a string ordinary content rather than
+    /// punctuation (PEP 701). The field may therefore also span lines and carry a `#` comment, in a
+    /// single-quoted f-string as much as a triple-quoted one; only the LITERAL part of a
+    /// single-quoted f-string still refuses a newline.
+    ///
+    /// A top-level `=` that is not part of a comparison operator makes it a `{expr=}`
+    /// self-documenting field: the returned `debug` string is the literal to emit before the value
+    /// -- the expression source through the `=` and any trailing whitespace, up to a
+    /// conversion/spec/`}`.
+    ///
+    /// It takes no quote character on purpose: which quote closes the enclosing f-string stopped
+    /// being a fact this scan needs when a field became able to contain that quote.
+    fn scan_fstring_expr(&mut self) -> Result<FStringField, LexError> {
         let mut text = String::new();
         let mut conversion: Option<char> = None;
         let mut spec: Option<String> = None;
@@ -1000,11 +1051,8 @@ impl Lexer {
         let mut depth = 0i32;
         loop {
             match self.peek() {
-                None | Some('\n') | Some('\r') => {
+                None => {
                     return Err(self.err("unterminated f-string expression"));
-                }
-                Some(c) if c == quote && depth == 0 => {
-                    return Err(self.err("f-string expression runs into the closing quote"));
                 }
                 Some('}') if depth == 0 => {
                     self.pos += 1;
@@ -1047,6 +1095,12 @@ impl Lexer {
                     debug.as_mut().expect("debug is Some").push(c);
                     self.pos += 1;
                 }
+                Some('"' | '\'') => self.scan_fstring_nested_string(&mut text)?,
+                Some('#') => {
+                    while !matches!(self.peek(), None | Some('\n')) {
+                        self.pos += 1;
+                    }
+                }
                 Some(c @ ('(' | '[' | '{')) => {
                     depth += 1;
                     text.push(c);
@@ -1058,6 +1112,75 @@ impl Lexer {
                     self.pos += 1;
                 }
                 Some(c) => {
+                    if c == '\n' {
+                        self.line += 1;
+                    }
+                    text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Consume a complete string literal inside a replacement field, appending its source verbatim.
+    ///
+    /// A field holds Python source, so it may contain a string in any spelling -- including the very
+    /// quote that closes the enclosing f-string (`f"{','.join(xs)}"` and `f"{",".join(xs)}"` are
+    /// both ordinary), and a triple-quoted one. **Nothing inside such a string is punctuation for
+    /// the field**: a `}` there closes no field and a `{` opens none, which is the whole reason a
+    /// field cannot be scanned by matching braces and quotes alone.
+    ///
+    /// A backslash escapes the following character for TERMINATION purposes even in a raw string --
+    /// `r"a\""` is a four-character string rather than an unterminated one -- so one rule serves
+    /// every prefix and this never needs to know which prefix it is inside.
+    ///
+    /// A NESTED F-STRING needs no special case, which is worth saying because it looks as though it
+    /// should. Scanning to the first unescaped matching quote can end EARLY inside one --
+    /// `f"{f"{"x"}"}"` is cut at the quote before `x` -- but the pieces are appended in order, so
+    /// the captured source comes out byte-identical to what was written either way, and it is
+    /// re-lexed by these same rules afterwards. The nesting is therefore handled by the recursion
+    /// that already exists rather than by looking ahead here. Verified three deep against CPython.
+    fn scan_fstring_nested_string(&mut self, text: &mut String) -> Result<(), LexError> {
+        let quote = self.peek().expect("called at a quote character");
+        let triple = self.peek2() == Some(quote) && self.peek3() == Some(quote);
+        let width = if triple { 3 } else { 1 };
+        for _ in 0..width {
+            text.push(quote);
+            self.pos += 1;
+        }
+        loop {
+            match self.peek() {
+                None => return Err(self.err("unterminated string in an f-string expression")),
+                Some('\n') if !triple => {
+                    return Err(self.err("unterminated string in an f-string expression"));
+                }
+                Some('\\') => {
+                    text.push('\\');
+                    self.pos += 1;
+                    if let Some(escaped) = self.peek() {
+                        if escaped == '\n' {
+                            self.line += 1;
+                        }
+                        text.push(escaped);
+                        self.pos += 1;
+                    }
+                }
+                Some(c) if c == quote => {
+                    if triple && !(self.peek2() == Some(quote) && self.peek3() == Some(quote)) {
+                        text.push(c);
+                        self.pos += 1;
+                        continue;
+                    }
+                    for _ in 0..width {
+                        text.push(quote);
+                        self.pos += 1;
+                    }
+                    return Ok(());
+                }
+                Some(c) => {
+                    if c == '\n' {
+                        self.line += 1;
+                    }
                     text.push(c);
                     self.pos += 1;
                 }
@@ -1235,12 +1358,15 @@ impl Lexer {
     fn lex_name(&mut self) {
         let mut name = String::new();
         while let Some(c) = self.peek() {
-            if c == '_' || c.is_ascii_alphanumeric() {
+            if is_identifier_continue(c) {
                 name.push(c);
                 self.pos += 1;
             } else {
                 break;
             }
+        }
+        if !name.is_ascii() {
+            name = lamella_unicode::normalize(&name, lamella_unicode::NormalizationForm::Nfkc);
         }
         let kind = match name.as_str() {
             "def" => Tok::KwDef,
@@ -1332,13 +1458,41 @@ impl Lexer {
             ']' => (Tok::RBracket, 1),
             '{' => (Tok::LBrace, 1),
             '}' => (Tok::RBrace, 1),
+            other if !other.is_ascii() => {
+                return Err(self.err(format!(
+                    "invalid character '{other}' (U+{:04X})",
+                    other as u32
+                )));
+            }
             other => return Err(self.err(format!("unexpected character {other:?}"))),
         };
         self.pos += width;
-        if matches!(kind, Tok::LParen | Tok::LBracket | Tok::LBrace) {
-            self.bracket_depth += 1;
-        } else if matches!(kind, Tok::RParen | Tok::RBracket | Tok::RBrace) {
-            self.bracket_depth = self.bracket_depth.saturating_sub(1);
+        match kind {
+            Tok::LParen => self.open_brackets.push(('(', self.line)),
+            Tok::LBracket => self.open_brackets.push(('[', self.line)),
+            Tok::LBrace => self.open_brackets.push(('{', self.line)),
+            Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                let closer = match kind {
+                    Tok::RParen => ')',
+                    Tok::RBracket => ']',
+                    _ => '}',
+                };
+                if let Some((opener, opened)) = self.open_brackets.last().copied() {
+                    if matching(opener) != closer {
+                        let where_opened = if opened == self.line {
+                            String::new()
+                        } else {
+                            format!(" on line {opened}")
+                        };
+                        return Err(self.err(format!(
+                            "closing parenthesis {closer:?} does not match opening \
+                             parenthesis {opener:?}{where_opened}"
+                        )));
+                    }
+                    self.open_brackets.pop();
+                }
+            }
+            _ => {}
         }
         self.push(kind);
         Ok(())
@@ -1368,6 +1522,59 @@ mod tests {
             .into_iter()
             .map(|t| t.kind)
             .collect()
+    }
+
+    #[test]
+    fn an_identifier_is_unicode_and_normalized_to_nfkc() {
+        let name = |src: &str| match tokenize(src).expect("tokenizes").first().map(|t| &t.kind) {
+            Some(Tok::Name(n)) => n.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        };
+        assert_eq!(name("caf\u{e9} = 1\n"), "caf\u{e9}", "an accented Latin letter continues one");
+        assert_eq!(name("\u{3bb} = 1\n"), "\u{3bb}", "Greek starts one");
+        assert_eq!(name("\u{437}\u{43d} = 1\n"), "\u{437}\u{43d}", "so does Cyrillic");
+        assert_eq!(name("_\u{e9} = 1\n"), "_\u{e9}", "the underscore is a start Unicode does not give");
+        assert_eq!(name("\u{e9}1 = 1\n"), "\u{e9}1", "and a digit continues after a non-ASCII start");
+
+        assert_eq!(name("\u{fb01} = 1\n"), "fi", "U+FB01 normalizes to the two letters");
+        assert_eq!(name("\u{212b} = 1\n"), "\u{c5}", "the angstrom sign normalizes to A-with-ring");
+        assert_eq!(name("value = 1\n"), "value");
+
+        let err = tokenize("x\u{b2} = 1\n").expect_err("a superscript digit is not an identifier");
+        assert_eq!(err.message, "invalid character '\u{b2}' (U+00B2)");
+        let err = tokenize("a\u{1f600} = 1\n").expect_err("nor is an emoji");
+        assert_eq!(err.message, "invalid character '\u{1f600}' (U+1F600)");
+        assert_eq!(
+            tokenize("a = $1\n").expect_err("a dollar is not Python").message,
+            "unexpected character '$'"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_bracket_is_reported_where_it_opened_not_where_the_input_ended() {
+        let unclosed = |src: &str| tokenize(src).expect_err("an unclosed bracket is refused");
+
+        let e = unclosed("xs = [1,\n      2\nprint(xs)\n");
+        assert_eq!(e.line, 1, "reported at the opening line: {}", e.message);
+        assert_eq!(e.message, "'[' was never closed");
+
+        let e = unclosed("f = print(\n    'a'\n");
+        assert_eq!((e.line, e.message.as_str()), (1, "'(' was never closed"));
+
+        let same = unclosed("xs = [1, 2)\n");
+        assert_eq!(same.line, 1);
+        assert_eq!(
+            same.message,
+            "closing parenthesis ')' does not match opening parenthesis '['"
+        );
+        let across = unclosed("xs = [1,\n      2,\n      3)\n");
+        assert_eq!(across.line, 3, "reported at the closer: {}", across.message);
+        assert_eq!(
+            across.message,
+            "closing parenthesis ')' does not match opening parenthesis '[' on line 1"
+        );
+
+        assert!(tokenize("xs = [(1, {'a': 2}), [3]]\n").is_ok());
     }
 
     #[test]
@@ -1623,6 +1830,36 @@ mod tests {
         assert_eq!(kinds("b'\\101'\n")[0], Tok::Bytes(vec![b'A']));
         assert_eq!(kinds("B\"\"\n")[0], Tok::Bytes(Vec::new()));
         assert!(crate::lexer::tokenize("b'\u{e9}'\n").is_err());
+    }
+
+    #[test]
+    fn a_replacement_field_holds_python_source_not_matched_punctuation() {
+        for source in [
+            "f\"{\",\".join(xs)}\"\n",
+            "f'{','.join(xs)}'\n",
+            "f\"{\"}\"}\"\n",
+            "f\"{'{'}\"\n",
+            "f\"{\"\"\"triple\"\"\"}\"\n",
+            "f\"{\"a\\\"b\"}\"\n",
+            "f\"{r\"a\\\"b\"}\"\n",
+            "f\"{max(\n    1,\n    2,\n)}\"\n",
+            "f\"{a  # why\n}\"\n",
+            "f\"{ {\"k\": 1}[\"k\"] }\"\n",
+            "f\"{ {1, 2} }\"\n",
+        ] {
+            assert!(tokenize(source).is_ok(), "should lex: {source:?}");
+        }
+        assert!(tokenize("f\"lit\nmore{1}\"\n").is_err());
+        assert!(tokenize("f\"{a\n").is_err());
+        assert!(tokenize("f\"{\"unclosed}\"\n").is_err());
+        for source in [
+            "f'{f\"{n}\"}'\n",
+            "f\"{f\"{a}\"}\"\n",
+            "f\"{f\"{f\"{a}\"}\"}\"\n",
+            "f\"{f\"{\"x\"}\"}\"\n",
+        ] {
+            assert!(tokenize(source).is_ok(), "should lex: {source:?}");
+        }
     }
 
     #[test]

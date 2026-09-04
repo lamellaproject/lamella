@@ -34,7 +34,7 @@ board = "arduino-uno-r4-minima"
 vendor = "arduino"
 family = "ra4m1"
 part = "r7fa4m1ab3cfm"
-board_model = 34            # lamella_wire::board_model::ARDUINO_UNO_R4_MINIMA
+product_model = 34          # lamella_wire::product_model::ARDUINO_UNO_R4_MINIMA
 sources = [
     "Arduino UNO R4 Minima user manual (SKU ABX00080, modified 06/08/2026), description: the board features a RA4M1 series microcontroller from Renesas (R7FA4M1AB3CFM#AA0), which embeds a 48 MHz Arm Cortex-M4 microprocessor, with 256 kB flash, 32 kB SRAM and 8 kB data memory (EEPROM); the operating voltage is 5 V",
     "Arduino UNO R4 Minima user manual (SKU ABX00080) section 4.1, the front-view component table: U1 is the R7FA4M1AB3CFM#AA0 microcontroller, U2 an ISL854102FRZ-T buck converter, PB1 the RESET button, J1 the ICSP header (SPI), J2 the SWD/JTAG connector, J3 a CX90B-16P USB-C connector, J4 the DC jack, DL1 the TX LED (serial transmit), DL2 the RX LED (serial receive), DL3 the power LED and DL4 the SCK LED (serial clock). Section 10.4 gives the SWD/JTAG connector's pinout as 1 +5V, 2 SWDIO, 3 GND, 4 SWCLK, 5 GND, 6 NC, 7 RX, 8 TX, 9 GND, 10 NC",

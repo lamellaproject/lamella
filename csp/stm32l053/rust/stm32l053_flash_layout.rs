@@ -3,3 +3,4 @@
 
 /// -- block constants --
 pub const ERASED_VALUE: u32 = 0x0;
+pub const WRITE_UNIT: u32 = 4;

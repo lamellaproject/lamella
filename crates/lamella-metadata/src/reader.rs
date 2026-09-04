@@ -1342,6 +1342,43 @@ impl<'a> Assembly<'a> {
         found
     }
 
+    /// The single `string` argument of every assembly-level custom attribute of type
+    /// `namespace`.`name`, in table order: the shape of every declaration a build makes ABOUT the
+    /// assembly it is producing (a friend, a required capability, a compilation symbol).
+    ///
+    /// Attributes on the Assembly manifest row (II.22.2's row 1, II.22.10's parent), so it never
+    /// sees an attribute on a type or a member. An `AllowMultiple` attribute yields one entry per
+    /// application and a single-application one yields at most one; a row whose blob does not decode
+    /// as one string is skipped rather than reported, because a foreign attribute of a shape this
+    /// reader does not know is not an error.
+    ///
+    /// The constructor signature is taken to be one `string` rather than resolved, because the ctor
+    /// of an attribute declared in ANOTHER assembly arrives as a `MemberRef` whose signature this
+    /// reader would have to decode to learn what the caller has already told it.
+    #[must_use]
+    pub fn assembly_attribute_strings(&self, namespace: &str, name: &str) -> Vec<&'a str> {
+        let assembly_row = Token::new(table::ASSEMBLY, 1);
+        let mut values = Vec::new();
+        for attribute in self.custom_attributes(assembly_row) {
+            let declaring = self
+                .resolve_method(attribute.constructor)
+                .and_then(|ctor| ctor.declaring_type);
+            let matches = declaring
+                .is_some_and(|declaring| declaring.namespace == namespace && declaring.name == name);
+            if !matches {
+                continue;
+            }
+            let decoded =
+                decode_custom_attribute(attribute.value, &[SigType::String], &|_| element::I4);
+            if let Some(decoded) = decoded
+                && let Some(AttrArg::Str(value)) = decoded.fixed.first()
+            {
+                values.push(*value);
+            }
+        }
+        values
+    }
+
     /// The simple names of the assemblies this one declares as FRIENDS: the string argument of
     /// every `[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("...")]` row on the
     /// Assembly manifest (II.22.2's row 1, II.22.10's parent).
@@ -1350,39 +1387,15 @@ impl<'a> Assembly<'a> {
     /// spelled `"Friend, PublicKey=0024..."`, so everything from the first comma is dropped and the
     /// remainder trimmed -- a reader that compared the whole string would match no strong-named
     /// reference assembly at all, which is the majority of the .NET reference pack.
-    ///
-    /// The constructor signature is known statically (one `string`) rather than resolved, because
-    /// the ctor of an attribute declared in ANOTHER assembly arrives as a `MemberRef` whose
-    /// signature this reader would have to decode to learn what it already knows.
     #[must_use]
     pub fn friend_assemblies(&self) -> Vec<&'a str> {
-        let assembly_row = Token::new(table::ASSEMBLY, 1);
-        let mut friends = Vec::new();
-        for attribute in self.custom_attributes(assembly_row) {
-            let names = self
-                .resolve_method(attribute.constructor)
-                .and_then(|ctor| ctor.declaring_type);
-            let is_ivt = names.is_some_and(|declaring| {
-                declaring.namespace == "System.Runtime.CompilerServices"
-                    && declaring.name == "InternalsVisibleToAttribute"
-            });
-            if !is_ivt {
-                continue;
-            }
-            let decoded =
-                decode_custom_attribute(attribute.value, &[SigType::String], &|_| element::I4);
-            if let Some(decoded) = decoded
-                && let Some(AttrArg::Str(display_name)) = decoded.fixed.first()
-            {
-                let simple = display_name
-                    .split(',')
-                    .next()
-                    .unwrap_or(display_name)
-                    .trim();
-                friends.push(simple);
-            }
-        }
-        friends
+        self.assembly_attribute_strings(
+            "System.Runtime.CompilerServices",
+            "InternalsVisibleToAttribute",
+        )
+        .into_iter()
+        .map(|display_name| display_name.split(',').next().unwrap_or(display_name).trim())
+        .collect()
     }
 
     /// Whether `method_token` is a `[Lamella.Runtime.RuntimeProvided]` seam: a method whose body the
@@ -1414,6 +1427,26 @@ impl<'a> Assembly<'a> {
     /// of an assembly wants [`Assembly::tokens_with_attribute`], which indexes the table in one pass.
     /// The same warning on [`Assembly::has_attribute`] records what the difference measured.
     #[must_use]
+    /// Every custom attribute in the assembly, paired with the token it is attached to.
+    ///
+    /// [`custom_attributes`](Self::custom_attributes) filters this table for ONE parent, so asking it
+    /// per member walks the whole table per member. A caller that wants every attachment -- a scan,
+    /// a census -- should walk it once through here instead: the cost stops being the product of two
+    /// table sizes, and every parent kind is covered without enumerating which kinds to ask about.
+    pub fn all_custom_attributes(&self) -> impl Iterator<Item = (Token, CustomAttribute<'a>)> + '_ {
+        let blob = self.image.blob();
+        (1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE)).filter_map(move |index| {
+            let row = self.tables.row(table::CUSTOM_ATTRIBUTE, index)?;
+            Some((
+                row.token(0),
+                CustomAttribute {
+                    constructor: row.token(1),
+                    value: blob.get(row.raw(2)).unwrap_or(&[]),
+                },
+            ))
+        })
+    }
+
     pub fn custom_attributes(
         &self,
         parent: Token,
@@ -1877,6 +1910,19 @@ impl<'a> Field<'a> {
         let row = self.assembly.tables.row(table::FIELD, self.index)?;
         let blob = self.assembly.image.blob().get(row.raw(2)).ok()?;
         parse_field(blob).ok()
+    }
+
+    /// The field's decoded type signature and its REQUIRED custom modifiers.
+    ///
+    /// A field carries them -- `modreq(System.Runtime.CompilerServices.IsVolatile)` is how a
+    /// `volatile` field is spelled -- and II.7.1.1 makes an unrecognized one a reason to refuse the
+    /// member, so a consumer asking "may I use this field" needs both halves from one decode rather
+    /// than a second walk of the same blob.
+    #[must_use]
+    pub fn signature_with_modifiers(&self) -> Option<(SigType, alloc::vec::Vec<Token>)> {
+        let row = self.assembly.tables.row(table::FIELD, self.index)?;
+        let blob = self.assembly.image.blob().get(row.raw(2)).ok()?;
+        crate::signature::parse_field_with_modifiers(blob).ok()
     }
 
     /// Whether the field is static.

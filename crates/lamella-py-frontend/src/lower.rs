@@ -2237,7 +2237,10 @@ fn lower_op(
         | bc::Op::ImportName(_)
         | bc::Op::ImportFrom(_)
         | bc::Op::ImportStar
-        | bc::Op::StoreGlobal(_) => {
+        | bc::Op::StoreGlobal(_)
+        | bc::Op::DeleteGlobal(_)
+        | bc::Op::DeleteDeref(_)
+        | bc::Op::DeleteName(_) => {
             return Err(LowerError::DynamicOperation);
         }
         bc::Op::PopTop => {

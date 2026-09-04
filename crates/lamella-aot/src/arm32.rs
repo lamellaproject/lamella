@@ -19,8 +19,10 @@ pub enum LowerError {
     /// CARRIES THE VERIFIER'S OWN ERRORS, for the same reason [`LowerError::CodeTooLarge`] carries
     /// its site: a bare "not well formed" names neither the malformed instruction nor the types that
     /// disagreed, so a refusing corpus row reported no reason at all and needed a second run under a
-    /// different tool to classify.
+    /// different tool to classify. The verifier returns a `Vec<VerifyError>`, and this boundary must carry it
+    /// rather than discard it.
     NotWellFormed {
+        /// What [`lamella_ir::verify`] rejected. Never empty: it is constructed only from an `Err`.
         errors: Vec<VerifyError>,
     },
     /// A control-flow shape this tracer does not handle yet: a branch target with
@@ -51,6 +53,21 @@ pub enum LowerError {
     /// The function contains a call, which the single-function lowering cannot
     /// resolve; calls are lowered by the program (module) lowering.
     CallUnsupported,
+    /// This image calls a string-allocating runtime seam and cannot name `System.String`, so the
+    /// ambient descriptor word would be 0 and every string those seams return would carry a null
+    /// type descriptor.
+    ///
+    /// **REFUSED ON THE HOST BECAUSE THE DEVICE CANNOT REPORT IT.** The archive is built `--release`
+    /// with `panic = "abort"` and a `loop {}` panic handler, so an assertion there cannot fail: it
+    /// either compiles out or converts a lockup at a garbage PC into a lockup at a known one. This
+    /// is a BUILD-WIRING fact, known at link time, in a process that has stderr and an exit code --
+    /// which is the only place a guard for it can actually fire.
+    ///
+    /// Carries the seam that forced it, so the message names a member rather than a condition.
+    StringSeamWithoutDescriptor {
+        /// The imported seam symbol whose presence made the descriptor necessary.
+        seam: alloc::string::String,
+    },
     /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
     /// surrogate under `string-utf8`, whose encoding has no form for one. REFUSED rather than replaced
     /// with U+FFFD, because string construction never loses data and the offending unit is known here,
@@ -2603,6 +2620,53 @@ fn lower_spilled_into(
                     continue;
                 }
             }
+            if let Inst::StaticLoad { owner, offset } = inst {
+                if let Some(MirType::ValueType { size, .. }) = func.value_type(*result) {
+                    let full_words = (size / 4) as u16;
+                    let rem = (size % 4) as u16;
+                    for w in 0..full_words {
+                        static_slot_addr(enc, &mut pool, &mut sym_pool, relocate, *owner, *offset)?;
+                        enc.ldr_imm(Reg::R0, Reg::R0, w * 4)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_store(enc, Reg::R0, slot(*result) + w * 4, Reg::R2)?;
+                    }
+                    for k in 0..rem {
+                        let at = full_words * 4 + k;
+                        static_slot_addr(enc, &mut pool, &mut sym_pool, relocate, *owner, *offset)?;
+                        enc.mov_reg(Reg::R1, Reg::R0);
+                        narrow_load_at(enc, Reg::R0, Reg::R1, at as u32, 1, false)?;
+                        slot_addr(enc, Reg::R1, slot(*result))?;
+                        narrow_store_at(enc, Reg::R0, Reg::R1, at as u32, 1)?;
+                    }
+                    continue;
+                }
+            }
+            if let Inst::StaticStore {
+                owner,
+                offset,
+                value,
+            } = inst
+            {
+                if let Some(MirType::ValueType { size, .. }) = func.value_type(*value) {
+                    let full_words = (size / 4) as u16;
+                    let rem = (size % 4) as u16;
+                    for w in 0..full_words {
+                        static_slot_addr(enc, &mut pool, &mut sym_pool, relocate, *owner, *offset)?;
+                        slot_load(enc, Reg::R1, slot(*value) + w * 4)?;
+                        enc.str_imm(Reg::R1, Reg::R0, w * 4)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                    for k in 0..rem {
+                        let at = full_words * 4 + k;
+                        static_slot_addr(enc, &mut pool, &mut sym_pool, relocate, *owner, *offset)?;
+                        enc.mov_reg(Reg::R2, Reg::R0);
+                        slot_addr(enc, Reg::R1, slot(*value))?;
+                        narrow_load_at(enc, Reg::R0, Reg::R1, at as u32, 1, false)?;
+                        narrow_store_at(enc, Reg::R0, Reg::R2, at as u32, 1)?;
+                    }
+                    continue;
+                }
+            }
             if let Inst::Call { callee, args } = inst {
                 if matches!(func.value_type(*result), Some(MirType::ValueType { size, .. }) if size > 4)
                 {
@@ -4276,6 +4340,7 @@ const EH_TAG_SYMBOL_FLAG: u32 = 0x0800_0000;
 const STR_BLOB_PREFIX: &str = "__lamella_str_";
 
 pub use crate::resolver::DescQualifiers;
+use crate::resolver::{STRING_ALLOCATING_SEAMS, STRING_TYPEDESC_SYMBOL};
 use crate::resolver::descriptor_symbol;
 
 /// The mode an object build runs in -- program vs library, strict vs deferring, plus the
@@ -5579,6 +5644,30 @@ fn emit_object_pass(
         enc.emit_bytes(&unencodable(crate::stringgen::string_blob_bytes(utf16))?);
         str_syms.push((label, enc.position() - start));
     }
+    if mode.emit_entry && string_header.is_none() && !descriptors.is_empty() {
+        if let Some(seam) = STRING_ALLOCATING_SEAMS
+            .iter()
+            .find(|name| externs.iter().any(|e| e == *name))
+        {
+            return Err(LowerError::StringSeamWithoutDescriptor {
+                seam: (*seam).into(),
+            });
+        }
+    }
+    let string_typedesc_label = if mode.emit_entry {
+        enc.align_to_word();
+        let label = enc.new_label();
+        enc.bind_label(label);
+        match string_header {
+            Some((handle, vtable_bytes)) => {
+                enc.data_word_symbol_addend(DESC_SYMBOL_FLAG | handle, vtable_bytes);
+            }
+            None => enc.emit_word(0),
+        }
+        Some(label)
+    } else {
+        None
+    };
     let assembled = if emit_entry && !defer_encode {
         enc.finish().map_err(reach_failure)?
     } else {
@@ -5688,6 +5777,8 @@ fn emit_object_pass(
         .iter()
         .map(|(label, _)| assembled.label_position(*label).unwrap_or(0))
         .collect();
+    let string_typedesc_position =
+        string_typedesc_label.map(|label| assembled.label_position(label).unwrap_or(0));
     let mut text = assembled.bytes;
     let mut symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
         .map(|i| {
@@ -5803,6 +5894,16 @@ fn emit_object_pass(
             name: str_names[id].as_str(),
             value: str_positions[id],
             size: *size,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+    }
+    if let Some(position) = string_typedesc_position {
+        symbols.push(lamella_elf::Symbol {
+            name: STRING_TYPEDESC_SYMBOL,
+            value: position,
+            size: 4,
             binding: lamella_elf::Binding::Global,
             kind: lamella_elf::SymbolType::NoType,
             section: lamella_elf::SymbolSection::Text,

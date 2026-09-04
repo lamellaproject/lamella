@@ -110,8 +110,9 @@ impl ObjectModel {
     /// Parks waiter `id` until the monotonic-millisecond `deadline`, replacing any prior park for it.
     ///
     /// The id is the event loop's own numbering and is never interpreted here or below -- see the
-    /// `reactor` field. What is parked is a TIMER; this runtime has no sockets, so `WaitReason::Io`
-    /// has no caller and would have nothing to poll if it did.
+    /// `reactor` field. What is parked is a TIMER; a socket park is
+    /// [`Self::park_waiter_on_socket`], and whether the poll set can hold anything depends on
+    /// whether an embedder installed a [`lamella_net_core::NetBackend`].
     pub fn park_waiter(&mut self, id: u32, deadline: u64) {
         self.reactor_store().park(id, lamella_reactor::WaitReason::Sleep(deadline));
     }

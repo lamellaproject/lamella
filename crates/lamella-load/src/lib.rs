@@ -41,8 +41,8 @@ macro_rules! intrinsic {
     };
 }
 use lamella_cil_runtime::intrinsics::{
-    array_clear_range, array_clone, array_copy_range, array_empty, array_get_value, array_rank,
-    array_set_value,
+    array_clear_range, array_clone, array_copy_range, array_create_instance, array_empty,
+    array_get_value, array_rank, array_set_value,
     boolean_to_string,
     buffer_block_copy, buffer_byte_length, char_to_string, console_write,
     decimal_add, decimal_compare, decimal_divide, decimal_multiply, decimal_remainder,
@@ -63,7 +63,7 @@ use lamella_cil_runtime::intrinsics::{
     interlocked_compare_exchange,
     md_array_address, md_array_get,
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
-    object_reference_equals, object_to_string,
+    object_get_hash_code, object_reference_equals, object_to_string,
     initialize_array, get_custom_attributes, string_concat, string_concat_object2,
     string_ctor_char_array, string_ctor_char_array_range, string_ctor_char_ptr,
     string_ctor_char_ptr_range, string_ctor_char_repeat, string_get_pinnable_reference,
@@ -72,7 +72,8 @@ use lamella_cil_runtime::intrinsics::{
     string_intern, string_is_interned,
     string_create_from_chars, string_not_equals, string_substring, string_substring_len,
     type_from_handle, type_get_name,
-    thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
+    thread_start, thread_join, thread_join_timeout, thread_yield, thread_sleep,
+    monitor_enter, monitor_exit,
     monitor_try_enter, monitor_try_enter_timeout, monitor_wait, monitor_wait_timeout,
     monitor_wait_timed_out, monitor_pulse,
     monitor_pulse_all,
@@ -97,7 +98,7 @@ use lamella_cil_runtime::intrinsics::{
     marshal_write_int32, marshal_write_int64, marshal_size_of,
     intptr_from_raw_value, intptr_to_raw_value,
     mmio_read32, mmio_write32, mmio_read8, mmio_write8, mmio_read16, mmio_write16,
-    value_type_equals,
+    value_type_equals, value_type_get_hash_code,
 };
 #[cfg(feature = "exceptions")]
 use lamella_cil_runtime::intrinsics::type_initialization_exception_runtime_type_name;
@@ -198,7 +199,7 @@ pub struct Program {
 }
 
 /// Why [`load`] could not produce a runnable program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadError {
     /// The assembly declares no entry point (CLI header EntryPointToken is 0).
     NoEntryPoint,
@@ -212,6 +213,14 @@ pub enum LoadError {
     /// is the honest answer -- the alternative is an image where some of those calls silently
     /// resolve to nothing.
     CircularLibraryReferences,
+    /// An assembly demands that its consumer understand something this runtime does not implement --
+    /// a required custom modifier (ECMA-335 II.7.1.1) or a `CompilerFeatureRequiredAttribute`.
+    ///
+    /// **This is the mechanism .NET gives an assembly's author to make a future feature fail LOUDLY
+    /// on an old consumer instead of running wrong on one, and refusing here is what honors it.**
+    /// The message names the mechanism, the demanded name and the member carrying it, because a
+    /// consumer that cannot say why it refused sends its reader to the wrong question.
+    UnmetDemand(alloc::string::String),
 }
 
 impl fmt::Display for LoadError {
@@ -219,6 +228,7 @@ impl fmt::Display for LoadError {
         formatter.write_str(match self {
             LoadError::NoEntryPoint => "assembly has no entry point",
             LoadError::EntryHasNoBody => "entry point has no IL body",
+            LoadError::UnmetDemand(message) => return formatter.write_str(message),
             LoadError::CircularLibraryReferences => {
                 "the library assemblies reference each other in a cycle, so no order loads each \
                  one after the libraries it references"
@@ -622,7 +632,28 @@ fn ram_cil(bytes: &[u8]) -> RawCil {
 /// # Errors
 /// [`LoadError::NoEntryPoint`] if the assembly names no entry point, or
 /// [`LoadError::EntryHasNoBody`] if that token has no loadable body.
+
+/// Refuses an assembly whose author marked it "do not use this if you do not understand it" with
+/// something this runtime does not implement.
+///
+/// The decision is `lamella_metadata::demands`, where signatures and custom attributes are read, so
+/// the AOT backend -- which never goes through this loader -- asks the identical question of the
+/// identical lists. This function is the loader's door, not a second copy of the rule.
+///
+/// Refusing at LOAD is deliberately earlier than either tier would otherwise fail: a compiled build
+/// rejects unknown IL when it compiles, and an interpreted one traps at run time, on the device.
+/// A demand is legible in the metadata before either happens, so both can be loud and early.
+fn refuse_unmet_demands(assemblies: &[&Assembly<'_>]) -> Result<(), LoadError> {
+    for assembly in assemblies {
+        if let Some(message) = lamella_metadata::demands::unmet_demand(assembly) {
+            return Err(LoadError::UnmetDemand(message));
+        }
+    }
+    Ok(())
+}
+
 pub fn load<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, LoadError> {
+    refuse_unmet_demands(&[assembly])?;
     if assembly.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint);
     }
@@ -652,6 +683,7 @@ pub fn load<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, LoadError> {
 /// # Errors
 /// As [`load`].
 pub fn load_unfrozen<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, LoadError> {
+    refuse_unmet_demands(&[assembly])?;
     if assembly.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint);
     }
@@ -1519,7 +1551,8 @@ pub fn load_program_lazy_corlib<'c, 'p>(
         &boxed_type_arguments,
     );
     let program_type_offset = module.type_count();
-    let entry = load_assembly(
+    let mut heirs: Vec<GenericBaseHeir<'_>> = Vec::new();
+    let entry = load_assembly_collecting(
         &mut module,
         program,
         flash_cil,
@@ -1528,6 +1561,7 @@ pub fn load_program_lazy_corlib<'c, 'p>(
         &mut resolution.type_index,
         &mut resolution.field_index,
         true,
+        &mut heirs,
     );
     #[cfg(feature = "generics")]
     {
@@ -1543,7 +1577,7 @@ pub fn load_program_lazy_corlib<'c, 'p>(
                 type_offset: None,
             },
         ];
-        monomorphize::monomorphize(
+        let lowering = monomorphize::monomorphize(
             &mut module,
             program,
             LAZY_PROGRAM_ASM,
@@ -1553,9 +1587,10 @@ pub fn load_program_lazy_corlib<'c, 'p>(
             flash_cil,
             &instantiations,
         );
+        relink_generic_base_heirs(&mut module, &heirs, &lowering);
     }
     #[cfg(not(feature = "generics"))]
-    let _ = program_type_offset;
+    let _ = (program_type_offset, &heirs);
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     if let Some(name) = first_unresolved_call(&module, program, LAZY_PROGRAM_ASM, corlib) {
         return Err(LazyLoadError::UnresolvedMember(name));
@@ -2883,6 +2918,11 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
     libraries: &[SourceAssembly<'l>],
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LoadError> {
+    let mut all: alloc::vec::Vec<&Assembly<'_>> = alloc::vec::Vec::with_capacity(libraries.len() + 2);
+    all.push(corlib);
+    all.extend(libraries.iter());
+    all.push(program);
+    refuse_unmet_demands(&all)?;
     #[cfg(feature = "generics")]
     let instantiations = {
         let mut references: Vec<Assembly<'_>> = Vec::with_capacity(1 + libraries.len());
@@ -3008,7 +3048,8 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
     let mut type_index = TypeNameIndex::new();
     let mut field_index = FieldNameIndex::new();
     let corlib_type_offset = module.type_count();
-    load_assembly(
+    let mut heirs: Vec<GenericBaseHeir<'_>> = Vec::new();
+    load_assembly_collecting(
         &mut module,
         corlib,
         flash_cil,
@@ -3017,11 +3058,12 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         &mut type_index,
         &mut field_index,
         true,
+        &mut heirs,
     );
     let mut library_type_offsets: Vec<usize> = Vec::with_capacity(libraries.len());
     for (position, library) in libraries.iter().enumerate() {
         library_type_offsets.push(module.type_count());
-        load_assembly(
+        load_assembly_collecting(
             &mut module,
             library,
             flash_cil,
@@ -3030,11 +3072,12 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
             &mut type_index,
             &mut field_index,
             true,
+            &mut heirs,
         );
     }
     let program_asm = 1 + libraries.len() as u8;
     let program_type_offset = module.type_count();
-    let entry = load_assembly(
+    let entry = load_assembly_collecting(
         &mut module,
         program,
         flash_cil,
@@ -3043,6 +3086,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         &mut type_index,
         &mut field_index,
         true,
+        &mut heirs,
     );
     #[cfg(feature = "generics")]
     let sources: Vec<monomorphize::DefinitionSource<'_>> = {
@@ -3085,6 +3129,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         flash_cil,
         instantiations,
     );
+    relink_generic_base_heirs(&mut module, &heirs, &lowering);
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     Ok((Program { module, entry }, lowering))
 }
@@ -3126,6 +3171,78 @@ fn load_assembly<'pe>(
     type_index: &mut TypeNameIndex,
     field_index: &mut FieldNameIndex,
     resolve_external: bool,
+) -> Option<MethodId> {
+    load_assembly_collecting(
+        module,
+        assembly,
+        materialize,
+        asm,
+        index,
+        type_index,
+        field_index,
+        resolve_external,
+        &mut Vec::new(),
+    )
+}
+
+/// A type whose `extends` is a `TypeSpec` -- it derives from a CONSTRUCTED GENERIC base
+/// (`class Derived : Base<int>`), whose identity does not exist while this walk is running.
+///
+/// **THE ORDINARY WALK CANNOT FINISH SUCH A TYPE AND MUST NOT PRETEND TO.** `Base<int>` is a type
+/// the MONOMORPHIZER makes, and it makes it after every assembly has loaded -- so at this point
+/// there is no field layout to inherit, no vtable to extend and no id to record as the base. Every
+/// one of the four resolutions this walk performs ([`base_type_id`], [`resolve_base_fields`],
+/// [`resolve_base_vtable`], [`compute_sig_methods`]) answers for a `TypeDef` or a `TypeRef` and
+/// has nothing to say about a `TypeSpec`, so each one silently produced a type with NO BASE AT
+/// ALL: an inherited field read trapped, `isinst` answered false, and an override reached through
+/// a base-typed reference ran the BASE body.
+///
+/// So the type is recorded here with the raw material a second pass needs, and
+/// [`relink_generic_base_heirs`] finishes it once the base instantiation exists.
+///
+///
+struct GenericBaseHeir<'pe> {
+    /// The assembly the type was declared in -- its own tokens' space, and what its virtual
+    /// methods' signature keys have to be encoded against.
+    assembly: Assembly<'pe>,
+    /// Its assembly id, for rebinding its field tokens.
+    asm: u8,
+    /// Its module type id.
+    type_id: u32,
+    /// How its base is reached.
+    base: HeirBase,
+    /// Its OWN instance fields, in declaration order -- the token to rebind and the zero value.
+    own_fields: Vec<(Token, Value, Option<Token>)>,
+    /// Its OWN virtual methods, in declaration order.
+    virtuals: Vec<VirtualMethod>,
+    /// Its OWN non-virtual instance methods, in declaration order.
+    nonvirtuals: Vec<VirtualMethod>,
+}
+
+/// How a [`GenericBaseHeir`] reaches its base: directly, as the constructed generic it names, or
+/// through an ancestor that is itself a heir and so is not finished until this pass finishes it.
+enum HeirBase {
+    /// The `TypeSpec` naming the constructed generic base, resolved once the monomorphizer has
+    /// emitted the instantiation.
+    Constructed(Token),
+    /// An ordinary base that is ITSELF in this set -- so the layout and vtable to inherit are the
+    /// ones this pass is about to write, not the ones the ordinary walk left.
+    Relinked(TypeId),
+}
+
+/// [`load_assembly`], additionally collecting every type whose base is a constructed generic
+/// (see [`GenericBaseHeir`]) into `heirs` for the monomorphizer's second pass.
+#[allow(clippy::too_many_arguments)]
+fn load_assembly_collecting<'pe>(
+    module: &mut Module,
+    assembly: &Assembly<'pe>,
+    materialize: CilMaterializer<'pe>,
+    asm: u8,
+    index: &mut NameIndex,
+    type_index: &mut TypeNameIndex,
+    field_index: &mut FieldNameIndex,
+    resolve_external: bool,
+    heirs: &mut Vec<GenericBaseHeir<'pe>>,
 ) -> Option<MethodId> {
     let type_offset = module.type_count();
     let entry_token = assembly.image().entry_point_token();
@@ -3404,8 +3521,8 @@ fn load_assembly<'pe>(
                             if matches!(operand.table(), TYPE_DEF | TYPE_REF | TYPE_SPEC) =>
                         {
                             ldtoken_type_tokens.insert(*operand);
+                            type_test_tokens.insert(*operand);
                             if matches!(instruction.opcode, Opcode::Box) {
-                                type_test_tokens.insert(*operand);
                                 box_tokens.insert(*operand);
                             }
                         }
@@ -3580,6 +3697,52 @@ fn load_assembly<'pe>(
     );
     bind_call_targets(module, assembly, asm, &callvirt_tokens, &methoddef_sigs);
     bind_explicit_overrides(module, assembly, asm, type_offset);
+    let mut heir_base: Vec<Option<HeirBase>> = (0..type_extends.len()).map(|_| None).collect();
+    for (local, extends) in type_extends.iter().enumerate() {
+        if extends.table() == TYPE_SPEC {
+            heir_base[local] = Some(HeirBase::Constructed(*extends));
+        }
+    }
+    for _ in 0..type_extends.len() {
+        let mut grew = false;
+        for local in 0..type_extends.len() {
+            if heir_base[local].is_some() {
+                continue;
+            }
+            let Some(base_id) = base_type_id(type_extends[local], type_extends.len())
+                .map(|base| (type_offset + base) as TypeId)
+                .or_else(|| external_base_type_id(assembly, type_extends[local], type_index))
+            else {
+                continue;
+            };
+            let in_set = match (base_id as usize)
+                .checked_sub(type_offset)
+                .filter(|index| *index < type_extends.len())
+            {
+                Some(index) => heir_base[index].is_some(),
+                None => heirs.iter().any(|heir| heir.type_id == base_id),
+            };
+            if in_set {
+                heir_base[local] = Some(HeirBase::Relinked(base_id));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (local, base) in heir_base.into_iter().enumerate() {
+        let Some(base) = base else { continue };
+        heirs.push(GenericBaseHeir {
+            assembly: assembly.clone(),
+            asm,
+            type_id: (type_offset + local) as u32,
+            base,
+            own_fields: own_fields[local].clone(),
+            virtuals: type_virtuals[local].clone(),
+            nonvirtuals: type_nonvirtuals[local].clone(),
+        });
+    }
     bind_types(
         assembly,
         module,
@@ -4224,6 +4387,8 @@ fn bcl_intrinsic(
         match method {
             "StartThread" => return Some(intrinsic!(thread_start)),
             "JoinThread" => return Some(intrinsic!(thread_join)),
+            "JoinThreadTimeout" => return Some(intrinsic!(thread_join_timeout)),
+            "JoinTimedOut" => return Some(intrinsic!(monitor_wait_timed_out)),
             "YieldThread" => return Some(intrinsic!(thread_yield)),
             "SleepThread" => return Some(intrinsic!(thread_sleep)),
             _ => {}
@@ -4423,6 +4588,14 @@ fn bcl_intrinsic(
             _ => None,
         },
         ("Object", ".ctor") => object_ctor_overload(signature),
+        ("Object", "GetHashCode") => match parameters_of(signature) {
+            [] => Some(intrinsic!(object_get_hash_code)),
+            _ => None,
+        },
+        ("ValueType", "GetHashCode") => match parameters_of(signature) {
+            [] => Some(intrinsic!(value_type_get_hash_code)),
+            _ => None,
+        },
         ("Object", "ReferenceEquals") => match parameters_of(signature) {
             [SigType::Object, SigType::Object] => Some(intrinsic!(object_reference_equals)),
             _ => None,
@@ -4547,6 +4720,10 @@ fn bcl_intrinsic(
         },
         ("Array", "Clone") => match parameters_of(signature) {
             [] => Some(intrinsic!(array_clone)),
+            _ => None,
+        },
+        ("Array", "CreateInstanceCore") => match parameters_of(signature) {
+            [SigType::Class(_), SigType::I4] => Some(intrinsic!(array_create_instance)),
             _ => None,
         },
         ("Buffer", "BlockCopyInternal") => match parameters_of(signature) {
@@ -5205,12 +5382,14 @@ fn record_custom_attributes(
             } else {
                 alloc::format!("{}.{}", type_name.namespace, type_name.name)
             };
-            let is_enum = assembly
-                .type_token_name(type_def.extends())
-                .is_some_and(|base| base.namespace == "System" && base.name == "Enum");
+            let extends = type_def.extends();
+            let has_base = extends.row() != 0;
+            let is_enum = has_base
+                && assembly
+                    .type_token_name(extends)
+                    .is_some_and(|base| base.namespace == "System" && base.name == "Enum");
             let base_handle = {
-                let extends = type_def.extends();
-                if extends.0 == 0 {
+                if !has_base {
                     0
                 } else if extends.0 >> 24 == u32::from(TYPE_DEF) {
                     asm_key(asm, extends.0)
@@ -5882,6 +6061,161 @@ fn build_field_layouts(
     }
 }
 
+/// Finishes every type whose base is a CONSTRUCTED GENERIC (see [`GenericBaseHeir`]), now that
+/// the monomorphizer has emitted the base instantiation and the identity exists.
+///
+/// Four things are replaced, and they are the four the ordinary walk could not compute:
+///
+///
+fn relink_generic_base_heirs(
+    module: &mut Module,
+    heirs: &[GenericBaseHeir<'_>],
+    lowering: &monomorphize::Lowering,
+) {
+    let mut done: Vec<bool> = heirs.iter().map(|_| false).collect();
+    for _ in 0..heirs.len() {
+        let mut progressed = false;
+        for (position, heir) in heirs.iter().enumerate() {
+            if done[position] {
+                continue;
+            }
+            let base = match heir.base {
+                HeirBase::Constructed(extends) => generic_base_of(heir, extends, lowering),
+                HeirBase::Relinked(base) => heirs
+                    .iter()
+                    .position(|other| other.type_id == base)
+                    .is_none_or(|ancestor| done[ancestor])
+                    .then_some(base),
+            };
+            let Some(base) = base else {
+                if matches!(heir.base, HeirBase::Constructed(_)) {
+                    done[position] = true;
+                    progressed = true;
+                }
+                continue;
+            };
+            done[position] = true;
+            progressed = true;
+            relink_one(module, heir, base);
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+/// Rewrites one heir's base link, field layout, vtable and dispatch maps against `base` -- the
+/// identity its `extends` names, now that it exists.
+fn relink_one(module: &mut Module, heir: &GenericBaseHeir<'_>, base: TypeId) {
+    {
+        module.set_type_base(heir.type_id, Some(base));
+
+        if let Some(base_handle) = module.type_handle_of(base) {
+            if let Some(mut record) = module.reflect_type_of_type(heir.type_id) {
+                record.base_handle = base_handle;
+                if let Some(handle) = module.type_handle_of(heir.type_id) {
+                    module.bind_reflect_type(handle, record);
+                }
+            }
+        }
+
+        let mut defaults = module.type_field_defaults(base).unwrap_or_default();
+        let base_count = defaults.len();
+        for (index, (token, zero, _)) in heir.own_fields.iter().enumerate() {
+            module.bind_field(heir.asm, *token, (base_count + index) as u32);
+            defaults.push(zero.clone());
+        }
+        module.set_type_field_defaults(heir.type_id, defaults);
+
+        let mut table = module.vtable_slot_keys(base).unwrap_or_default();
+        let mut slots: Vec<(MethodId, u32)> = Vec::new();
+        for method in &heir.virtuals {
+            let key = sig_encode(
+                &heir.assembly,
+                &method.name,
+                &method.params,
+                method.generic_arity,
+                &[],
+            );
+            let overridden = (!method.newslot)
+                .then(|| table.iter().position(|(slot, _)| *slot == key))
+                .flatten();
+            let slot = match overridden {
+                Some(slot) => {
+                    table[slot].1 = method.id;
+                    slot as u32
+                }
+                None => {
+                    table.push((key, method.id));
+                    (table.len() - 1) as u32
+                }
+            };
+            slots.push((method.id, slot));
+        }
+        module.set_vtable_slot_keys(heir.type_id, table.clone());
+        if !table.is_empty() {
+            module.set_vtable(heir.type_id, table.iter().map(|(_, id)| *id).collect());
+        }
+        for (method, slot) in slots {
+            module.bind_method_slot(method, slot);
+        }
+
+        let mut virtuals: BTreeMap<String, MethodId> = module.sig_method_keys(base).into_iter().collect();
+        for method in &heir.virtuals {
+            virtuals.insert(
+                sig_encode(&heir.assembly, &method.name, &method.params, method.generic_arity, &[]),
+                method.id,
+            );
+        }
+        if !virtuals.is_empty() {
+            module.set_sig_methods(heir.type_id, virtuals);
+        }
+        let mut nonvirtuals: BTreeMap<String, MethodId> =
+            module.sig_method_keys_nonvirtual(base).into_iter().collect();
+        for method in &heir.nonvirtuals {
+            nonvirtuals.insert(
+                sig_encode(&heir.assembly, &method.name, &method.params, method.generic_arity, &[]),
+                method.id,
+            );
+        }
+        if !nonvirtuals.is_empty() {
+            module.set_sig_methods_nonvirtual(heir.type_id, nonvirtuals);
+        }
+    }
+}
+
+/// The module id of the instantiation a heir's `extends` `TypeSpec` names, or `None` when the
+/// monomorphizer emitted no such instantiation.
+///
+/// Resolution is by CANONICAL NAME through `lamella_generics`, which is the identity the
+/// monomorphizer records its emitted types under -- so the two sides agree by construction rather
+/// than by a second spelling kept in step by hand.
+#[cfg(feature = "generics")]
+fn generic_base_of(
+    heir: &GenericBaseHeir<'_>,
+    extends: Token,
+    lowering: &monomorphize::Lowering,
+) -> Option<TypeId> {
+    let signature = heir.assembly.type_spec_signature(extends)?;
+    let name = lamella_generics::spell_sig(&heir.assembly, &signature)?;
+    lowering
+        .types
+        .iter()
+        .find(|(emitted, _)| *emitted == name)
+        .map(|(_, type_id)| *type_id)
+}
+
+/// The capability-off answer: nothing was monomorphized, so no `TypeSpec` base has an identity to
+/// be relinked to and every heir stays exactly where the ordinary walk left it.
+#[cfg(not(feature = "generics"))]
+fn generic_base_of(
+    _heir: &GenericBaseHeir<'_>,
+    _extends: Token,
+    _lowering: &monomorphize::Lowering,
+) -> Option<TypeId> {
+    None
+}
+
 /// The memoized full field layout (zero values) of `type_id`: its base's layout
 /// followed by its own instance fields.
 fn field_layout(
@@ -5908,6 +6242,7 @@ fn field_layout(
 }
 
 /// A virtual method declared by a type, for vtable construction.
+#[derive(Clone)]
 struct VirtualMethod {
     id: MethodId,
     name: String,

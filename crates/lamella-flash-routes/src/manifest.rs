@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 /// The flash-image sidecar record: what the producer says about the artifact beside it.
 ///
+/// Field for field the Lamella RHU record, including the ones nothing here acts on. `producer` is
+/// carried because a report that cannot name what built an image is a report a person cannot
+/// follow up.
 #[derive(Clone, Debug)]
 pub struct Manifest {
     /// The record's own version. A newer one is refused rather than read hopefully.
@@ -31,7 +34,7 @@ pub struct Manifest {
 /// A record numbered higher describes something written after this was; reading it as if the extra
 /// were absent is how a tool honors half a contract. The refusal names the number so the reader can
 /// tell "too new" from "malformed".
-const SCHEMA: u64 = 1;
+pub(crate) const SCHEMA: u64 = 1;
 
 /// Where the sidecar for `image` lives.
 ///
@@ -50,7 +53,7 @@ pub fn path_for(image: &Path) -> PathBuf {
 /// The sidecar beside `image`, if there is one.
 ///
 /// # Errors
-/// A sidecar that exists and cannot be read as the v0.1 record. Absence is `Ok(None)`.
+/// A sidecar that exists and cannot be read as the Lamella RHU record. Absence is `Ok(None)`.
 pub fn read(image: &Path) -> Result<Option<Manifest>, String> {
     let path = path_for(image);
     let text = match std::fs::read_to_string(&path) {
@@ -192,7 +195,7 @@ pub fn check_identity(
         Some(extension) => {
             return Err(format!(
                 "the sidecar describes a file in {:?} format and this one is {extension:?}.\n\
-                 The v0.1 record describes `elf` and `bin`; an image in another format has no \
+                 The Lamella RHU record describes `elf` and `bin`; an image in another format has no \
                  sidecar that can\ndescribe it, so remove the sidecar or point at the artifact it \
                  belongs to.",
                 manifest.format
@@ -382,6 +385,9 @@ mod tests {
         assert!(why.contains("\"elf\"") && why.contains("\"bin\""), "{why}");
     }
 
+    /// The Lamella RHU record describes `elf` and `bin`. `flash` also takes `.hex`, `.s19` and
+    /// `.uf2`, and a sidecar beside one of those cannot describe it -- so it is refused by name
+    /// rather than ignored, because an unchecked claim is worse than no claim.
     #[test]
     fn a_sidecar_beside_a_format_the_record_cannot_describe_is_refused() {
         let manifest = parse(&record_for(b"image", "bin", "\"0x0\"")).unwrap();

@@ -65,7 +65,7 @@ public sealed class Samd21I2cDriver : I2cDriver
         ForceIdle();
     }
 
-    public override int Write(int address, byte[] buffer, int count)
+    public override int Write(int address, System.ReadOnlySpan<byte> buffer, int count)
     {
         int started = Start(address, Samd21SercomI2cMasterLayout.DIRECTION_WRITE);
         if (started != Ok)
@@ -90,7 +90,7 @@ public sealed class Samd21I2cDriver : I2cDriver
         return Ok;
     }
 
-    public override int Read(int address, byte[] buffer, int count)
+    public override int Read(int address, System.Span<byte> buffer, int count)
     {
         int started = Start(address, Samd21SercomI2cMasterLayout.DIRECTION_READ);
         if (started != Ok)
@@ -100,8 +100,8 @@ public sealed class Samd21I2cDriver : I2cDriver
         return ReadPhase(buffer, count);
     }
 
-    public override int WriteRead(int address, byte[] writeBuffer, int writeCount,
-        byte[] readBuffer, int readCount)
+    public override int WriteRead(int address, System.ReadOnlySpan<byte> writeBuffer, int writeCount,
+        System.Span<byte> readBuffer, int readCount)
     {
         int started = Start(address, Samd21SercomI2cMasterLayout.DIRECTION_WRITE);
         if (started != Ok)
@@ -194,7 +194,7 @@ public sealed class Samd21I2cDriver : I2cDriver
 
     /// <summary>Receives `count` bytes and closes the transaction. The first byte is already in
     /// hand when this is entered -- addressing a slave for a read clocks it in.</summary>
-    int ReadPhase(byte[] buffer, int count)
+    int ReadPhase(System.Span<byte> buffer, int count)
     {
         if (count <= 0)
         {

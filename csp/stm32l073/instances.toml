@@ -1,0 +1,113 @@
+# INSTANCE map for the STM32L073 (L0x3, category 5): where each block copy sits, plus its RCC
+# clock-enable routing. `-1` = the row gates nothing (the RCC itself).
+#
+# THE PORT SET IS CATEGORY 5's, AND GPIOE IS THE ROW THAT MAKES THIS A FAMILY. RM0367 table 2
+# gives category 5 GPIOA, GPIOB and GPIOC full-featured, GPIOD full-featured where category 3 has
+# [2] alone, and GPIOE full-featured where category 3 has nothing at all.
+#
+# THIS MAP DESCRIBES THE DIE AND THE PARTS ROW DESCRIBES THE PACKAGE, and on this family the two
+# say different things. No LQFP64 pad reaches port E, so the parts row lists none -- and the port
+# is still here, because an instance map states where a block copy SITS and not whether a package
+# brings it out. A 100-pin variant would bond those pads with nothing in this file changing.
+#
+
+[table]
+kind = "instances"
+family = "stm32l073"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32L0x3 reference manual RM0367 Rev 8 section 2.2.2 table 3 (peripheral register boundary addresses), read as rendered pages: GPIOA 0x50000000, GPIOB 0x50000400, GPIOC 0x50000800, GPIOD 0x50000C00, GPIOE 0x50001000, GPIOH 0x50001C00, RCC 0x40021000, USART1 0x40013800, SPI1 0x40013000, EXTI 0x40010400, SYSCFG 0x40010000, USART2 0x40004400",
+    "RM0367 Rev 8 section 7.3.12 (RCC_IOPENR, address 0x2C) for IOPAEN 0, IOPBEN 1, IOPCEN 2, IOPDEN 3, IOPEEN 4 and IOPHEN 7",
+    "RM0367 Rev 8 section 7.3.14 (RCC_APB2ENR, address 0x34) for SYSCFGEN 0, SPI1EN 12 and USART1EN 14, and section 7.3.15 (RCC_APB1ENR, address 0x38) for USART2EN 17",
+    "RM0367 Rev 8 table 2 (overview of features per category) for which of these a category 5 device implements",
+]
+notes = [
+    "IOPEEN AT BIT 4 HAS NO COUNTERPART ON CATEGORY 3, which is the register-level form of the same fact table 2 states. A driver written against the sibling category's enable mask would leave port E unclocked and its registers reading zero, which is the quietest possible failure.",
+    "EXTI HAS NO RCC GATE OF ITS OWN: it is always clocked. SYSCFG does, and it is the register that SELECTS which port drives a line, so a design using an external interrupt needs both.",
+]
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x50000000
+rcc_en_off = 0x2C
+rcc_en_bit = 0
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x50000400
+rcc_en_off = 0x2C
+rcc_en_bit = 1
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x50000800
+rcc_en_off = 0x2C
+rcc_en_bit = 2
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x50000C00
+rcc_en_off = 0x2C
+rcc_en_bit = 3
+
+[[instances]]
+name = "gpioe"
+block = "gpio"
+base = 0x50001000
+rcc_en_off = 0x2C
+rcc_en_bit = 4
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x50001C00
+rcc_en_off = 0x2C
+rcc_en_bit = 7
+
+[[instances]]
+name = "usart1"
+block = "usart"
+base = 0x40013800
+rcc_en_off = 0x34
+rcc_en_bit = 14
+
+[[instances]]
+name = "usart2"
+block = "usart"
+base = 0x40004400
+rcc_en_off = 0x38
+rcc_en_bit = 17
+
+[[instances]]
+name = "spi1"
+block = "spi"
+base = 0x40013000
+rcc_en_off = 0x34
+rcc_en_bit = 12
+
+# --- the external-interrupt path ------------------------------------------------------------
+
+[[instances]]
+name = "exti"
+block = "exti"
+base = 0x40010400
+rcc_en_off = -1
+rcc_en_bit = -1
+
+[[instances]]
+name = "syscfg"
+block = "syscfg"
+base = 0x40010000
+rcc_en_off = 0x34
+rcc_en_bit = 0
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x40021000
+rcc_en_off = -1
+rcc_en_bit = -1

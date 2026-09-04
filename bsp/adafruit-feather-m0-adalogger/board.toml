@@ -12,7 +12,7 @@ board = "feather-m0-adalogger"
 vendor = "adafruit"
 family = "samd21"
 part = "atsamd21g18a"
-board_model = 19            # lamella_wire::board_model::FEATHER_M0_ADALOGGER
+product_model = 19          # lamella_wire::product_model::FEATHER_M0_ADALOGGER
 sources = [
     "Adafruit Feather M0 Adalogger guide (product 2796): '#4 - used as the MicroSD card CS (chip select) pin', '#7 - used as the MicroSD card CD (card detect) pin', 'SCK/MOSI/MISO (GPIO 24/23/22) - These are the hardware SPI pins', 'The SD card uses hardware SPI', '#13 - GPIO #13 and is connected to the red LED next to the USB jack'",
     "Adafruit ArduinoCore-samd variants/feather_m0/variant.cpp pin descriptor table: Arduino D4 = PORTA 8, D7 = PORTA 21, D13 = PORTA 17, and MISO/MOSI/SCK = PORTA 12 / PORTB 10 / PORTB 11, each marked PIO_SERCOM_ALT and commented SERCOM4/PAD[0], PAD[2], PAD[3]. The guide states ARDUINO pin numbers and never names a port pin, so this file is what maps them",

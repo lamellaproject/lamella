@@ -1,0 +1,58 @@
+# GCLK, the Generic Clock controller of the SAM D5x/E5x family -- the BLOCK layout. Register
+# offsets are GCLK-instance-relative; nothing here names an instance, a pin, a board or a clock
+# plan.
+#
+# TWO ARRAYS, AND THEY ARE INDEXED BY DIFFERENT THINGS. This is the single most available way to
+# misconfigure a peripheral on this family:
+#
+#   GENCTRL[n]   n is a GENERATOR, 0 to 11. A generator takes a clock source and divides it.
+#   PCHCTRL[m]   m is a PERIPHERAL CHANNEL, 0 to 47. A channel selects which generator feeds one
+#                particular peripheral's core clock.
+#
+# So a peripheral is clocked by writing ITS channel index with the generator number it should
+# listen to -- and both numbers are small integers in the same range, which is what makes the
+# mistake invisible. Writing PCHCTRL[0] instead of GENCTRL[0] reconfigures the clock of whatever
+# peripheral owns channel 0 and leaves the intended generator untouched, and every register
+# involved reads back exactly what was written.
+#
+# THE CHANNEL INDEX FOR A GIVEN PERIPHERAL IS INSTANCE TRUTH AND LIVES IN THE INSTANCE MAP, on the
+# row for that instance, so that a driver names the peripheral it means rather than an integer.
+
+[table]
+kind = "block"
+family = "same54"
+block = "gclk"
+sources = [
+    "SAM D5x/E5x Family Data Sheet DS60001507F ch 14 (GCLK): 14.8 Register Description, per-register Offset headings",
+    "DS60001507F 14.8, PCHCTRLm: Offset 0x80 + m*0x04 [m=0..47]; GENCTRLn: Offset 0x20 + n*0x04 [n=0..11]",
+]
+notes = [
+    "THE ARRAY STRIDES ARE THE MANUAL'S OWN, printed in the offset headings rather than derived: GENCTRLn at 0x20 + n*0x04 for n up to 11, and PCHCTRLm at 0x80 + m*0x04 for m up to 47. The two arrays do not abut and the gap between them is not an accident to be closed by arithmetic.",
+    "A CHANNEL IS NOT ENABLED BY SELECTING A GENERATOR. PCHCTRL.GEN chooses which generator feeds the channel and PCHCTRL.CHEN turns the channel on; writing GEN alone leaves the peripheral unclocked while the register reads back the generator that was asked for.",
+    "SYNCBUSY COVERS THE GENERATORS AND THE RESET, NOT THE CHANNELS. Its bits are SWRST and one per GENCTRL, so a driver waits after writing a generator and has nothing to wait on after writing a peripheral channel.",
+    "DECLARED SUBSET: the GENCTRL source values (SRC) are declared as a field and NOT enumerated, because nothing here configures a generator -- a driver that selects a peripheral's generator is choosing among generators a system clock plan has already set up. Enumerating the sources would oblige reading their table, and an undeclared value cannot be silently wrong.",
+]
+
+[registers.CTRLA]
+offset = 0x00
+width = 8
+fields = { SWRST = [0, 1] }
+notes = "Software reset of the whole controller. Resetting GCLK takes every peripheral's core clock away at once, which is why nothing that configures a single peripheral touches it."
+
+[registers.SYNCBUSY]
+offset = 0x04
+width = 32
+fields = { SWRST = [0, 1], GENCTRL = [2, 12] }
+notes = "Read-only. GENCTRL is TWELVE BITS, one per generator, at bits 13:2 -- so the bit to wait on after writing generator n is bit n+2, and the offset by two is easy to lose. There is no bit here for a peripheral channel."
+
+[registers.GENCTRL0]
+offset = 0x20
+width = 32
+fields = { SRC = [0, 5], GENEN = [8, 1], IDC = [9, 1], OOV = [10, 1], OE = [11, 1], DIVSEL = [12, 1], RUNSTDBY = [13, 1], DIV = [16, 16] }
+notes = "Element 0 of the generator array; element n is at 0x20 + n*0x04, for n up to 11. DIVSEL selects how DIV is read: as a plain divisor, or as a power of two. A generator with GENEN clear produces nothing, whatever DIV and SRC say."
+
+[registers.PCHCTRL0]
+offset = 0x80
+width = 32
+fields = { GEN = [0, 4], CHEN = [6, 1], WRTLOCK = [7, 1] }
+notes = "Element 0 of the peripheral channel array; element m is at 0x80 + m*0x04, for m up to 47. WRTLOCK makes the channel read-only until a hardware reset, so a channel that refuses a write is not necessarily a wrong address."

@@ -9,6 +9,7 @@ namespace System.Threading
         private int _id;
         private string _name;
         private bool _isBackground;
+        private ThreadPriority _priority = ThreadPriority.Normal;
 
         public Thread(ThreadStart start) { _start = start; }
 
@@ -29,6 +30,21 @@ namespace System.Threading
 
         public void Join() { if (_id != 0) JoinThread(_id); }
 
+        public bool Join(int millisecondsTimeout)
+        {
+            if (millisecondsTimeout < Timeout.Infinite) throw new ArgumentOutOfRangeException("millisecondsTimeout");
+            if (_id == 0) return true;
+            JoinThreadTimeout(_id, millisecondsTimeout);
+            return !JoinTimedOut();
+        }
+
+        public bool Join(TimeSpan timeout)
+        {
+            long millis = timeout.Ticks / TimeSpan.TicksPerMillisecond;
+            if (millis < Timeout.Infinite || millis > 2147483647L) throw new ArgumentOutOfRangeException("timeout");
+            return Join((int)millis);
+        }
+
         public static Thread CurrentThread { get { return _current; } }
 
 #if LAMELLA_SURFACE_NETFX_1_1
@@ -36,6 +52,20 @@ namespace System.Threading
 #endif
 
         public bool IsAlive { get { return true; } }
+
+        public ThreadPriority Priority
+        {
+            get { return _priority; }
+            set
+            {
+                if (value < ThreadPriority.Lowest || value > ThreadPriority.Highest)
+                {
+                    throw new ArgumentException("value");
+                }
+                _priority = value;
+            }
+        }
+
 
         public string Name
         {
@@ -45,6 +75,18 @@ namespace System.Threading
 
         public static void Sleep(int millisecondsTimeout) { SleepThread(millisecondsTimeout); }
 
+        public static void Sleep(TimeSpan timeout)
+        {
+            long millis = timeout.Ticks / TimeSpan.TicksPerMillisecond;
+            if (millis < Timeout.Infinite || millis > 2147483647L) throw new ArgumentOutOfRangeException("timeout");
+            Sleep((int)millis);
+        }
+
+        public static void SpinWait(int iterations)
+        {
+            if (iterations > 0) YieldThread();
+        }
+
 #if LAMELLA_SURFACE_NETFX_4_0
         public static bool Yield() { YieldThread(); return true; }
 #endif
@@ -53,6 +95,8 @@ namespace System.Threading
 
         [Lamella.Runtime.RuntimeProvided] private static int StartThread(ThreadStart start, bool isBackground) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static void JoinThread(int id) { }
+        [Lamella.Runtime.RuntimeProvided] private static void JoinThreadTimeout(int id, int millisecondsTimeout) { }
+        [Lamella.Runtime.RuntimeProvided] private static bool JoinTimedOut() { return false; }
         [Lamella.Runtime.RuntimeProvided] private static void YieldThread() { }
         [Lamella.Runtime.RuntimeProvided] private static void SleepThread(int millisecondsTimeout) { }
     }

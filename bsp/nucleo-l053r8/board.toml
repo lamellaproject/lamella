@@ -13,7 +13,7 @@ board = "nucleo-l053r8"
 vendor = "st"
 family = "stm32l053"
 part = "stm32l053r8t6"
-board_model = 41            # lamella_wire::board_model::NUCLEO_L053R8
+product_model = 41          # lamella_wire::product_model::NUCLEO_L053R8
 sources = [
     "STM32 Nucleo-64 boards user manual UM1724 Rev 17, which covers NUCLEO-L053R8 by name and gives its fitted part as STM32L053R8T6: section 6.9 for the virtual COM port on USART2 PA2/PA3, the LED section for the green user LED LD2, section 7.7 for the user button B1 on PC13, and table 17 (ARDUINO connectors on NUCLEO-L053R8) for the per-board header assignment",
     "UM1724 Rev 17 stating the package in its own words -- an STM32 microcontroller in an LQFP64 package -- rather than by a decode of the ordering code",

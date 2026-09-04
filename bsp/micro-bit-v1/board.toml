@@ -7,7 +7,7 @@ board = "micro-bit-v1"
 vendor = "micro-bit"
 family = "nrf51"
 part = "nrf51822"
-board_model = 1             # lamella_wire::board_model::MICROBIT_V1
+product_model = 1           # lamella_wire::product_model::MICROBIT_V1
 sources = [
     "micro:bit v1 board identity via the on-board DAPLink bridge the deploy tooling scopes by",
     "micro:bit Foundation edge connector documentation, tech.microbit.org/hardware/edgeconnector/ : pin 19 is I2C SCL and pin 20 is I2C SDA, and those pins are the bus 'used by the on-board motion sensor'",
@@ -54,7 +54,7 @@ source = "hfclk"            # the TWI times itself from the high-frequency clock
 # part's own datasheet fact rather than this board's. Both pairs have been read on silicon through
 # this board's bus and each answered its identity register, so what is missing here is not the
 # knowledge -- it is a way for one board file to say "it depends which revision you are holding".
-# Splitting this into two board files would need a second board_model, which is a wire-protocol
+# Splitting this into two board files would need a second product_model, which is a wire-protocol
 # constant and not this file's to mint.
 #
 # The chip pins come from the Foundation's own runtime (microbit-dal MicroBitPin.h), which maps

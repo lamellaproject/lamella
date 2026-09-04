@@ -1,0 +1,107 @@
+# BOARD binding: the Arduino Opta WiFi (AFX00002), an industrial PLC on an STM32H747XI. Board truth
+# ONLY: on-board devices and the carrier. Chip truth lives in csp/stm32h7/.
+#
+# THIS BOARD IS WHY THE FAIL-SAFE WORK NEEDED TWO OF THEM. Its four outputs are Finder RELAYS,
+# normally open, rated 250 VAC at 10 A -- so driving a pad energizes a coil and the CONTACT is what
+# makes an output live, and de-energized is open. That is a different kind of output from an LED,
+# and it is a different kind again from the P1AM-100's rack channels, which this part cannot reach
+# at all. Two boards, two shapes, one policy.
+#
+# WHAT IS STATED HERE IS ONLY WHAT TWO DOCUMENTS AGREE ON. Every row below is joined from the
+# vendor's own board variant (which names a PIN, not a ball) and from the schematic's own
+# microcontroller symbol, and the relay mapping is not a permutation anybody could have guessed:
+# OUT 1 2 3 4 are PI6 PI5 PI7 PI4, in that order. Two documents landing on the same shuffle is what
+# makes the join evidence rather than a coincidence of alignment.
+#
+# THE FOUR FACEPLATE STATUS LEDS ARE NOT ON PINS AND ARE DELIBERATELY ABSENT. The Arduino core
+# defines LED_D0..LED_D3 as pin numbers 7, 9, 8 and 153, which index its own table to PI0, PI1, PI3
+# and PH15 -- and the schematic gives PI0, PI1 and PI3 as SPI2.CS, SPI2.CLK and SPI2.MOSI. Those
+# three are a SPI BUS, not three indicators, so a row naming them would state that a status LED is
+# on a chip select. Whatever drives the faceplate LEDs sits behind that bus, and no document here
+# says what. So this file emits no LED constant for them, and a program reaching for one fails to
+# compile rather than driving a bus line.
+#
+# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the eight I1..I8 input terminals (they are
+# 0-10 V ANALOG inputs behind a conditioning network, reaching the part's analog-only PA0_C / PA1_C /
+# PC2_C / PC3_C pads and its PF pins, and neither an analog terminal nor its conditioning is a
+# gpio-in row); the Ethernet PHY and its port LEDs; the wireless module; the USB-C power-delivery
+# controller; the QSPI flash and the SD card interface; and the RS485 transceiver, which this
+# variant does not carry.
+
+[table]
+kind = "board"
+board = "opta-wifi"
+vendor = "arduino"
+family = "stm32h7"
+part = "stm32h747xi"
+product_model = 43            # lamella_wire::product_model::ARDUINO_OPTA_WIFI
+sources = [
+    "Arduino Opta datasheet (AFX00001-AFX00002-AFX00003): 'Dual-core ST STM32H747XI Processor', '4x Relays - Normally Open (NO) - Max: 10 A each', relay rated voltage 250 VAC and maximum peak current 15 A; the faceplate legend gives 'Relay Output Terminals 1...4, NO contact', 'I1...I8 digital/analog input terminals (0-10V)', 'Status LEDs 1...4 (User Programmable)' and 'User Programmable button', with the note that the LED above that button is available only on the Arduino Opta WiFi (AFX00002)",
+    "Arduino Opta schematics (AFX00001-AFX00002-AFX00003, file STM32H747, 30/01/2024), the U3B and U3A symbols of the STM32H747XIH6: PI4 carries OUT 4, PI5 OUT 2, PI6 OUT 1 and PI7 OUT 3; PI0, PI1 and PI3 carry SPI2.CS, SPI2.CLK and SPI2.MOSI; PE4 carries the PB_BLE net and PE5 the LED_BLE net",
+    "Arduino ArduinoCore-mbed variants/OPTA/pins_arduino.h and variant.cpp, index-ordered: RELAY1..RELAY4 are D0..D3, which are table indices 0..3 = PI_6, PI_5, PI_7, PI_4; BTN_USER is 94 = PE_4; LED_USER is LEDB = 25 = PE_5, whose own comment reads LED_BLE",
+    "Arduino Opta user manual: the relay sketch drives an output with digitalWrite(relayOutputs[i], HIGH) to turn it ON and LOW to turn it OFF; the button is initialized with pinMode(BTN_USER, INPUT) and the manual states 'The user button has an internal pull-up resistor, meaning its default value (while not being pressed) is HIGH'",
+    "STM32H747xI/G datasheet DS12930 Rev 1, Table 7 pin/ball definition: PI0, PI1, PI3, PI4, PI5, PI6, PI7, PE4, PE5 and PH15 are all present on the TFBGA240+25 ballout this part carries",
+]
+notes = [
+    "NOTHING IN THIS FILE HAS ANSWERED ON THE PART. Every row is a document join; no probe has reached this board here. A row that has been driven says so, and none of these do.",
+    "THE RELAY ORDER IS THE TRAP THIS BOARD SETS. OUT 1 is PI6 and OUT 4 is PI4, so the pins do not ascend with the terminals and PI4/PI5/PI6/PI7 in numerical order is OUT 4, OUT 2, OUT 1, OUT 3. Anyone writing a loop over the four pins in pin order and labelling them 1 to 4 gets a machine whose terminals are shuffled, which on this board means the wrong load closes.",
+    "A RELAY IS NOT AN LED AND `active = high` DOES NOT MEAN THE OUTPUT IS SAFE WHEN LOW. It means the coil is energized when the pin is high, and a normally-open contact is open when the coil is not energized. Open is the state the load sees as off; whether that is SAFE is a property of what is wired to the terminal, which no board file knows.",
+]
+
+# --- the carrier ------------------------------------------------------------------------------
+#
+# THE MICROCONTROLLER'S OWN USB DEVICE CONTROLLER, over the USB-C connector the faceplate legend
+# calls 'USB-C for programming and data logging'. No bridge sits between it and the host, so the
+# row carries no vendor identity: a bridge has a USB identity of its own to state and this path has
+# only the device the target itself presents.
+
+[[carriers]]
+kind = "native-usb"
+default = true
+
+# --- the relay outputs ------------------------------------------------------------------------
+
+[[devices]]
+name = "relay_1"
+kind = "gpio-out"
+pin = "PI6"
+active = "high"
+source = "The schematic's U3B symbol gives pin PI6 the net OUT 1. ArduinoCore-mbed's OPTA variant defines RELAY1 as D0, which is index 0 of g_APinDescription and reads PI_6. The user manual's relay sketch turns an output ON with digitalWrite(relay, HIGH), so the coil is energized on a high pin and the normally-open contact is open when it is not."
+
+[[devices]]
+name = "relay_2"
+kind = "gpio-out"
+pin = "PI5"
+active = "high"
+source = "The schematic's U3B symbol gives pin PI5 the net OUT 2. The OPTA variant defines RELAY2 as D1 = index 1 = PI_5. Polarity as for relay_1, from the same sketch."
+
+[[devices]]
+name = "relay_3"
+kind = "gpio-out"
+pin = "PI7"
+active = "high"
+source = "The schematic's U3B symbol gives pin PI7 the net OUT 3 -- NOT PI6 + 1, which is OUT 1's neighbour and a different terminal. The OPTA variant defines RELAY3 as D2 = index 2 = PI_7. Polarity as for relay_1, from the same sketch."
+
+[[devices]]
+name = "relay_4"
+kind = "gpio-out"
+pin = "PI4"
+active = "high"
+source = "The schematic's U3B symbol gives pin PI4 the net OUT 4. The OPTA variant defines RELAY4 as D3 = index 3 = PI_4. Polarity as for relay_1, from the same sketch."
+
+# --- the user button and its LED ----------------------------------------------------------------
+
+[[devices]]
+name = "user_button"
+kind = "gpio-in"
+pin = "PE4"
+active = "low"
+source = "ArduinoCore-mbed's OPTA variant defines BTN_USER as 94, which is index 94 of g_APinDescription and reads PE_4; the schematic's U3A symbol gives pin PE4 the net PB_BLE, a push-button net carried over from this part's Portenta lineage and adjacent to the LED net below. The user manual states the button 'has an internal pull-up resistor, meaning its default value (while not being pressed) is HIGH', so PRESSED is the low reading and the pin wants an input with a pull-up."
+
+[[devices]]
+name = "user_led"
+kind = "gpio-out"
+pin = "PE5"
+active = "unknown"          # the PAD is established twice over; the asserted level is not, and
+                            # `unknown` is how that is said instead of assuming an indicator sinks.
+source = "ArduinoCore-mbed's OPTA variant defines LED_USER as LEDB = 25 = PE_5, whose own table comment reads LED_BLE; the schematic's U3A symbol gives pin PE5 the net LED_BLE. This is the indicator above the user button, which the datasheet notes is fitted only on the Opta WiFi -- the variant this file describes. Those sources establish the pad. None of them states which level lights it: the user manual's HIGH-lights-it sketch drives the four FACEPLATE status LEDs, which are not this indicator and are not on pins at all, so borrowing their polarity would be reading one component's wiring off another's."

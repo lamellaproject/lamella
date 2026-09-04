@@ -18,7 +18,7 @@ validation = "none"
 
 # --- a disagreement worth carrying ------------------------------------------------------------
 #
-# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS: 0x38 on this bench against 0x3A and 0x1D in the manual.
+# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS: 0x38 measured, against 0x3A and 0x1D in the manual.
 
 [address]
 bus = "i2c"

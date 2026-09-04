@@ -15,8 +15,16 @@ part = "atsamd21g18a"
 package = "48-pin"
 flash = 0x40000
 ram = 0x8000
-pins = ["PA06", "PA08", "PA12-PA15", "PA17", "PA21-PA23", "PA27-PA28", "PB09-PB11", "PB22-PB23"]
-source = "DS40001882 ch 5 (48-pin) -- PARTIAL present-list; complete from the datasheet before authoring bindings on other pins. PA06 (48-pin pin 11) and PA17 (48-pin pin 26) added from the ch 7 I/O multiplexing table. PA08 (pin 13) and PA21 (pin 30) added the same way, and cross-checked against the 48-pin package pinout itself -- which is distinguishable from the 64-pin one because the 64-pin carries PB12-PB15 and the 48-pin does not."
+pins = ["PA04-PA08", "PA12-PA15", "PA17", "PA21-PA23", "PA27-PA28", "PB08-PB11", "PB22-PB23"]
+source = "DS40001882 ch 5 (48-pin) -- PARTIAL present-list; complete from the datasheet before authoring bindings on other pins. PA06 (48-pin pin 11) and PA17 (48-pin pin 26) added from the ch 7 I/O multiplexing table. PA08 (pin 13) and PA21 (pin 30) added the same way, and cross-checked against the 48-pin package pinout itself -- which is distinguishable from the 64-pin one because the 64-pin carries PB12-PB15 and the 48-pin does not. PA04 (pin 9), PA05 (pin 10) and PB08 (pin 7) added for the P1AM-100's base-controller select, its readiness line and its user LED, read from section 5.2.1's own QFN48/TQFP48 diagram under the '5.2 SAM D21G' heading rather than from the ch 7 table: that table flows its three package columns (SAMD21E / SAMD21G / SAMD21J) into one text stream, and a row for a pin the E variant does not carry then presents its G and J numbers where a reader expects E and G -- PB08 reads as 7 and 11 and is pin 7 on this package, not 11. PA07 (pin 12) joins the PA04-PA08 run because the run states it: it is on the same 48-pin diagram between PA06 and PA08."
+
+[[parts]]
+part = "atsamd21g17d"
+package = "48-pin"
+flash = 0x20000
+ram = 0x4000
+pins = ["PA00-PA01", "PA22", "PA30-PA31", "PB10-PB11", "PB22"]
+source = "DS40001882 ch 3 configuration summary: the ATSAMD21G17D row gives 128 KB program memory, 16 KB data memory, 48 pins in QFN and TQFP, and 38 I/O pins. It is the same 48-pin G package as the atsamd21g18a row above and differs from it only in those two sizes. PARTIAL present-list, and every pin in it is named against THIS part number by the SAM D21 Curiosity Nano user guide DS70005409D: PA00 XIN32 and PA01 XOUT32 (Table 4-3), PA22 and PB22 the debugger's CDC pair (Table 4-4), PA30 SWCLK and PA31 SWDATA (Table 4-4), PB10 LED0 (Table 4-1), PB11 SW0 and DBG2 (Table 4-2 and Table 4-4). Complete from the datasheet before authoring bindings on other pins."
 
 [[parts]]
 part = "atsamd21j18a"

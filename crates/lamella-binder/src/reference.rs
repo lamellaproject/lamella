@@ -60,6 +60,10 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly:
         "System.Diagnostics.CodeAnalysis",
         "SetsRequiredMembersAttribute",
     );
+    let by_ref_like = assembly.tokens_with_attribute(
+        "System.Runtime.CompilerServices",
+        "IsByRefLikeAttribute",
+    );
     for type_def in assembly.type_defs() {
         let own_parameters: &[&str] = type_parameters
             .get(&type_def.token().row())
@@ -73,6 +77,7 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly:
             own_parameters,
             &required_members,
             &sets_required,
+            &by_ref_like,
             internals_visible,
         ) {
             let mut info = info;
@@ -149,6 +154,7 @@ fn type_info(
     own_parameters: &[&str],
     required_members: &BTreeSet<lamella_token::Token>,
     sets_required: &BTreeSet<lamella_token::Token>,
+    by_ref_like: &BTreeSet<lamella_token::Token>,
     internals_visible: bool,
 ) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
@@ -185,6 +191,7 @@ fn type_info(
     info.internals_visible = internals_visible;
     info.is_sealed = type_def.is_sealed();
     info.is_abstract = type_def.is_abstract();
+    info.is_by_ref_like = by_ref_like.contains(&type_def.token());
     info.accessibility = type_visibility(type_def.flags());
     info.enclosing = enclosing;
     info.assembly = assembly.assembly_name().map(Box::from);
@@ -244,8 +251,14 @@ fn type_info(
                 token_type_symbol(assembly, *modifier)
                     == named_symbol("System.Runtime.CompilerServices", "IsExternalInit")
             });
+        let return_required_modifiers = signature
+            .return_type_required_modifiers
+            .iter()
+            .map(|modifier| token_type_symbol(assembly, *modifier))
+            .collect();
         let symbol = MethodSymbol {
             explicit_interface: None,
+            return_required_modifiers,
             name: method_name.into(),
             return_type: sigtype_to_symbol(
                 assembly,

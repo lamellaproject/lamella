@@ -1,0 +1,33 @@
+# BLOCK: the SAM4L flash controller (FLASHCALW), stated only as far as the facts consumers outside
+# the controller need. Its command set, its security bit and its picocache are not described here.
+#
+# NOT AN EEFC, WHICH IS THE FIRST THING TO KNOW ABOUT IT. The SAM3X, SAM4S, SAM4E and SAM4N use the
+# Enhanced Embedded Flash Controller and report their geometry from a Get Flash Descriptor command;
+# the SAM4L uses FLASHCALW, which does not. Both kinds still state a page size their own family
+# holds to, so both can be declared -- what differs is whether a driver can also ASK the part, and
+# on an EEFC it should, because the descriptor is the live cross-check against this file.
+#
+# THE PAGE IS 512 BYTES ACROSS EVERY DENSITY, and that is what makes it a block fact rather than a
+# part one: the parameter table gives 512 for the 1024-page, 512-page and 256-page devices alike.
+# A family whose densities DIFFERED would have to state this per part.
+#
+# THE ERASED VALUE COMES FROM THE PART'S OWN BLANK CHECK. FLASHCALW offers Quick Page Read, which
+# "read[s] all words in an addressed page. All bits in all words in this page are AND'ed together"
+# and is "useful to check that a page is in an erased state". A blank check built on AND returning
+# one is a part saying that erased is all ones, in a stronger form than a sentence would.
+
+[table]
+kind = "block"
+family = "sam4l"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 512
+sources = [
+    "write_unit: SAM4L datasheet Atmel-42023H, flash parameter table -- `Page Size (FLASH_W) 512 bytes` given for all three densities alongside `Number of Pages (FLASH_P) 1024 512 256`",
+    "erased_value: SAM4L datasheet Atmel-42023H section 14, Quick Page Read -- `All bits in all words in this page are AND'ed together` and the command is `useful to check that a page is in an erased state`",
+]
+notes = [
+    "Data reaches the array through a PAGE BUFFER whose native width is a 64-bit doubleword, filled by two 32-bit bus transfers with the low address first. That is the width of the accesses that FILL a unit, not the size of the operation that commits one, and reading it as the write unit would give 8 where the answer is 512.",
+    "The page buffer only clears bits, exactly as the array does: `writing to the page buffer can only change page buffer bits from one to zero`. It is not reset by a page write and must be cleared explicitly with Clear Page Buffer before the next page is staged.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

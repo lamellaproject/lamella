@@ -85,6 +85,60 @@ function Get-Sources($dir, [switch]$Recurse) {
     $paths
 }
 
+# The connector STANDARDS a board offers a socket of, deduplicated. A board with a socket can carry
+# an extension board, and a program written for that pairing needs the EXTENSION's descriptors as
+# well as the board's -- so the assembly for a board with sockets includes the emissions of every
+# extension built to a standard it offers.
+#
+# WHICH EXTENSION IS ACTUALLY PLUGGED IN IS NOT A FACT EITHER FILE HOLDS, and that is deliberate:
+# a board's own emission says what is plugged into a socket is not board truth, and an extension
+# does not know its host. So the assembly carries the descriptors of everything that COULD fit and
+# names nothing as fitted; a program picks one and states its own assumption.
+function Resolve-ConnectorStandards($boardDir) {
+    $toml = Join-Path $boardDir 'board.toml'
+    if (-not (Test-Path $toml)) { return @() }
+    $inConnector = $false
+    $standards = New-Object System.Collections.Generic.List[string]
+    foreach ($line in [System.IO.File]::ReadLines($toml)) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq '[[connectors]]') { $inConnector = $true; continue }
+        # Any other section header ends the row -- including a `[[connectors.<name>.pins]]`, whose
+        # rows state a position and never a standard.
+        if ($trimmed.StartsWith('[')) { $inConnector = $false; continue }
+        if (-not $inConnector) { continue }
+        if ($trimmed -match '^standard\s*=\s*"([^"]+)"') {
+            if (-not $standards.Contains($Matches[1])) { $standards.Add($Matches[1]) }
+        }
+    }
+    $standards
+}
+
+# The extension emissions built to any of those standards. Sorted by path for the same reason
+# Get-Sources sorts: metadata layout must not depend on enumeration order.
+function Resolve-ExtensionSources($root, $standards) {
+    if (-not $standards -or -not $standards.Count) { return @() }
+    $extRoot = Join-Path $root 'ext'
+    if (-not (Test-Path $extRoot)) { return @() }
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($dir in @(Get-ChildItem $extRoot -Directory | Sort-Object Name)) {
+        $toml = Join-Path $dir.FullName 'extension.toml'
+        if (-not (Test-Path $toml)) { continue }
+        $standard = ''
+        # The header runs to the first ARRAY section, which is the strata reader's own rule: an
+        # extension states its standard inside `[table]`, so stopping at the first `[` would stop
+        # at `[table]` itself and find nothing. That was this function's first bug.
+        foreach ($line in [System.IO.File]::ReadLines($toml)) {
+            $trimmed = $line.Trim()
+            if ($trimmed.StartsWith('[[')) { break }
+            if ($trimmed -match '^standard\s*=\s*"([^"]+)"') { $standard = $Matches[1]; break }
+        }
+        if (-not $standards.Contains($standard)) { continue }
+        $csharp = Join-Path $dir.FullName 'csharp'
+        if (Test-Path $csharp) { foreach ($f in @(Get-Sources $csharp -Recurse)) { $out.Add($f) } }
+    }
+    $out
+}
+
 # The chip family whose C# a board needs. A board states `family` directly; a MODULE board states
 # `module`, and the module states the family it wraps (the ATSAMW25 is a SAMD21G18A plus a radio,
 # so its boards compile the samd21 drivers).
@@ -148,11 +202,14 @@ foreach ($boardDir in $boards) {
         throw "bsp/$($boardDir.Name) needs csp/$family/csharp, which does not exist. Generate the family's C# or the board class cannot compile."
     }
 
-    $src = @(Get-Sources $familyCs -Recurse) + @(Get-Sources (Join-Path $boardDir.FullName 'csharp') -Recurse)
+    $standards = @(Resolve-ConnectorStandards $boardDir.FullName)
+    $extSrc = @(Resolve-ExtensionSources $root $standards)
+    $src = @(Get-Sources $familyCs -Recurse) + @(Get-Sources (Join-Path $boardDir.FullName 'csharp') -Recurse) + $extSrc
     $dll = Join-Path $out "Lamella.Boards.$qualified.dll"
     $refs = @($BoardReferences | ForEach-Object { "/reference:$(Join-Path $out "$_.dll")" })
 
-    Write-Host "Lamella.Boards.$qualified ($($src.Count) sources: csp/$family + bsp/$($boardDir.Name)) -> $dll"
+    $extNote = if ($extSrc.Count) { " + $($extSrc.Count) ext" } else { '' }
+    Write-Host "Lamella.Boards.$qualified ($($src.Count) sources: csp/$family + bsp/$($boardDir.Name)$extNote) -> $dll"
     & $Lcsc @src @defineArg @refs /target:library "/out:$dll" /debug-
     if ($LASTEXITCODE -ne 0) { throw "Lamella.Boards.$qualified compile failed ($LASTEXITCODE)" }
     $built += [pscustomobject]@{ Board = $boardDir.Name; Assembly = "Lamella.Boards.$qualified"; Bytes = (Get-Item $dll).Length }

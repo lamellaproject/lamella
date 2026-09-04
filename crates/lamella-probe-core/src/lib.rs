@@ -129,6 +129,34 @@ pub trait DapAccess {
     /// Drives the probe's nRESET line, returning the probe's reported pin state.
     fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError>;
 
+    /// Releases the target from reset with `SWCLK` held LOW across the release -- the SAM "reset
+    /// extension" -- so the application never runs and never takes the debug pins.
+    ///
+    /// Returns whether the probe could hold `SWCLK` low across the release. **`Ok(false)` is an
+    /// ANSWER AND NOT A FAILURE**: the target was reset, but by the plain pulse this trait's
+    /// default performs, and the guarantee the method exists for was not provided.
+    ///
+    /// # Why this is not [`set_reset`](Self::set_reset) twice
+    ///
+    /// Releasing nRESET starts the application, and a debugger then has to reach the debug port
+    /// before that application reconfigures the pins it is attaching through. On a part whose
+    /// firmware repurposes `SWCLK` or `SWDIO` the window is a few instructions wide, so the attach
+    /// succeeds intermittently or not at all -- and the failure is indistinguishable from bad
+    /// wiring. A SAM part samples `SWCLK` as reset is released: held low, it enters debug instead
+    /// of starting the application, and there is no window to lose.
+    ///
+    /// # The default is the race, deliberately, and it says so in the return
+    ///
+    /// A probe that cannot drive the two lines together gets nRESET pulsed and `Ok(false)`, which
+    /// is what it was doing before this method existed. What changes is that the caller can now
+    /// ASK, so a path that needs the guarantee can name the reason it did not get it rather than
+    /// working by luck on the probes that happen to idle `SWCLK` low.
+    fn reset_extension(&mut self) -> Result<bool, ProbeError> {
+        self.set_reset(true)?;
+        self.set_reset(false)?;
+        Ok(false)
+    }
+
     /// Writes `values` to one Access Port register back to back, in as few probe round-trips as the
     /// probe allows (CMSIS-DAP streams these with `DAP_TransferBlock`).
     ///
@@ -216,6 +244,9 @@ impl<D: DapAccess + ?Sized> DapAccess for &mut D {
     fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
         (**self).set_reset(assert)
     }
+    fn reset_extension(&mut self) -> Result<bool, ProbeError> {
+        (**self).reset_extension()
+    }
     fn write_ap_block(&mut self, address: u8, values: &[u32]) -> Result<(), ProbeError> {
         (**self).write_ap_block(address, values)
     }
@@ -288,6 +319,34 @@ pub trait TargetAccess {
     fn reset_and_halt(&mut self) -> Result<(), ProbeError>;
     /// Drives the probe's nRESET line, returning the probe's reported pin state.
     fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError>;
+
+    /// Releases the target from reset with `SWCLK` held LOW across the release -- the SAM "reset
+    /// extension" -- so the application never runs and never takes the debug pins.
+    ///
+    /// Returns whether the probe could hold `SWCLK` low across the release. **`Ok(false)` is an
+    /// ANSWER AND NOT A FAILURE**: the target was reset, but by the plain pulse this trait's
+    /// default performs, and the guarantee the method exists for was not provided.
+    ///
+    /// # Why this is not [`set_reset`](Self::set_reset) twice
+    ///
+    /// Releasing nRESET starts the application, and a debugger then has to reach the debug port
+    /// before that application reconfigures the pins it is attaching through. On a part whose
+    /// firmware repurposes `SWCLK` or `SWDIO` the window is a few instructions wide, so the attach
+    /// succeeds intermittently or not at all -- and the failure is indistinguishable from bad
+    /// wiring. A SAM part samples `SWCLK` as reset is released: held low, it enters debug instead
+    /// of starting the application, and there is no window to lose.
+    ///
+    /// # The default is the race, deliberately, and it says so in the return
+    ///
+    /// A probe that cannot drive the two lines together gets nRESET pulsed and `Ok(false)`, which
+    /// is what it was doing before this method existed. What changes is that the caller can now
+    /// ASK, so a path that needs the guarantee can name the reason it did not get it rather than
+    /// working by luck on the probes that happen to idle `SWCLK` low.
+    fn reset_extension(&mut self) -> Result<bool, ProbeError> {
+        self.set_reset(true)?;
+        self.set_reset(false)?;
+        Ok(false)
+    }
 
     /// Reads a core register by its architecture-specific selector.
     fn read_core_reg(&mut self, selector: u8) -> Result<u32, ProbeError>;
@@ -733,6 +792,10 @@ impl<D: DapAccess> TargetAccess for ArmDap<D> {
         self.dap.set_reset(assert)
     }
 
+    fn reset_extension(&mut self) -> Result<bool, ProbeError> {
+        self.dap.reset_extension()
+    }
+
     fn read_core_reg(&mut self, selector: u8) -> Result<u32, ProbeError> {
         cortex_m::read_core_reg(self, selector)
     }
@@ -779,5 +842,141 @@ impl<D: DapAccess> CoreMemory for ArmDap<D> {
 
     fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
         self.dap.set_reset(assert)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArmDap, DapAccess, ProbeError, TargetAccess};
+
+    /// What a probe was asked to do to its reset line, in order.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Pin {
+        Assert,
+        Release,
+        Extension,
+    }
+
+    /// A [`DapAccess`] that records reset activity and nothing else. `can_hold_swclk` selects which
+    /// of the two probe shapes it models: one that overrides `reset_extension` (a CMSIS-DAP probe)
+    /// and one that does not (whatever the trait's default covers).
+    struct FakeDap {
+        can_hold_swclk: bool,
+        log: Vec<Pin>,
+    }
+
+    impl FakeDap {
+        fn new(can_hold_swclk: bool) -> FakeDap {
+            FakeDap { can_hold_swclk, log: Vec::new() }
+        }
+    }
+
+    impl DapAccess for FakeDap {
+        fn connect(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn read_dp(&mut self, _address: u8) -> Result<u32, ProbeError> {
+            Ok(0)
+        }
+        fn write_dp(&mut self, _address: u8, _value: u32) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn read_ap(&mut self, _address: u8) -> Result<u32, ProbeError> {
+            Ok(0)
+        }
+        fn write_ap(&mut self, _address: u8, _value: u32) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
+            self.log.push(if assert { Pin::Assert } else { Pin::Release });
+            Ok(0)
+        }
+        fn reset_extension(&mut self) -> Result<bool, ProbeError> {
+            if !self.can_hold_swclk {
+                self.set_reset(true)?;
+                self.set_reset(false)?;
+                return Ok(false);
+            }
+            self.log.push(Pin::Extension);
+            Ok(true)
+        }
+    }
+
+    /// A probe that cannot drive the pair still resets the target, and SAYS it could not hold
+    /// SWCLK. Both halves matter: the pulse is what keeps a probe with no pin mask working, and the
+    /// `false` is the only way a caller can tell that the guarantee was not provided.
+    #[test]
+    fn the_default_reset_extension_pulses_nreset_and_reports_that_it_held_nothing() {
+        struct Bare(Vec<Pin>);
+        impl DapAccess for Bare {
+            fn connect(&mut self) -> Result<(), ProbeError> {
+                Ok(())
+            }
+            fn read_dp(&mut self, _address: u8) -> Result<u32, ProbeError> {
+                Ok(0)
+            }
+            fn write_dp(&mut self, _address: u8, _value: u32) -> Result<(), ProbeError> {
+                Ok(())
+            }
+            fn read_ap(&mut self, _address: u8) -> Result<u32, ProbeError> {
+                Ok(0)
+            }
+            fn write_ap(&mut self, _address: u8, _value: u32) -> Result<(), ProbeError> {
+                Ok(())
+            }
+            fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
+                self.0.push(if assert { Pin::Assert } else { Pin::Release });
+                Ok(0)
+            }
+        }
+
+        let mut bare = Bare(Vec::new());
+        assert!(
+            !bare.reset_extension().unwrap(),
+            "a probe with no pin mask must answer false rather than claim the guarantee"
+        );
+        assert_eq!(
+            bare.0,
+            vec![Pin::Assert, Pin::Release],
+            "and it must still reset the target, which is what it did before this method existed"
+        );
+    }
+
+    /// THE ONE THAT CATCHES A MISSING FORWARD, and it is the whole reason the bridge writes the
+    /// method out. `ArmDap` compiles perfectly well without overriding `reset_extension` -- it
+    /// would take the trait default, pulse nRESET, and report `false` for a probe that had just
+    /// told it `true`. That is a silent downgrade of a real capability, reached through a bridge
+    /// that looks complete because it compiles. Delete the forward in `impl TargetAccess for
+    /// ArmDap` and this test fails; nothing else in the tree does.
+    #[test]
+    fn armdap_forwards_reset_extension_instead_of_taking_the_default() {
+        let mut arm = ArmDap::new(FakeDap::new(true));
+        assert!(
+            TargetAccess::reset_extension(&mut arm).unwrap(),
+            "the bridge must report the PROBE's answer, not the default's"
+        );
+
+        let mut arm = ArmDap::new(FakeDap::new(false));
+        assert!(
+            !TargetAccess::reset_extension(&mut arm).unwrap(),
+            "and it must report a probe that cannot hold SWCLK as such"
+        );
+    }
+
+    /// The same downgrade, reached through a BORROW rather than through the bridge. A caller
+    /// holding `&mut D` -- a discovery session handing out its debug port -- must get the probe's
+    /// own sequence, not the default's.
+    #[test]
+    fn a_borrowed_probe_forwards_reset_extension() {
+        fn through_the_seam<D: DapAccess>(mut probe: D) -> bool {
+            probe.reset_extension().unwrap()
+        }
+
+        let mut probe = FakeDap::new(true);
+        assert!(
+            through_the_seam(&mut probe),
+            "a borrowed probe must not silently fall back to the pulse"
+        );
+        assert_eq!(probe.log, vec![Pin::Extension]);
     }
 }

@@ -35,8 +35,8 @@ lamella-probe-core = { path = "../lamella-probe-core" }
 # The host compile-and-run seam (LcscCompiler + the REPL engine's LoopbackLink), the device
 # enumeration behind `devices`, and the target grammar every verb taking `--target` shares. The
 # SAME seams the MCP server and lamella-dap use.
-lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb"] }
-# The wire protocol types: Capabilities / Negotiated / board_model, for what `devices --identify`
+lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb", "tcp"] }
+# The wire protocol types: Capabilities / Negotiated / product_model, for what `devices --identify`
 # reports back off a board.
 lamella-wire = { path = "../lamella-wire" }
 # The C# front end, called DIRECTLY by `build` rather than through the REPL compile seam, so the
@@ -53,7 +53,13 @@ lamella-syntax = { path = "../lamella-syntax" }
 # The ahead-of-time backend, for `flash`: a CIL assembly to a flashable bare-metal image. This is
 # the FLAT, linker-free path, and it needs nothing on the board -- which is why `flash` works on a
 # board that has never run Lamella.
-lamella-aot = { path = "../lamella-aot", features = ["arm32"] }
+#
+# EVERY INSTRUCTION SET THE CATALOG LISTS A BOARD FOR, selected through this crate's OWN features
+# below rather than named here. The features decide what the SHIPPED TOOL can compile, and a person
+# holding a board reads a missing generator as a missing capability of the project. The catalog has
+# RISC-V boards (`nano-ch32v003`, `esp32c6-devkitc`), so a build carrying Thumb alone answers them
+# with "unsupported target" while the generator it needed sat in the tree unlinked.
+lamella-aot = { path = "../lamella-aot", default-features = false }
 # Flattening a linked ELF into the bytes a flasher writes -- the same computation as
 # `objcopy -O binary`, in-tree, so taking an image somebody else's toolchain produced needs no
 # external tools. A linked ELF is the ordinary output of every toolchain that is not ours, which
@@ -102,6 +108,22 @@ lamella-load = { path = "../lamella-load", optional = true }
 lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 
 [features]
+# Every code generator this tool carries, on by default.
+#
+# They are re-declared here rather than named on the dependency because a cargo feature is not
+# visible to `cfg` outside the crate that declares it. `lamella deploy`'s refusal names the
+# instruction sets this build can generate code for, and it reads them with `cfg!`, which cannot ask
+# about another crate's feature. Without a passthrough declared here the refusal would have to carry
+# a list written by hand, and a hand-written list of what a build contains is answering from memory
+# rather than from the build. These make the answer derivable.
+#
+# `wasm` is deliberately absent: no board is a WebAssembly board, and that target reaches users
+# through the embedding path rather than through this tool.
+default = ["aot-arm32", "aot-riscv32"]
+# Thumb code generation -- every Cortex-M board in the catalog.
+aot-arm32 = ["lamella-aot/arm32"]
+# RV32 code generation -- `nano-ch32v003` (RV32EC) and `esp32c6-devkitc` in the catalog.
+aot-riscv32 = ["lamella-aot/riscv32"]
 # The flash image and the deploy path: compile -> bake (`Module::write_baked`, which needs
 # `code-in-place`) -> `.lmli`, and the chunked deploy over Lamella Link. Default-OFF for the
 # reason above, which means a workspace build produces a `lamella` that cannot deploy -- stated in

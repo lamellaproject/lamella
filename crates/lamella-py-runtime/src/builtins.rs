@@ -216,6 +216,10 @@ pub enum Builtin {
     /// DISTINCT from [`Builtin::GeneratorType`] because a program can tell them apart: a coroutine is
     /// not an iterator, and `await` accepts one where `yield from` does not.
     CoroutineType = 80,
+    /// The type of an async generator object -- what calling a body that both `yield`s and is
+    /// `async def` returns. A type object only. DISTINCT from both of the above because a program can
+    /// tell all three apart: this one is not an iterator AND not awaitable; it is `async for`-able.
+    AsyncGeneratorType = 81,
 }
 
 impl Builtin {
@@ -305,6 +309,7 @@ impl Builtin {
             78 => Some(Builtin::Dir),
             79 => Some(Builtin::IntIsInteger),
             80 => Some(Builtin::CoroutineType),
+            81 => Some(Builtin::AsyncGeneratorType),
             _ => None,
         }
     }
@@ -397,6 +402,7 @@ impl Builtin {
             Builtin::MethodType => "method",
             Builtin::GeneratorType => "generator",
             Builtin::CoroutineType => "coroutine",
+            Builtin::AsyncGeneratorType => "async_generator",
             Builtin::ModuleType => "module",
             Builtin::Open => "open",
             Builtin::Dir => "dir",
@@ -552,6 +558,8 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         Builtin::GeneratorType
     } else if model.is_coroutine(value) {
         Builtin::CoroutineType
+    } else if model.is_async_generator(value) {
+        Builtin::AsyncGeneratorType
     } else if model.is_module_object(value) {
         Builtin::ModuleType
     } else {
@@ -1033,24 +1041,28 @@ pub fn call_builtin(
             model.new_lazy_iter(LAZY_ZIP, Value::NONE, sources)
         }
         Builtin::Any => {
-            if args.len() != 1 {
-                return Err(Trap::TypeError);
-            }
-            let elements = collect_iterable(model, args, functions, depth)?;
-            for element in elements {
-                if model.py_truthy(element)?.unwrap_or(true) {
+            let [iterable] = args else {
+                let given = args.len();
+                let message = alloc::format!("any() takes exactly one argument ({given} given)");
+                return Err(model.raise_named_exception("TypeError", &message));
+            };
+            let iterator = iterator_for(*iterable, functions, model, depth)?;
+            while let Some(element) = crate::interp::py_next_value(iterator, functions, model, depth)? {
+                if crate::interp::py_truthy_dyn(element, functions, model, depth)? {
                     return Ok(Value::TRUE);
                 }
             }
             Ok(Value::FALSE)
         }
         Builtin::All => {
-            if args.len() != 1 {
-                return Err(Trap::TypeError);
-            }
-            let elements = collect_iterable(model, args, functions, depth)?;
-            for element in elements {
-                if !model.py_truthy(element)?.unwrap_or(true) {
+            let [iterable] = args else {
+                let given = args.len();
+                let message = alloc::format!("all() takes exactly one argument ({given} given)");
+                return Err(model.raise_named_exception("TypeError", &message));
+            };
+            let iterator = iterator_for(*iterable, functions, model, depth)?;
+            while let Some(element) = crate::interp::py_next_value(iterator, functions, model, depth)? {
+                if !crate::interp::py_truthy_dyn(element, functions, model, depth)? {
                     return Ok(Value::FALSE);
                 }
             }
@@ -1220,7 +1232,9 @@ pub fn call_builtin(
                 && !model.is_lazy_iter(iterator)
                 && model.find_dunder(iterator, "__next__").is_none()
             {
-                return Err(Trap::TypeError);
+                let type_name = model.tp_name_of(iterator);
+                let message = alloc::format!("'{type_name}' object is not an iterator");
+                return Err(model.raise_named_exception("TypeError", &message));
             }
             match py_next_value(iterator, functions, model, depth)? {
                 Some(value) => Ok(value),
@@ -1441,6 +1455,7 @@ pub fn call_builtin(
         | Builtin::MethodType
         | Builtin::GeneratorType
         | Builtin::CoroutineType
+        | Builtin::AsyncGeneratorType
         | Builtin::ModuleType) => {
             let message = alloc::format!("cannot create '{}' instances", only_a_type.python_name());
             Err(model.raise_named_exception("TypeError", &message))
@@ -1595,8 +1610,14 @@ pub fn call_builtin(
             }
             match model.py_hash(*x) {
                 Err(Trap::TypeError) => {
-                    let message = alloc::format!("unhashable type: '{}'", model.tp_name_of(*x));
-                    Err(model.raise_named_exception("TypeError", &message))
+                    match model.require_hashable_as(*x, crate::object::HashUse::Hash) {
+                        Ok(()) => {
+                            let message =
+                                alloc::format!("unhashable type: '{}'", model.tp_name_of(*x));
+                            Err(model.raise_named_exception("TypeError", &message))
+                        }
+                        Err(trap) => Err(trap),
+                    }
                 }
                 other => other,
             }
@@ -1685,6 +1706,7 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
             }
             Some(Builtin::GeneratorType) => model.is_generator(value),
             Some(Builtin::CoroutineType) => model.is_coroutine(value),
+            Some(Builtin::AsyncGeneratorType) => model.is_async_generator(value),
             Some(Builtin::ModuleType) => model.is_module_object(value),
             _ => return Err(Trap::TypeError),
         };
@@ -1877,9 +1899,12 @@ fn zip_kw(
     model.new_lazy_iter(LAZY_ZIP, flag, sources)
 }
 
-/// `print(*args, sep=' ', end='\n')`: the args rendered with str() and joined by `sep`, then `end`.
-/// A `str` or `None` (the default) `sep`/`end`; `flush=` is accepted and ignored; other keywords
-/// (`file=`) are a `TypeError`.
+/// `print(*args, sep=' ', end='\n', file=None)`: the args rendered with str() and joined by `sep`,
+/// then `end`. A `str` or `None` (the default) `sep`/`end`; `flush=` is accepted and ignored.
+///
+/// `file=` takes ANY OBJECT WITH A `write` METHOD, which is what CPython's `print` documents and
+/// what makes `print(..., file=sys.stderr)` work here. `None` is stdout, as it is there. A `file`
+/// without `write` is a `TypeError`, raised at the call rather than becoming a discarded line.
 fn print_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
@@ -1896,23 +1921,47 @@ fn print_kw(
     };
     let mut sep = String::from(" ");
     let mut end = String::from("\n");
+    let mut file = Value::NONE;
     for &(name, value) in kwargs {
         match name {
             "sep" => sep = separator(value, " ", model)?,
             "end" => end = separator(value, "\n", model)?,
             "flush" => {}
+            "file" => file = value,
             _ => return Err(Trap::TypeError),
         }
     }
+    let mut pieces: Vec<String> = Vec::with_capacity(posargs.len());
+    for arg in posargs {
+        pieces.push(display_arg(*arg, functions, model, depth)?);
+    }
     let mut out = String::new();
-    for (i, arg) in posargs.iter().enumerate() {
+    for (i, piece) in pieces.iter().enumerate() {
         if i > 0 {
             out.push_str(&sep);
         }
-        out.push_str(&display_arg(*arg, functions, model, depth)?);
+        out.push_str(piece);
     }
     out.push_str(&end);
-    model.write(&out);
+    if file.is_none() {
+        model.write(&out);
+        return Ok(Value::NONE);
+    }
+    let Some(write) = model.find_dunder(file, "write") else {
+        return Err(model.attribute_error(file, "write"));
+    };
+    let mut emit = |piece: &str, model: &mut ObjectModel| -> Result<(), Trap> {
+        let text = model.new_str(piece)?;
+        call_value(write, &[text], functions, model, depth)?;
+        Ok(())
+    };
+    for (i, piece) in pieces.iter().enumerate() {
+        if i > 0 {
+            emit(&sep, model)?;
+        }
+        emit(piece, model)?;
+    }
+    emit(&end, model)?;
     Ok(Value::NONE)
 }
 

@@ -43,7 +43,9 @@ FACTS = {
 # the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
 # touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
 # controller, a reset controller -- and those are one per chip, so they are stated once here.
-# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+# Each row carries whatever this family's record declares -- a base always, and per-instance
+# facts like a clock channel or a bus-enable bit where the family states them. Register offsets
+# and bit encodings belong to the driver that knows the block, not here.
 INSTANCES = {
     "xosc": {"block": "xosc", "base": 0x40024000},
     "clocks": {"block": "clocks", "base": 0x40008000},

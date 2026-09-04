@@ -316,12 +316,20 @@ pub enum CallArg {
 /// One `for target(s) in iterable [if cond ...]` clause of a comprehension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompClause {
-    /// The loop target(s): one name, or several for a tuple target `for k, v in ...`.
-    pub targets: Vec<String>,
+    /// The loop target(s), read by the same grammar the `for` STATEMENT's header is read by: names,
+    /// nested tuple/list targets, subscripts, attributes, and at most one star per sequence.
+    ///
+    pub targets: Vec<AssignTarget>,
     /// The iterable.
     pub iterable: Expr,
     /// Zero or more `if` filters that follow this `for` (before the next `for`).
     pub conditions: Vec<Expr>,
+    /// Whether this clause is `async for` (PEP 530), so it drives the ASYNC iterator protocol.
+    ///
+    /// One clause being async is enough to make the whole comprehension asynchronous: its hidden
+    /// function becomes a coroutine and the call site awaits it, exactly as an `await` in the
+    /// element does. Sync and async clauses may be mixed in one comprehension, in any order.
+    pub is_async: bool,
 }
 
 /// Every name `target` BINDS, appended to `out` in source order.
@@ -394,6 +402,61 @@ impl AssignTarget {
             AssignTarget::Starred(inner) => inner.collect_names(out),
             AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {}
         }
+    }
+
+    /// Append every expression this target CONTAINS -- recursing into nested tuples -- to `out`.
+    ///
+    /// The mirror of [`AssignTarget::collect_names`], and the two together are the whole of what a
+    /// target is: a name binds, and a subscript or attribute EVALUATES a container to store
+    /// through. `d[i].x = v` uses `d`, `i` and the attribute's object exactly as an expression in
+    /// any other position does, so every pass that walks expressions has to reach these too.
+    pub fn collect_exprs<'a>(&'a self, out: &mut Vec<&'a Expr>) {
+        match self {
+            AssignTarget::Name(_) => {}
+            AssignTarget::Subscript { container, index } => {
+                out.push(container);
+                out.push(index);
+            }
+            AssignTarget::Attribute { obj, .. } => out.push(obj),
+            AssignTarget::Tuple(elems) => {
+                for elem in elems {
+                    elem.collect_exprs(out);
+                }
+            }
+            AssignTarget::Starred(inner) => inner.collect_exprs(out),
+        }
+    }
+}
+
+/// What a `for` header's target list does with each item it is handed.
+///
+/// The statement `for T in xs:` and a comprehension's `for T in xs` clause read the same target
+/// grammar and owe the same three answers, so the decision lives here once rather than at each site
+/// that needs it -- one of them emitting a statement desugar, one building a hidden function's body,
+/// one emitting ops directly.
+pub enum ForBinding<'a> {
+    /// A lone plain name -- the loop variable itself. Nothing is unpacked and no store is needed.
+    Name(&'a str),
+    /// A lone target that is not a sequence: a subscript, an attribute, or a lone star. The item is
+    /// STORED into it whole. Unpacking here would ask a one-element sequence of a scalar item.
+    Store(&'a [AssignTarget]),
+    /// The item is UNPACKED into these targets -- either the elements of a single parenthesized or
+    /// bracketed target (`for (a, b) in`), or a comma-separated list of them (`for a, b in`).
+    Unpack(&'a [AssignTarget]),
+}
+
+/// Which of the three [`ForBinding`] shapes a parsed `for`-header target list is.
+///
+/// The order of the arms is the rule: a lone NAME is the loop variable, a lone SEQUENCE is unpacked
+/// into its own elements, any other lone target is stored into, and several targets are unpacked
+/// into. Getting the middle two the wrong way round is a wrong ANSWER rather than a refusal.
+#[must_use]
+pub fn for_binding(targets: &[AssignTarget]) -> ForBinding<'_> {
+    match targets {
+        [AssignTarget::Name(name)] => ForBinding::Name(name),
+        [AssignTarget::Tuple(inner)] => ForBinding::Unpack(inner),
+        [_] => ForBinding::Store(targets),
+        _ => ForBinding::Unpack(targets),
     }
 }
 
@@ -548,6 +611,12 @@ pub enum StmtKind {
         orelse: Vec<Stmt>,
         /// The `finally` clause; empty if absent.
         finalbody: Vec<Stmt>,
+        /// Whether the handlers are `except*` (PEP 654), which partitions an exception GROUP.
+        ///
+        /// One flag for the whole statement rather than one per handler, because mixing `except`
+        /// and `except*` on a single `try` is a syntax error -- so they are all one kind or all the
+        /// other, and a per-handler flag could represent a state the language cannot have.
+        star: bool,
     },
     /// A `with context [as target]:` statement (a single context manager). Desugars at compile time
     /// to the `__enter__` / `try` / `finally` / `__exit__` protocol.
@@ -629,8 +698,14 @@ pub enum StmtKind {
     },
     /// `from module import name [as alias], ...` -- bind members off a module.
     ImportFrom {
-        /// The module imported from (a simple name).
+        /// The module imported from. ABSOLUTE once [`crate::compile::resolve_relative_imports`] has
+        /// run; before that it is the part written after the dots, which is EMPTY for `from .
+        /// import x`.
         module: String,
+        /// The number of leading dots, so `0` for an ordinary absolute import and `n` for a
+        /// package-relative one. Resolution rewrites `module` and sets this back to `0`, so
+        /// everything downstream sees one shape.
+        level: u32,
         /// Each `(member_name, bound_name)`.
         names: Vec<(String, String)>,
     },
@@ -638,8 +713,12 @@ pub enum StmtKind {
     /// namespace (its `__all__` if defined, else every name not starting with `_`). The bound names
     /// are not known until run time, so they resolve as globals. Only valid at module level.
     ImportStar {
-        /// The module imported from (a simple name).
+        /// The module imported from. ABSOLUTE once
+        /// [`crate::compile::resolve_relative_imports`] has run; see [`StmtKind::ImportFrom`].
         module: String,
+        /// The number of leading dots -- `0` for an absolute import, `n` for a package-relative
+        /// one. Resolution rewrites `module` and sets this back to `0`.
+        level: u32,
     },
     /// `break` -- exit the innermost enclosing loop.
     Break,

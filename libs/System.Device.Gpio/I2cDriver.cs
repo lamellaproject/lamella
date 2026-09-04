@@ -26,17 +26,17 @@ namespace Lamella.Hardware
 
         /// <summary>One write transaction: START, address+W, <paramref name="count"/> bytes
         /// of <paramref name="buffer"/>, STOP. Returns a normalized status.</summary>
-        public abstract int Write(int address, byte[] buffer, int count);
+        public abstract int Write(int address, System.ReadOnlySpan<byte> buffer, int count);
 
         /// <summary>One read transaction: START, address+R, <paramref name="count"/> bytes
         /// into <paramref name="buffer"/>, STOP. Returns a normalized status.</summary>
-        public abstract int Read(int address, byte[] buffer, int count);
+        public abstract int Read(int address, System.Span<byte> buffer, int count);
 
         /// <summary>One combined transaction with a REPEATED START between the phases:
         /// START, address+W, the write bytes, RESTART, address+R, the read bytes, STOP --
         /// the register-read primitive. Returns a normalized status.</summary>
-        public abstract int WriteRead(int address, byte[] writeBuffer, int writeCount,
-                                      byte[] readBuffer, int readCount);
+        public abstract int WriteRead(int address, System.ReadOnlySpan<byte> writeBuffer, int writeCount,
+                                      System.Span<byte> readBuffer, int readCount);
 
         private readonly byte[] _probeScratch = new byte[1];
 
@@ -48,7 +48,7 @@ namespace Lamella.Hardware
         /// quick command).</summary>
         public virtual int Probe(int address)
         {
-            return Read(address, _probeScratch, 1);
+            return Read(address, new System.Span<byte>(_probeScratch), 1);
         }
 
         /// <summary>Disposes this instance.</summary>

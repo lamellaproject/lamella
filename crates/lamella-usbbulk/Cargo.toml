@@ -13,6 +13,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Devices_DeviceAndDriverInstallation",
+    # DEVPROPKEY / DEVPROPTYPE, for `DEVPKEY_Device_BusReportedDeviceDesc` -- the USB iProduct
+    # string as the device reported it, cached by the hub driver. It is the one product string
+    # obtainable WITHOUT opening the device, and opening a debug probe resets the board on it.
+    "Win32_Devices_Properties",
     "Win32_Devices_Usb",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",

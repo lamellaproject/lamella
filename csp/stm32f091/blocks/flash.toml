@@ -1,0 +1,36 @@
+# BLOCK: the STM32F0x1 embedded flash controller, stated only as far as the facts consumers outside
+# the controller need. Its unlock sequence, its page geometry and its command bits are not described
+# here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A HALF-WORD, WHICH IS AS NARROW AS AN ST CONTROLLER GETS. Two bytes -- an order
+# of magnitude below the STM32H7's thirty-two, which is why the number is stated per family and
+# never carried across one. RM0091 enforces it hard: `Any attempt to write data that are not
+# half-word long results in a bus error generating a Hard Fault interrupt`. Not a status flag, a
+# fault.
+#
+# THE ERASED VALUE COMES FROM THE PART'S OWN BLANK CHECK RATHER THAN FROM A SENTENCE ABOUT ERASING.
+# RM0091 does not state in words what a page reads as after an erase. It does define the EMPTY flag,
+# which the silicon sets `when the content of the address 0x0800 0000 is read as 0xFFFF FFFF` and
+# describes as the condition of `a virgin device`. That is the part telling us what it considers
+# blank, in a register whose whole purpose is to answer the question, and it is a better source than
+# the sentence we went looking for.
+
+[table]
+kind = "block"
+family = "stm32f091"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 2
+sources = [
+    "erased_value: STM32F0x1/F0x2/F0x8 reference manual RM0091 Rev 10 section 3.5.4, the FLASH_SR PGERR description: `Set by hardware when an address to be programmed contains a value different from 0xFFFF before programming` -- the controller refusing to program anything that is not the erased value, in the register that decides whether a write may proceed",
+    "erased_value: RM0091 Rev 10, page 54, the EMPTY flag, which agrees from the other direction: it is set `when the content of the address 0x0800 0000 is read as 0xFFFF FFFF`, in a paragraph describing `programming of a virgin device`",
+    "write_unit: RM0091 Rev 10 section 3.2.2 `Flash program and erase operations`, page 60: `The main flash memory can be programmed 16 bits at a time. The program operation is started when the CPU writes a half-word into a main flash memory address with the PG bit of the FLASH_CR register set`",
+    "write_unit: RM0091 Rev 10 section 3.2.2, page 60: `Any attempt to write data that are not half-word long results in a bus error generating a Hard Fault interrupt`",
+]
+notes = [
+    "The erase unit is not this number and is not declared here: RM0091 erases by PAGE, and the page size varies across the parts this manual covers.",
+    "The value is read from RM0091 itself rather than from a neighbouring ST family. Other ST controllers of the same era program four bytes at a time and one programs thirty-two, so a controller sharing a vendor is not a controller sharing a granularity.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

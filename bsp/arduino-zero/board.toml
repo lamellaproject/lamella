@@ -9,7 +9,7 @@ board = "zero"
 vendor = "arduino"
 family = "samd21"
 part = "atsamd21g18a"
-board_model = 12
+product_model = 12
 sources = [
     "Arduino Zero schematic: EDBG VCP = SERCOM5, PB22 (PAD2) TX / PB23 (PAD3) RX, function D",
 ]

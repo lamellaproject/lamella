@@ -101,9 +101,18 @@ fields = { AFSEL8 = [0, 4], AFSEL9 = [4, 4] }
 notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4] (PARTIAL: pins 8 and 9 stated). The nibble's value IS the AF number: 0111 selects AF7."
 
 [constants]
+# RM0399 12.4.1 states all four MODER codes together -- 00 input, 01 general purpose output,
+# 10 alternate function, 11 analog (reset state). INPUT was the one code no binding had needed, so
+# it was the one absent; a GPIO driver needs it, and a driver writing a bare 0 for it would be the
+# only mode value in this family not taken from the manual.
+MODER_MODE_INPUT = 0
 MODER_MODE_OUTPUT = 1
 MODER_MODE_AF = 2
 MODER_MODE_ANALOG = 3
 OTYPER_OPEN_DRAIN = 1
 OSPEEDR_VERY_HIGH = 3
+# PUPDR, RM0399 12.4.4: 00 no pull, 01 pull-up, 10 pull-down. The pull-down code joins with the
+# driver for the same reason INPUT did.
+PUPDR_NONE = 0
 PUPDR_PULL_UP = 1
+PUPDR_PULL_DOWN = 2

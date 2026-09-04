@@ -24,16 +24,134 @@ const C0_SR_EOP: u32 = 1 << 0;
 const C0_SR_BSY: u32 = 1 << 16;
 /// Set when the first word of a double word is sent, cleared when the second completes.
 const C0_SR_CFGBSY: u32 = 1 << 18;
-/// Every error the status register reports for a program or erase; the same bits clear them.
-pub(crate) const C0_SR_ERRORS: u32 =
-    (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 15);
+/// Every programming error flag RM0490 requires to be CLEARED before the next operation; the same
+/// bits clear them, by writing 1.
+///
+/// **MISSERR AND FASTERR ARE IN THIS SET EVEN THOUGH THIS DRIVER CANNOT CAUSE THEM, AND THAT IS THE
+/// POINT.** Both belong to fast programming, which this driver never enables -- but step 2 of both
+/// the program and the erase sequence in RM0490 s4.3.7 is *"check and clear all error programming
+/// flags due to a previous programming. If not, PGSERR is set"*, and it does not exempt the flags
+/// somebody else's tool left behind. A board can be attached already holding one from a session
+/// that has ended.
+///
+/// Leaving them out was not a one-off cost. This driver clears the flags it knows about before
+/// every operation, so an inherited MISSERR would have survived that clear, failed step 2, and set
+/// PGSERR on the FIRST program -- and then on every program after it, because nothing in the loop
+/// would ever have cleared the cause. **A flag we decline to clear is a wedge, not a warning.**
+///
+/// RDERR (bit 14) is deliberately NOT here: it is a PCROP *read* error, not a programming flag, so
+/// step 2 does not ask for it and clearing it would erase a reading somebody else may need.
+pub(crate) const C0_SR_ERRORS: u32 = (1 << 1)
+    | (1 << 3)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 8)
+    | (1 << 9)
+    | (1 << 15);
 
 /// The C0's flash page: 2 KB on every part in the series.
 pub const STM32C0_PAGE: u32 = 2048;
 /// Where the C0's main flash is mapped for execution.
 pub const STM32C0_FLASH_BASE: u32 = 0x0800_0000;
 /// The programming granule: 64 bits, written as two 32-bit stores.
+///
+/// RM0490 s4.3.7: *"The flash memory is programmed 64 bits at a time"* and *"It is only possible to
+/// program a double word (2 x 32-bit data)"*, with a byte or half-word write setting SIZERR and a
+/// misaligned double word setting PGAERR. So the granule carries an alignment requirement and is
+/// not merely a preferred size.
 pub const STM32C0_DOUBLE_WORD: usize = 8;
+
+/// What a double word of this array reads as when erased -- and the part's own hardware says so.
+///
+/// RM0490 does not state it as a sentence about erasing. It states it as the condition PROGERR
+/// tests: the flag is *"set by hardware when a double-word address to be programmed contains a
+/// value different from `0xFFFF FFFF` before programming, except if the data to write is
+/// `0x0000 0000`"*. That is the controller defining "erased" in the register whose whole job is to
+/// decide whether a write may proceed, which is a better source than a sentence would have been.
+///
+/// It states the reprogram rule in the same breath: a double word is write-once between erases, and
+/// the all-zero exception writes no information.
+pub const STM32C0_ERASED_VALUE: u32 = 0xFFFF_FFFF;
+
+/// See [`crate::STM32F0_FLASH_SIZE_REG`], whose doc carries the whole table and its sources.
+///
+/// Read from RM0490 Rev 6 s31.2, "Flash memory size data register (FSIZER)": base address
+/// `0x1FFF 75A0`, offset `0x00`, a 16-bit `FLASH_SIZE` field in Kbytes.
+pub const STM32C0_FLASH_SIZE_REG: u32 = 0x1FFF_75A0;
+
+/// Where this family keeps the register that names ST's die.
+///
+/// RM0490 Rev 6 section 2.2.2 places the DBG block at `0x40015800`. **The STM32F0 and STM32L0 keep
+/// theirs at the same address and an STM32F4 or F7 does not** -- that is a coincidence of three
+/// families rather than a rule, so this is declared here with its own citation rather than borrowed
+/// from a sibling's constant.
+pub const STM32C0_DBGMCU_IDCODE: u32 = 0x4001_5800;
+
+/// The `DEV_ID` values RM0490 Table 178 lists, with what each names.
+///
+/// **THE SAME FIVE IDS [`Stm32C0Device::from_dev_id`] DECODES, IN THE SHAPE EVERY FAMILY USES**, so
+/// a route can ask any family the same question without knowing which one it holds. It is a second
+/// spelling of one fact rather than a second fact, and
+/// `the_c0_part_table_and_the_device_decode_are_one_list` fails if they drift.
+///
+/// Each string says the id names a SUB-FAMILY and not a board, because every STM32C071 answers
+/// `0x493` and a caller must not read that as an identity.
+pub const STM32C0_PARTS: &[(u32, &str)] = &[
+    (0x443, "an STM32C011 -- the sub-family, which every part in it answers, not this board"),
+    (0x453, "an STM32C031 -- the sub-family, which every part in it answers, not this board"),
+    (0x44C, "an STM32C051 -- the sub-family, which every part in it answers, not this board"),
+    (0x493, "an STM32C071 -- the sub-family, which every part in it answers, not this board"),
+    (0x44D, "an STM32C091 or C092 -- the sub-family, which every part in it answers, not this board"),
+];
+
+/// Which STM32C0 sub-family a `DEV_ID` names.
+///
+/// **A SUB-FAMILY, NOT A BOARD.** Every STM32C071 answers `0x493`, so this settles which boundary
+/// map and which flash extent apply and settles nothing about which board is on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stm32C0Device {
+    /// `0x443`.
+    C011,
+    /// `0x453`.
+    C031,
+    /// `0x44C`.
+    C051,
+    /// `0x493`.
+    C071,
+    /// `0x44D` -- RM0490 Table 178 pairs C091xx and C092xx under one value.
+    C091,
+}
+
+impl Stm32C0Device {
+    /// Decodes `DEV_ID` -- the low TWELVE bits of [`STM32C0_DBGMCU_IDCODE`].
+    ///
+    /// Values from RM0490 Rev 6 Table 178. An id in no row returns `None` rather than a guess: this
+    /// address means something else entirely on a part from another vendor, and the debug port a
+    /// probe reads first is shared by every M0-class die.
+    #[must_use]
+    pub fn from_dev_id(dev_id: u32) -> Option<Self> {
+        match dev_id {
+            0x443 => Some(Stm32C0Device::C011),
+            0x453 => Some(Stm32C0Device::C031),
+            0x44C => Some(Stm32C0Device::C051),
+            0x493 => Some(Stm32C0Device::C071),
+            0x44D => Some(Stm32C0Device::C091),
+            _ => None,
+        }
+    }
+}
+
+/// Reads [`STM32C0_DBGMCU_IDCODE`] and returns `(DEV_ID, REV_ID)`.
+///
+/// **TWELVE BITS, NOT SIXTEEN, AND THIS FAMILY PUNISHES THE OBVIOUS WIDTH.** RM0490 says bits
+/// 15:12 are reserved and *"upon read, these reserved bits return 0b0110"* -- and they do. An
+/// STM32C071 reads `0x10016493`, so a `& 0xffff` yields `0x6493` where `0x493` is expected, and the
+/// part is then refused as unknown. Measured on a NUCLEO-C071RB.
+pub fn stm32c0_dev_id<A: TargetAccess>(target: &mut A) -> Result<(u32, u32), ProbeError> {
+    crate::stm32_dev_id(target, STM32C0_DBGMCU_IDCODE)
+}
 
 /// Names the error bits a failed operation left in `SR`.
 ///
@@ -44,7 +162,7 @@ fn c0_error_text(sr: u32) -> Option<&'static str> {
         return Some("STM32C0 flash write protection error (WRPERR) -- the page is write protected");
     }
     if sr & (1 << 7) != 0 {
-        return Some("STM32C0 flash programming sequence error (PGSERR) -- PG was not set, or a double word was not completed");
+        return Some("STM32C0 flash programming sequence error (PGSERR) -- PG was not set, a double word was not completed, or an error flag from a previous programming was still set when this one started");
     }
     if sr & (1 << 5) != 0 {
         return Some("STM32C0 flash programming alignment error (PGAERR) -- a double word must start on an 8-byte boundary");
@@ -57,6 +175,12 @@ fn c0_error_text(sr: u32) -> Option<&'static str> {
     }
     if sr & (1 << 1) != 0 {
         return Some("STM32C0 flash operation error (OPERR)");
+    }
+    if sr & (1 << 9) != 0 {
+        return Some("STM32C0 fast-programming error (FASTERR) -- set by a fast-programming sequence this driver does not use, so it was left by another tool");
+    }
+    if sr & (1 << 8) != 0 {
+        return Some("STM32C0 fast-programming data miss error (MISSERR) -- set by a fast-programming sequence this driver does not use, so it was left by another tool");
     }
     if sr & (1 << 15) != 0 {
         return Some("STM32C0 option-byte loading validity error (OPTVERR)");
@@ -156,16 +280,21 @@ impl<A: TargetAccess> Stm32C0Flash for A {
         c0_wait_idle(self, FlashWait::BeforeOperation)?;
         self.write_word(C0_CR, C0_CR_PG)?;
 
+        let mut padded = data.to_vec();
+        while padded.len() % STM32C0_DOUBLE_WORD != 0 {
+            padded.push(0xff);
+        }
+        let words: Vec<u32> = padded
+            .chunks(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+
+        let per_poll = STM32C0_PAGE as usize / 4;
         let mut at = address;
-        for chunk in data.chunks(STM32C0_DOUBLE_WORD) {
-            let mut dword = [0xffu8; STM32C0_DOUBLE_WORD];
-            dword[..chunk.len()].copy_from_slice(chunk);
-            let low = u32::from_le_bytes([dword[0], dword[1], dword[2], dword[3]]);
-            let high = u32::from_le_bytes([dword[4], dword[5], dword[6], dword[7]]);
-            self.write_word(at, low)?;
-            self.write_word(at + 4, high)?;
+        for chunk in words.chunks(per_poll) {
+            self.write_words(at, chunk)?;
             c0_wait_idle(self, FlashWait::AfterOperation)?;
-            at += STM32C0_DOUBLE_WORD as u32;
+            at += (chunk.len() * 4) as u32;
         }
 
         let cr = self.read_word(C0_CR)?;
@@ -190,11 +319,34 @@ mod tests {
 
     #[test]
     fn every_program_or_erase_error_bit_is_named() {
-        for bit in [1u32, 3, 4, 5, 6, 7, 15] {
+        for bit in [1u32, 3, 4, 5, 6, 7, 8, 9, 15] {
             assert!(c0_error_text(1 << bit).is_some(), "SR bit {bit} must be named");
         }
         assert!(c0_error_text(0).is_none());
         assert!(c0_error_text(C0_SR_BSY | C0_SR_CFGBSY | C0_SR_EOP).is_none());
+    }
+
+    /// Step 2 of BOTH sequences in RM0490 s4.3.7 is "check and clear all error programming flags
+    /// due to a previous programming. If not, PGSERR is set." So the mask this driver writes back
+    /// has to cover the fast-programming flags as well, even though it never sets FSTPG: it can
+    /// INHERIT one, and a flag it declines to clear fails step 2 on every operation afterwards
+    /// rather than once.
+    #[test]
+    fn the_clear_mask_covers_every_programming_error_flag_rm0490_names() {
+        for (bit, name) in [
+            (1u32, "OPERR"),
+            (3, "PROGERR"),
+            (4, "WRPERR"),
+            (5, "PGAERR"),
+            (6, "SIZERR"),
+            (7, "PGSERR"),
+            (8, "MISSERR"),
+            (9, "FASTERR"),
+        ] {
+            assert!(C0_SR_ERRORS & (1 << bit) != 0, "{name} (bit {bit}) must be cleared");
+        }
+        assert!(C0_SR_ERRORS & (1 << 14) == 0, "RDERR is not a programming flag");
+        assert!(C0_SR_ERRORS & (C0_SR_BSY | C0_SR_CFGBSY | C0_SR_EOP) == 0);
     }
 
     /// The alignment refusal is not a style rule: RM0490 raises PGAERR for a double word that does
@@ -206,5 +358,58 @@ mod tests {
         assert_ne!(0x0800_0004u32 as usize % STM32C0_DOUBLE_WORD, 0);
         assert_eq!(STM32C0_DOUBLE_WORD, 8);
         assert_eq!(STM32C0_PAGE, super::super::STM32F0_PAGE, "the page size is the coincidence");
+    }
+
+    /// The flash-size register is the part's own answer to "how big am I", and it has to be read
+    /// through the aligned-word path that serves the whole family -- see `stm32_flash_size_bytes`,
+    /// where three of the six addresses are NOT word aligned and the halfword has to be selected.
+    /// This one is, so the low half is the right half, and asserting that here is what keeps a
+    /// future edit to the shared reader from silently taking the wrong sixteen bits.
+    #[test]
+    fn the_flash_size_register_is_word_aligned_so_the_low_half_is_the_size() {
+        assert_eq!(STM32C0_FLASH_SIZE_REG, 0x1FFF_75A0);
+        assert_eq!(STM32C0_FLASH_SIZE_REG & 3, 0, "RM0490 31.2 puts FSIZER on a word boundary");
+        assert_eq!(STM32C0_FLASH_SIZE_REG & 2, 0, "so the size is the LOW halfword of that word");
+        assert_ne!(STM32C0_FLASH_SIZE_REG, super::super::STM32F0_FLASH_SIZE_REG);
+    }
+
+    /// Every value RM0490 Table 178 lists decodes, and nothing else does.
+    ///
+    /// The negative half is the one that matters: this address holds something on every part with a
+    /// debug port, so an id in no row has to be refused rather than carried into an erase.
+    #[test]
+    fn every_dev_id_rm0490_lists_decodes_and_nothing_else_does() {
+        for (id, want) in [
+            (0x443u32, Stm32C0Device::C011),
+            (0x453, Stm32C0Device::C031),
+            (0x44C, Stm32C0Device::C051),
+            (0x493, Stm32C0Device::C071),
+            (0x44D, Stm32C0Device::C091),
+        ] {
+            assert_eq!(Stm32C0Device::from_dev_id(id), Some(want), "{id:#05x}");
+        }
+        for foreign in [0x447u32, 0x440, 0x0bc1_1477, 0, 0xfff] {
+            assert_eq!(Stm32C0Device::from_dev_id(foreign), None, "{foreign:#x}");
+        }
+    }
+
+    /// The width of the mask is the whole test, because sixteen bits is the obvious choice and it
+    /// is wrong on this family: the reserved bits above DEV_ID read back as 0b0110 rather than 0.
+    #[test]
+    fn dev_id_is_twelve_bits_because_the_reserved_nibble_reads_back_set() {
+        let word = 0x1001_6493u32;
+        assert_eq!(word & 0xfff, 0x493, "twelve bits is the part id");
+        assert_ne!(word & 0xffff, 0x493, "sixteen bits is NOT, and decodes as nothing");
+        assert_eq!(Stm32C0Device::from_dev_id(word & 0xfff), Some(Stm32C0Device::C071));
+        assert_eq!(Stm32C0Device::from_dev_id(word & 0xffff), None);
+        assert_eq!(word >> 16, 0x1001, "REV_ID");
+    }
+
+    /// The erased value is the condition PROGERR tests, so it is not a free-standing claim: a
+    /// double word may be programmed only when it currently reads all ones.
+    #[test]
+    fn the_erased_value_is_all_ones() {
+        assert_eq!(STM32C0_ERASED_VALUE, 0xFFFF_FFFF);
+        assert_ne!(STM32C0_ERASED_VALUE, 0);
     }
 }

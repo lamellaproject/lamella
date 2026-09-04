@@ -41,6 +41,11 @@ part = "stm32l011k4t"
 package = "32-pin LQFP"
 flash = 0x4000
 ram = 0x800
+device_id_reg = 0x40015800
+device_id_mask = 0xFFF
+device_id = 0x457
+device_id_identifies = "class"
+identity_source = "Read from a NUCLEO-L011K4, whose fitted part is this row: DBGMCU_IDCODE at the peripheral address 0x40015800, DEV_ID in bits 11:0 (RM0377 27.4.1). IDENTIFIES A CLASS RATHER THAN A PART: 0x457 is ST product category 1, and a category spans lines. The three sibling package rows in this family state nothing here -- they are other order codes and no probe has read one."
 pins = ["PA0-PA15", "PB0-PB1", "PB3-PB7", "PB9", "PC14-PC15"]
 source = "DS027973 Rev 5 table 13, LQFP32 pin-number column, for the 26-pad set; table 2 column STM32L011K4 for 16 Kbytes flash, 2 Kbytes RAM and the 26-GPIO count on LQFP32; table 76 decoding STM32L011K4T6 as K = 32 pins, 4 = 16 Kbytes, T = LQFP. This is the part on the NUCLEO-L011K4: UM1956 names it STM32L011K4T6 explicitly. PB2 and PB8 are ABSENT from this package and present on the UFQFPN32 below, which is the difference between 26 pads and 28."
 

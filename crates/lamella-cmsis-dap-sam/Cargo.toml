@@ -15,7 +15,11 @@ workspace = true
 # The probe-neutral seam. These flash routines are written against `TargetAccess`, so they drive a
 # target through any probe family the seam supports, not just a CMSIS-DAP one.
 lamella-probe-core = { path = "../lamella-probe-core" }
-lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+# No transport features: these routines are written against the seam, and `usbhid` is the
+# CMSIS-DAP crate's DEFAULT -- so taking the default here compiles a native USB backend into a
+# crate that never names one, and refuses to build for any target that backend has no port for
+# (wasm32, where the browser supplies the transport). `lamella-probe` already states it this way.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", default-features = false }
 
 [dev-dependencies]
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
@@ -23,4 +27,11 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
 lamella-usbhid = { path = "../lamella-usbhid" }
 # Probe discovery/selection, so examples targeting a board on a COMPOSITE probe (e.g. the Arduino
 # Due behind an MCU-Link, whose DAP interface must be selected out of several) can open it.
-lamella-probe = { path = "../lamella-probe" }
+#
+# `usbbulk` is required for that to hold. An MCU-Link Pro exposes CMSIS-DAP on a WinUSB BULK
+# interface, and its only two HID interfaces are vendor-defined and speak something else -- so a
+# HID-only build selects one of those and gets a read timeout, reported as "could not open the
+# probe". The Arduino Due needs it most: it has NO on-board debugger at all, its programming port
+# being an ATmega16U2 serial bridge, so an external v2/v3 probe is the only way this crate's SAM3X
+# examples reach that part.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }

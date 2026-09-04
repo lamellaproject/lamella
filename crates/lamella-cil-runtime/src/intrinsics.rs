@@ -3305,6 +3305,23 @@ pub fn single_to_exponential(
     Ok(Some(alloc_str(vm, &format_exponential(f64::from(value), precision, upper))))
 }
 
+/// `text` with any group separators removed, BORROWED when there are none.
+///
+/// A separator carries no value and Rust's float parser has no notion of one. Where it is legal is
+/// decided by the managed validator before this seam is reached -- the integer part, after at least
+/// one digit, per .NET's default `NumberStyles.Float | AllowThousands` -- so stripping here cannot
+/// widen what `Parse` accepts. One helper rather than an arm in each of the two seams, because the
+/// two seams already differ only in their float width and this is the third thing that would have
+/// had to stay in step.
+#[cfg(feature = "float")]
+fn without_group_separators(text: &str) -> alloc::borrow::Cow<'_, str> {
+    if text.contains(',') {
+        alloc::borrow::Cow::Owned(text.replace(',', ""))
+    } else {
+        alloc::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// `System.Double::ParseValid(string)`: the numeric conversion behind the managed `Double.Parse` /
 /// `TryParse`, which have ALREADY validated the format (so the only work left is the
 /// decimal-to-nearest-double rounding managed C# cannot do without `unsafe`). Recognizes the .NET
@@ -3320,7 +3337,8 @@ pub fn single_to_exponential(
 pub fn double_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let chars = string_arg_chars(vm, args.first())?;
     let text = String::from_utf16(&chars).map_err(|_| Trap::InvalidArgument)?;
-    let trimmed = text.trim();
+    let trimmed = without_group_separators(text.trim());
+    let trimmed = trimmed.as_ref();
     let value = match trimmed.to_ascii_lowercase().as_str() {
         "nan" => f64::NAN,
         "infinity" | "+infinity" => f64::INFINITY,
@@ -3344,7 +3362,8 @@ pub fn double_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
 pub fn single_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let chars = string_arg_chars(vm, args.first())?;
     let text = String::from_utf16(&chars).map_err(|_| Trap::InvalidArgument)?;
-    let trimmed = text.trim();
+    let trimmed = without_group_separators(text.trim());
+    let trimmed = trimmed.as_ref();
     let value = match trimmed.to_ascii_lowercase().as_str() {
         "nan" => f32::NAN,
         "infinity" | "+infinity" => f32::INFINITY,
@@ -3396,8 +3415,35 @@ fn object_text(vm: &Vm, module: &Module, value: Option<&Value>) -> String {
             _ => String::from("object"),
         },
         Some(Value::Null) | None => String::new(),
+        Some(Value::NativeInt(handle)) if type_handle_text(module, *handle).is_some() => {
+            type_handle_text(module, *handle).unwrap_or_else(|| String::from("object"))
+        }
         Some(other) => scalar_text(other),
     }
+}
+
+/// The type name a reflection handle stands for, or `None` when the handle names no type this
+/// module knows -- which is what keeps an ordinary `IntPtr` rendering as the number it is.
+///
+/// # Why it does not simply read the reflection record
+///
+/// **THE TWO corlib-RESOLUTION TIERS DO NOT BOTH HAVE ONE.** `bind_reflect_type` runs in the eager
+/// load walk; the lazy tier materializes corlib types on demand and records no reflection entry for
+/// them. Keying this on the record alone made the REPL's `r.GetType()` answer `System.Int32` on
+/// eager and `8606711811` on lazy -- caught by `tier_differential`, whose own message states the
+/// rule it exists for: *"lazy resolution is a strategy, not a semantic, so every one of these is a
+/// bug in the lazy tier."*
+///
+///
+/// So the identity is what is read, and the record is only the first place it is looked for: the
+/// `TypeId` behind the handle exists on both tiers, and `type_full_name` answers from it.
+fn type_handle_text(module: &Module, handle: i64) -> Option<String> {
+    let handle = handle as u64;
+    if let Some(info) = module.reflect_type(handle) {
+        return Some(info.full_name);
+    }
+    let type_id = module.type_id_by_handle(handle)?;
+    module.type_full_name(type_id).map(String::from)
 }
 
 /// `System.String.Concat(object, object)`: each argument rendered by `ToString` (null as
@@ -3784,7 +3830,39 @@ pub fn thread_join(
         Some(&Value::Int32(id)) => id as u32,
         _ => return Err(Trap::TypeMismatch(Opcode::Call)),
     };
-    vm.request_join(id);
+    vm.request_join(id, None);
+    Ok(None)
+}
+
+/// `System.Threading.Thread.JoinThreadTimeout(int, int)`: [`thread_join`] with a DEADLINE. The
+/// thread parks on the target exactly as an untimed join does, and is additionally woken once
+/// `millisecondsTimeout` has passed.
+///
+/// It returns nothing, for the same reason the timed `Monitor.Wait` does: this call returns BEFORE
+/// the thread parks, and whether the join ended by completion or by deadline is decided at WAKE
+/// time. The managed `Join(int)` reads [`monitor_wait_timed_out`] once it resumes -- one verdict for
+/// every timed park, since a thread is in exactly one at a time.
+///
+/// A NEGATIVE timeout is an untimed join, which is `Timeout.Infinite`'s contract and is checked by
+/// the managed caller before it gets here. A zero timeout still parks and is simply already due, so
+/// it behaves as the immediate poll .NET specifies rather than becoming an untimed join.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the arguments are not two ints.
+pub fn thread_join_timeout(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (Some(&Value::Int32(id)), Some(&Value::Int32(millis))) = (args.first(), args.get(1)) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let deadline = if millis < 0 {
+        None
+    } else {
+        Some(vm.now_millis().map_or(0, |now| now.saturating_add(millis as u64)))
+    };
+    vm.request_join(id as u32, deadline);
     Ok(None)
 }
 
@@ -8069,6 +8147,41 @@ pub fn array_clone(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opti
     Ok(Some(Value::Object(clone)))
 }
 
+/// `System.Array.CreateInstance(Type, int)`'s runtime core: a new zero-initialized array of
+/// `length` elements whose element type is the one the `Type` names.
+///
+/// A `System.Type` on this runtime IS the asm-folded type handle (`typeof(T)` lowers to
+/// `ldtoken`/`GetTypeFromHandle`, which answers the token rather than a heap object), so unfolding
+/// it recovers exactly the `(assembly, token)` pair a `newarr` written at the same element type
+/// would carry -- and the allocation below is `newarr`'s own, shared rather than reimplemented.
+/// That is what makes `CreateInstance(typeof(T), n)` and `new T[n]` produce the same array: the
+/// same packing decision and the same element zero, including a struct element's field-zeroed
+/// instance rather than a null.
+///
+/// The managed wrapper has already rejected a null element type and a negative length, so the
+/// arguments arriving here are a handle and a non-negative count.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the arguments are not a type handle and an `int`, or if the count is
+/// negative (which the wrapper should have refused); [`Trap::OutOfMemory`] at the object budget.
+pub fn array_create_instance(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (Some(&Value::NativeInt(handle)), Some(&Value::Int32(length))) = (args.first(), args.get(1))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let length = usize::try_from(length).map_err(|_| Trap::TypeMismatch(Opcode::Call))?;
+    crate::interp::check_alloc_budget(vm)?;
+    let handle = handle as u64;
+    let asm = (handle >> 32) as u8;
+    let token = lamella_token::Token(handle as u32);
+    let object = crate::interp::alloc_array_of_element(vm, module, asm, token, length);
+    Ok(Some(Value::Object(object)))
+}
+
 /// `System.Buffer.ByteLength(Array)`: the array's total byte length (element count times the
 /// element type's byte width). Returns `-1` -- the sentinel the managed `Buffer.ByteLength`
 /// wrapper turns into `ArgumentException` -- for an array whose element type is NOT a primitive
@@ -8152,66 +8265,19 @@ fn buffer_count_arg(arg: Option<&Value>) -> Result<usize, Trap> {
 ///
 /// The managed corlib (`corlib/System/Decimal.cs`) owns everything that only needs 64-bit
 /// integer math -- the constructors, `ToString`, `Parse`, the integer conversions, hashing --
-/// and reaches HERE for the operations whose intermediates can exceed 96 bits (and so cannot
-/// be done with the C# corlib's `long`/`ulong`): the five arithmetic operators, comparison,
-/// and the floating-point conversions. Each works on a fixed-width `[u32]` magnitude so a
-/// 96x96 product (up to 192 bits) and a scale alignment (multiplying a 96-bit mantissa by a
-/// power of ten) are exact, then rescales the result half-to-even into the 96-bit/scale<=28
-/// range the way .NET's `DecCalc` does -- so `0.1m + 0.2m == 0.3m`, `1m / 3m` carries 28
-/// significant digits, and an out-of-range result raises `OverflowException`.
+/// and reaches the intrinsics below for the operations whose intermediates can exceed 96 bits:
+/// the five arithmetic operators, comparison, and the floating-point conversions.
+///
+/// Those operations live in [`lamella_decimal`], a `no_std` crate with no allocator, because a
+/// compiled program on a device needs exactly the same arithmetic and reaches it without a
+/// `Value` stack to unpack. Everything in this module is the marshalling on THIS side of that
+/// boundary: a `Decimal` on the value stack is a `Value::Struct` of four `Value::Int32`s, and
+/// the kernel takes and returns those same four words. Nothing here decides an arithmetic or a
+/// rounding question, so the two tiers cannot answer one differently.
 mod decimal_ops {
     use crate::value::Value;
     use alloc::boxed::Box;
-
-    /// The maximum scale (number of fractional decimal digits) a `Decimal` can carry.
-    const MAX_SCALE: u32 = 28;
-    /// The number of 32-bit limbs in the working magnitude: enough for a 96x96 product (192
-    /// bits = 6 limbs) plus headroom for a rounding carry and intermediate scale-up shifts.
-    const LIMBS: usize = 8;
-
-    /// A `Decimal` decoded into its parts: a 96-bit magnitude (held in the low three limbs of a
-    /// wider buffer), the base-ten scale, and the sign.
-    #[derive(Clone, Copy)]
-    pub struct Dec {
-        /// The mantissa magnitude, little-endian 32-bit limbs (only the low three are the value;
-        /// the rest are working headroom, zero on a decoded value).
-        mag: [u32; LIMBS],
-        /// The base-ten scale (`0..=28`): the value is `mag * 10^-scale`.
-        scale: u32,
-        /// The sign: true for negative.
-        negative: bool,
-    }
-
-    impl Dec {
-        /// Flips the sign (used to turn subtraction into addition).
-        pub fn negate(&mut self) {
-            if !is_zero(&self.mag) {
-                self.negative = !self.negative;
-            }
-        }
-
-        /// Whether the value is zero (a zero divisor check, before the sign matters).
-        pub fn is_zero_value(&self) -> bool {
-            is_zero(&self.mag)
-        }
-    }
-
-    /// Decodes `(lo, mid, hi, flags)` into a [`Dec`]. The scale and sign come from `flags`
-    /// (bits 16..23 and bit 31). An out-of-spec scale (> 28) is clamped defensively, though
-    /// a well-formed `Decimal` never carries one.
-    fn decode(lo: i32, mid: i32, hi: i32, flags: i32) -> Dec {
-        let mut mag = [0u32; LIMBS];
-        mag[0] = lo as u32;
-        mag[1] = mid as u32;
-        mag[2] = hi as u32;
-        let scale = ((flags as u32) >> 16) & 0xFF;
-        let negative = (flags as u32) & 0x8000_0000 != 0;
-        Dec {
-            mag,
-            scale: scale.min(MAX_SCALE),
-            negative,
-        }
-    }
+    use lamella_decimal::Dec;
 
     /// Reads a [`Dec`] from a `Value::Struct` argument (the inline value-type form a `Decimal`
     /// takes on the stack): its four field slots are `lo, mid, hi, flags`, matching the field
@@ -8223,488 +8289,26 @@ mod decimal_ops {
             _ => return None,
         };
         let word = |i: usize| match fields[i] {
-            Value::Int32(value) => Some(value),
+            Value::Int32(value) => Some(value as u32),
             _ => None,
         };
-        Some(decode(word(0)?, word(1)?, word(2)?, word(3)?))
-    }
-
-    /// Whether the magnitude is zero.
-    fn is_zero(mag: &[u32; LIMBS]) -> bool {
-        mag.iter().all(|&w| w == 0)
-    }
-
-    /// Whether the magnitude exceeds 96 bits (any limb above the low three is set).
-    fn exceeds_96(mag: &[u32; LIMBS]) -> bool {
-        mag[3..].iter().any(|&w| w != 0)
-    }
-
-    /// `mag += other` (limb-wise with carry). Returns the carry out of the top limb (nonzero
-    /// only on a true overflow past the buffer width, which the callers size against).
-    fn add_into(mag: &mut [u32; LIMBS], other: &[u32; LIMBS]) -> u32 {
-        let mut carry = 0u64;
-        for i in 0..LIMBS {
-            let sum = u64::from(mag[i]) + u64::from(other[i]) + carry;
-            mag[i] = sum as u32;
-            carry = sum >> 32;
-        }
-        carry as u32
-    }
-
-    /// `mag -= other`, assuming `mag >= other` (the caller orders the operands by magnitude).
-    fn sub_into(mag: &mut [u32; LIMBS], other: &[u32; LIMBS]) {
-        let mut borrow = 0i64;
-        for i in 0..LIMBS {
-            let diff = i64::from(mag[i]) - i64::from(other[i]) - borrow;
-            if diff < 0 {
-                mag[i] = (diff + (1i64 << 32)) as u32;
-                borrow = 1;
-            } else {
-                mag[i] = diff as u32;
-                borrow = 0;
-            }
-        }
-    }
-
-    /// Compares two magnitudes (`-1`/`0`/`1`), high limb first.
-    fn cmp_mag(a: &[u32; LIMBS], b: &[u32; LIMBS]) -> i32 {
-        for i in (0..LIMBS).rev() {
-            if a[i] != b[i] {
-                return if a[i] > b[i] { 1 } else { -1 };
-            }
-        }
-        0
-    }
-
-    /// `mag *= factor` (a single 32-bit multiplier). Returns the carry out of the top limb.
-    fn mul_small(mag: &mut [u32; LIMBS], factor: u32) -> u32 {
-        let mut carry = 0u64;
-        for limb in mag.iter_mut() {
-            let product = u64::from(*limb) * u64::from(factor) + carry;
-            *limb = product as u32;
-            carry = product >> 32;
-        }
-        carry as u32
-    }
-
-    /// `mag /= 10`, returning the remainder (`0..=9`). High limb first so the running remainder
-    /// threads down through the limbs.
-    fn div10(mag: &mut [u32; LIMBS]) -> u32 {
-        let mut remainder = 0u64;
-        for i in (0..LIMBS).rev() {
-            let cur = (remainder << 32) | u64::from(mag[i]);
-            mag[i] = (cur / 10) as u32;
-            remainder = cur % 10;
-        }
-        remainder as u32
-    }
-
-    /// Powers of ten that fit one 32-bit limb (`10^0 .. 10^9`), for scaling a magnitude up by a
-    /// known number of decimal places in chunks.
-    const POW10_U32: [u32; 10] = [
-        1,
-        10,
-        100,
-        1000,
-        10000,
-        100_000,
-        1_000_000,
-        10_000_000,
-        100_000_000,
-        1_000_000_000,
-    ];
-
-    /// Multiplies `mag` by `10^power` in single-limb chunks. Returns false if the product
-    /// overflows the working buffer (the caller treats that as out of range).
-    fn scale_up(mag: &mut [u32; LIMBS], mut power: u32) -> bool {
-        while power > 0 {
-            let chunk = power.min(9);
-            if mul_small(mag, POW10_U32[chunk as usize]) != 0 {
-                return false;
-            }
-            power -= chunk;
-        }
-        true
-    }
-
-    /// Rounds a magnitude down by `drop` decimal places, half-to-even (banker's rounding, what
-    /// .NET's `DecCalc` uses): divide by ten `drop` times, tracking whether anything below the
-    /// final digit was nonzero so a tie is broken to even. Returns the carry of a round-up that
-    /// could grow the magnitude (e.g. 9.5 -> 10).
-    fn round_off(mag: &mut [u32; LIMBS], drop: u32) {
-        if drop == 0 {
-            return;
-        }
-        let mut sticky = false;
-        let mut last = 0u32;
-        for _ in 0..drop {
-            sticky |= last != 0;
-            last = div10(mag);
-        }
-        let round_up = last > 5 || (last == 5 && (sticky || mag[0] & 1 == 1));
-        if round_up {
-            let mut one = [0u32; LIMBS];
-            one[0] = 1;
-            add_into(mag, &one);
-        }
-    }
-
-    /// Builds the result `Value::Struct([lo, mid, hi, flags])` from a magnitude, scale, and sign,
-    /// after rescaling it into the 96-bit / `scale<=28` range half-to-even. A magnitude that
-    /// still will not fit, or a scale that cannot be reduced enough, is an overflow (`None`).
-    /// A zero magnitude normalizes to a clean positive zero at the requested scale (matching
-    /// .NET, which keeps a zero's scale but not its sign).
-    fn finish(mut mag: [u32; LIMBS], mut scale: u32, negative: bool) -> Option<Value> {
-        while exceeds_96(&mag) || scale > MAX_SCALE {
-            if scale == 0 {
-                return None;
-            }
-            let drop = if scale > MAX_SCALE { scale - MAX_SCALE } else { 1 };
-            round_off(&mut mag, drop);
-            scale -= drop;
-        }
-        if is_zero(&mag) {
-            return Some(encode(&mag, scale, false));
-        }
-        Some(encode(&mag, scale, negative))
-    }
-
-    /// Packs a fit magnitude (low three limbs) + scale + sign into the `Value::Struct` form.
-    fn encode(mag: &[u32; LIMBS], scale: u32, negative: bool) -> Value {
-        let flags = (scale << 16) | if negative { 0x8000_0000 } else { 0 };
-        Value::Struct(Box::new([
-            Value::Int32(mag[0] as i32),
-            Value::Int32(mag[1] as i32),
-            Value::Int32(mag[2] as i32),
-            Value::Int32(flags as i32),
+        Some(lamella_decimal::decode([
+            word(0)?,
+            word(1)?,
+            word(2)?,
+            word(3)?,
         ]))
     }
 
-    /// Aligns two decoded decimals to a common scale by scaling the lower-scale magnitude up.
-    /// Returns the common scale, or `None` if scaling up overflowed the working buffer (the
-    /// callers map that to `OverflowException`).
-    fn align(a: &mut Dec, b: &mut Dec) -> Option<u32> {
-        if a.scale < b.scale {
-            if !scale_up(&mut a.mag, b.scale - a.scale) {
-                return None;
-            }
-            a.scale = b.scale;
-        } else if b.scale < a.scale {
-            if !scale_up(&mut b.mag, a.scale - b.scale) {
-                return None;
-            }
-            b.scale = a.scale;
-        }
-        Some(a.scale)
-    }
-
-    /// The signed sum `a + b` (used for both addition and subtraction; the caller flips `b`'s
-    /// sign for subtraction). Aligns scales, then adds same-sign magnitudes or subtracts the
-    /// smaller from the larger for opposite signs, and finishes (rescaling/rounding) the result.
-    pub fn add(mut a: Dec, mut b: Dec) -> Option<Value> {
-        let scale = align(&mut a, &mut b)?;
-        if a.negative == b.negative {
-            let mut mag = a.mag;
-            add_into(&mut mag, &b.mag);
-            finish(mag, scale, a.negative)
-        } else {
-            match cmp_mag(&a.mag, &b.mag) {
-                0 => finish([0u32; LIMBS], scale, false),
-                1 => {
-                    let mut mag = a.mag;
-                    sub_into(&mut mag, &b.mag);
-                    finish(mag, scale, a.negative)
-                }
-                _ => {
-                    let mut mag = b.mag;
-                    sub_into(&mut mag, &a.mag);
-                    finish(mag, scale, b.negative)
-                }
-            }
-        }
-    }
-
-    /// The product `a * b`: the magnitudes multiply (a full 192-bit schoolbook product over the
-    /// working buffer) and the scales add; `finish` then rescales/rounds into range. .NET caps
-    /// the product scale at 28, rounding away extra fractional digits, which `finish` does.
-    pub fn mul(a: Dec, b: Dec) -> Option<Value> {
-        let mut product = [0u32; LIMBS];
-        for i in 0..3 {
-            if a.mag[i] == 0 {
-                continue;
-            }
-            let mut carry = 0u64;
-            for j in 0..3 {
-                let pos = i + j;
-                let cur = u64::from(a.mag[i]) * u64::from(b.mag[j])
-                    + u64::from(product[pos])
-                    + carry;
-                product[pos] = cur as u32;
-                carry = cur >> 32;
-            }
-            let mut pos = i + 3;
-            while carry != 0 && pos < LIMBS {
-                let cur = u64::from(product[pos]) + carry;
-                product[pos] = cur as u32;
-                carry = cur >> 32;
-                pos += 1;
-            }
-            if carry != 0 {
-                return None;
-            }
-        }
-        let negative = a.negative != b.negative;
-        finish(product, a.scale + b.scale, negative)
-    }
-
-    /// The quotient `a / b`: align both to the same scale (so the quotient is the integer ratio
-    /// of the magnitudes), then long-divide, extending the dividend by extra factors of ten to
-    /// generate fractional digits up to .NET's 28-29 significant-digit limit, rounding the last
-    /// digit half-to-even. Division by zero is `None` (the managed wrapper raises
-    /// `DivideByZeroException`); the algorithm matches .NET's `VarDecDiv` results.
-    pub fn div(mut a: Dec, mut b: Dec) -> Option<Value> {
-        if is_zero(&b.mag) {
-            return None;
-        }
-        if is_zero(&a.mag) {
-            return finish([0u32; LIMBS], 0, false);
-        }
-        let common = a.scale.max(b.scale);
-        if !scale_up(&mut a.mag, common - a.scale) {
-            return None;
-        }
-        if !scale_up(&mut b.mag, common - b.scale) {
-            return None;
-        }
-        let divisor = b.mag;
-        let (mut quotient, mut remainder) = divmod(&a.mag, &divisor);
-        if exceeds_96(&quotient) {
-            return None;
-        }
-        let mut result_scale = 0u32;
-        while !is_zero(&remainder) && result_scale < MAX_SCALE {
-            if mul_small(&mut remainder, 10) != 0 {
-                break;
-            }
-            let (digit, r) = divmod(&remainder, &divisor);
-            let mut shifted = quotient;
-            if mul_small(&mut shifted, 10) != 0 {
-                break;
-            }
-            add_into(&mut shifted, &digit);
-            if exceeds_96(&shifted) {
-                break;
-            }
-            quotient = shifted;
-            remainder = r;
-            result_scale += 1;
-        }
-        if !is_zero(&remainder) {
-            let mut twice = remainder;
-            let overflow = mul_small(&mut twice, 2) != 0;
-            let round_up = if overflow {
-                true
-            } else {
-                let cmp = cmp_mag(&twice, &divisor);
-                cmp > 0 || (cmp == 0 && quotient[0] & 1 == 1)
-            };
-            if round_up {
-                let mut one = [0u32; LIMBS];
-                one[0] = 1;
-                add_into(&mut quotient, &one);
-                if exceeds_96(&quotient) {
-                    return None;
-                }
-            }
-        }
-        let negative = a.negative != b.negative;
-        finish(quotient, result_scale, negative)
-    }
-
-    /// The remainder `a % b` (.NET's `Decimal.Remainder`): the result has the sign of the
-    /// dividend and `|a % b| < |b|`. Computed by aligning scales and taking the magnitude
-    /// remainder of the integer division. `None` on a zero divisor.
-    pub fn rem(mut a: Dec, mut b: Dec) -> Option<Value> {
-        if is_zero(&b.mag) {
-            return None;
-        }
-        let scale = align(&mut a, &mut b)?;
-        let (_, r) = divmod(&a.mag, &b.mag);
-        finish(r, scale, a.negative)
-    }
-
-    /// Compares two decimals by value (`-1`/`0`/`1`), scale-independent: a zero is equal
-    /// regardless of sign, opposite signs order by sign, and same signs align scales then
-    /// compare magnitudes (the sign flips the order for negatives). Returns `None` only if a
-    /// scale alignment overflows the working buffer, which the caller surfaces as a fault.
-    pub fn compare(mut a: Dec, mut b: Dec) -> Option<i32> {
-        let a_zero = is_zero(&a.mag);
-        let b_zero = is_zero(&b.mag);
-        if a_zero && b_zero {
-            return Some(0);
-        }
-        if a_zero {
-            return Some(if b.negative { 1 } else { -1 });
-        }
-        if b_zero {
-            return Some(if a.negative { -1 } else { 1 });
-        }
-        if a.negative != b.negative {
-            return Some(if a.negative { -1 } else { 1 });
-        }
-        align(&mut a, &mut b)?;
-        let mag_cmp = cmp_mag(&a.mag, &b.mag);
-        Some(if a.negative { -mag_cmp } else { mag_cmp })
-    }
-
-    /// Integer division of magnitudes: returns `(quotient, remainder)` with
-    /// `dividend = quotient*divisor + remainder` and `remainder < divisor`. A restoring
-    /// bit-at-a-time long division over the working buffer -- exact and simple (the operands are
-    /// small enough that performance is a non-issue for the differential corpus).
-    fn divmod(dividend: &[u32; LIMBS], divisor: &[u32; LIMBS]) -> ([u32; LIMBS], [u32; LIMBS]) {
-        let mut quotient = [0u32; LIMBS];
-        let mut remainder = [0u32; LIMBS];
-        let total_bits = LIMBS * 32;
-        for bit in (0..total_bits).rev() {
-            shl1(&mut remainder);
-            let word = bit / 32;
-            let off = bit % 32;
-            if (dividend[word] >> off) & 1 == 1 {
-                remainder[0] |= 1;
-            }
-            if cmp_mag(&remainder, divisor) >= 0 {
-                sub_into(&mut remainder, divisor);
-                quotient[word] |= 1 << off;
-            }
-        }
-        (quotient, remainder)
-    }
-
-    /// `mag <<= 1`.
-    fn shl1(mag: &mut [u32; LIMBS]) {
-        let mut carry = 0u32;
-        for limb in mag.iter_mut() {
-            let new_carry = *limb >> 31;
-            *limb = (*limb << 1) | carry;
-            carry = new_carry;
-        }
-    }
-
-    /// Converts an `f64` to a [`Dec`] the way .NET's `Decimal(double)` ctor does: round the
-    /// value to 15 significant decimal digits (double's reliable precision), then express that as
-    /// a 96-bit mantissa with the matching scale. Returns `None` for NaN / infinity / a
-    /// magnitude outside the Decimal range (the managed ctor raises `OverflowException`).
-    #[cfg(feature = "float")]
-    pub fn from_double(value: f64) -> Option<Value> {
-        if !value.is_finite() {
-            return None;
-        }
-        if value == 0.0 {
-            return finish([0u32; LIMBS], 0, false);
-        }
-        let negative = value < 0.0;
-        let magnitude = value.abs();
-        let mut exp = floor_log10(magnitude);
-        let mut digits15 = magnitude / pow10_f64(exp - 14);
-        if digits15 >= 1e15 {
-            exp += 1;
-            digits15 = magnitude / pow10_f64(exp - 14);
-        } else if digits15 < 1e14 {
-            exp -= 1;
-            digits15 = magnitude / pow10_f64(exp - 14);
-        }
-        let rounded = round_half_even_f64(digits15);
-        let mut int_digits = rounded as u128;
-        if int_digits == 0 {
-            return finish([0u32; LIMBS], 0, false);
-        }
-        let mut scale_pow = exp - 14;
-        while int_digits % 10 == 0 {
-            int_digits /= 10;
-            scale_pow += 1;
-        }
-        let mut mag = [0u32; LIMBS];
-        mag[0] = int_digits as u32;
-        mag[1] = (int_digits >> 32) as u32;
-        mag[2] = (int_digits >> 64) as u32;
-        if scale_pow >= 0 {
-            if !scale_up(&mut mag, scale_pow as u32) {
-                return None;
-            }
-            finish(mag, 0, negative)
-        } else {
-            finish(mag, (-scale_pow) as u32, negative)
-        }
-    }
-
-    /// `floor(log10(x))` for a finite positive `x`, without a math library: bracket the value
-    /// between consecutive integer powers of ten (the range of magnitudes is small).
-    #[cfg(feature = "float")]
-    fn floor_log10(x: f64) -> i32 {
-        let mut exp = 0i32;
-        let mut v = x;
-        while v >= 10.0 {
-            v /= 10.0;
-            exp += 1;
-        }
-        while v < 1.0 {
-            v *= 10.0;
-            exp -= 1;
-        }
-        exp
-    }
-
-    /// `10^n` as an `f64` for a small signed exponent, by repeated multiply/divide (exact for the
-    /// |n| <= ~22 range where 10^n is representable exactly in a double; good enough beyond).
-    #[cfg(feature = "float")]
-    fn pow10_f64(n: i32) -> f64 {
-        let mut result = 1.0f64;
-        let mut k = n.abs();
-        while k > 0 {
-            result *= 10.0;
-            k -= 1;
-        }
-        if n < 0 { 1.0 / result } else { result }
-    }
-
-    /// Rounds an `f64` to the nearest integer, ties to even.
-    #[cfg(feature = "float")]
-    fn round_half_even_f64(x: f64) -> f64 {
-        let floor = floor_f64(x);
-        let frac = x - floor;
-        if frac < 0.5 {
-            floor
-        } else if frac > 0.5 {
-            floor + 1.0
-        } else if (floor as i64) & 1 == 0 {
-            floor
-        } else {
-            floor + 1.0
-        }
-    }
-
-    /// `floor(x)` for a non-negative `x` within the i64 range (the 15-digit integers here),
-    /// without a math library.
-    #[cfg(feature = "float")]
-    fn floor_f64(x: f64) -> f64 {
-        let truncated = x as i64 as f64;
-        if truncated > x { truncated - 1.0 } else { truncated }
-    }
-
-    /// Converts a decoded decimal to the nearest `f64` (.NET's `(double)dec` operator): the
-    /// 96-bit mantissa as a float divided by `10^scale`. Double's rounding gives the same
-    /// result as .NET here for the values the corpus exercises.
-    #[cfg(feature = "float")]
-    pub fn to_double(a: Dec) -> f64 {
-        let mantissa =
-            u128::from(a.mag[0]) | (u128::from(a.mag[1]) << 32) | (u128::from(a.mag[2]) << 64);
-        let mut value = mantissa as f64;
-        value /= pow10_f64(a.scale as i32);
-        if a.negative {
-            -value
-        } else {
-            value
-        }
+    /// Packs the kernel's four result words back into the `Value::Struct` form a `Decimal` takes
+    /// on the value stack.
+    pub fn encode(words: [u32; 4]) -> Value {
+        Value::Struct(Box::new([
+            Value::Int32(words[0] as i32),
+            Value::Int32(words[1] as i32),
+            Value::Int32(words[2] as i32),
+            Value::Int32(words[3] as i32),
+        ]))
     }
 
     /// Decodes the two-`Decimal` argument form (two `Value::Struct`s): `op_Addition(a, b)` etc.
@@ -8717,6 +8321,16 @@ mod decimal_ops {
     #[cfg(feature = "float")]
     pub fn one(args: &[Value]) -> Option<Dec> {
         dec_arg(args, 0)
+    }
+}
+
+/// Maps a decimal kernel fault onto the trap that raises the matching .NET exception. The kernel
+/// decides WHICH fault an operand pair produces, so a compiled program and the interpreter raise
+/// the same exception for the same inputs; this only names the interpreter's side of it.
+fn decimal_trap(fault: lamella_decimal::Fault) -> Trap {
+    match fault {
+        lamella_decimal::Fault::Overflow => Trap::Overflow,
+        lamella_decimal::Fault::DivideByZero => Trap::DivideByZero,
     }
 }
 
@@ -8733,9 +8347,9 @@ pub fn decimal_add(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    decimal_ops::add(a, b)
-        .ok_or(Trap::Overflow)
-        .map(Some)
+    lamella_decimal::add(a, b)
+        .map(|words| Some(decimal_ops::encode(words)))
+        .map_err(decimal_trap)
 }
 
 /// `System.Decimal::DecSub(...)`: the exact difference (backs `op_Subtraction`).
@@ -8747,11 +8361,10 @@ pub fn decimal_subtract(
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let (a, mut b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    b.negate();
-    decimal_ops::add(a, b)
-        .ok_or(Trap::Overflow)
-        .map(Some)
+    let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    lamella_decimal::subtract(a, b)
+        .map(|words| Some(decimal_ops::encode(words)))
+        .map_err(decimal_trap)
 }
 
 /// `System.Decimal::DecMul(...)`: the exact product (backs `op_Multiply`).
@@ -8764,9 +8377,9 @@ pub fn decimal_multiply(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    decimal_ops::mul(a, b)
-        .ok_or(Trap::Overflow)
-        .map(Some)
+    lamella_decimal::multiply(a, b)
+        .map(|words| Some(decimal_ops::encode(words)))
+        .map_err(decimal_trap)
 }
 
 /// `System.Decimal::DecDiv(...)`: the quotient at full Decimal precision (backs `op_Division`).
@@ -8780,12 +8393,9 @@ pub fn decimal_divide(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    if b.is_zero_value() {
-        return Err(Trap::DivideByZero);
-    }
-    decimal_ops::div(a, b)
-        .ok_or(Trap::Overflow)
-        .map(Some)
+    lamella_decimal::divide(a, b)
+        .map(|words| Some(decimal_ops::encode(words)))
+        .map_err(decimal_trap)
 }
 
 /// `System.Decimal::DecRem(...)`: the remainder with the dividend's sign (backs `op_Modulus`).
@@ -8799,12 +8409,9 @@ pub fn decimal_remainder(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    if b.is_zero_value() {
-        return Err(Trap::DivideByZero);
-    }
-    decimal_ops::rem(a, b)
-        .ok_or(Trap::Overflow)
-        .map(Some)
+    lamella_decimal::remainder(a, b)
+        .map(|words| Some(decimal_ops::encode(words)))
+        .map_err(decimal_trap)
 }
 
 /// `System.Decimal::DecCompare(...)`: `-1`/`0`/`1` by value (scale-independent). Backs
@@ -8818,7 +8425,7 @@ pub fn decimal_compare(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    let ordering = decimal_ops::compare(a, b).ok_or(Trap::Overflow)?;
+    let ordering = lamella_decimal::compare(a, b).map_err(decimal_trap)?;
     Ok(Some(Value::Int32(ordering)))
 }
 
@@ -8837,9 +8444,9 @@ pub fn decimal_from_double(
         Some(&Value::Float(value)) => value,
         _ => return Err(Trap::TypeMismatch(Opcode::Call)),
     };
-    decimal_ops::from_double(value)
-        .ok_or(Trap::Overflow)
-        .map(Some)
+    lamella_decimal::from_double(value)
+        .map(|words| Some(decimal_ops::encode(words)))
+        .map_err(decimal_trap)
 }
 
 /// `System.Decimal::ToDouble(lo,mid,hi,flags)`: the `(double)dec` operator.
@@ -8853,7 +8460,7 @@ pub fn decimal_to_double(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let a = decimal_ops::one(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    Ok(Some(Value::Float(decimal_ops::to_double(a))))
+    Ok(Some(Value::Float(lamella_decimal::to_double(a))))
 }
 
 #[cfg(test)]
@@ -9088,6 +8695,67 @@ mod tests {
         assert_eq!(
             console_write_line(&mut vm, &Module::new(), &[Value::Int32(7)]),
             Err(Trap::TypeMismatch(Opcode::Call))
+        );
+    }
+
+    /// `typeof(T).ToString()` must be the type's name, not the pointer the handle IS.
+    ///
+    ///
+    /// The negative row is the whole reason this is keyed on the handle RESOLVING rather than on
+    /// the value being a native int: an ordinary `IntPtr` still has to render as its number.
+    #[test]
+    fn a_type_handle_renders_as_its_name_and_a_plain_native_int_still_renders_as_a_number() {
+        use crate::module::{ReflectType, asm_key};
+
+        fn render(module: &Module, vm: &mut Vm, value: Value) -> String {
+            match object_to_string(vm, module, &[value]) {
+                Ok(Some(Value::Object(text))) => vm
+                    .heap()
+                    .as_string(text)
+                    .map(|units| String::from_utf16_lossy(&units))
+                    .unwrap_or_default(),
+                other => panic!("unexpected object_to_string result: {other:?}"),
+            }
+        }
+
+        let mut vm = Vm::new();
+        let mut module = Module::new();
+        let handle = asm_key(0, 0x0200_0007);
+        module.bind_reflect_type(
+            handle,
+            ReflectType {
+                namespace: String::from("Widgets"),
+                full_name: String::from("Widgets.Gadget"),
+                is_enum: false,
+                is_value_type: false,
+                is_interface: false,
+                is_abstract: false,
+                is_public: true,
+                base_handle: 0,
+            },
+        );
+
+        assert_eq!(
+            render(&module, &mut vm, Value::NativeInt(handle as i64)),
+            "Widgets.Gadget",
+            "a native int that IS a recorded type handle renders as the type"
+        );
+        let lazy_handle = asm_key(0, 0x0200_0009);
+        module.bind_type_token(0, Token(0x0200_0009), 3);
+        module.bind_type_full_name(3, String::from("System.Int32"));
+        assert!(
+            module.reflect_type(lazy_handle).is_none(),
+            "the row is only meaningful while this handle has NO reflection record"
+        );
+        assert_eq!(
+            render(&module, &mut vm, Value::NativeInt(lazy_handle as i64)),
+            "System.Int32",
+            "a handle with a type identity but no reflection record still renders as the type"
+        );
+        assert_eq!(
+            render(&module, &mut vm, Value::NativeInt(4096)),
+            "4096",
+            "a native int that names no type is still a number"
         );
     }
 
@@ -9368,5 +9036,119 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r, Value::Float(1.5));
+    }
+}
+
+/// `System.Object.GetHashCode()`: the IDENTITY hash every reference type inherits.
+///
+/// Two references to one object answer the same value, two distinct objects almost always answer
+/// different values, and the value does not change for the object's lifetime -- including across a
+/// collection, which relocates every surviving object. See [`crate::object::Heap::identity_hash`]
+/// for where it is stored and why the reference itself cannot be it.
+///
+/// # Why the base returning a constant was not merely slow
+///
+/// Every reference type that does not override this inherited `0`, so every hash bucket in every
+/// `Hashtable` and `Dictionary` keyed by such a type was bucket zero. The lookups still ANSWERED
+/// correctly, because `Equals` settles a collision -- which is exactly why nothing caught it -- but
+/// a table of n keys did n comparisons per probe. A value type keeps its own override
+/// ([`value_type_get_hash_code`] for the ones that declare none).
+///
+/// A null receiver cannot reach here through a `callvirt`, which null-checks first; the arm exists
+/// because an intrinsic is reachable from the seam directly and answering 0 beats trapping.
+pub fn object_get_hash_code(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let hash = match args.first() {
+        Some(Value::Object(reference)) => vm.heap_mut().identity_hash(*reference),
+        _ => 0,
+    };
+    Ok(Some(Value::Int32(hash)))
+}
+
+/// `System.ValueType.GetHashCode()`: the FIELD-WISE hash every struct and enum inherits.
+///
+/// # It has to agree with `ValueType.Equals`, not with `Object`'s
+///
+/// [`value_type_equals`] answers true for two boxes of the same value type carrying equal fields,
+/// so the hash has to be equal for exactly those. An identity hash here would break the contract
+/// outright: two separately boxed copies of one enum constant are two allocations, so a `Hashtable`
+/// keyed by an enum would stop reading back what it just wrote. That is the same defect
+/// [`value_type_equals`] exists to fix, one method along -- and it is why `Object`'s identity hash
+/// could not simply be inherited here.
+///
+/// The walk mirrors [`struct_fields_equal`] case for case: a nested value type recurses, a field
+/// holding a string contributes its CHARACTERS (what that field's own `String.GetHashCode` would),
+/// any other reference contributes its identity hash, and the rest hash by representation.
+pub fn value_type_get_hash_code(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let hash = match args.first() {
+        Some(Value::Object(reference)) => match vm.heap().boxed_value(*reference) {
+            Some(value) => struct_fields_hash(vm, &value),
+            None => 0,
+        },
+        _ => 0,
+    };
+    Ok(Some(Value::Int32(hash)))
+}
+
+/// The field-wise hash behind [`value_type_get_hash_code`], mirroring [`struct_fields_equal`].
+///
+/// # A reference field contributes its IDENTITY hash, and that is why this takes the heap mutably
+///
+/// `struct_fields_equal` gives a non-string reference field identity semantics, so the hash has to
+/// use the same notion of identity -- and the only stable one is the assigned identity hash, which
+/// may not exist yet. Contributing the raw `ObjectRef` instead would be stable only until the next
+/// collection, which compacts: a struct holding a reference would then hash differently before and
+/// after a GC, breaking the one property `GetHashCode` exists to guarantee.
+fn struct_fields_hash(vm: &mut Vm, value: &Value) -> i32 {
+    const OFFSET: u32 = 2_166_136_261;
+    const PRIME: u32 = 16_777_619;
+    fn mix(accumulator: u32, part: i32) -> u32 {
+        let mut hash = accumulator;
+        for byte in (part as u32).to_le_bytes() {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+    match value {
+        Value::Struct(fields) => {
+            let mut hash = OFFSET;
+            for field in fields.iter() {
+                hash = mix(hash, struct_fields_hash(vm, field));
+            }
+            hash as i32
+        }
+        Value::Object(reference) => {
+            let as_characters = vm.heap().as_string(*reference).map(|text| {
+                let mut hash = OFFSET;
+                for unit in text.iter() {
+                    hash = mix(hash, i32::from(*unit));
+                }
+                hash as i32
+            });
+            match as_characters {
+                Some(hash) => hash,
+                None => vm.heap_mut().identity_hash(*reference),
+            }
+        }
+        Value::Null => 0,
+        Value::Int32(number) => *number,
+        Value::Int64(number) => (*number as u64 ^ (*number as u64 >> 32)) as i32,
+        #[cfg(feature = "float")]
+        Value::Float(number) => {
+            let bits = number.to_bits();
+            (bits ^ (bits >> 32)) as i32
+        }
+        other => {
+            let _ = other;
+            0
+        }
     }
 }

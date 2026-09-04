@@ -11,4 +11,5 @@ public enum Stm32l0FlashLayout {
 
     // -- block constants --
     public static let ERASED_VALUE: UInt32 = 0x0
+    public static let WRITE_UNIT: UInt32 = 4
 }

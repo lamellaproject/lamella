@@ -45,6 +45,9 @@ pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
         TypeRefKind::Pointer(element) => {
             TypeSymbol::Pointer(alloc::boxed::Box::new(bind_type(element)))
         }
+        TypeRefKind::ByRef { referent, .. } => {
+            TypeSymbol::ByRef(alloc::boxed::Box::new(bind_type(referent)))
+        }
         TypeRefKind::Error => TypeSymbol::Error,
     }
 }

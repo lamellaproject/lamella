@@ -99,6 +99,7 @@ pub fn lower_async_method(
             catches: vec![BoundCatch {
                 exception_type: Some(exception_symbol()),
                 name: Some(exception_name),
+                filter: None,
                 body: Box::new(stmt(BoundStmtKind::Block(catch_body), span)),
                 span,
             }],
@@ -553,6 +554,12 @@ fn visit_expr(expr: &BoundExpr, f: &mut dyn FnMut(&BoundExpr)) {
         BoundExprKind::NullCoalescing { left, right } => {
             visit_expr(left, f);
             visit_expr(right, f);
+        }
+        BoundExprKind::Sequence { spilled, value } => {
+            for operand in spilled {
+                visit_expr(operand, f);
+            }
+            visit_expr(value, f);
         }
         _ => {}
     }
@@ -1100,6 +1107,7 @@ impl Rewriter {
                     rewritten_catches.push(BoundCatch {
                         exception_type: catch.exception_type.clone(),
                         name: catch.name.clone(),
+                        filter: catch.filter.clone(),
                         body: Box::new(stmt(BoundStmtKind::Block(rewritten.statements), span)),
                         span: catch.span,
                     });
@@ -1456,6 +1464,12 @@ impl Rewriter {
                 return Err(EmitError::Unsupported(
                     "an await under a null-coalescing operator (??) is not lowered yet (the \
                      branch rewrite is not built)",
+                ));
+            }
+            BoundExprKind::Sequence { .. } => {
+                return Err(EmitError::Unsupported(
+                    "an await under a lifted operator is not lowered yet (its operands spill to \
+                     locals, which do not survive a suspension)",
                 ));
             }
             BoundExprKind::Assignment {
@@ -1991,6 +2005,10 @@ fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> Option<Boun
         BoundExprKind::NullCoalescing { left, right } => BoundExprKind::NullCoalescing {
             left: Box::new(map_expr(left, replace)),
             right: Box::new(map_expr(right, replace)),
+        },
+        BoundExprKind::Sequence { spilled, value } => BoundExprKind::Sequence {
+            spilled: spilled.iter().map(|o| map_expr(o, replace)).collect(),
+            value: Box::new(map_expr(value, replace)),
         },
         BoundExprKind::Checked(operand) => {
             BoundExprKind::Checked(Box::new(map_expr(operand, replace)))

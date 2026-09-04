@@ -21,7 +21,8 @@ family = "stm32f42x"
 block = "gpio"
 sources = [
     "RM0090 Rev 22 section 8.4 (GPIO registers): GPIOx_MODER 0x00, GPIOx_OTYPER 0x04, GPIOx_OSPEEDR 0x08, GPIOx_PUPDR 0x0C, GPIOx_IDR 0x10, GPIOx_ODR 0x14, GPIOx_BSRR 0x18, GPIOx_LCKR 0x1C, GPIOx_AFRL 0x20, GPIOx_AFRH 0x24",
-    "RM0090 Rev 22 sections 8.4.1 to 8.4.4 per-bit descriptions: MODERy[1:0] at bits 2y with 00 = input (reset state), 01 = general purpose output mode and 10 = alternate function mode; OTy at bit y with 1 = output open-drain; OSPEEDRy[1:0] at bits 2y with 11 = very high speed; PUPDRy[1:0] at bits 2y with 01 = pull-up",
+    "RM0090 Rev 22 sections 8.4.1 to 8.4.4 per-bit descriptions: MODERy[1:0] at bits 2y with 00 = input (reset state), 01 = general purpose output mode, 10 = alternate function mode and 11 = analog mode; OTy at bit y with 1 = output open-drain; OSPEEDRy[1:0] at bits 2y with 11 = very high speed; PUPDRy[1:0] at bits 2y with 00 = no pull-up/pull-down, 01 = pull-up, 10 = pull-down and 11 reserved",
+    "RM0090 Rev 22 section 8.4.1 reset values, which are per PORT rather than per family: MODER resets to 0xA8000000 for port A, 0x00000280 for port B and 0x00000000 for every other port. Section 8.4.4 gives PUPDR the same shape -- 0x64000000, 0x00000100 and 0x00000000. The nonzero ports are the debug port: 0xA8000000 puts MODER13, MODER14 and MODER15 in alternate function, and 0x00000280 does the same for MODER3 and MODER4",
     "RM0090 Rev 22 sections 8.4.9 and 8.4.10: AFRL selects the alternate function for pins 0 to 7 and AFRH for pins 8 to 15, four bits per pin",
 ]
 notes = [
@@ -33,7 +34,7 @@ notes = [
 offset = 0x0
 width = 32
 fields = { MODER9 = [18, 2], MODER10 = [20, 2] }
-notes = "Port mode, 2 bits per pin at [2n, 2] (PARTIAL: pins 9 and 10 stated). 10 = alternate function; 01 = general purpose output; 00 = input, which is the reset state for most pins. The two written modes are both needed by a driver that disconnects one signal of a bus deliberately: alternate function hands the pin to a peripheral, and general purpose output is the only way to hold a level, because a pin left in alternate function mode with nothing driving it floats."
+notes = "Port mode, 2 bits per pin at [2n, 2] (PARTIAL: pins 9 and 10 stated). 10 = alternate function; 01 = general purpose output; 00 = input, which is the reset state for most pins; 11 = analog. The two written modes are both needed by a driver that disconnects one signal of a bus deliberately: alternate function hands the pin to a peripheral, and general purpose output is the only way to hold a level, because a pin left in alternate function mode with nothing driving it floats. THE RESET VALUE IS PER PORT AND TWO OF THEM ARE NOT ZERO: port A resets to 0xA8000000 and port B to 0x00000280, which is PA13, PA14, PA15, PB3 and PB4 held in alternate function -- the five-pin JTAG port. A part reached over SWD is using two of those five, and the other three are ordinary I/O that a reader expecting an all-zero reset would mistake for pins nothing has touched."
 
 [registers.OTYPER]
 offset = 0x4
@@ -93,6 +94,16 @@ notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4] (PART
 MODER_MODE_AF = 2
 MODER_MODE_OUTPUT = 1
 MODER_MODE_INPUT = 0
+# The fourth mode code. Section 8.4.1 states all four together and this was the one no binding had
+# ever asked for: an alternate-function binding wants 10, and 11 disconnects the digital side of the
+# pin entirely. A driver needs it to say what a pin is when it finds one already in it.
+MODER_MODE_ANALOG = 3
 OTYPER_OPEN_DRAIN = 1
 OSPEEDR_VERY_HIGH = 3
 PUPDR_PULL_UP = 1
+# The other two pull codes, section 8.4.4. Same reason: a binding only ever needed PULL_UP, and a
+# driver spelling 0 and 2 inline would be the only encodings in this block not taken from the
+# manual. 11 is RESERVED and deliberately has no constant -- a name for it would make a value the
+# part does not define look like one it does.
+PUPDR_NONE = 0
+PUPDR_PULL_DOWN = 2

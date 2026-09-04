@@ -1,8 +1,15 @@
-# BLOCK: the STM32L0x3 flash controller, stated only as far as the one fact consumers outside the
+# BLOCK: the STM32L0x3 flash controller, stated only as far as the facts consumers outside the
 # controller need. The controller itself is not described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
 #
 # THIS FAMILY ERASES TO ZERO, WHICH INVERTS THE USUAL BLANK CHECK. A correctly erased part reads as
 # full and a full part reads as erased.
+#
+# THE WRITE UNIT IS ONE 32-BIT WORD. RM0367 was read for this family on its own rather than carried
+# across from the L0x1 block, which is the rule for every fact in these files. The two manuals agree
+# here -- they do NOT agree about flash organization, which is what separates the categories -- and
+# an agreement that was checked is a different thing from one that was assumed.
 #
 
 [table]
@@ -10,11 +17,14 @@ kind = "block"
 family = "stm32l053"
 block = "flash"
 erased_value = 0x00000000
+write_unit = 4
 sources = [
-    "STM32L0x3 reference manual RM0367 Rev 8, the NVM chapter: NOTZEROERR is raised when a program targets a word whose content is not zero, which only coheres if an erased word IS zero",
-    "The STM32L053R8 array, which reads zero rather than ones after an erase -- the same controller behaviour established on an STM32L011",
+    "erased_value: STM32L0x3 reference manual RM0367 Rev 8, the NVM chapter: NOTZEROERR is raised when a program targets a word whose content is not zero, which only coheres if an erased word IS zero",
+    "erased_value: The STM32L053R8 array, which reads zero rather than ones after an erase -- the same controller behaviour established on an STM32L011",
+    "write_unit: RM0367 Rev 8 section 3.2 `NVM main features`: `Programming in the Flash memory performed by word or half-page`, read in RM0367 itself and not carried across from RM0377",
+    "write_unit: RM0367 Rev 8 section 3.3.4, subheading `Parallel write half-page Flash program memory`: the half-page mode requires a half-page-aligned first address and all 16 words in the same half-page, so it is a throughput mode rather than the granularity a placement rule can rely on",
 ]
 notes = [
-    "The 2 Kbytes of data EEPROM this family carries are a separate array from the program flash, and nothing here states a value for them.",
+    "The 2 Kbytes of data EEPROM this family carries are a separate array from the program flash, and nothing here states a value for them. RM0367 programs that array by word, half-word or byte, so neither fact here crosses to it.",
     "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
 ]

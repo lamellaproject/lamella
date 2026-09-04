@@ -1,7 +1,7 @@
 //! Lowering a bound method body to a CIL instruction stream (ECMA-335 1st ed,
 //! Partition III).
 
-use crate::expr::{EmitError, emit_expression, emit_local};
+use crate::expr::{EmitError, emit_expression, emit_local, emit_ref_argument};
 use crate::frame::{Frame, Slot};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
@@ -620,6 +620,9 @@ fn emit_statement(
                                 ));
                             }
                         }
+                    } else if let BoundExprKind::Ref { operand, .. } = &initializer.kind {
+                        crate::expr::emit_ref_argument(operand, frame, tokens, out)?;
+                        store_to(frame, &declarator.name, out)?;
                     } else {
                         emit_expression(initializer, frame, tokens, out)?;
                         store_to(frame, &declarator.name, out)?;
@@ -630,7 +633,14 @@ fn emit_statement(
         BoundStmtKind::Expression(expr) => emit_statement_expression(expr, frame, tokens, out)?,
         BoundStmtKind::Return(value) => {
             if let Some(value) = value {
-                emit_expression(value, frame, tokens, out)?;
+                if matches!(value.kind, BoundExprKind::Ref { .. }) {
+                    let BoundExprKind::Ref { operand, .. } = &value.kind else {
+                        unreachable!("just matched")
+                    };
+                    emit_ref_argument(operand, frame, tokens, out)?;
+                } else {
+                    emit_expression(value, frame, tokens, out)?;
+                }
             }
             match labels.epilogue {
                 Some(Epilogue { label, return_slot }) => {
@@ -1059,16 +1069,61 @@ fn emit_try(
     };
 
     for catch in catches {
+        let filter_start = catch.filter.as_ref().map(|condition| {
+            let start = out.len() as u32;
+            let done = labels.label();
+            if let Some(ty) = &catch.exception_type {
+                let bind = labels.label();
+                let token = tokens
+                    .instruction_type_token(ty)
+                    .ok_or(EmitError::Unsupported("a catch filter's type has no token"));
+                let token = match token {
+                    Ok(token) => token,
+                    Err(error) => return Err(error),
+                };
+                out.push(Instruction::new(Opcode::Isinst, Operand::Token(token)));
+                out.push(Instruction::simple(Opcode::Dup));
+                labels.branch(Opcode::Brtrue, bind, out);
+                out.push(Instruction::simple(Opcode::Pop));
+                out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+                labels.branch(Opcode::Br, done, out);
+                labels.place(bind, out);
+            }
+            if let Some(name) = catch.name.as_deref() {
+                frame.rebind_decl(catch.span, name);
+            }
+            match catch.name.as_deref().and_then(|name| frame.slot(name)) {
+                Some(Slot::Local(slot)) => {
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+                }
+                _ => out.push(Instruction::simple(Opcode::Pop)),
+            }
+            emit_expression(condition, frame, tokens, out)?;
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+            out.push(Instruction::simple(Opcode::CgtUn));
+            labels.place(done, out);
+            out.push(Instruction::simple(Opcode::Endfilter));
+            Ok(start)
+        });
+        let filter_start = match filter_start {
+            Some(Ok(start)) => Some(start),
+            Some(Err(error)) => return Err(error),
+            None => None,
+        };
         let handler_start = out.len() as u32;
         labels.points.push((handler_start, Some(catch.span)));
-        if let Some(name) = catch.name.as_deref() {
-            frame.rebind_decl(catch.span, name);
-        }
-        match catch.name.as_deref().and_then(|name| frame.slot(name)) {
-            Some(Slot::Local(slot)) => {
-                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+        if filter_start.is_none() {
+            if let Some(name) = catch.name.as_deref() {
+                frame.rebind_decl(catch.span, name);
             }
-            _ => out.push(Instruction::simple(Opcode::Pop)),
+            match catch.name.as_deref().and_then(|name| frame.slot(name)) {
+                Some(Slot::Local(slot)) => {
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+                }
+                _ => out.push(Instruction::simple(Opcode::Pop)),
+            }
+        } else {
+            out.push(Instruction::simple(Opcode::Pop));
         }
         labels.region_depth += 1;
         let emitted = emit_statement(&catch.body, frame, tokens, labels, out);
@@ -1077,20 +1132,26 @@ fn emit_try(
         if !always_exits(&catch.body) {
             labels.branch(Opcode::Leave, end, out);
         }
-        let ty = catch
-            .exception_type
-            .clone()
-            .unwrap_or(TypeSymbol::Special(SpecialType::Object));
-        let token = tokens
-            .instruction_type_token(&ty)
-            .ok_or(EmitError::Unsupported("a catch clause's type has no token"))?;
+        let kind = match filter_start {
+            Some(filter_start) => EhKind::Filter { filter_start },
+            None => {
+                let ty = catch
+                    .exception_type
+                    .clone()
+                    .unwrap_or(TypeSymbol::Special(SpecialType::Object));
+                let token = tokens
+                    .instruction_type_token(&ty)
+                    .ok_or(EmitError::Unsupported("a catch clause's type has no token"))?;
+                EhKind::Catch(token)
+            }
+        };
         labels.handlers.push(EhClause {
             try_range,
             handler_range: InstructionRange {
                 start: handler_start,
                 end: out.len() as u32,
             },
-            kind: EhKind::Catch(token),
+            kind,
         });
     }
 
@@ -1224,10 +1285,14 @@ fn emit_statement_expression(
             ..
         } => {
             if let BoundExprKind::Local(name) = &target.kind {
+                if let BoundExprKind::Ref { operand, .. } = &value.kind {
+                    crate::expr::emit_ref_argument(operand, frame, tokens, out)?;
+                    return store_to(frame, name, out);
+                }
                 if let Some((slot, element)) = frame.byref(name) {
-                    out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+                    out.push(slot.load());
                     emit_expression(value, frame, tokens, out)?;
-                    crate::expr::emit_byref_store(element, tokens, out)?;
+                    crate::expr::emit_byref_store(&element, tokens, out)?;
                     return Ok(());
                 }
                 emit_expression(value, frame, tokens, out)?;
@@ -1430,10 +1495,10 @@ pub(crate) fn emit_compound(
     match &target.kind {
         BoundExprKind::Local(name) => {
             if let Some((slot, element)) = frame.byref(name) {
-                out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+                out.push(slot.load());
                 emit_local(name, frame, tokens, out)?;
                 emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
-                crate::expr::emit_byref_store(element, tokens, out)?;
+                crate::expr::emit_byref_store(&element, tokens, out)?;
                 return Ok(());
             }
             emit_local(name, frame, tokens, out)?;
@@ -1605,6 +1670,28 @@ pub(crate) fn emit_compound(
             }
             Ok(())
         }
+        BoundExprKind::Dereference { operand } => {
+            emit_expression(operand, frame, tokens, out)?;
+            let address = frame.reserve_local(&operand.ty);
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(address)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
+            out.push(Instruction::simple(crate::expr::ldind_opcode(&target.ty)));
+            if leave == Leave::Old {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
+            emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
+            if leave == Leave::New {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
+            out.push(Instruction::simple(crate::expr::stind_opcode(&target.ty)));
+            if let Some(slot) = kept {
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+            }
+            Ok(())
+        }
         _ => Err(EmitError::Unsupported("compound assignment to this target")),
     }
 }
@@ -1648,6 +1735,31 @@ fn emit_combine(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if binary == BinaryOperator::Add
+        && rhs.is_some()
+        && matches!(
+            operand_ty,
+            TypeSymbol::Special(SpecialType::String | SpecialType::Object)
+        )
+    {
+        return match crate::expr::compound_concat(operand_ty, rhs) {
+            crate::expr::CompoundConcat::Spliced {
+                reference,
+                arguments,
+            } => {
+                for argument in &arguments {
+                    emit_expression(argument, frame, tokens, out)?;
+                }
+                crate::expr::emit_concat_call(&reference, tokens, out)
+            }
+            crate::expr::CompoundConcat::Pairwise(reference) => {
+                if let Some(value) = rhs {
+                    emit_expression(value, frame, tokens, out)?;
+                }
+                crate::expr::emit_concat_call(&reference, tokens, out)
+            }
+        };
+    }
     match rhs {
         Some(value) => {
             emit_expression(value, frame, tokens, out)?;
@@ -1666,28 +1778,6 @@ fn emit_combine(
             }
         }
         None => push_one(operand_ty, out),
-    }
-    if binary == BinaryOperator::Add
-        && matches!(
-            operand_ty,
-            TypeSymbol::Special(SpecialType::String | SpecialType::Object)
-        )
-    {
-        let value_is_string =
-            rhs.is_some_and(|value| matches!(value.ty, TypeSymbol::Special(SpecialType::String)));
-        let arg = TypeSymbol::Special(
-            if value_is_string && matches!(operand_ty, TypeSymbol::Special(SpecialType::String)) {
-                SpecialType::String
-            } else {
-                SpecialType::Object
-            },
-        );
-        let string = TypeSymbol::Special(SpecialType::String);
-        let token = tokens
-            .method(&string, "Concat", &[arg.clone(), arg])
-            .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
-        out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
-        return Ok(());
     }
     crate::expr::emit_binary(binary, operand_ty, checked, out)?;
     narrow_compound_result(operand_ty, checked, out);

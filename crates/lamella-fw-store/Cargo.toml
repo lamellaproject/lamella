@@ -1,0 +1,15 @@
+[package]
+name = "lamella-fw-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The on-device firmware store behind the Lamella Link DEVICE/FIRMWARE block: a per-family flash seam, and a boot locator record written so that losing power part-way through reads as no record rather than as a half-changed one. no_std, no allocation."
+publish = false
+
+[dependencies]
+lamella-wire = { path = "../lamella-wire" }
+
+[lints]
+workspace = true

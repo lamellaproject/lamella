@@ -125,7 +125,7 @@ public sealed class Rp2350I2cDriver : I2cDriver
     /// <summary>The strata's write sequence: START, address+W, <paramref name="count"/> bytes
     /// (STOP riding the last), each fed on TX-FIFO room; completion by TX_EMPTY, verdict from
     /// the abort source.</summary>
-    public override int Write(int address, byte[] buffer, int count)
+    public override int Write(int address, System.ReadOnlySpan<byte> buffer, int count)
     {
         SetTarget(address);
         for (int i = 0; i < count; i++)
@@ -140,7 +140,7 @@ public sealed class Rp2350I2cDriver : I2cDriver
 
     /// <summary>The strata's read sequence: START, address+R, <paramref name="count"/> bytes in
     /// command/pop lockstep (STOP riding the last command).</summary>
-    public override int Read(int address, byte[] buffer, int count)
+    public override int Read(int address, System.Span<byte> buffer, int count)
     {
         SetTarget(address);
         for (int i = 0; i < count; i++)
@@ -154,8 +154,8 @@ public sealed class Rp2350I2cDriver : I2cDriver
 
     /// <summary>The strata's write_then_read sequence: the write bytes go WITHOUT stop, the
     /// first read command carries RESTART (the repeated start), the last carries STOP.</summary>
-    public override int WriteRead(int address, byte[] writeBuffer, int writeCount,
-                                  byte[] readBuffer, int readCount)
+    public override int WriteRead(int address, System.ReadOnlySpan<byte> writeBuffer, int writeCount,
+                                  System.Span<byte> readBuffer, int readCount)
     {
         SetTarget(address);
         for (int i = 0; i < writeCount; i++)

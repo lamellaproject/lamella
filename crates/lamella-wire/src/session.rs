@@ -1,9 +1,10 @@
-//! Who owns the debug session, when several carriers can reach one target at once.
+//! Who owns the debug session, when several carriers can reach one target at once. A pure
+//! decision -- no carrier, no input and no output -- so the rule can be tested whole.
 
 use crate::Frame;
 
 /// What kind of carrier a claim arrives on. The ordering is the authority ordering, and it exists
-/// for one reason: a person at the bench with a cable is the way a board wedged by a remote host
+/// for one reason: a person at the board with a cable is the way a board wedged by a remote host
 /// gets recovered.
 ///
 /// `#[non_exhaustive]`: a carrier reached through a broker the device dialed OUT to is a third
@@ -53,7 +54,7 @@ pub enum Decision {
     /// is a wait of milliseconds, not a refusal.
     Deferred,
     /// Refused, and by whom. The class is the useful half -- it tells a remote host that the
-    /// board is in somebody's hands at the bench rather than merely busy.
+    /// board is in somebody's hands rather than merely busy.
     Refused {
         /// The holder's carrier class.
         holder: ChannelClass,
@@ -206,7 +207,7 @@ pub fn is_session_control(msg_type: u8) -> bool {
         msg_type,
         crate::msg::HELLO
             | crate::msg::HELLO_ACK
-            | crate::msg::NAK
+            | crate::msg::HELLO_NAK
             | crate::msg::ERROR
             | crate::msg::PING
             | crate::msg::PONG

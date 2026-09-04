@@ -5,6 +5,7 @@ namespace Lamella.Generated
     {
         private Sam4nInstances() { }
 
+        public const uint EEFC0_BASE = 0x400E0A00;
         public const uint PIOA_BASE = 0x400E0E00;
         public const uint PIOA_PID = 11;
         public const uint PIOB_BASE = 0x400E1000;

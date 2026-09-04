@@ -14,7 +14,7 @@ board = "feather-rp2040-adalogger"
 vendor = "adafruit"
 family = "rp2040"
 part = "rp2040"
-board_model = 18            # lamella_wire::board_model::FEATHER_RP2040_ADALOGGER
+product_model = 18          # lamella_wire::product_model::FEATHER_RP2040_ADALOGGER
 sources = [
     "Adafruit CircuitPython board definition ports/raspberrypi/boards/adafruit_feather_rp2040_adalogger/pins.c -- the board's own authoritative pin map: LED = GPIO13, NEOPIXEL = GPIO17, BUTTON/BOOT = GPIO7, TX/RX = GPIO0/GPIO1, SDA/SCL = GPIO2/GPIO3, header SCK/MOSI/MISO = GPIO14/GPIO15/GPIO8, SD_CLK/SD_MOSI/SD_MISO/SD_CS = GPIO18/GPIO19/GPIO20/GPIO23, SD_CARD_DETECT = GPIO16",
     "Adafruit product 5980 (Feather RP2040 Adalogger): 8 MB flash, microSD slot, STEMMA QT connector",

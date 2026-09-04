@@ -19,7 +19,7 @@ pub const CMD_RESET: u8 = 0xcf;
 /// The chip-identity register (vendor driver `nmasic.h`: `NMI_CHIPID` at the peripheral base).
 pub const NMI_CHIPID: u32 = 0x1000;
 /// The WINC SPI block's protocol-config register (`NMI_SPI_REG_BASE 0xe800` + 0x24): CRC checking
-/// enable bits [3:2] and the data-packet-size field [6:4].
+/// enable bits `[3:2]` and the data-packet-size field `[6:4]`.
 pub const NMI_SPI_PROTOCOL_CONFIG: u32 = 0xe824;
 
 /// Registers at or below this offset are the module's CLOCKLESS registers: readable via the

@@ -8,7 +8,10 @@ use lamella_ir::{
     VerifyError,
 };
 
-use crate::resolver::{ARRAY_DESC_MARK, TypeMeta, VtableEntry, descriptor_symbol};
+use crate::resolver::{
+    ARRAY_DESC_MARK, STRING_ALLOCATING_SEAMS, STRING_TYPEDESC_SYMBOL, TypeMeta, VtableEntry,
+    descriptor_symbol,
+};
 use crate::stringgen::CONSOLE_WRITE_BYTES;
 pub use crate::resolver::DescQualifiers;
 pub use crate::stackmaps::AssemblyStatics;
@@ -47,6 +50,22 @@ pub enum LowerError {
         offset: i64,
         /// The reach the encoding has, as `+/-limit` bytes.
         limit: i64,
+    },
+    /// A PROGRAM image reaches a runtime string seam ([`crate::resolver::STRING_ALLOCATING_SEAMS`])
+    /// while this build cannot name `System.String`, so the ambient descriptor word would be laid 0
+    /// and every string those seams return would carry a null descriptor.
+    ///
+    /// **REFUSED ON THE HOST BECAUSE THE DEVICE CANNOT REPORT IT.** The archive is built `--release`
+    /// with `panic = "abort"` and a `loop {}` panic handler, so an assertion there cannot fail: it
+    /// either compiles out or converts a fault at a garbage PC into a hang at a known one. This is a
+    /// BUILD-WIRING fact, known at link time, in a process that has stderr and an exit code -- which
+    /// is the only place a guard for it can actually fire. The ARM twin
+    /// (`crate::arm32::LowerError::StringSeamWithoutDescriptor`) refuses on the same terms.
+    ///
+    /// Carries the seam that forced it, so the message names a member rather than a condition.
+    StringSeamWithoutDescriptor {
+        /// The imported seam symbol whose presence made the descriptor necessary.
+        seam: alloc::string::String,
     },
     /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
     /// surrogate under `string-utf8`. Refused rather than replaced with U+FFFD -- see
@@ -653,6 +672,7 @@ type LoweredModule = (
     Vec<Option<MethodRecordInfo>>,
     LibraryStubReport,
     Vec<Vec<(u32, u32)>>,
+    Option<u32>,
 );
 
 /// One function's `.lamella_stackmaps` METHOD_SLOTS record material (the shared format in
@@ -833,8 +853,9 @@ fn lower_module_to_image(
     }
     let names_want_header = !cfg!(feature = "strip-type-names")
         && descriptors.iter().any(|m| m.full_name.is_some());
-    if let Some(handle) =
-        string_header.filter(|_| !abs_desc_relocs.is_empty() || names_want_header)
+    let lays_ambient_word = relocate && !tolerant;
+    if let Some(handle) = string_header
+        .filter(|_| !abs_desc_relocs.is_empty() || names_want_header || lays_ambient_word)
     {
         let handle = TypeHandle(handle);
         if !type_desc_labels.iter().any(|(h, _)| *h == handle) {
@@ -856,6 +877,32 @@ fn lower_module_to_image(
             }
         }
     }
+    if lays_ambient_word && string_header.is_none() && !descriptors.is_empty() {
+        if let Some(seam) = STRING_ALLOCATING_SEAMS
+            .iter()
+            .find(|name| externs.iter().any(|e| e == *name))
+        {
+            return Err(LowerError::StringSeamWithoutDescriptor {
+                seam: (*seam).into(),
+            });
+        }
+    }
+    let mut string_typedesc_position = lays_ambient_word.then(|| {
+        debug_assert_eq!(
+            enc.position() % 4,
+            0,
+            "the ambient descriptor word must be word-aligned for the archive's `lw` to read it"
+        );
+        let at = enc.position();
+        match string_header {
+            Some(handle) => {
+                abs_desc_relocs.push((at, DESC_SYMBOL_FLAG | handle, 0));
+                enc.emit_word(0);
+            }
+            None => enc.emit_word(0),
+        }
+        at
+    });
     if tolerant {
         for meta in descriptors {
             let Some(words) = meta.words.as_deref().filter(|_| meta.exported) else {
@@ -991,6 +1038,9 @@ fn lower_module_to_image(
                 *at = lamella_asm_riscv32::shift_position(shifts, *at);
             }
         }
+        if let Some(at) = &mut string_typedesc_position {
+            *at = lamella_asm_riscv32::shift_position(shifts, *at);
+        }
     }
     Ok((
         bytes,
@@ -1002,6 +1052,7 @@ fn lower_module_to_image(
         method_records,
         stub_report,
         method_lines,
+        string_typedesc_position,
     ))
 }
 
@@ -1289,6 +1340,7 @@ fn lower_object_relocatable(
         method_records,
         stub_report,
         method_lines,
+        string_typedesc_position,
     ) = lower_module_to_image(
         &program,
         alloc,
@@ -1350,6 +1402,16 @@ fn lower_object_relocatable(
             } else {
                 lamella_elf::Binding::Global
             },
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+    }
+    if let Some(position) = string_typedesc_position {
+        symbols.push(lamella_elf::Symbol {
+            name: STRING_TYPEDESC_SYMBOL,
+            value: position,
+            size: 4,
+            binding: lamella_elf::Binding::Global,
             kind: lamella_elf::SymbolType::NoType,
             section: lamella_elf::SymbolSection::Text,
         });
@@ -2783,6 +2845,25 @@ fn lower_inst_spilled(
             emit_fill_block(enc, t0, t1, t2);
         }
         Inst::StaticLoad { owner, offset } => {
+            if let Some(MirType::ValueType { size, .. }) = value_types.get(result.index()).copied() {
+                let full_words = size / 4;
+                let rem = size % 4;
+                field_offset(size.saturating_sub(1))?;
+                emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
+                for w in 0..full_words {
+                    enc.lw(t1, t0, (w * 4) as i32);
+                    slot_store(enc, t1, slot(result) + (w * 4) as i32);
+                }
+                if rem != 0 {
+                    slot_addr(enc, t2, slot(result));
+                    for k in 0..rem {
+                        let at = (full_words * 4 + k) as i32;
+                        enc.lbu(t1, t0, at);
+                        enc.sb(t1, t2, at);
+                    }
+                }
+                return Ok(());
+            }
             emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
             if matches!(value_types.get(result.index()), Some(MirType::I64 | MirType::F64)) {
                 enc.lw(t1, t0, 4);
@@ -2800,6 +2881,25 @@ fn lower_inst_spilled(
             offset,
             value,
         } => {
+            if let Some(MirType::ValueType { size, .. }) = value_types.get(value.index()).copied() {
+                let full_words = size / 4;
+                let rem = size % 4;
+                field_offset(size.saturating_sub(1))?;
+                emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
+                for w in 0..full_words {
+                    slot_load(enc, t1, slot(*value) + (w * 4) as i32);
+                    enc.sw(t1, t0, (w * 4) as i32);
+                }
+                if rem != 0 {
+                    slot_addr(enc, t2, slot(*value));
+                    for k in 0..rem {
+                        let at = (full_words * 4 + k) as i32;
+                        enc.lbu(t1, t2, at);
+                        enc.sb(t1, t0, at);
+                    }
+                }
+                return Ok(());
+            }
             emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
             slot_load(enc, t1, slot(*value));
             enc.sw(t1, t0, 0);
@@ -7584,6 +7684,204 @@ mod tests {
             at,
             "the header is the word IMMEDIATELY before the payload -- that is what `[obj - 4]` means"
         );
+    }
+
+    /// A `TypeMeta` for `System.String` rich enough for the ensure-block to lay a descriptor from.
+    /// `full_name: None` on purpose: a build that carries type NAMES already forces the descriptor
+    /// for a different reason, so a named one would let these tests pass without the ambient word's
+    /// own condition ever being the thing that fired.
+    fn string_meta(handle: u32) -> TypeMeta {
+        TypeMeta {
+            handle: TypeHandle(handle),
+            type_tag: 0x5151_5151,
+            vtable: Vec::new(),
+            itable: Vec::new(),
+            base: None,
+            words: Some(alloc::vec![8, 0, 0x5151_5151, 0].into_boxed_slice()),
+            exported: true,
+            full_name: None,
+        }
+    }
+
+    /// A body whose only content is a call to `seam` -- the shape a corlib `[RuntimeProvided]` string
+    /// helper reaches the backend as, once `rewrite_pinvoke` has turned the import into an extern.
+    fn seam_caller(seam: &str) -> Function {
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0x41,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::PInvoke {
+                            import: seam.into(),
+                            args: alloc::vec![ValueId(0)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        }
+    }
+
+    /// THE AMBIENT `System.String` DESCRIPTOR WORD, and the assertion that earns its place is not
+    /// "the symbol exists" -- a word hard-coded to 0 would pass that, and 0 is exactly the value the
+    /// defect produced. What is asserted is that the word RELOCATES to `System.String`'s descriptor.
+    ///
+    /// The program deliberately holds NO string literal and NO type names, which is the case that had
+    /// no descriptor laid at all before: the ensure-block fired only for `abs_desc_relocs` (literals)
+    /// or for name headers, so the word would have named an undefined symbol with a 0 addend. That
+    /// lands the reference on a descriptor's VTABLE rather than its WORDS -- a plausible descriptor
+    /// that is not one. The addend and the local definition are asserted for that reason, not for
+    /// tidiness.
+    #[test]
+    fn a_program_lays_the_ambient_string_descriptor_word_over_system_strings_descriptor() {
+        let handle = 7u32;
+        let qualifiers = DescQualifiers {
+            string: Some(handle),
+            ..DescQualifiers::default()
+        };
+        let bytes = lower_object_profile_statics_references(
+            &[seam_caller("lamella_char_to_string")],
+            &["main"],
+            &[],
+            &[string_meta(handle)],
+            None,
+            &[],
+            &qualifiers,
+            RiscvProfile::Rv32im,
+        )
+        .expect("a program reaching a string seam with a nameable System.String builds");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let word = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == crate::resolver::STRING_TYPEDESC_SYMBOL)
+            .expect("a PROGRAM object defines the ambient descriptor word")
+            .clone();
+        assert!(word.defined, "the program is where the word is DEFINED");
+        assert_eq!(word.size, 4, "one word");
+        let desc_name = alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle);
+        let desc = obj
+            .symbols
+            .iter()
+            .position(|s| s.name == desc_name)
+            .expect("the ambient word names System.String's descriptor, so it must be emitted");
+        assert!(
+            obj.symbols[desc].defined,
+            "the descriptor must be DEFINED here -- an undefined one would need the owner's vtable \
+             span in the addend instead of 0"
+        );
+        let reloc = obj
+            .relocations
+            .iter()
+            .find(|r| r.offset == word.value)
+            .expect(
+                "the ambient word must RELOCATE -- a bare 0 there is exactly the defect this fixes",
+            );
+        assert_eq!(
+            reloc.symbol, desc as u32,
+            "the word names System.String's descriptor and nothing else"
+        );
+        assert_eq!(
+            reloc.kind,
+            lamella_elf::riscv::R_RISCV_32,
+            "ABSOLUTE: the archive reads the word with a plain `lw`, with no site address to add a \
+             delta back to"
+        );
+        assert_eq!(
+            reloc.addend, 0,
+            "a locally laid descriptor resolves through desc_index, which adds its own vtable span"
+        );
+    }
+
+    /// A LIBRARY object defines NO ambient word. Every object in a link would otherwise define the
+    /// symbol and the link would fail `DuplicateSymbol`; a library's strings are described by the
+    /// program's word, which is the only one there is.
+    #[test]
+    fn a_library_object_defines_no_ambient_string_descriptor_word() {
+        let handle = 7u32;
+        let qualifiers = DescQualifiers {
+            string: Some(handle),
+            ..DescQualifiers::default()
+        };
+        let bytes = lower_object_library_statics(
+            &[seam_caller("lamella_char_to_string")],
+            &["helper"],
+            &[],
+            &[string_meta(handle)],
+            None,
+            &[],
+            &qualifiers,
+        )
+        .expect("a library reaching a string seam builds");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        assert!(
+            !obj.symbols
+                .iter()
+                .any(|s| s.name == crate::resolver::STRING_TYPEDESC_SYMBOL && s.defined),
+            "only the PROGRAM object defines the word -- two definitions is a link failure"
+        );
+    }
+
+    /// AN IMAGE REACHING A STRING SEAM WITH NO NAMEABLE `System.String` IS REFUSED ON THE HOST,
+    /// because the device cannot report it: the archive is `panic = "abort"` with a `loop {}` handler,
+    /// so a guard there either compiles out or turns one hang into another.
+    ///
+    /// The CONTROLS are the point of the second half. A guard that refused every seam-calling build
+    /// would pass the refusal assertion alone, and that is the failure mode worth catching -- the
+    /// same shape as a lookup that answers null to everything passing a test that only asks for hits.
+    #[test]
+    fn a_program_reaching_a_string_seam_without_system_string_is_refused() {
+        let handle = 7u32;
+        let refused = lower_object_profile_statics_references(
+            &[seam_caller("lamella_double_to_string")],
+            &["main"],
+            &[],
+            &[string_meta(handle)],
+            None,
+            &[],
+            &DescQualifiers::default(),
+            RiscvProfile::Rv32im,
+        );
+        match refused {
+            Err(LowerError::StringSeamWithoutDescriptor { seam }) => assert_eq!(
+                seam, "lamella_double_to_string",
+                "the refusal names the seam that forced the descriptor, not a condition"
+            ),
+            other => panic!(
+                "an image reaching a string seam with no `System.String` must be REFUSED on the \
+                 host -- the device cannot report it: {other:?}"
+            ),
+        }
+        lower_object_profile_statics_references(
+            &[seam_caller("lamella_console_newline")],
+            &["main"],
+            &[],
+            &[string_meta(handle)],
+            None,
+            &[],
+            &DescQualifiers::default(),
+            RiscvProfile::Rv32im,
+        )
+        .expect("a seam that allocates no string needs no descriptor");
+        lower_object(
+            &[seam_caller("lamella_double_to_string")],
+            &["main"],
+            &[],
+            &[],
+        )
+        .expect("a bare object lowering has no type world and is not guarded");
     }
 
     #[test]

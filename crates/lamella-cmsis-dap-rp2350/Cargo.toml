@@ -15,7 +15,11 @@ workspace = true
 # The probe-neutral seam. These flash routines are written against `TargetAccess`, so they drive a
 # target through any probe family the seam supports, not just a CMSIS-DAP one.
 lamella-probe-core = { path = "../lamella-probe-core" }
-lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+# No transport features: these routines are written against the seam, and `usbhid` is the
+# CMSIS-DAP crate's DEFAULT -- so taking the default here compiles a native USB backend into a
+# crate that never names one, and refuses to build for any target that backend has no port for
+# (wasm32, where the browser supplies the transport). `lamella-probe` already states it this way.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", default-features = false }
 
 [dev-dependencies]
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util", "usbbulk"] }

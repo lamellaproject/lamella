@@ -35,7 +35,7 @@ board = "arduino-giga-r1-wifi"
 vendor = "arduino"
 family = "stm32h7"
 part = "stm32h747xi"
-board_model = 33            # lamella_wire::board_model::ARDUINO_GIGA_R1_WIFI
+product_model = 33          # lamella_wire::product_model::ARDUINO_GIGA_R1_WIFI
 sources = [
     "Arduino GIGA R1 WiFi user manual (SKU ABX00063), features section: the microcontroller is an STM32H747XIH6 with a 32-bit Arm Cortex-M7 core with double-precision FPU up to 480 MHz and a 32-bit Arm Cortex-M4 core with FPU up to 240 MHz. The same section gives the memory as 2 MB flash and 1 MB RAM on the STM32H747XI, 16 MB of NOR flash on an AT25SF128A-MHB-T over a QSPI interface, and 8 MB of SDRAM on an AS4C4M16SA.",
     "Arduino GIGA R1 WiFi user manual (SKU ABX00063) section 6.1, the front-view component table: DL2 is an RGB SMLP34RGB2W3 common anode LED, DL1 is the power LED, PB1 is the RESET button, PB2 is the BOOT0 button, and the populated integrated circuits are U1 the microcontroller, U3 the 8 MB SDRAM, U4 the secure element, U5 the wireless module, U6 and U7 the buck converters and U8 the 16 MB flash. Section 13.5 states that the board has a built-in bootloader which allows flashing over USB, entered by double-tapping the reset button right after power-up.",

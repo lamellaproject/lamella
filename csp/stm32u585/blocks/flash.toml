@@ -1,0 +1,37 @@
+# BLOCK: the STM32U585 embedded flash controller, stated only as far as the facts consumers outside
+# the controller need. Its unlock sequence, its page geometry and its command bits are not described
+# here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 128-BIT QUAD-WORD AND IT IS NOT A CHOICE. The controller programs 137 bits at
+# a time -- 128 of data and 9 of ECC -- and RM0456 refuses anything narrower: a byte or half-word
+# write sets SIZERR, and a quad-word at an address that is not quad-word aligned sets PGAERR.
+#
+# AND THIS PART STATES THE REPROGRAM PROHIBITION AS PLAINLY AS ANY ST MANUAL DOES:
+# `Programming in a previously programmed address is not allowed except if the data to write is full
+# zero`, with PROGERR raised otherwise. So a rule of the form `write the record, then write its
+# magic into the same unit afterwards` does not merely risk an ECC problem here -- the controller
+# refuses it.
+#
+# RM0456 IS TITLED FOR THE SERIES AND SPLITS BY SUB-GROUP WHERE IT MATTERS. Its flash ORGANIZATION
+# is two tables, one for STM32U575/585 and one for STM32U59x/5Ax. Its programming granularity is
+# not split, and section 7.3.7 states the quad-word rule for the series without qualification.
+
+[table]
+kind = "block"
+family = "stm32u585"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 16
+sources = [
+    "erased_value: STM32U5 series reference manual RM0456 Rev 7 section 7.3.7 `Flash main memory programming sequences`: `If the user needs to program only one word, the quad-word must be completed with the erase value 0xFFFF FFFF to launch automatically the programming` -- the manual naming 0xFFFFFFFF as the erase value",
+    "write_unit: RM0456 Rev 7 section 7.3.7: `The flash memory is programmed 137 bits at a time (128-bit data + 9 bits ECC)` and `It is only possible to program quad-word (4 x 32-bit data)`",
+    "write_unit: RM0456 Rev 7 section 7.3.7: a byte or half-word write sets SIZERR, and a quad-word not aligned with a quad-word address sets PGAERR -- so the unit carries an alignment requirement and is not merely a preferred size",
+]
+notes = [
+    "A unit is write-once between erases, and the controller enforces it. RM0456 section 7.3.7: `Programming in a previously programmed address is not allowed except if the data to write is full zero`, setting PROGERR. The all-zero exception is not a general escape -- it writes no information.",
+    "RM0456 also offers BURST programming of 8 quad-words. That is a throughput mode, so it is not the granularity a placement rule can rely on.",
+    "The 512 bytes of OTP on this part are 32 quad-words and are written once. Nothing here states a value for that area.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

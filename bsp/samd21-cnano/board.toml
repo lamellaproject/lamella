@@ -1,0 +1,81 @@
+# BOARD binding: the SAM D21 Curiosity Nano (SAMD21-CNANO). Board truth only: the identity, the
+# carrier, and the two control lines a program can reach.
+#
+# IT SHARES A FAMILY AND A PACKAGE WITH THE XPLAINED PRO BOARDS AND NOT A PART. Every block table
+# in csp/samd21 describes silicon this board and the SAM D21 Xplained Pro have in common, and this
+# is the same 48-pin G package the SAMW25 module's host uses. What differs is the memory: 128 KB of
+# flash and 16 KB of SRAM against the ATSAMD21G18A's 256 KB and 32 KB, which is why the part row
+# rather than the family says so.
+#
+# BOTH CONTROL LINES ARE ACTIVE LOW AND THE GUIDE STATES BOTH IN WORDS, as its E51 sibling's does.
+# The LED lights when its line is driven to ground; the switch drives its line to ground when
+# pressed. AND THE SWITCH HAS NO EXTERNAL PULL-UP -- the guide's own Note says so and says what to
+# do about it, so a program opening that pin as a plain input reads a floating pad.
+#
+# THE CRYSTAL IS THE OPPOSITE OF THE E51 CURIOSITY NANO'S, AND THAT INVERSION IS THE THING TO GET
+# RIGHT. The E51 Nano populates its 32.768 kHz crystal by default. This board fits the footprint but
+# does NOT connect the crystal as it ships, because both of its pads are routed out to the edge
+# connector instead; the guide says using it takes hardware modification, and that the two edge
+# lines have to be disconnected first to avoid contention and excess capacitance. So PA00 and PA01
+# are ordinary I/O on a stock board here and are not on the E51 Nano, and a clock plan that assumed
+# the sibling's answer would wait on an oscillator that is not attached.
+#
+# THE DEBUGGER IS AN nEDBG, as the E51 Curiosity Nano's is. Its SWD lines reach PA31 and PA30 and
+# it has an nRESET line to the target, all of which are ALSO on the edge connector.
+
+[table]
+kind = "board"
+board = "samd21-cnano"
+vendor = "microchip"
+family = "samd21"
+part = "atsamd21g17d"
+product_model = 46          # lamella_wire::product_model::SAMD21_CURIOSITY_NANO
+sources = [
+    "SAM D21 Curiosity Nano Evaluation Kit User Guide DS70005409D section 4.2.1 and Table 4-1 (LED Connection): one yellow LED0 on PB10 with no shared functionality, and the section states the polarity in words -- the LED can be activated by driving the connected I/O line to the GND.",
+    "DS70005409D section 4.2.2 and Table 4-2 (Mechanical Switch): one generic user-configurable switch, SW0, on PB11, shared with DBG2 and the edge connector. When the switch is pressed it will drive the I/O line to ground, and the section's Note states that no pull-up resistor is connected to it and that the internal pull-up must be enabled to use it.",
+    "DS70005409D section 4.2.3 and Table 4-3 (Crystal Connections): the board has the OPTION for a 32.768 kHz crystal and by default that crystal is NOT connected, because the two I/O lines it would use -- PA00 XIN32 and PA01 XOUT32 -- are routed out to the edge connector. Using it requires hardware modification, and the guide says the two edge lines must be disconnected first to reduce contention and remove excess capacitance.",
+    "DS70005409D section 4.3.1 and Table 4-4 (Connection Details between the Target and Debugger Section): an on-board Nano Debugger programming and debugging over SWD, with SWDATA on PA31 (DBG0) and SWCLK on PA30 (DBG1), nRESET on DBG3, DBG2 on PB11, and the debugger's CDC pair on PB22 (the part's receive line) and PA22 (the part's transmit line) -- every one of them also brought out to the edge connector.",
+    "DS70005409D section 4.3.1: all connections between the target and the debugger are tri-stated as long as the debugger is not actively using the interface, so those pins can be configured to the application's requirements.",
+    "SAM D21 Family datasheet DS40001882 chapter 3 configuration summary, for the part's 128 KB program memory, 16 KB data memory and 48-pin QFN/TQFP packaging.",
+]
+notes = [
+    "THE DEBUGGER'S LINES ARE SHARED WITH THE EDGE CONNECTOR, which the SWD pair makes consequential rather than merely notable: a program that reconfigures PA30 or PA31 as a general-purpose pin takes the debug port away from the host while it runs. The guide's tri-state statement is about the DEBUGGER releasing the lines when idle, not about the target doing so.",
+    "SW0 IS SHARED WITH DBG2, which the LED is not. DBG2 is the debugger's general-purpose data-gateway line, so a host-side tool driving it and a program reading the button are reaching for the same pad. Nothing here binds DBG2; recorded because the sharing is invisible from the button's own row.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board nEDBG's CDC virtual port. Named for the mechanism rather
+                            # than the debugger variant: a host opens it the same way it opens an
+                            # Xplained Pro's, and the difference is the USB product id.
+baud = 115200
+default = true
+
+# --- the clock plan -------------------------------------------------------------------------------
+#
+# THE RESET PLAN, STATED RATHER THAN CONFIGURED, and it is the family's rather than this board's:
+# the part comes out of reset with the calibrated OSC8M enabled and used as the main clock source
+# running UNDIVIDED at 8 MHz, so generator 0 carries 8 MHz until something configures a source.
+# This board attaches no external oscillator to change that -- see the crystal note above, which is
+# where it differs from its sibling Nano rather than here.
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000
+
+# --- control lines ------------------------------------------------------------------------------
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB10"
+active = "low"
+source = "DS70005409D section 4.2.1 and Table 4-1: one yellow LED0 on PB10 with no shared functionality. 'The LED can be activated by driving the connected I/O line to the GND', which is the polarity stated in words rather than inferred from a schematic."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PB11"
+active = "low"
+source = "DS70005409D section 4.2.2 and Table 4-2: the generic user-configurable switch SW0 on PB11, shared with DBG2 and the edge connector. 'When this switch is pressed, it will drive the I/O line to ground (GND)'. THERE IS NO EXTERNAL PULL-UP: the section's Note says no pull-up resistor is connected to this switch and that the internal pull-up in the part must be enabled to use it, so a program opening this pin as a plain input reads a floating pad."

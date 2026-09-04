@@ -1,0 +1,130 @@
+# SERCOM in I2C MASTER mode on the Microchip SAM D5x/E5x family -- the BLOCK layout: register
+# offsets are SERCOM-instance-relative; nothing in this file names an instance, a pin, a board or a
+# clock plan. Instance bases live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+#
+# Authored from the per-register description headings in 36.10 ("Offset: 0x.."), one register at a
+# time. Those headings are the datasheet's authoritative per-register statement, and taking each one
+# individually is what keeps a register's offset tied to the same passage that gives its fields.
+#
+# THIS BLOCK IS NOT THE SAMD21's SERCOM AND MUST NOT BE FOLDED WITH IT. Three differences, each of
+# which a copy would get wrong in a direction that still compiles:
+#
+#   CTRLC at 0x08     does not exist in the SAMD21's I2C master at all. It carries DATA32B.
+#   DATA is 32 bits   the SAMD21's is 8. Only DATA[7:0] carries a byte when DATA32B is off, so a
+#                     narrow access still works -- which is exactly why a fold would go unnoticed.
+#   ADDR carries LEN  LEN[7:0] and LENEN give hardware-counted transaction length. The SAMD21 has
+#                     no such field, so an ADDR write that means one thing there means more here.
+
+[table]
+kind = "block"
+family = "same54"
+block = "sercom"
+mode = "i2c-master"
+sources = [
+    "SAM D5x/E5x Family Data Sheet DS60001507F ch 36 (SERCOM I2C): 36.10 Register Description - I2C Master, per-register Offset headings",
+    "DS60001507F 36.10.1 CTRLA, MODE description: these bits must be written to 0x5 to select the I2C master serial communication interface of the SERCOM",
+    "DS60001507F 36.10.2 CTRLB Table 36-4 (Command Description) and the ACKACT value table",
+    "DS60001507F 36.10.8 STATUS: the BUSSTATE value table, and 36.10.9 SYNCBUSY",
+    "DS60001507F 36.6.2.4.1 Master Clock Generation, page 915: the SCL frequency relation",
+]
+notes = [
+    "THE COMMAND ENCODING IS FOUR ROWS THAT DIFFER BY ONE, AND EVERY ROW IS STATED HERE RATHER THAN COUNTED. Table 36-4 reads 0x0 no action, 0x1 acknowledge action then repeated Start, 0x2 acknowledge action then a byte read, 0x3 acknowledge action then Stop. An encoding taken as three rows instead of four issues a byte read where a Stop belongs and a repeated Start where a byte read belongs, and both are legal bus operations, so the failure is a wrong transaction rather than a refusal.",
+    "CMD 0x2 IS DIRECTION-DEPENDENT AND IS A NO-OP IN THE WRITE DIRECTION. Table 36-4 splits that one row: with the transfer direction 0 (write) the command does nothing at all, and only with direction 1 (read) does it perform the acknowledge action and a byte read. A driver issuing it on a write transaction gets silence, not an error.",
+    "The SCL frequency relation, as printed with its subscripts, for BAUDLOW = 0: f_SCL = f_GCLK / (10 + 2*BAUD + f_GCLK*T_RISE). Solving for the divisor, and taking T_RISE as negligible for internal pull-ups: BAUD = f_GCLK/(2*f_SCL) - 5. T_HIGH is (BAUD + 5)/f_GCLK and T_LOW is (BAUDLOW + 5)/f_GCLK, so a non-zero BAUDLOW is what buys an asymmetric duty cycle -- which Fast-mode Plus requires, at a nominal high-to-low ratio of 1:2.",
+    "BAUD IS EIGHT BITS, SO A FAST CORE CLOCK CANNOT REACH A SLOW BUS. The relation floors f_SCL at f_GCLK/520 when BAUD is at its maximum of 255, which puts standard-mode 100 kHz out of reach for any peripheral channel running above about 52 MHz -- and a part whose main clock is well above that will be fed to the SERCOM unchanged unless a divided generator is selected for it. The failure is not a refusal: BAUD takes the low eight bits of whatever divisor was computed and the bus runs at some unintended speed. A driver that computes a divisor must check it fits before storing it.",
+    "MODE = 5 selects I2C master. The field sits at CTRLA[4:2], which is the SERCOM's own mode selector rather than anything specific to I2C.",
+    "ENABLE, SWRST and every enable-protected write must wait on the matching SYNCBUSY bit. Issuing a CMD sets SYNCBUSY.SYSOP, and so does forcing BUSSTATE, so a driver waits on that bit as well as on the two it is more likely to remember.",
+    "THE MASTER HOLDS SCL LOW WHILE MB OR SB IS PENDING, SO A DRIVER THAT DOES SLOW WORK BETWEEN BYTES BREAKS THE TRANSACTION RATHER THAN MERELY DELAYING IT. The flag descriptions say it plainly -- when the flag is set the master forces SCL low, stretching the clock -- and that stretch lasts until software acts. Many I2C and SMBus devices abandon a transfer whose clock is held too long: they reset their interface and RELEASE THE BUS, after which every further byte reads as 0xFF because nothing is driving it. Measured against a device whose limit is 25 ms: printing two console lines between reading one byte and commanding the next was enough to lose the transfer, reproducibly, and it looked exactly like a driver defect. Do the transaction, then report on it.",
+    "A command may only be issued while INTFLAG.MB or INTFLAG.SB is set. After ENABLE the bus state is UNKNOWN; writing 0x1 to STATUS.BUSSTATE forces IDLE, and IDLE is the only state software may force.",
+    "Addressing: ADDR.ADDR carries the 7-bit slave address SHIFTED LEFT ONE with bit 0 as the read/write direction, 0 being write. Writing ADDR is what starts the transaction, and it also clears STATUS.ARBLOST and STATUS.BUSERR as a side effect.",
+    "SMEN (smart mode) performs the acknowledge action automatically when DATA is read. A driver wanting explicit control of the last-byte NACK leaves it off and writes ACKACT before each command. Smart mode also cannot be used when the startup timing is controlled by software.",
+    "DECLARED SUBSET: the high-speed fields (HSBAUD, HSBAUDLOW, CTRLA.SPEED beyond Sm, CTRLA.SCLSM), the time-out fields (SEXTTOEN, MEXTTOEN, LOWTOUT, INACTOUT, SDAHOLD), the transaction-length fields (ADDR.LEN, ADDR.LENEN, STATUS.LENERR), ten-bit addressing and CTRLC.DATA32B all exist on this part and are NOT declared here, because nothing consumes them yet and an undeclared field cannot be silently wrong. Adding one obliges reading its description.",
+]
+
+[registers.CTRLA]
+offset = 0x00
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], MODE = [2, 3], RUNSTDBY = [7, 1], PINOUT = [16, 1], SDAHOLD = [20, 2], MEXTTOEN = [22, 1], SEXTTOEN = [23, 1], SPEED = [24, 2], SCLSM = [27, 1], INACTOUT = [28, 2], LOWTOUTSCL = [30, 1] }
+notes = "Enable-protected and write-synchronized. MODE must be 5 before ENABLE, and MODE itself is not synchronized."
+
+[registers.CTRLB]
+offset = 0x04
+width = 32
+fields = { SMEN = [8, 1], QCEN = [9, 1], CMD = [16, 2], ACKACT = [18, 1] }
+notes = "CMD is a STROBE: it always reads as zero, so a driver cannot confirm a command by reading it back and must watch INTFLAG and STATUS instead. ACKACT and CMD may be written in the same store, and the acknowledge action is then updated before the command triggers -- which is the only way to NACK a final byte and issue the Stop atomically."
+
+[registers.CTRLC]
+offset = 0x08
+width = 32
+fields = { DATA32B = [24, 1] }
+notes = "NO COUNTERPART IN THE SAMD21's I2C MASTER. Enable-protected but not write-synchronized. DATA32B widens DATA to a 32-bit access; with it clear, DATA carries one byte."
+
+[registers.BAUD]
+offset = 0x0C
+width = 32
+fields = { BAUD = [0, 8], BAUDLOW = [8, 8], HSBAUD = [16, 8], HSBAUDLOW = [24, 8] }
+notes = "Enable-protected. With BAUDLOW zero the BAUD field times both the high and the low phase of SCL; a non-zero BAUDLOW times the low phase separately. At least one of the two must be non-zero."
+
+[registers.INTENCLR]
+offset = 0x14
+width = 8
+fields = { MB = [0, 1], SB = [1, 1], ERROR = [7, 1] }
+notes = "Write 1s to disable the corresponding interrupt. Reading gives the current enable mask, the same value INTENSET reads."
+
+[registers.INTENSET]
+offset = 0x16
+width = 8
+fields = { MB = [0, 1], SB = [1, 1], ERROR = [7, 1] }
+notes = "Write 1s to enable. A polling driver enables nothing here and reads INTFLAG directly; the flags are set whether or not the interrupt is enabled."
+
+[registers.INTFLAG]
+offset = 0x18
+width = 8
+fields = { MB = [0, 1], SB = [1, 1], ERROR = [7, 1] }
+notes = "MB (master on bus) and SB (slave on bus) are the two flags a transaction is driven by, and a command may only be issued while one of them is set. Both are cleared by writing a 1, and MB is also cleared by writing ADDR or DATA."
+
+[registers.STATUS]
+offset = 0x1A
+width = 16
+fields = { BUSERR = [0, 1], ARBLOST = [1, 1], RXNACK = [2, 1], BUSSTATE = [4, 2], LOWTOUT = [6, 1], CLKHOLD = [7, 1], MEXTTOUT = [8, 1], SEXTTOUT = [9, 1], LENERR = [10, 1] }
+notes = "RXNACK is how an address probe answers: a device that is not there leaves it set after the address packet, and a device that is there clears it. Write-synchronized, so a driver waits on SYNCBUSY.SYSOP after forcing BUSSTATE."
+
+[registers.SYNCBUSY]
+offset = 0x1C
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], SYSOP = [2, 1] }
+notes = "Read-only, and the only three bits this mode defines. SYSOP covers a command strobe, a DATA access and a forced BUSSTATE alike, so one wait serves all three."
+
+[registers.ADDR]
+offset = 0x24
+width = 32
+fields = { ADDR = [0, 11], LENEN = [13, 1], HS = [14, 1], TENBITEN = [15, 1], LEN = [16, 8] }
+notes = "Writing this register STARTS A TRANSACTION -- it is not a configuration store -- and it also clears STATUS.ARBLOST and STATUS.BUSERR. For 7-bit addressing the address goes in ADDR[7:1] and the direction bit in ADDR[0]."
+
+[registers.DATA]
+offset = 0x28
+width = 32
+fields = { DATA = [0, 32] }
+notes = "THIRTY-TWO BITS WIDE HERE, eight on the SAMD21. With CTRLC.DATA32B clear only DATA[7:0] carries a byte, so a byte-wide access is correct and a fold with the narrower sibling would still appear to work."
+
+[registers.DBGCTRL]
+offset = 0x30
+width = 8
+fields = { DBGSTOP = [0, 1] }
+notes = "Whether the baud generator halts when the CPU is halted by a debugger. Nothing here writes it; it is placed so the map is the manual's."
+
+# Values a driver selects from, rather than computes.
+[constants]
+MODE_I2C_MASTER = 5
+BUSSTATE_UNKNOWN = 0
+BUSSTATE_IDLE = 1
+BUSSTATE_OWNER = 2
+BUSSTATE_BUSY = 3
+CMD_NONE = 0
+CMD_REPEATED_START = 1
+CMD_BYTE_READ = 2
+CMD_STOP = 3
+ACKACT_ACK = 0
+ACKACT_NACK = 1
+DIRECTION_WRITE = 0
+DIRECTION_READ = 1

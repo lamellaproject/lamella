@@ -1,0 +1,120 @@
+# BLOCK: the STM32L0x3 external-interrupt controller, category 5, plus the two facts an ISR needs
+# that are not registers at all -- which NVIC vector a line is delivered on, and how a line is
+# bound to a port.
+#
+# THE REGISTERS ARE A TWIN OF csp/stm32l053's AND THE PORT CODES ARE NOT, which is why this file
+# exists rather than being shared. RM0367 states the EXTI registers once for the whole book, so
+# every offset here was re-read from it and agrees with the category 3 family's. The
+# SYSCFG_EXTICR encoding is where the two part: code 0100 selects PE[x], and category 3 has no
+# port E for it to select. A shared file would hand a category 3 consumer a port code it cannot
+# use, which is the quiet half of the same mistake as omitting it here.
+#
+# WHY A LINE IS NOT A PAD, AND WHY THAT IS THE WHOLE DIFFICULTY. On this vendor a line is chosen by
+# the PIN INDEX and the port is chosen separately: RM0367 10.2.7 spells the encoding out in its own
+# words -- "select the source input for the EXTIx external interrupt: 0000: PA[x] pin, 0001: PB[x]
+# pin, 0010: PC[x] pin". So PC13 raises line 13 and PA13 raises line 13 too, and only SYSCFG_EXTICR
+# says which of them is live. On a SAM D the same idea is spelled the opposite way -- EXTINT is a
+# per-pad ALTERNATE FUNCTION whose number does not follow the pad number -- so the two families
+# cannot share a derivation, and neither may be inferred from the other.
+#
+# LINES ARE NOT DELIVERED ONE PER VECTOR. Three vectors cover sixteen lines on this part, so an ISR
+# is entered without yet knowing which pad fired and must read the pending register to find out.
+# That is why an interrupt seam needs the line AND the vector as separate facts.
+#
+
+[table]
+kind = "block"
+family = "stm32l073"
+block = "exti"
+sources = [
+    "STM32L0x3 reference manual RM0367 Rev 8 section 13.5 (EXTI registers), each stating its own address offset: 13.5.1 EXTI_IMR 0x00, 13.5.2 EXTI_EMR 0x04, 13.5.3 EXTI_RTSR 0x08, 13.5.4 EXTI_FTSR 0x0C, 13.5.5 EXTI_SWIER 0x10, 13.5.6 EXTI_PR 0x14",
+    "RM0367 Rev 8 table 55 (list of vectors): position 5 is EXTI[1:0] 'EXTI Line0 and 1 interrupts', position 6 is EXTI[3:2] 'EXTI Line2 and 3 interrupts', position 7 is EXTI[15:4] 'EXTI Line4 to 15 interrupts'",
+    "RM0367 Rev 8 sections 10.2.4 and 10.2.7 (SYSCFG_EXTICR1 and EXTICR4) for the port-selection encoding, which the manual states as 0000 = PA[x] through 0100 = PE[x] and 0101 = PH[x]",
+    "RM0367 Rev 8 sections 10.2.4 to 10.2.7 for the four SYSCFG_EXTICR address offsets, 0x08 0x0C 0x10 0x14 -- four lines per register, four bits per line",
+]
+notes = [
+    "A LINE IS THE PIN INDEX AND THE PORT IS A SEPARATE CHOICE. Line x is driven by pin x of whichever port SYSCFG_EXTICR selects for it, so two pads with the same index compete for one line and only one can be live. Nothing in the chip reports the competition -- it is the same class of conflict as a pad serving two peripherals.",
+    "EXTI_PR IS WRITE-ONE-TO-CLEAR AND CLEARING IT IS NOT OPTIONAL. An ISR that returns without writing the pending bit re-enters immediately. This is the reason the handler body is the BSP's and not the runtime's: the register, the offset and the bit are per-chip facts.",
+    "THE LINE-TO-VECTOR MAPPING IS STATED PER LINE RATHER THAN AS A RULE. Three vectors cover sixteen lines here; a SAM D EIC delivers every EXTINT on ONE vector. A generator that computed the grouping would bake this vendor into shared code, so a consumer looks a line up instead.",
+    "THE VECTOR CONSTANTS BELOW ARE NVIC POSITIONS, NOT ADDRESSES. Table 55 prints both; a position is what NVIC_ISER indexes and what an ISR declaration is named for. Three vectors cover sixteen lines, so an entered handler must read EXTI_PR to learn which pad fired.",
+    "NOT EVERY PORT CAN DRIVE EVERY LINE. RM0367 10.2.4 qualifies the port-H code in its own words -- 0101: PH[x] (only PH[1:0] and PH[10:9]) -- so the encoding is not a uniform port-times-index grid. The EXTICR4 page omits the PH row entirely because lines 12 to 15 have no PH pin, which is why the encoding was read from the EXTICR1 page as well.",
+    "No register FIELDS are stated. Every register here is one bit per line at [n], so a field row per line would restate the line number rather than add a fact.",
+]
+
+[registers.IMR]
+offset = 0x00
+width = 32
+fields = { }
+notes = "Interrupt mask, one bit per line at [n]. A line raises an NVIC interrupt only with its bit set here."
+
+[registers.EMR]
+offset = 0x04
+width = 32
+fields = { }
+notes = "Event mask, one bit per line at [n]. An event wakes the core without entering a handler."
+
+[registers.RTSR]
+offset = 0x08
+width = 32
+fields = { }
+notes = "Rising-edge trigger select, one bit per line at [n]."
+
+[registers.FTSR]
+offset = 0x0C
+width = 32
+fields = { }
+notes = "Falling-edge trigger select, one bit per line at [n]. Setting both RTSR and FTSR for a line is how a both-edges pin-change event is asked for, which is what the dotnet/iot ValueChanged surface means."
+
+[registers.SWIER]
+offset = 0x10
+width = 32
+fields = { }
+notes = "Software interrupt event, one bit per line at [n]."
+
+[registers.PR]
+offset = 0x14
+width = 32
+fields = { }
+notes = "Pending, one bit per line at [n]. WRITE ONE TO CLEAR. An ISR that does not clear its line re-enters immediately."
+
+# NVIC positions (table 55) and the SYSCFG_EXTICR port codes (10.2.7).
+[constants]
+VECTOR_EXTI_1_0 = 5
+VECTOR_EXTI_3_2 = 6
+VECTOR_EXTI_15_4 = 7
+# Which NVIC position each LINE is delivered on, one row per line rather than a rule. Three
+# vectors cover sixteen lines here; on a part whose controller has one vector for every line
+# these are all equal, and on this one they are not -- so the mapping is DATA and a consumer
+# looks a line up rather than computing it.
+LINE0_VECTOR = 5
+LINE1_VECTOR = 5
+LINE2_VECTOR = 6
+LINE3_VECTOR = 6
+LINE4_VECTOR = 7
+LINE5_VECTOR = 7
+LINE6_VECTOR = 7
+LINE7_VECTOR = 7
+LINE8_VECTOR = 7
+LINE9_VECTOR = 7
+LINE10_VECTOR = 7
+LINE11_VECTOR = 7
+LINE12_VECTOR = 7
+LINE13_VECTOR = 7
+LINE14_VECTOR = 7
+LINE15_VECTOR = 7
+
+# SYSCFG_EXTICR1 through 4 are SYSCFG-relative, four lines per register, four bits per line.
+EXTICR_FIRST_OFF = 0x08
+EXTICR_STRIDE = 4
+EXTICR_LINES_PER_REG = 4
+EXTICR_FIELD_BITS = 4
+
+EXTICR_PORT_A = 0
+EXTICR_PORT_B = 1
+EXTICR_PORT_C = 2
+EXTICR_PORT_D = 3
+# THE CODE CATEGORY 3 CANNOT USE, because it has no port E to select. RM0367 10.2.4 lists the
+# encoding once for the whole book -- 0100: PE[x] pin -- so the code is present in the manual for
+# both categories and is only reachable on this one.
+EXTICR_PORT_E = 4
+EXTICR_PORT_H = 5

@@ -1748,18 +1748,17 @@ impl<'a> Lexer<'a> {
     }
 
     /// Recognizes a post-1.0 operator at the current position that the target version does not
-    /// support (`=>` from C# 3.0, `??`/`::` from 2.0, `?.`/`?[` from 6.0), reports a `CS8022`
+    /// support (`??` and `::`, both from C# 2.0), reports a `CS8022`
     /// feature diagnostic, consumes it as one token, and returns `Unknown`. Without this, maximal
     /// munch over the 1.0 operator set would split it (`=` then `>`, two `?`, ...) and the error
     /// would name those, not the feature. `?.` is NOT gated when a digit follows -- it is then a
     /// conditional `?` and a `.5`-style real literal (`a ?.5 : b`), valid in any version (9.4.4.3).
     /// The opaque `Unknown` would otherwise trip a parser cascade at the same offset; that secondary
     /// cascade is dropped downstream (`without_gated_operator_cascades`) so only this CS8022 stands.
+    ///
     fn try_gate_post_1_0_operator(&mut self, start: usize) -> Option<TokenKind> {
         const GATED: &[(&str, Feature)] = &[
             ("??", Feature::NullCoalescing),
-            ("?[", Feature::NullConditional),
-            ("?.", Feature::NullConditional),
             ("::", Feature::NamespaceAlias),
         ];
         let rest = self.remaining();
@@ -1767,9 +1766,6 @@ impl<'a> Lexer<'a> {
             if !rest.starts_with(spelling)
                 || feature.gate_against(self.options.version).is_none()
             {
-                continue;
-            }
-            if spelling == "?." && rest[spelling.len()..].starts_with(|c: char| c.is_ascii_digit()) {
                 continue;
             }
             self.position += spelling.len();
@@ -2466,7 +2462,7 @@ class C { }
         );
         let one = tokenize_with("#pragma warning disable 169
 class C { }
-", LexOptions::default());
+", LexOptions { version: LanguageVersion::CSharp1, ..LexOptions::default() });
         assert_eq!(
             one.diagnostics.iter().map(Diagnostic::code).collect::<Vec<_>>(),
             [8022]
@@ -2509,8 +2505,9 @@ class C { }
 
     #[test]
     fn post_1_0_operators_report_cs8022_under_csharp1() {
-        for src in ["a ?? b", "a?.b", "a?[0]", "global::System"] {
-            let diagnostics = tokenize(src).diagnostics;
+        let iso1 = LexOptions { version: LanguageVersion::CSharp1, ..LexOptions::default() };
+        for src in ["a ?? b", "global::System"] {
+            let diagnostics = tokenize_with(src, iso1.clone()).diagnostics;
             assert!(
                 diagnostics.iter().any(|d| d.code() == 8022),
                 "{src:?} should report CS8022, got {diagnostics:?}"

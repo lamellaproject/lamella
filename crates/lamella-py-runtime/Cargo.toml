@@ -9,10 +9,33 @@ description = "Lamella's Python runtime: the bytecode interpreter, the dynamic o
 publish = false
 
 [features]
-default = ["gc-collect", "float", "complex", "bundled-stdlib", "introspection"]
+default = [
+    "gc-collect",
+    "float",
+    "complex",
+    "bundled-stdlib",
+    "introspection",
+    "asyncio-sync",
+    "asyncio-streams",
+    "threading",
+]
 float = ["dep:libm"]
 complex = ["float"]
 bundled-stdlib = []
+# `asyncio`'s COORDINATION LAYER: Lock, Event, Semaphore, BoundedSemaphore, Queue, wait_for and
+# timeout. The loop, futures, tasks, `sleep`, `gather` and `run` are NOT here -- they are asyncio
+# itself and every tier that has asyncio has them.
+#
+# A CAPABILITY RATHER THAN A PROFILE, and the cost is why it is separable: importing a module builds
+# every class and function in it as a heap object, so this surface costs 1,178 bytes of object heap
+# whether a program locks anything or not. The smallest board that runs Python has a 4,096-byte heap
+# and `import asyncio` already needed 3,728 of it.
+#
+# It needs `bundled-stdlib`: without it no module source is compiled in and there is nothing to
+# append to. Named rather than implied, so a build asking for one and not the other is told.
+asyncio-sync = ["bundled-stdlib"]
+asyncio-streams = ["bundled-stdlib"]
+threading = []
 introspection = []
 gc-collect = ["lamella-gc/gc-collect"]
 gc-none = []

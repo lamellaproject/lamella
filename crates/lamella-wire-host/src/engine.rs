@@ -3,7 +3,7 @@
 //! only ever runs CIL and holds no REPL state. A microcontroller running just the
 //! [`crate::run_program`] runner is a complete target.
 
-use crate::{RunResult, send_program, serve_one, try_recv_result};
+use crate::{ArtifactLoad, RunCollector, RunResult, send_program, serve_one};
 use lamella_wire::{MemTransport, TransportError};
 
 #[cfg(feature = "serial")]
@@ -48,8 +48,8 @@ pub trait ReplLink {
 }
 
 /// The in-process [`ReplLink`]: drives the [`crate::run_program`] reference runner over a real
-/// [`MemTransport`] loopback (encode a `RUN_PROGRAM` frame, the runner serves it, decode the
-/// `RUN_RESULT`). Hardware-free, and exercises the genuine framed protocol path -- not a shortcut
+/// [`MemTransport`] loopback (frame a load, the runner serves it, decode what comes back).
+/// Hardware-free, and it exercises the genuine framed protocol path -- not a shortcut
 /// around it -- so it behaves like the serial link minus the wire.
 pub struct LoopbackLink {
     corlib: Vec<u8>,
@@ -69,9 +69,12 @@ impl ReplLink for LoopbackLink {
     fn run(&mut self, seq: u16, program: &[u8]) -> Result<RunResult, TransportError> {
         send_program(&mut self.driver, seq, program)?;
         self.runner.feed(&self.driver.take_sent());
-        serve_one(&mut self.runner, &self.corlib)?;
+        let mut arena = ArtifactLoad::new();
+        while serve_one(&mut self.runner, &self.corlib, &mut arena)? {}
         self.driver.feed(&self.runner.take_sent());
-        try_recv_result(&mut self.driver, seq)?.ok_or(TransportError::Closed)
+        let mut run = RunCollector::new(seq);
+        run.poll(&mut self.driver)?;
+        run.finish().ok_or(TransportError::Closed)
     }
 }
 
@@ -611,11 +614,13 @@ impl ReplCompiler for LcscCompiler {
 
 
 
+#[allow(dead_code)]
 struct LiteralScan {
     state: ScanState,
 }
 
 #[derive(PartialEq)]
+#[allow(dead_code)]
 enum ScanState {
     Normal,
     String,
@@ -694,7 +699,13 @@ impl LiteralScan {
 /// Everything else (open brackets, mid-literal, a dangling operator, or an unterminated control
 /// statement) is INCOMPLETE, so the caller keeps reading.
 #[must_use]
-pub fn submission_is_complete(text: &str) -> bool {
+///
+/// Nothing in this crate calls it. It is a second implementation of a heuristic the REPL
+/// front-end also carries, and which of the two survives is a question about where the heuristic
+/// belongs rather than about this function. The attribute states that rather than letting six
+/// warnings state it once a build.
+#[allow(dead_code)]
+pub(crate) fn submission_is_complete(text: &str) -> bool {
     let mut depth: i32 = 0;
     let mut over_closed = false;
     let mut scan = LiteralScan::new();
@@ -730,6 +741,7 @@ pub fn submission_is_complete(text: &str) -> bool {
     !begins_with_body_keyword(trimmed) && !ends_with_dangling_operator(trimmed)
 }
 
+#[allow(dead_code)]
 fn begins_with_body_keyword(text: &str) -> bool {
     let head: String = text
         .chars()
@@ -752,6 +764,7 @@ fn begins_with_body_keyword(text: &str) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn ends_with_dangling_operator(text: &str) -> bool {
     let text = text.trim_end();
     if text.ends_with("&&") || text.ends_with("||") || text.ends_with("=>") {

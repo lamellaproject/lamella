@@ -17,6 +17,12 @@ part = "rp2040"
 package = "QFN-56"
 flash = 0
 ram = 0x42000
+dp_idcode = 0x0BC12477
+device_id_reg = 0x40000000
+device_id_mask = 0x0FFFFFFF
+device_id = 0x2927
+device_id_identifies = "part"
+identity_source = "Measured on silicon through a CMSIS-DAP probe: DPIDR 0x0bc12477 and SYSINFO CHIP_ID 0x20002927 at 0x40000000. The RP2040 datasheet section 2.20 gives CHIP_ID as REVISION in bits 31:28, PART in bits 27:12 and a JEP-106 MANUFACTURER in bits 11:0, so the identity is the low 28 bits and the revision is masked out -- it moves under a part that has not changed. PART 0x0002 with Raspberry Pi's JEP-106 designer code carrying its parity bit, (0x493 << 1) | 1 = 0x927. The DP IDCODE is Arm's M0-class multi-drop port design and names no part."
 pins = ["GP0-GP3", "GP7", "GP13", "GP16-GP17", "GP23-GP25", "GP29"]
 # GP2 and GP3 join on the datasheet rather than on silicon, which the first paragraph allows and
 # which is worth marking as the different kind of evidence it is: Table 615, the part's own pin

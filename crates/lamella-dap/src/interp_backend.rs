@@ -3,6 +3,7 @@
 //! interface an on-device target uses.
 
 use lamella_cil::{Instruction, Operand};
+use std::borrow::Cow;
 use lamella_debug_backend::{
     DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
 };
@@ -130,26 +131,44 @@ impl InterpreterBackend {
         }
     }
 
-    /// The CIL of a loaded method, or `None` for an intrinsic or unknown method. Decodes the body
-    /// lazily on first access (shared with the interpreter's own lazy decode).
-    fn method_code(&self, method: u32) -> Option<&[Instruction]> {
-        self.module.method_body(method).map(|body| &body.code[..])
+    /// The CIL of a loaded method, or `None` for an intrinsic or unknown method.
+    ///
+    /// Through the module's own accessor rather than `method_body`, because which of the two body
+    /// representations exists is decided by a feature `lamella-cil-runtime` declares -- so a `cfg`
+    /// here could not express it, and naming `method_body` outright stopped compiling the moment
+    /// anything in the build forwarded `code-in-place` (`lamella-wasm`'s `bake` does, which is why
+    /// `verify-wasm-builds`'s all-features row was red). Borrowed on the ordinary build; owned only
+    /// where the module holds bytes rather than a decoded body.
+    fn method_code(&self, method: u32) -> Option<Cow<'_, [Instruction]>> {
+        self.module.method_instructions(method)
     }
 
     /// The CIL byte offset of each instruction in `method` (index -> offset), recomputed
     /// from the decoded body to align with the Portable PDB's sequence points.
     fn offsets(&self, method: MethodId) -> Option<Vec<u32>> {
-        lamella_cil::instruction_offsets(self.method_code(method)?)
+        lamella_cil::instruction_offsets(&self.method_code(method)?)
     }
 
-    /// The CIL byte offset of `method`'s instruction `index`.
-    fn index_to_il_offset(&self, method: MethodId, index: u32) -> Option<u32> {
-        self.offsets(method)?.get(index as usize).copied()
+    /// The CIL byte offset of the ip value `ip` in `method`.
+    ///
+    ///
+    /// That build used not to compile at all, on an unrelated missing accessor. **Restoring the
+    /// accessor removed the only thing standing in front of this**, which is why the branch lands
+    /// with it rather than after it.
+    fn ip_to_il_offset(&self, method: MethodId, ip: u32) -> Option<u32> {
+        if lamella_cil_runtime::interp::IP_IS_IL_OFFSET {
+            return Some(ip);
+        }
+        self.offsets(method)?.get(ip as usize).copied()
     }
 
-    /// The instruction index at CIL byte offset `il_offset` in `method`: the boundary the
-    /// offset names, else the last instruction at or before it.
-    fn il_offset_to_index(&self, method: MethodId, il_offset: u32) -> Option<u32> {
+    /// The ip value naming CIL byte offset `il_offset` in `method`: under `code-in-place` the
+    /// offset itself, otherwise the instruction index at that boundary -- else the last
+    /// instruction at or before it.
+    fn il_offset_to_ip(&self, method: MethodId, il_offset: u32) -> Option<u32> {
+        if lamella_cil_runtime::interp::IP_IS_IL_OFFSET {
+            return Some(il_offset);
+        }
         let offsets = self.offsets(method)?;
         let slice = offsets.get(..offsets.len().saturating_sub(1))?;
         let index = slice
@@ -295,14 +314,14 @@ impl DebugBackend for InterpreterBackend {
         let method = self
             .module
             .resolve(self.module.method_asm(self.entry), Token::new(METHOD_DEF, method_rid))?;
-        let index = self.il_offset_to_index(method, il_offset)?;
-        Some(encode_address(method, index))
+        let ip = self.il_offset_to_ip(method, il_offset)?;
+        Some(encode_address(method, ip))
     }
 
     fn source_location(&self, address: u64) -> Option<SourceLocation> {
         let (method, index) = decode_address(address);
         let method_rid = *self.method_rid.get(&method)?;
-        let il_offset = self.index_to_il_offset(method, index)?;
+        let il_offset = self.ip_to_il_offset(method, index)?;
         let pdb = PortablePdb::read(self.pdb.as_ref()?).ok()?;
         let point = pdb.source_location(method_rid, il_offset)?;
         Some(SourceLocation {
@@ -312,6 +331,10 @@ impl DebugBackend for InterpreterBackend {
             end_line: point.end_line,
             end_column: point.end_column,
         })
+    }
+
+    fn step_budget(&self) -> usize {
+        1_000_000
     }
 
     fn has_source(&self) -> bool {
@@ -332,7 +355,7 @@ impl DebugBackend for InterpreterBackend {
         let Some(boundaries) = self.seq_boundaries.get(&frame.method) else {
             return false;
         };
-        self.index_to_il_offset(frame.method, frame.ip)
+        self.ip_to_il_offset(frame.method, frame.ip)
             .is_some_and(|il_offset| boundaries.contains(&il_offset))
     }
 
@@ -428,6 +451,7 @@ impl DebugBackend for InterpreterBackend {
     fn disassemble(&self, address: u64, offset: i64, count: usize) -> Vec<Disassembled> {
         let (method, base_ip) = decode_address(address);
         let code = self.method_code(method);
+        let code = code.as_deref();
         (0..count)
             .map(|step| {
                 let ip = i64::from(base_ip) + offset + step as i64;

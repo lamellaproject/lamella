@@ -1,0 +1,34 @@
+# BLOCK: the RA4M1's CODE FLASH, stated only as far as the facts consumers outside the flash
+# controller need. Its command set, its data flash and its startup-area swap are not described here.
+#
+# THE PROGRAMMING UNIT IS EIGHT BYTES AND THE ERASE UNIT IS A 2 KB BLOCK. The user's manual states
+# the pair together in its endurance definition rather than in a parameter table: "when 8-byte
+# programming is performed 256 times for different addresses in 2-KB blocks, and then the entire
+# block is erased, the reprogram/erase cycle is counted as one". 256 x 8 = 2048, so the two numbers
+# check each other in the sentence that carries them.
+#
+# READ IN THE HARDWARE USER'S MANUAL AND NOT THE GROUP DATASHEET. The datasheet defers -- "See
+# section 44, Flash Memory in User's Manual" -- and states no granularity of its own, so a reader
+# who stops at the datasheet finds nothing and a reader who guesses finds a plausible 4 or 128.
+#
+# OVERWRITING IS PROHIBITED, AND THAT IS THIS PART'S OWN WORD FOR IT: "programming the same address
+# for several times as one erasure is not enabled (overwriting is prohibited)". So a consumer must
+# erase before re-programming a unit rather than relying on bits only clearing -- the same rule the
+# STM32H7 has for a different reason, and unlike the parts that merely discourage it.
+
+[table]
+kind = "block"
+family = "ra4m1"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 8
+sources = [
+    "write_unit: RA4M1 Group User's Manual: Hardware, flash characteristics -- `Programming time 8-byte`, and the endurance definition `when 8-byte programming is performed 256 times for different addresses in 2-KB blocks`",
+    "erased_value: RA4M1 Group User's Manual: Hardware -- `The value in the blank product is FFFF FFFFh`",
+]
+notes = [
+    "The ERASE unit is a 2 KB block and is deliberately not declared here. It is stated in the same sentence as the write unit, so it was read rather than inferred -- but nothing consumes it yet, and a number carried without a consumer is a number nobody checks.",
+    "Overwriting a programmed unit is PROHIBITED rather than merely discouraged: the manual says programming the same address several times between erasures `is not enabled`. A consumer that reasons only from the write unit would not find this.",
+    "This is the CODE flash. The part also has a DATA flash with its own granularity, and nothing here states a value for it.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

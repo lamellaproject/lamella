@@ -45,12 +45,56 @@ fn error(message: &str) -> CompileError {
 /// valid module never binds a name before declaring it global in the same scope.
 fn check_declarations_precede_bindings(body: &[Stmt]) -> Result<(), CompileError> {
     let mut bound = BTreeSet::new();
-    walk_scope_for_declarations(body, &mut bound)
+    let mut used = BTreeSet::new();
+    walk_scope_for_declarations(body, &mut bound, &mut used, &annotated_names_in_scope(body))
+}
+
+/// The names this scope ANNOTATES anywhere -- `x: int`, with or without a value.
+///
+/// Scope-wide rather than positional, and that is the rule rather than a simplification: CPython
+/// refuses an annotated name declared global in EITHER order, so unlike the two checks beside it
+/// this one cannot be answered by what has been seen so far. Blocks belong to this scope; a nested
+/// `def` or `class` is its own and annotates its own names.
+fn annotated_names_in_scope(body: &[Stmt]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    fn walk(body: &[Stmt], names: &mut BTreeSet<String>) {
+        for stmt in body {
+            match &stmt.kind {
+                StmtKind::Assign(a) if a.annotation.is_some() => {
+                    names.insert(a.target.clone());
+                }
+                StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+                    walk(body, names);
+                    walk(orelse, names);
+                }
+                StmtKind::For { body, orelse, .. }
+                | StmtKind::ForIter { body, orelse, .. }
+                | StmtKind::AsyncFor { body, orelse, .. } => {
+                    walk(body, names);
+                    walk(orelse, names);
+                }
+                StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => walk(body, names),
+                StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
+                    walk(body, names);
+                    for h in handlers {
+                        walk(&h.body, names);
+                    }
+                    walk(orelse, names);
+                    walk(finalbody, names);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut names);
+    names
 }
 
 fn walk_scope_for_declarations(
     body: &[Stmt],
     bound: &mut BTreeSet<String>,
+    used: &mut BTreeSet<String>,
+    annotated: &BTreeSet<String>,
 ) -> Result<(), CompileError> {
     for stmt in body {
         match &stmt.kind {
@@ -61,6 +105,22 @@ fn walk_scope_for_declarations(
                     "nonlocal"
                 };
                 for name in names {
+                    if annotated.contains(name) {
+                        return Err(CompileError {
+                            message: alloc::format!(
+                                "line {}: annotated name '{name}' can't be {word}",
+                                stmt.line
+                            ),
+                        });
+                    }
+                    if used.contains(name) {
+                        return Err(CompileError {
+                            message: alloc::format!(
+                                "line {}: name '{name}' is used prior to {word} declaration",
+                                stmt.line
+                            ),
+                        });
+                    }
                     if bound.contains(name) {
                         return Err(CompileError {
                             message: alloc::format!(
@@ -73,48 +133,73 @@ fn walk_scope_for_declarations(
             }
             StmtKind::FuncDef(def) => {
                 bound.insert(def.name.clone());
+                absorb(stmt, bound, used);
                 let mut inner = BTreeSet::new();
-                walk_scope_for_declarations(&def.body, &mut inner)?;
+                let mut inner_used = BTreeSet::new();
+                walk_scope_for_declarations(&def.body, &mut inner, &mut inner_used, &annotated_names_in_scope(&def.body))?;
             }
             StmtKind::ClassDef { name, body, .. } => {
                 bound.insert(name.clone());
+                absorb(stmt, bound, used);
                 let mut inner = BTreeSet::new();
-                walk_scope_for_declarations(body, &mut inner)?;
+                let mut inner_used = BTreeSet::new();
+                walk_scope_for_declarations(body, &mut inner, &mut inner_used, &annotated_names_in_scope(body))?;
+            }
+            StmtKind::Decorated { inner, .. } => {
+                absorb(stmt, bound, used);
+                if let StmtKind::FuncDef(def) = &inner.kind {
+                    bound.insert(def.name.clone());
+                    let mut inner_bound = BTreeSet::new();
+                    let mut inner_used = BTreeSet::new();
+                    walk_scope_for_declarations(&def.body, &mut inner_bound, &mut inner_used, &annotated_names_in_scope(&def.body))?;
+                } else if let StmtKind::ClassDef { name, body, .. } = &inner.kind {
+                    bound.insert(name.clone());
+                    let mut inner_bound = BTreeSet::new();
+                    let mut inner_used = BTreeSet::new();
+                    walk_scope_for_declarations(body, &mut inner_bound, &mut inner_used, &annotated_names_in_scope(body))?;
+                }
             }
             StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
-                collect_stmt_bindings(stmt, bound);
-                walk_scope_for_declarations(body, bound)?;
-                walk_scope_for_declarations(orelse, bound)?;
+                absorb(stmt, bound, used);
+                walk_scope_for_declarations(body, bound, used, annotated)?;
+                walk_scope_for_declarations(orelse, bound, used, annotated)?;
             }
             StmtKind::For { body, orelse, .. }
             | StmtKind::ForIter { body, orelse, .. }
             | StmtKind::AsyncFor { body, orelse, .. } => {
-                collect_stmt_bindings(stmt, bound);
-                walk_scope_for_declarations(body, bound)?;
-                walk_scope_for_declarations(orelse, bound)?;
+                absorb(stmt, bound, used);
+                walk_scope_for_declarations(body, bound, used, annotated)?;
+                walk_scope_for_declarations(orelse, bound, used, annotated)?;
             }
             StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
-                collect_stmt_bindings(stmt, bound);
-                walk_scope_for_declarations(body, bound)?;
+                absorb(stmt, bound, used);
+                walk_scope_for_declarations(body, bound, used, annotated)?;
             }
-            StmtKind::Try {
-                body,
-                handlers,
-                orelse,
-                finalbody,
-            } => {
-                collect_stmt_bindings(stmt, bound);
-                walk_scope_for_declarations(body, bound)?;
+            StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
+                absorb(stmt, bound, used);
+                walk_scope_for_declarations(body, bound, used, annotated)?;
                 for handler in handlers {
-                    walk_scope_for_declarations(&handler.body, bound)?;
+                    walk_scope_for_declarations(&handler.body, bound, used, annotated)?;
                 }
-                walk_scope_for_declarations(orelse, bound)?;
-                walk_scope_for_declarations(finalbody, bound)?;
+                walk_scope_for_declarations(orelse, bound, used, annotated)?;
+                walk_scope_for_declarations(finalbody, bound, used, annotated)?;
             }
-            _ => collect_stmt_bindings(stmt, bound),
+            _ => absorb(stmt, bound, used),
         }
     }
     Ok(())
+}
+
+/// Fold `stmt`'s own bindings and its own uses into this scope's sets.
+///
+/// Called at each statement in source order and BEFORE its blocks are descended, which is what makes
+/// the rule positional: a use inside an `if` body that follows the declaration must not be visible
+/// to it.
+fn absorb(stmt: &Stmt, bound: &mut BTreeSet<String>, used: &mut BTreeSet<String>) {
+    collect_stmt_bindings(stmt, bound);
+    let own = collect_stmt_own_names(stmt);
+    used.extend(own.direct);
+    bound.extend(own.walrus_targets);
 }
 
 /// The names `stmt` binds in its OWN scope, not descending into blocks (the walk above does that in
@@ -154,16 +239,6 @@ fn collect_stmt_bindings(stmt: &Stmt, bound: &mut BTreeSet<String>) {
                 add_target(t, bound);
             }
         }
-        StmtKind::Import { modules } => {
-            for (module, alias) in modules {
-                bound.insert(String::from(ast::import_bound_name(module, alias)));
-            }
-        }
-        StmtKind::ImportFrom { names, .. } => {
-            for (_, as_name) in names {
-                bound.insert(as_name.clone());
-            }
-        }
         StmtKind::Try { handlers, .. } => {
             for handler in handlers {
                 if let Some(name) = &handler.name {
@@ -173,6 +248,221 @@ fn collect_stmt_bindings(stmt: &Stmt, bound: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// The names `stmt` READS in this scope, plus the ones a walrus inside it BINDS.
+///
+/// Its OWN expressions only: blocks are descended by the walk above, in source order, because the
+/// rule is positional and collecting a block up front would see a use that comes AFTER the
+/// declaration inside it. Nested scopes are not entered at all.
+///
+/// The safe direction here is the OPPOSITE of [`collect_stmt_bindings`]'s. A binding that misses a
+/// name lets a declaration wrongly pass, which keeps an over-accept; a use that gains one REFUSES A
+/// WORKING PROGRAM. So a construct whose status was not measured contributes nothing.
+///
+/// What counts was measured against CPython 3.14.6, and three answers are not the obvious ones. A
+/// nested function's DEFAULT ARGUMENTS and DECORATORS are uses out here, because that is where they
+/// are evaluated. A comprehension's OUTERMOST ITERABLE is a use out here for the same reason, while
+/// its element, conditions and inner iterables are not. And an ANNOTATION is not a use at all.
+fn collect_stmt_own_names(stmt: &Stmt) -> Uses {
+    let mut u = Uses::default();
+    match &stmt.kind {
+        StmtKind::FuncDef(f) => {
+            for p in &f.params {
+                if let Some(d) = &p.default {
+                    walk_expr_uses(d, &mut u);
+                }
+            }
+        }
+        StmtKind::ClassDef { bases, keywords, .. } => {
+            for b in bases {
+                walk_expr_uses(b, &mut u);
+            }
+            for (_, value) in keywords {
+                walk_expr_uses(value, &mut u);
+            }
+        }
+        StmtKind::Decorated { decorators, inner } => {
+            for d in decorators {
+                walk_expr_uses(d, &mut u);
+            }
+            let inner = collect_stmt_own_names(inner);
+            u.direct.extend(inner.direct);
+            u.walrus_targets.extend(inner.walrus_targets);
+        }
+        StmtKind::Return(value) => {
+            if let Some(v) = value {
+                walk_expr_uses(v, &mut u);
+            }
+        }
+        StmtKind::Assign(a) => {
+            if let Some(v) = &a.value {
+                match v {
+                    Expr::InplaceBinary { lhs, rhs, .. }
+                        if matches!(&**lhs, Expr::Name(n) if *n == a.target) =>
+                    {
+                        walk_expr_uses(rhs, &mut u);
+                    }
+                    _ => walk_expr_uses(v, &mut u),
+                }
+            }
+        }
+        StmtKind::MultiAssign { targets, value } | StmtKind::TupleAssign { targets, value } => {
+            walk_expr_uses(value, &mut u);
+            for t in targets {
+                walk_target_uses(t, &mut u);
+            }
+        }
+        StmtKind::SetItem { container, index, value, .. } => {
+            walk_expr_uses(container, &mut u);
+            walk_expr_uses(index, &mut u);
+            walk_expr_uses(value, &mut u);
+        }
+        StmtKind::SetAttr { obj, value, .. } => {
+            walk_expr_uses(obj, &mut u);
+            walk_expr_uses(value, &mut u);
+        }
+        StmtKind::Expr(e) => walk_expr_uses(e, &mut u),
+        StmtKind::If { test, .. } | StmtKind::While { test, .. } => {
+            walk_expr_uses(test, &mut u);
+        }
+        StmtKind::For { start, stop, .. } => {
+            walk_expr_uses(start, &mut u);
+            walk_expr_uses(stop, &mut u);
+        }
+        StmtKind::ForIter { iterable, .. } | StmtKind::AsyncFor { iterable, .. } => {
+            walk_expr_uses(iterable, &mut u);
+        }
+        StmtKind::With { context, optional_target, .. }
+        | StmtKind::AsyncWith { context, optional_target, .. } => {
+            walk_expr_uses(context, &mut u);
+            if let Some(t) = optional_target {
+                walk_target_uses(t, &mut u);
+            }
+        }
+        StmtKind::Try { handlers, .. } => {
+            for h in handlers {
+                if let Some(t) = &h.typ {
+                    walk_expr_uses(t, &mut u);
+                }
+            }
+        }
+        StmtKind::Raise { exc, cause } => {
+            for e in [exc, cause].into_iter().flatten() {
+                walk_expr_uses(e, &mut u);
+            }
+        }
+        StmtKind::Delete(_)
+        | StmtKind::Import { .. }
+        | StmtKind::ImportFrom { .. }
+        | StmtKind::ImportStar { .. }
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Global(_)
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass => {}
+    }
+    u
+}
+
+/// Rewrite every package-relative import in `module` to the absolute name it denotes, given that
+/// this is the module named `module_name`.
+///
+/// # Why it is a separate pass over the AST
+///
+/// A relative import means nothing without the name of the module that wrote it, and the parser is
+/// not told that name -- one source text compiles under whatever name the caller gives it. So the
+/// dots are counted at parse time and resolved here, before anything reads a module name: the
+/// bundler's import walk and the emitter then both see one shape, an absolute name, and neither
+/// learns the rule. Running it as a rewrite rather than at each reader is what keeps the rule in
+/// ONE place.
+///
+/// # The rule, which is CPython's
+///
+/// A module's PACKAGE is its own name minus the last component -- `pkg.mod` sits in `pkg`. Level 1
+/// means that package; each further dot strips one more component. The name written after the dots,
+/// when there is one, is appended.
+///
+/// # Errors
+///
+/// [`CompileError`] for a relative import that names no package we can find:
+///
+/// * the importing module's name has NO dot, so it sits in no package;
+/// * the dots reach past the top-level package.
+///
+/// NOTE: CPython reports both of these as an `ImportError` when the import RUNS. Reporting them at
+/// compile time is earlier, not different -- both programs fail either way, and naming the module
+/// at a source line beats an error raised from inside import machinery. The message wording is
+/// CPython's, so the same search finds the same answers.
+///
+/// The first case also covers a module that is itself a package because other modules are named
+/// beneath it -- `pkg` alongside `pkg.sub`, which is what a flat module registry has in place of an
+/// `__init__.py`. CPython resolves a relative import written there; this refuses it, because the
+/// import graph is walked breadth-first and the submodules that would show `pkg` to be a package
+/// are not all known at the point `pkg` itself is compiled.
+pub fn resolve_relative_imports(
+    module: &mut ModuleAst,
+    module_name: &str,
+) -> Result<(), CompileError> {
+    for stmt in &mut module.body {
+        let (relative, level) = match &mut stmt.kind {
+            StmtKind::ImportFrom { module, level, .. } | StmtKind::ImportStar { module, level } => {
+                (module, level)
+            }
+            _ => continue,
+        };
+        if *level == 0 {
+            continue;
+        }
+        let base = resolve_package(module_name, *level)?;
+        *relative = if relative.is_empty() {
+            base
+        } else {
+            format!("{base}.{relative}")
+        };
+        *level = 0;
+    }
+    Ok(())
+}
+
+/// Refuse to emit an import whose dots nobody resolved.
+///
+/// [`resolve_relative_imports`] runs over every module before it is compiled and sets `level` back
+/// to `0`, so reaching the emitter with dots left means a caller parsed a module and skipped that
+/// pass. `name_index` would then quietly intern the RELATIVE spelling -- `a` for `from .a import
+/// b` -- and the program would import the wrong module, or a real one by the same name.
+///
+/// It is a check rather than a comment saying the pass runs first, because a comment cannot fail.
+fn check_import_resolved(level: u32, module: &str) -> Result<(), CompileError> {
+    if level == 0 {
+        return Ok(());
+    }
+    Err(error(&format!(
+        "internal: a package-relative import (`{}{module}`) reached the emitter unresolved -- \
+         compile_module was called without resolve_relative_imports",
+        ".".repeat(level as usize)
+    )))
+}
+
+/// The absolute package name `level` dots reach from inside the module named `module_name`.
+fn resolve_package(module_name: &str, level: u32) -> Result<String, CompileError> {
+    let Some((package, _leaf)) = module_name.rsplit_once('.') else {
+        return Err(error(&format!(
+            "attempted relative import with no known parent package: `{module_name}` is not inside \
+             one (a package-relative import needs a module named `package.module`)"
+        )));
+    };
+    let mut base = package;
+    for _ in 1..level {
+        let Some((outer, _)) = base.rsplit_once('.') else {
+            return Err(error(&format!(
+                "attempted relative import beyond top-level package: {level} leading dots reach \
+                 past `{package}`, the package `{module_name}` is in"
+            )));
+        };
+        base = outer;
+    }
+    Ok(String::from(base))
 }
 
 /// Compile a module AST to a [`bc::Module`]: each top-level `def` becomes a function
@@ -771,12 +1061,7 @@ fn collect_class_body_bound(body: &[Stmt], bound: &mut BTreeSet<String>) {
                 collect_class_body_bound(body, bound);
                 collect_class_body_bound(orelse, bound);
             }
-            StmtKind::Try {
-                body,
-                handlers,
-                orelse,
-                finalbody,
-            } => {
+            StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
                 collect_class_body_bound(body, bound);
                 for handler in handlers {
                     collect_class_body_bound(&handler.body, bound);
@@ -960,6 +1245,7 @@ fn compile_code_object(
         hoisted: Vec::new(),
         lambda_counter: 0,
         has_yield: false,
+        returned_value_line: None,
         direct_body_stmt: false,
         decorating_a_def: false,
         block_def_counter: 0,
@@ -980,6 +1266,13 @@ fn compile_code_object(
     for stmt in body {
         compiler.direct_body_stmt = true;
         compiler.compile_stmt(stmt)?;
+    }
+    if compiler.has_yield && scope == Scope::Coroutine {
+        if let Some(line) = compiler.returned_value_line {
+            return Err(CompileError {
+                message: alloc::format!("line {line}: 'return' with value in async generator"),
+            });
+        }
     }
     let none = compiler.const_index(bc::Const::None);
     compiler.asm.emit(bc::Op::LoadConst(none));
@@ -1134,12 +1427,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_locals_stmt(s, names, types);
             }
         }
-        StmtKind::Try {
-            body,
-            handlers,
-            orelse,
-            finalbody,
-        } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             for h in handlers {
                 if let Some(name) = &h.name {
                     if !names.iter().any(|n| n == name) {
@@ -1228,8 +1516,12 @@ fn collect_comp_clauses(
     types: &mut Vec<bc::StaticType>,
 ) {
     for clause in clauses {
+        let mut bound = Vec::new();
         for t in &clause.targets {
-            add_dynamic_local(t, names, types);
+            t.collect_names(&mut bound);
+        }
+        for name in bound {
+            add_dynamic_local(name, names, types);
         }
         collect_comp_targets_expr(&clause.iterable, names, types);
         for cond in &clause.conditions {
@@ -1303,9 +1595,7 @@ fn collect_comp_targets_stmt(
                 collect_comp_targets_stmt(s, names, types);
             }
         }
-        StmtKind::Try {
-            body, handlers, orelse, finalbody,
-        } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             for s in body.iter().chain(orelse).chain(finalbody) {
                 collect_comp_targets_stmt(s, names, types);
             }
@@ -1385,33 +1675,34 @@ fn wrap_comp_clauses(mut body: Vec<Stmt>, clauses: &[CompClause], line: u32) -> 
         } else {
             clause.iterable.clone()
         };
-        body = if clause.targets.len() == 1 {
-            vec![Stmt::new(line, StmtKind::ForIter {
-                target: clause.targets[0].clone(),
-                iterable,
-                body,
-                orelse: Vec::new(),
-            })]
-        } else {
-            let loopvar = format!(".g{i}");
-            let mut inner = vec![Stmt::new(
-                line,
-                StmtKind::TupleAssign {
-                    targets: clause
-                        .targets
-                        .iter()
-                        .map(|t| ast::AssignTarget::Name(t.clone()))
-                        .collect(),
-                    value: Expr::Name(loopvar.clone()),
-                },
-            )];
-            inner.extend(body);
-            vec![Stmt::new(line, StmtKind::ForIter {
-                target: loopvar,
-                iterable,
-                body: inner,
-                orelse: Vec::new(),
-            })]
+        let for_clause = |target: String, iterable: Expr, body: Vec<Stmt>| {
+            let kind = if clause.is_async {
+                StmtKind::AsyncFor { target, iterable, body, orelse: Vec::new() }
+            } else {
+                StmtKind::ForIter { target, iterable, body, orelse: Vec::new() }
+            };
+            vec![Stmt::new(line, kind)]
+        };
+        body = match ast::for_binding(&clause.targets) {
+            ast::ForBinding::Name(name) => for_clause(String::from(name), iterable, body),
+            binding => {
+                let loopvar = format!(".g{i}");
+                let value = Expr::Name(loopvar.clone());
+                let store = match binding {
+                    ast::ForBinding::Name(_) => unreachable!("matched above"),
+                    ast::ForBinding::Store(targets) => StmtKind::MultiAssign {
+                        targets: targets.to_vec(),
+                        value,
+                    },
+                    ast::ForBinding::Unpack(targets) => StmtKind::TupleAssign {
+                        targets: targets.to_vec(),
+                        value,
+                    },
+                };
+                let mut inner = vec![Stmt::new(line, store)];
+                inner.extend(body);
+                for_clause(loopvar, iterable, inner)
+            }
         };
     }
     body
@@ -1484,12 +1775,18 @@ fn method_call_stmt(obj: &str, method: &str, args: Vec<Expr>, line: u32) -> Stmt
     })
 )}
 
-/// Whether a comprehension may compile to its own function scope (so its loop targets do not leak
-/// into the enclosing scope). It may UNLESS a walrus (`:=`) appears in a part that would move into
-/// that scope -- the element/key/value, a condition, or a non-outermost iterable -- because a walrus
-/// must bind in the containing scope (PEP 572), which only the inline form does. (A walrus in the
-/// outermost iterable is evaluated in the enclosing scope either way, so it does not force inline.)
-fn comprehension_hoists(main_exprs: &[&Expr], clauses: &[CompClause]) -> bool {
+/// The uses of the parts of a comprehension that MOVE INTO its hidden function: the element (or a
+/// dict's key and value), every condition, and every iterable but the outermost.
+///
+/// ONE walk, and [`comprehension_hoists`] / [`comprehension_awaits`] are both filters over it. Two
+/// walks of this shape would be two places a new part of a comprehension has to be added, and the
+/// one that missed it would answer "no" -- which for either predicate is the silently-wrong answer.
+///
+/// The outermost iterable is excluded on purpose, and both predicates depend on that exclusion for
+/// the same underlying reason: it is evaluated in the ENCLOSING scope and passed in as `.0`. So a
+/// walrus there binds in the containing scope without forcing the inline form, and an `await` there
+/// is already the enclosing coroutine's rather than the hidden function's.
+fn comp_inner_uses(main_exprs: &[&Expr], clauses: &[CompClause]) -> Uses {
     let mut u = Uses::default();
     for e in main_exprs {
         walk_expr_uses(e, &mut u);
@@ -1498,11 +1795,32 @@ fn comprehension_hoists(main_exprs: &[&Expr], clauses: &[CompClause]) -> bool {
         for cond in &c.conditions {
             walk_expr_uses(cond, &mut u);
         }
+        for target in &c.targets {
+            walk_target_uses(target, &mut u);
+        }
         if i > 0 {
             walk_expr_uses(&c.iterable, &mut u);
         }
     }
-    !u.has_walrus
+    u
+}
+
+/// Whether a comprehension may compile to its own function scope (so its loop targets do not leak
+/// into the enclosing scope). It may UNLESS a walrus (`:=`) appears in a part that would move into
+/// that scope -- the element/key/value, a condition, or a non-outermost iterable -- because a walrus
+/// must bind in the containing scope (PEP 572), which only the inline form does. (A walrus in the
+/// outermost iterable is evaluated in the enclosing scope either way, so it does not force inline.)
+fn comprehension_hoists(main_exprs: &[&Expr], clauses: &[CompClause]) -> bool {
+    !comp_inner_uses(main_exprs, clauses).has_walrus
+}
+
+/// Whether a comprehension's hidden function contains an `await`, so it must compile as a COROUTINE
+/// and its call site must await the result rather than take it directly.
+///
+/// This is the whole of what makes an ASYNCHRONOUS COMPREHENSION (PEP 530) different to compile: the
+/// hidden function is the unit that suspends, so it is the unit that carries the coroutine flag.
+fn comprehension_awaits(main_exprs: &[&Expr], clauses: &[CompClause]) -> bool {
+    clauses.iter().any(|c| c.is_async) || comp_inner_uses(main_exprs, clauses).has_await
 }
 
 /// The free variables of a hoisted comprehension's hidden function -- the names it captures from the
@@ -1643,6 +1961,13 @@ struct Uses {
     /// Set when a walrus (`:=`) was seen while walking. Used only to decide whether a comprehension
     /// can move to its own function scope (a walrus must bind in the containing scope, so it cannot).
     has_walrus: bool,
+    /// Set when an `await` was seen while walking. Used only to decide whether a comprehension's
+    /// hidden function must compile as a COROUTINE: an `await` in a part that moves into that
+    /// function makes the function itself the thing that has to be awaited.
+    has_await: bool,
+    /// The names a walrus BOUND while walking. A walrus binds from inside an expression, so it is
+    /// the one binding the statement-level collector cannot see for itself.
+    walrus_targets: BTreeSet<String>,
 }
 
 /// The user-visible names a function scope binds: its parameters plus every name assigned in its
@@ -1690,7 +2015,7 @@ fn collect_nonlocals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 collect_nonlocals_stmt(s, out);
             }
         }
-        StmtKind::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             for s in body.iter().chain(orelse.iter()).chain(finalbody.iter()) {
                 collect_nonlocals_stmt(s, out);
             }
@@ -1736,7 +2061,7 @@ fn collect_globals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 collect_globals_stmt(s, out);
             }
         }
-        StmtKind::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             for s in body.iter().chain(orelse.iter()).chain(finalbody.iter()) {
                 collect_globals_stmt(s, out);
             }
@@ -1857,7 +2182,7 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
                 walk_expr_uses(c, u);
             }
         }
-        StmtKind::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             walk_body_uses(body, u);
             for h in handlers {
                 if let Some(t) = &h.typ {
@@ -1899,19 +2224,10 @@ fn walk_body_uses(body: &[Stmt], u: &mut Uses) {
 /// Accumulate the name references in a store target -- a bare name binds (no use), while a
 /// subscript/attribute target uses the container/object (and index) it stores through.
 fn walk_target_uses(target: &ast::AssignTarget, u: &mut Uses) {
-    match target {
-        ast::AssignTarget::Name(_) => {}
-        ast::AssignTarget::Subscript { container, index } => {
-            walk_expr_uses(container, u);
-            walk_expr_uses(index, u);
-        }
-        ast::AssignTarget::Attribute { obj, .. } => walk_expr_uses(obj, u),
-        ast::AssignTarget::Tuple(targets) => {
-            for t in targets {
-                walk_target_uses(t, u);
-            }
-        }
-        ast::AssignTarget::Starred(inner) => walk_target_uses(inner, u),
+    let mut exprs = Vec::new();
+    target.collect_exprs(&mut exprs);
+    for expr in exprs {
+        walk_expr_uses(expr, u);
     }
 }
 
@@ -1992,12 +2308,16 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
                     walk_expr_uses(&first.iterable, u);
                 }
                 u.child_free.extend(comp_free_uses(&[element], clauses));
+                u.has_await |= comprehension_awaits(&[element], clauses);
             } else {
                 walk_expr_uses(element, u);
                 for c in clauses {
                     walk_expr_uses(&c.iterable, u);
                     for cond in &c.conditions {
                         walk_expr_uses(cond, u);
+                    }
+                    for target in &c.targets {
+                        walk_target_uses(target, u);
                     }
                 }
             }
@@ -2017,6 +2337,7 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
                     walk_expr_uses(&first.iterable, u);
                 }
                 u.child_free.extend(comp_free_uses(&[key, value], clauses));
+                u.has_await |= comprehension_awaits(&[key, value], clauses);
             } else {
                 walk_expr_uses(key, u);
                 walk_expr_uses(value, u);
@@ -2025,11 +2346,15 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
                     for cond in &c.conditions {
                         walk_expr_uses(cond, u);
                     }
+                    for target in &c.targets {
+                        walk_target_uses(target, u);
+                    }
                 }
             }
         }
-        Expr::Walrus { value, .. } => {
+        Expr::Walrus { target, value } => {
             u.has_walrus = true;
+            u.walrus_targets.insert(target.clone());
             walk_expr_uses(value, u);
         }
         Expr::Yield(value) => {
@@ -2037,7 +2362,11 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
                 walk_expr_uses(v, u);
             }
         }
-        Expr::YieldFrom(value) | Expr::Await(value) => walk_expr_uses(value, u),
+        Expr::YieldFrom(value) => walk_expr_uses(value, u),
+        Expr::Await(value) => {
+            u.has_await = true;
+            walk_expr_uses(value, u);
+        }
     }
 }
 
@@ -2202,7 +2531,7 @@ fn gather_appends_stmt(stmt: &Stmt, names: &[String], appends: &mut [Vec<Expr>])
                 gather_appends_stmt(s, names, appends);
             }
         }
-        StmtKind::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             for s in body.iter().chain(orelse).chain(finalbody) {
                 gather_appends_stmt(s, names, appends);
             }
@@ -2455,12 +2784,7 @@ fn gather_assignments_stmt(
                 gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
         }
-        StmtKind::Try {
-            body,
-            handlers,
-            orelse,
-            finalbody,
-        } => {
+        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
             for h in handlers {
                 if let Some(name) = &h.name {
                     if let Some(slot) = names.iter().position(|n| n == name) {
@@ -2794,6 +3118,11 @@ struct Compiler {
     lambda_counter: usize,
     /// Set when the body emits a `Yield`, marking this code object a generator function.
     has_yield: bool,
+    /// The line of the first value-carrying `return` in this scope, if any.
+    ///
+    /// Kept rather than acted on, because the rule it feeds -- an async generator may not return a
+    /// value -- is a property of the whole function and cannot be decided at the statement.
+    returned_value_line: Option<u32>,
     /// True while compiling a DIRECT statement of this code object's body (set per statement by the
     /// body loop, cleared on entry to `compile_stmt` so a nested statement sees false). At module
     /// scope this distinguishes a direct top-level `def` -- a pure function-table entry already
@@ -2876,6 +3205,14 @@ impl Compiler {
             self.asm.emit(bc::Op::LoadName(idx));
             return;
         }
+        if self.scope == Scope::Module
+            && !self.in_class_body
+            && !self.module_def_totals.contains_key(name)
+        {
+            let idx = self.name_index(name);
+            self.asm.emit(bc::Op::LoadGlobal(idx));
+            return;
+        }
         if let Some(deref) = self.deref_slot(name) {
             self.asm.emit(bc::Op::LoadDeref(deref));
         } else if let Some(slot) = self.local_slot(name) {
@@ -2927,6 +3264,149 @@ impl Compiler {
             self.asm.emit(bc::Op::LoadClosure(deref));
         }
         0x04
+    }
+
+    /// Rewrite a `try ... except* ...` into the ordinary statement it means (PEP 654).
+    ///
+    /// Everything it needs is already ordinary Python this compiler emits, so the feature is a
+    /// rewrite rather than new ops: catch everything, partition the group one clause at a time with
+    /// `split`, run each clause that matched, and re-raise whatever is left.
+    ///
+    /// ```text
+    /// try: BODY
+    /// except BaseException as e:
+    ///     rest = e if isinstance(e, BaseExceptionGroup) else ExceptionGroup("", [e])
+    ///     for each clause (T as n):
+    ///         if rest is not None:
+    ///             pair = rest.split(T); rest = pair[1]
+    ///             if pair[0] is not None:
+    ///                 n = pair[0]
+    ///                 HANDLER
+    ///     if rest is not None:
+    ///         raise rest if isinstance(e, BaseExceptionGroup) else e
+    /// ```
+    ///
+    /// Four behaviours here were measured against CPython 3.14.6 rather than read off the PEP, and
+    /// three of them are what a plausible reading gets wrong.
+    ///
+    /// EVERY MATCHING CLAUSE RUNS. `except*` is not first-match: a group holding a `ValueError` and
+    /// a `TypeError` runs both handlers, which is why the clauses chain on the RESIDUAL instead of
+    /// branching.
+    ///
+    /// A NON-GROUP IS WRAPPED FOR MATCHING, so `raise ValueError` is caught by `except* ValueError`
+    /// -- but IF NOTHING MATCHES, THE ORIGINAL PROPAGATES UNWRAPPED. A program that never asked for
+    /// a group must not have one appear in its traceback, which is why the final `raise` chooses
+    /// between the residual and the original rather than always raising the residual.
+    ///
+    /// AND THE PARTITION IS `split`'s, NOT THIS REWRITE'S. Nesting is preserved and a subclass keeps
+    /// its identity through the group's own `derive` hook; rebuilding groups here would silently
+    /// downgrade every user subclass to a plain `ExceptionGroup`.
+    fn desugar_except_star(
+        &mut self,
+        body: &[Stmt],
+        handlers: &[ExceptHandler],
+        orelse: &[Stmt],
+        finalbody: &[Stmt],
+    ) -> Result<Stmt, CompileError> {
+        let exc = format!(".t{}", self.alloc_temp());
+        let rest = format!(".t{}", self.alloc_temp());
+        let pair = format!(".t{}", self.alloc_temp());
+
+        let name = |n: &str| Expr::Name(String::from(n));
+        let call = |f: Expr, args: Vec<Expr>| Expr::Call {
+            func: Box::new(f),
+            args,
+            keywords: Vec::new(),
+        };
+        let attr = |v: Expr, a: &str| Expr::Attribute {
+            value: Box::new(v),
+            attr: String::from(a),
+        };
+        let index = |v: Expr, i: i64| Expr::Subscript {
+            value: Box::new(v),
+            index: Box::new(Expr::Int(i)),
+        };
+        let is_not_none = |e: Expr| Expr::Compare {
+            op: ast::CmpOp::IsNot,
+            lhs: Box::new(e),
+            rhs: Box::new(Expr::None),
+        };
+        let assign = |target: &str, value: Expr| {
+            StmtKind::Assign(Assign {
+                target: String::from(target),
+                annotation: None,
+                value: Some(value),
+            })
+        };
+        let is_group = || {
+            call(
+                name("isinstance"),
+                vec![name(&exc), name("BaseExceptionGroup")],
+            )
+        };
+
+        let mut inner = vec![self.at(assign(
+            &rest,
+            Expr::Conditional {
+                test: Box::new(is_group()),
+                body: Box::new(name(&exc)),
+                orelse: Box::new(call(
+                    name("ExceptionGroup"),
+                    vec![Expr::Str("".into()), Expr::List(vec![name(&exc)])],
+                )),
+            },
+        ))];
+
+        for handler in handlers {
+            let typ = handler
+                .typ
+                .clone()
+                .ok_or_else(|| error("an 'except*' clause needs an exception type"))?;
+            let mut matched = vec![
+                self.at(assign(&pair, call(attr(name(&rest), "split"), vec![typ]))),
+                self.at(assign(&rest, index(name(&pair), 1))),
+            ];
+            let mut ran = Vec::new();
+            if let Some(bound) = &handler.name {
+                ran.push(self.at(assign(bound, index(name(&pair), 0))));
+            }
+            ran.extend(handler.body.iter().cloned());
+            matched.push(self.at(StmtKind::If {
+                test: is_not_none(index(name(&pair), 0)),
+                body: ran,
+                orelse: Vec::new(),
+            }));
+            inner.push(self.at(StmtKind::If {
+                test: is_not_none(name(&rest)),
+                body: matched,
+                orelse: Vec::new(),
+            }));
+        }
+
+        inner.push(self.at(StmtKind::If {
+            test: is_not_none(name(&rest)),
+            body: vec![self.at(StmtKind::Raise {
+                exc: Some(Expr::Conditional {
+                    test: Box::new(is_group()),
+                    body: Box::new(name(&rest)),
+                    orelse: Box::new(name(&exc)),
+                }),
+                cause: None,
+            })],
+            orelse: Vec::new(),
+        }));
+
+        Ok(self.at(StmtKind::Try {
+            star: false,
+            body: body.to_vec(),
+            handlers: vec![ExceptHandler {
+                typ: Some(name("BaseException")),
+                name: Some(exc),
+                body: inner,
+            }],
+            orelse: orelse.to_vec(),
+            finalbody: finalbody.to_vec(),
+        }))
     }
 
     /// A statement this compiler synthesized while desugaring the statement it is compiling. It
@@ -2985,7 +3465,10 @@ impl Compiler {
                     return Err(error("'return' outside a function"));
                 }
                 match value {
-                    Some(expr) => self.compile_expr(expr)?,
+                    Some(expr) => {
+                        self.returned_value_line.get_or_insert(self.current_line);
+                        self.compile_expr(expr)?;
+                    }
                     None => {
                         let none = self.const_index(bc::Const::None);
                         self.asm.emit(bc::Op::LoadConst(none));
@@ -3059,12 +3542,11 @@ impl Compiler {
                 }
                 Ok(())
             }
-            StmtKind::Try {
-                body,
-                handlers,
-                orelse,
-                finalbody,
-            } => {
+            StmtKind::Try { body, handlers, orelse, finalbody, star } => {
+                if *star {
+                    let rewritten = self.desugar_except_star(body, handlers, orelse, finalbody)?;
+                    return self.compile_stmt(&rewritten);
+                }
                 if finalbody.is_empty() {
                     self.compile_try_except(body, handlers, orelse)
                 } else {
@@ -3117,7 +3599,8 @@ impl Compiler {
                 }
                 Ok(())
             }
-            StmtKind::ImportFrom { module, names } => {
+            StmtKind::ImportFrom { module, level, names } => {
+                check_import_resolved(*level, module)?;
                 let midx = self.name_index(module);
                 self.asm.emit(bc::Op::ImportName(midx));
                 for (member, bound) in names {
@@ -3128,7 +3611,8 @@ impl Compiler {
                 self.asm.emit(bc::Op::PopTop);
                 Ok(())
             }
-            StmtKind::ImportStar { module } => {
+            StmtKind::ImportStar { module, level } => {
+                check_import_resolved(*level, module)?;
                 if self.scope != Scope::Module {
                     return Err(error("import * is only allowed at module level"));
                 }
@@ -3818,6 +4302,7 @@ impl Compiler {
             operand: Box::new(Expr::Name(done_name.clone())),
         };
         let step = self.at(StmtKind::Try {
+            star: false,
             body: vec![self.at(StmtKind::Assign(Assign {
                 target: String::from(target),
                 annotation: None,
@@ -4209,7 +4694,8 @@ impl Compiler {
             Expr::ListComp { element, clauses } => {
                 if comprehension_hoists(&[element], clauses) {
                     let body = build_container_comp_body(CompKind::List(element), clauses, self.current_line);
-                    self.compile_hoisted_comprehension("listcomp", body, &clauses[0].iterable)?;
+                    let is_async = comprehension_awaits(&[element], clauses);
+                    self.compile_hoisted_comprehension("listcomp", body, &clauses[0].iterable, is_async, is_async, clauses[0].is_async)?;
                 } else {
                     self.compile_comprehension(CompKind::List(element), clauses)?;
                 }
@@ -4217,7 +4703,8 @@ impl Compiler {
             Expr::SetComp { element, clauses } => {
                 if comprehension_hoists(&[element], clauses) {
                     let body = build_container_comp_body(CompKind::Set(element), clauses, self.current_line);
-                    self.compile_hoisted_comprehension("setcomp", body, &clauses[0].iterable)?;
+                    let is_async = comprehension_awaits(&[element], clauses);
+                    self.compile_hoisted_comprehension("setcomp", body, &clauses[0].iterable, is_async, is_async, clauses[0].is_async)?;
                 } else {
                     self.compile_comprehension(CompKind::Set(element), clauses)?;
                 }
@@ -4229,14 +4716,23 @@ impl Compiler {
             } => {
                 if comprehension_hoists(&[key, value], clauses) {
                     let body = build_container_comp_body(CompKind::Dict(key, value), clauses, self.current_line);
-                    self.compile_hoisted_comprehension("dictcomp", body, &clauses[0].iterable)?;
+                    let is_async = comprehension_awaits(&[key, value], clauses);
+                    self.compile_hoisted_comprehension("dictcomp", body, &clauses[0].iterable, is_async, is_async, clauses[0].is_async)?;
                 } else {
                     self.compile_comprehension(CompKind::Dict(key, value), clauses)?;
                 }
             }
             Expr::GeneratorExp { element, clauses } => {
+                let coroutine_body = comprehension_awaits(&[element], clauses);
                 let body = build_genexpr_body(element, clauses, 0);
-                self.compile_hoisted_comprehension("genexpr", body, &clauses[0].iterable)?;
+                self.compile_hoisted_comprehension(
+                    "genexpr",
+                    body,
+                    &clauses[0].iterable,
+                    coroutine_body,
+                    false,
+                    clauses[0].is_async,
+                )?;
             }
             Expr::Binary { op, lhs, rhs } => {
                 if let Some(k) = self.int_pow_unroll_exponent(op, lhs, rhs) {
@@ -4361,10 +4857,7 @@ impl Compiler {
             }
             Expr::Await(value) => {
                 if self.scope != Scope::Coroutine {
-                    return Err(error(
-                        "'await' inside a comprehension is not supported in this subset (the \
-                         comprehension compiles to a function of its own, which is not a coroutine)",
-                    ));
+                    return Err(error("'await' outside an 'async def'"));
                 }
                 self.compile_expr(value)?;
                 self.asm.emit(bc::Op::Await);
@@ -4571,18 +5064,36 @@ impl Compiler {
     /// then at the call site build the (closure) function and call it with the eagerly-iter'd
     /// outermost iterable. The loop targets are the hidden function's locals, so they never leak into
     /// this scope. Shared by list/set/dict comprehensions and generator expressions.
+    ///
+    /// `coroutine_body` compiles that hidden function as a COROUTINE instead of a plain function,
+    /// which is what an `await` or an `async for` in the comprehension needs.
+    ///
+    /// `await_call` is SEPARATE from it, and the two come apart exactly once. For a container
+    /// comprehension both are true: the call returns a coroutine and the container is what the
+    /// program wanted, so the call site awaits it. For a GENERATOR EXPRESSION the body also yields,
+    /// so a coroutine body makes it an ASYNC GENERATOR -- and an async generator expression
+    /// evaluates to the async generator itself. Awaiting there would await an object the program
+    /// meant to iterate.
     fn compile_hoisted_comprehension(
         &mut self,
         tag: &str,
         body: Vec<Stmt>,
         first_iterable: &Expr,
+        coroutine_body: bool,
+        await_call: bool,
+        first_is_async: bool,
     ) -> Result<(), CompileError> {
+        if await_call && self.scope != Scope::Coroutine {
+            return Err(error(
+                "an asynchronous comprehension outside an 'async def' has nothing to await it",
+            ));
+        }
         let name = format!("{}.<{}.{}>", self.name, tag, self.lambda_counter);
         self.lambda_counter += 1;
         let params = [genexpr_param()];
         let body_refs: Vec<&Stmt> = body.iter().collect();
         let (co, nested) = compile_code_object(
-            Scope::Function,
+            if coroutine_body { Scope::Coroutine } else { Scope::Function },
             &name,
             &params,
             &None,
@@ -4597,8 +5108,13 @@ impl Compiler {
         let idx = self.name_index(&name);
         self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
         self.compile_expr(first_iterable)?;
-        self.asm.emit(bc::Op::GetIter);
+        if !first_is_async {
+            self.asm.emit(bc::Op::GetIter);
+        }
         self.asm.emit(bc::Op::Call(1));
+        if await_call {
+            self.asm.emit(bc::Op::Await);
+        }
         Ok(())
     }
 
@@ -4610,6 +5126,13 @@ impl Compiler {
         kind: CompKind,
         clauses: &[CompClause],
     ) -> Result<(), CompileError> {
+        if clauses.iter().any(|c| c.is_async) {
+            return Err(error(
+                "an 'async for' in a comprehension that also binds with ':=' is not supported in \
+                 this subset (the walrus makes the comprehension inline, which drives the \
+                 synchronous iterator protocol)",
+            ));
+        }
         let result = self.alloc_temp();
         let build = match kind {
             CompKind::List(_) => bc::Op::BuildList(0),
@@ -4661,7 +5184,7 @@ impl Compiler {
         self.asm.place(top);
         self.asm.emit(bc::Op::LoadFast(iter));
         self.asm.emit_for_iter(end);
-        self.bind_comp_targets(&clause.targets);
+        self.bind_comp_targets(&clause.targets)?;
         for cond in &clause.conditions {
             self.compile_expr(cond)?;
             self.asm.emit_branch(top);
@@ -4672,14 +5195,21 @@ impl Compiler {
         Ok(())
     }
 
-    /// Bind a clause's target(s): a single name stores directly; a tuple target unpacks
-    /// (`for k, v in d.items()`).
-    fn bind_comp_targets(&mut self, targets: &[String]) {
-        if targets.len() > 1 {
-            self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32));
-        }
-        for t in targets {
-            self.emit_store_name(t);
+    /// Bind a clause's target(s) to the item on top of the stack, in the INLINE form -- the one a
+    /// walrus forces, where the loop is emitted as ops here rather than desugared to a statement.
+    ///
+    /// The same three answers [`ast::for_binding`] gives the two desugaring paths, in ops: a lone
+    /// name stores, a lone non-sequence target stores through its container, and anything else
+    /// unpacks. The emitters are the tuple-assignment ones, so a nested target, a star and a
+    /// subscript behave here exactly as they do on the left of an `=`.
+    fn bind_comp_targets(&mut self, targets: &[ast::AssignTarget]) -> Result<(), CompileError> {
+        match ast::for_binding(targets) {
+            ast::ForBinding::Name(name) => {
+                self.emit_store_name(name);
+                Ok(())
+            }
+            ast::ForBinding::Store(one) => self.compile_unpack_target(&one[0]),
+            ast::ForBinding::Unpack(elems) => self.compile_unpack_sequence(elems),
         }
     }
 
@@ -5100,6 +5630,116 @@ mod tests {
             .iter_bodies()
             .find(|f| f.name == name)
             .expect("function present")
+    }
+
+    /// The absolute name a relative import in module `in_module` resolves to.
+    fn resolved(in_module: &str, source: &str) -> Result<String, CompileError> {
+        let mut ast = parse(tokenize(source).expect("tokenizes")).expect("parses");
+        resolve_relative_imports(&mut ast, in_module)?;
+        Ok(match &ast.body[0].kind {
+            StmtKind::ImportFrom { module, level, .. } | StmtKind::ImportStar { module, level } => {
+                assert_eq!(*level, 0, "resolution clears the level");
+                module.clone()
+            }
+            other => panic!("expected an import, got {other:?}"),
+        })
+    }
+
+    #[test]
+    fn a_relative_import_resolves_against_the_importing_modules_package() {
+        assert_eq!(resolved("pkg.mod", "from . import x\n").unwrap(), "pkg");
+        assert_eq!(resolved("pkg.mod", "from .a import b\n").unwrap(), "pkg.a");
+        assert_eq!(resolved("pkg.mod", "from .a.b import c\n").unwrap(), "pkg.a.b");
+        assert_eq!(resolved("pkg.mod", "from . import *\n").unwrap(), "pkg");
+        assert_eq!(resolved("pkg.sub.deep", "from . import x\n").unwrap(), "pkg.sub");
+        assert_eq!(resolved("pkg.sub.deep", "from .. import x\n").unwrap(), "pkg");
+        assert_eq!(resolved("pkg.sub.deep", "from ..a import b\n").unwrap(), "pkg.a");
+        assert_eq!(resolved("pkg.mod", "from math import sqrt\n").unwrap(), "math");
+        assert_eq!(resolved("top", "from math import sqrt\n").unwrap(), "math");
+    }
+
+    #[test]
+    fn a_relative_import_with_no_package_to_reach_is_refused_by_name() {
+        let err = resolved("main", "from . import x\n").unwrap_err();
+        assert!(
+            err.message.contains("no known parent package"),
+            "the wording is CPython's so a search finds the same answers: {}",
+            err.message
+        );
+        let err = resolved("pkg.mod", "from .. import x\n").unwrap_err();
+        assert!(
+            err.message.contains("beyond top-level package"),
+            "expected CPython's wording, got: {}",
+            err.message
+        );
+        assert!(resolved("pkg.sub.deep", "from ... import x\n").is_err());
+    }
+
+    #[test]
+    fn the_resolution_table_matches_cpythons_own() {
+        let ok: &[(&str, u32, &str, &str)] = &[
+            ("pkg.mod", 1, "", "pkg"),
+            ("pkg.mod", 1, "a", "pkg.a"),
+            ("pkg.mod", 1, "a.b", "pkg.a.b"),
+            ("pkg.sub.deep", 1, "", "pkg.sub"),
+            ("pkg.sub.deep", 1, "a", "pkg.sub.a"),
+            ("pkg.sub.deep", 1, "a.b", "pkg.sub.a.b"),
+            ("pkg.sub.deep", 2, "", "pkg"),
+            ("pkg.sub.deep", 2, "a", "pkg.a"),
+            ("pkg.sub.deep", 2, "a.b", "pkg.a.b"),
+            ("a.b.c.d", 1, "", "a.b.c"),
+            ("a.b.c.d", 1, "a", "a.b.c.a"),
+            ("a.b.c.d", 1, "a.b", "a.b.c.a.b"),
+            ("a.b.c.d", 2, "", "a.b"),
+            ("a.b.c.d", 2, "a", "a.b.a"),
+            ("a.b.c.d", 2, "a.b", "a.b.a.b"),
+            ("a.b.c.d", 3, "", "a"),
+            ("a.b.c.d", 3, "a", "a.a"),
+            ("a.b.c.d", 3, "a.b", "a.a.b"),
+            ("top.x", 1, "", "top"),
+            ("top.x", 1, "a", "top.a"),
+            ("top.x", 1, "a.b", "top.a.b"),
+        ];
+        let beyond: &[(&str, u32)] = &[
+            ("pkg.mod", 2),
+            ("pkg.mod", 3),
+            ("pkg.mod", 4),
+            ("pkg.sub.deep", 3),
+            ("pkg.sub.deep", 4),
+            ("a.b.c.d", 4),
+            ("top.x", 2),
+            ("top.x", 3),
+            ("top.x", 4),
+        ];
+        for &(in_module, level, name, want) in ok {
+            let source = alloc::format!("from {}{name} import z\n", ".".repeat(level as usize));
+            let got = resolved(in_module, &source).unwrap_or_else(|e| {
+                panic!("{in_module}: `{}` should resolve to {want}: {}", source.trim(), e.message)
+            });
+            assert_eq!(got, want, "in {in_module}, `{}`", source.trim());
+        }
+        for &(in_module, level) in beyond {
+            let source = alloc::format!("from {} import z\n", ".".repeat(level as usize));
+            match resolved(in_module, &source) {
+                Err(e) => assert!(
+                    e.message.contains("beyond top-level package"),
+                    "{in_module}: `{}` -- expected CPython's wording, got: {}",
+                    source.trim(),
+                    e.message
+                ),
+                Ok(got) => panic!(
+                    "{in_module}: `{}` resolved to `{got}`, where CPython raises ImportError",
+                    source.trim()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn the_emitter_refuses_an_import_nobody_resolved() {
+        let ast = parse(tokenize("from .a import b\n").expect("tokenizes")).expect("parses");
+        let err = compile_module("pkg.mod", &ast).unwrap_err();
+        assert!(err.message.contains("unresolved"), "got: {}", err.message);
     }
 
     #[test]
@@ -5586,23 +6226,97 @@ xs.append(1, 2)
 
     #[test]
     fn the_async_surface_this_subset_does_not_have_is_refused_by_name() {
-        assert!(compile_err("async def f():\n    yield 1\n").contains("async generator"));
+        assert!(compile_src("async def f():\n    yield 1\n").is_ok(), "PEP 525 compiles");
+        assert!(
+            compile_src("async def f():\n    return (await x for x in y)\n").is_ok(),
+            "and so does an asynchronous generator EXPRESSION"
+        );
         assert_eq!(
             compile_err("async def f():\n    yield from g()\n"),
             "'yield from' inside async function"
         );
-        assert!(
-            compile_err("async def f():\n    return [x async for x in y]\n")
-                .contains("asynchronous comprehension")
+        assert!(compile_src("async def f():\n    return [x async for x in y]\n").is_ok());
+        assert_eq!(
+            compile_err("def f():\n    return [x async for x in y]\n"),
+            "asynchronous comprehension outside of an asynchronous function"
+        );
+        assert_eq!(
+            compile_err("xs = [x async for x in y]\n"),
+            "asynchronous comprehension outside of an asynchronous function"
         );
         assert!(
-            compile_err("async def f():\n    return [await x for x in y]\n")
-                .contains("comprehension"),
-            "an await moved into a hidden comprehension function is refused, not emitted"
+            compile_err("async def f():\n    return [(z := x) async for x in y]\n")
+                .contains("also binds with ':='"),
+        );
+        let returning = compile_err("async def g():\n    yield 1\n    return 5\n");
+        assert!(
+            returning.contains("'return' with value in async generator"),
+            "CPython's own wording: {returning}"
+        );
+        assert!(
+            compile_src("async def g():\n    yield 1\n    return\n").is_ok(),
+            "a bare return is legal in an async generator"
         );
         assert!(compile_err("x = o.async\n").contains("is a keyword in Python 3.7 and later"));
         assert!(compile_err("def await():\n    pass\n").contains("is a keyword in Python 3.7 and later"));
         assert_eq!(compile_err("async = 1\n"), "expected 'def', 'for' or 'with' after 'async'");
+    }
+
+    #[test]
+    fn an_await_in_a_comprehension_makes_its_hidden_function_a_coroutine() {
+        fn hoisted(src: &str, tag: &str) -> (bool, bool) {
+            let m = compile_src(src).unwrap();
+            let co = m
+                .functions
+                .iter_bodies()
+                .find(|co| co.name.contains(tag))
+                .expect("a hoisted comprehension function");
+            let ops = &func(&m, "f").ops;
+            let call = ops
+                .iter()
+                .position(|op| matches!(op, Op::Call(1)))
+                .expect("the call that runs the hidden function");
+            (co.is_coroutine, matches!(ops.get(call + 1), Some(Op::Await)))
+        }
+
+        for (what, src) in [
+            ("element", "async def f(y):\n    return [await x for x in y]\n"),
+            ("set element", "async def f(y):\n    return {await x for x in y}\n"),
+            ("dict key", "async def f(y):\n    return {await x: 1 for x in y}\n"),
+            ("dict value", "async def f(y):\n    return {1: await x for x in y}\n"),
+            ("condition", "async def f(y):\n    return [x for x in y if await x]\n"),
+            ("inner iterable", "async def f(y):\n    return [z for x in y for z in await x]\n"),
+        ] {
+            let tag = if src.contains('{') { "comp." } else { "<listcomp." };
+            assert_eq!(hoisted(src, tag), (true, true), "await in the {what}");
+        }
+
+        assert_eq!(
+            hoisted("async def f(y):\n    return [x for x in await y]\n", "<listcomp."),
+            (false, false),
+            "an await in the outermost iterable belongs to the enclosing scope"
+        );
+        assert_eq!(
+            hoisted("async def f(y):\n    return [x for x in y]\n", "<listcomp."),
+            (false, false),
+            "a plain comprehension in an async def stays a plain function"
+        );
+
+        let nested = compile_src(
+            "async def f(y):\n    return [[await z for z in x] for x in y]\n",
+        )
+        .unwrap();
+        let comps: Vec<bool> = nested
+            .functions
+            .iter_bodies()
+            .filter(|co| co.name.contains("<listcomp."))
+            .map(|co| co.is_coroutine)
+            .collect();
+        assert_eq!(comps.len(), 2, "an outer and an inner hidden function");
+        assert!(
+            comps.iter().all(|c| *c),
+            "both hidden functions are coroutines, not just the one holding the await"
+        );
     }
 
     #[test]
@@ -5881,6 +6595,98 @@ xs.append(1, 2)
     }
 
     #[test]
+    fn an_async_generator_emits_both_flags_while_the_parser_still_refuses_the_source() {
+        let body = alloc::vec![Stmt::new(
+            2,
+            StmtKind::Expr(Expr::Yield(Some(Box::new(Expr::Int(1))))),
+        )];
+        let def = ast::FuncDef {
+            name: String::from("g"),
+            params: Vec::new(),
+            ret: None,
+            body,
+            is_async: true,
+        };
+        let module = ModuleAst {
+            body: alloc::vec![Stmt::new(1, StmtKind::FuncDef(def))],
+        };
+        let compiled = compile_module("test", &module).expect("an async generator compiles");
+        let code = func(&compiled, "g");
+
+        assert!(code.is_generator, "the body yields, so it is a generator");
+        assert!(code.is_coroutine, "the def is async, so it is a coroutine");
+        assert!(
+            code.ops.iter().any(|op| matches!(op, Op::Yield)),
+            "and the yield is emitted, not dropped: {:?}",
+            code.ops
+        );
+
+        let plain = compile_src("def g():\n    yield 1\n").unwrap();
+        assert!(func(&plain, "g").is_generator && !func(&plain, "g").is_coroutine);
+        let coro = compile_src("async def f():\n    return 1\n").unwrap();
+        assert!(func(&coro, "f").is_coroutine && !func(&coro, "f").is_generator);
+
+        let agen_returning = |value: Option<Expr>| {
+            let body = alloc::vec![
+                Stmt::new(2, StmtKind::Expr(Expr::Yield(Some(Box::new(Expr::Int(1)))))),
+                Stmt::new(3, StmtKind::Return(value)),
+            ];
+            let def = ast::FuncDef {
+                name: String::from("g"),
+                params: Vec::new(),
+                ret: None,
+                body,
+                is_async: true,
+            };
+            compile_module(
+                "test",
+                &ModuleAst { body: alloc::vec![Stmt::new(1, StmtKind::FuncDef(def))] },
+            )
+        };
+        let err = agen_returning(Some(Expr::Int(5))).expect_err("a value is refused");
+        assert!(
+            err.message.contains("'return' with value in async generator"),
+            "CPython's own wording: {}",
+            err.message
+        );
+        assert!(agen_returning(None).is_ok(), "a bare return is legal in an async generator");
+        assert!(compile_src("def g():\n    yield 1\n    return 5\n").is_ok());
+        assert!(compile_src("async def f():\n    return 5\n").is_ok());
+    }
+
+    #[test]
+    fn a_module_body_resolves_a_name_outward_where_a_function_body_does_not() {
+        let m = compile_src("ValueError = ValueError\n").unwrap();
+        assert!(
+            m.body.ops.iter().any(|op| matches!(op, Op::LoadGlobal(_))),
+            "a module-level read resolves outward: {:?}",
+            m.body.ops
+        );
+        assert!(
+            !m.body.ops.iter().any(|op| matches!(op, Op::LoadFast(_))),
+            "and not through the slot the assignment created: {:?}",
+            m.body.ops
+        );
+
+        let f = compile_src("def f():\n    ValueError = ValueError\n    return ValueError\n").unwrap();
+        assert!(
+            func(&f, "f").ops.iter().any(|op| matches!(op, Op::LoadFast(_))),
+            "a function body still reads its own local: {:?}",
+            func(&f, "f").ops
+        );
+
+        let d = compile_src(
+            "def which():\n    return 1\nfirst = which\ndef which():\n    return 2\n",
+        )
+        .unwrap();
+        assert!(
+            d.body.ops.iter().any(|op| matches!(op, Op::LoadFast(_))),
+            "a def-bound module name is read positionally: {:?}",
+            d.body.ops
+        );
+    }
+
+    #[test]
     fn a_declaration_must_precede_every_binding_of_its_name() {
         for (src, word) in [
             ("def f():
@@ -5915,6 +6721,23 @@ global x
             );
         }
 
+        for src in [
+            "def f():
+    import os
+    global os
+",
+            "def f():
+    from os import path
+    global path
+",
+            "def f():
+    import os as m
+    global m
+",
+        ] {
+            assert!(compile_src(src).is_ok(), "CPython compiles this: {src:?}");
+        }
+
         assert!(compile_src("def f():
     global x
     x = 1
@@ -5946,6 +6769,133 @@ global x
 class C:
     global y
     y = 2
+").is_ok());
+    }
+
+    #[test]
+    fn a_declaration_must_also_precede_every_use_of_its_name() {
+        for (src, word) in [
+            ("def f():
+    print(x)
+    global x
+", "global"),
+            ("def f():
+    if False:
+        print(x)
+    global x
+", "global"),
+            ("def f():
+    print(x.y)
+    global x
+", "global"),
+            ("print(x)
+global x
+", "global"),
+            ("def f():
+    def g(a=x):
+        pass
+    global x
+", "global"),
+            ("def f():
+    @x
+    def g():
+        pass
+    global x
+", "global"),
+            ("def f():
+    v = [i for i in x]
+    global x
+", "global"),
+            ("def o():
+    y = 1
+    def f():
+        print(y)
+        nonlocal y
+", "nonlocal"),
+        ] {
+            let err = compile_src(src).unwrap_err();
+            assert!(
+                err.message.contains(&alloc::format!("used prior to {word} declaration")),
+                "{src:?} gave {}",
+                err.message
+            );
+        }
+
+        for src in ["def f():
+    print(x)
+    x = 1
+    global x
+", "def f():
+    x = 1
+    print(x)
+    global x
+"] {
+            let err = compile_src(src).unwrap_err();
+            assert!(err.message.contains("used prior to"), "{src:?} gave {}", err.message);
+        }
+
+        let err = compile_src("def f():
+    x += 1
+    global x
+").unwrap_err();
+        assert!(err.message.contains("assigned to before"), "{}", err.message);
+
+        for src in [
+            "def f():
+    def g():
+        return x
+    global x
+",
+            "def f():
+    v = [x for _ in range(1)]
+    global x
+",
+            "def f():
+    h = lambda: x
+    global x
+",
+            "def f():
+    class C:
+        v = x
+    global x
+",
+            "def f():
+    v: x = 1
+    global x
+",
+            "def f():
+    global x
+    print(x)
+",
+        ] {
+            assert!(compile_src(src).is_ok(), "CPython compiles this: {src:?}");
+        }
+    }
+
+    #[test]
+    fn an_annotated_name_cannot_be_declared_at_all() {
+        for src in ["def f():
+    global x
+    x: int = 1
+", "def f():
+    x: int = 1
+    global x
+", "def f():
+    global x
+    x: int
+"] {
+            let err = compile_src(src).unwrap_err();
+            assert!(
+                err.message.contains("annotated name 'x' can't be global"),
+                "{src:?} gave {}",
+                err.message
+            );
+        }
+        assert!(compile_src("def f():
+    global x
+    def g():
+        x: int = 1
+    return g
 ").is_ok());
     }
 

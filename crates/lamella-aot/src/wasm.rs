@@ -43,6 +43,7 @@ pub enum LowerError {
     /// neither the malformed instruction nor the types that disagreed, so a refusing row reported no
     /// reason at all.
     NotWellFormed {
+        /// What [`lamella_ir::verify`] rejected. Never empty -- it is constructed only from an `Err`.
         errors: Vec<VerifyError>,
     },
     /// An instruction or type the WASM backend does not lower yet: a value type (no memory home in
@@ -1578,9 +1579,20 @@ fn lower_inst(
             if !matches!(owner, lamella_ir::StaticOwner::Own) {
                 return Err(LowerError::Unsupported);
             }
-            body.i32_const(STATIC_BASE);
-            emit_typed_load(body, value_types[result.index()], *offset)?;
-            body.local_set(local(result));
+            if let MirType::ValueType { size, .. } = value_types[result.index()] {
+                emit_bump(body, size.next_multiple_of(8) as i32);
+                body.local_set(local(result));
+                for word in 0..size.div_ceil(4) {
+                    body.local_get(local(result));
+                    body.i32_const(STATIC_BASE);
+                    body.i32_load(MemArg::new(4, *offset + word * 4));
+                    body.i32_store(MemArg::new(4, word * 4));
+                }
+            } else {
+                body.i32_const(STATIC_BASE);
+                emit_typed_load(body, value_types[result.index()], *offset)?;
+                body.local_set(local(result));
+            }
         }
         Inst::StaticStore {
             owner,
@@ -1590,9 +1602,18 @@ fn lower_inst(
             if !matches!(owner, lamella_ir::StaticOwner::Own) {
                 return Err(LowerError::Unsupported);
             }
-            body.i32_const(STATIC_BASE);
-            body.local_get(local(*value));
-            emit_typed_store(body, value_types[value.index()], *offset)?;
+            if let MirType::ValueType { size, .. } = value_types[value.index()] {
+                for word in 0..size.div_ceil(4) {
+                    body.i32_const(STATIC_BASE);
+                    body.local_get(local(*value));
+                    body.i32_load(MemArg::new(4, word * 4));
+                    body.i32_store(MemArg::new(4, *offset + word * 4));
+                }
+            } else {
+                body.i32_const(STATIC_BASE);
+                body.local_get(local(*value));
+                emit_typed_store(body, value_types[value.index()], *offset)?;
+            }
         }
         Inst::StaticAddr { owner, offset } => {
             if !matches!(owner, lamella_ir::StaticOwner::Own) {

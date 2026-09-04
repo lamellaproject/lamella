@@ -1,0 +1,42 @@
+# BLOCK: the STM32H7 embedded flash controller, stated only as far as the facts consumers outside
+# the controller need. Its unlock sequence, its sector geometry and its command bits are not
+# described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THIS IS THE PART THE WRITE-UNIT FACT EXISTS FOR. Its flash word is 256 bits -- 32 bytes -- and a
+# program command commits one whole flash word plus its 10 ECC bits. Software may hand the
+# controller as few as 8 bits, but the manual is explicit that only 256-bit writes are executed in
+# the non-volatile memory: the shortfall is filled by a force-write of the whole word. So a record
+# padded to "the write unit" here occupies 32 bytes, and any rule that says to pad a record to one
+# unit and program a magic value LAST has no "last" -- the single write covers the magic and the
+# record together, and losing power part way through leaves both in the same indeterminate state.
+#
+# AND THE SECOND HALF OF WHY THIS PART IS THE HARD ONE: A FLASH WORD MAY NOT BE REPROGRAMMED. The
+# manual advises against overwriting a word that is not virgin, because a second program computes a
+# new ECC over the merged content and the result is reported as an ECC error on every subsequent
+# read. So the escape of "write the record now and the magic into the same unit afterwards", which
+# an STM32F4 permits, is not available here.
+#
+# THE ERASE UNIT IS NOT THIS NUMBER AND IS NOT DECLARED HERE. Erase is by sector, and RM0399 gives
+# these parts eight sectors of 128 Kbytes per bank -- 4,096 times the write unit. A consumer
+# choosing where to PUT a record needs the erase unit as well as the write unit, and this file
+# declares only the one it can state for the whole block. Nothing here should be read as an answer
+# about erase granularity.
+
+[table]
+kind = "block"
+family = "stm32h7"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 32
+sources = [
+    "erased_value: STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4, the erase description: `The erase operation forces all non-volatile bit cells to high state, which corresponds to the virgin state` and `If the application software reads back a word that has been erased, all the bits will be read at 1, without ECC error`",
+    "write_unit: RM0399 Rev 4, the program/erase operation list: `Single flash word write (256-bit granularity), with the possibility for the application to force-write a user flash word with less than 256 bits`",
+    "write_unit: RM0399 Rev 4, the programming description: `Since a 10-bit ECC code is associated to each 256-bit data flash word, only write operations by 256 bits are executed in the non-volatile memory`",
+]
+notes = [
+    "A flash word must be virgin when programmed. RM0399: `It is not recommended to overwrite a flash word that is not virgin. The result may lead to an inconsistent ECC code that will be systematically reported by the embedded flash memory.` A consumer that programs one unit twice between erases is doing something an STM32F4 permits and this controller does not.",
+    "The AXI write buffer accepts 8-, 16-, 32- and 64-bit accesses. That is the width of the bus transaction that FILLS the 256-bit buffer, not the width of the operation that commits it, and reading it as the write unit would give 8 where the answer is 32.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

@@ -18,7 +18,7 @@ validation = "none"
 
 # --- a disagreement worth carrying ------------------------------------------------------------
 #
-# THE MANUAL'S TWO COLUMNS DISAGREE WITH EACH OTHER HERE, and this is the only member where they do: 0x76 shifted down is 0x3B, not the 0x3A the hardware column states. A unit on this bench answered 0x3A, so the hardware column is the one the bus bears out and the shift is what fails.
+# THE MANUAL'S TWO COLUMNS DISAGREE WITH EACH OTHER HERE, and this is the only member where they do: 0x76 shifted down is 0x3B, not the 0x3A the hardware column states. A unit answered 0x3A when measured, so the hardware column is the one the bus bears out and the shift is what fails.
 
 [address]
 bus = "i2c"

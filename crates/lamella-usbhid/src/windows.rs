@@ -10,8 +10,9 @@ use std::time::Duration;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInterfaceDetailW,
+    SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceInterfacePropertyW,
 };
+use windows_sys::Win32::Devices::Properties::{DEVPROPKEY, DEVPROPTYPE};
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData, HidD_GetAttributes,
     HidD_GetHidGuid, HidD_GetPreparsedData, HidD_GetProductString, HidD_GetSerialNumberString,
@@ -102,7 +103,64 @@ unsafe fn hid_string(handle: HANDLE, serial: bool) -> Option<String> {
 }
 
 /// Visits every present HID interface, calling `visit` with its path and a read-only query handle.
-unsafe fn for_each_hid(mut visit: impl FnMut(&[u16], HANDLE)) -> Result<()> {
+/// The HID usage page and usage of one device interface, from the PnP tree.
+///
+/// **THE POINT IS THAT THIS NEEDS NO HANDLE.** `HidP_GetCaps` answers the same question and wants
+/// an open device, and opening a debug probe's interface can make it re-enumerate -- which asserts
+/// NRST and resets the board wired to it. Windows already recorded these two numbers when the
+/// device arrived, so a listing can tell a CMSIS-DAP interface from a keyboard's media-key
+/// collection without touching either.
+///
+/// `DEVPKEY_DeviceInterface_HID_UsagePage` and `..._UsageId`, both `DEVPROP_TYPE_UINT16`.
+unsafe fn interface_usage(
+    info_set: HDEVINFO,
+    iface: *const SP_DEVICE_INTERFACE_DATA,
+) -> (Option<u16>, Option<u16>) {
+    const HID_FMTID: GUID = GUID {
+        data1: 0xCBF3_8310,
+        data2: 0x4A17,
+        data3: 0x4310,
+        data4: [0xA1, 0xEB, 0x24, 0x7F, 0x0B, 0x67, 0x59, 0x3B],
+    };
+    const USAGE_PAGE: DEVPROPKEY = DEVPROPKEY { fmtid: HID_FMTID, pid: 2 };
+    const USAGE_ID: DEVPROPKEY = DEVPROPKEY { fmtid: HID_FMTID, pid: 3 };
+    (
+        interface_u16(info_set, iface, &USAGE_PAGE),
+        interface_u16(info_set, iface, &USAGE_ID),
+    )
+}
+
+/// One `UINT16` device-interface property, or `None` where it is absent.
+unsafe fn interface_u16(
+    info_set: HDEVINFO,
+    iface: *const SP_DEVICE_INTERFACE_DATA,
+    key: *const DEVPROPKEY,
+) -> Option<u16> {
+    let mut ty: DEVPROPTYPE = 0;
+    let mut value: u16 = 0;
+    let mut needed: u32 = 0;
+    let ok = SetupDiGetDeviceInterfacePropertyW(
+        info_set,
+        iface,
+        key,
+        &mut ty,
+        (&raw mut value).cast::<u8>(),
+        std::mem::size_of::<u16>() as u32,
+        &mut needed,
+        0,
+    );
+    (ok != 0).then_some(value)
+}
+
+/// Walks the HID interfaces, opening only those `want` accepts.
+///
+/// `want` is handed the usage page and usage read from the PnP tree, before any handle exists. A
+/// caller that is LISTING passes a filter and never disturbs what it passes over; a caller that is
+/// looking for one specific device accepts everything, because it has to read attributes to find it.
+unsafe fn for_each_hid(
+    want: impl Fn(Option<u16>, Option<u16>) -> bool,
+    mut visit: impl FnMut(&[u16], HANDLE),
+) -> Result<()> {
     let guid = hid_guid();
     let info_set = SetupDiGetClassDevsW(
         &guid,
@@ -124,6 +182,10 @@ unsafe fn for_each_hid(mut visit: impl FnMut(&[u16], HANDLE)) -> Result<()> {
         let Some(path) = device_path(info_set, &iface) else {
             continue;
         };
+        let (usage_page, usage) = interface_usage(info_set, &iface);
+        if !want(usage_page, usage) {
+            continue;
+        }
         let handle = CreateFileW(
             path.as_ptr(),
             0,
@@ -187,7 +249,7 @@ fn path_string(path: &[u16]) -> String {
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     let mut out = Vec::new();
     unsafe {
-        for_each_hid(|path, handle| {
+        for_each_hid(|page, _| page.is_none_or(|page| page >= 0xFF00), |path, handle| {
             if let Some(attrs) = attributes(handle) {
                 let caps = hid_caps(handle);
                 out.push(DeviceInfo {
@@ -218,15 +280,14 @@ impl Device {
     pub fn open(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
         let mut chosen: Option<Vec<u16>> = None;
         unsafe {
-            for_each_hid(|path, handle| {
+            for_each_hid(|_, _| true, |path, handle| {
                 if chosen.is_some() {
                     return;
                 }
                 let matches = attributes(handle).is_some_and(|a| {
                     a.VendorID == vendor_id
                         && a.ProductID == product_id
-                        && serial
-                            .is_none_or(|want| hid_string(handle, true).as_deref() == Some(want))
+                        && crate::candidate_satisfies(serial, hid_string(handle, true).as_deref())
                 });
                 if matches {
                     chosen = Some(path.to_vec());

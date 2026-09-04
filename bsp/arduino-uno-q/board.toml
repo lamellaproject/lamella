@@ -51,7 +51,7 @@ board = "arduino-uno-q"
 vendor = "arduino"
 family = "stm32u585"
 part = "stm32u585ai"
-board_model = 36            # lamella_wire::board_model::ARDUINO_UNO_Q
+product_model = 36          # lamella_wire::product_model::ARDUINO_UNO_Q
 sources = [
     "Arduino UNO Q user manual (SKU ABX00162-ABX00173, modified 06/08/2026), description and section 6: UNO Q combines the Qualcomm Dragonwing QRB2210 microprocessor, a quad-core Arm Cortex-A53 running Debian Linux, with the STMicroelectronics STM32U585 microcontroller, an Arm Cortex-M33 running Arduino Core on Zephyr OS; section 6.2 gives the microcontroller a 3.3 V I/O domain and the LED matrix, and section 7 states that the two processors communicate through Arduino Bridge, an RPC layer that accommodates multiple physical transports (USB CDC, UART, or SPI)",
     "Arduino UNO Q user manual (SKU ABX00162-ABX00173): the RGB LED section gives RGB LED 3 (D27401) as LED3_R PH10, LED3_G PH11, LED3_B PH12 and RGB LED 4 (D27402) as LED4_R PH13, LED4_G PH14, LED4_B PH15, and states that the RGB LEDs are active-low, meaning they turn on when driven to logic 0",

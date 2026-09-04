@@ -45,8 +45,11 @@ find out whether a program compiles and does what you meant.
 `lamella devices` prints the word to pass. A cycle is about a second, and the board keeps its
 firmware.
 
---board <id> answers whether the program would FIT that board. It does not write anything; that
-is `deploy`.";
+--board <id> runs it HERE, against that board's generated `board` module -- that model's pins and
+peripherals, on this machine, with no hardware attached and nothing written to any board.
+
+Two questions this verb does not answer: whether a program FITS a board is `build --board <id>`,
+and putting it on one is `deploy`.";
 
 /// `lamella run <file> [--board <id>]`: compile and run on this machine.
 pub fn run_command(args: &[String]) -> ExitCode {
@@ -59,7 +62,7 @@ pub fn run_command(args: &[String]) -> ExitCode {
     let path = match parsed.only_positional("run", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
         Err(error) => {
-            eprintln!("{error}\n\nusage: lamella run <file.cs|file.py> [--board <id>]");
+            eprintln!("{error}\n\n{}", RUN_USAGE.lines().next().unwrap_or_default());
             return ExitCode::FAILURE;
         }
     };
@@ -692,6 +695,26 @@ mod tests {
             "`build` must open with the line a reader retypes: {}",
             USAGE.lines().next().unwrap_or_default()
         );
+    }
+
+    /// `run` has three modes and each serves a different language set, so the usage has to state
+    /// them and must not describe a question another verb answers.
+    #[test]
+    fn the_run_usage_states_each_modes_language_and_does_not_claim_to_answer_fit() {
+        assert!(
+            !RUN_USAGE.contains("would FIT"),
+            "`run --board` does not answer fit -- `build --board` does:\n{RUN_USAGE}"
+        );
+        for (flag, language) in [("--target <t>", "C#"), ("--board <id>", "Python")] {
+            let paragraph = RUN_USAGE
+                .split("\n\n")
+                .find(|block| block.starts_with(flag))
+                .unwrap_or_else(|| panic!("no paragraph opens with `{flag}`:\n{RUN_USAGE}"));
+            assert!(
+                paragraph.contains(language),
+                "`{flag}` serves {language} only today and the usage does not say so:\n{paragraph}"
+            );
+        }
     }
 
 }

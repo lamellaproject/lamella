@@ -30,7 +30,7 @@ notes = [
 # map is withheld by the vendor, so `primary` here describes the identity and the address and stops
 # where the document stops.
 #
-# `none`: a device acknowledged 0x29 on an I2C walk of this bench, which says something answered
+# `none`: a device acknowledged 0x29 on an I2C walk, which says something answered
 # that address rather than which part did. Nothing has read the identity registers.
 
 [sourcing]
@@ -69,7 +69,7 @@ notes = "DS13812 Rev 8 identification table: register Model_ID at index 0x010F r
 [address]
 bus = "i2c"
 base = 0x29
-notes = "DS13812 Rev 8: the document states 0x52, which its own protocol section identifies as the first byte of a transfer -- the 7-bit address shifted up with the direction bit appended. 0x52 >> 1 = 0x29, and 0x29 is what a device of this type answered on an I2C walk of this bench. The address is reassignable in software rather than by a strap, so no strap is modelled; a board carrying several of these separates them by assigning addresses at run time, which makes the address a property of the last thing that configured it rather than of the part or the carrier."
+notes = "DS13812 Rev 8: the document states 0x52, which its own protocol section identifies as the first byte of a transfer -- the 7-bit address shifted up with the direction bit appended. 0x52 >> 1 = 0x29, and 0x29 is what a device of this type answered on an I2C walk. The address is reassignable in software rather than by a strap, so no strap is modelled; a board carrying several of these separates them by assigning addresses at run time, which makes the address a property of the last thing that configured it rather than of the part or the carrier."
 
 # --- the bus, and the transfer that is not like the others ------------------------------------------
 

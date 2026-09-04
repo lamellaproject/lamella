@@ -217,3 +217,43 @@ mod tests {
         assert!(TypeSymbol::Error.is_error());
     }
 }
+
+impl TypeSymbol {
+    /// The type's name WITHOUT its namespace, as csc renders it in a handful of messages.
+    ///
+    /// **csc DOES NOT USE ONE RENDERING FOR ALL DIAGNOSTICS, AND THIS IS NOT A STYLE CHOICE WE
+    /// GET TO MAKE.** Measured on the same type in the same file: `CS0029` says
+    /// *'System.Func<int, int>'* and `CS1593` says *'Func<int, int>'*. Both are csc, one compilation
+    /// apart. The messages are search keys, so each one is copied as it is, and this exists for the
+    /// second group rather than as an opinion about which is better.
+    ///
+    /// Structural rather than string surgery: dropping everything before the last `.` would also
+    /// cut into a type ARGUMENT (`Func<System.Guid, int>`), which is a different type's name.
+    #[must_use]
+    pub fn short_name(&self) -> alloc::string::String {
+        use alloc::string::ToString;
+        match self {
+            TypeSymbol::Named(parts) => parts
+                .last()
+                .map_or_else(|| self.to_string(), |name| (**name).to_string()),
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => {
+                let mut out = definition
+                    .last()
+                    .map_or_else(alloc::string::String::new, |name| (**name).to_string());
+                out.push('<');
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&argument.to_string());
+                }
+                out.push('>');
+                out
+            }
+            _ => self.to_string(),
+        }
+    }
+}

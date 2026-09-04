@@ -40,17 +40,16 @@ fn print_boards() {
 
     if let Ok(boards) = lamella_wire_host::UsbTransport::list() {
         for board in boards {
-            let target = match &board.serial_number {
-                Some(serial) => format!("usb:{:04x}:{:04x}:{serial}", board.vendor_id, board.product_id),
-                None => format!("usb:{:04x}:{:04x}", board.vendor_id, board.product_id),
-            };
+            let target = lamella_wire_host::usb_target_of(&board);
+            let note = lamella_wire_host::firmware_era(&board).and_then(lamella_wire_host::era_note);
             items.push(format!(
-                "{{\"carrier\":\"usb\",\"target\":{},\"vid\":{},\"pid\":{},\"serial\":{},\"product\":{}}}",
+                "{{\"carrier\":\"usb\",\"target\":{},\"vid\":{},\"pid\":{},\"serial\":{},\"product\":{},\"note\":{}}}",
                 json_str(&target),
                 board.vendor_id,
                 board.product_id,
                 json_opt(board.serial_number.as_deref()),
                 json_opt(board.product.as_deref()),
+                json_opt(note),
             ));
         }
     }

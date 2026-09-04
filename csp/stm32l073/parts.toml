@@ -1,0 +1,52 @@
+# PARTS table for the STM32L0x3 family, category 5 (STM32L073x). Every row is an ORDERABLE variant.
+#
+# THIS IS A DIFFERENT FAMILY FROM csp/stm32l053 AND THEY SHARE A REFERENCE MANUAL, which is the
+# opposite of how the other splits in this directory arose. RM0367 covers the whole L0x3 line and
+# separates it into category 3 and category 5, and its own table 2 gives them different silicon:
+# GPIOD goes from [2] to full, GPIOE from ABSENT to full, GPIOH from [0:1] to [0:1][9:10], and the
+# NVM from "full-featured, single bank" to full-featured. So a family here is a CATEGORY, not a
+# manual.
+#
+# WHAT ACTUALLY SEPARATES THE TWO FAMILIES IN THIS DIRECTORY IS THE FLASH BLOCK AND THIS ROW.
+# The gpio and exti blocks are per-MANUAL and are the same registers for both categories -- they
+# are twins on purpose, and a twin of a block that varies by nothing is a file somebody can read
+# and confirm. The flash block is not: it carries exactly what varies per family, and folding the
+# two would state 2 Kbytes of single-bank data EEPROM about a part that has 6 in two banks.
+#
+# THE LQFP64 BONDS NO PORT E PAD AT ALL, and that is worth saying outright because the family split
+# turns on GPIOE existing. Figure 5 of the datasheet gives all 64 pins, and the GPIO pads among them
+# are PA0-PA15, PB0-PB15, PC0-PC15, PD2 and PH0-PH1 -- 51 pads, the same EXTENT as the category 3
+# part in the same package. So the die difference this family exists for is invisible on this
+# package, and a reader comparing present-lists would conclude the two parts are the same. They are
+# not: GPIOE is on the die and reachable on the 100-pin packages, which is why the instance map
+# names it and this row does not.
+
+[table]
+kind = "parts"
+family = "stm32l073"
+sources = [
+    "STM32L073x8/xB/xZ datasheet DS10685 Rev 7: figure 5 (STM32L073xx LQFP64 pinout) for the pad set; the feature list for up to 192 Kbytes of Flash program memory, 6 Kbytes of data EEPROM and 20 Kbytes of RAM; and section 8 ordering information, which decodes STM32L073RZT6 as R = 64 pins, Z = 192 Kbytes, T = LQFP, 6 = -40 to 85 C",
+    "DS10685 Rev 7 section 3.4: 'Flash program and data EEPROM are divided into two banks. This allows writing in one' bank while reading the other",
+    "STM32L0x3 reference manual RM0367 Rev 8 table 1 (memory density) and table 2 (overview of features per category): table 1 places STM32L073x at 64, 128 and 192 Kbytes in category 5, and table 2 gives category 5 GPIOD, GPIOE full-featured where category 3 has [2] and nothing",
+    "STM32 Nucleo-64 boards user manual UM1724 Rev 17, whose board table gives NUCLEO-L073RZ its fitted part as STM32L073RZT6",
+]
+notes = [
+    "DENSITY DOES NOT DECIDE THE CATEGORY ON THIS LINE, AND 64 KBYTES IS WHERE IT FAILS. RM0367 table 1 gives 64 Kbytes to BOTH STM32L053x (category 3) and STM32L073x (category 5); only 32 Kbytes is category 3 alone and only 128 and 192 are category 5 alone. A part at 64 Kbytes has to be named, not sized.",
+    "RAM IS 20 KBYTES AND IT IS THE DATASHEET's FIGURE, not a manual's. RM0367 has the same defect its sibling book does -- its sizing sentence is a line-wide ceiling -- so the manual cannot settle a part. The datasheet's feature list states 20 Kbytes for this line directly.",
+    "DATA EEPROM IS 6 KBYTES AND IN TWO BANKS, and it is a SEPARATE non-volatile array from the program flash. It is not part of the flash figure and this schema has no field for it. The two-bank arrangement covers the program flash as well, which is why a program spanning the bank boundary is a case worth having exercised.",
+    "PC14 and PC15 are the low-speed oscillator pins and PH0/PH1 the high-speed ones, so a board fitting either crystal loses those pads as I/O. PA13 and PA14 are SWDIO and SWCLK and come out of reset in alternate function.",
+    "THE 100-PIN PACKAGES ARE WHERE PORT E APPEARS, and this table describes none of them. Table 16's LQFP64 column reads '-' for PE2 while its LQFP100 column reads 1, so the pads exist on the die and the smaller package does not bring them out. A part row for an LQFP100 variant would carry them; this one must not.",
+]
+
+[[parts]]
+part = "stm32l073rzt6"
+package = "64-pin LQFP"
+flash = 0x30000
+ram = 0x5000
+device_id_reg = 0x40015800
+device_id_mask = 0xFFF
+device_id = 0x447
+device_id_identifies = "class"
+identity_source = "Read from a NUCLEO-L073RZ over SWD with the core still running, which answered DBGMCU_IDCODE 0x20006447: the register sits at the peripheral address 0x40015800 on this line -- RM0367 Rev 8 table 3's APB2 page gives DBG that boundary -- with DEV_ID in bits 11:0 and REV_ID in 31:16. IDENTIFIES A CLASS RATHER THAN A PART: 0x447 is ST product category 5, which covers the STM32L073x of this book and the STM32L071x of the sibling one alike, so the register separates a category and not an order code. The category is the fact worth having: it is the one where the NVM is dual bank."
+pins = ["PA0-PA15", "PB0-PB15", "PC0-PC15", "PD2", "PH0-PH1"]
+source = "DS10685 Rev 7 figure 5, the LQFP64 pinout: the 64 pins are VLCD(1), PC13(2), PC14(3), PC15(4), PH0(5), PH1(6), NRST(7), PC0-PC3(8-11), VSSA(12), VDDA(13), PA0-PA3(14-17), VSS(18), VDD(19), PA4-PA7(20-23), PC4(24), PC5(25), PB0-PB2(26-28), PB10(29), PB11(30), VSS(31), VDD(32), PB12-PB15(33-36), PC6-PC9(37-40), PA8-PA13(41-46), VSS(47), VDD_USB(48), PA14(49), PA15(50), PC10-PC12(51-53), PD2(54), PB3-PB7(55-59), BOOT0(60), PB8(61), PB9(62), VSS(63), VDD(64). Flash 192 Kbytes from the Z of the order code and RAM 20 Kbytes from the datasheet feature list. RM0367 table 1 places STM32L073x in category 5. This is the part on the NUCLEO-L073RZ, which UM1724 Rev 17 names as STM32L073RZT6."

@@ -17,9 +17,48 @@ const BAUD: u32 = 115_200;
 /// side, which is slow in a way a timeout should not be racing.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The deploy chunk size, in bytes. The far side acknowledges each chunk, so this trades round
-/// trips against the buffer a device has to hold.
-const CHUNK: usize = 8 * 1024;
+/// The deploy chunk size, in bytes.
+///
+/// # It is bounded by the SMALLEST device receive ring, not by round-trip economics
+///
+/// A serve firmware drains its UART into a fixed ring from an interrupt, and a full ring DROPS.
+/// So a frame larger than that ring can never assemble no matter how patient either side is: the
+/// reader waits for bytes that were discarded while it was being told about them. The principle is
+/// the same one a serve firmware applies when it sizes that ring: once the whole frame FITS, the
+/// reader has unlimited time, because no more bytes are coming.
+///
+const CHUNK: usize = 256;
+
+/// What a refusal reason MEANS, as a sentence somebody can act on.
+///
+/// A refusal is the target answering, not failing, and each reason has a different remedy: one says
+/// stop asking, the other says wait for a colleague to unplug. Rendering the struct printed
+/// `reason: 2, msg_type: 2` for the second, which reads as a protocol fault and sends the reader to
+/// the cable -- the one direction that cannot help.
+fn refusal(reason: u8) -> String {
+    match reason {
+        lamella_wire::error::SESSION_HELD => String::from(
+            concat!(
+                "another carrier already holds the debug session -- typically somebody at the ",
+                "board with a cable, or a host that did not let go. The request was well formed ",
+                "and this target implements it, so the answer changes when the other carrier ",
+                "releases it; a reset clears a session whose host is gone.",
+            ),
+        ),
+        lamella_wire::error::UNKNOWN_MESSAGE_TYPE => String::from(
+            concat!(
+                "this target does not implement that message. Stop asking rather than retrying ",
+                "-- the answer will not change without different firmware.",
+            ),
+        ),
+        other => unnamed_reason(other),
+    }
+}
+
+/// A reason byte this build has no sentence for, named rather than swallowed.
+fn unnamed_reason(reason: u8) -> String {
+    format!("refusal reason {reason}, which this build has no description for")
+}
 
 pub fn deploy_command(args: &[String]) -> ExitCode {
     let spec = Spec {
@@ -193,6 +232,17 @@ fn send_image(image: &[u8], target: &str, no_run: bool) -> ExitCode {
         }
     };
     if let Err(error) = hello_blocking(&mut transport, 0, host_caps(), TIMEOUT) {
+        if let lamella_wire::TransportError::Refused { reason, .. } = error {
+            eprintln!("lamella deploy: {target} refused the connection: {}", refusal(reason));
+            return ExitCode::FAILURE;
+        }
+        if let lamella_wire::TransportError::VersionMismatch { target_min, target_max } = error {
+            eprintln!(
+                "lamella deploy: cannot talk to {target}: {}",
+                lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
+            );
+            return ExitCode::FAILURE;
+        }
         eprintln!("lamella deploy: {target} did not answer a HELLO ({error:?}).");
         eprintln!("{}", no_answer());
         return ExitCode::FAILURE;

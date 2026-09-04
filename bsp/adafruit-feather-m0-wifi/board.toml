@@ -21,7 +21,7 @@ board = "feather-m0-wifi"
 vendor = "adafruit"
 family = "samd21"
 part = "atsamd21g18a"
-board_model = 17            # lamella_wire::board_model::FEATHER_M0_WIFI
+product_model = 17          # lamella_wire::product_model::FEATHER_M0_WIFI
 sources = [
     "Adafruit Feather M0 WiFi with ATWINC1500 guide (product 3010): 'WiFi.setPins(8,7,4,2)' is required with every WiFi101 sketch; '#13 - GPIO #13 and is connected to the red LED next to the USB jack'; 'MOSI / MISO / SCK - the SPI pins are also used for WiFi module communication'",
     "arduino-libraries/WiFi101 src/WiFi101.h: the signature is setPins(cs, irq, rst, en), which is what fixes 8/7/4/2 to CS/IRQ/RST/EN rather than any other order",

@@ -13,6 +13,8 @@ pub mod srcmap;
 pub mod compile;
 #[cfg(feature = "dap")]
 pub mod dap;
+#[cfg(feature = "probe")]
+pub mod probe;
 #[cfg(feature = "py")]
 pub mod py;
 #[cfg(feature = "repl")]

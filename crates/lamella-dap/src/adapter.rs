@@ -240,7 +240,16 @@ impl Debugger {
             #[cfg(feature = "interpreter")]
             "evaluate" => (
                 true,
-                Some(crate::repl_eval::evaluate(&mut self.repl, arg_str(request, "expression"))),
+                Some(crate::repl_eval::evaluate(
+                    &mut self.repl,
+                    arg_str(request, "expression"),
+                    request
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("frameId"))
+                        .is_some(),
+                    arg_str(request, "context"),
+                )),
             ),
             "disconnect" => (true, None),
             _ => (false, None),
@@ -389,11 +398,11 @@ impl Debugger {
         let mut stop = match action {
             Action::Resume => self.backend.resume(),
             Action::StepIn | Action::StepOver | Action::StepOut if self.backend.has_source() => {
-                self.source_step(action)
+                self.source_step(action, events)
             }
             Action::StepIn => self.backend.step(),
-            Action::StepOver => self.step_to_depth(|depth, start| depth <= start),
-            Action::StepOut => self.step_to_depth(|depth, start| depth < start),
+            Action::StepOver => self.step_to_depth(|depth, start| depth <= start, events),
+            Action::StepOut => self.step_to_depth(|depth, start| depth < start, events),
         };
         while matches!(stop, Stop::Breakpoint) {
             match self.breakpoint_action() {
@@ -471,8 +480,16 @@ impl Debugger {
     /// Single-steps until `reached(current_depth, start_depth)` -- `next` stops once
     /// back at or above the start depth (a stepped-over call has returned), `stepOut`
     /// once below it (the current method has returned).
-    fn step_to_depth(&mut self, reached: impl Fn(usize, usize) -> bool) -> Stop {
+    ///
+    /// Bounded by [`DebugBackend::step_budget`], because a callee that does not return leaves the
+    /// depth condition permanently unmet.
+    fn step_to_depth(
+        &mut self,
+        reached: impl Fn(usize, usize) -> bool,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) -> Stop {
         let start = self.backend.depth();
+        let mut budget = self.backend.step_budget().max(1);
         loop {
             match self.backend.step() {
                 Stop::Done => break Stop::Done,
@@ -480,9 +497,45 @@ impl Debugger {
                 Stop::Running => break Stop::Running,
                 Stop::Breakpoint => break Stop::Breakpoint,
                 _ if reached(self.backend.depth(), start) => break Stop::Step,
-                _ => {}
+                _ => {
+                    budget -= 1;
+                    if budget == 0 {
+                        break self.give_up_stepping(
+                            "the call being stepped over has not returned",
+                            events,
+                        );
+                    }
+                }
             }
         }
+    }
+
+    /// Ends a step that ran out of budget: says so on the console and parks the target where it
+    /// is, rather than stepping on or reporting a fault.
+    ///
+    /// Stopping is the honest outcome and a fault is not -- nothing has gone wrong with the
+    /// target or the connection, the step simply had no reachable end. The message says which
+    /// condition was being waited on, because the two have different remedies.
+    fn give_up_stepping(
+        &mut self,
+        waiting_for: &str,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) -> Stop {
+        let budget = self.backend.step_budget();
+        self.flush_output(events);
+        events.push((
+            "output",
+            Some(json!({
+                "category": "console",
+                "output": format!(
+                    "[lamella] Step gave up after {budget} instructions: {waiting_for}. \
+                     Execution is most likely in code with no line information -- a runtime \
+                     helper, or past the end of the program. Stopped where it is; use Continue, \
+                     or set a breakpoint where you want to land.\n"
+                ),
+            })),
+        ));
+        Stop::Step
     }
 
     /// Single-steps to the next source statement (sequence point) at the call depth the
@@ -490,13 +543,23 @@ impl Debugger {
     /// call), `next` at the next boundary in this frame or a caller (running a called
     /// method to completion), `stepOut` at the next boundary after the current method
     /// returns. Used when the backend has source info; otherwise stepping is per-CIL-op.
-    fn source_step(&mut self, action: Action) -> Stop {
+    ///
+    /// Bounded by [`DebugBackend::step_budget`]. `has_source` is a property of the whole image
+    /// and `at_source_boundary` a property of one pc, so a step that leaves the covered region
+    /// satisfies the first and never the second -- the loop condition can be unreachable while
+    /// the target is perfectly healthy.
+    fn source_step(
+        &mut self,
+        action: Action,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) -> Stop {
         if matches!(action, Action::StepOut) {
             if let Some(stop) = self.backend.step_out() {
                 return stop;
             }
         }
         let start = self.backend.depth();
+        let mut budget = self.backend.step_budget().max(1);
         loop {
             match self.backend.step() {
                 Stop::Done => break Stop::Done,
@@ -519,6 +582,11 @@ impl Debugger {
                     };
                     if reached && self.backend.at_source_boundary() {
                         break Stop::Step;
+                    }
+                    budget -= 1;
+                    if budget == 0 {
+                        break self
+                            .give_up_stepping("no source statement was reached", events);
                     }
                 }
             }
@@ -1134,6 +1202,126 @@ mod tests {
         fn take_output(&mut self) -> Option<String> {
             None
         }
+    }
+
+    /// A backend whose step command has no reachable end: it either claims line information for
+    /// the image and never parks on a statement (`source`), or descends a frame per step so a
+    /// depth condition is never met. Both are the shape of a target stepped into a region the
+    /// line table does not cover -- a runtime helper, or code past the end of the program.
+    ///
+    /// It asserts rather than stepping forever, so an adapter that does not bound its step loop
+    /// FAILS this test instead of hanging it, which is the only way a runaway loop can be
+    /// red-proved without a timeout.
+    struct NoEndBackend {
+        budget: usize,
+        steps: usize,
+        source: bool,
+    }
+
+    impl DebugBackend for NoEndBackend {
+        fn launch(&mut self) -> bool {
+            true
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            self.steps += 1;
+            assert!(
+                self.steps <= self.budget,
+                "the adapter stepped {} times against a step_budget of {}: the step loop is \
+                 unbounded, and against a real target it would step until someone killed \
+                 the session",
+                self.steps,
+                self.budget
+            );
+            Stop::Step
+        }
+        fn step_budget(&self) -> usize {
+            self.budget
+        }
+        fn has_source(&self) -> bool {
+            self.source
+        }
+        fn at_source_boundary(&self) -> bool {
+            false
+        }
+        fn depth(&self) -> usize {
+            if self.source { 1 } else { 1 + self.steps }
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn stack(&self) -> Vec<Frame> {
+            Vec::new()
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// Every `output` event's text in one string.
+    fn console_text(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Event(event) if event.event == "output" => event
+                    .body
+                    .as_ref()
+                    .and_then(|body| body["output"].as_str())
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn no_end_debugger(source: bool) -> Debugger {
+        let mut dbg = Debugger::with_backend(Box::new(NoEndBackend {
+            budget: 8,
+            steps: 0,
+            source,
+        }));
+        dbg.handle(&request(1, "launch", None));
+        dbg
+    }
+
+    #[test]
+    fn a_source_step_that_never_reaches_a_statement_stops_instead_of_stepping_forever() {
+        let mut dbg = no_end_debugger(true);
+        let out = dbg.handle(&request(2, "stepIn", None));
+        assert!(has_event(&out, "stopped"), "the session must come back");
+        assert!(
+            !has_event(&out, "terminated"),
+            "the target is healthy, not done"
+        );
+        let console = console_text(&out);
+        assert!(
+            console.contains("gave up after 8 instructions")
+                && console.contains("no source statement was reached"),
+            "the give-up must say what it was waiting for, not stop silently: {console:?}"
+        );
+    }
+
+    #[test]
+    fn a_depth_step_whose_call_never_returns_stops_instead_of_stepping_forever() {
+        let mut dbg = no_end_debugger(false);
+        let out = dbg.handle(&request(2, "next", None));
+        assert!(has_event(&out, "stopped"), "the session must come back");
+        let console = console_text(&out);
+        assert!(
+            console.contains("has not returned"),
+            "the two give-ups have different remedies and must not share one message: {console:?}"
+        );
     }
 
     fn loop_debugger(total_hits: u32) -> Debugger {

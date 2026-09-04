@@ -169,6 +169,16 @@ pub struct CallInfo {
     /// The result's [`MirType`] when `has_result` (so a value-type return types correctly);
     /// `None` falls back to `int32`.
     pub result_type: Option<MirType>,
+    /// Whether the callee takes a receiver -- already counted in [`Self::args`], and needed on its
+    /// own to answer ONE question the count cannot: whether a pending `ldloca` address is the
+    /// RECEIVER or an ordinary `ref`/`out` ARGUMENT.
+    ///
+    /// **THE TWO GO IN DIFFERENT PLACES AND THE DIFFERENCE IS SILENT.** A receiver is prepended at
+    /// argument 0; an argument belongs at the evaluation-stack depth it was recorded at. Assuming
+    /// the first for a STATIC callee reorders the operands of every `Foo(x, out s)` -- the byref
+    /// arrives where `x` was expected -- and nothing refuses, because both are one word wide and
+    /// the arity still matches.
+    pub has_this: bool,
     /// The resolved target.
     pub target: CallTarget,
 }
@@ -3238,7 +3248,20 @@ fn apply_value_op(
                 stack.push(result);
                 return Ok(());
             }
-            let pending = last_local_addr.take();
+            let mut pending = last_local_addr.take();
+            if constrained.is_none() && !info.has_this {
+                if let Some(argument) = pending.take() {
+                    materialize_pending(
+                        argument,
+                        stack,
+                        locals,
+                        local_types,
+                        args,
+                        value_types,
+                        insts,
+                    )?;
+                }
+            }
             let off_stack = pending.is_some() || constrained.is_some();
             let explicit = info.args.saturating_sub(off_stack as usize);
             let mut call_args = Vec::with_capacity(info.args);
@@ -3247,6 +3270,17 @@ fn apply_value_op(
             }
             call_args.reverse();
             let this = match (&constrained, direct) {
+                (Some(token), false) if resolver.box_is_noop(token) => match pending {
+                    Some(PendingAddr { source, offset: 0, .. }) => Some(addr_base(
+                        source,
+                        locals,
+                        local_types,
+                        args,
+                        value_types,
+                        insts,
+                    )?),
+                    _ => stack.pop(),
+                },
                 (Some(token), false) => Some(box_constrained_receiver(
                     token,
                     resolver,
@@ -8004,6 +8038,7 @@ mod tests {
                     args: 2,
                     has_result: true,
                     result_type: None,
+                    has_this: false,
                     target: CallTarget::Internal(7),
                 })
             }
@@ -8077,6 +8112,7 @@ mod tests {
                     args: 3,
                     has_result: false,
                     result_type: None,
+                    has_this: true,
                     target: CallTarget::Internal(1),
                 })
             }
@@ -8158,6 +8194,7 @@ mod tests {
                     args: 0,
                     has_result: true,
                     result_type: Some(MirType::I32),
+                    has_this: false,
                     target: CallTarget::External("MathLib.Answer.0".into()),
                 })
             }
@@ -8191,6 +8228,7 @@ mod tests {
                     args: 3,
                     has_result: false,
                     result_type: None,
+                    has_this: true,
                     target: CallTarget::Internal(1),
                 })
             }
@@ -8241,6 +8279,7 @@ mod tests {
                     args: 1,
                     has_result: false,
                     result_type: None,
+                    has_this: false,
                     target: CallTarget::Intrinsic(Intrinsic::DebugWriteLine),
                 })
             }
@@ -8278,6 +8317,7 @@ mod tests {
                     args: 1,
                     has_result: false,
                     result_type: None,
+                    has_this: false,
                     target: CallTarget::Intrinsic(Intrinsic::ConsoleWriteLineInt),
                 })
             }
@@ -8578,6 +8618,7 @@ mod tests {
                     args: 1,
                     has_result: false,
                     result_type: None,
+                    has_this: false,
                     target: CallTarget::Internal(7),
                 })
             }
@@ -8827,11 +8868,11 @@ mod tests {
 
     /// A rectangular array's `Address` PSEUDO-METHOD yields the element's address.
     ///
-    /// A multidimensional array type declares four pseudo-methods -- `.ctor`, `Get`, `Set`,
-    /// `Address` -- and only the first three were lowered; the resolver's own comment said so. The
-    /// fourth is not optional surface: `fixed (int* p = m)` over a rectangular array pins it and
-    /// points at element `[0, ..]` THROUGH `Address`, because the 1-D `ldelema` cannot express a
-    /// rank-N index. So a `fixed` statement over `int[,]` refused to build at all.
+    /// A multidimensional array type declares four pseudo-methods -- `.ctor`, `Get`, `Set` and
+    /// `Address` -- and the fourth is not optional surface: `fixed (int* p = m)` over a
+    /// rectangular array pins it and points at element `[0, ..]` THROUGH `Address`, because the
+    /// 1-D `ldelema` cannot express a rank-N index. Without it a `fixed` statement over `int[,]`
+    /// does not build at all.
     ///
     /// The address is bounds-checked like the load and store beside it -- on every backend it is the
     /// same element-address computation, kept as a value rather than read through.
@@ -9663,6 +9704,7 @@ mod tests {
                 args: 0,
                 has_result: false,
                 result_type: None,
+                has_this: false,
                 target: CallTarget::Internal(callee),
             })
         }
@@ -10097,6 +10139,7 @@ mod tests {
                     args: 2,
                     has_result: true,
                     result_type: Some(MirType::I32),
+                    has_this: false,
                     target: CallTarget::Intrinsic(Intrinsic::StringEquals),
                 })
             }
@@ -10434,6 +10477,7 @@ mod tests {
                     args: 1,
                     has_result: true,
                     result_type: Some(MirType::I32),
+                    has_this: false,
                     target: CallTarget::Internal(9),
                 })
             }
@@ -11644,6 +11688,7 @@ mod tests {
                     args: 1,
                     has_result: true,
                     result_type: Some(MirType::ObjectRef),
+                    has_this: true,
                     target: CallTarget::Internal(3),
                 })
             }
@@ -11706,6 +11751,7 @@ mod tests {
                     args: 1,
                     has_result: true,
                     result_type: Some(MirType::ObjectRef),
+                    has_this: true,
                     target: CallTarget::Internal(3),
                 })
             }
@@ -11714,6 +11760,7 @@ mod tests {
                     args: 1,
                     has_result: true,
                     result_type: Some(MirType::ObjectRef),
+                    has_this: true,
                     target: CallTarget::Internal(11),
                 })
             }
@@ -11806,6 +11853,7 @@ mod tests {
                 args: self.args,
                 has_result: true,
                 result_type: Some(MirType::ObjectRef),
+                has_this: true,
                 target: CallTarget::Internal(9),
             })
         }

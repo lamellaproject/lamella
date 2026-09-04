@@ -20,13 +20,19 @@ lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
 # The per-part flash controllers these backends sequence.
 lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", features = ["microbit"] }
 lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350" }
+lamella-cmsis-dap-rp2040 = { path = "../lamella-cmsis-dap-rp2040" }
 lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32" }
+lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam" }
 # The UF2 container: emitting one, and recognizing one that is already wrapped.
 lamella-flash-format = { path = "../lamella-flash-format" }
 # Flattening a linked ELF by physical address -- the `objcopy -O binary` computation, in-tree.
 lamella-elf = { path = "../lamella-elf" }
 # Board resolution, so a board id means the same thing here as in every verdict verb.
 lamella-catalog = { path = "../lamella-catalog" }
+# The Lamella Link protocol version, for `contracts` to REPORT rather than restate. Nothing here
+# speaks the wire; this crate depends on it so that the number a build states about itself comes
+# from the crate that defines it, and both front ends already link it, so it costs no code.
+lamella-wire = { path = "../lamella-wire" }
 # The digest that identifies a linked image in its sidecar record, and the JSON that record is
 # written in. `sha256` is public in `lamella-pe` for exactly this consumer -- one hash in the tree
 # rather than two, because two implementations of a digest disagreeing is silent and total.

@@ -1,0 +1,34 @@
+# BLOCK: the STM32L4 embedded flash controller, stated only as far as the facts consumers outside
+# the controller need. Its unlock sequence, its page geometry and its command bits are not described
+# here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 64-BIT DOUBLE WORD AND IT IS NOT A CHOICE. Unlike the F4 and F7 controllers,
+# which let software pick a parallelism, this one programs 72 bits at a time -- 64 bits of data and
+# 8 of ECC -- and RM0351 is flat about it: only a double word can be programmed, and a program at an
+# address that is not double-word aligned is refused. So a consumer cannot get a narrower unit here
+# by asking for one; software that wants to write a single 32-bit word completes the double word
+# with the erase value and programs both halves together.
+#
+# THAT ECC IS ALSO WHY A UNIT SHOULD BE TREATED AS WRITE-ONCE BETWEEN ERASES. The code is computed
+# over the double word being programmed, so a second program of the same double word recomputes it
+# over content the first program already changed. RM0351 does not offer the F4's `successive writes
+# that only clear bits` escape, and a placement rule that relies on one is not portable to this part.
+
+[table]
+kind = "block"
+family = "stm32l476"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 8
+sources = [
+    "erased_value: STM32L47x/48x/49x/L4Ax reference manual RM0351 Rev 11 section 3.3.7 `Flash main memory programming sequences`: `If the user needs to program only one word, double word must be completed with the erase value 0xFFFF FFFF to launch automatically the programming` -- the manual naming 0xFFFFFFFF as the erase value",
+    "write_unit: RM0351 Rev 11 section 3.3.7: `The Flash memory is programmed 72 bits at a time (64 bits + 8 bits ECC)` and `It is only possible to program double word (2 x 32-bit data)`",
+    "write_unit: RM0351 Rev 11 section 3.3.7: `Any attempt to write a double word which is not aligned with a double word address will [set an error flag]` -- so the unit carries an alignment requirement and is not merely a preferred size",
+]
+notes = [
+    "RM0351 also offers FAST PROGRAMMING, which writes a ROW of 32 double words in one high-voltage cycle. That is a throughput mode with conditions -- the bank must have been mass-erased and HCLK must be at least 8 MHz -- so it is not the granularity a placement rule can rely on, in the same way the STM32L0's half-page is not.",
+    "The 1 Kbyte of OTP on this part is 128 double words and is written once: RM0351 warns that if only one bit of a double word is at 0, the entire double word cannot be written again. Nothing here states a value for that area.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

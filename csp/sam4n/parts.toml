@@ -16,6 +16,7 @@ notes = [
 [[parts]]
 part = "atsam4n16c"
 package = "QFP100"
+identity_source = "CHIPID CIDR reads 0x29560ce0 with EXID 0x00000000 on a part of this row, read over a CMSIS-DAP probe. Corroborated by the flash controller rather than by the order code: its descriptor reports a 1024-Kbyte plane of 512-byte pages, which is the 0x100000 this row states, and reports ONE plane where the sibling SAM4S family has two."
 flash = 0x100000
 ram = 0x14000
 pins = ["PA30", "PB14"]

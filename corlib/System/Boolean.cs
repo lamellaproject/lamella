@@ -18,13 +18,18 @@ namespace System
             return true;
         }
 
+        private static bool IsBooleanPad(char c)
+        {
+            return Char.IsWhiteSpace(c) || c == (char)0x00;
+        }
+
         public static bool Parse(string value)
         {
             if ((object)value == null) throw new ArgumentNullException("value");
             int start = 0;
             int end = value.Length - 1;
-            while (start <= end && Char.IsWhiteSpace(value[start])) start++;
-            while (end >= start && Char.IsWhiteSpace(value[end])) end--;
+            while (start <= end && IsBooleanPad(value[start])) start++;
+            while (end >= start && IsBooleanPad(value[end])) end--;
             int len = end - start + 1;
             if (len == 4 && MatchesIgnoreCase(value, start, TrueString)) return true;
             if (len == 5 && MatchesIgnoreCase(value, start, FalseString)) return false;
@@ -38,8 +43,8 @@ namespace System
             if ((object)value == null) return false;
             int start = 0;
             int end = value.Length - 1;
-            while (start <= end && Char.IsWhiteSpace(value[start])) start++;
-            while (end >= start && Char.IsWhiteSpace(value[end])) end--;
+            while (start <= end && IsBooleanPad(value[start])) start++;
+            while (end >= start && IsBooleanPad(value[end])) end--;
             int len = end - start + 1;
             if (len == 4 && MatchesIgnoreCase(value, start, TrueString)) { result = true; return true; }
             if (len == 5 && MatchesIgnoreCase(value, start, FalseString)) { result = false; return true; }

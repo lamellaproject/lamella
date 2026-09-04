@@ -1,0 +1,169 @@
+# EXTENSION binding: the I/O1 Xplained Pro, a general-purpose extension board. Every line names a
+# SIGNAL of the ../standards/xplained-pro.toml standard and never a host pad; which pad a signal
+# reaches is the HOST's fact and lives in that host's `[[headers]]` row.
+#
+# THIS BOARD USES EVERY SIGNAL THE STANDARD DEFINES, which is what its own guide claims -- it
+# "utilizes all functions on the standard Xplained Pro extension header" -- and the rows below bear
+# out: a light sensor on the ADC pair's positive line, a low-pass filter bridging a PWM pin to the
+# ADC pair's negative line, an LED on the other PWM pin, both general-purpose lines on a header, a
+# temperature sensor with EEPROM on I2C with its alarm on the interrupt line, a UART loopback, and a
+# microSD card on the SPI bus with its detect on the second slave select.
+#
+# SO IT EXERCISES SIX KINDS OF HOST DRIVER AT ONCE -- ADC, PWM, GPIO, I2C, UART and SPI -- which is
+# what makes it worth more than any single-purpose extension and also what makes it cost more.
+#
+# TWO POLARITIES COME OUT THE OPPOSITE OF THE OBVIOUS WAY AND BOTH ARE STATED RATHER THAN INFERRED.
+# The LED lights when its line is driven to GROUND, so it is ACTIVE LOW on a pin the standard calls
+# PWM(+). And the card-detect line is shorted to ground BY THE PRESENCE OF A CARD, so it reads LOW
+# when a card is in and needs a pull-up on the host to read anything at all when one is not.
+#
+# THE LOW-PASS FILTER IS THE ONE FEATURE THAT IS NOT A CHIP. Two of the twenty pins are wired to
+# each other through a resistor and a capacitor, so a host can drive a PWM signal out and sample the
+# smoothed result back on its own ADC without anything else attached. It is a self-test for two
+# drivers at once, and no `[[devices]]` row can express it -- it has no device.
+
+[table]
+kind = "extension"
+extension = "atio1-xpro"
+vendor = "microchip"
+standard = "xplained-pro"
+kit_identifier = 1775
+sources = [
+    "Atmel I/O1 Xplained Pro user guide Atmel-42078B, Table 4-2 (I/O1 Xplained Pro Extension Header): pin 1 ID, 2 GND, 3 LIGHTSENSOR light sensor output (ADC), 4 LP_OUT low pass filter output (ADC), 5 GPIO1, 6 GPIO2, 7 LED LED control (PWM), 8 LP_IN low pass filter input (PWM), 9 TEMP_ALERT the ALERT pin of the temperature sensor chip (IRQ), 10 microSD_DETECT the detect pin on the microSD card connector (GPIO), 11 TWI SDA, 12 TWI SCL, 13 UART RX, 14 UART TX, 15 microSD_SS chip select connected to the DAT3 pin, 16 SPI_MOSI connected to CMD, 17 SPI_MISO connected to D0, 18 SPI_SCK connected to CLK, 19 GND, 20 VCC.",
+    "Atmel-42078B section 4.3.1, Table 4-6 (LED Connection): one yellow LED on EXT pin 7, controllable by PWM or regular GPIO operation, and 'The LED can be activated by driving the connected I/O line to GND'.",
+    "Atmel-42078B section 4.3.2, Table 4-7 (Low Pass Filter Connections): a first order low-pass filter with a cutoff frequency of approximately 2340 Hz, realized with a 680 ohm resistor and a 100 nF capacitor, its input on EXT pin 8 (silk PWM) and its output on EXT pin 4 (silk ADC).",
+    "Atmel-42078B section 4.3.3, Table 4-8 (Temperature Sensor Connections): an AT30TSE758 temperature sensor with an 8 kbit serial EEPROM inside, SDA on EXT pin 11 to sensor pin 1, SCL on EXT pin 12 to sensor pin 2, ALERT on EXT pin 9 to sensor pin 3, and address lines A2/A1/A0 on sensor pins 5/6/7 reaching no EXT pin. The sensor has two addresses, 0b1001 A2 A1 A0 for the temperature sensor and 0b1010 A2 A1 A0 for the EEPROM; A2, A1 and A0 are pulled high through 100 kilohm resistors by default, making the defaults 0b1001111 and 0b1010111, and soldering a strap on the back of the board for An makes that bit zero.",
+    "Atmel-42078B section 4.3.4, Table 4-9 (microSD Connector Connections): D3 on EXT pin 15 is the active low chip select, pulled high through a 100 kilohm pullup; CMD on EXT pin 16 is SPI_MOSI; CLK on EXT pin 18 is SPI_SCK; D0 on EXT pin 17 is SPI_MISO; SW_A on EXT pin 10 and SW_B at ground are short-circuited when a card is put into the connector, and to use this as a card indicator the internal pullup in the target device must be enabled.",
+    "Atmel-42078B section 4.3.5, Table 4-10 (Light Sensor Connections): a TEMT6000 light sensor from Vishay whose signal is on EXT pin 3 and whose data can be read by an ADC pin on the host.",
+    "Atmel-42078B sections 4.2.3 and 4.2.4, Tables 4-4 and 4-5: a 2-pin GPIO header carrying EXT pins 5 and 6 through 39 ohm series resistors, and a 2-pin UART header carrying EXT pin 14 (TX) and EXT pin 13 (RX) through 39 ohm series resistors, WITH A JUMPER MOUNTED to enable the UART to work in loopback mode.",
+    "Atmel-42078B section 5.1: the product identifier for I/O1 Xplained Pro is A09-1775, which is the nnnn field of the nnnnrrssssssssss serial the board's identification chip carries.",
+]
+notes = [
+    "THE UART SHIPS SHORTED. Its two lines reach a 2-pin header whose jumper is MOUNTED from the factory, which ties transmit to receive -- so a host that opens this UART and writes reads its own bytes back, and that is the feature rather than a fault. Removing the jumper is what makes the two lines independent, and a program that assumed a peer would find one that echoes perfectly.",
+    "THE TEMPERATURE SENSOR'S ADDRESS IS A BOARD FACT AND IT IS SOLDER-SELECTABLE. The three address lines reach no header pin, so a host cannot change them; they are pulled high by default and a strap on the back of the board pulls one low. The two addresses below are the DEFAULT unit's. A board whose straps have been cut is not what this file describes, and the straps would have to be read off the unit.",
+    "THE TEMPERATURE SENSOR ABANDONS A TRANSFER WHOSE CLOCK IS HELD TOO LONG, AND IT IS NOT A FAULT BUT A FEATURE IT ADVERTISES. Atmel-8751F section 11.2: it supports the SMBus timeout, resetting its serial interface and releasing the bus -- letting SDA float high -- when SCL stays low longer than tTIMEOUT, specified at 25 ms minimum and 75 ms maximum. A host that pauses mid-transaction therefore does not resume where it left off; it reads 0xFF from a bus nothing is driving. THE TEMPERATURE REGISTER MAKES THAT DETECTABLE, because its low four bits are always zero at every resolution, so a lower byte with any low nibble set cannot be data.",
+    "ONE CHIP ANSWERS AT TWO ADDRESSES, and they are not adjacent: the temperature sensor is 0b1001xxx and the EEPROM inside the same package is 0b1010xxx. A scan of the bus finds two devices and there is one part.",
+    "THE ALERT LINE'S LEVEL IS A DEVICE SETTING RATHER THAN A WIRING FACT, WHICH IS WHY ITS ROW STILL STATES `unknown` NOW THAT THE SENSOR'S OWN DATASHEET HAS BEEN READ. The pin is an open-drain output whose polarity is the POL bit of the sensor's configuration register -- logic 0 active low, logic 1 active high -- and POL is loaded at power-up from the NONVOLATILE NVPOL bit. So the factory default is active low, a program that has ever written NVPOL on a unit changed that unit's power-up level permanently, and nothing on the wire reports which it is. A driver that needs a level SETS it rather than assuming one; emitting a compile-time constant here would hand a program a claim the hardware does not guarantee.",
+    "THE LIGHT SENSOR READS BACKWARDS FROM THE OBVIOUS DIRECTION, WHICH IS MEASURED RATHER THAN INFERRED. Covering the sensor RAISES the converted value and uncovering it lowers it, so the phototransistor pulls its node toward ground as light increases rather than driving it upward. Measured on hardware 2026-08-31 against a host ADC: about 3650 counts of 4095 uncovered in a lit room and about 3900 covered. The guide states no direction, and the opposite one is what a reader assumes from the words light sensor, so a program calibrated the wrong way round would report bright for dark and never fail.",
+    "THE LIGHT SENSOR AND THE FILTER SHARE NOTHING BUT A NAME. Both are described as ADC, and they are the standard's two DIFFERENT analog pins: the sensor is on the pair's positive line and the filter's output on its negative line. A host wiring one ADC channel would reach one of them.",
+]
+
+# --- the buses ----------------------------------------------------------------------------------
+
+[[buses]]
+role = "sd-spi"
+kind = "spi"
+ss = "spi_ss_a"
+mosi = "spi_mosi"
+miso = "spi_miso"
+sck = "spi_sck"
+source = "Atmel-42078B Table 4-2 pins 15 to 18 and Table 4-9, which names the card connector pin each reaches: DAT3, CMD, D0 and CLK. The card is reached in SPI mode, not in the 4-bit SD mode its D1 and D2 lines would need -- those two reach no header pin."
+
+[[buses]]
+role = "sensor-i2c"
+kind = "i2c"
+sda = "i2c_sda"
+scl = "i2c_scl"
+source = "Atmel-42078B Table 4-2 pins 11 and 12 and Table 4-8, which gives them as sensor pins 1 and 2."
+
+# --- what is on the board, reached over a bus ---------------------------------------------------
+
+[[devices]]
+name = "temperature"
+kind = "i2c-device"
+bus = "sensor-i2c"
+part = "at30tse758"
+address = 0x4F
+source = "Atmel-42078B section 4.3.3: the temperature sensor answers at 0b1001 A2 A1 A0, and A2/A1/A0 are pulled high through 100 kilohm resistors by default, so the default address is 0b1001111. That is 0x4F as a seven-bit address."
+
+[[devices]]
+name = "eeprom"
+kind = "i2c-device"
+bus = "sensor-i2c"
+part = "at30tse758"
+address = 0x57
+source = "Atmel-42078B section 4.3.3: the 8 kbit EEPROM inside the same AT30TSE758 package answers at 0b1010 A2 A1 A0, defaulting to 0b1010111, which is 0x57 as a seven-bit address. When communicating with the EEPROM part of the address is used as a page address."
+
+[[devices]]
+name = "sdcard"
+kind = "spi-device"
+bus = "sd-spi"
+part = "microsd-socket"
+source = "Atmel-42078B section 4.3.4: a microSD card connector reached over SPI. The part is the SOCKET rather than a chip -- what answers on the bus is whatever card is inserted, and there may be none."
+
+# --- control and analog lines -------------------------------------------------------------------
+
+[[devices]]
+name = "led"
+kind = "gpio-out"
+signal = "pwm_p"
+active = "low"
+source = "Atmel-42078B section 4.3.1 and Table 4-6: one yellow LED on EXT pin 7, and the guide states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'. It is on a PWM-capable pin so it can be dimmed, and it is a plain output when it is not."
+
+[[devices]]
+name = "sd_detect"
+kind = "gpio-in"
+signal = "spi_ss_b"
+active = "low"
+source = "Atmel-42078B section 4.3.4 and Table 4-9: SW_A on card-connector pin 9 reaches EXT pin 10 and SW_B on pin 10 is at ground, and 'When a microSD card is put into the connector, SW_A and SW_B are short-circuited'. So a present card pulls the line to ground and the level is LOW -- derived from the stated mechanism, not from the name. The same passage states the consequence: 'To use this as a card indicator remember to enable internal pullup in the target device', because with no card the line is driven by nothing at all."
+
+[[devices]]
+name = "temp_alert"
+kind = "gpio-in"
+signal = "irq"
+active = "unknown"
+source = "Atmel-42078B Table 4-2 pin 9 and Table 4-8 place the ALERT pin of the temperature sensor, sensor pin 3, on EXT pin 9, and describe it only as a temperature alarm signalling pin. The level comes from the sensor instead: Atmel-8751F section 3 and 6.3.4 give ALERT as an open-drain output whose polarity is the POL bit of the configuration register, logic 0 being active low, with POL loaded at power-up from the nonvolatile NVPOL bit. Atmel-8854 states the same mechanism in the same words for the A-suffix parts, so the answer does not depend on which of the two is fitted. No level is claimed here because none is fixed."
+
+[[devices]]
+name = "light"
+kind = "analog-in"
+signal = "adc_p"
+active = "none"
+source = "Atmel-42078B section 4.3.5 and Table 4-10: a TEMT6000 light sensor from Vishay, its signal on EXT pin 3, read by an ADC pin on the host. An analog line has no active level, which is what `none` states rather than leaving the field absent."
+
+[[devices]]
+name = "filter_out"
+kind = "analog-in"
+signal = "adc_n"
+active = "none"
+source = "Atmel-42078B section 4.3.2 and Table 4-7: the output of the on-board first-order low-pass filter, on EXT pin 4, silk-screened ADC."
+
+[[devices]]
+name = "filter_in"
+kind = "gpio-out"
+signal = "pwm_n"
+active = "none"
+source = "Atmel-42078B section 4.3.2 and Table 4-7: the input of the on-board low-pass filter, on EXT pin 8, silk-screened PWM. A driven line rather than a signalling one, so it asserts nothing and states `none`."
+
+[[devices]]
+name = "gpio1"
+kind = "gpio-out"
+signal = "gpio1"
+active = "none"
+source = "Atmel-42078B section 4.2.3 and Table 4-4: EXT pin 5 is routed through a 39 ohm series resistor to a 2-pin header, for whatever a user attaches. It asserts nothing on this board, which is what `none` states."
+
+[[devices]]
+name = "gpio2"
+kind = "gpio-out"
+signal = "gpio2"
+active = "none"
+source = "Atmel-42078B section 4.2.3 and Table 4-4: EXT pin 6 is routed through a 39 ohm series resistor to the same 2-pin header."
+
+# --- the two features that are not devices --------------------------------------------------------
+#
+# A LOW-PASS FILTER AND A UART LOOPBACK ARE BOTH WIRES BETWEEN TWO PINS OF THIS CONNECTOR. Neither
+# has a part, an address or a bus, so neither can be a device row -- and both are the most useful
+# things on the board for proving a host driver works, because a host can drive one end and read
+# the other with nothing else attached.
+
+[[loopbacks]]
+name = "low-pass-filter"
+drive = "pwm_n"
+sense_signal = "adc_n"
+source = "Atmel-42078B section 4.3.2: a first order low-pass filter with a cutoff of approximately 2340 Hz, a 680 ohm resistor and a 100 nF capacitor, input on EXT pin 8 and output on EXT pin 4. A PWM duty cycle driven in comes back out as a voltage an ADC can sample, so one extension proves a PWM driver and an ADC driver against each other."
+
+[[loopbacks]]
+name = "uart"
+drive = "uart_tx"
+sense_signal = "uart_rx"
+source = "Atmel-42078B section 4.2.4 and Table 4-5: EXT pin 14 (TX) and EXT pin 13 (RX) reach a 2-pin header through 39 ohm series resistors, and the header 'comes with a jumper mounted to enable the UART to work in loopback mode'. MOUNTED IS THE FACTORY STATE, so out of the box this UART echoes."

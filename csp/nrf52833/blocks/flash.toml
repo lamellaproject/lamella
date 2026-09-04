@@ -1,0 +1,34 @@
+# BLOCK: the nRF52833 non-volatile memory controller (NVMC), stated only as far as the facts
+# consumers outside the controller need. Its enable protocol and its erase commands are not
+# described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 32-BIT WORD. `Only full 32-bit words can be written to flash memory using the
+# NVMC interface`, and software wanting to change fewer bits writes the whole word with the rest set
+# to 1 -- which is possible because a 1 in the written word leaves the stored bit alone.
+#
+# AND THE FACT THAT SEPARATES THIS PART FROM ITS nRF51 SIBLING: A WORD MAY BE WRITTEN TWICE, AND
+# ONLY TWICE. The product specification gives nWRITE = 2 -- `Number of times a 32-bit word can be
+# written before erase` -- and says the limit still applies to the write-the-whole-word-with-ones
+# trick above. So this part does permit the shape of `write the record, then write its magic into
+# the same unit`, but it permits it exactly once more, and a consumer that uses the allowance for
+# convenience has spent the part's only spare write. A placement rule that spans two units instead
+# needs no allowance on any part and is the one to prefer.
+
+[table]
+kind = "block"
+family = "nrf52833"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 4
+sources = [
+    "erased_value: nRF52833 Product Specification 4452_021 v1.7 section 4.3.1 `Writing to flash`: `The NVMC is only able to write 0 to bits in flash memory that are erased (set to 1). It cannot rewrite a bit back to 1`",
+    "write_unit: nRF52833 Product Specification 4452_021 v1.7 section 4.3.1: `When write is enabled, full 32-bit words can be written to word-aligned addresses in flash memory` and `Only full 32-bit words can be written to flash memory using the NVMC interface`",
+    "write_unit: nRF52833 Product Specification 4452_021 v1.7, the NVMC electrical specification: nWRITE = 2, `Number of times a 32-bit word can be written before erase`, and tWRITE = 42.51 us, `Time to write one 32-bit word` -- both stated per 32-bit word",
+]
+notes = [
+    "The erase unit is not this number and is not declared here: the flash is divided into pages and an erase is by page, which is a part fact rather than a controller one.",
+    "nWRITE = 2 is a budget, not a licence. The product specification is explicit that writing a full word with unchanged bits set to 1, in order to change fewer than 32 bits, still counts against it.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

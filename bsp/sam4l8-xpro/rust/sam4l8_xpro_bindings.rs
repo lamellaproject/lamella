@@ -3,6 +3,8 @@
 
 pub const BOARD_MODEL: u16 = 27;
 pub const BOARD_VENDOR: &str = "Atmel";
+pub const CARRIER_USB_VID: u16 = 0x03EB;
+pub const CARRIER_USB_PID: u16 = 0x2111;
 
 pub const LED0_PORT_BASE: u32 = 0x400E1400;
 pub const LED0_PIN: u32 = 7;

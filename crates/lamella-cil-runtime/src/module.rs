@@ -5,13 +5,14 @@ use crate::interp::Vm;
 use crate::object::PrimKind;
 use crate::trap::Trap;
 use crate::value::Value;
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 #[cfg(all(not(feature = "code-preload"), not(feature = "code-in-place")))]
 use core::cell::OnceCell;
-use lamella_cil::MethodBodyImage;
+use lamella_cil::{Instruction, MethodBodyImage};
 #[cfg(feature = "code-in-place")]
 use lamella_cil::{EhClause, read_body_layout, write_method_body};
 #[cfg(not(feature = "code-in-place"))]
@@ -3480,6 +3481,37 @@ impl Module {
         }
     }
 
+    /// A managed method's DECODED instructions, in whichever way THIS build materializes a body --
+    /// borrowed from the cache where there is one, decoded from the resident bytes where there is
+    /// not. `None` for an intrinsic or unknown method, and for a body whose bytes do not decode.
+    ///
+    /// # Why the seam is here and not at the caller
+    ///
+    /// [`Module::method_body`] exists only under `not(code-in-place)` and
+    /// [`Module::method_code_bytes`] only under `code-in-place`, so a consumer that wants
+    /// instructions has to pick between them -- and **a cargo feature is not visible to `cfg`
+    /// outside the crate that declares it**, so a consumer in another crate cannot make that choice
+    /// at all. It can only be made here.
+    ///
+    /// **Routing every consumer through one accessor is what stops a fourth from having to know.**
+    ///
+    /// A [`Cow`] rather than an owned `Vec`, so the common build pays nothing: the cached body is
+    /// handed back borrowed and only the in-place build allocates. A debugger reading a body is not
+    /// a hot path, which is what makes the allocation acceptable where it does happen.
+    #[must_use]
+    pub fn method_instructions(&self, id: MethodId) -> Option<Cow<'_, [Instruction]>> {
+        #[cfg(not(feature = "code-in-place"))]
+        {
+            self.method_body(id).map(|body| Cow::Borrowed(&body.code[..]))
+        }
+        #[cfg(feature = "code-in-place")]
+        {
+            self.method_code_bytes(id)
+                .and_then(|code| lamella_cil::decode(code).ok())
+                .map(Cow::Owned)
+        }
+    }
+
     /// The instruction bytes of a managed method (the `code-in-place` fetch source: decoded one
     /// instruction per step, ip in byte offsets), or `None` for an intrinsic or unknown method.
     ///
@@ -5359,7 +5391,17 @@ impl Module {
         if is(self.primitive_int32_token) {
             return Some(Value::Int32(0));
         }
-        None
+        match self.type_full_name(type_id)? {
+            "System.Boolean" | "System.Byte" | "System.SByte" | "System.Int16" | "System.UInt16"
+            | "System.Char" | "System.Int32" | "System.UInt32" => Some(Value::Int32(0)),
+            "System.Int64" | "System.UInt64" => Some(Value::Int64(0)),
+            "System.IntPtr" | "System.UIntPtr" => Some(Value::NativeInt(0)),
+            #[cfg(feature = "float")]
+            "System.Double" => Some(Value::Float(0.0)),
+            #[cfg(feature = "float")]
+            "System.Single" => Some(Value::Single(0.0)),
+            _ => None,
+        }
     }
 
     /// Whether `method`'s declaring type is a value type. A `callvirt` that resolves to such a
@@ -5563,6 +5605,63 @@ impl Module {
         if let Some(info) = self.types.get_mut(type_id as usize) {
             info.sig_methods = interned;
         }
+    }
+
+    /// One type's signature-keyed VIRTUAL instance methods, as TEXT keys -- the seed a type
+    /// built AFTER this one inherits when the two are laid out in separate passes.
+    ///
+    /// [`Module::set_sig_methods`] interns its keys, and [`Module::sig_dispatch`] takes an
+    /// interned id, so neither can hand a later builder the map it has to extend. A type
+    /// deriving from a CONSTRUCTED GENERIC base is exactly that case: its base's identity does
+    /// not exist until the monomorphizer has emitted it, so the derived type's own maps are
+    /// built in a second pass that has to start from what the base ended up with.
+    #[must_use]
+    pub fn sig_method_keys(&self, type_id: TypeId) -> Vec<(String, MethodId)> {
+        self.sig_run_keys(self.frozen.sig_virtual_runs, type_id).unwrap_or_else(|| {
+            self.types
+                .get(type_id as usize)
+                .map(|info| {
+                    info.sig_methods
+                        .iter()
+                        .map(|(sig, method)| (self.sig_text(*sig), *method))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// [`Module::sig_method_keys`] for the NON-VIRTUAL instance map.
+    #[must_use]
+    pub fn sig_method_keys_nonvirtual(&self, type_id: TypeId) -> Vec<(String, MethodId)> {
+        self.sig_run_keys(self.frozen.sig_nonvirtual_runs, type_id).unwrap_or_else(|| {
+            self.types
+                .get(type_id as usize)
+                .map(|info| {
+                    info.sig_methods_nonvirtual
+                        .iter()
+                        .map(|(sig, method)| (self.sig_text(*sig), *method))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// One type's frozen `(SigId, method)` run as text keys, or `None` when the freeze recorded
+    /// none -- in which case the caller reads the builder's own map instead.
+    fn sig_run_keys(&self, runs: DenseU64Column, type_id: TypeId) -> Option<Vec<(String, MethodId)>> {
+        let packed = runs.get(&self.arena, type_id)?;
+        let offset = ((packed >> 32) as usize).checked_sub(1)?;
+        let count = (packed & 0xFFFF_FFFF) as usize;
+        Some(
+            (0..count)
+                .filter_map(|index| {
+                    Some((
+                        self.sig_text(self.arena.read_u32(offset + index * 8)?),
+                        self.arena.read_u32(offset + index * 8 + 4)?,
+                    ))
+                })
+                .collect(),
+        )
     }
 
     /// Adds ONE entry to `type_id`'s dispatch map, leaving the rest intact -- the incremental
@@ -6089,6 +6188,17 @@ impl Module {
             return Some(direct);
         }
         self.reflect_type_direct(self.canonical_type_handle(handle)?)
+    }
+
+    /// The reflection record of `type_id`, reached through its canonical handle -- for a load-time
+    /// consumer holding a `TypeId` rather than a token.
+    ///
+    /// [`Module::reflect_type`] takes the HANDLE, which is what an intrinsic has; a pass that is
+    /// still building types has the id and would otherwise have to re-derive the handle at each
+    /// site. `None` when the type has no handle bound yet or no record at that handle.
+    #[must_use]
+    pub fn reflect_type_of_type(&self, type_id: TypeId) -> Option<ReflectType> {
+        self.reflect_type(self.type_handle_of(type_id)?)
     }
 
     /// The reflection record keyed DIRECTLY by `handle` (no cross-assembly folding): the frozen

@@ -1,0 +1,45 @@
+# The SAMR21 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+
+[table]
+kind = "pins"
+family = "samr21"
+sources = [
+    "SAM R21 datasheet Atmel-42223G Table 5-1 (PORT Function Multiplexing). The distinction between column C (SERCOM) and column D (SERCOM-ALT) lives in the table's header row, so a cell in this table does not carry its own meaning and every row below records the letter alongside the pad",
+]
+notes = [
+    "COLUMN C IS SERCOM AND COLUMN D IS SERCOM-ALT. A pin carrying a pad of each has two rows here and they are told apart only by the letter, so a row without its function letter is not a fact.",
+    "PA10, PA11, PB16 and PB17 HAVE NO ROWS AND MUST NOT GAIN ANY: section 5.2 states they cannot be configured as outputs because they are permanently wired to the RFCTRL inputs.",
+    "NEITHER MAY SERCOM4 GAIN ONE. Its four pads are inside the package on the transceiver's SPI; no row here can name a package pin for them because Table 5-1 does not carry them at all.",
+]
+
+# ---- the SAM R21 Xplained Pro's EDBG virtual COM port -------------------------------------------
+#
+# WARNING: THE KIT'S OWN USER GUIDE IS WRONG ABOUT ONE OF THESE TWO PINS AND THE PART DATASHEET
+# IS RIGHT. Table 4-12 of the SAM R21 Xplained Pro user guide (Atmel-42243D) prints:
+#
+#     PA04     SERCOM0 PAD[0] UART TXD (SAM R21 TX line)
+#     PA05     SERCOM1 PAD[1] UART RXD (SAM R21 RX line)
+#
+# A UART cannot straddle two SERCOM instances -- one instance owns the pads of one link -- and
+# Table 5-1 of the part datasheet gives PA05 as SERCOM0/PAD[1] under SERCOM-ALT, with no SERCOM1
+# function on that pad at all. The guide's SERCOM1 is a typographical error in the guide, and the
+# rows below take the datasheet. Anyone reconciling this file against the kit guide will find the
+# disagreement; it is deliberate, and correcting it back would move a UART's receive pad onto an
+# instance that does not own it.
+
+
+[[pins]]
+pin = "PA04"
+function = "D"
+instance = "sercom0"
+signal = "pad0"
+source = "Atmel-42223G Table 5-1: the PA04 row (SAM R21G pin 9) is empty in column C and carries SERCOM0/PAD[0] in column D, SERCOM-ALT. Corroborated by SAM R21 Xplained Pro user guide Atmel-42243D Table 4-12, which names the same instance and pad for the EDBG's TX line."
+
+[[pins]]
+pin = "PA05"
+function = "D"
+instance = "sercom0"
+signal = "pad1"
+source = "Atmel-42223G Table 5-1: the PA05 row (SAM R21G pin 10) is empty in column C and carries SERCOM0/PAD[1] in column D, SERCOM-ALT. THE KIT GUIDE DISAGREES AND IS WRONG -- Atmel-42243D Table 4-12 prints 'SERCOM1 PAD[1]' against this pin, which would put a UART's receive pad on a different instance from its transmit pad. See the block comment above."

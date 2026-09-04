@@ -150,9 +150,8 @@ pub fn line_program(functions: &[FunctionLines]) -> GeneratedSection {
         code_relocs.push((data.len() as u32, index));
         data.extend_from_slice(&0u32.to_le_bytes());
 
-        let file_index = files.iter().position(|f| *f == func.file).unwrap_or(0);
         data.push(DW_LNS_SET_FILE);
-        uleb128(&mut data, file_index as u64);
+        uleb128(&mut data, file_index(&files, func.file));
 
         let mut address: u32 = 0;
         let mut line: i64 = 1;
@@ -260,7 +259,15 @@ pub fn inline_string(out: &mut Vec<u8>, s: &str) {
     out.push(0);
 }
 
-/// The distinct source files across `functions`, in first-appearance order.
+/// The file-name table in EMITTED order: the primary source file at index 0, then the distinct
+/// source files across `functions` in first-appearance order -- so the primary one appears twice.
+///
+/// **THE DUPLICATE IS LOAD-BEARING.** DWARF 5 numbers file entries from 0 and makes entry 0 the
+/// compilation file (section 6.2.4), but the line program's `file` register still has an INITIAL
+/// VALUE OF 1 (table 6.4). A table with a single entry is therefore well formed and yet has a
+/// starting state naming an entry that does not exist, and a reader that resolves that state
+/// eagerly rejects the whole table rather than the one row. Emitting the primary file at both 0
+/// and 1 leaves no index a reader can reach out of range.
 ///
 /// Shared by the line program and the compilation unit deliberately: a subprogram's
 /// `DW_AT_decl_file` is an index into the LINE program's file table, so two independently built
@@ -272,7 +279,21 @@ fn file_table<'a>(functions: &[FunctionLines<'a>]) -> Vec<&'a str> {
             files.push(f.file);
         }
     }
+    if let Some(primary) = files.first().copied() {
+        files.insert(0, primary);
+    }
     files
+}
+
+/// `name`'s index in [`file_table`]'s output, searched from 1 -- entry 0 is the duplicate of the
+/// primary file, and an index the initial state can also produce is the one shape worth not
+/// emitting. A file not in the table falls back to 1, the primary.
+fn file_index(files: &[&str], name: &str) -> u64 {
+    files
+        .iter()
+        .skip(1)
+        .position(|f| *f == name)
+        .map_or(1, |i| i as u64 + 1)
 }
 
 
@@ -424,8 +445,7 @@ pub fn compilation_unit(
     for (index, func) in functions.iter().enumerate() {
         uleb128(&mut info, ABBREV_SUBPROGRAM);
         inline_string(&mut info, func.name);
-        let file_index = files.iter().position(|f| *f == func.file).unwrap_or(0);
-        info.push(file_index as u8);
+        info.push(file_index(&files, func.file) as u8);
         let decl_line = func.rows.first().map_or(0, |row| row.line);
         info.extend_from_slice(&decl_line.to_le_bytes());
         code_relocs.push((info.len() as u32, index));
@@ -642,7 +662,11 @@ mod tests {
                 .filter(|w| *w == needle)
                 .count()
         };
-        assert_eq!(count(b"one.cs\0"), 1, "`one.cs` is pooled, not repeated");
+        assert_eq!(
+            count(b"one.cs\0"),
+            2,
+            "the primary file is entry 0 AND entry 1, and pooled thereafter"
+        );
         assert_eq!(count(b"two.cs\0"), 1);
         assert_eq!(generated.code_relocs.len(), 3);
     }
@@ -887,13 +911,16 @@ mod tests {
             .windows(7)
             .position(|w| w == b"second\0")
             .expect("the subprogram name");
-        assert_eq!(info.data[at + 7], 1, "`second` declares file index 1");
+        assert_eq!(info.data[at + 7], 2, "`second` declares file index 2");
         let at = info
             .data
             .windows(6)
             .position(|w| w == b"first\0")
             .expect("the subprogram name");
-        assert_eq!(info.data[at + 6], 0, "`first` declares file index 0");
+        assert_eq!(
+            info.data[at + 6], 1,
+            "`first` declares file index 1 -- never 0, which the initial state also names"
+        );
     }
 
     #[test]

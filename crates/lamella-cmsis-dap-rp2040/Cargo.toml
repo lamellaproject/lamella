@@ -1,0 +1,30 @@
+[package]
+name = "lamella-cmsis-dap-rp2040"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Raspberry Pi RP2040 flash programming over the Lamella CMSIS-DAP debug stack -- multi-drop SWD port selection, the ADIv5 MEM-AP, and the chip's bootrom flash API driven from the debugger; a device-specific extension of lamella-cmsis-dap."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The probe-neutral seam. The flash routine is written against `TargetAccess`, so it drives a target
+# through any probe family the seam supports, not just a CMSIS-DAP one.
+lamella-probe-core = { path = "../lamella-probe-core" }
+# No transport features: these routines are written against the seam, and `usbhid` is the
+# CMSIS-DAP crate's DEFAULT -- so taking the default here compiles a native USB backend into a
+# crate that never names one, and refuses to build for any target that backend has no port for
+# (wasm32, where the browser supplies the transport). Every sibling extension crate states it
+# this way, and so does `lamella-probe`.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", default-features = false }
+
+[dev-dependencies]
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util", "usbbulk"] }
+lamella-usbbulk = { path = "../lamella-usbbulk" }
+# Probe SELECTION: a Pico carries no debug hardware, so the probe is external and every RPi Debug
+# Probe is `2e8a:000c` -- an example must say WHICH one.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }

@@ -1,0 +1,37 @@
+# BLOCK: the STM32U5A5 embedded flash controller, stated only as far as the facts consumers outside
+# the controller need. Its unlock sequence, its page geometry and its command bits are not described
+# here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 128-BIT QUAD-WORD AND IT IS NOT A CHOICE. The controller programs 137 bits at
+# a time -- 128 of data and 9 of ECC -- and RM0456 refuses anything narrower: a byte or half-word
+# write sets SIZERR, and a quad-word at an address that is not quad-word aligned sets PGAERR. A unit
+# is also write-once between erases, and the controller enforces that rather than merely advising
+# against it.
+#
+# WHY THIS IS A SEPARATE FILE FROM THE STM32U585 BLOCK AND NOT A REFERENCE TO IT. RM0456 covers the
+# series but SPLITS BY SUB-GROUP wherever the sub-groups differ, and flash is one of the places it
+# does: the module organization is two tables, one for STM32U575/585 and one for STM32U59x/5Ax --
+# the sub-group this part is in. This family's own parts table already carries that distinction for
+# SRAM and the memory map, for the same reason. What the manual does NOT split is the programming
+# granularity, and section 7.3.7 states the quad-word rule for the series without qualification, so
+# the two families agree here on the manual's authority rather than by one copying the other.
+
+[table]
+kind = "block"
+family = "stm32u5a5"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 16
+sources = [
+    "erased_value: STM32U5 series reference manual RM0456 Rev 7 section 7.3.7 `Flash main memory programming sequences`: `If the user needs to program only one word, the quad-word must be completed with the erase value 0xFFFF FFFF to launch automatically the programming` -- the manual naming 0xFFFFFFFF as the erase value",
+    "write_unit: RM0456 Rev 7 section 7.3.7: `The flash memory is programmed 137 bits at a time (128-bit data + 9 bits ECC)` and `It is only possible to program quad-word (4 x 32-bit data)`, stated for the series and not qualified by sub-group",
+    "write_unit: RM0456 Rev 7 section 7.3.7: a byte or half-word write sets SIZERR, and a quad-word not aligned with a quad-word address sets PGAERR",
+]
+notes = [
+    "A unit is write-once between erases, and the controller enforces it. RM0456 section 7.3.7: `Programming in a previously programmed address is not allowed except if the data to write is full zero`, setting PROGERR.",
+    "RM0456 also offers BURST programming of 8 quad-words. That is a throughput mode, so it is not the granularity a placement rule can rely on.",
+    "The flash ORGANIZATION does differ from the STM32U575/585 sub-group and is not stated here: RM0456 gives each sub-group its own module table. A consumer needing sizes or bank layout takes them from the parts table, not from this block.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

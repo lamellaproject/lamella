@@ -48,6 +48,16 @@ pub struct Advertisement {
 }
 
 impl Advertisement {
+    /// Whether this describes something a peer could actually reach.
+    ///
+    /// `false` until the board has an address. A board with none can still form a perfectly
+    /// well-shaped advertisement -- a name, a host, a port -- and every record but the A record
+    /// publishes fine, which is exactly the problem: the answer looks complete.
+    #[must_use]
+    pub fn is_reachable(&self) -> bool {
+        self.ipv4.is_some()
+    }
+
     /// `<Instance>.<Service>.<Domain>` (RFC 6763, section 4.1).
     fn instance_labels(&self) -> Vec<Vec<u8>> {
         let mut labels = Vec::with_capacity(4);
@@ -186,10 +196,27 @@ impl Responder {
         &self.advertisement
     }
 
-    /// An unsolicited announcement of everything this board offers (RFC 6762, section 8.3).
+    /// An unsolicited announcement of everything this board offers (RFC 6762, section 8.3), or
+    /// `None` while the board has no address to publish.
+    ///
+    /// # Why an addressless board announces NOTHING rather than what it has
+    ///
+    /// The A record is the only one that needs an address, so a board without one still produces a
+    /// PTR naming the instance, an SRV naming host and port, and a TXT -- a complete-looking
+    /// service whose target host resolves to nothing. **A browser lists the board and no host can
+    /// open it**, which reads as a broken board rather than as one that is not ready, and the
+    /// symptom is a connection timeout: the reading that sends somebody to look at a cable.
+    ///
+    /// Not announcing is the honest state. The board is discoverable the moment a lease lands and
+    /// the caller announces again, and until then it is absent rather than misdescribed. That is
+    /// the same rule the Link listener follows one layer down -- a bind to an all-zero address
+    /// succeeds with no address at all, so "listening" and "reachable" are separate facts and only
+    /// the second one is worth telling anybody.
     #[must_use]
-    pub fn announcement(&self) -> Vec<u8> {
-        wire::write_response(0, &self.advertisement.records())
+    pub fn announcement(&self) -> Option<Vec<u8>> {
+        self.advertisement
+            .is_reachable()
+            .then(|| wire::write_response(0, &self.advertisement.records()))
     }
 
     /// Consider one received datagram, and answer if it asked about us.
@@ -199,6 +226,9 @@ impl Responder {
     /// device shouting over its neighbors.
     #[must_use]
     pub fn handle(&self, datagram: &[u8]) -> Option<Reply> {
+        if !self.advertisement.is_reachable() {
+            return None;
+        }
         let message = Message::read(datagram).ok()?;
         if message.response {
             return None;

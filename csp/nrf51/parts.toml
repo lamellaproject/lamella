@@ -11,5 +11,7 @@ part = "nrf51822"
 package = "QFN"
 flash = 0x40000
 ram = 0x4000
+dp_idcode = 0x0BB11477
+identity_source = "The debug port a BBC micro:bit v1 answers with, read through a CMSIS-DAP probe; the nRF flashing backend refuses a deploy whose target part answers a different one, which is the difference between nothing happening and the wrong board being erased. 0x0bb11477 is Arm's generic Cortex-M0 SW-DP and an STM32F0 answers the same, so it narrows a search and names no part. The reading that names a Nordic die is FICR."
 pins = ["P0.00", "P0.04-P0.15", "P0.30"]
 source = "nRF51822 PS v3.4 (256 KB flash / 16 KB RAM; GPIO is one port of up to 32 I/Os depending on package, section 3.7). The pin list is PARTIAL rather than the package's full set: P0.04-P0.15 are the display matrix, and P0.00 + P0.30 are the two-wire bus -- both confirmed as general-purpose I/O on the QFN pin assignment table (pins 4 and 3)."

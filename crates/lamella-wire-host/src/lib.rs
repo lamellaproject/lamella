@@ -1,11 +1,13 @@
 //! The HOST side of the Lamella Link debug + REPL channel:
 
 pub use lamella_runner::{
-    RunResult, baked_image_checksum, bundle, debug, deploy, repl, run_program, send_image,
-    send_program, serve_one, try_recv_result,
+    ArtifactLoad, RunCollector, RunResult, baked_image_checksum, debug, deploy, exec, load, repl,
+    run_program, send_image, send_program, serve_one, stop_exit,
 };
 
 pub mod engine;
+pub mod firmware;
+pub mod identity;
 
 #[cfg(feature = "debug-backend")]
 pub mod debug_backend;
@@ -114,7 +116,7 @@ impl core::fmt::Display for ResolveError {
 ///
 /// **Ambiguity is REFUSED, not resolved by picking the first.** A substring match is a convenience
 /// for a human reading a serial off a label; silently taking one of several matches is how a tool
-/// writes to the wrong board, and this bench has four probes whose serials share a prefix.
+/// writes to the wrong board, and probe serials commonly share a prefix.
 ///
 /// # Errors
 /// [`ResolveError`] if nothing matches or if more than one does.
@@ -277,6 +279,8 @@ impl UsbTransport {
     /// List the attached Lamella Link boards (any VID/PID under the Lamella Link interface GUID), with
     /// product + serial strings where the OS reports them -- the picker's data source.
     ///
+    /// # A board carries the identity it was flashed with, and the list has to hold both
+    ///
     /// # Errors
     /// [`TransportError::Carrier`] if the platform cannot enumerate by interface GUID.
     pub fn list() -> Result<Vec<lamella_usbbulk::DeviceInfo>, TransportError> {
@@ -285,7 +289,9 @@ impl UsbTransport {
             Err(lamella_usbbulk::Error::Unsupported) => Ok(lamella_usbbulk::enumerate()
                 .map_err(|_| TransportError::Carrier)?
                 .into_iter()
-                .filter(|board| board.vendor_id == lamella_wire::usb::VID)
+                .filter(|board| {
+                    lamella_wire::usb::identify(board.vendor_id, board.product_id).is_some()
+                })
                 .collect()),
             Err(_) => Err(TransportError::Carrier),
         }
@@ -389,6 +395,45 @@ fn format_usb_target(vid: u16, pid: u16, serial: Option<&str>) -> String {
     match serial {
         Some(serial) => format!("usb:{vid:04x}:{pid:04x}:{serial}"),
         None => format!("usb:{vid:04x}:{pid:04x}"),
+    }
+}
+
+/// Which firmware era `board` was flashed in, or `None` if it is not a Lamella Link.
+///
+/// A thin forward to [`lamella_wire::usb::identify`] so a listing asks the same question the scan's
+/// own filter asks. The definition stays there; this is where a board is the subject rather than a
+/// pair of numbers.
+#[cfg(feature = "usb")]
+#[must_use]
+pub fn firmware_era(board: &lamella_usbbulk::DeviceInfo) -> Option<lamella_wire::usb::LinkIdentity> {
+    lamella_wire::usb::identify(board.vendor_id, board.product_id)
+}
+
+/// The one line a listing should print beside a board of `era`, or `None` when there is nothing
+/// to say about it.
+///
+/// # What this says, and the thing it deliberately does not say
+///
+/// A board answering the previous vendor id is **invisible to a scan that matches only the current
+/// pair** -- not listed as old, not listed at all -- and a board nobody lists is a board nobody
+/// thinks to reprogram. That is what this note is for, and it is the whole of what the vendor id
+/// establishes.
+///
+/// **It is NOT a statement that the firmware is otherwise current.** The vendor id changed at one
+/// moment; the message numbering changed at another. A board on the previous vendor id was
+/// certainly flashed before both, but a board on the current one may still predate the numbering --
+/// so `None` here means "nothing to say about this board's era", never "this board is up to date".
+/// A listing that reads it as reassurance would give exactly the false comfort the missing-board
+/// case is dangerous for.
+#[must_use]
+pub fn era_note(era: lamella_wire::usb::LinkIdentity) -> Option<&'static str> {
+    match era {
+        lamella_wire::usb::LinkIdentity::Current => None,
+        lamella_wire::usb::LinkIdentity::Legacy => Some(
+            "legacy vendor id: this board was flashed before the Lamella Link had one of its own, \
+             so a scan matching only the current pair does not list it at all. Reflash it to move \
+             it to the current pair.",
+        ),
     }
 }
 
@@ -785,6 +830,58 @@ pub fn available_carriers() -> &'static [&'static str] {
     ]
 }
 
+/// What a [`TransportError::VersionMismatch`] MEANS, as a sentence somebody can act on, naming
+/// which end is behind.
+///
+/// `host` is the version the reporting build speaks -- [`lamella_wire::PROTOCOL_VERSION`] for a
+/// tool talking to a board directly. It is a parameter rather than read from the constant so that
+/// the direction logic is a pure function of its inputs: the "board is behind" branch cannot be
+/// reached at all while `PROTOCOL_VERSION` is 1, and a rule nothing can exercise is a rule nothing
+/// checks.
+///
+/// # Why the sentence lives here and not at each tool
+///
+/// Three tools report this and each had its own wording for the failure it replaced -- *no answer*,
+/// *no HELLO_ACK*, *did not answer a HELLO* -- every one of which says the board is silent. **The
+/// board is not silent: it answered, promptly and correctly, that it cannot speak to this build.**
+/// A sentence written three times is a sentence corrected once, so this is the one copy.
+///
+/// It states the DIRECTION because that is what decides the remedy, and a reader given two version
+/// numbers has to work it out: a target behind the host wants reflashing, a target ahead of it wants
+/// newer tools, and those send a person to opposite conclusions.
+#[must_use]
+pub fn version_mismatch(host: u16, target_min: u16, target_max: u16) -> String {
+    if target_max == 0 {
+        return format!(
+            concat!(
+                "it speaks a Lamella Link version this build cannot read, and its reply did not ",
+                "decode. This tool speaks version {host}.",
+            ),
+            host = host,
+        );
+    }
+    let range = if target_min == target_max {
+        format!("version {target_min}")
+    } else {
+        format!("versions {target_min} to {target_max}")
+    };
+    let remedy = if target_max < host {
+        "the BOARD is behind this tool -- reflash its serve firmware from this tree"
+    } else {
+        "this TOOL is behind the board -- update the tools, the board is newer"
+    };
+    format!(
+        concat!(
+            "it is running Lamella firmware and it answered, but the two of you share no protocol ",
+            "version: it speaks {range} and this tool speaks {host}. {remedy}. Nothing is wrong ",
+            "with the cable or the port -- the handshake completed and the answer was a refusal.",
+        ),
+        range = range,
+        host = host,
+        remedy = remedy,
+    )
+}
+
 /// Host driver, blocking: HELLO the target and return the negotiated session (the chosen
 /// version + the capability INTERSECTION). `host_caps` is what this host offers -- check
 /// the result's caps to pick the PE ([`send_program`]) vs baked ([`send_image`]) path.
@@ -798,7 +895,7 @@ pub fn hello_blocking(
     host_caps: lamella_wire::Capabilities,
     timeout: Duration,
 ) -> Result<lamella_wire::Negotiated, TransportError> {
-    use lamella_wire::{Hello, HelloAck, PROTOCOL_VERSION, ProtocolRange, host_finish, msg};
+    use lamella_wire::{Hello, HelloAck, HelloNak, PROTOCOL_VERSION, ProtocolRange, host_finish, msg};
     let hello = Hello {
         range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
         caps: host_caps,
@@ -818,11 +915,19 @@ pub fn hello_blocking(
                         return Ok(host_finish(&ack, host_caps));
                     }
                 }
-                msg::NAK if frame.seq == seq => return Err(TransportError::Closed),
+                msg::HELLO_NAK if frame.seq == seq => {
+                    let range = HelloNak::decode(&frame.payload)
+                        .map_or(ProtocolRange { min: 0, max: 0 }, |nak| nak.target_range);
+                    return Err(TransportError::VersionMismatch {
+                        target_min: range.min,
+                        target_max: range.max,
+                    });
+                }
                 msg::ERROR if frame.seq == seq => {
                     return Err(TransportError::Refused {
                         reason: frame.payload.first().copied().unwrap_or(0),
-                        msg_type: frame.payload.get(1).copied().unwrap_or(0),
+                        msg_type: lamella_wire::error::refused_message_type(&frame.payload)
+                            .unwrap_or(0),
                     });
                 }
                 _ => {}
@@ -864,9 +969,76 @@ pub fn eval_image_blocking(
     await_result(transport, seq, timeout)
 }
 
+/// What a target said about an artifact transfer: it took the bytes, or it refused a chunk.
+///
+/// # Why this is not a `bool`
+///
+/// A `bool` makes a refused transfer easy to walk past. `driver(..)?` propagates only the carrier
+/// faults, so a `false` returned from a target that answered promptly and precisely slides through
+/// the one operator a caller reaches for first -- and the caller carries on as though the artifact
+/// were there. Matching is required to learn anything here, and that is the point.
+///
+/// **A refusal stays out of the error channel** because it is a NEGOTIATED outcome and not a fault:
+/// the carrier worked, the target answered, and the answer was no. Putting it in `Err` would push
+/// every caller into matching on error KINDS to tell a negotiation from a broken cable.
+///
+/// [`TransferAck::Rejected`] carries WHICH chunk, which is the question a refusal actually raises.
+/// A bare `false` says it failed and nothing else, so a caller that wants to report or retry has to
+/// have tracked the index itself -- state every caller would have to keep in order to use the
+/// answer at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferAck {
+    /// The target took every chunk it was offered.
+    Accepted,
+    /// The target refused a chunk. `chunk` is that chunk's index in the plan, counting from zero.
+    Rejected {
+        /// The index of the refused chunk in the plan that produced it.
+        chunk: usize,
+    },
+}
+
+/// What running a loaded artifact did: it ran, or the target refused the transfer and nothing
+/// started.
+///
+/// The second outcome exists because a LOAD is chunked and each chunk is acknowledged, so a target
+/// can decline the bytes -- an arena that cannot hold them is the ordinary case on a small part.
+/// Reporting that as a carrier fault would send a reader to look at a cable for a board that
+/// answered immediately and exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The artifact crossed, started, and finished. The result is the program's own.
+    Ran(RunResult),
+    /// The target refused a chunk of the transfer, so nothing started. `chunk` is its index.
+    Rejected {
+        /// The index of the refused chunk in the plan that produced it.
+        chunk: usize,
+    },
+}
+
+/// Whether one transfer status means the chunk was ACCEPTED.
+///
+/// `written, cannot read back` is an acceptance and not a failure, and reading it the other way
+/// would abort a legitimate deploy: it is what a target says when it is holding back a partial flash
+/// write unit, in preference to reporting a read-back match over bytes that are not in flash yet.
+/// The two refusals are a failed write and a rejected range.
+///
+/// ONE definition, because several drivers ask it. The status carries more than an acceptance --
+/// a CRC over the memory as assembled or the flash as read back -- and a caller that wants that
+/// reads the reply itself.
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+fn transfer_accepted(payload: &[u8]) -> bool {
+    use lamella_wire::msg::xfer;
+    matches!(payload.first().copied(), Some(xfer::MATCHED) | Some(xfer::WRITTEN_NOT_READ_BACK))
+}
+
 /// Host driver, blocking: persist `image` to the target's flash (it boots on reset), or
 /// -- with `image` empty -- clear the deployed image (un-deploy). Returns whether the
 /// target reported the flash write / clear succeeded.
+///
+/// A non-empty image goes through [`deploy_chunked_blocking`] rather than a second code path: the
+/// deploy op is chunked without exception now, and a single-frame image is its degenerate one-chunk
+/// case. That is what keeps the artifact kind on every frame, so an interrupted transfer cannot be
+/// misread as a partial artifact of another kind.
 ///
 /// # Errors
 /// [`TransportError::Closed`] on timeout; otherwise a carrier [`TransportError`].
@@ -878,13 +1050,15 @@ pub fn deploy_blocking(
     timeout: Duration,
 ) -> Result<bool, TransportError> {
     use lamella_wire::Frame;
-    let msg_type = if image.is_empty() { deploy::DEPLOY_CLEAR } else { deploy::DEPLOY_IMAGE };
-    transport.send(msg_type, seq, image)?;
+    if !image.is_empty() {
+        return deploy_chunked_blocking(transport, seq, image, CHUNK_DATA_CAP, timeout);
+    }
+    transport.send(deploy::DEPLOY_CLEAR, seq, &[])?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-            if msg_type == deploy::DEPLOY_RESULT && reply_seq == seq {
-                return Ok(payload.first().copied().unwrap_or(0) == 1);
+            if msg_type == deploy::XFER_RESULT && reply_seq == seq {
+                return Ok(transfer_accepted(&payload));
             }
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -892,12 +1066,18 @@ pub fn deploy_blocking(
     Err(TransportError::Closed)
 }
 
-/// The largest image slice one `DEPLOY_CHUNK` frame can carry: the frame's `u16` LEN cap, less the
-/// 8-byte `(offset, total)` header this payload puts ahead of the bytes, rounded DOWN to the 512-byte
-/// flash page a chunk must start on.
+/// The largest image slice one `DEPLOY_IMAGE` frame can carry: the frame's `u16` LEN cap, less the
+/// 8-byte `(offset, total)` header this payload puts ahead of the bytes, rounded DOWN to 512 bytes
+/// -- the LARGEST write granularity any supported target requires, so a chunk this size starts
+/// on a write unit whichever board receives it.
+///
+/// **512 is a CEILING over the supported targets, not the write unit of any particular one.** A
+/// target's write unit is a property of its flash controller and nothing on the wire carries it, so
+/// rounding to the largest one any supported target requires is what makes a single number safe for
+/// all of them. It is not a claim that a given board wants 512.
 ///
 /// **This is a bound on what the wire can carry, not on throughput.** A frame's `LEN` is a `u16`
-/// ([`lamella_wire::MAX_PAYLOAD`]), and a `DEPLOY_CHUNK` spends 8 of those bytes on
+/// ([`lamella_wire::MAX_PAYLOAD`]), and a chunk spends 8 of those bytes on
 /// `(offset, total)` before any image byte.
 ///
 /// Without the refusal below it would be a bound on SILENT CORRUPTION: an `encode_frame` answering
@@ -913,12 +1093,27 @@ pub const CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 512) * 512;
 
 /// Deploy a baked image to flash in CHUNKS, so an image larger than one 64 KB wire frame can cross
 /// the wire (the frame LEN is a `u16`, so a single [`deploy_blocking`] silently truncates a
-/// corlib-baked image). Sends `DEPLOY_CHUNK(offset, total, bytes)` frames in ascending order,
-/// waiting for each `DEPLOY_RESULT` ack before the next; returns whether every chunk verified.
-/// `chunk_len` must be a multiple of the target's flash page (512 B) so each chunk starts on a page
-/// boundary; its UPPER bound is enforced here rather than required of the caller (see
-/// [`CHUNK_DATA_CAP`]). A single-chunk deploy (image `<= chunk_len`) is equivalent to a
-/// `DEPLOY_IMAGE`, without the truncation risk.
+/// corlib-baked image). Sends `DEPLOY_IMAGE(offset, total, bytes)` frames in ascending order,
+/// waiting for each `XFER_RESULT` ack before the next; returns whether every chunk was accepted.
+/// `chunk_len` must be a multiple of the TARGET's flash write unit, so that each chunk starts on
+/// one. Its UPPER bound is enforced here rather than required of the caller (see
+/// [`CHUNK_DATA_CAP`]); the alignment is NOT, and cannot be -- see below.
+///
+/// # The write unit is a per-board fact this call cannot check
+///
+/// It is not one number: across the supported targets the accepted offset must be a multiple of
+/// anything from 4 bytes to 512. **Nothing in the handshake or the manifest carries which**, so a
+/// caller choosing `chunk_len` is choosing against a board property it has no way to read. Passing
+/// [`CHUNK_DATA_CAP`]'s 512-byte granularity is safe on every supported target; anything smaller is
+/// safe only where the target's own unit divides it.
+///
+/// **An unaligned chunk is not uniformly refused**, so the symptom of a wrong `chunk_len` depends on
+/// which target received it -- which is the reading that gets blamed on the board.
+///
+/// [`lamella_wire::Negotiated::max_chunk_data`] answers the OTHER half -- how much the target's
+/// carrier can absorb -- and a caller must satisfy both. On a small ring the two can be jointly
+/// unsatisfiable: a 256-byte receive ring cannot carry a 512-byte-aligned chunk at all, and that is
+/// a fact about the board rather than something a caller can pick its way around.
 ///
 /// # Errors
 /// Propagates a [`TransportError`], or reports the wire closed if a chunk goes unacked past `timeout`.
@@ -940,14 +1135,14 @@ pub fn deploy_chunked_blocking(
         payload.extend_from_slice(&(offset as u32).to_le_bytes());
         payload.extend_from_slice(&total.to_le_bytes());
         payload.extend_from_slice(&image[offset..end]);
-        transport.send(deploy::DEPLOY_CHUNK, seq, &payload)?;
+        transport.send(deploy::DEPLOY_IMAGE, seq, &payload)?;
 
         let deadline = Instant::now() + timeout;
         let mut acked = None;
         'wait: while Instant::now() < deadline {
             while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-                if msg_type == deploy::DEPLOY_RESULT && reply_seq == seq {
-                    acked = Some(payload.first().copied().unwrap_or(0) == 1);
+                if msg_type == deploy::XFER_RESULT && reply_seq == seq {
+                    acked = Some(transfer_accepted(&payload));
                     break 'wait;
                 }
             }
@@ -963,8 +1158,16 @@ pub fn deploy_chunked_blocking(
     Ok(true)
 }
 
-/// The largest bundle slice one `DEPLOY_BUNDLE` frame can carry: the frame's `u16` LEN cap, less the
-/// 8-byte `(offset, total)` header every bundle chunk carries, rounded DOWN to a 4-byte word.
+/// The largest bundle slice one frame can carry: the frame's `u16` LEN cap, less the 8-byte
+/// `(offset, total)` header every chunk carries, rounded DOWN to a 4-byte word.
+///
+/// # Why this is not published
+///
+/// A published constant is the one form that cannot stay flexible, because it invites arithmetic
+/// at a call site: `((u16::MAX - 8) / 4) * 4` publishes an 8-byte header and a `u16` length field
+/// AS A NUMBER, and every caller who computes with it is silently wrong the day either changes.
+/// It is also unnecessary -- [`BundleChunks::new`] clamps, so passing the bundle's own length is
+/// correct without a caller ever seeing the cap.
 ///
 /// **The alignment is the target's, not a preference.** A bundle is written to flash with word
 /// stores, so `deploy_bundle_chunk` REFUSES an `offset % 4 != 0` outright. That makes an unaligned
@@ -976,18 +1179,20 @@ pub fn deploy_chunked_blocking(
 /// erases per page; the bundle path erases once up front, so word alignment is all its stores
 /// require. Reusing the image cap here would work, and would quietly demand 128x more alignment
 /// than the target asks for.
-pub const BUNDLE_CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 4) * 4;
+pub(crate) const BUNDLE_CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 4) * 4;
 
-/// Host driver: send a BUNDLE for the target to run from RAM now, without persisting it -- the
-/// bundle counterpart of [`lamella_runner::send_program`], and the SEND HALF on its own.
+/// Host driver: put ONE planned chunk of a bundle on the wire as a LOAD -- into the target's RAM,
+/// without persisting it. The ack is the caller's to collect with [`try_recv_bundle_ack`].
 ///
-/// **THE REPLY IS A [`lamella_runner::repl::RUN_RESULT`], COLLECTED WITH
-/// [`lamella_runner::try_recv_result`]** -- the same poll a program run uses, because the target
-/// answers both the same way. So a caller that cannot block has every piece it needs and no
-/// waiting policy is imposed here.
+/// The mirror of [`send_bundle_chunk`], which puts the same planned chunk in the persistent region
+/// instead. Both take a frame from [`BundleChunks`]: the two halves of the transfer differ only in
+/// where the bytes land, so they share one plan, one chunk shape and one reply.
 ///
-/// A bundle is an artifact the target loads through a front end rather than a baked CIL image (a
-/// `.lpyc` Python bundle today), so this is the path a `.lpyc` takes and a baked image never does.
+/// **A LOAD STARTS NOTHING.** It places an artifact and stops there; starting it is a separate op,
+/// which is what makes the same transfer usable for running now and for inspecting before running.
+///
+/// A bundle is an artifact the target loads through a front end rather than a baked image, so this
+/// is the path a Python bundle takes and a baked image never does.
 ///
 /// **GATE ON [`lamella_wire::Capabilities::BUNDLE`], from the `HELLO_ACK`**, which
 /// [`hello_blocking`] already returns -- the bit exists precisely so a host can decide without a
@@ -997,40 +1202,82 @@ pub const BUNDLE_CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 4) * 4;
 /// [`TransportError::Refused`] promptly rather than timing out -- but it spends a round trip to
 /// learn what the session already knew.
 ///
-/// **Payload is the bundle's BARE bytes, with no `(offset, total)` header.** That asymmetry with
-/// [`deploy_bundle_blocking`] is the protocol's and is deliberate: running from RAM does not chunk,
-/// so it does not carry a header it would never vary.
-///
 /// # Errors
-/// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
-/// on timeout; otherwise a carrier [`TransportError`].
+/// Propagates a [`TransportError`] from the carrier.
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn send_run_bundle(
     transport: &mut impl Transport,
     seq: u16,
-    bundle: &[u8],
+    chunk: &[u8],
 ) -> Result<(), TransportError> {
-    transport.send(lamella_runner::bundle::RUN_BUNDLE, seq, bundle)
+    transport.send(load::LOAD_BUNDLE, seq, chunk)
 }
 
-/// Host driver, blocking: [`send_run_bundle`] and wait for the result.
+/// Host driver, blocking: load `bundle` into the target's RAM chunk by chunk, then start it and wait
+/// for the result.
 ///
-/// **A CONVENIENCE OVER THE TWO HALVES ABOVE, NOT THE CONTRACT.** A host with an event loop, a
-/// cancel button or an agent behind it drives `send_run_bundle` + [`lamella_runner::try_recv_result`]
-/// itself and owns its own waiting; nothing here needs a thread.
+/// **A CONVENIENCE OVER [`BundleChunks`], [`send_run_bundle`] AND [`try_recv_bundle_ack`], NOT THE
+/// CONTRACT.** A host with an event loop, a cancel button or an agent behind it drives those three
+/// and owns its own waiting; nothing here needs a thread.
+///
+/// # Choosing `timeout`
+///
+/// It bounds each WAIT, not the call: one wait per chunk acknowledged, then one for the program to
+/// finish. So it is governed by two things a caller knows and this function does not -- how long a
+/// round trip takes on the carrier in use, and how long the PROGRAM runs.
+///
+/// The transfer term is arithmetic: a bundle divided by the frame size, times a round trip. Over a
+/// serial carrier at 115200 baud a full frame is about 5.7 seconds of line time, so a per-wait
+/// bound under that will time out a transfer that is proceeding normally. The program term has no
+/// formula at all -- a blink never returns.
+///
+/// Worked example: a 40 KB bundle over a 115200 carrier crosses in one frame, so a wait of 30
+/// seconds covers the transfer with room, and the choice is then entirely about the program. There
+/// is deliberately no default constant here: a value that suits a test suite would silently cut off
+/// a program somebody meant to watch.
 ///
 /// # Errors
 /// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
 /// on timeout; otherwise a carrier [`TransportError`].
+///
+/// A target REFUSING a chunk is not among them: it is [`RunOutcome::Rejected`], because the carrier
+/// worked and the target answered.
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn run_bundle_blocking(
     transport: &mut impl Transport,
     seq: u16,
     bundle: &[u8],
     timeout: Duration,
-) -> Result<RunResult, TransportError> {
-    send_run_bundle(transport, seq, bundle)?;
-    await_result(transport, seq, timeout)
+) -> Result<RunOutcome, TransportError> {
+    let mut chunks = BundleChunks::new(bundle, BUNDLE_CHUNK_DATA_CAP);
+    let mut index = 0usize;
+    while let Some(chunk) = chunks.next() {
+        send_run_bundle(transport, seq, &chunk)?;
+        if let TransferAck::Rejected { chunk } = await_transfer_ack(transport, seq, index, timeout)? {
+            return Ok(RunOutcome::Rejected { chunk });
+        }
+        index += 1;
+    }
+    transport.send(exec::EXEC, seq, &[exec::exec_source::LOADED, 0])?;
+    Ok(RunOutcome::Ran(await_result(transport, seq, timeout)?))
+}
+
+/// Wait for one chunk's transfer ack.
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+fn await_transfer_ack(
+    transport: &mut impl Transport,
+    seq: u16,
+    chunk: usize,
+    timeout: Duration,
+) -> Result<TransferAck, TransportError> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(ack) = try_recv_bundle_ack(transport, seq, chunk)? {
+            return Ok(ack);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Err(TransportError::Closed)
 }
 
 /// **DEPLOYING a BUNDLE: the protocol, stated once.** A bundle persists to the target's deploy
@@ -1041,7 +1288,7 @@ pub fn run_bundle_blocking(
 /// **Payload is ALWAYS `[offset u32][total u32][bytes]`**, so a bundle that fits one frame is the
 /// degenerate one-chunk case rather than a second code path -- the protocol pays eight bytes on a
 /// small bundle to keep the artifact kind on EVERY frame, so an interrupted transfer cannot be
-/// misread as a partial baked image. **A bundle NEVER travels under `DEPLOY_CHUNK`.**
+/// misread as a partial artifact of another kind.
 ///
 /// The chunk plan for a bundle deploy: **pure arithmetic, no I/O, no waiting.**
 ///
@@ -1079,10 +1326,10 @@ impl<'a> BundleChunks<'a> {
     /// The next frame payload -- `[offset u32][total u32][bytes]` -- or `None` when the bundle is
     /// fully planned.
     ///
-    /// **An EMPTY bundle yields exactly ONE frame** (`offset = 0, total = 0`), mirroring
-    /// `deploy_blocking`'s empty-image clear: the target erases the header and commits a zero
-    /// length, which is how it records "nothing deployed". Yielding nothing would report a clear
-    /// that never happened.
+    /// **An EMPTY bundle yields exactly ONE frame** (`offset = 0, total = 0`): the target erases
+    /// the header and commits a zero length, which is how it records that nothing is deployed.
+    /// Yielding nothing would report a clear that never happened. Discarding a transfer is a
+    /// different thing and has its own op.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Vec<u8>> {
         if self.done {
@@ -1110,15 +1357,19 @@ pub fn send_bundle_chunk(
     seq: u16,
     chunk: &[u8],
 ) -> Result<(), TransportError> {
-    transport.send(lamella_runner::bundle::DEPLOY_BUNDLE, seq, chunk)
+    transport.send(deploy::DEPLOY_BUNDLE, seq, chunk)
 }
 
-/// Host driver: poll for one chunk's `DEPLOY_RESULT` (non-blocking; `Ok(None)` if it is not in yet).
+/// Host driver: poll for one chunk's `XFER_RESULT` (non-blocking; `Ok(None)` if it is not in yet).
 ///
-/// `Ok(Some(true))` accepted, `Ok(Some(false))` the target REJECTED that chunk. Following
-/// [`lamella_runner::try_recv_result`]'s rule, `Ok(None)` means one thing only -- nothing has
-/// arrived -- so a refusal comes back as [`TransportError::Refused`] rather than as a caller
-/// polling a healthy link to its deadline and blaming the cable.
+/// `chunk` is the index of the chunk this poll is FOR, and it is an argument because only the
+/// caller knows it: the reply carries the request's sequence number, not a position in a plan.
+/// Passing it is what lets a [`TransferAck::Rejected`] answer the question it raises without the
+/// caller having tracked the index alongside.
+///
+/// `Ok(None)` means ONE thing -- nothing has arrived -- so a target that does not implement the
+/// op comes back as [`TransportError::Refused`] rather than as a caller polling a healthy link to
+/// its deadline and blaming the cable.
 ///
 /// # Errors
 /// [`TransportError::Refused`] when the target answered `ERROR` for this sequence; otherwise a
@@ -1127,14 +1378,19 @@ pub fn send_bundle_chunk(
 pub fn try_recv_bundle_ack(
     transport: &mut impl Transport,
     seq: u16,
-) -> Result<Option<bool>, TransportError> {
+    chunk: usize,
+) -> Result<Option<TransferAck>, TransportError> {
     use lamella_wire::{Frame, msg};
     while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
         if reply_seq != seq {
             continue;
         }
-        if msg_type == deploy::DEPLOY_RESULT {
-            return Ok(Some(payload.first().copied().unwrap_or(0) == 1));
+        if msg_type == deploy::XFER_RESULT {
+            return Ok(Some(if transfer_accepted(&payload) {
+                TransferAck::Accepted
+            } else {
+                TransferAck::Rejected { chunk }
+            }));
         }
         if msg_type == msg::ERROR {
             return Err(TransportError::Refused {
@@ -1156,6 +1412,9 @@ pub fn try_recv_bundle_ack(
 /// # Errors
 /// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
 /// if a chunk goes unacked past `timeout`; otherwise a carrier [`TransportError`].
+///
+/// A target REJECTING a chunk is not among them: it is [`TransferAck::Rejected`], and it carries
+/// which chunk.
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn deploy_bundle_blocking(
     transport: &mut impl Transport,
@@ -1163,32 +1422,30 @@ pub fn deploy_bundle_blocking(
     bundle: &[u8],
     chunk_len: usize,
     timeout: Duration,
-) -> Result<bool, TransportError> {
+) -> Result<TransferAck, TransportError> {
     let mut chunks = BundleChunks::new(bundle, chunk_len);
+    let mut index = 0usize;
     while let Some(chunk) = chunks.next() {
         send_bundle_chunk(transport, seq, &chunk)?;
-        let deadline = Instant::now() + timeout;
-        let mut acked = None;
-        while Instant::now() < deadline {
-            if let Some(ack) = try_recv_bundle_ack(transport, seq)? {
-                acked = Some(ack);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
+        if let rejected @ TransferAck::Rejected { .. } =
+            await_transfer_ack(transport, seq, index, timeout)?
+        {
+            return Ok(rejected);
         }
-        match acked {
-            Some(true) => {}
-            Some(false) => return Ok(false),
-            None => return Err(TransportError::Closed),
-        }
+        index += 1;
     }
-    Ok(true)
+    Ok(TransferAck::Accepted)
 }
 
-/// Host driver, blocking: query the deployed image's content checksum -- `Some(checksum)` if the
-/// target holds a valid image, `None` if none. Compare it to a freshly-baked image's
+/// Host driver, blocking: query the deployed artifact's content checksum -- `Some(checksum)` when
+/// the target holds one it has VERIFIED, `None` otherwise. Compare it to a freshly-baked image's
 /// [`lamella_runner::baked_image_checksum`] to SKIP re-deploying an image the target already holds
 /// (content-addressed deploy -- the phone-style "already installed, just run it").
+///
+/// The reply distinguishes five states -- nothing there, verified, present but unverifiable, a
+/// different runtime's artifact, a different partition layout -- and this reduces four of them to
+/// `None`. That reduction is right for the question this function asks, because every one of the
+/// four is a case where the caller should deploy; a caller that wants to say WHY reads the reply.
 ///
 /// # Errors
 /// [`TransportError::Closed`] on timeout; otherwise a carrier [`TransportError`].
@@ -1204,8 +1461,9 @@ pub fn deployed_status_blocking(
     while Instant::now() < deadline {
         while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
             if msg_type == deploy::DEPLOY_STATUS_RESULT && reply_seq == seq {
-                if payload.first().copied().unwrap_or(0) == 1 && payload.len() >= 9 {
-                    let sum = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+                let verified = payload.first().copied() == Some(deploy::deploy_state::VERIFIED);
+                if verified && payload.len() >= 10 {
+                    let sum = u64::from_le_bytes(payload[2..10].try_into().unwrap());
                     return Ok(Some(sum));
                 }
                 return Ok(None);
@@ -1216,10 +1474,17 @@ pub fn deployed_status_blocking(
     Err(TransportError::Closed)
 }
 
-/// Host driver: pull the target's full resident-profile manifest ([`profile::GET_PROFILE`] ->
-/// [`profile::PROFILE_MANIFEST`]): the identity + the complete intrinsic-id listing of the
-/// resident surface. Ask only when the `HELLO_ACK`'s [`lamella_wire::ProfileIdentity`] hash
-/// misses the host's manifest cache -- a KNOWN board costs no extra round-trip at all.
+/// Host driver: pull the target's full resident-profile manifest: the identity, the resident
+/// library's capability-symbol bitmap, the profile name, and the complete listing of runtime seams
+/// the target registers. Ask only when the `HELLO_ACK` identity's hash misses the host's manifest
+/// cache -- a KNOWN board costs no extra round trip at all.
+///
+/// The reply is CHUNKED, `offset, total, bytes` like every other transfer, which is what makes the
+/// manifest's own promise of an unconstrained profile description true rather than aspirational: one
+/// frame's length field caps at 65,535 bytes, and the manifest grows with the seam count and with
+/// each resident runtime a board carries. Chunks are reassembled here; a chunk arriving out of order
+/// re-requests from the point already held rather than restarting, which is what the request's
+/// offset is for.
 ///
 /// # Errors
 /// [`TransportError::Closed`] on timeout or an undecodable manifest; otherwise a carrier error.
@@ -1231,12 +1496,23 @@ pub fn profile_manifest_blocking(
 ) -> Result<lamella_wire::ProfileManifest, TransportError> {
     use lamella_runner::profile;
     use lamella_wire::{Frame, ProfileManifest};
-    transport.send(profile::GET_PROFILE, seq, &[])?;
+    let mut held: Vec<u8> = Vec::new();
+    transport.send(profile::PROFILE_GET, seq, &0u32.to_le_bytes())?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-            if msg_type == profile::PROFILE_MANIFEST && reply_seq == seq {
-                return ProfileManifest::decode(&payload).ok_or(TransportError::Closed);
+            if msg_type != profile::PROFILE_MANIFEST || reply_seq != seq || payload.len() < 8 {
+                continue;
+            }
+            let offset = u32::from_le_bytes(payload[0..4].try_into().unwrap_or_default()) as usize;
+            let total = u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) as usize;
+            if offset != held.len() {
+                transport.send(profile::PROFILE_GET, seq, &(held.len() as u32).to_le_bytes())?;
+                continue;
+            }
+            held.extend_from_slice(&payload[8..]);
+            if held.len() >= total {
+                return ProfileManifest::decode(&held).ok_or(TransportError::Closed);
             }
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -1244,15 +1520,18 @@ pub fn profile_manifest_blocking(
     Err(TransportError::Closed)
 }
 
-/// Host driver: tell the target to boot its deployed image NOW ([`deploy::DEPLOY_RUN`]) -- a clean
-/// self-reset into the boot-run path, so deploy->run needs no debug probe. Fire-and-forget: the
-/// target resets and does not reply (do NOT then `HELLO`, which would interrupt the running app).
+/// Host driver: tell the target to start its DEPLOYED artifact now, so deploy-then-run needs no
+/// debug probe.
+///
+/// The target acknowledges before anything the start implies, so a host can tell an accepted start
+/// from a target that simply stopped answering. Do not follow it with a `HELLO` -- that is a
+/// separate question and asking it is not free.
 ///
 /// # Errors
 /// A carrier [`TransportError`] if the command could not be sent.
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn send_deploy_run(transport: &mut impl Transport, seq: u16) -> Result<(), TransportError> {
-    transport.send(deploy::DEPLOY_RUN, seq, &[])
+    transport.send(exec::EXEC, seq, &[exec::exec_source::DEPLOYED, 0])
 }
 
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
@@ -1261,10 +1540,11 @@ fn await_result(
     seq: u16,
     timeout: Duration,
 ) -> Result<RunResult, TransportError> {
+    let mut run = RunCollector::new(seq);
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(result) = try_recv_result(transport, seq)? {
-            return Ok(result);
+        if run.poll(transport)? {
+            return run.finish().ok_or(TransportError::Closed);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1302,6 +1582,127 @@ mod tests {
     use super::*;
     use lamella_wire::MemTransport;
 
+    /// A TARGET THAT REFUSES THE VERSION IS REPORTED AS A VERSION REFUSAL, NOT AS A CLOSED LINK.
+    ///
+    /// This is the defect the variant was added for. `hello_blocking` decoded the `HELLO_NAK` and
+    /// threw it away, returning `Closed` -- so the protocol's ONE deliberate incompatibility signal
+    /// arrived at the user as *the link is closed*, which is the reading that sends somebody to
+    /// check a cable that is fine.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn a_version_refusal_is_not_reported_as_a_closed_link() {
+        use lamella_wire::{HelloNak, ProtocolRange, msg};
+
+        let mut transport = MemTransport::new();
+        let nak = HelloNak { target_range: ProtocolRange { min: 7, max: 9 } };
+        let frame = lamella_wire::encode_frame(msg::HELLO_NAK, 0, &nak.encode()).expect("frames");
+        transport.feed(&frame);
+
+        let error = hello_blocking(
+            &mut transport,
+            0,
+            lamella_wire::Capabilities(0),
+            Duration::from_millis(200),
+        )
+        .expect_err("a NAK is not a session");
+
+        match error {
+            TransportError::VersionMismatch { target_min, target_max } => {
+                assert_eq!((target_min, target_max), (7, 9), "the target's own range survives");
+            }
+            other => panic!("a version refusal must not arrive as {other:?}"),
+        }
+    }
+
+    /// AND THE SENTENCE NAMES THE DIRECTION, because that is what decides where a person goes next.
+    ///
+    /// Two version numbers on their own leave the reader to work out which end is behind, and the
+    /// two answers send them to opposite places.
+    ///
+    #[test]
+    fn the_version_sentence_says_which_end_has_to_move() {
+        let behind = version_mismatch(3, 1, 1);
+        assert!(behind.contains("BOARD is behind"), "got {behind}");
+        assert!(behind.contains("reflash"), "and says what to do: {behind}");
+        assert!(behind.contains("version 1"), "a single version does not read as a range: {behind}");
+
+        let ahead = version_mismatch(1, 4, 6);
+        assert!(ahead.contains("TOOL is behind"), "got {ahead}");
+        assert!(ahead.contains("update the tools"), "and says what to do: {ahead}");
+        assert!(ahead.contains("versions 4 to 6"), "a real range reads as a range: {ahead}");
+
+        for sentence in [&behind, &ahead] {
+            assert!(sentence.contains("cable"), "must rule the cable out: {sentence}");
+        }
+
+        for sentence in [&behind, &ahead] {
+            assert!(!sentence.contains("  "), "a doubled space reached the sentence: {sentence}");
+        }
+    }
+
+    /// A NAK THAT DID NOT DECODE STILL PRODUCES A SENTENCE, AND IT DOES NOT INVENT A DIRECTION.
+    ///
+    /// `0` is not a protocol version, so it cannot be mistaken for a real range -- but a renderer
+    /// comparing it numerically would confidently report the board as behind, which is a direction
+    /// invented out of a decode failure.
+    #[test]
+    fn an_undecodable_refusal_does_not_claim_to_know_which_end_is_behind() {
+        let sentence = version_mismatch(lamella_wire::PROTOCOL_VERSION, 0, 0);
+        assert!(!sentence.contains("BOARD is behind"), "got {sentence}");
+        assert!(!sentence.contains("TOOL is behind"), "got {sentence}");
+        assert!(sentence.contains("did not decode"), "and says what happened: {sentence}");
+        assert!(!sentence.contains("  "), "a doubled space reached the sentence: {sentence}");
+    }
+
+    #[cfg(feature = "usb")]
+    fn listed_board(vendor_id: u16, product_id: u16) -> lamella_usbbulk::DeviceInfo {
+        lamella_usbbulk::DeviceInfo {
+            vendor_id,
+            product_id,
+            serial_number: Some(String::from("BENCHSERIAL0001")),
+            product: Some(String::from("Lamella Link (test)")),
+            interface_name: None,
+        }
+    }
+
+    #[cfg(feature = "usb")]
+    #[test]
+    fn a_current_board_is_recognized_and_has_nothing_said_about_it() {
+        use lamella_wire::usb::{LinkIdentity, PID, VID};
+        let era = firmware_era(&listed_board(VID, PID)).expect("a Link");
+        assert_eq!(era, LinkIdentity::Current);
+        assert_eq!(era_note(era), None);
+    }
+
+    #[cfg(feature = "usb")]
+    #[test]
+    fn a_legacy_board_is_recognized_and_the_note_says_why_it_would_be_missing() {
+        use lamella_wire::usb::{LEGACY_VID, LinkIdentity, PID};
+        let era = firmware_era(&listed_board(LEGACY_VID, PID)).expect("a Link");
+        assert_eq!(era, LinkIdentity::Legacy);
+        let note = era_note(era).expect("a legacy board has something said about it");
+        assert!(note.contains("does not list it at all"), "got {note}");
+        assert!(note.contains("Reflash"), "and says what to do: {note}");
+    }
+
+    #[cfg(feature = "usb")]
+    #[test]
+    fn something_that_is_not_a_link_is_not_given_an_era_at_all() {
+        use lamella_wire::usb::{LEGACY_VID, PID, VID};
+        assert_eq!(firmware_era(&listed_board(0x2e8a, 0x000c)), None, "a debug probe is not a Link");
+        assert_eq!(firmware_era(&listed_board(VID, PID + 1)), None, "the product id matters too");
+        assert_eq!(firmware_era(&listed_board(LEGACY_VID, PID + 1)), None, "on both pairs");
+    }
+
+    /// One accepted transfer ack, framed: `status | crc32`. Built here rather than spelled at each
+    /// site so a test cannot come to disagree with the ladder about what acceptance looks like.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn xfer_ack(seq: u16) -> Vec<u8> {
+        let mut payload = vec![lamella_wire::msg::xfer::MATCHED];
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        encode_frame(deploy::XFER_RESULT, seq, &payload).expect("a 5-byte ack frames")
+    }
+
     fn corlib() -> Option<Vec<u8>> {
         std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll")).ok()
     }
@@ -1328,17 +1729,20 @@ mod tests {
         send_program(&mut driver, 1, &program).unwrap();
         runner.feed(&driver.take_sent());
 
-        assert!(serve_one(&mut runner, &corlib).unwrap(), "the runner handled a RUN_PROGRAM");
+        let mut arena = ArtifactLoad::new();
+        while serve_one(&mut runner, &corlib, &mut arena).unwrap() {}
         driver.feed(&runner.take_sent());
 
-        let result = try_recv_result(&mut driver, 1).unwrap().expect("a result arrived");
+        let mut run = RunCollector::new(1);
+        assert!(run.poll(&mut driver).unwrap(), "the execution ended");
+        let result = run.finish().expect("a result arrived");
         assert_eq!(result.exit, 7);
         assert_eq!(result.stdout, "hi\n");
     }
 
     /// THE HAZARD [`CHUNK_DATA_CAP`] EXISTS FOR.
     ///
-    /// A `DEPLOY_CHUNK` payload carries 8 bytes of `(offset, total)` ahead of the image bytes, and
+    /// A `DEPLOY_IMAGE` payload carries 8 bytes of `(offset, total)` ahead of the image bytes, and
     /// those 8 bytes are what make 65536 -- round, and a legal multiple of the 512-byte flash page
     /// the doc asks for -- the value that goes over the wire's `u16` length field.
     ///
@@ -1358,7 +1762,7 @@ mod tests {
         assert_eq!(
             lamella_wire::encode_frame(0x20, 1, &over),
             None,
-            "an over-long DEPLOY_CHUNK must be refused; truncating it produced a frame the target \
+            "an over-long chunk must be refused; truncating it produced a frame the target \
              could not tell from a good one"
         );
 
@@ -1382,7 +1786,7 @@ mod tests {
         let image: Vec<u8> = (0..(2 * 65536 + 777)).map(|i| (i % 251) as u8).collect();
         let mut transport = MemTransport::new();
         for _ in 0..8 {
-            transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 3, &[1]).expect("a 1-byte ack frames"));
+            transport.feed(&xfer_ack(3));
         }
 
         let ok = deploy_chunked_blocking(&mut transport, 3, &image, 65536, Duration::from_secs(5))
@@ -1394,7 +1798,7 @@ mod tests {
         let mut reader = FrameReader::new();
         reader.push(&transport.take_sent());
         while let Some(frame) = reader.next_frame() {
-            if frame.msg_type != deploy::DEPLOY_CHUNK {
+            if frame.msg_type != deploy::DEPLOY_IMAGE {
                 continue;
             }
             let offset = u32::from_le_bytes(frame.payload[0..4].try_into().unwrap()) as usize;
@@ -1419,12 +1823,12 @@ mod tests {
         let bundle: Vec<u8> = (0..10_003).map(|i| (i % 251) as u8).collect();
         let mut transport = MemTransport::new();
         for _ in 0..32 {
-            transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 7, &[1]).expect("a 1-byte ack frames"));
+            transport.feed(&xfer_ack(7));
         }
 
-        let ok = deploy_bundle_blocking(&mut transport, 7, &bundle, 1023, Duration::from_secs(5))
+        let ack = deploy_bundle_blocking(&mut transport, 7, &bundle, 1023, Duration::from_secs(5))
             .expect("the in-memory carrier never errors");
-        assert!(ok, "every chunk acked");
+        assert_eq!(ack, TransferAck::Accepted, "every chunk acked");
 
         let mut got = vec![0u8; bundle.len()];
         let mut covered = vec![false; bundle.len()];
@@ -1434,7 +1838,7 @@ mod tests {
         while let Some(frame) = reader.next_frame() {
             assert_eq!(
                 frame.msg_type,
-                lamella_runner::bundle::DEPLOY_BUNDLE,
+                deploy::DEPLOY_BUNDLE,
                 "a bundle must never travel under another op"
             );
             let offset = u32::from_le_bytes(frame.payload[0..4].try_into().unwrap()) as usize;
@@ -1459,16 +1863,16 @@ mod tests {
     #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
     fn an_empty_bundle_still_sends_one_frame_because_that_is_the_clear() {
         let mut transport = MemTransport::new();
-        transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 9, &[1]).expect("a 1-byte ack frames"));
+        transport.feed(&xfer_ack(9));
 
-        let ok = deploy_bundle_blocking(&mut transport, 9, &[], 4096, Duration::from_secs(5))
+        let ack = deploy_bundle_blocking(&mut transport, 9, &[], 4096, Duration::from_secs(5))
             .expect("the in-memory carrier never errors");
-        assert!(ok, "the clear was acked");
+        assert_eq!(ack, TransferAck::Accepted, "the clear was acked");
 
         let mut reader = FrameReader::new();
         reader.push(&transport.take_sent());
         let frame = reader.next_frame().expect("a clear must put ONE frame on the wire");
-        assert_eq!(frame.msg_type, lamella_runner::bundle::DEPLOY_BUNDLE);
+        assert_eq!(frame.msg_type, deploy::DEPLOY_BUNDLE);
         assert_eq!(frame.payload, vec![0u8; 8], "offset 0, total 0, and no bytes");
         assert!(reader.next_frame().is_none(), "a clear is exactly one frame");
     }
@@ -1490,26 +1894,33 @@ mod tests {
         );
     }
 
-    /// `RUN_BUNDLE` takes the BARE bytes. The asymmetry with `DEPLOY_BUNDLE` is the protocol's and is
+    /// Both halves take the SAME chunk shape. Where they differ is where the bytes land, and that is
     /// deliberate, so a header helpfully added here would be decoded as the first eight bytes of the
     /// program.
+    ///
+    /// A LOAD places an artifact and STARTS NOTHING, so the two halves have to both appear on the
+    /// wire and in that order. This asserts what CROSSED rather than what came back: the completion
+    /// event and its decode belong to the target-side runner, and a test that fed one here would be
+    /// asserting that lane's shape rather than this driver's.
     #[test]
     #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
-    fn run_bundle_sends_the_bare_bytes_with_no_chunk_header() {
+    fn a_bundle_run_loads_in_chunks_and_then_starts_what_it_loaded() {
         let bundle: Vec<u8> = (0..64).map(|i| (i % 251) as u8).collect();
         let mut transport = MemTransport::new();
-        transport.feed(
-            &encode_frame(repl::RUN_RESULT, 6, &RunResult { exit: 0, stdout: String::new() }.encode())
-                .expect("a result frames"),
-        );
+        transport.feed(&xfer_ack(6));
 
-        run_bundle_blocking(&mut transport, 6, &bundle, Duration::from_secs(5))
-            .expect("the in-memory carrier never errors");
+        let _ = run_bundle_blocking(&mut transport, 6, &bundle, Duration::from_millis(20));
 
         let mut reader = FrameReader::new();
         reader.push(&transport.take_sent());
-        let frame = reader.next_frame().expect("one frame");
-        assert_eq!(frame.msg_type, lamella_runner::bundle::RUN_BUNDLE);
-        assert_eq!(frame.payload, bundle, "RUN_BUNDLE must carry the bundle and nothing else");
+        let load = reader.next_frame().expect("the load chunk");
+        assert_eq!(load.msg_type, load::LOAD_BUNDLE);
+        assert_eq!(&load.payload[0..4], &0u32.to_le_bytes(), "offset 0");
+        assert_eq!(&load.payload[4..8], &(bundle.len() as u32).to_le_bytes(), "the whole length");
+        assert_eq!(&load.payload[8..], &bundle[..], "then the bundle");
+
+        let start = reader.next_frame().expect("the start");
+        assert_eq!(start.msg_type, exec::EXEC);
+        assert_eq!(start.payload, vec![exec::exec_source::LOADED, 0], "from RAM, running");
     }
 }

@@ -8,17 +8,38 @@
 # STM32F405xx/07xx and STM32F415xx/17xx. Every offset and bit below is from SECTION 6. The two
 # sections state overlapping register names at overlapping offsets, so reading the wrong one
 # produces a table that looks entirely plausible and gates the wrong peripherals.
+#
+# ALL ELEVEN GPIO PORTS ARE PLACED, WHICH IS A DELIBERATE EXCEPTION TO THE EVIDENCE-ONLY RULE THIS
+# FILE OTHERWISE FOLLOWS. A port normally joins when something reaches it, and on that rule GPIOH
+# through GPIOK would be absent because no binding here touches one. A GPIO DRIVER is a different
+# kind of consumer from a binding: it presents a pin count and answers for every pin inside it, so
+# a map with holes hands a caller a pin number whose port has no base -- and the hole sits wherever
+# nothing happened to be bound rather than anywhere a reader would predict. The four joined with
+# the driver, from the same table as the seven already here.
+#
+# THE BOUNDARY TABLE DESCRIBES THE ADDRESS SPACE, WHICH IS NOT A PAD LIST, AND THE GAP IS LARGE ON
+# THIS FAMILY. Every part here decodes eleven port register blocks; no package bonds eleven ports'
+# worth of pads. DS9405 Rev 13 Table 2 gives the widest of them 168 GPIOs, which is ports A to J
+# whole plus PK0-PK7 -- so PORT K IS EIGHT PADS WIDE ON THE DIE ITSELF, and its register still
+# carries sixteen fields. The LQFP144 bonds 114: that datasheet's figure 13 shows ports A to G
+# whole, PH0 and PH1, and no PI, PJ or PK pad at all. What a part BONDS is that part's `pins`
+# present-list in parts.toml, and nothing in this file.
+#
+# RM0090's TABLE 1 PRINTS IN DESCENDING ADDRESS ORDER, so a reader walking DOWN that page is
+# walking UP the port letters, and GPIOK is the first GPIO row rather than the last. The eleven
+# bases below run the other way.
 
 [table]
 kind = "instances"
 family = "stm32f42x"
 record = ["base", "rcc_en_off", "rcc_en_bit"]
 sources = [
-    "RM0090 Rev 22 memory map (Table 1, register boundary addresses): RCC 0x40023800, GPIOA 0x40020000, GPIOB 0x40020400, GPIOC 0x40020800, GPIOD 0x40020C00, GPIOE 0x40021000, GPIOF 0x40021400, GPIOG 0x40021800, USART1 0x40011000",
+    "RM0090 Rev 22 memory map (Table 1, register boundary addresses): RCC 0x40023800, GPIOA 0x40020000, GPIOB 0x40020400, GPIOC 0x40020800, GPIOD 0x40020C00, GPIOE 0x40021000, GPIOF 0x40021400, GPIOG 0x40021800, GPIOH 0x40021C00, GPIOI 0x40022000, GPIOJ 0x40022400, GPIOK 0x40022800, USART1 0x40011000. The table prints its rows in DESCENDING address order, so the GPIO block runs from GPIOK down to GPIOA on the page.",
     "RM0090 Rev 22 section 6.3.10 RCC_AHB1ENR (address offset 0x30): GPIOAEN bit 0, GPIOBEN bit 1, GPIOCEN bit 2, GPIODEN bit 3, GPIOEEN bit 4, GPIOFEN bit 5, GPIOGEN bit 6, GPIOHEN bit 7, GPIOIEN bit 8, GPIOJEN bit 9, GPIOKEN bit 10",
     "RM0090 Rev 22 section 6.3.14 RCC_APB2ENR (address offset 0x44): USART1EN bit 4",
     "RM0090 Rev 22 memory map: USART2 0x40004400, the USB OTG full-speed core 0x50000000, the embedded-flash interface 0x40023C00. Section 6.3.13 RCC_APB1ENR (address offset 0x40) gives USART2EN bit 17 and section 6.3.11 RCC_AHB2ENR (address offset 0x34) gives OTGFSEN bit 7",
     "RM0090 Rev 22 memory map: the FMC control registers at 0xA0000000. Section 6.3.12 RCC_AHB3ENR (address offset 0x38) gives FMCEN bit 0",
+    "STM32F427xx/STM32F429xx datasheet DS9405 Rev 13, for what the SILICON bonds as opposed to what it decodes: Table 2 gives 168 GPIOs to the widest package and 114 to the STM32F429Zx, and figure 13's LQFP144 pinout shows ports A to G whole plus PH0 and PH1 and no port I, J or K pad. The eleven port blocks below are the address space every part in the family decodes, which is a superset of both",
 ]
 notes = [
     "Every bit position here is the one the reference manual's per-bit descriptions give, which name each enable bit and its position in prose.",
@@ -105,6 +126,38 @@ block = "gpio"
 base = 0x40021800
 rcc_en_off = 0x30   # RCC_AHB1ENR
 rcc_en_bit = 6      # GPIOGEN
+
+# THE FOUR PORTS NO BINDING REACHES, PLACED FOR THE GPIO DRIVER. They are the exception this file's
+# header states: a driver answers for every pin in its count, so the four that no board has bound
+# have to be here or a caller's pin number lands on a port with no base.
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x40021C00
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 7      # GPIOHEN
+
+[[instances]]
+name = "gpioi"
+block = "gpio"
+base = 0x40022000
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 8      # GPIOIEN
+
+[[instances]]
+name = "gpioj"
+block = "gpio"
+base = 0x40022400
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 9      # GPIOJEN
+
+[[instances]]
+name = "gpiok"
+block = "gpio"
+base = 0x40022800
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 10     # GPIOKEN
 
 [[instances]]
 name = "rcc"

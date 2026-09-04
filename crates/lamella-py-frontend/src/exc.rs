@@ -13,14 +13,19 @@ pub fn is_builtin_exception(name: &str) -> bool {
 /// The tags a `catch`/`except` of `name` matches: `name`'s own tag plus the tag of every type that
 /// derives from it -- a thrown subtype the handler must take. Empty when `name` is not a built-in
 /// exception (so the caller can fall the whole function to the dynamic path). The hierarchy lists
-/// each base BEFORE its children, so one forward pass accumulates the entire descendant set.
+/// every base BEFORE its children, so one forward pass accumulates the entire descendant set.
+///
+/// A type is taken when ANY of its direct bases is already in the set, which is what makes the pass
+/// correct for the one built-in with two bases (`ExceptionGroup`, under both `BaseExceptionGroup`
+/// and `Exception`): each base independently pulls it in, so `except Exception:` and
+/// `except BaseExceptionGroup:` both take a group.
 pub fn subtype_tags(name: &str) -> Vec<u32> {
     if !is_builtin_exception(name) {
         return Vec::new();
     }
     let mut names: Vec<&str> = vec![name];
-    for &(ty, base) in EXCEPTION_HIERARCHY {
-        if names.contains(&base) && !names.contains(&ty) {
+    for &(ty, bases) in EXCEPTION_HIERARCHY {
+        if bases.iter().any(|b| names.contains(b)) && !names.contains(&ty) {
             names.push(ty);
         }
     }

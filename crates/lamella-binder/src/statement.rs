@@ -1,9 +1,7 @@
 //! Statement binding (ECMA-334 1st ed, clause 15).
 
 use crate::bind::bind_type;
-use crate::bound::{
-    Binder, BoundExpr, BoundExprKind, MethodReference, constant_int_value, constant_literal_value,
-};
+use crate::bound::{Binder, BoundExpr, BoundExprKind, MethodReference};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use lamella_syntax::version::Feature;
 use crate::special::SpecialType;
@@ -207,6 +205,21 @@ fn switch_label_text(label: &BoundSwitchLabel) -> Box<str> {
     }
 }
 
+/// A bound lambda's body (14.5.11).
+///
+/// **THE TWO ARMS ARE NOT INTERCHANGEABLE AT THE EMITTER EITHER.** An expression body's value IS
+/// the return, so the synthesized method is `<expr>; ret`; a block body already contains its
+/// `return` statements and is emitted as a body. Folding them into one would mean synthesizing a
+/// `return` around an expression that may be `void` -- `() => Console.WriteLine(1)` converted to
+/// `Action` has a body whose expression has no value to return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundLambdaBody {
+    /// `x => expr`.
+    Expression(BoundExpr),
+    /// `x => { statements }`.
+    Block(BoundStmt),
+}
+
 /// A bound `catch` clause (15.10): the caught type, the bound exception variable
 /// (in the handler's scope), and the handler body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +228,9 @@ pub struct BoundCatch {
     pub exception_type: Option<TypeSymbol>,
     /// The exception variable's name, if any.
     pub name: Option<Box<str>>,
+    /// The exception filter's bound condition -- `catch (E e) when (cond)` -- else `None`. Bound in
+    /// the SAME scope as the handler, so the exception variable is visible to it.
+    pub filter: Option<BoundExpr>,
     /// The handler body.
     pub body: Box<BoundStmt>,
     /// The `catch (...)` clause header's span, for a debug build's sequence point on it
@@ -243,6 +259,9 @@ impl Binder {
             }
             StmtKind::Empty => BoundStmtKind::Empty,
             StmtKind::Expression(expr) => {
+                if let Some(kind) = self.bind_conditional_access_statement(expr) {
+                    return BoundStmt { kind, span: stmt.span };
+                }
                 let bound = self.bind_expression(expr);
                 if !is_statement_expression(&bound.kind) {
                     self.report(Diagnostic::new(
@@ -261,9 +280,9 @@ impl Binder {
                 declarators,
                 is_const,
             } => {
-                if let Some(name) = crate::program::restricted_array_element(ty) {
+                if let Some(name) = crate::program::restricted_array_element(self, ty) {
                     self.report(Diagnostic::new(
-                        DiagnosticKind::RestrictedTypeArrayElement { ty: name.into() },
+                        DiagnosticKind::RestrictedTypeArrayElement { ty: name },
                         ty.span,
                     ));
                 }
@@ -297,7 +316,16 @@ impl Binder {
                 BoundStmtKind::While { condition, body }
             }
             StmtKind::Return(value) => {
-                let value = value.as_ref().map(|expr| self.bind_expression(expr));
+                let expected = self.current_return_type();
+                let value = value.as_ref().map(|expr| {
+                    match expected
+                        .as_ref()
+                        .and_then(|target| self.bind_target_typed(expr, target))
+                    {
+                        Some(bound) => bound,
+                        None => self.bind_expression(expr),
+                    }
+                });
                 if self.return_leaves_finally() {
                     self.report(Diagnostic::new(
                         DiagnosticKind::ControlLeavesFinally,
@@ -402,12 +430,7 @@ impl Binder {
                     ));
                 }
                 if let (Some(operand), Some(expr)) = (&bound, value.as_ref()) {
-                    if self.is_provably_not_exception(&operand.ty) {
-                        self.report(Diagnostic::new(
-                            DiagnosticKind::CaughtTypeMustBeException,
-                            expr.span,
-                        ));
-                    }
+                    self.check_thrown_operand(operand, expr.span);
                 }
                 BoundStmtKind::Throw(bound)
             }
@@ -516,7 +539,7 @@ impl Binder {
                 catches: {
                     if let Some(index) = catches
                         .iter()
-                        .position(|catch| catch.exception_type.is_none())
+                        .position(|catch| catch.exception_type.is_none() && catch.filter.is_none())
                     {
                         for later in &catches[index + 1..] {
                             self.report(Diagnostic::new(
@@ -576,12 +599,17 @@ impl Binder {
                         stmt.span,
                     ));
                 }
-                if let ExprKind::Literal(Literal::String(text)) = &expr.kind {
-                    BoundStmtKind::GotoCaseString(text.clone())
-                } else {
-                    match self.case_label_value(expr) {
+                let bound = self.bind_expression(expr);
+                self.record_case_label_uses(&bound);
+                match self.required_constant(expr, &bound) {
+                    Some(Literal::String(text)) => BoundStmtKind::GotoCaseString(text),
+                    Some(literal) => match crate::bound::literal_int_value(&literal) {
                         Some(value) => BoundStmtKind::GotoCase(value),
                         None => BoundStmtKind::Error,
+                    },
+                    None => {
+                        self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, expr.span));
+                        BoundStmtKind::Error
                     }
                 }
             }
@@ -605,21 +633,18 @@ impl Binder {
                 let bound = self.bind_expression(expr);
                 self.record_case_label_uses(&bound);
                 self.check_assignable(&bound, governing, expr.span);
-                match crate::bound::constant_literal_value(&bound) {
+                match self.required_constant(expr, &bound) {
                     Some(Literal::String(text)) => BoundSwitchLabel::CaseString(text),
                     Some(Literal::Null) => BoundSwitchLabel::CaseNull,
                     Some(literal) => match crate::bound::literal_int_value(&literal) {
                         Some(value) => BoundSwitchLabel::Case(value),
                         None => {
-                            self.report(Diagnostic::new(
-                                DiagnosticKind::ConstantExpected,
-                                expr.span,
-                            ));
+                            self.report_non_constant_case(governing, expr.span);
                             BoundSwitchLabel::Case(0)
                         }
                     },
                     None => {
-                        self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, expr.span));
+                        self.report_non_constant_case(governing, expr.span);
                         BoundSwitchLabel::Case(0)
                     }
                 }
@@ -627,25 +652,6 @@ impl Binder {
         }
     }
 
-    /// A `case`/`goto case` label's constant value (15.7.2): the label is bound and folded as a
-    /// constant expression (14.15) -- an integer/char/enum constant, or any arithmetic, cast, or
-    /// member reference over them. `None` when it is not a constant integer, which the caller
-    /// reports as `CS0150`. Locals a folded label references are recorded so the unused-local
-    /// check is not misled.
-    fn case_label_value(&mut self, expr: &Expr) -> Option<i64> {
-        let bound = self.bind_expression(expr);
-        self.record_case_label_uses(&bound);
-        constant_int_value(&bound)
-    }
-
-    /// Whether `ty` can be PROVEN not to derive from `System.Exception` -- which makes a
-    /// `catch` or `throw` of it CS0155.
-    ///
-    /// Conservative in ONE direction. An unresolved type, or a class whose base chain leaves
-    /// this compilation, answers false, so an exception type we cannot see is never falsely
-    /// flagged; the cost is missing it. A primitive, `string` or `object` is decided outright
-    /// -- `object` is `Exception`'s BASE, not its descendant -- and a struct, enum, interface
-    /// or delegate cannot derive from a class at all.
     /// Whether `ty` can be PROVEN not to derive from `System.<name>` -- the same conservative walk
     /// [`Self::is_provably_not_exception`] makes, generalized so the attribute rule can reuse it.
     /// A chain that leaves this compilation answers false ("cannot prove"), so an unresolvable
@@ -672,6 +678,49 @@ impl Binder {
         false
     }
 
+    /// Checks the operand of a `throw` -- the STATEMENT's and the EXPRESSION's alike -- against
+    /// `System.Exception` (15.9.5). One function, because the two spellings throw the same value
+    /// by the same rule and csc gives them the same diagnostic, measured on `new object()`, an
+    /// `int` and a `string`.
+    ///
+    /// csc reports the ordinary CONVERSION diagnostic here: `CS0266` when an explicit conversion
+    /// exists and `CS0029` when none does. It is NOT `CS0155`, which is the code for a `catch`
+    /// clause naming a non-exception TYPE -- a different question, asked of a type rather than of
+    /// a value.
+    ///
+    /// **THE CONSERVATIVE FALLBACK IS KEPT AND IT IS LOAD-BEARING.** A compilation whose corlib
+    /// declares no `System.Exception` cannot be asked a conversion question about it, and
+    /// [`Binder::check_assignable`] would answer one anyway -- reporting `CS0029` against a target
+    /// that does not exist. So the conversion check runs only when the model HAS the type, and the
+    /// provable-negative test answers otherwise, exactly as it did before.
+    pub(crate) fn check_thrown_operand(&mut self, operand: &BoundExpr, span: Span) {
+        let exception = TypeSymbol::Named([Box::from("System"), Box::from("Exception")].into());
+        if self.model().get_by_symbol(&exception).is_some() {
+            if !operand.ty.is_error() {
+                self.check_assignable(operand, &exception, span);
+            }
+            return;
+        }
+        if self.is_provably_not_exception(&operand.ty) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::CaughtTypeMustBeException,
+                span,
+            ));
+        }
+    }
+
+    /// Whether `ty` can be PROVEN not to derive from `System.Exception`.
+    ///
+    /// A `catch` clause naming such a TYPE is `CS0155`. A `throw` of such a VALUE is not: csc
+    /// gives the ordinary conversion diagnostic there, which [`Self::check_thrown_operand`]
+    /// asks for directly. This walk answers for a `throw` only as that function's fallback, for
+    /// a compilation whose corlib declares no `System.Exception` to convert against.
+    ///
+    /// Conservative in ONE direction. An unresolved type, or a class whose base chain leaves
+    /// this compilation, answers false, so an exception type we cannot see is never falsely
+    /// flagged; the cost is missing it. A primitive, `string` or `object` is decided outright
+    /// -- `object` is `Exception`'s BASE, not its descendant -- and a struct, enum, interface
+    /// or delegate cannot derive from a class at all.
     pub(crate) fn is_provably_not_exception(&self, ty: &TypeSymbol) -> bool {
         match ty {
             TypeSymbol::Error => return false,
@@ -718,6 +767,27 @@ impl Binder {
             let ty = exception_type.clone().unwrap_or(TypeSymbol::Error);
             self.declare_local(name, ty);
         }
+        let filter = catch.filter.as_ref().map(|condition| {
+            self.enter_catch_filter();
+            let bound = self.bind_condition(condition);
+            self.exit_catch_filter();
+            match &bound.kind {
+                BoundExprKind::Literal(Literal::Boolean(true)) => {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ConstantTrueFilter,
+                        condition.span,
+                    ));
+                }
+                BoundExprKind::Literal(Literal::Boolean(false)) => {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ConstantFalseFilter,
+                        condition.span,
+                    ));
+                }
+                _ => {}
+            }
+            bound
+        });
         self.enter_catch();
         let body = Box::new(self.bind_statement(&catch.body));
         self.exit_catch();
@@ -725,6 +795,7 @@ impl Binder {
         BoundCatch {
             exception_type,
             name: catch.name.clone(),
+            filter,
             body,
             span: catch.span,
         }
@@ -767,7 +838,7 @@ impl Binder {
         let enumerator: Box<str> = format!("<enumerator>{}", span.start).into();
         let call = |receiver: BoundExpr, method: MethodReference| -> BoundExpr {
             let return_type = method.return_type.clone();
-            BoundExpr {
+            let call = BoundExpr {
                 kind: BoundExprKind::Call {
                     callee: Box::new(BoundExpr {
                         kind: BoundExprKind::MethodGroup {
@@ -779,8 +850,9 @@ impl Binder {
                     arguments: Vec::new(),
                     method: Some(method),
                 },
-                ty: return_type,
-            }
+                ty: return_type.clone(),
+            };
+            crate::bound::Binder::deref_ref_return(call, &return_type)
         };
         let enumerator_ref = || BoundExpr {
             kind: BoundExprKind::Local(enumerator.clone()),
@@ -839,7 +911,11 @@ impl Binder {
                 alloc::vec!["System".into(), "IDisposable".into()];
             TypeSymbol::Named(parts.into_boxed_slice())
         };
-        let loop_stmt = match self.resolve_instance_method(&idisposable, "Dispose", span) {
+        let disposal_would_box = self.type_is_by_ref_like(&enumerator_type);
+        let loop_stmt = match self
+            .resolve_instance_method(&idisposable, "Dispose", span)
+            .filter(|_| !disposal_would_box)
+        {
             Some(dispose) => {
                 let disposable: Box<str> = format!("<disposable>{}", span.start).into();
                 let disposable_ref = || BoundExpr {
@@ -1244,6 +1320,13 @@ impl Binder {
     }
 
     fn bind_local(&mut self, ty: &TypeRef, declarators: &[VariableDeclarator]) -> BoundStmtKind {
+        if let TypeRefKind::ByRef {
+            referent,
+            is_readonly,
+        } = &ty.kind
+        {
+            return self.bind_ref_local(referent, *is_readonly, declarators);
+        }
         if self.is_implicitly_typed(ty) {
             return self.bind_implicitly_typed_local(ty, declarators);
         }
@@ -1255,6 +1338,9 @@ impl Binder {
         for declarator in declarators {
             self.check_local_name_available(declarator);
             let initializer = declarator.initializer.as_ref().map(|expr| {
+                if let Some(bound) = self.bind_target_typed(expr, &declared) {
+                    return bound;
+                }
                 if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
                     let (lengths, elements) = match self.bind_rectangular_array(expr, &declared, &[]) {
                         Some(rectangular) => rectangular,
@@ -1264,6 +1350,12 @@ impl Binder {
                         kind: BoundExprKind::ArrayCreation { lengths, elements },
                         ty: declared.clone(),
                     };
+                }
+                if matches!(expr.kind, ExprKind::RefArgument { .. }) {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::CannotInitializeByValueWithRef,
+                        expr.span,
+                    ));
                 }
                 let value = self.bind_expression(expr);
                 if value.ty.is_error() || !self.assignable(&value, &declared) {
@@ -1280,6 +1372,95 @@ impl Binder {
         }
         BoundStmtKind::Local {
             ty: declared,
+            declarators: bound,
+        }
+    }
+
+    /// Binds a BY-REFERENCE local declaration, `ref T r = ref e;` (C# 7.0) and `ref readonly T r`
+    /// (C# 7.2).
+    ///
+    /// **THE LOCAL IS DECLARED IN SCOPE WITH THE REFERENT TYPE AND THE STATEMENT CARRIES THE
+    /// BYREF**, and the split is the whole design. A read of `r` yields `int`, so every use site --
+    /// arithmetic, a call argument, an assignment, overload resolution -- type-checks with no
+    /// knowledge of this feature at all, which is the same arrangement a `ref` PARAMETER has had
+    /// since before it existed. The `ByRef` on the bound statement is what the emitter's frame
+    /// reads, and it is what makes the local's SIGNATURE `T&` and its reads and writes indirect.
+    ///
+    /// **EVERY DECLARATOR OF A `ref` DECLARATION IS ITSELF BY REFERENCE**, measured rather than
+    /// assumed: `ref int r = ref a[0], s = a[1];` is CS8172 at `s`. The `ref` is not a
+    /// per-declarator spelling that the others may decline.
+    ///
+    /// Three refusals, each measured at 7.0 and each with its own code:
+    ///
+    /// | shape | code |
+    /// |---|---|
+    /// | `ref int r;` -- no initializer | `CS8174` |
+    /// | `ref int r = a[0];` -- a VALUE initializer | `CS8172` |
+    /// | an initializer naming no storage | `CS1510`/`CS0192`/`CS0206`, via `check_ref_operand` |
+    fn bind_ref_local(
+        &mut self,
+        referent: &TypeRef,
+        is_readonly: bool,
+        declarators: &[VariableDeclarator],
+    ) -> BoundStmtKind {
+        let implicit = self.is_implicitly_typed(referent);
+        if implicit {
+            self.gate_feature(Feature::ImplicitlyTypedLocalVariable, referent.span);
+        }
+        let declared = if implicit {
+            let saved = self.diagnostic_count();
+            let inferred = declarators
+                .first()
+                .and_then(|declarator| declarator.initializer.as_ref())
+                .map(|expr| self.bind_expression(expr).ty)
+                .unwrap_or(TypeSymbol::Error);
+            self.truncate_diagnostics(saved);
+            inferred
+        } else {
+            self.resolve_type_ref(referent)
+        };
+        let mut bound = Vec::with_capacity(declarators.len());
+        for declarator in declarators {
+            self.check_local_name_available(declarator);
+            let (initializer, returnable) = match &declarator.initializer {
+                Some(expr) if matches!(expr.kind, ExprKind::RefArgument { .. }) => {
+                    let value = self.bind_expression(expr);
+                    let returnable = match &value.kind {
+                        BoundExprKind::Ref { operand, .. } => {
+                            self.check_assignable(operand, &declared, declarator.span);
+                            self.storage_outlives_frame(operand)
+                        }
+                        _ => false,
+                    };
+                    (Some(value), returnable)
+                }
+                Some(expr) => {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::CannotInitializeByRefWithValue,
+                        expr.span,
+                    ));
+                    let value = self.bind_expression(expr);
+                    (Some(value), false)
+                }
+                None => {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ByRefLocalMustHaveInitializer {
+                            name: declarator.name.clone(),
+                        },
+                        declarator.span,
+                    ));
+                    (None, false)
+                }
+            };
+            self.declare_local(&declarator.name, declared.clone());
+            self.declare_ref_local(&declarator.name, returnable, is_readonly);
+            bound.push(BoundDeclarator {
+                name: declarator.name.clone(),
+                initializer,
+            });
+        }
+        BoundStmtKind::Local {
+            ty: TypeSymbol::ByRef(alloc::boxed::Box::new(declared)),
             declarators: bound,
         }
     }
@@ -1530,20 +1711,59 @@ impl Binder {
         };
         for declarator in declarators {
             self.check_local_name_available(declarator);
+            let diagnostics_before = self.diagnostics().len();
             let value = declarator.initializer.as_ref().map(|expr| {
                 let bound = self.bind_expression(expr);
                 self.check_assignable(&bound, &declared, declarator.span);
                 self.convert(bound, &declared)
             });
-            match value.as_ref().and_then(constant_literal_value) {
+            let folded = match (declarator.initializer.as_ref(), value.as_ref()) {
+                (Some(syntax), Some(bound)) => self.required_constant(syntax, bound),
+                _ => None,
+            };
+            let recovered = folded.is_none() && declarator.initializer.is_some();
+            match folded {
                 Some(folded) => self.declare_const_local(&declarator.name, folded, declared.clone()),
+                None if recovered => self.declare_const_local(
+                    &declarator.name,
+                    crate::declaration::default_value_literal(ty),
+                    declared.clone(),
+                ),
                 None => {
                     self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, declarator.span));
                     self.declare_local(&declarator.name, declared.clone());
                 }
             }
+            if recovered
+                && !self.diagnostics()[diagnostics_before..].iter().any(|diagnostic| {
+                    diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+                })
+            {
+                let span = declarator
+                    .initializer
+                    .as_ref()
+                    .map_or(declarator.span, |expr| expr.span);
+                self.report(Diagnostic::new(
+                    DiagnosticKind::NonConstantFieldInitializer {
+                        field: declarator.name.clone(),
+                    },
+                    span,
+                ));
+            }
         }
         BoundStmtKind::Empty
+    }
+
+    /// CS9135: a `case` label that did not fold to a constant of the governing type. The message
+    /// NAMES that type (`A constant value of type 'int' is expected`), which is what separates it
+    /// from the bare CS0150 a `goto case` draws.
+    fn report_non_constant_case(&mut self, governing: &TypeSymbol, span: Span) {
+        self.report(Diagnostic::new(
+            DiagnosticKind::ConstantOfTypeExpected {
+                ty: alloc::format!("{governing}").into(),
+            },
+            span,
+        ));
     }
 
     fn bind_condition(&mut self, condition: &Expr) -> BoundExpr {
@@ -1587,7 +1807,7 @@ fn section_anchor(section: &SwitchSection, fallback: Span) -> Span {
 /// list (`await t;` discards the result, exactly as a call statement does). `checked`/
 /// `unchecked` wrappers and a binding error are admitted conservatively, so an
 /// odd-but-legal form is a gap, not a false CS0201.
-fn is_statement_expression(kind: &BoundExprKind) -> bool {
+pub(crate) fn is_statement_expression(kind: &BoundExprKind) -> bool {
     matches!(
         kind,
         BoundExprKind::Assignment { .. }
@@ -1613,7 +1833,14 @@ mod tests {
     use lamella_syntax::parser::parse_statement;
 
     fn codes(source: &str) -> Vec<u16> {
+        codes_at(source, lamella_syntax::version::LanguageVersion::DEFAULT)
+    }
+
+    /// [`codes`] with the rung NAMED, for the rows whose subject is a particular dialect.
+    ///
+    fn codes_at(source: &str, version: lamella_syntax::version::LanguageVersion) -> Vec<u16> {
         let mut binder = Binder::new();
+        binder.set_language_version(version);
         binder.enter_scope();
         binder.bind_statement(&parse_statement(source).statement);
         binder
@@ -1670,8 +1897,9 @@ mod tests {
     /// not. Until the parser recorded the prefix, the same source INFERRED a type and compiled.
     #[test]
     fn a_verbatim_var_is_an_ordinary_type_name() {
-        assert_eq!(codes("@var v = 42;"), [246]);
-        assert_eq!(codes("var v = 42;"), [8022]);
+        let iso1 = lamella_syntax::version::LanguageVersion::CSharp1;
+        assert_eq!(codes_at("@var v = 42;", iso1), [246]);
+        assert_eq!(codes_at("var v = 42;", iso1), [8022]);
     }
 
     #[test]
@@ -1684,8 +1912,12 @@ mod tests {
 
     #[test]
     fn switch_on_bool_is_gated_as_a_post_1_0_feature() {
-        assert_eq!(codes("{ bool b = true; switch (b) { case true: break; } }"), [8022]);
-        assert_eq!(codes("{ int n = 1; switch (n) { case 1: break; } }"), []);
+        let iso1 = lamella_syntax::version::LanguageVersion::CSharp1;
+        assert_eq!(
+            codes_at("{ bool b = true; switch (b) { case true: break; } }", iso1),
+            [8022]
+        );
+        assert_eq!(codes_at("{ int n = 1; switch (n) { case 1: break; } }", iso1), []);
     }
 
     #[test]

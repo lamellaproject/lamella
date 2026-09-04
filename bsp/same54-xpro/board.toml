@@ -1,7 +1,14 @@
-# BOARD binding: the SAM E54 Xplained Pro -- identity-first. Board truth only: the
-# identity, the part, and the carrier. NO peripheral bindings yet (the SAM E54 family has
-# no generated driver); the vcp binding + its pin rows (SERCOM2, TX PB25/PAD0, RX
-# PB24/PAD1, function D) land here with the family's driver.
+# BOARD binding: the SAM E54 Xplained Pro. Board truth only: the identity, the carrier, the two
+# control lines a program can reach, and the three extension sockets.
+#
+# TWO PERIPHERALS ARE CLAIMED HERE: EXT1's I2C and EXT1's analog pad. Nothing claims the VCP's
+# SERCOM2, and nothing claims a pad of EXT2 or EXT3 -- those sockets are DESCRIBED below, and a
+# socket described is not a peripheral claimed. The two answer different questions.
+#
+# BOTH CONTROL LINES ARE ACTIVE LOW AND THE MANUAL STATES BOTH IN WORDS. The LED lights when its
+# line is driven to ground; the button drives its line to ground when pressed. AND THE BUTTON HAS
+# NO EXTERNAL PULL-UP -- the guide says so outright and says what to do about it: the internal
+# pull-up must be enabled or the pin floats and reads nothing meaningful.
 
 [table]
 kind = "board"
@@ -9,12 +16,337 @@ board = "same54-xpro"
 vendor = "microchip"
 family = "same54"
 part = "atsame54p20a"
-board_model = 4             # lamella_wire::board_model::SAME54_XPLAINED_PRO
-sources = ["SAM E54 Xplained Pro board identity via the on-board EDBG bridge"]
+product_model = 4           # lamella_wire::product_model::SAME54_XPLAINED_PRO
+sources = [
+    "SAM E54 Xplained Pro board identity via the on-board EDBG bridge",
+    "SAM E54 Xplained Pro User's Guide DS70005321A section 5.3.3, Table 5-15 (LED Connection): one yellow LED0 on PC18, shared with the PDEC and with EDBG GPIO2, and the section states the polarity in words -- the LED can be activated by driving the connected I/O line to GND.",
+    "DS70005321A section 5.3.2, Table 5-14 (Mechanical Buttons): the board carries a RESET button on the reset line and one generic user-configurable button on PB31, silkscreened SW0 and shared with EDBG GPIO3. The section states that a pressed button drives the I/O line to GND, and its Info note states that there is NO pull-up resistor connected to the generic user button and that the internal pull-up must be enabled to use it.",
+]
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG bridge's VCP; a silent board is DTR-first
+usb_vid = 0x03EB            # the debugger's own USB identity, read off this kit rather than
+usb_pid = 0x2111            # inherited from a sibling. THE PAIR NARROWS TO A KIT AND NEVER TO A
+                            # BOARD: several Xplained Pro kits answer 0x2111, so a host that must
+                            # reach THIS board settles the rest on the probe's serial.
                             # (the EDBG VCP sends nothing until the host asserts DTR).
 baud = 115200               # the bridge's wire rate
-default = true              # this board states no [[plans]] row, so the carrier names no
-                            # operating point.
+default = true              # the board's default carrier; the operating point it runs at is
+                            # the [[plans]] row below.
+
+# --- the clock plan -------------------------------------------------------------------------------
+#
+# THE RESET PLAN, STATED RATHER THAN CONFIGURED. This part comes out of reset already running, and
+# the manual says how: once power is stable and reset is released "the device will use a 48MHz
+# clock by default. The clock source for this clock signal is DFLL48M, which is enabled after a
+# reset by default. This is also the default time base for Generic Clock Generator 0."
+#
+# SO GENERATOR 0 IS THE ONLY ONE A BINDING MAY NAME UNTIL SOMETHING CONFIGURES ANOTHER, and that is
+# the manual's sentence too: "Other generic clocks are disabled." A binding riding generator 1 under
+# this plan would select a generator that produces nothing, and the peripheral would sit unclocked
+# with every register reading back exactly what was written to it.
+
+[[plans]]
+name = "dfll48m-48mhz"
+default = true
+source = "dfll48m"
+gclk0_hz = 48000000
+
+# --- control lines ------------------------------------------------------------------------------
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PC18"
+active = "low"
+source = "DS70005321A section 5.3.3 and Table 5-15: one yellow LED0 on PC18. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic. The pad is shared with the PDEC and with EDBG GPIO2, so a design using either reaches the same wire."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PB31"
+active = "low"
+source = "DS70005321A section 5.3.2 and Table 5-14: the generic user button, silkscreened SW0, on PB31 and shared with EDBG GPIO3. 'When a button is pressed it will drive the I/O line to GND'. THERE IS NO EXTERNAL PULL-UP: the section's own note says no pull-up resistor is connected to this button and that the internal pull-up in the device must be enabled to use it, so a program opening this pin as a plain input reads a floating pad."
+
+# --- peripheral bindings ---------------------------------------------------------------------------
+#
+# WHY A BINDING AND A CONNECTOR ROW BOTH NAME THESE TWO PADS, AND WHY THAT IS NOT A DUPLICATE. The
+# connector rows below say what EXT1 position 11 and position 12 reach, which is a fact about the
+# socket and stays true whatever is plugged in. This row says the board offers those two pads AS AN
+# I2C MASTER, which is a fact about a peripheral being claimed. A board can carry a socket it never
+# drives; the two statements answer different questions and a program uses both.
+
+[[bindings]]
+role = "ext1-i2c"
+kind = "i2c"
+instance = "sercom3"
+function = "C"              # column C of the multiplexing table. The SAME pads are a SERCOM on
+                            # column D as well, and the PAD NUMBERS REVERSE between the columns --
+                            # so the letter is not a formality, it decides which line is data.
+gclk_gen = 0                # the only generator running under this board's reset plan
+sda = { pin = "PA22" }      # I2C fixes SDA to pad0 and SCL to pad1, so unlike a uart binding
+scl = { pin = "PA23" }      # there is no pad routing for a board to choose -- hence no pads here.
+source = "DS70005321A Table 5-1 (Extension Header EXT1) gives SERCOM3 PAD[0]/PAD[1] I2C on PA22/PA23, shared with the camera connector. DS60001507F Table 6-1 gives column C of PA22 as SERCOM3/PAD[0] and of PA23 as SERCOM3/PAD[1], and Table 6-8 lists both pads among those with I2C support on the 128-pin package."
+
+[[bindings]]
+role = "ext1-adc-p"
+kind = "adc"
+instance = "adc1"
+function = "B"              # column B of the multiplexing table is the ANALOG column, and it
+                            # covers six peripherals at once -- ANAREF, both ADCs, the AC, the DAC
+                            # and the touch controller. So the letter does not say WHICH analog
+                            # block reaches the pad; the pin map's cell does, and it names the
+                            # converter's channel with it.
+gclk_gen = 0                # the only generator running under this board's reset plan
+reference_uv = 3300000      # VDDANA, which on this board is the regulated 3.3V rail
+ain = { pin = "PB04" }
+source = "DS70005321A Table 5-1 (Extension Header EXT1) gives the analog position as ADC1/AIN[6] on PB04, and DS60001507F Table 6-1's PB04 row gives the function B cell as ADC1/AIN[6]. The reference is the board's own analog supply: DS70005321A section 6.2 describes two on-board 3.3V regulators feeding VCC_P3V3 as the target's main supply, so full scale is 3.3V when the converter selects VDDANA."
+
+# THE REFERENCE STATED HERE IS THE ANALOG SUPPLY, AND THE DRIVER SELECTS THAT SUPPLY AS ITS
+# REFERENCE. The two have to agree and nothing checks it: a board that wanted an external reference
+# would state a different voltage here and still get VDDANA on the part, so every count would be
+# read against a scale the hardware is not using. When a board needs that, the binding grows a field
+# naming WHICH reference rather than only what it measures -- stated here so the next board does not
+# discover the coupling by getting wrong numbers.
+
+# --- extension connectors ------------------------------------------------------------------------
+#
+# THREE XPLAINED PRO STANDARD EXTENSION HEADERS. Each line below pairs a SOCKET POSITION -- the
+# standard's own name for it, defined once in ext/standards/xplained-pro.toml -- with the pad it
+# reaches on THIS board. That is the host half of a join an extension board completes from the
+# other side: an extension names the position it uses and never a pad, this names the pad and never
+# an extension, and one extension file therefore fits every host that offers a socket.
+#
+# THE THREE DIFFER PAD FOR PAD, so which socket a given extension is plugged into changes every
+# address a binding resolves to. That is why the standard's own rule is that a board with two
+# sockets of one standard numbers them.
+#
+# NO SOCKET STATES `id`. All three of the guide's tables give the identification-chip line no SAM
+# E54 pin at all: it reaches the embedded debugger rather than an MCU pad, and the guide says the
+# chip's contents are read and sent to the vendor's IDE. So a HOST TOOL can identify a fitted
+# extension over the debug probe, and a program running on this target cannot.
+#
+# EXT1'S SPI CONTROLLER IS ITS OWN AND THE OTHER TWO SHARE. SERCOM4 serves EXT1 and nothing else.
+# EXT2 and EXT3 share SERCOM6's clock and both data lines with each other AND with the embedded
+# debugger's data gateway, differing only in their selects -- so two extensions there are two
+# devices on one bus, which works, splits the bandwidth and contends with the debugger. An
+# extension carrying a network interface belongs on EXT1.
+#
+# AND NO SOCKET PIN IS SHARED WITH THIS BOARD'S OWN ETHERNET. Every Ethernet entry in the guide's
+# three shared-functionality columns belongs to the camera connector, never to a socket -- which is
+# what makes a network extension and the on-board MAC two independent interfaces rather than a
+# conflict over one pad.
+#
+# EVERY LINE IS A PIN ROW AND NONE IS A BUS ROW, WHICH IS A STATEMENT ABOUT THIS BOARD RATHER THAN
+# ABOUT THE STANDARD. A connector names a bus ONCE, by the binding role that serves it, so that a
+# socket holds no second copy of an instance and a mux function. This board has no bindings at all
+# yet -- its own header says so -- so there is no role to name, and the socket positions carrying
+# SPI, I2C and UART are stated as the single lines they are. They become bus rows when this family
+# gains its first SERCOM binding, and the pin rows for those positions go at the same time.
+
+[[connectors]]
+name = "ext1"
+standard = "xplained-pro"
+source = "SAM E54 Xplained Pro User's Guide DS70005321A Table 5-1 (Extension Header EXT1): ADC1/AIN[6] and AIN[7] on PB04/PB05; GPIO (RTS) and GPIO (CTS) on PA06/PA07; TC4/WO[0] and WO[1] on PB08/PB09; IRQ7/GPIO on PB07; GPIO on PA27; SERCOM3 PAD[0]/PAD[1] I2C on PA22/PA23, shared with the camera connector; SERCOM0 PAD[1]/PAD[0] UART on PA05/PA04; SERCOM4 PAD[2]/PAD[0]/PAD[3]/PAD[1] SPI on PB28/PB27/PB29/PB26, shared with nothing. Pin 1 and the power and ground pins state no SAM E54 pin and appear in no row below."
+
+[[connectors.ext1.pins]]
+signal = "adc_p"
+pin = "PB04"
+
+[[connectors.ext1.pins]]
+signal = "adc_n"
+pin = "PB05"
+
+[[connectors.ext1.pins]]
+signal = "gpio1"
+pin = "PA06"
+
+[[connectors.ext1.pins]]
+signal = "gpio2"
+pin = "PA07"
+
+[[connectors.ext1.pins]]
+signal = "pwm_p"
+pin = "PB08"
+
+[[connectors.ext1.pins]]
+signal = "pwm_n"
+pin = "PB09"
+
+[[connectors.ext1.pins]]
+signal = "irq"
+pin = "PB07"
+
+[[connectors.ext1.pins]]
+signal = "spi_ss_b"
+pin = "PA27"
+
+[[connectors.ext1.pins]]
+signal = "i2c_sda"
+pin = "PA22"
+
+[[connectors.ext1.pins]]
+signal = "i2c_scl"
+pin = "PA23"
+
+[[connectors.ext1.pins]]
+signal = "uart_rx"
+pin = "PA05"
+
+[[connectors.ext1.pins]]
+signal = "uart_tx"
+pin = "PA04"
+
+[[connectors.ext1.pins]]
+signal = "spi_ss_a"
+pin = "PB28"
+
+[[connectors.ext1.pins]]
+signal = "spi_mosi"
+pin = "PB27"
+
+[[connectors.ext1.pins]]
+signal = "spi_miso"
+pin = "PB29"
+
+[[connectors.ext1.pins]]
+signal = "spi_sck"
+pin = "PB26"
+
+[[connectors]]
+name = "ext2"
+standard = "xplained-pro"
+source = "DS70005321A Table 5-2 (Extension Header EXT2): ADC0/AIN[12] and AIN[1] on PB00/PA03; GPIO on PB01/PB06; TCC4/WO[4] and WO[5] on PB14/PB15, both shared with the camera connector; IRQ0/GPIO on PD00; GPIO on PB02; SERCOM7 PAD[0]/PAD[1] I2C on PD08/PD09, shared with the AT24MAC402, the ATECC508, the camera connector, EXT3 and the debugger's data gateway; SERCOM5 PAD[1]/PAD[0] UART on PB17/PB16; SERCOM6 PAD[2] SPI SS on PC06 alone, with PAD[0]/PAD[3]/PAD[1] on PC04/PC07/PC05 shared with EXT3 and the data gateway."
+
+[[connectors.ext2.pins]]
+signal = "adc_p"
+pin = "PB00"
+
+[[connectors.ext2.pins]]
+signal = "adc_n"
+pin = "PA03"
+
+[[connectors.ext2.pins]]
+signal = "gpio1"
+pin = "PB01"
+
+[[connectors.ext2.pins]]
+signal = "gpio2"
+pin = "PB06"
+
+[[connectors.ext2.pins]]
+signal = "pwm_p"
+pin = "PB14"
+
+[[connectors.ext2.pins]]
+signal = "pwm_n"
+pin = "PB15"
+
+[[connectors.ext2.pins]]
+signal = "irq"
+pin = "PD00"
+
+[[connectors.ext2.pins]]
+signal = "spi_ss_b"
+pin = "PB02"
+
+[[connectors.ext2.pins]]
+signal = "i2c_sda"
+pin = "PD08"
+
+[[connectors.ext2.pins]]
+signal = "i2c_scl"
+pin = "PD09"
+
+[[connectors.ext2.pins]]
+signal = "uart_rx"
+pin = "PB17"
+
+[[connectors.ext2.pins]]
+signal = "uart_tx"
+pin = "PB16"
+
+[[connectors.ext2.pins]]
+signal = "spi_ss_a"
+pin = "PC06"
+
+[[connectors.ext2.pins]]
+signal = "spi_mosi"
+pin = "PC04"
+
+[[connectors.ext2.pins]]
+signal = "spi_miso"
+pin = "PC07"
+
+[[connectors.ext2.pins]]
+signal = "spi_sck"
+pin = "PC05"
+
+[[connectors]]
+name = "ext3"
+standard = "xplained-pro"
+source = "DS70005321A Table 5-3 (Extension Header EXT3): ADC1/AIN[4] and AIN[5] on PC02/PC03; GPIO on PC01/PC10; TCC0/WO[3] and WO[4] on PD10/PD11; IRQ14/GPIO on PC30; GPIO on PC31; SERCOM7 PAD[0]/PAD[1] I2C on PD08/PD09, THE SAME TWO PADS EXT2 USES; SERCOM1 PAD[1]/PAD[0] UART on PC23/PC22; and the SPI select on PC14, which the table gives as a plain GPIO rather than a SERCOM pad, over SERCOM6 PAD[0]/PAD[3]/PAD[1] on PC04/PC07/PC05 shared with EXT2 and the data gateway."
+
+[[connectors.ext3.pins]]
+signal = "adc_p"
+pin = "PC02"
+
+[[connectors.ext3.pins]]
+signal = "adc_n"
+pin = "PC03"
+
+[[connectors.ext3.pins]]
+signal = "gpio1"
+pin = "PC01"
+
+[[connectors.ext3.pins]]
+signal = "gpio2"
+pin = "PC10"
+
+[[connectors.ext3.pins]]
+signal = "pwm_p"
+pin = "PD10"
+
+[[connectors.ext3.pins]]
+signal = "pwm_n"
+pin = "PD11"
+
+[[connectors.ext3.pins]]
+signal = "irq"
+pin = "PC30"
+
+[[connectors.ext3.pins]]
+signal = "spi_ss_b"
+pin = "PC31"
+
+[[connectors.ext3.pins]]
+signal = "i2c_sda"
+pin = "PD08"
+
+[[connectors.ext3.pins]]
+signal = "i2c_scl"
+pin = "PD09"
+
+[[connectors.ext3.pins]]
+signal = "uart_rx"
+pin = "PC23"
+
+[[connectors.ext3.pins]]
+signal = "uart_tx"
+pin = "PC22"
+
+[[connectors.ext3.pins]]
+signal = "spi_ss_a"
+pin = "PC14"
+
+[[connectors.ext3.pins]]
+signal = "spi_mosi"
+pin = "PC04"
+
+[[connectors.ext3.pins]]
+signal = "spi_miso"
+pin = "PC07"
+
+[[connectors.ext3.pins]]
+signal = "spi_sck"
+pin = "PC05"

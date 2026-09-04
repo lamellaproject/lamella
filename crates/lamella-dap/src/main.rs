@@ -12,7 +12,8 @@ fn main() {
         eprintln!("cannot read {path}: {error}");
         process::exit(1);
     });
-    let assembly = lamella_metadata::Assembly::read(&bytes).unwrap_or_else(|error| {
+    let bytes = lamella_load::resident_bytes(&bytes);
+    let assembly = lamella_metadata::Assembly::read(bytes).unwrap_or_else(|error| {
         eprintln!("cannot parse {path}: {error:?}");
         process::exit(1);
     });

@@ -17,7 +17,7 @@ pub mod product_id {
     /// ST-Link/V2-1 (on-board on Nucleo/Discovery/EVAL boards; composite with MSD + VCP).
     pub const V2_1: u16 = 0x374b;
     /// The second id ST assigns to the ST-LINK/V2-1 generation (TN1235: "374B or 3752 for
-    /// ST-LINK/V2-1"). On this bench it is an **STLINK-V2EC** -- the V2 generation's USB Type-C
+    /// ST-LINK/V2-1"). One such probe is an **STLINK-V2EC** -- the V2 generation's USB Type-C
     /// variant, fitted to the most recent boards of that generation.
     ///
     /// Measured on a NUCLEO-C071RB before the document was found, and the two agree: the probe
@@ -156,13 +156,78 @@ const DEBUG_ERR_BAD_AP: u8 = 0x1d;
 ///
 /// THE GENERATION IS CHECKED FIRST AND THE JTAG FIELD IS NOT CONSULTED ON A V3, WHICH IS THE
 /// WHOLE POINT OF WRITING IT THIS WAY. A V3's JTAG/SWD sub-version is not the V2 counter continued
-/// -- the bench V3S reports `1` -- so a plain `jtag >= 15` test rejects the very probes that ONLY
+/// -- a V3S reports `1` -- so a plain `jtag >= 15` test rejects the very probes that ONLY
 /// answer the wide form, and does it silently.
 ///
 /// Split out from the transfer path so the DECISION is testable without a probe, the same reason
 /// [`rw_status_failure`] is.
 fn wide_status_supported(stlink: u8, jtag: u8) -> bool {
     stlink >= 3 || jtag >= FIRST_JTAG_WITH_WIDE_STATUS
+}
+
+/// What a flash run concluded, from the two observations that can disagree about it.
+///
+/// **A PROGRAM STEP AND A READ-BACK ARE SEPARATE OBSERVATIONS, AND EITHER CAN BE WRONG ABOUT THE
+/// OTHER.** Reporting one and inferring the other is what makes a flash tool claim a board needs
+/// re-writing when the bytes are already on it -- a transport that complains after the last word
+/// has landed produces exactly that, and it is the reason these four cases are four rather than
+/// two.
+///
+/// This is a decision rather than a message so that it can be tested: the four cases are the whole
+/// content, and the sentences a person reads belong to whichever tool is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashVerdict {
+    /// The program step was clean and every word read back.
+    Verified,
+    /// The program step was clean and the flash does not match. The part was not programmed.
+    Mismatch {
+        /// How many words differ.
+        wrong: usize,
+    },
+    /// **The program step reported an error and the flash matches the image anyway.**
+    ///
+    /// Not success, because an error on the wire is worth chasing and a second attempt may not be
+    /// so lucky -- and not failure, because nothing needs re-writing. A caller that collapses this
+    /// into either one is throwing away the fact that decides what to do next.
+    VerifiedDespiteError,
+    /// The program step reported an error and the flash does not match it.
+    Failed {
+        /// How many words differ.
+        wrong: usize,
+    },
+}
+
+impl FlashVerdict {
+    /// The verdict from a program result and a read-back comparison.
+    #[must_use]
+    pub fn of(program_failed: bool, wrong: usize) -> Self {
+        match (program_failed, wrong) {
+            (false, 0) => FlashVerdict::Verified,
+            (false, wrong) => FlashVerdict::Mismatch { wrong },
+            (true, 0) => FlashVerdict::VerifiedDespiteError,
+            (true, wrong) => FlashVerdict::Failed { wrong },
+        }
+    }
+
+    /// The process exit code a bench tool should carry.
+    ///
+    /// **FOUR OUTCOMES, THREE CODES, AND THE THIRD ONE EARNS ITS KEEP.** A script that treats every
+    /// non-zero as "re-flash it" would otherwise re-flash a board that is already correct, which on
+    /// a part whose flash is write-once between erases is a second erase for nothing.
+    #[must_use]
+    pub fn exit_code(self) -> i32 {
+        match self {
+            FlashVerdict::Verified => 0,
+            FlashVerdict::Mismatch { .. } | FlashVerdict::Failed { .. } => 1,
+            FlashVerdict::VerifiedDespiteError => 4,
+        }
+    }
+
+    /// Whether the image is on the part, whatever the wire said while putting it there.
+    #[must_use]
+    pub fn image_is_on_the_part(self) -> bool {
+        matches!(self, FlashVerdict::Verified | FlashVerdict::VerifiedDespiteError)
+    }
 }
 
 /// Maps a transfer-status code to the failure it names, or `None` when the transfer completed.
@@ -204,6 +269,10 @@ const COMMAND_LEN: usize = 16;
 /// length field is 16 bits regardless; 1 KiB keeps well inside both while still amortising the USB
 /// round trip over a useful block.
 const MAX_TRANSFER: usize = 1024;
+
+/// How long to let the reset line settle either side of driving it.
+///
+const RESET_SETTLE: Duration = Duration::from_millis(50);
 
 /// How long to wait for a reply before calling the probe unresponsive.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -656,6 +725,99 @@ impl StLink {
         Ok(0)
     }
 
+    /// Enters SWD with the core held in reset, so a target whose running firmware leaves the debug
+    /// access port unreachable can still be attached to.
+    ///
+    /// MEASURED ON A NUCLEO-H755ZI-Q, where the plain [`enter_swd`](Self::enter_swd)
+    /// path reaches the DEBUG PORT and no further: `READ_IDCODE` answers `0x6ba02477` and then
+    /// every memory access fails, as does opening the access port at all. Holding nRST across the
+    /// SWD entry read the CPUID immediately. **A probe that reports an id is not a probe that can
+    /// read memory**, which is why the plain path's success is not evidence a target is attached.
+    ///
+    /// WHAT IS RECORDED IS THE SEQUENCE THAT WORKED, NOT A MECHANISM. Holding reset and re-entering
+    /// SWD change together here and were not separated, because the condition does not survive its
+    /// own cure: once this has run, the plain path succeeds on the same board until it is
+    /// power-cycled. The control that would attribute the fix cannot be run twice in one session,
+    /// so the honest claim is the smaller one.
+    ///
+    /// It leaves reset ASSERTED. The caller decides what happens on release -- ordinarily arming
+    /// the reset vector catch and then [`release_reset`](Self::release_reset), which is what
+    /// [`attach_under_reset`](Self::attach_under_reset) does.
+    pub fn enter_swd_under_reset(&mut self) -> Result<(), ProbeError> {
+        self.enter_swd()?;
+        self.drive_nrst(true)?;
+        std::thread::sleep(RESET_SETTLE);
+        self.enter_swd()
+    }
+
+    /// Releases a reset asserted by [`enter_swd_under_reset`] and lets the line settle.
+    pub fn release_reset(&mut self) -> Result<(), ProbeError> {
+        self.drive_nrst(false)?;
+        std::thread::sleep(RESET_SETTLE);
+        Ok(())
+    }
+
+    /// Attaches to a target that refuses the plain path and leaves the core HALTED at its reset
+    /// vector -- the state a flash routine needs before it erases the code the core is running.
+    ///
+    /// The vector catch is armed while the core is still held, so nothing races the arm: the target
+    /// cannot execute an instruction between the arm and the release.
+    pub fn attach_under_reset(&mut self) -> Result<(), ProbeError> {
+        self.enter_swd_under_reset()?;
+        cortex_m::arm_reset_catch(self)?;
+        self.release_reset()?;
+        cortex_m::wait_halted(self)?;
+        cortex_m::disarm_reset_catch(self)
+    }
+
+    /// The highest application voltage ANY ST-Link in TN1235 states support for, in volts.
+    ///
+    /// # "5 V tolerant inputs" is not permission to debug a 5 V target
+    ///
+    /// TN1235 states two different things and they are easy to read as one. Every probe it
+    /// describes has an APPLICATION VOLTAGE SUPPORT range, and the top of that range is 3.6 V on
+    /// all of them. Some additionally say "5 V tolerant inputs" -- which is a statement about the
+    /// input pins SURVIVING a higher level, not about the interface being specified to operate
+    /// there. A probe can be undamaged by a 5 V target and still not be a probe that debugs one.
+    ///
+    /// ```text
+    /// ST-LINK/V2      1.65-3.6 V   and 5 V tolerant inputs
+    /// STLINK-V2EC     1.65-3.6 V   (no tolerance clause)
+    /// STLINK-V3SET    3-3.6 V      and 5 V tolerant inputs
+    /// STLINK-V3MODS   3-3.6 V      and 5 V tolerant inputs
+    /// STLINK-V3MINIE  1.65-3.6 V   (no tolerance clause)
+    /// STLINK-V3EC     1.65-3.6 V   (no tolerance clause)
+    /// STLINK-V3PWR    1.6-3.6 V    (a level shifter, same ceiling)
+    /// ```
+    ///
+    /// **THE CEILING IS THE SAME ON EVERY ROW, WHICH IS WHY THIS IS ONE NUMBER AND NOT A TABLE PER
+    /// PROBE.** It could not be a table anyway: the product id cannot tell a V3E from a V3EC from a
+    /// V3MINIE -- all three answer 0x374E or 0x3754 -- so a per-model rule would need a model this
+    /// bus does not carry.
+    ///
+    /// The probes WITHOUT the tolerance clause are the ones that reach DOWN to 1.65 V. So the
+    /// probe best suited to a low-voltage part is the one least able to survive a high-voltage one,
+    /// which is the opposite of the intuition that a newer probe is a more capable probe.
+    pub const MAX_APPLICATION_VOLTAGE: f32 = 3.6;
+
+    /// Whether a measured target rail is outside what any ST-Link is specified to drive, and what
+    /// to say about it.
+    ///
+    /// Returns `None` when the reading is inside the specified range or is too low to be a live
+    /// rail at all -- a near-zero reading means no target rather than a bad one, and reporting it
+    /// as over-voltage would be the wrong complaint entirely.
+    #[must_use]
+    pub fn application_voltage_warning(volts: f32) -> Option<&'static str> {
+        if volts <= Self::MAX_APPLICATION_VOLTAGE {
+            return None;
+        }
+        Some(
+            "OUT OF RANGE -- no ST-Link states application voltage support above 3.6 V (TN1235). \
+             A probe marked \"5 V tolerant inputs\" may survive this; one without that clause may \
+             not, and neither is specified to debug at this level. Disconnect before driving SWD.",
+        )
+    }
+
     /// Measures the TARGET's supply voltage, in volts.
     ///
     /// The probe returns two ADC readings rather than a voltage: a reading of its own 1.2 V internal
@@ -839,6 +1001,37 @@ pub fn diagnose(product_id: u16) -> Result<Binding, ProbeError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The four outcomes, and the one that exists because a board demonstrated it.
+    #[test]
+    fn a_verdict_keeps_the_two_observations_apart() {
+        assert_eq!(FlashVerdict::of(false, 0), FlashVerdict::Verified);
+        assert_eq!(FlashVerdict::of(false, 7), FlashVerdict::Mismatch { wrong: 7 });
+        assert_eq!(FlashVerdict::of(true, 0), FlashVerdict::VerifiedDespiteError);
+        assert_eq!(FlashVerdict::of(true, 7), FlashVerdict::Failed { wrong: 7 });
+    }
+
+    /// A clean run is 0, a part that was not programmed is 1, and the write that landed while the
+    /// wire complained is its own code -- because a script keying on "non-zero means re-flash"
+    /// would re-erase a part that is already correct.
+    #[test]
+    fn the_exit_code_separates_a_bad_write_from_a_noisy_one() {
+        assert_eq!(FlashVerdict::Verified.exit_code(), 0);
+        assert_eq!(FlashVerdict::Mismatch { wrong: 1 }.exit_code(), 1);
+        assert_eq!(FlashVerdict::Failed { wrong: 1 }.exit_code(), 1);
+        assert_eq!(FlashVerdict::VerifiedDespiteError.exit_code(), 4);
+        assert_ne!(FlashVerdict::Verified.exit_code(), FlashVerdict::VerifiedDespiteError.exit_code());
+    }
+
+    /// The question a caller actually asks -- "do I need to write this board again?" -- and the
+    /// answer is NO in both verified cases, which is the whole point of keeping them apart.
+    #[test]
+    fn the_image_is_on_the_part_in_both_verified_cases() {
+        assert!(FlashVerdict::Verified.image_is_on_the_part());
+        assert!(FlashVerdict::VerifiedDespiteError.image_is_on_the_part());
+        assert!(!FlashVerdict::Mismatch { wrong: 1 }.image_is_on_the_part());
+        assert!(!FlashVerdict::Failed { wrong: 1 }.image_is_on_the_part());
+    }
     use super::*;
 
     #[test]
@@ -917,5 +1110,31 @@ mod tests {
         assert_eq!(Mode::from_byte(0x01), Mode::Mass);
         assert_eq!(Mode::from_byte(0x02), Mode::Debug);
         assert_eq!(Mode::from_byte(0x42), Mode::Other(0x42));
+    }
+}
+
+#[cfg(test)]
+mod application_voltage_tests {
+    use super::StLink;
+
+    #[test]
+    fn a_five_volt_target_is_named_out_of_range() {
+        assert!(StLink::application_voltage_warning(5.0).is_some());
+        assert!(StLink::application_voltage_warning(3.61).is_some());
+    }
+
+    #[test]
+    fn every_rail_an_st_link_is_specified_for_passes_silently() {
+        for volts in [1.65, 1.8, 2.5, 3.0, 3.3, 3.6] {
+            assert!(
+                StLink::application_voltage_warning(volts).is_none(),
+                "{volts} V is inside TN1235's range and must not warn"
+            );
+        }
+    }
+
+    #[test]
+    fn no_target_is_not_reported_as_an_over_voltage() {
+        assert!(StLink::application_voltage_warning(0.0).is_none());
     }
 }

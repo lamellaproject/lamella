@@ -59,6 +59,7 @@ const C_STEP: u32 = 1 << 2;
 const C_MASKINTS: u32 = 1 << 3;
 const S_REGRDY: u32 = 1 << 16;
 const S_HALT: u32 = 1 << 17;
+const S_RESET_ST: u32 = 1 << 25;
 const DCRSR_WRITE: u32 = 1 << 16;
 
 
@@ -279,7 +280,7 @@ impl<T: Transport> Dap<T> {
     }
 
     /// Reads a raw `DAP_Info` value -- the info block after the length byte -- for the numeric ids:
-    /// 0xF0 Capabilities (a bitfield: bit 0 SWD, bit 1 JTAG, ...), 0xFB packet count, 0xFF packet
+    /// 0xF0 Capabilities (a bitfield: bit 0 SWD, bit 1 JTAG, ...), 0xFE packet count, 0xFF packet
     /// size (u16, little-endian). The string ids are better read through
     /// [`info_string`](Self::info_string). Empty when the probe does not populate the id.
     pub fn info_bytes(&mut self, id: u8) -> Result<Vec<u8>, DapError> {
@@ -309,6 +310,45 @@ impl<T: Transport> Dap<T> {
     /// [`connect_swd_at`](Self::connect_swd_at) to choose the rate.
     pub fn connect_swd(&mut self) -> Result<(), DapError> {
         self.connect_swd_at(1_000_000)
+    }
+
+    /// Asks the PROBE to reset the target, however this probe must -- `DAP_ResetTarget`.
+    ///
+    /// Returns whether the probe reports having executed a device-specific reset sequence: `true`
+    /// means it did something, `false` means it accepted the command and performed no vendor
+    /// sequence. **Both are successful replies**, and the difference is the whole value of the
+    /// return -- see [`proto::reset_target`].
+    ///
+    /// # When to reach for this rather than the pins
+    ///
+    /// Use it when the board's reset path is not a line the host can name: the probe performs
+    /// whatever sequence that board needs. Where nRESET IS host-addressable, prefer
+    /// [`reset_extension`](Self::reset_extension), which additionally stops the application from
+    /// running -- something no reset alone does.
+    ///
+    /// NOTE what a `false` return does and does not say, because it is narrower than it looks. It
+    /// says the probe reports running no DEVICE-SPECIFIC sequence. It does not say the target was
+    /// not reset: a probe is free to answer `false` and reset the part anyway through its ordinary
+    /// reset line, and at least one does -- an nEDBG reports `Execute` clear on every call while
+    /// the target's own `S_RESET_ST` shows it was reset. Nor does it establish that the board's
+    /// reset path is unreachable by other means.
+    ///
+    /// So `false` is not a reason to report a failed reset. Confirm with
+    /// [`took_reset`](Self::took_reset), which asks the core.
+    ///
+    /// **SO `Ok(false)` IS AN ANSWER, NOT A FAILURE**: it means "this probe has no reset of its
+    /// own, use [`swj_pins`](Self::swj_pins)". The two are alternatives rather than a fallback
+    /// chain -- on some probes only one of them moves the line.
+    ///
+    /// # Errors
+    /// When the probe rejects the command or the transport fails. **A probe whose firmware
+    /// predates the command answers [`proto::INVALID_COMMAND`], which is a different thing from
+    /// `Execute` 0 and arrives here as an error rather than as `Ok(false)`**: one says the probe
+    /// has no reset of its own, the other that it does not know the question. It arrives as
+    /// [`DapError::Unsupported`], and there is no capability bit to check first.
+    pub fn reset_target(&mut self) -> Result<bool, DapError> {
+        let reply = self.command(&proto::reset_target())?;
+        Ok(reply.get(2).is_some_and(|execute| execute & 1 != 0))
     }
 
     /// [`connect_swd`](Self::connect_swd) at a chosen SWCLK frequency.
@@ -586,6 +626,26 @@ impl<T: Transport> Dap<T> {
         self.poll_dhcsr(S_REGRDY, "register transfer")
     }
 
+    /// Whether the core has been reset since this was last called -- DHCSR's `S_RESET_ST`.
+    ///
+    /// # This is the only party that can confirm a reset, and it CLEARS ON READ
+    ///
+    /// No reset command reports what the target did. `DAP_ResetTarget` reports whether the PROBE
+    /// ran a sequence, and `DAP_SWJ_Pins` reports SENSED pin levels, which on an open-drain or
+    /// level-shifted reset line need not follow what was commanded. Both can report success over a
+    /// target that never moved, and `DAP_SWJ_Pins` can report no movement over one that did.
+    /// `S_RESET_ST` is set by the CORE, so it answers the question the others only appear to.
+    ///
+    /// The bit is sticky and **clears when read**, which makes the calling order load-bearing: call
+    /// this once BEFORE the reset attempt to consume any reset already latched (power-on latches
+    /// one), then once after. Reading only afterwards cannot tell your reset from that one.
+    ///
+    /// Requires halting debug to have been enabled -- DHCSR is readable regardless, but a target
+    /// whose debug power domain has just been reset may need the connect re-established first.
+    pub fn took_reset(&mut self) -> Result<bool, DapError> {
+        Ok(self.read_word(DHCSR)? & S_RESET_ST != 0)
+    }
+
     /// Polls DHCSR until `flag` is set (used for S_HALT after a step and S_REGRDY after
     /// a core-register transfer).
     fn poll_dhcsr(&mut self, flag: u32, what: &'static str) -> Result<(), DapError> {
@@ -658,6 +718,41 @@ impl<T: Transport> Dap<T> {
     /// straight into a halt). Waits up to 100 ms for the line to settle.
     pub fn set_reset(&mut self, assert: bool) -> Result<u8, DapError> {
         self.swj_pins(if assert { 0 } else { proto::PIN_NRESET }, proto::PIN_NRESET, 100_000)
+    }
+
+    /// Releases the target from reset with SWCLK held low -- the SAM "reset extension" -- so the
+    /// application never runs and never takes the SWD pins.
+    ///
+    /// # Why this is not the same as asserting and releasing nRESET
+    ///
+    /// [`set_reset`](Self::set_reset) leaves a race. Releasing nRESET starts the application, and a
+    /// debugger then has to reach the DP before that application reconfigures the pins it is trying
+    /// to attach through. On a part whose firmware repurposes SWCLK or SWDIO the window is a few
+    /// instructions wide, so the attach succeeds intermittently or not at all, and the failure is
+    /// indistinguishable from bad wiring.
+    ///
+    /// SAM parts sample SWCLK as reset is released: held low, the device enters debug rather than
+    /// starting the application, and there is no window to lose. Both edges are driven with a ZERO
+    /// settle time deliberately -- a wait here spends the very interval the sequence exists to
+    /// close.
+    ///
+    /// This leaves SWCLK driven low. The switch sequence that
+    /// [`connect_swd`](Self::connect_swd) sends drives it again, so follow this with a connect;
+    /// [`connect_swd_under_reset_at`](Self::connect_swd_under_reset_at) is the two together.
+    pub fn reset_extension(&mut self) -> Result<(), DapError> {
+        let lines = proto::PIN_NRESET | proto::PIN_SWCLK;
+        self.swj_pins(0, lines, 0)?;
+        self.swj_pins(proto::PIN_NRESET, lines, 0)?;
+        Ok(())
+    }
+
+    /// [`connect_swd_at`](Self::connect_swd_at) preceded by a
+    /// [`reset_extension`](Self::reset_extension), for a target whose application would otherwise
+    /// take the SWD pins before the connect lands.
+    pub fn connect_swd_under_reset_at(&mut self, clock_hz: u32) -> Result<(), DapError> {
+        self.connect_port(Port::Swd)?;
+        self.reset_extension()?;
+        self.connect_swd_at(clock_hz)
     }
 
     /// Drives the SWJ pins named in `select` to the levels in `output`, waits up to `wait_us` for
@@ -835,6 +930,20 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
         Ok(Dap::set_reset(self, assert)?)
     }
 
+    /// A CMSIS-DAP probe CAN hold `SWCLK` low across the release, so this is
+    /// [`Dap::reset_extension`] and the answer is `true`.
+    ///
+    /// `true` says the two `DAP_SWJ_Pins` commands were issued and accepted, which is the
+    /// strongest claim available here and is deliberately not a claim about the pins themselves:
+    /// the readback that command returns is not a reliable witness. Measured on an nEDBG, it came
+    /// back `0x83` in BOTH phases, identically, 9 runs, while the target's own `S_RESET_ST` showed
+    /// it had been reset every time -- so a level check here would report failure on a probe that
+    /// had just done the job.
+    fn reset_extension(&mut self) -> Result<bool, lamella_probe_core::ProbeError> {
+        Dap::reset_extension(self)?;
+        Ok(true)
+    }
+
     /// Streams the values with `DAP_TransferBlock`, chunked to the probe's packet. The MEM-AP's
     /// 1 KB `TAR` auto-increment window is NOT handled here -- that is the caller's (MEM-AP) concern;
     /// this is purely "write these values to one AP register in as few round-trips as possible".
@@ -953,6 +1062,95 @@ mod tests {
     /// This is the bulk path every flash program and verify rides, and nothing exercised
     /// it: an off-by-one in the chunking would corrupt a deploy while every unit test stayed green,
     /// and the first instrument to notice would be a flash verify failing on real silicon.
+    /// `DAP_ResetTarget` answers `Status | Execute`, and a caller that reads only the status
+    /// learns nothing about whether a target moved. `command` already refuses a non-OK status, so
+    /// what these pin is the DISTINCTION the second byte carries.
+    #[test]
+    fn reset_target_reports_whether_a_vendor_sequence_ran() {
+        let mut dap = Dap::new(Mock::new(vec![echo(proto::cmd::RESET_TARGET, &[0x00, 0x01])]));
+        assert!(dap.reset_target().unwrap(), "Execute bit 0 set means a vendor sequence ran");
+
+        let mut dap = Dap::new(Mock::new(vec![echo(proto::cmd::RESET_TARGET, &[0x00, 0x00])]));
+        assert!(!dap.reset_target().unwrap(), "Execute clear means the probe performed no sequence");
+    }
+
+    /// The reset extension differs from a plain reset in exactly one respect -- SWCLK is SELECTED
+    /// and driven LOW across the release of nRESET -- and that one difference IS the mechanism: it
+    /// is what stops the application running. A test that checked only nRESET would pass just as
+    /// happily on `set_reset`, which does not.
+    /// The same sequence reached through the SEAM rather than through the inherent method, which is
+    /// the way every chip driver and flash route gets to it.
+    ///
+    /// `DapAccess::reset_extension` has a DEFAULT BODY -- an nRESET pulse answering `Ok(false)` --
+    /// so deleting this probe's override compiles, keeps every other test green, and silently
+    /// downgrades a probe that can hold SWCLK into one that says it cannot. Nothing but this
+    /// notices.
+    #[test]
+    fn the_seam_member_reaches_the_real_sequence_rather_than_the_trait_default() {
+        use lamella_probe_core::DapAccess;
+
+        let mut dap = Dap::new(Mock::new(vec![
+            echo(proto::cmd::SWJ_PINS, &[0x00]),
+            echo(proto::cmd::SWJ_PINS, &[proto::PIN_NRESET]),
+        ]));
+        assert!(
+            DapAccess::reset_extension(&mut dap).unwrap(),
+            "a CMSIS-DAP probe CAN hold SWCLK low, so the seam must answer true"
+        );
+
+        let lines = proto::PIN_NRESET | proto::PIN_SWCLK;
+        let sent = &dap.transport().sent;
+        assert_eq!(sent.len(), 2, "the default's pulse would be two DAP_SWJ_Pins frames too");
+        assert_eq!(sent[0][2], lines, "both lines selected, driven low");
+        assert_eq!(sent[1][2], lines, "and still both across the release");
+        assert_eq!(sent[1][1], proto::PIN_NRESET, "nRESET high, SWCLK still low");
+    }
+
+    #[test]
+    fn reset_extension_holds_swclk_low_across_the_release_of_nreset() {
+        let mut dap = Dap::new(Mock::new(vec![
+            echo(proto::cmd::SWJ_PINS, &[0x00]),
+            echo(proto::cmd::SWJ_PINS, &[proto::PIN_NRESET]),
+        ]));
+        dap.reset_extension().unwrap();
+
+        let sent = &dap.transport().sent;
+        assert_eq!(sent.len(), 2, "the sequence is two frames: drive both low, then release nRESET");
+
+        let lines = proto::PIN_NRESET | proto::PIN_SWCLK;
+        assert_eq!(sent[0], vec![proto::cmd::SWJ_PINS, 0x00, lines, 0, 0, 0, 0]);
+        assert_eq!(sent[1], vec![proto::cmd::SWJ_PINS, proto::PIN_NRESET, lines, 0, 0, 0, 0]);
+
+        assert_eq!(
+            sent[1][2] & proto::PIN_SWCLK,
+            proto::PIN_SWCLK,
+            "SWCLK must still be SELECTED when nRESET is released"
+        );
+        assert_eq!(
+            sent[1][1] & proto::PIN_SWCLK,
+            0,
+            "SWCLK must still be driven LOW when nRESET is released"
+        );
+
+        for frame in sent {
+            assert_eq!(&frame[3..7], &[0, 0, 0, 0], "the settle time must be zero");
+        }
+    }
+
+    /// A probe that does not implement the command replies `0xFF`, and there is no capability bit
+    /// to have checked beforehand -- so the refusal must arrive as `Unsupported` and not as a
+    /// timeout naming something else.
+    #[test]
+    fn reset_target_reports_an_unimplemented_probe_as_unsupported() {
+        let mut dap = Dap::new(Mock::new(vec![vec![proto::INVALID_COMMAND]]));
+        match dap.reset_target() {
+            Err(DapError::Unsupported { command }) => {
+                assert_eq!(command, proto::cmd::RESET_TARGET);
+            }
+            other => panic!("an unimplemented DAP_ResetTarget must be Unsupported, got {other:?}"),
+        }
+    }
+
     #[test]
     fn block_read_spans_packets_and_preserves_order() {
         const PER_PACKET: usize = 14;
@@ -1073,6 +1271,37 @@ mod tests {
             [SENTINEL, SENTINEL],
             "the tail the probe never sent must not be presented as data"
         );
+    }
+
+    /// `DAP_ResetTarget` reports whether the probe HAS a device-specific reset, not merely that it
+    /// answered.
+    ///
+    /// **THE TWO REPLIES DIFFER IN ONE BYTE AND MEAN OPPOSITE THINGS.** `Execute` 1 says the probe
+    /// performed a reset sequence of its own; 0 says it has none and the caller must reach for
+    /// `DAP_SWJ_Pins` instead. Both are `DAP_OK`, so a helper that returned `Result<(), _>` would
+    /// report a reset that never happened -- which on a board whose application holds the SWD pins
+    /// is the difference between a diagnosis and a dead end.
+    #[test]
+    fn reset_target_distinguishes_a_probe_that_reset_from_one_that_cannot() {
+        let mut did = Dap::new(Mock::new(vec![vec![proto::cmd::RESET_TARGET, proto::DAP_OK, 1]]));
+        assert!(did.reset_target().unwrap(), "Execute 1 means the probe reset the target");
+
+        let mut cannot = Dap::new(Mock::new(vec![vec![proto::cmd::RESET_TARGET, proto::DAP_OK, 0]]));
+        assert!(
+            !cannot.reset_target().unwrap(),
+            "Execute 0 means the probe has no reset of its own -- an answer, not a failure"
+        );
+
+        let mut terse = Dap::new(Mock::new(vec![vec![proto::cmd::RESET_TARGET, proto::DAP_OK]]));
+        assert!(!terse.reset_target().unwrap());
+    }
+
+    /// The encoding is one byte, because the command takes no arguments.
+    #[test]
+    fn reset_target_is_a_bare_command() {
+        assert_eq!(proto::reset_target(), [0x0a]);
+        assert_eq!(proto::reset_target()[0], proto::cmd::RESET_TARGET);
+        assert_ne!(proto::cmd::RESET_TARGET, proto::cmd::SWJ_PINS);
     }
 
     #[test]

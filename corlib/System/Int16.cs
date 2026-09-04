@@ -58,9 +58,9 @@ namespace System
         {
             if ((object)s == null) throw new ArgumentNullException("s");
             int end = s.Length;
-            while (end > 0 && Char.IsWhiteSpace(s[end - 1])) end = end - 1;
+            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
             int i = 0;
-            while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1;
+            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
             bool negative = false;
             if (i < end && s[i] == '-') { negative = true; i = i + 1; }
             else if (i < end && s[i] == '+') { i = i + 1; }

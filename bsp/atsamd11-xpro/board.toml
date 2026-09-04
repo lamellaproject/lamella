@@ -15,7 +15,7 @@ board = "atsamd11-xpro"
 vendor = "microchip"
 family = "samd11"
 part = "atsamd11d14am"
-board_model = 37
+product_model = 37
 sources = [
     "SAM D11 Xplained Pro user guide Atmel-42349: EDBG virtual COM port = SERCOM2, PA10 (PAD2) UART TX / PA11 (PAD3) UART RX",
     "SAM D11 datasheet Atmel-42363H table 6-1: PA10 and PA11 reach SERCOM2/PAD[2] and SERCOM2/PAD[3] at peripheral function D (their function C is SERCOM0)",

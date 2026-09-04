@@ -1,0 +1,34 @@
+# BLOCK: the STM32L0x3 flash controller as category 5 carries it, stated only as far as the facts
+# consumers outside the controller need. The controller itself is not described here.
+#
+# THIS FILE IS THE REASON csp/stm32l053 AND csp/stm32l073 ARE TWO FAMILIES RATHER THAN ONE. The
+# gpio and exti blocks beside it are twins on purpose -- RM0367 states those registers once for
+# the whole book. This one is not, and it does not merely differ in a number: it declares no
+# registers at all and exists to carry exactly what varies per family, so a fold would replace a
+# 6-Kbyte two-bank array with a 2-Kbyte single-bank one and lose the bank boundary entirely.
+# A reader tidying this directory finds three files that look alike and one that is not. This is it.
+#
+# THIS FAMILY ERASES TO ZERO, WHICH INVERTS THE USUAL BLANK CHECK. A correctly erased part reads as
+# full and a full part reads as erased.
+#
+
+[table]
+kind = "block"
+family = "stm32l073"
+block = "flash"
+erased_value = 0x00000000
+write_unit = 4
+sources = [
+    "STM32L0x3 reference manual RM0367 Rev 8, the NVM chapter: NOTZEROERR is raised when a program targets a word whose content is not zero, which only coheres if an erased word IS zero; and its dual-bank sections, which give this line read-while-write and 'Dual-bank boot capability allowing to boot either from Bank 1 or Bank 2 at startup'",
+    "RM0367 Rev 8 table 2 (overview of features per category): the NVM row reads 'full-featured, single bank' for category 3 and 'full-featured' for category 5",
+    "STM32L073x8/xB/xZ datasheet DS10685 Rev 7 section 3.4: 'Flash program and data EEPROM are divided into two banks. This allows writing in one' bank while reading the other, and the feature list's 6 Kbytes of data EEPROM with ECC",
+    "A program on a NUCLEO-L073RZ crossing the bank boundary in one call, spanning 0x08017FF8 to 0x08018008 -- two words in Bank 1 and two in Bank 2 -- which read back unchanged against a control doing the same across an ordinary page join mid-bank",
+]
+notes = [
+    "write_unit: RM0367 Rev 8 section 3.2 `NVM main features` states that programming in the Flash memory is performed BY WORD OR HALF-PAGE, and a word on this part is four bytes. Read in RM0367, which is the book this family is in, rather than taken from the sibling family beside it -- the two agree because one manual governs both, not because the value was carried across.",
+    "write_unit is the granularity a PLACEMENT rule can rely on, which is why it is four and not the half-page. Half-page programming exists and is faster, but it requires a half-page-aligned first address with every word of the transfer inside that half-page, so it is a throughput mode a writer opts into rather than the unit an image can be laid out against.",
+    "THE DATA EEPROM IS 6 KBYTES HERE AND 2 ON THE CATEGORY 3 FAMILY, and it is a separate array from the program flash. Nothing here states a value for it; the size is a parts-row fact and appears in its notes.",
+    "BOTH ARRAYS ARE SPLIT INTO TWO BANKS -- the program flash and the data EEPROM alike -- which is what read-while-write means on this line. The boundary is a real address a program can straddle, and one has been straddled deliberately on silicon rather than avoided.",
+    "THE BANK BOUNDARY NEEDED NO BANK PARAMETER. A program spanning it was accepted by the same sequence a single-bank part of this series takes, so a driver does not select a bank and a caller does not name one. That is a measured absence rather than an unimplemented feature, and it is the kind of fact a fold with the single-bank family would delete.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

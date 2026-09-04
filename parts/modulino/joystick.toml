@@ -18,7 +18,7 @@ validation = "none"
 
 # --- a disagreement worth carrying ------------------------------------------------------------
 #
-# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS: 0x2C on this bench against 0x40 and 0x20 in the manual. Measured by ISOLATION: unplugging this node emptied the multiplexer channel that had been answering 0x2C, with every other channel unchanged. It had earlier been reached only by elimination, which was the weakest basis in this family; it no longer is.
+# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS: 0x2C measured, against 0x40 and 0x20 in the manual. Measured by ISOLATION: unplugging this node emptied the multiplexer channel that had been answering 0x2C, with every other channel unchanged. It had earlier been reached only by elimination, which was the weakest basis in this family; it no longer is.
 
 [address]
 bus = "i2c"

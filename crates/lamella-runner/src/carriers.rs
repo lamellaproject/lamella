@@ -3,7 +3,7 @@
 use lamella_wire::session::{Arbiter, ChannelClass, ChannelId, Decision, Granted};
 use lamella_wire::{Frame, Transport, TransportError, error, msg};
 
-use crate::{bundle, deploy};
+use crate::{deploy, device};
 
 /// The sequence number a target-originated frame carries when it answers no request: the
 /// revocation and the liveness probe. Unsolicited frames ride at zero everywhere in this protocol.
@@ -38,30 +38,46 @@ impl Default for Windows {
     }
 }
 
-/// Whether a message type programs flash, and therefore holds a transfer open.
+/// Whether a frame programs flash, and therefore holds a transfer open.
 ///
-/// The module-firmware types are here for the same reason the image ones are, and more sharply: the
-/// erase alone takes seconds, which is the longest a board spends unable to survive losing its
-/// session.
+/// A reply, a query and a reset are all absent on purpose. Only a write leaves a half-finished state
+/// behind it.
 ///
-/// A reply, a query and a reset are all absent on purpose. Only a write leaves a half-finished
-/// state behind it.
-fn writes_flash(msg_type: u8) -> bool {
+/// # Why an EXTENSION frame needs its payload read, and only four bytes of it
+///
+/// The module-firmware transfer moved behind the extension type, so every extension now shares one
+/// type byte and a classifier reading only that byte cannot tell a firmware erase from a frame that
+/// writes nothing. Treating them all as writes was the safe placeholder, and it holds a session
+/// against a physically attached cable for the length of any extension frame at all.
+///
+/// The `ns, op` header is the PROTOCOL's own and always present, so reading it is not reaching into
+/// an extension's private encoding -- and the answer for a pair lives with the namespace that
+/// defines it ([`lamella_wire::msg::ext::writes_flash`]) rather than in a second table here that
+/// would gain a new op in neither place.
+fn writes_flash(frame: &lamella_wire::Frame) -> bool {
+    use lamella_wire::msg::ext;
+    if frame.msg_type == lamella_wire::msg::EXTENDED {
+        let Some(header) = frame.payload.get(..4) else { return true };
+        return ext::writes_flash(
+            u16::from_le_bytes([header[0], header[1]]),
+            u16::from_le_bytes([header[2], header[3]]),
+        );
+    }
     matches!(
-        msg_type,
-        deploy::DEPLOY_IMAGE
+        frame.msg_type,
+        deploy::DEPLOY_PE
+            | deploy::DEPLOY_IMAGE
+            | deploy::DEPLOY_BUNDLE
+            | deploy::DEPLOY_JS
             | deploy::DEPLOY_CLEAR
-            | deploy::DEPLOY_CHUNK
-            | deploy::WINC_FW_START
-            | deploy::WINC_FW_CHUNK
-            | deploy::WINC_FW_END
-            | bundle::DEPLOY_BUNDLE
+            | device::FW_WRITE
+            | device::FW_ACTIVATE
     )
 }
 
 /// One carrier a set serves on: a transport, and what kind of reach it represents.
 ///
-/// The class is the carrier's, not the peer's, and it is what makes somebody at the bench with a
+/// The class is the carrier's, not the peer's, and it is what makes somebody physically present with a
 /// cable outrank a remote host. A firmware states it once, where it knows what the transport is
 /// physically attached to, because nothing further down can tell.
 pub struct Carrier<'t> {
@@ -484,7 +500,7 @@ impl<'a, 't> CarrierSet<'a, 't> {
         }
 
         self.reply_to = Some(index);
-        if writes_flash(frame.msg_type) {
+        if writes_flash(&frame) {
             if let Some(now) = self.now() {
                 self.arbiter.enter_critical();
                 self.write_deadline = Some(now.saturating_add(self.windows.write_ms));
@@ -870,10 +886,10 @@ mod tests {
         set.poll().unwrap();
         let _ = tcp.target_sent();
 
-        tcp.host_sends(deploy::DEPLOY_CHUNK, 2, &chunk_payload());
+        tcp.host_sends(deploy::DEPLOY_IMAGE, 2, &chunk_payload());
         let writing = set.poll().unwrap().expect("the owner's chunk is served");
-        assert_eq!(writing.msg_type, deploy::DEPLOY_CHUNK);
-        set.send(deploy::DEPLOY_RESULT, 2, &[1]).unwrap();
+        assert_eq!(writing.msg_type, deploy::DEPLOY_IMAGE);
+        set.send(deploy::XFER_RESULT, 2, &[lamella_wire::msg::xfer::MATCHED, 0, 0, 0, 0]).unwrap();
         let _ = tcp.target_sent();
         assert!(set.writing(), "the transfer outlives its own reply, which is the whole point");
 
@@ -907,7 +923,7 @@ mod tests {
 
         tcp.host_sends(msg::HELLO, 1, &[]);
         set.poll().unwrap();
-        tcp.host_sends(deploy::DEPLOY_CHUNK, 2, &chunk_payload());
+        tcp.host_sends(deploy::DEPLOY_IMAGE, 2, &chunk_payload());
         set.poll().unwrap();
         let _ = tcp.target_sent();
         assert!(set.writing());
@@ -1016,12 +1032,12 @@ mod tests {
         let mut set = CarrierSet::new(&mut carriers, now_ms, windows()).expect("two carriers");
 
         assert_eq!(set.owner(), None);
-        set.send(crate::repl::RUN_RESULT, 0, &[7]).unwrap();
+        set.send(crate::debug::EVT_STOPPED, 0, &[7]).unwrap();
 
         for (name, line) in [("uart", &uart), ("usb", &usb)] {
             let sent = line.target_sent();
             assert_eq!(sent.len(), 1, "the {name} carrier was told");
-            assert_eq!(sent[0].msg_type, crate::repl::RUN_RESULT);
+            assert_eq!(sent[0].msg_type, crate::debug::EVT_STOPPED);
             assert_eq!(sent[0].payload, vec![7]);
         }
     }
@@ -1128,7 +1144,7 @@ mod tests {
 
         tcp.host_sends(msg::HELLO, 1, &[]);
         set.poll().unwrap();
-        tcp.host_sends(deploy::DEPLOY_CHUNK, 2, &chunk_payload());
+        tcp.host_sends(deploy::DEPLOY_IMAGE, 2, &chunk_payload());
         set.poll().unwrap();
         let _ = tcp.target_sent();
 

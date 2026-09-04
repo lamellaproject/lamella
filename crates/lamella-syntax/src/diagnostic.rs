@@ -17,6 +17,13 @@ pub enum Severity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiagnosticKind {
+    /// `CS1547`: `void` written where a type is required -- here, the referent of a `ref` return
+    /// (`ref void M()`).
+    ///
+    /// **A `ref` RETURN NAMES STORAGE, AND `void` NAMES NONE.** csc reports it at the `void` token
+    /// rather than at the `ref`, measured, and with the same text it uses for a `void` local: the
+    /// keyword is not usable in this context, whichever context that is.
+    VoidByReference,
     /// A delimited comment was not closed with `*/` before the end of the file.
     UnterminatedDelimitedComment,
     /// A character was found that cannot begin any token.
@@ -340,6 +347,7 @@ impl DiagnosticKind {
     #[must_use]
     pub fn code(&self) -> u16 {
         match self {
+            DiagnosticKind::VoidByReference => 1547,
             DiagnosticKind::UnterminatedDelimitedComment => 1035,
             DiagnosticKind::UnexpectedCharacter { .. } => 1056,
             DiagnosticKind::IntegerLiteralTooLarge => 1021,
@@ -416,6 +424,9 @@ impl DiagnosticKind {
 impl fmt::Display for DiagnosticKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DiagnosticKind::VoidByReference => {
+                f.write_str("Keyword 'void' cannot be used in this context")
+            }
             DiagnosticKind::UnterminatedDelimitedComment => f.write_str("End-of-comment expected"),
             DiagnosticKind::UnexpectedCharacter { character } => {
                 write!(f, "Unexpected character '{character}'")

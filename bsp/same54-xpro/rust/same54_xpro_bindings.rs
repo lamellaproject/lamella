@@ -3,3 +3,206 @@
 
 pub const BOARD_MODEL: u16 = 4;
 pub const BOARD_VENDOR: &str = "Microchip";
+pub const CARRIER_USB_VID: u16 = 0x03EB;
+pub const CARRIER_USB_PID: u16 = 0x2111;
+
+/// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+/// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+/// peripherals of the same kind can share no register at all, so a consumer that selects a
+/// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+/// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+/// name a driver; and a uart is a different register map on every family, so the kind does
+/// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+pub const EXT1_I2C_DRIVER_FAMILY: &str = "same54-sercom";
+pub const EXT1_ADC_P_DRIVER_FAMILY: &str = "same54-adc";
+
+pub const EXT1_ADC_P_ADC_BASE: u32 = 0x43002000;
+pub const EXT1_ADC_P_GCLK_PCHCTRL_REG: u32 = 0x40001D24;
+pub const EXT1_ADC_P_GCLK_PCHCTRL_VALUE: u32 = 0x40;
+pub const EXT1_ADC_P_APB_MASK_REG: u32 = 0x40000820;
+pub const EXT1_ADC_P_APB_MASK: u32 = 0x100;
+pub const EXT1_ADC_P_CALIB_REG: u32 = 0x43002048;
+pub const EXT1_ADC_P_NVM_CALIB_AREA: u32 = 0x800080;
+pub const EXT1_ADC_P_NVM_CALIB_LSB: u32 = 16;
+pub const EXT1_ADC_P_PMUX_REG: u32 = 0x410080B2;
+pub const EXT1_ADC_P_PMUX_MASK: u32 = 0xF;
+pub const EXT1_ADC_P_PMUX_VALUE: u32 = 0x1;
+pub const EXT1_ADC_P_PINCFG_REG: u32 = 0x410080C4;
+pub const EXT1_ADC_P_MUXPOS: u32 = 6;
+pub const EXT1_ADC_P_REFERENCE_UV: u32 = 3300000;
+
+pub const EXT1_I2C_SERCOM_BASE: u32 = 0x41014000;
+pub const EXT1_I2C_GCLK_PCHCTRL_REG: u32 = 0x40001CE0;
+pub const EXT1_I2C_GCLK_PCHCTRL_VALUE: u32 = 0x40;
+pub const EXT1_I2C_APB_MASK_REG: u32 = 0x40000818;
+pub const EXT1_I2C_APB_MASK: u32 = 0x400;
+pub const EXT1_I2C_PMUX_REG: u32 = 0x4100803B;
+pub const EXT1_I2C_PMUX_PAIR: u32 = 0x22;
+pub const EXT1_I2C_PINCFG_SDA_REG: u32 = 0x41008056;
+pub const EXT1_I2C_PINCFG_SCL_REG: u32 = 0x41008057;
+pub const EXT1_I2C_CORE_CLOCK_HZ: u32 = 48000000;
+
+pub const LED0_PORT_BASE: u32 = 0x41008100;
+pub const LED0_PIN: u32 = 18;
+pub const LED0_MASK: u32 = 0x40000;
+pub const LED0_ACTIVE_LOW: u32 = 1;
+pub const BUTTON0_PORT_BASE: u32 = 0x41008080;
+pub const BUTTON0_PIN: u32 = 31;
+pub const BUTTON0_MASK: u32 = 0x80000000;
+pub const BUTTON0_ACTIVE_LOW: u32 = 1;
+
+/// -- connectors: the sockets a removable module plugs into. The socket is board truth --
+/// it is on the schematic and identical on every unit -- and what is plugged into it is not,
+/// so no row here names a module. A socket brings out whole BUSES, each named by the binding
+/// role that serves it, and single LINES, each named by the standard's own name for that
+/// position and carrying the port wiring a driver needs to drive it. Which of a socket's
+/// protocols an attached module speaks is a property of the module, so a board that offers
+/// several states all of them and chooses none --
+pub const CONNECTOR_COUNT: u32 = 3;
+pub const CONNECTOR_EXT1_STANDARD: &str = "xplained-pro";
+pub const CONNECTOR_EXT1_ADC_P_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_ADC_P_PIN: u32 = 4;
+pub const CONNECTOR_EXT1_ADC_P_MASK: u32 = 0x10;
+pub const CONNECTOR_EXT1_ADC_N_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_ADC_N_PIN: u32 = 5;
+pub const CONNECTOR_EXT1_ADC_N_MASK: u32 = 0x20;
+pub const CONNECTOR_EXT1_GPIO1_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT1_GPIO1_PIN: u32 = 6;
+pub const CONNECTOR_EXT1_GPIO1_MASK: u32 = 0x40;
+pub const CONNECTOR_EXT1_GPIO2_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT1_GPIO2_PIN: u32 = 7;
+pub const CONNECTOR_EXT1_GPIO2_MASK: u32 = 0x80;
+pub const CONNECTOR_EXT1_PWM_P_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_PWM_P_PIN: u32 = 8;
+pub const CONNECTOR_EXT1_PWM_P_MASK: u32 = 0x100;
+pub const CONNECTOR_EXT1_PWM_N_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_PWM_N_PIN: u32 = 9;
+pub const CONNECTOR_EXT1_PWM_N_MASK: u32 = 0x200;
+pub const CONNECTOR_EXT1_IRQ_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_IRQ_PIN: u32 = 7;
+pub const CONNECTOR_EXT1_IRQ_MASK: u32 = 0x80;
+pub const CONNECTOR_EXT1_SPI_SS_B_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT1_SPI_SS_B_PIN: u32 = 27;
+pub const CONNECTOR_EXT1_SPI_SS_B_MASK: u32 = 0x8000000;
+pub const CONNECTOR_EXT1_I2C_SDA_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT1_I2C_SDA_PIN: u32 = 22;
+pub const CONNECTOR_EXT1_I2C_SDA_MASK: u32 = 0x400000;
+pub const CONNECTOR_EXT1_I2C_SCL_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT1_I2C_SCL_PIN: u32 = 23;
+pub const CONNECTOR_EXT1_I2C_SCL_MASK: u32 = 0x800000;
+pub const CONNECTOR_EXT1_UART_RX_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT1_UART_RX_PIN: u32 = 5;
+pub const CONNECTOR_EXT1_UART_RX_MASK: u32 = 0x20;
+pub const CONNECTOR_EXT1_UART_TX_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT1_UART_TX_PIN: u32 = 4;
+pub const CONNECTOR_EXT1_UART_TX_MASK: u32 = 0x10;
+pub const CONNECTOR_EXT1_SPI_SS_A_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_SPI_SS_A_PIN: u32 = 28;
+pub const CONNECTOR_EXT1_SPI_SS_A_MASK: u32 = 0x10000000;
+pub const CONNECTOR_EXT1_SPI_MOSI_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_SPI_MOSI_PIN: u32 = 27;
+pub const CONNECTOR_EXT1_SPI_MOSI_MASK: u32 = 0x8000000;
+pub const CONNECTOR_EXT1_SPI_MISO_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_SPI_MISO_PIN: u32 = 29;
+pub const CONNECTOR_EXT1_SPI_MISO_MASK: u32 = 0x20000000;
+pub const CONNECTOR_EXT1_SPI_SCK_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT1_SPI_SCK_PIN: u32 = 26;
+pub const CONNECTOR_EXT1_SPI_SCK_MASK: u32 = 0x4000000;
+pub const CONNECTOR_EXT2_STANDARD: &str = "xplained-pro";
+pub const CONNECTOR_EXT2_ADC_P_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_ADC_P_PIN: u32 = 0;
+pub const CONNECTOR_EXT2_ADC_P_MASK: u32 = 0x1;
+pub const CONNECTOR_EXT2_ADC_N_PORT_BASE: u32 = 0x41008000;
+pub const CONNECTOR_EXT2_ADC_N_PIN: u32 = 3;
+pub const CONNECTOR_EXT2_ADC_N_MASK: u32 = 0x8;
+pub const CONNECTOR_EXT2_GPIO1_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_GPIO1_PIN: u32 = 1;
+pub const CONNECTOR_EXT2_GPIO1_MASK: u32 = 0x2;
+pub const CONNECTOR_EXT2_GPIO2_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_GPIO2_PIN: u32 = 6;
+pub const CONNECTOR_EXT2_GPIO2_MASK: u32 = 0x40;
+pub const CONNECTOR_EXT2_PWM_P_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_PWM_P_PIN: u32 = 14;
+pub const CONNECTOR_EXT2_PWM_P_MASK: u32 = 0x4000;
+pub const CONNECTOR_EXT2_PWM_N_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_PWM_N_PIN: u32 = 15;
+pub const CONNECTOR_EXT2_PWM_N_MASK: u32 = 0x8000;
+pub const CONNECTOR_EXT2_IRQ_PORT_BASE: u32 = 0x41008180;
+pub const CONNECTOR_EXT2_IRQ_PIN: u32 = 0;
+pub const CONNECTOR_EXT2_IRQ_MASK: u32 = 0x1;
+pub const CONNECTOR_EXT2_SPI_SS_B_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_SPI_SS_B_PIN: u32 = 2;
+pub const CONNECTOR_EXT2_SPI_SS_B_MASK: u32 = 0x4;
+pub const CONNECTOR_EXT2_I2C_SDA_PORT_BASE: u32 = 0x41008180;
+pub const CONNECTOR_EXT2_I2C_SDA_PIN: u32 = 8;
+pub const CONNECTOR_EXT2_I2C_SDA_MASK: u32 = 0x100;
+pub const CONNECTOR_EXT2_I2C_SCL_PORT_BASE: u32 = 0x41008180;
+pub const CONNECTOR_EXT2_I2C_SCL_PIN: u32 = 9;
+pub const CONNECTOR_EXT2_I2C_SCL_MASK: u32 = 0x200;
+pub const CONNECTOR_EXT2_UART_RX_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_UART_RX_PIN: u32 = 17;
+pub const CONNECTOR_EXT2_UART_RX_MASK: u32 = 0x20000;
+pub const CONNECTOR_EXT2_UART_TX_PORT_BASE: u32 = 0x41008080;
+pub const CONNECTOR_EXT2_UART_TX_PIN: u32 = 16;
+pub const CONNECTOR_EXT2_UART_TX_MASK: u32 = 0x10000;
+pub const CONNECTOR_EXT2_SPI_SS_A_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT2_SPI_SS_A_PIN: u32 = 6;
+pub const CONNECTOR_EXT2_SPI_SS_A_MASK: u32 = 0x40;
+pub const CONNECTOR_EXT2_SPI_MOSI_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT2_SPI_MOSI_PIN: u32 = 4;
+pub const CONNECTOR_EXT2_SPI_MOSI_MASK: u32 = 0x10;
+pub const CONNECTOR_EXT2_SPI_MISO_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT2_SPI_MISO_PIN: u32 = 7;
+pub const CONNECTOR_EXT2_SPI_MISO_MASK: u32 = 0x80;
+pub const CONNECTOR_EXT2_SPI_SCK_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT2_SPI_SCK_PIN: u32 = 5;
+pub const CONNECTOR_EXT2_SPI_SCK_MASK: u32 = 0x20;
+pub const CONNECTOR_EXT3_STANDARD: &str = "xplained-pro";
+pub const CONNECTOR_EXT3_ADC_P_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_ADC_P_PIN: u32 = 2;
+pub const CONNECTOR_EXT3_ADC_P_MASK: u32 = 0x4;
+pub const CONNECTOR_EXT3_ADC_N_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_ADC_N_PIN: u32 = 3;
+pub const CONNECTOR_EXT3_ADC_N_MASK: u32 = 0x8;
+pub const CONNECTOR_EXT3_GPIO1_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_GPIO1_PIN: u32 = 1;
+pub const CONNECTOR_EXT3_GPIO1_MASK: u32 = 0x2;
+pub const CONNECTOR_EXT3_GPIO2_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_GPIO2_PIN: u32 = 10;
+pub const CONNECTOR_EXT3_GPIO2_MASK: u32 = 0x400;
+pub const CONNECTOR_EXT3_PWM_P_PORT_BASE: u32 = 0x41008180;
+pub const CONNECTOR_EXT3_PWM_P_PIN: u32 = 10;
+pub const CONNECTOR_EXT3_PWM_P_MASK: u32 = 0x400;
+pub const CONNECTOR_EXT3_PWM_N_PORT_BASE: u32 = 0x41008180;
+pub const CONNECTOR_EXT3_PWM_N_PIN: u32 = 11;
+pub const CONNECTOR_EXT3_PWM_N_MASK: u32 = 0x800;
+pub const CONNECTOR_EXT3_IRQ_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_IRQ_PIN: u32 = 30;
+pub const CONNECTOR_EXT3_IRQ_MASK: u32 = 0x40000000;
+pub const CONNECTOR_EXT3_SPI_SS_B_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_SPI_SS_B_PIN: u32 = 31;
+pub const CONNECTOR_EXT3_SPI_SS_B_MASK: u32 = 0x80000000;
+pub const CONNECTOR_EXT3_I2C_SDA_PORT_BASE: u32 = 0x41008180;
+pub const CONNECTOR_EXT3_I2C_SDA_PIN: u32 = 8;
+pub const CONNECTOR_EXT3_I2C_SDA_MASK: u32 = 0x100;
+pub const CONNECTOR_EXT3_I2C_SCL_PORT_BASE: u32 = 0x41008180;
+pub const CONNECTOR_EXT3_I2C_SCL_PIN: u32 = 9;
+pub const CONNECTOR_EXT3_I2C_SCL_MASK: u32 = 0x200;
+pub const CONNECTOR_EXT3_UART_RX_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_UART_RX_PIN: u32 = 23;
+pub const CONNECTOR_EXT3_UART_RX_MASK: u32 = 0x800000;
+pub const CONNECTOR_EXT3_UART_TX_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_UART_TX_PIN: u32 = 22;
+pub const CONNECTOR_EXT3_UART_TX_MASK: u32 = 0x400000;
+pub const CONNECTOR_EXT3_SPI_SS_A_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_SPI_SS_A_PIN: u32 = 14;
+pub const CONNECTOR_EXT3_SPI_SS_A_MASK: u32 = 0x4000;
+pub const CONNECTOR_EXT3_SPI_MOSI_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_SPI_MOSI_PIN: u32 = 4;
+pub const CONNECTOR_EXT3_SPI_MOSI_MASK: u32 = 0x10;
+pub const CONNECTOR_EXT3_SPI_MISO_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_SPI_MISO_PIN: u32 = 7;
+pub const CONNECTOR_EXT3_SPI_MISO_MASK: u32 = 0x80;
+pub const CONNECTOR_EXT3_SPI_SCK_PORT_BASE: u32 = 0x41008100;
+pub const CONNECTOR_EXT3_SPI_SCK_PIN: u32 = 5;
+pub const CONNECTOR_EXT3_SPI_SCK_MASK: u32 = 0x20;

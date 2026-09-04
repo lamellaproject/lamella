@@ -5,6 +5,38 @@ use crate::symbols::{Model, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::vec::Vec;
 
+/// Whether `ty` is BY-REF-LIKE -- a `ref struct` (C# 7.2), declared here or imported.
+///
+/// An INSTANTIATION answers by its DEFINITION, under the arity-mangled name the model keys it
+/// by: `Span<byte>` is by-ref-like because `` Span`1 `` is. Looking it up unmangled finds nothing
+/// and answers `false` for every generic ref struct there is, which is the whole population that
+/// matters.
+#[must_use]
+pub fn is_by_ref_like(model: &Model, ty: &TypeSymbol) -> bool {
+    let definition = match ty {
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => crate::symbols::definition_symbol(definition, arguments.len()),
+        other => other.clone(),
+    };
+    model
+        .get_by_symbol(&definition)
+        .is_some_and(|info| info.is_by_ref_like)
+}
+
+/// Whether `to` is a target a value would have to BOX to reach.
+fn is_reference_target(model: &Model, to: &TypeSymbol) -> bool {
+    match to {
+        TypeSymbol::Special(SpecialType::Object | SpecialType::String) => true,
+        TypeSymbol::Named(_) | TypeSymbol::Instantiation { .. } => matches!(
+            model.get_by_symbol(to).map(|info| info.kind),
+            Some(TypeKind::Class | TypeKind::Interface | TypeKind::Delegate)
+        ),
+        _ => false,
+    }
+}
+
 /// Whether an implicit conversion exists from `from` to `to`, including the
 /// reference conversions that walk `model`'s inheritance graph (13.1).
 #[must_use]
@@ -18,6 +50,9 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
     }
     if let TypeSymbol::ByRef(element) = to {
         return from == element.as_ref();
+    }
+    if is_by_ref_like(model, from) && is_reference_target(model, to) {
+        return false;
     }
     if matches!(from, TypeSymbol::Special(SpecialType::Null)) {
         return is_reference_type(model, to)
@@ -80,6 +115,11 @@ fn is_system_type(ty: &TypeSymbol, name: &str) -> bool {
 /// (boxing/unboxing and reference downcast). User-defined and enum casts follow.
 #[must_use]
 pub fn can_cast(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    if (is_by_ref_like(model, from) && is_reference_target(model, to))
+        || (is_by_ref_like(model, to) && is_reference_target(model, from))
+    {
+        return false;
+    }
     converts(model, from, to)
         || converts(model, to, from)
         || (is_numeric_type(from) && is_numeric_type(to))

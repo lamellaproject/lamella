@@ -59,6 +59,24 @@ pub enum Trap {
     /// The bytecode was malformed: an out-of-range pool index, jump target, local slot,
     /// inline-cache slot, or argument count. A well-formed front end never emits this.
     Malformed,
+    /// Every live thread is blocked waiting for another one, so no thread can ever run again --
+    /// a join cycle.
+    ///
+    /// **It is a trap and not a Python exception because there is no thread left to raise it in.**
+    /// An exception is delivered to a running frame and searched for a handler; here every frame
+    /// belongs to a thread that is by definition not running, so there is nowhere to deliver it.
+    ///
+    /// **And the alternative -- ending the program quietly -- is the one outcome this design will
+    /// not ship.** A deadlocked program that exits 0 with no message reads to its author as "my
+    /// code did nothing", which sends them to look at the code that ran rather than at the wait
+    /// that never ended. CPython hangs forever instead, which at least never claims success; a
+    /// green-thread scheduler can see the whole cycle and say so. The ahead-of-time tier reached
+    /// the same answer first and prints `DEADLOCK` on the console before halting
+    /// (`runtime-support`'s `sched_deadlock_trap`), so the two tiers report the same event.
+    ///
+    /// The scheduler writes WHICH thread is waiting on WHICH to `sys.stderr` before returning this,
+    /// because the bare word names the failure without locating it.
+    Deadlock,
     /// A Python exception is in flight (a `raise`, a `Reraise`, or a propagated exception):
     /// the exception object lives in the model's pending slot, and the interpreter's
     /// exception-table search routes it to a handler. It only surfaces as an "uncaught

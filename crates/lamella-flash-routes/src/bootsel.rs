@@ -173,7 +173,7 @@ mod tests {
     /// **THE TWO FAMILIES DIFFER IN EXACTLY ONE WAY THAT MATTERS, AND IT IS NOT THE MODEL.** A
     /// micro:bit's DAPLink states a unique id; an RP2350's UF2 bootloader does not, so two of them
     /// cannot be told apart from anything on the volume. These are the real files, byte for byte
-    /// as they were read off this bench.
+    /// as they were read off the hardware.
     #[test]
     fn a_uf2_volume_has_no_identity_and_a_daplink_one_does() {
         let uf2 = "UF2 Bootloader v1.0\nModel: Raspberry Pi RP2350\nBoard-ID: RP2350\n";
@@ -185,11 +185,11 @@ mod tests {
         );
 
         let daplink = "# DAPLink Firmware - see https://mbed.com/daplink\n\
-                       Unique ID: 9900000031864e45004440180000004f00000000\n\
+                       Unique ID: 9900000000000000000000000000000000000001\n\
                        HIC ID: 97969901\n\
                        Daplink Mode: Interface\n\
                        Board name: micro:bit\n";
-        assert_eq!(serial_of(daplink).as_deref(), Some("9900000031864e45004440180000004f00000000"));
+        assert_eq!(serial_of(daplink).as_deref(), Some("9900000000000000000000000000000000000001"));
         assert_eq!(model_of(daplink), "micro:bit");
     }
 
@@ -214,10 +214,10 @@ mod tests {
             volume: "D:\\".to_owned(),
             label: String::new(),
             model: "Raspberry Pi RP2350".to_owned(),
-            serial: Some("C2E506C2673D626B".to_owned()),
+            serial: Some("SERIAL0000000004".to_owned()),
         };
         assert!(named.describe().starts_with("(bootloader)"), "got {}", named.describe());
-        assert!(named.describe().contains("C2E506C2673D626B"));
+        assert!(named.describe().contains("SERIAL0000000004"));
 
         let anonymous = Waiting { serial: None, ..named };
         assert!(anonymous.describe().contains("D:\\"), "with no serial, the volume is all there is");

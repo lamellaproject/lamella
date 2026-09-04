@@ -20,7 +20,7 @@ board = "stm32f429i-disco"
 vendor = "st"
 family = "stm32f42x"
 part = "stm32f429zi"
-board_model = 21            # lamella_wire::board_model::STM32F429I_DISCO
+product_model = 21          # lamella_wire::product_model::STM32F429I_DISCO
 sources = [
     "Discovery kit user manual UM1670 Rev 6 section 7.3.3 (VCP configuration): the ST-LINK/V2-B supports a virtual COM port on U2 pins 12 and 13, connected to the target's USART1 (PA9, PA10) through the SB11 and SB15 solder bridges",
     "UM1670 Rev 6 Table 7 (STM32 pin description versus board functions): the VCP column gives PA9 = USART1_TX at LQFP144 pin 101 and PA10 = USART1_RX at pin 102, and both pins are unused in every other board-function column",

@@ -32,6 +32,22 @@ impl std::error::Error for Error {}
 /// A HID operation result.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Whether one candidate device is eligible for an open -- the single decision all three backends
+/// make, so that they make it the same way.
+///
+/// `reported` NONE with a serial requested is a NO: **a device that does not say who it is cannot be
+/// the device you named, and a missing string is not a wildcard.** `wanted` NONE is a yes for
+/// everything; choosing among several unnamed candidates belongs to the layer that knows what the
+/// caller asked for, which is where an ambiguous unnamed open is refused.
+///
+pub(crate) fn candidate_satisfies(wanted: Option<&str>, reported: Option<&str>) -> bool {
+    match wanted {
+        None => true,
+        Some(wanted) => reported
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(wanted)),
+    }
+}
+
 /// A HID device discovered by [`enumerate`].
 ///
 /// A physical probe can expose SEVERAL HID interfaces (a composite device -- e.g. the NXP MCU-Link

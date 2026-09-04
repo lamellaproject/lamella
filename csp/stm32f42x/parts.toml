@@ -38,6 +38,12 @@ part = "stm32f429zi"
 package = "LQFP144"
 flash = 0x200000
 ram = 0x30000
+dp_idcode = 0x2BA01477
+device_id_reg = 0xE0042000
+device_id_mask = 0xFFF
+device_id = 0x419
+device_id_identifies = "class"
+identity_source = "The fitted part answered DBGMCU_IDCODE 0x20036419 at 0xE0042000, which is DEV_ID 0x419 in bits 11:0 with REV_ID 0x2003 in bits 31:16 -- so the mask keeps the DEV_ID field and drops the revision. IDENTIFIES A CLASS RATHER THAN A PART: RM0090 gives DEV_ID 0x419 to STM32F42xxx and STM32F43xxx alike, so this register cannot separate this row from the stm32f439zi one beside it, and neither can the JTAG ID code 0x06419041 the same manual gives both. What separates them is the peripheral set. The DP IDCODE was measured on this part and is Arm's M3/M4-class SW-DP, shared with every STM32 M3 or M4 and with the nRF52833."
 pins = [
     "PA0",
     "PA9-PA10",

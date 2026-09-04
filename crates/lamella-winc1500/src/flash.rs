@@ -5,7 +5,7 @@
 //! the shared packet memory. Everything here runs with the WINC's CPU HALTED (download
 //! mode), so the firmware cannot race its own store -- which is exactly what a firmware
 //! UPDATE needs: dump, erase, program, verify, over any transport that implements the
-//! [`crate::spi::SpiBus`] wire, whether a debug probe bit-bangs the bus or a host controller
+//! [`SpiBus`](crate::SpiBus) wire, whether a debug probe bit-bangs the bus or a host controller
 //! drives it in hardware.
 
 use crate::SpiBus;

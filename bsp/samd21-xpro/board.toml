@@ -8,7 +8,7 @@ board = "samd21-xpro"
 vendor = "microchip"
 family = "samd21"
 part = "atsamd21j18a"
-board_model = 5
+product_model = 5
 sources = [
     "SAM D21 Xplained Pro user guide UG 42220: EDBG VCP = SERCOM3, PA22 (PAD0) TX / PA23 (PAD1) RX, peripheral function C",
 ]

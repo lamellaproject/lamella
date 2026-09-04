@@ -1,14 +1,56 @@
-# PARTS table for the SAM E54 family. The pin present-list is EMPTY (identity-first; no
-# binding references a pin).
+# PARTS table for the SAM E54 family.
+#
+# THE PRESENT-LIST IS COMPLETE, WHICH IS A CLAIM AND NOT A CONVENIENCE. A partial list refuses
+# safely and a complete one promises that everything absent from it is absent from the silicon, so
+# it is written only when a whole package pinout has been read. That happened here because the
+# first consumer needed forty-three pads at once -- a board with three extension sockets.
+#
+# THE PART NUMBER DOES NOT SETTLE THE PACKAGE, AND THE ORDERING SCHEME SAYS SO. Section 1's
+# ordering information decodes the pin-count letter as G = 48, J = 64, N = 100 and P = 120/128 --
+# so a `P` part is one of TWO packages, and the letter alone cannot say which. The configuration
+# summary gives ATSAME54P20A both a 128-pin TQFP and a 120-ball TFBGA, and gives the pair ONE I/O
+# count. So the pad set below is the same either way and the package does not change it.
+#
+# AND THE 100-PIN PART IS A DIFFERENT PAD SET THAT LOOKS LIKE THIS ONE. Reading the `P` as 100
+# pins is the natural mistake -- N is 100 and P is next -- and the 100-pin TQFP carries NO PB26,
+# PB27, PB28 or PB29. Port B is COMPLETE on the package below and short of four pads on that one,
+# and those four carry a SERCOM. So a present-list taken from the wrong figure does not merely
+# omit: it refuses a binding that names a pad this silicon has, and the refusal reads as though the
+# binding were wrong rather than the list.
+#
+# THE ARITHMETIC IS THE CROSS-CHECK. The pinout figure gives 128 positions of which 29 are power,
+# ground, reset or the switching-regulator pin, leaving 99 -- and the configuration summary states
+# 99 I/O pins for this row independently. Two places in one document, counted two different ways.
 
 [table]
 kind = "parts"
 family = "same54"
 
 [[parts]]
-part = "atsame54p20a"
-package = "TQFP (package suffix + pin count deferred to the datasheet)"
+part = "atsame51j20a"
+package = "64-pin TQFP"
 flash = 0x100000
 ram = 0x40000
-pins = []
-source = "ATSAME54P20A part facts: 1 MB flash / 256 KB RAM"
+pins = [
+    "PA00-PA25", "PA27", "PA30-PA31",
+    "PB00-PB17", "PB22-PB23", "PB30-PB31",
+]
+source = "SAM D5x/E5x Family Data Sheet DS60001507F section 4.2, figure 4-2 (64-Pin TQFP and VQFN Package): the pad set above is every I/O position of that figure. PORT A IS THE SAME SET AS THE 128-PIN PART -- PA00-PA25, PA27 and PA30-PA31, so PA26, PA28 and PA29 are bonded on neither -- and the reduction is entirely in port B, which carries PB00-PB17, PB22-PB23 and PB30-PB31 here against PB00-PB31 there. Ports C and D are absent from this package altogether. That is 51 pads, and the configuration summary's I/O-pin row gives 51 for the 64-pin column independently. The same summary gives the SAME51J20 row 1024 Kbytes of flash and 256 Kbytes of RAM."
+
+# THE E51 AND THE E54 ARE ONE FAMILY AND TWO PACKAGES, WHICH IS WHY BOTH ROWS LIVE HERE. Every
+# block table in this directory describes silicon they share; what differs is which pads that
+# silicon is bonded out to, and a pad list is exactly what a parts row exists to carry. A consumer
+# asking whether a pin exists gets a different answer per row and the same answer from every block.
+
+[[parts]]
+part = "atsame54p20a"
+package = "128-pin TQFP"
+flash = 0x100000
+ram = 0x40000
+pins = [
+    "PA00-PA25", "PA27", "PA30-PA31",
+    "PB00-PB31",
+    "PC00-PC07", "PC10-PC28", "PC30-PC31",
+    "PD00-PD01", "PD08-PD12", "PD20-PD21",
+]
+source = "SAM D5x/E5x Family Data Sheet DS60001507F. Section 4.6, figure 4-5 (128-Pin TQFP Package): the pad set above is every I/O position of that figure. Port B is COMPLETE at PB00-PB31; port A carries PA00-PA25, PA27 and PA30-PA31, so PA26, PA28 and PA29 are not bonded; port C carries PC00-PC07, PC10-PC28 and PC30-PC31, so PC08, PC09 and PC29 are not; port D carries only PD00-PD01, PD08-PD12 and PD20-PD21. That is 99 pads, and section 1's configuration summary states 99 I/O pins for the SAME54P20 row independently, with 1024 Kbytes of flash and 256 Kbytes of RAM. Section 1's ordering information decodes the pin-count letter P as 120/128 pins, and the configuration summary gives this row a 128-pin TQFP and a 120-ball TFBGA with that one I/O count between them -- so the pad set does not depend on which of the two a board fits, and the package named here is the through-hole one an evaluation board carries."

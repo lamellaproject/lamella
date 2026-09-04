@@ -1,0 +1,30 @@
+# BLOCK: the nRF51 non-volatile memory controller (NVMC), stated only as far as the facts consumers
+# outside the controller need. Its enable protocol and its erase commands are not described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 32-BIT WORD AND THE PART FAULTS IF YOU DISAGREE. The reference manual is
+# unusually direct: `Only word aligned writes are allowed. Byte or half word aligned writes will
+# result in a hard fault.` So the unit is four bytes and the alignment is not advisory.
+#
+# THE ERASED VALUE IS STATED SIDEWAYS AND IS NONE THE WEAKER FOR IT. The manual says the NVMC `is
+# only able to write bits in the NVM that are erased, that is, set to 1`. It defines the erased
+# state as the one-state in the course of saying what the controller can do to it, which is the
+# same fact a sentence beginning `after an erase` would have carried.
+
+[table]
+kind = "block"
+family = "nrf51"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 4
+sources = [
+    "erased_value: nRF51 Series Reference Manual Version 3.0 section 6.1.1 `Writing to the NVM`: `The NVMC is only able to write bits in the NVM that are erased, that is, set to 1`",
+    "write_unit: nRF51 Series Reference Manual Version 3.0 section 6.1.1: `When writing is enabled, the NVM is written by writing a word to a word aligned address in the CODE or UICR`",
+    "write_unit: nRF51 Series Reference Manual Version 3.0 section 6.1.1: `Only word aligned writes are allowed. Byte or half word aligned writes will result in a hard fault`",
+]
+notes = [
+    "The erase unit is not this number and is not declared here: the nRF51 erases by PAGE, and the page size is a part fact rather than a controller one.",
+    "Writing to the UICR goes through the same controller and the same word granularity, but a UICR write takes effect only after a reset. Nothing here says anything about when a write becomes visible.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

@@ -22,6 +22,8 @@ part = "stm32f091rc"
 package = "64-pin (order-code package suffix deferred to the datasheet)"
 flash = 0
 ram = 0x8000
+dp_idcode = 0x0BB11477
+identity_source = "Read from the NUCLEO-F091RC over an ST-Link. 0x0bb11477 is Arm's generic Cortex-M0 SW-DP, which an nRF51 answers as readily, so it names no part. The reading that names an ST die is DBGMCU_IDCODE, at a peripheral address on this line rather than at the Cortex address an F4 or F7 uses."
 pins = ["PA2-PA3"]
 source = "RM0091 (32 Kbytes SRAM; flash 'up to 256 Kbyte' -- exact F091RC size DEFERRED to the DS) -- the pin list is PARTIAL rather than the package's full set"
 

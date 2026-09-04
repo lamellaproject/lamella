@@ -266,8 +266,7 @@ pub fn link_at_base_gc(
     entry: &str,
     text_base: u32,
 ) -> Result<LinkedImage, LinkError> {
-    let trimmed = garbage_collect(objects, entry);
-    link_with_base(&trimmed, entry, Some(text_base), &[])
+    link_gc_inner(objects, entry, false, Some(text_base))
 }
 
 /// Re-exported from [`lamella_elf`] so the backend that NAMES descriptor symbols and the linker that
@@ -367,10 +366,69 @@ pub fn check_instantiation_cap(objects: &[Object], cap: usize) -> Result<(), Lin
 /// and all other data, then rebuilds each object re-laid-out with its symbols and relocations remapped, so
 /// unused functions/descriptors and the undefined externs only they referenced drop out.
 pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
+    trim_all(objects, &reachable_from(objects, entry))
+}
+
+/// Rebuilds every object against `keep`, EXCEPT the ones [`resolves_against_its_own_layout`] refuses
+/// to move, which are passed through whole.
+fn trim_all(objects: &[Object], keep: &BTreeSet<String>) -> Vec<Object> {
+    objects
+        .iter()
+        .map(|obj| match resolves_against_its_own_layout(obj) {
+            true => obj.clone(),
+            false => trim_object(obj, keep),
+        })
+        .collect()
+}
+
+/// Whether any of `obj`'s code relocations names a target the trim CANNOT PUT BACK: one that is
+/// defined here and either has no name at all (a section symbol) or has no `st_size`.
+///
+/// **SUCH AN OBJECT IS KEPT WHOLE, BECAUSE A SYMBOL-GRANULARITY TRIM CANNOT RE-ADDRESS IT.**
+/// [`trim_object`] rebuilds an object by copying each kept symbol's `[st_value, st_value + st_size)`
+/// and re-pointing relocations AT THE SYMBOL BY NAME, so a target survives the move when it has a
+/// name to be found by and a size to be copied. Neither of these has both:
+///
+///   * a SECTION symbol carries no name, and its relocation's offset into the section rides in the
+///     ADDEND -- which on ARM is IMPLICIT, i.e. the instruction's own immediate field, so there is
+///     not even an addend to rewrite. The addend also addresses the whole section rather than the
+///     target's own bytes, so no per-symbol remap could be right.
+///   * a size-0 definition is dropped by the trim whatever reaches it (see [`trim_object`]).
+///
+/// A real linker has the same limit and answers it the same way: `--gc-sections` works at SECTION
+/// granularity and never splits a section it cannot re-address.
+///
+/// **A NAMED, SIZED LOCAL IS NOT HERE, AND THE OMISSION IS DELIBERATE.** It moves correctly: the
+/// walk roots it (a relocation target's name is pushed whatever its binding), the trim keeps it, and
+/// the relocation is re-pointed at its new position with the addend still measured from the symbol's
+/// own base. Including it would keep whole every archive member carrying an internal label, for no
+/// gain.
+///
+/// The objects this selects are compiled ones that address their own literal pools this way; a
+/// symbol table the backend writes itself names and sizes every relocation target, so a program
+/// object and a corlib object are both unaffected.
+fn resolves_against_its_own_layout(obj: &Object) -> bool {
+    obj.relocations.iter().any(|r| {
+        obj.symbols
+            .get(r.symbol as usize)
+            .is_some_and(|s| s.defined && (s.name.is_empty() || s.size == 0))
+    })
+}
+
+/// The names [`garbage_collect`] keeps: everything the cross-object reference graph reaches from
+/// `entry`, plus everything [`kept_regardless`] keeps without being reached.
+///
+/// **EXTRACTED SO THE FOLD PATH ASKS THE SAME QUESTION RATHER THAN ANSWERING IT AGAIN.**
+/// [`link_gc_inner`] needs the reachable set MINUS the functions ICF folds away, which it cannot get
+/// from [`garbage_collect`]'s objects-in/objects-out shape; before this split it walked a graph of
+/// its own that followed a function's calls and NOTHING a data symbol references, so every
+/// descriptor, string blob and statics record fell out of the image and the link died on the first
+/// reference to one.
+fn reachable_from(objects: &[Object], entry: &str) -> BTreeSet<String> {
     let mut defs: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, s) in obj.symbols.iter().enumerate() {
-            if s.defined && s.binding != Binding::Local && !s.name.is_empty() {
+            if s.defined && !s.name.is_empty() {
                 defs.entry(s.name.as_str()).or_default().push((oi, si));
             }
         }
@@ -381,6 +439,13 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
     for obj in objects {
         for s in &obj.symbols {
             if s.defined && s.size > 0 && !s.name.is_empty() && kept_regardless(s) {
+                stack.push(s.name.clone());
+            }
+        }
+    }
+    for obj in objects.iter().filter(|o| resolves_against_its_own_layout(o)) {
+        for s in &obj.symbols {
+            if s.defined && !s.name.is_empty() {
                 stack.push(s.name.clone());
             }
         }
@@ -406,11 +471,7 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
             }
         }
     }
-    let mut out = Vec::with_capacity(objects.len());
-    for obj in objects {
-        out.push(trim_object(obj, &reachable));
-    }
-    out
+    reachable
 }
 
 /// Whether [`trim_object`] keeps this symbol WITHOUT asking whether anything reaches it.
@@ -1460,10 +1521,11 @@ fn relocation_addend(text: &[u8], machine: Machine, site: u32, r: &ParsedRelocat
     }
 }
 
-/// Like [`link`], but with `--gc-sections` dead-stripping at the FUNCTION level: only functions
-/// reachable from `entry` (over the call graph the `.rela.text` relocations expose) are kept; unused
-/// functions are dropped even from an otherwise-used object. The kept functions are re-laid-out
-/// (the entry first) and their relocations re-applied to the new offsets.
+/// Like [`link`], but with `--gc-sections` dead-stripping first: [`garbage_collect`]'s reachability
+/// walk from `entry` decides what survives -- a function's calls AND a data symbol's references, so
+/// a reached descriptor keeps the methods its vtable points at and an unreached one takes its
+/// vtable's methods with it -- and the survivors are linked exactly as [`link`] links them. This is
+/// [`link_at_base_gc`] without a base; the two are one path.
 pub fn link_gc(objects: &[Object], entry: &str) -> Result<LinkedImage, LinkError> {
     link_gc_inner(objects, entry, false, None)
 }
@@ -1486,6 +1548,13 @@ pub fn link_icf(
 /// As [`link_gc`], but pulling archive members on demand first, exactly as [`link_with_archives`]
 /// does -- so a program that reaches the runtime-support archive can be measured against its
 /// [`link_icf_with_archives`] twin on the SAME input.
+///
+/// **THE ARCHIVE IS DEAD-STRIPPED HERE AND IS NOT IN THE PRODUCTION LINK, WHICH IS THE WHOLE
+/// DIFFERENCE THE SIZE LEDGER MEASURES.** `link_with_archives` pulls a member WHOLE to resolve one
+/// undefined symbol and never revisits it, and the AOT driver runs [`garbage_collect`] on the
+/// program objects BEFORE the archives are added -- so a seam the program's corlib names but never
+/// reaches is charged to every image. Pulling and THEN dead-stripping is what this path does
+/// differently, so `text_prod - text_gc` is that charge.
 pub fn link_gc_with_archives(
     objects: &[Object],
     archives: &[Archive],
@@ -1508,119 +1577,122 @@ pub fn link_icf_with_archives(
     link_gc_inner(&include_on_demand(objects, archives), entry, true, text_base)
 }
 
+/// Dead-strips from `entry` and then links through the ORDINARY layout, optionally folding
+/// identical functions on the way (see [`link_gc`] / [`link_icf`]).
+///
+/// **THE WHOLE POINT OF THIS SHAPE IS THAT IT ANSWERS NO QUESTION TWICE.** Reachability is
+/// [`reachable_from`]'s -- the same walk [`garbage_collect`] uses, which follows a data symbol's
+/// references as well as a function's calls. Trimming is [`trim_object`]'s. Layout, symbol
+/// resolution, the statics window, the stack-map tables and the veneers are
+/// [`link_with_base`]'s. What is left here is ICF's own decision and nothing else.
+///
+/// **ICF IS EXPRESSED AS AN OBJECT REWRITE RATHER THAN A LAYOUT OF ITS OWN**: a folded-away
+/// function is dropped from the keep set (which takes its stack-map record with it, by
+/// `trim_object`'s existing record rule) and its name is re-defined as an ALIAS of the
+/// representative's address. That is the whole difference between `link_gc` and `link_icf`, which
+/// is what makes `text_icf` against `text_gc` a measurement of folding rather than of two linkers.
 fn link_gc_inner(
     objects: &[Object],
     entry: &str,
     fold: bool,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    check_instantiation_cap(objects, INSTANTIATION_CAP)?;
     let machine = link_machine(objects)?;
-    let mut funcs: Vec<(usize, String, u32, u32)> = Vec::new();
-    for (oi, obj) in objects.iter().enumerate() {
-        let mut bounds: Vec<(u32, String)> = obj
-            .symbols
-            .iter()
-            .filter(|s| {
-                s.defined
-                    && s.binding == Binding::Global
-                    && s.kind == SymbolType::Func
-                    && !s.name.is_empty()
-            })
-            .map(|s| (normalized_value(machine, s.value), s.name.clone()))
-            .collect();
-        bounds.sort_by_key(|(v, _)| *v);
-        for i in 0..bounds.len() {
-            let start = bounds[i].0;
-            let end = bounds
-                .get(i + 1)
-                .map(|(v, _)| *v)
-                .unwrap_or(obj.text.len() as u32);
-            funcs.push((oi, bounds[i].1.clone(), start, end));
+    let mut keep = reachable_from(objects, entry);
+    let folds = match fold {
+        true => plan_folds(objects, machine, &keep, entry),
+        false => Vec::new(),
+    };
+    for (away, _) in &folds {
+        keep.remove(away);
+    }
+    let mut trimmed: Vec<Object> = trim_all(objects, &keep);
+    define_fold_aliases(&mut trimmed, &folds);
+    link_with_base(&trimmed, entry, text_base, &[])
+}
+
+/// The ICF decision as `(folded-away name, representative name)` pairs, over the functions that
+/// SURVIVE dead-stripping. Empty when nothing folds.
+///
+/// A function is a candidate when it is a defined, sized, non-local `STT_FUNC` symbol that `keep`
+/// retains and that exactly ONE object defines. **The extent is `st_value .. st_value + st_size`**,
+/// the same extent [`garbage_collect`] and [`trim_object`] take. It is deliberately not the span up
+/// to the next function symbol, which would swallow any data laid between two functions.
+///
+/// **A MULTIPLY-DEFINED NAME IS EXCLUDED, AND NOT AS A REFINEMENT.** `compiler_builtins` emits
+/// its `__aeabi_*` soft-float helpers WEAK and several pulled members re-define one, so the same
+/// name arrives twice with identical bytes -- an identical fingerprint, which would fold the second
+/// copy into the first and hand back the pair `(name, name)`. Dropping `name` from the keep set
+/// then deletes BOTH definitions and the alias has nothing to point at: a fold that erases the
+/// function it was meant to share. Which copy survives is `link_with_base_inner`'s strong-over-weak
+/// rule to decide, not this pass's, so the honest move is not to fold such a name at all.
+fn plan_folds(
+    objects: &[Object],
+    machine: Machine,
+    keep: &BTreeSet<String>,
+    entry: &str,
+) -> Vec<(String, String)> {
+    let mut definitions: BTreeMap<&str, usize> = BTreeMap::new();
+    for obj in objects {
+        for s in &obj.symbols {
+            if s.defined && !s.name.is_empty() {
+                *definitions.entry(s.name.as_str()).or_default() += 1;
+            }
         }
     }
-    let index_of = |name: &str| funcs.iter().position(|(_, n, _, _)| n == name);
-    let entry_fi = index_of(entry).ok_or_else(|| LinkError::MissingEntry(String::from(entry)))?;
-
-    let mut reachable = alloc::vec![false; funcs.len()];
-    let mut stack = alloc::vec![entry_fi];
-    reachable[entry_fi] = true;
-    while let Some(fi) = stack.pop() {
-        let (oi, _, start, end) = funcs[fi].clone();
-        for r in &objects[oi].relocations {
-            if r.offset < start || r.offset >= end {
+    let mut funcs: Vec<Func> = Vec::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        if resolves_against_its_own_layout(obj) {
+            continue;
+        }
+        for s in &obj.symbols {
+            if !s.defined
+                || s.size == 0
+                || s.name.is_empty()
+                || s.binding == Binding::Local
+                || s.kind != SymbolType::Func
+                || !keep.contains(&s.name)
+                || definitions.get(s.name.as_str()).copied().unwrap_or(0) != 1
+            {
                 continue;
             }
-            if let Some(s) = objects[oi].symbols.get(r.symbol as usize) {
-                if let Some(tfi) = index_of(&s.name) {
-                    if !reachable[tfi] {
-                        reachable[tfi] = true;
-                        stack.push(tfi);
-                    }
-                }
-            }
+            let start = normalized_value(machine, s.value);
+            funcs.push((oi, s.name.clone(), start, start + s.size));
         }
     }
-
-    let fold_to = if fold {
-        compute_folds(&funcs, objects, machine, &reachable, entry_fi)
-    } else {
-        alloc::vec![None; funcs.len()]
+    let Some(entry_fi) = funcs.iter().position(|(_, n, _, _)| n == entry) else {
+        return Vec::new();
     };
+    compute_folds(&funcs, objects, machine, entry_fi)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(fi, rep)| Some((funcs[fi].1.clone(), funcs[rep?].1.clone())))
+        .collect()
+}
 
-    let mut text: Vec<u8> = Vec::new();
-    let mut new_offset: Vec<Option<u32>> = alloc::vec![None; funcs.len()];
-    let mut defined: Vec<Defined> = Vec::new();
-    let order = core::iter::once(entry_fi).chain(
-        (0..funcs.len()).filter(|&fi| reachable[fi] && fi != entry_fi && fold_to[fi].is_none()),
-    );
-    for fi in order {
-        let (oi, name, start, end) = &funcs[fi];
-        align_to(&mut text, objects[*oi].text_align);
-        let off = text.len() as u32;
-        new_offset[fi] = Some(off);
-        defined.push((name.clone(), off, machine == Machine::Arm));
-        text.extend_from_slice(&objects[*oi].text[*start as usize..*end as usize]);
-    }
-    for fi in 0..funcs.len() {
-        if let Some(rep) = fold_to[fi] {
-            let rep_off = new_offset[rep].expect("a representative is laid out");
-            defined.push((funcs[fi].1.clone(), rep_off, machine == Machine::Arm));
-        }
-    }
-
-    let no_veneers: BTreeMap<u32, u32> = BTreeMap::new();
-    for fi in 0..funcs.len() {
-        let Some(fbase) = new_offset[fi] else {
+/// Re-defines each folded-away name as an alias of its representative, in the object that kept the
+/// representative.
+///
+/// The alias carries the representative's `st_value` VERBATIM -- Thumb bit included, since on ARM
+/// that bit is what makes an `R_ARM_ABS32` reference re-enter Thumb state -- and its `st_size`,
+/// because the alias really does cover those bytes. Nothing is added for a representative that did
+/// not survive the trim; [`plan_folds`] elects one from the keep set, so that cannot happen, and a
+/// silent skip is still better than a panic in a linker.
+fn define_fold_aliases(objects: &mut [Object], folds: &[(String, String)]) {
+    for (away, rep) in folds {
+        let Some((oi, sym)) = objects.iter().enumerate().find_map(|(oi, o)| {
+            o.symbols
+                .iter()
+                .find(|s| s.defined && s.name == *rep)
+                .map(|s| (oi, s.clone()))
+        }) else {
             continue;
         };
-        let (oi, _, start, end) = &funcs[fi];
-        for r in &objects[*oi].relocations {
-            if r.offset < *start || r.offset >= *end {
-                continue;
-            }
-            let site = fbase + (r.offset - start);
-            apply_relocation(
-                &mut text,
-                machine,
-                site,
-                text_base,
-                fbase.wrapping_sub(*start),
-                &defined,
-                &objects[*oi].symbols,
-                r,
-                &no_veneers,
-            )?;
-        }
+        objects[oi].symbols.push(lamella_elf::ParsedSymbol {
+            name: away.clone(),
+            ..sym
+        });
     }
-
-    let entry_offset = new_offset[entry_fi].expect("entry laid out");
-    Ok(LinkedImage {
-        text,
-        entry_offset,
-        symbols: defined.into_iter().map(|(n, a, _)| (n, a)).collect(),
-        debug_sections: Vec::new(),
-    })
 }
 
 /// A function for ICF comparison: `(oi, name, start, end)` -- its object + byte range.
@@ -1652,14 +1724,15 @@ fn function_fingerprint(func: &Func, objects: &[Object]) -> Fingerprint {
 }
 
 /// Decides ICF folding: returns `fold_to`, where `fold_to[fi] = Some(rep)` means function `fi` folds
-/// into representative `rep`. Reachable functions are grouped by fingerprint; in each group the
-/// non-address-taken duplicates fold into one survivor (an address-taken member preferred as the
+/// into representative `rep`. `funcs` is the SURVIVING set -- [`plan_folds`] filters it against the
+/// dead-strip keep set, so there is no reachability flag to consult here and no way to fold into a
+/// representative that is about to be trimmed. Functions are grouped by fingerprint; in each group
+/// the non-address-taken duplicates fold into one survivor (an address-taken member preferred as the
 /// survivor so its identity is what remains). Address-taken functions and the entry never fold away.
 fn compute_folds(
     funcs: &[Func],
     objects: &[Object],
     machine: Machine,
-    reachable: &[bool],
     entry_fi: usize,
 ) -> Vec<Option<usize>> {
     let mut address_taken: BTreeSet<&str> = BTreeSet::new();
@@ -1676,13 +1749,13 @@ fn compute_folds(
             }
         }
     }
-    let fps: Vec<Option<Fingerprint>> = (0..funcs.len())
-        .map(|fi| reachable[fi].then(|| function_fingerprint(&funcs[fi], objects)))
+    let fps: Vec<Fingerprint> = funcs
+        .iter()
+        .map(|f| function_fingerprint(f, objects))
         .collect();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for fi in 0..funcs.len() {
-        let Some(fp) = &fps[fi] else { continue };
-        match groups.iter_mut().find(|g| fps[g[0]].as_ref() == Some(fp)) {
+        match groups.iter_mut().find(|g| fps[g[0]] == fps[fi]) {
             Some(g) => g.push(fi),
             None => groups.push(alloc::vec![fi]),
         }
@@ -3409,6 +3482,53 @@ mod tests {
         );
     }
 
+    /// AND THE DEAD-STRIP MUST NOT MOVE THAT OBJECT'S BYTES. The section symbol's value plus the
+    /// relocation's addend is an offset into the section as it was LAID OUT; a symbol-granularity
+    /// re-layout invalidates it and there is no name to re-resolve through, so `trim_all` passes
+    /// such an object through whole. Before that rule, `trim_object` turned the unnamed target into
+    /// an undefined extern and 51 corpus programs failed the gc link on `UndefinedSymbol("")` --
+    /// the empty string being what an unnamed target becomes when it is looked up by name.
+    ///
+    /// The `dead` function is the control in the other direction: the object is kept whole, so a
+    /// body nothing calls survives HERE, where it would be stripped from any other object. That is
+    /// the cost of the rule and it is asserted rather than left as a claim.
+    #[test]
+    fn an_object_that_resolves_against_its_own_layout_is_kept_whole() {
+        let section = Symbol {
+            name: "",
+            value: 4,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::NoType,
+            section: SymbolSection::Text,
+        };
+        let obj = obj_arm(
+            &[
+                0, 0, 0, 0,
+                0x0D, 0xF0, 0xFE, 0xCA,
+                0x70, 0x47,
+            ],
+            &[func("f", 1, 8), section, func("dead", 9, 2)],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+        );
+        let img = link_at_base_gc(core::slice::from_ref(&obj), "f", 0x1000)
+            .expect("an object with a section-relative relocation must still link through the gc path");
+        assert_eq!(
+            u32::from_le_bytes(img.text[0..4].try_into().unwrap()),
+            0x1000 + 4,
+            "the section-relative word must still address the constant at blob offset 4"
+        );
+        assert!(
+            img.symbols.iter().any(|(n, _)| n == "dead"),
+            "the object is kept WHOLE, so even its unreached body survives -- the cost of the rule"
+        );
+    }
+
     #[test]
     fn a_transitively_needed_member_is_pulled() {
         let main = obj_arm(
@@ -3514,25 +3634,54 @@ mod tests {
         );
     }
 
-    /// THE DEFECT, STATED: the `--gc-sections`/ICF path is FUNCTION-ONLY, so it cannot link any
-    /// object that references a defined DATA symbol -- and every AOT program does (its type
-    /// descriptors, its stack-map table, its statics region). `link_gc_inner` gathers only
-    /// `SymbolType::Func` symbols, lays out only those, and defines only those, so a reference to a
-    /// data symbol that IS defined in the input comes back `UndefinedSymbol`.
-    ///
-    /// This is asserted rather than merely noted because the consequence is easy to miss and
-    /// expensive to assume away: ICF is the lever the generics code-model audit prices
-    /// monomorphization against, and it has never met a real image. The `link` control in the same
-    /// test is what makes the claim about the PATH rather than about the fixture.
-    ///
-    /// When the fold path learns about data symbols, this test fails -- that is intended. Replace
-    /// it then with the positive assertion (the image links AND the duplicate folds).
+    /// A WEAKLY DUPLICATED FUNCTION MUST NOT FOLD INTO ITSELF. `compiler_builtins` re-defines its
+    /// `__aeabi_*` helpers weak in several archive members, so one name can arrive twice with
+    /// byte-identical bodies. Grouping those by fingerprint yields the fold pair `(dup, dup)`, and
+    /// dropping `dup` from the keep set then deletes BOTH copies -- an "optimization" that erases
+    /// the function. The control is the SAME objects under `link_gc`: it links, so this row is
+    /// about folding rather than about the fixture.
     #[test]
-    fn the_gc_and_icf_path_cannot_link_a_reference_to_a_data_symbol() {
+    fn a_weakly_duplicated_identical_function_is_not_folded_out_of_existence() {
+        let body = &[0x15, 0x20, 0x70, 0x47];
+        let main = obj_arm(
+            &[0x00, 0xB5, 0x00, 0xF0, 0x00, 0xD0, 0x00, 0xBD],
+            &[func("main", 1, 8), undef("dup")],
+            &[Relocation {
+                offset: 2,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+        let one = obj_arm(body, &[weak("dup", 1, 4)], &[]);
+        let two = obj_arm(body, &[weak("dup", 1, 4)], &[]);
+        let inputs = [main, one, two];
+        assert!(
+            link_gc(&inputs, "main").is_ok(),
+            "the control must link -- otherwise the fixture is what is wrong"
+        );
+        let icf = link_icf(&inputs, "main", None);
+        assert!(
+            icf.as_ref().is_ok_and(|i| i.symbols.iter().any(|(n, _)| n == "dup")),
+            "the fold path must keep a definition of `dup`; got {icf:?}"
+        );
+    }
+
+    /// THE DEFECT THAT WAS, NOW STATED AS THE PROPERTY: the `--gc-sections`/ICF path used to be
+    /// FUNCTION-ONLY, so it could not link any object referencing a defined DATA symbol -- and
+    /// every AOT program does (its type descriptors, its string blobs, its stack-map records, its
+    /// statics region). The predecessor of this test ASSERTED that refusal, with a note saying to
+    /// replace it with the positive claim once the path learned about data. This is that
+    /// replacement.
+    ///
+    /// The `link_at_base` control is kept for the reason it was written: it makes the claim about
+    /// the PATH rather than about the fixture, in both directions.
+    #[test]
+    fn the_gc_and_icf_path_links_a_reference_to_a_data_symbol() {
         let text = [0x15, 0x20, 0x70, 0x47, 0, 0, 0, 0];
         let main = obj_arm(
             &text,
-            &[func("main", 1, 4), data("desc", 8, 4)],
+            &[func("main", 1, 8), data("desc", 8, 4)],
             &[Relocation {
                 offset: 4,
                 symbol: 1,
@@ -3545,15 +3694,108 @@ mod tests {
             plain.is_ok(),
             "the control must link -- otherwise the fixture is what is wrong, not the path"
         );
-        for refused in [
-            link_gc_with_archives(core::slice::from_ref(&main), &[], "main", Some(0x8000)),
-            link_icf_with_archives(core::slice::from_ref(&main), &[], "main", Some(0x8000)),
+        for (label, linked) in [
+            (
+                "gc",
+                link_gc_with_archives(core::slice::from_ref(&main), &[], "main", Some(0x8000)),
+            ),
+            (
+                "icf",
+                link_icf_with_archives(core::slice::from_ref(&main), &[], "main", Some(0x8000)),
+            ),
         ] {
-            assert!(
-                matches!(&refused, Err(LinkError::UndefinedSymbol(n)) if n == "desc"),
-                "the fold path must still refuse a defined data symbol; got {refused:?}"
+            let image = linked.unwrap_or_else(|e| panic!("the {label} path must link: {e:?}"));
+            let desc = image
+                .symbols
+                .iter()
+                .find(|(n, _)| n == "desc")
+                .unwrap_or_else(|| panic!("the {label} image must define `desc`"))
+                .1;
+            let word = u32::from_le_bytes(image.text[4..8].try_into().unwrap());
+            assert_eq!(
+                word,
+                0x8000 + desc,
+                "the {label} image's ABS32 word must hold `desc`'s address"
             );
         }
+    }
+
+    /// A DEFINED SYMBOL WITH NO `st_size` IS DROPPED BY THE DEAD-STRIP, AND THE LINK THEN NAMES IT
+    /// AS UNDEFINED. This is `trim_object`'s copy rule showing through: it copies
+    /// `[st_value, st_value + st_size)`, so a size-less symbol contributes no bytes and cannot be
+    /// kept over somebody else's code.
+    ///
+    /// It is pinned because the failure READS LIKE A MISSING DEFINITION and is not one -- fifteen
+    /// `global_asm!` shims in the runtime-support archive were exactly this, and the fix is a
+    /// `.size` directive in the assembly, not a change here. The `link_at_base` control links the
+    /// same objects, so the row is about the dead-strip and not about the fixture.
+    #[test]
+    fn a_defined_symbol_with_no_size_does_not_survive_the_dead_strip() {
+        let main = obj_arm(
+            &[0x00, 0xB5, 0x00, 0xF0, 0x00, 0xD0, 0x00, 0xBD],
+            &[func("main", 1, 8), undef("shim")],
+            &[Relocation {
+                offset: 2,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+        let unsized_shim = obj_arm(&[0x70, 0x47], &[func("shim", 1, 0)], &[]);
+        let sized_shim = obj_arm(&[0x70, 0x47], &[func("shim", 1, 2)], &[]);
+        assert!(
+            link_at_base(&[main.clone(), unsized_shim.clone()], "main", 0x8000).is_ok(),
+            "the control must link the size-less symbol -- the ordinary link never trims"
+        );
+        let refused = link_gc(&[main.clone(), unsized_shim], "main");
+        assert!(
+            matches!(&refused, Err(LinkError::UndefinedSymbol(n)) if n == "shim"),
+            "a size-less definition must not survive the trim; got {refused:?}"
+        );
+        assert!(
+            link_gc(&[main, sized_shim], "main").is_ok(),
+            "and the SIZE is the whole difference -- the same shim with st_size links"
+        );
+    }
+
+    /// A REACHED **LOCAL** BODY'S OWN CALLS ARE FOLLOWED. `trim_object` keeps a symbol by NAME with
+    /// no binding test, so a local function whose name is reached survives; the walk therefore has
+    /// to follow its relocations too, or the trim keeps a body whose callee it just dropped.
+    ///
+    /// Nothing had exercised this because the only objects ever dead-stripped were the backend's
+    /// own, where every body is Global. An ARCHIVE member is full of internal-linkage Rust bodies,
+    /// and `link_gc_with_archives` is what began trimming those.
+    #[test]
+    fn a_reached_local_bodys_own_calls_are_rooted() {
+        let mut helper = func("helper", 9, 8);
+        helper.binding = Binding::Local;
+        let caller = obj_arm(
+            &[
+                0x00, 0xB5, 0x00, 0xF0, 0x00, 0xD0, 0x00, 0xBD,
+                0x00, 0xB5, 0x00, 0xF0, 0x00, 0xD0, 0x00, 0xBD,
+            ],
+            &[func("main", 1, 8), helper, undef("leaf")],
+            &[
+                Relocation {
+                    offset: 2,
+                    symbol: 1,
+                    kind: arm::R_ARM_THM_CALL,
+                    addend: -4,
+                },
+                Relocation {
+                    offset: 10,
+                    symbol: 2,
+                    kind: arm::R_ARM_THM_CALL,
+                    addend: -4,
+                },
+            ],
+        );
+        let leaf = obj_arm(&[0x70, 0x47], &[func("leaf", 1, 2)], &[]);
+        let image = link_gc(&[caller, leaf], "main").expect("the local body's callee must survive");
+        assert!(
+            image.symbols.iter().any(|(n, _)| n == "leaf"),
+            "`leaf` is reached only through a LOCAL caller and must still be kept"
+        );
     }
 
     /// The archive-pulling twins resolve an undefined symbol from a member exactly as

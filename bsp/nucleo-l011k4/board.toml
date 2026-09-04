@@ -12,7 +12,7 @@ board = "nucleo-l011k4"
 vendor = "st"
 family = "stm32l0"
 part = "stm32l011k4t"
-board_model = 39            # lamella_wire::board_model::NUCLEO_L011K4
+product_model = 39          # lamella_wire::product_model::NUCLEO_L011K4
 sources = [
     "STM32 Nucleo-32 boards user manual UM1956 Rev 5 (MB1180), which covers NUCLEO-L011K4 by name: section 7.9 and table 7 for the virtual COM port (SB2 ON connects PA2 as VCP TX, SB3 ON connects PA15 as VCP RX, both default), and the LED section for the green user LED LD3 on PB3 at Arduino Nano signal D13",
     "UM1956 Rev 5 naming the fitted part as STM32L011K4T6",

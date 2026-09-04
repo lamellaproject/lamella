@@ -5,6 +5,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use lamella_binder::{BoundStmt, BoundStmtKind, SpecialType, TypeSymbol};
+use lamella_cil::{Instruction, Opcode, Operand};
 use lamella_syntax::span::Span;
 
 /// Where a named variable lives in a method frame.
@@ -14,6 +15,30 @@ pub enum Slot {
     Argument(u16),
     /// A local-variable slot (`ldloc`/`stloc`).
     Local(u16),
+}
+
+impl Slot {
+    /// The instruction that pushes this slot's CONTENTS. For a byref slot -- a `ref`/`out`
+    /// parameter or a `ref` local -- that is the managed pointer it holds, which the caller then
+    /// derefs.
+    #[must_use]
+    pub fn load(self) -> Instruction {
+        match self {
+            Slot::Argument(index) => Instruction::new(Opcode::Ldarg, Operand::Variable(index)),
+            Slot::Local(index) => Instruction::new(Opcode::Ldloc, Operand::Variable(index)),
+        }
+    }
+
+    /// The instruction that overwrites this slot's contents. The mirror of [`Slot::load`]; for a
+    /// byref slot this REBINDS the pointer rather than writing through it, which C# admits only at
+    /// a `ref` local's declaration (ref REASSIGNMENT is C# 7.3 and unbuilt).
+    #[must_use]
+    pub fn store(self) -> Instruction {
+        match self {
+            Slot::Argument(index) => Instruction::new(Opcode::Starg, Operand::Variable(index)),
+            Slot::Local(index) => Instruction::new(Opcode::Stloc, Operand::Variable(index)),
+        }
+    }
 }
 
 /// A method's variable slots, keyed by name, with the local types in slot order.
@@ -44,6 +69,16 @@ pub struct Frame {
     /// Local slots that must be PINNED in the signature -- a `fixed` statement's array
     /// holder, so the GC does not move the array while a pointer into it is live.
     pinned: RefCell<BTreeSet<u16>>,
+    /// The local slot holding each spilled operand of the enclosing
+    /// [`BoundExprKind::Sequence`](lamella_binder::BoundExprKind::Sequence)s, innermost scope
+    /// last. A `Temp(i)` reads the innermost scope's `i`th slot.
+    ///
+    /// **A STACK RATHER THAN A MAP, BECAUSE SEQUENCES NEST AND THE INDEX IS POSITIONAL.**
+    /// `(a + b) + c` puts one sequence inside another's operand list, and both number their
+    /// operands from zero; a flat map would have the inner one overwrite the outer's slots and
+    /// the outer's `Temp(0)` would then read the inner's spilled value. Behind a `RefCell` for
+    /// the same reason `local_types` is: emission holds the frame by shared reference.
+    temp_scopes: RefCell<Vec<Vec<u16>>>,
     /// The DECLARING TYPE's own type-parameter names, in declaration order, so emission can turn
     /// a `T` into the `!n` a token spells it with. Empty for a method of a non-generic type.
     type_parameters: Vec<Box<str>>,
@@ -115,14 +150,33 @@ impl Frame {
         }
     }
 
-    /// The argument slot and referent type of `name` when it is a byref (`ref`/`out`)
-    /// parameter, so a read derefs (`ldind`) and a write stores through it (`stind`).
+    /// The slot and referent type of `name` when it holds a MANAGED POINTER rather than a value --
+    /// a `ref`/`out` parameter or a `ref` LOCAL -- so a read derefs (`ldind`) and a write stores
+    /// through it (`stind`).
+    ///
+    /// **THE SLOT IS RETURNED RATHER THAN ITS INDEX, SO A CALLER CANNOT CHOOSE THE LOAD
+    /// INSTRUCTION WITHOUT DECIDING WHICH KIND OF SLOT IT HAS.** An index alone is the same `u16`
+    /// for an argument and a local, and eight call sites read this: with a bare index, one that
+    /// loads an argument slot with a local's number reads the wrong variable and compiles.
+    /// [`Slot::load`] and [`Slot::store`] make the choice unspellable.
+    ///
+    /// **A LOCAL'S BYREF-NESS IS READ FROM ITS SLOT'S TYPE, NOT FROM A BY-NAME MAP**, so two
+    /// same-named locals in sibling scopes -- one `ref int r`, one plain `int r` -- cannot be
+    /// confused for each other. `byref_types` stays by name for PARAMETERS, where a name is unique
+    /// in the method and there is no slot type to read.
     #[must_use]
-    pub fn byref(&self, name: &str) -> Option<(u16, &TypeSymbol)> {
-        let ty = self.byref_types.get(name)?;
-        match self.slots.get(name)? {
-            Slot::Argument(slot) => Some((*slot, ty)),
-            Slot::Local(_) => None,
+    pub fn byref(&self, name: &str) -> Option<(Slot, TypeSymbol)> {
+        match *self.slots.get(name)? {
+            Slot::Argument(index) => {
+                let ty = self.byref_types.get(name)?;
+                Some((Slot::Argument(index), ty.clone()))
+            }
+            Slot::Local(index) => match self.local_types.borrow().get(index as usize) {
+                Some(TypeSymbol::ByRef(referent)) => {
+                    Some((Slot::Local(index), (**referent).clone()))
+                }
+                _ => None,
+            },
         }
     }
 
@@ -155,6 +209,9 @@ impl Frame {
         }
     }
 
+    /// Reserves and names the slot for one declared local. A `ref` local arrives here with a
+    /// `TypeSymbol::ByRef` type and needs no special case: the slot's type IS the fact, which is
+    /// what makes its signature `T&` and what [`Frame::byref`] reads back.
     fn declare_local(&mut self, span: Span, name: &str, ty: &TypeSymbol) {
         let slot = self.reserve_local(ty);
         self.name_local(slot, name);
@@ -176,6 +233,37 @@ impl Frame {
         };
         self.local_names.borrow_mut().push(Box::from(""));
         slot
+    }
+
+    /// Opens a scope for a [`BoundExprKind::Sequence`](lamella_binder::BoundExprKind::Sequence)'s
+    /// spilled operands. Paired with [`Frame::close_temp_scope`].
+    pub fn open_temp_scope(&self) {
+        self.temp_scopes.borrow_mut().push(Vec::new());
+    }
+
+    /// Records `slot` as the next spilled operand of the innermost open scope, so a later
+    /// `Temp(i)` finds it. Operands are bound one at a time as each is stored, so an operand may
+    /// name the ones spilled before it.
+    pub fn bind_temp(&self, slot: u16) {
+        if let Some(scope) = self.temp_scopes.borrow_mut().last_mut() {
+            scope.push(slot);
+        }
+    }
+
+    /// Closes the innermost spilled-operand scope.
+    pub fn close_temp_scope(&self) {
+        self.temp_scopes.borrow_mut().pop();
+    }
+
+    /// The local slot of the innermost scope's `index`th spilled operand, or `None` when there is
+    /// no such operand -- which means a `Temp` was emitted outside the `Sequence` that binds it,
+    /// and the caller reports it rather than emitting a wrong slot.
+    #[must_use]
+    pub fn temp_slot(&self, index: u32) -> Option<u16> {
+        self.temp_scopes
+            .borrow()
+            .last()
+            .and_then(|scope| scope.get(index as usize).copied())
     }
 
     /// Reserves a PINNED local (a `fixed` array holder): the slot is reported by

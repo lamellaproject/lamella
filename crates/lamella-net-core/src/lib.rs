@@ -196,3 +196,232 @@ pub struct InterfaceInfo {
     /// Whether the address was obtained by DHCP (vs a static configuration).
     pub dhcp_enabled: bool,
 }
+
+/// Watches a backend's IPv4 address and reports each CHANGE exactly once.
+///
+/// # Why a bring-up window is not enough on its own
+///
+/// A bring-up that waits a bounded time for DHCP and then narrates the outcome publishes a
+/// VERDICT, and the stack can go on to contradict it -- the lease arrives after the wait gave up.
+/// Lengthening the wait does not settle it either, because a lease can arrive with no relation to
+/// boot at all: a renewal after an expiry is the ordinary case. What a firmware can do reliably is
+/// say so at the moment it happens. This type is the single implementation of that detection, so
+/// several narration sites cannot each get the transition subtly wrong.
+///
+/// # A loss is a change too
+///
+/// `[0, 0, 0, 0]` is this seam's spelling of "unassigned", so losing an address is a change to
+/// `None` and is worth reporting: a board that has quietly stopped being reachable otherwise looks
+/// exactly like a board nobody has connected to.
+///
+/// # What it reads
+///
+/// Interface 0, through [`NetBackend::interface_info`], whose default implementation returns
+/// `None`. A backend that does not implement it reports no interface, so this watch stays silent
+/// -- which is correct for a backend that has no interfaces, and indistinguishable from a backend
+/// that simply has not overridden the method. Confirm that a backend answers `interface_info`
+/// before reading this watch's silence as "nothing changed".
+pub struct AddressWatch {
+    /// The address last REPORTED, so a change is measured against what a reader has been told
+    /// rather than against the previous poll.
+    reported: Option<[u8; 4]>,
+    /// Whether anything has been reported yet, which is what separates "no address, as before"
+    /// from a first look that happens to find none.
+    started: bool,
+}
+
+impl Default for AddressWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AddressWatch {
+    /// A watch that has reported nothing yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { reported: None, started: false }
+    }
+
+    /// The address now, if it DIFFERS from what was last reported; otherwise `None`.
+    ///
+    /// The first call reports whatever it finds, including `None` for a board with no address --
+    /// a caller that only wants to hear about a gain can ignore a `Some(None)`.
+    pub fn changed(&mut self, net: &mut dyn NetBackend) -> Option<Option<[u8; 4]>> {
+        let current = match net.interface_info(0) {
+            Some(info) if info.ipv4 != [0, 0, 0, 0] => Some(info.ipv4),
+            _ => None,
+        };
+        if self.started && current == self.reported {
+            return None;
+        }
+        self.started = true;
+        self.reported = current;
+        Some(current)
+    }
+
+    /// The address last reported, without polling the backend.
+    #[must_use]
+    pub fn reported(&self) -> Option<[u8; 4]> {
+        self.reported
+    }
+}
+
+#[cfg(test)]
+mod address_watch_tests {
+    use super::*;
+
+    /// A backend that answers only [`NetBackend::interface_info`], because that is the whole of
+    /// what [`AddressWatch`] reads. Every other operation panics rather than returning a plausible
+    /// value: a watch that started using one would be doing something this type does not claim.
+    #[derive(Debug)]
+    struct OneIface {
+        ipv4: Option<[u8; 4]>,
+        /// Whether the backend reports an interface at all -- the case a backend that has not
+        /// overridden `interface_info` presents, which must read as silence and not as a loss.
+        present: bool,
+    }
+
+    impl OneIface {
+        fn at(ipv4: Option<[u8; 4]>) -> Self {
+            Self { ipv4, present: true }
+        }
+    }
+
+    impl NetBackend for OneIface {
+        fn resolve(&mut self, _host: &str) -> Vec<Vec<u8>> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn tcp_connect(&mut self, _addr: &[u8], _port: u16) -> NetResult<SocketHandle> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn connect_check(&mut self, _socket: SocketHandle) -> NetResult<()> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn tcp_listen(&mut self, _addr: &[u8], _port: u16, _backlog: i32) -> NetResult<SocketHandle> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn accept(&mut self, _listener: SocketHandle) -> NetResult<SocketHandle> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn recv(&mut self, _socket: SocketHandle, _buf: &mut [u8]) -> NetResult<usize> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn send(&mut self, _socket: SocketHandle, _buf: &[u8]) -> NetResult<usize> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn udp_bind(&mut self, _addr: &[u8], _port: u16) -> NetResult<SocketHandle> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn udp_send_to(
+            &mut self,
+            _socket: SocketHandle,
+            _buf: &[u8],
+            _addr: &[u8],
+            _port: u16,
+        ) -> NetResult<usize> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn udp_recv_from(
+            &mut self,
+            _socket: SocketHandle,
+            _buf: &mut [u8],
+            _sender_addr: &mut [u8],
+        ) -> NetResult<(usize, usize, u16)> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn local_port(&mut self, _socket: SocketHandle) -> Option<u16> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn close(&mut self, _socket: SocketHandle) {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn register(&mut self, _socket: SocketHandle, _interest: Interest) {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn deregister(&mut self, _socket: SocketHandle) {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn poll(&mut self, _timeout_ms: Option<u64>) -> Vec<SocketHandle> {
+            unimplemented!("AddressWatch reads interface_info only")
+        }
+        fn interface_info(&mut self, index: u32) -> Option<InterfaceInfo> {
+            if !self.present || index != 0 {
+                return None;
+            }
+            Some(InterfaceInfo {
+                oper_status: OperStatus::Up,
+                kind: IfaceKind::Ethernet,
+                ipv4: self.ipv4.unwrap_or([0, 0, 0, 0]),
+                subnet: [255, 255, 255, 0],
+                gateway: [192, 168, 1, 1],
+                dhcp_enabled: true,
+            })
+        }
+    }
+
+    /// THE CASE THIS TYPE EXISTS FOR: an address that arrives after the caller has already given
+    /// up waiting for it is reported, and reported ONCE.
+    #[test]
+    fn a_late_address_is_reported_once() {
+        let mut net = OneIface::at(None);
+        let mut watch = AddressWatch::new();
+
+        assert_eq!(watch.changed(&mut net), Some(None), "the first look reports what it finds");
+        assert_eq!(watch.changed(&mut net), None, "still no address is not news");
+
+        net.ipv4 = Some([192, 168, 1, 205]);
+        assert_eq!(watch.changed(&mut net), Some(Some([192, 168, 1, 205])), "the lease lands");
+        assert_eq!(watch.changed(&mut net), None, "and is not announced twice");
+        assert_eq!(watch.reported(), Some([192, 168, 1, 205]));
+    }
+
+    /// A lease LOST is a change too. A board that has quietly stopped being reachable otherwise
+    /// reads exactly like a board nobody has dialed.
+    #[test]
+    fn losing_the_address_is_a_change() {
+        let mut net = OneIface::at(Some([10, 0, 0, 7]));
+        let mut watch = AddressWatch::new();
+        assert_eq!(watch.changed(&mut net), Some(Some([10, 0, 0, 7])));
+
+        net.ipv4 = None;
+        assert_eq!(watch.changed(&mut net), Some(None), "the address went away");
+        assert_eq!(watch.changed(&mut net), None);
+        assert_eq!(watch.reported(), None);
+    }
+
+    /// A RENEWAL ONTO A DIFFERENT ADDRESS is a change, not a repeat -- the case a watch that only
+    /// asked "do we have one yet" would miss, leaving every host pointed at the old address.
+    #[test]
+    fn a_different_address_is_a_change_without_passing_through_none() {
+        let mut net = OneIface::at(Some([192, 168, 1, 205]));
+        let mut watch = AddressWatch::new();
+        assert_eq!(watch.changed(&mut net), Some(Some([192, 168, 1, 205])));
+
+        net.ipv4 = Some([192, 168, 1, 206]);
+        assert_eq!(watch.changed(&mut net), Some(Some([192, 168, 1, 206])));
+        assert_eq!(watch.changed(&mut net), None);
+    }
+
+    /// `[0,0,0,0]` is the seam's spelling of "unassigned", so it must read as NO address rather
+    /// than as an address that happens to be zero -- otherwise a board with no lease reports
+    /// itself reachable at 0.0.0.0.
+    #[test]
+    fn the_unassigned_address_is_not_an_address() {
+        let mut net = OneIface::at(Some([0, 0, 0, 0]));
+        let mut watch = AddressWatch::new();
+        assert_eq!(watch.changed(&mut net), Some(None));
+        assert_eq!(watch.reported(), None);
+    }
+
+    /// A backend that reports NO interface -- which is what the trait's own default does -- must
+    /// look like silence, not like an address that was lost. This is the state every backend that
+    /// has not overridden `interface_info` is in, and it must not manufacture an event.
+    #[test]
+    fn a_backend_with_no_interface_reports_no_address_and_then_nothing() {
+        let mut net = OneIface { ipv4: None, present: false };
+        let mut watch = AddressWatch::new();
+        assert_eq!(watch.changed(&mut net), Some(None), "the first look still reports");
+        assert_eq!(watch.changed(&mut net), None, "and then it is quiet forever");
+    }
+}

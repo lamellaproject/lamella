@@ -386,6 +386,68 @@ pub fn sig_to_type_arg(assembly: &Assembly<'_>, ty: &SigType) -> Result<TypeArg,
     })
 }
 
+/// The INVERSE of [`sig_to_type_arg`]: a name-keyed [`TypeArg`] back to a signature the assembly
+/// being lowered could have written itself.
+///
+/// **RESOLVING A NAME IS NOT INVENTING A TOKEN, AND THAT DISTINCTION IS THE WHOLE REASON THIS IS
+/// SOUND.** The closure walk hands back NAMES, because a token means nothing outside the assembly
+/// that issued it. This looks each name up in `tokens` -- an index of the target assembly's OWN
+/// `TypeDef` and `TypeRef` rows -- and takes the token that assembly ALREADY HAS. A `List<Alpha>`
+/// closes over `ListEnumerator<Alpha>`; `Alpha` is the program's own type at the program's own row,
+/// so the signature this builds is one the program could have spelled.
+///
+/// `None` the moment a part cannot be expressed -- an unresolvable name, or a `!n`/`!!n`, which is
+/// an OPEN type and names no instantiation at all. Declining is the safe direction: the caller
+/// leaves the call site refused rather than putting a fabricated type in an image.
+///
+/// A primitive carries no token anywhere (`int`, `string`, `object` are element BYTES, II.23.1.16),
+/// which is why the whole BCL case -- `List<int>`, `EqualityComparer<int>` -- needs no `tokens`
+/// entry at all.
+pub fn type_arg_to_sig(
+    argument: &TypeArg,
+    tokens: &BTreeMap<String, Token>,
+) -> Option<SigType> {
+    let named = |name: &str, value_type: bool| -> Option<Token> {
+        let _ = value_type;
+        tokens.get(name).copied()
+    };
+    match argument {
+        TypeArg::Primitive(byte) => lamella_metadata::signature::payload_free_sig(*byte),
+        TypeArg::Named { name, value_type } => {
+            let token = named(name, *value_type)?;
+            Some(if *value_type {
+                SigType::ValueType(token)
+            } else {
+                SigType::Class(token)
+            })
+        }
+        TypeArg::Instance {
+            definition,
+            value_type,
+            arguments,
+        } => {
+            let token = named(definition, *value_type)?;
+            let inner: Option<Vec<SigType>> = arguments
+                .iter()
+                .map(|a| type_arg_to_sig(a, tokens))
+                .collect();
+            Some(SigType::GenericInst {
+                definition: Box::new(if *value_type {
+                    SigType::ValueType(token)
+                } else {
+                    SigType::Class(token)
+                }),
+                arguments: inner?,
+            })
+        }
+        TypeArg::SzArray(element) => Some(SigType::SzArray(Box::new(type_arg_to_sig(
+            element, tokens,
+        )?))),
+        TypeArg::Var(_) | TypeArg::MVar(_) => None,
+        TypeArg::Array { .. } | TypeArg::Pointer(_) | TypeArg::ByRef(_) => None,
+    }
+}
+
 /// The canonical spelling of a `SigType`, through [`TypeArg::spell`].
 ///
 /// It exists so a caller holding a `SigType` never formats one itself. **A second spelling of a
@@ -730,60 +792,61 @@ impl<'a> Program<'a> {
         Ok(walk.found)
     }
 
-    /// Every closed instantiation the PROGRAM names directly: its `TypeSpec` rows, the type
-    /// arguments of its `MethodSpec` rows, and the field and method signatures of its own types.
+    /// Every closed instantiation ANY assembly in the set names directly: its `TypeSpec` rows, the
+    /// type arguments of its `MethodSpec` rows, and the field and method signatures of its own
+    /// types.
     ///
     /// Open ones are skipped here rather than refused: `List<!0>` inside a generic definition is
     /// not a root, it is an EDGE from that definition's own instantiations, and the closure walk is
     /// what closes it.
+    ///
     fn roots(&self) -> Result<Vec<TypeArg>, Refusal> {
-        let Some(assembly) = self.assemblies.first() else {
-            return Ok(Vec::new());
-        };
         let mut roots = Vec::new();
-        let tables = assembly.tables();
-        for index in 1..=tables.row_count(table::TYPE_SPEC) {
-            let token = Token::new(table::TYPE_SPEC, index);
-            let ty = self.type_spec(assembly, token)?;
-            collect_closed(&ty, &mut roots);
-        }
-        for index in 1..=tables.row_count(table::METHOD_SPEC) {
-            let Some(row) = tables.row(table::METHOD_SPEC, index) else {
-                continue;
-            };
-            for argument in self.method_spec_arguments(assembly, row.raw(1))? {
-                collect_closed(&argument, &mut roots);
-            }
-        }
-        for type_def in assembly.type_defs() {
-            for field in type_def.fields() {
-                let ty = self.field_signature(assembly, field.token())?;
+        for assembly in self.assemblies {
+            let tables = assembly.tables();
+            for index in 1..=tables.row_count(table::TYPE_SPEC) {
+                let token = Token::new(table::TYPE_SPEC, index);
+                let ty = self.type_spec(assembly, token)?;
                 collect_closed(&ty, &mut roots);
             }
-            for method in type_def.methods() {
-                for ty in self.method_signature(assembly, method.signature_blob())? {
-                    collect_closed(&ty, &mut roots);
+            for index in 1..=tables.row_count(table::METHOD_SPEC) {
+                let Some(row) = tables.row(table::METHOD_SPEC, index) else {
+                    continue;
+                };
+                for argument in self.method_spec_arguments(assembly, row.raw(1))? {
+                    collect_closed(&argument, &mut roots);
                 }
             }
-        }
-        for index in 1..=tables.row_count(table::MEMBER_REF) {
-            let Some(member) = assembly.member_ref(index) else {
-                continue;
-            };
-            if member.is_field() {
-                if let Some(ty) = member.field_type() {
-                    collect_closed(&self.from_sig(assembly, &ty)?, &mut roots);
-                }
-            } else {
-                for ty in self.method_signature(assembly, member.signature_blob())? {
+            for type_def in assembly.type_defs() {
+                for field in type_def.fields() {
+                    let ty = self.field_signature(assembly, field.token())?;
                     collect_closed(&ty, &mut roots);
                 }
+                for method in type_def.methods() {
+                    for ty in self.method_signature(assembly, method.signature_blob())? {
+                        collect_closed(&ty, &mut roots);
+                    }
+                }
             }
-        }
-        for index in 1..=tables.row_count(table::STAND_ALONE_SIG) {
-            let token = Token::new(table::STAND_ALONE_SIG, index);
-            for ty in self.local_var_types(assembly, token)? {
-                collect_closed(&ty, &mut roots);
+            for index in 1..=tables.row_count(table::MEMBER_REF) {
+                let Some(member) = assembly.member_ref(index) else {
+                    continue;
+                };
+                if member.is_field() {
+                    if let Some(ty) = member.field_type() {
+                        collect_closed(&self.from_sig(assembly, &ty)?, &mut roots);
+                    }
+                } else {
+                    for ty in self.method_signature(assembly, member.signature_blob())? {
+                        collect_closed(&ty, &mut roots);
+                    }
+                }
+            }
+            for index in 1..=tables.row_count(table::STAND_ALONE_SIG) {
+                let token = Token::new(table::STAND_ALONE_SIG, index);
+                for ty in self.local_var_types(assembly, token)? {
+                    collect_closed(&ty, &mut roots);
+                }
             }
         }
         Ok(roots)
@@ -1341,6 +1404,19 @@ pub struct MonoBody {
     /// The instantiation's canonical spelling -- the identity half of the call-site key, and the
     /// only identity that survives an assembly boundary.
     pub instantiation: Box<str>,
+    /// The definition's full name, carried beside [`Self::arguments`] and `None` on the same terms.
+    /// Kept rather than split back out of the instantiation's spelling, because this crate has one
+    /// speller and re-deriving a definition from a spelled name would be a second reading of it.
+    pub definition: Option<Box<str>>,
+    /// The CLOSED type arguments, carried rather than derived, for an instantiation the module
+    /// spells through NO `TypeSpec` row of its own.
+    ///
+    /// **`None` IS THE ORDINARY CASE AND KEEPS EVERY EXISTING BODY BYTE-IDENTICAL:** the module
+    /// named the instantiation, [`Self::spec`] is its row, and the arguments are decoded from it as
+    /// they always were. `Some` is a body the CLOSURE found -- `ListEnumerator<int>` reached only
+    /// through `List<int>.GetEnumerator`'s own CIL -- for which no row exists to decode, so the
+    /// arguments the walk resolved travel with the body instead.
+    pub arguments: Option<Vec<SigType>>,
     /// The `TypeSpec` token, in the module's OWN assembly, that spells this instantiation.
     ///
     /// **The token is kept rather than the arguments' names because the ARGUMENTS are what
@@ -1367,6 +1443,24 @@ pub struct MonoBody {
     pub parameters: Vec<SigType>,
     /// WHICH ASSEMBLY'S METADATA `rid` INDEXES. See [`BodyOwner`].
     pub owner: BodyOwner,
+    /// Whether this entry stands for a declaration with NO CIL -- an ABSTRACT method of the
+    /// definition -- rather than a body to substitute into. The emitter lays a TRAP at its index.
+    ///
+    /// **A DISPATCH TABLE NEEDS A SLOT FOR A DECLARATION THAT HAS NO BODY, and the slot cannot be
+    /// omitted.** A vtable with a slot left out is not a smaller vtable: every slot after it shifts,
+    /// so a `callvirt` computed against the numbering lands on a different method. The plan is where
+    /// the index comes from, so a declaration with no body still needs an entry here -- otherwise
+    /// `instantiation_dispatch` has nothing to name and refuses the whole instantiation, which is
+    /// what stood between this tier and any abstract generic (`EqualityComparer<T>` among them).
+    ///
+    /// **REACHING IT IS IMPOSSIBLE RATHER THAN MERELY UNLIKELY**, which is why a trap is honest and
+    /// not defensive: no instance of an abstract type exists, and a `callvirt` on a real object
+    /// dispatches through THAT object's descriptor -- the concrete derived type's, whose slot holds
+    /// the override. This type's descriptor is read for type tests and as a declared type, neither
+    /// of which touches the vtable. A trap rather than a returning stub because an unreachable slot
+    /// that answers a value is absence rendered as a confident value, which is the shape this
+    /// project has now been bitten by four times.
+    pub declaration_only: bool,
 }
 
 /// Which assembly declares the definition whose CIL a [`MonoBody`] lowers.
@@ -1555,6 +1649,105 @@ impl MonoPlan {
     /// is an owner token, while the emitted body lands in the CALLER's function table. A consumer
     /// that lowers one of these bodies with a resolver over the CALLER produces a body that links,
     /// boots and answers wrong. [`MonoBody::owner`] is what a consumer must read before it lowers,
+    /// Plans the instantiations the CLOSURE finds that this module's own `TypeSpec` table does not
+    /// name -- the transitive half of the type axis.
+    ///
+    /// The arguments are carried on the body rather than decoded from a row, because there is no row:
+    /// the walk resolves them by NAME and [`type_arg_to_sig`] turns that back into a signature the
+    /// module could have written, by looking each name up in the module's OWN tables.
+    ///
+    /// **AN INSTANTIATION WHOSE ARGUMENTS CANNOT BE EXPRESSED IS SKIPPED, NOT GUESSED AT.** The call
+    /// site then stays exactly as refused as it is today, which is the direction that cannot put a
+    /// wrong type in an image.
+    /// A full dotted name split the way [`Assembly::find_type`] wants it -- everything before the
+    /// last `.` is the namespace, the remainder is the simple name, and a name with no `.` is in the
+    /// global namespace. The inverse of the join `type_def_full_name` performs.
+    fn split_full_name(full: &str) -> (&str, &str) {
+        full.rsplit_once('.').unwrap_or(("", full))
+    }
+
+    fn extend_with_closure<'a>(
+        assembly: &Assembly<'a>,
+        references: &[&Assembly<'a>],
+        bodies: &mut Vec<MonoBody>,
+        seen: &mut BTreeSet<Box<str>>,
+        next: &mut u32,
+    ) -> Result<(), Refusal> {
+        let mut assemblies: Vec<Assembly<'a>> = Vec::with_capacity(1 + references.len());
+        assemblies.push(*assembly);
+        assemblies.extend(references.iter().map(|reference| **reference));
+        let walk = Program::new(&assemblies);
+        let Ok(closed) = walk.instantiations() else {
+            return Ok(());
+        };
+        let mut tokens: BTreeMap<String, Token> = BTreeMap::new();
+        for type_ref in assembly.type_refs() {
+            if let Some(name) = type_def_full_name(assembly, type_ref.token()) {
+                tokens.entry(name).or_insert(type_ref.token());
+            }
+        }
+        for type_def in assembly.type_defs() {
+            if let Some(name) = type_def_full_name(assembly, type_def.token()) {
+                tokens.insert(name, type_def.token());
+            }
+        }
+        for instantiation in closed {
+            if seen.contains(&instantiation.name) {
+                continue;
+            }
+            let Some(arguments) = instantiation
+                .arguments
+                .iter()
+                .map(|argument| type_arg_to_sig(argument, &tokens))
+                .collect::<Option<Vec<SigType>>>()
+            else {
+                continue;
+            };
+            let (namespace, simple) = Self::split_full_name(&instantiation.definition);
+            let (owner, type_def) = if let Some(type_def) = assembly.find_type(namespace, simple) {
+                (BodyOwner::Own, type_def)
+            } else {
+                let Some((ordinal, type_def)) =
+                    Assembly::find_in_references(references, namespace, simple)
+                else {
+                    continue;
+                };
+                let Ok(ordinal) = u8::try_from(ordinal) else {
+                    continue;
+                };
+                (BodyOwner::Reference(ordinal), type_def)
+            };
+            seen.insert(instantiation.name.clone());
+            for method in type_def.methods() {
+                let declaration_only =
+                    method.body().is_none() && method.is_abstract() && !type_def.is_interface();
+                if method.body().is_none() && !declaration_only {
+                    continue;
+                }
+                let Some(method_name) = method.name() else {
+                    continue;
+                };
+                let Some(signature) = method.signature() else {
+                    continue;
+                };
+                bodies.push(MonoBody {
+                    index: *next,
+                    instantiation: instantiation.name.clone(),
+                    definition: Some(instantiation.definition.clone()),
+                    arguments: Some(arguments.clone()),
+                    spec: Token::new(table::TYPE_SPEC, 0),
+                    rid: method.rid(),
+                    name: Box::from(method_name),
+                    parameters: signature.parameters,
+                    owner,
+                    declaration_only,
+                });
+                *next += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// and no shipping build path passes references here yet.
     pub fn for_assembly_with_references<'a>(
         assembly: &Assembly<'a>,
@@ -1606,7 +1799,9 @@ impl MonoPlan {
                 continue;
             };
             for method in type_def.methods() {
-                if method.body().is_none() {
+                let declaration_only =
+                    method.body().is_none() && method.is_abstract() && !type_def.is_interface();
+                if method.body().is_none() && !declaration_only {
                     continue;
                 }
                 let method_name = method
@@ -1619,15 +1814,19 @@ impl MonoPlan {
                 bodies.push(MonoBody {
                     index: next,
                     instantiation: name.clone(),
+                    definition: None,
+                    arguments: None,
                     spec,
                     rid: method.rid(),
                     name: Box::from(method_name),
                     parameters,
                     owner,
+                    declaration_only,
                 });
                 next += 1;
             }
         }
+        Self::extend_with_closure(assembly, references, &mut bodies, &mut seen, &mut next)?;
         let axis = Self::method_axis(assembly, references, &mut next)?;
         Ok(MonoPlan {
             bodies,
@@ -2137,6 +2336,27 @@ impl MonoPlan {
             .map(|body| body.index)
     }
 
+    /// The `(definition full name, closed arguments)` a CLOSURE-FOUND instantiation carries, or
+    /// `None` for one the module spells through a `TypeSpec` row of its own.
+    ///
+    /// **THE DESCRIPTOR PATH NEEDS THIS AND CANNOT GET IT FROM THE ROW**, because there is no row:
+    /// an instantiation reached only through another body's CIL is named nowhere in the module's
+    /// tables. A consumer that decodes [`MonoBody::spec`] alone gives such a type BODIES AND NO
+    /// DESCRIPTOR -- it builds, links, and then dispatches through a vtable that was never laid.
+    #[must_use]
+    pub fn carried(&self, instantiation: &str) -> Option<(&str, &[SigType])> {
+        self.bodies.iter().find_map(|body| {
+            (&*body.instantiation == instantiation)
+                .then(|| {
+                    Some((
+                        &**body.definition.as_ref()?,
+                        &**body.arguments.as_ref()?,
+                    ))
+                })
+                .flatten()
+        })
+    }
+
     /// Every body to emit, in index order.
     #[must_use]
     pub fn bodies(&self) -> &[MonoBody] {
@@ -2193,11 +2413,14 @@ mod tests {
         MonoBody {
             index,
             instantiation: instantiation.to_owned().into_boxed_str(),
+            definition: None,
+            arguments: None,
             spec: Token::new(table::TYPE_SPEC, 1),
             rid: 4,
             name: name.to_owned().into_boxed_str(),
             parameters,
             owner: BodyOwner::Own,
+            declaration_only: false,
         }
     }
 

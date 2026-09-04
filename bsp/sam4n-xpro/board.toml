@@ -12,7 +12,7 @@ board = "sam4n-xpro"
 vendor = "atmel"
 family = "sam4n"
 part = "atsam4n16c"
-board_model = 25            # lamella_wire::board_model::SAM4N_XPLAINED_PRO
+product_model = 25          # lamella_wire::product_model::SAM4N_XPLAINED_PRO
 sources = [
     "SAM4N Xplained Pro user guide (Atmel-42104): section 4.2.2 mechanical buttons and table 4-9, section 4.2.3 LED and table 4-10, section 4.3 embedded debugger implementation and table 4-12 virtual COM port connections, section 4.2.1 crystals and tables 4-7/4-8.",
     "SAM4N Series datasheet (Atmel-11158) ordering information, for the package and memory sizes the part id resolves to.",
@@ -34,6 +34,10 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG bridge's VCP.
+usb_vid = 0x03EB            # the debugger's own USB identity, read off this kit rather than
+usb_pid = 0x2111            # inherited from a sibling. THE PAIR NARROWS TO A KIT AND NEVER TO A
+                            # BOARD: several Xplained Pro kits answer 0x2111, so anything that must
+                            # reach THIS board settles the rest on the probe's serial.
 baud = 115200
 default = true              # this board states no [[plans]] row, so the carrier names no
                             # operating point.

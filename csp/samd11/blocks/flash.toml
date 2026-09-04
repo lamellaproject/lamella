@@ -1,0 +1,32 @@
+# BLOCK: the SAM D11 non-volatile memory controller (NVMCTRL), stated only as far as the facts
+# consumers outside the controller need. Its command set and its lock regions are not described
+# here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A PAGE, AND THE ERASE UNIT IS FOUR OF THEM. The datasheet separates the two in
+# one sentence: `The NVM has a row-erase granularity, while the write granularity is by page.` The
+# page is 64 bytes on this family's single flash density, so the write unit is 64 and the row is
+# 256.
+#
+# READ IN THE SAM D11 DATASHEET RATHER THAN CARRIED ACROSS FROM THE D10 OR THE D21. The three agree,
+# and the agreement was checked in three documents instead of assumed from one. The D11 is not the
+# D10 with more flash -- it carries a USB device the D10 does not have at all -- so a family
+# resemblance is not an argument about any particular register.
+
+[table]
+kind = "block"
+family = "samd11"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 64
+sources = [
+    "erased_value: SAM D11 datasheet Atmel-42363H section 21.6.5.4 `Erase Row`: `Before a page can be written, the row that contains the page must be erased` and `Erasing the row sets all bits to one`",
+    "write_unit: SAM D11 datasheet Atmel-42363H section 21.6.3 `Memory Organization`: `The NVM is organized into rows, where each row contains four pages` and `The NVM has a row-erase granularity, while the write granularity is by page`",
+    "write_unit: SAM D11 datasheet Atmel-42363H section 9.2, the flash parameter table: 256 pages of `Page size (FLASH_W) 64 bytes` across the 16 Kbyte part",
+]
+notes = [
+    "Data reaches the array through a PAGE BUFFER before a Write Page command commits it. The width of the accesses that fill that buffer is not the size of the operation that commits it.",
+    "The erase unit is a ROW of four pages -- 256 bytes -- and is deliberately not declared here.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

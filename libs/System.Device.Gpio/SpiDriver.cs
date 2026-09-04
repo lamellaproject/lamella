@@ -17,11 +17,12 @@ namespace Lamella.Hardware
 
         /// <summary>Clocks <paramref name="count"/> words out of <paramref name="writeBuffer"/>
         /// while simultaneously clocking <paramref name="count"/> words into
-        /// <paramref name="readBuffer"/>, as ONE bus operation. A null
-        /// <paramref name="writeBuffer"/> clocks zeros out; a null
+        /// <paramref name="readBuffer"/>, as ONE bus operation. An EMPTY
+        /// <paramref name="writeBuffer"/> clocks zeros out; an empty
         /// <paramref name="readBuffer"/> discards the inbound words. Returns 0 on success or
         /// a nonzero chip status.</summary>
-        public abstract int TransferFullDuplex(byte[] writeBuffer, byte[] readBuffer, int count);
+        public abstract int TransferFullDuplex(System.ReadOnlySpan<byte> writeBuffer,
+                                               System.Span<byte> readBuffer, int count);
 
         /// <summary>Asserts or releases the managed chip select
         /// (<paramref name="asserted"/> is logical: the driver maps it to the pin level via

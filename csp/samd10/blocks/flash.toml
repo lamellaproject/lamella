@@ -1,0 +1,33 @@
+# BLOCK: the SAM D10 non-volatile memory controller (NVMCTRL), stated only as far as the facts
+# consumers outside the controller need. Its command set and its lock regions are not described
+# here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A PAGE, AND THE ERASE UNIT IS FOUR OF THEM. The datasheet separates the two in
+# one sentence: `The NVM has a row-erase granularity, while the write granularity is by page.` The
+# page is 64 bytes on both of this family's flash densities, so the write unit is 64 and the row is
+# 256.
+#
+# READ IN THE SAM D10 DATASHEET RATHER THAN CARRIED ACROSS FROM THE D11 OR THE D21. The three agree,
+# and the agreement was checked in three documents instead of assumed from one. That rule is not
+# ceremony here: the page size on this controller is a PARAM.PSZ field whose encoding runs from 8
+# bytes to 1024, and the D10 datasheet says in the same breath that not every device family provides
+# every size.
+
+[table]
+kind = "block"
+family = "samd10"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 64
+sources = [
+    "erased_value: SAM D10 datasheet Atmel-42242H section 21.6.5.4 `Erase Row`: `Before a page can be written, the row that contains the page must be erased` and `Erasing the row sets all bits to one`",
+    "write_unit: SAM D10 datasheet Atmel-42242H section 21.6.3 `Memory Organization`: `The NVM is organized into rows, where each row contains four pages` and `The NVM has a row-erase granularity, while the write granularity is by page`",
+    "write_unit: SAM D10 datasheet Atmel-42242H section 9.2, the flash parameter table, which gives `Page size (FLASH_W) 64 bytes` for both the 16 Kbyte and 8 Kbyte parts",
+]
+notes = [
+    "Data reaches the array through a PAGE BUFFER before a Write Page command commits it. The width of the accesses that fill that buffer is not the size of the operation that commits it.",
+    "The erase unit is a ROW of four pages -- 256 bytes -- and is deliberately not declared here. A consumer that needs it should get it from a source that states it, not by multiplying this number by four on the strength of one family's organization.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

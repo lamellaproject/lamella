@@ -1,4 +1,5 @@
 //! Which key a target will accept, and when a replacement takes over from the one it replaces.
+//! The rotation POLICY only, and no cryptography at all: a caller supplies the verifier.
 
 /// Key length in bytes. 32, so the same material serves a MAC and a TLS pre-shared key without a
 /// second size to keep track of.

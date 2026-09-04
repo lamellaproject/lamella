@@ -316,6 +316,7 @@ mod tests {
 
     fn method(type_parameters: &[&str], parameters: Vec<TypeSymbol>) -> MethodSymbol {
         MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "M".into(),
             return_type: TypeSymbol::special(SpecialType::Void),

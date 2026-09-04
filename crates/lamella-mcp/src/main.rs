@@ -62,7 +62,7 @@ fn resources_list() -> Value {
     json!({ "resources": meta })
 }
 
-/// The `lamella://boards` body, COMPUTED from [`lamella_wire::board_model`] rather than stored.
+/// The `lamella://boards` body, COMPUTED from [`lamella_wire::product_model`] rather than stored.
 ///
 /// That module is the one canonical value -> name map, so enumerating it here is the difference
 /// between a list that is right and a list that was right when someone last copied it. It also
@@ -73,17 +73,17 @@ fn resources_list() -> Value {
 /// idiom `lamella-wire`'s `board-models-json` example uses to emit the JS registry.
 fn boards_resource_text() -> String {
     let mut out = String::from(
-        "# Supported dev boards\n\nThe `board_model` wire values a board reports over Lamella Link:\n\n\
+        "# Supported dev boards\n\nThe `product_model` wire values a board reports over Lamella Link:\n\n\
          | model | board |\n|--:|---|\n",
     );
     let mut model: u16 = 0;
-    while let Some(name) = lamella_wire::board_model::name(model) {
+    while let Some(name) = lamella_wire::product_model::name(model) {
         out.push_str(&format!("| {model} | {name} |\n"));
         model += 1;
     }
     out.push_str(
         "\nRun `lamella_list_devices` to see the boards attached to this machine, and \
-         `lamella_identify_device` on one of them to read its `board_model` and chip IDCODE live.\n",
+         `lamella_identify_device` on one of them to read its `product_model` and chip IDCODE live.\n",
     );
     out
 }
@@ -141,21 +141,49 @@ fn host_caps() -> Capabilities {
             | Capabilities::STEPPING
             | Capabilities::REPL_RUN
             | Capabilities::BAKED_IMAGE
-            | Capabilities::DEBUG_ATTACH,
+            | Capabilities::DEBUG_BOOT_DEPLOYED,
     )
 }
 
-/// A display name for a Lamella Link `board_model`. DERIVES from [`lamella_wire::board_model::name`] -- the ONE
+/// A display name for a Lamella Link `product_model`. DERIVES from [`lamella_wire::product_model::name`] -- the ONE
 /// canonical value -> name map -- so it cannot drift from the registry. (Hand-mirroring it drifted twice: "SAM E54"
 /// for canonical "SAME54", and four boards missing entirely.) `None` means the registry does not know the code;
 /// UNKNOWN (0) names ITSELF "custom board", which is a recognized answer rather than an unrecognized one.
-fn board_model_name(model: u16) -> Option<&'static str> {
-    lamella_wire::board_model::name(model)
+fn product_model_name(model: u16) -> Option<&'static str> {
+    lamella_wire::product_model::name(model)
 }
 
 /// Enumerate attached boards (native-USB Lamella Link devices + OS serial ports), cross-platform.
 /// `lamella_boards`: every board this build knows. The peer of the CLI's `boards` verb, reading the
 /// SAME compiled-in catalog -- not a second list.
+///
+/// **AND THE SAME COLUMNS**, which is the half that is easy to lose: two listings can agree on
+/// every row and still answer different questions. `can_flash` is here because "which boards exist"
+/// and "which boards can I write" are the second question a caller asks, and an assistant that
+/// cannot see the answer discovers it by attempting a write.
+/// `lamella_version`: what this build is, and what it will accept.
+///
+/// **THE POINT IS THAT AN ASSISTANT ANSWERS "WHICH VERSION" FROM DATA RATHER THAN FROM MEMORY.** A
+/// model asked what a toolchain supports will otherwise answer from training, which is a claim
+/// about some build and not about this one -- and the numbers that decide interoperation are not
+/// the one a release note names.
+///
+fn tool_version() -> Value {
+    let it = lamella_flash_routes::contracts::Contracts::of(env!("CARGO_PKG_VERSION"));
+    text_result(
+        serde_json::to_string_pretty(&json!({
+            "tool": it.tool,
+            "link_protocol": it.wire_protocol,
+            "sidecar_schema": it.sidecar_schema,
+            "boards": it.boards,
+            "flashable": it.flashable,
+            "reads_as": it.describe(),
+        }))
+        .unwrap_or_default(),
+        false,
+    )
+}
+
 fn tool_boards() -> Value {
     let mut items: Vec<Value> = Vec::new();
     for (id, _) in lamella_catalog::BOARDS {
@@ -166,6 +194,7 @@ fn tool_boards() -> Value {
                 "flash_bytes": part.flash,
                 "ram_bytes": part.ram,
                 "family": board.family,
+                "can_flash": lamella_flash_routes::can_flash(id),
             })),
             Err(why) => items.push(json!({ "board": id, "unresolved": why })),
         }
@@ -276,25 +305,47 @@ fn tool_list_devices() -> Value {
     text_result(text, false)
 }
 
-/// Render the identity a HELLO negotiated: Lamella Link version, capabilities, and (when reported) the board name,
-/// profile name/abi, and chip IDCODE + device id.
+/// Render the identity a HELLO negotiated: Lamella Link version, capabilities, the board, its target
+/// ABI, which firmware build is answering, the chip's own identity, and one line per resident runtime.
 fn format_identity(target: &str, neg: &Negotiated) -> String {
     let mut s = format!("target: {target}\nLamella Link version: {}\ncapabilities: {:#010x}\n", neg.version, neg.caps.0);
-    match &neg.profile {
-        Some(p) => {
-            let board = board_model_name(p.board_model).unwrap_or("(unrecognized board_model)");
-            s.push_str(&format!("board: {board} (board_model {})\n", p.board_model));
-            s.push_str(&format!("profile: {} (abi {})\n", p.name(), p.abi));
-            if p.chip_idcode != 0 {
-                s.push_str(&format!("chip IDCODE: {:#010x}\n", p.chip_idcode));
-                if p.chip_devid != 0 {
-                    s.push_str(&format!("chip devid: {:#010x}\n", p.chip_devid));
-                }
-            } else {
-                s.push_str("chip IDCODE: (not reported by this firmware yet)\n");
-            }
+    let identity = &neg.identity;
+    let board = product_model_name(identity.product_model).unwrap_or("(unrecognized product_model)");
+    s.push_str(&format!("board: {board} (product_model {})\n", identity.product_model));
+    match lamella_wire::arch::name(identity.arch) {
+        Some(name) => s.push_str(&format!("arch: {name}\n")),
+        None => s.push_str("arch: (not reported by this firmware)\n"),
+    }
+    if identity.firmware_version != [0, 0] {
+        s.push_str(&format!(
+            "firmware build: day {} build {}\n",
+            identity.firmware_version[0], identity.firmware_version[1]
+        ));
+    }
+    if identity.chip_id_kind == lamella_wire::chip_id_kind::NONE {
+        s.push_str("chip id: (not reported by this firmware)\n");
+    } else {
+        s.push_str(&format!("chip id (kind {}): ", identity.chip_id_kind));
+        for byte in &identity.chip_id {
+            s.push_str(&format!("{byte:02x}"));
         }
-        None => s.push_str("profile: (target reported no ProfileIdentity)\n"),
+        s.push('\n');
+    }
+    if identity.surfaces.is_empty() {
+        s.push_str("resident runtimes: (none reported)\n");
+    }
+    for surface in &identity.surfaces {
+        let version = surface.lib_version;
+        s.push_str(&format!(
+            "resident runtime: tier {} abi {} hash {:#018x} library {}.{}.{}.{}\n",
+            surface.tier, surface.abi, surface.hash, version[0], version[1], version[2], version[3]
+        ));
+    }
+    if let Some((tier, field)) = neg.unreadable_surface_version() {
+        s.push_str(&format!(
+            "WARNING: tier {tier} claims a resident library and reports no {field}. The firmware \
+             could not read it, so this board cannot be version-compared against anything.\n"
+        ));
     }
     s
 }
@@ -310,6 +361,10 @@ fn tool_identify_device(target: &str) -> Value {
     };
     match hello_blocking(&mut transport, 1, host_caps(), Duration::from_secs(3)) {
         Ok(neg) => text_result(format_identity(target, &neg), false),
+        Err(lamella_wire::TransportError::VersionMismatch { target_min, target_max }) => text_result(
+            format!("{target}: {}", lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)),
+            true,
+        ),
         Err(e) => text_result(format!("no HELLO_ACK from {target} (is serve firmware running?): {e:?}"), true),
     }
 }
@@ -438,6 +493,7 @@ impl Server {
             "lamella_flash" => self.tool_flash(&args),
             "lamella_check" => self.tool_check(lang, code),
             "lamella_run" => self.tool_run(lang, code),
+            "lamella_version" => tool_version(),
             "lamella_boards" => tool_boards(),
             "lamella_fit" => tool_fit(
                 args.get("board").and_then(Value::as_str).unwrap_or_default(),
@@ -500,7 +556,7 @@ impl Server {
     /// server's scope, and hands the write to `lamella_flash_routes`.
     ///
     /// It refuses rather than choosing at every point the CLI does, and the reason is sharper for
-    /// an agent than for a person: a caller that cannot see the bench has no way to notice that the
+    /// an agent than for a person: a caller that cannot see the hardware has no way to notice that the
     /// board it wrote was not the board it meant.
     fn tool_flash(&self, args: &Value) -> Value {
         let image = args.get("image").and_then(Value::as_str).unwrap_or_default();
@@ -790,7 +846,7 @@ fn respond_error(out: &mut impl Write, id: &Value, code: i64, message: &str) {
 ///
 /// So the ranking is not fixed. On a part with a die-unique id, `chip:` is the only scope that
 /// survives somebody moving a cable, because a probe serial names a cable and a board id names a
-/// family. On a part that can only name its category, `chip:` is a third family check and the bench
+/// family. On a part that can only name its category, `chip:` is a third family check and the board
 /// still needs `probe:`. The first two are worth having either way: they refuse in a millisecond
 /// and without a probe, and a mistake they catch never reaches a board.
 ///
@@ -985,7 +1041,7 @@ lives rather than typed. For a project-scoped client that is usually a file in t
     "mcpServers": {
       "lamella": {
         "command": "lamella-mcp",
-        "args": ["--allow-device=chip:412A9EB6FC8B35CD"]
+        "args": ["--allow-device=chip:1234ABCD5678EF01"]
       }
     }
   }
@@ -1154,11 +1210,11 @@ mod tests {
         let text = body["contents"][0]["text"].as_str().expect("it has text").to_owned();
 
         let mut model: u16 = 0;
-        while let Some(name) = lamella_wire::board_model::name(model) {
+        while let Some(name) = lamella_wire::product_model::name(model) {
             assert!(
                 text.contains(&format!("| {model} | {name} |")),
-                "board_model {model} ({name}) is missing from the boards resource -- \
-                 the resource is not deriving from lamella_wire::board_model"
+                "product_model {model} ({name}) is missing from the boards resource -- \
+                 the resource is not deriving from lamella_wire::product_model"
             );
             model += 1;
         }
@@ -1233,7 +1289,8 @@ mod tests {
     ///
     #[test]
     fn the_contract_declares_exactly_the_tools_this_server_routes() {
-        const ROUTED: [&str; 21] = [
+        const ROUTED: [&str; 22] = [
+            "lamella_version",
             "lamella_check",
             "lamella_run",
             "lamella_size",
@@ -1343,13 +1400,13 @@ mod tests {
     #[test]
     fn a_chip_scope_reaches_the_contract_and_a_board_scope_does_not() {
         let scope = DeviceScope::parse(
-            ["--allow-device=chip:412A9EB6FC8B35CD".to_owned()].into_iter(),
+            ["--allow-device=chip:1234ABCD5678EF01".to_owned()].into_iter(),
         )
         .expect("a chip scope parses");
         assert!(scope.allowed);
         assert_eq!(
             scope.identities(),
-            lamella_flash_backend::Allow::Identities(vec![0x412A_9EB6_FC8B_35CD]),
+            lamella_flash_backend::Allow::Identities(vec![0x1234_ABCD_5678_EF01]),
             "a chip scope must reach the contract, which is the only place it can be checked              against the PART"
         );
 
@@ -1368,9 +1425,9 @@ mod tests {
     /// satisfied by a call that named no cable at all.
     #[test]
     fn a_probe_scope_is_not_satisfied_by_naming_no_probe() {
-        let scope = DeviceScope::parse(["--allow-device=probe:E664A836A35DAA37".to_owned()].into_iter())
+        let scope = DeviceScope::parse(["--allow-device=probe:SERIAL0000000005".to_owned()].into_iter())
             .expect("parses");
-        assert!(scope.permits_request("rpi-pico2", Some("E664A836A35DAA37")));
+        assert!(scope.permits_request("rpi-pico2", Some("SERIAL0000000005")));
         assert!(!scope.permits_request("rpi-pico2", Some("SOMETHING-ELSE")));
         assert!(
             !scope.permits_request("rpi-pico2", None),
@@ -1548,5 +1605,64 @@ mod tests {
         );
         assert!(!verdict.assumptions.is_empty(), "a verdict must say what it took as given");
         assert!(!verdict.not_answered.is_empty(), "and what it cannot answer");
+    }
+
+    /// `lamella_version` answers with the same numbers the CLI prints, from the same statement.
+    ///
+    /// **TWO FRONT ENDS THAT DISAGREE ABOUT WHAT A BUILD SUPPORTS IS WORSE THAN NEITHER ANSWERING**,
+    /// which is the failure `lamella-flash-routes` was lifted out to prevent for board routing and
+    /// this extends to the contracts. They share one `Contracts`, so the only way they could
+    /// diverge is a hand-typed number here -- which is exactly what this refuses.
+    #[test]
+    fn the_version_tool_reports_the_contracts_and_not_a_copy_of_them() {
+        let it = lamella_flash_routes::contracts::Contracts::of(env!("CARGO_PKG_VERSION"));
+        let rendered = tool_version();
+        let text = rendered
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+            .expect("the tool returns text");
+        let body: Value = serde_json::from_str(text).expect("and the text is JSON");
+
+        assert_eq!(body["link_protocol"], it.wire_protocol);
+        assert_eq!(body["sidecar_schema"], it.sidecar_schema);
+        assert_eq!(body["boards"], it.boards);
+        assert_eq!(body["flashable"], it.flashable);
+        assert_eq!(body["reads_as"], it.describe());
+        assert_ne!(it.boards, it.flashable);
+    }
+
+    /// `lamella_boards` answers the flash question for EVERY row, from the routing table itself.
+    ///
+    /// **TWO LISTINGS CAN AGREE ON EVERY ROW AND STILL ANSWER DIFFERENT QUESTIONS**, which is the
+    /// drift this checks and a shared catalog does not prevent by itself: membership came from
+    /// `lamella_catalog` all along, and the flash column is what a caller asked for.
+    ///
+    /// The population assert is the load-bearing one. A `can_flash` that answered `false` for
+    /// everything would satisfy a per-row check and be useless, and it reads exactly like a crate
+    /// that is not wired in.
+    #[test]
+    fn the_board_listing_answers_the_flash_question_the_cli_column_answers() {
+        let listing = tool_boards();
+        let rendered = serde_json::to_string(&listing).expect("the listing serializes");
+        assert!(rendered.contains("can_flash"), "the flash column is missing from the listing");
+
+        let routable =
+            lamella_catalog::BOARDS.iter().filter(|(id, _)| lamella_flash_routes::can_flash(id));
+        assert!(routable.count() > 0, "no board is routable, so this column proves nothing");
+
+        let unrouted = lamella_catalog::BOARDS
+            .iter()
+            .filter(|(id, _)| !lamella_flash_routes::can_flash(id))
+            .count();
+        assert!(unrouted > 0, "every board is routable, so the false side proves nothing");
+
+        assert!(lamella_flash_routes::can_flash("rpi-pico2"), "a Pico 2 has a route");
+        assert!(
+            !lamella_flash_routes::can_flash("same51-cnano"),
+            "a board with no route must say so rather than being omitted"
+        );
     }
 }

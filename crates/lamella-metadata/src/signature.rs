@@ -264,6 +264,19 @@ pub struct MethodSig {
     /// Only the return position is captured, because that is where the one modifier this compiler
     /// acts on appears; see [`read_type_collecting_required`].
     pub return_type_required_modifiers: Vec<Token>,
+    /// EVERY required custom modifier in this signature, in any position -- the return type and all
+    /// parameters -- in the order the decoder met them.
+    ///
+    /// **This answers a different question from the field above and deliberately overlaps it.**
+    /// `return_type_required_modifiers` is POSITIONAL: it exists because `modreq(IsExternalInit)` on
+    /// the return type is what makes a setter init-only, and where it sits is the whole meaning. This
+    /// one is not positional at all -- it exists because II.7.1.1 says a `modreq` a consumer does not
+    /// understand makes the item UNUSABLE, and that rule does not care which position carried it.
+    ///
+    /// A consumer asking "may I use this member" must read THIS list. Reading the positional one
+    /// instead answers for the return type and silently accepts a `modreq` on a parameter, which is
+    /// the same shape as checking two of three call sites.
+    pub required_modifiers: Vec<Token>,
     /// How many type parameters the method itself declares (the `1` of `T Identity<T>(T)`), or 0.
     ///
     /// **BINDING-SIGNIFICANT, NOT BOOKKEEPING** (II.23.2.1): the runtime overloads generic methods
@@ -476,12 +489,23 @@ pub fn parse_type(blob: &[u8]) -> Result<SigType, SigError> {
 
 /// Decodes a field-signature blob (II.23.2.4): the FIELD byte then the type.
 pub fn parse_field(blob: &[u8]) -> Result<SigType, SigError> {
+    Ok(parse_field_with_modifiers(blob)?.0)
+}
+
+/// [`parse_field`], and the field's REQUIRED custom modifiers beside the type.
+///
+/// A field carries them too -- `modreq(System.Runtime.CompilerServices.IsVolatile)` is how a
+/// `volatile` field is spelled -- so a consumer deciding whether it may use a member has to ask a
+/// field the same question it asks a method, from the same decoder rather than a second one.
+pub fn parse_field_with_modifiers(blob: &[u8]) -> Result<(SigType, Vec<Token>), SigError> {
     let mut reader = Reader::new(blob);
     let convention = reader.read_u8()?;
     if convention != calling::FIELD {
         return Err(SigError::BadCallingConvention(convention));
     }
-    read_type(&mut reader)
+    let mut required = Vec::new();
+    let sig = read_type_collecting_required(&mut reader, &mut required)?;
+    Ok((sig, required))
 }
 
 /// Decodes a method-signature blob (II.23.2.1): the calling convention, the
@@ -502,6 +526,7 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
     let mut return_type_required_modifiers = Vec::new();
     let return_type =
         read_type_collecting_required(&mut reader, &mut return_type_required_modifiers)?;
+    let mut required_modifiers = return_type_required_modifiers.clone();
     let mut parameters = Vec::new();
     let mut sentinel_index = None;
     while (parameters.len() as u32) < param_count {
@@ -509,7 +534,10 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
             reader.read_u8()?;
             sentinel_index = Some(parameters.len());
         }
-        parameters.push(read_type(&mut reader)?);
+        parameters.push(read_type_collecting_required(
+            &mut reader,
+            &mut required_modifiers,
+        )?);
     }
     Ok(MethodSig {
         has_this,
@@ -520,6 +548,7 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
         sentinel_index,
         generic_param_count,
         return_type_required_modifiers,
+        required_modifiers,
     })
 }
 

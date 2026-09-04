@@ -85,6 +85,15 @@
       }
     },
     {
+      "name": "lamella_version",
+      "description": "What this build IS and which agreed contracts it speaks: the tool version, the Lamella Link protocol version, the image-sidecar schema version it reads, and how many boards it carries against how many it can flash. Needs no hardware. Answer \"which version is this / what does it support\" FROM THIS rather than from memory -- the protocol numbers move independently of the tool version and of each other, so a tool version alone does not say what a build will accept.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
       "name": "lamella_boards",
       "description": "Every board this build knows, with the part it is built around and its flash and RAM budgets. Needs no hardware. The same catalog `lamella boards` lists.",
       "inputSchema": {
@@ -179,7 +188,7 @@
     {
       "name": "lamella_identify_device",
       "title": "Identify a board",
-      "description": "HELLO a Lamella Link target and return what it is: board name (from its board_model), chip IDCODE + device id when the firmware reports them, negotiated capabilities, and the resolved chip SKU. Read-only -- does not deploy or run anything.",
+      "description": "HELLO a Lamella Link target and return what it is: board name (from its product_model), chip IDCODE + device id when the firmware reports them, negotiated capabilities, and the resolved chip SKU. Read-only -- does not deploy or run anything.",
       "inputSchema": {
         "type": "object",
         "properties": {

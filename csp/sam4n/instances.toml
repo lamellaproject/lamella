@@ -23,6 +23,18 @@ sources = [
     "SAM4N Series datasheet (Atmel-11158): peripheral identifiers table (PIOA 11, PIOB 12, PIOC 13), and the PIO register addresses given per controller as 0x400E0E00 (PIOA), 0x400E1000 (PIOB), 0x400E1200 (PIOC)",
 ]
 
+# THE FLASH CONTROLLER, AND THERE IS EXACTLY ONE OF THEM. The SAM4S beside this family places two
+# -- one per plane -- and this part is single plane, so a route carried across from that family
+# finds nothing at the second address and waits for a ready bit that never comes. That is not a
+# guess about the symptom: a tool written for the SAM4S read this part's EEFC0 descriptor fine and
+# then timed out on EEFC1, which is what a missing controller looks like from the host.
+
+[[instances]]
+name = "eefc0"
+block = "eefc"
+base = 0x400E0A00   # the family's own register table places EEFC_FMR here
+pid = -1
+
 [[instances]]
 name = "pioa"
 block = "pio"

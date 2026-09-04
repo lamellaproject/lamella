@@ -23,6 +23,18 @@ sources = [
     "SAM4E Series datasheet (Atmel-11157): peripheral identifiers table (PIOA 9, PIOB 10, PIOC 11, PIOD 12, PIOE 13), and the PIO register addresses given per controller as 0x400E0E00 (PIOA), 0x400E1000 (PIOB), 0x400E1200 (PIOC), 0x400E1400 (PIOD), 0x400E1600 (PIOE)",
 ]
 
+# THE FLASH CONTROLLER, AND THERE IS EXACTLY ONE. The SAM4S shares this controller's sequence and
+# places TWO of them, one per plane; this part is single plane. A route carried across from that
+# family looks for a second controller and waits on a ready bit that never arrives -- observed
+# rather than predicted: a tool written for the SAM4S read this part's EEFC0 descriptor correctly
+# and then timed out on EEFC1.
+
+[[instances]]
+name = "eefc0"
+block = "eefc"
+base = 0x400E0A00   # this family's own manual places the EEFC user interface here
+pid = -1
+
 [[instances]]
 name = "pioa"
 block = "pio"

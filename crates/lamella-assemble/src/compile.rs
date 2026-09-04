@@ -31,7 +31,8 @@ use lamella_syntax::ast::{
     ConstructorInitializerKind, DelegateDecl, EnumDecl, Expr, ExprKind, Literal, Member, Modifier,
     NamespaceMember, Parameter, ParameterModifier, QualifiedName, Stmt, StmtKind, TypeDecl, TypeKind,
     TypeParameter,
-    TypeRef, UsingDirective, UsingKind, VariableDeclarator, explicit_interface_member_name,
+    TypeRef, UsingDirective, VariableDeclarator, auto_property_backing_field_name,
+    explicit_interface_member_name, is_auto_property,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
 use lamella_syntax::lexer::LexOptions;
@@ -643,6 +644,7 @@ fn build_image(
     for pending in pending_async {
         emit_async_machine(&mut image, &mut binder, &mut tokens, pending)?;
     }
+    emit_is_readonly_attribute(&mut image, binder.model(), &mut tokens);
     for unit in units {
         emit_global_attributes(&mut image, &binder, &mut tokens, &unit.global_attributes);
     }
@@ -1585,12 +1587,7 @@ fn emit_namespace(
 ) -> Result<(), crate::EmitError> {
     let scope = binder.import_scope();
     for using in usings {
-        match &using.kind {
-            UsingKind::Namespace(name) => binder.import_namespace(&join_namespace("", name)),
-            UsingKind::Alias { name, target } => {
-                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
-            }
-        }
+        binder.import_using(&using.kind);
     }
     let mut prefix = String::new();
     for part in namespace.split('.').filter(|part| !part.is_empty()) {
@@ -1727,19 +1724,14 @@ fn enter_part(binder: &mut Binder, part: &PartialPart<'_>) -> PartScope {
     let imports = binder.import_scope();
     let defined = binder.replace_defined_symbols(part.defined_symbols.clone());
     for using in part.usings {
-        match &using.kind {
-            UsingKind::Namespace(name) => binder.import_namespace(&join_namespace("", name)),
-            UsingKind::Alias { name, target } => {
-                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
-            }
-        }
+        binder.import_using(&using.kind);
     }
     PartScope { imports, defined }
 }
 
 /// What [`enter_part`] displaced, to be handed to [`leave_part`].
 struct PartScope {
-    imports: (usize, usize),
+    imports: lamella_binder::bound::ImportScope,
     defined: alloc::collections::BTreeSet<Box<str>>,
 }
 
@@ -1915,13 +1907,14 @@ fn emit_interface(
                     member_type_sig(tokens, &enclosing, &binder.canonicalize(&parameter_symbol(parameter)))
                 })
                 .collect::<Result<_, _>>()?;
-            let signature = method_signature(
-                true,
-                &parameter_sigs,
-                &member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(return_type)))?,
-            );
+            let return_sig = member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(return_type)))?;
+            let return_sig = bodyless_return_sig(return_type, return_sig, image, tokens);
+            let signature = method_signature(true, &parameter_sigs, &return_sig);
             let method =
                 image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS, &parameter_names(parameters));
+            if is_readonly_ref(return_type) {
+                mark_readonly_return(image, tokens, method);
+            }
             emit_declared_parameter_metadata(image, binder, tokens, &enclosing, method, parameters);
         }
     }
@@ -1933,15 +1926,23 @@ fn emit_interface(
         {
             let property_ty = binder.canonicalize(&bind_type(ty));
             let element = member_type_sig(tokens, &enclosing, &property_ty)?;
-            let property = image.add_property(name, &property_signature(true, &[], &element), 0);
+            let property_sig = bodyless_return_sig(ty, element.clone(), image, tokens);
+            let property = image.add_property(name, &property_signature(true, &[], &property_sig), 0);
+            if is_readonly_ref(ty) {
+                attach_is_readonly(tokens, property);
+            }
             if getter.is_some() {
-                let signature = method_signature(true, &[], &element);
+                let signature =
+                    method_signature(true, &[], &bodyless_return_sig(ty, element.clone(), image, tokens));
                 let token = image.add_abstract_method(
                     &accessor_name("get_", name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
                     &[],
                 );
+                if is_readonly_ref(ty) {
+                    mark_readonly_return(image, tokens, token);
+                }
                 image.add_method_semantics(SEMANTICS_GETTER, token, property);
             }
             if setter.is_some() {
@@ -2272,18 +2273,59 @@ fn object_base_ctor(image: &mut ImageBuilder, tokens: &Tokens) -> Token {
 /// synthesized default constructor (and of an explicit constructor with no `: base(...)` chain).
 /// A base declared in THIS assembly has its constructor registered by the token pre-pass; a base
 /// in a REFERENCED assembly does not, so mint a `MemberRef` to it -- mirroring how the `extends`
-/// clause resolves the base type (this module's TypeDef, else a TypeRef into the owning assembly).
+/// clause resolves the base type, which is [`base_type_token`] and its three shapes.
 /// Falling back to `Object::.ctor` here (the previous behaviour) silently skips the base's own
 /// construction -- its field initializers and constructor body never run.
-fn base_class_ctor(image: &mut ImageBuilder, tokens: &Tokens, base_class: &TypeSymbol) -> Token {
-    if let Some(token) = tokens.method(base_class, ".ctor", &[]) {
+fn base_class_ctor(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    base_class: &TypeSymbol,
+    own_parameters: &[Box<str>],
+) -> Token {
+    if matches!(base_class, TypeSymbol::Instantiation { .. }) {
+        if let Some(parent) = base_type_token(base_class, own_parameters, image, tokens) {
+            return image.member_ref(parent, ".ctor", &method_signature(true, &[], &TypeSig::Void));
+        }
+    } else if let Some(token) = tokens.method(base_class, ".ctor", &[]) {
         return token;
-    }
-    if let Some((namespace, name)) = split_type_name(base_class) {
+    } else if let Some((namespace, name)) = split_type_name(base_class) {
         let parent = image.type_ref(&namespace, &name);
         return image.member_ref(parent, ".ctor", &method_signature(true, &[], &TypeSig::Void));
     }
     object_base_ctor(image, tokens)
+}
+
+/// The token naming a BASE TYPE in a type header -- the `extends` slot (II.22.37, a `TypeDefOrRef`)
+/// and the parent of the base constructor a derived type chains to.
+///
+/// **THREE SHAPES, AND A NAME-BASED LOOKUP ANSWERS FOR ONLY TWO.** This module's `TypeDef` for a
+/// sibling base, a `TypeRef` for one in a referenced assembly, and -- the shape that had no arm at
+/// either position -- a `TypeSpec` for a CONSTRUCTED generic base, `class D : B<int>`. Without it
+/// `split_type_name` returned `None` for the instantiation, the `extends` slot took its
+/// `System.Object` fallback, and the derived type shipped with no base at all: exit 0, no
+/// diagnostic, and the base's fields, virtuals and identity gone from the metadata BOTH TIERS read.
+///
+/// **THE DECLARING TYPE'S PARAMETERS ARE IN SCOPE HERE, WHICH IS WHY THEY ARE A PARAMETER OF THIS
+/// FUNCTION AND NOT THE CALLER'S BUSINESS.** `class Bag<T> : Base<T>` names `` Base`1<!0> ``, and
+/// the minting walk reads that position out of [`Tokens::body_scope`] -- which no method has
+/// entered at a type header, so a `T` left to it is minted as a `TypeRef` to a class no assembly
+/// declares. The `InterfaceImpl` list states the same rule at the same point for the same reason.
+/// It is ONE rule at three positions in this header and only the interface one ever had it.
+fn base_type_token(
+    ty: &TypeSymbol,
+    own_parameters: &[Box<str>],
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) -> Option<Token> {
+    if matches!(ty, TypeSymbol::Instantiation { .. }) {
+        let saved = tokens.enter_body_scope(&[], own_parameters);
+        let token = mint_composite_type_spec(ty, image, tokens);
+        tokens.restore_body_scope(saved);
+        return token;
+    }
+    tokens
+        .type_token(ty)
+        .or_else(|| split_type_name(ty).map(|(namespace, name)| image.type_ref(&namespace, &name)))
 }
 
 /// The base constructor an IMPLICIT `: base()` calls when it is not the parameterless one, with
@@ -2488,12 +2530,7 @@ fn emit_type_inner(
         } else {
             let base_token = base_class
                 .as_ref()
-                .and_then(|symbol| {
-                    tokens.type_token(symbol).or_else(|| {
-                        split_type_name(symbol)
-                            .map(|(namespace, name)| image.type_ref(&namespace, &name))
-                    })
-                })
+                .and_then(|symbol| base_type_token(symbol, &own_parameters, image, tokens))
                 .unwrap_or(object);
             (base_token, PUBLIC_CLASS)
         };
@@ -2619,9 +2656,16 @@ fn emit_type_inner(
                         FIELD_STATIC
                     } else {
                         0
+                    }
+                    | if setter.is_none()
+                        || setter.as_ref().is_some_and(|accessor| accessor.is_init)
+                    {
+                        FIELD_INITONLY
+                    } else {
+                        0
                     };
                 let field = image.add_field(
-                    &backing_field_name(explicit_interface.as_ref(), name),
+                    &auto_property_backing_field_name(explicit_interface.as_ref(), name),
                     &signature,
                     flags,
                 );
@@ -2659,7 +2703,7 @@ fn emit_type_inner(
         let base_ctor = if is_system_object {
             None
         } else if let Some(symbol) = base_class.as_ref() {
-            Some(base_class_ctor(image, tokens, symbol))
+            Some(base_class_ctor(image, tokens, symbol, &own_parameters))
         } else {
             Some(object_base_ctor(image, tokens))
         };
@@ -2857,7 +2901,7 @@ fn emit_type_inner(
                 let base_ctor = if is_struct || is_system_object || initializer.is_some() {
                     None
                 } else if let Some(symbol) = base_class.as_ref() {
-                    Some(base_class_ctor(image, tokens, symbol))
+                    Some(base_class_ctor(image, tokens, symbol, &own_parameters))
                 } else {
                     Some(object_base_ctor(image, tokens))
                 };
@@ -3285,14 +3329,15 @@ fn emit_abstract_method(
             member_type_sig(tokens, &enclosing, &binder.canonicalize(&parameter_symbol(parameter)))
         })
         .collect::<Result<_, _>>()?;
-    let signature = method_signature(
-        true,
-        &parameter_sigs,
-        &member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(return_type)))?,
-    );
+    let return_sig = member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(return_type)))?;
+    let return_sig = bodyless_return_sig(return_type, return_sig, image, tokens);
+    let signature = method_signature(true, &parameter_sigs, &return_sig);
     let visibility = member_visibility(modifiers);
     let flags = visibility | slot_flags(modifiers, visibility);
     let method = image.add_abstract_method(name, &signature, flags, &parameter_names(parameters));
+    if is_readonly_ref(return_type) {
+        mark_readonly_return(image, tokens, method);
+    }
     emit_declared_parameter_metadata(image, binder, tokens, enclosing, method, parameters);
     Ok(method)
 }
@@ -3398,6 +3443,7 @@ fn emit_one_method_in_scope(
         let method_name = explicit_interface_member_name(interface, name);
         let flags =
             METHOD_PRIVATE | METHOD_VIRTUAL | METHOD_FINAL | METHOD_NEWSLOT | METHOD_HIDEBYSIG;
+        tokens.next_return_is_readonly_ref = is_readonly_ref(return_type);
         let body_token = emit_method_body(
             image,
             binder,
@@ -3452,6 +3498,7 @@ fn emit_one_method_in_scope(
     {
         flags |= METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_HIDEBYSIG;
     }
+    tokens.next_return_is_readonly_ref = is_readonly_ref(return_type);
     let method = emit_method_body(
         image,
         binder,
@@ -4220,6 +4267,210 @@ fn apply_init_only_modifier(
     })
 }
 
+/// Wraps a `ref readonly T` return in its `modreq`, when the member being emitted was written that
+/// way. The sibling of [`apply_init_only_modifier`], and deliberately the same shape.
+///
+/// The modifier NAMES a type, so the type has to exist: a reference set that does not declare
+/// `InAttribute` cannot express the feature at all, and the modifier is then left off rather
+/// than a fabricated reference being minted.
+/// Every required modifier a member's RETURN can carry, applied in one place.
+///
+/// **`emit_method_body` BUILDS A SIGNATURE AT TWO POINTS** -- the deferred-body path an async method
+/// takes, and the ordinary `add_method` one -- and a modifier applied at one of them is absent from
+/// the other with nothing to say so. The `init` modifier was at both and the `ref readonly` one was
+/// at the first alone, which put `ref readonly int M()` and `ref int M()` in the metadata as the
+/// same method: csc reading it accepted a write through the returned reference at all five
+/// positions. **The repair is this function rather than a second careful call**, so a third
+/// modifier is added once instead of being added at one site and forgotten at the other.
+/// Marks a member's RETURN as read-only the way csc does: a sequence-0 `Param` row (II.22.33)
+/// carrying `[System.Runtime.CompilerServices.IsReadOnlyAttribute]`.
+///
+/// **THE `modreq` ALONE IS NOT ENOUGH, AND THAT IS THE WHOLE REASON THIS EXISTS.** Emitting
+/// `T& modreq(InAttribute)` and nothing else produces a member csc cannot use AT ALL -- not even to
+/// READ it: `CS0570: 'Bag.RoAt(int)' is not supported by the language`. A bare `modreq(InAttribute)`
+/// on a RETURN is not a C# concept; the attribute on the return parameter is what says the member
+/// is `ref readonly` rather than something the language cannot express. Measured by diffing csc's
+/// own metadata against ours, where the signature blobs were byte-equivalent and csc's had a
+/// sequence-0 `Param` row that ours did not.
+///
+/// **CALL IT WHILE THIS METHOD IS THE LAST ONE ADDED.** `add_return_param` appends to the `Param`
+/// table, and a `MethodDef`'s parameter run is read as "from my `ParamList` to the next method's" --
+/// so a row added after another method exists lands in that method's run instead.
+/// The return `TypeSig` of a BODYLESS member -- abstract, or on an interface -- with the
+/// `ref readonly` modifier applied when the declaration carries one.
+///
+/// **THE BODIED PATH CANNOT SERVE THESE.** `emit_method_body` builds its signature from a mark this
+/// crate sets just before calling it; a member with no body never goes through it, so an abstract
+/// or interface `ref readonly T M()` would emit a plain `T&` and every consumer would assign
+/// through it. Measured: csc refuses the write at both positions against its own metadata.
+fn bodyless_return_sig(
+    return_type: &TypeRef,
+    sig: TypeSig,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) -> TypeSig {
+    if is_readonly_ref(return_type) {
+        readonly_ref_sig(image, tokens, sig)
+    } else {
+        sig
+    }
+}
+
+fn mark_readonly_return(image: &mut ImageBuilder, tokens: &mut Tokens, method: Token) {
+    let _ = method;
+    let return_param = image.add_return_param();
+    attach_is_readonly(tokens, return_param);
+}
+
+/// Attaches `[System.Runtime.CompilerServices.IsReadOnlyAttribute]` to `parent`.
+///
+/// **TWO PARENTS, AND BOTH ARE REQUIRED FOR THE MEMBER KINDS THAT HAVE THEM.** csc puts it on the
+/// sequence-0 `Param` of every `ref readonly` member AND on the `Property` row of a `ref readonly`
+/// property or indexer -- measured on csc's own output. Marking only the accessor leaves a property
+/// csc reads as an ordinary `ref`, and it will let a caller assign through it.
+fn attach_is_readonly(tokens: &mut Tokens, parent: Token) {
+    tokens.pending_is_readonly.push(parent);
+}
+
+/// The namespace and name of the `ref readonly` marker attribute, in one place because the
+/// synthesis, the reference lookup and the `TypeRef` all have to spell the same type.
+const IS_READONLY_ATTRIBUTE: (&str, &str) = ("System.Runtime.CompilerServices", "IsReadOnlyAttribute");
+
+/// Writes `[IsReadOnlyAttribute]` onto every position [`attach_is_readonly`] recorded, and -- when
+/// no reference supplies the attribute -- SYNTHESIZES the type into this assembly first.
+///
+/// **AN ASSEMBLY THAT NAMES A TYPE NOTHING DECLARES IS NOT MERELY MISSING A MARKER: A CORLIB LIKE
+/// THAT DOES NOT LOAD AT ALL.** The emitter minted a `TypeRef` for the attribute and attached it
+/// to the sequence-0 `Param` of every `ref readonly` member, resolving into a reference that does
+/// not have it. csc reading such a core library reports `CS0518: predefined type 'System.Object'
+/// is not defined or imported` **for a one-line program** -- because a reference that fails to load
+/// reads as an EMPTY reference, and the diagnostic is about the first predefined type that goes
+/// missing rather than about the member that caused it. Isolated to one variable and proved in both
+/// directions: the same core library compiles and loads with `ref` in place of `ref readonly`, and
+/// loads again with the attribute declared in source.
+///
+/// **AN ORDINARY LIBRARY SURVIVED IT, WHICH IS WHY IT WENT UNNOTICED.** csc reads a `ref readonly`
+/// member out of a non-corlib assembly with the same dangling reference and still answers `CS8331`
+/// for a write through it, exactly as it does for its own output. Only the core library -- the
+/// assembly whose failure to load takes `System.Object` with it -- turns the loose end into a
+/// compilation that cannot start.
+///
+/// **SYNTHESIZED ONLY WHEN NOBODY ELSE HAS IT**, which is what csc does: compiled against a
+/// reference set that declares the attribute it emits a `TypeRef` and no type at all. The lookup
+/// covers this compilation's own declarations too, so a core library that declares the attribute in
+/// source gets one copy rather than two.
+///
+fn emit_is_readonly_attribute(image: &mut ImageBuilder, model: &Model, tokens: &mut Tokens) {
+    let pending = core::mem::take(&mut tokens.pending_is_readonly);
+    if pending.is_empty() {
+        return;
+    }
+    let (namespace, name) = IS_READONLY_ATTRIBUTE;
+    let marker = named_symbol(namespace, name);
+    let constructor = if model.get(namespace, name).is_some() {
+        mint_named_type_token(&marker, image, tokens);
+        match tokens.type_token(&marker) {
+            Some(ty) => image.member_ref(ty, ".ctor", &method_signature(true, &[], &TypeSig::Void)),
+            None => return,
+        }
+    } else {
+        synthesize_is_readonly_attribute(image, tokens)
+    };
+    for parent in pending {
+        image.add_custom_attribute(parent, constructor, &[0x01, 0x00, 0x00, 0x00]);
+    }
+}
+
+/// Adds `internal sealed class IsReadOnlyAttribute : Attribute` and its public parameterless
+/// constructor, returning the constructor's `MethodDef` token.
+///
+/// **THE BASE AND ITS CONSTRUCTOR GO THROUGH THE ORDINARY LOOKUPS**, which is the whole reason this
+/// works in a core library: there `System.Attribute` is a `TypeDef` in this very module and its
+/// `.ctor` a `MethodDef`, while in an ordinary compilation both are references. `base_type_token`
+/// and `base_class_ctor` already answer for both, so neither shape is spelled here.
+///
+/// **THE TYPE AND ITS CONSTRUCTOR ARE ADDED BACK TO BACK AND LAST**, because `add_type` fixes the
+/// type's `first_method` from the current row count and a type owns every `MethodDef` up to the
+/// next one's.
+fn synthesize_is_readonly_attribute(image: &mut ImageBuilder, tokens: &mut Tokens) -> Token {
+    let (namespace, name) = IS_READONLY_ATTRIBUTE;
+    let attribute = named_symbol("System", "Attribute");
+    let extends = base_type_token(&attribute, &[], image, tokens)
+        .unwrap_or_else(|| image.type_ref("System", "Attribute"));
+    image.add_type(namespace, name, extends, TYPE_SEALED | TYPE_BEFORE_FIELD_INIT);
+    let base_ctor = base_class_ctor(image, tokens, &attribute, &[]);
+    let code = alloc::vec![
+        Instruction::new(Opcode::Ldarg, Operand::Variable(0)),
+        Instruction::new(Opcode::Call, Operand::Token(base_ctor)),
+        Instruction::simple(Opcode::Ret),
+    ];
+    let body = MethodBodyImage {
+        max_stack: max_stack(&code).max(1),
+        init_locals: false,
+        local_var_sig: None,
+        code: code.into_boxed_slice(),
+        handlers: alloc::boxed::Box::new([]),
+    };
+    let Ok(body_bytes) = write_method_body(&body) else {
+        return Token::new(0, 0);
+    };
+    image.add_method(
+        ".ctor",
+        &method_signature(true, &[], &TypeSig::Void),
+        &body_bytes,
+        ctor_flags(&[Modifier::Public]),
+        IL_MANAGED,
+        &[],
+    )
+}
+
+fn apply_return_modifiers(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    return_sig: TypeSig,
+) -> Result<TypeSig, crate::EmitError> {
+    let return_sig = apply_init_only_modifier(image, tokens, return_sig)?;
+    Ok(apply_readonly_ref_modifier(image, tokens, return_sig))
+}
+
+fn apply_readonly_ref_modifier(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    return_sig: TypeSig,
+) -> TypeSig {
+    if !core::mem::take(&mut tokens.next_return_is_readonly_ref) {
+        return return_sig;
+    }
+    readonly_ref_sig(image, tokens, return_sig)
+}
+
+/// [`apply_readonly_ref_modifier`] without the pre-set: for the BODILESS positions -- an abstract
+/// member, an interface member -- which build their signature outright rather than through
+/// [`emit_method_body`], and so have the declaration in hand instead of a mark.
+fn readonly_ref_sig(image: &mut ImageBuilder, tokens: &mut Tokens, return_sig: TypeSig) -> TypeSig {
+    let marker = named_symbol("System.Runtime.InteropServices", "InAttribute");
+    mint_named_type_token(&marker, image, tokens);
+    match tokens.type_token(&marker) {
+        Some(modifier) => TypeSig::Modified {
+            modifier,
+            inner: Box::new(return_sig),
+        },
+        None => return_sig,
+    }
+}
+
+/// Whether a member's return type was written `ref readonly`, read from the SYNTAX because the
+/// bound symbol cannot say: `ref readonly T` and `ref T` are one `TypeSymbol::ByRef`.
+fn is_readonly_ref(return_type: &TypeRef) -> bool {
+    matches!(
+        return_type.kind,
+        lamella_syntax::ast::TypeRefKind::ByRef {
+            is_readonly: true,
+            ..
+        }
+    )
+}
+
 fn emit_method_body(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -4281,7 +4532,7 @@ fn emit_method_body(
             })
             .collect::<Result<_, _>>()?;
         let return_sig = open_type_sig(tokens, return_symbol, scope)?;
-        let return_sig = apply_init_only_modifier(image, tokens, return_sig)?;
+        let return_sig = apply_return_modifiers(image, tokens, return_sig)?;
         let signature = method_signature(!is_static, &parameter_sigs, &return_sig);
         let stub_token = image.add_method_deferred_body(
             name,
@@ -4546,7 +4797,8 @@ fn emit_bound_body_in_scope(
         })
         .collect::<Result<_, _>>()?;
     let return_sig = open_type_sig(tokens, return_symbol, scope)?;
-    let return_sig = apply_init_only_modifier(image, tokens, return_sig)?;
+    let readonly_return = tokens.next_return_is_readonly_ref;
+    let return_sig = apply_return_modifiers(image, tokens, return_sig)?;
     let signature = if is_vararg {
         vararg_method_signature(!is_static, &parameter_sigs, &return_sig)
     } else if method_type_parameters.is_empty() {
@@ -4567,6 +4819,9 @@ fn emit_bound_body_in_scope(
         IL_MANAGED,
         &parameter_names,
     );
+    if readonly_return {
+        mark_readonly_return(image, tokens, method);
+    }
     emit_generic_parameters(image, tokens, method, method_type_parameters, method_constraints);
     if let Some(debug) = method_debug {
         image.set_method_debug(method, debug);
@@ -4797,15 +5052,21 @@ fn emit_property(
         Some(interface) => explicit_interface_member_name(interface, name),
         None => String::from(name),
     };
-    let signature = property_signature(!is_static, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
+    let property_sig = member_type_sig(tokens, enclosing, &property_ty)?;
+    let property_sig = bodyless_return_sig(ty, property_sig, image, tokens);
+    let signature = property_signature(!is_static, &[], &property_sig);
     let property = image.add_property(&property_name, &signature, 0);
+    if is_readonly_ref(ty) {
+        attach_is_readonly(tokens, property);
+    }
+
     let void = TypeSymbol::Special(SpecialType::Void);
     let backing = if is_auto_property(modifiers, getter, setter, false) {
         auto_backing_field(
             image,
             tokens,
             enclosing,
-            &backing_field_name(explicit_interface, name),
+            &auto_property_backing_field_name(explicit_interface, name),
             &property_ty,
         )
     } else {
@@ -4826,6 +5087,7 @@ fn emit_property(
         );
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let token = if let Some(body) = &getter.body {
+            tokens.next_return_is_readonly_ref = is_readonly_ref(ty);
             let token = emit_method_body(
                 image, binder, tokens, enclosing, &[], &[], &method_name, &property_ty, &[], &[], body,
                 is_static, false, false, flags, None, debug,
@@ -4965,10 +5227,6 @@ fn emit_property(
 /// Whether a property is an AUTOMATICALLY IMPLEMENTED one (C# 3.0 10.7.3): BOTH accessors present
 /// and BOTH written without a body, on a member that is not abstract, extern, or an interface's.
 ///
-/// **BOTH, NOT EITHER.** A getter-only `{ get; }` is C# 6.0's readonly auto-property, whose backing
-/// field is `initonly`, and a half-written `{ get; set { ... } }` is not an auto-property at all --
-/// the binder refuses each with its own diagnostic, and this predicate is what keeps the emitter
-/// from synthesizing a field for either.
 /// Whether a field-like event declaration (`event H E;`) carries a synthesized backing delegate
 /// field. An ordinary one does; an `abstract` one does not, because it declares only the contract
 /// -- its `add_E`/`remove_E` are bodyless and there is nothing to combine a handler onto. An
@@ -4980,45 +5238,6 @@ fn emit_property(
 /// token after it. This is [`is_auto_property`]'s shape for the member kind beside it.
 fn event_has_backing_field(modifiers: &[Modifier], is_interface: bool) -> bool {
     !is_interface && !modifiers.contains(&Modifier::Abstract)
-}
-
-fn is_auto_property(
-    modifiers: &[Modifier],
-    getter: Option<&lamella_syntax::ast::Accessor>,
-    setter: Option<&lamella_syntax::ast::Accessor>,
-    is_interface: bool,
-) -> bool {
-    if is_interface
-        || modifiers
-            .iter()
-            .any(|modifier| matches!(modifier, Modifier::Abstract | Modifier::Extern))
-    {
-        return false;
-    }
-    matches!((getter, setter), (Some(get), Some(set)) if get.body.is_none() && set.body.is_none())
-}
-
-/// The metadata name of an auto-property's backing field: csc's `<Name>k__BackingField`, and
-/// `<IHas.N>k__BackingField` for an explicit interface implementation -- measured.
-///
-/// **NOT A LEGAL C# IDENTIFIER, ON PURPOSE.** The angle brackets are what keep it from colliding
-/// with anything the program can declare, and copying csc's spelling exactly is what lets a
-/// debugger, a serializer or a reflection-based tool recognize the field for what it is.
-///
-/// The interface qualifier is not decoration either: a type may explicitly implement `N` from two
-/// different interfaces AND declare its own `N`, which is three distinct auto-properties whose
-/// backing fields would otherwise share one name.
-fn backing_field_name(
-    explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
-    property: &str,
-) -> String {
-    match explicit_interface {
-        Some(interface) => alloc::format!(
-            "<{}>k__BackingField",
-            explicit_interface_member_name(interface, property)
-        ),
-        None => alloc::format!("<{property}>k__BackingField"),
-    }
 }
 
 /// The token a synthesized accessor must use to reach its own backing field, which is NOT always
@@ -5238,8 +5457,12 @@ fn emit_indexer(
         .map(|(_, ty)| member_type_sig(tokens, enclosing, ty))
         .collect::<Result<_, _>>()?;
     let element_sig = member_type_sig(tokens, enclosing, &element_ty)?;
+    let property_sig = bodyless_return_sig(ty, element_sig.clone(), image, tokens);
     let property =
-        image.add_property(name, &property_signature(true, &index_sigs, &element_sig), 0);
+        image.add_property(name, &property_signature(true, &index_sigs, &property_sig), 0);
+    if is_readonly_ref(ty) {
+        attach_is_readonly(tokens, property);
+    }
     let void = TypeSymbol::Special(SpecialType::Void);
     if let Some(getter) = getter {
         let getter_name = accessor_name("get_", name);
@@ -5248,6 +5471,7 @@ fn emit_indexer(
             &index_param_types,
         );
         let token = if let Some(body) = &getter.body {
+            tokens.next_return_is_readonly_ref = is_readonly_ref(ty);
             Some(emit_method_body(
                 image, binder, tokens, enclosing, &[], &[], &getter_name, &element_ty, &index_params, &[],
                 body, false, false, false, flags, None, debug,
@@ -5837,6 +6061,9 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
                     .clone()
                     .unwrap_or(TypeSymbol::Special(SpecialType::Object));
                 mint_type_token(image, tokens, &ty);
+                if let Some(filter) = &catch.filter {
+                    mint_in_expr(filter, image, tokens);
+                }
                 mint_references(&catch.body, image, tokens);
             }
             if let Some(finally) = finally {
@@ -5906,13 +6133,32 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             operator,
             ..
         } => {
+            use lamella_syntax::ast::BinaryOperator as Op;
+            if let Some(call) = crate::expr::concat_call(expr) {
+                match call {
+                    crate::expr::ConcatCall::Literal(text) => {
+                        let token = image.user_string(&text);
+                        tokens.insert_string(&text, token);
+                    }
+                    crate::expr::ConcatCall::Fixed {
+                        reference,
+                        arguments,
+                    } => {
+                        for argument in &arguments {
+                            mint_in_expr(argument, image, tokens);
+                        }
+                        mint_member_ref(&reference, image, tokens);
+                    }
+                    crate::expr::ConcatCall::Packed { reference, array } => {
+                        mint_in_expr(&array, image, tokens);
+                        mint_member_ref(&reference, image, tokens);
+                    }
+                }
+                return;
+            }
             mint_in_expr(left, image, tokens);
             mint_in_expr(right, image, tokens);
-            use lamella_syntax::ast::BinaryOperator as Op;
-            if matches!(operator, Op::Add) && is_string(&expr.ty) {
-                let both = is_string(&left.ty) && is_string(&right.ty);
-                mint_member_ref(&string_concat_reference(both), image, tokens);
-            } else if matches!(operator, Op::Equal | Op::NotEqual)
+            if matches!(operator, Op::Equal | Op::NotEqual)
                 && is_string(&left.ty)
                 && is_string(&right.ty)
             {
@@ -6047,15 +6293,20 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 mint_member_ref(target, image, tokens);
             }
             if tokens.method(delegate_type, ".ctor", &[]).is_none() {
-                if let Some((namespace, name)) = split_type_name(delegate_type) {
-                    mint_named_type_token(delegate_type, image, tokens);
-                    let ctor_sig = method_signature(
-                        true,
-                        &[TypeSig::Object, TypeSig::NativeInt],
-                        &TypeSig::Void,
-                    );
-                    let type_ref = image.type_ref(&namespace, &name);
-                    let ctor = image.member_ref(type_ref, ".ctor", &ctor_sig);
+                let ctor_sig =
+                    method_signature(true, &[TypeSig::Object, TypeSig::NativeInt], &TypeSig::Void);
+                let parent = match delegate_type {
+                    TypeSymbol::Instantiation {
+                        definition,
+                        arguments,
+                    } => mint_type_spec(delegate_type, definition, arguments, image, tokens),
+                    _ => split_type_name(delegate_type).map(|(namespace, name)| {
+                        mint_named_type_token(delegate_type, image, tokens);
+                        image.type_ref(&namespace, &name)
+                    }),
+                };
+                if let Some(parent) = parent {
+                    let ctor = image.member_ref(parent, ".ctor", &ctor_sig);
                     tokens.insert_method(delegate_type, ".ctor", &[], ctor);
                 }
             }
@@ -6166,7 +6417,18 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             ..
         } => {
             mint_in_expr(target, image, tokens);
-            mint_in_expr(value, image, tokens);
+            let spliced = matches!(operator, lamella_syntax::ast::AssignmentOperator::Add)
+                && matches!(
+                    target.ty,
+                    TypeSymbol::Special(SpecialType::String | SpecialType::Object)
+                )
+                && matches!(
+                    crate::expr::compound_concat(&target.ty, Some(value)),
+                    crate::expr::CompoundConcat::Spliced { .. }
+                );
+            if !spliced {
+                mint_in_expr(value, image, tokens);
+            }
             if let BoundExprKind::PropertyAccess {
                 receiver,
                 setter_declaring_type,
@@ -6198,8 +6460,20 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     TypeSymbol::Special(SpecialType::String | SpecialType::Object)
                 )
             {
-                let both_string = is_string(&target.ty) && is_string(&value.ty);
-                mint_member_ref(&string_concat_reference(both_string), image, tokens);
+                match crate::expr::compound_concat(&target.ty, Some(value)) {
+                    crate::expr::CompoundConcat::Spliced {
+                        reference,
+                        arguments,
+                    } => {
+                        for argument in &arguments {
+                            mint_in_expr(argument, image, tokens);
+                        }
+                        mint_member_ref(&reference, image, tokens);
+                    }
+                    crate::expr::CompoundConcat::Pairwise(reference) => {
+                        mint_member_ref(&reference, image, tokens);
+                    }
+                }
             }
         }
         BoundExprKind::Conditional {
@@ -6215,6 +6489,12 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             mint_in_expr(left, image, tokens);
             mint_in_expr(right, image, tokens);
         }
+        BoundExprKind::Sequence { spilled, value } => {
+            for operand in spilled {
+                mint_in_expr(operand, image, tokens);
+            }
+            mint_in_expr(value, image, tokens);
+        }
         BoundExprKind::TypeTest { operand, target, .. } => {
             mint_in_expr(operand, image, tokens);
             if is_value_type(&operand.ty, tokens) {
@@ -6222,6 +6502,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             }
             mint_type_token(image, tokens, target);
         }
+        BoundExprKind::Throw(operand) => mint_in_expr(operand, image, tokens),
         BoundExprKind::TypeOf(target) => {
             mint_type_token(image, tokens, target);
             mint_type_token(image, tokens, &crate::expr::system_type_symbol());
@@ -6253,6 +6534,12 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
         }
         BoundExprKind::SizeOf(target) => {
             mint_named_type_token(target, image, tokens);
+        }
+        BoundExprKind::DefaultValue(target) => {
+            mint_type_token(image, tokens, target);
+        }
+        BoundExprKind::Dereference { operand } | BoundExprKind::AddressOf { operand } => {
+            mint_in_expr(operand, image, tokens);
         }
         _ => {}
     }
@@ -6286,28 +6573,6 @@ pub(crate) fn offset_to_string_data_reference() -> lamella_binder::MethodReferen
         name: "get_OffsetToStringData".into(),
         parameters: alloc::vec![],
         return_type: TypeSymbol::Special(SpecialType::Int32),
-        is_static: true,
-        is_vararg: false,
-        instantiation: None,
-        declaring_instantiation: None,
-    }
-}
-
-/// The `String.Concat` overload a concatenation lowers to: `Concat(string, string)` when
-/// both operands are strings, otherwise `Concat(object, object)` (a non-string operand was
-/// boxed/typed to object by the binder).
-fn string_concat_reference(both_strings: bool) -> lamella_binder::MethodReference {
-    let string = TypeSymbol::Special(SpecialType::String);
-    let arg = TypeSymbol::Special(if both_strings {
-        SpecialType::String
-    } else {
-        SpecialType::Object
-    });
-    lamella_binder::MethodReference {
-        declaring_type: string.clone(),
-        name: "Concat".into(),
-        parameters: alloc::vec![arg.clone(), arg],
-        return_type: string,
         is_static: true,
         is_vararg: false,
         instantiation: None,
@@ -6539,6 +6804,17 @@ fn mint_instantiated_member_ref(
     ) else {
         return;
     };
+    let mut return_sig = return_sig;
+    for modifier in &declaring.return_required_modifiers {
+        mint_named_type_token(modifier, image, tokens);
+        let Some(token) = tokens.type_token(modifier) else {
+            return;
+        };
+        return_sig = TypeSig::Modified {
+            modifier: token,
+            inner: Box::new(return_sig),
+        };
+    }
     let signature = method_signature(!method.is_static, &parameter_sigs, &return_sig);
     let member = image.member_ref(parent, &method.name, &signature);
     tokens.insert_method(
@@ -7689,49 +7965,72 @@ fn split_type_name(ty: &TypeSymbol) -> Option<(String, String)> {
 }
 
 
-/// Synthesizes `this.<field> = <init>;` for each instance field initializer, in
-/// declaration order (17.11). They run before the base-constructor call in every
-/// constructor that does not chain to `this(...)`, so a virtual method the base
-/// constructor invokes observes them already assigned. Static and const fields are
-/// excluded here (a const folds; static initializers run in the static constructor).
+/// Synthesizes `this.<field> = <init>;` for each instance field initializer AND each instance
+/// AUTO-PROPERTY INITIALIZER, in declaration order (17.11). They run before the base-constructor
+/// call in every constructor that does not chain to `this(...)`, so a virtual method the base
+/// constructor invokes observes them already assigned. Static and const fields are excluded here
+/// (a const folds; static initializers run in the static constructor).
+///
+/// **THE TWO KINDS INTERLEAVE AND THE ORDER IS THE SOURCE'S**, which is why one walk over the
+/// members produces both rather than one walk appending to another: `int A = 1; int P { get; } = 2;
+/// int B = 3;` stores A, P's backing field and B in that order, measured on csc's own `.ctor`.
+///
+/// **AN AUTO-PROPERTY INITIALIZER TARGETS THE BACKING FIELD, NOT THE PROPERTY.** That is not an
+/// optimization: a getter-only auto-property has no setter to call, and going through a VIRTUAL
+/// setter would run a derived override before the derived constructor had. csc emits `stfld` here
+/// and so do we, which is the whole reason the binder models the field at all.
 fn field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
     let mut statements = Vec::new();
+    let mut push = |name: Box<str>, init: &Expr, span| {
+        let target = Expr::new(
+            ExprKind::MemberAccess {
+                receiver: Box::new(Expr::new(ExprKind::This, span)),
+                name,
+            },
+            span,
+        );
+        let assignment = Expr::new(
+            ExprKind::Assignment {
+                operator: AssignmentOperator::Assign,
+                target: Box::new(target),
+                value: Box::new(init.clone()),
+            },
+            span,
+        );
+        statements.push(Stmt::new(StmtKind::Expression(assignment), span));
+    };
     for member in &declaration.members {
-        let Member::Field {
-            modifiers,
-            declarators,
-            ..
-        } = member
-        else {
-            continue;
-        };
-        if modifiers
-            .iter()
-            .any(|m| matches!(m, Modifier::Static | Modifier::Const))
-        {
-            continue;
-        }
-        for declarator in declarators {
-            let Some(init) = &declarator.initializer else {
-                continue;
-            };
-            let span = declarator.span;
-            let target = Expr::new(
-                ExprKind::MemberAccess {
-                    receiver: Box::new(Expr::new(ExprKind::This, span)),
-                    name: declarator.name.clone(),
-                },
+        match member {
+            Member::Field {
+                modifiers,
+                declarators,
+                ..
+            } => {
+                if modifiers
+                    .iter()
+                    .any(|m| matches!(m, Modifier::Static | Modifier::Const))
+                {
+                    continue;
+                }
+                for declarator in declarators {
+                    if let Some(init) = &declarator.initializer {
+                        push(declarator.name.clone(), init, declarator.span);
+                    }
+                }
+            }
+            Member::Property {
+                modifiers,
+                name,
+                explicit_interface,
+                initializer: Some(init),
                 span,
-            );
-            let assignment = Expr::new(
-                ExprKind::Assignment {
-                    operator: AssignmentOperator::Assign,
-                    target: Box::new(target),
-                    value: Box::new(init.clone()),
-                },
-                span,
-            );
-            statements.push(Stmt::new(StmtKind::Expression(assignment), span));
+                ..
+            } if !modifiers.iter().any(|m| matches!(m, Modifier::Static)) => push(
+                auto_property_backing_field_name(explicit_interface.as_ref(), name).into(),
+                init,
+                *span,
+            ),
+            _ => {}
         }
     }
     statements
@@ -7763,61 +8062,101 @@ fn static_constructor_body(declaration: &TypeDecl) -> Option<&Stmt> {
     })
 }
 
-/// The fields whose initializers run in the `.cctor`: every `static` field, plus a `const
-/// decimal` (which has no `Constant` form, so it initializes there as a static readonly). Every
-/// other `const` is a compile-time literal inlined at use, and an instance field initializes in
-/// the instance constructor -- neither belongs here. Yielding each field's bound type with its
-/// declarators keeps the `.cctor` emit DECISION and the `.cctor` BODY over the same field set.
-fn static_initializer_fields<'a>(
-    declaration: &'a TypeDecl,
-) -> impl Iterator<Item = (TypeSymbol, &'a [VariableDeclarator])> + 'a {
-    declaration.members.iter().filter_map(|member| {
-        let Member::Field {
-            modifiers,
-            ty,
-            declarators,
-            ..
-        } = member
-        else {
-            return None;
-        };
-        let is_static = modifiers.iter().any(|m| matches!(m, Modifier::Static));
-        let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
-        let field_ty = bind_type(ty);
-        if is_const {
-            if !matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal)) {
-                return None;
-            }
-        } else if !is_static {
-            return None;
-        }
-        Some((field_ty, declarators.as_slice()))
-    })
+/// One initializer that runs in the `.cctor`.
+struct StaticInitializer<'a> {
+    /// The bound type of the storage being written -- the decimal-const and default-value tests
+    /// ask about it, and neither can be answered from the expression alone.
+    field_ty: TypeSymbol,
+    /// What the synthesized assignment names: a declared field's own name, or an auto-property's
+    /// `<P>k__BackingField`.
+    target: Box<str>,
+    /// The initializer expression as written.
+    init: &'a Expr,
+    /// Where the store is reported and given its sequence point.
+    span: Span,
 }
 
-/// Synthesizes `<field> = <init>;` for each static (and `const decimal`) field initializer, in
-/// declaration order -- the statements that run first in the static constructor.
+/// The initializers that run in the `.cctor`, in declaration order: every `static` field, every
+/// `const decimal` (which has no `Constant` form, so it initializes there as a static readonly),
+/// and every `static` AUTO-PROPERTY INITIALIZER, which stores to the property's backing field.
+/// Every other `const` is a compile-time literal inlined at use, and an instance initializer runs
+/// in the instance constructor -- neither belongs here.
+///
+/// **ONE LIST FOR THE DECISION AND FOR THE BODY.** `needs_static_constructor` and
+/// `static_field_initializer_statements` must range over the same set: a `.cctor` the decision
+/// omits and the body would have filled loses its stores silently, and one the decision emits and
+/// the body leaves empty is a row csc does not write.
+fn static_initializers(declaration: &TypeDecl) -> Vec<StaticInitializer<'_>> {
+    let mut found = Vec::new();
+    for member in &declaration.members {
+        match member {
+            Member::Field {
+                modifiers,
+                ty,
+                declarators,
+                ..
+            } => {
+                let is_static = modifiers.iter().any(|m| matches!(m, Modifier::Static));
+                let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
+                let field_ty = bind_type(ty);
+                if is_const {
+                    if !matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal)) {
+                        continue;
+                    }
+                } else if !is_static {
+                    continue;
+                }
+                for declarator in declarators {
+                    if let Some(init) = &declarator.initializer {
+                        found.push(StaticInitializer {
+                            field_ty: field_ty.clone(),
+                            target: declarator.name.clone(),
+                            init,
+                            span: declarator.span,
+                        });
+                    }
+                }
+            }
+            Member::Property {
+                modifiers,
+                ty,
+                name,
+                explicit_interface,
+                initializer: Some(init),
+                span,
+                ..
+            } if modifiers.iter().any(|m| matches!(m, Modifier::Static)) => {
+                found.push(StaticInitializer {
+                    field_ty: bind_type(ty),
+                    target: auto_property_backing_field_name(explicit_interface.as_ref(), name)
+                        .into(),
+                    init,
+                    span: *span,
+                });
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Synthesizes `<field> = <init>;` for each static initializer, in declaration order -- the
+/// statements that run first in the static constructor.
 fn static_field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
-    let mut statements = Vec::new();
-    for (_field_ty, declarators) in static_initializer_fields(declaration) {
-        for declarator in declarators {
-            let Some(init) = &declarator.initializer else {
-                continue;
-            };
-            let span = declarator.span;
-            let target = Expr::name(declarator.name.clone(), span);
+    static_initializers(declaration)
+        .into_iter()
+        .map(|entry| {
             let assignment = Expr::new(
                 ExprKind::Assignment {
                     operator: AssignmentOperator::Assign,
-                    target: Box::new(target),
-                    value: Box::new(init.clone()),
+                    target: Box::new(Expr::name(entry.target, entry.span)),
+                    value: Box::new(entry.init.clone()),
                 },
-                span,
+                entry.span,
             );
-            statements.push(Stmt::new(StmtKind::Expression(assignment), span));
-        }
-    }
-    statements
+            Stmt::new(StmtKind::Expression(assignment), entry.span)
+        })
+        .collect()
 }
 
 /// Whether a static field initializer assigns exactly the field type's default value -- so csc
@@ -7875,14 +8214,9 @@ fn is_integer_special(special: SpecialType) -> bool {
 /// emitting a redundant `.cctor`, which also cost the declaration a spurious sequence point).
 fn needs_static_constructor(declaration: &TypeDecl) -> bool {
     static_constructor_body(declaration).is_some()
-        || static_initializer_fields(declaration).any(|(field_ty, declarators)| {
-            declarators.iter().any(|declarator| {
-                declarator
-                    .initializer
-                    .as_ref()
-                    .is_some_and(|init| !is_default_valued_static_init(&field_ty, init))
-            })
-        })
+        || static_initializers(declaration)
+            .iter()
+            .any(|entry| !is_default_valued_static_init(&entry.field_ty, entry.init))
 }
 
 /// Whether the type declares an INSTANCE constructor (a static constructor does not
@@ -8417,7 +8751,7 @@ fn collect_type_tokens(
                 *next_field += 1;
                 tokens.insert_field(
                     &declaring,
-                    &backing_field_name(explicit_interface.as_ref(), name),
+                    &auto_property_backing_field_name(explicit_interface.as_ref(), name),
                     Token::new(FIELD, *next_field),
                 );
             }
@@ -8839,12 +9173,7 @@ fn collect_tokens(
 ) {
     let scope = binder.import_scope();
     for using in usings {
-        match &using.kind {
-            UsingKind::Namespace(name) => binder.import_namespace(&join_namespace("", name)),
-            UsingKind::Alias { name, target } => {
-                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
-            }
-        }
+        binder.import_using(&using.kind);
     }
     let mut prefix = String::new();
     for part in namespace.split('.').filter(|part| !part.is_empty()) {
@@ -10138,6 +10467,10 @@ mod tests {
     /// for a public member, so when `int ILeft.Value()` is present the plain `public int Value()`
     /// beside it implements no interface member at all -- csc gives it no `virtual`, `newslot` or
     /// `final`, and this compiler gave it all three.
+    ///
+    /// ONE predicate serves every member kind, so a defect in it reaches all of them at once:
+    /// a method, a property or indexer accessor, and both event accessors. Measured against csc
+    /// on this exact source.
     ///
     /// The two controls are most of the value. `Plain` implements the same interface IMPLICITLY and
     /// its members MUST keep the sealed-virtual slot; `Lonely` implements nothing and must have
@@ -12518,6 +12851,197 @@ mod tests {
     }
 
     #[test]
+    fn an_exception_filter_becomes_a_filter_clause_that_carries_no_type() {
+        use lamella_cil::{EhKind, Opcode};
+        let unit = parse_compilation_unit(
+            "namespace System { public class Exception { } } \
+             class Program { static int n; public static void Main() { \
+                 try { n = 1; } \
+                 catch (System.Exception e) when (e != null) { n = n + 2; } \
+                 catch (System.Exception) { n = 3; } } }",
+        )
+        .unit;
+        let result = compile(
+            &unit,
+            "ef.dll",
+            "ef",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp6,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let main = assembly
+            .find_type("", "Program")
+            .expect("the Program type")
+            .methods()
+            .find(|method| method.name() == Some("Main"))
+            .expect("the Main method");
+        let body = main.body().expect("Main has a method body");
+        assert_eq!(body.handlers.len(), 2, "one filtered clause and one typed one");
+
+        let EhKind::Filter { filter_start } = body.handlers[0].kind else {
+            panic!("the first clause is filtered, got {:?}", body.handlers[0].kind);
+        };
+        assert!(
+            matches!(body.handlers[1].kind, EhKind::Catch(_)),
+            "the control clause is an ordinary typed catch, got {:?}",
+            body.handlers[1].kind
+        );
+        let handler_start = body.handlers[0].handler_range.start;
+        assert!(
+            filter_start < handler_start,
+            "the filter runs before the handler it guards"
+        );
+        assert_eq!(
+            body.code[handler_start as usize - 1].opcode,
+            Opcode::Endfilter,
+            "the instruction before the handler is the filter's verdict"
+        );
+        assert_eq!(body.code[filter_start as usize].opcode, Opcode::Isinst);
+        assert_eq!(body.code[handler_start as usize].opcode, Opcode::Pop);
+        assert_eq!(
+            body.code[body.handlers[1].handler_range.start as usize].opcode,
+            Opcode::Pop,
+            "the control catch is unnamed, so it discards too -- see the named case in the gate"
+        );
+    }
+
+    #[test]
+    fn a_readonly_auto_property_gets_an_initonly_field_and_no_setter() {
+        use lamella_cil::Opcode;
+        let unit = parse_compilation_unit(
+            "class C { public int Only { get; } \
+                 public int Writable { get; set; } \
+                 public static int Shared { get; } \
+                 int m = 7; public int Manual { get { return m; } } }",
+        )
+        .unit;
+        let result = compile(
+            &unit,
+            "ro.dll",
+            "ro",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp6,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let ty = assembly.find_type("", "C").expect("the C type");
+        let field_named = |name: &str| {
+            ty.fields()
+                .find(|field| field.name() == Some(name))
+                .unwrap_or_else(|| panic!("field {name} is missing"))
+        };
+        let initonly = |name: &str| field_named(name).flags() & u32::from(FIELD_INITONLY) != 0;
+        assert!(initonly("<Only>k__BackingField"), "`{{ get; }}` is write-once");
+        assert!(
+            initonly("<Shared>k__BackingField"),
+            "and so is the static spelling of it"
+        );
+        assert!(
+            !initonly("<Writable>k__BackingField"),
+            "`{{ get; set; }}` has a setter, so its field is not initonly"
+        );
+        assert!(
+            ty.fields()
+                .all(|field| field.name() != Some("<Manual>k__BackingField")),
+            "a getter-only property with a WRITTEN body is not an auto-property"
+        );
+        let method = |name: &str| ty.methods().find(|method| method.name() == Some(name));
+        assert!(
+            method("set_Only").is_none(),
+            "there is no setter to synthesize, and emitting one would make the property writable"
+        );
+        assert!(method("set_Writable").is_some(), "the control still has one");
+        assert_eq!(
+            method("get_Only")
+                .expect("get_Only")
+                .body()
+                .expect("a body")
+                .code
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .collect::<Vec<_>>(),
+            [Opcode::Ldarg, Opcode::Ldfld, Opcode::Ret]
+        );
+    }
+
+    #[test]
+    fn an_auto_property_initializer_stores_to_the_backing_field_in_declaration_order() {
+        use lamella_cil::Opcode;
+        let unit = parse_compilation_unit(
+            "class C { public int A { get; set; } = 1; public int F = 2; \
+                 public int B { get; } = 3; public static int S { get; } = 4; }",
+        )
+        .unit;
+        let result = compile(
+            &unit,
+            "api.dll",
+            "api",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp6,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let ty = assembly.find_type("", "C").expect("the C type");
+        assert_eq!(
+            ty.fields().filter_map(|field| field.name()).collect::<Vec<_>>(),
+            [
+                "<A>k__BackingField",
+                "F",
+                "<B>k__BackingField",
+                "<S>k__BackingField",
+            ]
+        );
+        let opcodes = |name: &str| -> Vec<Opcode> {
+            ty.methods()
+                .find(|method| method.name() == Some(name))
+                .unwrap_or_else(|| panic!("method {name} is missing"))
+                .body()
+                .unwrap_or_else(|| panic!("method {name} has no body"))
+                .code
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .collect()
+        };
+        assert_eq!(
+            opcodes(".ctor"),
+            [
+                Opcode::Ldarg,
+                Opcode::LdcI4,
+                Opcode::Stfld,
+                Opcode::Ldarg,
+                Opcode::LdcI4,
+                Opcode::Stfld,
+                Opcode::Ldarg,
+                Opcode::LdcI4,
+                Opcode::Stfld,
+                Opcode::Ldarg,
+                Opcode::Call,
+                Opcode::Ret,
+            ]
+        );
+        assert_eq!(
+            opcodes(".cctor"),
+            [Opcode::LdcI4, Opcode::Stsfld, Opcode::Ret]
+        );
+    }
+
+    #[test]
     fn a_generic_auto_property_reaches_its_field_through_a_type_spec() {
         use lamella_cil::Operand;
         let options = LexOptions {
@@ -14336,9 +14860,9 @@ mod tests {
     /// The selection step accepts an operator whose return type merely CONVERTS to the target, and
     /// every type converts to `object`, so without the guard each of the first three rows here
     /// binds `op_Implicit` and calls it. **Against the real BCL that is an emit refusal, and
-    /// `(object)aString` was nine of the C# differential's nine failures; from source it is worse
-    /// than a refusal -- `(Base)d` returned an `Other`, so a virtual call through `b` answered from
-    /// the wrong object with no diagnostic anywhere.**
+    /// `(object)aString` alone reaches it from every string cast in a program; from source it is
+    /// worse than a refusal -- `(Base)d` returns an `Other`, so a virtual call through `b` answers
+    /// from the wrong object with no diagnostic anywhere.**
     ///
     /// **`ToOther` IS THE INSTRUMENT, NOT A COURTESY ROW.** `(Other)t` is the case where the
     /// operator genuinely applies; a build whose search returned nothing at all satisfies every

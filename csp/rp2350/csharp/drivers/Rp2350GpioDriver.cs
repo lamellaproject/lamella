@@ -18,8 +18,21 @@ public sealed class Rp2350GpioDriver : GpioDriver
     private readonly uint _sioOeClr;
     private readonly uint _bankResetMask;
 
-    public Rp2350GpioDriver()
+    private readonly uint _reserved;
+
+    /// <summary>Reserves nothing -- every pin is the app's.</summary>
+    public Rp2350GpioDriver() : this(0u) { }
+
+    /// <summary>Reserves the pins whose bits are set, so <c>SetPinMode</c> refuses them. A board
+    /// passes the lines it must keep -- its debug transport, a fixed peripheral's control pin --
+    /// because only the board knows which those are.</summary>
+    /// <remarks>THE PICO 2 W IS WHY THIS EXISTS ON THIS FAMILY. Its wireless part sits on GP23,
+    /// GP24, GP25 and GP29, and GP25 is the pin that drives the user LED on a Pico 2. So the line
+    /// that blinks a Pico 2 asserts the radio's chip select on a Pico 2 W, from identical source and
+    /// with nothing to see.</remarks>
+    public Rp2350GpioDriver(uint reserved)
     {
+        _reserved = reserved;
         _resetsClr = Rp2350Instances.RESETS_CLR_BASE + Rp2350ResetsLayout.RESET_OFF;
         _resetsDone = Rp2350Instances.RESETS_BASE + Rp2350ResetsLayout.RESET_DONE_OFF;
         _ioCtrl0 = Rp2350Instances.IO_BANK0_BASE + Rp2350IoBank0Layout.GPIO0_CTRL_OFF;
@@ -42,6 +55,8 @@ public sealed class Rp2350GpioDriver : GpioDriver
 
     protected override void ClosePin(int pinNumber)
     {
+        if (IsReserved(pinNumber)) return;
+
         Mmio.Write32(_sioOeClr, 1u << pinNumber);
     }
 
@@ -54,8 +69,21 @@ public sealed class Rp2350GpioDriver : GpioDriver
         }
     }
 
+    private bool IsReserved(int pinNumber)
+    {
+        return (_reserved & (1u << pinNumber)) != 0u;
+    }
+
     protected override void SetPinMode(int pinNumber, PinMode mode)
     {
+        if (IsReserved(pinNumber))
+        {
+#if LAMELLA_CORLIB_LINKED
+            throw new System.ArgumentException("pin is reserved by the board");
+#else
+            throw new System.Exception("pin is reserved by the board");
+#endif
+        }
         EnsureBankReady();
         Mmio.Write32(_ioCtrl0 + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * (uint)pinNumber,
             Rp2350IoBank0Layout.FUNCSEL_SIO);

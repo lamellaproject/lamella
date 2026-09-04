@@ -453,12 +453,10 @@ pub fn image_for_board(
 /// be false -- the board is in the table precisely because it can be written.
 fn cannot_build_for(board_id: &str) -> String {
     let mut message = format!(
-        "lamella deploy: {board_id} can be FLASHED but not BUILT FOR -- the ahead-of-time
+        "lamella deploy: nothing here names an ahead-of-time target for {board_id}, so this
 "
     );
-    message.push_str("backend has no target for its chip, so there is nothing to compile this
-");
-    message.push_str("program into.
+    message.push_str("verb has nothing to compile the program into.
 
 ");
     message.push_str(&format!("    lamella flash <image> --board {board_id}
@@ -466,8 +464,38 @@ fn cannot_build_for(board_id: &str) -> String {
 "));
     message.push_str("writes an image that already exists, which is the verb this board
 ");
-    message.push_str("supports today.");
+    message.push_str("supports today.
+
+");
+    message.push_str("a board reaches this two ways, and they are a different wait: no code
+");
+    message.push_str("generator exists for its instruction set, or one exists and nobody has
+");
+    message.push_str(&format!("wired it to this board. this build generates {}.
+", generators_in_this_build()));
     message
+}
+
+/// The instruction sets THIS BINARY can generate code for, as a phrase for a refusal to quote.
+///
+/// **A tool cannot report a capability it was not linked with, and it must not report one it was.**
+/// The ahead-of-time backend selects its code generators by cargo feature, so what the project can
+/// compile and what the program in front of a reader can compile are two different questions --
+/// and the second is the one a refusal is answering. Deriving the list keeps them apart: a build
+/// configured differently says something different, without anyone editing this sentence.
+fn generators_in_this_build() -> String {
+    let mut sets: Vec<&str> = Vec::new();
+    if cfg!(feature = "aot-arm32") {
+        sets.push("Cortex-M");
+    }
+    if cfg!(feature = "aot-riscv32") {
+        sets.push("RISC-V");
+    }
+    match sets.as_slice() {
+        [] => "no instruction set at all, which is a build configuration error".to_owned(),
+        [only] => format!("code for {only}"),
+        [first, rest @ ..] => format!("code for {first} and {}", rest.join(" and ")),
+    }
 }
 
 /// Compile `source` and lower it ahead of time to a bare-metal image for `aot_target`.
@@ -488,7 +516,7 @@ fn build_image(
             path.display()
         ));
     }
-    lamella_aot::build::build_cortex_m(&assembly, aot_target).map_err(|error| {
+    lamella_aot::build::build(&assembly, aot_target).map_err(|error| {
         format!(
             "lamella deploy: the ahead-of-time build failed: {error:?}\n\n\
              This is the flat, linker-free path, and its limits are worth knowing before you read \
@@ -648,6 +676,10 @@ mod tests {
     ///
     /// It is the state a reader is most likely to misread, because the write succeeded and the
     /// board is running: nothing about the outcome hints that a check the route CAN do was not done.
+    /// **THE INVARIANT THAT REPLACED A SECOND PREDICATE.** The wording tests above are only as
+    /// honest as the verification handed to them, so this asserts the thing that actually decides
+    /// it: the volume mechanism declares its own impossibility by answering `None`, which is what
+    /// makes a "verified" sentence unreachable on that route rather than merely unwritten.
     ///
     /// **AN UNSTAMPED RP2350 IMAGE MUST BE REFUSED HERE, BECAUSE THE BOARD WILL NOT SAY ANYTHING.**
     /// The bootrom scans the first 4 KB for a PICOBIN block and, finding none, does not boot: no
@@ -853,6 +885,20 @@ class Program
     }
 
     #[test]
+    fn the_tool_carries_a_code_generator_for_every_target_it_can_be_handed() {
+        if lamella_wire_host::engine::LcscCompiler::discover().is_err() {
+            return;
+        }
+        let path = Path::new("Blink.cs");
+        for target in ["microbit", "ch32v003"] {
+            let image = build_image(path, BLINK, target, true).unwrap_or_else(|error| {
+                panic!("{target}: this build cannot compile for it: {error}")
+            });
+            assert!(image.len() > 64, "{target}: {} B is too small to be a program", image.len());
+        }
+    }
+
+    #[test]
     fn a_program_with_no_entry_is_refused_by_name() {
         if lamella_wire_host::engine::LcscCompiler::discover().is_err() {
             return;
@@ -882,12 +928,12 @@ class Program
     }
 
     #[test]
-    fn an_ambiguous_bench_with_no_terminal_refuses_and_names_the_candidates() {
+    fn ambiguous_hardware_with_no_terminal_refuses_and_names_the_candidates() {
         let candidates =
-            vec!["E664A836A3198437".to_owned(), "E664A836A329AB37".to_owned()];
+            vec!["SERIAL0000000002".to_owned(), "SERIAL0000000003".to_owned()];
         let error = ask(&candidates).expect_err("no terminal in a test process");
-        assert!(error.contains("E664A836A3198437"), "it names every candidate: {error}");
-        assert!(error.contains("E664A836A329AB37"), "both of them: {error}");
+        assert!(error.contains("SERIAL0000000002"), "it names every candidate: {error}");
+        assert!(error.contains("SERIAL0000000003"), "both of them: {error}");
         assert!(error.contains("--probe"), "and the way to choose: {error}");
         assert!(error.contains("succeeds and reports nothing"), "and why it will not guess");
     }

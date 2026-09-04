@@ -14,22 +14,75 @@ namespace System
         private static readonly int[] DaysToMonth366 =
             { 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366 };
 
-        private long _ticks;
+        private long _dateData;
+
+        private const int KindShift = 62;
+        private const long TicksMask = 0x3FFFFFFFFFFFFFFF;
+        private const long KindBitsMask = 3L << KindShift;
+        private const long KindBitsUnspecified = 0L;
+        private const long KindBitsUtc = 1L << KindShift;
+        private const long KindBitsLocal = 2L << KindShift;
+
+        private const long MinTicks = 0;
+        private const long MaxTicks = 3155378975999999999;
+
+        private long InternalTicks { get { return _dateData & TicksMask; } }
+
+        private long InternalKindBits { get { return _dateData & KindBitsMask; } }
+
+        private static long CheckedTicks(long ticks)
+        {
+            if (ticks < MinTicks || ticks > MaxTicks)
+            {
+                throw new ArgumentOutOfRangeException("Ticks must be between DateTime.MinValue.Ticks and DateTime.MaxValue.Ticks.");
+            }
+            return ticks;
+        }
+
+        private static DateTime FromDateData(long dateData)
+        {
+            DateTime result = new DateTime(0L);
+            result._dateData = dateData;
+            return result;
+        }
+
+        private DateTime WithTicks(long ticks)
+        {
+            return FromDateData(CheckedTicks(ticks) | InternalKindBits);
+        }
 
         public static readonly DateTime MinValue = new DateTime(0L);
         public static readonly DateTime MaxValue = new DateTime(DateToTicks(9999, 12, 31) + TicksPerDay - 1);
 
-        public DateTime(long ticks) { _ticks = ticks; }
+        public DateTime(long ticks) { _dateData = CheckedTicks(ticks); }
 
         public DateTime(int year, int month, int day)
         {
-            _ticks = DateToTicks(year, month, day);
+            _dateData = CheckedTicks(DateToTicks(year, month, day));
         }
 
         public DateTime(int year, int month, int day, int hour, int minute, int second)
         {
-            _ticks = DateToTicks(year, month, day) + TimeToTicks(hour, minute, second);
+            _dateData = CheckedTicks(DateToTicks(year, month, day) + TimeToTicks(hour, minute, second));
         }
+
+        public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond)
+        {
+            _dateData = CheckedTicks(DateToTicks(year, month, day)
+                + TimeToTicks(hour, minute, second)
+                + (long)millisecond * TicksPerMillisecond);
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public DateTime(long ticks, DateTimeKind kind)
+        {
+            if (kind < DateTimeKind.Unspecified || kind > DateTimeKind.Local)
+            {
+                throw new ArgumentException("Invalid DateTimeKind value.", "kind");
+            }
+            _dateData = CheckedTicks(ticks) | ((long)kind << KindShift);
+        }
+#endif
 
         public static bool IsLeapYear(int year)
         {
@@ -50,24 +103,24 @@ namespace System
             return totalSeconds * TicksPerSecond;
         }
 
-        public long Ticks { get { return _ticks; } }
+        public long Ticks { get { return InternalTicks; } }
 
         [Lamella.Runtime.RuntimeProvided] private static long NowTicks() { return 0; }
 
-        public static DateTime Now { get { return new DateTime(NowTicks()); } }
+        public static DateTime Now { get { return FromDateData(CheckedTicks(NowTicks()) | KindBitsLocal); } }
 
-        public static DateTime UtcNow { get { return new DateTime(NowTicks()); } }
+        public static DateTime UtcNow { get { return FromDateData(CheckedTicks(NowTicks()) | KindBitsUtc); } }
 
         public static DateTime Today
         {
             get
             {
-                long ticks = NowTicks();
-                return new DateTime(ticks - (ticks % TicksPerDay));
+                long ticks = CheckedTicks(NowTicks());
+                return FromDateData((ticks - (ticks % TicksPerDay)) | KindBitsLocal);
             }
         }
 
-        private int DayNumber { get { return (int)(_ticks / TicksPerDay); } }
+        private int DayNumber { get { return (int)(InternalTicks / TicksPerDay); } }
 
         private int GetDatePart(int part)
         {
@@ -101,21 +154,21 @@ namespace System
         public int Day { get { return GetDatePart(2); } }
         public int DayOfYear { get { return GetDatePart(3); } }
 
-        public int Hour { get { return (int)((_ticks / TicksPerHour) % 24); } }
-        public int Minute { get { return (int)((_ticks / TicksPerMinute) % 60); } }
-        public int Second { get { return (int)((_ticks / TicksPerSecond) % 60); } }
-        public int Millisecond { get { return (int)((_ticks / TicksPerMillisecond) % 1000); } }
+        public int Hour { get { return (int)((InternalTicks / TicksPerHour) % 24); } }
+        public int Minute { get { return (int)((InternalTicks / TicksPerMinute) % 60); } }
+        public int Second { get { return (int)((InternalTicks / TicksPerSecond) % 60); } }
+        public int Millisecond { get { return (int)((InternalTicks / TicksPerMillisecond) % 1000); } }
 
-        public DayOfWeek DayOfWeek { get { return (DayOfWeek)((int)((_ticks / TicksPerDay + 1) % 7)); } }
+        public DayOfWeek DayOfWeek { get { return (DayOfWeek)((int)((InternalTicks / TicksPerDay + 1) % 7)); } }
 
-        public DateTime Date { get { return new DateTime(_ticks - (_ticks % TicksPerDay)); } }
+        public DateTime Date { get { long ticks = InternalTicks; return WithTicks(ticks - (ticks % TicksPerDay)); } }
 
-        public TimeSpan TimeOfDay { get { return new TimeSpan(_ticks % TicksPerDay); } }
+        public TimeSpan TimeOfDay { get { return new TimeSpan(InternalTicks % TicksPerDay); } }
 
-        public DateTime Add(TimeSpan value) { return new DateTime(_ticks + value.Ticks); }
-        public DateTime AddTicks(long value) { return new DateTime(_ticks + value); }
-        public TimeSpan Subtract(DateTime value) { return new TimeSpan(_ticks - value._ticks); }
-        public DateTime Subtract(TimeSpan value) { return new DateTime(_ticks - value.Ticks); }
+        public DateTime Add(TimeSpan value) { return WithTicks(InternalTicks + value.Ticks); }
+        public DateTime AddTicks(long value) { return WithTicks(InternalTicks + value); }
+        public TimeSpan Subtract(DateTime value) { return new TimeSpan(InternalTicks - value.InternalTicks); }
+        public DateTime Subtract(TimeSpan value) { return WithTicks(InternalTicks - value.Ticks); }
 
 #if LAMELLA_SURFACE_FLOAT
         public DateTime AddDays(double value) { return AddTicks((long)(value * (double)TicksPerDay)); }
@@ -143,7 +196,7 @@ namespace System
             }
             int daysInMonth = DaysInMonth(y, m);
             if (d > daysInMonth) d = daysInMonth;
-            return new DateTime(DateToTicks(y, m, d) + (_ticks % TicksPerDay));
+            return WithTicks(DateToTicks(y, m, d) + (InternalTicks % TicksPerDay));
         }
 
         public DateTime AddYears(int value)
@@ -159,8 +212,8 @@ namespace System
 
         public int CompareTo(DateTime value)
         {
-            if (_ticks < value._ticks) return -1;
-            if (_ticks > value._ticks) return 1;
+            if (InternalTicks < value.InternalTicks) return -1;
+            if (InternalTicks > value.InternalTicks) return 1;
             return 0;
         }
 
@@ -170,29 +223,257 @@ namespace System
             return CompareTo((DateTime)obj);
         }
 
-        public bool Equals(DateTime value) { return _ticks == value._ticks; }
+        public bool Equals(DateTime value) { return InternalTicks == value.InternalTicks; }
 
         public override bool Equals(object obj)
         {
             if (obj == null) return false;
-            return _ticks == ((DateTime)obj)._ticks;
+            return InternalTicks == ((DateTime)obj).InternalTicks;
         }
 
         public override int GetHashCode()
         {
-            return (int)_ticks ^ (int)(_ticks >> 32);
+            long ticks = InternalTicks;
+            return (int)ticks ^ (int)(ticks >> 32);
         }
 
-        public static bool operator ==(DateTime left, DateTime right) { return left._ticks == right._ticks; }
-        public static bool operator !=(DateTime left, DateTime right) { return left._ticks != right._ticks; }
-        public static bool operator <(DateTime left, DateTime right) { return left._ticks < right._ticks; }
-        public static bool operator >(DateTime left, DateTime right) { return left._ticks > right._ticks; }
-        public static bool operator <=(DateTime left, DateTime right) { return left._ticks <= right._ticks; }
-        public static bool operator >=(DateTime left, DateTime right) { return left._ticks >= right._ticks; }
+        public static int Compare(DateTime t1, DateTime t2)
+        {
+            if (t1.InternalTicks < t2.InternalTicks) return -1;
+            if (t1.InternalTicks > t2.InternalTicks) return 1;
+            return 0;
+        }
 
-        public static DateTime operator +(DateTime d, TimeSpan t) { return new DateTime(d._ticks + t.Ticks); }
-        public static DateTime operator -(DateTime d, TimeSpan t) { return new DateTime(d._ticks - t.Ticks); }
-        public static TimeSpan operator -(DateTime left, DateTime right) { return new TimeSpan(left._ticks - right._ticks); }
+        public static bool Equals(DateTime t1, DateTime t2)
+        {
+            return t1.InternalTicks == t2.InternalTicks;
+        }
+
+        public DateTime ToLocalTime()
+        {
+            if (InternalKindBits == KindBitsLocal) return this;
+            return FromDateData(InternalTicks | KindBitsLocal);
+        }
+
+        public DateTime ToUniversalTime()
+        {
+            if (InternalKindBits == KindBitsUtc) return this;
+            return FromDateData(InternalTicks | KindBitsUtc);
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public DateTimeKind Kind { get { return (DateTimeKind)(int)((_dateData >> KindShift) & 3L); } }
+
+        public static DateTime SpecifyKind(DateTime value, DateTimeKind kind)
+        {
+            return new DateTime(value.InternalTicks, kind);
+        }
+#endif
+
+        public static bool operator ==(DateTime left, DateTime right) { return left.InternalTicks == right.InternalTicks; }
+        public static bool operator !=(DateTime left, DateTime right) { return left.InternalTicks != right.InternalTicks; }
+        public static bool operator <(DateTime left, DateTime right) { return left.InternalTicks < right.InternalTicks; }
+        public static bool operator >(DateTime left, DateTime right) { return left.InternalTicks > right.InternalTicks; }
+        public static bool operator <=(DateTime left, DateTime right) { return left.InternalTicks <= right.InternalTicks; }
+        public static bool operator >=(DateTime left, DateTime right) { return left.InternalTicks >= right.InternalTicks; }
+
+        public static DateTime operator +(DateTime d, TimeSpan t) { return d.WithTicks(d.InternalTicks + t.Ticks); }
+        public static DateTime operator -(DateTime d, TimeSpan t) { return d.WithTicks(d.InternalTicks - t.Ticks); }
+        public static TimeSpan operator -(DateTime left, DateTime right) { return new TimeSpan(left.InternalTicks - right.InternalTicks); }
+
+        public static DateTime Parse(string s)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            DateTime parsed;
+            if (!TryParseCore(s, out parsed))
+            {
+                throw new FormatException("String was not recognized as a valid DateTime.");
+            }
+            return parsed;
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public static bool TryParse(string s, out DateTime result)
+        {
+            return TryParseCore(s, out result);
+        }
+#endif
+
+        private static bool TryParseCore(string s, out DateTime result)
+        {
+            result = new DateTime(0L);
+            if ((object)s == null) return false;
+
+            int end = s.Length;
+            while (end > 0 && Char.IsWhiteSpace(s[end - 1])) end = end - 1;
+            int i = 0;
+            while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1;
+            if (i >= end) return false;
+
+            int firstStart = i;
+            int stop = DigitRunEnd(s, i, end);
+            if (stop == i) return false;
+            int first = DigitValue(s, i, stop);
+            int firstLength = stop - i;
+
+            int year = 0;
+            int month = 0;
+            int day = 0;
+            bool haveDate = false;
+
+            if (stop < end && s[stop] == '-')
+            {
+                if (firstLength != 4) return false;
+                year = first;
+                i = stop + 1;
+                stop = DigitRunEnd(s, i, end);
+                if (stop == i || stop - i > 2) return false;
+                month = DigitValue(s, i, stop);
+                i = stop;
+                if (i >= end || s[i] != '-') return false;
+                i = i + 1;
+                stop = DigitRunEnd(s, i, end);
+                if (stop == i || stop - i > 2) return false;
+                day = DigitValue(s, i, stop);
+                i = stop;
+                haveDate = true;
+            }
+            else if (stop < end && s[stop] == '/')
+            {
+                if (firstLength > 2) return false;
+                month = first;
+                i = stop + 1;
+                stop = DigitRunEnd(s, i, end);
+                if (stop == i || stop - i > 2) return false;
+                day = DigitValue(s, i, stop);
+                i = stop;
+                if (i >= end || s[i] != '/') return false;
+                i = i + 1;
+                stop = DigitRunEnd(s, i, end);
+                if (stop - i != 4) return false;
+                year = DigitValue(s, i, stop);
+                i = stop;
+                haveDate = true;
+            }
+
+            long dayTicks;
+            if (haveDate)
+            {
+                if (year < 1 || year > 9999) return false;
+                if (month < 1 || month > 12) return false;
+                if (day < 1 || day > DaysInMonth(year, month)) return false;
+                dayTicks = DateToTicks(year, month, day);
+                if (i < end)
+                {
+                    if (s[i] == 'T') i = i + 1;
+                    else if (Char.IsWhiteSpace(s[i])) { while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1; }
+                    else return false;
+                    if (i >= end) return false;
+                }
+            }
+            else
+            {
+                long nowTicks = CheckedTicks(NowTicks());
+                dayTicks = nowTicks - (nowTicks % TicksPerDay);
+                i = firstStart;
+            }
+
+            long timeTicks = 0;
+            if (i < end)
+            {
+                if (!TryReadTime(s, end, i, out timeTicks)) return false;
+            }
+            else if (!haveDate)
+            {
+                return false;
+            }
+
+            result = FromDateData((dayTicks + timeTicks) | KindBitsUnspecified);
+            return true;
+        }
+
+        private static bool TryReadTime(string s, int end, int i, out long ticks)
+        {
+            ticks = 0;
+            int stop = DigitRunEnd(s, i, end);
+            if (stop == i || stop - i > 2) return false;
+            int hour = DigitValue(s, i, stop);
+            i = stop;
+            if (i >= end || s[i] != ':') return false;
+            i = i + 1;
+            stop = DigitRunEnd(s, i, end);
+            if (stop - i != 2) return false;
+            int minute = DigitValue(s, i, stop);
+            i = stop;
+
+            int second = 0;
+            long fraction = 0;
+            if (i < end && s[i] == ':')
+            {
+                i = i + 1;
+                stop = DigitRunEnd(s, i, end);
+                if (stop - i != 2) return false;
+                second = DigitValue(s, i, stop);
+                i = stop;
+                if (i < end && s[i] == '.')
+                {
+                    i = i + 1;
+                    stop = DigitRunEnd(s, i, end);
+                    int length = stop - i;
+                    if (length < 1 || length > 7) return false;
+                    long scale = TicksPerSecond / 10;
+                    for (int j = i; j < stop; j++)
+                    {
+                        fraction = fraction + (long)(s[j] - '0') * scale;
+                        scale = scale / 10;
+                    }
+                    i = stop;
+                }
+            }
+
+            bool pm = false;
+            bool haveDesignator = false;
+            while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1;
+            if (i < end)
+            {
+                if (i + 2 > end) return false;
+                char lead = s[i];
+                char mark = s[i + 1];
+                if (mark != 'M' && mark != 'm') return false;
+                if (lead == 'P' || lead == 'p') pm = true;
+                else if (lead != 'A' && lead != 'a') return false;
+                haveDesignator = true;
+                i = i + 2;
+                while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1;
+            }
+            if (i != end) return false;
+
+            if (haveDesignator)
+            {
+                if (hour < 1 || hour > 12) return false;
+                if (pm) { if (hour != 12) hour = hour + 12; }
+                else if (hour == 12) hour = 0;
+            }
+            else if (hour > 23) return false;
+            if (minute > 59 || second > 59) return false;
+
+            ticks = TimeToTicks(hour, minute, second) + fraction;
+            return true;
+        }
+
+        private static int DigitRunEnd(string s, int start, int end)
+        {
+            int j = start;
+            while (j < end && s[j] >= '0' && s[j] <= '9') j = j + 1;
+            return j;
+        }
+
+        private static int DigitValue(string s, int start, int stop)
+        {
+            int value = 0;
+            for (int j = start; j < stop; j++) value = value * 10 + (s[j] - '0');
+            return value;
+        }
 
         private static void AppendPadded(System.Text.StringBuilder builder, int value, int width)
         {

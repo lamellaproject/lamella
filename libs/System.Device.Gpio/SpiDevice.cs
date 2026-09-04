@@ -16,30 +16,30 @@ namespace System.Device.Spi
         public abstract SpiConnectionSettings ConnectionSettings { get; }
 
         /// <summary>Reads data from the SPI device, filling <paramref name="buffer"/>.</summary>
-        public abstract void Read(byte[] buffer);
+        public abstract void Read(System.Span<byte> buffer);
 
         /// <summary>Reads a byte from the SPI device.</summary>
         public virtual byte ReadByte()
         {
             byte[] buffer = new byte[1];
-            Read(buffer);
+            Read(new System.Span<byte>(buffer));
             return buffer[0];
         }
 
         /// <summary>Writes <paramref name="buffer"/> to the SPI device.</summary>
-        public abstract void Write(byte[] buffer);
+        public abstract void Write(System.ReadOnlySpan<byte> buffer);
 
         /// <summary>Writes a byte to the SPI device.</summary>
         public virtual void WriteByte(byte value)
         {
             byte[] buffer = new byte[1];
             buffer[0] = value;
-            Write(buffer);
+            Write(new System.ReadOnlySpan<byte>(buffer));
         }
 
         /// <summary>Writes and reads data as one full-duplex operation: every written word
         /// clocks a word in. The buffers must be the same length.</summary>
-        public abstract void TransferFullDuplex(byte[] writeBuffer, byte[] readBuffer);
+        public abstract void TransferFullDuplex(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer);
 
         /// <summary>Creates a communications channel to the device described by
         /// <paramref name="settings"/>, over the driver the board bound for
@@ -73,6 +73,7 @@ namespace System.Device.Spi
         private readonly bool _ownsDriver;
         private readonly byte[] _oneOut;
         private readonly byte[] _oneIn;
+        private readonly byte[] _none;
 
         internal DriverSpiDevice(SpiConnectionSettings settings, SpiDriver driver, bool ownsDriver)
         {
@@ -81,6 +82,7 @@ namespace System.Device.Spi
             _ownsDriver = ownsDriver;
             _oneOut = new byte[1];
             _oneIn = new byte[1];
+            _none = new byte[0];
             driver.Configure(settings);
         }
 
@@ -94,34 +96,30 @@ namespace System.Device.Spi
             get { return _driver.NativeBusIdentity; }
         }
 
-        public override void Read(byte[] buffer)
+        public override void Read(System.Span<byte> buffer)
         {
-            if ((object)buffer == null) throw new System.ArgumentNullException("buffer");
-            Transfer(null, buffer, buffer.Length);
+            Transfer(new System.ReadOnlySpan<byte>(_none), buffer, buffer.Length);
         }
 
         public override byte ReadByte()
         {
-            Transfer(null, _oneIn, 1);
+            Transfer(new System.ReadOnlySpan<byte>(_none), new System.Span<byte>(_oneIn), 1);
             return _oneIn[0];
         }
 
-        public override void Write(byte[] buffer)
+        public override void Write(System.ReadOnlySpan<byte> buffer)
         {
-            if ((object)buffer == null) throw new System.ArgumentNullException("buffer");
-            Transfer(buffer, null, buffer.Length);
+            Transfer(buffer, new System.Span<byte>(_none), buffer.Length);
         }
 
         public override void WriteByte(byte value)
         {
             _oneOut[0] = value;
-            Transfer(_oneOut, null, 1);
+            Transfer(new System.ReadOnlySpan<byte>(_oneOut), new System.Span<byte>(_none), 1);
         }
 
-        public override void TransferFullDuplex(byte[] writeBuffer, byte[] readBuffer)
+        public override void TransferFullDuplex(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer)
         {
-            if ((object)writeBuffer == null) throw new System.ArgumentNullException("writeBuffer");
-            if ((object)readBuffer == null) throw new System.ArgumentNullException("readBuffer");
             if (writeBuffer.Length != readBuffer.Length)
             {
                 throw new System.ArgumentException("The write and read buffers must be the same length.");
@@ -129,7 +127,7 @@ namespace System.Device.Spi
             Transfer(writeBuffer, readBuffer, writeBuffer.Length);
         }
 
-        private void Transfer(byte[] writeBuffer, byte[] readBuffer, int count)
+        private void Transfer(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer, int count)
         {
             _driver.SetChipSelect(true);
             int status;

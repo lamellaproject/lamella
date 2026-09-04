@@ -538,6 +538,29 @@ pub struct Heap {
     /// [`Heap::should_collect`]); adapts after each collection.
     #[cfg(feature = "gc")]
     gc_threshold: usize,
+    /// The identity hash of each object that has been ASKED for one, as `(object index, hash)`
+    /// sorted by index -- the storage behind `Object.GetHashCode`.
+    ///
+    /// # Why it cannot be derived from the reference
+    ///
+    /// `Object.GetHashCode` answers a value that is stable for the object's LIFETIME and equal for
+    /// two references to one object. An `ObjectRef` satisfies neither on its own: [`Heap::collect`]
+    /// compacts, so every surviving object's index changes whenever a collection runs. The hash is
+    /// therefore ASSIGNED once, on first request, and carried across collections with its object.
+    ///
+    /// # Lazy, and WEAK
+    ///
+    /// Entries appear only for objects somebody hashed, so a program that never hashes pays
+    /// nothing. And a hashed object is NOT kept alive by having been hashed: the collector drops
+    /// entries whose object did not survive, in the same pass that rewrites the survivors' indices.
+    /// Treating these as strong roots -- the way the exception-message table deliberately does --
+    /// would mean every object ever used as a dictionary key lived forever.
+    ///
+    identity_hashes: Vec<(u32, i32)>,
+    /// The counter the next identity hash is mixed from. Not the hash itself: consecutive counter
+    /// values would put every object in adjacent buckets, which is the distribution failure this
+    /// whole change exists to remove.
+    next_identity_hash: u32,
     /// A HARD ceiling on the live object count (`None` = unbounded, the host default). An
     /// embedder on a fixed heap sets it BELOW the real capacity (leaving headroom to allocate
     /// the OutOfMemoryException itself); when a collection cannot bring the count under it, the
@@ -557,6 +580,8 @@ impl Default for Heap {
         Heap {
             objects: Vec::new(),
             intern: BTreeMap::new(),
+            identity_hashes: Vec::new(),
+            next_identity_hash: 0,
             gc_threshold: INITIAL_GC_THRESHOLD,
             object_budget: None,
             #[cfg(feature = "finalizers")]
@@ -570,6 +595,37 @@ impl Heap {
     #[must_use]
     pub fn new() -> Heap {
         Heap::default()
+    }
+
+    /// The identity hash of `reference`, assigning one on first request.
+    ///
+    /// Stable for the object's lifetime, equal for two references to one object, and unrelated to
+    /// the object's current index -- see [`Heap::identity_hashes`] for why the index cannot be it.
+    /// Never zero, so a stored hash is distinguishable from an empty slot by eye in a dump.
+    pub fn identity_hash(&mut self, reference: ObjectRef) -> i32 {
+        let index = reference.0;
+        match self.identity_hashes.binary_search_by_key(&index, |&(key, _)| key) {
+            Ok(at) => self.identity_hashes[at].1,
+            Err(at) => {
+                self.next_identity_hash = self.next_identity_hash.wrapping_add(1);
+                let mut mixed = self.next_identity_hash;
+                mixed ^= mixed >> 16;
+                mixed = mixed.wrapping_mul(0x7feb_352d);
+                mixed ^= mixed >> 15;
+                mixed = mixed.wrapping_mul(0x846c_a68b);
+                mixed ^= mixed >> 16;
+                let hash = if mixed == 0 { 1 } else { mixed as i32 };
+                self.identity_hashes.insert(at, (index, hash));
+                hash
+            }
+        }
+    }
+
+    /// How many objects currently carry an assigned identity hash -- for tests that need to see the
+    /// table shrink when hashed objects die, which is the property that keeps it from being a leak.
+    #[must_use]
+    pub fn identity_hash_count(&self) -> usize {
+        self.identity_hashes.len()
     }
 
     /// Sets the HARD live-object budget (`None` = unbounded). See [`Heap::object_budget`].
@@ -1676,6 +1732,13 @@ impl Heap {
                 *reference = ObjectRef(new_index);
             }
         }
+        self.identity_hashes.retain_mut(|(index, _)| match remap[*index as usize] {
+            Some(moved) => {
+                *index = moved;
+                true
+            }
+            None => false,
+        });
         self.gc_threshold = self
             .objects
             .len()
@@ -2423,5 +2486,106 @@ mod tests {
         assert!(!heap.array_remove_at(packed, 0));
         assert!(!heap.array_insert(packed, 0, Value::Int32(1)));
         assert_eq!(heap.array_len(packed), Some(2));
+    }
+}
+
+#[cfg(all(test, feature = "gc"))]
+mod identity_hash_tests {
+    use super::*;
+
+    /// The contract's first clause: one object, one hash, however often it is asked.
+    #[test]
+    fn one_object_answers_one_hash() {
+        let mut heap = Heap::new();
+        let object = heap.alloc_instance(1, alloc::vec![Value::Int32(7)]);
+        let first = heap.identity_hash(object);
+        assert_eq!(heap.identity_hash(object), first, "asking twice must not reassign");
+        assert_ne!(first, 0, "an assigned hash is never zero");
+    }
+
+    /// The clause the old constant broke: distinct objects get distinct hashes, so a table keyed by
+    /// them does not collapse into one bucket.
+    #[test]
+    fn distinct_objects_get_distinct_hashes() {
+        let mut heap = Heap::new();
+        let hashes: Vec<i32> = (0..64)
+            .map(|n| {
+                let object = heap.alloc_instance(1, alloc::vec![Value::Int32(n)]);
+                heap.identity_hash(object)
+            })
+            .collect();
+        let mut unique = hashes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), hashes.len(), "64 objects produced a collision: {hashes:?}");
+    }
+
+    /// THE CASE THE REFERENCE ITSELF CANNOT SATISFY. A collection compacts, so a surviving object's
+    /// index changes -- and its hash must not. This is the whole reason the value is stored.
+    #[test]
+    fn a_hash_survives_the_collection_that_moves_its_object() {
+        let mut heap = Heap::new();
+        let doomed = heap.alloc_instance(1, alloc::vec![Value::Int32(1)]);
+        let mut kept = heap.alloc_instance(1, alloc::vec![Value::Int32(2)]);
+        let _ = heap.identity_hash(doomed);
+        let before = heap.identity_hash(kept);
+        let index_before = kept.0;
+
+        let mut root = Value::Object(kept);
+        heap.collect(&mut |visit: &mut dyn FnMut(&mut Value)| visit(&mut root));
+        let Value::Object(moved) = root else { panic!("the root stopped being an object") };
+        kept = moved;
+
+        assert_ne!(kept.0, index_before, "the survivor did not actually move -- test proves nothing");
+        assert_eq!(heap.identity_hash(kept), before, "the hash moved with the object");
+    }
+
+    /// And the property that keeps the table from being a leak: hashing an object does not root it,
+    /// so its entry goes away with it.
+    #[test]
+    fn a_dead_objects_hash_is_dropped() {
+        let mut heap = Heap::new();
+        let doomed = heap.alloc_instance(1, alloc::vec![Value::Int32(1)]);
+        let kept = heap.alloc_instance(1, alloc::vec![Value::Int32(2)]);
+        let _ = heap.identity_hash(doomed);
+        let _ = heap.identity_hash(kept);
+        assert_eq!(heap.identity_hash_count(), 2);
+
+        let mut root = Value::Object(kept);
+        heap.collect(&mut |visit: &mut dyn FnMut(&mut Value)| visit(&mut root));
+
+        assert_eq!(
+            heap.identity_hash_count(),
+            1,
+            "the unreachable object's hash entry outlived it, so hashing roots"
+        );
+    }
+
+    /// The table is searched by binary search, so it has to stay sorted across a compaction. A
+    /// lookup that silently missed would hand the same object a SECOND hash.
+    #[test]
+    fn the_table_stays_searchable_after_a_compaction() {
+        let mut heap = Heap::new();
+        let mut kept: Vec<ObjectRef> = Vec::new();
+        for n in 0..8 {
+            let object = heap.alloc_instance(1, alloc::vec![Value::Int32(n)]);
+            if n % 2 == 0 {
+                kept.push(object);
+            }
+        }
+        let before: Vec<i32> = kept.iter().map(|&o| heap.identity_hash(o)).collect();
+
+        let mut roots: Vec<Value> = kept.iter().map(|&o| Value::Object(o)).collect();
+        heap.collect(&mut |visit: &mut dyn FnMut(&mut Value)| {
+            for value in roots.iter_mut() {
+                visit(value);
+            }
+        });
+
+        for (slot, want) in roots.iter().zip(before.iter()) {
+            let Value::Object(reference) = slot else { panic!("a root stopped being an object") };
+            assert_eq!(heap.identity_hash(*reference), *want, "a survivor was rehashed");
+        }
+        assert_eq!(heap.identity_hash_count(), before.len(), "the table gained or lost entries");
     }
 }

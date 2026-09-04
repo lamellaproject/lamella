@@ -1,0 +1,30 @@
+# BLOCK layout: the RP2040 user-bank pad controls. The per-pin register ARRAY is
+# GPIO<n> = base + GPIO0 offset + GPIO_STRIDE * n (stride 4, beside io-bank0's 8 -- the rp pads
+# derivation). VOLTAGE_SELECT sits at offset 0 and is per BANK rather than per pin, which is why
+# the array starts at 0x04.
+#
+# THERE IS NO ISOLATION BIT ON THIS PART, and that is the difference from the RP2350 rather than
+# an omission here. This part's bit 8 is Reserved; the RP2350 puts ISO there and resets it SET, so
+# every pin on that family needs a pad write before it works at all. Here the reset state is
+# already usable -- IE = 1, SCHMITT = 1, PDE = 1, DRIVE = 4 mA -- so routing the IO_BANK0 function
+# select is sufficient to drive a pin, and a pad write is only needed to change a pull or a drive.
+# Taking the sibling's layout would give this part a bit the silicon does not have.
+
+[table]
+kind = "block"
+family = "rp2040"
+block = "pads-bank0"
+sources = ["RP2040 datasheet 2.19.6.1 Table 339 (List of PADS_BANK0 registers) and Table 341 (the GPIO0..GPIO29 bit layout)"]
+notes = [
+    "The array covers GPIO0 to GPIO29 (0x04 to 0x78); SWCLK and SWD follow at 0x7c and 0x80 and are the debug pins, not user GPIOs.",
+    "PUE and PDE are independent enables rather than a direction bit -- setting both is a bus keeper, and neither is a level.",
+]
+
+[registers.GPIO0]
+offset = 0x4
+width = 32
+fields = { SLEWFAST = [0, 1], SCHMITT = [1, 1], PDE = [2, 1], PUE = [3, 1], DRIVE = [4, 2], IE = [6, 1], OD = [7, 1] }
+notes = "The array base pin (GPIO0); per-pin stride is 4. Reset state has IE, SCHMITT and PDE set and DRIVE at 4 mA."
+
+[constants]
+GPIO_STRIDE = 4

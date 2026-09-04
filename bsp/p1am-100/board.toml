@@ -1,0 +1,96 @@
+# BOARD binding: the AutomationDirect / FACTS Engineering P1AM-100, an industrial PLC CPU in the
+# Arduino MKR form factor. Board truth ONLY: on-board devices, the carrier, and the clock plan.
+# Chip truth lives in csp/samd21/.
+#
+# WHAT MAKES THIS BOARD UNUSUAL IS WHAT IT DOES NOT HAVE ROWS FOR, and no other SAMD21 product
+# shares the shape. Its real outputs are not on this part at all: up to fifteen P1000 I/O modules
+# clip onto a backplane to the right of the CPU and are reached over a SPI link to a separate base
+# controller, which is a co-processor with its own reset and its own readiness signal. So a
+# `[[devices]]` row here can describe the LINK and cannot describe a channel -- driving a pad on
+# this part does not drive a rack output, and there is no pin whose level says whether one is safe.
+#
+# The rows below are therefore the honest set: the one indicator and the switch this part owns
+# directly, the three lines that reach the base controller, and the card socket's select. What a
+# rack CHANNEL is, and how a channel joins a fail-safe latch set, is the vocabulary step and is
+# not invented here.
+#
+# The MKR header is a SUPERSET of what is stated: the board brings out the usual MKR pins, and a
+# row joins when a binding, a pin-map row or a device reaches it -- the same demand-driven rule
+# every other board in this directory follows.
+
+[table]
+kind = "board"
+board = "p1am-100"
+vendor = "automation-direct"   # -> the AutomationDirect namespace segment. The company sells the
+                               # product; FACTS Engineering designed it and publishes the schematic
+                               # and the Arduino core, which is why both appear in the sources.
+family = "samd21"
+part = "atsamd21g18a"
+product_model = 42            # lamella_wire::product_model::P1AM_100
+sources = [
+    "FACTS Engineering P1AM_100_REVA schematic (P1AM-Design-Files), sheet 2 of 2: the MCU is an ATSAMD21G18A, and the sheet carries an explicit IDE-number/SAMD-pin/purpose table giving IDE 31 = PA28 Toggle Switch, IDE 32 = PB8 BUILTIN_LED, IDE 33 = PB9 Base Controller Enable, IDE 28 = PA14 SD Card CS, IDE 5 = PB11 ETH CS",
+    "The same sheet's net names: PA16_S1_MOSI, PA17_S1_SCK and PA19_S1_MISO reach the base controller and the P1000 Module Connector; ARDUINO_CS reaches PA04_AIN4 through R17 (0 ohm, populated); COP_READY reaches PA05_AIN5 through R22 (0 ohm, populated), with R26 and R27 inside a DEPOP box and so unpopulated",
+    "FACTS Engineering P1AMCore variants/P1AM-100/variant.cpp pin descriptor table, index-ordered: Arduino 8/9/10 = PORTA 16/17/19, A3 = index 18 = PORTA 4, A4 = index 19 = PORTA 5, 28 = PORTA 14, 31 = PORTA 28, 32 = PORTB 8",
+    "FACTS Engineering P1AM-100 reference page: 'Pins A3, A4, and 8-10 are used for the base controller', with pin 8 MOSI, 9 CLK, 10 MISO, A3 CS, A4 ACK; the yellow user LED 'can be referenced by using LED_BUILTIN or 32' and the toggle switch 'using 31 or SWITCH_BUILTIN'",
+    "AutomationDirect P1AM-100 product page: SAMD21G18 at 48 MHz, 256 KB flash / 32 KB SRAM, microSD, a 32.768 kHz crystal for the RTC, and up to 15 P1000 I/O modules",
+]
+
+[[carriers]]
+kind = "native-usb"         # the chip's own USB device controller, over the micro-B jack. There is
+plan = "osc8m-8mhz"         # no on-board debugger and no bridge UART, so there is no fixed bridge
+default = true              # identity to state; the board is programmed through its own SAM-BA
+                            # bootloader, which a double-tap of the reset button enters.
+
+[[plans]]
+name = "osc8m-8mhz"         # the reset oscillator with its prescaler cleared -- the same plan the
+default = true              # other samd21 boards run. The board's 32.768 kHz crystal (Y2) feeds the
+source = "osc8m"            # RTC; a plan naming it joins when a consumer derives a value from it.
+gclk0_hz = 8000000
+
+[[plans]]
+name = "usb-48mhz"
+source = "dfll48m-usb-recovery"
+gclk1_hz = 48000000
+
+[[devices]]                 # the yellow user LED on the faceplate -- the board's blink target, and
+name = "led"                # the one indicator a program owns. The PWR and BASE LEDs beside it are
+kind = "gpio-out"           # hardware status lights and reach no pin, so neither gets a row.
+pin = "PB08"
+active = "high"
+source = "P1AM_100_REVA sheet 2 pin table (IDE 32 = PB8 = BUILTIN_LED), the net BUILTIN_LED driving D3 'LED' Yellow-Builtin, and variant.cpp index 32 = PORTB 8"
+
+[[devices]]                 # the recessed toggle switch behind the faceplate, marked RUN / STOP. An
+name = "run-switch"         # INPUT the program reads, not a supervisor: nothing in hardware acts on
+kind = "gpio-in"            # it, so what RUN means is the program's to decide.
+pin = "PA28"
+active = "low"              # RUN is the LOW reading -- see the source; the obvious guess is backwards.
+source = "P1AM_100_REVA sheet 2 pin table (IDE 31 = PA28 = Toggle Switch); variant.cpp index 31 = PORTA 28; the P1AM library defines SWITCH_BUILTIN as 31. THE POLARITY IS READ OFF THE TOGGLE'S OWN THREE TERMINALS rather than from the name: on the schematic's switch symbol, terminal 3 is +3.3V and sits on the STOP side of the body, terminal 1 is GND and sits on the RUN side, and terminal 2 is the common carrying the RUN_SWITCH net to that pad. So selecting RUN ties the pad to ground and the program reads LOW, and STOP reads HIGH. A row that assumed a switch asserts high would have inverted the one input on this board that names a machine state."
+
+[[devices]]                 # the base controller's ENABLE line. It is the co-processor that owns
+name = "base-enable"        # every rack channel, so this pin gates whether the outputs downstream
+kind = "gpio-out"           # can be driven at all -- a board-level fact with no channel behind it.
+pin = "PB09"
+active = "high"
+source = "P1AM_100_REVA sheet 2 pin table (IDE 33 = PB9 = Base Controller Enable) and the BASE_LED_GPIO / COP_RST_LATCH network around U3 (SN74LVC1G32DCK) feeding BASE_RESET and LATCH_RESET on the P1000 Module Connector. The polarity is the vendor library's own statement rather than a convention: P1AM.cpp defines `baseEnable` as 33 and writes it through `enableBaseController(state)`, called with HIGH at 'Start base controller' and with LOW at 'Disable base controller'."
+
+[[devices]]                 # the base controller's chip select on the SPI link, brought out to the
+name = "base-cs"            # MKR header as A3 -- so a shield claiming A3 takes the rack with it.
+kind = "gpio-out"
+pin = "PA04"
+active = "low"
+source = "P1AM_100_REVA sheet 2: the ARDUINO_CS net reaches PA04_AIN4 through R17 (0 ohm, populated), and PA04_AIN4 reaches header J6-5 = A3 through ferrite L6; the reference page states 'Pin A3: CS'. The polarity is the vendor library's own statement rather than the SPI convention: P1AM.cpp defines `slaveSelectPin` as A3 and brackets every base-controller transfer with `digitalWrite(slaveSelectPin, LOW)` before and `HIGH` after."
+
+[[devices]]                 # the base controller's readiness line back to this part (COP_READY,
+name = "base-ready"         # brought out as A4). An INPUT: the co-processor raises it, and a
+kind = "gpio-in"            # program that ignores it talks to a base that has not finished starting.
+pin = "PA05"
+active = "high"
+source = "P1AM_100_REVA sheet 2: the COP_READY net reaches PA05_AIN5 through R22 (0 ohm, populated) -- R26 to PA20_TCC0-W6 and R27 are inside the DEPOP box and are not fitted -- and PA05_AIN5 reaches header J6-6 = A4 through ferrite L13; the reference page states 'Pin A4: ACK'. The polarity is the vendor library's: P1AM.cpp defines `slaveAckPin` as A4 and spins on `while(!digitalRead(slaveAckPin))` at the comment 'wait for Base Controller to be ready', so READY is the HIGH reading."
+
+[[devices]]                 # the microSD socket's chip select. The card itself rides SERCOM2 (SPI1
+name = "sd-cs"              # in the vendor's numbering); this is the one line of that group the
+kind = "gpio-out"           # board drives as a plain pin rather than as a peripheral signal.
+pin = "PA14"
+active = "unknown"          # the PAD is established twice over; the asserted level is not, and
+                            # `unknown` is how that is said instead of assuming the SPI convention.
+source = "P1AM_100_REVA sheet 2 pin table (IDE 28 = PA14 = SD Card CS) and variant.cpp index 28 = PORTA 14, commented 'SS: as GPIO'. Those two establish the pad. Neither states the asserted level, and unlike the base-controller select there is no vendor library driving this line to read it off -- so the level is recorded as unestablished rather than inferred from what an SD host usually does."

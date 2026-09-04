@@ -10,8 +10,9 @@ use lamella_syntax::version::LanguageVersion;
 /// `/langversion` will be wired through**, and deliberately a single function rather than a
 /// literal repeated at each gate.
 ///
-/// It answers [`LanguageVersion::DEFAULT`] today because ISO-1 is the only dialect lcsc implements,
-/// so every feature gate fires unconditionally and every gate code is `CS8022`. The value is
+/// It answers [`LanguageVersion::DEFAULT`], which is DERIVED from what this build implements
+/// rather than pinned to ISO-1 -- so a gate here fires only for a construct the default rung does
+/// not admit, and the gate code is the default rung's rather than always `CS8022`. The value is
 /// nonetheless carried on the diagnostic rather than assumed where the message is formatted,
 /// because the code and the message's "in C# N" both derive from it: a second dialect changes five
 /// call sites through here, not thirty through a format string.
@@ -744,6 +745,23 @@ pub enum DiagnosticKind {
         /// The method name.
         method: Box<str>,
     },
+    /// `CS7007`: a `using static` directive names a NAMESPACE. Its operand is a `type_name`
+    /// (13.5.4), and the whole content of the mistake is that one word: the same text without
+    /// `static` is a correct namespace import, which is why csc's message suggests it.
+    UsingStaticNamesANamespace {
+        /// The name as written.
+        name: Box<str>,
+    },
+    /// `CS0229`: a simple name is offered at the same precedence by a `using static` import and by
+    /// something else in scope -- another import, or a `using`-imported type (13.5.3). Distinct
+    /// from `CS0104`, which is two TYPES: csc words this one as a bare *"Ambiguity between X and
+    /// Y"*, and reports it only where the name is USED.
+    AmbiguousMember {
+        /// One candidate's qualified name, as csc quotes it.
+        first: Box<str>,
+        /// The other candidate's qualified name.
+        second: Box<str>,
+    },
     /// `CS0122`: the member is inaccessible due to its protection level.
     Inaccessible {
         /// The qualified member name.
@@ -795,8 +813,16 @@ pub enum DiagnosticKind {
         /// The non-delegate target type.
         target: Box<str>,
     },
-    /// `CS0150`: a constant value was expected (e.g. a non-constant `case` label).
+    /// `CS0150`: a constant value was expected. Kept for the positions csc still reports it in;
+    /// a `case` label is [`Self::ConstantOfTypeExpected`], which names the governing type.
     ConstantExpected,
+    /// `CS9135`: a `case` label that is not a constant of the switch's governing type. csc quotes
+    /// that type, which is what separates this from the bare [`Self::ConstantExpected`] -- measured
+    /// at every rung from C# 5 to `latest`, all of which answer CS9135 here.
+    ConstantOfTypeExpected {
+        /// The governing type, as the message quotes it.
+        ty: Box<str>,
+    },
     /// `CS1525`: a term that cannot begin an expression at all, with the term quoted as csc
     /// quotes it -- `Invalid expression term 'int'`.
     ///
@@ -847,7 +873,10 @@ pub enum DiagnosticKind {
         /// The shadowing name.
         name: Box<str>,
     },
-    /// `CS0201`: an expression that is not assignment, call, increment, decrement,
+    /// `CS8978`: `receiver?.M` naming a METHOD GROUP. A method group is not a value, so there is
+    /// no nullable form of one to produce; csc's own wording is what this renders.
+    MethodGroupNotNullable,
+    /// `CS0201`: an expression that is not assignment, call, increment, decrement, await,
     /// or object creation was used as a statement.
     IllegalStatementExpression,
     /// `CS0260`: a declaration of a type is missing the `partial` modifier while another
@@ -942,6 +971,44 @@ pub enum DiagnosticKind {
     /// `CS0182`: an attribute argument that is not a constant, a `typeof`, or an array creation.
     /// An attribute is baked into metadata, so nothing evaluated at run time can supply one.
     NonConstantAttributeArgument,
+    /// `CS9244`: a BY-REF-LIKE type used as a type argument.
+    ///
+    /// A `ref struct` lives only on the stack; a type argument may be stored anywhere the
+    /// constructed type stores it, so no generic type or method may take one. **`S?` reaches
+    /// this rule rather than a rule of its own** -- `S?` is `System.Nullable<S>`, so it is a type
+    /// ARGUMENT, and csc names `Nullable<T>` as the declaration in the message. Measured.
+    ///
+    /// C# 13's `allows ref struct` lifts this for a parameter that opts in. No rung this
+    /// compiler supports reaches it -- the ladder stops at C# 11 -- so the refusal is
+    /// unconditional here rather than gated.
+    ByRefLikeTypeArgument {
+        /// The by-ref-like type argument, as csc renders it.
+        argument: Box<str>,
+        /// The type parameter it was passed for.
+        parameter: Box<str>,
+        /// The generic type or method that declares the parameter.
+        declaration: Box<str>,
+    },
+    /// `CS8345`: a field, or an auto-implemented property, whose type is BY-REF-LIKE where it is
+    /// not an instance member of a `ref struct` (C# 7.2).
+    ///
+    /// A `ref struct` may live only on the stack. A field of one in a class puts it on the heap;
+    /// a field of one in an ordinary struct puts it wherever that struct goes, which may be the
+    /// heap. **A `static` field is refused even inside a `ref struct`** -- csc's message says
+    /// INSTANCE member, and a static field of a stack-only type has nowhere to live. Measured.
+    ByRefLikeFieldType {
+        /// The by-ref-like type, as csc renders it in the message.
+        ty: Box<str>,
+    },
+    /// `CS8115`: a throw expression where the language does not admit one (C# 7.0). It stands in
+    /// the right operand of `??` and in either arm of `?:`, and nowhere else -- a PARENTHESIZED
+    /// one, `s ?? (throw e)`, is refused too, measured.
+    ///
+    /// It is a diagnostic about the CONTEXT rather than the expression, which is why the parser
+    /// admits one wherever an expression is parsed at null-coalescing precedence: there is
+    /// something to refuse only because it parsed. Where the grammar does not reach at all -- the
+    /// operand of a binary operator -- csc says `CS1525` instead, and so does this.
+    ThrowExpressionNotAllowed,
     /// `CS0227`: the source contains `unsafe` but the compilation was not given `/unsafe`. The
     /// language supports unsafe code in full; a compilation opts IN to containing it, exactly as
     /// csc requires.
@@ -1264,16 +1331,30 @@ pub enum DiagnosticKind {
         /// The field name.
         field: Box<str>,
     },
-    /// `CS0200`: a property with no `set` accessor is assigned.
-    /// CS8852: an init-only property or indexer assigned outside the places C# 9 permits.
+    /// `CS8852`: an init-only property or indexer assigned outside the places C# 9 permits.
     InitOnlyAssignment {
         /// The property, rendered qualified by its declaring type (`Box.P`), as csc renders it.
         property: Box<str>,
     },
+    /// `CS0200`: a property with no `set` accessor is assigned.
     PropertyCannotBeAssigned {
         /// The property, qualified as csc renders it (`C.P`).
         property: Box<str>,
     },
+    /// `CS8050`: an initializer on a property that is not automatically implemented -- one with a
+    /// written accessor body, or an `abstract` or `extern` one, which has no backing field for the
+    /// value to initialize.
+    ///
+    /// **THE TEXT IS csc's SENTENCE WITH ONE CLAUSE DROPPED, DELIBERATELY.** Modern csc says
+    /// *"Only auto-implemented properties, or properties that use the 'field' keyword, can have
+    /// initializers."* -- and the `field` keyword is C# 14, above the top of this compiler's
+    /// version ladder and unparseable by it. Naming it would send a reader looking for a construct
+    /// no `/langversion` here can select. This is the same call the CS0501 rule below already makes
+    /// for a half-written property, for the same reason.
+    InitializerOnNonAutoProperty,
+    /// `CS8053`: an instance property declared in an INTERFACE carries an initializer. An interface
+    /// has no instance state and no constructor to run one in.
+    InstancePropertyInitializerInInterface,
     /// `CS1061`: a member is not found on the type of an EXPRESSION (as opposed to `CS0117`, which
     /// is the same absence on a type named directly).
     ///
@@ -1524,6 +1605,15 @@ pub enum DiagnosticKind {
     /// `CS0026`: the `this` keyword used in a static method, static property, or static
     /// field initializer, where there is no instance.
     ThisInStaticContext,
+    /// `CS0027`: the `this` keyword used where there is no instance to name it -- a FIELD (or
+    /// auto-property, or enum member) initializer, which runs before the constructor's own body
+    /// and outside any member.
+    ///
+    /// **A DIFFERENT CODE FROM [`DiagnosticKind::ThisInStaticContext`] AND csc SPLITS THEM**, which
+    /// is worth stating because both refuse `this`: CS0026 is a static MEMBER naming it, and its
+    /// sentence lists the three static contexts; CS0027 is a position with no member at all, and
+    /// its sentence names none.
+    ThisNotAvailableInContext,
     /// `CS0176`: a static member was accessed through an instance.
     StaticMemberViaInstance {
         /// The qualified member name.
@@ -1556,6 +1646,106 @@ pub enum DiagnosticKind {
     ReturnValueInVoidMethod {
         /// The enclosing method's name.
         method: Box<str>,
+    },
+    /// `CS8149`: `return ref e;` in a member that returns BY VALUE.
+    ///
+    /// The two codes are the two directions and csc's wording is the reverse of what the code
+    /// number suggests, which is why both texts are quoted from a measured run rather than
+    /// reconstructed: 8149 is the one about a BY-REFERENCE return being in the wrong place.
+    ByRefReturnInValueMethod,
+    /// `CS8150`: `return e;` in a member that returns BY REFERENCE -- the `ref` is missing.
+    ByValueReturnInRefMethod,
+    /// `CS8168`: `return ref x;` where `x` is an ordinary local, whose storage dies with the frame.
+    CannotReturnLocalByReference {
+        /// The local's name, which csc quotes.
+        name: Box<str>,
+    },
+    /// `CS8166`: `return ref p;` where `p` is a by-value parameter, whose storage is the frame's.
+    CannotReturnParameterByReference {
+        /// The parameter's name, which csc quotes.
+        name: Box<str>,
+    },
+    /// `CS8156`: `return ref <rvalue>;` -- an expression with no storage to take the address of.
+    ExpressionCannotBeReturnedByReference,
+    /// `CS1510`: the operand of a `ref`/`out` names no storage -- a literal, a constant, an
+    /// arithmetic result, or a call to a method that does not return by reference.
+    ///
+    /// **THIS IS THE `ref` OPERAND RULE AND IT HAS THREE POSITIONS, NOT ONE**: a `ref`/`out`
+    /// ARGUMENT, `return ref e`, and a `ref` LOCAL's initializer. All three build one
+    /// `BoundExprKind::Ref`, so the check lives where that node is built rather than at each
+    /// position -- the shape a rule with several implementations needs to avoid gaining its next
+    /// case in none of them.
+    RefOperandNotAssignable,
+    /// `CS0192`: a `readonly` field used as a `ref`/`out` operand outside a constructor.
+    ///
+    /// A SEPARATE CODE FROM the CS0191 an ASSIGNMENT to one draws, and csc's text says so: this
+    /// one names "a ref or out value" and carries its own "(except in a constructor)" clause.
+    RefOperandReadonlyField,
+    /// `CS0206`: a property or indexer that does not return by reference, used as a `ref`/`out`
+    /// operand. A ref-returning one is legal and does not reach here -- it binds through
+    /// `deref_ref_return` to a `Dereference`, which names storage.
+    RefOperandNonRefProperty,
+    /// `CS8373`: the left-hand side of a ref assignment is not a ref variable -- `r = ref x;` where
+    /// `r` is an ordinary local or a by-value parameter.
+    RefAssignTargetNotRef,
+    /// `CS8173`: the ref-assigned expression has the wrong type. csc names the TARGET's type and
+    /// says the expression must be of it, which is the reverse of an ordinary conversion message.
+    RefAssignTypeMismatch {
+        /// The ref variable's referent type, which csc quotes.
+        ty: Box<str>,
+    },
+    /// `CS8160`: `return ref f;` where `f` is a `readonly` field.
+    ///
+    /// A THIRD code for the same operand: a readonly field is `CS0192` as a `ref` argument,
+    /// `CS0191` as a ref-reassignment source, and this when returned. Measured at 7.3.
+    ReadonlyFieldReturnedByReference,
+    /// `CS1059`: `++`/`--` applied to something that is not a variable, property or indexer.
+    ///
+    /// A SEPARATE CODE FROM the `CS0131` an ASSIGNMENT to the same operand draws -- measured on one
+    /// `ref readonly` local: `r = 7` is CS0131 and `r++` is CS1059, and `r += 1` is CS0131 again,
+    /// because a compound assignment is an assignment.
+    StepOperandNotAssignable,
+    /// `CS8174`: a `ref` local declared with no initializer -- `ref int r;`.
+    ///
+    /// A by-value local may be declared unassigned and assigned later; a by-reference one may not,
+    /// because there is no later spelling that binds it. Ref REASSIGNMENT (`r = ref x`) is C# 7.3
+    /// and would not help: it rebinds, it does not initialize.
+    ByRefLocalMustHaveInitializer {
+        /// The local's name.
+        name: Box<str>,
+    },
+    /// `CS8172`: a `ref` local initialized with a VALUE -- `ref int r = a[0];`.
+    ///
+    /// The declaration's `ref` distributes to EVERY declarator, measured: in
+    /// `ref int r = ref a[0], s = a[1];` this is reported at `s`, not at the declaration.
+    CannotInitializeByRefWithValue,
+    /// `CS8171`: a BY-VALUE local initialized with a reference -- `int r = ref a[0];`.
+    ///
+    /// The mirror of [`DiagnosticKind::CannotInitializeByRefWithValue`], and the pair reads the
+    /// reverse of what the numbers suggest in the same way CS8149/CS8150 do: 8171 is the one about
+    /// the by-VALUE declaration.
+    CannotInitializeByValueWithRef,
+    /// `CS8157`: `return ref r;` where `r` is a `ref` local bound to storage that does not outlive
+    /// the frame.
+    ///
+    /// **A `ref` LOCAL IS RETURNABLE OR NOT ACCORDING TO WHAT IT WAS BOUND TO, WHICH IS A FACT
+    /// ABOUT ITS DECLARATION AND NOT ABOUT THE `return`.** `ref int r = ref f;` may be returned;
+    /// `ref int r = ref x;` for a local `x` may not, and csc quotes the REF LOCAL's name rather
+    /// than the storage's -- so the answer has to be carried from the declaration.
+    CannotReturnRefLocalInitializedToValue {
+        /// The ref local's name, which csc quotes.
+        name: Box<str>,
+    },
+    /// `CS9075`: `return ref x;` where `x` is an `out` parameter.
+    ///
+    /// **AN `out` PARAMETER IS BYREF AND STILL NOT RETURNABLE, WHICH IS WHY THIS IS NOT
+    /// [`DiagnosticKind::CannotReturnParameterByReference`].** Its storage IS the caller's, so the
+    /// frame-lifetime argument that refuses a by-value parameter does not apply; what refuses it is
+    /// that `out` is implicitly SCOPED to the method, and csc says so in those words at every rung
+    /// -- measured at 7.0, four releases before `scoped` was spellable.
+    CannotReturnScopedParameterByReference {
+        /// The parameter's name, which csc quotes.
+        name: Box<str>,
     },
     /// `CS0126`: a `return` in a value-returning method has no expression.
     ReturnValueRequired {
@@ -1651,6 +1841,67 @@ pub enum DiagnosticKind {
     AwaitInFinally,
     /// `CS1996`: `await` in the body of a lock statement, at every version.
     AwaitInLock,
+    /// `CS7094`: `await` in the FILTER expression of a catch clause.
+    ///
+    /// **UNCONDITIONAL, WHERE ITS CATCH-AND-FINALLY SIBLINGS ARE RUNG-DEPENDENT.** C# 6 lifted the
+    /// ban on awaiting in a catch or finally BODY (CS1985/CS1984 below it, clean at and above), and
+    /// it did not lift this one: a filter runs during the first pass of exception dispatch, before
+    /// the stack unwinds, and there is no point in that pass at which a continuation could resume.
+    /// Measured at 6, where the two siblings are silent.
+    AwaitInCatchFilter,
+    /// `CS1660`: a lambda converted to something that is not a delegate type.
+    LambdaNeedsDelegateTarget {
+        /// The type it could not convert to, as csc renders it.
+        type_name: Box<str>,
+    },
+    /// `CS8917`: a lambda in a position with NO target type -- `var f = x => x;` or a conversion to
+    /// `object`.
+    ///
+    /// **A DIFFERENT CODE FROM CS1660 AND csc SPLITS THEM ON A REAL DISTINCTION**: CS1660 is a
+    /// target that exists and is not a delegate, CS8917 is no usable target at all. Measured: `int
+    /// f = x => x;` is CS1660 and `object f = x => x;` is CS8917, because from C# 10 a lambda has a
+    /// natural type and converting to `object` asks for it.
+    LambdaTypeNotInferred,
+    /// `CS1593`: the target delegate takes a different number of arguments than the lambda declares.
+    LambdaParameterCount {
+        /// The delegate type, as csc renders it.
+        type_name: Box<str>,
+        /// How many parameters the LAMBDA wrote -- csc's sentence names that count and says the
+        /// delegate does not take it.
+        written: usize,
+    },
+    /// `CS0748`: a lambda parameter list that mixes written and inferred types.
+    LambdaParameterTypesMixed,
+    /// `CS1661`: a lambda whose written parameter types do not match the delegate's. Reported
+    /// ALONGSIDE [`DiagnosticKind::LambdaParameterTypeMismatch`], which names the offending
+    /// parameter -- csc emits both, measured.
+    LambdaParameterTypesDoNotMatch {
+        /// The delegate type, as csc renders it.
+        type_name: Box<str>,
+    },
+    /// `CS1678`: one lambda parameter's written type is not the delegate's.
+    LambdaParameterTypeMismatch {
+        /// The parameter's ONE-BASED position, which is how csc counts them.
+        position: usize,
+        /// The type the source wrote.
+        written: Box<str>,
+        /// The type the delegate declares.
+        expected: Box<str>,
+    },
+    /// `CS8030`: a lambda converted to a `void`-returning delegate returns a value.
+    LambdaReturnsValueToVoidDelegate,
+    /// `CS1643`: a block-bodied lambda whose delegate returns a value has a path that does not.
+    LambdaNotAllPathsReturn {
+        /// The delegate type, as csc renders it.
+        type_name: Box<str>,
+    },
+    /// `CS7095` (warning): an exception filter whose condition is the constant `true`. The filter
+    /// decides nothing, and the clause means what it would mean without one.
+    ConstantTrueFilter,
+    /// `CS8360` (warning): an exception filter whose condition is the constant `false`. The handler
+    /// can never run, so csc points at the whole `try`/`catch` rather than at the filter -- its
+    /// wording says *consider removing the try-catch block*, where CS7095's says *the filter*.
+    ConstantFalseFilter,
     /// `CS4009`: a `void`- or `int`-returning entry point marked `async` -- measured, and
     /// distinct from the 'async main' GATE, which is what a `Task`-returning async `Main`
     /// draws instead (that one is a real C# 7.1 feature; this one is never legal).
@@ -1726,6 +1977,8 @@ impl DiagnosticKind {
             DiagnosticKind::OverloadDiffersOnlyByRefOut { .. } => 663,
             DiagnosticKind::ArgumentConversion { .. } => 1503,
             DiagnosticKind::AmbiguousCall { .. } => 121,
+            DiagnosticKind::AmbiguousMember { .. } => 229,
+            DiagnosticKind::UsingStaticNamesANamespace { .. } => 7007,
             DiagnosticKind::Inaccessible { .. } => 122,
             DiagnosticKind::InvalidAttributeParameterType { .. } => 181,
             DiagnosticKind::NotAValidNamedAttributeArgument { .. } => 617,
@@ -1735,6 +1988,7 @@ impl DiagnosticKind {
             DiagnosticKind::MultipleEntryPoints => 17,
             DiagnosticKind::MethodGroupToNonDelegate { .. } => 428,
             DiagnosticKind::ConstantExpected => 150,
+            DiagnosticKind::ConstantOfTypeExpected { .. } => 9135,
             DiagnosticKind::InvalidExpressionTerm { .. } => 1525,
             DiagnosticKind::ExpressionHasNoName => 8081,
             DiagnosticKind::DuplicateCaseLabel { .. } => 152,
@@ -1742,6 +1996,7 @@ impl DiagnosticKind {
             DiagnosticKind::SwitchFallOutFinal { .. } => 8070,
             DiagnosticKind::DuplicateLocal { .. } => 128,
             DiagnosticKind::LocalShadowsEnclosing { .. } => 136,
+            DiagnosticKind::MethodGroupNotNullable => 8978,
             DiagnosticKind::IllegalStatementExpression => 201,
             DiagnosticKind::MissingPartialModifier { .. } => 260,
             DiagnosticKind::PartialDeclarationsDifferentKinds { .. } => 261,
@@ -1759,6 +2014,9 @@ impl DiagnosticKind {
             DiagnosticKind::NotAnAttributeClass { .. } => 616,
             DiagnosticKind::DuplicateAttribute { .. } => 579,
             DiagnosticKind::NonConstantAttributeArgument => 182,
+            DiagnosticKind::ThrowExpressionNotAllowed => 8115,
+            DiagnosticKind::ByRefLikeFieldType { .. } => 8345,
+            DiagnosticKind::ByRefLikeTypeArgument { .. } => 9244,
             DiagnosticKind::UnsafeCodeRequiresOption => 227,
             DiagnosticKind::NonConstantFieldInitializer { .. } => 133,
             DiagnosticKind::OverloadableUnaryOperatorExpected => 1019,
@@ -1786,6 +2044,8 @@ impl DiagnosticKind {
             DiagnosticKind::AbstractMethodWithBody { .. } => 500,
             DiagnosticKind::MethodMustHaveBody { .. } => 501,
             DiagnosticKind::AutoPropertyMustHaveGetAccessor => 8051,
+            DiagnosticKind::InitializerOnNonAutoProperty => 8050,
+            DiagnosticKind::InstancePropertyInitializerInInterface => 8053,
             DiagnosticKind::AccessorAccessibilityNotMoreRestrictive { .. } => 273,
             DiagnosticKind::AccessorAccessibilityOnBothAccessors { .. } => 274,
             DiagnosticKind::AccessorAccessibilityNeedsBothAccessors { .. } => 276,
@@ -1848,6 +2108,7 @@ impl DiagnosticKind {
             DiagnosticKind::UnreachableCode => 162,
             DiagnosticKind::ObjectReferenceRequired { .. } => 120,
             DiagnosticKind::ThisInStaticContext => 26,
+            DiagnosticKind::ThisNotAvailableInContext => 27,
             DiagnosticKind::StaticMemberViaInstance { .. } => 176,
             DiagnosticKind::CannotIndex { .. } => 21,
             DiagnosticKind::NoConstructor { .. } => 1729,
@@ -1855,6 +2116,23 @@ impl DiagnosticKind {
             DiagnosticKind::NoOverloadMatchesDelegate { .. } => 123,
             DiagnosticKind::ReturnValueInVoidMethod { .. } => 127,
             DiagnosticKind::ReturnValueRequired { .. } => 126,
+            DiagnosticKind::ByRefReturnInValueMethod => 8149,
+            DiagnosticKind::ByValueReturnInRefMethod => 8150,
+            DiagnosticKind::CannotReturnLocalByReference { .. } => 8168,
+            DiagnosticKind::CannotReturnParameterByReference { .. } => 8166,
+            DiagnosticKind::ExpressionCannotBeReturnedByReference => 8156,
+            DiagnosticKind::RefOperandNotAssignable => 1510,
+            DiagnosticKind::RefOperandReadonlyField => 192,
+            DiagnosticKind::RefOperandNonRefProperty => 206,
+            DiagnosticKind::RefAssignTargetNotRef => 8373,
+            DiagnosticKind::RefAssignTypeMismatch { .. } => 8173,
+            DiagnosticKind::ReadonlyFieldReturnedByReference => 8160,
+            DiagnosticKind::StepOperandNotAssignable => 1059,
+            DiagnosticKind::ByRefLocalMustHaveInitializer { .. } => 8174,
+            DiagnosticKind::CannotInitializeByRefWithValue => 8172,
+            DiagnosticKind::CannotInitializeByValueWithRef => 8171,
+            DiagnosticKind::CannotReturnRefLocalInitializedToValue { .. } => 8157,
+            DiagnosticKind::CannotReturnScopedParameterByReference { .. } => 9075,
             DiagnosticKind::NotAllPathsReturn { .. } => 161,
             DiagnosticKind::CannotCast { .. } => 30,
             DiagnosticKind::AsConversionMissing { .. } => 39,
@@ -1872,6 +2150,17 @@ impl DiagnosticKind {
             DiagnosticKind::AwaitInCatch => 1985,
             DiagnosticKind::AwaitInFinally => 1984,
             DiagnosticKind::AwaitInLock => 1996,
+            DiagnosticKind::AwaitInCatchFilter => 7094,
+            DiagnosticKind::LambdaNeedsDelegateTarget { .. } => 1660,
+            DiagnosticKind::LambdaTypeNotInferred => 8917,
+            DiagnosticKind::LambdaParameterCount { .. } => 1593,
+            DiagnosticKind::LambdaParameterTypesMixed => 748,
+            DiagnosticKind::LambdaParameterTypesDoNotMatch { .. } => 1661,
+            DiagnosticKind::LambdaParameterTypeMismatch { .. } => 1678,
+            DiagnosticKind::LambdaReturnsValueToVoidDelegate => 8030,
+            DiagnosticKind::LambdaNotAllPathsReturn { .. } => 1643,
+            DiagnosticKind::ConstantTrueFilter => 7095,
+            DiagnosticKind::ConstantFalseFilter => 8360,
             DiagnosticKind::AsyncVoidEntryPoint => 4009,
         }
     }
@@ -1888,6 +2177,8 @@ impl DiagnosticKind {
             | DiagnosticKind::FieldNeverUsed { .. }
             | DiagnosticKind::FieldNeverAssigned { .. }
             | DiagnosticKind::UnreachableCode
+            | DiagnosticKind::ConstantTrueFilter
+            | DiagnosticKind::ConstantFalseFilter
             | DiagnosticKind::UnreferencedLabel => Severity::Warning,
             _ => Severity::Error,
         }
@@ -2190,6 +2481,13 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "Argument {index}: cannot convert from '{from}' to '{to}'"
             ),
+            DiagnosticKind::UsingStaticNamesANamespace { name } => write!(
+                f,
+                "A 'using static' directive can only be applied to types; '{name}' is a namespace not a type. Consider a 'using namespace' directive instead"
+            ),
+            DiagnosticKind::AmbiguousMember { first, second } => {
+                write!(f, "Ambiguity between '{first}' and '{second}'")
+            }
             DiagnosticKind::AmbiguousCall { method } => {
                 write!(f, "The call is ambiguous between overloads of '{method}'")
             }
@@ -2237,6 +2535,9 @@ impl fmt::Display for DiagnosticKind {
                 "Cannot convert method group '{method}' to non-delegate type '{target}'"
             ),
             DiagnosticKind::ConstantExpected => write!(f, "A constant value is expected"),
+            DiagnosticKind::ConstantOfTypeExpected { ty } => {
+                write!(f, "A constant value of type '{ty}' is expected")
+            }
             DiagnosticKind::InvalidExpressionTerm { term } => {
                 write!(f, "Invalid expression term '{term}'")
             }
@@ -2263,9 +2564,12 @@ impl fmt::Display for DiagnosticKind {
                  because it would give a different meaning to '{name}', which is \
                  already used in a 'parent or current' scope to denote something else"
             ),
+            DiagnosticKind::MethodGroupNotNullable => {
+                write!(f, "'method group' cannot be made nullable")
+            }
             DiagnosticKind::IllegalStatementExpression => write!(
                 f,
-                "Only assignment, call, increment, decrement, and new object \
+                "Only assignment, call, increment, decrement, await, and new object \
                  expressions can be used as a statement"
             ),
             DiagnosticKind::MissingPartialModifier { name } => write!(
@@ -2341,6 +2645,24 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::DuplicateAttribute { name } => {
                 write!(f, "Duplicate '{name}' attribute")
             }
+            DiagnosticKind::ThrowExpressionNotAllowed => {
+                write!(f, "A throw expression is not allowed in this context.")
+            }
+            DiagnosticKind::ByRefLikeTypeArgument {
+                argument,
+                parameter,
+                declaration,
+            } => write!(
+                f,
+                "The type '{argument}' may not be a ref struct or a type parameter allowing ref \
+                 structs in order to use it as parameter '{parameter}' in the generic type or \
+                 method '{declaration}'"
+            ),
+            DiagnosticKind::ByRefLikeFieldType { ty } => write!(
+                f,
+                "Field or auto-implemented property cannot be of type '{ty}' unless it is an \
+                 instance member of a ref struct."
+            ),
             DiagnosticKind::NonConstantAttributeArgument => write!(
                 f,
                 "An attribute argument must be a constant expression, typeof expression or \
@@ -2435,6 +2757,12 @@ impl fmt::Display for DiagnosticKind {
             ),
             DiagnosticKind::AutoPropertyMustHaveGetAccessor => {
                 write!(f, "Auto-implemented properties must have get accessors.")
+            }
+            DiagnosticKind::InitializerOnNonAutoProperty => {
+                write!(f, "Only auto-implemented properties can have initializers.")
+            }
+            DiagnosticKind::InstancePropertyInitializerInInterface => {
+                write!(f, "Instance properties in interfaces cannot have initializers.")
             }
             DiagnosticKind::AccessorAccessibilityNotMoreRestrictive { accessor, property } => write!(
                 f,
@@ -2712,6 +3040,9 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "An object reference is required for the non-static field, method, or property '{member}'"
             ),
+            DiagnosticKind::ThisNotAvailableInContext => {
+                write!(f, "Keyword 'this' is not available in the current context")
+            }
             DiagnosticKind::ThisInStaticContext => write!(
                 f,
                 "Keyword 'this' is not valid in a static property, static method, or static field initializer"
@@ -2741,6 +3072,71 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::ReturnValueRequired { ty } => {
                 write!(f, "An object of a type convertible to '{ty}' is required")
             }
+            DiagnosticKind::ByRefReturnInValueMethod => write!(
+                f,
+                "By-reference returns may only be used in methods that return by reference"
+            ),
+            DiagnosticKind::ByValueReturnInRefMethod => write!(
+                f,
+                "By-value returns may only be used in methods that return by value"
+            ),
+            DiagnosticKind::CannotReturnLocalByReference { name } => write!(
+                f,
+                "Cannot return local '{name}' by reference because it is not a ref local"
+            ),
+            DiagnosticKind::CannotReturnParameterByReference { name } => write!(
+                f,
+                "Cannot return a parameter by reference '{name}' because it is not a ref parameter"
+            ),
+            DiagnosticKind::ExpressionCannotBeReturnedByReference => write!(
+                f,
+                "An expression cannot be used in this context because it may not be passed or returned by reference"
+            ),
+            DiagnosticKind::RefOperandNotAssignable => {
+                write!(f, "A ref or out value must be an assignable variable")
+            }
+            DiagnosticKind::RefOperandReadonlyField => write!(
+                f,
+                "A readonly field cannot be used as a ref or out value (except in a constructor)"
+            ),
+            DiagnosticKind::RefOperandNonRefProperty => write!(
+                f,
+                "A non ref-returning property or indexer may not be used as an out or ref value"
+            ),
+            DiagnosticKind::RefAssignTargetNotRef => write!(
+                f,
+                "The left-hand side of a ref assignment must be a ref variable."
+            ),
+            DiagnosticKind::RefAssignTypeMismatch { ty } => write!(
+                f,
+                "The expression must be of type '{ty}' because it is being assigned by reference"
+            ),
+            DiagnosticKind::ReadonlyFieldReturnedByReference => write!(
+                f,
+                "A readonly field cannot be returned by writable reference"
+            ),
+            DiagnosticKind::StepOperandNotAssignable => write!(
+                f,
+                "The operand of an increment or decrement operator must be a variable, property or indexer"
+            ),
+            DiagnosticKind::ByRefLocalMustHaveInitializer { .. } => write!(
+                f,
+                "A declaration of a by-reference variable must have an initializer"
+            ),
+            DiagnosticKind::CannotInitializeByRefWithValue => {
+                write!(f, "Cannot initialize a by-reference variable with a value")
+            }
+            DiagnosticKind::CannotInitializeByValueWithRef => {
+                write!(f, "Cannot initialize a by-value variable with a reference")
+            }
+            DiagnosticKind::CannotReturnRefLocalInitializedToValue { name } => write!(
+                f,
+                "Cannot return '{name}' by reference because it was initialized to a value that cannot be returned by reference"
+            ),
+            DiagnosticKind::CannotReturnScopedParameterByReference { name } => write!(
+                f,
+                "Cannot return a parameter by reference '{name}' because it is scoped to the current method"
+            ),
             DiagnosticKind::NotAllPathsReturn { method } => {
                 write!(f, "'{method}': not all code paths return a value")
             }
@@ -2795,6 +3191,50 @@ impl fmt::Display for DiagnosticKind {
                 write!(f, "'{awaiter}' does not implement 'INotifyCompletion'")
             }
             DiagnosticKind::AwaitInCatch => f.write_str("Cannot await in a catch clause"),
+            DiagnosticKind::AwaitInCatchFilter => {
+                f.write_str("Cannot await in the filter expression of a catch clause")
+            }
+            DiagnosticKind::LambdaNeedsDelegateTarget { type_name } => write!(
+                f,
+                "Cannot convert lambda expression to type '{type_name}' because it is not a \
+                 delegate type"
+            ),
+            DiagnosticKind::LambdaTypeNotInferred => {
+                f.write_str("The delegate type could not be inferred.")
+            }
+            DiagnosticKind::LambdaParameterCount { type_name, written } => {
+                write!(f, "Delegate '{type_name}' does not take {written} arguments")
+            }
+            DiagnosticKind::LambdaParameterTypesMixed => f.write_str(
+                "Inconsistent lambda parameter usage; parameter types must be all explicit or all \
+                 implicit",
+            ),
+            DiagnosticKind::LambdaParameterTypesDoNotMatch { type_name } => write!(
+                f,
+                "Cannot convert lambda expression to type '{type_name}' because the parameter \
+                 types do not match the delegate parameter types"
+            ),
+            DiagnosticKind::LambdaParameterTypeMismatch {
+                position,
+                written,
+                expected,
+            } => write!(
+                f,
+                "Parameter {position} is declared as type '{written}' but should be '{expected}'"
+            ),
+            DiagnosticKind::LambdaReturnsValueToVoidDelegate => f.write_str(
+                "Anonymous function converted to a void returning delegate cannot return a value",
+            ),
+            DiagnosticKind::LambdaNotAllPathsReturn { type_name } => write!(
+                f,
+                "Not all code paths return a value in lambda expression of type '{type_name}'"
+            ),
+            DiagnosticKind::ConstantTrueFilter => f.write_str(
+                "Filter expression is a constant 'true', consider removing the filter",
+            ),
+            DiagnosticKind::ConstantFalseFilter => f.write_str(
+                "Filter expression is a constant 'false', consider removing the try-catch block",
+            ),
             DiagnosticKind::AwaitInFinally => {
                 f.write_str("Cannot await in the body of a finally clause")
             }

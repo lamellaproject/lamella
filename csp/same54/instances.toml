@@ -1,30 +1,209 @@
-# INSTANCE map for the SAM E54 family -- identity-first: only the placed block copies
-# appear, bases-only. The E54's per-instance
-# clock routing (MCLK bank enables + GCLK peripheral channels) is richer than the SAMD21's;
-# its record shape is settled alongside the family's first generated driver, not guessed here.
+# INSTANCE map for the SAM E54 family -- identity-first: only the placed block copies appear.
+#
+# THE RECORD SHAPE IS SETTLED HERE, alongside the family's first clocked peripheral, which is what
+# the bases-only version of this file said it was waiting for. Four fields beyond the base, and
+# each answers a question a driver cannot answer from the base alone:
+#
+#   gclk_core_id      which GCLK peripheral channel feeds this instance's core clock, as an index
+#                     into GCLK.PCHCTRL. -1 where the instance has no peripheral channel at all.
+#   apb_mask_offset   which MCLK mask register enables this instance's bus clock, as an offset
+#                     from the MCLK base. The E54 spreads its peripherals over FOUR APB buses.
+#   apb_bit           the bit within that mask.
+#   nvm_calib_lsb     where this instance's production calibration values start in the NVM
+#                     software calibration word. -1 where the instance needs none.
+#
+# THE CALIBRATION POSITION IS ONE NUMBER FOR THREE VALUES. Each converter's three fields sit
+# contiguously and three bits apart, so the position of the first locates all of them -- and the
+# two converters sit at DIFFERENT offsets in the same word, which is exactly why it cannot be a
+# block constant.
+#
+# THE APB BUS IS PER-INSTANCE AND NOT PER-BLOCK, which is why the offset is a row value rather than
+# a block constant: the eight SERCOMs sit on THREE DIFFERENT masks (APBA, APBB and APBD). A record
+# carrying one bus for the block would be right for two instances and wrong for six.
+#
+# THIS MAP IS ADDRESS SPACE AND NOT A PRESENCE LIST. The family map places eight SERCOM slots; how
+# many a given device bonds to pads is the package's business and lives in parts.toml. A row here
+# says where a block copy WOULD be reached, not that a particular part carries it out to a pin.
 
 [table]
 kind = "instances"
 family = "same54"
-record = ["base"]
+record = ["base", "gclk_core_id", "apb_mask_offset", "apb_bit", "nvm_calib_lsb"]
 
 [[instances]]
 name = "mclk"
 block = "mclk"
-base = 0x40000800   # AHBMASK at +0x10 (0x40000810), APBCMASK at +0x1C;
-                    # APBBMASK at +0x18
+base = 0x40000800   # AHBMASK at +0x10, APBAMASK +0x14, APBBMASK +0x18, APBCMASK +0x1C,
+                    # APBDMASK +0x20 -- each from its own register description heading
+gclk_core_id = -1   # the clock controller is not itself fed by a peripheral channel
+apb_mask_offset = 0x14
+apb_bit = 2
+nvm_calib_lsb = -1
 
 [[instances]]
 name = "gclk"
 block = "gclk"
-base = 0x40001C00   # PCHCTRL[23] at 0x40001CDC = base + 0x80 + 4 * 23
+base = 0x40001C00   # PCHCTRL[m] at base + 0x80 + 4 * m
+gclk_core_id = -1
+apb_mask_offset = 0x14
+apb_bit = 7
+nvm_calib_lsb = -1
+
+# THE EIGHT SERCOMs. Every one of the four values below differs between instances, and the three
+# groupings are not the same grouping: the bases fall in three address regions, the peripheral
+# channels in three runs, and the APB masks over three registers -- but a SERCOM that shares a base
+# region with another does not necessarily share anything else with it. Read each row whole.
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x40003000
+gclk_core_id = 7
+apb_mask_offset = 0x14
+apb_bit = 12
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x40003400
+gclk_core_id = 8
+apb_mask_offset = 0x14
+apb_bit = 13
+nvm_calib_lsb = -1
 
 [[instances]]
 name = "sercom2"
 block = "sercom"
-base = 0x41012000   # SERCOM2: PB25/PAD0, PB24/PAD1
+base = 0x41012000
+gclk_core_id = 23
+apb_mask_offset = 0x18
+apb_bit = 9
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "sercom3"
+block = "sercom"
+base = 0x41014000
+gclk_core_id = 24
+apb_mask_offset = 0x18
+apb_bit = 10
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "sercom4"
+block = "sercom"
+base = 0x43000000
+gclk_core_id = 34
+apb_mask_offset = 0x20
+apb_bit = 0
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "sercom5"
+block = "sercom"
+base = 0x43000400
+gclk_core_id = 35
+apb_mask_offset = 0x20
+apb_bit = 1
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "sercom6"
+block = "sercom"
+base = 0x43000800
+gclk_core_id = 36
+apb_mask_offset = 0x20
+apb_bit = 2
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "sercom7"
+block = "sercom"
+base = 0x43000C00
+gclk_core_id = 37
+apb_mask_offset = 0x20
+apb_bit = 3
+nvm_calib_lsb = -1
+
+# THE TWO ANALOG-TO-DIGITAL CONVERTERS. Neither works out of reset: the block table's header
+# states why, and the last value on each row is what a driver needs to fix it.
+
+[[instances]]
+name = "adc0"
+block = "adc"
+base = 0x43001C00
+gclk_core_id = 40
+apb_mask_offset = 0x20
+apb_bit = 7
+nvm_calib_lsb = 2
+
+[[instances]]
+name = "adc1"
+block = "adc"
+base = 0x43002000
+gclk_core_id = 41
+apb_mask_offset = 0x20
+apb_bit = 8
+nvm_calib_lsb = 16
 
 [[instances]]
 name = "gmac"
 block = "gmac"
-base = 0x42000800   # GMAC: the E54 Ethernet MAC
+base = 0x42000800   # the E54 Ethernet MAC
+gclk_core_id = -1   # clocked from the bus and its own pins, not from a peripheral channel
+apb_mask_offset = 0x1C
+apb_bit = 2
+nvm_calib_lsb = -1
+
+# THE FOUR PORT GROUPS. One PORT peripheral, four register sets inside it, and the manual states
+# the spacing rather than leaving it to be derived: "The I/O pins are assembled in pin groups with
+# up to 32 pins. Group 0 consists of the PA pins, and group 1 is for the PB pins, etc. Each pin
+# group has its own PORT registers, with a 0x80 address spacing." So group N sits at the PORT base
+# plus 0x80 * N, and each is placed as its own row because that is what a consumer names.
+#
+# FOUR ROWS, ONE CLOCK: all four groups are the same PORT peripheral, so they carry the same APB
+# mask bit. Enabling a group is not a thing the hardware can do, and the repeated value says so.
+# That clock is enabled out of reset, which is why a GPIO driver on this family works having
+# touched no clock register at all.
+#
+# THE SAMD21 USES THE SAME 0x80 SPACING AT A DIFFERENT BASE, which is exactly the near-miss this
+# tree keeps paying for: 0x41004400 there against 0x41008000 here, with the stride identical. A row
+# carried across would have TWO of its three values right and the one that matters wrong, and every
+# gate would stay green. Every number below is from this family's own manual.
+
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x41008000   # PORT group 0, the PA pins
+gclk_core_id = -1
+apb_mask_offset = 0x18
+apb_bit = 4
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "portb"
+block = "port"
+base = 0x41008080   # PORT group 1, the PB pins
+gclk_core_id = -1
+apb_mask_offset = 0x18
+apb_bit = 4
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "portc"
+block = "port"
+base = 0x41008100   # PORT group 2, the PC pins
+gclk_core_id = -1
+apb_mask_offset = 0x18
+apb_bit = 4
+nvm_calib_lsb = -1
+
+[[instances]]
+name = "portd"
+block = "port"
+base = 0x41008180   # PORT group 3, the PD pins
+gclk_core_id = -1
+apb_mask_offset = 0x18
+apb_bit = 4
+nvm_calib_lsb = -1

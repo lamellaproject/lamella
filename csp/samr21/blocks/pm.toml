@@ -1,0 +1,23 @@
+# The SAMR21 Power Manager block: only the register the peripheral bring-up paths touch is
+# transcribed here (partial, append-only, schema total). Offsets are PM-base-relative; the base
+# lives in ../instances.toml.
+
+[table]
+kind = "block"
+family = "samr21"
+block = "pm"
+sources = [
+    "SAM R21 datasheet Atmel-42223G section 14.8.10 (APBC Mask): 'Offset: 0x20', and one prose paragraph per bit naming the peripheral it gates",
+    "Atmel-42223G Table 10-1 (Peripherals Configuration Summary), whose APB Clock Index column states the same six SERCOM positions independently",
+]
+notes = [
+    "APBCMASK gates each peripheral's APB (bus) clock; SERCOM0..5 = bits 2..7. Read-modify-write in drivers (other peripherals share the register).",
+    "THE BIT POSITIONS WERE TAKEN FROM THE PER-BIT PROSE, NOT FROM THE BIT-FIELD DIAGRAM. The diagram's rows extract with Access and Reset lines interleaved between the bit numbers and the names, which is how a name comes to sit under the wrong number; 14.8.10's numbered paragraphs each name one bit and one peripheral and cannot desynchronize.",
+    "RFCTRL AT BIT 21 IS WHY THIS BLOCK IS NOT THE SAMD21'S. The SAM R21 gates its RF front-end control from the same register as the SERCOMs, and nothing on a SAMD21 occupies that position. It is transcribed because it is part of what this register means on this part, not because a driver reaches for it yet -- and a board that never touches the radio still shares the register with whatever eventually does.",
+]
+
+[registers.APBCMASK]
+offset = 0x20
+width = 32
+fields = { SERCOM0 = [2, 1], SERCOM1 = [3, 1], SERCOM2 = [4, 1], SERCOM3 = [5, 1], SERCOM4 = [6, 1], SERCOM5 = [7, 1], RFCTRL = [21, 1] }
+notes = "One gate bit per APBC peripheral; a driver ORs in its instance's bit (the instance row carries the bit index). Reset value is 0x00010000 -- the ADC's bit 16 comes up set and every SERCOM bit comes up clear, so a read-modify-write is required rather than a plain store."

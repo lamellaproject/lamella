@@ -33,7 +33,7 @@ notes = [
 # and the hard-iron offset registers. All are in the data sheet and none is transcribed.
 #
 # Validation is `none`: no physical part of this type has answered anything. There is not one on
-# this bench -- what is here is the other candidate for the same footprint.
+# measurement -- what is here is the other candidate for the same footprint.
 
 [sourcing]
 facts = "primary"

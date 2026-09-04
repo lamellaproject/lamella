@@ -1,0 +1,43 @@
+# PIN map for the STM32C0 series: EMPTY, and that is a statement about which document fills this
+# file rather than about the part.
+#
+# A pin map pairs a pad with an alternate-function number and the peripheral signal that function
+# routes to. NONE OF THAT IS IN A REFERENCE MANUAL. RM0490 describes the die -- its peripherals,
+# their registers, their memory map -- and says nothing about which pads a package bonds out or
+# which AF number reaches them. The alternate-function table in the part's DATASHEET is what fills
+# this file, and no row here has been read from one yet.
+#
+# AN EMPTY MAP IS NOT A PAD SPACE AND MUST NOT BE READ AS ONE. Zero rows means "no
+# alternate-function table has been read". It does not mean the part has no pins, and it does not
+# mean no controller reaches a given pad. A consumer that treats the absence as a negative gets a
+# confident, complete-looking wrong answer -- which is true of any present-list and hardest to
+# resist on one that is empty.
+#
+# AND A SECOND REASON, WHICH IS STRUCTURAL AND OUTLIVES THE MISSING TABLE. A row here names an
+# INSTANCE and a SIGNAL, and it also names a PIN that some part's present-list has to carry. The
+# reader enforces both ends. This family declares one instance, and no part row carries a pin.
+#
+# THE INSTANCE HALF IS THE CHEAP ONE. The reader lets an instance name a block whose table does not
+# exist yet -- deliberately, while block tables are incomplete -- so a `usart2` instance costs only
+# its base and its clock-enable bits, and both are read and recorded in instances.toml.
+#
+# THE PRESENT-LIST HALF IS THE REAL ONE, AND IT NEEDS A DIFFERENT TABLE FROM THE ONE BELOW. A
+# present-list says which pads a PACKAGE bonds out. The alternate-function tables say which signals
+# a DIE routes. Those are not the same statement and on some parts they genuinely differ, so a pad
+# may not be added to a present-list on the strength of appearing in an AF table. That needs the
+# pinout for the ordering code in hand, which is a package fact and belongs with whoever owns pad
+# space.
+#
+# THE BINDING CHECKER WILL REFUSE A BOARD THAT CLAIMS A PIN THIS FILE DOES NOT CARRY, and its
+# refusal says to grow the map from the datasheet rather than from the binding. That refusal is
+# correct and should be left to fire: a board needing a C0 pad is the event that produces the pin
+# row, and inventing one to silence it would put an unsourced pin fact in the one file whose whole
+# job is to be the source.
+#
+
+[table]
+kind = "pins"
+family = "stm32c0"
+sources = [
+    "No row below yet. The alternate-function map is read -- DS14693 Rev 2 Tables 13 to 20 -- but a row also needs a pin some part's present-list carries, and a present-list is a package fact that comes from the pinout rather than from those tables.",
+]

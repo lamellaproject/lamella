@@ -7,7 +7,7 @@ board = "pico"
 vendor = "raspberry-pi"
 family = "rp2040"
 part = "rp2040"
-board_model = 13            # lamella_wire::board_model::PICO
+product_model = 13          # lamella_wire::product_model::PICO
 sources = ["Raspberry Pi Pico datasheet (pinout: GP0/GP1 on header pins 1/2; 12 MHz crystal)"]
 
 [memory]                    # the RP2040 has NO internal flash (chip flash = 0,

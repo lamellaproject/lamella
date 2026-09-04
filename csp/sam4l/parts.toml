@@ -17,6 +17,7 @@ notes = [
 [[parts]]
 part = "atsam4lc8c"
 package = "TQFP100"
+identity_source = "CHIPID CIDR reads 0xab0b0ae0 and EXID reads 0x1400000f on a 100-pin part of this row, read over a CMSIS-DAP probe. THE CIDR ALONE DOES NOT NAME THE PART: Atmel-42023H table 9-1 decodes that CIDR for the 48-pin ATSAM4LS devices, and a 100-pin LC shares it while reporting its own EXID, which that table does not carry. So the EXID above is the discriminating half and is recorded because the document does not supply it. Corroborated the same reading by the flash controller: FPR reports 512-byte pages and 1024 of them, which is the 0x80000 this row states, arrived at from a register rather than from the order code."
 flash = 0x80000
 ram = 0x10000
 pins = ["PC07", "PC24"]

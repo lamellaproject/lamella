@@ -5,7 +5,7 @@ namespace Lamella.Boards.Arduino
 {
     public sealed class Due
     {
-        /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
+        /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = DueBindings.BOARD_MODEL;
 
         /// <summary>The routed master clock under the board's default plan, in Hz -- also the

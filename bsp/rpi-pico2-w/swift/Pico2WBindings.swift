@@ -88,7 +88,6 @@ public enum Pico2WBindings {
     public static let CYW43439_DATA_PORT_BASE: UInt32 = 0xD0000000
     public static let CYW43439_DATA_PIN: UInt32 = 24
     public static let CYW43439_DATA_MASK: UInt32 = 0x1000000
-    public static let CYW43439_DATA_ACTIVE_LOW: UInt32 = 0
     public static let CYW43439_CS_PORT_BASE: UInt32 = 0xD0000000
     public static let CYW43439_CS_PIN: UInt32 = 25
     public static let CYW43439_CS_MASK: UInt32 = 0x2000000
@@ -96,7 +95,6 @@ public enum Pico2WBindings {
     public static let CYW43439_CLK_PORT_BASE: UInt32 = 0xD0000000
     public static let CYW43439_CLK_PIN: UInt32 = 29
     public static let CYW43439_CLK_MASK: UInt32 = 0x20000000
-    public static let CYW43439_CLK_ACTIVE_LOW: UInt32 = 0
 
     // -- memory regions the board fits: SIZE is what a program may reach, which a device's own
     // size may exceed; a region with a CONTROLLER does not exist until that instance is brought

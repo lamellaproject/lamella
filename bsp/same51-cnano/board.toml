@@ -1,0 +1,75 @@
+# BOARD binding: the SAM E51 Curiosity Nano (EV76S68A). Board truth only: the identity, the
+# carrier, and the two control lines a program can reach.
+#
+# IT SHARES A FAMILY WITH THE SAM E54 XPLAINED PRO AND NOT A PACKAGE. Every block table in
+# csp/same54 describes silicon these two have in common; what differs is which pads it is bonded
+# out to, which is why the part row rather than the family says so. This one is the 64-pin package:
+# 51 pads, port A complete as the larger part has it, port B cut to PB00-PB17 plus four, and no
+# port C or D at all.
+#
+# BOTH CONTROL LINES ARE ACTIVE LOW AND THE GUIDE STATES BOTH IN WORDS, exactly as the Xplained Pro
+# board's do. The LED lights when its line is driven to ground; the switch drives its line to ground
+# when pressed. AND THE SWITCH HAS NO EXTERNAL PULL-UP -- the guide says so outright and says what
+# to do about it, so a program opening that pin as a plain input reads a floating pad.
+#
+# THE DEBUGGER IS AN nEDBG RATHER THAN AN EDBG, and the difference that matters to a host is the USB
+# product id, not the carrier: it presents the same CDC virtual port. Its SWD lines reach PA31 and
+# PA30, and it has an nRESET line to the target, all of which are ALSO on the edge connector.
+
+[table]
+kind = "board"
+board = "same51-cnano"
+vendor = "microchip"
+family = "same54"
+part = "atsame51j20a"
+product_model = 45          # lamella_wire::product_model::SAME51_CURIOSITY_NANO
+sources = [
+    "SAM E51 Curiosity Nano User Guide DS70005432B section 4.2.2 and Table 4-1 (LED Connection): one yellow LED0 on PA14, no shared functionality, and the section states the polarity in words -- the LED can be activated by driving the connected I/O line to GND.",
+    "DS70005432B section 4.2.2 and Table 4-2 (Mechanical Switch): one generic user-configurable switch, SW0, on PA15 with no shared functionality. When the switch is pressed it drives the I/O line to ground, and the section's Tip states that there is NO pull-up resistor connected to it and that the internal pull-up must be enabled to use it.",
+    "DS70005432B Table 4-4 (On-Board Debugger Connections): SWDATA on PA31 and SWCLK on PA30, SWO on PB30, an nRESET line to the target, and the debugger's CDC pair on PB17 (target receive) and PB16 (target transmit) -- every one of them also brought out to the edge connector.",
+    "DS70005432B section 4.2.3: the board carries a 32.768 kHz crystal, populated by default.",
+]
+notes = [
+    "THE DEBUGGER'S LINES ARE SHARED WITH THE EDGE CONNECTOR, which the SWD pair makes consequential rather than merely notable: a program that reconfigures PA30 or PA31 as a general-purpose pin takes the debug port away from the host while it runs. That is not hypothetical on this board -- the firmware it shipped with does exactly that, and the debugger cannot reach the part until the target is held in reset.",
+    "THE CRYSTAL IS POPULATED, so the two pads it uses are not available as I/O on a stock board. Nothing here binds them; recorded because a pad list says a pin exists and cannot say what is soldered to it.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board nEDBG's CDC virtual port. Named for the mechanism rather
+                            # than the debugger variant: a host opens it the same way it opens an
+                            # Xplained Pro's, and the difference is the USB product id.
+usb_vid = 0x03EB            # which is this: an nEDBG answers 0x2175 where an Xplained Pro's EDBG
+usb_pid = 0x2175            # answers 0x2111. Read off this kit rather than inherited, and it
+                            # narrows to a KIT rather than to a board -- the probe's serial is
+                            # what separates two of the same kit.
+baud = 115200
+default = true
+
+# --- the clock plan -------------------------------------------------------------------------------
+#
+# THE RESET PLAN, STATED RATHER THAN CONFIGURED, and it is the family's rather than this board's:
+# the part comes out of reset on DFLL48M at 48 MHz as generator 0's time base, and every other
+# generator is disabled until something configures one. The 32.768 kHz crystal this board populates
+# is an input a plan could use and this one does not.
+
+[[plans]]
+name = "dfll48m-48mhz"
+default = true
+source = "dfll48m"
+gclk0_hz = 48000000
+
+# --- control lines ------------------------------------------------------------------------------
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PA14"
+active = "low"
+source = "DS70005432B section 4.2.2 and Table 4-1: one yellow LED0 on PA14 with no shared functionality. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA15"
+active = "low"
+source = "DS70005432B section 4.2.2 and Table 4-2: the generic user-configurable switch SW0 on PA15, no shared functionality. 'When the switch is pressed, it will drive the I/O line to ground (GND)'. THERE IS NO EXTERNAL PULL-UP: the section's Tip says no pull-up resistor is connected to this switch and that the internal pull-up in the part must be enabled to use it, so a program opening this pin as a plain input reads a floating pad."

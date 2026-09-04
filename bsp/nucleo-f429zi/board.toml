@@ -18,7 +18,7 @@ board = "nucleo-f429zi"
 vendor = "st"
 family = "stm32f42x"
 part = "stm32f429zi"
-board_model = 28            # lamella_wire::board_model::NUCLEO_F429ZI
+product_model = 28          # lamella_wire::product_model::NUCLEO_F429ZI
 sources = [
     "UM1974 (STM32 Nucleo-144 boards, MB1137): user LD1 is a green LED on PB0, LD2 a blue LED on PB7, LD3 a red LED on PB14; B1 USER is connected to PC13 by default; the USART3 interface on PD8 and PD9 carries the virtual COM port with SB5/SB6 ON and SB7/SB4 OFF.",
     "MB1137 schematic revision B-01, from ST's Nucleo-144 CAD pack. Sheet 2 (MCU): PB7 through SB139 and R31 680R to LD2's anode with its cathode at ground; PB14 through SB118 and R30 1K to LD3; PC13 through SB173 to the B1 USER switch, whose other side is VDD, with R58 220K to ground. Sheet 6 (extension connectors): PB0 through SB120 into R34 10K with R33 200K to ground, feeding the non-inverting input of U7, a TSV631AILT off +3V3_PER wired as a unity-gain follower, whose output drives R32 510R into LD1's anode with the cathode at ground.",

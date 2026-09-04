@@ -54,6 +54,29 @@ pub struct BlockTable {
     /// so a default would be silently wrong wherever the minority case holds -- and that is the
     /// direction nobody checks.
     pub erased_value: Option<Int>,
+    /// How many bytes this block's controller programs in ONE operation, for a flash block.
+    ///
+    /// The number of bytes a single program command commits, and the alignment it requires: a
+    /// controller either performs that operation or does not, so a consumer can place a value it
+    /// needs to appear all-at-once inside one unit. It ranges from 2 bytes on an STM32F0 to 512 on
+    /// a SAM4S, and 32 on an STM32H7 whose flash word additionally cannot be programmed twice.
+    ///
+    /// WHAT IT IS FOR, since a number with no consumer becomes a ritual. A record whose presence
+    /// must survive losing power mid-write is laid out across at least TWO of these, with the
+    /// value that makes it valid alone in the last one and programmed last -- so a torn write
+    /// leaves that value absent and the record reads as not there, rather than as half of a record
+    /// that claims to be whole. The older rule, "pad the record to one write unit and program the
+    /// magic last", has no "last" wherever the unit is as large as the record.
+    ///
+    /// REQUIRED and NOT DEFAULTED, for the same reason as `erased_value`: the values that would
+    /// have to be guessed differ by a factor of 256 between one controller and another, and a
+    /// guess is wrong silently -- a record laid out for a 4-byte unit on a 32-byte part fits
+    /// entirely in one unit and loses the property it was laid out to have.
+    ///
+    /// WARNING: it is a BLOCK fact only where the array is ON the die. A part whose program store
+    /// is an external SPI-NOR chip has no answer here that is a property of the part, and gets no
+    /// flash block at all rather than a plausible 256.
+    pub write_unit: Option<Int>,
 }
 
 impl BlockRegister {
@@ -298,9 +321,80 @@ pub struct PartRow {
     /// settles what is CHOSEN. Reading it as permission to emit FP instructions would be a
     /// mistake in the other direction from ignoring it.
     pub isa_float: String,
+    /// What the DEBUG PORT answers about ITSELF -- the SW-DP IDCODE / DPIDR -- or `None` where the
+    /// part has no such port or nobody has read one.
+    ///
+    /// IT NAMES A PORT DESIGN AND NOT A PART. `0x0bc11477` is Arm's M0-class SW-DP: an STM32L0, an
+    /// STM32C0 and a SAM D11 all answer it. `0x2ba01477` is answered by an nRF52833 and by every
+    /// STM32 M3/M4. So this value narrows a search and NEVER concludes one, which is why it is a
+    /// separate field from [`device_id`] rather than the two sharing a name.
+    ///
+    /// A part reached over a non-Arm debug transport has none -- the CH32V003 is a WCH single-wire
+    /// part and the ESP32-C6 has a built-in USB-Serial-JTAG -- and states nothing here rather than
+    /// a zero, because `0x00000000` is a value and "there is no such register" is not.
+    pub dp_idcode: Option<Int>,
+    /// The vendor register that answers about the SILICON rather than about the debug port, when
+    /// one is recorded: `None` alongside [`device_id`], [`device_id_mask`] and
+    /// [`device_id_identifies`], or all four together.
+    ///
+    /// THE ADDRESS IS PART OF THE FACT AND VARIES INSIDE ONE VENDOR. ST keeps `DBGMCU_IDCODE` at a
+    /// peripheral address on an F0 or L0 (`0x40015800`) and at `0xE0042000` on an F4 or F7; Nordic
+    /// answers in FICR, Microchip in the DSU's DID. A field holding only a value would push the
+    /// address into a tool, where it becomes a per-vendor branch nobody can audit against the
+    /// tables.
+    pub device_id_reg: Option<Int>,
+    /// Which bits of [`device_id_reg`] carry the identity. The rest are typically a die REVISION,
+    /// which changes under a part that has not changed -- so a tool comparing whole words reports a
+    /// difference where there is none.
+    pub device_id_mask: Option<Int>,
+    /// What the masked [`device_id_reg`] reads on this part.
+    pub device_id: Option<Int>,
+    /// Whether that value names THIS PART (`part`) or something broader (`class`). REQUIRED once a
+    /// device id is stated, and it is the field that stops the second reading repeating the first
+    /// one's mistake.
+    ///
+    /// A SECOND READING IS NOT AUTOMATICALLY AN IDENTITY. RM0090 gives `DEV_ID` 0x419 to
+    /// STM32F42xxx and STM32F43xxx alike, and an STM32L0's `DEV_ID` names a product CATEGORY
+    /// spanning two lines -- so on those parts even the vendor register cannot say which part is on
+    /// the wire. Stating `class` is how a table says that outright instead of leaving a consumer to
+    /// discover it against silicon.
+    pub device_id_identifies: String,
 }
 
+/// What a `device_id` value is established to name. CLOSED: anything else is refused where it is
+/// written.
+pub const DEVICE_ID_SCOPES: &[&str] = &["part", "class"];
+
 impl PartRow {
+    /// Refuses a half-stated identity: the four `device_id*` fields are one fact and travel
+    /// together.
+    ///
+    /// THREE OF THE FOUR IS WORSE THAN NONE, and each missing one fails differently. Without the
+    /// REGISTER a consumer has a number and nowhere to read it. Without the MASK it compares whole
+    /// words and reports a die revision as a different part. Without `identifies` it treats a value
+    /// that names a whole product category as though it named the part, which is the reading a
+    /// probe cannot correct for you.
+    fn check_identity(&self, family: &str) -> Result<(), String> {
+        let stated = [
+            ("device_id_reg", self.device_id_reg.is_some()),
+            ("device_id_mask", self.device_id_mask.is_some()),
+            ("device_id", self.device_id.is_some()),
+            ("device_id_identifies", !self.device_id_identifies.is_empty()),
+        ];
+        let present: Vec<&str> = stated.iter().filter(|(_, v)| *v).map(|(k, _)| *k).collect();
+        let absent: Vec<&str> = stated.iter().filter(|(_, v)| !*v).map(|(k, _)| *k).collect();
+        if present.is_empty() || absent.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{family}: part '{}' states {} and not {} -- a device identity is those four fields \
+             together or none of them",
+            self.part,
+            present.join(", "),
+            absent.join(", ")
+        ))
+    }
+
     /// Whether `pin` (e.g. `PB10`) is inside this part's present-list.
     #[must_use]
     pub fn has_pin(&self, pin: &str) -> bool {
@@ -385,7 +479,8 @@ pub struct ControlPin {
     pub kind: String,
     /// The pin name (pin-wired rows; empty for bus devices).
     pub pin: String,
-    /// `low` or `high` (the asserted level; pin-wired rows).
+    /// The asserted level of a pin-wired row, one of [`ACTIVE_LEVELS`]. Empty only on a bus device,
+    /// which has no pin to assert a level on.
     pub active: String,
     /// The binding role a bus device rides (empty for pin-wired rows).
     pub role: String,
@@ -403,6 +498,36 @@ impl Default for ControlPin {
             role: String::new(),
             address: -1,
         }
+    }
+}
+
+/// The levels a pin-wired control line may declare. CLOSED: anything else is refused where it is
+/// written.
+///
+/// FOUR WORDS AND NOT TWO, because a polarity has four states and only two of them are a level.
+/// `none` is a line whose nature has no asserted level -- a clock, a bidirectional data pin -- and
+/// `unknown` is a line whose level nobody has established yet. Collapsing those two loses the
+/// difference between a fact that does not exist and a fact nobody looked for, which is the same
+/// distinction the parts rows had to grow for their pad space.
+pub const ACTIVE_LEVELS: &[&str] = &["low", "high", "none", "unknown"];
+
+/// Whether a control line asserts LOW, or `None` when it declares no level at all.
+///
+/// THE WHOLE POINT IS THAT THIS IS ONE FUNCTION. Four emitters -- C#, Rust, Swift, Python -- each
+/// carried their own `active == "low"`, so absence and every typo rendered as a confident
+/// active-HIGH, byte-identical to a board that claimed it. Four independent spellings of one rule
+/// is four chances to fix three of them: the repair is the extraction, not a more careful
+/// comparison at the fourth site.
+///
+/// `None` MEANS THE EMITTERS PRODUCE NOTHING for this line's polarity -- no constant in the three
+/// typed languages, no key in Python's dict. A consumer that needs the level then fails to COMPILE,
+/// or raises a `KeyError`, against a board that never stated one: the loud form of the same
+/// information. Emitting a placeholder value instead was tried and is what the defect WAS.
+pub fn asserts_low(control: &ControlPin) -> Option<bool> {
+    match control.active.as_str() {
+        "low" => Some(true),
+        "high" => Some(false),
+        _ => None,
     }
 }
 
@@ -600,7 +725,8 @@ pub struct Discriminator {
 /// because a board's silkscreen carries one of them and not the other. Whether the two are
 /// interchangeable is a claim about the two standards rather than about any board, so it is not
 /// stated here.
-pub const CONNECTOR_STANDARDS: [&str; 4] = ["qwiic", "stemma-qt", "mikrobus", "arduino-uno-v3"];
+pub const CONNECTOR_STANDARDS: [&str; 5] =
+    ["qwiic", "stemma-qt", "mikrobus", "arduino-uno-v3", "xplained-pro"];
 
 /// The bus kinds a connector may bring out as a whole group, matching the binding kinds.
 pub const CONNECTOR_BUS_SIGNALS: [&str; 3] = ["i2c", "spi", "uart"];
@@ -663,6 +789,123 @@ pub struct Connector {
     pub pins: Vec<ConnectorPin>,
 }
 
+/// One position of a connector STANDARD: the join vocabulary two files meet in.
+///
+/// A standard describes neither a chip nor a board, which is why it is neither. It exists
+/// because an extension board and a host board each state HALF of a wiring and neither may state
+/// the other's half: the extension names the position it uses, the host names the pad behind that
+/// position, and the position name is all they share. Defining the names once, with their pin
+/// numbers, is what keeps a typo on either side from becoming a join that matches nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StandardPin {
+    /// The connector pin number the position sits on.
+    pub number: i64,
+    /// The canonical position name, and the ONLY spelling a file may join on.
+    pub signal: String,
+    /// Another spelling the same position appears under in a vendor document. Recorded so a reader
+    /// meeting it can find the row; NEVER a join key, because one position joining under two names
+    /// lets two files agree while naming different things.
+    pub aka: String,
+    /// Whether a host can wire this position to a pad at all. Power, ground and an identification
+    /// line are positions of the connector and reach no pad.
+    pub routable: bool,
+    /// What the standard says the position is for.
+    pub description: String,
+}
+
+/// A connector standard: `ext/standards/<standard>.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderStandardTable {
+    /// The standard id, matching a board connector's `standard =`.
+    pub standard: String,
+    /// Every position, in pin-number order.
+    pub pins: Vec<StandardPin>,
+}
+
+impl HeaderStandardTable {
+    /// The position of that name, if the standard defines one.
+    pub fn pin(&self, signal: &str) -> Option<&StandardPin> {
+        self.pins.iter().find(|p| p.signal == signal)
+    }
+}
+
+/// One bus an extension board presents, named by the standard positions it occupies.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionBus {
+    /// The extension's own name for the bus.
+    pub role: String,
+    /// `spi`, `i2c` or `uart`.
+    pub kind: String,
+    /// The standard positions this bus rides, by the extension's role for each.
+    pub lines: Vec<(String, String)>,
+    /// Where the wiring is stated.
+    pub source: String,
+}
+
+/// One thing on an extension board that a host reaches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionDevice {
+    /// The extension's own name for it.
+    pub name: String,
+    /// `gpio-in`, `gpio-out`, `analog-in`, `spi-device`, `i2c-device`.
+    pub kind: String,
+    /// The standard position it sits on, for a line-wired device. Empty for a bus-wired one.
+    pub signal: String,
+    /// The bus role it answers on, for a bus-wired device. Empty for a line-wired one.
+    pub bus: String,
+    /// `low`, `high`, `none` or `unknown`. A CLOSED vocabulary, and absence REFUSES: an omitted
+    /// level would emit as active-high and a board declining to claim one would be
+    /// indistinguishable from a board claiming the common answer.
+    pub active: String,
+    /// The part on the extension, where the row names one.
+    pub part: String,
+    /// The device's bus address, where a document states one. `-1` when it does not.
+    pub address: i64,
+    /// Where the row is stated.
+    pub source: String,
+}
+
+/// An extension board: `ext/<extension>/extension.toml`.
+///
+/// EVERY LINE IS A STANDARD POSITION AND NEVER A HOST PAD, which is what lets one of these bind to
+/// every host that offers a socket of the same standard.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionTable {
+    /// The extension id, matching its directory name.
+    pub extension: String,
+    /// Who made it.
+    pub vendor: String,
+    /// The connector standard it plugs into.
+    pub standard: String,
+    /// The `nnnn` field of the serial its identification chip carries, or `-1`.
+    pub kit_identifier: i64,
+    /// The buses it presents.
+    pub buses: Vec<ExtensionBus>,
+    /// The devices a host reaches.
+    pub devices: Vec<ExtensionDevice>,
+}
+
+impl ExtensionTable {
+    /// Every standard position this extension needs a host to wire, without duplicates, in the
+    /// order the file states them. THIS IS THE REQUIREMENT SET a socket is measured against.
+    pub fn required_positions(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for bus in &self.buses {
+            for (_, signal) in &bus.lines {
+                if !out.contains(signal) {
+                    out.push(signal.clone());
+                }
+            }
+        }
+        for device in &self.devices {
+            if !device.signal.is_empty() && !out.contains(&device.signal) {
+                out.push(device.signal.clone());
+            }
+        }
+        out
+    }
+}
+
 /// A board BSP: the bindings, carrier, plans, and identity of one product.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoardTable {
@@ -678,8 +921,8 @@ pub struct BoardTable {
     pub module: String,
     /// The exact part id (required with `family`; implied by `module`).
     pub part: String,
-    /// The `lamella_wire::board_model` wire code.
-    pub board_model: i64,
+    /// The `lamella_wire::product_model` wire code.
+    pub product_model: i64,
     /// The memory regions the board fits, in table order. Empty = no record: the part's own
     /// parts row is the whole memory truth.
     pub memory: Vec<MemoryRegion>,
@@ -1058,6 +1301,10 @@ pub enum Strata {
     Module(ModuleTable),
     /// A board BSP.
     Board(BoardTable),
+    /// A connector standard -- the join vocabulary.
+    HeaderStandard(HeaderStandardTable),
+    /// An extension board.
+    Extension(ExtensionTable),
     /// A part table from the `parts/` tree.
     Device(DeviceTable),
 }
@@ -1221,6 +1468,8 @@ pub fn parse(text: &str) -> Result<Strata, String> {
         "parts" => build_parts(&header, rest).map(Strata::Parts),
         "module" => build_module(&header, rest).map(Strata::Module),
         "board" => build_board(&header, rest).map(Strata::Board),
+        "header-standard" => build_header_standard(&header, rest).map(Strata::HeaderStandard),
+        "extension" => build_extension(&header, rest).map(Strata::Extension),
         "device" => build_device(&header, rest, false).map(Strata::Device),
         "device-base" => build_device(&header, rest, true).map(Strata::Device),
         other => Err(format!("unknown strata kind '{other}'")),
@@ -1271,7 +1520,10 @@ fn build_block(
     header: &[(usize, String, RawValue)],
     items: &[(usize, Item)],
 ) -> Result<BlockTable, String> {
-    header_reject_unknown(header, &["kind", "family", "block", "mode", "erased_value", "sources", "notes"])?;
+    header_reject_unknown(
+        header,
+        &["kind", "family", "block", "mode", "erased_value", "write_unit", "sources", "notes"],
+    )?;
     let mut table = BlockTable {
         family: header_str(header, "family")?,
         block: header_str(header, "block")?,
@@ -1297,6 +1549,32 @@ fn build_block(
     }
     if let Some(value) = table.erased_value {
         table.constants.push((String::from("ERASED_VALUE"), value));
+    }
+
+    table.write_unit = match header.iter().find(|(_, k, _)| k == "write_unit") {
+        Some((line, k, v)) => Some(as_int(*line, k, v)?),
+        None => None,
+    };
+    if table.block == "flash" && table.write_unit.is_none() {
+        return Err(format!(
+            "block {}/{}: a flash block must declare `write_unit` -- how many bytes the controller \n             programs in ONE operation. It is NOT defaulted: real controllers answer 2, 4, 8, 16, \n             32, 64 and 512, and a record laid out for the wrong one loses the torn-write property \n             it was laid out to have, without failing. Read it from the part's own manual, and \n             NEVER from a sibling family",
+            table.family, table.block
+        ));
+    }
+    if table.block != "flash" && table.write_unit.is_some() {
+        return Err(format!(
+            "block {}/{}: `write_unit` belongs to a flash block and this is not one -- a block with \n             no array to program would be declaring a field nothing reads",
+            table.family, table.block
+        ));
+    }
+    if let Some(value) = table.write_unit {
+        if value.value <= 0 || (value.value & (value.value - 1)) != 0 {
+            return Err(format!(
+                "block {}/{}: `write_unit` is {} and must be a positive power of two -- every consumer \n             of it aligns a record to a unit boundary so that one command writes the unit that \n             makes the record valid, and a unit with no boundary cannot carry that",
+                table.family, table.block, value.value
+            ));
+        }
+        table.constants.push((String::from("WRITE_UNIT"), value));
     }
 
     enum At {
@@ -2280,6 +2558,11 @@ fn build_parts(
                     isa_registers: 0,
                     isa_muldiv: String::new(),
                     isa_float: String::new(),
+                    dp_idcode: None,
+                    device_id_reg: None,
+                    device_id_mask: None,
+                    device_id: None,
+                    device_id_identifies: String::new(),
                 });
                 open = true;
             }
@@ -2302,6 +2585,24 @@ fn build_parts(
                     ("isa_float", RawValue::Str(s)) => row.isa_float = s.clone(),
                     ("isa_source", RawValue::Str(_)) => {}
                     ("source", RawValue::Str(_)) => {}
+                    ("identity_source", RawValue::Str(_)) => {}
+                    ("dp_idcode", RawValue::Int(i)) => row.dp_idcode = Some(i.clone()),
+                    ("device_id_reg", RawValue::Int(i)) => row.device_id_reg = Some(i.clone()),
+                    ("device_id_mask", RawValue::Int(i)) => row.device_id_mask = Some(i.clone()),
+                    ("device_id", RawValue::Int(i)) => row.device_id = Some(i.clone()),
+                    ("device_id_identifies", RawValue::Str(s)) => {
+                        if !DEVICE_ID_SCOPES.contains(&s.as_str()) {
+                            return Err(err(
+                                *line,
+                                &format!(
+                                    "device_id_identifies = '{s}' is not one of {} -- say whether \
+                                     the value names THIS PART or a broader class",
+                                    DEVICE_ID_SCOPES.join(", ")
+                                ),
+                            ));
+                        }
+                        row.device_id_identifies = s.clone();
+                    }
                     ("pins", RawValue::Array(parts)) => {
                         for part in parts {
                             match part {
@@ -2365,6 +2666,7 @@ fn build_parts(
     for row in &table.rows {
         validate_part_isa(row)?;
         validate_part_cores(row)?;
+        row.check_identity(&table.family)?;
         for (pin, owner) in &row.reserved {
             if !row.has_pin(pin) {
                 return Err(format!(
@@ -2414,7 +2716,20 @@ fn control_pin_key(
     match (key, value) {
         ("name", RawValue::Str(s)) => pin.name = s.clone(),
         ("pin", RawValue::Str(s)) => pin.pin = s.clone(),
-        ("active", RawValue::Str(s)) => pin.active = s.clone(),
+        ("active", RawValue::Str(s)) => {
+            if !ACTIVE_LEVELS.contains(&s.as_str()) {
+                return Err(err(
+                    line,
+                    &format!(
+                        "control line '{}': active = '{s}' is not one of {} -- an unrecognized \
+                         level used to emit as active-high, which is a claim nobody made",
+                        pin.name,
+                        ACTIVE_LEVELS.join(", ")
+                    ),
+                ));
+            }
+            pin.active = s.clone();
+        }
         ("kind", RawValue::Str(s)) => pin.kind = s.clone(),
         ("role", RawValue::Str(s)) => pin.role = s.clone(),
         ("address", RawValue::Int(i)) => pin.address = i.value,
@@ -2468,13 +2783,359 @@ fn build_module(
     Ok(table)
 }
 
+/// The active levels a control line may state. A CLOSED vocabulary, and absence is a PARSE ERROR:
+/// an omitted level emits as active-high in every language, so a board declining to claim one and a
+/// board claiming the common answer would produce identical output.
+const EXTENSION_ACTIVE: [&str; 4] = ["low", "high", "none", "unknown"];
+
+/// The device kinds an extension row may declare.
+const EXTENSION_DEVICE_KINDS: [&str; 5] =
+    ["gpio-in", "gpio-out", "analog-in", "spi-device", "i2c-device"];
+
+/// The line names each bus kind states, in the order a reader expects them.
+fn extension_bus_lines(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "spi" => &["ss", "mosi", "miso", "sck"],
+        "i2c" => &["sda", "scl"],
+        "uart" => &["rx", "tx"],
+        _ => &[],
+    }
+}
+
+fn build_header_standard(
+    header: &[(usize, String, RawValue)],
+    items: &[(usize, Item)],
+) -> Result<HeaderStandardTable, String> {
+    header_reject_unknown(header, &["kind", "standard", "sources", "notes"])?;
+    let mut table =
+        HeaderStandardTable { standard: header_str(header, "standard")?, ..Default::default() };
+    let mut open = false;
+    for (line, item) in items {
+        match item {
+            Item::ArraySection(name) if name == "pins" => {
+                table.pins.push(StandardPin { number: -1, ..Default::default() });
+                open = true;
+            }
+            Item::Section(name) | Item::ArraySection(name) => {
+                return Err(err(
+                    *line,
+                    &format!("unexpected section '{name}' in a header standard -- it states [[pins]] and nothing else"),
+                ));
+            }
+            Item::KeyValue(key, value) => {
+                if !open {
+                    return Err(err(*line, "key outside any section"));
+                }
+                let row = table.pins.last_mut().expect("open");
+                match key.as_str() {
+                    "number" => row.number = as_int(*line, key, value)?.value,
+                    "signal" => row.signal = as_str(*line, key, value)?,
+                    "aka" => row.aka = as_str(*line, key, value)?,
+                    "routable" => row.routable = as_int(*line, key, value)?.value != 0,
+                    "description" => row.description = as_str(*line, key, value)?,
+                    other => {
+                        return Err(err(
+                            *line,
+                            &format!("unexpected standard pin key '{other}' -- a position states number, signal, routable, description and optionally aka"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    validate_header_standard(&table)?;
+    Ok(table)
+}
+
+fn validate_header_standard(table: &HeaderStandardTable) -> Result<(), String> {
+    if table.standard.is_empty() {
+        return Err("a header standard states no standard id".to_string());
+    }
+    if table.pins.is_empty() {
+        return Err(format!(
+            "standard '{}' defines no position -- a vocabulary nothing can be said in is a name, not a fact",
+            table.standard
+        ));
+    }
+    for row in &table.pins {
+        if row.number < 1 {
+            return Err(format!(
+                "standard '{}': position '{}' states no pin number -- a position without one cannot be checked against a document",
+                table.standard, row.signal
+            ));
+        }
+        if row.signal.is_empty() || row.description.is_empty() {
+            return Err(format!(
+                "standard '{}': the position at pin {} states no {}",
+                table.standard,
+                row.number,
+                if row.signal.is_empty() { "signal" } else { "description" }
+            ));
+        }
+        if table.pins.iter().filter(|other| other.signal == row.signal).count() > 1 {
+            return Err(format!(
+                "standard '{}' defines the position '{}' twice -- a join key is a name, and two rows sharing one make a join ambiguous rather than redundant",
+                table.standard, row.signal
+            ));
+        }
+        if table.pins.iter().filter(|other| other.number == row.number).count() > 1 {
+            return Err(format!(
+                "standard '{}' puts two positions on pin {}",
+                table.standard, row.number
+            ));
+        }
+        if !row.aka.is_empty() && table.pin(&row.aka).is_some() {
+            return Err(format!(
+                "standard '{}': '{}' is recorded as another spelling of '{}' AND defined as a position of its own -- one position, one join key",
+                table.standard, row.aka, row.signal
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_extension(
+    header: &[(usize, String, RawValue)],
+    items: &[(usize, Item)],
+) -> Result<ExtensionTable, String> {
+    header_reject_unknown(
+        header,
+        &["kind", "extension", "vendor", "standard", "kit_identifier", "sources", "notes"],
+    )?;
+    let mut table = ExtensionTable {
+        extension: header_str(header, "extension")?,
+        vendor: header_str(header, "vendor")?,
+        standard: header_str(header, "standard")?,
+        kit_identifier: -1,
+        ..Default::default()
+    };
+    for (line, key, value) in header {
+        if key == "kit_identifier" {
+            table.kit_identifier = as_int(*line, key, value)?.value;
+        }
+    }
+
+    enum At {
+        None,
+        Bus,
+        Device,
+        /// A feature that is a wire between two positions of the connector, or a part with no line
+        /// at all. Neither can be a device row, and both are read and discarded here: they carry
+        /// no address and nothing resolves through them.
+        Prose,
+    }
+    let mut at = At::None;
+    for (line, item) in items {
+        match item {
+            Item::ArraySection(name) if name == "buses" => {
+                table.buses.push(ExtensionBus::default());
+                at = At::Bus;
+            }
+            Item::ArraySection(name) if name == "devices" => {
+                table.devices.push(ExtensionDevice { address: -1, ..Default::default() });
+                at = At::Device;
+            }
+            Item::ArraySection(name) if name == "loopbacks" || name == "unbound" => {
+                at = At::Prose;
+            }
+            Item::Section(name) | Item::ArraySection(name) => {
+                return Err(err(
+                    *line,
+                    &format!("unexpected section '{name}' in an extension file -- the key set is closed"),
+                ));
+            }
+            Item::KeyValue(key, value) => match at {
+                At::None => return Err(err(*line, "key outside any section")),
+                At::Prose => {}
+                At::Bus => {
+                    let row = table.buses.last_mut().expect("open");
+                    match key.as_str() {
+                        "role" => row.role = as_str(*line, key, value)?,
+                        "kind" => row.kind = as_str(*line, key, value)?,
+                        "source" => row.source = as_str(*line, key, value)?,
+                        other => {
+                            let names = extension_bus_lines(&row.kind);
+                            if names.contains(&other) {
+                                row.lines.push((other.to_string(), as_str(*line, key, value)?));
+                            } else if row.kind.is_empty() {
+                                return Err(err(
+                                    *line,
+                                    &format!("bus key '{other}' comes before the bus states its kind -- state `kind` first so the line names can be checked"),
+                                ));
+                            } else {
+                                return Err(err(
+                                    *line,
+                                    &format!(
+                                        "unexpected bus key '{other}' -- a {} bus states {}",
+                                        row.kind,
+                                        names.join(", ")
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                At::Device => {
+                    let row = table.devices.last_mut().expect("open");
+                    match key.as_str() {
+                        "name" => row.name = as_str(*line, key, value)?,
+                        "kind" => row.kind = as_str(*line, key, value)?,
+                        "signal" => row.signal = as_str(*line, key, value)?,
+                        "bus" => row.bus = as_str(*line, key, value)?,
+                        "active" => row.active = as_str(*line, key, value)?,
+                        "part" => row.part = as_str(*line, key, value)?,
+                        "source" => row.source = as_str(*line, key, value)?,
+                        "address" => match value {
+                            RawValue::Str(_) => {
+                                let stated = as_str(*line, key, value)?;
+                                if stated != "unknown" {
+                                    return Err(err(
+                                        *line,
+                                        &format!("address '{stated}' is neither a number nor `unknown`"),
+                                    ));
+                                }
+                            }
+                            _ => row.address = as_int(*line, key, value)?.value,
+                        },
+                        other => {
+                            return Err(err(
+                                *line,
+                                &format!("unexpected device key '{other}' in an extension -- a device states name, kind, and either signal or bus, plus active, part, address and source"),
+                            ));
+                        }
+                    }
+                }
+            },
+        }
+    }
+    validate_extension(&table)?;
+    Ok(table)
+}
+
+fn validate_extension(table: &ExtensionTable) -> Result<(), String> {
+    if table.extension.is_empty() || table.vendor.is_empty() || table.standard.is_empty() {
+        return Err("an extension states extension, vendor and standard".to_string());
+    }
+    if table.buses.is_empty() && table.devices.is_empty() {
+        return Err(format!(
+            "extension '{}' presents neither a bus nor a device -- an extension nothing reaches through is a name, not a fact",
+            table.extension
+        ));
+    }
+    for bus in &table.buses {
+        if bus.role.is_empty() || bus.source.is_empty() {
+            return Err(format!(
+                "extension '{}': a bus states {}",
+                table.extension,
+                if bus.role.is_empty() { "no role" } else { "no source" }
+            ));
+        }
+        let expected = extension_bus_lines(&bus.kind);
+        if expected.is_empty() {
+            return Err(format!(
+                "extension '{}': bus '{}' is of kind '{}', which is not one of {}",
+                table.extension,
+                bus.role,
+                bus.kind,
+                CONNECTOR_BUS_SIGNALS.join("/")
+            ));
+        }
+        for name in expected {
+            if !bus.lines.iter().any(|(line, _)| line == name) {
+                return Err(format!(
+                    "extension '{}': {} bus '{}' states no {} -- a bus that names some of its lines and not others is a partial wiring, and the missing one reads as absent from the connector",
+                    table.extension, bus.kind, bus.role, name
+                ));
+            }
+        }
+        if table.buses.iter().filter(|other| other.role == bus.role).count() > 1 {
+            return Err(format!(
+                "extension '{}': two buses are named '{}'",
+                table.extension, bus.role
+            ));
+        }
+    }
+    for device in &table.devices {
+        if device.name.is_empty() || device.source.is_empty() {
+            return Err(format!(
+                "extension '{}': a device states {}",
+                table.extension,
+                if device.name.is_empty() { "no name" } else { "no source" }
+            ));
+        }
+        if !EXTENSION_DEVICE_KINDS.contains(&device.kind.as_str()) {
+            return Err(format!(
+                "extension '{}': device '{}' is of kind '{}', which is not one of {}",
+                table.extension,
+                device.name,
+                device.kind,
+                EXTENSION_DEVICE_KINDS.join("/")
+            ));
+        }
+        if device.signal.is_empty() == device.bus.is_empty() {
+            return Err(format!(
+                "extension '{}': device '{}' states {} -- a device is EITHER on a connector position or on a bus, never both and never neither",
+                table.extension,
+                device.name,
+                if device.signal.is_empty() { "neither a signal nor a bus" } else { "both a signal and a bus" }
+            ));
+        }
+        if !device.bus.is_empty() && !table.buses.iter().any(|b| b.role == device.bus) {
+            return Err(format!(
+                "extension '{}': device '{}' answers on bus '{}', which no [[buses]] row declares",
+                table.extension, device.name, device.bus
+            ));
+        }
+        if !device.signal.is_empty() && !EXTENSION_ACTIVE.contains(&device.active.as_str()) {
+            return Err(format!(
+                "extension '{}': device '{}' states active '{}' -- one of {} is required, and ABSENCE REFUSES: an omitted level emits as active-high, so a board declining to claim one would be indistinguishable from a board claiming the common answer",
+                table.extension,
+                device.name,
+                device.active,
+                EXTENSION_ACTIVE.join("/")
+            ));
+        }
+        if table.devices.iter().filter(|other| other.name == device.name).count() > 1 {
+            return Err(format!(
+                "extension '{}': two devices are named '{}'",
+                table.extension, device.name
+            ));
+        }
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for bus in &table.buses {
+        for (_, position) in &bus.lines {
+            if seen.contains(position) {
+                return Err(format!(
+                    "extension '{}' uses connector position '{}' twice -- one position is one hole, and two claims on it cannot both be wired",
+                    table.extension, position
+                ));
+            }
+            seen.push(position.clone());
+        }
+    }
+    for device in &table.devices {
+        if device.signal.is_empty() {
+            continue;
+        }
+        if seen.contains(&device.signal) {
+            return Err(format!(
+                "extension '{}' uses connector position '{}' twice -- one position is one hole, and two claims on it cannot both be wired",
+                table.extension, device.signal
+            ));
+        }
+        seen.push(device.signal.clone());
+    }
+    Ok(())
+}
+
 fn build_board(
     header: &[(usize, String, RawValue)],
     items: &[(usize, Item)],
 ) -> Result<BoardTable, String> {
     header_reject_unknown(
         header,
-        &["kind", "board", "vendor", "family", "module", "part", "board_model", "sources", "notes"],
+        &["kind", "board", "vendor", "family", "module", "part", "product_model", "sources", "notes"],
     )?;
     let mut table = BoardTable {
         board: header_str(header, "board")?,
@@ -2485,8 +3146,8 @@ fn build_board(
         ..Default::default()
     };
     for (line, key, value) in header {
-        if key == "board_model" {
-            table.board_model = as_int(*line, key, value)?.value;
+        if key == "product_model" {
+            table.product_model = as_int(*line, key, value)?.value;
         }
     }
     if table.family.is_empty() == table.module.is_empty() {
@@ -3350,6 +4011,17 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
     }
     validate_bindings(set, &bindings, &part, &board.board)?;
     for line in board.devices.iter().chain(module_pins.iter()) {
+        if !line.pin.is_empty() && line.active.is_empty() {
+            return Err(format!(
+                "board {}: device '{}' is wired to {} and states no `active` level -- write one of {} \
+                 (`none` for a line with no asserted level, such as a clock or a bidirectional data \
+                 pin; `unknown` where nobody has established it yet)",
+                board.board,
+                line.name,
+                line.pin,
+                ACTIVE_LEVELS.join(", ")
+            ));
+        }
         if !line.pin.is_empty() && !part_row.has_pin(&line.pin) {
             return Err(format!(
                 "board {}: device '{}' is wired to {}, which is not in part {}'s pin list (if the pin exists on silicon, grow the parts row from the datasheet)",
@@ -3948,6 +4620,146 @@ fn resolve_i2c_samd21(
     })
 }
 
+/// One resolved SAM E54 `kind = "i2c"` binding. The samd21 arm's twin in everything the SERCOM
+/// itself does, and its opposite in how the peripheral is CLOCKED -- which is why it is a separate
+/// shape rather than a widened one:
+///
+///   A CHANNEL ADDRESS, NOT A COMPOSED WORD. That family routes a core clock by composing one
+///   CLKCTRL value -- id, generator and enable together -- into a single shared register. This one
+///   has a register PER CHANNEL, so the channel index resolves to an ADDRESS here and the stored
+///   value carries only the generator and the enable bit.
+///
+///   A MASK REGISTER, NOT JUST A MASK. That family gates every SERCOM from one APB mask. This one
+///   spreads eight SERCOMs over THREE, so which register to write is a per-instance fact and a
+///   descriptor carrying only a bit would name a register the driver had to guess.
+///
+/// Widening the samd21 struct to cover both would put four shipping boards behind a shape change
+/// to serve one. This file already declines that trade four times over -- there are five i2c
+/// emission shapes here because there are five ways to clock and mux an I2C master.
+struct Same54SercomI2cEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    sercom_base: i64,
+    irq: i64,
+    gclk_pchctrl_reg: i64,
+    gclk_pchctrl_value: i64,
+    apb_mask_reg: i64,
+    apb_mask: i64,
+    pmux_reg: i64,
+    pmux_pair: i64,
+    pincfg_sda_reg: i64,
+    pincfg_scl_reg: i64,
+    core_clock_hz: i64,
+}
+
+/// Resolves a same54 `kind = "i2c"` binding. The pin half is the samd21 arm's exactly -- I2C fixes
+/// SDA to pad0 and SCL to pad1, so there is no routing to choose, and an adjacent pin pair shares
+/// one PMUX byte. The clock half is this family's own; see [`Same54SercomI2cEmission`].
+fn resolve_i2c_same54(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<Same54SercomI2cEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let name = &binding.instance;
+    let base = instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    let irq = instances.value(name, "irq").unwrap_or(-1);
+    let gclk_id = instances
+        .value(name, "gclk_core_id")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no gclk_core_id"))?;
+    let apb_mask_offset = instances
+        .value(name, "apb_mask_offset")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no apb_mask_offset"))?;
+    let apb_bit = instances
+        .value(name, "apb_bit")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no apb_bit"))?;
+
+    if binding.gclk_gen < 0 {
+        return Err(format!(
+            "{board}: i2c binding '{}' declares no gclk_gen (which generator its core clock rides under the default plan)",
+            binding.role
+        ));
+    }
+
+    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
+    let pchctrl =
+        gclk.register("PCHCTRL0").ok_or_else(|| format!("{board}: gclk has no PCHCTRL0"))?;
+    let gclk_base = instances
+        .value("gclk", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'gclk'"))?;
+    let pch_shift = |field: &str| -> Result<u32, String> {
+        pchctrl
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.lsb)
+            .ok_or_else(|| format!("{board}: PCHCTRL0 has no {field} field"))
+    };
+    let gclk_pchctrl_reg =
+        gclk_base + pchctrl.offset.value + gclk_id * i64::from(pchctrl.width / 8);
+    let gclk_pchctrl_value = binding.gclk_gen << pch_shift("GEN")? | 1i64 << pch_shift("CHEN")?;
+
+    let mclk_base = instances
+        .value("mclk", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'mclk'"))?;
+
+    let sda = binding.pins.iter().find(|(s, _)| s == "sda").map(|(_, p)| p);
+    let scl = binding.pins.iter().find(|(s, _)| s == "scl").map(|(_, p)| p);
+    let (Some(sda), Some(scl)) = (sda, scl) else {
+        return Err(format!("{board}: i2c binding '{}' needs sda and scl pins", binding.role));
+    };
+    let (sda_port, sda_index) =
+        split_pin(&sda.pin).ok_or_else(|| format!("{board}: bad pin {}", sda.pin))?;
+    let (scl_port, scl_index) =
+        split_pin(&scl.pin).ok_or_else(|| format!("{board}: bad pin {}", scl.pin))?;
+    if sda_port != scl_port || sda_index / 2 != scl_index / 2 {
+        return Err(format!(
+            "{board}: i2c binding '{}' pins {}/{} do not share a PMUX byte -- per-pin nibble emission is the named growth path; refuse until a real board needs it",
+            binding.role, sda.pin, scl.pin
+        ));
+    }
+    let group = format!("port{sda_port}");
+    let group_base = instances
+        .value(&group, "base")
+        .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+    let port = set.block("port", "").ok_or_else(|| format!("{board}: no port block table"))?;
+    let pmux0 = port.register("PMUX0").ok_or_else(|| format!("{board}: port has no PMUX0"))?;
+    let pincfg0 = port.register("PINCFG0").ok_or_else(|| format!("{board}: port has no PINCFG0"))?;
+    let func = port
+        .constant(&format!("FUNC_{}", binding.function.to_ascii_uppercase()))
+        .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let core_clock_hz = plan.gclk_hz(binding.gclk_gen).ok_or_else(|| {
+        format!(
+            "{board}: default plan '{}' states no gclk{}_hz rate for binding '{}'",
+            plan.name, binding.gclk_gen, binding.role
+        )
+    })?;
+
+    Ok(Same54SercomI2cEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        sercom_base: base,
+        irq,
+        gclk_pchctrl_reg,
+        gclk_pchctrl_value,
+        apb_mask_reg: mclk_base + apb_mask_offset,
+        apb_mask: 1i64 << apb_bit,
+        pmux_reg: group_base + pmux0.offset.value + i64::from(sda_index / 2),
+        pmux_pair: (func << 4) | func,
+        pincfg_sda_reg: group_base + pincfg0.offset.value + i64::from(sda_index),
+        pincfg_scl_reg: group_base + pincfg0.offset.value + i64::from(scl_index),
+        core_clock_hz,
+    })
+}
+
 /// One resolved rp-family uart-binding emission (the PL011 shape): the
 /// uart base, the combined reset-release mask (the binding's instance + both IO banks), the
 /// per-pin IO_BANK0 CTRL addresses from the rp pin
@@ -4349,6 +5161,173 @@ fn resolve_i2c_dw(
 /// in microvolts (board truth, so it rides the adc binding and emits per-board).
 /// The channel map and calibration records stay CHIP truth in the adc block's layout
 /// emission; the plan's clk_adc rate is verified against the block's required rate.
+/// One resolved SAM E54 `kind = "adc"` binding. The rp arm binds a WHOLE CONVERTER and names no
+/// pin, because that family's channels are fixed pads a driver selects by number at run time. This
+/// one binds a PAD, because here a channel and a pad are a pairing the chip states per pin, and the
+/// pad has to be handed to the analog function before the converter can see it.
+///
+/// AND IT CARRIES A CALIBRATION ADDRESS, WHICH NO OTHER ADC ROLE IN THIS FILE DOES. This converter
+/// does not work out of reset: three production values must be copied out of the NVM software
+/// calibration area into CALIB "to allow conversion", in the manual's own words. So the descriptor
+/// names WHERE to read them and WHERE that instance's three sit in the word -- the second is a
+/// per-instance fact, because the two converters occupy different offsets of the same word.
+struct Same54AdcEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    adc_base: i64,
+    gclk_pchctrl_reg: i64,
+    gclk_pchctrl_value: i64,
+    apb_mask_reg: i64,
+    apb_mask: i64,
+    calib_reg: i64,
+    nvm_calib_area: i64,
+    nvm_calib_lsb: i64,
+    pmux_reg: i64,
+    pmux_mask: i64,
+    pmux_value: i64,
+    pincfg_reg: i64,
+    muxpos: i64,
+    reference_uv: i64,
+}
+
+/// Resolves a same54 `kind = "adc"` binding. The clock half is the i2c arm's; the pin half is not,
+/// and the difference is worth stating: an I2C binding muxes a PAIR of adjacent pads and can write
+/// both nibbles of one PMUX byte, while this binds ONE pad and must leave its neighbour's nibble
+/// alone -- so the descriptor carries a mask and a value for a read-modify-write rather than a byte.
+fn resolve_adc_same54(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<Same54AdcEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let name = &binding.instance;
+    let base = instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    let gclk_id = instances
+        .value(name, "gclk_core_id")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no gclk_core_id"))?;
+    let apb_mask_offset = instances
+        .value(name, "apb_mask_offset")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no apb_mask_offset"))?;
+    let apb_bit = instances
+        .value(name, "apb_bit")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no apb_bit"))?;
+    let nvm_calib_lsb = instances
+        .value(name, "nvm_calib_lsb")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| {
+            format!(
+                "{board}: instance {name} states no nvm_calib_lsb, and this converter does not \
+                 convert until its production calibration is loaded -- the row must say where that \
+                 instance's values sit in the NVM word"
+            )
+        })?;
+
+    if binding.gclk_gen < 0 {
+        return Err(format!(
+            "{board}: adc binding '{}' declares no gclk_gen (which generator its core clock rides under the default plan)",
+            binding.role
+        ));
+    }
+    if binding.reference_uv <= 0 {
+        return Err(format!(
+            "{board}: adc binding '{}' states no reference_uv -- a count means nothing without the reference it is a fraction of",
+            binding.role
+        ));
+    }
+
+    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
+    let pchctrl =
+        gclk.register("PCHCTRL0").ok_or_else(|| format!("{board}: gclk has no PCHCTRL0"))?;
+    let gclk_base = instances
+        .value("gclk", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'gclk'"))?;
+    let pch_shift = |field: &str| -> Result<u32, String> {
+        pchctrl
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.lsb)
+            .ok_or_else(|| format!("{board}: PCHCTRL0 has no {field} field"))
+    };
+    let gclk_pchctrl_reg =
+        gclk_base + pchctrl.offset.value + gclk_id * i64::from(pchctrl.width / 8);
+    let gclk_pchctrl_value = binding.gclk_gen << pch_shift("GEN")? | 1i64 << pch_shift("CHEN")?;
+
+    let mclk_base = instances
+        .value("mclk", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'mclk'"))?;
+
+    let adc = set.block("adc", "").ok_or_else(|| format!("{board}: no adc block table"))?;
+    let calib = adc.register("CALIB").ok_or_else(|| format!("{board}: adc has no CALIB"))?;
+    let nvm_calib_area = adc
+        .constant("NVM_CALIBRATION_AREA")
+        .ok_or_else(|| format!("{board}: adc block has no NVM_CALIBRATION_AREA constant"))?;
+
+    let ain = binding.pins.iter().find(|(s, _)| s == "ain").map(|(_, p)| p);
+    let Some(ain) = ain else {
+        return Err(format!("{board}: adc binding '{}' needs an `ain` pin", binding.role));
+    };
+    let (port, index) =
+        split_pin(&ain.pin).ok_or_else(|| format!("{board}: bad pin {}", ain.pin))?;
+
+    let cell = set.pin_row(&ain.pin, &binding.function).ok_or_else(|| {
+        format!(
+            "{board}: adc binding '{}' claims {} function {} but pins.toml has no such row",
+            binding.role, ain.pin, binding.function
+        )
+    })?;
+    let muxpos = cell
+        .signal
+        .strip_prefix("ain")
+        .and_then(|rest| rest.parse::<i64>().ok())
+        .ok_or_else(|| {
+            format!(
+                "{board}: adc binding '{}' routes {} to pin-map signal '{}', which does not name an \
+                 analog input -- an adc cell reads `ain<N>` and the N is the converter's channel",
+                binding.role, ain.pin, cell.signal
+            )
+        })?;
+
+    let group = format!("port{port}");
+    let group_base = instances
+        .value(&group, "base")
+        .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+    let port_block = set.block("port", "").ok_or_else(|| format!("{board}: no port block table"))?;
+    let pmux0 = port_block.register("PMUX0").ok_or_else(|| format!("{board}: port has no PMUX0"))?;
+    let pincfg0 =
+        port_block.register("PINCFG0").ok_or_else(|| format!("{board}: port has no PINCFG0"))?;
+    let func = port_block
+        .constant(&format!("FUNC_{}", binding.function.to_ascii_uppercase()))
+        .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
+    let odd = i64::from(index % 2 == 1);
+    let shift = odd * 4;
+
+    Ok(Same54AdcEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        adc_base: base,
+        gclk_pchctrl_reg,
+        gclk_pchctrl_value,
+        apb_mask_reg: mclk_base + apb_mask_offset,
+        apb_mask: 1i64 << apb_bit,
+        calib_reg: base + calib.offset.value,
+        nvm_calib_area,
+        nvm_calib_lsb,
+        pmux_reg: group_base + pmux0.offset.value + i64::from(index / 2),
+        pmux_mask: 0xF << shift,
+        pmux_value: func << shift,
+        pincfg_reg: group_base + pincfg0.offset.value + i64::from(index),
+        muxpos,
+        reference_uv: binding.reference_uv,
+    })
+}
+
 struct RpAdcEmission {
     prefix: String,
     role: String,
@@ -5601,6 +6580,8 @@ struct BoardEmissions {
     st_i2cs: Vec<StI2cEmission>,
     sercom_spis: Vec<SpiEmission>,
     sercom_i2cs: Vec<SercomI2cEmission>,
+    same54_i2cs: Vec<Same54SercomI2cEmission>,
+    same54_adcs: Vec<Same54AdcEmission>,
     pl022_spis: Vec<SpiPl022Emission>,
     st_spis: Vec<StSpiEmission>,
     nrf_twis: Vec<NrfTwiEmission>,
@@ -5660,6 +6641,8 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         st_i2cs: Vec::new(),
         sercom_spis: Vec::new(),
         sercom_i2cs: Vec::new(),
+        same54_i2cs: Vec::new(),
+        same54_adcs: Vec::new(),
         pl022_spis: Vec::new(),
         st_spis: Vec::new(),
         nrf_twis: Vec::new(),
@@ -5671,14 +6654,14 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         let emitted_before = emissions.skipped.len();
         match binding.kind.as_str() {
             "uart" => match set.family.as_str() {
-                "samd10" | "samd11" | "samd21" => {
+                "samd10" | "samd11" | "samd21" | "samr21" => {
                     emissions.sercom_uarts.push(resolve_uart(set, resolved, binding)?)
                 }
                 "rp2040" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, false)?),
                 "rp2350" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, true)?),
                 "esp32c6" => emissions.esp_uarts.push(resolve_uart_esp32c6(set, resolved, binding)?),
                 "sam3x" => emissions.sam3x_uarts.push(resolve_uart_sam3x(set, resolved, binding)?),
-                "stm32l476" | "stm32l0" | "stm32l053" | "stm32u5a5" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
+                "stm32l476" | "stm32l0" | "stm32l053" | "stm32l073" | "stm32u5a5" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
                     emissions.st_uarts.push(resolve_uart_stm32(set, resolved, binding)?);
                 }
                 other => {
@@ -5703,6 +6686,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             },
             "i2c" => match set.family.as_str() {
                 "samd21" => emissions.sercom_i2cs.push(resolve_i2c_samd21(set, resolved, binding)?),
+                "same54" => emissions.same54_i2cs.push(resolve_i2c_same54(set, resolved, binding)?),
                 "nrf52833" | "nrf51" => {
                     emissions.nrf_twis.push(resolve_i2c_nrf(set, resolved, binding)?)
                 }
@@ -5718,7 +6702,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                 }
             },
             "interrupt" => match set.family.as_str() {
-                "stm32l053" => {
+                "stm32l053" | "stm32l073" => {
                     emissions.st_interrupts.push(resolve_interrupt_stm32(set, resolved, binding)?);
                 }
                 other => {
@@ -5730,6 +6714,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             },
             "adc" => match set.family.as_str() {
                 "rp2350" => emissions.rp_adcs.push(resolve_adc_rp(set, resolved, binding)?),
+                "same54" => emissions.same54_adcs.push(resolve_adc_same54(set, resolved, binding)?),
                 other => {
                     return Err(format!(
                         "{}: no adc emission shape for family '{other}' -- add its derivation path first",
@@ -5813,6 +6798,8 @@ pub fn emit_board_csharp(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        same54_i2cs,
+        same54_adcs,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -5835,7 +6822,7 @@ pub fn emit_board_csharp(
     emit_header(&mut out, &class, &what, sources, regen);
 
     out.push_str("\n        // -- identity --\n");
-    push_const(&mut out, "int", "BOARD_MODEL", &resolved.board.board_model.to_string());
+    push_const(&mut out, "int", "BOARD_MODEL", &resolved.board.product_model.to_string());
     push_const(&mut out, "string", "BOARD_VENDOR", &format!("\"{}\"", vendor_segment(&resolved.board.vendor)));
     if resolved.board.carrier.usb_vid > 0 {
         push_const(&mut out, "uint", "CARRIER_USB_VID", &format!("0x{:04X}", resolved.board.carrier.usb_vid));
@@ -6006,6 +6993,51 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_PINCFG_SCL_REG"), &format!("0x{:X}", i2c.pincfg_scl_reg));
         push_const(&mut out, "uint", &format!("{p}_CORE_CLOCK_HZ"), &i2c.core_clock_hz.to_string());
     }
+    for adc in &same54_adcs {
+        let p = &adc.prefix;
+        out.push_str(&format!("
+        // -- {p}: a same54 adc binding descriptor. It carries a CALIBRATION ADDRESS
+        // because this converter does not convert until three production values are
+        // copied out of NVM, and a PMUX MASK because one pad is muxed without
+        // disturbing its neighbour --
+"));
+        push_const(&mut out, "uint", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
+        push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
+        push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", adc.gclk_pchctrl_value));
+        push_const(&mut out, "uint", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", adc.apb_mask_reg));
+        push_const(&mut out, "uint", &format!("{p}_APB_MASK"), &format!("0x{:X}", adc.apb_mask));
+        push_const(&mut out, "uint", &format!("{p}_CALIB_REG"), &format!("0x{:X}", adc.calib_reg));
+        push_const(&mut out, "uint", &format!("{p}_NVM_CALIB_AREA"), &format!("0x{:X}", adc.nvm_calib_area));
+        push_const(&mut out, "uint", &format!("{p}_NVM_CALIB_LSB"), &adc.nvm_calib_lsb.to_string());
+        push_const(&mut out, "uint", &format!("{p}_PMUX_REG"), &format!("0x{:X}", adc.pmux_reg));
+        push_const(&mut out, "uint", &format!("{p}_PMUX_MASK"), &format!("0x{:X}", adc.pmux_mask));
+        push_const(&mut out, "uint", &format!("{p}_PMUX_VALUE"), &format!("0x{:X}", adc.pmux_value));
+        push_const(&mut out, "uint", &format!("{p}_PINCFG_REG"), &format!("0x{:X}", adc.pincfg_reg));
+        push_const(&mut out, "uint", &format!("{p}_MUXPOS"), &adc.muxpos.to_string());
+        push_const(&mut out, "uint", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+    }
+    for i2c in &same54_i2cs {
+        let p = &i2c.prefix;
+        out.push_str(&format!("
+        // -- {p}: a same54 sercom-i2c binding descriptor. A CHANNEL REGISTER and a
+        // MASK REGISTER, not a composed word and a bare mask: this family routes each
+        // core clock through its own PCHCTRL and gates its SERCOMs from three
+        // different APB masks --
+"));
+        push_const(&mut out, "uint", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", i2c.sercom_base));
+        if i2c.irq >= 0 {
+            push_const(&mut out, "uint", &format!("{p}_IRQ"), &i2c.irq.to_string());
+        }
+        push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", i2c.gclk_pchctrl_reg));
+        push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", i2c.gclk_pchctrl_value));
+        push_const(&mut out, "uint", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", i2c.apb_mask_reg));
+        push_const(&mut out, "uint", &format!("{p}_APB_MASK"), &format!("0x{:X}", i2c.apb_mask));
+        push_const(&mut out, "uint", &format!("{p}_PMUX_REG"), &format!("0x{:X}", i2c.pmux_reg));
+        push_const(&mut out, "uint", &format!("{p}_PMUX_PAIR"), &format!("0x{:X}", i2c.pmux_pair));
+        push_const(&mut out, "uint", &format!("{p}_PINCFG_SDA_REG"), &format!("0x{:X}", i2c.pincfg_sda_reg));
+        push_const(&mut out, "uint", &format!("{p}_PINCFG_SCL_REG"), &format!("0x{:X}", i2c.pincfg_scl_reg));
+        push_const(&mut out, "uint", &format!("{p}_CORE_CLOCK_HZ"), &i2c.core_clock_hz.to_string());
+    }
 
     for spi in &pl022_spis {
         let p = &spi.prefix;
@@ -6143,12 +7175,9 @@ pub fn emit_board_csharp(
             push_const(&mut out, "uint", &format!("{p}_PORT_BASE"), &format!("0x{group_base:X}"));
             push_const(&mut out, "uint", &format!("{p}_PIN"), &index.to_string());
             push_const(&mut out, "uint", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
-            push_const(
-                &mut out,
-                "uint",
-                &format!("{p}_ACTIVE_LOW"),
-                if control.active == "low" { "1" } else { "0" },
-            );
+            if let Some(low) = asserts_low(control) {
+                push_const(&mut out, "uint", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
+            }
         }
     }
 
@@ -6998,6 +8027,8 @@ pub fn emit_board_rust(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        same54_i2cs,
+        same54_adcs,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -7021,7 +8052,7 @@ pub fn emit_board_rust(
     emit_rust_header(&mut out, &what, sources, regen);
 
     out.push_str("\n// -- identity --\n");
-    push_rust_const(&mut out, "u16", "BOARD_MODEL", &resolved.board.board_model.to_string());
+    push_rust_const(&mut out, "u16", "BOARD_MODEL", &resolved.board.product_model.to_string());
     push_rust_const(&mut out, "&str", "BOARD_VENDOR", &format!("\"{}\"", vendor_segment(&resolved.board.vendor)));
     if resolved.board.carrier.usb_vid > 0 {
         push_rust_const(&mut out, "u16", "CARRIER_USB_VID", &format!("0x{:04X}", resolved.board.carrier.usb_vid));
@@ -7193,6 +8224,46 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_SCL_REG"), &format!("0x{:X}", i2c.pincfg_scl_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_CORE_CLOCK_HZ"), &i2c.core_clock_hz.to_string());
     }
+    for adc in &same54_adcs {
+        let p = &adc.prefix;
+        out.push_str(&format!("
+//  -- {p}: a same54 adc binding descriptor. A CALIBRATION ADDRESS and a PMUX MASK --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", adc.gclk_pchctrl_value));
+        push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", adc.apb_mask_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK"), &format!("0x{:X}", adc.apb_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_CALIB_REG"), &format!("0x{:X}", adc.calib_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_NVM_CALIB_AREA"), &format!("0x{:X}", adc.nvm_calib_area));
+        push_rust_const(&mut out, "u32", &format!("{p}_NVM_CALIB_LSB"), &adc.nvm_calib_lsb.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_REG"), &format!("0x{:X}", adc.pmux_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_MASK"), &format!("0x{:X}", adc.pmux_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_VALUE"), &format!("0x{:X}", adc.pmux_value));
+        push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_REG"), &format!("0x{:X}", adc.pincfg_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_MUXPOS"), &adc.muxpos.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+    }
+    for i2c in &same54_i2cs {
+        let p = &i2c.prefix;
+        out.push_str(&format!("
+//  -- {p}: a same54 sercom-i2c binding descriptor. A CHANNEL REGISTER and a MASK
+//  REGISTER, not a composed word and a bare mask --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", i2c.sercom_base));
+        if i2c.irq >= 0 {
+            push_rust_const(&mut out, "u32", &format!("{p}_IRQ"), &i2c.irq.to_string());
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", i2c.gclk_pchctrl_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", i2c.gclk_pchctrl_value));
+        push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", i2c.apb_mask_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK"), &format!("0x{:X}", i2c.apb_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_REG"), &format!("0x{:X}", i2c.pmux_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_PAIR"), &format!("0x{:X}", i2c.pmux_pair));
+        push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_SDA_REG"), &format!("0x{:X}", i2c.pincfg_sda_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_SCL_REG"), &format!("0x{:X}", i2c.pincfg_scl_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_CORE_CLOCK_HZ"), &i2c.core_clock_hz.to_string());
+    }
 
     for spi in &pl022_spis {
         let p = &spi.prefix;
@@ -7330,12 +8401,9 @@ pub fn emit_board_rust(
             push_rust_const(&mut out, "u32", &format!("{p}_PORT_BASE"), &format!("0x{group_base:X}"));
             push_rust_const(&mut out, "u32", &format!("{p}_PIN"), &index.to_string());
             push_rust_const(&mut out, "u32", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
-            push_rust_const(
-                &mut out,
-                "u32",
-                &format!("{p}_ACTIVE_LOW"),
-                if control.active == "low" { "1" } else { "0" },
-            );
+            if let Some(low) = asserts_low(control) {
+                push_rust_const(&mut out, "u32", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
+            }
         }
     }
 
@@ -7367,9 +8435,11 @@ const SWIFT_FAMILIES: &[&str] = &[
     "samd10",
     "samd11",
     "samd21",
+    "samr21",
     "stm32f7",
     "stm32l0",
     "stm32l053",
+    "stm32l073",
     "stm32l476",
 ];
 
@@ -7557,6 +8627,8 @@ pub fn emit_board_swift(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        same54_i2cs,
+        same54_adcs,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -7581,7 +8653,7 @@ pub fn emit_board_swift(
     out.push_str(&format!("\npublic enum {class} {{\n"));
 
     out.push_str("    // -- identity --\n");
-    push_swift_const(&mut out, "UInt16", "BOARD_MODEL", &resolved.board.board_model.to_string());
+    push_swift_const(&mut out, "UInt16", "BOARD_MODEL", &resolved.board.product_model.to_string());
     push_swift_const(&mut out, "String", "BOARD_VENDOR", &format!("\"{}\"", vendor_segment(&resolved.board.vendor)));
     if resolved.board.carrier.usb_vid > 0 {
         push_swift_const(&mut out, "UInt16", "CARRIER_USB_VID", &format!("0x{:04X}", resolved.board.carrier.usb_vid));
@@ -7752,6 +8824,46 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_SCL_REG"), &format!("0x{:X}", i2c.pincfg_scl_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_CORE_CLOCK_HZ"), &i2c.core_clock_hz.to_string());
     }
+    for adc in &same54_adcs {
+        let p = &adc.prefix;
+        out.push_str(&format!("
+        // -- {p}: a same54 adc binding descriptor. A CALIBRATION ADDRESS and a PMUX MASK --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", adc.gclk_pchctrl_value));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", adc.apb_mask_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK"), &format!("0x{:X}", adc.apb_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_CALIB_REG"), &format!("0x{:X}", adc.calib_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_NVM_CALIB_AREA"), &format!("0x{:X}", adc.nvm_calib_area));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_NVM_CALIB_LSB"), &adc.nvm_calib_lsb.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_REG"), &format!("0x{:X}", adc.pmux_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_MASK"), &format!("0x{:X}", adc.pmux_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_VALUE"), &format!("0x{:X}", adc.pmux_value));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_REG"), &format!("0x{:X}", adc.pincfg_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_MUXPOS"), &adc.muxpos.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+    }
+    for i2c in &same54_i2cs {
+        let p = &i2c.prefix;
+        out.push_str(&format!("
+        // -- {p}: a same54 sercom-i2c binding descriptor. A CHANNEL REGISTER and a
+        // MASK REGISTER, not a composed word and a bare mask --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", i2c.sercom_base));
+        if i2c.irq >= 0 {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_IRQ"), &i2c.irq.to_string());
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", i2c.gclk_pchctrl_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", i2c.gclk_pchctrl_value));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", i2c.apb_mask_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK"), &format!("0x{:X}", i2c.apb_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_REG"), &format!("0x{:X}", i2c.pmux_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_PAIR"), &format!("0x{:X}", i2c.pmux_pair));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_SDA_REG"), &format!("0x{:X}", i2c.pincfg_sda_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_SCL_REG"), &format!("0x{:X}", i2c.pincfg_scl_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_CORE_CLOCK_HZ"), &i2c.core_clock_hz.to_string());
+    }
 
     for spi in &pl022_spis {
         let p = &spi.prefix;
@@ -7889,12 +9001,9 @@ pub fn emit_board_swift(
             push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_BASE"), &format!("0x{group_base:X}"));
             push_swift_const(&mut out, "UInt32", &format!("{p}_PIN"), &index.to_string());
             push_swift_const(&mut out, "UInt32", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
-            push_swift_const(
-                &mut out,
-                "UInt32",
-                &format!("{p}_ACTIVE_LOW"),
-                if control.active == "low" { "1" } else { "0" },
-            );
+            if let Some(low) = asserts_low(control) {
+                push_swift_const(&mut out, "UInt32", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
+            }
         }
     }
 
@@ -7941,6 +9050,8 @@ pub fn emit_board_python(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        same54_i2cs,
+        same54_adcs,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -7962,7 +9073,7 @@ pub fn emit_board_python(
     }
     out.push('\n');
     out.push_str(&format!("BOARD = \"{}\"\n", resolved.board.board));
-    out.push_str(&format!("BOARD_MODEL = {}\n", resolved.board.board_model));
+    out.push_str(&format!("BOARD_MODEL = {}\n", resolved.board.product_model));
     out.push_str(&format!("BOARD_VENDOR = \"{}\"\n", vendor_segment(&resolved.board.vendor)));
 
     let mut roles: Vec<(&str, Vec<(String, String)>)> = Vec::new();
@@ -8159,6 +9270,47 @@ pub fn emit_board_python(
         rows.push(("core_clock_hz".to_string(), i2c.core_clock_hz.to_string()));
         roles.push((&i2c.role, rows));
     }
+    for adc in &same54_adcs {
+        let rows = vec![
+            ("kind".to_string(), "\"adc\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", adc.instance)),
+            ("adc_base".to_string(), format!("0x{:X}", adc.adc_base)),
+            ("gclk_pchctrl_reg".to_string(), format!("0x{:X}", adc.gclk_pchctrl_reg)),
+            ("gclk_pchctrl_value".to_string(), format!("0x{:X}", adc.gclk_pchctrl_value)),
+            ("apb_mask_reg".to_string(), format!("0x{:X}", adc.apb_mask_reg)),
+            ("apb_mask".to_string(), format!("0x{:X}", adc.apb_mask)),
+            ("calib_reg".to_string(), format!("0x{:X}", adc.calib_reg)),
+            ("nvm_calib_area".to_string(), format!("0x{:X}", adc.nvm_calib_area)),
+            ("nvm_calib_lsb".to_string(), adc.nvm_calib_lsb.to_string()),
+            ("pmux_reg".to_string(), format!("0x{:X}", adc.pmux_reg)),
+            ("pmux_mask".to_string(), format!("0x{:X}", adc.pmux_mask)),
+            ("pmux_value".to_string(), format!("0x{:X}", adc.pmux_value)),
+            ("pincfg_reg".to_string(), format!("0x{:X}", adc.pincfg_reg)),
+            ("muxpos".to_string(), adc.muxpos.to_string()),
+            ("reference_uv".to_string(), adc.reference_uv.to_string()),
+        ];
+        roles.push((&adc.role, rows));
+    }
+    for i2c in &same54_i2cs {
+        let mut rows = vec![
+            ("kind".to_string(), "\"i2c\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", i2c.instance)),
+            ("sercom_base".to_string(), format!("0x{:X}", i2c.sercom_base)),
+        ];
+        if i2c.irq >= 0 {
+            rows.push(("irq".to_string(), i2c.irq.to_string()));
+        }
+        rows.push(("gclk_pchctrl_reg".to_string(), format!("0x{:X}", i2c.gclk_pchctrl_reg)));
+        rows.push(("gclk_pchctrl_value".to_string(), format!("0x{:X}", i2c.gclk_pchctrl_value)));
+        rows.push(("apb_mask_reg".to_string(), format!("0x{:X}", i2c.apb_mask_reg)));
+        rows.push(("apb_mask".to_string(), format!("0x{:X}", i2c.apb_mask)));
+        rows.push(("pmux_reg".to_string(), format!("0x{:X}", i2c.pmux_reg)));
+        rows.push(("pmux_pair".to_string(), format!("0x{:X}", i2c.pmux_pair)));
+        rows.push(("pincfg_sda_reg".to_string(), format!("0x{:X}", i2c.pincfg_sda_reg)));
+        rows.push(("pincfg_scl_reg".to_string(), format!("0x{:X}", i2c.pincfg_scl_reg)));
+        rows.push(("core_clock_hz".to_string(), i2c.core_clock_hz.to_string()));
+        roles.push((&i2c.role, rows));
+    }
     for spi in &pl022_spis {
         let mut rows = vec![
             ("kind".to_string(), "\"spi\"".to_string()),
@@ -8294,7 +9446,9 @@ pub fn emit_board_python(
     out.push_str("}\n");
 
     out.push_str(
-        "\n# The chip's instance map: every block this family places, with its base address and\n# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also\n# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock\n# controller, a reset controller -- and those are one per chip, so they are stated once here.\n# Bases only: register offsets and bit encodings belong to the driver that knows the block.\nINSTANCES = {\n",
+        "\n# The chip's instance map: every block this family places, with its base address and\n# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also\n# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock\n# controller, a reset controller -- and those are one per chip, so they are stated once here.\n# Each row carries whatever this family's record declares -- a base always, and per-instance
+# facts like a clock channel or a bus-enable bit where the family states them. Register offsets
+# and bit encodings belong to the driver that knows the block, not here.\nINSTANCES = {\n",
     );
     for row in &set.instances.rows {
         let mut entry = format!("    \"{}\": {{\"block\": \"{}\"", row.name, row.block);
@@ -8342,11 +9496,15 @@ pub fn emit_board_python(
             continue;
         }
         let (group_base, index) = control_pin_group_base(set, &resolved.board.board, &control.pin)?;
+        let polarity = match asserts_low(control) {
+            Some(true) => ", \"active_low\": True".to_string(),
+            Some(false) => ", \"active_low\": False".to_string(),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "    \"{}\": {{{kind}\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"mask\": 0x{:X}, \"active_low\": {}}},\n",
+            "    \"{}\": {{{kind}\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"mask\": 0x{:X}{polarity}}},\n",
             control.name,
             1u64 << index,
-            if control.active == "low" { "True" } else { "False" }
         ));
     }
     out.push_str("}\n");
@@ -8648,12 +9806,14 @@ fn validate_device(part: &DeviceTable) -> Result<(), String> {
             ));
         }
     }
-    if let Some(mapped) = part.registers.iter().find(|r| r.reg.value == identity.reg.value) {
-        if mapped.width != identity.width {
-            return Err(format!(
-                "{who}: [identity] reads register 0x{:X} as {} bits and [registers.{}] declares it {} bits",
-                identity.reg.value, identity.width, mapped.name, mapped.width
-            ));
+    if identity.absent.is_empty() {
+        if let Some(mapped) = part.registers.iter().find(|r| r.reg.value == identity.reg.value) {
+            if mapped.width != identity.width {
+                return Err(format!(
+                    "{who}: [identity] reads register 0x{:X} as {} bits and [registers.{}] declares it {} bits",
+                    identity.reg.value, identity.width, mapped.name, mapped.width
+                ));
+            }
         }
     }
     if part.buses.is_empty() {
@@ -9267,6 +10427,236 @@ pub fn generate_parts(repo_root: &std::path::Path, family: &str) -> Result<Vec<G
 }
 
 
+/// The C# class name for an extension's emission.
+pub fn extension_class(extension: &str) -> String {
+    format!("{}Extension", pascal(extension))
+}
+
+/// Loads a connector standard from `ext/standards/<standard>.toml`.
+pub fn load_standard(
+    repo_root: &std::path::Path,
+    standard: &str,
+) -> Result<HeaderStandardTable, String> {
+    let path = repo_root.join(format!("ext/standards/{standard}.toml"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("ext/standards/{standard}.toml: {error}"))?;
+    match parse(&text).map_err(|error| format!("ext/standards/{standard}.toml: {error}"))? {
+        Strata::HeaderStandard(table) => {
+            if table.standard != standard {
+                return Err(format!(
+                    "ext/standards/{standard}.toml declares standard '{}' -- the file name IS the id",
+                    table.standard
+                ));
+            }
+            Ok(table)
+        }
+        _ => Err(format!("ext/standards/{standard}.toml is not a header standard")),
+    }
+}
+
+/// Loads an extension from `ext/<extension>/extension.toml`, together with the standard it names.
+pub fn load_extension(
+    repo_root: &std::path::Path,
+    extension: &str,
+) -> Result<(ExtensionTable, HeaderStandardTable), String> {
+    let path = repo_root.join(format!("ext/{extension}/extension.toml"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("ext/{extension}/extension.toml: {error}"))?;
+    let table = match parse(&text)
+        .map_err(|error| format!("ext/{extension}/extension.toml: {error}"))?
+    {
+        Strata::Extension(table) => table,
+        _ => return Err(format!("ext/{extension}/extension.toml is not an extension")),
+    };
+    if table.extension != extension {
+        return Err(format!(
+            "ext/{extension}/extension.toml declares extension '{}' -- the directory name IS the id",
+            table.extension
+        ));
+    }
+    let standard = load_standard(repo_root, &table.standard)?;
+
+    for position in table.required_positions() {
+        match standard.pin(&position) {
+            None => {
+                let spelling = standard
+                    .pins
+                    .iter()
+                    .find(|row| row.aka == position)
+                    .map(|row| format!(" -- the standard spells it '{}'", row.signal))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "extension '{}' uses position '{position}', which the '{}' standard does not define{spelling}. A join key is a name, and a name that matches nothing joins to nothing SILENTLY -- so this refuses rather than resolving to an empty set.",
+                    table.extension, table.standard
+                ));
+            }
+            Some(row) if !row.routable => {
+                return Err(format!(
+                    "extension '{}' uses position '{position}', which the '{}' standard marks unroutable ({}). A host cannot wire it to a pad, so nothing can resolve through it.",
+                    table.extension, table.standard, row.description
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok((table, standard))
+}
+
+/// Every extension directory under `ext/`, sorted.
+///
+/// A DIRECTORY QUALIFIES BY HOLDING AN `extension.toml`, NOT BY BEING A DIRECTORY. `ext/` also
+/// holds `standards/`, the connector vocabularies the boards join through, and it will hold
+/// whatever the next non-board thing under this tree turns out to be. A walk keyed on "is a
+/// directory" adopts each of those as an extension and fails on the file it then cannot open --
+/// so the marker file is the test, and a directory that is not an extension is skipped because it
+/// does not claim to be one rather than because this list was updated.
+pub fn extensions(repo_root: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut found: Vec<String> = std::fs::read_dir(repo_root.join("ext"))
+        .map_err(|error| format!("ext/: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("extension.toml").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
+/// The positions an extension needs that a socket does NOT bring out, in the extension's order.
+///
+/// EMPTY MEANS IT FITS. This is the whole verdict a host can give about a removable board without
+/// anyone declaring that one is plugged in: an extension states what it needs, a socket states what
+/// it offers, and the difference is computable. It answers about the WIRING only -- whether a
+/// driver exists for what is on the extension is a different question with a different answer.
+pub fn extension_gaps(connector: &Connector, extension: &ExtensionTable) -> Vec<String> {
+    extension
+        .required_positions()
+        .into_iter()
+        .filter(|position| !connector.pins.iter().any(|line| line.signal == *position))
+        .collect()
+}
+
+/// Builds an extension's emission rows.
+fn extension_rows(table: &ExtensionTable, standard: &HeaderStandardTable) -> Vec<Row> {
+    let mut rows = Vec::new();
+    text(&mut rows, "EXTENSION".to_string(), &table.extension);
+    text(&mut rows, "VENDOR".to_string(), &table.vendor);
+    text(&mut rows, "STANDARD".to_string(), &table.standard);
+    if table.kit_identifier >= 0 {
+        section(
+            &mut rows,
+            "-- the kit identifier its identification chip carries, as the `nnnn` field of an\n\
+             `nnnnrrssssssssss` serial. It is how a FITTED extension can be told from an assumed\n\
+             one -- but on a kit with an embedded debugger the identification line reaches the\n\
+             DEBUGGER rather than an MCU pad, so this is a host tool's reading and not a\n\
+             program's --"
+                .to_string(),
+        );
+        uint(&mut rows, "KIT_IDENTIFIER".to_string(), table.kit_identifier.to_string());
+    }
+
+    section(
+        &mut rows,
+        "-- what this board needs a host socket to bring out. Each POSITION is the connector\n\
+         standard's own name for a hole, never a pad: this file cannot name a pad, because it does\n\
+         not know which host it is plugged into. A host's `CONNECTOR_<socket>_<POSITION>_*`\n\
+         constants carry the pad behind each one, and the two are joined on the position name --"
+            .to_string(),
+    );
+    uint(&mut rows, "POSITION_COUNT".to_string(), table.required_positions().len().to_string());
+    for position in table.required_positions() {
+        let number = standard.pin(&position).map(|row| row.number).unwrap_or(-1);
+        uint(
+            &mut rows,
+            format!("POSITION_{}_PIN", upper_snake(&position)),
+            number.to_string(),
+        );
+    }
+
+    if !table.buses.is_empty() {
+        section(
+            &mut rows,
+            "-- the buses this board presents, each naming the socket positions it rides. A host\n\
+             resolves them through the same socket constants; which of its controllers is behind\n\
+             them is the HOST's fact and appears nowhere here --"
+                .to_string(),
+        );
+        uint(&mut rows, "BUS_COUNT".to_string(), table.buses.len().to_string());
+        for bus in &table.buses {
+            let prefix = format!("BUS_{}", upper_snake(&bus.role));
+            text(&mut rows, format!("{prefix}_KIND"), &bus.kind);
+            for (line, position) in &bus.lines {
+                text(&mut rows, format!("{prefix}_{}", upper_snake(line)), position);
+            }
+        }
+    }
+
+    section(
+        &mut rows,
+        "-- the devices a host reaches. A LINE-wired device names the socket position it sits on\n\
+         and its active level; a BUS-wired one names the bus and, where a document states one, its\n\
+         address. An active level of `unknown` is a document that does not say, recorded as such:\n\
+         no polarity constant is emitted for it, so a program that assumed one fails to compile --"
+            .to_string(),
+    );
+    uint(&mut rows, "DEVICE_COUNT".to_string(), table.devices.len().to_string());
+    for device in &table.devices {
+        let prefix = format!("DEVICE_{}", upper_snake(&device.name));
+        text(&mut rows, format!("{prefix}_KIND"), &device.kind);
+        if !device.signal.is_empty() {
+            text(&mut rows, format!("{prefix}_POSITION"), &device.signal);
+            match device.active.as_str() {
+                "low" => uint(&mut rows, format!("{prefix}_ACTIVE_LOW"), "1".to_string()),
+                "high" => uint(&mut rows, format!("{prefix}_ACTIVE_LOW"), "0".to_string()),
+                _ => {}
+            }
+        }
+        if !device.bus.is_empty() {
+            text(&mut rows, format!("{prefix}_BUS"), &device.bus);
+        }
+        if !device.part.is_empty() {
+            text(&mut rows, format!("{prefix}_PART"), &device.part);
+        }
+        if device.address >= 0 {
+            uint(&mut rows, format!("{prefix}_ADDRESS"), format!("0x{:X}", device.address));
+        }
+    }
+    rows
+}
+
+/// Generates an extension's emissions: the C# class and its 1:1 Rust twin.
+pub fn generate_extension(
+    repo_root: &std::path::Path,
+    extension: &str,
+) -> Result<Vec<Generated>, String> {
+    let regen = format!("cargo run -p lamella-bsp-gen -- gen-ext . {extension}");
+    let (table, standard) = load_extension(repo_root, extension)?;
+    let rows = extension_rows(&table, &standard);
+    let sources =
+        vec![
+            format!("ext/{extension}/extension.toml"),
+            format!("ext/standards/{}.toml", table.standard),
+        ];
+    let what = format!(
+        "The {} EXTENSION board, resolved against the {} connector standard: what it needs a host\n\
+         // socket to bring out, and what a host reaches through it. NO HOST PAD APPEARS HERE and none\n\
+         // can -- an extension does not know which board it is plugged into, which is exactly what\n\
+         // lets one of these bind to every host that offers a socket of this standard.",
+        table.extension, table.standard
+    );
+    let class = extension_class(extension);
+    Ok(vec![
+        Generated {
+            path: format!("ext/{extension}/csharp/{class}.g.cs"),
+            contents: render_csharp(&class, &what, &rows, &sources, &regen)?,
+        },
+        Generated {
+            path: format!("ext/{extension}/rust/{}_extension.rs", snake(extension)),
+            contents: render_rust(&what, &rows, &sources, &regen)?,
+        },
+    ])
+}
+
+
 /// One generated file: its repo-relative path and contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Generated {
@@ -9420,6 +10810,70 @@ value = 0x2
         assert!(parse(&bad).unwrap_err().contains("no width"));
     }
 
+    /// A flash block carrying only registers, so each of the two required facts can be added and
+    /// removed one at a time. `block = "flash"` is what arms both rules.
+    const FLASH_BLOCK: &str = r#"
+[table]
+kind = "block"
+family = "fam"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 4
+"#;
+
+    #[test]
+    fn a_flash_block_carries_both_required_facts_as_constants() {
+        let Strata::Block(block) = parse(FLASH_BLOCK).expect("parses") else { panic!("kind") };
+        assert_eq!(block.erased_value.expect("erased_value").value, 0xffff_ffff);
+        assert_eq!(block.write_unit.expect("write_unit").value, 4);
+        let emitted = emit_layout_rust(&block, "src.toml", "regen").expect("emits");
+        assert!(emitted.contains("pub const ERASED_VALUE: u32 = 0xFFFFFFFF;"), "{emitted}");
+        assert!(emitted.contains("pub const WRITE_UNIT: u32 = 4;"), "{emitted}");
+    }
+
+    #[test]
+    fn a_flash_block_without_a_write_unit_refuses() {
+        let bad = FLASH_BLOCK.replace("write_unit = 4\n", "");
+        assert!(parse(&bad).unwrap_err().contains("must declare `write_unit`"));
+    }
+
+    #[test]
+    fn a_flash_block_without_an_erased_value_refuses() {
+        let bad = FLASH_BLOCK.replace("erased_value = 0xffffffff\n", "");
+        assert!(parse(&bad).unwrap_err().contains("must declare `erased_value`"));
+    }
+
+    /// Both facts are refused on a block with no array, so a required field cannot spread into a
+    /// ritual every block performs.
+    #[test]
+    fn a_non_flash_block_may_declare_neither_fact() {
+        for key in ["erased_value = 0x0", "write_unit = 4"] {
+            let bad = BLOCK.replace("mode = \"m\"", &format!("mode = \"m\"\n{key}"));
+            let error = parse(&bad).unwrap_err();
+            assert!(error.contains("and this is not one"), "{key}: {error}");
+        }
+    }
+
+    /// The placement rule this number exists for ALIGNS a record to a unit boundary, and a unit
+    /// that is not a power of two has no boundary. Zero would divide by nothing at all.
+    #[test]
+    fn a_write_unit_that_is_not_a_power_of_two_refuses() {
+        for value in ["0", "3", "48", "-4"] {
+            let bad = FLASH_BLOCK.replace("write_unit = 4", &format!("write_unit = {value}"));
+            let error = parse(&bad).unwrap_err();
+            assert!(error.contains("positive power of two"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn every_write_unit_a_real_controller_wants_is_accepted() {
+        for value in [2, 4, 8, 16, 32, 64, 256, 512] {
+            let text = FLASH_BLOCK.replace("write_unit = 4", &format!("write_unit = {value}"));
+            let Strata::Block(block) = parse(&text).expect("parses") else { panic!("kind") };
+            assert_eq!(block.write_unit.expect("write_unit").value, value);
+        }
+    }
+
     #[test]
     fn a_board_with_a_divisor_key_refuses_v4() {
         let bad = r#"
@@ -9429,7 +10883,7 @@ board = "b"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 [[plans]]
 name = "n"
 default = true
@@ -9452,7 +10906,7 @@ board = "b"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 [carrier]
 kind = "edbg-vcp"
 baud = 115200
@@ -9479,7 +10933,7 @@ board = "b"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 [[carriers]]
 kind = "uart"
 baud = 115200
@@ -9516,7 +10970,7 @@ board = "b"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 [[carriers]]
 kind = "uart"
 role = "uart0"
@@ -9564,7 +11018,7 @@ board = "b"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 [[carriers]]
 kind = "native-usb"
 plan = "fast"
@@ -9609,7 +11063,7 @@ board = "bare"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 [[plans]]
 name = "n"
 default = true
@@ -9631,7 +11085,7 @@ board = "b"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 [memory]
 flash = 0x200000
 source = "board datasheet"
@@ -9662,7 +11116,7 @@ board = "b"
 vendor = "vend"
 family = "fam"
 part = "p"
-board_model = 1
+product_model = 1
 
 [[memory]]
 name = "qspi"
@@ -10371,6 +11825,50 @@ resolution_bits = "16..20, depending only on the oversampling setting"
             parts: vec![device(member)],
         };
         resolve_device(&set, &set.parts[0]).expect("the member resolves against its base")
+    }
+
+    /// A part that states it has NO identity register may still declare a register at 0x00.
+    ///
+    /// REPORTED FROM OUTSIDE AND IT BLOCKED A REAL TABLE. `[identity] absent` leaves `reg` and
+    /// `width` at their defaults, 0 and 0, and the cross-check that guards against an identity
+    /// disagreeing with its own register-map entry then compared those defaults against whatever
+    /// register happened to sit at 0x00 -- which is most parts' first register. The refusal named
+    /// a fact the table never stated: "[identity] reads register 0x0 as 0 bits". Absence read as a
+    /// claim, which is the same shape as an omitted polarity emitting as active-high.
+    #[test]
+    fn a_part_with_no_identity_may_declare_a_register_at_zero() {
+        let base = DEVICE_BASE
+            .replace("[registers.ctrl_meas]\nreg = 0xF4", "[registers.ctrl_meas]\nreg = 0x00")
+            .replace(
+                "[identity]\nreg = 0xD0\nwidth = 8\n",
+                "[identity]\nabsent = \"this fixture describes no identity register\"\n",
+            );
+        let member = DEVICE_MEMBER.replace(
+            "[identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x56, 0x57, 0x58]",
+            "[identity]\nabsent = \"this fixture describes no identity register\"",
+        );
+        assert!(base.contains("[registers.ctrl_meas]\nreg = 0x00"), "the base puts a register at 0x00");
+        assert!(member.contains("absent ="), "the member states no identity");
+        let set = DeviceSet {
+            family: "fam".into(),
+            base: Some(device(&base)),
+            parts: vec![device(&member)],
+        };
+        let part = resolve_device(&set, &set.parts[0]).expect("the member resolves against its base");
+        validate_device(&part).expect("a part with no identity and a register at 0x00 is ordinary");
+    }
+
+    /// ...and the check it is exempt from still fires where an identity WAS stated. A fix that
+    /// silenced the disagreement outright would look identical from the test above.
+    #[test]
+    fn a_stated_identity_still_has_to_agree_with_its_register_map_entry() {
+        let member = DEVICE_MEMBER
+            .replace("[identity]\nreg = 0xD0\nwidth = 8", "[identity]\nreg = 0xF4\nwidth = 16");
+        let part = flattened(&member);
+        let error = validate_device(&part)
+            .expect_err("an identity 16 bits wide over an 8-bit mapped register is a disagreement");
+        assert!(error.contains("0xF4"), "the message names the register: {error}");
+        assert!(error.contains("16 bits"), "and both widths: {error}");
     }
 
     fn emissions(part: &DeviceTable) -> [String; 4] {

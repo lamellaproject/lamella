@@ -27,7 +27,7 @@ notes = [
 #
 # `identified` is unreachable for this part by construction -- it has no identity register, only a
 # control register whose value is whatever was last written. A unit of this type acknowledged
-# address 0x70 on an I2C walk of this bench and its channel behaviour was then characterized by
+# address 0x70 on an I2C walk and its channel behaviour was then characterized by
 # experiment, which is the `exercised` shape; it is recorded as evidence below.
 
 [sourcing]

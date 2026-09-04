@@ -322,6 +322,9 @@ impl UnusedScan {
             } => {
                 self.statement(body);
                 for catch in catches {
+                    if let Some(filter) = &catch.filter {
+                        self.uses(filter);
+                    }
                     self.statement(&catch.body);
                 }
                 if let Some(finally) = finally {
@@ -372,6 +375,26 @@ impl UnusedScan {
     }
 }
 
+/// Whether evaluating `expr` never yields a value because control leaves first.
+///
+/// A THROW EXPRESSION is the only leaf that does this, and it matters at exactly one place: the
+/// merge after a `?:`, where an arm that throws must not be intersected into the definitely-
+/// assigned set. It recurses through a nested conditional because csc does -- measured on
+/// `c ? (d ? throw a : throw b) : (x = 1)`, which leaves `x` assigned -- and through the
+/// `checked`/`unchecked` wrappers, which change nothing about whether control continues.
+fn never_completes(expr: &BoundExpr) -> bool {
+    match &expr.kind {
+        BoundExprKind::Throw(_) => true,
+        BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => never_completes(inner),
+        BoundExprKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => never_completes(when_true) && never_completes(when_false),
+        _ => false,
+    }
+}
+
 /// Visits every local USE in `expr` -- a `Local` reference in any position, an assignment target
 /// included (counting a target as a use only makes the unused check more conservative) -- calling
 /// `f` with each local's name. Shared by [`collect_uses`], which gathers the names, and
@@ -379,6 +402,11 @@ impl UnusedScan {
 fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
     match &expr.kind {
         BoundExprKind::Local(name) => f(name),
+        BoundExprKind::Lambda { captures, .. } => {
+            for (name, _) in captures {
+                f(name);
+            }
+        }
         BoundExprKind::Literal(_)
         | BoundExprKind::This
         | BoundExprKind::Base
@@ -387,6 +415,7 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
         | BoundExprKind::TypeOf(_)
         | BoundExprKind::SizeOf(_)
         | BoundExprKind::DefaultValue(_)
+        | BoundExprKind::Temp(_)
         | BoundExprKind::Error => {}
         BoundExprKind::FieldAccess { receiver, .. }
         | BoundExprKind::PropertyAccess { receiver, .. }
@@ -456,7 +485,9 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
         | BoundExprKind::TypeTest { operand, .. }
         | BoundExprKind::Conversion { operand, .. }
         | BoundExprKind::Await { operand, .. } => visit_local_uses(operand, f),
-        BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
+        BoundExprKind::Checked(inner)
+        | BoundExprKind::Unchecked(inner)
+        | BoundExprKind::Throw(inner) => {
             visit_local_uses(inner, f);
         }
         BoundExprKind::Conditional {
@@ -471,6 +502,12 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
         BoundExprKind::NullCoalescing { left, right } => {
             visit_local_uses(left, f);
             visit_local_uses(right, f);
+        }
+        BoundExprKind::Sequence { spilled, value } => {
+            for operand in spilled {
+                visit_local_uses(operand, f);
+            }
+            visit_local_uses(value, f);
         }
         BoundExprKind::Assignment { target, value, .. } => {
             visit_local_uses(target, f);
@@ -611,6 +648,9 @@ pub(crate) fn collect_field_accesses(stmt: &BoundStmt, reads: &mut FieldSet, wri
         } => {
             collect_field_accesses(body, reads, writes);
             for catch in catches {
+                if let Some(filter) = &catch.filter {
+                    collect_field_uses(filter, reads, writes);
+                }
                 collect_field_accesses(&catch.body, reads, writes);
             }
             if let Some(finally) = finally {
@@ -739,6 +779,14 @@ fn mark_target_chain_written(receiver: &BoundExpr, writes: &mut FieldSet) {
 
 pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes: &mut FieldSet) {
     match &expr.kind {
+        BoundExprKind::Lambda { body, .. } => match &**body {
+            crate::statement::BoundLambdaBody::Expression(expression) => {
+                collect_field_uses(expression, reads, writes);
+            }
+            crate::statement::BoundLambdaBody::Block(block) => {
+                collect_field_accesses(block, reads, writes);
+            }
+        },
         BoundExprKind::Assignment {
             operator,
             target,
@@ -785,6 +833,7 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
         | BoundExprKind::TypeOf(_)
         | BoundExprKind::SizeOf(_)
         | BoundExprKind::DefaultValue(_)
+        | BoundExprKind::Temp(_)
         | BoundExprKind::Error => {}
         BoundExprKind::PropertyAccess { receiver, .. }
         | BoundExprKind::MethodGroup { receiver, .. } => collect_field_uses(receiver, reads, writes),
@@ -872,7 +921,9 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
         BoundExprKind::Cast { operand, .. }
         | BoundExprKind::TypeTest { operand, .. }
         | BoundExprKind::Conversion { operand, .. } => collect_field_uses(operand, reads, writes),
-        BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
+        BoundExprKind::Checked(inner)
+        | BoundExprKind::Unchecked(inner)
+        | BoundExprKind::Throw(inner) => {
             collect_field_uses(inner, reads, writes);
         }
         BoundExprKind::Conditional {
@@ -887,6 +938,12 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
         BoundExprKind::NullCoalescing { left, right } => {
             collect_field_uses(left, reads, writes);
             collect_field_uses(right, reads, writes);
+        }
+        BoundExprKind::Sequence { spilled, value } => {
+            for operand in spilled {
+                collect_field_uses(operand, reads, writes);
+            }
+            collect_field_uses(value, reads, writes);
         }
     }
 }
@@ -1568,6 +1625,9 @@ impl Analyzer<'_> {
                     if let Some(name) = &catch.name {
                         catch_set.insert(name.clone());
                     }
+                    if let Some(filter) = &catch.filter {
+                        self.expression(filter, &mut catch_set, catch.span);
+                    }
                     let reached = self.statement(&catch.body, catch_set);
                     end = merge(end, reached);
                 }
@@ -1659,6 +1719,33 @@ impl Analyzer<'_> {
                     ));
                 }
             }
+            BoundExprKind::Lambda {
+                captures,
+                parameters,
+                body,
+                ..
+            } => {
+                for (name, _) in captures {
+                    if !assigned.contains(name) {
+                        self.diagnostics.push(Diagnostic::new(
+                            DiagnosticKind::UseOfUnassignedLocal { name: name.clone() },
+                            span,
+                        ));
+                    }
+                }
+                let mut inner = assigned.clone();
+                for (name, _) in parameters {
+                    inner.insert(name.clone());
+                }
+                match &**body {
+                    crate::statement::BoundLambdaBody::Expression(expression) => {
+                        self.expression(expression, &mut inner, span);
+                    }
+                    crate::statement::BoundLambdaBody::Block(block) => {
+                        self.statement(block, inner);
+                    }
+                }
+            }
             BoundExprKind::Literal(_)
             | BoundExprKind::This
             | BoundExprKind::Base
@@ -1667,6 +1754,7 @@ impl Analyzer<'_> {
             | BoundExprKind::TypeOf(_)
             | BoundExprKind::SizeOf(_)
             | BoundExprKind::DefaultValue(_)
+            | BoundExprKind::Temp(_)
             | BoundExprKind::Error => {}
             BoundExprKind::FieldAccess { receiver, .. }
             | BoundExprKind::PropertyAccess { receiver, .. }
@@ -1796,13 +1884,25 @@ impl Analyzer<'_> {
                 let mut if_false = assigned.clone();
                 self.expression(when_true, &mut if_true, span);
                 self.expression(when_false, &mut if_false, span);
-                *assigned = if_true.intersection(&if_false).cloned().collect();
+                *assigned = match (never_completes(when_true), never_completes(when_false)) {
+                    (true, true) => assigned.clone(),
+                    (true, false) => if_false,
+                    (false, true) => if_true,
+                    (false, false) => if_true.intersection(&if_false).cloned().collect(),
+                };
             }
             BoundExprKind::NullCoalescing { left, right } => {
                 self.expression(left, assigned, span);
                 let mut if_null = assigned.clone();
                 self.expression(right, &mut if_null, span);
             }
+            BoundExprKind::Sequence { spilled, value } => {
+                for operand in spilled {
+                    self.expression(operand, assigned, span);
+                }
+                self.expression(value, assigned, span);
+            }
+            BoundExprKind::Throw(operand) => self.expression(operand, assigned, span),
             BoundExprKind::Assignment {
                 operator,
                 target,

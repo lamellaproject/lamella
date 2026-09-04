@@ -83,7 +83,7 @@ pub fn fit_command(args: &[String]) -> ExitCode {
         parsed.value("--board"),
         parsed.value("--image-bytes").and_then(|value| value.parse::<i64>().ok()),
     ) else {
-        eprintln!("usage: lamella fit --board <id> --image-bytes <n>");
+        eprintln!("{}", FIT_USAGE.lines().next().unwrap_or_default());
         eprintln!(
             "\n`lamella build <file> --board <id>` measures <n> for you: it compiles the program \
              and answers this question about the image it produced."
@@ -162,7 +162,7 @@ pub fn reconcile_command(args: &[String]) -> ExitCode {
     }
 
     let Some(board_id) = parsed.value("--board") else {
-        eprintln!("usage: lamella reconcile --board <id> [--read <discriminator>=<value>]");
+        eprintln!("{}", RECONCILE_USAGE.lines().next().unwrap_or_default());
         return ExitCode::FAILURE;
     };
     let (board, part) = match catalog::resolve(board_id) {

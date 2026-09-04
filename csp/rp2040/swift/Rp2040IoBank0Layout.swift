@@ -16,4 +16,5 @@ public enum Rp2040IoBank0Layout {
     // -- block constants --
     public static let GPIO_CTRL_STRIDE: UInt32 = 8
     public static let FUNCSEL_UART: UInt32 = 2
+    public static let FUNCSEL_SIO: UInt32 = 5
 }

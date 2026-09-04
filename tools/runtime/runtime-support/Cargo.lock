@@ -107,11 +107,16 @@ name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-decimal",
  "lamella-net-core",
  "lamella-reactor",
  "lamella-token",
  "lamella-wtf8",
 ]
+
+[[package]]
+name = "lamella-decimal"
+version = "0.0.0"
 
 [[package]]
 name = "lamella-net-core"
@@ -133,6 +138,7 @@ version = "0.0.0"
 name = "lamella-runtime-support"
 version = "0.0.0"
 dependencies = [
+ "lamella-decimal",
  "lamella-runtime-support-net",
 ]
 

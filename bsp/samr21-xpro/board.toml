@@ -1,0 +1,72 @@
+# The SAM R21 Xplained Pro (ATSAMR21-XPRO): board truth only -- what is wired to what. Chip
+# truth lives in csp/samr21/.
+#
+# THE PART IS A SAM D21 AND AN AT86RF233 IN ONE PACKAGE, and the kit exists to show the radio.
+# What that costs a board is stated once, in csp/samr21/parts.toml: 28 general-purpose I/O pins
+# where a 48-pin SAM D21 has 38. Nothing here may reach SERCOM4 or PA10/PA11/PB16/PB17.
+#
+# WARNING: THIS KIT'S OWN USER GUIDE HAS A TYPOGRAPHICAL ERROR IN THE ONE TABLE THIS FILE DEPENDS ON.
+# Atmel-42243D Table 4-12 gives the virtual COM port as SERCOM0 PAD[0] on PA04 and SERCOM*1*
+# PAD[1] on PA05. A UART's two pads belong to one instance; the part datasheet's Table 5-1 gives
+# PA05 as SERCOM0/PAD[1] and gives it no SERCOM1 function at all. The binding below is SERCOM0
+# for both pads, and csp/samr21/pins.toml carries the same correction against the same source.
+
+[table]
+kind = "board"
+board = "samr21-xpro"
+vendor = "microchip"
+family = "samr21"
+part = "atsamr21g18a"
+product_model = 47          # lamella_wire::product_model::SAMR21_XPLAINED_PRO
+sources = [
+    "SAM R21 Xplained Pro user guide Atmel-42243D (04/2016) section 4.2.3 and Table 4-8 (LED Connections): one yellow LED0 on PA19, and section 4.2.3 states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'.",
+    "Atmel-42243D section 4.2.2 and Table 4-7 (Mechanical Buttons): two buttons, RESET on the part's RESETN line and a generic user-configurable SW0 on PA28. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'.",
+    "Atmel-42243D section 4.4.1 and Table 4-11 (SWD Connections): SWD clock on PA30 and SWD data on PA31.",
+    "Atmel-42243D section 4.4.2 and Table 4-12 (Virtual COM Port Connections), CORRECTED against SAM R21 datasheet Atmel-42223G Table 5-1 for the instance on PA05 -- see the header above.",
+    "Atmel-42243D section 4.2.1 with Table 4-5 and Table 4-6: TWO crystals are fitted. The 32.768 kHz one is on PA00 (XIN32) and PA01 (XOUT32); the 16 MHz one is on the dedicated XTAL1/XTAL2 package pins and is wired to the RF die rather than to the microcontroller.",
+]
+notes = [
+    "THE 16 MHz CRYSTAL COSTS NO PAD AND THE 32.768 kHz ONE COSTS TWO. XTAL1 and XTAL2 are package pins 3 and 4 on the QFN48 and are not PORT pads at all, so the RF reference takes nothing from a board's pin budget. PA00 and PA01 are ordinary pads that this kit populates with the 32.768 kHz crystal, so they are not available as I/O on a stock board. Nothing here binds them; recorded because a pad list says a pin exists and cannot say what is soldered to it.",
+    "THE 16 MHz CLOCK REACHES THE MICROCONTROLLER ONLY BY WAY OF THE RADIO. Atmel-42243D section 4.2.1's Note states that the crystal is connected directly to the RF die inside the part and that its clock is routed out of the RF die's CLKM pin to a GCLK I/O pin. So a plan that wants the 16 MHz reference is asking the transceiver for it, which is a different act from enabling an oscillator, and no plan here does that yet.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP. It states the polarity and stops there, where the SAM D21 and E51 Curiosity Nano guides both state outright that no pull-up is fitted and that the internal one must be enabled. The absence of the statement is not the presence of a resistor: this is recorded so that a program opening PA28 as a plain input is understood to be relying on something this document does not establish.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
+baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
+plan = "osc8m-8mhz"         # Atmel-42096 describes the composite device without giving an id
+default = true              # table. Nor can a sibling supply it -- same54-xpro and samw25-xpro
+                            # both answer 0x2111 while samd21-xpro answers 0x2169, so an
+                            # Xplained Pro's product id does not follow from being one. It is
+                            # read off the kit, the way same54-xpro's row records having been.
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom0"
+function = "D"              # SERCOM-ALT. Both pads are in Table 5-1's column D and neither has a
+gclk_gen = 0                # column-C SERCOM at all, so the letter is not a choice between two.
+tx = { pin = "PA04", pad = 0 }
+rx = { pin = "PA05", pad = 1 }
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PA19"
+active = "low"
+source = "Atmel-42243D section 4.2.3 and Table 4-8: one yellow LED0 on PA19. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA28"
+active = "low"
+source = "Atmel-42243D section 4.2.2 and Table 4-7: the generic user-configurable button SW0 on PA28, silkscreened SW0. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."

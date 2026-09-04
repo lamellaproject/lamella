@@ -343,8 +343,17 @@ impl Vm {
     }
 
     /// Requests that the running thread block until thread `target` completes (`Thread.Join`).
-    pub fn request_join(&mut self, target: u32) {
-        self.thread_op = Some(ThreadOp::Join { target });
+    pub fn request_join(&mut self, target: u32, deadline: Option<u64>) {
+        self.thread_op = Some(ThreadOp::Join { target, deadline });
+    }
+
+    /// Records that `thread`'s current timed park ran out of time, for the managed side to read back
+    /// through [`take_wait_timed_out`](Self::take_wait_timed_out) once it runs again.
+    ///
+    /// Separate from [`resolve_lock_deadline`](Self::resolve_lock_deadline), which records the same
+    /// verdict as one outcome of a decision it also has to make; a join has no such decision.
+    pub fn record_park_timeout(&mut self, thread: u32) {
+        self.wait_timeouts.insert(thread);
     }
 
     /// The id of the green thread currently running.
@@ -558,9 +567,13 @@ impl Vm {
         true
     }
 
-    /// Whether `thread`'s most recent timed `Monitor.Wait` ended by its deadline, CONSUMING the
-    /// verdict so a later wait cannot read a stale one. Backs the managed `Wait(object, int)`'s
-    /// return value.
+    /// Whether `thread`'s most recent TIMED PARK ended by its deadline, CONSUMING the verdict so a
+    /// later park cannot read a stale one.
+    ///
+    /// One verdict serves all three timed parks -- `Monitor.Wait(object, int)`, a timed
+    /// `Monitor.TryEnter`, and `Thread.Join(int)` -- because they ask one question, "did I get it in
+    /// time", and a thread is parked in exactly one of them at a time. A second flag per park would
+    /// be a second answer to that question, and the two would drift.
     pub fn take_wait_timed_out(&mut self, thread: u32) -> bool {
         self.wait_timeouts.remove(&thread)
     }
@@ -1849,8 +1862,10 @@ enum ThreadOp {
     Spawn { id: u32, method: MethodId, target: Value, background: bool },
     /// Cooperatively yield the running thread.
     Yield,
-    /// Block the running thread until thread `target` completes.
-    Join { target: u32 },
+    /// Block the running thread until thread `target` completes, or -- with a `deadline` (monotonic
+    /// ms, a timed `Thread.Join`) -- until that passes, whichever is first. `None` waits however
+    /// long it takes, which is the untimed `Join()`.
+    Join { target: u32, deadline: Option<u64> },
     /// Block the running thread on a `Monitor` lock -- a failed acquire (queued in the lock's
     /// waiters) or a `Monitor.Wait` (parked in the condition wait-set). The scheduler parks it until
     /// a later wake hands it the lock. `wake`, if set, is a contender that a `Monitor.Wait`'s release
@@ -1951,8 +1966,14 @@ struct ThreadSlot {
 enum ThreadState {
     /// Runnable.
     Ready,
-    /// Blocked until the thread with this id finishes.
-    Joining(u32),
+    /// Blocked until the thread with this id finishes, or -- when a DEADLINE is set (a timed
+    /// `Thread.Join`) -- until that monotonic-millisecond deadline passes, whichever comes first.
+    ///
+    /// A deadline wake here is unambiguous, unlike [`BlockedUntil`](Self::BlockedUntil)'s: the only
+    /// thing that clears a join is the target FINISHING, and no thread runs during the reactor's
+    /// block point, so a joiner the reactor wakes really did run out of time. It is recorded as a
+    /// timed-park verdict for the managed `Join(int)` to read.
+    Joining(u32, Option<u64>),
     /// Blocked on a `Monitor` lock; set back to `Ready` by a [`ThreadOp::WakeThread`] when the
     /// lock's owner releases and hands it over.
     Blocked,
@@ -2023,6 +2044,9 @@ fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
         match slot.state {
             ThreadState::Sleeping(deadline) => parks.push((slot.id, WaitReason::Sleep(deadline))),
             ThreadState::BlockedUntil(deadline) => parks.push((slot.id, WaitReason::Sleep(deadline))),
+            ThreadState::Joining(_, Some(deadline)) => {
+                parks.push((slot.id, WaitReason::Sleep(deadline)));
+            }
             ThreadState::IoWait(handle, deadline) => {
                 parks.push((slot.id, WaitReason::Io(handle)));
                 if let Some(deadline) = deadline {
@@ -2047,6 +2071,9 @@ fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
                             slot.state = ThreadState::Blocked;
                         }
                         continue;
+                    }
+                    if let ThreadState::Joining(_, Some(_)) = slot.state {
+                        vm.record_park_timeout(slot.id);
                     }
                     slot.state = ThreadState::Ready;
                 }
@@ -2083,7 +2110,7 @@ pub fn run(
     entry: MethodId,
     args: Vec<Value>,
 ) -> Result<Option<Value>, Trap> {
-    run_serviced(module, vm, entry, args, &mut || {})
+    run_serviced(module, vm, entry, args, &mut |_vm| {})
 }
 
 /// Boots a BAKED module ([`Module::from_baked`]): runs its static constructors in order,
@@ -2118,6 +2145,10 @@ pub fn boot_baked(module: &Module, vm: &mut Vm, entry: MethodId) -> Result<Metho
 /// ever regaining control, so the serve never pumps the carrier and the host drops the Link. Plain
 /// [`run`] passes a no-op, so host runs and tests are unaffected.
 ///
+/// **The callback SEES the machine** (`&Vm`), which is what lets a serve stream a program's output
+/// while it runs rather than only when it ends. Without it the callback could pump the carrier and
+/// had nothing to put on it: the output existed, the poll happened, and the two could not meet.
+///
 /// # Errors
 /// Propagates a [`Trap`] from any thread's execution.
 pub fn run_serviced(
@@ -2125,10 +2156,10 @@ pub fn run_serviced(
     vm: &mut Vm,
     entry: MethodId,
     args: Vec<Value>,
-    service: &mut dyn FnMut(),
+    service: &mut dyn FnMut(&Vm),
 ) -> Result<Option<Value>, Trap> {
-    match run_interruptible(module, vm, entry, args, &mut || {
-        service();
+    match run_interruptible(module, vm, entry, args, &mut |vm| {
+        service(vm);
         true
     })? {
         Ran::Finished(value) => Ok(value),
@@ -2210,7 +2241,7 @@ pub fn run_interruptible(
     vm: &mut Vm,
     entry: MethodId,
     args: Vec<Value>,
-    service: &mut dyn FnMut() -> bool,
+    service: &mut dyn FnMut(&Vm) -> bool,
 ) -> Result<Ran, Trap> {
     if module.is_baked() && !vm.all_cctors_run(module) && !module.static_ctors().contains(&entry) {
         return Err(Trap::StaticCtorsNotRun);
@@ -2232,11 +2263,11 @@ pub fn run_interruptible(
             break;
         }
         let Some(index) = next_ready_thread(&threads, cursor) else {
-            if !service() {
+            if !service(vm) {
                 return Ok(Ran::Interrupted);
             }
             if idle_wait(&mut threads, vm) {
-                if !service() {
+                if !service(vm) {
                     return Ok(Ran::Interrupted);
                 }
                 continue;
@@ -2254,7 +2285,7 @@ pub fn run_interruptible(
                 threads[index].state = ThreadState::Done;
                 live -= 1;
                 for slot in &mut threads {
-                    if slot.state == ThreadState::Joining(finished) {
+                    if matches!(slot.state, ThreadState::Joining(target, _) if target == finished) {
                         slot.state = ThreadState::Ready;
                     }
                 }
@@ -2273,12 +2304,12 @@ pub fn run_interruptible(
                     live += 1;
                 }
                 Some(ThreadOp::Yield) => cursor = index + 1,
-                Some(ThreadOp::Join { target }) => {
+                Some(ThreadOp::Join { target, deadline }) => {
                     let pending = threads
                         .iter()
                         .any(|slot| slot.id == target && slot.state != ThreadState::Done);
                     if pending {
-                        threads[index].state = ThreadState::Joining(target);
+                        threads[index].state = ThreadState::Joining(target, deadline);
                     }
                     cursor = index + 1;
                 }
@@ -2458,7 +2489,9 @@ pub enum Status {
 pub struct FrameView<'s> {
     /// The method running in this frame.
     pub method: MethodId,
-    /// The index of the instruction about to execute.
+    /// Where execution is in the method, IN THE ACTIVE IP DOMAIN: the INDEX of the instruction
+    /// about to execute by default, and its CIL BYTE OFFSET under `code-in-place`.
+    ///
     pub ip: u32,
     /// The evaluation stack, bottom first.
     pub stack: &'s [Value],
@@ -2603,7 +2636,7 @@ impl Session {
         &mut self,
         module: &Module,
         vm: &mut Vm,
-        service: &mut dyn FnMut() -> bool,
+        service: &mut dyn FnMut(&Vm) -> bool,
     ) -> Result<ThreadStatus, Trap> {
         let mut quantum = TIME_SLICE_QUANTUM;
         loop {
@@ -2616,7 +2649,7 @@ impl Session {
             }
             quantum -= 1;
             if quantum == 0 {
-                if !service() {
+                if !service(vm) {
                     return Ok(ThreadStatus::Interrupted);
                 }
                 let _ = vm.now_millis();
@@ -4092,6 +4125,20 @@ fn take_args_pooled(frame: &mut Frame, vm: &mut Vm, count: u16) -> Result<Vec<Va
 /// decoded one instruction per step with the ip a CIL byte offset. `advance` is the only fetch
 /// site, and [`step`] moves ip/target/len around as opaque values, so both domains run the same
 /// dispatcher unchanged.
+/// Whether a frame's `ip` is a CIL BYTE OFFSET rather than an instruction INDEX.
+///
+/// # Why this is exported at all
+///
+/// **THE DOMAIN IS DECIDED BY A FEATURE THIS CRATE DECLARES, AND A CONSUMER CANNOT SEE IT.** A
+/// cargo feature is not visible to `cfg` outside the crate that declares it, so `lamella-dap`
+/// cannot write `#[cfg(feature = "code-in-place")]` and cannot ask any other way. Without this it
+/// has to ASSUME a domain, and the assumption is wrong in exactly one configuration.
+///
+///
+/// This is the same repair as [`Module::method_instructions`] one level up: **ask the crate that
+/// owns the condition.**
+pub const IP_IS_IL_OFFSET: bool = cfg!(feature = "code-in-place");
+
 #[cfg(not(feature = "code-in-place"))]
 fn method_code(module: &Module, id: MethodId) -> Result<&[Instruction], Trap> {
     module.method_body(id).map(|body| &body.code[..]).ok_or(Trap::NoSuchMethod(id))
@@ -4596,11 +4643,45 @@ fn catch_matches(
 /// budget deliberately leaves below capacity. Unbounded by default (`object_budget = None`),
 /// so a host that sets no budget never pays for the check.
 #[inline]
-fn check_alloc_budget(vm: &Vm) -> Result<(), Trap> {
+pub(crate) fn check_alloc_budget(vm: &Vm) -> Result<(), Trap> {
     if vm.heap().at_budget() {
         return Err(Trap::OutOfMemory);
     }
     Ok(())
+}
+
+/// Allocate a zero-initialized array of `length` elements whose element type is `token` in
+/// assembly `asm`, and answer the new object.
+///
+/// This is the WHOLE of what `newarr` (III.4.20) does after its operand and length are in hand,
+/// and it is a function rather than an inline arm because `System.Array.CreateInstance` asks the
+/// identical question at run time from a `Type` handle. Two implementations of "what is this
+/// element type's zero, and does it pack" would be two answers to a question whose wrong answer is
+/// silent -- an array of nulls where .NET has zeroed structs reads as working code until an
+/// element is used.
+pub(crate) fn alloc_array_of_element(
+    vm: &mut Vm,
+    module: &Module,
+    asm: u8,
+    token: Token,
+    length: usize,
+) -> ObjectRef {
+    let element_type = asm_key(asm, token.0);
+    match module.array_prim_kind(asm, token) {
+        Some(kind) if kind.packable() => vm.heap_mut().alloc_packed_array(kind, length, element_type),
+        _ => {
+            let default = match module.array_default(asm, token) {
+                Some(default) => default,
+                None if !module.is_enum_by_handle(element_type) => module
+                    .type_id_of(asm, token)
+                    .filter(|&type_id| module.type_is_value_type(type_id))
+                    .and_then(|type_id| module.type_field_defaults(type_id))
+                    .map_or(Value::Null, |fields| Value::Struct(fields.into_boxed_slice())),
+                None => Value::Int32(0),
+            };
+            vm.heap_mut().alloc_typed_array(alloc::vec![default; length], element_type)
+        }
+    }
 }
 
 fn step(
@@ -4955,6 +5036,12 @@ fn step(
                         match read_constrained_receiver(frame, frame_index, vm, &location) {
                             None => {}
                             Some(value @ (Value::Object(_) | Value::Null)) => args[0] = value,
+                            Some(value)
+                                if runtime_type
+                                    .is_some_and(|type_id| !module.type_is_value_type(type_id)) =>
+                            {
+                                args[0] = value;
+                            }
                             Some(value) => {
                                 check_alloc_budget(vm)?;
                                 let boxed =
@@ -5489,6 +5576,14 @@ fn step(
                 frame.stack.push(value);
                 return Ok(Flow::Next);
             }
+            if module.is_some_and(|module| {
+                module
+                    .type_id_of(asm, token)
+                    .is_some_and(|type_id| !module.type_is_value_type(type_id))
+            }) {
+                frame.stack.push(value);
+                return Ok(Flow::Next);
+            }
             if let Some(underlying) =
                 module.and_then(|module| nullable_underlying_of(module, asm, token))
             {
@@ -5565,27 +5660,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Newarr))?;
             let token = token_operand(instruction)?;
             let length = array_length(frame.pop()?)?;
-            let element_type = asm_key(asm, token.0);
-            let object = match module.array_prim_kind(asm, token) {
-                Some(kind) if kind.packable() => {
-                    vm.heap_mut().alloc_packed_array(kind, length, element_type)
-                }
-                _ => {
-                    let default = match module.array_default(asm, token) {
-                        Some(default) => default,
-                        None if !module.is_enum_by_handle(element_type) => module
-                            .type_id_of(asm, token)
-                            .filter(|&type_id| module.type_is_value_type(type_id))
-                            .and_then(|type_id| module.type_field_defaults(type_id))
-                            .map_or(Value::Null, |fields| {
-                                Value::Struct(fields.into_boxed_slice())
-                            }),
-                        None => Value::Int32(0),
-                    };
-                    vm.heap_mut()
-                        .alloc_typed_array(alloc::vec![default; length], element_type)
-                }
-            };
+            let object = alloc_array_of_element(vm, module, asm, token, length);
             frame.stack.push(Value::Object(object));
         }
 
@@ -6705,33 +6780,15 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         });
     }
 
-    #[cfg(feature = "float")]
-    if matches!(opcode, Opcode::ConvU8 | Opcode::ConvU) {
-        let float = match value {
-            Value::Float(f) => Some(f),
-            Value::Single(f) => Some(f64::from(f)),
-            _ => None,
-        };
-        if let Some(f) = float {
-            if (9_223_372_036_854_775_808.0..18_446_744_073_709_551_616.0).contains(&f) {
-                let unsigned = f as u64;
-                return Ok(if opcode == Opcode::ConvU8 {
-                    Value::Int64(unsigned as i64)
-                } else {
-                    Value::NativeInt(unsigned as i64)
-                });
-            }
-        }
-    }
 
     let (source, from_32) = match value {
         Value::Int32(x) => (i64::from(x), true),
         Value::Int64(x) => (x, false),
         Value::NativeInt(x) => (x, false),
         #[cfg(feature = "float")]
-        Value::Float(f) => (f as i64, false),
+        Value::Float(f) => (float_to_intermediate(opcode, f), false),
         #[cfg(feature = "float")]
-        Value::Single(f) => (f as i64, false),
+        Value::Single(f) => (float_to_intermediate(opcode, f64::from(f)), false),
         Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
             return Err(Trap::TypeMismatch(opcode));
         }
@@ -6756,6 +6813,46 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Opcode::ConvU => Value::NativeInt(zero_extended),
         _ => return Err(Trap::Unsupported(opcode)),
     })
+}
+
+/// A float narrowed to the signed intermediate a `conv.*` truncates from, answering what .NET
+/// answers when the value does not fit or is NaN.
+///
+/// ECMA-335 III.3.27 declines to choose here: "If overflow occurs converting a floating-point type
+/// to an integer, or if the floating-point value being converted to an integer is a NaN, the value
+/// returned is unspecified." So any answer conforms, including Rust's `as`, which saturates and
+/// sends NaN to zero. This one matches .NET instead, because that is what a program written here
+/// meets when it runs there.
+#[cfg(feature = "float")]
+fn float_to_intermediate(opcode: Opcode, float: f64) -> i64 {
+    if matches!(opcode, Opcode::ConvU8 | Opcode::ConvU) {
+        const BIAS: f64 = 9_223_372_036_854_775_808.0;
+        return if float < BIAS {
+            signed_64(float)
+        } else {
+            signed_64(float - BIAS).wrapping_add(i64::MIN)
+        };
+    }
+    if matches!(opcode, Opcode::ConvI8 | Opcode::ConvI | Opcode::ConvU4) {
+        return signed_64(float);
+    }
+    if float.is_nan() || !(-2_147_483_648.0..2_147_483_648.0).contains(&float) {
+        return i64::from(i32::MIN);
+    }
+    i64::from(float as i32)
+}
+
+/// A float truncated toward zero into 64 signed bits, answering `i64::MIN` -- x86's "integer
+/// indefinite" -- when it does not fit or is NaN, where Rust's `as` would saturate and send NaN to
+/// zero. The one place that difference is expressed, so the arms above cannot drift apart.
+#[cfg(feature = "float")]
+fn signed_64(float: f64) -> i64 {
+    if float.is_nan()
+        || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&float)
+    {
+        return i64::MIN;
+    }
+    float as i64
 }
 
 /// The checked conversions `conv.ovf.*`: like [`convert`] but yielding [`Trap::Overflow`]

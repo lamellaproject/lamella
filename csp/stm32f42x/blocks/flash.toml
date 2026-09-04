@@ -1,0 +1,40 @@
+# BLOCK: the STM32F42x/F43x embedded flash controller, stated only as far as the facts consumers
+# outside the controller need. Its unlock sequence, its sector geometry and its command bits are not
+# described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A SOFTWARE CHOICE ON THIS PART, AND THE VALUE HERE IS THE ONE A BOARD AT AN
+# ORDINARY SUPPLY CAN TAKE. The controller's PSIZE field selects x8, x16, x32 or x64 -- one, two,
+# four or eight bytes per program operation -- and RM0090 Table 13 caps it by SUPPLY VOLTAGE. x64 is
+# available only with an external VPP of 8 to 9 V applied to the VPP pad, which the manual itself
+# advises limiting to factory programming. At 2.7-3.6 V without it the cap is x32, so four bytes is
+# the largest unit this part can be programmed in on a board that does not supply VPP.
+#
+# WARNING: RM0090 TABLE 13 HAS FIVE VOLTAGE COLUMNS AND FOUR PARALLELISM VALUES, because the x16
+# cell SPANS the 2.4-2.7 V and 2.1-2.4 V columns. A reader who pairs the columns off one by one
+# puts x8 against 2.1-2.4 V and leaves 1.8-2.1 V unanswered, which is wrong for two of the five.
+#
+# THE UNIT MAY BE PROGRAMMED AGAIN WITHOUT AN ERASE, WHICH IS NOT TRUE OF EVERY ST CONTROLLER.
+# RM0090 permits successive writes that only change bits from 1 to 0. That is a property of this
+# family: on an STM32H7 a second program of the same flash word produces an ECC error on every later
+# read. A consumer relying on it must take it from the family that states it.
+
+[table]
+kind = "block"
+family = "stm32f42x"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 4
+sources = [
+    "erased_value: STM32F405/415, F407/417, F427/437 and F429/439 reference manual RM0090 Rev 22 section 3.6.4: `Successive write operations are possible without the need of an erase operation when changing bits from 1 to 0. Writing 1 requires a flash memory erase operation` -- so the state an erase leaves is all ones",
+    "write_unit: RM0090 Rev 22 section 3.6.2 `Program/erase parallelism`: `The parallelism size is configured through the PSIZE field in the FLASH_CR register. It represents the number of bytes to be programmed each time a write operation occurs`",
+    "write_unit: RM0090 Rev 22 Table 13 `Maximum program/erase parallelism`, page 85: x64 requires 2.7-3.6 V WITH external VPP, x32 is the cap at 2.7-3.6 V without it, x16 covers 2.4-2.7 V and 2.1-2.4 V, and x8 covers 1.8-2.1 V",
+    "write_unit: RM0090 Rev 22 section 3.6.4, which requires the ACCESS WIDTH to match the chosen parallelism -- word access for x32 -- and raises PGPERR when it does not",
+]
+notes = [
+    "x64 needs an external 8-9 V supply on the VPP pad. RM0090 advises limiting VPP to initial programming on the factory line and warns that leaving it applied for more than an hour may damage the flash, so it is a production-programming mode rather than one an application uses.",
+    "RM0090 refuses a program that would cross a 128-bit row boundary, raising PGAERR. That is an alignment rule about rows and is a separate constraint from the write unit; a consumer aligning a record to the write unit satisfies it, and one aligning to nothing does not.",
+    "The erase unit is not this number and is not declared here. Erase on this family is by SECTOR and the sectors are not uniform -- they range from 16 Kbytes to 128 Kbytes within one part -- so it is not a fact a block can carry.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

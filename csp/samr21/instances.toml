@@ -1,0 +1,122 @@
+# The SAMR21 instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# EVERY VALUE BELOW WAS READ OFF THE SAM R21'S OWN TABLE 10-1. The SERCOM rows then agree with
+# the SAMD21's, value for value -- which is a RESULT here rather than an assumption, and the
+# distinction is the whole reason this file exists separately from that family's. A part that
+# shares an ancestor shares some addresses and not others, and which is which is not derivable
+# from the resemblance.
+#
+# TWO STATEMENTS OF THE BASES AGREE AND BOTH WERE CHECKED: Figure 7-1 (Product Mapping) gives
+# SYSCTRL 0x40000800 and GCLK 0x40000C00, and Table 10-1 gives the same two independently.
+
+
+[table]
+kind = "instances"
+family = "samr21"
+record = ["base", "gclk_core_id", "apbc_bit", "irq"]
+sources = [
+    "SAM R21 datasheet Atmel-42223G: Table 10-1 (Peripherals Configuration Summary) for base address, IRQ line, APB-C index and generic-clock index; Figure 7-1 (Product Mapping) for the same bases independently",
+    "Atmel-42223G section 14.8.10 (APBC Mask) for the APB-C bit positions, stated one bit at a time in prose rather than read out of the register-summary table",
+    "Atmel-42223G section 21.8 (PORT register descriptions), whose offset formula '0x00+x*0x80 [x=0..2]' states BOTH the group stride and how many groups there are",
+]
+notes = [
+    "SERCOM bases stride 0x400 from 0x42000800; GCLK core-clock IDs stride 1 from 0x14; APBC bits stride 1 from bit 2; NVIC lines stride 1 from 9. Each row is still stated explicitly -- a table is data, not a formula.",
+    "SERCOM4 IS ROWED AND MUST NOT BE BOUND BY A BOARD. It is a real placed instance with a real base, IRQ and gate bit, and it is wired inside the package to the AT86RF233. Omitting the row would misdescribe the silicon; binding it would drive the radio's SPI from a board file.",
+    "THREE PORT GROUPS, WHICH IS ONE MORE THAN THE SAMD21 HAS. Section 21.8's offset formula ranges x over 0..2, so group 2 exists and is where the radio's SCLK, MISO and CLKM live (PC16, PC18, PC19).",
+]
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 0x14
+apbc_bit = 2
+irq = 9
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 0x15
+apbc_bit = 3
+irq = 10
+
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 0x16
+apbc_bit = 4
+irq = 11
+
+[[instances]]
+name = "sercom3"
+block = "sercom"
+base = 0x42001400
+gclk_core_id = 0x17
+apbc_bit = 5
+irq = 12
+
+# THE RADIO'S SERCOM. Rowed because it is placed silicon, not because anything may bind it --
+# see the note above and parts.toml, which states the same refusal from the pad side.
+[[instances]]
+name = "sercom4"
+block = "sercom"
+base = 0x42001800
+gclk_core_id = 0x18
+apbc_bit = 6
+irq = 13
+
+[[instances]]
+name = "sercom5"
+block = "sercom"
+base = 0x42001C00
+gclk_core_id = 0x19
+apbc_bit = 7
+irq = 14
+
+[[instances]]
+name = "pm"
+block = "pm"
+base = 0x40000400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40000C00
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x41004400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "portb"
+block = "port"
+base = 0x41004480
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+# GROUP 2. Its base is the PORT base plus two strides, and BOTH halves of that come from the
+# register descriptions' own offset formula rather than from a separately printed address:
+# 0x00+x*0x80 [x=0..2] states the 0x80 stride and states that x reaches 2. No package pin on the
+# SAM R21G reaches this group -- PC16, PC18 and PC19 are the transceiver's CLKM, SCLK and MISO.
+[[instances]]
+name = "portc"
+block = "port"
+base = 0x41004500
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1

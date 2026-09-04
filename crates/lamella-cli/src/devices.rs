@@ -47,7 +47,7 @@ pub fn devices_command(args: &[String]) -> ExitCode {
         Err(halt) => return halt.code(),
     };
 
-    let mut attached = enumerate();
+    let (mut attached, unrecognized) = enumerate();
     for waiting in lamella_flash_routes::bootsel::waiting() {
         let what = format!("{}  ({})", waiting.state(), waiting.volume);
         attached.push(Attached { target: waiting.describe(), carrier: "volume", what });
@@ -63,6 +63,13 @@ pub fn devices_command(args: &[String]) -> ExitCode {
         println!("{:<width$}  {:<7}  {}", board.target, board.carrier, board.what, width = width);
     }
     println!("\n{} attached. Paste a TARGET into --target.", attached.len());
+    if unrecognized > 0 {
+        println!(
+            "{unrecognized} other vendor-class USB device(s) attached are not debug probes. A\n\
+             CMSIS-DAP interface names itself as one and these did not, so they are something\n\
+             else -- but if a probe of yours is missing above, it is among them."
+        );
+    }
     if attached.iter().any(|board| board.carrier == "volume") {
         println!(
             "A `(bootloader)` or `(volume)` row takes an image by having one COPIED to it, so it\n\
@@ -88,9 +95,10 @@ pub fn devices_command(args: &[String]) -> ExitCode {
 }
 
 /// Every attached board, native-USB Lamella Link devices first and then the OS serial ports.
-fn enumerate() -> Vec<Attached> {
+fn enumerate() -> (Vec<Attached>, usize) {
     let mut attached = Vec::new();
-    let probes = lamella_probe::list();
+    let mut unrecognized = 0usize;
+    let probes = lamella_probe::list_reporting(&mut unrecognized);
     for probe in &probes {
         let target = match &probe.serial {
             Some(serial) => format!("--probe {serial}"),
@@ -129,7 +137,7 @@ fn enumerate() -> Vec<Attached> {
         }
         attached.push(Attached { target, carrier: "serial", what });
     }
-    attached
+    (attached, unrecognized)
 }
 
 /// The target to print for `port`, and a note when it is not the obvious one.
@@ -192,6 +200,9 @@ fn identify(target: &str) -> String {
     };
     match hello_blocking(&mut transport, 1, host_caps(), IDENTIFY_TIMEOUT) {
         Ok(negotiated) => render_identity(&negotiated),
+        Err(lamella_wire::TransportError::VersionMismatch { target_min, target_max }) => {
+            lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
+        }
         Err(_) => "no answer -- this is normal unless Lamella firmware is running on it".to_owned(),
     }
 }
@@ -207,32 +218,50 @@ fn host_caps() -> Capabilities {
             | Capabilities::STEPPING
             | Capabilities::REPL_RUN
             | Capabilities::BAKED_IMAGE
-            | Capabilities::DEBUG_ATTACH,
+            | Capabilities::DEBUG_BOOT_DEPLOYED,
     )
 }
 
-/// Render a negotiated identity: the board name, the profile, and the chip id where the firmware
-/// reports one.
+/// Render a negotiated identity: the board, its target ABI, which firmware build is answering, the
+/// chip's own identity, and one line per resident runtime.
 fn render_identity(negotiated: &Negotiated) -> String {
     let mut text = format!(
         "Lamella Link version {}, capabilities {:#010x}\n",
         negotiated.version, negotiated.caps.0
     );
-    let Some(profile) = &negotiated.profile else {
-        text.push_str("the target reported no profile identity\n");
-        return text;
-    };
-    let board = lamella_wire::board_model::name(profile.board_model)
-        .unwrap_or("(a board_model this build does not recognize)");
-    text.push_str(&format!("board {board} (board_model {})\n", profile.board_model));
-    text.push_str(&format!("profile {} (abi {})\n", profile.name(), profile.abi));
-    if profile.chip_idcode == 0 {
-        text.push_str("chip id: not reported by this firmware\n");
-        return text;
+    let identity = &negotiated.identity;
+    let board = lamella_wire::product_model::name(identity.product_model)
+        .unwrap_or("(a product_model this build does not recognize)");
+    text.push_str(&format!("board {board} (product_model {})\n", identity.product_model));
+    match lamella_wire::arch::name(identity.arch) {
+        Some(name) => text.push_str(&format!("arch {name}\n")),
+        None => text.push_str("arch: not reported by this firmware\n"),
     }
-    text.push_str(&format!("chip IDCODE {:#010x}\n", profile.chip_idcode));
-    if profile.chip_devid != 0 {
-        text.push_str(&format!("chip devid {:#010x}\n", profile.chip_devid));
+    if identity.firmware_version != [0, 0] {
+        text.push_str(&format!(
+            "firmware build day {} build {}\n",
+            identity.firmware_version[0], identity.firmware_version[1]
+        ));
+    }
+    if identity.chip_id_kind == lamella_wire::chip_id_kind::NONE {
+        text.push_str("chip id: not reported by this firmware\n");
+    } else {
+        let hex: String = identity.chip_id.iter().map(|byte| format!("{byte:02x}")).collect();
+        text.push_str(&format!("chip id (kind {}) {hex}\n", identity.chip_id_kind));
+    }
+    for surface in &identity.surfaces {
+        let v = surface.lib_version;
+        let f = surface.lib_file_version;
+        text.push_str(&format!(
+            "resident runtime: tier {} abi {} hash {:#018x} library {}.{}.{}.{} build {}.{}.{}.{}\n",
+            surface.tier, surface.abi, surface.hash, v[0], v[1], v[2], v[3], f[0], f[1], f[2], f[3]
+        ));
+    }
+    if let Some((tier, field)) = negotiated.unreadable_surface_version() {
+        text.push_str(&format!(
+            "WARNING: tier {tier} claims a resident library and reports no {field}. The firmware \
+             could not read it, so this board cannot be version-compared against anything.\n"
+        ));
     }
     text
 }
@@ -287,9 +316,9 @@ mod tests {
     #[test]
     fn a_serial_number_shared_by_two_ports_is_not_printed_as_a_target() {
         let all = vec![
-            port("COM11", Some("STKVKH3CMA5YD")),
-            port("COM76", Some("STKVKH3CMA5YD")),
-            port("COM8", Some("E6614103E760132F")),
+            port("COM11", Some("PROBEALPHA001")),
+            port("COM76", Some("PROBEALPHA001")),
+            port("COM8", Some("SERIAL0000000001")),
             port("COM3", None),
         ];
 
@@ -298,7 +327,7 @@ mod tests {
         assert!(note.expect("it explains itself").contains("2 ports"), "and says how many");
 
         let (target, note) = serial_target(&all[2], &all);
-        assert_eq!(target, "serial:E6614103E760132F", "a unique serial is the stable handle");
+        assert_eq!(target, "serial:SERIAL0000000001", "a unique serial is the stable handle");
         assert!(note.is_none(), "and needs no explanation");
 
         let (target, note) = serial_target(&all[3], &all);

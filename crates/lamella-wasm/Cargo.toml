@@ -29,6 +29,15 @@ serde_json = { version = "1", optional = true }
 # The AOT backend, for the in-page chip/wasm exporter (lamella_aot_build). Default features bring the
 # ARM32 backend (chip images); enable lamella-aot's `wasm` feature too for the C# -> .wasm widget path.
 lamella-aot = { path = "../lamella-aot", optional = true }
+# The probe feature pulls in the CMSIS-DAP command layer, the shared MEM-AP / Cortex-M layer, and
+# the per-part flash routines, so a browser drives real silicon through the SAME code a native
+# deploy drives it through. `default-features = false` because the CMSIS-DAP crate defaults to its
+# native USB-HID transport, which has no wasm32 backend -- here the host supplies the transport.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", optional = true, default-features = false }
+lamella-probe-core = { path = "../lamella-probe-core", optional = true }
+lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", optional = true }
+lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350", optional = true }
+lamella-cmsis-dap-rp2040 = { path = "../lamella-cmsis-dap-rp2040", optional = true }
 # The py feature pulls in the Python front end + runtime for the in-page Python runner.
 lamella-py-frontend = { path = "../lamella-py-frontend", optional = true }
 lamella-py-runtime = { path = "../lamella-py-runtime", optional = true }
@@ -59,6 +68,19 @@ compile = [
 # serde_json carries the build's `{ error }` envelope, so a failed lowering reports WHY to the page
 # instead of collapsing into an empty buffer.
 aot = ["dep:lamella-aot", "dep:serde_json"]
+# Adds the in-page debug-probe agent (lamella_probe_create/request/flash/dispose): CMSIS-DAP over a
+# host-supplied packet transport, the ADIv5 MEM-AP and Cortex-M run control above it, and the
+# per-part flash routines -- so a page connects a real probe, programs a chip and debugs it. This is
+# the Debug ACCESS PORT and is unrelated to the `dap` feature, which is the Debug ADAPTER PROTOCOL
+# agent for a program running in this module. Off by default.
+probe = [
+    "dep:lamella-cmsis-dap",
+    "dep:lamella-probe-core",
+    "dep:lamella-cmsis-dap-nrf",
+    "dep:lamella-cmsis-dap-rp2350",
+    "dep:lamella-cmsis-dap-rp2040",
+    "dep:serde_json",
+]
 # Adds the in-page Python runner (lamella_py_run: Python source -> compile + run main() -> rendered
 # result + diagnostics) so Studio compiles + runs the user's Python client-side. Off by default.
 py = ["dep:lamella-py-frontend", "dep:lamella-py-runtime"]

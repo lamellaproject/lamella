@@ -12,3 +12,4 @@ pub const GPIO0_CTRL_FUNCSEL_LSB: u32 = 0;
 /// -- block constants --
 pub const GPIO_CTRL_STRIDE: u32 = 8;
 pub const FUNCSEL_UART: u32 = 2;
+pub const FUNCSEL_SIO: u32 = 5;

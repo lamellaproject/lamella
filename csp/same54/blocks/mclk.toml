@@ -1,0 +1,91 @@
+# MCLK, the Main Clock controller of the SAM D5x/E5x family -- the BLOCK layout. Register offsets
+# are MCLK-instance-relative; nothing here names an instance, a pin, a board or a clock plan.
+#
+# WHAT THIS BLOCK IS FOR: every peripheral on this family sits behind two clocks, and MCLK owns one
+# of them. The BUS clock, enabled by a bit in one of the four APB mask registers below, is what
+# makes a peripheral's registers readable at all. The CORE clock, routed by GCLK, is what makes it
+# do work. A peripheral with only the bus clock reads and writes its registers and never acts; a
+# peripheral with only the core clock faults the bus on the first access.
+#
+# THE APB MASK REGISTERS DECLARE NO PER-PERIPHERAL FIELDS, AND THAT IS DELIBERATE. Each is thirty-
+# two single-bit enables, and which bit belongs to which peripheral is ALREADY STATED, once, in the
+# instance map: every row carries the mask offset and the bit that clock it. Naming them again here
+# would be the same fact in two files, free to disagree, and the disagreement would be a peripheral
+# that never comes out of reset while both files look right. The register is placed; the mapping
+# has one home.
+#
+# FOUR APB BUSES, AND THE PERIPHERALS OF ONE BLOCK ARE SPREAD OVER THEM. The eight SERCOMs sit on
+# three different masks. There is no bus that "the SERCOMs" are on.
+
+[table]
+kind = "block"
+family = "same54"
+block = "mclk"
+sources = [
+    "SAM D5x/E5x Family Data Sheet DS60001507F ch 15 (MCLK): the Register Description, per-register Offset headings",
+]
+notes = [
+    "OFFSET 0x00 CARRIES NO REGISTER THIS BLOCK DECLARES. The first register described is INTENCLR at 0x01, and the map below starts there rather than assuming a control register sits at the base the way several sibling controllers put one.",
+    "AHBMASK, HSDIV and CPUDIV are placed and NOT written by anything here. The bus and CPU division are a system clock plan rather than a driver's business, and a driver that changed them would be reaching outside the peripheral it was asked for.",
+    "DECLARED SUBSET: the interrupt registers are declared with their single CKRDY bit; nothing here enables the interrupt, and a driver that wanted to wait for a clock change polls INTFLAG instead.",
+]
+
+[registers.INTENCLR]
+offset = 0x01
+width = 8
+fields = { CKRDY = [0, 1] }
+notes = "Write 1 to disable the clock-ready interrupt."
+
+[registers.INTENSET]
+offset = 0x02
+width = 8
+fields = { CKRDY = [0, 1] }
+notes = "Write 1 to enable it. The flag in INTFLAG is set whether or not the interrupt is enabled, so a polling driver leaves this alone."
+
+[registers.INTFLAG]
+offset = 0x03
+width = 8
+fields = { CKRDY = [0, 1] }
+notes = "Set when the CPU and bus clocks have taken a new division. Cleared by writing a 1."
+
+[registers.HSDIV]
+offset = 0x04
+width = 8
+fields = { DIV = [0, 8] }
+notes = "High-speed clock division. A system clock plan owns this; placed so the map is the manual's."
+
+[registers.CPUDIV]
+offset = 0x05
+width = 8
+fields = { DIV = [0, 8] }
+notes = "CPU clock division from the main clock. A system clock plan owns this."
+
+[registers.AHBMASK]
+offset = 0x10
+width = 32
+fields = { }
+notes = "AHB clock enables, one bit per bus master or high-bandwidth peripheral. No fields declared: nothing here enables an AHB peripheral, and the instance map is where a bit would be named if one did."
+
+[registers.APBAMASK]
+offset = 0x14
+width = 32
+fields = { }
+notes = "APB bridge A clock enables. Which bit belongs to which peripheral is stated in the instance map and nowhere else."
+
+[registers.APBBMASK]
+offset = 0x18
+width = 32
+fields = { }
+notes = "APB bridge B clock enables. Enabled out of reset for at least one peripheral, which is why some blocks on this bridge work having touched no clock register."
+
+[registers.APBCMASK]
+offset = 0x1C
+width = 32
+fields = { }
+notes = "APB bridge C clock enables."
+
+[registers.APBDMASK]
+offset = 0x20
+width = 32
+fields = { }
+notes = "APB bridge D clock enables."

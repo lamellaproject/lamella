@@ -23,7 +23,7 @@ notes = [
 # --- sourcing --------------------------------------------------------------------------------
 #
 # `none`, and unlike most parts at this rung that is not merely a matter of nobody having tried.
-# A device acknowledged 0x44 on an I2C walk of this bench, which establishes only that something
+# A device acknowledged 0x44 on an I2C walk, which establishes only that something
 # answered that address. THE RUNG ABOVE IS UNREACHABLE FOR THIS PART BY CONSTRUCTION -- `identified`
 # means one answered its identity register, and it has none. Confidence in this part can only come
 # from exercising it: requesting a measurement and decoding a plausible one.

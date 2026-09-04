@@ -18,7 +18,7 @@ validation = "none"
 
 # --- a disagreement worth carrying ------------------------------------------------------------
 #
-# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS. A unit on this bench answered 0x24, where the manual gives 0x6A and 0x35. Since the address is software-assignable the two are not in contradiction -- a unit carries whatever its firmware was built with -- but a program written to the documented default does not find this one.
+# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS. A unit answered 0x24 when measured, where the manual gives 0x6A and 0x35. Since the address is software-assignable the two are not in contradiction -- a unit carries whatever its firmware was built with -- but a program written to the documented default does not find this one.
 
 [address]
 bus = "i2c"

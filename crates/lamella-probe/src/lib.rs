@@ -283,11 +283,7 @@ pub fn resolve_serial(
     product_id: u16,
     requested: Option<&str>,
 ) -> Result<String, ProbeError> {
-    let selector = match requested {
-        Some(serial) if !serial.trim().is_empty() => Selector::by_serial(serial.trim().to_owned()),
-        _ => Selector::from_environment(),
-    }
-    .with_vid_pid(vendor_id, product_id);
+    let selector = Selector::named_or_environment(requested).with_vid_pid(vendor_id, product_id);
     choose_serial(&list(), &selector)
 }
 
@@ -385,10 +381,26 @@ pub fn open_bulk(
 /// like a probe (standard desktop HID) are filtered out; whether a candidate truly speaks DAP is
 /// confirmed at [`open`] time. For the raw per-interface view, enumerate the transports directly.
 pub fn list() -> Vec<ProbeInfo> {
+    list_reporting(&mut 0)
+}
+
+/// [`list`], also reporting how many vendor-class devices were recognized as NOT probes.
+///
+/// **FOR A CALLER THAT PRINTS A LISTING, SO THE FILTER IS ACCOUNTABLE.** `lamella devices` is the
+/// command someone runs when they are already confused, and the worst thing it can do is quietly
+/// leave out the probe they are looking for. A count lets it say "and 3 other vendor-class devices"
+/// rather than silently presenting a filtered list as the whole bus: keep it visible, just do not 
+/// let it block.
+pub fn list_reporting(unrecognized: &mut usize) -> Vec<ProbeInfo> {
     let mut best: Vec<ProbeInfo> = Vec::new();
-    for cand in all_candidates() {
+    for cand in all_candidates_counting(unrecognized) {
         match best.iter_mut().find(|p| {
-            p.vendor_id == cand.vendor_id && p.product_id == cand.product_id && p.serial == cand.serial
+            p.vendor_id == cand.vendor_id
+                && p.product_id == cand.product_id
+                && match (&p.serial, &cand.serial) {
+                    (Some(held), Some(found)) => held.eq_ignore_ascii_case(found),
+                    (held, found) => held == found,
+                }
         }) {
             Some(existing) if selection_rank(&cand) < selection_rank(existing) => *existing = cand,
             Some(_) => {}
@@ -418,13 +430,34 @@ fn distinct_probes(candidates: &[ProbeInfo]) -> Vec<String> {
 /// Every probe-like interface across the native transports -- one entry per interface, so a
 /// composite probe appears several times. The candidate set [`open`] selects from.
 fn all_candidates() -> Vec<ProbeInfo> {
+    all_candidates_counting(&mut 0)
+}
+
+/// [`all_candidates`], also counting the vendor-class devices it passed over.
+///
+/// **THE COUNT EXISTS SO A FILTER CANNOT HIDE A PROBE IN SILENCE.** Recognizing a probe means
+/// declining to list something, and the thing this project keeps paying for is a listing that
+/// omits what it could not account for and reports the survivors as the whole set. A number a
+/// caller can print costs nothing and makes an unrecognized probe visible as a discrepancy
+/// instead of as an absence.
+fn all_candidates_counting(unrecognized: &mut usize) -> Vec<ProbeInfo> {
     let mut out = Vec::new();
     if let Ok(hids) = lamella_usbhid::enumerate() {
-        out.extend(hids.into_iter().filter(looks_like_probe_hid).map(ProbeInfo::from_hid));
+        for hid in hids {
+            if is_cmsis_dap_v1(&hid) {
+                out.push(ProbeInfo::from_hid(hid));
+            }
+        }
     }
     #[cfg(feature = "usbbulk")]
     if let Ok(bulk) = lamella_usbbulk::enumerate() {
-        out.extend(bulk.into_iter().map(ProbeInfo::from_bulk));
+        for device in bulk {
+            match is_cmsis_dap_v2(&device) {
+                Some(true) => out.push(ProbeInfo::from_bulk(device)),
+                Some(false) => *unrecognized += 1,
+                None => out.push(ProbeInfo::from_bulk(device)),
+            }
+        }
     }
     out
 }
@@ -461,8 +494,40 @@ pub fn open(selector: &Selector) -> Result<Session, ProbeError> {
     Err(last)
 }
 
-/// Whether a HID interface is plausibly a debug probe (so [`list`] shows it and [`open`] may try it).
-fn looks_like_probe_hid(d: &lamella_usbhid::DeviceInfo) -> bool {
+/// Whether a vendor-bulk interface is a CMSIS-DAP **v2** interface -- `Some(false)` for a settled
+/// no, and `None` where the platform did not say.
+///
+/// **THE TEST IS THE SPECIFICATION'S OWN: a CMSIS-DAP v2 interface's `iInterface` string contains
+/// `CMSIS-DAP`.** That is what the standard requires of a probe, so it recognizes one nobody here
+/// has heard of -- which a vendor-id allowlist cannot do, and the difference matters more than it
+/// looks: an unlisted vendor's probe would not be mis-listed, it would be ABSENT, and a listing
+/// that omits a probe is indistinguishable from a bench that has none.
+///
+/// **THE THREE-VALUED RETURN IS THE LOAD-BEARING PART.** A backend that could not read the
+/// interface name has said nothing about what the device is, and folding that into `false` would
+/// disqualify a probe for want of a string. `None` means "cannot tell", and the caller lists it.
+///
+/// A Lamella Link board is vendor-class and is deliberately NOT matched here. It is not a CMSIS-DAP
+/// probe, and it is found by its Lamella vendor id instead -- which is a sound rule for a device
+/// this project defines, and would not be one for somebody else's.
+#[cfg(feature = "usbbulk")]
+fn is_cmsis_dap_v2(d: &lamella_usbbulk::DeviceInfo) -> Option<bool> {
+    let name = d.interface_name.as_deref()?;
+    let upper = name.to_ascii_uppercase();
+    Some(upper.contains("CMSIS-DAP") || upper.contains("CMSIS_DAP"))
+}
+
+/// Whether a HID interface is a CMSIS-DAP **v1** interface -- the transport's own signature, not a
+/// guess about who made the device.
+///
+/// **NAMED FOR THE SPECIFICATION IT TESTS RATHER THAN AS A HEDGE.** A name that only claims
+/// resemblance reads as a heuristic somebody may tighten with a vendor list, and a vendor list is
+/// hand-kept -- so a probe from a vendor nobody wrote down becomes invisible, which is the failure
+/// this crate exists to prevent, arriving through the door marked "tidy the listing".
+///
+/// Its v2 sibling is [`is_cmsis_dap_v2`]. The two answer the same question on the two transports,
+/// and they are named so that a reader looking for one finds the other.
+fn is_cmsis_dap_v1(d: &lamella_usbhid::DeviceInfo) -> bool {
     if matches!(d.input_report_len, Some(len) if len < 63) {
         return false;
     }
@@ -690,9 +755,26 @@ mod tests {
         assert_eq!(Selector::from_environment().serial, None);
     }
 
+    #[cfg(feature = "usbbulk")]
+    #[test]
+    fn the_v2_rule_reads_the_specifications_own_string_and_says_when_it_cannot_tell() {
+        let device = |name: Option<&str>| lamella_usbbulk::DeviceInfo {
+            vendor_id: 0x2e8a,
+            product_id: 0x000c,
+            serial_number: Some("SERIAL0000000001".to_owned()),
+            product: Some("Debug Probe".to_owned()),
+            interface_name: name.map(str::to_owned),
+        };
+        assert_eq!(is_cmsis_dap_v2(&device(Some("CMSIS-DAP v2 Interface"))), Some(true));
+        assert_eq!(is_cmsis_dap_v2(&device(Some("Probe _CMSIS_DAP_"))), Some(true));
+        assert_eq!(is_cmsis_dap_v2(&device(Some("ST-Link Debug"))), Some(false));
+        assert_eq!(is_cmsis_dap_v2(&device(Some("Vendor Data Interface"))), Some(false));
+        assert_eq!(is_cmsis_dap_v2(&device(None)), None);
+    }
+
     #[test]
     fn probe_hid_filter_keeps_vendor_pages_and_drops_desktop_hid() {
-        assert!(looks_like_probe_hid(&lamella_usbhid::DeviceInfo {
+        assert!(is_cmsis_dap_v1(&lamella_usbhid::DeviceInfo {
             vendor_id: 0x1fc9,
             product_id: 0x0143,
             serial_number: None,
@@ -703,7 +785,7 @@ mod tests {
             input_report_len: Some(65),
             output_report_len: Some(65),
         }));
-        assert!(!looks_like_probe_hid(&lamella_usbhid::DeviceInfo {
+        assert!(!is_cmsis_dap_v1(&lamella_usbhid::DeviceInfo {
             vendor_id: 0x046d,
             product_id: 0xc52b,
             serial_number: None,
@@ -714,7 +796,7 @@ mod tests {
             input_report_len: Some(8),
             output_report_len: Some(8),
         }));
-        assert!(looks_like_probe_hid(&lamella_usbhid::DeviceInfo {
+        assert!(is_cmsis_dap_v1(&lamella_usbhid::DeviceInfo {
             vendor_id: 0x0d28,
             product_id: 0x0204,
             serial_number: None,
@@ -725,7 +807,7 @@ mod tests {
             input_report_len: None,
             output_report_len: None,
         }));
-        assert!(!looks_like_probe_hid(&lamella_usbhid::DeviceInfo {
+        assert!(!is_cmsis_dap_v1(&lamella_usbhid::DeviceInfo {
             vendor_id: 0x17ef,
             product_id: 0x60ee,
             serial_number: None,

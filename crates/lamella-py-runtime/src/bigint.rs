@@ -113,6 +113,49 @@ impl BigInt {
         }
     }
 
+    /// Orders this integer against `f` **exactly**, with no rounding on either side. `None` when
+    /// `f` is NaN, which is unordered against everything.
+    ///
+    /// # Why this is not `self.to_f64().partial_cmp(&f)`
+    ///
+    /// Because that answers a different question. [`Self::to_f64`] rounds to 53 bits, so every
+    /// integer within one ulp of `f` collapses onto it and compares EQUAL: `2**53 + 1 == 2.0**53`
+    /// becomes true, and `2**53 + 1 > 2.0**53` becomes false. Both are wrong, and wrong in
+    /// comparison is worse than wrong in arithmetic -- it silently redirects control flow, with no
+    /// diagnostic and no bad-looking value for anyone to notice.
+    ///
+    /// # The method, which is exact because it never divides
+    ///
+    /// A finite `f64` is exactly `mantissa * 2^exponent` for integers `mantissa` and `exponent`
+    /// ([`f64_parts`]). So instead of converting either side to the other's type, both are scaled
+    /// to integers by the ONE side that needs it:
+    ///
+    /// ```text
+    ///     exponent >= 0     compare  self                with  mantissa << exponent
+    ///     exponent <  0     compare  self << -exponent   with  mantissa
+    /// ```
+    ///
+    /// Every term is an exact integer and the comparison is an integer comparison. A shift is at
+    /// most 1074 bits (the widest a subnormal needs), so the scaled values stay small enough to
+    /// build even on a device.
+    #[must_use]
+    #[cfg(feature = "float")]
+    pub fn cmp_f64(&self, f: f64) -> Option<Ordering> {
+        if f.is_nan() {
+            return None;
+        }
+        if f.is_infinite() {
+            return Some(if f > 0.0 { Ordering::Less } else { Ordering::Greater });
+        }
+        let (mantissa, exponent) = f64_parts(f);
+        let scaled_float = BigInt::from_i128(mantissa);
+        if exponent >= 0 {
+            Some(self.cmp(&scaled_float.shl(exponent.unsigned_abs().into())))
+        } else {
+            Some(self.shl(exponent.unsigned_abs().into()).cmp(&scaled_float))
+        }
+    }
+
     /// The number of bits in the magnitude (Python's `int.bit_length`): 0 for zero, else the
     /// position of the most-significant set bit.
     #[must_use]
@@ -648,6 +691,39 @@ fn mag_divmod_small(mag: &[u32], divisor: u32) -> (Vec<u32>, u32) {
         quotient.pop();
     }
     (quotient, remainder as u32)
+}
+
+/// Splits a FINITE `f64` into the exact `(mantissa, exponent)` with `f == mantissa * 2^exponent`.
+///
+/// Read straight off the IEEE-754 encoding rather than computed, because that is where the answer
+/// already is: 52 stored mantissa bits, an 11-bit biased exponent, and a sign. A normal value
+/// carries an implicit leading 1 that the stored field does not, and a subnormal does not carry it
+/// and has a fixed exponent -- **the two cases differ in both halves**, which is why they are
+/// written out rather than folded together.
+///
+/// The mantissa is signed, so zero and negative zero both give `(0, _)` and compare equal to the
+/// integer zero, as Python requires.
+///
+/// **Finite input only.** A NaN or an infinity has no such form; callers test for those first
+/// (see [`BigInt::cmp_f64`]), because the answer for them is not a comparison of magnitudes.
+#[cfg(feature = "float")]
+fn f64_parts(f: f64) -> (i128, i32) {
+    /// Stored mantissa bits.
+    const MANTISSA_BITS: u32 = 52;
+    /// What the stored exponent is offset by, PLUS the mantissa width -- because the mantissa is
+    /// read as an integer rather than as a fraction, which scales it by `2^52`.
+    const EXPONENT_BIAS_AND_WIDTH: i32 = 1075;
+
+    let bits = f.to_bits();
+    let stored_exponent = ((bits >> MANTISSA_BITS) & 0x7ff) as i32;
+    let stored_mantissa = i128::from(bits & ((1u64 << MANTISSA_BITS) - 1));
+    let (magnitude, exponent) = if stored_exponent == 0 {
+        (stored_mantissa, 1 - EXPONENT_BIAS_AND_WIDTH)
+    } else {
+        (stored_mantissa + (1i128 << MANTISSA_BITS), stored_exponent - EXPONENT_BIAS_AND_WIDTH)
+    };
+    let negative = bits >> 63 == 1;
+    (if negative { -magnitude } else { magnitude }, exponent)
 }
 
 #[cfg(test)]

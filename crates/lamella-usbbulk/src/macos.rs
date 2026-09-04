@@ -160,10 +160,70 @@ unsafe extern "C" {
     fn IOCreatePlugInInterfaceForService(service: io_service_t, pluginType: CFUUIDRef, interfaceType: CFUUIDRef, theInterface: *mut *mut *mut IOCFPlugInInterface, theScore: *mut i32) -> kern_return_t;
     fn IODestroyPlugInInterface(interface: *mut *mut IOCFPlugInInterface) -> kern_return_t;
     fn IORegistryEntryCreateCFProperty(entry: io_object_t, key: CFStringRef, allocator: CFAllocatorRef, options: u32) -> CFTypeRef;
+    fn CFNumberGetValue(number: CFTypeRef, theType: i32, valuePtr: *mut c_void) -> u8;
+    fn IORegistryEntryGetChildIterator(entry: io_object_t, plane: *const c_char, iterator: *mut io_iterator_t) -> kern_return_t;
 }
 
 /// Read a string property (`"USB Serial Number"`, `"USB Product Name"`) from a device's IORegistry entry,
 /// without opening the device. `None` if absent, empty, or not a string.
+/// One NUMERIC IORegistry property of a device entry -- `idVendor`, `idProduct`, `bInterfaceClass`.
+///
+/// The kernel publishes these when the device enumerates, so reading them costs no user client and
+/// touches the device not at all. `kCFNumberSInt32Type` is 3; the values here are all byte or word
+/// sized, so a 32-bit read that does not fit a `u16` is a property that is not what was asked for.
+unsafe fn registry_u16(entry: io_object_t, key: &str) -> Option<u16> {
+    let key_c = std::ffi::CString::new(key).ok()?;
+    let cf_key = CFStringCreateWithCString(null(), key_c.as_ptr(), kCFStringEncodingUTF8);
+    if cf_key.is_null() {
+        return None;
+    }
+    let value = IORegistryEntryCreateCFProperty(entry, cf_key, null(), 0);
+    CFRelease(cf_key);
+    if value.is_null() {
+        return None;
+    }
+    let mut raw: i32 = 0;
+    let ok = CFNumberGetValue(value, 3, (&raw mut raw).cast::<c_void>());
+    CFRelease(value);
+    (ok != 0).then(|| u16::try_from(raw).ok()).flatten()
+}
+
+/// Whether any INTERFACE of this device is vendor-specific (class `0xFF`) -- the CMSIS-DAP v2 and
+/// Lamella Link shape -- answered from the IORegistry instead of from a configuration descriptor.
+///
+/// **`Some(false)` is a settled no; `None` means the registry did not say**, which is a different
+/// thing and is why this is not a `bool`. The interfaces are child entries of the device on the
+/// IOService plane and each publishes `bInterfaceClass`; a device whose children are not yet
+/// published answers `None` and the caller falls back rather than concluding it is not a probe.
+unsafe fn has_vendor_iface_registry(svc: io_object_t) -> Option<(bool, Option<String>)> {
+    let plane = std::ffi::CString::new("IOService").ok()?;
+    let mut iter: io_iterator_t = 0;
+    if IORegistryEntryGetChildIterator(svc, plane.as_ptr(), &mut iter) != kIOReturnSuccess {
+        return None;
+    }
+    let mut saw_any = false;
+    let mut vendor = false;
+    let mut name = None;
+    loop {
+        let child = IOIteratorNext(iter);
+        if child == 0 {
+            break;
+        }
+        if let Some(class) = registry_u16(child, "bInterfaceClass") {
+            saw_any = true;
+            if class == 0xFF {
+                vendor = true;
+                if name.is_none() {
+                    name = registry_string(child, "kUSBString");
+                }
+            }
+        }
+        IOObjectRelease(child);
+    }
+    IOObjectRelease(iter);
+    saw_any.then_some((vendor, name))
+}
+
 unsafe fn registry_string(entry: io_object_t, key: &str) -> Option<String> {
     let key_c = std::ffi::CString::new(key).ok()?;
     let cf_key = CFStringCreateWithCString(null(), key_c.as_ptr(), kCFStringEncodingUTF8);
@@ -491,6 +551,23 @@ unsafe fn has_vendor_iface(dev: *mut *mut IOUSBDeviceInterface500) -> bool {
 /// The VID/PID of the device behind `svc` if it is a usable CMSIS-DAP v2 probe: a known probe vendor
 /// that actually exposes a vendor-specific (class 0xFF) interface.
 unsafe fn device_info(svc: io_service_t, plugin_id: CFUUIDRef, dev_user: CFUUIDRef, dev_iid: CFUUIDBytes) -> Option<DeviceInfo> {
+    if let (Some(vendor_id), Some(product_id), Some((is_bulk, interface_name))) = (
+        registry_u16(svc, "idVendor"),
+        registry_u16(svc, "idProduct"),
+        has_vendor_iface_registry(svc),
+    ) {
+        if !is_bulk {
+            return None;
+        }
+        return Some(DeviceInfo {
+            vendor_id,
+            product_id,
+            serial_number: registry_string(svc, "USB Serial Number"),
+            product: registry_string(svc, "USB Product Name"),
+            interface_name,
+        });
+    }
+
     let mut plugin: *mut *mut IOCFPlugInInterface = null_mut();
     let mut score = 0i32;
     if IOCreatePlugInInterfaceForService(svc, dev_user, plugin_id, &mut plugin, &mut score) != kIOReturnSuccess || plugin.is_null() {
@@ -517,6 +594,7 @@ unsafe fn device_info(svc: io_service_t, plugin_id: CFUUIDRef, dev_user: CFUUIDR
         product_id: pid,
         serial_number: registry_string(svc, "USB Serial Number"),
         product: registry_string(svc, "USB Product Name"),
+        interface_name: None,
     })
 }
 

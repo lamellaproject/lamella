@@ -9,7 +9,7 @@ kind = "board"
 board = "mkr1000"
 vendor = "arduino"
 module = "samw25"
-board_model = 9
+product_model = 9
 sources = [
     "Arduino MKR1000 schematic (native USB wire, no debug bridge)",
     "size-gate feature notes: identical module-internal WINC wiring to the SAMW25 XPro; the board flips the advertised identity, otherwise the same build",

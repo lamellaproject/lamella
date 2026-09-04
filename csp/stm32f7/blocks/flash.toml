@@ -1,0 +1,36 @@
+# BLOCK: the STM32F74x/F75x embedded flash controller, stated only as far as the facts consumers
+# outside the controller need. Its unlock sequence, its sector geometry and its command bits are not
+# described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A SOFTWARE CHOICE ON THIS PART, AND THE VALUE HERE IS THE ONE A BOARD AT AN
+# ORDINARY SUPPLY CAN TAKE. PSIZE selects x8, x16, x32 or x64 -- one, two, four or eight bytes per
+# program operation -- capped by supply voltage. x64 needs an external VPP of 8 to 9 V; at 2.7-3.6 V
+# without it the cap is x32, so four bytes is the largest unit this part can be programmed in on a
+# board that does not supply VPP.
+#
+# WARNING: RM0385 TABLE 6 HAS FIVE VOLTAGE COLUMNS AND FOUR PARALLELISM VALUES, because the x16 cell
+# SPANS two of the columns. A reader who pairs them off one by one is wrong for two of the five.
+#
+# READ IN RM0385 RATHER THAN CARRIED ACROSS FROM RM0090. The F4 and F7 controllers reach the same
+# answer, and this file records the answer RM0385 gives, because a value taken from a sibling family
+# is right until the day it is not and nothing marks the day.
+
+[table]
+kind = "block"
+family = "stm32f7"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 4
+sources = [
+    "erased_value: STM32F75x/F74x reference manual RM0385 Rev 9 section 3.3.7 `Flash programming sequences`: `Successive write operations are possible without the need of an erase operation when changing bits from 1 to 0. Writing 1 requires a Flash memory erase operation` -- so the state an erase leaves is all ones",
+    "write_unit: RM0385 Rev 9 section 3.3.5 `Maximum program/erase parallelism`: `The maximum parallelism size is configured through the PSIZE field in the FLASH_CR register. It represents the number of bytes to be programmed each time a write operation occurs`",
+    "write_unit: RM0385 Rev 9 Table 6 `Maximum program/erase parallelism`, page 82: x64 requires 2.7-3.6 V WITH external VPP, x32 is the cap at 2.7-3.6 V without it, x16 covers 2.4-2.7 V and 2.1-2.4 V, and x8 covers 1.8-2.1 V",
+    "write_unit: RM0385 Rev 9 section 3.3.7, which requires the ACCESS WIDTH to match the chosen parallelism -- word access for x32",
+]
+notes = [
+    "x64 needs an external 8-9 V supply on the VPP pad. RM0385 advises limiting VPP to initial programming on the factory line and warns that leaving it applied for more than an hour may damage the flash, so it is a production-programming mode rather than one an application uses.",
+    "The erase unit is not this number and is not declared here. Erase on this family is by SECTOR and the sectors are not uniform within a part, so it is not a fact a block can carry.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

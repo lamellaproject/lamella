@@ -91,6 +91,17 @@ pub struct Tokens {
     /// Async methods whose machines and stub bodies land after the source types; see
     /// `compile::emit_async_machine`.
     pub(crate) pending_async: Vec<crate::compile::PendingAsync>,
+    /// The `Param` and `Property` rows that a `ref readonly` member needs
+    /// `[System.Runtime.CompilerServices.IsReadOnlyAttribute]` on, held until every type exists.
+    ///
+    /// **THE ATTACHMENT WAITS BECAUSE THE ATTRIBUTE TYPE MAY HAVE TO BE SYNTHESIZED, AND A
+    /// SYNTHESIZED TYPE CAN ONLY BE ADDED WHEN NO OTHER TYPE'S ROWS FOLLOW IT** -- a `TypeDef`
+    /// owns the `MethodDef` rows from its own `first_method` up to the next type's. So
+    /// `compile::emit_is_readonly_attribute` drains this after the source types and the async
+    /// machines, decides once whether a reference supplies the attribute, and writes every
+    /// `CustomAttribute` row against the one constructor. Those rows may be added at any time;
+    /// `finish` sorts the table by parent.
+    pub(crate) pending_is_readonly: Vec<lamella_token::Token>,
     /// Set just before emitting an `init` accessor: its return type is written
     /// `void modreq(System.Runtime.CompilerServices.IsExternalInit)` rather than plain `void`.
     /// CONSUMED (cleared) by the emit that reads it, so a forgotten reset cannot reach the next
@@ -102,6 +113,19 @@ pub struct Tokens {
     /// `void set_P(T)`, so a build that drops it emits metadata in which the two are the same
     /// method -- and any consumer, csc included, will assign the property wherever it likes.
     pub(crate) next_return_is_external_init: bool,
+    /// Set just before emitting a member whose return type was written `ref readonly T`: its
+    /// return is `T& modreq(System.Runtime.InteropServices.InAttribute)` rather than a plain
+    /// `T&`. CONSUMED (cleared) by the emit that reads it, the same pre-set-and-self-clear shape
+    /// as [`Tokens::next_return_is_external_init`] beside it, and for the same reason: the
+    /// signature is built from a `TypeSymbol`, and `ref readonly T` and `ref T` are the SAME type.
+    /// The difference is a fact about the member's signature, which no symbol can carry.
+    ///
+    /// **THE MODIFIER IS THE FEATURE, EXACTLY AS IT IS FOR AN `init` SETTER.** A build that drops
+    /// it emits metadata in which `ref readonly int M()` and `ref int M()` are the same method,
+    /// and any consumer -- csc included -- will then assign through the returned reference.
+    /// Measured: csc reading its own metadata refuses that write at all eight positions a
+    /// `ref readonly` member can occupy, and accepts it against a plain `ref` control at each.
+    pub(crate) next_return_is_readonly_ref: bool,
     /// Per-enclosing-type counter over async methods, so `<M>d__N` names two same-named
     /// overloads apart. Keyed like `types`.
     pub(crate) async_counters: BTreeMap<String, usize>,

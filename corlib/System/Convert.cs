@@ -68,6 +68,111 @@ namespace System
             return result;
         }
 
+        public static string ToBase64String(byte[] inArray)
+        {
+            if ((object)inArray == null) throw new ArgumentNullException("inArray");
+            return ToBase64String(inArray, 0, inArray.Length);
+        }
+
+        public static string ToBase64String(byte[] inArray, int offset, int length)
+        {
+            if ((object)inArray == null) throw new ArgumentNullException("inArray");
+            if (offset < 0) throw new ArgumentOutOfRangeException("offset");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+            if (offset > inArray.Length - length) throw new ArgumentOutOfRangeException("offset");
+            if (length == 0) return String.Empty;
+
+            int groups = (length + 2) / 3;
+            char[] chars = new char[groups * 4];
+            int outIndex = 0;
+            int i = offset;
+            int end = offset + length;
+            while (end - i >= 3)
+            {
+                int triple = (inArray[i] << 16) | (inArray[i + 1] << 8) | inArray[i + 2];
+                chars[outIndex++] = Base64Digit((triple >> 18) & 0x3F);
+                chars[outIndex++] = Base64Digit((triple >> 12) & 0x3F);
+                chars[outIndex++] = Base64Digit((triple >> 6) & 0x3F);
+                chars[outIndex++] = Base64Digit(triple & 0x3F);
+                i = i + 3;
+            }
+            int remaining = end - i;
+            if (remaining == 1)
+            {
+                int single = inArray[i] << 16;
+                chars[outIndex++] = Base64Digit((single >> 18) & 0x3F);
+                chars[outIndex++] = Base64Digit((single >> 12) & 0x3F);
+                chars[outIndex++] = '=';
+                chars[outIndex++] = '=';
+            }
+            else if (remaining == 2)
+            {
+                int pair = (inArray[i] << 16) | (inArray[i + 1] << 8);
+                chars[outIndex++] = Base64Digit((pair >> 18) & 0x3F);
+                chars[outIndex++] = Base64Digit((pair >> 12) & 0x3F);
+                chars[outIndex++] = Base64Digit((pair >> 6) & 0x3F);
+                chars[outIndex++] = '=';
+            }
+            return new String(chars, 0, outIndex);
+        }
+
+        private static char Base64Digit(int sixBits)
+        {
+            if (sixBits < 26) return (char)('A' + sixBits);
+            if (sixBits < 52) return (char)('a' + (sixBits - 26));
+            if (sixBits < 62) return (char)('0' + (sixBits - 52));
+            if (sixBits == 62) return '+';
+            return '/';
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public static string ToBase64String(byte[] inArray, Base64FormattingOptions options)
+        {
+            if ((object)inArray == null) throw new ArgumentNullException("inArray");
+            return ToBase64String(inArray, 0, inArray.Length, options);
+        }
+
+        public static string ToBase64String(byte[] inArray, int offset, int length, Base64FormattingOptions options)
+        {
+            if (options != Base64FormattingOptions.None && options != Base64FormattingOptions.InsertLineBreaks)
+            {
+                throw new ArgumentException("Illegal enum value.", "options");
+            }
+            string encoded = ToBase64String(inArray, offset, length);
+            if (options == Base64FormattingOptions.None) return encoded;
+            return InsertBase64LineBreaks(encoded);
+        }
+
+        private static string InsertBase64LineBreaks(string encoded)
+        {
+            if (encoded.Length <= 76) return encoded;
+            System.Text.StringBuilder wrapped = new System.Text.StringBuilder();
+            int i = 0;
+            while (i < encoded.Length)
+            {
+                int take = encoded.Length - i;
+                if (take > 76) take = 76;
+                if (i > 0)
+                {
+                    wrapped.Append((char)13);
+                    wrapped.Append((char)10);
+                }
+                wrapped.Append(encoded.Substring(i, take));
+                i = i + take;
+            }
+            return wrapped.ToString();
+        }
+#endif
+
+        public static byte[] FromBase64CharArray(char[] inArray, int offset, int length)
+        {
+            if ((object)inArray == null) throw new ArgumentNullException("inArray");
+            if (offset < 0) throw new ArgumentOutOfRangeException("offset");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+            if (offset > inArray.Length - length) throw new ArgumentOutOfRangeException("offset");
+            return FromBase64String(new String(inArray, offset, length));
+        }
+
         private static int Base64Value(char c)
         {
             if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -124,6 +229,150 @@ namespace System
         public static string ToString(string value)
         {
             return value;
+        }
+
+        public static DateTime ToDateTime(string value)
+        {
+            if ((object)value == null) return new DateTime(0L);
+            return DateTime.Parse(value);
+        }
+
+        private static void CheckBaseN(int fromBase)
+        {
+            if (fromBase != 2 && fromBase != 8 && fromBase != 10 && fromBase != 16)
+            {
+                throw new ArgumentException("Invalid Base.", "fromBase");
+            }
+        }
+
+        private static int BaseNDigit(char c, int fromBase)
+        {
+            int digit;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+            else return -1;
+            if (digit >= fromBase) return -1;
+            return digit;
+        }
+
+        private static ulong BaseNMask(int bits)
+        {
+            if (bits == 64) return UInt64.MaxValue;
+            return (1UL << bits) - 1UL;
+        }
+
+        private static ulong ParseBaseN(string value, int fromBase, int bits, bool signedTarget)
+        {
+            CheckBaseN(fromBase);
+            if ((object)value == null) return 0;
+            if (value.Length == 0)
+            {
+                throw new ArgumentOutOfRangeException("Index was out of range. Must be non-negative and less than the size of the collection.");
+            }
+
+            int i = 0;
+            bool negative = false;
+            if (value[i] == '-')
+            {
+                if (fromBase != 10)
+                {
+                    throw new ArgumentException("Only base 10 can represent a negative value.", "value");
+                }
+                negative = true;
+                i = i + 1;
+            }
+            else if (value[i] == '+')
+            {
+                i = i + 1;
+            }
+            if (negative && !signedTarget)
+            {
+                throw new OverflowException("Value was either too large or too small for an unsigned integer.");
+            }
+            if (fromBase == 16 && i + 1 < value.Length && value[i] == '0'
+                && (value[i + 1] == 'x' || value[i + 1] == 'X'))
+            {
+                i = i + 2;
+            }
+            if (i >= value.Length)
+            {
+                throw new FormatException("Could not find any recognizable digits.");
+            }
+
+            ulong limit;
+            if (fromBase == 10 && signedTarget)
+            {
+                ulong half = 1UL << (bits - 1);
+                limit = negative ? half : half - 1UL;
+            }
+            else
+            {
+                limit = BaseNMask(bits);
+            }
+
+            ulong radix = (ulong)fromBase;
+            ulong accumulated = 0;
+            while (i < value.Length)
+            {
+                int digit = BaseNDigit(value[i], fromBase);
+                if (digit < 0)
+                {
+                    throw new FormatException("Additional non-parsable characters are at the end of the string.");
+                }
+                if (accumulated > (limit - (ulong)digit) / radix)
+                {
+                    throw new OverflowException("Value was either too large or too small.");
+                }
+                accumulated = accumulated * radix + (ulong)digit;
+                i = i + 1;
+            }
+
+            if (negative)
+            {
+                return unchecked((ulong)(-(long)accumulated)) & BaseNMask(bits);
+            }
+            return accumulated;
+        }
+
+        public static byte ToByte(string value, int fromBase)
+        {
+            return unchecked((byte)ParseBaseN(value, fromBase, 8, false));
+        }
+
+        public static sbyte ToSByte(string value, int fromBase)
+        {
+            return unchecked((sbyte)(byte)ParseBaseN(value, fromBase, 8, true));
+        }
+
+        public static short ToInt16(string value, int fromBase)
+        {
+            return unchecked((short)(ushort)ParseBaseN(value, fromBase, 16, true));
+        }
+
+        public static ushort ToUInt16(string value, int fromBase)
+        {
+            return unchecked((ushort)ParseBaseN(value, fromBase, 16, false));
+        }
+
+        public static int ToInt32(string value, int fromBase)
+        {
+            return unchecked((int)(uint)ParseBaseN(value, fromBase, 32, true));
+        }
+
+        public static uint ToUInt32(string value, int fromBase)
+        {
+            return unchecked((uint)ParseBaseN(value, fromBase, 32, false));
+        }
+
+        public static long ToInt64(string value, int fromBase)
+        {
+            return unchecked((long)ParseBaseN(value, fromBase, 64, true));
+        }
+
+        public static ulong ToUInt64(string value, int fromBase)
+        {
+            return ParseBaseN(value, fromBase, 64, false);
         }
 
         public static byte ToByte(string value, IFormatProvider provider) { return ToByte(value); }

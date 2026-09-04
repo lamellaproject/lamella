@@ -11,7 +11,7 @@ board = "pico2-w"
 vendor = "raspberry-pi"
 family = "rp2350"
 part = "rp2350a"
-board_model = 10            # lamella_wire::board_model::PICO2_W
+product_model = 10          # lamella_wire::product_model::PICO2_W
 sources = ["Raspberry Pi Pico 2 W datasheet (4 MB flash key-features list; p.9 wireless wiring) + the Pico 2 W schematic"]
 
 [memory]                    # chip flash = 0 (external XIP, gate-pinned); the
@@ -77,6 +77,7 @@ source = "Pico 2 W datasheet p.9 + schematic: WL_REG_ON = GPIO23 (the chip's pow
 [[devices]]
 name = "cyw43439-data"
 pin = "GP24"
+active = "none"
 source = "Pico 2 W datasheet p.9 + schematic: the gSPI DATA line (DI + DO + IRQ share GPIO24)"
 
 [[devices]]
@@ -88,6 +89,7 @@ source = "Pico 2 W datasheet p.9 + schematic: gSPI CS = GPIO25 (active low)"
 [[devices]]
 name = "cyw43439-clk"
 pin = "GP29"
+active = "none"
 source = "Pico 2 W datasheet p.9 + schematic: gSPI CLK = GPIO29"
 
 # --- THE USER LED IS NOT ON THIS CHIP, AND THAT IS WHY THERE IS NO ROW FOR IT ------------------

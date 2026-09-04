@@ -5,32 +5,31 @@ use core::fmt;
 /// A version of the C# language.
 ///
 /// Every variant through [`LanguageVersion::SELECTABLE_MAX`] can be SELECTED, which is a statement
-/// about what we can gate against rather than about what we have built -- see
+/// about what this build can gate against rather than what it implements -- see
 /// [`Feature::is_implemented`] for the other half.
 ///
 /// Ordering follows release order, so `>=` is the natural way to ask whether a
 /// version is recent enough for a given feature.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum LanguageVersion {
-    /// C# 1.0, as standardised by ECMA-334 1st edition (December 2001).
-    #[default]
+    /// C# 1.0, as standardized by ECMA-334 1st edition (December 2001).
     CSharp1,
-    /// C# 2.0 (ECMA-334 3rd ed). Present only to gate post-1.0 features; not yet implemented.
+    /// C# 2.0 (ECMA-334 3rd ed). Present only to gate post-1.0 features; not implemented.
     CSharp2,
-    /// C# 3.0. A gating label only; not yet implemented.
+    /// C# 3.0. A gating label only; not implemented.
     CSharp3,
-    /// C# 4.0. A gating label only; not yet implemented.
+    /// C# 4.0. A gating label only; not implemented.
     CSharp4,
-    /// C# 5.0. A gating label only; not yet implemented. Present because the DIAGNOSTIC CODE for a
+    /// C# 5.0. A gating label only; not implemented. Present because the DIAGNOSTIC CODE for a
     /// too-new feature is keyed on the version being compiled (see
     /// [`LanguageVersion::feature_gate_code`]) and C# 5 has its own -- a gap in this enum would
-    /// silently borrow its neighbour's code.
+    /// silently borrow its neighbor's code.
     CSharp5,
-    /// C# 6.0 (ECMA-334 6th ed, 2022). A gating label only; not yet implemented.
+    /// C# 6.0 (ECMA-334 6th ed, 2022). A gating label only; not implemented.
     CSharp6,
     /// C# 7.0 (ECMA-334 7th ed, 2023 -- ISO/IEC 20619:2023 -- the latest ratified standard). A
-    /// gating label only; not yet implemented.
+    /// gating label only; not implemented.
     CSharp7,
     /// C# 7.1. A gating label only. Present so a 7.x feature can be gated precisely -- see
     /// `CSharp7_2`.
@@ -43,39 +42,85 @@ pub enum LanguageVersion {
     /// C# 7.3. A gating label only; present so the 7.x run is contiguous rather than having a hole
     /// where 7.1 and 7.3 fall back to `Unsupported` while 7.2 works.
     CSharp7_3,
-    /// C# 8.0. A gating label only; not yet implemented.
+    /// C# 8.0. A gating label only; not implemented.
     CSharp8,
     /// C# 9.0 -- the rung that carries TOP-LEVEL STATEMENTS, which is why the ceiling reaches here:
     /// every dotnet/iot and nanoFramework sample program is a bare statement file with no `Main`.
-    /// A gating label only; not yet implemented.
+    /// A gating label only; not implemented.
     CSharp9,
     /// C# 10.0 -- the rung that carries FILE-SCOPED NAMESPACES, which 115 files of dotnet/iot use.
-    /// A gating label only; not yet implemented.
+    /// A gating label only; not implemented.
     CSharp10,
     /// C# 11.0 -- the rung that carries REQUIRED MEMBERS, the one C# 11 feature both compatibility
-    /// targets adopted (64 uses in dotnet/iot, 56 in nanoFramework). A gating label only; not yet
+    /// targets adopted (64 uses in dotnet/iot, 56 in nanoFramework). A gating label only; not
     /// implemented.
     CSharp11,
 }
 
+/// The dialect a `LexOptions` carries when nothing sets one: [`LanguageVersion::DEFAULT`].
+///
+/// **WRITTEN OUT RATHER THAN DERIVED, SO THE TWO SPELLINGS OF "DEFAULT" CANNOT COME APART.**
+/// `LanguageVersion::DEFAULT` (the associated const) and `LanguageVersion::default()` (this trait)
+/// are different spellings a reader takes for one thing. `LexOptions` derives `Default`, so every
+/// compilation that sets no version arrives through this impl rather than through the const -- and
+/// a `#[default]` attribute on a variant would answer that question independently of the const.
+/// There is one answer and the const is it.
+impl Default for LanguageVersion {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl LanguageVersion {
-    /// The dialect compiled when no `/langversion` is given.
+    /// The dialect compiled when no `/langversion` is given: **the lowest rung that permits every
+    /// feature this build implements**, derived rather than chosen.
     ///
-    /// **STAYS C# 1.0, and is deliberately NOT derived from [`Self::SELECTABLE_MAX`].** It was
-    /// defined as the ceiling while the two were the same value, and leaving it that way would have
-    /// meant that raising the ceiling silently changed every compilation that never asked for a
-    /// dialect -- including the whole differential corpus, whose job is to hold lcsc against
-    /// ECMA-334 1st edition. The default is a conformance decision; the ceiling is a capability
-    /// one. They coincided once and must not be spelled as if they always will.
-    pub const DEFAULT: LanguageVersion = LanguageVersion::CSharp1;
+    /// Compiling an ordinary program must not produce a wall of *"not available in C# 1.0"*. A
+    /// default below what the build implements refuses a construct by DIALECT that the compiler
+    /// can produce, and says *"use language version 9 or greater"* to someone who cannot fix it
+    /// with a switch -- the exact lie [`Feature::gate_against`]'s two-bit rule exists to prevent,
+    /// told in reverse.
+    ///
+    /// **DERIVED, SO IT CANNOT GO STALE, AND NOT ALIASED TO [`Self::SELECTABLE_MAX`].** The two
+    /// answer different questions -- the ceiling is what `/langversion` may SELECT, this is what a
+    /// compilation gets when it does not ask -- and they are equal today only because the newest
+    /// implemented feature happens to sit at the newest selectable rung. Aliasing would make a
+    /// raised ceiling silently move every unqualified compilation; deriving moves this one only
+    /// when a feature actually lands.
+    ///
+    pub const DEFAULT: LanguageVersion = Self::lowest_rung_admitting_every_built_feature();
+
+    /// The rung [`Self::DEFAULT`] derives to: the HIGHEST `introduced_in` among the features this
+    /// build implements.
+    ///
+    /// That maximum IS "the lowest rung that permits them all", because
+    /// [`Self::supports`] is `self >= feature.introduced_in()` -- a rung admits a feature exactly
+    /// when it is at least the feature's own, so the lowest rung admitting every one of them is the
+    /// greatest of theirs. Written as the maximum rather than as a search so the reason is on the
+    /// page instead of in a loop.
+    const fn lowest_rung_admitting_every_built_feature() -> LanguageVersion {
+        let mut highest = LanguageVersion::CSharp1;
+        let mut index = 0;
+        while index < Feature::ALL.len() {
+            let feature = Feature::ALL[index];
+            if feature.is_implemented() {
+                let rung = feature.introduced_in();
+                if rung as u8 > highest as u8 {
+                    highest = rung;
+                }
+            }
+            index += 1;
+        }
+        highest
+    }
 
     /// The newest dialect `/langversion` will select.
     ///
     /// **Selecting a dialect is NOT a claim that lcsc implements all of it.** A dialect decides
     /// which constructs are PERMITTED; [`Feature::is_implemented`] decides which of those this build
-    /// can actually produce, and a construct needs both. So the ceiling can name every version we
-    /// can gate against, and a permitted-but-unbuilt construct is refused by name (`LAM0001`)
-    /// rather than by pretending the dialect forbids it.
+    /// can actually produce, and a construct needs both. So the ceiling can name every version
+    /// this build can gate against, and a permitted-but-unbuilt construct is refused by name
+    /// (`LAM0001`) rather than by pretending the dialect forbids it.
     pub const SELECTABLE_MAX: LanguageVersion = LanguageVersion::CSharp11;
 
     /// Every selectable dialect, in release order, so a check across "all the rungs" is DERIVED
@@ -346,7 +391,7 @@ impl fmt::Display for LanguageVersion {
 }
 
 /// Returns `true` when `value` names a C# version that exists in the wider
-/// language but is beyond what we implement today.
+/// language but is beyond what this compiler implements.
 ///
 /// This is a flat list rather than a parsed number so the driver can reject,
 /// say, `-langversion:7.3` with a precise message long before that version's
@@ -360,10 +405,10 @@ fn is_known_future_version(value: &str) -> bool {
 
 /// A language feature that the front end gates on a [`LanguageVersion`].
 ///
-/// The table is seeded with a few post-1.0 features to fix the pattern: when we
-/// implement a feature we add its variant and the version that introduced it,
-/// and the parser or binder calls [`LanguageVersion::supports`] before accepting
-/// the construct. C# 1.0 features need no gate and so do not appear here.
+/// The table is seeded with a few post-1.0 features to fix the pattern: a feature
+/// gains a variant and the version that introduced it, and the parser or binder
+/// calls [`LanguageVersion::supports`] before accepting the construct. C# 1.0
+/// features need no gate and so do not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Feature {
@@ -391,6 +436,21 @@ pub enum Feature {
     /// read a name off. lcsc is deliberately stricter here; the description is therefore OURS,
     /// written in csc's style rather than copied from it.
     NullCoalescing,
+    /// An EXCEPTION FILTER -- `catch (E e) when (cond)`. Introduced in C# 6.0.
+    ///
+    /// **IT IS NOT AN `if` AT THE TOP OF THE HANDLER, AND THE DIFFERENCE IS OBSERVABLE.** A filter
+    /// runs BEFORE the stack unwinds, in the two-pass exception model the CLI has always had
+    /// (II.12.4.2): if it answers false the exception keeps travelling from its ORIGINAL throw
+    /// point, so an outer handler sees the frames that were there. Rewriting one as `catch { if
+    /// (!cond) throw; }` unwinds first and rethrows from the wrong place, which is why the feature
+    /// exists at all rather than being sugar.
+    ///
+    /// The type test moves INTO the filter block: `isinst E; dup; brtrue bind; pop; ldc.i4.0; br
+    /// done; bind: stloc v; <cond>; done: endfilter`, and the handler that follows begins by
+    /// popping the exception the runtime pushes -- because the variable was already stored in the
+    /// filter. csc's shape, measured for all three spellings (typed and named, typed and unnamed,
+    /// and a general `catch when`, which has no type test).
+    ExceptionFilter,
     /// A GETTER-ONLY automatically implemented property, `int P { get; }`. Introduced in C# 6.0.
     ///
     /// **A DIFFERENT FEATURE FROM [`Feature::AutoProperties`], AND csc NAMES IT DIFFERENTLY** --
@@ -426,11 +486,10 @@ pub enum Feature {
     LambdaExpression,
     /// An expression-bodied method, `int M() => 1;`. Introduced in **C# 6.0**.
     ///
-    /// **Split out of the old `LambdaArrow` after measuring csc, which reports
+    /// **A separate feature from `LambdaArrow`, whose token it shares**: csc reports
     /// `'expression-bodied method' ... Please use language version 6 or greater` -- three releases
-    /// after the lambda that shares its token.** While the two were one variant, a dialect of C# 3,
-    /// 4 or 5 PERMITTED an expression-bodied member that csc rejects; that is the accepts-invalid
-    /// column, and it was harmless only because neither half is built yet.
+    /// after the lambda. Folded into one variant, a dialect of C# 3, 4 or 5 would PERMIT an
+    /// expression-bodied member that csc rejects: the accepts-invalid column.
     ///
     /// **A lexer cannot make this distinction** -- `=>` is one token and which feature it belongs
     /// to is a question about the enclosing declaration. So the lexer keeps gating
@@ -459,6 +518,90 @@ pub enum Feature {
     /// -- no hyphens on "expression body", and the noun is *property* even for an indexer's
     /// accessor.
     ExpressionBodiedAccessor,
+    /// A THROW EXPRESSION, `s ?? throw new ArgumentNullException(nameof(s))`. Introduced in
+    /// **C# 7.0**.
+    ///
+    /// **WHERE it may stand is the whole feature**, and it is a shorter list than the name
+    /// suggests: the right operand of `??`, and either arm of `?:`. Anywhere else that an
+    /// expression may appear, csc refuses it as `CS8115` -- including a PARENTHESIZED one,
+    /// `s ?? (throw e)`, which is measured and refused.
+    ///
+    /// `int M() => throw e;` needs none of this: an expression body already desugars to the block
+    /// it means, and the block a throw expression means is `{ throw e; }` -- the STATEMENT, which
+    /// every pass has always handled.
+    ThrowExpression,
+    /// A `ref struct` declaration, `ref struct S { }`. Introduced in **C# 7.2**.
+    ///
+    /// The type is BY-REF-LIKE: it may live only on the stack, so it cannot be a field of a
+    /// class or of an ordinary struct, an array element, a type argument, or boxed. csc encodes
+    /// it in metadata as `IsByRefLikeAttribute`, plus an `ObsoleteAttribute` that makes an older
+    /// compiler refuse the type rather than silently heap-allocate it.
+    ///
+    /// **THE RESTRICTIONS ARE THE FEATURE.** Declaring one is a parser change of a few lines;
+    /// what makes it correct is refusing every position that would put it on the heap.
+    RefStruct,
+    /// A by-reference local or return: `ref T M()`, `ref T this[int i]`, `ref T P { get; }` and
+    /// `ref T r = ref x;`. Introduced in C# 7.0.
+    ///
+    /// **ONE FEATURE COVERS BOTH HALVES BECAUSE csc TREATS THEM AS ONE**, measured: a ref return
+    /// and a ref local at `/langversion:6` both report *Feature 'byref locals and returns'*. Two
+    /// variants here would be two names, and the name is what the diagnostic prints.
+    ///
+    /// The declaring half is what a device corlib needs: `System.Span<T>`'s indexer is
+    /// `ref T this[int index]`, and a board has no .NET to consume such a member from, so being
+    /// able to CONSUME one is a separate capability that does not substitute for this.
+    ByRefLocalsAndReturns,
+    /// The `readonly` of a `ref readonly T` return. Introduced in C# 7.2.
+    ///
+    /// **A SEPARATE GATE FROM [`Feature::ByRefLocalsAndReturns`], AT A SEPARATE TOKEN, AND csc
+    /// REPORTS BOTH FOR ONE DECLARATION.** Measured at `/langversion:6`, `ref readonly int M()`
+    /// draws CS8059 twice: *byref locals and returns* at the `ref` and *readonly references* at the
+    /// `readonly`, four columns apart. At 7.0 only the second fires. Folding them into one gate
+    /// would drop a diagnostic csc emits and name the wrong rung for the one it kept.
+    ///
+    /// It is a real signature difference and not a spelling: `ref readonly T` is `T&` plus a
+    /// `modreq` on `System.Runtime.InteropServices.InAttribute`, which is why `ReadOnlySpan<T>`'s
+    /// indexer needed its own work on the consuming side too.
+    ReadOnlyReferences,
+    /// Ref REASSIGNMENT -- `r = ref a[1];`, rebinding a `ref` local or `ref` parameter to different
+    /// storage. Introduced in C# 7.3.
+    ///
+    /// **A SEPARATE FEATURE FROM [`Feature::ByRefLocalsAndReturns`], ONE RUNG HIGHER**, with its own
+    /// name in csc's message: measured at 7.2, `r = ref a[1]` reports *ref reassignment* and version
+    /// 7.3, where the declaration that created `r` is admitted at 7.0.
+    ///
+    /// It REBINDS rather than writes: `r = ref x` points `r` at `x`, where `r = x` writes through
+    /// `r` into whatever it already points at. Both are legal on the same local and they are
+    /// different statements, which is why the gate is at the RHS `ref` and not at the `=`.
+    RefReassignment,
+    /// An AUTO-PROPERTY INITIALIZER -- `public int P { get; set; } = 5;`. Introduced in C# 6.0.
+    ///
+    /// The value initializes the property's BACKING FIELD directly, not through the setter, which
+    /// is what lets a GETTER-ONLY auto-property have one at all (`int P { get; } = 5;` has no
+    /// setter to call) and what keeps a virtual setter from being invoked before the derived
+    /// constructor has run.
+    ///
+    /// **IT LOWERS EXACTLY WHERE A FIELD INITIALIZER DOES**, and shares the walk: the instance form
+    /// becomes `this.<P>k__BackingField = value` at the head of every constructor that does not
+    /// chain to `this(...)`, and the static form becomes a `.cctor` store. The two kinds interleave
+    /// in declaration order, measured on csc's own `.ctor` -- so one walk over the members produces
+    /// both rather than one appending to the other.
+    ///
+    /// **AN INITIALIZER ON A PROPERTY THAT IS NOT AUTOMATICALLY IMPLEMENTED IS `CS8050`, AND ON
+    /// AN INTERFACE'S INSTANCE PROPERTY IT IS `CS8053`.** Both are rules about where an initializer
+    /// may be WRITTEN rather than about this gate, so both are reported whatever the rung.
+    AutoPropertyInitializer,
+    /// A `ref` FIELD -- `public ref int f;`. Introduced in C# 11, and legal ONLY in a
+    /// `ref struct`.
+    ///
+    /// **A SEPARATE FEATURE FROM [`Feature::ByRefLocalsAndReturns`] AND FOUR RUNGS LATER**, which
+    /// matters because the member-type grammar is shared: the same `ref` that makes a method
+    /// return by reference sits in front of a field declaration, so admitting one admits the
+    /// spelling of the other. Measured: `public ref int f;` in a class draws `CS8107` naming
+    /// *ref fields* and version 11.0, plus `CS9059` -- *A ref field can only be declared in a ref
+    /// struct.* -- which is a second rule and not this gate.
+    ///
+    RefFields,
     /// An object initializer, `new C { F = 1 }`. Introduced in C# 3.0.
     ///
     /// **csc names the two initializer forms differently and this one is the DEFAULT**: an empty
@@ -470,7 +613,7 @@ pub enum Feature {
     /// Same version as [`Feature::ObjectInitializer`] and a different NOUN, which is the whole
     /// reason the two are separate variants: one enum entry could carry the right version and only
     /// ever half the right message. csc tells them apart by whether the first element is an
-    /// assignment, and so do we.
+    /// assignment, and so does lcsc.
     CollectionInitializer,
     /// An anonymous object creation `new { A = 1, ... }`, producing an instance of a
     /// compiler-synthesized anonymous type. Introduced in C# 3.0.
@@ -481,7 +624,7 @@ pub enum Feature {
     /// **ONE variant covers the `foreach` iteration variable too** (8.8.4), because csc gates both
     /// under this single name -- measured, `foreach (var v in a)` at ISO-1 reports `Feature
     /// 'implicitly typed local variable'`, naming a LOCAL VARIABLE for an iteration variable. A
-    /// second variant would have produced a message no csc user ever sees.
+    /// second variant would produce a message no csc user ever sees.
     ///
     /// **`var` is a CONTEXTUAL keyword and this feature does not own the word.** A type genuinely
     /// named `var` takes precedence (C# 3.0 spec, 8.5.1: *"and no type named var is in scope"*), so
@@ -522,9 +665,10 @@ pub enum Feature {
     /// A `required` member -- an initializer the caller MUST supply. Introduced in C# 11.0.
     ///
     /// **The one C# 11 feature both compatibility targets adopted**: 64 uses in dotnet/iot, 56 in
-    /// nanoFramework. Earlier research reported zero, having measured only the PUBLIC surface; the
-    /// uses are in drivers and internals. Unlike the two above it is a real feature rather than
-    /// syntax -- it needs `RequiredMemberAttribute` and an initialization-safety rule.
+    /// nanoFramework, all of them in drivers and internals rather than on the public surface -- a
+    /// census that reads the public surface alone reports zero. Unlike the two above it is a real
+    /// feature rather than syntax -- it needs `RequiredMemberAttribute` and an
+    /// initialization-safety rule.
     RequiredMembers,
     /// A digit separator IMMEDIATELY AFTER a base prefix -- `0x_FF`, `0b_1010`. Introduced in
     /// C# 7.2, a full release AFTER separators themselves.
@@ -545,11 +689,9 @@ pub enum Feature {
     /// spelling. The name `records` does exist -- a `with` expression is the only spelling that
     /// surfaces it, `CS8370`/`CS8400 Feature 'records'` at 7.3 and 8.0.
     ///
-    /// **Sequenced AFTER generics deliberately**: a record is a code generator whose output binds
+    /// **Ordered after generics**: a record is a code generator whose output binds
     /// `IEquatable<T>`, so it cannot land before the thing it generates against. 92 files and 93
-    /// declarations in dotnet/iot (measured by `tools/lang-gap/corpus-census.ps1`; an earlier
-    /// figure of 44 here was low by more than 2x), 11 in nanoFramework. 38 of the 92 are
-    /// positional.
+    /// declarations in dotnet/iot, 11 in nanoFramework; 38 of the 92 are positional.
     Records,
     /// The `record class` / `record struct` KEYWORD forms -- C# 10, and a csc feature separate
     /// from [`Feature::Records`].
@@ -559,7 +701,25 @@ pub enum Feature {
     /// not available in C# 9.0*. Measured one compilation per rung, and `readonly record struct`
     /// reports the same.
     ///
+    /// **Gated by name rather than implemented**, so a program using the keyword pair is refused
+    /// in csc's own words instead of being silently miscompiled. Across the pinned dotnet/iot
+    /// corpus the pair unlocks a single file, so the gate alone carries nearly all of its value.
     RecordStructs,
+    /// A record that INHERITS -- `record D(int Y) : B(X)` -- C# 9.0, and gated separately from
+    /// [`Feature::Records`] because the members csc generates for it are not the ones it generates
+    /// for a base record.
+    ///
+    /// **THE DIFFERENCE IS NOT COSMETIC AND IT CANNOT BE DECIDED WHERE THE DESUGAR RUNS.** A
+    /// derived record OVERRIDES `EqualityContract`, `ToString`, `PrintMembers` and `GetHashCode`
+    /// where a base one introduces them, seals `Equals(Base)` beside a NEW `Equals(Derived)`, and
+    /// returns the BASE type from `<Clone>$` -- measured against csc's own inventory. Whether a
+    /// base name IS a record is a question about a RESOLVED type, and the record desugar runs in
+    /// the parser, where a base list is a list of names.
+    ///
+    /// **Gated by name rather than implemented**, so such a program is refused instead of getting
+    /// a second `virtual` slot for a member its base already declares -- a silent dispatch failure
+    /// rather than a diagnostic. csc has no separate name for it, so the refusal borrows `records`.
+    RecordInheritance,
     /// An `init` accessor in place of a property or indexer `set` -- C# 9.0.
     ///
     /// **csc's OWN FEATURE, GATED SEPARATELY FROM `records`**, and named `'init-only setters'`.
@@ -659,18 +819,21 @@ pub enum Feature {
     ConstantInterpolatedStrings,
     /// An `await` inside a `catch` or `finally` block -- introduced in **C# 6.0**. Below 6 the
     /// refusal is csc's own CS1985/CS1984 (measured, and the two texts are asymmetric); at 6 and
-    /// above csc compiles it (measured at both rungs).
+    /// above csc compiles it (measured at both rungs), so from 6 up the refusal is the
+    /// permitted-but-unbuilt half: resuming inside a handler needs exception spilling and
+    /// pending-fault rethrow, which this build does not implement.
     AwaitInCatchOrFinally,
 }
 
 impl Feature {
-    /// Whether **lcsc has built** this feature, as distinct from whether a language version
-    /// PERMITS it ([`Self::introduced_in`]).
+    /// Whether **this build implements** this feature, as distinct from whether a language
+    /// version PERMITS it ([`Self::introduced_in`]).
     ///
     /// **The two questions are independent and conflating them is the trap this method exists to
     /// prevent.** A selectable `/langversion:7` must not be read as "lcsc implements C# 7": it
-    /// selects a DIALECT, and this table says which of that dialect's features we can actually
-    /// compile. A feature the dialect permits and we have not built has to be refused by NAME --
+    /// selects a DIALECT, and this table says which of that dialect's features this build can
+    /// actually compile. A feature the dialect permits and this build does not implement has to be
+    /// refused by NAME --
     /// telling the user to "use language version 7 or greater" when they already did would be a
     /// lie, and one that sends them looking for a compiler switch that cannot help.
     ///
@@ -679,13 +842,15 @@ impl Feature {
     /// anyway, because ISO-1 is the dialect. Implemented and permitted are two bits, and only both
     /// together admit a construct.
     #[must_use]
-    pub fn is_implemented(self) -> bool {
+    pub const fn is_implemented(self) -> bool {
         match self {
             Feature::StaticClasses | Feature::BinaryLiterals | Feature::DigitSeparators => true,
             Feature::FileScopedNamespaces => true,
             Feature::ObjectInitializer | Feature::CollectionInitializer => true,
             Feature::ImplicitlyTypedLocalVariable => true,
             Feature::Generics => true,
+            Feature::Records => true,
+
             Feature::DefaultOperator => true,
             Feature::NullCoalescing => true,
             Feature::PragmaDirective | Feature::AutoProperties => true,
@@ -694,23 +859,30 @@ impl Feature {
             Feature::ExpressionBodiedMethod
             | Feature::ExpressionBodiedProperty
             | Feature::ExpressionBodiedIndexer
-            | Feature::ExpressionBodiedAccessor => true,
+            | Feature::ExpressionBodiedAccessor
+            | Feature::ThrowExpression
+            | Feature::RefStruct => true,
             Feature::RequiredMembers | Feature::LeadingDigitSeparator => true,
+            Feature::NullConditional => true,
+            Feature::UsingStatic => true,
             Feature::DefaultParameterValues => true,
+            Feature::AutoPropertyInitializer | Feature::ReadonlyAutoProperty => true,
+            Feature::ExceptionFilter => true,
             Feature::AnonymousMethods
             | Feature::NamespaceAlias
             | Feature::LambdaExpression
             | Feature::AnonymousObjectCreation
             | Feature::NamedArguments
-            | Feature::NullConditional
-            | Feature::UsingStatic
-            | Feature::ReadonlyAutoProperty
             | Feature::SwitchOnBool
             | Feature::TopLevelStatements
-            | Feature::Records
             | Feature::RecordStructs
+            | Feature::RecordInheritance
             | Feature::DefaultInterfaceImplementation
-            | Feature::ParameterlessStructConstructor => false,
+            | Feature::ParameterlessStructConstructor
+            | Feature::RefFields => false,
+            Feature::ReadOnlyReferences => true,
+            Feature::ByRefLocalsAndReturns => true,
+            Feature::RefReassignment => true,
             Feature::InitOnlySetters => true,
             Feature::AsyncFunction => true,
             Feature::PartialTypes => true,
@@ -721,7 +893,7 @@ impl Feature {
             | Feature::CallerInfoAttribute => false,
             Feature::NameOf => true,
             Feature::InterpolatedStrings => true,
-            Feature::ConstantInterpolatedStrings => false,
+            Feature::ConstantInterpolatedStrings => true,
         }
     }
 
@@ -737,7 +909,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 46] = [
+    pub const ALL: [Feature; 55] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -746,6 +918,8 @@ impl Feature {
         Feature::NullCoalescing,
         Feature::PragmaDirective,
         Feature::ReadonlyAutoProperty,
+        Feature::AutoPropertyInitializer,
+        Feature::ExceptionFilter,
         Feature::NamespaceAlias,
         Feature::AccessorAccessibility,
         Feature::LambdaExpression,
@@ -753,6 +927,12 @@ impl Feature {
         Feature::ExpressionBodiedProperty,
         Feature::ExpressionBodiedIndexer,
         Feature::ExpressionBodiedAccessor,
+        Feature::ThrowExpression,
+        Feature::RefStruct,
+        Feature::ByRefLocalsAndReturns,
+        Feature::RefReassignment,
+        Feature::ReadOnlyReferences,
+        Feature::RefFields,
         Feature::ObjectInitializer,
         Feature::CollectionInitializer,
         Feature::AnonymousObjectCreation,
@@ -771,6 +951,7 @@ impl Feature {
         Feature::LeadingDigitSeparator,
         Feature::Records,
         Feature::RecordStructs,
+        Feature::RecordInheritance,
         Feature::InitOnlySetters,
         Feature::DefaultInterfaceImplementation,
         Feature::ParameterlessStructConstructor,
@@ -788,7 +969,7 @@ impl Feature {
 
     /// The first language version in which this feature is available.
     #[must_use]
-    pub fn introduced_in(self) -> LanguageVersion {
+    pub const fn introduced_in(self) -> LanguageVersion {
         match self {
             Feature::Generics
             | Feature::StaticClasses
@@ -812,16 +993,25 @@ impl Feature {
             | Feature::ExpressionBodiedProperty
             | Feature::ExpressionBodiedIndexer => LanguageVersion::CSharp6,
             Feature::ExpressionBodiedAccessor => LanguageVersion::CSharp7,
+            Feature::ThrowExpression => LanguageVersion::CSharp7,
+            Feature::RefStruct => LanguageVersion::CSharp7_2,
+            Feature::AutoPropertyInitializer => LanguageVersion::CSharp6,
+            Feature::ByRefLocalsAndReturns => LanguageVersion::CSharp7,
+            Feature::RefReassignment => LanguageVersion::CSharp7_3,
+            Feature::ReadOnlyReferences => LanguageVersion::CSharp7_2,
+            Feature::RefFields => LanguageVersion::CSharp11,
             Feature::NullConditional
             | Feature::UsingStatic
             | Feature::NameOf
             | Feature::InterpolatedStrings
+            | Feature::ExceptionFilter
             | Feature::ReadonlyAutoProperty => LanguageVersion::CSharp6,
             Feature::ConstantInterpolatedStrings => LanguageVersion::CSharp10,
             Feature::BinaryLiterals | Feature::DigitSeparators => LanguageVersion::CSharp7,
             Feature::LeadingDigitSeparator => LanguageVersion::CSharp7_2,
             Feature::TopLevelStatements | Feature::Records => LanguageVersion::CSharp9,
             Feature::RecordStructs => LanguageVersion::CSharp10,
+            Feature::RecordInheritance => LanguageVersion::CSharp9,
             Feature::InitOnlySetters => LanguageVersion::CSharp9,
             Feature::FileScopedNamespaces => LanguageVersion::CSharp10,
             Feature::RequiredMembers => LanguageVersion::CSharp11,
@@ -841,7 +1031,7 @@ impl Feature {
     /// search key: a user who pastes it into a search engine has to land on the same results a csc
     /// user does.
     ///
-    /// | we said | csc says |
+    /// | plausible description | csc says |
     /// |---|---|
     /// | nullable value types | **nullable types** |
     /// | the namespace alias qualifier `'::'` | **namespace alias qualifier** |
@@ -855,8 +1045,8 @@ impl Feature {
     /// **THE PATTERN IS THAT A DESCRIPTION OF THE LANGUAGE IS NOT csc's NAME FOR THE CONSTRUCT**:
     /// a parenthesized operator spelling, a plural where csc reports one occurrence,
     /// and two features merged where the message has to pick one noun. The last kind is the one
-    /// that cost something real -- see [`Feature::ExpressionBodiedMethod`], where the merge also
-    /// carried the wrong VERSION.
+    /// that takes a VERSION error with it -- see [`Feature::ExpressionBodiedMethod`], where
+    /// merging the two would put the member forms on the accessor form's rung.
     ///
     /// **Do NOT add quotes here.** The renderers supply them, and a string carrying its own
     /// would nest.
@@ -869,6 +1059,7 @@ impl Feature {
             Feature::NullableValueTypes => "nullable types",
             Feature::NullCoalescing => "null coalescing operator",
             Feature::ReadonlyAutoProperty => "readonly automatically implemented properties",
+            Feature::ExceptionFilter => "exception filter",
             Feature::PragmaDirective => "#pragma",
             Feature::NamespaceAlias => "namespace alias qualifier",
             Feature::AccessorAccessibility => "access modifiers on properties",
@@ -877,6 +1068,13 @@ impl Feature {
             Feature::ExpressionBodiedProperty => "expression-bodied property",
             Feature::ExpressionBodiedIndexer => "expression-bodied indexer",
             Feature::ExpressionBodiedAccessor => "expression body property accessor",
+            Feature::ThrowExpression => "throw expression",
+            Feature::RefStruct => "ref structs",
+            Feature::AutoPropertyInitializer => "auto property initializer",
+            Feature::ByRefLocalsAndReturns => "byref locals and returns",
+            Feature::RefReassignment => "ref reassignment",
+            Feature::ReadOnlyReferences => "readonly references",
+            Feature::RefFields => "ref fields",
             Feature::ObjectInitializer => "object initializer",
             Feature::CollectionInitializer => "collection initializer",
             Feature::AnonymousObjectCreation => "anonymous types",
@@ -896,6 +1094,7 @@ impl Feature {
             Feature::RequiredMembers => "required members",
             Feature::Records => "records",
             Feature::RecordStructs => "record structs",
+            Feature::RecordInheritance => "records",
             Feature::InitOnlySetters => "init-only setters",
             Feature::DefaultInterfaceImplementation => "default interface implementation",
             Feature::ParameterlessStructConstructor => "parameterless struct constructors",
@@ -915,7 +1114,7 @@ impl Feature {
     /// Whether `version` admits this feature, and if not, WHICH of the two bits refused it.
     ///
     /// **THE TWO-BIT RULE, STATED ONCE.** A construct needs its dialect to PERMIT it
-    /// ([`Self::introduced_in`]) and this build to have BUILT it ([`Self::is_implemented`]), and
+    /// ([`Self::introduced_in`]) and this build to IMPLEMENT it ([`Self::is_implemented`]), and
     /// the two failures want different diagnostics because they want different actions from the
     /// reader: raising `/langversion` fixes the first and cannot touch the second.
     ///
@@ -955,8 +1154,8 @@ pub enum FeatureGate {
 /// [`LanguageVersion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageVersionError {
-    /// The value names a real C# version that this compiler does not implement
-    /// yet, for example `ISO-2` while only C# 1.0 is supported.
+    /// The value names a real C# version that this compiler does not implement,
+    /// for example `ISO-2` while only C# 1.0 is supported.
     Unsupported,
     /// The value names no known C# version.
     Invalid,
@@ -966,9 +1165,9 @@ impl fmt::Display for LanguageVersionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LanguageVersionError::Unsupported => {
-                f.write_str("that C# version is not supported by this compiler yet")
+                f.write_str("that C# version is not supported by this compiler")
             }
-            LanguageVersionError::Invalid => f.write_str("unrecognised C# language version"),
+            LanguageVersionError::Invalid => f.write_str("unrecognized C# language version"),
         }
     }
 }
@@ -978,10 +1177,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_and_latest_are_csharp1() {
-        assert_eq!(LanguageVersion::DEFAULT, LanguageVersion::CSharp1);
+    fn the_default_is_the_lowest_rung_that_admits_everything_built() {
+        let expected = Feature::ALL
+            .into_iter()
+            .filter(|feature| feature.is_implemented())
+            .map(Feature::introduced_in)
+            .max()
+            .expect("some feature is implemented");
+        assert_eq!(LanguageVersion::DEFAULT, expected);
+        assert!(LanguageVersion::DEFAULT.is_selectable());
         assert_eq!(LanguageVersion::SELECTABLE_MAX, LanguageVersion::CSharp11);
-        assert_ne!(LanguageVersion::DEFAULT, LanguageVersion::SELECTABLE_MAX);
         assert!(LanguageVersion::CSharp1.is_selectable());
         assert!(LanguageVersion::CSharp11.is_selectable());
     }
@@ -1012,12 +1217,22 @@ mod tests {
         assert!(LanguageVersion::CSharp2.supports(Feature::AnonymousMethods));
         assert!(!Feature::AnonymousMethods.is_implemented());
 
+        let permitted_but_unbuilt = Feature::ALL
+            .into_iter()
+            .filter(|feature| LanguageVersion::DEFAULT.supports(*feature) && !feature.is_implemented())
+            .count();
+        assert!(
+            permitted_but_unbuilt > 0,
+            "no feature is permitted-but-unbuilt at the default rung, so the two bits have stopped \
+             being distinguishable here and this test proves nothing"
+        );
         for feature in Feature::ALL {
-            let admitted = LanguageVersion::DEFAULT.supports(feature) && feature.is_implemented();
+            if !feature.is_implemented() {
+                continue;
+            }
             assert!(
-                !admitted,
-                "{feature:?} would be admitted under the default dialect; every feature in this \
-                 table is post-1.0 and the default is ISO-1"
+                LanguageVersion::DEFAULT.supports(feature),
+                "{feature:?} is implemented and the default dialect refuses it"
             );
         }
     }
@@ -1077,6 +1292,14 @@ mod tests {
                 | Feature::ExpressionBodiedProperty
                 | Feature::ExpressionBodiedIndexer
                 | Feature::ExpressionBodiedAccessor
+                | Feature::ThrowExpression
+                | Feature::RefStruct
+                | Feature::ByRefLocalsAndReturns
+                | Feature::RefReassignment
+                | Feature::AutoPropertyInitializer
+                | Feature::ExceptionFilter
+                | Feature::ReadOnlyReferences
+                | Feature::RefFields
                 | Feature::ObjectInitializer
                 | Feature::CollectionInitializer
                 | Feature::AnonymousObjectCreation
@@ -1095,6 +1318,7 @@ mod tests {
                 | Feature::LeadingDigitSeparator
                 | Feature::Records
                 | Feature::RecordStructs
+                | Feature::RecordInheritance
                 | Feature::InitOnlySetters
                 | Feature::DefaultInterfaceImplementation
                 | Feature::ParameterlessStructConstructor
@@ -1112,7 +1336,7 @@ mod tests {
         }
         assert_eq!(
             Feature::ALL.len(),
-            46,
+            55,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }
@@ -1148,15 +1372,15 @@ mod tests {
     }
 
     #[test]
-    fn the_default_rung_admits_no_post_1_0_feature() {
+    fn the_default_rung_admits_every_feature_this_build_implements() {
         for feature in Feature::ALL {
-            if feature.introduced_in() == LanguageVersion::CSharp1 {
+            if !feature.is_implemented() {
                 continue;
             }
-            let admitted = LanguageVersion::DEFAULT.supports(feature) && feature.is_implemented();
             assert!(
-                !admitted,
-                "{feature:?} would be admitted under the default dialect; it is post-1.0 and the                  default is ISO-1"
+                LanguageVersion::DEFAULT.supports(feature),
+                "{feature:?} is implemented but the default dialect does not permit it, so an \
+                 unflagged compilation refuses a construct this build can produce"
             );
         }
     }
@@ -1253,7 +1477,7 @@ mod tests {
 
     #[test]
     fn parse_flag_accepts_csharp1_spellings() {
-        for value in ["ISO-1", "iso-1", "1", "1.0", " 1 ", "default"] {
+        for value in ["ISO-1", "iso-1", "1", "1.0", " 1 "] {
             assert_eq!(
                 LanguageVersion::parse_flag(value),
                 Ok(LanguageVersion::CSharp1),
@@ -1267,10 +1491,15 @@ mod tests {
                 "value was {value:?}"
             );
         }
-        assert_ne!(
+        assert_eq!(
             LanguageVersion::parse_flag("default"),
+            Ok(LanguageVersion::DEFAULT),
+            "`default` is the derived answer -- what this build implements"
+        );
+        assert_eq!(
             LanguageVersion::parse_flag("latest"),
-            "default and latest answer different questions"
+            Ok(LanguageVersion::SELECTABLE_MAX),
+            "`latest` is the capability answer -- the newest dialect we can gate against"
         );
     }
 
@@ -1356,23 +1585,26 @@ mod tests {
     /// permit a construct never reaches the question of whether it was built.
     #[test]
     fn the_version_bit_is_asked_first() {
-        assert!(!Feature::Records.is_implemented());
+        assert!(!Feature::RecordInheritance.is_implemented());
         assert!(matches!(
-            Feature::Records.gate_against(LanguageVersion::CSharp1),
+            Feature::RecordInheritance.gate_against(LanguageVersion::CSharp1),
             Some(FeatureGate::RequiresLaterVersion { required: "9.0" })
         ));
         assert!(matches!(
-            Feature::Records.gate_against(LanguageVersion::CSharp9),
+            Feature::RecordInheritance.gate_against(LanguageVersion::CSharp9),
             Some(FeatureGate::NotInThisBuild)
         ));
     }
 
-    /// Both of these read `false` while the compiler emitted them correctly, and nothing noticed
-    /// because no gate site consulted `is_implemented` at all.
+    /// `is_implemented` is the only record that a feature is emittable, so one the compiler emits
+    /// must read `true` here: a stale `false` refuses a working construct as `NotInThisBuild` at
+    /// every rung, including the one that introduced it.
     #[test]
-    fn two_features_that_were_marked_unbuilt_while_being_built() {
+    fn a_feature_the_compiler_emits_reads_implemented_and_its_gate_admits_it() {
         assert!(Feature::RequiredMembers.is_implemented());
         assert!(Feature::LeadingDigitSeparator.is_implemented());
+        assert!(Feature::Records.is_implemented());
+        assert_eq!(Feature::Records.gate_against(LanguageVersion::CSharp9), None);
         assert_eq!(Feature::RequiredMembers.gate_against(LanguageVersion::CSharp11), None);
         assert_eq!(Feature::LeadingDigitSeparator.gate_against(LanguageVersion::CSharp7_2), None);
     }

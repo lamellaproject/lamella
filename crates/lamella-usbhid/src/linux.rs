@@ -9,8 +9,19 @@ use std::time::Duration;
 /// CMSIS-DAP report payload size (excludes the report-id byte).
 const REPORT_MAX: usize = 64;
 
-/// `(hidraw node name, vendor id, product id, product string)` for each `/sys/class/hidraw` entry.
-fn scan() -> Vec<(String, u16, u16, Option<String>)> {
+/// One `/sys/class/hidraw` entry, as much as sysfs states about it.
+struct Entry {
+    /// The hidraw node name (e.g. `hidraw0`) -- the reopen key for `open_id`.
+    name: String,
+    vendor_id: u16,
+    product_id: u16,
+    /// `HID_UNIQ`: the device's own serial, where it reports one.
+    serial: Option<String>,
+    product: Option<String>,
+}
+
+/// Every `/sys/class/hidraw` entry, read from sysfs. Opens nothing.
+fn scan() -> Vec<Entry> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir("/sys/class/hidraw") else {
         return out;
@@ -20,7 +31,7 @@ fn scan() -> Vec<(String, u16, u16, Option<String>)> {
         let Ok(uevent) = fs::read_to_string(entry.path().join("device/uevent")) else {
             continue;
         };
-        let (mut vid, mut pid, mut product) = (0u16, 0u16, None);
+        let (mut vid, mut pid, mut product, mut serial) = (0u16, 0u16, None, None);
         for line in uevent.lines() {
             if let Some(id) = line.strip_prefix("HID_ID=") {
                 let mut parts = id.split(':');
@@ -31,10 +42,15 @@ fn scan() -> Vec<(String, u16, u16, Option<String>)> {
                 }
             } else if let Some(n) = line.strip_prefix("HID_NAME=") {
                 product = Some(n.to_string());
+            } else if let Some(u) = line.strip_prefix("HID_UNIQ=") {
+                let u = u.trim();
+                if !u.is_empty() {
+                    serial = Some(u.to_string());
+                }
             }
         }
         if vid != 0 {
-            out.push((name, vid, pid, product));
+            out.push(Entry { name, vendor_id: vid, product_id: pid, serial, product });
         }
     }
     out
@@ -43,12 +59,12 @@ fn scan() -> Vec<(String, u16, u16, Option<String>)> {
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     Ok(scan()
         .into_iter()
-        .map(|(name, vendor_id, product_id, product)| DeviceInfo {
-            vendor_id,
-            product_id,
-            serial_number: None,
-            product,
-            id: name,
+        .map(|entry| DeviceInfo {
+            vendor_id: entry.vendor_id,
+            product_id: entry.product_id,
+            serial_number: entry.serial,
+            product: entry.product,
+            id: entry.name,
             usage_page: None,
             usage: None,
             input_report_len: None,
@@ -62,9 +78,20 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn open(vendor_id: u16, product_id: u16, _serial: Option<&str>) -> Result<Self> {
-        for (name, vid, pid, _) in scan() {
-            if vid == vendor_id && pid == product_id {
+    /// Opens the HID device with `vendor_id`/`product_id`, and with `serial` when one is named.
+    ///
+    /// **A NAMED SERIAL IS A FILTER, NOT A LABEL.** Several probes of one model answer to the same
+    /// vendor and product id, so taking the first match opens whichever the kernel enumerated
+    /// first -- and the caller that named a serial is precisely the caller who cannot tolerate
+    /// that. A serial matching nothing attached is [`Error::NotFound`]: refusing names a board an
+    /// operator can go and plug in, where opening a different one writes to it.
+    pub fn open(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
+        for entry in scan() {
+            if entry.vendor_id == vendor_id
+                && entry.product_id == product_id
+                && crate::candidate_satisfies(serial, entry.serial.as_deref())
+            {
+                let name = entry.name;
                 let path = format!("/dev/{name}");
                 let file = fs::OpenOptions::new()
                     .read(true)
@@ -99,7 +126,26 @@ impl Device {
             .map_err(|e| Error::Os(format!("hidraw write: {e}")))
     }
 
-    pub fn read_report(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<usize> {
+    /// Reads one input report, waiting at most `timeout`.
+    ///
+    /// **THE TIMEOUT IS HONOURED WITH `poll(2)` BECAUSE A READ THAT IGNORES IT NEVER RETURNS.**
+    /// hidraw blocks until a report arrives, and the reasoning for letting it -- that a CMSIS-DAP
+    /// probe answers a request promptly -- holds only where a request was actually sent.
+    pub fn read_report(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let ready = unsafe { libc::poll(&raw mut pfd, 1, millis) };
+        if ready < 0 {
+            return Err(Error::Os(format!("hidraw poll: {}", std::io::Error::last_os_error())));
+        }
+        if ready == 0 {
+            return Err(Error::Timeout);
+        }
         let mut report = vec![0u8; REPORT_MAX];
         let n = self
             .file

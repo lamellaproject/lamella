@@ -726,6 +726,13 @@ pub fn write_executable_arm_thumb_with_heap(
 /// segment still covers only the headers plus `.text`, so the debug bytes ride along in the file
 /// and cost the target nothing. Flash the same `.text`; hand a debugger this.
 ///
+/// `text_addr` IS THE ADDRESS `.text` GETS, not a file base: pass the address the code was LINKED
+/// at (`lamella_link`'s `text_base`), and the load segment is placed so `.text` lands exactly there.
+/// That is what makes the DWARF and the section table agree -- every address in the debug info was
+/// resolved against the link base, and a `.text` placed anywhere else describes the wrong bytes at
+/// every lookup. Unlike [`write_executable`], nothing LOADS this file, so there is no file base to
+/// express and the headers simply precede `.text` in its address space.
+///
 /// `debug` is `(section name, bytes)`, taken straight from `LinkedImage::debug_sections`.
 /// `entry_thumb` sets `e_entry`'s low bit, as [`write_executable_arm_thumb`] does.
 ///
@@ -736,14 +743,15 @@ pub fn write_debuggable_executable(
     machine: Machine,
     text: &[u8],
     entry_offset: u32,
-    base: u32,
+    text_addr: u32,
     entry_thumb: bool,
     debug: &[(&str, &[u8])],
 ) -> Vec<u8> {
     const PHDR_SIZE: u32 = 32;
     let text_off = EHDR_SIZE + PHDR_SIZE;
+    let base = text_addr - text_off;
     let loaded = text_off + text.len() as u32;
-    let entry = (base + text_off + entry_offset) | entry_thumb as u32;
+    let entry = (text_addr + entry_offset) | entry_thumb as u32;
 
     let mut shstrtab: Vec<u8> = alloc::vec![0];
     let text_name = add_name(&mut shstrtab, ".text");
@@ -1175,8 +1183,8 @@ pub struct Object {
     /// The `.text` relocations.
     pub relocations: Vec<ParsedRelocation>,
     /// Sections carried through the link rather than merged into [`Self::text`] -- today the DWARF
-    /// `.debug_*` family (see [`Section`]). Empty for an object with no debug info, which is every
-    /// object the AOT backend emits today, so the code path costs nothing when it is not in use.
+    /// `.debug_*` family (see [`Section`]). Empty for an object with no debug info, so the code path
+    /// costs nothing when it is not in use.
     pub sections: Vec<ParsedSection>,
 }
 
@@ -1740,7 +1748,12 @@ mod tests {
         assert_eq!(u16::from_le_bytes([exe[50], exe[51]]), 4);
         assert_eq!(
             u32::from_le_bytes([exe[24], exe[25], exe[26], exe[27]]),
-            (0x1_0000 + 84) | 1
+            0x1_0000 | 1
+        );
+        assert_eq!(
+            u32::from_le_bytes([exe[60], exe[61], exe[62], exe[63]]),
+            0x1_0000 - 84,
+            "p_vaddr is placed so that .text lands on text_addr"
         );
 
         let p_filesz = u32::from_le_bytes([exe[68], exe[69], exe[70], exe[71]]);
@@ -1759,7 +1772,7 @@ mod tests {
 
         assert_eq!(name_of(1), ".text");
         assert_eq!(shdr(1, SH_FLAGS), 0x2 | 0x4);
-        assert_eq!(shdr(1, SH_ADDR), 0x1_0000 + 84);
+        assert_eq!(shdr(1, SH_ADDR), 0x1_0000);
 
         for (i, (name, data)) in [(".debug_info", &info[..]), (".debug_abbrev", &abbrev[..])]
             .iter()

@@ -17,6 +17,12 @@ namespace System
         {
             return GetLength(dimension) - 1;
         }
+
+        public bool IsFixedSize { get { return true; } }
+        public bool IsReadOnly { get { return false; } }
+        public bool IsSynchronized { get { return false; } }
+        public object SyncRoot { get { return this; } }
+
         [Lamella.Runtime.RuntimeProvided] public object GetValue(int index) { return null; }
         [Lamella.Runtime.RuntimeProvided] public void SetValue(object value, int index) { }
 
@@ -130,6 +136,12 @@ namespace System
             }
         }
 
+        public void CopyTo(Array array, int index)
+        {
+            if ((object)array != null && array.Rank != 1) throw new ArgumentException("array");
+            Copy(this, GetLowerBound(0), array, index, Length);
+        }
+
         [Lamella.Runtime.RuntimeProvided]
         private static bool CopyCore(Array source, int sourceIndex, Array destination, int destinationIndex, int length) { return false; }
 
@@ -144,6 +156,15 @@ namespace System
         }
 
         [Lamella.Runtime.RuntimeProvided] private static void ClearCore(Array array, int index, int length) { }
+
+        public static Array CreateInstance(Type elementType, int length)
+        {
+            if ((object)elementType == null) throw new ArgumentNullException("elementType");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+            return CreateInstanceCore(elementType, length);
+        }
+
+        [Lamella.Runtime.RuntimeProvided] private static Array CreateInstanceCore(Type elementType, int length) { return null; }
 
         public static void Sort(Array array)
         {
@@ -170,9 +191,18 @@ namespace System
         public static int BinarySearch(Array array, object value, System.Collections.IComparer comparer)
         {
             if (array == null) throw new ArgumentNullException("array");
+            return BinarySearch(array, 0, array.Length, value, comparer);
+        }
+
+        public static int BinarySearch(Array array, int index, int length, object value, System.Collections.IComparer comparer)
+        {
+            if (array == null) throw new ArgumentNullException("array");
+            if (index < 0) throw new ArgumentOutOfRangeException("index");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+            if (index > array.Length - length) throw new ArgumentException("array");
             if (comparer == null) comparer = System.Collections.Comparer.Default;
-            int lo = 0;
-            int hi = array.Length - 1;
+            int lo = index;
+            int hi = index + length - 1;
             while (lo <= hi)
             {
                 int mid = lo + ((hi - lo) >> 1);

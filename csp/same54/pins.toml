@@ -1,7 +1,60 @@
-# PIN map for the SAM E54 family: pin x function -> (instance, signal). EMPTY on purpose --
-# identity-first. Rows follow the samd21 shape
-# ((pin, function letter) -> (sercom, pad)) when the first binding demands them.
+# PIN map for the SAM E54 family: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source. Grow the table with the
+# boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
 
 [table]
 kind = "pins"
 family = "same54"
+sources = [
+    "SAM D5x/E5x Family Data Sheet DS60001507F Table 6-1 (Multiplexed Peripheral Signals), whose column letters A to N are the function selection and whose cells name the instance and signal each reaches",
+    "DS60001507F Table 6-8 (SERCOM I2C Pinout), which lists the pads with I2C support per package -- used as corroboration for the I2C rows below, never as their source",
+    "SAM E54 Xplained Pro user guide DS70005321A Table 5-1, which names the peripheral behind each extension-header position -- used as corroboration for the rows below, never as their source",
+]
+
+# THE FUNCTION LETTER IS A COLUMN OF Table 6-1 AND THE COLUMNS ARE NOT INTERCHANGEABLE. Column C
+# and column D both carry a SERCOM for these two pads, and the PAD NUMBERS SWAP BETWEEN THEM: on
+# column C the lower-numbered pin is pad 0, and on column D it is pad 1. So a row moved from one
+# column to the other does not merely select a different SERCOM -- it exchanges the two signals of
+# whatever bus is on it, which for I2C means exchanging data and clock. Both alternatives are
+# recorded here for that reason, and only the column C rows have a consumer.
+
+[[pins]]
+pin = "PA22"
+function = "C"
+instance = "sercom3"
+signal = "pad0"
+source = "DS60001507F Table 6-1 (Multiplexed Peripheral Signals), the PA22 row: column C is SERCOM3/PAD[0]. Table 6-8 (SERCOM I2C Pinout) independently lists PA22 among the pads with I2C support on the 128-pin package."
+
+[[pins]]
+pin = "PA23"
+function = "C"
+instance = "sercom3"
+signal = "pad1"
+source = "DS60001507F Table 6-1, the PA23 row: column C is SERCOM3/PAD[1]. Table 6-8 independently lists PA23 among the pads with I2C support on the 128-pin package."
+
+[[pins]]
+pin = "PA22"
+function = "D"
+instance = "sercom5"
+signal = "pad1"
+source = "DS60001507F Table 6-1, the PA22 row: column D is SERCOM5/PAD[1]. NOTE THE PAD NUMBER against the column C row above -- the same pad is pad 0 of one SERCOM and pad 1 of another."
+
+[[pins]]
+pin = "PA23"
+function = "D"
+instance = "sercom5"
+signal = "pad0"
+source = "DS60001507F Table 6-1, the PA23 row: column D is SERCOM5/PAD[0]. The pad numbers of PA22 and PA23 are reversed between columns C and D, so the pair is ordered one way on SERCOM3 and the other way on SERCOM5."
+
+# THE ANALOG FUNCTION IS COLUMN B, AND IT IS ONE COLUMN COVERING SIX PERIPHERALS. Table 6-1 puts
+# ANAREF, ADC0, ADC1, AC, DAC and PTC all under the single function letter B, so selecting B on a
+# pad does not say WHICH analog peripheral reaches it -- the cell does, and that is what this row
+# records. The channel number is part of the signal name for the same reason: a converter reaches a
+# pad on one numbered input, and the number is a property of the pairing rather than of either.
+
+[[pins]]
+pin = "PB04"
+function = "B"
+instance = "adc1"
+signal = "ain6"
+source = "DS60001507F Table 6-1 (Multiplexed Peripheral Signals), the PB04 row: the function B cell is ADC1/AIN[6]."

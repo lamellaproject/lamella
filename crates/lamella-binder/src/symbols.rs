@@ -245,6 +245,19 @@ pub struct MethodSymbol {
     pub name: Box<str>,
     /// The return type (`void` is `SpecialType::Void`).
     pub return_type: TypeSymbol,
+    /// The REQUIRED custom modifiers on the return type of an IMPORTED method, as the types they
+    /// name. Empty for a method declared in this compilation, and for an imported one with none.
+    ///
+    /// **A `modreq` IS PART OF THE SIGNATURE A `MemberRef` HAS TO MATCH (II.23.2.7), SO DROPPING IT
+    /// ON IMPORT EMITS A CALL THAT RESOLVES TO NOTHING.** `ReadOnlySpan<T>.get_Item` returns
+    /// `ref readonly T`, which is `!0& modreq(InAttribute)`; a `MemberRef` naming a bare `!0&` is a
+    /// different signature and the target method is simply not found. `Span<T>`'s indexer returns a
+    /// plain `ref T`, which is the whole reason one worked while the other did not.
+    ///
+    /// [`Self::is_init`] is the same question asked about ONE modifier, and it is kept beside this
+    /// rather than derived from it because it answers a LANGUAGE question -- whether the accessor
+    /// is `init` -- where this answers a metadata one.
+    pub return_required_modifiers: Vec<TypeSymbol>,
     /// The parameter types, in order. This is what overload resolution and signature identity are
     /// computed from, and it is deliberately unchanged: widening it to a struct would rewrite ~230
     /// call sites for facts almost none of them want.
@@ -573,6 +586,17 @@ pub struct TypeInfo {
     /// Unlike `type_parameters` this IS load-bearing: it decides whether `Box<int>` is legal, and
     /// it is what the `GenericParam` flag word and the `GenericParamConstraint` rows are built from.
     pub type_parameter_constraints: Vec<TypeParameterConstraints>,
+    /// Whether the type is BY-REF-LIKE -- a `ref struct` (C# 7.2).
+    ///
+    /// Such a type may live only on the stack, so it may not be a field of a class or of an
+    /// ordinary struct, an array element, a type argument, or boxed. **It is true of an IMPORTED
+    /// type as well as a declared one**, and the imported case is the one that matters first:
+    /// `System.Span<T>` is a `ref struct`, so every restriction applies to it whether or not this
+    /// compilation declares a `ref struct` of its own.
+    ///
+    /// In metadata the mark is `IsByRefLikeAttribute` (II.23.2) -- there is no `TypeAttributes`
+    /// bit for it -- so it is decoded from that attribute or not at all.
+    pub is_by_ref_like: bool,
 }
 
 /// The resolved constraints on ONE type parameter (ECMA-334 4th ed 25.7).
@@ -796,6 +820,7 @@ impl TypeInfo {
             type_parameter_constraints: Vec::new(),
             is_partial: false,
             synthesized_constructor: false,
+            is_by_ref_like: false,
         }
     }
 
@@ -993,6 +1018,7 @@ pub struct Model {
 /// collector is upstream of it.
 fn implicit_constructor() -> MethodSymbol {
     MethodSymbol {
+        return_required_modifiers: Vec::new(),
         explicit_interface: None,
         name: ".ctor".into(),
         return_type: TypeSymbol::Special(SpecialType::Void),
@@ -1137,12 +1163,27 @@ impl Model {
     /// `None` for a non-instantiated type, for a definition not in the model, and for a member
     /// that does not match -- emission then refuses rather than writing a `!n` it guessed.
     #[must_use]
-    pub fn open_member(
-        &self,
+    /// The open declaration an instantiation names, and the type-parameter names its ARGUMENTS
+    /// bind to -- in order, so the two zip.
+    ///
+    /// **FOR A TYPE NESTED IN A GENERIC THOSE ARE NOT THE SAME LIST.** `Span<byte>.Enumerator`
+    /// declares no type parameters of its own, yet the instantiation carries one argument: its
+    /// members are written against `Span<T>`'s `T`, inherited from the ENCLOSING type. Comparing
+    /// the nested type's own count against the argument count therefore refuses a perfectly
+    /// ordinary type -- and refusing here is silent, because every caller reads `None` as "not
+    /// reached through an instantiation" and falls back to the definition's open signature.
+    ///
+    /// That is what made `foreach` over a `Span<byte>` fail: the enumerator's `MoveNext` lost its
+    /// instantiation, was minted with a plain `TypeRef` parent, and emission refused it as a call
+    /// outside this module -- while the desugar, seeing no pattern, fell back to non-generic
+    /// `IEnumerator` whose `Current` is `object` and asked for an unbox. One cause, two messages.
+    ///
+    /// Extracted rather than repaired in place: three callers had the same prologue and the same
+    /// wrong comparison, so a fix at one of them would have left two.
+    fn open_declaration<'model>(
+        &'model self,
         declaring: &TypeSymbol,
-        name: &str,
-        parameters: &[TypeSymbol],
-    ) -> Option<(Vec<Box<str>>, MethodSymbol)> {
+    ) -> Option<(&'model TypeInfo, Vec<Box<str>>)> {
         let TypeSymbol::Instantiation {
             definition,
             arguments,
@@ -1155,11 +1196,37 @@ impl Model {
             &namespace,
             &definition_metadata_name(definition, arguments.len()),
         )?;
-        if open.type_parameters.len() != arguments.len() {
+        let mut names = open.type_parameters.clone();
+        let mut parts: &[Box<str>] = definition;
+        while names.len() < arguments.len() {
+            let (_, enclosing_parts) = parts.split_last()?;
+            if enclosing_parts.is_empty() {
+                return None;
+            }
+            let (enclosing_namespace, enclosing_name) = split_named(enclosing_parts);
+            let enclosing = self.get(&enclosing_namespace, enclosing_name)?;
+            let mut outer = enclosing.type_parameters.clone();
+            outer.extend(names);
+            names = outer;
+            parts = enclosing_parts;
+        }
+        if names.len() != arguments.len() {
             return None;
         }
-        let bindings: BTreeMap<&str, &TypeSymbol> = open
-            .type_parameters
+        Some((open, names))
+    }
+
+    pub fn open_member(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> Option<(Vec<Box<str>>, MethodSymbol)> {
+        let TypeSymbol::Instantiation { arguments, .. } = declaring else {
+            return None;
+        };
+        let (open, type_parameters) = self.open_declaration(declaring)?;
+        let bindings: BTreeMap<&str, &TypeSymbol> = type_parameters
             .iter()
             .map(|parameter| &**parameter)
             .zip(arguments.iter())
@@ -1178,7 +1245,7 @@ impl Model {
                     .zip(parameters)
                     .all(|(open_ty, closed)| substitute(open_ty, &bindings) == *closed)
         })?;
-        Some((open.type_parameters.clone(), member.clone()))
+        Some((type_parameters, member.clone()))
     }
 
     /// [`Model::open_member`] for a PROPERTY ACCESSOR, which is not in `methods` to be found.
@@ -1199,31 +1266,17 @@ impl Model {
         property: &str,
         want_setter: bool,
     ) -> Option<(Vec<Box<str>>, Vec<TypeSymbol>, TypeSymbol)> {
-        let TypeSymbol::Instantiation {
-            definition,
-            arguments,
-        } = declaring
-        else {
-            return None;
-        };
-        let (namespace, _) = split_named(definition);
-        let open = self.get(
-            &namespace,
-            &definition_metadata_name(definition, arguments.len()),
-        )?;
-        if open.type_parameters.len() != arguments.len() {
-            return None;
-        }
+        let (open, type_parameters) = self.open_declaration(declaring)?;
         let declared = open.find_property(property)?;
         let open_ty = declared.ty.clone();
         Some(if want_setter {
             (
-                open.type_parameters.clone(),
+                type_parameters.clone(),
                 alloc::vec![open_ty],
                 TypeSymbol::Special(SpecialType::Void),
             )
         } else {
-            (open.type_parameters.clone(), Vec::new(), open_ty)
+            (type_parameters, Vec::new(), open_ty)
         })
     }
 
@@ -1239,23 +1292,9 @@ impl Model {
         declaring: &TypeSymbol,
         name: &str,
     ) -> Option<(Vec<Box<str>>, TypeSymbol)> {
-        let TypeSymbol::Instantiation {
-            definition,
-            arguments,
-        } = declaring
-        else {
-            return None;
-        };
-        let (namespace, _) = split_named(definition);
-        let open = self.get(
-            &namespace,
-            &definition_metadata_name(definition, arguments.len()),
-        )?;
-        if open.type_parameters.len() != arguments.len() {
-            return None;
-        }
+        let (open, type_parameters) = self.open_declaration(declaring)?;
         let field = open.find_field(name)?;
-        Some((open.type_parameters.clone(), field.ty.clone()))
+        Some((type_parameters, field.ty.clone()))
     }
 
     /// Resolves each type's base *class* -- the first of its declared bases that is
@@ -1775,6 +1814,7 @@ mod tests {
             is_required: false,
         });
         info.methods.push(MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
@@ -1794,6 +1834,7 @@ mod tests {
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
@@ -1813,6 +1854,7 @@ mod tests {
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),

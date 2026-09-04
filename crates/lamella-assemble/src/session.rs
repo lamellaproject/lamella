@@ -40,6 +40,9 @@ pub struct Session {
     /// The namespaces imported by `using` directives so far, in order (deduped), brought
     /// into scope for every submission so names resolve without qualification.
     imports: Vec<Box<str>>,
+    /// The types imported by `using static` directives so far, in order (deduped), as dotted
+    /// names -- brought into scope for every submission the same way `imports` is.
+    static_imports: Vec<Box<str>>,
     /// The types declared by submissions so far, in order. Each is emitted as a TypeDef in
     /// its declaring delta (the runtime adds it to the module) and kept here so later
     /// submissions bind + reference it by name.
@@ -77,6 +80,7 @@ impl Session {
             base_model,
             fields: Vec::new(),
             imports: Vec::new(),
+            static_imports: Vec::new(),
             types: Vec::new(),
             counter: 0,
         }
@@ -136,8 +140,13 @@ impl Session {
         let initial_fields = self.field_table();
         let occurrences = self.occurrences();
         let mut binder = Binder::with_model(model.clone());
-        for namespace in self.imports.iter().chain(new_imports.iter()) {
+        for namespace in self.imports.iter().chain(new_imports.namespaces.iter()) {
             binder.import_namespace(namespace);
+        }
+        for imported in self.static_imports.iter().chain(new_imports.static_types.iter()) {
+            binder.import_static_type(TypeSymbol::Named(
+                imported.split('.').map(Box::from).collect(),
+            ));
         }
         let binding = binder.bind_submission(
             repl_type.clone(),
@@ -176,7 +185,8 @@ impl Session {
                         ty: field.ty,
                     });
                 }
-                self.imports.extend(new_imports);
+                self.imports.extend(new_imports.namespaces);
+                self.static_imports.extend(new_imports.static_types);
                 self.types.extend(parsed.types);
                 self.counter = index;
                 SubmissionResult {
@@ -246,14 +256,21 @@ impl Session {
         counts
     }
 
-    /// The namespaces a submission's `using` directives import that are not already in
-    /// scope, as dotted strings, deduped against the session's imports and within the list.
-    /// Alias directives (`using X = T;`) are not handled yet.
-    fn new_imports(&self, usings: &[UsingDirective]) -> Vec<Box<str>> {
-        let mut new_imports: Vec<Box<str>> = Vec::new();
+    /// What a submission's `using` directives add to the session that is not already in scope, as
+    /// dotted strings, deduped against the session's own lists and within each list.
+    ///
+    /// **BOTH KINDS IN ONE PASS, BECAUSE A SECOND LOOP IS WHERE THE NEXT KIND GOES MISSING.**
+    /// `using static` arrived after this function was written and the `let ... else { continue }`
+    /// here dropped it in silence -- a REPL line importing `System.Math` would have compiled and
+    /// then failed on `Abs` with `CS0103`. Alias directives (`using X = T;`) are still not carried,
+    /// and that is now a named gap rather than a fallthrough.
+    fn new_imports(&self, usings: &[UsingDirective]) -> NewImports {
+        let mut new = NewImports::default();
         for directive in usings {
-            let UsingKind::Namespace(name) = &directive.kind else {
-                continue;
+            let (name, into, seen) = match &directive.kind {
+                UsingKind::Namespace(name) => (name, &mut new.namespaces, &self.imports),
+                UsingKind::Static(name) => (name, &mut new.static_types, &self.static_imports),
+                UsingKind::Alias { .. } => continue,
             };
             let mut dotted = String::new();
             for part in &name.parts {
@@ -262,17 +279,26 @@ impl Session {
                 }
                 dotted.push_str(part);
             }
-            let already = self
-                .imports
+            let already = seen
                 .iter()
-                .chain(new_imports.iter())
-                .any(|namespace| **namespace == *dotted);
+                .chain(into.iter())
+                .any(|existing| **existing == *dotted);
             if !already {
-                new_imports.push(dotted.into());
+                into.push(dotted.into());
             }
         }
-        new_imports
+        new
     }
+}
+
+/// What one submission's `using` directives newly bring into scope, by kind. Committed to the
+/// session only on a clean compile, which is why it is a value rather than a mutation.
+#[derive(Default)]
+struct NewImports {
+    /// Namespaces from `using N;`.
+    namespaces: Vec<Box<str>>,
+    /// Types from `using static N.T;`, as dotted names.
+    static_types: Vec<Box<str>>,
 }
 
 /// The symbol of the persistent REPL type `<repl>.__Repl`.

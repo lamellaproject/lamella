@@ -1,0 +1,141 @@
+# The ADC of the Microchip SAM D5x/E5x family -- the BLOCK layout. Register offsets are
+# ADC-instance-relative; nothing here names an instance, a pin, a board or a clock plan.
+#
+# THIS CONVERTER DOES NOT WORK OUT OF RESET AND THE MANUAL SAYS SO IN THOSE TERMS. Three production
+# calibration values live in the NVM Software Calibration Area and "must be loaded ... into the ADC
+# Calibration register (CALIB) by software TO ALLOW CONVERSION and to achieve specified accuracy".
+# Not merely to be accurate -- to convert at all. A driver that enables this block and starts a
+# conversion without doing that first has skipped a required step, and the way that presents is a
+# result register holding something rather than an error.
+#
+# AND THE THREE VALUES ARE PACKED IN A DIFFERENT ORDER IN THE TWO PLACES, which is the trap this
+# note exists for. Same three names, same three widths, middle two exchanged:
+#
+#                    in the NVM row        in the CALIB register
+#   BIASCOMP         lowest                lowest
+#   BIASREFBUF       middle                HIGHEST
+#   BIASR2R          highest               MIDDLE
+#
+# So a driver that reads the row and stores it, or that repacks the fields in the order it read
+# them, puts the reference buffer scaling into the rail-to-rail field and the rail-to-rail scaling
+# into the reference buffer field. Both are three-bit values in range, so nothing refuses, and the
+# converter runs mis-trimmed.
+
+[table]
+kind = "block"
+family = "same54"
+block = "adc"
+sources = [
+    "SAM D5x/E5x Family Data Sheet DS60001507F ch 45 (ADC): 45.8 Register Description, per-register Offset headings",
+    "DS60001507F 45.5.10 Calibration: the BIASREFBUF, BIASR2R and BIASCOMP values from the production test must be loaded from the NVM Software Calibration Area into CALIB by software to allow conversion and to achieve specified accuracy",
+    "DS60001507F 9.5 and Table 9-3 (NVM Software Calibration Area Mapping): the area is read at 0x00800080, with ADC0 BIASCOMP at 4:2, BIASREFBUF at 7:5, BIASR2R at 10:8, and ADC1 BIASCOMP at 18:16, BIASREFBUF at 21:19, BIASR2R at 24:22",
+    "DS60001507F 45.8.6 REFCTRL: the REFSEL value table",
+    "DS60001507F 45.8.8 CTRLB: the RESSEL value table",
+]
+notes = [
+    "EACH ADC's THREE CALIBRATION FIELDS ARE CONTIGUOUS AND EVENLY SPACED IN THE NVM ROW, three bits apart, so one bit position per instance locates all three: BIASCOMP at that position, BIASREFBUF three bits above it, BIASR2R six bits above it. That position is a per-instance fact and is stated on the instance row rather than here, because the two converters sit at different offsets in the same word.",
+    "A CONVERSION IS STARTED BY A STROBE AND FINISHED BY A FLAG, and neither is the register a reader looks at first: SWTRIG.START begins one and INTFLAG.RESRDY says the result is in RESULT. STATUS.ADCBUSY is a different question -- whether the converter is occupied -- and polling it instead of RESRDY reads a result that may be the previous conversion's.",
+    "ENABLE, SWRST and the enable-protected writes each have their own SYNCBUSY bit, and there are THIRTEEN of them rather than the usual three: INPUTCTRL, CTRLB, REFCTRL, AVGCTRL, SAMPCTRL and the window and correction registers all synchronize separately. Changing the input channel between conversions is therefore a write that must be waited on, which a driver sampling two pins in turn will meet on every switch.",
+    "REFSEL 0x6 (AREFC) EXISTS ON ONE INSTANCE ONLY. The value table states it as ADC1 only, so it is a value whose legality depends on which converter is being configured -- the block cannot refuse it and an instance-blind driver would not know to.",
+    "RESSEL 0x1 IS NOT A RESOLUTION IN THE SENSE THE OTHER VALUES ARE: the table names it 16BIT and describes it as the averaging-mode output rather than a 16-bit conversion. The converter is 12-bit; a 16-bit result is what accumulating several conversions produces.",
+    "DECLARED SUBSET: the window monitor (WINLT, WINUT and CTRLB.WINMODE), the digital correction registers (GAINCORR, OFFSETCORR, CTRLB.CORREN), the DMA sequencing registers (DSEQDATA, DSEQCTRL, DSEQSTAT), the dual-converter fields (CTRLA.DUALSEL, CTRLA.SLAVEEN) and RESS are placed or omitted without fields, because nothing consumes them yet and an undeclared field cannot be silently wrong.",
+]
+
+[registers.CTRLA]
+offset = 0x00
+width = 16
+fields = { SWRST = [0, 1], ENABLE = [1, 1], DUALSEL = [3, 2], SLAVEEN = [5, 1], RUNSTDBY = [6, 1], ONDEMAND = [7, 1], PRESCALER = [8, 3], R2R = [15, 1] }
+notes = "Enable-protected and write-synchronized. PRESCALER divides the peripheral channel clock down to the converter's own clock, which has a maximum this block does not state."
+
+[registers.EVCTRL]
+offset = 0x02
+width = 8
+fields = { FLUSHEI = [0, 1], STARTEI = [1, 1], FLUSHINV = [2, 1], STARTINV = [3, 1], RESRDYEO = [4, 1], WINMONEO = [5, 1] }
+notes = "Event input and output enables. Nothing here uses the event system; placed so the map is the manual's."
+
+[registers.DBGCTRL]
+offset = 0x03
+width = 8
+fields = { DBGRUN = [0, 1] }
+notes = "Whether the converter keeps running while the CPU is halted by a debugger."
+
+[registers.INPUTCTRL]
+offset = 0x04
+width = 16
+fields = { MUXPOS = [0, 5], DIFFMODE = [7, 1], MUXNEG = [8, 5], DSEQSTOP = [15, 1] }
+notes = "MUXPOS selects the positive input. WITH DIFFMODE CLEAR THE NEGATIVE INPUT IS INTERNALLY GROUNDED and MUXNEG is not consulted, so a single-ended read sets one field and leaves the other alone. Write-synchronized, and its own SYNCBUSY bit must be waited on before a conversion is started on the new channel."
+
+[registers.CTRLB]
+offset = 0x06
+width = 16
+fields = { LEFTADJ = [0, 1], FREERUN = [1, 1], CORREN = [2, 1], RESSEL = [3, 2], WINMODE = [8, 3], WINSS = [11, 1] }
+notes = "LEFTADJ shifts the result to the top of RESULT rather than the bottom, so a driver that ignores it reads a 12-bit value multiplied by 16 and still in range."
+
+[registers.REFCTRL]
+offset = 0x08
+width = 8
+fields = { REFSEL = [0, 4], REFCOMP = [7, 1] }
+notes = "The reference sets what full scale MEANS, so it is the difference between a count and a voltage. Write-synchronized."
+
+[registers.AVGCTRL]
+offset = 0x0A
+width = 8
+fields = { SAMPLENUM = [0, 4], ADJRES = [4, 3] }
+notes = "SAMPLENUM accumulates several conversions and ADJRES divides the sum back down. Averaging is what RESSEL's 16BIT setting exists for."
+
+[registers.SAMPCTRL]
+offset = 0x0B
+width = 8
+fields = { SAMPLEN = [0, 6], OFFCOMP = [7, 1] }
+notes = "Sampling time in converter clock cycles. A HIGH-IMPEDANCE SOURCE NEEDS MORE OF IT than the reset value gives, and the failure is a reading pulled toward whatever was sampled before rather than a refusal."
+
+[registers.SWTRIG]
+offset = 0x14
+width = 8
+fields = { FLUSH = [0, 1], START = [1, 1] }
+notes = "Both are strobes. Write-synchronized, so its SYNCBUSY bit is set by the write that starts a conversion."
+
+[registers.INTFLAG]
+offset = 0x2E
+width = 8
+fields = { RESRDY = [0, 1], OVERRUN = [1, 1], WINMON = [2, 1] }
+notes = "RESRDY is the flag that says RESULT holds this conversion. Cleared by writing a 1, and also cleared by reading RESULT."
+
+[registers.STATUS]
+offset = 0x2F
+width = 8
+fields = { ADCBUSY = [0, 1], WCC = [2, 6] }
+notes = "ADCBUSY answers whether the converter is occupied, which is NOT the same question as whether a result is ready; see the block header note."
+
+[registers.SYNCBUSY]
+offset = 0x30
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], INPUTCTRL = [2, 1], CTRLB = [3, 1], REFCTRL = [4, 1], AVGCTRL = [5, 1], SAMPCTRL = [6, 1], WINLT = [7, 1], WINUT = [8, 1], GAINCORR = [9, 1], OFFSETCORR = [10, 1], SWTRIG = [11, 1], RBSSW = [31, 1] }
+notes = "Read-only, and THIRTEEN separate bits rather than the three a simpler peripheral has. A driver waits on the bit for the register it just wrote, not on a single busy flag."
+
+[registers.RESULT]
+offset = 0x40
+width = 16
+fields = { RESULT = [0, 16] }
+notes = "Sixteen bits wide whatever RESSEL says, so a 12-bit conversion occupies the low twelve unless CTRLB.LEFTADJ moved it. Reading it clears INTFLAG.RESRDY."
+
+[registers.CALIB]
+offset = 0x48
+width = 16
+fields = { BIASCOMP = [0, 3], BIASR2R = [4, 3], BIASREFBUF = [8, 3] }
+notes = "THE FIELD ORDER HERE IS NOT THE NVM ROW's ORDER -- see the block header. BIASR2R sits in the middle here and highest there; BIASREFBUF the reverse. Every value is three bits, so a mis-ordered pack is in range and silent."
+
+# Values a driver selects from, rather than computes.
+[constants]
+NVM_CALIBRATION_AREA = 0x00800080
+NVM_BIASREFBUF_OFFSET = 3
+NVM_BIASR2R_OFFSET = 6
+RESSEL_12BIT = 0
+RESSEL_16BIT = 1
+RESSEL_10BIT = 2
+REFSEL_INTREF = 0
+REFSEL_INTVCC0 = 2
+REFSEL_INTVCC1 = 3
+REFSEL_AREFA = 4
+REFSEL_AREFB = 5
+REFSEL_AREFC = 6

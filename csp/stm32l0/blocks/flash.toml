@@ -1,6 +1,8 @@
-# BLOCK: the STM32L0x1 flash controller, stated ONLY as far as one fact that consumers outside the
+# BLOCK: the STM32L0x1 flash controller, stated ONLY as far as the facts consumers outside the
 # controller need. The controller itself -- its unlock sequences, its page geometry, its command
 # bits -- is not described here and is not this file's to describe.
+#
+# Two facts, and each `sources` entry names the one it backs.
 #
 # WHY THE ERASED VALUE IS A BLOCK FACT AND NOT A PART FACT. It is a property of the CONTROLLER, not
 # of a die: every STM32L0 category erases to zero -- 1, 2, 3 and 5, L0x1 and L0x3 alike -- and it
@@ -16,18 +18,27 @@
 # THIS FAMILY ERASES TO ZERO, WHICH INVERTS THE USUAL BLANK CHECK. A correctly erased part reads as
 # full and a full part reads as erased.
 #
+# THE WRITE UNIT IS ONE 32-BIT WORD, AND THE HALF-PAGE MODE DOES NOT CHANGE IT. RM0377 offers two
+# ways to program this array -- a word at a time, or sixteen words as one half-page -- and the
+# half-page is a THROUGHPUT mode with conditions attached: the address must be half-page aligned and
+# all sixteen words must fall in the same half-page. A consumer placing a value that has to appear
+# all-at-once takes the unit that is always available, not the one that is faster when it applies.
+#
 
 [table]
 kind = "block"
 family = "stm32l0"
 block = "flash"
 erased_value = 0x00000000
+write_unit = 4
 sources = [
-    "STM32L0x1 reference manual RM0377 Rev 10 section 3.3.4 and the FLASH_SR description: NOTZEROERR is raised when a program targets a word whose content is not zero, and outside category 3 devices the write is not performed at all -- which only coheres if an erased word IS zero",
-    "RM0377 Rev 10, the flash page-erase code example, which performs the erase by writing a zero word to an address inside the page",
-    "A read of the part: an STM32L011 erased, programmed and verified over SWD, whose freshly erased array reads zero rather than ones",
+    "erased_value: STM32L0x1 reference manual RM0377 Rev 10 section 3.3.4 and the FLASH_SR description: NOTZEROERR is raised when a program targets a word whose content is not zero, and outside category 3 devices the write is not performed at all -- which only coheres if an erased word IS zero",
+    "erased_value: RM0377 Rev 10, the flash page-erase code example, which performs the erase by writing a zero word to an address inside the page",
+    "erased_value: A read of the part: an STM32L011 erased, programmed and verified over SWD, whose freshly erased array reads zero rather than ones",
+    "write_unit: RM0377 Rev 10 section 3.2 `NVM main features`: `Programming in the Flash memory performed by word or half-page` -- a word being data of 32-bit length by that manual's own glossary in section 1",
+    "write_unit: RM0377 Rev 10 section 3.3.4, subheading `Parallel write half-page Flash program memory`, which states the conditions the half-page mode carries: the first address must be half-page aligned and all 16 words must lie in the same half-page",
 ]
 notes = [
-    "The 512 bytes of data EEPROM this family also carries are a separate array from the program flash. Nothing here states a value for them, and a consumer must not assume this one applies to that array.",
+    "The 512 bytes of data EEPROM this family also carries are a separate array from the program flash. Nothing here states a value for them, and a consumer must not assume this one applies to that array. RM0377 programs that array by word, half-word OR byte, which is a THIRD granularity and another reason not to read either fact here across to it.",
     "This block declares no registers. A block file is useful the moment it carries a fact a consumer needs, and the register map of this controller is read and owned elsewhere -- a partial transcription of it here would be a second spelling of somebody else's source.",
 ]

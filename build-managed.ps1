@@ -84,14 +84,27 @@ $Assemblies = @(
     # `Microsoft.SPOT.*` is already unambiguous about whose design it is, so the assembly takes NETMF's
     # own name with no prefix -- unlike the nanoFramework rows above, whose namespaces are `System.*`.
     # It shims onto System.Device.Gpio and so is built after it.
-    @{ name = 'Microsoft.SPOT.Hardware';                references = @('System.Device.Gpio') }
+    #
+    # HELD, and the hold is the same one `tools/build-corlib.ps1`'s `$buildSpot` already carries: this
+    # tier needs nested-type identity, which the compiler that builds it does not yet have. That
+    # script gates it and this one did not, so the row arrived here unconditional and took the whole
+    # script down with it. Delete the `held` line when the compiler lands it; nothing else changes.
+    @{ name = 'Microsoft.SPOT.Hardware';                references = @('System.Device.Gpio');
+       held = 'nested-type identity; see $buildSpot in tools/build-corlib.ps1' }
 )
 
 # An assembly present on disk but missing from the list above would be silently skipped, and a
 # library that nothing compiles is how a source file rots undetected. Fail instead.
+#
+# A FOLDED directory counts as listed. `extraSources` names a source set that builds INTO another
+# assembly rather than getting one of its own, so its files ARE compiled and the rot this guard
+# exists to catch cannot reach them. Reading only `name` made the first fold refuse the whole
+# script -- the guard fired on `System.Device.Pwm` the moment it stopped being an assembly, which
+# is the one shape a completeness check must not treat as absence.
 $onDisk = @(Get-ChildItem (Join-Path $root 'libs') -Directory |
     Where-Object { $_.Name -ne 'checks' } | ForEach-Object { $_.Name } | Sort-Object)
-$listed = @($Assemblies | ForEach-Object { $_.name } | Sort-Object)
+$listed = @($Assemblies | ForEach-Object { $_.name; $_.extraSources } |
+    Where-Object { $_ } | Sort-Object)
 $unlisted = @($onDisk | Where-Object { $listed -notcontains $_ })
 $missing = @($listed | Where-Object { $onDisk -notcontains $_ })
 if ($unlisted.Count) { throw "libs/ contains assemblies this script does not build: $($unlisted -join ', '). Add them to `$Assemblies (in dependency order)." }
@@ -163,8 +176,16 @@ Write-Host "corlib ($($corlibSrc.Count) sources) -> $corlibDll"
 if ($LASTEXITCODE -ne 0) { throw "corlib compile failed ($LASTEXITCODE)" }
 
 # --- libs --------------------------------------------------------------------------------------
+$built = @('corlib.dll')
 foreach ($assembly in $Assemblies) {
     $name = $assembly.name
+    # A held row is announced on every run rather than skipped quietly: a source set nothing
+    # compiles is the rot this script's completeness guard exists to catch, and a silent skip
+    # would reintroduce it one field lower down.
+    if ($assembly.held) {
+        Write-Host "$name -- HELD, not built: $($assembly.held)"
+        continue
+    }
     $src = @(Get-Sources (Join-Path $root "libs/$name"))
     if (-not $src.Count) { throw "libs/$name contains no .cs sources" }
     # Source directories that build INTO this assembly rather than getting one of their own.
@@ -179,6 +200,17 @@ foreach ($assembly in $Assemblies) {
     Write-Host "$name ($($src.Count) sources) -> $dll"
     & $Lcsc @src @langArg @defineArg @refs /target:library "/out:$dll" /debug-
     if ($LASTEXITCODE -ne 0) { throw "$name compile failed ($LASTEXITCODE)" }
+    $built += "$name.dll"
+}
+
+$folded = @($Assemblies | ForEach-Object { $_.extraSources } | Where-Object { $_ })
+$heldOut = @($Assemblies | Where-Object { $_.held } | ForEach-Object { $_.name })
+foreach ($gone in @($folded + $heldOut)) {
+    $stale = Join-Path $out "$gone.dll"
+    if (Test-Path $stale) {
+        Write-Host "$gone.dll -- REMOVED from $out, this script no longer produces it"
+        Remove-Item $stale
+    }
 }
 
 Write-Host ''
@@ -186,4 +218,6 @@ foreach ($f in (Get-ChildItem $out -Filter *.dll | Sort-Object Name)) {
     Write-Host ("  {0,-34} {1,9:N0} bytes" -f $f.Name, $f.Length)
 }
 Write-Host ''
-Write-Host "Done. $((Get-ChildItem $out -Filter *.dll).Count) assemblies in $out"
+# What this RUN produced, not what the directory holds. The two differ whenever a previous run
+# wrote something this one does not.
+Write-Host "Done. $($built.Count) assemblies built into $out ($((Get-ChildItem $out -Filter *.dll).Count) .dll files there, board assemblies included)"

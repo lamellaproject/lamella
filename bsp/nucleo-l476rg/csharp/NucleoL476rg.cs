@@ -5,7 +5,7 @@ namespace Lamella.Boards.St
 {
     public sealed class NucleoL476rg
     {
-        /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
+        /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = NucleoL476rgBindings.BOARD_MODEL;
 
         /// <summary>The ST-LINK virtual-COM UART (USART2, PA2 TX / PA3 RX at AF7, 115200-8N1

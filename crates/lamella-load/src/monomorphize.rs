@@ -692,22 +692,45 @@ pub(crate) fn monomorphize<'pe>(
         ));
     }
 
-    for (index, entry) in &mut emitted {
+    let base_of: Vec<Option<TypeId>> = emitted
+        .iter()
+        .map(|(index, entry)| {
+            let source = &sources[entry.source];
+            let extends = source.assembly.type_def(entry.def_row)?.extends();
+            instantiation_of_spec(
+                &source.assembly,
+                extends,
+                &instantiations[*index].arguments,
+                instantiations,
+                &emitted,
+            )
+            .or_else(|| {
+                base_type_of(
+                    module,
+                    &source.assembly,
+                    source.asm,
+                    source.type_offset,
+                    type_index,
+                    extends,
+                )
+            })
+        })
+        .collect();
+    for (position, (_, entry)) in emitted.iter().enumerate() {
+        module.set_type_base(entry.type_id, base_of[position]);
+    }
+    let order = inheritance_order(&emitted, &base_of);
+
+    for position in &order {
+        let (index, entry) = &mut emitted[*position];
         let want = &instantiations[*index];
-        let source = &sources[entry.source];
+        let owner_source = entry.source;
+        let source = &sources[owner_source];
         let assembly = &source.assembly;
         let Some(type_def) = assembly.type_def(entry.def_row) else {
             continue;
         };
-        let base = base_type_of(
-            module,
-            assembly,
-            source.asm,
-            source.type_offset,
-            type_index,
-            type_def.extends(),
-        );
-        module.set_type_base(entry.type_id, base);
+        let base = base_of[*position];
         let mut defaults = base
             .and_then(|base| module.type_field_defaults(base))
             .unwrap_or_default();
@@ -716,10 +739,15 @@ pub(crate) fn monomorphize<'pe>(
         for field in type_def.fields() {
             if field.is_static() {
                 if !field.is_literal() {
-                    let Some(substituted) = field
-                        .signature()
-                        .and_then(|sig| substitute(&sig, &want.arguments))
-                    else {
+                    let Some(declared) = field.signature() else {
+                        lowering.refusals.push(Refusal::UnboundAfterSubstitution {
+                            instantiation: want.name.clone(),
+                            token: 0,
+                        });
+                        refused = true;
+                        continue;
+                    };
+                    let Some(substituted) = substitute(&declared, &want.arguments) else {
                         lowering.refusals.push(Refusal::UnboundAfterSubstitution {
                             instantiation: want.name.clone(),
                             token: 0,
@@ -729,10 +757,10 @@ pub(crate) fn monomorphize<'pe>(
                     };
                     let zero = default_field_value_substituted(
                         module,
-                        assembly,
-                        source.asm,
-                        source.type_offset,
+                        sources,
+                        owner_source,
                         type_index,
+                        &declared,
                         &substituted,
                         &field_index.enum_zeros,
                     );
@@ -740,10 +768,15 @@ pub(crate) fn monomorphize<'pe>(
                 }
                 continue;
             }
-            let Some(substituted) = field
-                .signature()
-                .and_then(|sig| substitute(&sig, &want.arguments))
-            else {
+            let Some(declared) = field.signature() else {
+                lowering.refusals.push(Refusal::UnboundAfterSubstitution {
+                    instantiation: want.name.clone(),
+                    token: 0,
+                });
+                refused = true;
+                continue;
+            };
+            let Some(substituted) = substitute(&declared, &want.arguments) else {
                 lowering.refusals.push(Refusal::UnboundAfterSubstitution {
                     instantiation: want.name.clone(),
                     token: 0,
@@ -754,10 +787,10 @@ pub(crate) fn monomorphize<'pe>(
             entry.own_field_slots.push(defaults.len() as u32);
             defaults.push(default_field_value_substituted(
                 module,
-                assembly,
-                source.asm,
-                source.type_offset,
+                sources,
+                owner_source,
                 type_index,
+                &declared,
                 &substituted,
                 &field_index.enum_zeros,
             ));
@@ -784,25 +817,13 @@ pub(crate) fn monomorphize<'pe>(
         let mut resolved = Vec::new();
         for token in type_def.interfaces() {
             let interface_id = if token.table() == TYPE_SPEC {
-                assembly
-                    .type_spec_signature(token)
-                    .and_then(|sig| substitute(&sig, &want.arguments))
-                    .and_then(|closed| match closed {
-                        SigType::GenericInst {
-                            definition,
-                            arguments,
-                        } => {
-                            let definition_token = match definition.as_ref() {
-                                SigType::Class(token) | SigType::ValueType(token) => *token,
-                                _ => return None,
-                            };
-                            let name = definition_key(assembly, definition_token)?;
-                            let target =
-                                find_instantiation(instantiations, &emitted, &name, &arguments)?;
-                            Some(emitted[target].1.type_id)
-                        }
-                        _ => None,
-                    })
+                instantiation_of_spec(
+                    assembly,
+                    token,
+                    &want.arguments,
+                    instantiations,
+                    &emitted,
+                )
             } else {
                 module.type_id_of(asm, token).or_else(|| {
                     assembly
@@ -897,7 +918,6 @@ pub(crate) fn monomorphize<'pe>(
         };
         let assembly = &sources[source_index].assembly;
         let asm = sources[source_index].asm;
-        let type_offset = sources[source_index].type_offset;
         let want = &instantiations[index];
         let owner_statics = Some(OwnerLayout {
             def_row,
@@ -929,7 +949,6 @@ pub(crate) fn monomorphize<'pe>(
                     module,
                     assembly,
                     asm,
-                    type_offset,
                     sources,
                     source_index,
                     type_index,
@@ -966,7 +985,8 @@ pub(crate) fn monomorphize<'pe>(
         emitted[position].1.methods[method_position] = None;
     }
 
-    for (index, entry) in &emitted {
+    for position in &order {
+        let (index, entry) = &emitted[*position];
         let want = &instantiations[*index];
         let assembly = &sources[entry.source].assembly;
         let methods = definition_methods
@@ -1048,23 +1068,30 @@ pub(crate) fn monomorphize<'pe>(
         lowering.refusals.push(refusal);
         return lowering;
     }
-    bind_closed_type_specs(module, program, program_asm, instantiations, &emitted);
-    bind_closed_member_refs(
-        module,
-        program,
-        program_asm,
-        sources,
-        instantiations,
-        &emitted,
-        &definition_methods,
-        &mut lowering,
-    );
+    for source in sources {
+        bind_closed_type_specs(
+            module,
+            &source.assembly,
+            source.asm,
+            instantiations,
+            &emitted,
+        );
+        bind_closed_member_refs(
+            module,
+            &source.assembly,
+            source.asm,
+            sources,
+            instantiations,
+            &emitted,
+            &definition_methods,
+            &mut lowering,
+        );
+    }
 
     lower_method_pairs(
         module,
         program,
         program_asm,
-        sources[PROGRAM_SOURCE].type_offset,
         sources,
         type_index,
         field_index,
@@ -1076,6 +1103,34 @@ pub(crate) fn monomorphize<'pe>(
         &mut next_synthetic_row,
         &mut lowering,
     );
+
+    for (index, entry) in &emitted {
+        let Some(handle) = module.type_handle_of(entry.type_id) else {
+            continue;
+        };
+        let source = &sources[entry.source];
+        let Some(type_def) = source.assembly.type_def(entry.def_row) else {
+            continue;
+        };
+        let namespace = type_def.name().map_or(String::new(), |name| String::from(name.namespace));
+        let full_name = instantiations[*index].name.clone();
+        module.bind_reflect_type(
+            handle,
+            lamella_cil_runtime::module::ReflectType {
+                namespace,
+                full_name,
+                is_enum: false,
+                is_value_type: entry.is_value_type,
+                is_interface: type_def.is_interface(),
+                is_abstract: type_def.is_abstract(),
+                is_public: type_def.is_public(),
+                base_handle: module
+                    .type_base(entry.type_id)
+                    .and_then(|base| module.type_handle_of(base))
+                    .unwrap_or(0),
+            },
+        );
+    }
 
     lowering
 }
@@ -1137,7 +1192,6 @@ fn lower_method_pairs<'pe>(
     _module: &mut Module,
     _assembly: &Assembly<'pe>,
     _asm: u8,
-    _type_offset: Option<usize>,
     _sources: &[DefinitionSource<'pe>],
     _type_index: &TypeNameIndex,
     _field_index: &FieldNameIndex,
@@ -1203,7 +1257,6 @@ fn lower_method_pairs<'pe>(
     module: &mut Module,
     assembly: &Assembly<'pe>,
     asm: u8,
-    type_offset: Option<usize>,
     sources: &[DefinitionSource<'pe>],
     type_index: &TypeNameIndex,
     field_index: &FieldNameIndex,
@@ -1393,7 +1446,6 @@ fn lower_method_pairs<'pe>(
                     module,
                     assembly,
                     asm,
-                    type_offset,
                     sources,
                     PROGRAM_SOURCE,
                     type_index,
@@ -1921,6 +1973,42 @@ pub(crate) fn mentions_parameter(sig: &SigType) -> bool {
     }
 }
 
+/// Whether substituting `sig` yields one of the ARGUMENTS rather than something the body wrote --
+/// i.e. whether every token in the substituted form belongs to the assembly that spelled the
+/// instantiation instead of to the assembly the body was copied out of.
+///
+/// # Why a predicate, and why it is not [`mentions_parameter`]
+///
+/// A body copied out of a reference and the arguments it is copied FOR are two assemblies, and a
+/// token means nothing outside the one that wrote it. Substitution mixes them: `!0` is replaced
+/// wholesale by an argument, while a `TypeSpec` naming `` List`1<!0> `` keeps the definition's own
+/// `TypeDefOrRef` for `` List`1 `` and takes an argument only inside. So "does this mention a
+/// parameter" (which is what makes a site OPEN) is a different question from "whose tables does the
+/// RESULT resolve against", and answering the second with the first is what read a program's row
+/// number against the corlib's tables.
+///
+/// **Getting it wrong is loud or silent by luck, not by kind.** Reading an argument's token
+/// against the body's tables answers with whatever that assembly has at that row number: a real
+/// and unrelated type where it has one, so a boxed receiver dispatches to the wrong type's method
+/// and two equal values answer NOT EQUAL, and nothing at all where it has none, so the call
+/// refuses. **One cause, and which of the two you get depends only on whether the other assembly
+/// happens to hold a row of that number.**
+///
+/// Transparent through the wrappers a substitution carries through -- an array, a pointer, a
+/// by-ref -- because those introduce no token of their own, so the only token in the result is
+/// still the argument's. A `GenericInst` is NOT transparent: its definition token is the body's
+/// whatever its arguments are, and [`bind_type_operand`]'s own arm reads exactly that.
+fn substituted_is_an_argument(sig: &SigType) -> bool {
+    match sig {
+        SigType::Var(_) | SigType::MVar(_) => true,
+        SigType::SzArray(inner) | SigType::Pointer(inner) | SigType::ByRef(inner) => {
+            substituted_is_an_argument(inner)
+        }
+        SigType::Array { element, .. } => substituted_is_an_argument(element),
+        _ => false,
+    }
+}
+
 /// `sig` with `!n` replaced by `type_arguments[n]` and `!!n` by `method_arguments[n]`.
 ///
 /// # The type axis passes an EMPTY `method_arguments`, and that is how its rule survives
@@ -2033,25 +2121,44 @@ fn substituted_sig_key<'pe>(
     Some(super::sig_encode(assembly, name, &substituted, generic_arity, &[]))
 }
 
-/// The zero value one substituted field signature takes.
+/// The zero value one substituted field signature takes, read in the world that wrote it.
+///
+/// **`Nullable<T>.GetValueOrDefault()` is where ordinary code reads one.** An instance whose
+/// `HasValue` is false has never had its `value` field written, so what it hands back IS this
+/// default -- which made the world question observable rather than latent: at a program struct the
+/// field defaulted to null and reading a field off it trapped, at a program enum it defaulted to a
+/// struct where the underlying integer's zero belongs, and at a primitive it was correct, because a
+/// payload-free argument carries no token to resolve.
 fn default_field_value_substituted<'pe>(
     module: &Module,
-    assembly: &Assembly<'pe>,
-    asm: u8,
-    type_offset: Option<usize>,
+    sources: &[DefinitionSource<'pe>],
+    owner_source: usize,
     type_index: &TypeNameIndex,
-    sig: &SigType,
+    declared: &SigType,
+    substituted: &SigType,
     enum_zeros: &BTreeMap<String, Value>,
 ) -> Value {
-    if let SigType::ValueType(token) = sig {
-        if let Some(name) = assembly.type_token_name(*token) {
+    let world = &sources[if substituted_is_an_argument(declared) {
+        PROGRAM_SOURCE
+    } else {
+        owner_source
+    }];
+    if let SigType::ValueType(token) = substituted {
+        if let Some(name) = world.assembly.type_token_name(*token) {
             if let Some(zero) = enum_zeros.get(&type_name_key(name)) {
                 return zero.clone();
             }
         }
     }
-    struct_zero_of_sig(module, assembly, asm, type_offset, type_index, sig)
-        .unwrap_or_else(|| default_field_value(Some(sig.clone())))
+    struct_zero_of_sig(
+        module,
+        &world.assembly,
+        world.asm,
+        world.type_offset,
+        type_index,
+        substituted,
+    )
+    .unwrap_or_else(|| default_field_value(Some(substituted.clone())))
 }
 
 /// A zero INSTANCE of a substituted signature naming a STRUCT, or `None` when the signature names
@@ -2115,6 +2222,89 @@ fn base_type_of<'pe>(
             .and_then(|name| type_index.get(&type_name_key(name)).copied()),
         _ => None,
     }
+}
+
+/// The emitted instantiation a `TypeSpec` token names, closed under `arguments` -- the base of
+/// `class Derived<T> : Base<T>` at `Derived<int>`, or an interface row that mentions `T`.
+///
+/// `None` for any other table, for a `TypeSpec` that is not a `GENERICINST` (an array or pointer
+/// one is perfectly ordinary and simply not this), for one that does not close under `arguments`
+/// (a method type parameter reaches here), and for one naming an instantiation this pass did not
+/// emit. **Every one of those is a decline rather than a guess**: the caller then falls back to the
+/// ordinary `TypeDefOrRef` resolution, or leaves the link absent, which is where it was.
+///
+#[cfg(feature = "generics")]
+fn instantiation_of_spec<'pe>(
+    assembly: &Assembly<'pe>,
+    token: Token,
+    arguments: &[SigType],
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+) -> Option<TypeId> {
+    if token.table() != TYPE_SPEC {
+        return None;
+    }
+    let SigType::GenericInst {
+        definition,
+        arguments: closed,
+    } = substitute(&assembly.type_spec_signature(token)?, arguments)?
+    else {
+        return None;
+    };
+    let definition_token = match definition.as_ref() {
+        SigType::Class(token) | SigType::ValueType(token) => *token,
+        _ => return None,
+    };
+    let name = definition_key(assembly, definition_token)?;
+    let target = find_instantiation(instantiations, emitted, &name, &closed)?;
+    Some(emitted[target].1.type_id)
+}
+
+/// The capability-off answer: there is no instantiation set, so no `TypeSpec` names one.
+#[cfg(not(feature = "generics"))]
+fn instantiation_of_spec<'pe>(
+    _assembly: &Assembly<'pe>,
+    _token: Token,
+    _arguments: &[SigType],
+    _instantiations: &[Instantiation],
+    _emitted: &[(usize, Emitted)],
+) -> Option<TypeId> {
+    None
+}
+
+/// A permutation of `emitted`'s positions in which a base always precedes the instantiations that
+/// inherit from it, so field layout and vtable construction each need one linear pass.
+///
+fn inheritance_order(emitted: &[(usize, Emitted)], base_of: &[Option<TypeId>]) -> Vec<usize> {
+    let position_of: BTreeMap<TypeId, usize> = emitted
+        .iter()
+        .enumerate()
+        .map(|(position, (_, entry))| (entry.type_id, position))
+        .collect();
+    let mut order: Vec<usize> = Vec::with_capacity(emitted.len());
+    let mut placed: Vec<bool> = alloc::vec![false; emitted.len()];
+    for _ in 0..emitted.len() {
+        let mut progressed = false;
+        for position in 0..emitted.len() {
+            if placed[position] {
+                continue;
+            }
+            let ready = match base_of[position].and_then(|base| position_of.get(&base)) {
+                Some(&base) => placed[base],
+                None => true,
+            };
+            if ready {
+                placed[position] = true;
+                order.push(position);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    order.extend((0..emitted.len()).filter(|position| !placed[*position]));
+    order
 }
 
 /// The full name, with its arity backtick, of the one generic definition ECMA-335 special-cases in
@@ -2273,6 +2463,31 @@ fn find_instantiation_named(
     find_instantiation(instantiations, emitted, definition, arguments)
 }
 
+/// One parameter of a member signature, closed under `arguments` and spelled canonically -- the
+/// form in which a call SITE's parameter and a DEFINITION's parameter can be compared across an
+/// assembly boundary. `None` without the `generics` capability, or when the parameter does not
+/// close (a method type parameter) or does not spell.
+///
+#[cfg(feature = "generics")]
+fn spell_closed_param(
+    assembly: &Assembly<'_>,
+    param: &SigType,
+    arguments: &[SigType],
+) -> Option<String> {
+    let closed = substitute(param, arguments)?;
+    lamella_generics::spell_sig(assembly, &closed)
+}
+
+/// The capability-off answer: no instantiation set, so nothing to spell against.
+#[cfg(not(feature = "generics"))]
+fn spell_closed_param(
+    _assembly: &Assembly<'_>,
+    _param: &SigType,
+    _arguments: &[SigType],
+) -> Option<String> {
+    None
+}
+
 /// The canonical name of `open` instantiated with `arguments`, with the two sides read against the
 /// assemblies they were actually written in -- the definition against `definition_assembly`, every
 /// argument against `argument_assembly`. `None` without the `generics` capability, or when either
@@ -2299,7 +2514,6 @@ fn bind_open_token<'pe>(
     module: &mut Module,
     assembly: &Assembly<'pe>,
     asm: u8,
-    type_offset: Option<usize>,
     sources: &[DefinitionSource<'pe>],
     owner_source: usize,
     type_index: &TypeNameIndex,
@@ -2379,11 +2593,15 @@ fn bind_open_token<'pe>(
                     instantiation: owner.into(),
                     token: site.token.0,
                 })?;
+            let operand = &sources[if substituted_is_an_argument(&sig) {
+                PROGRAM_SOURCE
+            } else {
+                owner_source
+            }];
             bind_type_operand(
                 module,
-                assembly,
+                operand,
                 asm,
-                type_offset,
                 type_index,
                 instantiations,
                 emitted,
@@ -2500,12 +2718,28 @@ fn bind_open_token<'pe>(
 
 /// Binds a rewritten TYPE token -- the operand of `newobj`'s type, `castclass`, `isinst`, `box`,
 /// `newarr`, `ldtoken`, `initobj`, `constrained.`.
+///
+/// **TWO ASSEMBLY IDS, AND THEY ANSWER DIFFERENT QUESTIONS.** `site_asm` is WHERE the synthetic
+/// token is registered -- the token space the rewritten body resolves against, which is the
+/// assembly the body was copied out of and nothing else. `operand` is the world the SUBSTITUTED
+/// SIGNATURE was written in, which is the assembly that spelled the instantiation whenever `!n` was
+/// what got substituted. Everything that READS a token takes `operand`; everything that REGISTERS
+/// one takes `site_asm`.
+///
+/// **Collapsing the two fails in both directions and neither failure is loud.** Reading the operand
+/// in the body's world resolves a program row number against the definition's tables, which names a
+/// real and unrelated type or nothing at all. Registering under the operand's world binds the
+/// synthetic token in a space the copied CIL never consults, so the site resolves to nothing --
+/// including for a payload-free argument that carries no token anywhere in it.
+///
+/// The caller picks the operand's world once ([`substituted_is_an_argument`]) so the three
+/// consumers here share one answer, rather than each getting the choice right separately: three
+/// careful calls is the arrangement where the fourth is added without one.
 #[allow(clippy::too_many_arguments)]
 fn bind_type_operand<'pe>(
     module: &mut Module,
-    assembly: &Assembly<'pe>,
-    asm: u8,
-    type_offset: Option<usize>,
+    operand: &DefinitionSource<'pe>,
+    site_asm: u8,
     type_index: &TypeNameIndex,
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
@@ -2514,16 +2748,22 @@ fn bind_type_operand<'pe>(
     synthetic: Token,
     substituted: &SigType,
 ) -> Result<(), Refusal> {
+    let DefinitionSource {
+        assembly,
+        asm,
+        type_offset,
+    } = operand;
+    let (asm, type_offset) = (*asm, *type_offset);
     let unbound = || Refusal::UnboundAfterSubstitution {
         instantiation: owner.into(),
         token: site.token.0,
     };
 
-    module.bind_cast_elem(asm, synthetic, cast_elem_of_sig(asm, substituted));
+    module.bind_cast_elem(site_asm, synthetic, cast_elem_of_sig(asm, substituted));
     if matches!(site.opcode, Opcode::Newarr) {
         let zero = struct_zero_of_sig(module, assembly, asm, type_offset, type_index, substituted)
             .unwrap_or_else(|| default_field_value(Some(substituted.clone())));
-        module.bind_array_default(asm, synthetic, zero);
+        module.bind_array_default(site_asm, synthetic, zero);
     }
     match substituted {
         SigType::GenericInst {
@@ -2541,26 +2781,26 @@ fn bind_type_operand<'pe>(
                     wanted: definition_name.clone(),
                 })?;
             let (target_index, target_entry) = &emitted[target];
-            module.bind_type_token(asm, synthetic, target_entry.type_id);
-            module.bind_type_name(asm, synthetic, instantiations[*target_index].name.clone());
+            module.bind_type_token(site_asm, synthetic, target_entry.type_id);
+            module.bind_type_name(site_asm, synthetic, instantiations[*target_index].name.clone());
             Ok(())
         }
         SigType::Class(token) | SigType::ValueType(token) => {
             let name = assembly.type_token_name(*token).ok_or_else(unbound)?;
             if let Some(&type_id) = type_index.get(&type_name_key(name)) {
-                module.bind_type_token(asm, synthetic, type_id);
+                module.bind_type_token(site_asm, synthetic, type_id);
             }
-            module.bind_type_name(asm, synthetic, name.name.into());
+            module.bind_type_name(site_asm, synthetic, name.name.into());
             Ok(())
         }
         other => {
             let display = primitive_display_name(other);
             if !display.is_empty() {
                 if let Some(&type_id) = type_index.get(&type_key("System", display)) {
-                    module.bind_type_token(asm, synthetic, type_id);
+                    module.bind_type_token(site_asm, synthetic, type_id);
                 }
             }
-            module.bind_type_name(asm, synthetic, display.into());
+            module.bind_type_name(site_asm, synthetic, display.into());
             Ok(())
         }
     }
@@ -2828,9 +3068,30 @@ fn bind_closed_member_refs<'pe>(
             .get(&(entry.source, entry.def_row))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let spelled_site: Option<Vec<String>> = params
+            .iter()
+            .map(|param| spell_closed_param(assembly, param, &want.arguments))
+            .collect();
         let Some(position) = methods
             .iter()
-            .position(|method| method.name == name && method.params == params)
+            .position(|method| {
+                if method.name != name {
+                    return false;
+                }
+                if method.params == params {
+                    return true;
+                }
+                let Some(site) = spelled_site.as_ref() else {
+                    return false;
+                };
+                if method.params.len() != site.len() {
+                    return false;
+                }
+                method.params.iter().zip(site).all(|(declared, spelled)| {
+                    spell_closed_param(definition_assembly, declared, &want.arguments)
+                        .is_some_and(|name| &name == spelled)
+                })
+            })
         else {
             lowering.refusals.push(Refusal::UnboundAfterSubstitution {
                 instantiation: want.name.clone(),

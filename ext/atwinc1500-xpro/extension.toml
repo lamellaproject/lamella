@@ -1,0 +1,124 @@
+# EXTENSION binding: the WINC1500-XPRO, an ATWINC15x0-MR210xB Wi-Fi module on an Xplained Pro
+# extension board. Every line below names a SIGNAL of the ../standards/xplained-pro.toml standard
+# and never a host pad, because this board carries no host: its own guide says it "connects to any
+# Xplained Pro standard extension header on any Xplained Pro MCU board". Which pad a signal reaches
+# is the HOST's fact and lives in that host's `[[headers]]` row.
+#
+# SPI IS THE ONLY HOST INTERFACE, and the guide says so outright. The UART and I2C lines this
+# connector carries are development and debug paths, not the way a program talks to the radio -- and
+# both can be physically separated from the host by removing resistors (R117/R118 for the UART,
+# R107/R108 for the I2C). A driver that reached for the UART would be using a debug connector.
+#
+# THE TWO LEDS HAVE NO HOST PIN AT ALL. There is one dual green/red LED and the MODULE drives it,
+# from its own GPIO 5 and GPIO 6. Nothing on the extension header reaches it, so no row here offers
+# one and no constant is emitted for it -- the same treatment the Pico W's LED and the Opta's four
+# faceplate LEDs have, and for the same reason: a property that compiles and does nothing is worse
+# than one that does not compile.
+#
+# AND THERE IS A SECOND SLAVE ON THIS BOARD THAT IS NOT THE RADIO. An ATECC508A CryptoAuthentication
+# device sits on the SAME I2C lines as the module, with the host as master. Reaching it is a
+# resistor change rather than a software choice on a stock board, which is why it is recorded and
+# not bound.
+
+[table]
+kind = "extension"
+extension = "atwinc1500-xpro"
+vendor = "microchip"
+standard = "xplained-pro"
+kit_identifier = 2442
+sources = [
+    "WINC1500-XPRO User's Guide DS50002616A section 4.1.1, Table 4-1 (WINC1500-XPRO Extension Header): pin 1 ID_DATA, 2 GND, 3 NC, 4 NC, 5 RESET_N active-low hard reset to the board, 6 WAKE active-high host wake control signal to the wireless module, 7 NC, 8 NC, 9 IRQN interrupt output from the wireless module to the host, 10 CHIP_EN active-high module enable signal to the wireless module from the host, 11 I2C_SDA, 12 I2C_SCL, 13 UART_RX, 14 UART_TX, 15 SPI_SSN active-low slave select of the SPI interface to the wireless module from the host, 16 SPI_MOSI, 17 SPI_MISO, 18 SPI_SCK, 19 GND, 20 VCC_TARGET target 3.3V supply from the host MCU board.",
+    "DS50002616A section 4.2.1, Table 4-5 (ATWINC15x0-MR210xB Control Signals), which gives the same eight signals as module pin numbers: extension 5 to module 4 RESET_N, 6 to 11 WAKE, 9 to 13 IRQ_N, 10 to 22 CHIP_EN, 15 to 16 SPI_SSN, 16 to 15 SPI_MOSI, 17 to 17 SPI_MISO, 18 to 18 SPI_SCK. Two tables, one connector, and they agree -- which is the cross-check, since the header table alone could be a transcription.",
+    "DS50002616A section 4.1.1 prose: SPI is the only host interface of the wireless module; the UART is for debug and the I2C for development debug, reached at connectors J103 and J104, and the UART and I2C connections to the host can be separated by removing R117/R118 and R107/R108 respectively.",
+    "DS50002616A section 4.2.2, Table 4-6 (LED Connection): one dual green/red LED driven by the module's own pin 27 (GPIO 5, green) and pin 1 (GPIO 6, red). DS50002616A section 4.2.3, Table 4-7 (Crypto Device Connection): an ATECC508A sharing the module's I2C lines, module pin 3 I2C data and pin 2 I2C clock, with the host MCU as master.",
+    "DS50002616A section 2: the board is designed to connect to the header marked EXT1 and is compatible with all Xplained Pro EXT headers.",
+    "DS50002616A section 4.3 (Hardware Revision History): the product identifier for the WINC1500-XPRO is A09-2442, which is the nnnn field of the nnnnrrssssssssss serial the board's identification chip carries.",
+]
+notes = [
+    "FOUR OF THE FIVE CONTROL LINES CARRY A DOCUMENTED POLARITY AND THE FIFTH DOES NOT. RESET_N, CHIP_EN, WAKE and SPI_SSN are each described with their active level in words; IRQN is described only as an interrupt output from the module to the host. It therefore states `unknown` rather than borrowing the level its name implies -- an `_N` suffix is a vendor habit, not a statement, and this driver's own host seam calling it active low is our code rather than a document about this board.",
+    "The four unconnected pins are stated rather than left out. A reader comparing this file against a host's header needs to know that the ADC and PWM lines are unconnected on THIS board rather than absent from the standard -- those four pins are the standard's analog and PWM pairs, and an extension that used them would find them waiting.",
+    "The eight signals this board uses fall entirely inside the standard: SPI plus the four general-purpose lines. It takes GPIO1 and GPIO2 for RESET_N and WAKE, IRQ for IRQN and SPI_SS_B for CHIP_EN, which is what those lines are for -- so it is a conforming extension even though four of its names are its own.",
+]
+
+# --- the bus -----------------------------------------------------------------------------------
+#
+# ONE SPI BUS, AND IT TAKES THE PREFERRED SELECT. The standard asks that SPI_SS_A preferably not be
+# connected to anything else, and this board honors that: its SPI_SSN is on pin 15, leaving
+# SPI_SS_B free -- which is exactly why CHIP_EN can have it.
+
+[[buses]]
+role = "winc-spi"
+kind = "spi"
+ss = "spi_ss_a"
+mosi = "spi_mosi"
+miso = "spi_miso"
+sck = "spi_sck"
+source = "DS50002616A Table 4-1 pins 15 to 18, cross-checked against Table 4-5's module pin numbers."
+
+# The debug I2C. Declared because two slaves sit on it and a reader needs to know the bus exists;
+# NOT bound to a role, because on a stock board it reaches the module rather than the crypto device
+# and choosing between them is a resistor change.
+
+[[buses]]
+role = "winc-debug-i2c"
+kind = "i2c"
+sda = "i2c_sda"
+scl = "i2c_scl"
+source = "DS50002616A Table 4-1 pins 11 and 12, and section 4.2.3: the same two lines are shared between the wireless module and the ATECC508A, with the host as master."
+
+# --- control lines -----------------------------------------------------------------------------
+
+[[devices]]
+name = "reset_n"
+kind = "gpio-out"
+signal = "gpio1"
+active = "low"
+source = "DS50002616A Table 4-1 pin 5: active-low hard reset to the board. Table 4-5 gives the same line as module pin 4, RESET_N."
+
+[[devices]]
+name = "wake"
+kind = "gpio-out"
+signal = "gpio2"
+active = "high"
+source = "DS50002616A Table 4-1 pin 6: active-high host wake control signal to the wireless module. Table 4-5 gives it as module pin 11, WAKE."
+
+[[devices]]
+name = "chip_en"
+kind = "gpio-out"
+signal = "spi_ss_b"
+active = "high"
+source = "DS50002616A Table 4-1 pin 10: active-high module enable signal to the wireless module from the host. Table 4-5 gives it as module pin 22, CHIP_EN. It sits on the standard's SECOND slave select, used here as the general-purpose line that pin also is."
+
+[[devices]]
+name = "irq_n"
+kind = "gpio-in"
+signal = "irq"
+active = "unknown"
+source = "DS50002616A Table 4-1 pin 9 and Table 4-5 module pin 13 both name this line IRQ_N and describe it as an interrupt output from the wireless module to the host. NEITHER STATES AN ACTIVE LEVEL, and no other document on this bench does either, so none is claimed here."
+
+# --- what is on the board, reached over a bus ---------------------------------------------------
+
+[[devices]]
+name = "radio"
+kind = "spi-device"
+bus = "winc-spi"
+part = "atwinc15x0-mr210xb"
+source = "DS50002616A section 1.2: the WINC1500-XPRO is an extension board for the SmartConnect ATWINC15x0-MR210xB Wi-Fi module. Section 4.2.1: SPI is the only host interface."
+
+[[devices]]
+name = "crypto"
+kind = "i2c-device"
+bus = "winc-debug-i2c"
+part = "atecc508a"
+address = 0x60
+source = "DS50002616A section 4.2.3: a CryptoAuthentication ATECC508A shares the module's I2C lines, module pin 3 data and pin 2 clock, host as master. The address is the part's DEFAULT and not a wiring fact: DS20005927A gives configuration zone byte 16 as I2C_Address with a default of 0xC0, whose bits 7-1 form the device address the part answers to, which is 0x60 as a seven-bit address. DS20005928A Table 1 gives the whole pinout as VCC, GND, SDA, SCL and five no-connects, so there are no address pins to strap, and DS20005927A states that all seven bits are programmable in the configuration zone. So two units of this module can answer differently, and one whose configuration zone has been locked cannot be changed back. Reaching it on a stock board also means removing R107 and R108 to separate the module from the same two lines, and possibly mounting pull-ups R104 and R105 -- a hardware change, so this row records the part rather than binding it."
+
+# --- what has no pin, stated so a program cannot reach for it ------------------------------------
+#
+# The dual green/red LED is driven by the MODULE's own GPIO 5 and GPIO 6 and reaches no pin of this
+# connector. It is named here so a reader knows the board has one and knows why nothing offers it.
+
+[[unbound]]
+name = "status-led"
+reason = "One dual green/red LED, driven by the module's own GPIO 5 (green, module pin 27) and GPIO 6 (red, module pin 1). No line of the extension header reaches it, so a host cannot drive it and no constant is emitted for it. Whatever lights it is the module's firmware, and this guide does not say what."
+source = "DS50002616A section 4.2.2, Table 4-6 (LED Connection)."

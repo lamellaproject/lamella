@@ -9,7 +9,7 @@ description = "Harvests the neutral chip/board fact strata and emits the generat
 publish = false
 
 [dev-dependencies]
-# The board-identity gate: every bsp/*/board.toml's board_model code must
+# The board-identity gate: every bsp/*/board.toml's product_model code must
 # be one lamella-wire's canonical map knows, and unique across boards -- the wire crate stays
 # the ONE map; the gate needs no mirrored table.
 lamella-wire = { path = "../lamella-wire" }

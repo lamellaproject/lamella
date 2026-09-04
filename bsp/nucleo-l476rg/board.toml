@@ -7,7 +7,7 @@ board = "nucleo-l476rg"
 vendor = "st"
 family = "stm32l476"
 part = "stm32l476rg"
-board_model = 8             # lamella_wire::board_model::STM32L476
+product_model = 8           # lamella_wire::product_model::STM32L476
 sources = ["Nucleo-64 user manual UM1724 (ST-LINK VCP = USART2 on PA2/PA3; LD2 = PA5)"]
 
 [[carriers]]

@@ -7,6 +7,8 @@ namespace Lamella.Generated
 
         public const int BOARD_MODEL = 26;
         public const string BOARD_VENDOR = "Atmel";
+        public const uint CARRIER_USB_VID = 0x03EB;
+        public const uint CARRIER_USB_PID = 0x2111;
 
         public const uint LED0_PORT_BASE = 0x400E1400;
         public const uint LED0_PIN = 22;

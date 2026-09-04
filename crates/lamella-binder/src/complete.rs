@@ -74,20 +74,27 @@ impl Completion {
 /// Completions for the caret at byte `offset` in `source`, given the parsed `unit` and
 /// the bound `model`. After a `.`, the receiver's members (a value/type) or the members
 /// of a namespace (`System.` -> its types and child namespaces); otherwise the names in
-/// scope. Generics (a C# 2.0 feature) are never offered for the 1.0 target.
+/// scope.
+///
+/// **`version` IS THE RUNG THE CALLER COMPILES AT, AND IT IS A PARAMETER BECAUSE READING A
+/// CONSTANT HERE MADE THE EDITOR DISAGREE WITH ITSELF.** This read `LanguageVersion::DEFAULT`
+/// while `lamella-wasm` compiled at `SELECTABLE_MAX`, so the browser offered a C# 1.0 completion
+/// surface -- no generic type in the list -- and then compiled the same buffer at the ceiling.
+/// A caller with one rung has to be able to say so once.
 #[must_use]
 pub fn complete(
     source: &str,
     unit: &CompilationUnit,
     model: &Model,
     offset: usize,
+    version: LanguageVersion,
 ) -> Vec<Completion> {
     let mut items = if let Some(receiver) = receiver_expression(source, offset) {
         qualified_completions(unit, model, offset, receiver)
     } else {
         scope_completions(source, unit, model, offset)
     };
-    if !LanguageVersion::DEFAULT.supports(Feature::Generics) {
+    if !version.supports(Feature::Generics) {
         items.retain(|item| !item.label.contains('`'));
     }
     items
@@ -899,7 +906,7 @@ mod tests {
         let mut model = Model::new();
         collect_into(&mut model, &unit);
         model.link_bases();
-        complete(source, &unit, &model, offset)
+        complete(source, &unit, &model, offset, LanguageVersion::DEFAULT)
             .iter()
             .map(|item| item.label.to_string())
             .collect()
@@ -946,7 +953,7 @@ mod tests {
         collect_into(&mut model, &unit);
         model.link_bases();
         let offset = source.find("w.").unwrap() + 2;
-        let items = complete(source, &unit, &model, offset);
+        let items = complete(source, &unit, &model, offset, LanguageVersion::DEFAULT);
 
         let add = items.iter().find(|item| &*item.label == "Add").expect("Add");
         assert_eq!(add.kind, CompletionKind::Method);
@@ -1016,7 +1023,7 @@ mod tests {
         let mut model = Model::new();
         collect_into(&mut model, &unit);
         model.link_bases();
-        complete(source, &unit, &model, offset)
+        complete(source, &unit, &model, offset, LanguageVersion::DEFAULT)
             .iter()
             .map(|item| item.label.to_string())
             .collect()
@@ -1066,9 +1073,9 @@ mod tests {
         model
     }
 
-    fn namespace_labels(model: &Model, source: &str) -> Vec<String> {
+    fn namespace_labels(model: &Model, source: &str, version: LanguageVersion) -> Vec<String> {
         let unit = parse_compilation_unit(source).unit;
-        complete(source, &unit, model, source.len())
+        complete(source, &unit, model, source.len(), version)
             .iter()
             .map(|item| item.label.to_string())
             .collect()
@@ -1082,7 +1089,7 @@ mod tests {
             ("System.IO", "Stream"),
             ("System.Collections", "ArrayList"),
         ]);
-        let labels = namespace_labels(&model, "System.");
+        let labels = namespace_labels(&model, "System.", LanguageVersion::DEFAULT);
         assert!(labels.contains(&"Console".to_string()), "got {labels:?}");
         assert!(labels.contains(&"String".to_string()), "got {labels:?}");
         assert!(labels.contains(&"IO".to_string()), "got {labels:?}");
@@ -1097,7 +1104,7 @@ mod tests {
             ("System.Collections.Generic", "Dictionary`2"),
             ("System.Collections.Generic", "Marker"),
         ]);
-        let labels = namespace_labels(&model, "System.Collections.Generic.");
+        let labels = namespace_labels(&model, "System.Collections.Generic.", LanguageVersion::CSharp1);
         assert!(
             !labels.iter().any(|label| label.contains('`')),
             "a generic leaked: {labels:?}"

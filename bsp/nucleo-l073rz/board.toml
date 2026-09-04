@@ -1,0 +1,63 @@
+# BOARD binding: the ST NUCLEO-L073RZ. Board truth ONLY: role bindings, the carrier, and the clock
+# plan. Chip truth lives in csp/stm32l073/.
+#
+# ONE BOARD MANUAL, MANY BOARDS, AND THE GENERIC TEXT IS NOT ENOUGH. UM1724 covers every Nucleo-64,
+# and its LED section says the user LED is "PA5 (pin 21) or PB13 (pin 34) depending on the STM32
+# target" -- which settles nothing on its own. The per-board table is what does, and this board's is
+# TABLE 18, shared with the NUCLEO-L010RB: it gives D13 as PA5, and the LED is on D13.
+#
+
+[table]
+kind = "board"
+board = "nucleo-l073rz"
+vendor = "st"
+family = "stm32l073"
+part = "stm32l073rzt6"
+product_model = 44            # lamella_wire::product_model::NUCLEO_L073RZ
+sources = [
+    "STM32 Nucleo-64 boards user manual UM1724 Rev 17, which covers NUCLEO-L073RZ by name and gives its fitted part as STM32L073RZT6: section 6.9 for the virtual COM port on USART2, the LED section for the green user LED LD2 ('the I/O is HIGH value, the LED is on'), section 7.7 for the user button B1 on PC13, and table 18 (ARDUINO connectors on NUCLEO-L010RB and NUCLEO-L073RZ) for the per-board header assignment -- D13 = PA5 SPI1_SCK, D1 = PA2 USART2_TX, D0 = PA3 USART2_RX",
+    "STM32L073x8/xB/xZ datasheet DS10685 Rev 7 table 17 for the alternate-function numbers those pads take",
+]
+notes = [
+    "THE GREEN USER LED AND THE HEADER'S SPI CLOCK ARE THE SAME PAD. Table 18 gives D13 as PA5, and PA5 is SPI1_SCK at AF0 on this part. Driving LD2 and clocking SPI1 through that pad are mutually exclusive, and nothing in the chip reports it.",
+    "THE RESET CLOCK DOES NOT DIVIDE EVENLY INTO 115200. MSI runs at 2.097 MHz out of reset, so the divisor rounds to 18 and the line runs at about 116500 baud -- roughly +1.1%, inside tolerance for an 8-bit frame but not zero. Firmware wanting margin raises MSI and states that as its own plan.",
+    "THE USER BUTTON IS BOUND AS AN INTERRUPT, NOT AS AN INPUT. B1 is on PC13, which raises EXTI line 13; the reset button is on NRST and is not the chip's to see. The token below is minted here and is opaque to the runtime -- it travels from this board's ISR back to the driver, which maps it to a GpioPin.",
+    "THIS BOARD'S HEADER TABLE IS NOT THE NUCLEO-L053R8's, and the two are one table apart in the same manual. UM1724 gives the L053R8 table 17 and this board table 18, and the two differ where the parts differ -- table 18 carries a warning that PWM is not supported by D10 on this target because the timer is not available on PB6. A binding taken from the neighbouring table would name real pads of a real board and the wrong one.",
+]
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge
+role = "vcp"
+baud = 115200
+plan = "msi-2mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart2"
+function = "AF4"
+tx = { pin = "PA2" }
+rx = { pin = "PA3" }
+
+[[bindings]]
+role = "button"
+kind = "interrupt"
+instance = "exti"
+function = "EXTI"           # not a mux: the pad stays a GPIO and SYSCFG routes it to the line
+token = 0
+pin = { pin = "PC13" }
+
+[[plans]]
+name = "msi-2mhz"
+default = true
+source = "msi"
+msi_hz = 2097000            # the reset clock: MSI at 2.097 MHz is the system clock source after
+pclk_hz = 2097000           # power reset, with all prescalers at 1
+
+[[devices]]                 # the green user LED LD2, on the header's D13 pad.
+name = "led"
+kind = "gpio-out"
+pin = "PA5"
+active = "high"
+source = "UM1724 Rev 17 table 18 gives D13 as PA5 on this board, and the manual's LED section states the polarity in its own words: 'the I/O is HIGH value, the LED is on' and 'the I/O is LOW, the LED is off'. The generic sentence one line above it -- 'PA5 (pin 21) or PB13 (pin 34) depending on the STM32 target' -- settles nothing by itself, which is why the per-board table is cited rather than it."

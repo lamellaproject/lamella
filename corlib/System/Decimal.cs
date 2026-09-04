@@ -373,9 +373,9 @@ namespace System
             result = Zero;
             if ((object)s == null) return 0;
             int end = s.Length;
-            while (end > 0 && Char.IsWhiteSpace(s[end - 1])) end = end - 1;
+            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
             int i = 0;
-            while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1;
+            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
             if (i >= end) return 0;
 
             bool negative = false;
@@ -396,6 +396,7 @@ namespace System
                     i = i + 1;
                     continue;
                 }
+                if (c == ',') { if (sawDot || !sawDigit) return 0; i = i + 1; continue; }
                 if (c < '0' || c > '9') return 0;
                 sawDigit = true;
                 int digit = c - '0';

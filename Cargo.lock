@@ -299,6 +299,7 @@ dependencies = [
  "lamella-probe",
  "lamella-probe-core",
  "lamella-token",
+ "lamella-wasm-interp",
 ]
 
 [[package]]
@@ -360,6 +361,7 @@ name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-decimal",
  "lamella-net-core",
  "lamella-reactor",
  "lamella-token",
@@ -419,6 +421,16 @@ dependencies = [
  "lamella-probe-core",
  "lamella-py-frontend",
  "lamella-usbhid",
+]
+
+[[package]]
+name = "lamella-cmsis-dap-rp2040"
+version = "0.0.0"
+dependencies = [
+ "lamella-cmsis-dap",
+ "lamella-probe",
+ "lamella-probe-core",
+ "lamella-usbbulk",
 ]
 
 [[package]]
@@ -501,6 +513,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-decimal"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-elf"
 version = "0.0.0"
 
@@ -546,7 +562,9 @@ dependencies = [
  "lamella-aot",
  "lamella-catalog",
  "lamella-cmsis-dap-nrf",
+ "lamella-cmsis-dap-rp2040",
  "lamella-cmsis-dap-rp2350",
+ "lamella-cmsis-dap-sam",
  "lamella-cmsis-dap-stm32",
  "lamella-elf",
  "lamella-flash-backend",
@@ -555,6 +573,7 @@ dependencies = [
  "lamella-probe",
  "lamella-probe-core",
  "lamella-stlink",
+ "lamella-wire",
  "serde_json",
 ]
 
@@ -570,6 +589,13 @@ name = "lamella-fs-mem"
 version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
+]
+
+[[package]]
+name = "lamella-fw-store"
+version = "0.0.0"
+dependencies = [
+ "lamella-wire",
 ]
 
 [[package]]
@@ -734,6 +760,7 @@ dependencies = [
  "lamella-ir",
  "lamella-link",
  "lamella-py-bytecode",
+ "lamella-unicode",
 ]
 
 [[package]]
@@ -886,6 +913,7 @@ dependencies = [
 name = "lamella-usbhid"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "windows-sys 0.59.0",
 ]
 
@@ -897,9 +925,14 @@ dependencies = [
  "lamella-assemble",
  "lamella-binder",
  "lamella-cil-runtime",
+ "lamella-cmsis-dap",
+ "lamella-cmsis-dap-nrf",
+ "lamella-cmsis-dap-rp2040",
+ "lamella-cmsis-dap-rp2350",
  "lamella-dap",
  "lamella-load",
  "lamella-metadata",
+ "lamella-probe-core",
  "lamella-py-frontend",
  "lamella-py-runtime",
  "lamella-syntax",

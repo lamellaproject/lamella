@@ -17,31 +17,31 @@ namespace System.Device.I2c
 
         /// <summary>Reads data from the device, filling <paramref name="buffer"/> in one
         /// transaction.</summary>
-        public abstract void Read(byte[] buffer);
+        public abstract void Read(System.Span<byte> buffer);
 
         /// <summary>Reads a byte from the device.</summary>
         public virtual byte ReadByte()
         {
             byte[] buffer = new byte[1];
-            Read(buffer);
+            Read(new System.Span<byte>(buffer));
             return buffer[0];
         }
 
         /// <summary>Writes <paramref name="buffer"/> to the device in one transaction.</summary>
-        public abstract void Write(byte[] buffer);
+        public abstract void Write(System.ReadOnlySpan<byte> buffer);
 
         /// <summary>Writes a byte to the device.</summary>
         public virtual void WriteByte(byte value)
         {
             byte[] buffer = new byte[1];
             buffer[0] = value;
-            Write(buffer);
+            Write(new System.ReadOnlySpan<byte>(buffer));
         }
 
         /// <summary>Performs an atomic write-then-read: the write bytes go out, a RESTART
         /// condition (not a STOP) follows, and the read fills <paramref name="readBuffer"/>
         /// -- the register-read idiom.</summary>
-        public abstract void WriteRead(byte[] writeBuffer, byte[] readBuffer);
+        public abstract void WriteRead(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer);
 
         /// <summary>Creates a communications channel to the device described by
         /// <paramref name="settings"/>, over the driver the board bound for
@@ -88,34 +88,30 @@ namespace System.Device.I2c
             get { return _settings.Clone(); }
         }
 
-        public override void Read(byte[] buffer)
+        public override void Read(System.Span<byte> buffer)
         {
-            if ((object)buffer == null) throw new System.ArgumentNullException("buffer");
             Check(_driver.Read(_settings.DeviceAddress, buffer, buffer.Length), false);
         }
 
         public override byte ReadByte()
         {
-            Check(_driver.Read(_settings.DeviceAddress, _one, 1), false);
+            Check(_driver.Read(_settings.DeviceAddress, new System.Span<byte>(_one), 1), false);
             return _one[0];
         }
 
-        public override void Write(byte[] buffer)
+        public override void Write(System.ReadOnlySpan<byte> buffer)
         {
-            if ((object)buffer == null) throw new System.ArgumentNullException("buffer");
             Check(_driver.Write(_settings.DeviceAddress, buffer, buffer.Length), true);
         }
 
         public override void WriteByte(byte value)
         {
             _one[0] = value;
-            Check(_driver.Write(_settings.DeviceAddress, _one, 1), true);
+            Check(_driver.Write(_settings.DeviceAddress, new System.ReadOnlySpan<byte>(_one), 1), true);
         }
 
-        public override void WriteRead(byte[] writeBuffer, byte[] readBuffer)
+        public override void WriteRead(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer)
         {
-            if ((object)writeBuffer == null) throw new System.ArgumentNullException("writeBuffer");
-            if ((object)readBuffer == null) throw new System.ArgumentNullException("readBuffer");
             Check(_driver.WriteRead(_settings.DeviceAddress, writeBuffer, writeBuffer.Length,
                 readBuffer, readBuffer.Length), true);
         }

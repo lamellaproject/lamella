@@ -27,12 +27,12 @@ family = "stm32h7"
 record = ["base", "rcc_en_off", "rcc_en_bit"]
 sources = [
     "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4: Table 7 register boundary addresses -- RCC 0x58024400 and GPIOA through GPIOK from 0x58020000 in 0x400 steps on AHB4 (D3), with GPIOK occupying 0x58022800-0x58022BFF, USART3 0x40004800 on APB1 (D2)",
-    "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4: RCC_AHB4ENR 9.7.42 (address offset 0x0E0, GPIOBEN bit 1, GPIOCEN bit 2, GPIODEN bit 3, GPIOEEN bit 4, GPIOIEN bit 8, GPIOJEN bit 9, GPIOKEN bit 10); RCC_APB1LENR 9.7.44 (address offset 0x0E8, USART3EN bit 18)",
+    "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4: RCC_AHB4ENR 9.7.42 (address offset 0x0E0), whose per-bit prose gives GPIOAEN through GPIOKEN at bits 0 to 10 in alphabetical order -- GPIOAEN 0, GPIOBEN 1, GPIOCEN 2, GPIODEN 3, GPIOEEN 4, GPIOFEN 5, GPIOGEN 6, GPIOHEN 7, GPIOIEN 8, GPIOJEN 9, GPIOKEN 10; RCC_APB1LENR 9.7.44 (address offset 0x0E8, USART3EN bit 18)",
 ]
 notes = [
     "Every bit position here is taken from the reference manual's per-bit descriptions rather than from its register bit-map diagram: the diagram is a wide table whose columns do not survive a text conversion, and the per-bit prose states the same fact unambiguously.",
     "The GPIO ports sit in the D3 power domain and the USART in D2, which is a fact with a consequence nothing here models yet: RM0399 warns that enabling a peripheral in a domain that is in DStop or DStandby makes the power controller raise that domain first, so the clock-enable write can take far longer than the two clock cycles it takes within a running domain.",
-    "This family places six GPIO ports rather than the eleven the part carries, and one USART of the many it carries, because a present-list and an instance map here are evidence-only: a row is added when a board reaches the block.",
+    "ALL ELEVEN GPIO PORTS ARE PLACED, AND THAT IS A DEPARTURE FROM THE EVIDENCE-ONLY RULE THE REST OF THIS FILE FOLLOWS. Seven were here because a board reached them; GPIOA, GPIOF, GPIOG and GPIOH joined when this family gained a GPIO DRIVER, which is a different kind of consumer from a binding. A driver presents `PinCount` and answers for every pin in it, so a map with holes would give a caller a pin number whose port has no base -- and the hole would be wherever nothing had been bound yet, which is the least predictable place for one. The USART row stays evidence-only: nothing presents a count over USARTs.",
     "Every base below was read off RM0399 Table 7 rather than stepped from GPIOA, and the table repays that: it prints its rows in DESCENDING address order, GPIOK first and GPIOA last, so an eye running down the page and an index counting up the alphabet move in opposite directions. The arithmetic happens to agree here -- 0x400 per port with no gap -- and a boundary table exists to be read, not to be predicted.",
 ]
 
@@ -42,6 +42,13 @@ block = "usart"
 base = 0x40004800
 rcc_en_off = 0xE8   # RCC_APB1LENR (the shared form; C1 is 0x148 and C2 0x1A8)
 rcc_en_bit = 18     # USART3EN
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x58020000
+rcc_en_off = 0xE0   # RCC_AHB4ENR (the shared form; C1 is 0x140 and C2 0x1A0)
+rcc_en_bit = 0      # GPIOAEN
 
 [[instances]]
 name = "gpiob"
@@ -76,6 +83,27 @@ rcc_en_bit = 4      # GPIOEEN
 # the run A=0 through K=10 -- but the letters skip no position only because this register carries
 # nothing else below bit 11, and the same vendor's other lines put a port's enable bit in a
 # register whose low bits are already spent. Both were read from RM0399's per-bit descriptions.
+
+[[instances]]
+name = "gpiof"
+block = "gpio"
+base = 0x58021400
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 5      # GPIOFEN
+
+[[instances]]
+name = "gpiog"
+block = "gpio"
+base = 0x58021800
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 6      # GPIOGEN
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x58021C00
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 7      # GPIOHEN
 
 [[instances]]
 name = "gpioi"

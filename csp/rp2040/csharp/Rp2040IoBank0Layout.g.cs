@@ -13,5 +13,6 @@ namespace Lamella.Generated
 
         public const uint GPIO_CTRL_STRIDE = 8;
         public const uint FUNCSEL_UART = 2;
+        public const uint FUNCSEL_SIO = 5;
     }
 }

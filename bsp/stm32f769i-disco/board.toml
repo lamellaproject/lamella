@@ -22,7 +22,7 @@ board = "stm32f769i-disco"
 vendor = "st"
 family = "stm32f769"
 part = "stm32f769ni"
-board_model = 30            # lamella_wire::board_model::STM32F769I_DISCO
+product_model = 30          # lamella_wire::product_model::STM32F769I_DISCO
 sources = [
     "UM2033 Rev 5 (Discovery kit with STM32F769NI MCU) section 5.15: the serial interface USART1 is directly available as a virtual COM port of the PC, connected to the ST-LINK/V2-1 USB connector, configured with 115200 b/s, 8 bits data, no parity, one stop bit and no flow control.",
     "UM2033 Rev 5 section 5.16 and Table 4 (control port assignment): LD1 USER1 on PJ13 and LD2 USER2 on PJ5; the blue button B1 is the user button and the black button B2 is the reset. To light a LED a zero low-logic state must be written to the port; when B1 is depressed the logic state is 1.",

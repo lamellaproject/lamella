@@ -39,7 +39,7 @@ board = "stm32072b-eval"
 vendor = "st"
 family = "stm32f091"
 part = "stm32f072vb"
-board_model = 31            # lamella_wire::board_model::STM32072B_EVAL
+product_model = 31          # lamella_wire::product_model::STM32072B_EVAL
 sources = [
     "UM1714 Rev 1 (DocID025744), Evaluation board for STM32 F0 series with STM32F072VB MCU. Introduction: the board carries an STM32F072VBT6 with internal 16KB SRAM and 128KB flash, and an ST-LINK/V2 is integrated for program loading and debugging over SWD. Section 2.20: four general purpose colour LEDs LD1-LD4 are available as display devices, two push buttons (B1 Reset, B2 tamper) and one joystick, whose selection key is connected to PA0.",
     "UM1714 Rev 1 Table 34 'STM32072B-EVAL IO assignment': PD8 LED1, PD9 LED2, PD10 LED3, PD11 LED4, PC13 TAMPER_KEY, PA0 JOY_SEL, PE2 JOY_LEFT, PE3 JOY_RIGHT, PF9 JOY_UP, PF10 JOY_DOWN.",

@@ -7,5 +7,208 @@ namespace Lamella.Generated
 
         public const int BOARD_MODEL = 4;
         public const string BOARD_VENDOR = "Microchip";
+        public const uint CARRIER_USB_VID = 0x03EB;
+        public const uint CARRIER_USB_PID = 0x2111;
+
+        /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+        /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+        /// peripherals of the same kind can share no register at all, so a consumer that selects a
+        /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+        /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+        /// name a driver; and a uart is a different register map on every family, so the kind does
+        /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+        public const string EXT1_I2C_DRIVER_FAMILY = "same54-sercom";
+        public const string EXT1_ADC_P_DRIVER_FAMILY = "same54-adc";
+
+        public const uint EXT1_ADC_P_ADC_BASE = 0x43002000;
+        public const uint EXT1_ADC_P_GCLK_PCHCTRL_REG = 0x40001D24;
+        public const uint EXT1_ADC_P_GCLK_PCHCTRL_VALUE = 0x40;
+        public const uint EXT1_ADC_P_APB_MASK_REG = 0x40000820;
+        public const uint EXT1_ADC_P_APB_MASK = 0x100;
+        public const uint EXT1_ADC_P_CALIB_REG = 0x43002048;
+        public const uint EXT1_ADC_P_NVM_CALIB_AREA = 0x800080;
+        public const uint EXT1_ADC_P_NVM_CALIB_LSB = 16;
+        public const uint EXT1_ADC_P_PMUX_REG = 0x410080B2;
+        public const uint EXT1_ADC_P_PMUX_MASK = 0xF;
+        public const uint EXT1_ADC_P_PMUX_VALUE = 0x1;
+        public const uint EXT1_ADC_P_PINCFG_REG = 0x410080C4;
+        public const uint EXT1_ADC_P_MUXPOS = 6;
+        public const uint EXT1_ADC_P_REFERENCE_UV = 3300000;
+
+        public const uint EXT1_I2C_SERCOM_BASE = 0x41014000;
+        public const uint EXT1_I2C_GCLK_PCHCTRL_REG = 0x40001CE0;
+        public const uint EXT1_I2C_GCLK_PCHCTRL_VALUE = 0x40;
+        public const uint EXT1_I2C_APB_MASK_REG = 0x40000818;
+        public const uint EXT1_I2C_APB_MASK = 0x400;
+        public const uint EXT1_I2C_PMUX_REG = 0x4100803B;
+        public const uint EXT1_I2C_PMUX_PAIR = 0x22;
+        public const uint EXT1_I2C_PINCFG_SDA_REG = 0x41008056;
+        public const uint EXT1_I2C_PINCFG_SCL_REG = 0x41008057;
+        public const uint EXT1_I2C_CORE_CLOCK_HZ = 48000000;
+
+        public const uint LED0_PORT_BASE = 0x41008100;
+        public const uint LED0_PIN = 18;
+        public const uint LED0_MASK = 0x40000;
+        public const uint LED0_ACTIVE_LOW = 1;
+        public const uint BUTTON0_PORT_BASE = 0x41008080;
+        public const uint BUTTON0_PIN = 31;
+        public const uint BUTTON0_MASK = 0x80000000;
+        public const uint BUTTON0_ACTIVE_LOW = 1;
+
+        /// -- connectors: the sockets a removable module plugs into. The socket is board truth --
+        /// it is on the schematic and identical on every unit -- and what is plugged into it is not,
+        /// so no row here names a module. A socket brings out whole BUSES, each named by the binding
+        /// role that serves it, and single LINES, each named by the standard's own name for that
+        /// position and carrying the port wiring a driver needs to drive it. Which of a socket's
+        /// protocols an attached module speaks is a property of the module, so a board that offers
+        /// several states all of them and chooses none --
+        public const uint CONNECTOR_COUNT = 3;
+        public const string CONNECTOR_EXT1_STANDARD = "xplained-pro";
+        public const uint CONNECTOR_EXT1_ADC_P_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_ADC_P_PIN = 4;
+        public const uint CONNECTOR_EXT1_ADC_P_MASK = 0x10;
+        public const uint CONNECTOR_EXT1_ADC_N_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_ADC_N_PIN = 5;
+        public const uint CONNECTOR_EXT1_ADC_N_MASK = 0x20;
+        public const uint CONNECTOR_EXT1_GPIO1_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT1_GPIO1_PIN = 6;
+        public const uint CONNECTOR_EXT1_GPIO1_MASK = 0x40;
+        public const uint CONNECTOR_EXT1_GPIO2_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT1_GPIO2_PIN = 7;
+        public const uint CONNECTOR_EXT1_GPIO2_MASK = 0x80;
+        public const uint CONNECTOR_EXT1_PWM_P_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_PWM_P_PIN = 8;
+        public const uint CONNECTOR_EXT1_PWM_P_MASK = 0x100;
+        public const uint CONNECTOR_EXT1_PWM_N_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_PWM_N_PIN = 9;
+        public const uint CONNECTOR_EXT1_PWM_N_MASK = 0x200;
+        public const uint CONNECTOR_EXT1_IRQ_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_IRQ_PIN = 7;
+        public const uint CONNECTOR_EXT1_IRQ_MASK = 0x80;
+        public const uint CONNECTOR_EXT1_SPI_SS_B_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT1_SPI_SS_B_PIN = 27;
+        public const uint CONNECTOR_EXT1_SPI_SS_B_MASK = 0x8000000;
+        public const uint CONNECTOR_EXT1_I2C_SDA_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT1_I2C_SDA_PIN = 22;
+        public const uint CONNECTOR_EXT1_I2C_SDA_MASK = 0x400000;
+        public const uint CONNECTOR_EXT1_I2C_SCL_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT1_I2C_SCL_PIN = 23;
+        public const uint CONNECTOR_EXT1_I2C_SCL_MASK = 0x800000;
+        public const uint CONNECTOR_EXT1_UART_RX_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT1_UART_RX_PIN = 5;
+        public const uint CONNECTOR_EXT1_UART_RX_MASK = 0x20;
+        public const uint CONNECTOR_EXT1_UART_TX_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT1_UART_TX_PIN = 4;
+        public const uint CONNECTOR_EXT1_UART_TX_MASK = 0x10;
+        public const uint CONNECTOR_EXT1_SPI_SS_A_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_SPI_SS_A_PIN = 28;
+        public const uint CONNECTOR_EXT1_SPI_SS_A_MASK = 0x10000000;
+        public const uint CONNECTOR_EXT1_SPI_MOSI_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_SPI_MOSI_PIN = 27;
+        public const uint CONNECTOR_EXT1_SPI_MOSI_MASK = 0x8000000;
+        public const uint CONNECTOR_EXT1_SPI_MISO_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_SPI_MISO_PIN = 29;
+        public const uint CONNECTOR_EXT1_SPI_MISO_MASK = 0x20000000;
+        public const uint CONNECTOR_EXT1_SPI_SCK_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT1_SPI_SCK_PIN = 26;
+        public const uint CONNECTOR_EXT1_SPI_SCK_MASK = 0x4000000;
+        public const string CONNECTOR_EXT2_STANDARD = "xplained-pro";
+        public const uint CONNECTOR_EXT2_ADC_P_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_ADC_P_PIN = 0;
+        public const uint CONNECTOR_EXT2_ADC_P_MASK = 0x1;
+        public const uint CONNECTOR_EXT2_ADC_N_PORT_BASE = 0x41008000;
+        public const uint CONNECTOR_EXT2_ADC_N_PIN = 3;
+        public const uint CONNECTOR_EXT2_ADC_N_MASK = 0x8;
+        public const uint CONNECTOR_EXT2_GPIO1_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_GPIO1_PIN = 1;
+        public const uint CONNECTOR_EXT2_GPIO1_MASK = 0x2;
+        public const uint CONNECTOR_EXT2_GPIO2_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_GPIO2_PIN = 6;
+        public const uint CONNECTOR_EXT2_GPIO2_MASK = 0x40;
+        public const uint CONNECTOR_EXT2_PWM_P_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_PWM_P_PIN = 14;
+        public const uint CONNECTOR_EXT2_PWM_P_MASK = 0x4000;
+        public const uint CONNECTOR_EXT2_PWM_N_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_PWM_N_PIN = 15;
+        public const uint CONNECTOR_EXT2_PWM_N_MASK = 0x8000;
+        public const uint CONNECTOR_EXT2_IRQ_PORT_BASE = 0x41008180;
+        public const uint CONNECTOR_EXT2_IRQ_PIN = 0;
+        public const uint CONNECTOR_EXT2_IRQ_MASK = 0x1;
+        public const uint CONNECTOR_EXT2_SPI_SS_B_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_SPI_SS_B_PIN = 2;
+        public const uint CONNECTOR_EXT2_SPI_SS_B_MASK = 0x4;
+        public const uint CONNECTOR_EXT2_I2C_SDA_PORT_BASE = 0x41008180;
+        public const uint CONNECTOR_EXT2_I2C_SDA_PIN = 8;
+        public const uint CONNECTOR_EXT2_I2C_SDA_MASK = 0x100;
+        public const uint CONNECTOR_EXT2_I2C_SCL_PORT_BASE = 0x41008180;
+        public const uint CONNECTOR_EXT2_I2C_SCL_PIN = 9;
+        public const uint CONNECTOR_EXT2_I2C_SCL_MASK = 0x200;
+        public const uint CONNECTOR_EXT2_UART_RX_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_UART_RX_PIN = 17;
+        public const uint CONNECTOR_EXT2_UART_RX_MASK = 0x20000;
+        public const uint CONNECTOR_EXT2_UART_TX_PORT_BASE = 0x41008080;
+        public const uint CONNECTOR_EXT2_UART_TX_PIN = 16;
+        public const uint CONNECTOR_EXT2_UART_TX_MASK = 0x10000;
+        public const uint CONNECTOR_EXT2_SPI_SS_A_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT2_SPI_SS_A_PIN = 6;
+        public const uint CONNECTOR_EXT2_SPI_SS_A_MASK = 0x40;
+        public const uint CONNECTOR_EXT2_SPI_MOSI_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT2_SPI_MOSI_PIN = 4;
+        public const uint CONNECTOR_EXT2_SPI_MOSI_MASK = 0x10;
+        public const uint CONNECTOR_EXT2_SPI_MISO_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT2_SPI_MISO_PIN = 7;
+        public const uint CONNECTOR_EXT2_SPI_MISO_MASK = 0x80;
+        public const uint CONNECTOR_EXT2_SPI_SCK_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT2_SPI_SCK_PIN = 5;
+        public const uint CONNECTOR_EXT2_SPI_SCK_MASK = 0x20;
+        public const string CONNECTOR_EXT3_STANDARD = "xplained-pro";
+        public const uint CONNECTOR_EXT3_ADC_P_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_ADC_P_PIN = 2;
+        public const uint CONNECTOR_EXT3_ADC_P_MASK = 0x4;
+        public const uint CONNECTOR_EXT3_ADC_N_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_ADC_N_PIN = 3;
+        public const uint CONNECTOR_EXT3_ADC_N_MASK = 0x8;
+        public const uint CONNECTOR_EXT3_GPIO1_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_GPIO1_PIN = 1;
+        public const uint CONNECTOR_EXT3_GPIO1_MASK = 0x2;
+        public const uint CONNECTOR_EXT3_GPIO2_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_GPIO2_PIN = 10;
+        public const uint CONNECTOR_EXT3_GPIO2_MASK = 0x400;
+        public const uint CONNECTOR_EXT3_PWM_P_PORT_BASE = 0x41008180;
+        public const uint CONNECTOR_EXT3_PWM_P_PIN = 10;
+        public const uint CONNECTOR_EXT3_PWM_P_MASK = 0x400;
+        public const uint CONNECTOR_EXT3_PWM_N_PORT_BASE = 0x41008180;
+        public const uint CONNECTOR_EXT3_PWM_N_PIN = 11;
+        public const uint CONNECTOR_EXT3_PWM_N_MASK = 0x800;
+        public const uint CONNECTOR_EXT3_IRQ_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_IRQ_PIN = 30;
+        public const uint CONNECTOR_EXT3_IRQ_MASK = 0x40000000;
+        public const uint CONNECTOR_EXT3_SPI_SS_B_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_SPI_SS_B_PIN = 31;
+        public const uint CONNECTOR_EXT3_SPI_SS_B_MASK = 0x80000000;
+        public const uint CONNECTOR_EXT3_I2C_SDA_PORT_BASE = 0x41008180;
+        public const uint CONNECTOR_EXT3_I2C_SDA_PIN = 8;
+        public const uint CONNECTOR_EXT3_I2C_SDA_MASK = 0x100;
+        public const uint CONNECTOR_EXT3_I2C_SCL_PORT_BASE = 0x41008180;
+        public const uint CONNECTOR_EXT3_I2C_SCL_PIN = 9;
+        public const uint CONNECTOR_EXT3_I2C_SCL_MASK = 0x200;
+        public const uint CONNECTOR_EXT3_UART_RX_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_UART_RX_PIN = 23;
+        public const uint CONNECTOR_EXT3_UART_RX_MASK = 0x800000;
+        public const uint CONNECTOR_EXT3_UART_TX_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_UART_TX_PIN = 22;
+        public const uint CONNECTOR_EXT3_UART_TX_MASK = 0x400000;
+        public const uint CONNECTOR_EXT3_SPI_SS_A_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_SPI_SS_A_PIN = 14;
+        public const uint CONNECTOR_EXT3_SPI_SS_A_MASK = 0x4000;
+        public const uint CONNECTOR_EXT3_SPI_MOSI_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_SPI_MOSI_PIN = 4;
+        public const uint CONNECTOR_EXT3_SPI_MOSI_MASK = 0x10;
+        public const uint CONNECTOR_EXT3_SPI_MISO_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_SPI_MISO_PIN = 7;
+        public const uint CONNECTOR_EXT3_SPI_MISO_MASK = 0x80;
+        public const uint CONNECTOR_EXT3_SPI_SCK_PORT_BASE = 0x41008100;
+        public const uint CONNECTOR_EXT3_SPI_SCK_PIN = 5;
+        public const uint CONNECTOR_EXT3_SPI_SCK_MASK = 0x20;
     }
 }

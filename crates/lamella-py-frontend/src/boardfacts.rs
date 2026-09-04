@@ -487,12 +487,7 @@ impl Folder<'_> {
                 }
                 Ok(())
             }
-            StmtKind::Try {
-                body,
-                handlers,
-                orelse,
-                finalbody,
-            } => {
+            StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
                 self.body(body)?;
                 for handler in handlers {
                     if let Some(typ) = &mut handler.typ {
@@ -558,6 +553,9 @@ impl Folder<'_> {
 
     fn clauses(&mut self, clauses: &mut [CompClause]) -> Result<(), BoardFactError> {
         for clause in clauses {
+            for target in clause.targets.iter_mut() {
+                self.target(target)?;
+            }
             self.expr(&mut clause.iterable)?;
             for condition in &mut clause.conditions {
                 self.expr(condition)?;

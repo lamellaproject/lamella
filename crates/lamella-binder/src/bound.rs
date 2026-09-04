@@ -7,6 +7,7 @@ use crate::diagnostic::{Diagnostic, DiagnosticKind, GenericMember};
 use crate::infer::{infer_expanded_type_arguments, infer_method_type_arguments};
 use crate::resolve::{Shadowed, TypeTable, resolve_type};
 use crate::special::SpecialType;
+use crate::statement::{BoundDeclarator, BoundLambdaBody, BoundStmt, BoundStmtKind};
 use crate::symbols::{
     Accessibility, EventSymbol, MethodSymbol, Model, ParameterMode, PropertySymbol, TypeInfo,
     TypeKind, unmangled_type_name,
@@ -20,8 +21,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
     AssignmentOperator, BinaryOperator, Expr, ExprKind, Initializer, InterpolationPart, Literal,
-    MemberInitializer, MemberInitializerValue, PostfixOperator, TypeParameter,
+    MemberInitializer, MemberInitializerValue, PostfixOperator, RefPosition, TypeParameter,
     TypeParameterConstraintClause, TypeRef, TypeRefKind, TypeTestOperation, UnaryOperator,
+    UsingKind, auto_property_backing_field_name,
 };
 use lamella_syntax::span::Span;
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
@@ -270,6 +272,14 @@ pub struct TypeInstantiation {
     pub parameters: Vec<TypeSymbol>,
     /// The member's return type before substitution -- `T` for `Box<T>.Get()`.
     pub return_type: TypeSymbol,
+    /// The REQUIRED custom modifiers on that return type, as the types they name.
+    ///
+    /// **THE `MemberRef` MINTED FOR THIS MEMBER HAS TO REPRODUCE THEM OR IT NAMES A DIFFERENT
+    /// SIGNATURE.** `ReadOnlySpan<T>.get_Item` returns `ref readonly T` -- `!0& modreq(InAttribute)`
+    /// -- and a reference naming a bare `!0&` resolves to no method at all. It travels here rather
+    /// than on `MethodReference` because this struct is the OPEN signature the reference is written
+    /// from, and it already carries the return type the modifiers belong to.
+    pub return_required_modifiers: Vec<TypeSymbol>,
 }
 
 /// The generic instantiation a call site named -- the `<int>` of `Id<int>(x)` -- carried beside
@@ -477,6 +487,69 @@ pub enum ConversionKind {
 pub enum BoundExprKind {
     /// A constant literal, retyped from the syntax (9.4.4).
     Literal(Literal),
+    /// Operands evaluated ONCE into compiler temporaries, then a value that may name each of
+    /// them any number of times as [`BoundExprKind::Temp`].
+    ///
+    /// **THIS IS THE ONE THING A LIFTED OPERATOR NEEDS THAT THE BOUND TREE COULD NOT SAY.** Every
+    /// lifted operator (14.2.7) reads both operands TWICE -- `a + b` is
+    /// `(a.HasValue & b.HasValue) ? new S?(a.GetValueOrDefault() + b.GetValueOrDefault()) : null`
+    /// -- so writing the operand expression into both positions would evaluate it twice, and
+    /// `Get() + 1` would call `Get` on the `HasValue` test and again on the unwrap. Once operands
+    /// can be named more than once, EVERY lifted operator lowers into nodes that already existed:
+    /// a conditional, a binary, a property access, an object creation. That is why there is one
+    /// new node here and not one per operator.
+    ///
+    /// The operands are evaluated LEFT TO RIGHT and all of them BEFORE the value, which is the
+    /// order the standard requires and csc emits (measured: `Get() + Get()` calls both, stores
+    /// both, and only then tests `HasValue`).
+    ///
+    /// **AN OPERAND IS EVALUATED IN THE ENCLOSING SCOPE, so it may name an OUTER sequence's
+    /// temporaries and NOT its own sequence's earlier ones.** That is what lets a nested access
+    /// spill an expression built from the temporary above it -- `b?.Next?.Next?.N` -- which is the
+    /// shape the other reading refused.
+    ///
+    /// **A WALKER OVER THE BOUND TREE MUST VISIT BOTH FIELDS.** The user's own subexpressions are
+    /// normally all in `spilled` -- the value is synthesized -- but `??` is the exception that
+    /// makes the rule unsafe to lean on: its right operand must not be evaluated unless the left
+    /// is null, so it lives in the VALUE.
+    Sequence {
+        /// The operands, evaluated left to right and exactly once each.
+        spilled: Vec<BoundExpr>,
+        /// The value, naming an operand as [`BoundExprKind::Temp`].
+        value: Box<BoundExpr>,
+    },
+    /// A read of the `i`th operand spilled by the INNERMOST enclosing
+    /// [`BoundExprKind::Sequence`]. Positional rather than named because the sequences that
+    /// produce it are synthesized, so there is no source name to carry and nothing to collide.
+    ///
+    /// **INNERMOST MEANS INNERMOST-OPEN, AND A NESTED SEQUENCE'S OPERANDS ARE EVALUATED BEFORE ITS
+    /// SCOPE OPENS.** So an outer `Temp(0)` inside a nested sequence's OPERAND is fine and reads
+    /// the outer temporary, which is what a chained `?.` needs; one inside a nested sequence's
+    /// VALUE would read the inner one, and nothing produces that. A `Temp` with no scope to name
+    /// emits as an error rather than as a wrong slot.
+    Temp(u32),
+    /// A LAMBDA that has been converted to a delegate type (14.5.11).
+    ///
+    /// **THE NODE ONLY EXISTS AFTER THE CONVERSION**, which is the whole shape of the feature: a
+    /// lambda has no type of its own, so it is bound against a target and the target is recorded
+    /// here. An unconverted lambda never reaches the tree -- it is a diagnostic instead.
+    Lambda {
+        /// The delegate type it converted to.
+        delegate_type: TypeSymbol,
+        /// The delegate's `Invoke`, substituted -- the parameter and return types the body was
+        /// bound against, and the shape the synthesized method must have.
+        invoke: Box<MethodReference>,
+        /// The parameters, named as the source wrote them and typed from `invoke`.
+        parameters: Vec<(Box<str>, TypeSymbol)>,
+        /// The bound body.
+        body: Box<BoundLambdaBody>,
+        /// The enclosing locals and parameters the body reads, with their types, in first-seen
+        /// order. EMPTY means the lambda can be lowered to a static method with no closure.
+        captures: Vec<(Box<str>, TypeSymbol)>,
+        /// Whether the body reads `this` -- a capture too, and a different one: it is hoisted as
+        /// `<>4__this` rather than by name, and on its own it needs no display class at all.
+        captures_this: bool,
+    },
     /// A reference to a local variable or parameter (14.5.2).
     Local(Box<str>),
     /// A `ref`/`out` argument (17.5.1): the address of the inner variable, passed to a
@@ -718,6 +791,13 @@ pub enum BoundExprKind {
         /// The right operand -- evaluated only when the left one is null.
         right: Box<BoundExpr>,
     },
+    /// A THROW EXPRESSION (C# 7.0): `throw e` where a value is expected.
+    ///
+    /// **IT NEVER PRODUCES ONE**, which is what the `ty` field records rather than describes: a
+    /// throw expression has no type of its own and takes the one its CONTEXT needs -- the left
+    /// operand's type in `a ?? throw e`, the other arm's in `c ? x : throw e`. Both are contexts
+    /// where the value is used, and the throwing path simply never reaches the use.
+    Throw(Box<BoundExpr>),
     /// A `typeof` expression (14.5.11), naming the type it reflects; its type is
     /// `System.Type`.
     TypeOf(TypeSymbol),
@@ -796,6 +876,22 @@ struct MethodContext {
     /// for CS1997 against a `Task` return type, CS0161/CS0126 stand down (falling off the end
     /// completes the task), and the await-context rules (CS1985/1984/1996) apply only here.
     is_async: bool,
+    /// The member's `ref` parameter names. A `return ref x;` naming one is legal, because that
+    /// storage is the CALLER's and outlives this frame.
+    ///
+    ref_parameter_names: Vec<Box<str>>,
+    /// The member's `out` parameter names, refused with their own code rather than this member's
+    /// by-value one -- see [`MethodContext::ref_parameter_names`].
+    out_parameter_names: Vec<Box<str>>,
+    /// The member's parameter names, in order.
+    ///
+    /// **HELD ONLY SO A `return ref x;` CAN NAME THE RIGHT CODE**, and the two codes are not
+    /// interchangeable: csc answers `CS8168` for an ordinary LOCAL and `CS8166` for a by-value
+    /// PARAMETER, quoting the name either way. Both are refusals for the same reason -- the storage
+    /// dies with the frame -- and a reader who gets the wrong one goes looking for the wrong
+    /// declaration. The scope map cannot tell them apart: `declare_local` puts parameters and
+    /// locals in one table, correctly, because for every other question they behave alike.
+    parameter_names: Vec<Box<str>>,
 }
 
 /// The result of binding one REPL submission ([`Binder::bind_submission`]): the bound
@@ -826,6 +922,22 @@ pub struct DeclaredField {
     pub ty: TypeSymbol,
 }
 
+/// One lambda being bound: where its own scopes start, and what it has captured so far.
+///
+/// `Default` so the binder that holds a stack of these can stay `#[derive(Default)]`.
+#[derive(Debug, Clone, Default)]
+struct LambdaFrame {
+    /// `self.scopes.len()` at the moment the lambda's parameter scope was pushed. A name that
+    /// resolves at a depth BELOW this came from the enclosing method and is therefore captured.
+    scope_floor: usize,
+    /// Captured enclosing locals with their types, in FIRST-SEEN order -- which is the order a
+    /// display class's fields are emitted in, so it is part of the answer and not incidental.
+    captures: Vec<(Box<str>, TypeSymbol)>,
+    /// Whether the body reads `this`. A capture too, and a different one: csc hoists it as
+    /// `<>4__this` rather than by name, and on its own it needs no display class at all.
+    captures_this: bool,
+}
+
 /// Binds expressions, accumulating the semantic diagnostics found. Holds a stack
 /// of local-variable scopes for name resolution.
 #[derive(Debug, Default)]
@@ -836,6 +948,15 @@ pub struct Binder {
     /// place rather than at each construct.
     language_version: LanguageVersion,
     scopes: Vec<BTreeMap<String, TypeSymbol>>,
+    /// One frame per lambda currently being bound, innermost last.
+    ///
+    /// **CAPTURE IS RECORDED WHERE THE NAME RESOLVES, NOT BY WALKING THE BODY AFTERWARDS.** A
+    /// capture is exactly "a name that resolved to a scope OUTSIDE this lambda", and the scope
+    /// stack is the only place that fact exists -- by the time the body is a bound tree, a
+    /// `Local("x")` from a captured outer local and one from the lambda's own parameter are the
+    /// same node. Re-deriving the distinction afterwards means re-deriving which names the lambda
+    /// introduced, which is a second answer to a question binding already answered.
+    lambda_frames: Vec<LambdaFrame>,
     /// The type parameters currently in scope, innermost last, each with the constraints its
     /// declaration wrote. Pushed by [`Binder::enter_type_parameters`] and popped by
     /// [`Binder::exit_type_parameters`], so it tracks the SAME scope the type table does.
@@ -854,11 +975,32 @@ pub struct Binder {
     /// `bind_method`, which consumes (clears) it -- like `set_canon`, pre-set state the
     /// caller owns; self-clearing so a forgotten reset cannot leak into the next member.
     next_method_vararg: bool,
+    /// The BY-REFERENCE parameter names of the NEXT [`Binder::bind_method`] call, so a
+    /// `return ref x;` naming one is accepted rather than refused as a frame-local.
+    ///
+    /// **THE MODIFIER IS GONE BY THE TIME THE BODY BINDS, AND CORRECTLY SO.** `bound_parameters`
+    /// records a `ref int x` parameter's type as `int`, because that is what reading `x` in the
+    /// body yields; the byref-ness is a fact about the CALLING CONVENTION, which the emitter
+    /// recovers from its own frame. So the scope map cannot answer *may this name's storage
+    /// outlive the call*, and nothing else in the binder could either.
+    ///
+    /// Pre-set by the caller and CONSUMED by `bind_method`, the same shape as
+    /// [`Binder::next_method_vararg`] beside it and for the same reason: self-clearing, so a
+    /// member whose caller forgot to set it cannot inherit the previous member's list.
+    next_method_ref_parameters: Vec<Box<str>>,
     imported_namespaces: Vec<Box<str>>,
     /// `using X = N.T;` aliases in scope, each the alias name and its target type, so an
     /// unqualified `X` resolves to the target (16.4.1). Scoped per namespace block alongside
     /// `imported_namespaces`.
     aliases: Vec<(Box<str>, TypeSymbol)>,
+    /// `using static N.T;` imports in scope, each the imported TYPE, so an unqualified name
+    /// resolves to one of its directly declared static members or nested types (ECMA-334 6th ed,
+    /// 13.5.4). Scoped per namespace block alongside `imported_namespaces`.
+    ///
+    /// **A TYPE, WHERE `imported_namespaces` HOLDS A STRING**, because the two are searched
+    /// differently: a namespace is a lookup key, an imported type is a member-lookup receiver AND
+    /// (through its full dotted name) a nested-type scope.
+    imported_static_types: Vec<TypeSymbol>,
     /// Locals to EXEMPT from the unused-local check (`CS0168`/`CS0219`) of the method being
     /// bound: a local referenced only in a `switch` case-label expression (folded out of the
     /// bound tree, so its use is otherwise invisible), and a local whose initializer failed to
@@ -868,6 +1010,14 @@ pub struct Binder {
     /// Whether expressions are currently bound in a `checked` context (14.5.12),
     /// tracked as the binder descends so each arithmetic/cast node records whether
     /// emission should use the overflow-checking form. C# 1.0 defaults to unchecked.
+    /// The value each enclosing NULL-CONDITIONAL ACCESS has already tested, innermost last:
+    /// what an [`ExprKind::ConditionalReceiver`] in its `access` subtree binds to.
+    ///
+    /// **A STACK, BECAUSE `?.` NESTS THROUGH ARGUMENTS**: `a?.M(c?.D)` binds `c`'s access while
+    /// `a`'s is still open, and each placeholder means the nearest one. It is pushed for exactly
+    /// the span of the access binding, so a `ConditionalReceiver` reached anywhere else finds it
+    /// empty -- which is a compiler defect rather than a source error, and reports as one.
+    conditional_receivers: Vec<BoundExpr>,
     pub(crate) checked_context: bool,
     /// Whether expressions are currently in an explicit `unchecked` context (14.16). Distinct
     /// from `checked_context`: a CONSTANT operation is checked by DEFAULT, so a constant overflow
@@ -900,6 +1050,10 @@ pub struct Binder {
     /// How many enclosing `catch` clauses the binder is inside, so a bare `throw;` outside one
     /// is `CS0156` -- there is no exception in flight to re-throw. Reset per method.
     catch_depth: u32,
+    /// How many exception FILTERS enclose the expression being bound. Separate from
+    /// `catch_depth` because the two rules differ: awaiting in a catch BODY is legal from C# 6 and
+    /// awaiting in a filter is legal at no rung (CS7094).
+    filter_depth: u32,
     /// How many enclosing `finally` blocks the binder is inside, so a `return` that would leave
     /// one is `CS0157`. Reset per method.
     finally_depth: u32,
@@ -924,6 +1078,14 @@ pub struct Binder {
     /// nothing. Reset per method. Keyed by name; a local constant is also declared as a local
     /// so a redeclaration is still `CS0128`/`CS0136`.
     const_locals: BTreeMap<String, (Literal, TypeSymbol, usize)>,
+    /// The `ref` LOCALS in scope, each with what its declaration decided about it and the scope
+    /// depth it was declared at (evicted by `exit_scope`, exactly as `const_locals` is).
+    ///
+    /// **THE SCOPE MAP CANNOT CARRY THIS, AND THAT IS DELIBERATE RATHER THAN A GAP.** A ref local
+    /// is declared there with its REFERENT type -- `int` for a `ref int r` -- because that is what
+    /// READING it yields, which is the same shape a `ref` PARAMETER already has. So every use site
+    /// type-checks without knowing, and the two rules that DO need to know look here.
+    ref_locals: BTreeMap<String, (RefLocal, usize)>,
     /// CS0414 field-use tracking, accumulated across a whole compilation unit. Each pair is a
     /// field's declaring type (dotted name) and its name. A WRITE is a simple `=` target or an
     /// initializer; a READ is every other access. A private, non-const field that the unit
@@ -1042,6 +1204,49 @@ fn type_is_externally_visible(model: &Model, symbol: &TypeSymbol) -> bool {
         }
     }
     true
+}
+
+/// Folds every framework-named primitive in `ty` to its keyword form, at every level of an array,
+/// pointer, byref or type ARGUMENT -- [`TypeSymbol::fold_builtin`] itself answers about one node.
+///
+/// Kept separate from [`Binder::canonicalize`] because the two rules COMPOSE rather than nest: that
+/// one decides which type a name denotes, this one decides which of a type's two spellings to
+/// compare by. Signature comparison is then the qualifier plus this, instead of a second traversal
+/// that has to re-list every variant of [`TypeSymbol`] and can be short one.
+fn fold_builtins_deep(ty: TypeSymbol) -> TypeSymbol {
+    match ty {
+        TypeSymbol::Array { element, rank } => TypeSymbol::Array {
+            element: Box::new(fold_builtins_deep(*element)),
+            rank,
+        },
+        TypeSymbol::Pointer(inner) => TypeSymbol::Pointer(Box::new(fold_builtins_deep(*inner))),
+        TypeSymbol::ByRef(inner) => TypeSymbol::ByRef(Box::new(fold_builtins_deep(*inner))),
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => TypeSymbol::Instantiation {
+            definition,
+            arguments: arguments
+                .into_vec()
+                .into_iter()
+                .map(fold_builtins_deep)
+                .collect(),
+        },
+        other => other.fold_builtin(),
+    }
+}
+
+/// How much of each `using` axis was in scope at a [`Binder::import_scope`] call, to be handed
+/// back to [`Binder::restore_import_scope`].
+///
+/// **OPAQUE, AND THAT IS THE POINT.** Three lengths of the same type are a shape in which two can
+/// be swapped silently, so they are named fields rather than a tuple, and there is no public
+/// constructor: the only way to hold one is to have taken a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportScope {
+    namespaces: usize,
+    aliases: usize,
+    static_types: usize,
 }
 
 impl Binder {
@@ -2032,9 +2237,6 @@ impl Binder {
             let Some(constraints) = info.constraints_on(index) else {
                 continue;
             };
-            if constraints.is_empty() {
-                continue;
-            }
             let parameter: Box<str> = info.type_parameters[index].clone();
             self.check_one_type_argument(
                 argument,
@@ -2089,6 +2291,17 @@ impl Binder {
         member: GenericMember,
         span: Span,
     ) {
+        if self.type_is_by_ref_like(argument) {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::ByRefLikeTypeArgument {
+                    argument: alloc::format!("{argument}").into(),
+                    parameter: parameter.into(),
+                    declaration: declaration.into(),
+                },
+                span,
+            ));
+            return;
+        }
         if constraints.reference_type && !self.satisfies_reference_type_constraint(argument) {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::TypeArgumentMustBeReferenceType {
@@ -2356,6 +2569,18 @@ impl Binder {
                 }
                 self.named_type_in_scope(name).unwrap_or_else(|| ty.clone())
             }
+            TypeSymbol::Named(parts) => {
+                let [leading @ .., name] = &parts[..] else {
+                    return ty.clone();
+                };
+                if self.model.get(&leading.join("."), name).is_some() {
+                    return ty.clone();
+                }
+                match self.enclosing_type_scope(leading, name) {
+                    Some(enclosing) => qualified_type_symbol(&enclosing, name).fold_builtin(),
+                    None => ty.clone(),
+                }
+            }
             TypeSymbol::Array { element, rank } => TypeSymbol::Array {
                 element: Box::new(self.canonicalize(element)),
                 rank: *rank,
@@ -2397,7 +2622,73 @@ impl Binder {
         }
     }
 
-    /// Whether `from` implicitly converts to `to`, including reference conversions
+    /// A bound call, wrapped in a dereference when the member returns BY REFERENCE.
+///
+/// **A `ref`-RETURNING MEMBER YIELDS A VARIABLE OF THE REFERENT TYPE, NOT A VALUE OF THE BYREF
+/// TYPE.** `b[0]` on a `Span<byte>` is a `byte` -- readable AND assignable -- because the element
+/// access IS a variable and `Span`'s indexer is `ref T this[int]`. Leaving the byref on the
+/// expression made every use of one a type error: `CS0266: cannot convert 'ref byte' to 'byte'` on
+/// a read and `CS0131: the left-hand side must be a variable` on a write, which is the whole of why
+/// `System.Device.I2c` and `System.Device.Spi` do not compile without this.
+///
+/// **THE WRAPPER IS `Dereference`, THE SAME NODE `*p` PRODUCES, AND REUSING IT IS THE POINT.** It
+/// is already an lvalue ([`is_lvalue`]), the emitter already reads through it with `ldind` and
+/// writes through it with `stind`, and the write path already takes its width from the TARGET's
+/// type rather than the operand's. A ref-returning indexer has no `set_` accessor at all -- a write
+/// goes through the GETTER's address -- so a store node of its own would have had to re-derive
+/// every one of those. The unsafe gate lives on the SYNTAX `*p`, not on this node, so a synthesized
+/// one demands nothing of the caller.
+///
+/// The call keeps `ByRef(T)` as its own type, which is what the emitter reads to pick the width.
+    /// Builds a bound PROPERTY read, dereferencing it when the property returns BY REFERENCE.
+    ///
+    /// **THE ONE CONSTRUCTOR EXISTS BECAUSE THE RULE HAD THREE SITES AND REACHED ONE.** A property
+    /// is bound at three places -- an explicit `x.P`, an unqualified `P` in the declaring type, and
+    /// an unqualified `P` inherited from an enclosing type -- and the 08-30 repair that taught
+    /// `e.Current` to deref a `ref T` property landed at the FIRST only. Measured on the other two:
+    /// `int v = Rp;` for a source-declared `static ref int Rp` was `CS0266: cannot convert
+    /// 'ref int' to 'int'`, a correct program refused, and using it as a `ref` argument produced
+    /// `ref ref int`.
+    ///
+    /// The repair is the extraction rather than two more calls, because the next position added
+    /// would have gone the same way. [`Self::deref_ref_return`] is a no-op unless the declared type
+    /// is `ByRef`, so an ordinary property keeps exactly the node and type it always had.
+    fn property_access(
+        receiver: BoundExpr,
+        declaring_type: TypeSymbol,
+        setter_declaring_type: TypeSymbol,
+        getter_instantiation: Option<Box<TypeInstantiation>>,
+        setter_instantiation: Option<Box<TypeInstantiation>>,
+        name: &str,
+        ty: TypeSymbol,
+    ) -> BoundExpr {
+        let access = BoundExpr {
+            kind: BoundExprKind::PropertyAccess {
+                receiver: Box::new(receiver),
+                declaring_type,
+                setter_declaring_type,
+                getter_instantiation,
+                setter_instantiation,
+                name: name.into(),
+            },
+            ty: ty.clone(),
+        };
+        Self::deref_ref_return(access, &ty)
+    }
+
+pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundExpr {
+    match declared {
+        TypeSymbol::ByRef(referent) => BoundExpr {
+            ty: (**referent).clone(),
+            kind: BoundExprKind::Dereference {
+                operand: Box::new(call),
+            },
+        },
+        _ => call,
+    }
+}
+
+/// Whether `from` implicitly converts to `to`, including reference conversions
     /// that walk the model's inheritance graph (13.1).
     pub(crate) fn converts(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         converts(&self.model, from, to)
@@ -2599,7 +2890,8 @@ impl Binder {
             }
             if crate::conversion::nullable_underlying(&expr.ty).is_none()
                 && (expr.ty == *underlying
-                    || crate::conversion::converts(&self.model, &expr.ty, underlying))
+                    || crate::conversion::converts(&self.model, &expr.ty, underlying)
+                    || implicit_constant_conversion(&expr, underlying))
             {
                 let value = self.convert(expr, underlying);
                 return BoundExpr {
@@ -2621,6 +2913,7 @@ impl Binder {
                                         ["T".into()].into()
                                     )],
                                     return_type: TypeSymbol::Special(SpecialType::Void),
+                                    return_required_modifiers: Vec::new(),
                                 },
                             )),
                         }),
@@ -2705,6 +2998,179 @@ impl Binder {
             ty: target.clone(),
             ..expr
         }
+    }
+
+    /// Binds an expression whose meaning depends on the type it is being converted TO, returning
+    /// `None` when the syntax is not one of those.
+    ///
+    /// **ONE DOOR, BECAUSE THE SITES ARE THE HARD PART AND THERE ARE FOUR OF THEM.** A local
+    /// declaration, an assignment, a `return` and a field initializer each know a target type, and
+    /// a target-typed form reaches the language through all four. The array-initializer shorthand
+    /// already taught that lesson the expensive way -- it is target-typed at three sites and each
+    /// one calls `bind_array_initializer` separately. This function exists so the NEXT such form is
+    /// added once rather than four times, and so a site that forgets it is a missing CALL rather
+    /// than a silently untyped expression.
+    pub(crate) fn bind_target_typed(
+        &mut self,
+        expr: &Expr,
+        target: &TypeSymbol,
+    ) -> Option<BoundExpr> {
+        match &expr.kind {
+            ExprKind::Lambda {
+                parameters,
+                body,
+                parenthesized,
+            } => Some(self.bind_lambda(expr, parameters, body, *parenthesized, target)),
+            _ => None,
+        }
+    }
+
+    /// Binds a LAMBDA against the delegate type it is being converted to (14.5.11).
+    ///
+    /// **A LAMBDA HAS NO TYPE UNTIL IT HAS A TARGET, WHICH IS WHY THIS TAKES ONE.** Its parameter
+    /// types come from the target delegate's `Invoke` unless the source wrote them, its return type
+    /// is `Invoke`'s, and its body cannot be bound before either is known -- so there is no
+    /// "bind the lambda, then convert it" order available.
+    fn bind_lambda(
+        &mut self,
+        expr: &Expr,
+        parameters: &[lamella_syntax::ast::LambdaParameter],
+        body: &lamella_syntax::ast::LambdaBody,
+        parenthesized: bool,
+        target: &TypeSymbol,
+    ) -> BoundExpr {
+        let _ = parenthesized;
+        let Some(invoke) = self.delegate_invoke(target) else {
+            let kind = if matches!(target, TypeSymbol::Special(SpecialType::Object))
+                || target.is_error()
+            {
+                DiagnosticKind::LambdaTypeNotInferred
+            } else {
+                DiagnosticKind::LambdaNeedsDelegateTarget {
+                    type_name: target.to_string().into(),
+                }
+            };
+            self.report(Diagnostic::new(kind, expr.span));
+            return error_expr();
+        };
+        if parameters.len() != invoke.parameters.len() {
+            self.report(Diagnostic::new(
+                DiagnosticKind::LambdaParameterCount {
+                    type_name: target.short_name().into(),
+                    written: parameters.len(),
+                },
+                expr.span,
+            ));
+            return error_expr();
+        }
+        let explicit = parameters.iter().filter(|p| p.ty.is_some()).count();
+        if explicit != 0 && explicit != parameters.len() {
+            self.report(Diagnostic::new(
+                DiagnosticKind::LambdaParameterTypesMixed,
+                expr.span,
+            ));
+            return error_expr();
+        }
+        let mut bound_parameters: Vec<(Box<str>, TypeSymbol)> = Vec::new();
+        for (parameter, expected) in parameters.iter().zip(invoke.parameters.iter()) {
+            let ty = match &parameter.ty {
+                None => expected.clone(),
+                Some(written) => {
+                    let written_ty = self.resolve_type_ref(written);
+                    if !written_ty.is_error() && &written_ty != expected {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::LambdaParameterTypesDoNotMatch {
+                                type_name: target.short_name().into(),
+                            },
+                            expr.span,
+                        ));
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::LambdaParameterTypeMismatch {
+                                position: bound_parameters.len() + 1,
+                                written: written_ty.to_string().into(),
+                                expected: expected.to_string().into(),
+                            },
+                            parameter.span,
+                        ));
+                    }
+                    written_ty
+                }
+            };
+            bound_parameters.push((parameter.name.clone(), ty));
+        }
+        self.enter_scope();
+        self.lambda_frames.push(LambdaFrame {
+            scope_floor: self.scopes.len() - 1,
+            captures: Vec::new(),
+            captures_this: false,
+        });
+        for (name, ty) in &bound_parameters {
+            self.declare_local(name, ty.clone());
+        }
+        let bound_body = match body {
+            lamella_syntax::ast::LambdaBody::Expression(expression) => {
+                let value = self.bind_expression(expression);
+                if invoke.return_type.is_void() {
+                    if !crate::statement::is_statement_expression(&value.kind) {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::IllegalStatementExpression,
+                            expression.span,
+                        ));
+                    }
+                    BoundLambdaBody::Expression(value)
+                } else {
+                    self.check_assignable(&value, &invoke.return_type, expression.span);
+                    let converted = self.convert(value, &invoke.return_type);
+                    BoundLambdaBody::Expression(converted)
+                }
+            }
+            lamella_syntax::ast::LambdaBody::Block(block) => {
+                let saved = self.current_method.clone();
+                if let Some(context) = self.current_method.as_mut() {
+                    context.return_type = invoke.return_type.clone();
+                }
+                let bound = self.bind_statement(block);
+                self.current_method = saved;
+                BoundLambdaBody::Block(bound)
+            }
+        };
+        let frame = self.lambda_frames.pop().unwrap_or_default();
+        self.exit_scope();
+        let (captures, captures_this) = (frame.captures, frame.captures_this);
+        BoundExpr {
+            ty: target.clone(),
+            kind: BoundExprKind::Lambda {
+                delegate_type: target.clone(),
+                invoke: Box::new(invoke),
+                parameters: bound_parameters,
+                body: Box::new(bound_body),
+                captures,
+                captures_this,
+            },
+        }
+    }
+
+    /// The delegate `Invoke` of `ty`, substituted, or `None` when `ty` is not a delegate.
+    ///
+    /// **SUBSTITUTED IS THE LOAD-BEARING WORD.** `Func<int,string>`'s `Invoke` must come back
+    /// `(int) -> string` and not `(T) -> TResult`, or every parameter this infers is a type
+    /// parameter with no argument behind it. `type_info_of` closes a constructed generic's members
+    /// on the way out, which is the same answer the method-group conversion beside this relies on.
+    fn delegate_invoke(&self, ty: &TypeSymbol) -> Option<MethodReference> {
+        let info = self
+            .type_info_of(ty)
+            .filter(|info| info.kind == TypeKind::Delegate)?;
+        let invoke = info.methods.iter().find(|m| &*m.name == "Invoke")?;
+        Some(MethodReference {
+            declaring_instantiation: self.declaring_instantiation_of(ty, "Invoke", &invoke.parameters),
+            declaring_type: ty.clone(),
+            name: invoke.name.clone(),
+            parameters: invoke.parameters.clone(),
+            return_type: invoke.return_type.clone(),
+            is_static: false,
+            is_vararg: false,
+            instantiation: None,
+        })
     }
 
     /// Binds an array initializer `{ e, ... }` against `array_ty`, converting each
@@ -2810,10 +3276,24 @@ impl Binder {
     }
 
     /// Converts `value` to the enclosing method's return type, for a `return`.
+    /// The enclosing member's declared return type, when there is one.
+    ///
+    /// A lambda's BLOCK body swaps this for the delegate's return type while it binds, so a
+    /// `return` inside a nested lambda targets the inner delegate rather than the outer method --
+    /// which is what makes this the right source for a `return`'s target type.
+    pub(crate) fn current_return_type(&self) -> Option<TypeSymbol> {
+        self.current_method
+            .as_ref()
+            .map(|method| method.return_type.clone())
+    }
+
     pub(crate) fn convert_to_return_type(&self, value: BoundExpr) -> BoundExpr {
         match &self.current_method {
             Some(method) => {
-                let target = method.return_type.clone();
+                let target = match &method.return_type {
+                    TypeSymbol::ByRef(_) => return value,
+                    other => other.clone(),
+                };
                 self.convert(value, &target)
             }
             None => value,
@@ -2997,6 +3477,53 @@ impl Binder {
         self.aliases.push((name.into(), target));
     }
 
+    /// Brings a `using static N.T;` import into scope: `T`'s directly declared static members and
+    /// nested types become nameable without qualification (13.5.4).
+    ///
+    /// **THE SAME TYPE IMPORTED TWICE IS ONE IMPORT.** csc compiles `using static N1.A;` written
+    /// twice and so does 13.5.3, which makes a name ambiguous between *types or members* rather
+    /// than between directives. Without this the second copy collides with the first: a repeated
+    /// directive gave `CS0121` for a method and would have given `CS0104` for a nested type.
+    /// Dropping the duplicate rather than filtering at the lookup keeps both search paths right,
+    /// and it leaves the scope lengths correct -- an inner block that re-imports an outer type adds
+    /// nothing and so truncates to nothing.
+    pub fn import_static_type(&mut self, ty: TypeSymbol) {
+        if self.imported_static_types.contains(&ty) {
+            return;
+        }
+        self.imported_static_types.push(ty);
+    }
+
+    /// Whether a dotted name denotes a NAMESPACE in this compilation's world -- what separates
+    /// `using static System;` (CS7007) from `using static System.Math;`.
+    #[must_use]
+    pub fn names_a_namespace(&self, name: &str) -> bool {
+        self.model.is_namespace(name)
+    }
+
+    /// Applies one `using` directive to this binder.
+    ///
+    /// **ONE FUNCTION BECAUSE THERE ARE FIVE CALLERS.** The same three-armed dispatch stood
+    /// open-coded in `qualify_declared_signatures`, in the declaration walk, and at three points in
+    /// the emitter -- so a fourth kind of directive would have been added to whichever one the
+    /// author had open and silently missing from the rest. `using static` IS that fourth kind, and
+    /// it is added here once.
+    ///
+    /// The declaration walk does MORE than this (it reports `CS1537` for a repeated alias and
+    /// resolves each target so an unusable one is named where it is written); it calls this for the
+    /// scope effect and keeps its own diagnostics.
+    pub fn import_using(&mut self, kind: &UsingKind) {
+        match kind {
+            UsingKind::Namespace(name) => self.import_namespace(&crate::program::dotted(name)),
+            UsingKind::Static(name) => {
+                self.import_static_type(TypeSymbol::Named(name.parts.iter().cloned().collect()));
+            }
+            UsingKind::Alias { name, target } => {
+                self.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
+            }
+        }
+    }
+
     /// The target type of an in-scope alias `name`, if any (the most recent wins).
     fn alias_target(&self, name: &str) -> Option<TypeSymbol> {
         self.aliases
@@ -3006,17 +3533,23 @@ impl Binder {
             .map(|(_, target)| target.clone())
     }
 
-    /// A marker for the current set of imported namespaces and aliases, to scope the usings
-    /// of a namespace block: snapshot before, restore after.
+    /// A marker for the current set of imported namespaces, aliases and static types, to scope the
+    /// usings of a namespace block: snapshot before, restore after.
     #[must_use]
-    pub fn import_scope(&self) -> (usize, usize) {
-        (self.imported_namespaces.len(), self.aliases.len())
+    pub fn import_scope(&self) -> ImportScope {
+        ImportScope {
+            namespaces: self.imported_namespaces.len(),
+            aliases: self.aliases.len(),
+            static_types: self.imported_static_types.len(),
+        }
     }
 
-    /// Restores the imported namespaces and aliases to an earlier [`Binder::import_scope`].
-    pub fn restore_import_scope(&mut self, scope: (usize, usize)) {
-        self.imported_namespaces.truncate(scope.0);
-        self.aliases.truncate(scope.1);
+    /// Restores the imported namespaces, aliases and static types to an earlier
+    /// [`Binder::import_scope`].
+    pub fn restore_import_scope(&mut self, scope: ImportScope) {
+        self.imported_namespaces.truncate(scope.namespaces);
+        self.aliases.truncate(scope.aliases);
+        self.imported_static_types.truncate(scope.static_types);
     }
 
     /// The current type's namespace, if any, for unqualified type resolution.
@@ -3085,6 +3618,81 @@ impl Binder {
         None
     }
 
+    /// The scopes an unqualified name searches after the enclosing type's OWN: every type
+    /// `enclosing` inherits a declaration space from, most-derived first.
+    ///
+    /// **A DERIVED CLASS CAN NAME ITS BASE'S NESTED TYPES BARE**, because a class inherits the
+    /// members of its base class type (10.2.2) and an inherited member is in the derived class's
+    /// declaration space. `class Derived : Base { Derived(Mode m) }` where `Base` declares
+    /// `Mode` is the shape, and it is not a corner: NETMF's surface is nested-type-heavy by
+    /// construction -- `Cpu.Pin`, `Port.ResistorMode`, `PWM.ScaleFactor` -- so every derived
+    /// driver in it names one.
+    ///
+    /// **WHICH TYPES CONTRIBUTE IS NOT "EVERYTHING AFTER THE COLON", AND THE DIFFERENCE IS
+    /// MEASURABLE.** A class or struct takes its BASE CLASS chain and nothing else -- an
+    /// interface it implements contributes no scope, so `class C : B, I` can name `B`'s nested
+    /// types and not `I`'s. An INTERFACE takes its base interfaces, which is the whole of its
+    /// base list (20.2.2). Measured against csc, five programs: a class implementing an
+    /// interface with a nested type is `CS0246` there, and so is a struct; an interface
+    /// extending one compiles.
+    ///
+    /// The walk is bounded by `seen` rather than by trusting the chain to be acyclic: `CS0146`
+    /// reports a circular base, but name resolution runs against the same model whether or not
+    /// that check has fired, and a cycle here would hang the compiler rather than diagnose
+    /// one.
+    fn inherited_type_scopes(&self, enclosing: &str) -> Vec<Box<str>> {
+        let mut scopes: Vec<Box<str>> = Vec::new();
+        let mut pending: Vec<Box<str>> = alloc::vec![enclosing.into()];
+        let mut seen: Vec<Box<str>> = alloc::vec![enclosing.into()];
+        while let Some(current) = pending.pop() {
+            let (namespace, name) = match current.rsplit_once('.') {
+                Some((namespace, name)) => (namespace, name),
+                None => ("", &*current),
+            };
+            let Some(info) = self.model.get(namespace, name) else {
+                continue;
+            };
+            let inherited: Vec<&TypeSymbol> = if matches!(info.kind, TypeKind::Interface) {
+                info.bases.iter().collect()
+            } else {
+                info.base.iter().collect()
+            };
+            for base in inherited {
+                let Some(scope) = Self::type_scope_key(base) else {
+                    continue;
+                };
+                if seen.iter().any(|had| *had == scope) {
+                    continue;
+                }
+                seen.push(scope.clone());
+                scopes.push(scope.clone());
+                pending.push(scope);
+            }
+        }
+        scopes
+    }
+
+    /// A type's full name as the model keys its NESTED types under, or `None` for a type that
+    /// cannot declare any (an array, a pointer, an error type).
+    ///
+    /// A constructed generic answers with its DEFINITION's metadata name -- `` Box`1 `` for
+    /// `Box<int>` -- because that is the one key space a source-collected and a reference-read
+    /// definition meet in, and a nested type belongs to the definition rather than to any one
+    /// instantiation of it.
+    fn type_scope_key(ty: &TypeSymbol) -> Option<Box<str>> {
+        match ty {
+            TypeSymbol::Named(parts) => Some(parts.join(".").into()),
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => match crate::symbols::definition_symbol(definition, arguments.len()) {
+                TypeSymbol::Named(parts) => Some(parts.join(".").into()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The distinct in-scope namespaces (current, global, and imported) that hold
     /// a type with this name.
     /// The namespaces (in scope) that declare a type of this simple name, ordered
@@ -3102,13 +3710,24 @@ impl Binder {
                 }
                 enclosing.push_str(part);
             }
-            search.push((enclosing.into(), false));
+            search.extend(
+                self.inherited_type_scopes(&enclosing)
+                    .into_iter()
+                    .map(|scope| (scope, false)),
+            );
+            search.insert(0, (enclosing.into(), false));
         }
         if let Some(current) = self.current_namespace() {
             search.push((current, false));
         }
         search.push((Box::from(""), false));
         search.extend(self.imported_namespaces.iter().cloned().map(|ns| (ns, true)));
+        search.extend(
+            self.imported_static_types
+                .iter()
+                .filter_map(Self::type_scope_key)
+                .map(|scope| (scope, true)),
+        );
         let mut hits: Vec<(Box<str>, bool)> = Vec::new();
         for (namespace, imported) in search {
             if self.model.get(&namespace, name).is_some()
@@ -3126,6 +3745,13 @@ impl Binder {
     /// mark, so it never leaks past the one member it was set for.
     pub fn set_next_method_vararg(&mut self) {
         self.next_method_vararg = true;
+    }
+
+    /// Names the BY-REFERENCE parameters (`ref` and `out`) of the next
+    /// [`Binder::bind_method`] call, so `return ref x;` naming one is accepted. See
+    /// [`Binder::next_method_ref_parameters`] for why the parameter list itself cannot say.
+    pub fn set_next_method_ref_parameters(&mut self, names: Vec<Box<str>>) {
+        self.next_method_ref_parameters = names;
     }
 
     /// Binds a method body end to end: the enclosing type is in scope for `this`
@@ -3157,6 +3783,12 @@ impl Binder {
             is_static,
             is_vararg: core::mem::take(&mut self.next_method_vararg),
             is_async,
+            ref_parameter_names: core::mem::take(&mut self.next_method_ref_parameters),
+            out_parameter_names: out_parameters.to_vec(),
+            parameter_names: parameters
+                .iter()
+                .map(|(parameter, _)| parameter.clone())
+                .collect(),
         });
         self.enter_scope();
         self.case_label_uses.clear();
@@ -3164,6 +3796,7 @@ impl Binder {
         self.loop_depth = 0;
         self.switch_depth = 0;
         self.catch_depth = 0;
+        self.filter_depth = 0;
         self.finally_depth = 0;
         self.lock_depth = 0;
         self.finally_floor.clear();
@@ -3247,6 +3880,9 @@ impl Binder {
             is_static: true,
             is_vararg: false,
             is_async: false,
+            ref_parameter_names: Vec::new(),
+            out_parameter_names: Vec::new(),
+            parameter_names: Vec::new(),
         });
         self.enter_scope();
         self.case_label_uses.clear();
@@ -3254,6 +3890,7 @@ impl Binder {
         self.loop_depth = 0;
         self.switch_depth = 0;
         self.catch_depth = 0;
+        self.filter_depth = 0;
         self.finally_depth = 0;
         self.lock_depth = 0;
         self.finally_floor.clear();
@@ -3458,12 +4095,16 @@ impl Binder {
     /// initializer's type error withholds an unrelated body diagnostic and an instance one does
     /// not. They look identical in the source, which is why this is a parameter rather than
     /// something inferred here.
+    /// `constant_required` is `is_const` MINUS the fields already reported as circular: one of
+    /// those binds cleanly and never folds, so it would draw CS0133 on top of the CS0110 that
+    /// already explains it, where csc reports the cycle alone.
     pub fn bind_field_initializer(
         &mut self,
         enclosing: TypeSymbol,
         field_name: &str,
         field_type: &TypeSymbol,
         initializer: &Expr,
+        constant_required: bool,
         is_const: bool,
     ) {
         self.current_type = Some(enclosing.clone());
@@ -3471,13 +4112,35 @@ impl Binder {
         let was_in_initializer = self.in_field_initializer;
         self.in_field_initializer = true;
         let diagnostics_before = self.diagnostics.len();
-        let value = self.bind_expression(initializer);
+        let value = match self.bind_target_typed(initializer, field_type) {
+            Some(bound) => bound,
+            None => self.bind_expression(initializer),
+        };
         self.check_assignable(&value, field_type, initializer.span);
         self.in_field_initializer = was_in_initializer;
         self.exit_scope();
         self.current_type = None;
         if !is_const {
             self.mark_body_phase(diagnostics_before);
+        }
+        let initializer_failed = self.diagnostics[diagnostics_before..]
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+            });
+        let folded = if constant_required {
+            self.required_constant(initializer, &value)
+        } else {
+            None
+        };
+        if constant_required && !initializer_failed && folded.is_none() {
+            let field = alloc::format!("{enclosing}.{field_name}");
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::NonConstantFieldInitializer {
+                    field: field.into(),
+                },
+                initializer.span,
+            ));
         }
         let initializer_referenced_self = self.diagnostics[diagnostics_before..]
             .iter()
@@ -3493,6 +4156,58 @@ impl Binder {
             }
         }
         crate::flow::collect_field_uses(&value, &mut self.field_reads, &mut self.field_writes);
+    }
+
+    /// Binds an `enum` member's initializer in the enum's own scope, so a sibling member resolves
+    /// by bare name (`enum E { A = 1, B = A + 1 }`) exactly as a `const` field's initializer sees
+    /// its siblings. Returns the bound expression and whether binding drew an error -- the caller
+    /// stops there when it did, because a name that did not resolve is already reported and is
+    /// not additionally "not a constant".
+    ///
+    /// Binding is what supplies all three of the member's answers at once: whether the name
+    /// resolves, whether its type converts, and whether the value is constant.
+    pub(crate) fn bind_enum_member_value(
+        &mut self,
+        enclosing: &TypeSymbol,
+        initializer: &Expr,
+    ) -> (BoundExpr, bool) {
+        let previous_type = self.current_type.take();
+        self.current_type = Some(enclosing.clone());
+        self.enter_scope();
+        let was_in_initializer = self.in_field_initializer;
+        self.in_field_initializer = true;
+        let diagnostics_before = self.diagnostics.len();
+        let value = self.bind_expression(initializer);
+        self.in_field_initializer = was_in_initializer;
+        self.exit_scope();
+        self.current_type = previous_type;
+        let failed = self.diagnostics[diagnostics_before..].iter().any(|diagnostic| {
+            diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+        });
+        (value, failed)
+    }
+
+    /// The constant value of an initializer WHERE THE LANGUAGE REQUIRES ONE, with the version
+    /// gate that admitting it needs. Every constant-required position asks through here: the
+    /// `const` field and local, the `enum` member, the attribute argument and the `case` label.
+    ///
+    /// **THE FOLD AND THE PERMISSION ARE TWO DIFFERENT THINGS.** `$"plain"` folds to a literal at
+    /// every rung, but STANDING where a constant is required is a C# 10 feature -- so the value
+    /// being available does not settle whether the language admits it here, and both questions are
+    /// asked. The gate is here rather than in [`Self::bind_interpolated_string`] because that
+    /// binder cannot know where its result is going.
+    pub(crate) fn required_constant(
+        &mut self,
+        syntax: &Expr,
+        bound: &BoundExpr,
+    ) -> Option<Literal> {
+        if is_interpolated_string(syntax) {
+            self.gate_feature(
+                Feature::ConstantInterpolatedStrings,
+                Span::empty_at(syntax.span.start),
+            );
+        }
+        constant_literal_value(bound)
     }
 
     /// Checks a `return` statement against the enclosing method's return type
@@ -3535,8 +4250,323 @@ impl Binder {
                     },
                     span,
                 )),
-                Some(expr) => self.check_assignable(expr, &method.return_type, span),
+                Some(expr) => self.check_ref_return(expr, &method, span),
             }
+        }
+    }
+
+    /// The `ref`-ness half of a `return`, and then the ordinary assignability check against the
+    /// type the member actually returns.
+    ///
+    /// **THE TWO DIRECTIONS ARE TWO CODES AND csc'S WORDING IS THE REVERSE OF WHAT THE NUMBERS
+    /// SUGGEST**, measured rather than reconstructed: `CS8149` is *By-reference returns may only be
+    /// used in methods that return by reference* -- a `return ref e;` in a by-VALUE member -- and
+    /// `CS8150` is its mirror, a plain `return e;` in a by-REFERENCE one.
+    ///
+    /// **AND THE COMPARISON IS AGAINST THE REFERENT, NOT THE BYREF.** A member declared `ref int`
+    /// has the return type `ByRef(int)` while `ref a[0]` is an `int` at the address of; comparing
+    /// the two directly would refuse every correct program with a conversion error. This is the
+    /// same shape a `ref` PARAMETER already has, where the argument's type is the referent's and
+    /// the parameter's is the byref.
+    fn check_ref_return(&mut self, expr: &BoundExpr, method: &MethodContext, span: Span) {
+        let by_reference = matches!(method.return_type, TypeSymbol::ByRef(_));
+        let written_ref = matches!(expr.kind, BoundExprKind::Ref { .. });
+        match (by_reference, written_ref) {
+            (false, true) => {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ByRefReturnInValueMethod,
+                    span,
+                ));
+                return;
+            }
+            (true, false) => {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ByValueReturnInRefMethod,
+                    span,
+                ));
+                return;
+            }
+            (false, false) => {
+                self.check_assignable(expr, &method.return_type, span);
+                return;
+            }
+            (true, true) => {}
+        }
+        let TypeSymbol::ByRef(referent) = &method.return_type else {
+            return;
+        };
+        let BoundExprKind::Ref { operand, .. } = &expr.kind else {
+            return;
+        };
+        self.check_returnable_by_reference(operand, method, span);
+        self.check_assignable(operand, referent, span);
+    }
+
+    /// Whether the storage `operand` names outlives the call, which is the whole of what makes a
+    /// `ref` return safe: a caller holding the returned address must not be holding a dead frame.
+    ///
+    /// **THE RESTRICTIONS ARE THE FEATURE.** Returning the address of a field, a static, an array
+    /// element or a `ref` parameter is safe because none of that storage belongs to this frame;
+    /// returning an ordinary local's or a by-value parameter's is not, and csc names them
+    /// differently -- `CS8168` quoting the local, `CS8166` quoting the parameter -- which is why
+    /// [`MethodContext::parameter_names`] exists. An expression with no storage at all
+    /// (`return ref 5;`) is `CS8156`.
+    ///
+    fn check_returnable_by_reference(
+        &mut self,
+        operand: &BoundExpr,
+        method: &MethodContext,
+        span: Span,
+    ) {
+        let BoundExprKind::Local(name) = &operand.kind else {
+            return;
+        };
+        if let Some(record) = self.ref_local(name) {
+            if !record.returnable {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::CannotReturnRefLocalInitializedToValue { name: name.clone() },
+                    span,
+                ));
+            }
+            return;
+        }
+        if method.ref_parameter_names.iter().any(|p| **p == **name) {
+            return;
+        }
+        let kind = if method.out_parameter_names.iter().any(|p| **p == **name) {
+            DiagnosticKind::CannotReturnScopedParameterByReference { name: name.clone() }
+        } else if method.parameter_names.iter().any(|p| **p == **name) {
+            DiagnosticKind::CannotReturnParameterByReference { name: name.clone() }
+        } else {
+            DiagnosticKind::CannotReturnLocalByReference { name: name.clone() }
+        };
+        self.diagnostics.push(Diagnostic::new(kind, span));
+    }
+
+    /// Whether `expr` reads a `ref readonly` LOCAL, which may not be written THROUGH.
+    ///
+    /// **THE RULE HAS THREE WRITE POSITIONS AND THEY DO NOT SHARE A CODE**, measured on one
+    /// declaration at 7.2: `r = 7` is `CS0131`, `r += 1` is `CS0131` (a compound assignment is an
+    /// assignment), and `r++` is `CS1059`. So the PREDICATE is shared and the diagnostic is each
+    /// caller's -- folding them would print the wrong code at two of the three.
+    ///
+    /// A `ref readonly` local carries no metadata of its own: a local's signature is `T&` either
+    /// way, and the readonly-ness lives only here. That is why the refusal IS the feature at this
+    /// position, exactly as the `modreq` is at a `ref readonly` RETURN.
+    fn writes_through_readonly_ref(&self, expr: &BoundExpr) -> bool {
+        let BoundExprKind::Local(name) = &expr.kind else {
+            return false;
+        };
+        self.ref_local(name).is_some_and(|record| record.is_readonly)
+    }
+
+    /// How many diagnostics have been reported so far, paired with [`Binder::truncate_diagnostics`]
+    /// so a SPECULATIVE bind can be rolled back. The parser has the same pair for the same reason:
+    /// a reading that is abandoned must not leave its complaints behind.
+    pub(crate) fn diagnostic_count(&self) -> usize {
+        self.diagnostics.len()
+    }
+
+    /// Drops every diagnostic reported since [`Binder::diagnostic_count`] returned `mark`.
+    pub(crate) fn truncate_diagnostics(&mut self, mark: usize) {
+        self.diagnostics.truncate(mark);
+    }
+
+    /// Records what a `ref` local's declaration decided, for the rules a use site cannot answer.
+    /// Scoped exactly as a local constant is, and evicted by [`Binder::exit_scope`].
+    pub(crate) fn declare_ref_local(&mut self, name: &str, returnable: bool, is_readonly: bool) {
+        let declared_at = self.scopes.len();
+        self.ref_locals.insert(
+            name.into(),
+            (
+                RefLocal {
+                    returnable,
+                    is_readonly,
+                },
+                declared_at,
+            ),
+        );
+    }
+
+    /// What a `ref` local of this name was declared to be, if the name is one.
+    pub(crate) fn ref_local(&self, name: &str) -> Option<RefLocal> {
+        self.ref_locals.get(name).map(|(record, _)| *record)
+    }
+
+    /// Whether the storage `operand` names outlives the current frame -- the SAME question
+    /// [`Binder::check_returnable_by_reference`] asks, asked QUIETLY.
+    ///
+    /// **A `ref` LOCAL'S DECLARATION MUST ASK IT WITHOUT REPORTING**: `ref int r = ref x;` for an
+    /// ordinary local `x` is a legal declaration that merely cannot be RETURNED, so the CS8168 the
+    /// reporting form would raise there would refuse a program csc compiles. The two share this
+    /// body so a position that becomes returnable becomes returnable in both.
+    pub(crate) fn storage_outlives_frame(&self, operand: &BoundExpr) -> bool {
+        let BoundExprKind::Local(name) = &operand.kind else {
+            return true;
+        };
+        if let Some(record) = self.ref_local(name) {
+            return record.returnable;
+        }
+        let Some(method) = self.current_method.as_ref() else {
+            return false;
+        };
+        method.ref_parameter_names.iter().any(|p| **p == **name)
+    }
+
+    /// Binds a ref REASSIGNMENT, `r = ref e` (C# 7.3): points `r` at different storage rather than
+    /// writing through it.
+    ///
+    /// **THE TARGET MUST ALREADY HOLD A REFERENCE**, which is `CS8373` when it does not -- a plain
+    /// local or a by-value parameter has no address to rebind. A `ref` LOCAL and a `ref`/`out`
+    /// PARAMETER both qualify, measured; and a `ref readonly` local qualifies too, because
+    /// rebinding is not writing THROUGH it.
+    ///
+    /// **THE TYPE MUST MATCH EXACTLY AND csc'S MESSAGE READS BACKWARDS FROM AN ORDINARY
+    /// CONVERSION**: `CS8173` names the TARGET's type and says the expression must be of it, where
+    /// `CS0029` would name the source's. A reference is not converted on assignment -- there is
+    /// nowhere to put a converted value -- so this is an identity check rather than an
+    /// assignability one.
+    fn bind_ref_reassignment(
+        &mut self,
+        target: BoundExpr,
+        value_expr: &Expr,
+        span: Span,
+    ) -> BoundExpr {
+        let value = self.bind_expression(value_expr);
+        let holds_reference = match &target.kind {
+            BoundExprKind::Local(name) => {
+                self.ref_local(name).is_some()
+                    || self
+                        .current_method
+                        .as_ref()
+                        .is_some_and(|method| {
+                            method.ref_parameter_names.iter().any(|p| **p == **name)
+                                || method.out_parameter_names.iter().any(|p| **p == **name)
+                        })
+            }
+            _ => false,
+        };
+        if !target.ty.is_error() && !holds_reference {
+            self.diagnostics
+                .push(Diagnostic::new(DiagnosticKind::RefAssignTargetNotRef, span));
+        } else if let BoundExprKind::Ref { operand, .. } = &value.kind {
+            if !target.ty.is_error() && !operand.ty.is_error() && operand.ty != target.ty {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::RefAssignTypeMismatch {
+                        ty: target.ty.to_string().into(),
+                    },
+                    value_expr.span,
+                ));
+            }
+        }
+        let ty = target.ty.clone();
+        BoundExpr {
+            kind: BoundExprKind::Assignment {
+                operator: AssignmentOperator::Assign,
+                target: Box::new(target),
+                value: Box::new(value),
+                checked: false,
+            },
+            ty,
+        }
+    }
+
+    /// Refuses a `ref`/`out` operand that names no assignable storage, with csc's three codes.
+    ///
+    /// **ONE FUNCTION, AT THE ONE PLACE `BoundExprKind::Ref` IS BUILT, BECAUSE THE RULE HAS THREE
+    /// POSITIONS**: a `ref`/`out` ARGUMENT, `return ref e`, and a `ref` LOCAL's initializer. It had
+    /// ZERO implementations before the third position existed -- `M(ref 5)`, `M(ref readonlyField)`
+    /// and `M(ref P)` all compiled here, silently, and csc refuses all three. Writing it at the
+    /// ref-local site alone would have left the older two accepting-invalid while looking fixed.
+    ///
+    /// The three codes are not interchangeable and each was measured at 7.2:
+    ///
+    /// | operand | code |
+    /// |---|---|
+    /// | a literal, a constant, `f + 1`, a non-ref-returning CALL | `CS1510` |
+    /// | a `readonly` field, outside a constructor | `CS0192` |
+    /// | a property or indexer that does not return by reference | `CS0206` |
+    ///
+    /// **A REF-RETURNING MEMBER IS LEGAL AND DOES NOT REACH THE `CS0206` ARM**: `deref_ref_return`
+    /// has already wrapped its access in a `Dereference`, which names storage, so the arms below
+    /// see a bare `PropertyAccess`/`IndexerAccess` only when the member returns by value. A
+    /// PARENTHESIZED variable is likewise still a variable -- measured, `M(ref (f))` compiles --
+    /// and it arrives here as the inner node, parentheses having no bound form.
+    fn check_ref_operand(&mut self, operand: &BoundExpr, span: Span, position: RefPosition) {
+        if operand.ty.is_error() {
+            return;
+        }
+        let kind = match &operand.kind {
+            BoundExprKind::FieldAccess {
+                field: Some(field), ..
+            } if self.field_is_constant(&field.declaring_type, &field.name) => {
+                Self::no_storage_code(position)
+            }
+            BoundExprKind::FieldAccess {
+                field: Some(field), ..
+            } => {
+                let in_constructor = matches!(
+                    self.current_method.as_ref(),
+                    Some(context) if &*context.name == ".ctor" || &*context.name == ".cctor"
+                );
+                if in_constructor || !self.field_is_readonly(&field.declaring_type, &field.name) {
+                    return;
+                }
+                match position {
+                    RefPosition::Argument => DiagnosticKind::RefOperandReadonlyField,
+                    RefPosition::Reassignment => DiagnosticKind::ReadonlyAssignment {
+                        field: field.name.clone(),
+                    },
+                    RefPosition::Return => DiagnosticKind::ReadonlyFieldReturnedByReference,
+                }
+            }
+            BoundExprKind::PropertyAccess { .. } | BoundExprKind::IndexerAccess { .. } => {
+                Self::non_ref_property_code(position)
+            }
+            BoundExprKind::Call {
+                method: Some(method),
+                ..
+            } if self
+                .indexer_accessor(&method.declaring_type, "get_", method.parameters.len())
+                .is_some_and(|accessor| accessor == method.name) =>
+            {
+                Self::non_ref_property_code(position)
+            }
+            BoundExprKind::Local(_)
+            | BoundExprKind::FieldAccess { field: None, .. }
+            | BoundExprKind::ElementAccess { .. }
+            | BoundExprKind::Dereference { .. }
+            | BoundExprKind::RefValue { .. }
+            | BoundExprKind::This => return,
+            _ => Self::no_storage_code(position),
+        };
+        self.diagnostics.push(Diagnostic::new(kind, span));
+    }
+
+    /// The code for an operand that names NO STORAGE -- a literal, a constant, an arithmetic
+    /// result, a call to a method that does not return by reference. Measured at 7.3:
+    /// `CS1510` where the reference is passed or bound, `CS8156` where it is RETURNED, because a
+    /// return additionally asks the storage to outlive the frame and csc says so in one message.
+    fn no_storage_code(position: RefPosition) -> DiagnosticKind {
+        match position {
+            RefPosition::Argument | RefPosition::Reassignment => {
+                DiagnosticKind::RefOperandNotAssignable
+            }
+            RefPosition::Return => DiagnosticKind::ExpressionCannotBeReturnedByReference,
+        }
+    }
+
+    /// The code for a PROPERTY or INDEXER that does not return by reference.
+    ///
+    /// **THE REASSIGNMENT POSITION ANSWERS `CS1510`, NOT `CS0206`.** Measured on one non-ref
+    /// property at 7.3: `ref int r = ref P;` and `M(ref P)` are `CS0206`, `r = ref P;` is `CS1510`,
+    /// and `return ref P;` is `CS8156`. Three codes, one operand, and nothing in the shape of the
+    /// expression distinguishes them -- only the position does.
+    fn non_ref_property_code(position: RefPosition) -> DiagnosticKind {
+        match position {
+            RefPosition::Argument => DiagnosticKind::RefOperandNonRefProperty,
+            RefPosition::Reassignment => DiagnosticKind::RefOperandNotAssignable,
+            RefPosition::Return => DiagnosticKind::ExpressionCannotBeReturnedByReference,
         }
     }
 
@@ -3550,6 +4580,7 @@ impl Binder {
         self.scopes.pop();
         let depth = self.scopes.len();
         self.const_locals.retain(|_, (_, _, declared_at)| *declared_at <= depth);
+        self.ref_locals.retain(|_, (_, declared_at)| *declared_at <= depth);
     }
 
     /// Enters / leaves a loop body, so `break`/`continue` know they have an enclosing loop.
@@ -3582,6 +4613,14 @@ impl Binder {
         self.lock_depth = self.lock_depth.saturating_sub(1);
     }
     /// Enters / leaves a `catch` clause, so a bare `throw;` knows it has an exception in flight.
+    pub(crate) fn enter_catch_filter(&mut self) {
+        self.filter_depth += 1;
+    }
+
+    pub(crate) fn exit_catch_filter(&mut self) {
+        self.filter_depth = self.filter_depth.saturating_sub(1);
+    }
+
     pub(crate) fn enter_catch(&mut self) {
         self.catch_depth += 1;
     }
@@ -3656,6 +4695,42 @@ impl Binder {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
+    /// [`Self::lookup_local`] plus the DEPTH it resolved at -- the index of the scope holding it.
+    ///
+    /// The depth is what makes a capture decidable: a lambda records the scope count at its own
+    /// entry, and anything found below that came from the enclosing method.
+    fn lookup_local_depth(&self, name: &str) -> Option<(usize, &TypeSymbol)> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, scope)| scope.get(name).map(|ty| (depth, ty)))
+    }
+
+    /// Records a captured local in every enclosing lambda frame whose scope floor it is below.
+    ///
+    /// **EVERY frame, not just the innermost.** A local captured by a nested lambda is captured by
+    /// the outer one too -- the inner delegate reaches it through the outer frame, so the outer
+    /// lambda's closure has to hold it whether or not its own body ever names it.
+    fn note_capture(&mut self, name: &str, ty: &TypeSymbol, depth: usize) {
+        for frame in &mut self.lambda_frames {
+            if depth >= frame.scope_floor {
+                continue;
+            }
+            if frame.captures.iter().any(|(seen, _)| &**seen == name) {
+                continue;
+            }
+            frame.captures.push((Box::from(name), ty.clone()));
+        }
+    }
+
+    /// Records that `this` was read, in every lambda frame currently open.
+    fn note_this_capture(&mut self) {
+        for frame in &mut self.lambda_frames {
+            frame.captures_this = true;
+        }
+    }
+
     /// Whether a local of this name is already declared in the innermost scope: a
     /// redeclaration (CS0128).
     pub(crate) fn local_in_current_scope(&self, name: &str) -> bool {
@@ -3688,13 +4763,20 @@ impl Binder {
             }
             ExprKind::Name { name, .. } => self.bind_name(name, expr.span),
             ExprKind::This => {
-                if self.in_static_method() {
+                if self.in_field_initializer {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ThisNotAvailableInContext,
+                        expr.span,
+                    ));
+                    error_expr()
+                } else if self.in_static_method() {
                     self.report(Diagnostic::new(
                         DiagnosticKind::ThisInStaticContext,
                         expr.span,
                     ));
                     error_expr()
                 } else {
+                    self.note_this_capture();
                     self.this_expr()
                 }
             }
@@ -3702,6 +4784,13 @@ impl Binder {
             ExprKind::MemberAccess { receiver, name } => {
                 self.bind_member_access(receiver, name, expr.span)
             }
+            ExprKind::ConditionalAccess { receiver, access } => {
+                self.bind_conditional_access(receiver, access, expr.span)
+            }
+            ExprKind::ConditionalReceiver => match self.conditional_receivers.last() {
+                Some(value) => value.clone(),
+                None => error_expr(),
+            },
             ExprKind::InterpolatedString(parts) => {
                 self.bind_interpolated_string(parts, expr.span)
             }
@@ -3785,8 +4874,14 @@ impl Binder {
             } => self.bind_binary(*operator, left, right, expr.span),
             ExprKind::Unary { operator, operand } => self.bind_unary(*operator, operand, expr.span),
             ExprKind::Await(operand) => self.bind_await(operand, expr.span),
-            ExprKind::RefArgument { out, operand } => {
+            ExprKind::RefArgument {
+                out,
+                position,
+                operand,
+            } => {
+                let span = operand.span;
                 let operand = self.bind_expression(operand);
+                self.check_ref_operand(&operand, span, *position);
                 let ty = operand.ty.clone();
                 BoundExpr {
                     kind: BoundExprKind::Ref {
@@ -3867,6 +4962,11 @@ impl Binder {
                     }
                 }
                 if !operand.ty.is_error() && !ty.is_error() {
+                    if crate::conversion::nullable_underlying(&ty).is_some()
+                        && self.assignable(&operand, &ty)
+                    {
+                        return self.convert(operand, &ty);
+                    }
                     if matches!(ty, TypeSymbol::Special(SpecialType::Decimal))
                         != matches!(operand.ty, TypeSymbol::Special(SpecialType::Decimal))
                     {
@@ -4192,6 +5292,17 @@ impl Binder {
                     ty,
                 }
             }
+            ExprKind::Throw(operand) => {
+                let bound = self.bind_expression(operand);
+                self.report(Diagnostic::new(
+                    DiagnosticKind::ThrowExpressionNotAllowed,
+                    expr.span,
+                ));
+                BoundExpr {
+                    kind: BoundExprKind::Throw(Box::new(bound)),
+                    ty: TypeSymbol::Error,
+                }
+            }
             ExprKind::Conditional {
                 condition,
                 when_true,
@@ -4234,6 +5345,13 @@ impl Binder {
                     ty,
                 }
             }
+            ExprKind::Lambda { .. } => {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::LambdaTypeNotInferred,
+                    expr.span,
+                ));
+                error_expr()
+            }
             ExprKind::Parenthesized(inner) => self.bind_expression(inner),
             _ => BoundExpr {
                 kind: BoundExprKind::Error,
@@ -4261,6 +5379,14 @@ impl Binder {
                 DiagnosticKind::DivisionByConstantZero,
                 span,
             ));
+        }
+        if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+            if let Some(bound) = self.bind_nullable_null_comparison(operator, &left, &right, span) {
+                return bound;
+            }
+        }
+        if let Some(bound) = self.bind_lifted_binary(operator, left.clone(), right.clone(), span) {
+            return bound;
         }
         if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
             && !left.ty.is_error()
@@ -4671,6 +5797,14 @@ impl Binder {
         span: Span,
     ) -> BoundExpr {
         let operand = self.bind_expression(operand_expr);
+        if matches!(
+            operator,
+            UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
+        ) && self.writes_through_readonly_ref(&operand)
+        {
+            self.diagnostics
+                .push(Diagnostic::new(DiagnosticKind::StepOperandNotAssignable, span));
+        }
         if operator == UnaryOperator::Minus && matches!(&operand_expr.kind, ExprKind::Literal(_)) {
             if let BoundExprKind::Literal(literal) = &operand.kind {
                 if let Some((folded, ty)) =
@@ -4682,6 +5816,9 @@ impl Binder {
                     };
                 }
             }
+        }
+        if let Some(bound) = self.bind_lifted_unary(operator, operand.clone(), span) {
+            return bound;
         }
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
@@ -4840,7 +5977,15 @@ impl Binder {
         operand_expr: &Expr,
         span: Span,
     ) -> BoundExpr {
+        if matches!(operand_expr.kind, ExprKind::ConditionalAccess { .. }) {
+            self.report(Diagnostic::new(DiagnosticKind::StepOperandNotAssignable, span));
+            return error_expr();
+        }
         let operand = self.bind_expression(operand_expr);
+        if self.writes_through_readonly_ref(&operand) {
+            self.diagnostics
+                .push(Diagnostic::new(DiagnosticKind::StepOperandNotAssignable, span));
+        }
         let step_name = match operator {
             PostfixOperator::Increment => "op_Increment",
             PostfixOperator::Decrement => "op_Decrement",
@@ -4947,6 +6092,81 @@ impl Binder {
         ));
     }
 
+    /// Binds a THROW EXPRESSION (C# 7.0) that stands in a context admitting one, giving it the
+    /// type that context needs.
+    ///
+    /// **ONE FUNCTION FOR EVERY PERMITTED POSITION**, and there are only two -- the right operand
+    /// of `??` and either arm of `?:`. Each recognizes the syntax itself and calls this; the
+    /// generic expression binder refuses everything else as `CS8115`, so a position that forgets
+    /// to call this REFUSES rather than silently accepting, which is the safe direction for a
+    /// rule whose whole content is where it may appear.
+    ///
+    /// The operand is checked by [`Binder::check_thrown_operand`], the same function the throw
+    /// STATEMENT uses, so the two spellings cannot drift into two answers about what may be thrown.
+    pub(crate) fn bind_throw_expression(&mut self, operand: &Expr, ty: TypeSymbol) -> BoundExpr {
+        let bound = self.bind_expression(operand);
+        self.check_thrown_operand(&bound, operand.span);
+        BoundExpr {
+            kind: BoundExprKind::Throw(Box::new(bound)),
+            ty,
+        }
+    }
+
+    /// The `?:` arm of [`Binder::bind_conditional`] where at least one arm is a THROW EXPRESSION.
+    ///
+    /// The result type is the arm that is NOT a throw; the throwing arm takes the same type, so
+    /// the conditional is uniform to the emitter and to definite assignment. With both arms
+    /// throwing there is no type at all and csc reports `CS0173` naming `<throw expression>` on
+    /// both sides -- a spelling with no type behind it, which is why it is written rather than
+    /// rendered from a `TypeSymbol`.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_conditional_with_throw(
+        &mut self,
+        condition: BoundExpr,
+        when_true: &Expr,
+        when_false: &Expr,
+        true_throws: bool,
+        false_throws: bool,
+    ) -> BoundExpr {
+        let (when_true, when_false, ty) = match (true_throws, false_throws) {
+            (true, true) => {
+                let error = TypeSymbol::Error;
+                (
+                    self.throw_arm(when_true, error.clone()),
+                    self.throw_arm(when_false, error.clone()),
+                    error,
+                )
+            }
+            (true, false) => {
+                let value = self.bind_expression(when_false);
+                let ty = value.ty.clone();
+                (self.throw_arm(when_true, ty.clone()), value, ty)
+            }
+            (false, true) => {
+                let value = self.bind_expression(when_true);
+                let ty = value.ty.clone();
+                (value, self.throw_arm(when_false, ty.clone()), ty)
+            }
+            (false, false) => unreachable!("the caller checked that one arm throws"),
+        };
+        BoundExpr {
+            kind: BoundExprKind::Conditional {
+                condition: Box::new(condition),
+                when_true: Box::new(when_true),
+                when_false: Box::new(when_false),
+            },
+            ty,
+        }
+    }
+
+    /// Binds an arm already known to be a throw expression, at the type the conditional settled on.
+    fn throw_arm(&mut self, arm: &Expr, ty: TypeSymbol) -> BoundExpr {
+        let ExprKind::Throw(operand) = &arm.kind else {
+            unreachable!("the caller matched the syntax")
+        };
+        self.bind_throw_expression(operand, ty)
+    }
+
     fn bind_conditional(
         &mut self,
         condition: &Expr,
@@ -4971,6 +6191,17 @@ impl Binder {
             condition
         };
         let span = when_false.span;
+        let true_throws = matches!(when_true.kind, ExprKind::Throw(_));
+        let false_throws = matches!(when_false.kind, ExprKind::Throw(_));
+        if true_throws || false_throws {
+            return self.bind_conditional_with_throw(
+                condition,
+                when_true,
+                when_false,
+                true_throws,
+                false_throws,
+            );
+        }
         let when_true = self.bind_expression(when_true);
         let when_false = self.bind_expression(when_false);
         let ty = if when_true.ty.is_error() || when_false.ty.is_error() {
@@ -5008,6 +6239,699 @@ impl Binder {
         }
     }
 
+    /// `n == null` and `n != null` where `n` is a NULLABLE VALUE TYPE, and their mirrors with the
+    /// literal on the left.
+    ///
+    /// **THIS IS A PEEPHOLE OVER [`Binder::bind_lifted_binary`], NOT A SEPARATE RULE, AND THE
+    /// EARLIER CLAIM THAT IT WAS ONE RESTED ON A RESULT TYPE THAT WAS NEVER MEASURED.** The null
+    /// literal converts to `T?` (13.7.1), so `n == null` IS the lifted `==` with a constant null
+    /// operand; lifted `==` yields `bool` -- measured, not `bool?` -- so nothing about the result
+    /// type distinguishes the two. What the general form would emit is
+    /// `(n.GetValueOrDefault() == default(T)) & (n.HasValue == false)`, whose first term is dead
+    /// because the second already decides it. Reduced here to `!n.HasValue`, which is what csc
+    /// emits and which names the operand ONCE -- so it needs no temporary, and a side-effecting
+    /// `Get() == null` calls `Get` a single time.
+    ///
+    /// Returns `None` when this is not the shape, leaving every other `==`/`!=` untouched.
+    fn bind_nullable_null_comparison(
+        &mut self,
+        operator: BinaryOperator,
+        left: &BoundExpr,
+        right: &BoundExpr,
+        span: Span,
+    ) -> Option<BoundExpr> {
+        let is_null = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Literal(Literal::Null));
+        let nullable = |e: &BoundExpr| {
+            matches!(&e.ty, TypeSymbol::Instantiation { definition, arguments }
+                if crate::types::is_nullable(definition, arguments))
+                && !e.ty.is_error()
+        };
+        let operand = if nullable(left) && is_null(right) {
+            left
+        } else if nullable(right) && is_null(left) {
+            right
+        } else {
+            return None;
+        };
+        let has_value = self.member_access_of(operand.clone(), "HasValue", span);
+        if has_value.ty.is_error() {
+            return None;
+        }
+        Some(match operator {
+            BinaryOperator::NotEqual => has_value,
+            _ => BoundExpr {
+                kind: BoundExprKind::Unary {
+                    operator: UnaryOperator::Not,
+                    operand: Box::new(has_value),
+                },
+                ty: TypeSymbol::Special(SpecialType::Boolean),
+            },
+        })
+    }
+
+    /// Binds a NULL-CONDITIONAL ACCESS `a?.B`, `a?[i]` and the whole chain after it (C# 6.0).
+    ///
+    /// **THE `?` COVERS EVERYTHING TO ITS RIGHT, AND THAT IS THE FEATURE RATHER THAN A DETAIL.**
+    /// `a?.B.C` evaluates NEITHER `B` nor `C` when `a` is null -- measured, with a counting
+    /// property at both positions -- so the parser hands the whole trailing chain in as `access`,
+    /// rooted at a placeholder, and this binds it under one test.
+    ///
+    /// **THE RESULT GAINS A `?` ONLY WHEN THE CHAIN'S OWN TYPE IS A NON-NULLABLE VALUE TYPE.**
+    /// Measured against csc across the shapes that differ:
+    ///
+    /// | expression | result |
+    /// |---|---|
+    /// | `b?.N` on an `int` field | `int?` |
+    /// | `b?.S` on a `string` field | `string`, unchanged |
+    /// | `b?.Next` on a class | that class, unchanged |
+    /// | `b?.M()` returning `int` | `int?` |
+    /// | `s?.Length` | `int?` |
+    ///
+    /// **THE RECEIVER IS UNWRAPPED BEFORE THE CHAIN BINDS, WHICH IS WHY `n?.Value` IS `CS1061` AND
+    /// NOT AN `int?`.** For a `T?` receiver the access binds against `T` -- so `int?` offers
+    /// `int`'s members, and `Value` is not one of them. csc agrees; it was worth measuring because
+    /// the obvious reading (bind against `T?`, then test) accepts a program csc refuses.
+    ///
+    /// A NON-NULLABLE VALUE TYPE receiver has nothing to test and is `CS0023`, the same code a
+    /// lifted unary operator gives -- `Operator '?' cannot be applied to operand of type 'int'`.
+    ///
+    /// The `void` case is not here: `b?.V();` produces no value and is legal only as a statement,
+    /// so [`Binder::bind_conditional_access_statement`] takes it and lowers to an `if`.
+    fn bind_conditional_access(&mut self, receiver: &Expr, access: &Expr, span: Span) -> BoundExpr {
+        let Some(parts) = self.conditional_access_parts(receiver, access, span, None) else {
+            return error_expr();
+        };
+        if parts.access.ty.is_void() {
+            self.report(Diagnostic::new(DiagnosticKind::IllegalStatementExpression, span));
+            return error_expr();
+        }
+        self.conditional_access_value(parts, span)
+    }
+
+    /// The value form of a bound null-conditional access: the conditional, and the spill around it.
+    fn conditional_access_value(&mut self, parts: ConditionalAccessParts, span: Span) -> BoundExpr {
+        let _ = span;
+        let ConditionalAccessParts {
+            receiver,
+            test,
+            access,
+            spill,
+        } = parts;
+        let result_ty = if self.is_value_type(&access.ty)
+            && crate::conversion::nullable_underlying(&access.ty).is_none()
+        {
+            self.nullable_of(&access.ty)
+        } else {
+            access.ty.clone()
+        };
+        let when_true = self.convert(access, &result_ty);
+        let value = BoundExpr {
+            kind: BoundExprKind::Conditional {
+                condition: Box::new(test),
+                when_true: Box::new(when_true),
+                when_false: Box::new(BoundExpr {
+                    kind: BoundExprKind::DefaultValue(result_ty.clone()),
+                    ty: result_ty.clone(),
+                }),
+            },
+            ty: result_ty.clone(),
+        };
+        if !spill {
+            return value;
+        }
+        BoundExpr {
+            kind: BoundExprKind::Sequence {
+                spilled: alloc::vec![receiver],
+                value: Box::new(value),
+            },
+            ty: result_ty,
+        }
+    }
+
+    /// Binds a null-conditional access STANDING AS A STATEMENT, which is a different legality
+    /// question from the value form and -- for a `void` chain -- a different lowering.
+    ///
+    /// **CS0201 IS A QUESTION ABOUT THE CHAIN, NOT ABOUT THE LOWERING.** `b?.N;` is refused and
+    /// `b?.M();` is accepted -- measured -- yet both lower to a conditional, which
+    /// `is_statement_expression` rejects alike. So what is asked is whether the CHAIN is a
+    /// statement expression.
+    ///
+    /// **A `void` CHAIN CANNOT USE THE VALUE FORM AT ALL**: it gives the conditional no type and
+    /// no null to stand in for one. `b?.V();` lowers to `if (b != null) { b.V(); }` instead, over
+    /// a synthesized local when the receiver is not repeatable -- the same shape `foreach` uses for
+    /// its enumerator, and for the same reason: the receiver must be evaluated once and named
+    /// twice, in a position where the expression-level spill has nothing to hang from.
+    ///
+    /// A chain that DOES produce a value goes through the ordinary value form and its result is
+    /// discarded like any other expression statement's.
+    ///
+    /// `None` when this is not a conditional access, leaving the ordinary statement path.
+    pub(crate) fn bind_conditional_access_statement(
+        &mut self,
+        expr: &Expr,
+    ) -> Option<BoundStmtKind> {
+        let ExprKind::ConditionalAccess { receiver, access } = &expr.kind else {
+            return None;
+        };
+        let holder: Box<str> = alloc::format!("<cond>{}", expr.span.start).into();
+        let parts =
+            self.conditional_access_parts(receiver, access, expr.span, Some(holder.clone()))?;
+        if !crate::statement::is_statement_expression(&parts.access.kind) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::IllegalStatementExpression,
+                expr.span,
+            ));
+        }
+        if !parts.access.ty.is_void() {
+            let value = self.conditional_access_value(parts, expr.span);
+            return Some(BoundStmtKind::Expression(value));
+        }
+        let ConditionalAccessParts {
+            receiver,
+            test,
+            access,
+            spill,
+        } = parts;
+        let guard = BoundStmt {
+            kind: BoundStmtKind::If {
+                condition: test,
+                then_branch: Box::new(BoundStmt {
+                    kind: BoundStmtKind::Expression(access),
+                    span: expr.span,
+                }),
+                else_branch: None,
+            },
+            span: expr.span,
+        };
+        if !spill {
+            return Some(guard.kind);
+        }
+        let ty = receiver.ty.clone();
+        Some(BoundStmtKind::Block(alloc::vec![
+            BoundStmt {
+                kind: BoundStmtKind::Local {
+                    ty,
+                    declarators: alloc::vec![BoundDeclarator {
+                        name: holder,
+                        initializer: Some(receiver),
+                    }],
+                },
+                span: expr.span,
+            },
+            guard,
+        ]))
+    }
+
+    /// The three pieces every null-conditional access needs, whether it stands as a value or as a
+    /// statement: the receiver to spill, the test that decides, and the bound chain.
+    ///
+    /// Split out because the `void` case cannot go through [`Binder::bind_conditional_access`] --
+    /// it becomes an `if` statement -- and binding the chain twice would report every diagnostic
+    /// inside it twice.
+    ///
+    /// `holder` names a synthesized LOCAL to spill into instead of a temporary, which the statement
+    /// form needs: its `if` is not an expression, so there is no `Sequence` to hang a `Temp` from.
+    fn conditional_access_parts(
+        &mut self,
+        receiver: &Expr,
+        access: &Expr,
+        span: Span,
+        holder: Option<Box<str>>,
+    ) -> Option<ConditionalAccessParts> {
+        let bound = self.bind_expression(receiver);
+        if bound.ty.is_error() {
+            return None;
+        }
+        let nullable_underlying = crate::conversion::nullable_underlying(&bound.ty).cloned();
+        if nullable_underlying.is_none() && self.is_value_type(&bound.ty) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::UnaryOperatorNotApplicable {
+                    operator: "?".into(),
+                    operand: bound.ty.to_string().into(),
+                },
+                span,
+            ));
+            return None;
+        }
+        let spill = !repeatable_operand(&bound);
+        let spilled = match (spill, &holder) {
+            (false, _) => bound.clone(),
+            (true, Some(name)) => BoundExpr {
+                kind: BoundExprKind::Local(name.clone()),
+                ty: bound.ty.clone(),
+            },
+            (true, None) => BoundExpr {
+                kind: BoundExprKind::Temp(0),
+                ty: bound.ty.clone(),
+            },
+        };
+        let (test, tested_value) = match &nullable_underlying {
+            Some(_) => {
+                let has_value = self.member_access_of(spilled.clone(), "HasValue", span);
+                if has_value.ty.is_error() {
+                    return None;
+                }
+                let value = self.nullable_value(spilled, span)?;
+                (has_value, value)
+            }
+            None => {
+                let null = BoundExpr {
+                    kind: BoundExprKind::Literal(Literal::Null),
+                    ty: TypeSymbol::Special(SpecialType::Null),
+                };
+                let test = self.binary_node(
+                    BinaryOperator::NotEqual,
+                    spilled.clone(),
+                    null,
+                    TypeSymbol::Special(SpecialType::Boolean),
+                );
+                (test, spilled)
+            }
+        };
+        self.conditional_receivers.push(tested_value);
+        let access = self.bind_expression(access);
+        self.conditional_receivers.pop();
+        if matches!(access.kind, BoundExprKind::MethodGroup { .. }) {
+            self.report(Diagnostic::new(DiagnosticKind::MethodGroupNotNullable, span));
+            return None;
+        }
+        if access.ty.is_error() {
+            return None;
+        }
+        Some(ConditionalAccessParts {
+            receiver: bound,
+            test,
+            access,
+            spill,
+        })
+    }
+
+    /// Binds a LIFTED binary operator (ECMA-334 4th ed 14.2.7): a predefined operator applied
+    /// where at least one operand is a nullable value type `T?`.
+    ///
+    /// **THE OPERATOR IS THE UNDERLYING ONE; ONLY ITS OPERANDS AND RESULT GAIN A `?`.** So
+    /// applicability is asked of the UNWRAPPED types -- `int? + long` is the `long + long`
+    /// operator -- and a mixed-width pair needs no `int? -> long?` conversion, which this build
+    /// deliberately does not admit (13.7.2). Lifting on the underlying types is what makes that
+    /// omission cost nothing here.
+    ///
+    /// **THREE RESULT SHAPES, DUMPED FROM csc RATHER THAN DERIVED, AND TWO OF THE THREE WOULD HAVE
+    /// BEEN GUESSED WRONG.** With the operands spilled to `x` and `y`, and `x.V` for
+    /// `x.GetValueOrDefault()`:
+    ///
+    /// | operators | result | value |
+    /// |---|---|---|
+    /// | `+ - * / % & \| ^ << >>` | `S?` | `(x.HasValue & y.HasValue) ? new S?(x.V op y.V) : null` |
+    /// | `==` `!=` | `bool` | `(x.V == y.V) & (x.HasValue == y.HasValue)`, negated for `!=` |
+    /// | `< > <= >=` | `bool` | `(x.V op y.V) & x.HasValue & y.HasValue` |
+    ///
+    /// **AN EQUALITY YIELDS `bool`, NOT `bool?`**, which is what makes `if (a == b)` legal on two
+    /// `int?` -- and the branchless form above has no `HasValue` test to branch on at all. `!=` is
+    /// the NEGATION of the `==` form, not the mirror of it with `|` and `!=`. A RELATIONAL result is
+    /// `bool` too and is FALSE when either operand is null, which is why its presence terms are
+    /// `and`ed onto the comparison instead of compared to each other.
+    ///
+    /// `GetValueOrDefault()` rather than `Value`, because both operands are unwrapped
+    /// unconditionally in the two `bool` shapes: an unwrap that THREW on a null operand would turn
+    /// `a == b` into an exception.
+    ///
+    /// **A NON-NULLABLE OPERAND IS KNOWN NON-NULL, so it contributes no presence term and is used
+    /// as it stands** -- `a + 1` tests only `a`. That is a fact about the operand's TYPE, and it is
+    /// the only simplification taken. csc takes a second one that this does not: it folds `a == 5`
+    /// to `a.V == 5` alone, sound only because `5` differs from `default(int)`. For `a == 0` csc
+    /// emits the `& a.HasValue` this always emits, so copying the fold without its condition would
+    /// answer `true` for `((int?)null) == 0`.
+    ///
+    /// `None` when there is no lifted form, leaving `bind_binary` to report CS0019 against the
+    /// NULLABLE type names -- which is what csc names too.
+    fn bind_lifted_binary(
+        &mut self,
+        operator: BinaryOperator,
+        left: BoundExpr,
+        right: BoundExpr,
+        span: Span,
+    ) -> Option<BoundExpr> {
+        use BinaryOperator as Op;
+        if left.ty.is_error() || right.ty.is_error() {
+            return None;
+        }
+        let null_literal = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Literal(Literal::Null));
+        let (left, right) = if crate::conversion::nullable_underlying(&left.ty).is_some()
+            && null_literal(&right)
+        {
+            let ty = left.ty.clone();
+            let right = self.convert(right, &ty);
+            (left, right)
+        } else if crate::conversion::nullable_underlying(&right.ty).is_some() && null_literal(&left)
+        {
+            let ty = right.ty.clone();
+            let left = self.convert(left, &ty);
+            (left, right)
+        } else {
+            (left, right)
+        };
+        let left_nullable = crate::conversion::nullable_underlying(&left.ty).cloned();
+        let right_nullable = crate::conversion::nullable_underlying(&right.ty).cloned();
+        if left_nullable.is_none() && right_nullable.is_none() {
+            return None;
+        }
+        let left_under = left_nullable.clone().unwrap_or_else(|| left.ty.clone());
+        let right_under = right_nullable.clone().unwrap_or_else(|| right.ty.clone());
+        if !self.is_value_type(&left_under)
+            || !self.is_value_type(&right_under)
+            || crate::conversion::nullable_underlying(&left_under).is_some()
+            || crate::conversion::nullable_underlying(&right_under).is_some()
+        {
+            return None;
+        }
+        if matches!(operator, Op::LogicalAnd | Op::LogicalOr)
+            || (matches!(operator, Op::BitwiseAnd | Op::BitwiseOr)
+                && matches!(left_under, TypeSymbol::Special(SpecialType::Boolean))
+                && matches!(right_under, TypeSymbol::Special(SpecialType::Boolean)))
+        {
+            return None;
+        }
+        let boolean = TypeSymbol::Special(SpecialType::Boolean);
+        let comparison = matches!(operator, Op::Equal | Op::NotEqual);
+        let relational = matches!(
+            operator,
+            Op::LessThan | Op::GreaterThan | Op::LessThanOrEqual | Op::GreaterThanOrEqual
+        );
+        let declares_operators = |binder: &Self, ty: &TypeSymbol| {
+            matches!(
+                binder.type_info_of(ty).map(|info| info.kind),
+                Some(TypeKind::Struct | TypeKind::Class)
+            )
+        };
+        let user_equality_first =
+            comparison && (declares_operators(self, &left_under) || declares_operators(self, &right_under));
+        let (left_ty, right_ty) = (left.ty.clone(), right.ty.clone());
+        let spill = !(repeatable_operand(&left) && repeatable_operand(&right));
+        let operands = [left.clone(), right.clone()];
+        let temp = |index: u32, ty: &TypeSymbol| {
+            if spill {
+                BoundExpr {
+                    kind: BoundExprKind::Temp(index),
+                    ty: ty.clone(),
+                }
+            } else {
+                operands[index as usize].clone()
+            }
+        };
+        let left_value = self.nullable_value(temp(0, &left_ty), span)?;
+        let right_value = self.nullable_value(temp(1, &right_ty), span)?;
+        let (left_value, right_value) =
+            self.adjust_binary_constant(operator, left_value, right_value);
+        let inner_operator = if operator == Op::NotEqual {
+            Op::Equal
+        } else {
+            operator
+        };
+        let user_first = if user_equality_first {
+            self.bind_user_binary_operator(inner_operator, &left_value, &right_value)
+        } else {
+            None
+        };
+        let (inner, user_defined) = match user_first {
+            Some(call) => (call, true),
+            None => {
+                let predefined = self
+                    .enum_binary_result(inner_operator, &left_value.ty, &right_value.ty)
+                    .or_else(|| {
+                        binary_result_type(self, inner_operator, &left_value.ty, &right_value.ty)
+                    });
+                match predefined {
+                    Some(result) => (
+                        self.binary_node(inner_operator, left_value, right_value, result),
+                        false,
+                    ),
+                    None => (
+                        self.bind_user_binary_operator(inner_operator, &left_value, &right_value)?,
+                        true,
+                    ),
+                }
+            }
+        };
+        if (comparison || relational) && inner.ty != boolean {
+            return None;
+        }
+        let underlying_result = inner.ty.clone();
+        let mut presence: Vec<BoundExpr> = Vec::new();
+        for (index, ty) in [(0u32, &left_ty), (1u32, &right_ty)] {
+            if crate::conversion::nullable_underlying(ty).is_none() {
+                continue;
+            }
+            let term = self.member_access_of(temp(index, ty), "HasValue", span);
+            if term.ty.is_error() {
+                return None;
+            }
+            presence.push(term);
+        }
+        let value = if comparison && user_defined {
+            let (same_presence, both_present) = match <[BoundExpr; 2]>::try_from(presence) {
+                Ok([left_has, right_has]) => (
+                    self.binary_node(Op::Equal, left_has.clone(), right_has, boolean.clone()),
+                    left_has,
+                ),
+                Err(mut single) => {
+                    let term = single.pop()?;
+                    (term.clone(), term)
+                }
+            };
+            let when_present = BoundExpr {
+                kind: BoundExprKind::Conditional {
+                    condition: Box::new(both_present),
+                    when_true: Box::new(inner),
+                    when_false: Box::new(BoundExpr {
+                        kind: BoundExprKind::Literal(Literal::Boolean(true)),
+                        ty: boolean.clone(),
+                    }),
+                },
+                ty: boolean.clone(),
+            };
+            let equal = BoundExpr {
+                kind: BoundExprKind::Conditional {
+                    condition: Box::new(same_presence),
+                    when_true: Box::new(when_present),
+                    when_false: Box::new(BoundExpr {
+                        kind: BoundExprKind::Literal(Literal::Boolean(false)),
+                        ty: boolean.clone(),
+                    }),
+                },
+                ty: boolean.clone(),
+            };
+            if operator == Op::NotEqual {
+                BoundExpr {
+                    kind: BoundExprKind::Unary {
+                        operator: UnaryOperator::Not,
+                        operand: Box::new(equal),
+                    },
+                    ty: boolean.clone(),
+                }
+            } else {
+                equal
+            }
+        } else if comparison {
+            let same_presence = match <[BoundExpr; 2]>::try_from(presence) {
+                Ok([left_has, right_has]) => {
+                    self.binary_node(Op::Equal, left_has, right_has, boolean.clone())
+                }
+                Err(mut single) => single.pop()?,
+            };
+            let equal = self.binary_node(Op::BitwiseAnd, inner, same_presence, boolean.clone());
+            if operator == Op::NotEqual {
+                BoundExpr {
+                    kind: BoundExprKind::Unary {
+                        operator: UnaryOperator::Not,
+                        operand: Box::new(equal),
+                    },
+                    ty: boolean.clone(),
+                }
+            } else {
+                equal
+            }
+        } else if relational {
+            presence.into_iter().fold(inner, |combined, term| {
+                self.binary_node(Op::BitwiseAnd, combined, term, boolean.clone())
+            })
+        } else {
+            let result_ty = self.nullable_of(&underlying_result);
+            let condition = presence
+                .into_iter()
+                .reduce(|combined, term| {
+                    self.binary_node(Op::BitwiseAnd, combined, term, boolean.clone())
+                })?;
+            let wrapped = self.convert(inner, &result_ty);
+            BoundExpr {
+                kind: BoundExprKind::Conditional {
+                    condition: Box::new(condition),
+                    when_true: Box::new(wrapped),
+                    when_false: Box::new(BoundExpr {
+                        kind: BoundExprKind::DefaultValue(result_ty.clone()),
+                        ty: result_ty.clone(),
+                    }),
+                },
+                ty: result_ty,
+            }
+        };
+        if !spill {
+            return Some(value);
+        }
+        let ty = value.ty.clone();
+        Some(BoundExpr {
+            kind: BoundExprKind::Sequence {
+                spilled: alloc::vec![left, right],
+                value: Box::new(value),
+            },
+            ty,
+        })
+    }
+
+    /// Binds a LIFTED unary operator (14.2.7): `-a`, `+a`, `~a` and `!a` over a `T?`, whose result
+    /// is `S?` for the underlying operator's `S`.
+    ///
+    /// One operand, so one presence term and no comparison shapes: `a.HasValue ? new S?(op a.V) :
+    /// null`. `++`/`--` are lifted too but are not here -- they READ, operate and WRITE BACK, so
+    /// they belong to the compound-assignment lowering rather than to this value path.
+    fn bind_lifted_unary(
+        &mut self,
+        operator: UnaryOperator,
+        operand: BoundExpr,
+        span: Span,
+    ) -> Option<BoundExpr> {
+        if operand.ty.is_error()
+            || matches!(
+                operator,
+                UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
+            )
+        {
+            return None;
+        }
+        let underlying = crate::conversion::nullable_underlying(&operand.ty)?.clone();
+        let underlying_result = if operator == UnaryOperator::Complement
+            && self.is_enum_type(&underlying)
+        {
+            underlying.clone()
+        } else {
+            unary_result_type(operator, &underlying)?
+        };
+        let operand_ty = operand.ty.clone();
+        let spill = !repeatable_operand(&operand);
+        let spilled = if spill {
+            BoundExpr {
+                kind: BoundExprKind::Temp(0),
+                ty: operand_ty.clone(),
+            }
+        } else {
+            operand.clone()
+        };
+        let has_value = self.member_access_of(spilled.clone(), "HasValue", span);
+        if has_value.ty.is_error() {
+            return None;
+        }
+        let value = self.nullable_value(spilled, span)?;
+        let result_ty = self.nullable_of(&underlying_result);
+        let inner = BoundExpr {
+            kind: BoundExprKind::Unary {
+                operator,
+                operand: Box::new(value),
+            },
+            ty: underlying_result,
+        };
+        let wrapped = self.convert(inner, &result_ty);
+        let value = BoundExpr {
+            kind: BoundExprKind::Conditional {
+                condition: Box::new(has_value),
+                when_true: Box::new(wrapped),
+                when_false: Box::new(BoundExpr {
+                    kind: BoundExprKind::DefaultValue(result_ty.clone()),
+                    ty: result_ty.clone(),
+                }),
+            },
+            ty: result_ty.clone(),
+        };
+        if !spill {
+            return Some(value);
+        }
+        Some(BoundExpr {
+            kind: BoundExprKind::Sequence {
+                spilled: alloc::vec![operand],
+                value: Box::new(value),
+            },
+            ty: result_ty,
+        })
+    }
+
+    /// `System.Nullable<underlying>`, the type `T?` denotes (11.4).
+    fn nullable_of(&self, underlying: &TypeSymbol) -> TypeSymbol {
+        TypeSymbol::Instantiation {
+            definition: alloc::vec!["System".into(), "Nullable".into()].into_boxed_slice(),
+            arguments: alloc::vec![underlying.clone()].into_boxed_slice(),
+        }
+    }
+
+    /// A nullable operand's VALUE: `operand.GetValueOrDefault()`. An operand whose type is not
+    /// nullable is already its value and is returned untouched, which is what lets a lifted
+    /// operator mix `int?` and `int` without wrapping the second one first.
+    ///
+    /// `None` when `Nullable<T>` has no such method to resolve -- a corlib without one, where the
+    /// caller declines the lifted form rather than emitting a call to nothing.
+    fn nullable_value(&mut self, operand: BoundExpr, span: Span) -> Option<BoundExpr> {
+        if crate::conversion::nullable_underlying(&operand.ty).is_none() {
+            return Some(operand);
+        }
+        let method = self.resolve_instance_method(&operand.ty, "GetValueOrDefault", span)?;
+        let return_type = method.return_type.clone();
+        Some(BoundExpr {
+            kind: BoundExprKind::Call {
+                callee: Box::new(BoundExpr {
+                    kind: BoundExprKind::MethodGroup {
+                        receiver: Box::new(operand),
+                        name: method.name.clone(),
+                    },
+                    ty: TypeSymbol::Error,
+                }),
+                arguments: Vec::new(),
+                method: Some(method),
+            },
+            ty: return_type,
+        })
+    }
+
+    /// Builds `left OP right` from two ALREADY-BOUND operands whose result type is known: binary
+    /// numeric promotion (14.2.6.2) and then the node.
+    ///
+    /// **THE PROMOTION IS THE POINT, AND IT IS WHY THIS IS A FUNCTION RATHER THAN THREE COPIES.**
+    /// ECMA-335 requires matched operand types, so a `double`/`int` pair must be widened before it
+    /// reaches the emitter. `bind_binary` does that for operands it bound from syntax; every site
+    /// that builds a binary from operands it already holds -- a lifted operator's unwrapped values,
+    /// an indexer compound assignment's current value -- needs the same step.
+    fn binary_node(
+        &mut self,
+        operator: BinaryOperator,
+        left: BoundExpr,
+        right: BoundExpr,
+        ty: TypeSymbol,
+    ) -> BoundExpr {
+        let (left, right) =
+            if let Some(common) = binary_operand_promotion(operator, &left.ty, &right.ty) {
+                let target = TypeSymbol::Special(common);
+                (self.convert(left, &target), self.convert(right, &target))
+            } else {
+                (left, right)
+            };
+        BoundExpr {
+            kind: BoundExprKind::Binary {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+                checked: self.checked_context,
+            },
+            ty,
+        }
+    }
+
+
     /// Binds `left ?? right` (C# 2.0; ECMA-334 4th ed 14.13).
     ///
     /// **THE RESULT TYPE IS A CONVERSION QUESTION, NOT A PROMOTION**, and the two directions are
@@ -5018,15 +6942,27 @@ impl Binder {
     /// on the stack -- for a reference type that conversion is representation-preserving and emits
     /// nothing, which is what makes the `dup`/`brtrue`/`pop` lowering legal.
     ///
-    /// **THE LEFT OPERAND MUST BE A REFERENCE TYPE HERE, AND THAT IS NARROWER THAN 14.13 SAYS.**
-    /// The standard also admits a NULLABLE VALUE TYPE on the left, whose result is the underlying
-    /// type; this compiler has no nullable value types yet ([`Feature::NullableValueTypes`]), so
-    /// there is no such expression to bind and the case cannot be exercised. A NON-nullable value
-    /// type is CS0019 in csc -- measured on `int a; a ?? 2` -- and is CS0019 here. When nullable
-    /// value types land, this is the site that gains the third rule, and the refusal above it is
-    /// what makes that arrival loud rather than silent.
+    /// **A NULLABLE VALUE TYPE ON THE LEFT IS THE THIRD RULE, AND ITS RESULT IS THE UNDERLYING
+    /// TYPE**: `int? a; a ?? 7` is an `int`, not an `int?`. It is handled before the two conversion
+    /// directions above, because asking them first would find `int?` and `int` mutually convertible
+    /// and answer `int?`. A NON-nullable value type on the left remains CS0019, measured on
+    /// `int a; a ?? 2`.
     fn bind_null_coalescing(&mut self, left: &Expr, right: &Expr, span: Span) -> BoundExpr {
         let left = self.bind_expression(left);
+        if let Some(underlying) = crate::conversion::nullable_underlying(&left.ty).cloned() {
+            return self.bind_nullable_coalescing(left, &underlying, right, span);
+        }
+        if let ExprKind::Throw(operand) = &right.kind {
+            let ty = left.ty.clone();
+            let right = self.bind_throw_expression(operand, ty.clone());
+            return BoundExpr {
+                kind: BoundExprKind::NullCoalescing {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                ty,
+            };
+        }
         let right = self.bind_expression(right);
         if left.ty.is_error() || right.ty.is_error() {
             return BoundExpr {
@@ -5067,6 +7003,120 @@ impl Binder {
             kind: BoundExprKind::NullCoalescing {
                 left: Box::new(left),
                 right: Box::new(right),
+            },
+            ty,
+        }
+    }
+
+    /// `a ?? b` where `a` is a NULLABLE VALUE TYPE (ECMA-334 4th ed 14.12).
+    ///
+    /// **THE RESULT TYPE IS `A0`, `A` OR `B` IN THAT ORDER OF PREFERENCE, AND THE ORDER IS THE
+    /// WHOLE RULE.** `A` is the left operand's type, `A0` its underlying type, `B` the right's:
+    ///
+    /// | first condition that holds | result | value when `a` is non-null |
+    /// |---|---|---|
+    /// | `b` converts to `A0` | `A0` | `a` unwrapped |
+    /// | `b` converts to `A` | `A` | `a` itself, still wrapped |
+    /// | `A0` converts to `B` | `B` | `a` unwrapped, then converted |
+    ///
+    /// Asking those in any other order gets the ordinary case wrong: `int? ?? int` would find `int`
+    /// convertible to `int?` and answer `int?`, where both the standard and csc say `int`. The THIRD
+    /// bullet is a conversion from `A0`, not from `A`, which is what types `int? ?? long` as `long`.
+    ///
+    /// **THE RIGHT OPERAND RUNS ONLY WHEN `a` IS NULL**, which is what the conditional gives and
+    /// what a `GetValueOrDefault(b)` fold would NOT: that form evaluates its argument first, so
+    /// `a ?? Side()` would call `Side` even for a non-null `a`. csc emits the fold only where the
+    /// right operand cannot have an effect.
+    fn bind_nullable_coalescing(
+        &mut self,
+        left: BoundExpr,
+        underlying: &TypeSymbol,
+        right: &Expr,
+        span: Span,
+    ) -> BoundExpr {
+        let left_ty = left.ty.clone();
+        let (right, ty) = if let ExprKind::Throw(operand) = &right.kind {
+            let bound = self.bind_throw_expression(operand, underlying.clone());
+            (bound, underlying.clone())
+        } else {
+            let bound = self.bind_expression(right);
+            if bound.ty.is_error() {
+                return BoundExpr {
+                    kind: BoundExprKind::NullCoalescing {
+                        left: Box::new(left),
+                        right: Box::new(bound),
+                    },
+                    ty: TypeSymbol::Error,
+                };
+            }
+            let ty = if self.assignable(&bound, underlying) {
+                underlying.clone()
+            } else if self.assignable(&bound, &left_ty) {
+                left_ty.clone()
+            } else if crate::conversion::converts(&self.model, underlying, &bound.ty) {
+                bound.ty.clone()
+            } else {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::OperatorNotApplicable {
+                        operator: "??".into(),
+                        left: left_ty.to_string().into(),
+                        right: bound.ty.to_string().into(),
+                    },
+                    span,
+                ));
+                TypeSymbol::Error
+            };
+            (bound, ty)
+        };
+        if ty.is_error() {
+            return BoundExpr {
+                kind: BoundExprKind::NullCoalescing {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                ty,
+            };
+        }
+        let spill = !(repeatable_operand(&left) && repeatable_operand(&right));
+        let spilled = if spill {
+            BoundExpr {
+                kind: BoundExprKind::Temp(0),
+                ty: left_ty.clone(),
+            }
+        } else {
+            left.clone()
+        };
+        let when_true = if ty == left_ty {
+            spilled.clone()
+        } else {
+            let Some(value) = self.nullable_value(spilled.clone(), span) else {
+                return BoundExpr {
+                    kind: BoundExprKind::NullCoalescing {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    ty: TypeSymbol::Error,
+                };
+            };
+            self.convert(value, &ty)
+        };
+        let has_value = self.member_access_of(spilled, "HasValue", span);
+        let when_false = self.convert(right, &ty);
+        let value = BoundExpr {
+            kind: BoundExprKind::Conditional {
+                condition: Box::new(has_value),
+                when_true: Box::new(when_true),
+                when_false: Box::new(when_false),
+            },
+            ty: ty.clone(),
+        };
+        if !spill {
+            return value;
+        }
+        BoundExpr {
+            kind: BoundExprKind::Sequence {
+                spilled: alloc::vec![left],
+                value: Box::new(value),
             },
             ty,
         }
@@ -5124,7 +7174,146 @@ impl Binder {
         }
     }
 
+    /// Binds an assignment, then settles what a write to a property with NO `set` accessor means.
+    ///
+    /// **THE POST-PASS IS WHY THIS IS A WRAPPER.** `bind_assignment_inner` has eight arms that
+    /// each build their own `Assignment` node -- the plain store, the delegate `+=`, the pointer,
+    /// enum and user-operator compounds -- and every one of them targets the property node it was
+    /// handed. Redirecting the write in one place after the fact covers all eight; doing it before
+    /// would have to be done in each -- and a rule with several implementations gains its next case in
+    /// none of them.
+    ///
+    /// **AND THE SPLIT IS THE POINT, NOT AN ARTEFACT**: only the assignment's TARGET is redirected
+    /// to the backing field. The compound forms READ through `get_P` inside their value expression,
+    /// which is where csc reads it too -- and it has to be, because a VIRTUAL getter-only
+    /// auto-property's read must dispatch to an override that a `ldfld` would step past.
     fn bind_assignment(
+        &mut self,
+        operator: AssignmentOperator,
+        target_expr: &Expr,
+        value_expr: &Expr,
+        span: Span,
+    ) -> BoundExpr {
+        let target_span = target_expr.span;
+        let checkpoint = self.diagnostics.len();
+        let bound = self.bind_assignment_inner(operator, target_expr, value_expr, span);
+        let BoundExprKind::Assignment { target, .. } = &bound.kind else {
+            return bound;
+        };
+        let BoundExprKind::PropertyAccess {
+            receiver,
+            setter_declaring_type,
+            name,
+            ..
+        } = &target.kind
+        else {
+            return bound;
+        };
+        if self.property_has_setter(setter_declaring_type, name) {
+            return bound;
+        }
+        let redirected =
+            self.auto_property_backing_write(receiver, setter_declaring_type, name);
+        let Some(field) = redirected else {
+            let declaring = self
+                .property_declaring_type(setter_declaring_type, name)
+                .unwrap_or_else(|| setter_declaring_type.clone());
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::PropertyCannotBeAssigned {
+                    property: alloc::format!("{declaring}.{name}").into(),
+                },
+                target_span,
+            ));
+            return bound;
+        };
+        if let Some(binary_op) = compound_binary_operator(operator) {
+            self.diagnostics.truncate(checkpoint);
+            let applied = Expr::new(
+                ExprKind::Binary {
+                    operator: binary_op,
+                    left: Box::new(target_expr.clone()),
+                    right: Box::new(value_expr.clone()),
+                },
+                span,
+            );
+            return self.bind_assignment(AssignmentOperator::Assign, target_expr, &applied, span);
+        }
+        let store = BoundExpr {
+            ty: field.ty.clone(),
+            kind: BoundExprKind::FieldAccess {
+                receiver: receiver.clone(),
+                name: field.name.clone(),
+                field: Some(field),
+            },
+        };
+        let BoundExprKind::Assignment {
+            operator,
+            value,
+            checked,
+            ..
+        } = bound.kind
+        else {
+            unreachable!("matched as an assignment above")
+        };
+        BoundExpr {
+            ty: bound.ty,
+            kind: BoundExprKind::Assignment {
+                operator,
+                target: Box::new(store),
+                value,
+                checked,
+            },
+        }
+    }
+
+    /// The backing field a write to the SETTER-LESS auto-property `name` lowers to, or `None` when
+    /// the write is one csc refuses.
+    ///
+    /// C# 6.0's readonly auto-property may be assigned from exactly one place, and each half of
+    /// that was measured rather than reasoned about: an INSTANCE one from an instance constructor
+    /// of the declaring type **through `this`** -- `o.P = 1` for another instance of the same type
+    /// is CS0200 even inside that constructor -- and a STATIC one from the static constructor. A
+    /// DERIVED type's constructor cannot (CS0200 naming the base), and neither can a NESTED type's,
+    /// which is why this asks whether the current type IS the declaring one rather than whether it
+    /// is in its private scope.
+    ///
+    /// **THE MODELED FIELD IS THE TEST FOR "AUTOMATICALLY IMPLEMENTED".** A getter-only property
+    /// with a BODY is refused by the same CS0200, and the thing that separates the two is that only
+    /// one of them has a `<P>k__BackingField` for `resolve_member` to find. Resolving it rather
+    /// than constructing a reference by hand is also what carries the generic instantiation: inside
+    /// `C<T>` the store must name a `MemberRef` on the `TypeSpec`, not the open `FieldDef`.
+    fn auto_property_backing_write(
+        &self,
+        receiver: &BoundExpr,
+        declaring: &TypeSymbol,
+        name: &str,
+    ) -> Option<FieldReference> {
+        let current = self.current_type.as_ref()?;
+        if current != declaring && fold_primitive_name(current) != fold_primitive_name(declaring) {
+            return None;
+        }
+        let context = self.current_method.as_ref()?;
+        let is_static = self
+            .type_info_of(declaring)?
+            .find_property(name)
+            .map(|property| property.is_static)?;
+        let in_constructor = matches!(&*context.name, ".ctor" | ".cctor");
+        let permitted = if is_static {
+            in_constructor && context.is_static
+        } else {
+            in_constructor && !context.is_static && matches!(receiver.kind, BoundExprKind::This)
+        };
+        if !permitted {
+            return None;
+        }
+        let backing = auto_property_backing_field_name(None, name);
+        match self.resolve_member(&receiver.ty, &backing) {
+            MemberResolution::Field(field) => Some(field),
+            _ => None,
+        }
+    }
+
+    fn bind_assignment_inner(
         &mut self,
         operator: AssignmentOperator,
         target_expr: &Expr,
@@ -5197,6 +7386,9 @@ impl Binder {
             }
         }
         let target = self.bind_expression(target_expr);
+        if matches!(value_expr.kind, ExprKind::RefArgument { position: RefPosition::Reassignment, .. }) {
+            return self.bind_ref_reassignment(target, value_expr, span);
+        }
         if let BoundExprKind::FieldAccess {
             field: Some(field), ..
         } = &target.kind
@@ -5234,6 +7426,21 @@ impl Binder {
                     },
                     target_span,
                 ));
+            }
+        }
+        if operator == AssignmentOperator::Assign && !target.ty.is_error() {
+            let target_ty = target.ty.clone();
+            if let Some(bound) = self.bind_target_typed(value_expr, &target_ty) {
+                let ty = target_ty.clone();
+                return BoundExpr {
+                    kind: BoundExprKind::Assignment {
+                        operator,
+                        target: Box::new(target),
+                        value: Box::new(bound),
+                        checked: self.checked_context,
+                    },
+                    ty,
+                };
             }
         }
         let mut value = if operator == AssignmentOperator::Assign
@@ -5399,7 +7606,10 @@ impl Binder {
         }
         let this_in_struct =
             matches!(target.kind, BoundExprKind::This) && self.is_value_type(&target.ty);
-        if !target.ty.is_error() && !is_lvalue(&target) && !this_in_struct {
+        if !target.ty.is_error()
+            && (!is_lvalue(&target) || self.writes_through_readonly_ref(&target))
+            && !this_in_struct
+        {
             self.diagnostics
                 .push(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
         } else if !target.ty.is_error() && !value.ty.is_error() {
@@ -5474,7 +7684,9 @@ impl Binder {
     fn bind_await(&mut self, operand: &Expr, span: Span) -> BoundExpr {
         let bound = self.bind_expression(operand);
         if self.current_method.as_ref().is_some_and(|method| method.is_async) {
-            if self.catch_depth > 0 {
+            if self.filter_depth > 0 {
+                self.report(Diagnostic::new(DiagnosticKind::AwaitInCatchFilter, span));
+            } else if self.catch_depth > 0 {
                 if self.language_version.supports(Feature::AwaitInCatchOrFinally) {
                     self.gate_feature(Feature::AwaitInCatchOrFinally, span);
                 } else {
@@ -5823,17 +8035,15 @@ impl Binder {
                         name,
                         &ty,
                     );
-                BoundExpr {
-                    kind: BoundExprKind::PropertyAccess {
-                        receiver: Box::new(receiver),
-                        declaring_type: getter_declaring,
-                        setter_declaring_type: setter_declaring,
-                        getter_instantiation,
-                        setter_instantiation,
-                        name: name.into(),
-                    },
+                Self::property_access(
+                    receiver,
+                    getter_declaring,
+                    setter_declaring,
+                    getter_instantiation,
+                    setter_instantiation,
+                    name,
                     ty,
-                }
+                )
             }
             MemberResolution::MethodGroup => BoundExpr {
                 kind: BoundExprKind::MethodGroup {
@@ -6529,17 +8739,18 @@ impl Binder {
                 .collect(),
             _ => arguments,
         };
-        let ty = resolved
+        let declared = resolved
             .as_ref()
             .map_or(TypeSymbol::Error, |method| method.return_type.clone());
-        BoundExpr {
+        let call = BoundExpr {
             kind: BoundExprKind::Call {
                 callee: Box::new(callee),
                 arguments,
                 method: resolved,
             },
-            ty,
-        }
+            ty: declared.clone(),
+        };
+        Self::deref_ref_return(call, &declared)
     }
 
     /// The argument a call site supplies for an OMITTED optional parameter (12.6.4.2): the
@@ -6817,9 +9028,6 @@ impl Binder {
             let Some(constraints) = definition.constraints_on(index) else {
                 continue;
             };
-            if constraints.is_empty() {
-                continue;
-            }
             let parameter: Box<str> = definition.type_parameters[index].clone();
             let constraints = constraints.clone();
             self.check_one_type_argument_as(
@@ -7324,7 +9532,7 @@ impl Binder {
     ) -> Option<BoundExpr> {
         let (method_ref, arguments) =
             self.resolve_indexer_accessor(&receiver.ty, accessor, arguments, span)?;
-        let ty = method_ref.return_type.clone();
+        let declared = method_ref.return_type.clone();
         let callee = BoundExpr {
             ty: TypeSymbol::Error,
             kind: BoundExprKind::MethodGroup {
@@ -7332,14 +9540,15 @@ impl Binder {
                 name: accessor.into(),
             },
         };
-        Some(BoundExpr {
+        let call = BoundExpr {
             kind: BoundExprKind::Call {
                 callee: Box::new(callee),
                 arguments,
                 method: Some(method_ref),
             },
-            ty,
-        })
+            ty: declared.clone(),
+        };
+        Some(Self::deref_ref_return(call, &declared))
     }
 
     /// Binds a COMPOUND indexer assignment `receiver[indices] op= value` as the read-modify-write
@@ -7382,15 +9591,7 @@ impl Binder {
 
         let operand = self.bind_expression(value_expr);
         let result_ty = binary_result_type(self, binary_op, &current.ty, &operand.ty)?;
-        let combined = BoundExpr {
-            kind: BoundExprKind::Binary {
-                operator: binary_op,
-                left: Box::new(current),
-                right: Box::new(operand),
-                checked: self.checked_context,
-            },
-            ty: result_ty,
-        };
+        let combined = self.binary_node(binary_op, current, operand, result_ty);
 
         let mut store_args = store_indices;
         store_args.push(combined);
@@ -7778,10 +9979,49 @@ impl Binder {
         self.property_is_init(enclosing, property)
     }
 
+    /// Whether the property `name` reached through `declaring_type` has a `set` accessor.
+    ///
+    /// **THE BASE CHAIN IS WALKED, AND ASKING ONE TYPE MISSED EVERY INHERITED PROPERTY.**
+    /// `TypeInfo::find_property` looks only at the members a type declares, so a getter-only
+    /// property inherited from a base answered "has a setter" by default and its assignment reached
+    /// the emitter, which refused it with no diagnostic code. Measured against csc, which reports
+    /// CS0200 there and names the BASE as the declaring type.
+    ///
+    /// Unknown -- a type outside the model, or a name the chain does not declare -- stays `true`:
+    /// refusing an assignment we cannot check would invent a diagnostic, so this is permissive in
+    /// the one direction that cannot.
     fn property_has_setter(&self, declaring_type: &TypeSymbol, name: &str) -> bool {
-        self.type_info_of(declaring_type)
-            .and_then(|info| info.find_property(name).map(|property| property.has_setter))
-            .unwrap_or(true)
+        match self.property_declaring_type(declaring_type, name) {
+            Some(declaring) => self
+                .type_info_of(&declaring)
+                .and_then(|info| info.find_property(name).map(|property| property.has_setter))
+                .unwrap_or(true),
+            None => true,
+        }
+    }
+
+    /// Walking up from `from`, the first type in the base chain that DECLARES a property called
+    /// `name` -- or `None` when no type in the chain does, or the chain leaves the model.
+    ///
+    /// **`TypeInfo::find_property` LOOKS ONLY AT WHAT A TYPE DECLARES**, so every question about an
+    /// INHERITED property has to walk, and both of this function's callers were getting the wrong
+    /// answer without it: a getter-only property inherited from a base read as having a setter, and
+    /// the diagnostic that finally reported it named the derived type csc does not name.
+    fn property_declaring_type(&self, from: &TypeSymbol, name: &str) -> Option<TypeSymbol> {
+        let mut current = Some(from.clone());
+        let mut seen: Vec<TypeSymbol> = Vec::new();
+        while let Some(ty) = current {
+            if seen.contains(&ty) {
+                return None;
+            }
+            seen.push(ty.clone());
+            let info = self.type_info_of(&ty)?;
+            if info.find_property(name).is_some() {
+                return Some(ty);
+            }
+            current = info.base.clone();
+        }
+        None
     }
 
     fn bind_object_creation(
@@ -8121,7 +10361,7 @@ impl Binder {
     /// inaccessible member does not participate in overload resolution, so it cannot shadow an
     /// accessible one. If EVERY candidate is inaccessible, all are returned so the caller still
     /// reports its normal failure rather than silently finding nothing.
-    fn accessible_overloads(
+    pub(crate) fn accessible_overloads(
         &self,
         declaring: &TypeSymbol,
         candidates: &[MethodSymbol],
@@ -8157,7 +10397,7 @@ impl Binder {
     /// So the second pass runs the SAME resolution over the wider set and reports only when it
     /// succeeds; a failure there falls through to the accessible set's diagnostic, which is why the
     /// last row is a plain "no constructor takes 0 arguments" and not a protection-level error.
-    fn check_constructor(
+    pub(crate) fn check_constructor(
         &mut self,
         target: &TypeSymbol,
         accessible: &[MethodSymbol],
@@ -8282,7 +10522,7 @@ impl Binder {
     ///
     /// The same holds for `protected internal` ACROSS an assembly boundary, where the `internal`
     /// half does not apply: a derived class in another assembly gets CS0122 on `new B(...)` too.
-    fn constructor_is_accessible(
+    pub(crate) fn constructor_is_accessible(
         &self,
         target: &TypeSymbol,
         accessibility: Accessibility,
@@ -8718,40 +10958,8 @@ impl Binder {
             let Some(info) = self.type_info_of(&current_ty) else {
                 continue;
             };
-            let declaring = type_symbol_in(&info.namespace, &info.name);
-            let named = member_declaring_type(&current_ty, &info);
-            let (resolution, accessible) = if let Some(field) = info.find_field(name) {
-                (
-                    MemberResolution::Field(FieldReference {
-                        declaring_instantiation: self
-                            .field_instantiation_of(&named, &field.name),
-                        declaring_type: named.clone(),
-                        name: field.name.clone(),
-                        ty: self.resolve_type(&field.ty),
-                        is_static: field.is_static,
-                        is_readonly: field.is_readonly,
-                        is_volatile: field.is_volatile,
-                        accessibility: field.accessibility,
-                        constant: field.constant.clone(),
-                    }),
-                    self.is_accessible(&declaring, field.accessibility),
-                )
-            } else if let Some(property) = info.find_property(name) {
-                (
-                    MemberResolution::Property {
-                        declaring_type: named.clone(),
-                        ty: self.resolve_type(&property.ty),
-                        accessibility: property.accessibility,
-                        is_static: property.is_static,
-                    },
-                    self.is_accessible(&declaring, property.accessibility),
-                )
-            } else if info.methods_named(name).next().is_some() {
-                let any_accessible = info
-                    .methods_named(name)
-                    .any(|method| self.is_accessible(&declaring, method.accessibility));
-                (MemberResolution::MethodGroup, any_accessible)
-            } else {
+            let Some((resolution, accessible)) = self.member_declared_in(&current_ty, &info, name)
+            else {
                 for base in member_lookup_bases(&info) {
                     pending.push(base);
                 }
@@ -8768,6 +10976,73 @@ impl Binder {
         inaccessible.unwrap_or(MemberResolution::NoSuchMember(ty.to_string()))
     }
 
+    /// The member `name` DECLARED DIRECTLY in `info` (the model entry for `current_ty`), with
+    /// whether it is accessible from here. `None` when this type declares no such member, which is
+    /// the caller's signal to keep walking -- or, for a caller that must not walk, the answer.
+    ///
+    /// **THE `using static` IMPORT IS WHY THIS IS A FUNCTION.** `resolve_member` searches the base
+    /// chain and the interfaces; 13.5.4 imports only what the named type declares itself, so the
+    /// two callers need the same per-type answer and different walks around it. The alternative was
+    /// a second copy of the field/property/method-group triple, which is the shape this codebase
+    /// has been bitten by.
+    ///
+    /// AN INSTANTIATION IS NAMED AS ITSELF HERE, AND THIS IS THE THIRD COPY OF THE SAME LINE.
+    /// `declaring_type_in_chain` rebuilt a member's declaring type from `namespace`/`name` and
+    /// dropped the arguments; so did this, for FIELDS and PROPERTIES.
+    ///
+    /// **THE FIELD CASE IS THE ONE THAT CORRUPTS DATA RATHER THAN METADATA.** With the
+    /// instantiation erased, `Counter<int>.Total` and `Counter<string>.Total` resolve to the
+    /// definition's single `FieldDef` -- ONE static cell where ECMA-335 II.9.7 requires one per
+    /// instantiation. Measured on the interpreter tier: a program that should answer 10507
+    /// answered 503503, with zero violations reported, because an erased use site is
+    /// indistinguishable from non-generic code and so is never refused.
+    ///
+    /// Accessibility is still asked of the DEFINITION: no type argument changes private or
+    /// protected scope.
+    fn member_declared_in(
+        &self,
+        current_ty: &TypeSymbol,
+        info: &TypeInfo,
+        name: &str,
+    ) -> Option<(MemberResolution, bool)> {
+        let declaring = type_symbol_in(&info.namespace, &info.name);
+        let named = member_declaring_type(current_ty, info);
+        if let Some(field) = info.find_field(name) {
+            return Some((
+                MemberResolution::Field(FieldReference {
+                    declaring_instantiation: self.field_instantiation_of(&named, &field.name),
+                    declaring_type: named.clone(),
+                    name: field.name.clone(),
+                    ty: self.resolve_type(&field.ty),
+                    is_static: field.is_static,
+                    is_readonly: field.is_readonly,
+                    is_volatile: field.is_volatile,
+                    accessibility: field.accessibility,
+                    constant: field.constant.clone(),
+                }),
+                self.is_accessible(&declaring, field.accessibility),
+            ));
+        }
+        if let Some(property) = info.find_property(name) {
+            return Some((
+                MemberResolution::Property {
+                    declaring_type: named.clone(),
+                    ty: self.resolve_type(&property.ty),
+                    accessibility: property.accessibility,
+                    is_static: property.is_static,
+                },
+                self.is_accessible(&declaring, property.accessibility),
+            ));
+        }
+        if info.methods_named(name).next().is_some() {
+            let any_accessible = info
+                .methods_named(name)
+                .any(|method| self.is_accessible(&declaring, method.accessibility));
+            return Some((MemberResolution::MethodGroup, any_accessible));
+        }
+        None
+    }
+
     /// Resolves a simple name against the STATIC members of the current type's enclosing types
     /// (14.5.2): a nested type sees its enclosing types' static fields, constants, and properties
     /// by simple name, at any depth. Instance members of an enclosing type are not in scope (there
@@ -8780,54 +11055,179 @@ impl Binder {
         };
         let mut enclosing = self.current_type.as_ref().and_then(enclosing_of);
         while let Some(ty) = enclosing {
-            let type_reference = || {
-                Box::new(BoundExpr {
-                    kind: BoundExprKind::TypeReference(ty.clone()),
-                    ty: ty.clone(),
-                })
-            };
-            match self.resolve_member(&ty, name) {
-                MemberResolution::Field(field) if field.is_static => {
-                    return Some(BoundExpr {
-                        ty: field.ty.clone(),
-                        kind: BoundExprKind::FieldAccess {
-                            receiver: type_reference(),
-                            name: name.into(),
-                            field: Some(field),
-                        },
-                    });
-                }
-                MemberResolution::Property {
-                    ty: property_ty,
-                    is_static: true,
-                    ..
-                } => {
-                    let (getter_declaring, setter_declaring) =
-                        self.property_accessor_declarers(&ty, name);
-                    let (getter_instantiation, setter_instantiation) = self
-                        .property_accessor_instantiations(
-                            &getter_declaring,
-                            &setter_declaring,
-                            name,
-                            &property_ty,
-                        );
-                    return Some(BoundExpr {
-                        kind: BoundExprKind::PropertyAccess {
-                            receiver: type_reference(),
-                            declaring_type: getter_declaring,
-                            setter_declaring_type: setter_declaring,
-                            getter_instantiation,
-                            setter_instantiation,
-                            name: name.into(),
-                        },
-                        ty: property_ty,
-                    });
-                }
-                _ => {}
+            let resolution = self.resolve_member(&ty, name);
+            if let Some(bound) = self.static_member_expr(&ty, name, resolution) {
+                return Some(bound);
             }
             enclosing = enclosing_of(&ty);
         }
         None
+    }
+
+    /// A simple name resolved against the `using static` imports in scope: a static field,
+    /// constant, property or method DECLARED DIRECTLY in one of the imported types (13.5.4).
+    ///
+    /// `type_hits` is what [`Binder::type_namespaces_containing`] answered for the same name, and
+    /// it is a parameter rather than a second lookup because the two answers INTERACT:
+    ///
+    /// * a type found in a more specific scope than an import -- the enclosing type, the current
+    ///   namespace, the global namespace -- SHADOWS the imported member, so this answers `None`
+    ///   and the caller takes the type. Measured: a nested `T` in the enclosing class wins over a
+    ///   `using static` that also offers `T`.
+    /// * a type found in an IMPORTED scope shares the member's precedence level, and csc calls
+    ///   that `CS0229` -- *"Ambiguity between 'C0.A' and 'A'"* -- rather than picking either.
+    ///
+    /// Reports and yields an error expression for the ambiguous and inaccessible cases, because
+    /// both are answers: falling through to `CS0103` would say the name does not exist when the
+    /// compiler has found two of it, or one it may not touch.
+    fn resolve_imported_static(
+        &mut self,
+        name: &str,
+        span: Span,
+        type_hits: &[(Box<str>, bool)],
+    ) -> Option<BoundExpr> {
+        if self.imported_static_types.is_empty() {
+            return None;
+        }
+        let type_is_imported = match type_hits.first() {
+            Some((_, imported)) => *imported,
+            None => false,
+        };
+        if type_hits.first().is_some() && !type_is_imported {
+            return None;
+        }
+        let imported: Vec<TypeSymbol> = self.imported_static_types.clone();
+        let mut accessible: Vec<(TypeSymbol, MemberResolution)> = Vec::new();
+        let mut inaccessible: Option<TypeSymbol> = None;
+        for ty in imported {
+            let Some(info) = self.type_info_of(&ty) else {
+                continue;
+            };
+            let Some((resolution, is_accessible)) = self.member_declared_in(&ty, &info, name) else {
+                continue;
+            };
+            let is_static = match &resolution {
+                MemberResolution::Field(field) => field.is_static,
+                MemberResolution::Property { is_static, .. } => *is_static,
+                MemberResolution::MethodGroup => {
+                    info.methods_named(name).any(|method| method.is_static)
+                }
+                _ => false,
+            };
+            if !is_static {
+                continue;
+            }
+            if is_accessible {
+                accessible.push((ty, resolution));
+            } else if inaccessible.is_none() {
+                inaccessible = Some(ty);
+            }
+        }
+        if accessible.len() > 1 {
+            let all_methods = accessible
+                .iter()
+                .all(|(_, resolution)| matches!(resolution, MemberResolution::MethodGroup));
+            let kind = if all_methods {
+                DiagnosticKind::AmbiguousCall {
+                    method: name.into(),
+                }
+            } else {
+                DiagnosticKind::AmbiguousMember {
+                    first: format!("{}.{name}", simple_type_name(&accessible[0].0)).into(),
+                    second: format!("{}.{name}", simple_type_name(&accessible[1].0)).into(),
+                }
+            };
+            self.diagnostics.push(Diagnostic::new(kind, span));
+            return Some(error_expr());
+        }
+        let Some((ty, resolution)) = accessible.pop() else {
+            let inaccessible = inaccessible?;
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::Inaccessible {
+                    member: format!("{}.{name}", simple_type_name(&inaccessible)).into(),
+                },
+                span,
+            ));
+            return Some(error_expr());
+        };
+        if type_is_imported {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::AmbiguousMember {
+                    first: format!("{}.{name}", simple_type_name(&ty)).into(),
+                    second: name.into(),
+                },
+                span,
+            ));
+            return Some(error_expr());
+        }
+        if matches!(resolution, MemberResolution::MethodGroup) {
+            return Some(BoundExpr {
+                kind: BoundExprKind::MethodGroup {
+                    receiver: Box::new(BoundExpr {
+                        kind: BoundExprKind::TypeReference(ty.clone()),
+                        ty,
+                    }),
+                    name: name.into(),
+                },
+                ty: TypeSymbol::Error,
+            });
+        }
+        self.static_member_expr(&ty, name, resolution)
+    }
+
+    /// A static field, constant or property `name` of `ty`, as an expression whose receiver is the
+    /// TYPE rather than any value -- `None` for anything else the lookup found.
+    ///
+    /// **THE LOOKUP IS THE CALLER'S AND THE CONSTRUCTION IS SHARED**, because the two callers
+    /// disagree about exactly one thing and agree about everything after it: an enclosing type's
+    /// statics are searched down the BASE CHAIN (14.5.2), and a `using static` import is searched
+    /// in the named type ALONE (13.5.4). Passing the resolution in keeps that difference at the
+    /// one place it exists instead of duplicating twenty lines of node building to hold it.
+    fn static_member_expr(
+        &self,
+        ty: &TypeSymbol,
+        name: &str,
+        resolution: MemberResolution,
+    ) -> Option<BoundExpr> {
+        let type_reference = || BoundExpr {
+            kind: BoundExprKind::TypeReference(ty.clone()),
+            ty: ty.clone(),
+        };
+        match resolution {
+            MemberResolution::Field(field) if field.is_static => Some(BoundExpr {
+                ty: field.ty.clone(),
+                kind: BoundExprKind::FieldAccess {
+                    receiver: Box::new(type_reference()),
+                    name: name.into(),
+                    field: Some(field),
+                },
+            }),
+            MemberResolution::Property {
+                ty: property_ty,
+                is_static: true,
+                ..
+            } => {
+                let (getter_declaring, setter_declaring) =
+                    self.property_accessor_declarers(ty, name);
+                let (getter_instantiation, setter_instantiation) = self
+                    .property_accessor_instantiations(
+                        &getter_declaring,
+                        &setter_declaring,
+                        name,
+                        &property_ty,
+                    );
+                Some(Self::property_access(
+                    type_reference(),
+                    getter_declaring,
+                    setter_declaring,
+                    getter_instantiation,
+                    setter_instantiation,
+                    name,
+                    property_ty,
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// The model entry for a named type, if any. Owned for an instantiation, borrowed otherwise --
@@ -8853,6 +11253,20 @@ impl Binder {
         ) && self
             .type_info_of(&expr.ty)
             .is_some_and(|info| info.kind == TypeKind::Delegate)
+    }
+
+    /// Whether the field `name` declared by `declaring` is `const` -- a compile-time constant with
+    /// no storage of its own, which is why a `ref` to one is CS1510 and not the CS0192 a `readonly`
+    /// field draws.
+    fn field_is_constant(&self, declaring: &TypeSymbol, name: &str) -> bool {
+        self.type_info_of(declaring)
+            .and_then(|info| {
+                info.fields
+                    .iter()
+                    .find(|field| &*field.name == name)
+                    .map(|field| field.constant.is_some())
+            })
+            .unwrap_or(false)
     }
 
     /// Whether the field `name` declared by `declaring` is `readonly` (CS0191).
@@ -9833,11 +12247,21 @@ impl Binder {
         })
     }
 
-    /// Normalizes a type for cross-source signature comparison: a framework-named primitive/
-    /// `object`/`string` folds to its special form, at every level of an array/pointer/byref, so
-    /// a metadata `System.Object` parameter and the `object` keyword are the same type. A
-    /// single-part name is qualified through [`Binder::canonicalize`], so a signature read from
-    /// SYNTAX compares against one read from METADATA.
+    /// Normalizes a type for cross-source signature comparison, so a signature read from SYNTAX
+    /// compares equal to one read from METADATA: [`Binder::canonicalize`] decides which type each
+    /// name denotes, and [`fold_builtins_deep`] picks between a framework-named primitive and its
+    /// keyword, at every level of an array, pointer, byref or type ARGUMENT.
+    ///
+    /// **IT IS THOSE TWO AND NOTHING ELSE, AND THAT IS THE POINT.** Walking the type here instead
+    /// would put a second arm list beside the qualifier's own, and a [`TypeSymbol`] variant can be
+    /// added to one and missed by the other -- a rule with two implementations, which gains a case
+    /// in neither. A constructed generic left unqualified compares equal to nothing, so an
+    /// `override void Read(Span<byte> b)` against an imported `abstract void Read(System.Span<byte>)`
+    /// is `CS0115` while the same override spelled `System.Span<byte>` is clean.
+    ///
+    /// **THAT FAILURE POINTS NOWHERE NEAR ITS CAUSE**, which is why the composition is worth
+    /// keeping: a non-generic simple name, a fully qualified generic and the whole interface path
+    /// are all unaffected by it, so nothing in the shape of the symptom names the missing arm.
     ///
     /// **SCOPED, NOT WORLD-UNIQUE.** This is the ONE position where a name read from syntax meets
     /// one read from metadata, so a qualifier that answers only when the simple name is unique in
@@ -9851,27 +12275,19 @@ impl Binder {
     /// The caller enters the enclosing type and its type parameters, matching
     /// `qualify_declared_signatures`, which rewrites the model's copy of these same signatures.
     fn normalize_for_signature(&self, ty: &TypeSymbol) -> TypeSymbol {
-        match ty {
-            TypeSymbol::Array { element, rank } => TypeSymbol::Array {
-                element: Box::new(self.normalize_for_signature(element)),
-                rank: *rank,
-            },
-            TypeSymbol::Pointer(inner) => {
-                TypeSymbol::Pointer(Box::new(self.normalize_for_signature(inner)))
-            }
-            TypeSymbol::ByRef(inner) => {
-                TypeSymbol::ByRef(Box::new(self.normalize_for_signature(inner)))
-            }
-            TypeSymbol::Named(parts) => {
-                let qualified = if parts.len() == 1 {
-                    self.canonicalize(ty)
-                } else {
-                    ty.clone()
-                };
-                qualified.fold_builtin()
-            }
-            _ => ty.clone(),
-        }
+        fold_builtins_deep(self.canonicalize(ty))
+    }
+
+    /// Whether `ty` is BY-REF-LIKE -- a `ref struct`, declared here or imported.
+    ///
+    /// **AN INSTANTIATION ANSWERS BY ITS DEFINITION, UNDER THE ARITY-MANGLED NAME.** `Span<byte>`
+    /// is by-ref-like because `Span<T>` is, and the arguments have nothing to say about it -- but
+    /// the model keys that definition `` System.Span`1 `` (II.10.7.2), so looking it up as
+    /// `System.Span` finds NOTHING and answers `false`. [`definition_symbol`] is the spelling a
+    /// source-collected and a reference-read definition both arrive with, which is why the lookup
+    /// goes through it rather than rebuilding the name here.
+    pub(crate) fn type_is_by_ref_like(&self, ty: &TypeSymbol) -> bool {
+        crate::conversion::is_by_ref_like(self.model(), ty)
     }
 
     /// Whether an instance member emitted under `method_name` with `params` (a method, or a
@@ -10428,7 +12844,16 @@ impl Binder {
                 ..
             } => Some(MethodReference {
                 declaring_instantiation: self
-                    .declaring_instantiation_of(&declaring_type, &getter, &[]),
+                    .model
+                    .open_property_accessor(&declaring_type, name, false)
+                    .map(|(type_parameters, parameters, return_type)| {
+                        alloc::boxed::Box::new(TypeInstantiation {
+                            type_parameters,
+                            parameters,
+                            return_type,
+                            return_required_modifiers: Vec::new(),
+                        })
+                    }),
                 declaring_type,
                 name: getter.into(),
                 parameters: Vec::new(),
@@ -10573,6 +12998,7 @@ impl Binder {
                 type_parameters,
                 parameters,
                 return_type,
+                return_required_modifiers: Vec::new(),
             }))
         };
         (
@@ -10712,6 +13138,7 @@ impl Binder {
             type_parameters,
             parameters: open.parameters,
             return_type: open.return_type,
+            return_required_modifiers: open.return_required_modifiers,
         }))
     }
 
@@ -10740,10 +13167,12 @@ impl Binder {
                 ty: ty.clone(),
             };
         }
-        if let Some(ty) = self.lookup_local(name) {
+        if let Some((depth, ty)) = self.lookup_local_depth(name) {
+            let ty = ty.clone();
+            self.note_capture(name, &ty, depth);
             return BoundExpr {
                 kind: BoundExprKind::Local(name.into()),
-                ty: ty.clone(),
+                ty,
             };
         }
         if let Some(receiver) = self.session_receiver.clone() {
@@ -10823,17 +13252,15 @@ impl Binder {
                             name,
                             &ty,
                         );
-                    return BoundExpr {
-                        kind: BoundExprKind::PropertyAccess {
-                            receiver: Box::new(receiver),
-                            declaring_type: getter_declaring,
-                            setter_declaring_type: setter_declaring,
-                            getter_instantiation,
-                            setter_instantiation,
-                            name: name.into(),
-                        },
+                    return Self::property_access(
+                        receiver,
+                        getter_declaring,
+                        setter_declaring,
+                        getter_instantiation,
+                        setter_instantiation,
+                        name,
                         ty,
-                    };
+                    );
                 }
                 MemberResolution::MethodGroup => {
                     return BoundExpr {
@@ -10857,10 +13284,14 @@ impl Binder {
             };
         }
         let hits = self.type_namespaces_containing(name);
+        if let Some(bound) = self.resolve_imported_static(name, span, &hits) {
+            return bound;
+        }
         if let Some((namespace, imported)) = hits.first() {
             let ambiguous_import = *imported && hits.get(1).is_some_and(|(_, other)| *other);
             if !ambiguous_import {
                 let ty = type_symbol_in(namespace, name);
+                self.check_type_is_accessible(&ty, span);
                 return BoundExpr {
                     kind: BoundExprKind::TypeReference(ty.clone()),
                     ty,
@@ -11099,6 +13530,43 @@ fn binary_result_type(
 /// share a type, so `r8` + `i4` cannot be mixed). `None` for string concatenation, the shift operators, the logical
 /// operators, and any non-numeric operand pair -- which promote differently or not at all and are
 /// handled in `bind_binary` directly.
+/// The pieces of a null-conditional access, shared by its value form and its statement form.
+struct ConditionalAccessParts {
+    /// The receiver as bound, spilled by the caller when it is not repeatable.
+    receiver: BoundExpr,
+    /// The test that decides: `!= null` for a reference receiver, `HasValue` for a `T?`.
+    test: BoundExpr,
+    /// The whole trailing chain, bound against the tested (and unwrapped) value.
+    access: BoundExpr,
+    /// Whether the receiver needs a temporary; `false` when re-reading it costs nothing.
+    spill: bool,
+}
+
+/// Whether a lifted operator's operand can be NAMED TWICE instead of spilled to a temporary.
+///
+/// **READING IT TWICE MUST COST NOTHING AND MUST SEE THE SAME VALUE**, which a literal, a
+/// `default(T)` and a local or parameter all satisfy. Everything else -- a call, a property, a
+/// field, an assignment -- either has an effect or can observe one, and spills.
+///
+/// **THE LOCAL CASE IS ONLY SAFE BECAUSE THE DECISION IS MADE FOR ALL THE OPERANDS AT ONCE.**
+/// A local is stable only while nothing writes it, and the other operand runs BETWEEN the two
+/// reads: in `a + Get()`, a `Get` that assigns `a` would have the second read see the new value
+/// and the first the old. One operand that is not repeatable therefore spills every operand,
+/// which is also the evaluation order 14.2.7 requires -- all operands before any `HasValue` test.
+///
+/// The saving is the point rather than a tidiness: `a + 1` and `a == 5` are the shapes real code
+/// is made of, and spilling their constant costs a local slot and a `stloc`/`ldloc` pair at every
+/// one of them.
+fn repeatable_operand(operand: &BoundExpr) -> bool {
+    matches!(
+        operand.kind,
+        BoundExprKind::Literal(_)
+            | BoundExprKind::DefaultValue(_)
+            | BoundExprKind::Local(_)
+            | BoundExprKind::Temp(_)
+    )
+}
+
 fn binary_operand_promotion(
     operator: BinaryOperator,
     left: &TypeSymbol,
@@ -11363,6 +13831,16 @@ fn full_type_name(namespace: &str, name: &str) -> Box<str> {
 /// An error placeholder expression, used for recovery.
 
 
+/// Whether `expr` is an interpolated string, seeing through parentheses -- `($"a")` is one just as
+/// `$"a"` is, and the version gate applies to both.
+fn is_interpolated_string(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::InterpolatedString(_) => true,
+        ExprKind::Parenthesized(inner) => is_interpolated_string(inner),
+        _ => false,
+    }
+}
+
 /// Splices a nested interpolated string's parts into its parent's.
 ///
 /// A nested interpolated string does not become a call of its own: `$"a{$"i{s}"}b"` is
@@ -11509,6 +13987,9 @@ fn predefined_constant(special: SpecialType, member: &str) -> Option<i64> {
 /// `target` -- the implicit constant expression conversion (13.1.7), which lets
 /// `byte b = 10` and `b[0] = 10` compile without a cast.
 fn implicit_constant_conversion(expr: &BoundExpr, target: &TypeSymbol) -> bool {
+    if let Some(underlying) = crate::conversion::nullable_underlying(target) {
+        return implicit_constant_conversion(expr, underlying);
+    }
     let (TypeSymbol::Special(source), TypeSymbol::Special(target)) = (&expr.ty, target) else {
         return false;
     };
@@ -11653,7 +14134,7 @@ pub(crate) fn coerce_constant(value: i64, target: SpecialType) -> Option<Literal
 /// condition folds to a `bool`. `None` for anything not a constant expression. Unlike
 /// [`constant_int_value`] this keeps the value's kind (so a `bool`, `char`, or `string`
 /// constant round-trips), for a local constant's stored value.
-pub(crate) fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
+pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
     use crate::declaration::{fold_const_binary, fold_const_unary};
     match &expr.kind {
         BoundExprKind::Literal(literal) => Some(literal.clone()),
@@ -12466,6 +14947,21 @@ fn is_repeatable(expr: &lamella_syntax::ast::Expr) -> bool {
     }
 }
 
+/// What a `ref` local's DECLARATION decided, for the two rules that cannot be answered at the use.
+///
+/// **BOTH FACTS ARE ABOUT THE INITIALIZER AND NEITHER IS RECOVERABLE FROM THE USE SITE**, which is
+/// the whole reason this record exists rather than a test at each `return`/assignment.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RefLocal {
+    /// Whether `return ref r` is legal -- true when the storage it was bound to outlives the frame
+    /// (a field, a static, an array element, a `ref` parameter, a ref-returning call). csc's
+    /// `CS8157` quotes the REF LOCAL's name, not the storage's, so the answer has to travel from
+    /// the declaration to the `return`.
+    returnable: bool,
+    /// Whether it was declared `ref readonly` (C# 7.2), which refuses a write THROUGH it.
+    is_readonly: bool,
+}
+
 fn is_lvalue(expr: &BoundExpr) -> bool {
     matches!(
         expr.kind,
@@ -12792,6 +15288,11 @@ mod tests {
             BoundExprKind::NullCoalescing { left, right } => {
                 alloc::format!("{} ?? {}", render_lowering(left), render_lowering(right))
             }
+            BoundExprKind::Sequence { spilled, value } => {
+                let rendered: Vec<String> = spilled.iter().map(render_lowering).collect();
+                alloc::format!("let({}) {}", rendered.join(", "), render_lowering(value))
+            }
+            BoundExprKind::Temp(index) => alloc::format!("t{index}"),
             BoundExprKind::ArrayCreation { elements, .. } => {
                 let rendered: Vec<String> = elements.iter().map(render_lowering).collect();
                 alloc::format!("[{}]", rendered.join(", "))
@@ -13124,6 +15625,7 @@ mod tests {
             is_required: false,
         });
         widget.methods.push(MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
@@ -13355,6 +15857,7 @@ mod tests {
             is_required: false,
         });
         widget.methods.push(MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
@@ -13792,6 +16295,7 @@ mod tests {
             parameters: Vec<TypeSymbol>,
         ) -> MethodSymbol {
             MethodSymbol {
+                return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: name.into(),
                 return_type,
@@ -14075,6 +16579,7 @@ mod tests {
         };
         let int = || TypeSymbol::Special(SpecialType::Int32);
         let accessor = |name: &str, parameters: Vec<TypeSymbol>| MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: name.into(),
             return_type: int(),
@@ -14724,7 +17229,7 @@ mod tests {
                 "class C { static int Run() { int x = 1; int y = 2; \
                  switch (x) { case y: return 1; default: return 0; } } }"
             ),
-            [150]
+            [9135]
         );
         assert_eq!(
             codes(
@@ -15215,6 +17720,7 @@ mod tests {
         let int = TypeSymbol::Special(SpecialType::Int32);
         let mut calc = TypeInfo::new("", "Calc", TypeKind::Class);
         calc.methods.push(MethodSymbol {
+            return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "F".into(),
             return_type: int.clone(),

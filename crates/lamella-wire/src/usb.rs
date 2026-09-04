@@ -1,5 +1,7 @@
 //! Identity + USB descriptors for the native driverless-WinUSB Lamella Link carrier -- the fast
-//! interpreter-flash path for a board with a native USB device peripheral.
+//! interpreter-flash path for a board with a native USB device peripheral. ONE home for the
+//! shared identity, the interface GUID, the endpoints and the descriptor bytes, so a firmware, a
+//! host and a browser cannot drift.
 
 /// Vendor id: Lamella LLC's own USB-IF vendor id.
 ///
@@ -8,6 +10,34 @@
 /// WebUSB filter all match on this pair BEFORE anything is opened, so it is the only identity the
 /// device has until the protocol gets a chance to speak.
 pub const VID: u16 = 0x39E9;
+
+pub const LEGACY_VID: u16 = 0x1209;
+
+/// Which vendor id a board answered to
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkIdentity {
+    /// The Link's own vendor id.
+    Current,
+    Legacy,
+}
+
+/// Whether a `(vendor_id, product_id)` pair is a Lamella Link at all
+///
+/// ONE definition, because two things act on it -- what a scan KEEPS and what a picker SAYS -- and a
+/// rule with two implementations gains its next case in one of them. Here that case is a whole era
+/// of boards: a filter written against the current pair alone drops them, and a renderer written
+/// against the current pair alone cannot explain the ones it is handed.
+#[must_use]
+pub const fn identify(vendor_id: u16, product_id: u16) -> Option<LinkIdentity> {
+    if product_id != PID {
+        return None;
+    }
+    match vendor_id {
+        VID => Some(LinkIdentity::Current),
+        LEGACY_VID => Some(LinkIdentity::Legacy),
+        _ => None,
+    }
+}
 /// Product id: the Lamella Link vendor-specific bulk interface.
 ///
 /// **ONE product id for every board, deliberately.** A product id distinguishes a device SHAPE, not a

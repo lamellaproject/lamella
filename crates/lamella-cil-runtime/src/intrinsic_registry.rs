@@ -29,6 +29,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(array_clear_range),
     entry!(array_copy_range),
     entry!(array_clone),
+    entry!(array_create_instance),
     entry!(array_empty),
     entry!(array_get_value),
     entry!(array_rank),
@@ -377,6 +378,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(net_is_available),
     entry!(object_ctor),
     entry!(object_get_type),
+    entry!(object_get_hash_code),
     entry!(object_reference_equals),
     entry!(object_to_string),
     #[cfg(feature = "collections")]
@@ -486,6 +488,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     #[cfg(feature = "finalizers")]
     entry!(suppress_finalize),
     entry!(thread_join),
+    entry!(thread_join_timeout),
     entry!(thread_sleep),
     entry!(thread_start),
     entry!(thread_yield),
@@ -549,6 +552,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(type_is_value_type),
     entry!(type_property_custom_attributes),
     entry!(value_type_equals),
+    entry!(value_type_get_hash_code),
     #[cfg(feature = "finalizers")]
     entry!(wait_for_pending_finalizers),
     #[cfg(feature = "gc")]

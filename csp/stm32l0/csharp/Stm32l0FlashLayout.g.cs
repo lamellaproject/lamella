@@ -8,5 +8,6 @@ namespace Lamella.Generated
 
 
         public const uint ERASED_VALUE = 0x0;
+        public const uint WRITE_UNIT = 4;
     }
 }

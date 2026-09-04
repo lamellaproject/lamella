@@ -144,6 +144,32 @@ pub fn emit_expression(
     match &expr.kind {
         BoundExprKind::Literal(literal) => emit_literal(literal, &expr.ty, tokens, out),
         BoundExprKind::Local(name) => emit_local(name, frame, tokens, out),
+        BoundExprKind::Sequence { spilled, value } => {
+            let mut slots = Vec::with_capacity(spilled.len());
+            for operand in spilled {
+                emit_expression(operand, frame, tokens, out)?;
+                let slot = frame.reserve_local(&operand.ty);
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+                slots.push(slot);
+            }
+            frame.open_temp_scope();
+            for slot in slots {
+                frame.bind_temp(slot);
+            }
+            let result = emit_expression(value, frame, tokens, out);
+            frame.close_temp_scope();
+            result
+        }
+        BoundExprKind::Temp(index) => {
+            let slot = frame
+                .temp_slot(*index)
+                .ok_or(EmitError::Unsupported("a Temp outside its Sequence"))?;
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+            Ok(())
+        }
+        BoundExprKind::Binary { .. } if concat_call(expr).is_some() => {
+            emit_concat(expr, frame, tokens, out)
+        }
         BoundExprKind::Binary {
             operator,
             left,
@@ -170,20 +196,7 @@ pub fn emit_expression(
                 }
                 let is_string =
                     |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(SpecialType::String));
-                if matches!(operator, BinaryOperator::Add) && is_string(&expr.ty) {
-                    let arg = if is_string(&left.ty) && is_string(&right.ty) {
-                        SpecialType::String
-                    } else {
-                        SpecialType::Object
-                    };
-                    let arg = TypeSymbol::Special(arg);
-                    let string = TypeSymbol::Special(SpecialType::String);
-                    let token = tokens
-                        .method(&string, "Concat", &[arg.clone(), arg])
-                        .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
-                    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
-                    Ok(())
-                } else if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
+                if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
                     && is_string(&left.ty)
                     && is_string(&right.ty)
                 {
@@ -328,6 +341,11 @@ pub fn emit_expression(
         BoundExprKind::NullCoalescing { left, right } => {
             emit_null_coalescing(left, right, frame, tokens, out)
         }
+        BoundExprKind::Throw(operand) => {
+            emit_expression(operand, frame, tokens, out)?;
+            out.push(Instruction::simple(Opcode::Throw));
+            Ok(())
+        }
         BoundExprKind::TypeOf(target) => emit_typeof(target, tokens, out),
         BoundExprKind::SizeOf(target) => emit_sizeof(target, tokens, out),
         BoundExprKind::DefaultValue(target) => emit_default_value(target, frame, tokens, out),
@@ -352,7 +370,7 @@ pub fn emit_expression(
         }
         BoundExprKind::Dereference { operand } => {
             emit_expression(operand, frame, tokens, out)?;
-            let TypeSymbol::Pointer(element) = &operand.ty else {
+            let (TypeSymbol::Pointer(element) | TypeSymbol::ByRef(element)) = &operand.ty else {
                 return Err(EmitError::Unsupported("dereference of a non-pointer"));
             };
             out.push(Instruction::simple(ldind_opcode(element)));
@@ -410,10 +428,10 @@ pub fn emit_expression(
             }
             BoundExprKind::Local(name) => {
                 let (slot, element) = frame.byref(name).expect("byref checked above");
-                out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+                out.push(slot.load());
                 emit_expression(value, frame, tokens, out)?;
                 let kept = keep_assigned(true, &value.ty, frame, out);
-                emit_byref_store(element, tokens, out)?;
+                emit_byref_store(&element, tokens, out)?;
                 load_kept(kept, out);
                 Ok(())
             }
@@ -1135,7 +1153,7 @@ fn emit_call(
 /// Pushes the address of a `ref`/`out` argument variable: a byref parameter's slot
 /// already holds the address (`ldarg`), otherwise it is the variable's address
 /// (`ldloca`/`ldarga`/`ldflda`).
-fn emit_ref_argument(
+pub(crate) fn emit_ref_argument(
     operand: &BoundExpr,
     frame: &Frame,
     tokens: &Tokens,
@@ -1143,7 +1161,7 @@ fn emit_ref_argument(
 ) -> Result<(), EmitError> {
     if let BoundExprKind::Local(name) = &operand.kind {
         if let Some((slot, _)) = frame.byref(name) {
-            out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+            out.push(slot.load());
             return Ok(());
         }
     }
@@ -1820,7 +1838,7 @@ fn emit_local_address(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     if let Some((slot, _)) = frame.byref(name) {
-        out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+        out.push(slot.load());
         return Ok(());
     }
     match frame.slot(name) {
@@ -1867,6 +1885,13 @@ pub(crate) fn emit_value_type_receiver(
 ) -> Result<(), EmitError> {
     match &receiver.kind {
         BoundExprKind::Local(name) => emit_local_address(name, frame, out),
+        BoundExprKind::Temp(index) => {
+            let slot = frame
+                .temp_slot(*index)
+                .ok_or(EmitError::Unsupported("a Temp outside its Sequence"))?;
+            out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+            Ok(())
+        }
         BoundExprKind::FieldAccess {
             receiver: container,
             field: Some(field),
@@ -1942,14 +1967,14 @@ pub(crate) fn emit_local(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     if let Some((slot, element)) = frame.byref(name) {
-        out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
-        if tokens.is_struct(element) || tokens.is_enum(element) {
+        out.push(slot.load());
+        if tokens.is_struct(&element) || tokens.is_enum(&element) {
             let token = tokens
-                .instruction_type_token(element)
+                .instruction_type_token(&element)
                 .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
             out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
         } else {
-            out.push(Instruction::simple(ldind_opcode(element)));
+            out.push(Instruction::simple(ldind_opcode(&element)));
         }
         return Ok(());
     }
@@ -1998,7 +2023,7 @@ fn emit_step_expression(
     };
     if frame.byref(name).is_some() {
         return Err(EmitError::Unsupported(
-            "++/-- of a byref parameter in expression position",
+            "++/-- of a byref variable in expression position",
         ));
     }
     let store = match frame.slot(name) {
@@ -2708,5 +2733,299 @@ mod tests {
         assert_eq!(emit("true"), [i4(1)]);
         assert_eq!(emit("!true"), [i4(1), i4(0), op(Opcode::Ceq)]);
         assert_eq!(emit("5 & 3"), [i4(5), i4(3), op(Opcode::And)]);
+    }
+}
+
+/// Emits a string `+` chain as ONE `String.Concat` call (or one `ldstr`, when it all folded).
+fn emit_concat(
+    expr: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let Some(call) = concat_call(expr) else {
+        return Err(EmitError::Unsupported("a string concatenation with no plan"));
+    };
+    match call {
+        ConcatCall::Literal(text) => {
+            emit_literal(&Literal::String(text), &expr.ty, tokens, out)
+        }
+        ConcatCall::Fixed {
+            reference,
+            arguments,
+        } => {
+            for argument in &arguments {
+                emit_expression(argument, frame, tokens, out)?;
+            }
+            emit_concat_call(&reference, tokens, out)
+        }
+        ConcatCall::Packed { reference, array } => {
+            emit_expression(&array, frame, tokens, out)?;
+            emit_concat_call(&reference, tokens, out)
+        }
+    }
+}
+
+/// The `call` instruction for a resolved `String.Concat` overload.
+pub(crate) fn emit_concat_call(
+    reference: &MethodReference,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let token = tokens
+        .method(
+            &reference.declaring_type,
+            &reference.name,
+            &reference.parameters,
+        )
+        .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
+    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+    Ok(())
+}
+
+/// The single `String.Concat` call a string `+` chain lowers to.
+///
+/// **THE CHAIN IS ONE CALL, NOT ONE PER `+`.** `"a" + s + "b"` parses as `(("a" + s) + "b")`, and
+/// emitting each `+` on its own would give `Concat(Concat("a", s), "b")` -- two calls and an
+/// intermediate string that is thrown away. The chain is flattened instead and `Concat` is called
+/// once, so an n-term concatenation allocates one string rather than n-1. On a part with 64 KB of
+/// RAM that is not cosmetic.
+///
+/// Adjacent constants merge on the way through, because **THE PIECE COUNT IS THE OVERLOAD**:
+/// `String.Concat` has fixed arities up to four (strings) or three (objects) and a `params` one
+/// past that, so `"a" + "b" + s` left as three pieces would take a different call -- and a
+/// different allocation -- from the two csc uses.
+pub(crate) enum ConcatCall {
+    /// Every piece folded to text, so the whole chain is one `ldstr` and no call at all.
+    Literal(Box<[u16]>),
+    /// A fixed-arity overload: two to four `string`s, or two to three `object`s.
+    Fixed {
+        /// The overload to call.
+        reference: MethodReference,
+        /// Its arguments, in order.
+        arguments: Vec<BoundExpr>,
+    },
+    /// The `params` overload past the fixed arities. The array is built here rather than left to
+    /// `params` expansion, because this call is synthesized and never went through overload
+    /// resolution -- the same reason the interpolation lowering builds its own.
+    Packed {
+        /// `Concat(string[])` or `Concat(object[])`.
+        reference: MethodReference,
+        /// The array creation that supplies its one argument.
+        array: BoundExpr,
+    },
+}
+
+/// Whether `ty` is `string`.
+fn is_string_type(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Special(SpecialType::String))
+}
+
+/// The plan for `expr` when it is the TOP of a string `+` chain, else `None`.
+///
+/// Called from the minting pass and from emission, and it must be ONE function for both: the two
+/// choose a `MemberRef` from the piece count, and a mint that counted differently from the emit
+/// would leave the call naming a method the module does not carry.
+pub(crate) fn concat_call(expr: &BoundExpr) -> Option<ConcatCall> {
+    if !is_string_type(&expr.ty) {
+        return None;
+    }
+    let BoundExprKind::Binary {
+        operator: BinaryOperator::Add,
+        ..
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let mut operands: Vec<&BoundExpr> = Vec::new();
+    flatten_concat(expr, &mut operands);
+    let mut pieces: Vec<ConcatPiece> = Vec::with_capacity(operands.len());
+    for operand in operands {
+        match constant_text(operand) {
+            Some(text) => match pieces.last_mut() {
+                Some(ConcatPiece::Text(existing)) => {
+                    let mut merged = existing.to_vec();
+                    merged.extend_from_slice(&text);
+                    *existing = merged.into_boxed_slice();
+                }
+                _ => pieces.push(ConcatPiece::Text(text)),
+            },
+            None => pieces.push(ConcatPiece::Value(operand.clone())),
+        }
+    }
+    while pieces.len() > 2 {
+        let Some(index) = pieces
+            .iter()
+            .position(|piece| matches!(piece, ConcatPiece::Text(text) if text.is_empty()))
+        else {
+            break;
+        };
+        pieces.remove(index);
+    }
+    if let [ConcatPiece::Text(text)] = pieces.as_slice() {
+        return Some(ConcatCall::Literal(text.clone()));
+    }
+    if pieces.len() < 2 {
+        return None;
+    }
+    let all_strings = pieces.iter().all(|piece| match piece {
+        ConcatPiece::Text(_) => true,
+        ConcatPiece::Value(value) => is_string_type(&value.ty),
+    });
+    let element = TypeSymbol::Special(if all_strings {
+        SpecialType::String
+    } else {
+        SpecialType::Object
+    });
+    let string = TypeSymbol::Special(SpecialType::String);
+    let arguments: Vec<BoundExpr> = pieces
+        .into_iter()
+        .map(|piece| match piece {
+            ConcatPiece::Text(text) => BoundExpr {
+                kind: BoundExprKind::Literal(Literal::String(text)),
+                ty: string.clone(),
+            },
+            ConcatPiece::Value(value) => value,
+        })
+        .collect();
+    let fixed_limit = if all_strings { 4 } else { 3 };
+    if arguments.len() <= fixed_limit {
+        let reference = concat_reference(alloc::vec![element; arguments.len()]);
+        return Some(ConcatCall::Fixed {
+            reference,
+            arguments,
+        });
+    }
+    let array_ty = TypeSymbol::Array {
+        element: Box::new(element),
+        rank: 1,
+    };
+    Some(ConcatCall::Packed {
+        reference: concat_reference(alloc::vec![array_ty.clone()]),
+        array: BoundExpr {
+            kind: BoundExprKind::ArrayCreation {
+                lengths: Vec::new(),
+                elements: arguments,
+            },
+            ty: array_ty,
+        },
+    })
+}
+
+/// One operand of a flattened chain, before the arguments are built.
+enum ConcatPiece {
+    /// Literal text: one string constant, or a run of adjacent ones merged.
+    Text(Box<[u16]>),
+    /// A value the call takes as an argument, in the form the binder gave it.
+    Value(BoundExpr),
+}
+
+/// Collects the operands of a string `+` chain, descending through every `+` that yields a string.
+///
+/// It descends through PARENTHESES for free -- the binder leaves no node for them -- so
+/// `"a" + (s + "b")` flattens to the same three pieces the left-associated spelling gives, which
+/// is csc's answer for both.
+fn flatten_concat<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    if let BoundExprKind::Binary {
+        operator: BinaryOperator::Add,
+        left,
+        right,
+        ..
+    } = &expr.kind
+    {
+        if is_string_type(&expr.ty) {
+            flatten_concat(left, out);
+            flatten_concat(right, out);
+            return;
+        }
+    }
+    out.push(expr);
+}
+
+/// The UTF-16 text of an operand that is a compile-time string constant, else `None`.
+///
+/// A non-string constant is deliberately not text: `"a" + 1` renders the `1` at run time (there is
+/// no implicit int-to-string conversion to fold through), and csc refuses that same expression
+/// where a constant is required for exactly that reason.
+fn constant_text(operand: &BoundExpr) -> Option<Box<[u16]>> {
+    match lamella_binder::constant_literal_value(operand) {
+        Some(Literal::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+/// `string System.String::Concat(...)` for the given parameter list.
+fn concat_reference(parameters: Vec<TypeSymbol>) -> MethodReference {
+    let string = TypeSymbol::Special(SpecialType::String);
+    MethodReference {
+        declaring_type: string.clone(),
+        name: "Concat".into(),
+        parameters,
+        return_type: string,
+        is_static: true,
+        is_vararg: false,
+        instantiation: None,
+        declaring_instantiation: None,
+    }
+}
+
+/// The `String.Concat` call a string (or `object`) `op=` lowers to.
+///
+/// **THE TARGET'S CURRENT VALUE IS THE FIRST ARGUMENT**, and it is already on the stack when this
+/// is decided -- `s += X` loads `s`, evaluates `X`, concatenates, stores. So a `+=` whose
+/// right-hand side is itself a `+` chain is one concatenation of n+1 pieces, and csc calls
+/// `Concat` once for the whole thing.
+pub(crate) enum CompoundConcat {
+    /// `Concat(a, b)`: the target's value and the right-hand side as one value. What a `+=` whose
+    /// right-hand side is not a chain gets, and the fallback when a spliced one would not fit.
+    Pairwise(MethodReference),
+    /// The right-hand chain's pieces spliced in behind the target's value, as one call.
+    Spliced {
+        /// The overload the combined arity selects.
+        reference: MethodReference,
+        /// The right-hand pieces, in order. The target's value is already on the stack.
+        arguments: Vec<BoundExpr>,
+    },
+}
+
+/// Plans the concatenation for `target op= rhs`.
+///
+/// ONLY THE FIXED ARITIES SPLICE. Past them `Concat` takes an array, and the target's value is
+/// already on the stack UNDER where that array would be built, so reordering it would need a
+/// temporary. A chain too long to splice keeps the pairwise call.
+pub(crate) fn compound_concat(target_ty: &TypeSymbol, rhs: Option<&BoundExpr>) -> CompoundConcat {
+    let value_is_string = rhs.is_some_and(|value| is_string_type(&value.ty));
+    let pairwise_element = TypeSymbol::Special(
+        if value_is_string && is_string_type(target_ty) {
+            SpecialType::String
+        } else {
+            SpecialType::Object
+        },
+    );
+    let pairwise = CompoundConcat::Pairwise(concat_reference(alloc::vec![
+        pairwise_element.clone();
+        2
+    ]));
+    let Some(value) = rhs else {
+        return pairwise;
+    };
+    let Some(ConcatCall::Fixed {
+        reference,
+        arguments,
+    }) = concat_call(value)
+    else {
+        return pairwise;
+    };
+    let element = match reference.parameters.first() {
+        Some(element) if is_string_type(element) && is_string_type(target_ty) => element.clone(),
+        _ => TypeSymbol::Special(SpecialType::Object),
+    };
+    let limit = if is_string_type(&element) { 4 } else { 3 };
+    if arguments.len() + 1 > limit {
+        return pairwise;
+    }
+    CompoundConcat::Spliced {
+        reference: concat_reference(alloc::vec![element; arguments.len() + 1]),
+        arguments,
     }
 }

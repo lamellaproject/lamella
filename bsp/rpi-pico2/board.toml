@@ -8,7 +8,7 @@ board = "pico2"
 vendor = "raspberry-pi"
 family = "rp2350"
 part = "rp2350a"
-board_model = 2             # lamella_wire::board_model::PICO2
+product_model = 2           # lamella_wire::product_model::PICO2
 sources = ["Raspberry Pi Pico 2 pinout (GP0/GP1 header pins 1/2, GP4/GP5 pins 6/7, GP16-GP19 pins 21/22/24/25; 12 MHz crystal; 3V3 ADC rail)"]
 
 [memory]                    # the RP2350 has NO internal flash (chip flash = 0,

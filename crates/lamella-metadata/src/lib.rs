@@ -8,6 +8,7 @@ extern crate alloc;
 pub mod bytes;
 pub mod coded;
 pub mod constant;
+pub mod demands;
 pub mod flags;
 pub mod heaps;
 pub mod image;

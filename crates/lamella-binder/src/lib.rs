@@ -29,7 +29,8 @@ pub use bound::{
     Binder, BoundExpr, BoundExprKind, BoundInitializer, BoundInitializerTarget,
     BoundMemberInitializer, BoundMemberInitializerValue, ConversionKind, DeclaredField,
     FieldInstantiation, FieldReference, ConvertingStep, MethodInstantiation, MethodReference,
-    SubmissionBinding, TypeInstantiation, bind_expression, literal_int_value,
+    SubmissionBinding, TypeInstantiation, bind_expression, constant_literal_value,
+    literal_int_value,
 };
 pub use conversion::{has_implicit_conversion, nullable_underlying};
 pub use declaration::{

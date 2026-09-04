@@ -10,9 +10,10 @@
 # specification is being followed, not a claim of complete coverage.
 #
 # NOT PROVIDED -- absent rather than stubbed, so a missing attribute is visible at the call site:
-# `stdout` / `stderr` / `stdin` (they want file objects), `modules` and `path` (the import machinery's
-# own state), `getsizeof`, `settrace`, and the frame accessors.
+# `stdout` / `stdin` (they want the read side of a file object), `modules` and `path` (the import
+# machinery's own state), `getsizeof`, `settrace`, and the frame accessors.
 import _platform
+import _sys
 
 # --- the machine ---
 byteorder = _platform.byteorder
@@ -67,3 +68,34 @@ def exit(status=None):
     if status is None:
         raise SystemExit()
     raise SystemExit(status)
+
+
+# --- the diagnostic stream ---
+
+
+class _StdErr:
+    # `sys.stderr`, with the two methods a diagnostic writer actually calls.
+    #
+    # WHY IT IS A CLASS AND NOT THE SEAM FUNCTION ITSELF: `sys.stderr.write(...)` is what CPython
+    # programs write, and `print(..., file=sys.stderr)` passes the OBJECT and calls `write` on it.
+    # Exposing the raw function under the name would work for neither.
+    #
+    # It is not a file object: no `read`, no `close`, no `fileno`. A stream a program can only
+    # write to is what this runtime has, and the absent methods are absent rather than raising a
+    # stub's error, so `hasattr` tells the truth.
+
+    def write(self, text):
+        # CPython returns the number of CHARACTERS written, and code in the wild does use it.
+        _sys.stderr_write(text)
+        return len(text)
+
+    def flush(self):
+        # Nothing is held back: a write leaves through the seam immediately, so there is nothing to
+        # flush. Present because callers flush after writing and an AttributeError there would
+        # convert a diagnostic into a second failure.
+        pass
+
+
+#: The error stream. Diagnostics, tracebacks, and the event loop's report of a task that died with
+#: nobody to tell it.
+stderr = _StdErr()

@@ -11,6 +11,10 @@ publish = false
 [dependencies]
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 lamella-ir = { path = "../lamella-ir" }
+# Identifier tables and NFKC, shared with the JS front end, the regexp engine and the Python runtime
+# rather than restated here: PEP 3131 spells an identifier `xid_start xid_continue*` and normalizes
+# it, and both halves of that are already generated from one UCD pin.
+lamella-unicode = { path = "../lamella-unicode" }
 
 [dev-dependencies]
 lamella-flash-format = { path = "../lamella-flash-format" }

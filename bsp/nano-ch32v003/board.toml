@@ -18,7 +18,7 @@ board = "nano-ch32v003"
 vendor = "muselab"
 family = "ch32v003"
 part = "ch32v003f4u6"
-board_model = 23            # lamella_wire::board_model::NANO_CH32V003
+product_model = 23          # lamella_wire::product_model::NANO_CH32V003
 sources = ["MuseLab nanoCH32V003 v1.0 schematic (the board designer's own published sheet, titled 'nanoCH32V003 v1.0'), read at cell level"]
 
 # --- the board's own control: one LED, and it is plain GPIO -------------------------------------

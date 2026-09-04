@@ -158,7 +158,14 @@ fn complete_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
     }
     lamella_binder::collect_into(&mut model, &unit);
     model.link_bases();
-    let items: Vec<serde_json::Value> = lamella_binder::complete(source, &unit, &model, offset)
+    let items: Vec<serde_json::Value> =
+        lamella_binder::complete(
+            source,
+            &unit,
+            &model,
+            offset,
+            lamella_syntax::version::LanguageVersion::SELECTABLE_MAX,
+        )
         .into_iter()
         .map(|item| {
             serde_json::json!({

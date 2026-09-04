@@ -131,6 +131,25 @@ pub trait DebugBackend {
         false
     }
 
+    /// How many single-steps the adapter may spend on one step command before giving up and
+    /// stopping where the target is.
+    ///
+    /// A source-level step single-steps until [`DebugBackend::at_source_boundary`] holds, and a
+    /// depth step until the frame it is waiting on returns. Neither condition is guaranteed to
+    /// arrive: [`DebugBackend::has_source`] is a property of the whole image, while
+    /// `at_source_boundary` is a property of one pc, so stepping into a region the line table
+    /// does not cover -- a runtime helper, a startup trampoline, code past the end of the
+    /// program -- satisfies the first and never the second.
+    ///
+    /// The default suits a backend where a step is a round trip to a device, which is the case
+    /// for every remote backend and the case where an unbounded loop is most expensive: it is a
+    /// ceiling on an unproductive wait, not a limit on any real source line. A backend whose
+    /// steps are local calls should raise it, since for those the same ceiling would cut a legal
+    /// step through a long uncovered method short.
+    fn step_budget(&self) -> usize {
+        4_096
+    }
+
     /// The variables in one scope of frame `index`. Interpreter: the frame's
     /// arguments / locals / evaluation-stack slots. Device: locals/arguments recovered
     /// from the AOT debug-info (register or stack-slot homes), read via memory/regs.

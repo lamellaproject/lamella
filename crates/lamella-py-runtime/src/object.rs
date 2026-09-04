@@ -233,6 +233,18 @@ pub(crate) const OBJECT_GETSTATE: u32 = u32::MAX - 6;
 /// `super().__new__(cls)` all name the class explicitly, and the class named there is the one
 /// allocated (which is how a `__new__` returning a subclass instance works).
 pub(crate) const OBJECT_NEW: u32 = u32::MAX - 5;
+/// A synthetic method id for `BaseExceptionGroup.split(condition)` -- the `(matched, rest)` partition
+/// PEP 654's `except*` is written in terms of. Dispatched by the interpreter's `call_value` rather
+/// than the model-only path, because a condition may be a CALLABLE and testing a member then means
+/// running Python.
+pub(crate) const EXC_GROUP_SPLIT: u32 = u32::MAX - 7;
+/// A synthetic method id for `BaseExceptionGroup.subgroup(condition)` -- `split(condition)[0]`, the
+/// matching half alone. Same dispatch, same reason.
+pub(crate) const EXC_GROUP_SUBGROUP: u32 = u32::MAX - 8;
+/// A synthetic method id for `BaseExceptionGroup.derive(excs)` -- a new group with this one's message
+/// and the given members, the hook `split` builds each half through so that a user subclass carrying
+/// extra state can override it and keep that state across a partition.
+pub(crate) const EXC_GROUP_DERIVE: u32 = u32::MAX - 9;
 const SET_UNION: u32 = 0;
 const SET_INTERSECTION: u32 = 1;
 const SET_DIFFERENCE: u32 = 2;
@@ -2255,6 +2267,10 @@ pub struct ObjectModel {
     /// Captured `print(...)` output (the interpreter is `no_std`, so it buffers rather than
     /// writing a stream; the host drains it).
     stdout: String,
+    /// Captured `sys.stderr` output, held apart from [`Self::stdout`] for the whole reason the two
+    /// streams exist: a host renders a program's OUTPUT and its DIAGNOSTICS differently, and one
+    /// buffer cannot be split back afterward however the text is worded.
+    stderr: String,
     /// The GC type-descriptor id of the `gpio` module singleton (the clean hardware API).
     gpio_type_id: u32,
     /// The GC type-descriptor id of the `board` pin-name singleton.
@@ -2335,6 +2351,8 @@ pub struct ObjectModel {
     /// the generator's -- see the descriptor for why they share, and `arena_of` for the one line that
     /// makes the sharing safe.
     coroutine_type_id: u32,
+    async_generator_type_id: u32,
+    agen_step_type_id: u32,
     /// The GC type-descriptor id of a `Cell` -- a heap box holding one tagged `Value`, shared
     /// (mutably) between an enclosing function and a nested closure that captures the variable.
     cell_type_id: u32,
@@ -2487,11 +2505,81 @@ pub struct ObjectModel {
     /// How many interpreter drive loops are running, maintained by the driver itself. The safe point
     /// needs to know whether the loop reaching it is the OUTERMOST one, because only that loop's frame
     /// stack is every frame there is; see `is_outermost_drive`.
-    #[cfg(feature = "gc-collect")]
+    ///
+    /// NOT gated on `gc-collect`, and that is deliberate. The collector was the first consumer of
+    /// "is this loop the outermost one", not the only possible one: **a thread switch needs exactly
+    /// the same fact**, because you may only swap out a call stack you can see all of. Gated, a build
+    /// with the collector off would answer `false` forever -- so a tier that turned off an unrelated
+    /// feature would silently lose the ability to preempt, which is the one failure mode this design
+    /// refuses to ship. It is a `u32` and two arithmetic ops per driver entry.
     drive_nesting: u32,
+    /// Threads asked for and not yet materialized: `(id, callable, args-tuple)`.
+    ///
+    /// The request is raised by the `_thread` seam and acted on by the scheduler, which is the only
+    /// party that can build a stack -- the same split the C# tier uses, and for the same reason: a
+    /// driver loop cannot reach the thread table it is being driven from.
+    ///
+    /// **These are GC ROOTS and are visited as such.** A collection between the request and the
+    /// switch that services it would otherwise reclaim the very function the new thread is about to
+    /// run, and the window is real: a spawn allocates, and allocation is what triggers collection.
+    pending_spawns: Vec<(u32, Value, Value)>,
+    /// The id of the thread whose slice is running. `0` is the main thread, and it is also the
+    /// answer before any scheduler exists -- a program with no threads is thread 0 running.
+    current_thread: u32,
+    #[cfg(feature = "threading")]
+    /// The next thread id to hand out. Never reused, so a stale id names nothing rather than
+    /// somebody else.
+    next_thread_id: u32,
+    /// How many green threads the scheduler is running. `0` or `1` means the running stack's roots
+    /// are the entire root set, which is what lets the safe point collect inline; above that only the
+    /// scheduler can reach every thread's frames.
+    live_threads: u32,
+    #[cfg(feature = "threading")]
+    /// The thread the running one has asked to wait for -- `_thread.join(id)`, raised by the seam
+    /// and acted on by the scheduler, which is the only party that knows whether that thread is
+    /// still running.
+    ///
+    /// **A plain id and not a `Value`, so it is not a GC root** -- unlike `pending_spawns`, which
+    /// holds the callable the new thread will run and must be traced. Worth saying out loud
+    /// because the two fields look alike and only one of them can strand an object.
+    ///
+    /// The seam sets it and RETURNS `None` normally; the driver notices it at the switch point and
+    /// hands the interpreter back with the stack intact. So the joining frame has already taken the
+    /// call's result and resumes at the op after it, which is what blocking means for a green
+    /// thread.
+    pending_join: Option<u32>,
+    #[cfg(feature = "threading")]
+    /// A block the running thread has asked for -- `threading.Lock.acquire` on a held lock, or
+    /// `Event.wait` before the flag is set. Serviced by the scheduler exactly as [`Self::pending_join`]
+    /// is, and it carries WHAT is being waited for only so a deadlock can be described.
+    ///
+    /// >>> THE WAIT SET IS NOT HERE, AND THAT IS THE DESIGN. A lock's queue of waiting thread ids is
+    /// an ordinary Python list living on the lock object, so it is traced, freed and inspected like
+    /// anything else a program made -- no lock table in the runtime, and nothing to leak when a
+    /// program builds locks in a loop. What the runtime owns is the one thing Python cannot express:
+    /// the parking. <<<
+    pending_block: Option<crate::interp::BlockReason>,
+    #[cfg(feature = "threading")]
+    /// Threads a release or a set has handed the lock / the flag to, made `Ready` by the scheduler at
+    /// the next switch. See [`Self::pending_block`].
+    pending_wakes: Vec<u32>,
+    /// A collection the safe point wanted and could not perform, because more than one thread was
+    /// live. Taken by the scheduler at a switch, where every stack is consistent and reachable.
+    deferred_collect: bool,
+    /// How many ops the running thread may execute before it must yield the interpreter, or `None`
+    /// for "run to completion" -- which is every program that never starts a thread, so a
+    /// single-threaded program pays one `Option` check per op and nothing else.
+    ///
+    /// Set by the scheduler before each slice and TAKEN by the driver, so it applies to exactly one
+    /// drive rather than leaking into the next.
+    thread_quantum: Option<u32>,
     /// The embedder's console, if it installed one: `print` writes straight through instead of
     /// accumulating. `None` = capture in `stdout` and hand it over on request.
     console_fn: Option<fn(&str)>,
+    /// The embedder's ERROR console, if it installed one. `None` = capture in `stderr`. Separate
+    /// from [`Self::console_fn`] so a firmware can frame the two streams differently -- which the
+    /// wire requires, since `EVT_OUTPUT` carries the stream number in the frame.
+    error_console_fn: Option<fn(&str)>,
     /// The embedder's view of the memory this model is allocated OUT OF, as `(used, capacity)` bytes:
     /// a device's bump-arena frontier, answered in constant time by whoever owns that arena. `None` on
     /// a host, where there is no such bound -- see [`ObjectModel::set_arena_probe`].
@@ -2633,6 +2721,18 @@ pub struct ObjectModel {
     reactor: crate::reactor::ParkStore,
 }
 
+
+/// Which use of an unhashable value is being refused. CPython names it in the message, and it is the
+/// only thing that differs between the three forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HashUse {
+    /// A dict key: `cannot use 'list' as a dict key (unhashable type: 'list')`.
+    DictKey,
+    /// A set element (or a frozenset's): `... as a set element ...`.
+    SetElement,
+    /// The `hash()` builtin, which names no context: `unhashable type: 'list'`.
+    Hash,
+}
 
 impl ObjectModel {
     /// The integer a `range` membership test compares against: an int (including a bool) directly,
@@ -2916,6 +3016,18 @@ impl ObjectModel {
             payload_size: 8,
             ref_offsets: Vec::new(),
             tagged_offsets: Vec::new(),
+        });
+        let async_generator_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let agen_step_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 12,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0, 8],
         });
         let cell_type_id = descs.len() as u32;
         descs.push(TypeDesc {
@@ -3210,6 +3322,7 @@ impl ObjectModel {
             current_module: 0,
             function_dicts: Vec::new(),
             stdout: String::new(),
+            stderr: String::new(),
             gpio_type_id,
             board_type_id,
             pin_type_id,
@@ -3236,9 +3349,22 @@ impl ObjectModel {
             collections: 0,
             #[cfg(feature = "gc-collect")]
             allocation_refused: false,
-            #[cfg(feature = "gc-collect")]
             drive_nesting: 0,
+            pending_spawns: Vec::new(),
+            #[cfg(feature = "threading")]
+            pending_join: None,
+            #[cfg(feature = "threading")]
+            pending_block: None,
+            #[cfg(feature = "threading")]
+            pending_wakes: Vec::new(),
+            current_thread: 0,
+            #[cfg(feature = "threading")]
+            next_thread_id: 1,
+            live_threads: 0,
+            deferred_collect: false,
+            thread_quantum: None,
             console_fn: None,
+            error_console_fn: None,
             #[cfg(feature = "gc-collect")]
             arena_probe: None,
             file_ops: None,
@@ -3263,6 +3389,8 @@ impl ObjectModel {
             py_function_type_id,
             generator_type_id,
             coroutine_type_id,
+            async_generator_type_id,
+            agen_step_type_id,
             cell_type_id,
             lazy_iter_type_id,
             method_wrapper_type_id,
@@ -3942,21 +4070,7 @@ impl ObjectModel {
     /// object, so the caller falls back to the numeric / identity path.
     pub fn py_compare(&self, op: CmpOp, lhs: Value, rhs: Value) -> Result<Option<Value>, Trap> {
         if self.is_range(lhs) && self.is_range(rhs) && matches!(op, CmpOp::Eq | CmpOp::Ne) {
-            let (a_start, a_stop, a_step) = self.range_bounds(lhs);
-            let (b_start, b_stop, b_step) = self.range_bounds(rhs);
-            let length = |start: i64, stop: i64, step: i64| -> i64 {
-                if step > 0 && start < stop {
-                    (stop - start - 1) / step + 1
-                } else if step < 0 && start > stop {
-                    (start - stop - 1) / (-step) + 1
-                } else {
-                    0
-                }
-            };
-            let a_len = length(a_start, a_stop, a_step);
-            let b_len = length(b_start, b_stop, b_step);
-            let equal = a_len == b_len
-                && (a_len == 0 || (a_start == b_start && (a_len == 1 || a_step == b_step)));
+            let equal = self.range_eq(lhs, rhs);
             let holds = if op == CmpOp::Eq { equal } else { !equal };
             return Ok(Some(Value::from_bool(holds)));
         }
@@ -4013,16 +4127,20 @@ impl ObjectModel {
             };
         }
         if self.is_slice(lhs) && self.is_slice(rhs) {
-            let (a_start, a_stop, a_step) = self.slice_components(lhs);
-            let (b_start, b_stop, b_step) = self.slice_components(rhs);
-            let equal = self.key_eq(a_start, b_start)
-                && self.key_eq(a_stop, b_stop)
-                && self.key_eq(a_step, b_step);
-            return match op {
-                CmpOp::Eq => Ok(Some(Value::from_bool(equal))),
-                CmpOp::Ne => Ok(Some(Value::from_bool(!equal))),
-                _ => Err(Trap::TypeError),
+            if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                let equal = self.slice_eq(lhs, rhs);
+                let holds = if op == CmpOp::Eq { equal } else { !equal };
+                return Ok(Some(Value::from_bool(holds)));
+            }
+            let ordering = self.compare_slice_ordered(lhs, rhs)?;
+            let holds = match op {
+                CmpOp::Lt => ordering == Ordering::Less,
+                CmpOp::Le => ordering != Ordering::Greater,
+                CmpOp::Gt => ordering == Ordering::Greater,
+                CmpOp::Ge => ordering != Ordering::Less,
+                _ => return Ok(None),
             };
+            return Ok(Some(Value::from_bool(holds)));
         }
         match (self.str_bytes(lhs), self.str_bytes(rhs)) {
             (None, None) => Ok(None),
@@ -4402,6 +4520,54 @@ impl ObjectModel {
         let stop = Value::from_bits(self.heap.read_u32(reference.0 + 4));
         let step = Value::from_bits(self.heap.read_u32(reference.0 + 8));
         (start, stop, step)
+    }
+
+    /// Whether two slices are the same slice: `(start, stop, step)` equal component-wise.
+    ///
+    /// >>> ONE IMPLEMENTATION, BECAUSE THERE ARE THREE PLACES THAT ASK. `==` asks (`py_compare`), a
+    /// dict/set/`in` asks (`key_eq`), and `hash` has to agree with both or a slice key goes into a
+    /// container and cannot be found again. Slices reached only the FIRST of those, which is exactly
+    /// how `d[slice(1, 2)] = v` followed by `slice(1, 2) in d` answered `False`. <<<
+    #[must_use]
+    pub(crate) fn slice_eq(&self, a: Value, b: Value) -> bool {
+        let (a_start, a_stop, a_step) = self.slice_components(a);
+        let (b_start, b_stop, b_step) = self.slice_components(b);
+        self.key_eq(a_start, b_start) && self.key_eq(a_stop, b_stop) && self.key_eq(a_step, b_step)
+    }
+
+    /// Two slices ordered as the tuples `(start, stop, step)`, which is what CPython does. A `None`
+    /// meeting an `int` at the deciding component is a `TypeError`, exactly as in a tuple.
+    pub(crate) fn compare_slice_ordered(&self, a: Value, b: Value) -> Result<Ordering, Trap> {
+        let (a_start, a_stop, a_step) = self.slice_components(a);
+        let (b_start, b_stop, b_step) = self.slice_components(b);
+        for (x, y) in [(a_start, b_start), (a_stop, b_stop), (a_step, b_step)] {
+            if self.key_eq(x, y) {
+                continue;
+            }
+            return self.compare_ordered(x, y);
+        }
+        Ok(Ordering::Equal)
+    }
+
+    /// Whether two ranges describe the SAME SEQUENCE -- which is what range equality means, and is
+    /// not the same as being written alike: `range(0)` equals `range(5, 5)` and `range(0, 5, 2)`
+    /// equals `range(0, 6, 2)`. Shared by `==` and by `key_eq`, for the reason on [`Self::slice_eq`].
+    #[must_use]
+    pub(crate) fn range_eq(&self, a: Value, b: Value) -> bool {
+        let (a_start, a_stop, a_step) = self.range_bounds(a);
+        let (b_start, b_stop, b_step) = self.range_bounds(b);
+        let length = |start: i64, stop: i64, step: i64| -> i64 {
+            if step > 0 && start < stop {
+                (stop - start - 1) / step + 1
+            } else if step < 0 && start > stop {
+                (start - stop - 1) / (-step) + 1
+            } else {
+                0
+            }
+        };
+        let a_len = length(a_start, a_stop, a_step);
+        let b_len = length(b_start, b_stop, b_step);
+        a_len == b_len && (a_len == 0 || (a_start == b_start && (a_len == 1 || a_step == b_step)))
     }
 
     /// Allocates a `range(start, stop, step)` -- a lazy int sequence (the bounds are fixnums,
@@ -5037,6 +5203,9 @@ impl ObjectModel {
     /// the last value winning (Python `{...}` display semantics; the key keeps its first
     /// position).
     pub fn new_dict(&mut self, pairs: Vec<(Value, Value)>) -> Result<Value, Trap> {
+        for &(key, _) in &pairs {
+            self.require_hashable_as(key, HashUse::DictKey)?;
+        }
         let mut entries: Vec<(Value, Value)> = Vec::new();
         for (key, value) in pairs {
             match entries.iter().position(|(k, _)| self.key_eq(*k, key)) {
@@ -5088,7 +5257,7 @@ impl ObjectModel {
         depth: usize,
     ) -> Result<Option<usize>, Trap> {
         let i = self.dict_slot(dict).ok_or(Trap::TypeError)?;
-        self.require_hashable(key)?;
+        self.require_hashable_as(key, HashUse::DictKey)?;
         if !self.is_instance(key) {
             let mut saw_instance_key = false;
             for (idx, (k, _)) in self.dicts[i].iter().enumerate() {
@@ -5123,6 +5292,9 @@ impl ObjectModel {
     /// order, into the shared arena under `type_id`.
     fn alloc_set(&mut self, elements: Vec<Value>, type_id: u32) -> Result<Value, Trap> {
         let mut deduped: Vec<Value> = Vec::new();
+        for &element in &elements {
+            self.require_hashable_as(element, HashUse::SetElement)?;
+        }
         for element in elements {
             if !deduped.iter().any(|e| self.key_eq(*e, element)) {
                 deduped.push(element);
@@ -5170,6 +5342,7 @@ impl ObjectModel {
     /// Adds `value` to the set (a no-op if an equal element is present) -- `set.add` and the
     /// `SetAdd` comprehension op.
     pub fn set_add(&mut self, set: Value, value: Value) -> Result<(), Trap> {
+        self.require_hashable_as(value, HashUse::SetElement)?;
         let index = self.container_slot(set, self.set_type_id).ok_or(Trap::TypeError)?;
         if !self.sets[index].iter().any(|e| self.key_eq(*e, value)) {
             self.sets[index].push(value);
@@ -5203,10 +5376,67 @@ impl ObjectModel {
         Ok(())
     }
 
+    #[cfg(feature = "threading")]
+    /// Element 0 of a one-slot list -- the CELL the `threading` module locks against.
+    ///
+    /// >>> WHY A LIST AND NOT A FIELD IN THE RUNTIME. A lock's state (who holds it) and its queue of
+    /// waiting thread ids are ordinary Python objects on the lock, so the collector traces them, a
+    /// dropped lock frees them, and a program that builds locks in a loop leaks nothing -- where a
+    /// lock table keyed by a handle would leak an entry per lock forever. What Python cannot do
+    /// itself is the ONE thing these accessors give it: a test and a set with no thread switch in
+    /// between, because a native call runs inside a single op and the switch point is between ops.
+    /// Written as two Python statements the test and the set are two ops, and two threads acquire
+    /// the same lock. <<<
+    #[must_use]
+    pub(crate) fn slot_get(&self, cell: Value) -> Option<Value> {
+        self.seq_value(cell).and_then(|elements| elements.first().copied())
+    }
+
+    #[cfg(feature = "threading")]
+    /// Writes element 0 of a one-slot list. See [`Self::slot_get`].
+    pub(crate) fn slot_set(&mut self, cell: Value, value: Value) -> Result<(), Trap> {
+        let index = self.container_slot(cell, self.list_type_id).ok_or(Trap::TypeError)?;
+        *self.seqs[index].first_mut().ok_or(Trap::IndexError)? = value;
+        Ok(())
+    }
+
+    #[cfg(feature = "threading")]
+    /// Removes and returns the FIRST element of a list -- how a lock hands itself to the thread that
+    /// has waited longest. FIFO is the property: a wait set drained from the other end starves.
+    pub(crate) fn list_pop_front(&mut self, list: Value) -> Option<Value> {
+        let index = self.container_slot(list, self.list_type_id)?;
+        let elements = self.seqs.get_mut(index)?;
+        (!elements.is_empty()).then(|| elements.remove(0))
+    }
+
+    #[cfg(feature = "threading")]
+    /// Empties a list and answers what was in it -- an `Event.set` waking everyone at once.
+    pub(crate) fn list_take_all(&mut self, list: Value) -> Vec<Value> {
+        let Some(index) = self.container_slot(list, self.list_type_id) else {
+            return Vec::new();
+        };
+        self.seqs.get_mut(index).map(core::mem::take).unwrap_or_default()
+    }
+
     /// Python value equality for container keys/membership over the value subset we have:
     /// `int`/`bool` compare numerically (so `True == 1`), `str` by content, everything else
     /// by identity (`None`, the same object). Enough for `in`, dict keys, and `==` on these.
+    ///
+    /// >>> **IDENTITY FIRST, and it is the RULE rather than a shortcut.** CPython's container
+    /// comparison is `x is y or x == y` -- every dict lookup, `in`, `list.index` and set membership
+    /// goes through it -- so an object is found in a container it was put into even when it does not
+    /// equal itself. **That is the whole of why a NaN key works there**: `d = {nan: "x"}; d[nan]`
+    /// gives `"x"` and `nan in d` is True, while a DIFFERENT NaN is not found. <<<
+    ///
+    /// Skipping it looks like an optimization the equality below makes unnecessary, and it is not:
+    /// with value equality alone a NaN key can never be retrieved by anything, including the exact
+    /// object used to store it -- so a program can put something in a dict and be told it is not
+    /// there. This runtime boxes floats as distinct heap objects, so `Value` equality IS Python's
+    /// `is` for them, and the two rules coincide exactly.
     pub(crate) fn key_eq(&self, a: Value, b: Value) -> bool {
+        if a == b {
+            return true;
+        }
         if let (Some(x), Some(y)) = (self.as_i128(a), self.as_i128(b)) {
             return x == y;
         }
@@ -5215,9 +5445,7 @@ impl ObjectModel {
         }
         #[cfg(feature = "float")]
         if self.is_float(a) || self.is_float(b) {
-            if let (Some(x), Some(y)) = (self.as_f64(a), self.as_f64(b)) {
-                return x == y;
-            }
+            return self.compare_numeric(a, b) == Some(Ordering::Equal);
         }
         if let (Some(x), Some(y)) = (self.str_bytes(a), self.str_bytes(b)) {
             return x == y;
@@ -5235,6 +5463,12 @@ impl ObjectModel {
         }
         if self.is_dict(a) && self.is_dict(b) {
             return self.dict_equal(a, b);
+        }
+        if self.is_slice(a) && self.is_slice(b) {
+            return self.slice_eq(a, b);
+        }
+        if self.is_range(a) && self.is_range(b) {
+            return self.range_eq(a, b);
         }
         if (self.is_set(a) || self.is_frozenset(a)) && (self.is_set(b) || self.is_frozenset(b)) {
             let (Some(ea), Some(eb)) = (self.set_value(a), self.set_value(b)) else {
@@ -5356,6 +5590,7 @@ impl ObjectModel {
             return Ok(());
         }
         if let Some(i) = self.dict_slot(container) {
+            self.require_hashable_as(index, HashUse::DictKey)?;
             match self.dicts[i].iter().position(|(k, _)| self.key_eq(*k, index)) {
                 Some(slot) => self.dicts[i][slot].1 = value,
                 None => self.dicts[i].push((index, value)),
@@ -6058,6 +6293,31 @@ impl ObjectModel {
             }
             return Ok(hash);
         }
+        if self.is_slice(value) {
+            let (start, stop, step) = self.slice_components(value);
+            let mut hash: u32 = 2_166_136_261;
+            for component in [start, stop, step] {
+                hash ^= self.py_hash(component)?.as_fixnum().unwrap_or(0) as u32;
+                hash = hash.wrapping_mul(16_777_619);
+            }
+            return Ok(hash);
+        }
+        if self.is_range(value) {
+            let (start, stop, step) = self.range_bounds(value);
+            let length = if step > 0 && start < stop {
+                (stop - start - 1) / step + 1
+            } else if step < 0 && start > stop {
+                (start - stop - 1) / (-step) + 1
+            } else {
+                0
+            };
+            let mut hash: u32 = 2_166_136_261;
+            for part in [length, if length == 0 { 0 } else { start }, if length <= 1 { 0 } else { step }] {
+                hash ^= (part as i32 as u32) ^ ((part >> 32) as u32);
+                hash = hash.wrapping_mul(16_777_619);
+            }
+            return Ok(hash);
+        }
         if self.is_object_base(value) {
             if let Some(reference) = value.as_ref() {
                 return Ok(reference.0.wrapping_mul(2_654_435_761));
@@ -6713,19 +6973,48 @@ impl ObjectModel {
     /// name 'name' from 'module'"), matching CPython (not the `AttributeError` a plain `module.name`
     /// attribute read would give). Backs [`crate::interp`]'s `ImportFrom` op.
     pub fn import_from(&mut self, module: Value, name: &str) -> Result<Value, Trap> {
-        if self.is_module_object(module) {
-            let namespace = self.module_namespace(module);
-            if let Some(value) = self.dict_get_str(namespace, name) {
-                return Ok(value);
-            }
+        if let Some(value) = self.module_member(module, name) {
+            return Ok(value);
         }
-        let module_name = self
-            .modules
-            .iter()
-            .find(|(_, m)| *m == module)
-            .map_or_else(String::new, |(n, _)| n.clone());
+        let module_name = self.module_name_of(module).unwrap_or_default();
         let message = alloc::format!("cannot import name '{name}' from '{module_name}'");
         Err(self.raise_named_exception("ImportError", &message))
+    }
+
+    /// `name` as read off `module`'s namespace, or `None` -- the non-raising half of
+    /// [`Self::import_from`], for a caller that has somewhere else to look first.
+    #[must_use]
+    pub fn module_member(&self, module: Value, name: &str) -> Option<Value> {
+        if !self.is_module_object(module) {
+            return None;
+        }
+        self.dict_get_str(self.module_namespace(module), name)
+    }
+
+    /// The registry name a module object is cached under, or `None` if it is not in the registry.
+    #[must_use]
+    pub fn module_name_of(&self, module: Value) -> Option<String> {
+        self.modules.iter().find(|(_, m)| *m == module).map(|(n, _)| n.clone())
+    }
+
+    /// The dotted path of `module`'s SUBMODULE `name`, when there is an importable one.
+    ///
+    /// >>> `from pkg import sub` DOES NOT ONLY READ AN ATTRIBUTE. When `sub` is not bound in the
+    /// package's namespace, CPython imports `pkg.sub` and hangs it on the parent -- which is how a
+    /// package's submodule is reached by that spelling at all, and why a package whose `__init__.py`
+    /// is empty still serves `from pkg import sub`. This answers WHETHER there is such a submodule;
+    /// importing it is the interpreter's, because a body has to run on the importer's frame stack.
+    /// <<<
+    #[must_use]
+    pub fn submodule_path(&self, module: Value, name: &str) -> Option<String> {
+        if name.contains('.') {
+            return None;
+        }
+        let dotted = alloc::format!("{}.{name}", self.module_name_of(module)?);
+        let importable = self.cached_module(&dotted).is_some()
+            || self.managed_module_id(&dotted).is_some()
+            || self.has_managed_submodules(&dotted);
+        importable.then_some(dotted)
     }
 
     /// `iter(iterable)` (`Op::GetIter`): an iterator over a `str`/`list`/`tuple`/`dict` (a
@@ -7326,6 +7615,9 @@ impl ObjectModel {
             let message = alloc::format!("object.__new__(X): X is not a type object ({kind})");
             return Err(self.raise_named_exception("TypeError", &message));
         }
+        if let Some(actual) = self.group_class_for(class, posargs)? {
+            return self.new_object(actual);
+        }
         if !posargs.is_empty() || !kwargs.is_empty() {
             if self.find_in_class(class, "__new__").is_some() {
                 let message =
@@ -7693,6 +7985,87 @@ impl ObjectModel {
         Ok(Value::from_ref(reference))
     }
 
+    /// Allocates an ASYNC generator object -- what calling a body that both `yield`s and is
+    /// `async def` evaluates to. Like the other two, the call runs NO body: the frame is suspended
+    /// from the start and the first `__anext__` is what enters it.
+    pub fn new_async_generator(&mut self, frame: Frame, home_module: u16) -> Result<Value, Trap> {
+        let index =
+            take_arena_slot(&mut self.generators, &mut self.freed_slots.generators, Some(frame));
+        let reference = self.alloc_object(self.async_generator_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, index);
+        self.heap.write_u32(reference.0 + 4, u32::from(home_module));
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is an async generator object.
+    #[must_use]
+    pub fn is_async_generator(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.async_generator_type_id)
+    }
+
+    /// Allocates one pending step of `agen` -- the awaitable `__anext__()` and friends hand back.
+    pub fn new_agen_step(&mut self, agen: Value, kind: u32, value: Value) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.agen_step_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, agen.bits());
+        self.heap.write_u32(reference.0 + 4, kind);
+        self.heap.write_u32(reference.0 + 8, value.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a pending async-generator step.
+    #[must_use]
+    pub fn is_agen_step(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.agen_step_type_id)
+    }
+
+    /// The async generator a step will advance.
+    #[must_use]
+    pub(crate) fn agen_step_target(&self, step: Value) -> Value {
+        self.read_slot(step, 0)
+    }
+
+    /// Which entry point made the step (see the `AGEN_STEP_*` ids), or RESUMED once it has begun.
+    #[must_use]
+    pub(crate) fn agen_step_kind(&self, step: Value) -> u32 {
+        step.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + 4))
+    }
+
+    /// Marks a step as begun, so the next value the event loop sends in is forwarded to the
+    /// generator's own pending await rather than starting the step over.
+    pub(crate) fn set_agen_step_kind(&mut self, step: Value, kind: u32) {
+        if let Some(reference) = step.as_ref() {
+            self.heap.write_u32(reference.0 + 4, kind);
+        }
+    }
+
+    /// The value the step carries -- `asend`'s value, `athrow`'s exception, or `None`.
+    #[must_use]
+    pub(crate) fn agen_step_value(&self, step: Value) -> Value {
+        self.read_slot(step, 2)
+    }
+
+    /// Whether the frame suspended inside `gen` is mid-DELEGATION -- suspended by an `await` or a
+    /// `yield from` rather than by a plain `yield`.
+    ///
+    /// **This is the whole discriminator an async generator needs.** Its body suspends the same frame
+    /// two ways and both travel outward as a yielded value: a plain `yield` produces an ITEM, which is
+    /// what the awaiting `__anext__` must return, while an `await` inside the body produces something
+    /// the EVENT LOOP must wait on, which has to keep travelling. Without this the two are
+    /// indistinguishable and a generator that awaits anything would hand the loop's future to the
+    /// program as if it were data.
+    #[must_use]
+    pub(crate) fn generator_is_delegating(&self, generator: Value) -> bool {
+        let Some(reference) = generator.as_ref() else {
+            return false;
+        };
+        let index = self.heap.read_u32(reference.0) as usize;
+        matches!(self.generators.get(index), Some(Some(frame)) if frame.is_delegating())
+    }
+
     /// Whether `value` is a coroutine object.
     #[must_use]
     pub fn is_coroutine(&self, value: Value) -> bool {
@@ -7722,7 +8095,9 @@ impl ObjectModel {
     fn holds_suspended_frame(&self, value: Value) -> bool {
         value.as_ref().is_some_and(|r| {
             let id = self.heap.type_id_of(r);
-            id == self.generator_type_id || id == self.coroutine_type_id
+            id == self.generator_type_id
+                || id == self.coroutine_type_id
+                || id == self.async_generator_type_id
         })
     }
 
@@ -7949,6 +8324,26 @@ impl ObjectModel {
         if name == "__getstate__" {
             return self.new_bound_method(instance, OBJECT_GETSTATE);
         }
+        if matches!(name, "message" | "exceptions" | "split" | "subgroup" | "derive")
+            && self.is_exception_group(instance)
+        {
+            match name {
+                "message" => {
+                    if let Some(message) = self.group_message(instance) {
+                        return Ok(message);
+                    }
+                }
+                "exceptions" => {
+                    if let Some(members) = self.group_members(instance) {
+                        return self.new_tuple(members);
+                    }
+                }
+                "split" => return self.new_bound_method(instance, EXC_GROUP_SPLIT),
+                "subgroup" => return self.new_bound_method(instance, EXC_GROUP_SUBGROUP),
+                "derive" => return self.new_bound_method(instance, EXC_GROUP_DERIVE),
+                _ => {}
+            }
+        }
         if name == "value"
             && self
                 .exc_class_lookup("StopIteration")
@@ -8064,6 +8459,27 @@ impl ObjectModel {
         };
         let functions = self.managed_functions_rc(self.function_home(func))?;
         functions.get(index as usize).map(|code| code.name.clone())
+    }
+
+    /// Whether `func`'s code object is an `async def` -- what `asyncio.iscoroutinefunction` answers.
+    /// `None` when `func` is not a user function at all (a builtin, or anything else), which the
+    /// caller reports as `False`.
+    ///
+    /// It has to be asked of the CODE and cannot be derived from the value: an `async def` and a
+    /// `def` are the same kind of object until one is CALLED, and calling it to find out is not
+    /// available to a predicate. Resolved against the function's HOME module exactly as its name and
+    /// docstring are.
+    #[must_use]
+    pub fn function_is_coroutine(&self, func: Value) -> Option<bool> {
+        let index = if let Some(idx) = func.as_function_index() {
+            idx
+        } else if self.is_py_function(func) {
+            self.py_function_index(func)
+        } else {
+            return None;
+        };
+        let functions = self.managed_functions_rc(self.function_home(func))?;
+        functions.get(index as usize).map(|code| code.is_coroutine)
     }
 
     /// The docstring on `func`'s code object, or `None` when it has none (or is not a user function).
@@ -8288,40 +8704,58 @@ impl ObjectModel {
         hooks
     }
 
-    /// Builds the built-in exception class hierarchy on first use (idempotent), from the shared
-    /// [`lamella_py_bytecode::EXCEPTION_HIERARCHY`] table (the one definition every engine
-    /// derives from). Each entry's base is built before it; `""` is the root's
-    /// (BaseException's) base.
-    fn ensure_exception_types(&mut self) {
-        if self.exception_classes.len() == lamella_py_bytecode::EXCEPTION_HIERARCHY.len() {
-            return;
+    /// Builds the built-in exception class `name`, and every base it needs, on demand -- from the
+    /// shared [`lamella_py_bytecode::EXCEPTION_HIERARCHY`] table (the one definition every engine
+    /// derives from). Returns the class, or `None` for a name the table does not have and for a heap
+    /// too full to build one.
+    ///
+    /// **A program pays for the exception types it NAMES, and for nothing else.** `raise ValueError`
+    /// builds three classes (`BaseException`, `Exception`, `ValueError`) where building the whole
+    /// table builds thirty-five, and the difference is object heap on a part that has four kilobytes
+    /// of it. Measured: the two `ExceptionGroup` rows cost 104 bytes of live heap when every class is
+    /// built eagerly, which took `import array` from 4,032 bytes to 4,138 against a micro:bit v2's
+    /// 4,096 -- a module lost to a feature that board's program had not asked for.
+    ///
+    /// **Building the table all at once ALSO made a class's availability a function of its position
+    /// in it**, and that is the hazard this shape removes rather than merely improves on. Every step
+    /// here allocates, so a heap under pressure can run out part way through a list -- and with one
+    /// pass over the whole table, every class after the point it stopped simply did not exist for the
+    /// rest of the run.
+    ///
+    /// Here a chain is built root-first and each base is complete before its child, so a failure
+    /// leaves only well-formed classes behind and the next attempt (after a collection rebuilds the
+    /// reserve) completes it. Availability depends on what was asked for and on whether the heap
+    /// could afford that one chain -- never on where a row sits.
+    ///
+    /// An already-built class is returned rather than rebuilt: a second object for a name a program
+    /// already holds would make `except OSError` miss an `OSError`.
+    fn ensure_exception_type(&mut self, name: &str) -> Option<Value> {
+        if let Some(class) = self.exc_class_lookup(name) {
+            return Some(class);
         }
-        for &(name, base_name) in lamella_py_bytecode::EXCEPTION_HIERARCHY {
-            if self.exc_class_lookup(name).is_some() {
-                continue;
-            }
-            let name_value = match self.new_str(name) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let base = if base_name.is_empty() {
-                Value::NONE
-            } else {
-                self.exc_class_lookup(base_name).unwrap_or(Value::NONE)
-            };
-            let namespace = match self.new_dict(Vec::new()) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            if let Ok(class) = self.new_class(name_value, base, namespace) {
-                self.exception_classes.push((name, class));
-            } else {
-                return;
-            }
+        let &(entry, base_names) = lamella_py_bytecode::EXCEPTION_HIERARCHY
+            .iter()
+            .find(|(n, _)| *n == name)?;
+        let mut resolved = Vec::with_capacity(base_names.len());
+        for base in base_names {
+            resolved.push(self.ensure_exception_type(base)?);
         }
+        let name_value = self.new_str(entry).ok()?;
+        let bases = match resolved.as_slice() {
+            [] => Value::NONE,
+            [single] => *single,
+            many => self.new_tuple(many.to_vec()).ok()?,
+        };
+        let namespace = self.new_dict(Vec::new()).ok()?;
+        let class = self.new_class(name_value, bases, namespace).ok()?;
+        self.exception_classes.push((entry, class));
+        Some(class)
     }
 
-    /// The built-in exception class named `name`, or `None` (assumes the hierarchy is built).
+    /// The built-in exception class named `name`, or `None` -- a `&self` read of what has actually
+    /// been built. A name whose class does not exist yet answers `None`, and every caller of this
+    /// (rather than of [`Self::exception_class`]) is asking a question where that is the right
+    /// answer: no instance can be a `KeyError` if nothing has ever built `KeyError`.
     fn exc_class_lookup(&self, name: &str) -> Option<Value> {
         self.exception_classes
             .iter()
@@ -8329,10 +8763,9 @@ impl ObjectModel {
             .map(|(_, c)| *c)
     }
 
-    /// The built-in exception class named `name`, building the hierarchy on first use.
+    /// The built-in exception class named `name`, built (with its bases) on first use.
     pub fn exception_class(&mut self, name: &str) -> Option<Value> {
-        self.ensure_exception_types();
-        self.exc_class_lookup(name)
+        self.ensure_exception_type(name)
     }
 
     /// Whether `exc` (a class instance) is an instance of `target` -- i.e. `target` is on its
@@ -8385,7 +8818,11 @@ impl ObjectModel {
             Trap::Overflow => "OverflowError",
             Trap::FloatUnavailable => "NotImplementedError",
             Trap::OutOfMemory => "MemoryError",
-            Trap::Raised | Trap::StackUnderflow | Trap::Unsupported | Trap::Malformed => {
+            Trap::Raised
+            | Trap::StackUnderflow
+            | Trap::Unsupported
+            | Trap::Malformed
+            | Trap::Deadlock => {
                 return None;
             }
         };
@@ -8426,6 +8863,40 @@ impl ObjectModel {
             self.set_trap_arg(text);
         }
         trap
+    }
+
+    /// The `NameError` for a name nothing resolved, carrying CPython's text:
+    /// `name 'undefined_name' is not defined`.
+    ///
+    /// **One implementation for three raise sites.** A name can fail to resolve from a global load,
+    /// a deletion, or a function-table lookup, and the message is the same fact each time. Written
+    /// once because a message added at one of three sites is a message the other two do not get --
+    /// which is how this one came to be empty at all three.
+    pub(crate) fn name_error(&mut self, name: &str) -> Trap {
+        let message = alloc::format!("name '{name}' is not defined");
+        self.with_message(Trap::NameError, &message)
+    }
+
+    /// The `UnboundLocalError` for reading a local that holds no value, carrying CPython's text:
+    /// `cannot access local variable 'x' where it is not associated with a value`. Raised for a
+    /// read before assignment and for a read after `del`, which are the same fact about the slot.
+    pub(crate) fn unbound_local_error(&mut self, name: &str) -> Trap {
+        let message =
+            alloc::format!("cannot access local variable '{name}' where it is not associated with a value");
+        self.with_message(Trap::UnboundLocal, &message)
+    }
+
+    /// The error for reading a free variable whose cell is empty, carrying CPython's text:
+    /// `cannot access free variable 'v' where it is not associated with a value in enclosing scope`.
+    ///
+    /// This is a `NameError` and NOT an `UnboundLocalError`, which is the opposite of what the
+    /// local case does: a free variable is not local to the frame reading it, so the
+    /// local-specific subclass does not apply.
+    pub(crate) fn free_variable_error(&mut self, name: &str) -> Trap {
+        let message = alloc::format!(
+            "cannot access free variable '{name}' where it is not associated with a value in enclosing scope"
+        );
+        self.with_message(Trap::NameError, &message)
     }
 
     /// A fresh, no-argument instance of the named built-in exception (e.g. `GeneratorExit`).
@@ -8887,8 +9358,7 @@ impl ObjectModel {
     /// an instance is used as-is; the result must derive from `BaseException` (else `TypeError`
     /// -- "exceptions must derive from BaseException").
     pub fn raise_value(&mut self, value: Value) -> Result<Value, Trap> {
-        self.ensure_exception_types();
-        let base_exception = self.exc_class_lookup("BaseException").ok_or(Trap::Malformed)?;
+        let base_exception = self.ensure_exception_type("BaseException").ok_or(Trap::Malformed)?;
         let instance = if self.is_class(value) {
             self.new_object(value)?
         } else {
@@ -8981,7 +9451,7 @@ impl ObjectModel {
     /// instance falls back to its `repr` (`<ClassName object>`).
     fn instance_display(&self, instance: Value) -> String {
         if self.is_exception_value(instance) {
-            return self.exception_message(instance);
+            return self.exception_message_of(instance);
         }
         self.repr(instance)
     }
@@ -8998,7 +9468,7 @@ impl ObjectModel {
     /// Whether `value` is an exception CLASS -- a class object with `BaseException` in its MRO
     /// (`ValueError`, or a user subclass of one). The class twin of [`is_exception_value`], which
     /// tests an exception INSTANCE. Assumes the hierarchy is built (an exception class value implies it).
-    fn is_exception_class(&self, value: Value) -> bool {
+    pub(crate) fn is_exception_class(&self, value: Value) -> bool {
         if !self.is_class(value) {
             return false;
         }
@@ -9006,12 +9476,158 @@ impl ObjectModel {
             .is_some_and(|base| self.class_mro_vec(value).contains(&base))
     }
 
+    /// Whether `value` is an exception GROUP instance -- `BaseExceptionGroup` or anything derived
+    /// from it, which by construction includes every `ExceptionGroup`. This is the test the `except*`
+    /// desugar uses to decide whether a caught exception needs wrapping, and the test `split` uses to
+    /// decide whether a member is recursed into or matched as a leaf.
+    #[must_use]
+    pub fn is_exception_group(&self, value: Value) -> bool {
+        self.exc_class_lookup("BaseExceptionGroup")
+            .is_some_and(|base| self.is_instance_of(value, base))
+    }
+
+    /// A group's `.message` -- its first stored arg. `None` when `value` is not a well-formed group.
+    #[must_use]
+    pub fn group_message(&self, value: Value) -> Option<Value> {
+        let args = self.instance_attr(value, "args")?;
+        self.seq_value(args)?.first().copied()
+    }
+
+    /// A group's members -- its second stored arg, as a plain `Vec`. `None` when `value` is not a
+    /// well-formed group. The STORED form is whatever the caller passed (CPython keeps that object in
+    /// `args`), while the `.exceptions` ATTRIBUTE is always a tuple; both read from here.
+    #[must_use]
+    pub fn group_members(&self, value: Value) -> Option<Vec<Value>> {
+        let args = self.instance_attr(value, "args")?;
+        let members = self.seq_value(args)?.get(1).copied()?;
+        self.seq_value(members).cloned()
+    }
+
+    /// Validates `BaseExceptionGroup(message, exceptions)` and answers WHICH class to allocate, or
+    /// `None` when `class` is not a group class at all (every other class allocates as before).
+    ///
+    /// The promotion is the part that is easy to miss and was measured rather than recalled:
+    /// `BaseExceptionGroup("m", [ValueError()])` evaluates to an **`ExceptionGroup`**, because a group
+    /// whose members are all ordinary exceptions IS the narrow kind. Without it, `except Exception:`
+    /// would not take a group CPython says it takes. A class the program DERIVED from either group is
+    /// never re-targeted -- the subclass is what was asked for.
+    fn group_class_for(&mut self, class: Value, posargs: &[Value]) -> Result<Option<Value>, Trap> {
+        let Some(base_group) = self.exc_class_lookup("BaseExceptionGroup") else {
+            return Ok(None);
+        };
+        if !self.is_subclass_of(class, base_group) {
+            return Ok(None);
+        }
+        let Some(narrow) = self.ensure_exception_type("ExceptionGroup") else {
+            return Ok(None);
+        };
+        let [message, members] = posargs else {
+            let given = posargs.len();
+            let text = alloc::format!(
+                "BaseExceptionGroup.__new__() takes exactly 2 arguments ({given} given)"
+            );
+            return Err(self.raise_named_exception("TypeError", &text));
+        };
+        if self.str_bytes(*message).is_none() {
+            let kind = self.type_name_of(*message);
+            let text =
+                alloc::format!("BaseExceptionGroup.__new__() argument 1 must be str, not {kind}");
+            return Err(self.raise_named_exception("TypeError", &text));
+        }
+        let narrow_ok = self.validate_group_members(*members)?;
+        if self.is_subclass_of(class, narrow) && !narrow_ok {
+            let text = "Cannot nest BaseExceptions in an ExceptionGroup";
+            return Err(self.raise_named_exception("TypeError", text));
+        }
+        if class == base_group && narrow_ok {
+            return Ok(Some(narrow));
+        }
+        Ok(Some(class))
+    }
+
+    /// Checks the `exceptions` argument of a group constructor (or of `derive`) and reports whether
+    /// every member is an ordinary `Exception` -- which is what decides `ExceptionGroup` from
+    /// `BaseExceptionGroup`. A non-sequence, an empty one, or a member that is not an exception at
+    /// all is refused here, with CPython's own wording.
+    fn validate_group_members(&mut self, members: Value) -> Result<bool, Trap> {
+        if !self.is_list(members) && !self.is_tuple(members) {
+            let text = "second argument (exceptions) must be a sequence";
+            return Err(self.raise_named_exception("TypeError", text));
+        }
+        let elements = self.seq_value(members).cloned().unwrap_or_default();
+        if elements.is_empty() {
+            let text = "second argument (exceptions) must be a non-empty sequence";
+            return Err(self.raise_named_exception("ValueError", text));
+        }
+        let ordinary = self.ensure_exception_type("Exception");
+        let mut all_ordinary = true;
+        for (index, &element) in elements.iter().enumerate() {
+            if !self.is_exception_value(element) {
+                let text = alloc::format!(
+                    "Item {index} of second argument (exceptions) is not an exception"
+                );
+                return Err(self.raise_named_exception("ValueError", &text));
+            }
+            all_ordinary &= ordinary.is_some_and(|c| self.is_instance_of(element, c));
+        }
+        Ok(all_ordinary)
+    }
+
+    /// Builds a group carrying `message` and `members`, choosing its class the way the constructor
+    /// does -- the shared tail of `derive` and of the two halves `split` returns. It starts from
+    /// `BaseExceptionGroup` and lets the promotion pick, so a subclass that does NOT override
+    /// `derive` degrades to a plain group exactly as CPython's default `derive` does (measured:
+    /// `MyGroup(...).split(...)` returns an `ExceptionGroup`, not a `MyGroup`).
+    pub fn new_exception_group(&mut self, message: Value, members: &[Value]) -> Result<Value, Trap> {
+        let base_group = self.exc_class_lookup("BaseExceptionGroup").ok_or(Trap::Malformed)?;
+        let members_list = self.new_list(members.to_vec())?;
+        let class = self
+            .group_class_for(base_group, &[message, members_list])?
+            .unwrap_or(base_group);
+        let instance = self.new_object(class)?;
+        self.init_default_args(instance, &[message, members_list])?;
+        Ok(instance)
+    }
+
+    /// The members argument of `derive(excs)`, validated by the constructor's own rules and returned
+    /// as a plain `Vec`. Shared with the constructor deliberately: `derive` is the hook `split` builds
+    /// both halves through, so a member list `BaseExceptionGroup(...)` would refuse must not become
+    /// constructible by going the other way round.
+    pub fn group_derive_members(&mut self, members: Value) -> Result<Vec<Value>, Trap> {
+        self.validate_group_members(members)?;
+        Ok(self.seq_value(members).cloned().unwrap_or_default())
+    }
+
+    /// Copies the raise-time metadata a partitioned group inherits from the group it came out of.
+    /// `split` propagates `__cause__` / `__context__` / `__suppress_context__` onto BOTH halves
+    /// (measured), so a handler that re-raises the residual still reports what the original was
+    /// chained to; a bare `derive` does NOT, which is why this is its own step rather than part of
+    /// the construction above.
+    pub fn copy_group_metadata(&mut self, from: Value, to: Value) -> Result<(), Trap> {
+        for name in ["__cause__", "__context__", "__suppress_context__"] {
+            if let Some(value) = self.instance_attr(from, name) {
+                self.py_setattr_instance(to, name, value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The str message of an exception instance: `str(arg)` for a single stored arg, `""` for none,
     /// else the args tuple's repr (Python's `BaseException.__str__`).
-    fn exception_message(&self, instance: Value) -> String {
+    fn exception_message_of(&self, instance: Value) -> String {
         let Some(args) = self.instance_attr(instance, "args") else {
             return String::new();
         };
+        if self.is_exception_group(instance) {
+            if let (Some(message), Some(members)) =
+                (self.group_message(instance), self.group_members(instance))
+            {
+                let text = self.display(message).unwrap_or_else(|_| self.repr(message));
+                let count = members.len();
+                let plural = if count == 1 { "" } else { "s" };
+                return alloc::format!("{text} ({count} sub-exception{plural})");
+            }
+        }
         let key_error = self
             .exc_class_lookup("KeyError")
             .is_some_and(|class| self.is_instance_of(instance, class));
@@ -9059,28 +9675,84 @@ impl ObjectModel {
         self.str_name(self.read_slot(class, 0))
     }
 
-    /// Raises `TypeError: unhashable type: '<Class>'` if `value` is a user instance whose class defines
-    /// `__eq__` but not `__hash__` -- CPython makes such a class unhashable (defining `__eq__` nulls the
-    /// inherited `__hash__`), so it cannot be a set element or dict key. A non-instance, or an instance
-    /// whose class defines both dunders (or neither), is hashable. This runtime's sets and dicts
-    /// linear-scan `__eq__` and never call `__hash__`, so this is the guard that rejects an unhashable
-    /// key/element the way CPython's hashing does.
+    /// Raises `TypeError` if `value` is a user instance whose class defines `__eq__` but not
+    /// `__hash__` -- CPython makes such a class unhashable (defining `__eq__` nulls the inherited
+    /// `__hash__`), so it cannot be a set element or dict key. A non-instance, or an instance whose
+    /// class defines both dunders (or neither), is hashable. This runtime's sets and dicts
+    /// linear-scan `__eq__` and never call `__hash__`, so this is the guard that rejects an
+    /// unhashable key/element the way CPython's hashing does.
+    ///
+    /// `use_` names the USE, which CPython 3.14 puts in the message:
+    /// `cannot use 'list' as a dict key (unhashable type: 'list')`.
     ///
     /// Caveat: the test is by MRO presence, so a subclass that adds `__eq__` while a BASE supplies
     /// `__hash__` is (leniently) treated as hashable, where CPython would null it -- a rare pattern.
-    pub(crate) fn require_hashable(&mut self, value: Value) -> Result<(), Trap> {
-        if !self.is_instance(value) {
+    pub(crate) fn require_hashable_as(&mut self, value: Value, use_: HashUse) -> Result<(), Trap> {
+        let Some(inner) = self.unhashable_name(value) else {
             return Ok(());
+        };
+        let outer = self.tp_name_of(value);
+        let message = match use_ {
+            HashUse::Hash => alloc::format!("unhashable type: '{inner}'"),
+            HashUse::DictKey => {
+                alloc::format!("cannot use '{outer}' as a dict key (unhashable type: '{inner}')")
+            }
+            HashUse::SetElement => {
+                alloc::format!("cannot use '{outer}' as a set element (unhashable type: '{inner}')")
+            }
+        };
+        Err(self.with_message(Trap::TypeError, &message))
+    }
+
+    /// The name of what makes `value` unhashable, or `None` when it is hashable.
+    ///
+    /// **Hashability is a property of the whole VALUE and not of its type**, which is the case a
+    /// per-type answer gets wrong: a tuple is hashable, and `(1, [2])` is not. So this recurses, and
+    /// reports the name of the element that actually refuses -- the `inner` half of CPython's message.
+    ///
+    /// The unhashable builtins are the MUTABLE containers, and the reason is worth keeping: a
+    /// container that can change after it is stored would move to a different hash bucket without
+    /// telling anyone, so the entry becomes unreachable while still being there. `bytes` and
+    /// `frozenset` are the immutable twins of two of these and are hashable, which is the whole point
+    /// of their existing.
+    #[must_use]
+    fn unhashable_name(&mut self, value: Value) -> Option<String> {
+        if self.is_list(value)
+            || self.is_dict(value)
+            || self.is_set(value)
+            || self.is_deque(value)
+            || self.is_bytearray(value)
+            || self.is_memoryview(value)
+        {
+            return Some(self.tp_name_of(value));
         }
-        if self.find_dunder(value, "__eq__").is_some() && self.find_dunder(value, "__hash__").is_none() {
-            let name = self.instance_class_name(value).map(String::from);
-            let message = match name.as_deref() {
-                Some(class) => alloc::format!("unhashable type: '{class}'"),
-                None => String::from("unhashable type"),
-            };
-            return Err(self.with_message(Trap::TypeError, &message));
+        if self.is_tuple(value) || self.is_ntinstance(value) {
+            let elements = self.seq_value(value).cloned().unwrap_or_default();
+            for element in elements {
+                if let Some(name) = self.unhashable_name(element) {
+                    return Some(name);
+                }
+            }
+            return None;
         }
-        Ok(())
+        if self.is_slice(value) {
+            let (start, stop, step) = self.slice_components(value);
+            for component in [start, stop, step] {
+                if let Some(name) = self.unhashable_name(component) {
+                    return Some(name);
+                }
+            }
+            return None;
+        }
+        if self.is_instance(value)
+            && self.find_dunder(value, "__eq__").is_some()
+            && self.find_dunder(value, "__hash__").is_none()
+        {
+            return Some(
+                self.instance_class_name(value).map_or_else(|| String::from("object"), String::from),
+            );
+        }
+        None
     }
 
     /// Whether the arena is under enough pressure to be worth collecting -- asked at a SAFE POINT, not
@@ -9238,14 +9910,176 @@ impl ObjectModel {
     /// one -- which is unsound, and which no reading of that call site reveals. Three corpus rows failed
     /// exactly that way. Counting here cannot be forgotten, because a loop that does not announce itself
     /// does not run.
-    #[cfg(feature = "gc-collect")]
     pub(crate) fn enter_drive(&mut self) -> bool {
         self.drive_nesting += 1;
         self.drive_nesting == 1
     }
 
+    /// Whether a driver loop is already running -- so an entry about to start one would be NESTED.
+    ///
+    /// Asked by [`crate::interp::run_frames`] to decide whether it is the top-level run (and may
+    /// therefore be the scheduler) or a callback reached from inside a running one, which may not.
+    /// The same counter the safe point reads, asked one instant earlier.
+    #[must_use]
+    pub(crate) fn is_driving(&self) -> bool {
+        self.drive_nesting > 0
+    }
+
+    #[cfg(feature = "threading")]
+    /// Asks the scheduler to start `callable(*args)` as a new thread, answering its id.
+    ///
+    /// >>> THE CAP IS REFUSED LOUDLY, AND BOTH HALVES OF THAT MATTER. The two tiers must accept the
+    /// SAME programs, and the ahead-of-time tier's four threads are a hard property of preallocated
+    /// native stacks -- so an interpreter that accepted a fifth would run programs the deployed image
+    /// refuses. And a SILENT refusal is worse than either: an unstored one leaves the thread never
+    /// running while the program carries on as though it had started. <<<
+    pub(crate) fn spawn_thread(&mut self, callable: Value, args: Value) -> Result<u32, Trap> {
+        if callable.as_function_index().is_none() && !self.is_py_function(callable) {
+            let kind = self.type_name_of(callable);
+            let message = alloc::format!("thread target must be a function, not '{kind}'");
+            return Err(self.raise_named_exception("TypeError", &message));
+        }
+        let live = self.live_threads as usize + self.pending_spawns.len();
+        if live >= crate::interp::MAX_THREADS {
+            let max = crate::interp::MAX_THREADS;
+            let message = alloc::format!("can't start new thread (limit is {max})");
+            return Err(self.raise_named_exception("RuntimeError", &message));
+        }
+        let id = self.next_thread_id;
+        self.next_thread_id += 1;
+        self.pending_spawns.push((id, callable, args));
+        Ok(id)
+    }
+
+    #[cfg(feature = "threading")]
+    /// Which thread's slice is running. See the field.
+    #[must_use]
+    pub(crate) fn current_thread_id(&self) -> u32 {
+        self.current_thread
+    }
+
+    /// The scheduler's record of whose slice is about to run.
+    pub(crate) fn set_current_thread_id(&mut self, id: u32) {
+        self.current_thread = id;
+    }
+
+    /// Takes the spawn requests raised since the last switch. The scheduler's half.
+    pub(crate) fn take_pending_spawns(&mut self) -> Vec<(u32, Value, Value)> {
+        core::mem::take(&mut self.pending_spawns)
+    }
+
+    #[cfg(feature = "threading")]
+    /// Asks the scheduler to block the running thread until thread `target` finishes. See the field.
+    ///
+    /// It does NOT check whether `target` is still running, and cannot: the thread table is the
+    /// scheduler's. A join on a thread that has already finished is serviced as "nothing to wait
+    /// for" there, which is where the answer is knowable.
+    pub(crate) fn request_join(&mut self, target: u32) {
+        self.pending_join = Some(target);
+    }
+
+    #[cfg(feature = "threading")]
+    /// Takes the join request. The SCHEDULER's half of the pair above.
+    pub(crate) fn take_pending_join(&mut self) -> Option<u32> {
+        self.pending_join.take()
+    }
+
+    #[cfg(feature = "threading")]
+    /// Asks the scheduler to park the running thread until something wakes it. See the field.
+    pub(crate) fn request_block(&mut self, reason: crate::interp::BlockReason) {
+        self.pending_block = Some(reason);
+    }
+
+    #[cfg(feature = "threading")]
+    /// Takes the block request. The SCHEDULER's half.
+    pub(crate) fn take_pending_block(&mut self) -> Option<crate::interp::BlockReason> {
+        self.pending_block.take()
+    }
+
+    #[cfg(feature = "threading")]
+    /// Makes thread `id` runnable again at the next switch -- a lock handed over, a flag set.
+    ///
+    /// A wake for a thread that is not parked is a NO-OP by construction: the scheduler applies it
+    /// only to a `Blocked` slot. That matters because a Python-level wait set can name a thread that
+    /// has since been woken by something else.
+    pub(crate) fn wake_thread(&mut self, id: u32) {
+        self.pending_wakes.push(id);
+    }
+
+    #[cfg(feature = "threading")]
+    /// Takes the wakes raised since the last switch. The SCHEDULER's half of the pair above.
+    pub(crate) fn take_pending_wakes(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.pending_wakes)
+    }
+
+    #[cfg(feature = "threading")]
+    /// Whether the running thread has asked to be put aside -- for a `join`, or for a lock or an
+    /// event a Python object owns. The DRIVER's half, read at the switch point.
+    ///
+    /// Read rather than taken, so the request survives to the scheduler, which is the only party
+    /// that can act on it.
+    #[must_use]
+    pub(crate) fn has_pending_park(&self) -> bool {
+        self.pending_join.is_some() || self.pending_block.is_some()
+    }
+
+    /// How many green threads are live. See the field. The SCHEDULER's count, so it does not include
+    /// a thread asked for during the running slice.
+    #[must_use]
+    pub(crate) fn live_thread_count(&self) -> u32 {
+        self.live_threads
+    }
+
+    #[cfg(feature = "threading")]
+    /// What `_thread.active_count()` answers: live threads PLUS those asked for and not yet started.
+    ///
+    /// The pending half matters and is not pedantry -- a program that starts three threads and asks
+    /// immediately is asking within the same slice, before any switch has serviced them, and would
+    /// otherwise be told it has one. It is also the count the cap is enforced against, so the two
+    /// agree by construction rather than by being maintained together.
+    #[must_use]
+    pub(crate) fn active_thread_count(&self) -> u32 {
+        self.live_threads.max(1) + self.pending_spawns.len() as u32
+    }
+
+    /// The scheduler's record of how many threads it is running.
+    pub(crate) fn set_live_thread_count(&mut self, count: u32) {
+        self.live_threads = count;
+    }
+
+    /// Asks for a collection at the next thread switch.
+    ///
+    /// >>> WHY A SAFE POINT CANNOT ALWAYS COLLECT ONCE THERE ARE THREADS. A collection must root
+    /// EVERY thread's frames, and a driver loop can only see its own -- the suspended stacks belong
+    /// to the scheduler. Collecting inline with several threads live would reclaim another thread's
+    /// locals while it was merely not running. So the safe point defers, and the switch (where every
+    /// stack is consistent and the scheduler holds them all) performs it. <<<
+    ///
+    /// A single-threaded program never takes this path: its own stack IS the root set.
+    pub(crate) fn request_collect(&mut self) {
+        self.deferred_collect = true;
+    }
+
+    /// Takes any pending deferred collection. The scheduler's half of the pair above.
+    pub(crate) fn take_deferred_collect(&mut self) -> bool {
+        core::mem::take(&mut self.deferred_collect)
+    }
+
+    /// The op budget for the slice about to run, cleared as it is read.
+    ///
+    /// TAKEN rather than read, so a budget applies to ONE drive. A budget that survived its slice
+    /// would preempt the next thing the interpreter ran -- including a nested dunder call, which
+    /// cannot be preempted at all -- and the bug would look like a program stopping at random.
+    pub(crate) fn take_thread_quantum(&mut self) -> Option<u32> {
+        self.thread_quantum.take()
+    }
+
+    /// Sets the op budget for the next drive. The scheduler's half of the pair above.
+    pub(crate) fn set_thread_quantum(&mut self, ops: u32) {
+        self.thread_quantum = Some(ops);
+    }
+
     /// Records that a driver loop has finished. Pairs with [`Self::enter_drive`] on every exit path.
-    #[cfg(feature = "gc-collect")]
     pub(crate) fn leave_drive(&mut self) {
         self.drive_nesting = self.drive_nesting.saturating_sub(1);
     }
@@ -9367,6 +10201,7 @@ impl ObjectModel {
             function_dicts,
             generators,
             frame_pool,
+            pending_spawns,
             pending_trap_arg,
             generator_return,
             delegated_throw,
@@ -9424,6 +10259,10 @@ impl ObjectModel {
             }
             for (_, value) in function_dicts.iter_mut() {
                 Value::trace_slot(value, visit);
+            }
+            for (_, callable, args) in pending_spawns.iter_mut() {
+                Value::trace_slot(callable, visit);
+                Value::trace_slot(args, visit);
             }
             for slot in [
                 pending_exception.as_mut(),
@@ -9599,7 +10438,10 @@ impl ObjectModel {
         if type_id == self.bytes_type_id || type_id == self.bytearray_type_id {
             return Some(ArenaKind::ByteBuffers);
         }
-        if type_id == self.generator_type_id || type_id == self.coroutine_type_id {
+        if type_id == self.generator_type_id
+            || type_id == self.coroutine_type_id
+            || type_id == self.async_generator_type_id
+        {
             return Some(ArenaKind::Generators);
         }
         None
@@ -9682,6 +10524,35 @@ impl ObjectModel {
         core::mem::take(&mut self.stdout)
     }
 
+    /// Installs the embedder's ERROR console: everything written to `sys.stderr` goes straight to it
+    /// and nothing is retained.
+    ///
+    /// A SECOND seam rather than a flag on [`Self::set_console`], because the two streams leave a
+    /// device by different routes: the wire frames each `EVT_OUTPUT` with the stream it belongs to,
+    /// so a firmware needs to know WHICH one it is being handed at the moment it is handed it. A
+    /// single console taking a tag would push that decision to every call site instead.
+    pub fn set_error_console(&mut self, console: fn(&str)) {
+        self.error_console_fn = Some(console);
+    }
+
+    /// Appends `text` to `sys.stderr` -- diagnostics, tracebacks, and the event loop's report of a
+    /// task that died with nobody to tell.
+    ///
+    /// No trailing newline is added: the writer supplies its own, as `sys.stderr.write` does in
+    /// CPython. [`Self::write_line`] is `print`'s seam and this deliberately is not its twin.
+    pub fn write_stderr(&mut self, text: &str) {
+        if let Some(console) = self.error_console_fn {
+            console(text);
+            return;
+        }
+        self.stderr.push_str(text);
+    }
+
+    /// Drains the captured `sys.stderr` output. Always EMPTY when an error console is installed.
+    pub fn take_stderr(&mut self) -> String {
+        core::mem::take(&mut self.stderr)
+    }
+
     /// Unpacks an iterable into exactly `count` elements (`a, b = x`); a length mismatch is a
     /// `ValueError` ("not enough" / "too many values to unpack"). Works over any iterable.
     pub fn unpack_sequence(&mut self, value: Value, count: usize) -> Result<Vec<Value>, Trap> {
@@ -9735,6 +10606,35 @@ impl ObjectModel {
             return None;
         }
         self.str_name(self.read_slot(class, 0))
+    }
+
+    /// The MESSAGE of an exception instance -- `"list index out of range"` -- or `None` if `exc` is
+    /// not one. The twin of [`Self::exception_type_name`], and the other half of `Type: message`.
+    ///
+    /// # Why this is exception-specific rather than a general `str(value)`
+    ///
+    /// Because a correct general one has to run Python. `str(x)` honors `__str__`, which is a
+    /// method, which needs the module's function table and a mutable interpreter -- and the caller
+    /// this exists for is an error path that has just been handed a failure. **Reporting a failure
+    /// by running more user code is how a bad error becomes a worse one**: a `__str__` that traps
+    /// while a trap is being reported gives a second failure with no better message, or a loop.
+    ///
+    /// The other general shape -- a `str(value)` that does NOT honor `__str__` -- is worse than
+    /// narrow, it is quietly wrong: it would render a user object by ignoring the method written to
+    /// render it, and nothing in the answer would say so.
+    ///
+    /// So this reads the exception's stored `args` directly out of its `__dict__`, resolves no
+    /// methods, cannot fail, and needs only `&self`. It is `BaseException.__str__`, which is what
+    /// every built-in exception's message IS.
+    ///
+    /// **THE LIMIT, STATED SO IT IS NOT DISCOVERED:** a user exception that OVERRIDES `__str__`
+    /// reports its `args`-based message here rather than the override. Every built-in reports
+    /// exactly what CPython prints. Honoring an override is a different capability -- it needs the
+    /// function table -- and belongs in a separate interpreter-aware call rather than in this one
+    /// sometimes running Python and sometimes not.
+    #[must_use]
+    pub fn exception_message(&self, exc: Value) -> Option<String> {
+        self.is_exception_value(exc).then(|| self.exception_message_of(exc))
     }
 
     /// The shared heap (for the collector, and for tests that drive a collection).
@@ -9846,7 +10746,7 @@ impl ObjectModel {
             byte_buffers,
             namespaces,
             frames,
-            stdout: self.stdout.capacity(),
+            stdout: self.stdout.capacity() + self.stderr.capacity(),
         }
     }
 
@@ -10151,6 +11051,10 @@ impl ObjectModel {
         }
         if type_id == self.generator_type_id {
             let method_id = crate::interp::generator_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.async_generator_type_id {
+            let method_id = crate::interp::async_generator_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
         if type_id == self.coroutine_type_id {
@@ -16213,25 +17117,12 @@ impl ObjectModel {
                 };
                 Ok(Value::from_bool(matches))
             }
-            BYTES_FIND => {
-                let [sub] = args else {
-                    return Err(Trap::TypeError);
-                };
-                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
-                let needle = self.bytes_value(*sub).ok_or(Trap::TypeError)?;
-                let index = if needle.is_empty() {
-                    0
-                } else {
-                    data.windows(needle.len()).position(|w| w == needle).map_or(-1, |p| p as i64)
-                };
-                Value::fixnum(i32::try_from(index).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)
-            }
             BYTES_COUNT => {
-                let [sub] = args else {
-                    return Err(Trap::TypeError);
-                };
-                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
-                let needle = self.bytes_value(*sub).ok_or(Trap::TypeError)?;
+                let (sub, start, end) = affix_and_bounds(args)?;
+                let whole = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                let (a, b) = normalize_bounds(start, end, whole.len() as i64);
+                let data = &whole[(a as usize).min(whole.len())..(b as usize).min(whole.len())];
+                let needle = self.bytes_value(sub).ok_or(Trap::TypeError)?;
                 let count = if needle.is_empty() {
                     data.len() + 1
                 } else {
@@ -16413,12 +17304,13 @@ impl ObjectModel {
                     self.new_bytes(result)
                 }
             }
-            BYTES_RFIND | BYTES_INDEX | BYTES_RINDEX => {
-                let [sub] = args else {
-                    return Err(Trap::TypeError);
-                };
-                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
-                let needle = self.bytes_value(*sub).ok_or(Trap::TypeError)?;
+            BYTES_FIND | BYTES_RFIND | BYTES_INDEX | BYTES_RINDEX => {
+                let (sub, start, end) = affix_and_bounds(args)?;
+                let whole = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                let (a, b) = normalize_bounds(start, end, whole.len() as i64);
+                let (a, b) = ((a as usize).min(whole.len()), (b as usize).min(whole.len()));
+                let data = if a <= b { &whole[a..b] } else { &whole[0..0] };
+                let needle = self.bytes_value(sub).ok_or(Trap::TypeError)?;
                 let from_right = method_id == BYTES_RFIND || method_id == BYTES_RINDEX;
                 let pos = if needle.is_empty() {
                     Some(if from_right { data.len() } else { 0 })
@@ -16434,6 +17326,7 @@ impl ObjectModel {
                     }
                     None => -1,
                 };
+                let index = if index < 0 { index } else { index + a as i64 };
                 Value::fixnum(i32::try_from(index).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)
             }
             BYTES_LJUST | BYTES_RJUST | BYTES_CENTER => {
@@ -16770,6 +17663,7 @@ impl ObjectModel {
                 let [value] = args else {
                     return Err(Trap::TypeError);
                 };
+                self.require_hashable_as(*value, HashUse::SetElement)?;
                 let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
                 if !crate::interp::elems_contain(*value, &a, functions, self, depth)? {
                     self.set_push(receiver, *value)?;
@@ -16780,7 +17674,7 @@ impl ObjectModel {
                 let [value] = args else {
                     return Err(Trap::TypeError);
                 };
-                self.require_hashable(*value)?;
+                self.require_hashable_as(*value, HashUse::SetElement)?;
                 let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
                 let mut position = None;
                 for (i, &e) in a.iter().enumerate() {
@@ -16878,6 +17772,29 @@ impl ObjectModel {
     /// (lexicographic, recursive, shorter-is-less when one is a prefix). Comparing two different
     /// orderable kinds -- or any unorderable type -- is a `TypeError`, matching CPython (`1 < "a"`
     /// raises). Only same-kind sequences compare (`[1] < (1,)` is a TypeError).
+    /// The order of two numbers where at least one is a float, computed EXACTLY. `None` when
+    /// either is a NaN (unordered) or either is not a number.
+    ///
+    /// # The one place the int/float rule lives
+    ///
+    /// Both `==` and the orderings need it, and they reach it from different callers -- `key_eq`
+    /// for equality, dict keys and `in`; [`Self::compare_ordered`] for `<`, `sort`, `min` and
+    /// `max`. **Widening the int to `f64` at each site is what made them agree on a wrong answer**:
+    /// a double holds 53 bits, so `2**53 + 1` rounds onto `2.0**53` and every comparison between
+    /// them inverts. Two implementations of one rule is how a repair reaches only one of them, so
+    /// the rule is here and the callers only decide what to do with a `None`.
+    ///
+    /// float-vs-float still compares as `f64`, which is exact for that pair by construction.
+    #[cfg(feature = "float")]
+    pub(crate) fn compare_numeric(&self, a: Value, b: Value) -> Option<Ordering> {
+        match (self.float_value(a), self.float_value(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y),
+            (None, Some(y)) => self.as_bigint(a)?.cmp_f64(y),
+            (Some(x), None) => self.as_bigint(b)?.cmp_f64(x).map(Ordering::reverse),
+            (None, None) => None,
+        }
+    }
+
     pub(crate) fn compare_ordered(&self, a: Value, b: Value) -> Result<Ordering, Trap> {
         if let (Some(x), Some(y)) = (self.as_i128(a), self.as_i128(b)) {
             return Ok(x.cmp(&y));
@@ -16889,8 +17806,11 @@ impl ObjectModel {
         }
         #[cfg(feature = "float")]
         if self.is_float(a) || self.is_float(b) {
-            if let (Some(x), Some(y)) = (self.as_f64(a), self.as_f64(b)) {
-                return Ok(x.partial_cmp(&y).unwrap_or(Ordering::Equal));
+            if let Some(ordering) = self.compare_numeric(a, b) {
+                return Ok(ordering);
+            }
+            if self.as_f64(a).is_some() && self.as_f64(b).is_some() {
+                return Ok(Ordering::Equal);
             }
         }
         if let (Some(x), Some(y)) = (self.str_bytes(a), self.str_bytes(b)) {
@@ -16912,6 +17832,9 @@ impl ObjectModel {
                 }
                 return Ok(xs.len().cmp(&ys.len()));
             }
+        }
+        if self.is_slice(a) && self.is_slice(b) {
+            return self.compare_slice_ordered(a, b);
         }
         Err(Trap::TypeError)
     }

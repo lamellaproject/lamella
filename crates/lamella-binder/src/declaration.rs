@@ -18,7 +18,8 @@ use alloc::vec::Vec;
 use lamella_syntax::ast::{
     AttributeArgument, AttributeSection, BinaryOperator, CompilationUnit, Expr, ExprKind, Literal,
     Member, Modifier, NamespaceMember, QualifiedName, TypeDecl, TypeKind as SyntaxTypeKind,
-    TypeParameterConstraint as SyntaxConstraint, UnaryOperator, explicit_interface_member_name,
+    TypeParameterConstraint as SyntaxConstraint, UnaryOperator, auto_property_backing_field_name,
+    explicit_interface_member_name, is_auto_property,
 };
 
 /// Builds the [`Model`] of every type and member declared in `unit`.
@@ -105,6 +106,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             info.accessibility = accessibility_of(&declaration.modifiers);
             info.is_sealed = true;
             info.methods.push(MethodSymbol {
+                return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: "Invoke".into(),
                 return_type: bind_type(&declaration.return_type),
@@ -284,7 +286,7 @@ pub fn fold_parameter_default(expr: &Expr) -> Option<Literal> {
 /// What `default(T)` contributes as a parameter's default: the zero of a predefined value type,
 /// and `Literal::Null` for everything else. See [`fold_parameter_default`] for why a STRUCT lands
 /// in the second group.
-fn default_value_literal(target: &lamella_syntax::ast::TypeRef) -> Literal {
+pub(crate) fn default_value_literal(target: &lamella_syntax::ast::TypeRef) -> Literal {
     use lamella_syntax::ast::{PredefinedType, TypeRefKind};
     let TypeRefKind::Predefined(predefined) = &target.kind else {
         return Literal::Null;
@@ -367,6 +369,28 @@ pub fn parameter_default_in_model(
             let inner = parameter_default_in_model(model, containing, operand)?;
             Some(integer_literal(literal_int_value(&inner)?))
         }
+        ExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => fold_const_binary(
+            *operator,
+            &parameter_default_in_model(model, containing, left)?,
+            &parameter_default_in_model(model, containing, right)?,
+        ),
+        ExprKind::Unary { operator, operand } => fold_const_unary(
+            *operator,
+            &parameter_default_in_model(model, containing, operand)?,
+        ),
+        ExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => match parameter_default_in_model(model, containing, condition)? {
+            Literal::Boolean(true) => parameter_default_in_model(model, containing, when_true),
+            Literal::Boolean(false) => parameter_default_in_model(model, containing, when_false),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -403,6 +427,25 @@ pub(crate) fn const_expr_references(expr: &Expr, out: &mut Vec<Box<str>>) {
 /// The literal a unary minus produces for the two values 9.4.4.2 gives a SPECIAL rule -- `2^63`
 /// becoming `long.MinValue` and `2^31` becoming `int.MinValue` -- with the special type each takes.
 /// `None` for every other operand, which negates ordinarily.
+///
+/// **ONE FUNCTION BECAUSE THE RULE HAD TWO IMPLEMENTATIONS AND THE MISSING CASE WAS MISSING FROM
+/// BOTH.** `bind_unary` applies it at a use site and [`fold_const_unary`] at a constant
+/// initializer, and each spelled its own `matches!`. Both admitted the unsuffixed spelling ONLY,
+/// so `long v = -9223372036854775808L;` was `CS0023 Operator '-' cannot be applied to operand of
+/// type 'ulong'` in five positions -- expression, `const` field, `case` label, and the hex
+/// spelling `-0x8000000000000000L` -- while csc accepts all five. Adding the case carefully at one
+/// of the two sites would have left the other refusing, and nothing would have said so.
+///
+/// **THE TWO CLAUSES DIFFER BY EXACTLY THE SUFFIX, AND THAT IS THE STANDARD AND NOT AN OVERSIGHT.**
+/// 9.4.4.2 admits *"no integer-type-suffix or the integer-type-suffix L or l"* for the `long` case
+/// and *"no integer-type-suffix"* alone for the `int` case. Measured against csc: `-2147483648L` is
+/// an ordinary `long` negation and needs no rule, while `-9223372036854775808UL`, `-...U` and
+/// `-...LU` are `CS0023` under BOTH compilers -- a `u` forces `ulong` and the rule does not reach
+/// it.
+///
+/// **A PARENTHESIZED OPERAND IS NOT THIS RULE**: the clause says the literal must be *"the token
+/// immediately following a unary minus operator token"*, so `-(9223372036854775808L)` is `CS0023`,
+/// measured, and both callers get that for free by only ever passing a bare literal here.
 pub(crate) fn negated_integer_min_literal(operand: &Literal) -> Option<(Literal, SpecialType)> {
     match operand {
         Literal::Integer {
@@ -1021,6 +1064,11 @@ fn dotted_suffixes(full: &str) -> Vec<String> {
 /// creation, element access, increment, or other form that can never be a compile-time constant. A
 /// `true` result does NOT prove it folds (a name may be unresolved -- that is a separate CS0103); a
 /// `false` result means the SHAPE alone rules it out, so the use site is non-constant.
+///
+/// ONE CALLER IS LEFT, and the shape is all it can have: an ATTRIBUTE ARGUMENT whose attribute
+/// type did not resolve, where nothing was bound to ask about. Every position that HAS a bound
+/// expression asks [`crate::bound::Binder::required_constant`] instead, because a name's shape
+/// says nothing about what it resolves to.
 pub(crate) fn is_constant_form(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Literal(_) | ExprKind::Name { .. } | ExprKind::PredefinedType(_) => true,
@@ -1129,6 +1177,11 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
         .any(|modifier| matches!(modifier, Modifier::Partial));
     info.is_sealed = declaration.modifiers.iter().any(|m| matches!(m, Modifier::Sealed))
         || matches!(declaration.kind, SyntaxTypeKind::Struct);
+    info.is_by_ref_like = matches!(declaration.kind, SyntaxTypeKind::Struct)
+        && declaration
+            .modifiers
+            .iter()
+            .any(|m| matches!(m, Modifier::Ref));
     info.is_abstract = declaration
         .modifiers
         .iter()
@@ -1254,6 +1307,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 attributes,
                 ..
             } => info.methods.push(MethodSymbol {
+                return_required_modifiers: Vec::new(),
                 name: match explicit_interface {
                     Some(interface) => explicit_interface_member_name(interface, name).into(),
                     None => name.clone(),
@@ -1293,6 +1347,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: operator.method_name(parameters.len()).into(),
                 return_type: bind_type(return_type),
@@ -1317,6 +1372,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: direction.method_name().into(),
                 return_type: bind_type(target),
@@ -1343,7 +1399,21 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 setter,
                 explicit_interface,
                 ..
-            } => info.properties.push(PropertySymbol {
+            } => {
+                if is_auto_property(modifiers, getter.as_ref(), setter.as_ref(), is_interface) {
+                    info.fields.push(FieldSymbol {
+                        name: auto_property_backing_field_name(explicit_interface.as_ref(), name)
+                            .into(),
+                        ty: bind_type(ty),
+                        is_static: is_static(modifiers),
+                        is_readonly: setter.is_none(),
+                        is_volatile: false,
+                        accessibility: Accessibility::Private,
+                        constant: None,
+                        is_required: false,
+                    });
+                }
+                info.properties.push(PropertySymbol {
                 name: name.clone(),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
@@ -1362,8 +1432,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 setter_accessibility: setter
                     .as_ref()
                     .map(|accessor| accessor_access(accessor, modifiers)),
-                is_required: modifiers.iter().any(|m| matches!(m, Modifier::Required)),
-            }),
+                    is_required: modifiers.iter().any(|m| matches!(m, Modifier::Required)),
+                });
+            }
             Member::Indexer {
                 modifiers,
                 ty,
@@ -1381,6 +1452,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let indexer_is_sealed = is_sealed_member(modifiers);
                 if getter.is_some() {
                     info.methods.push(MethodSymbol {
+                        return_required_modifiers: Vec::new(),
                         explicit_interface: None,
                         name: "get_Item".into(),
                         return_type: element.clone(),
@@ -1409,6 +1481,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     let mut parameters = indices;
                     parameters.push(element);
                     info.methods.push(MethodSymbol {
+                        return_required_modifiers: Vec::new(),
                         explicit_interface: None,
                         name: "set_Item".into(),
                         return_type: TypeSymbol::Special(SpecialType::Void),
@@ -1468,6 +1541,7 @@ fn constructor(
     accessibility: Accessibility,
 ) -> MethodSymbol {
     MethodSymbol {
+        return_required_modifiers: Vec::new(),
         explicit_interface: None,
         name: ".ctor".into(),
         return_type: TypeSymbol::Special(SpecialType::Void),

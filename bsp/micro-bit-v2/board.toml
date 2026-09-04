@@ -13,7 +13,7 @@ board = "micro-bit-v2"
 vendor = "micro-bit"
 family = "nrf52833"
 part = "nrf52833"
-board_model = 11            # lamella_wire::board_model::MICROBIT_V2
+product_model = 11          # lamella_wire::product_model::MICROBIT_V2
 sources = ["micro:bit v2.0.0_S schematic (I2C_INT wiring, bus residents, 1k pulls)"]
 
 [[carriers]]

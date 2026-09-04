@@ -1,0 +1,36 @@
+# PARTS table for the STM32C0 series.
+#
+# ONE ROW, AND IT IS AN ORDERABLE VARIANT. A parts row names a part somebody can buy -- that is what
+# `package`, `pins` and a board file's `part = "..."` all mean, and it is why every other row in this
+# directory is an order code rather than a line name. The five sub-families RM0490 covers are not
+# orderable and have no package, so they cannot carry a pad set; they are recorded in `notes` below
+# as the address map they actually are.
+#
+#
+# THE EXTENTS AND THE FITTED PART COINCIDE HERE, WHICH IS WORTH STATING RATHER THAN LEAVING AS LUCK.
+# RM0490's STM32C071xx boundary table gives 128 Kbytes of main flash and 24 Kbytes of SRAM, and the
+# STM32C071RBT6's own datasheet gives the same two numbers for the order code. Two documents, one
+# answer -- and the part itself agrees, because FSIZER reads 128.
+#
+#
+
+[table]
+kind = "parts"
+family = "stm32c0"
+notes = [
+    "THE OTHER FOUR SUB-FAMILIES, as an address map rather than as parts. RM0490 Rev 6 gives each its own boundary table: STM32C011xx and STM32C031xx share Table 2 (32 Kbytes flash, 12 Kbytes SRAM), STM32C051xx has Table 3 (64 and 12) and STM32C091xx has Table 5 (256 and 36). Those are the extents a sub-family's map allows rather than an order code's fitted memory, and no row here names one.",
+    "THE DEV_ID VALUES THAT TELL THE SUB-FAMILIES APART are RM0490 Rev 6 Table 178: 0x443 STM32C011xx, 0x453 STM32C031xx, 0x44C STM32C051xx, 0x493 STM32C071xx, 0x44D STM32C091xx/92xx. Each names a SUB-FAMILY rather than an order code, so no reading of one identifies the board in front of you.",
+    "Bits 15:12 of this family's DBG_IDCODE are reserved and read back as 0b0110, so an STM32C071 returns 0x10016493 in that register. A whole-word comparison is therefore a die fact, a sixteen-bit mask decodes as nothing at all, and only the low TWELVE bits are the part id.",
+    "PD7 IS ABSENT FROM THE LQFP64 and the range above says so: the package brings out PD0-PD6 and then PD8 and PD9. A PD0-PD9 range would claim a pad this package does not bond.",
+    "PA9 AND PA10 EACH APPEAR TWICE in the pinout figure -- natively, and again as remap labels on PA11 and PA12. All four pads are present; a bracketed label there is a remap rather than an alias for an absent pin.",
+    "PF2 IS THE RESET PIN, named PF2-NRST in the pinout. It is listed because the part carries the pad. Whether an option byte frees it as I/O is NOT stated here, because DS14693 does not say it and it must not be inferred -- a board binding PF2 is the moment to settle that.",
+    "THE N VERSION IS A DIFFERENT PAD SET AND IS NOT THIS ROW. An STM32C071RxTxN puts VDDIO2 and VSS at pins 40 and 41 where this variant puts PD8 and PD9. Two pinouts share one figure caption, and the difference is two pins a GP-version board would bind and an N-version board would drive into a supply.",
+]
+
+[[parts]]
+part = "stm32c071rbt6"
+package = "64-pin LQFP"
+flash = 0x20000
+ram = 0x6000
+pins = ["PA0-PA15", "PB0-PB15", "PC0-PC15", "PD0-PD6", "PD8-PD9", "PF0-PF3"]
+source = "STM32C071x8/xB datasheet DS14693 Rev 2 section 8, the ordering information scheme, decodes STM32C071RBT6 as R = 64 pins, B = 128 Kbytes of flash, T = LQFP. Flash 128 KB and SRAM 24 Kbytes come from that datasheet's own feature list and section 3, and agree with RM0490 Rev 6 Table 4's STM32C071xx boundary map (main flash 0x08000000-0x0801FFFF, SRAM 0x20000000-0x20005FFF) and with the part, whose FSIZER at 0x1FFF75A0 reads 128. The pad set is the complete general-purpose I/O set of figure 10, STM32C071RxT LQFP64 pinout, GP version -- NOT the RxTxN version beside it, which bonds VDDIO2 and VSS where this one bonds PD8 and PD9"

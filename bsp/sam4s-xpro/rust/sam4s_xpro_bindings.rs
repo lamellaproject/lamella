@@ -3,3 +3,5 @@
 
 pub const BOARD_MODEL: u16 = 3;
 pub const BOARD_VENDOR: &str = "Microchip";
+pub const CARRIER_USB_VID: u16 = 0x03EB;
+pub const CARRIER_USB_PID: u16 = 0x2111;

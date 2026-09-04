@@ -9,7 +9,11 @@
 //! the F0's 16 bits). Two families that agree on the easy fact and differ on the hard one are
 //! exactly the pair worth keeping apart.
 mod c0;
-pub use c0::{STM32C0_DOUBLE_WORD, STM32C0_FLASH_BASE, STM32C0_PAGE, Stm32C0Flash};
+pub use c0::{
+    STM32C0_DBGMCU_IDCODE, STM32C0_DOUBLE_WORD, STM32C0_ERASED_VALUE, STM32C0_FLASH_BASE,
+    STM32C0_FLASH_SIZE_REG, STM32C0_PAGE, STM32C0_PARTS, Stm32C0Device, Stm32C0Flash,
+    stm32c0_dev_id,
+};
 
 /// The U5 gets its own module again: 8 KB pages, a 128-bit quad-word granule, two banks selected
 /// by a `BKER` bit, and TrustZone-aliased registers. Four families in this crate now have four
@@ -17,12 +21,25 @@ pub use c0::{STM32C0_DOUBLE_WORD, STM32C0_FLASH_BASE, STM32C0_PAGE, Stm32C0Flash
 /// copied from a neighbour and the one that only fails on silicon.
 mod u5;
 pub use u5::{
-    STM32U5_FLASH_BASE, STM32U5_FLASH_SIZE_REG, STM32U5_PAGE, STM32U5_MAX_PAGES_PER_BANK, STM32U5_QUAD_WORD, Stm32U5Flash,
+    STM32U5_DBGMCU_IDCODE, STM32U5_FLASH_BASE, STM32U5_FLASH_SIZE_REG, STM32U5_PAGE, STM32U5_MAX_PAGES_PER_BANK, STM32U5_PARTS, STM32U5_QUAD_WORD, Stm32U5Flash,
 };
 
 mod h7;
 pub use h7::{
-    STM32H7_BANK2_BASE, STM32H7_FLASH_BASE, STM32H7_FLASH_WORD, STM32H7_SECTOR, Stm32H7Flash,
+    STM32H7_BANK2_BASE, STM32H7_DBGMCU_IDC, STM32H7_FLASH_BASE, STM32H7_FLASH_WORD, STM32H7_PARTS,
+    STM32H7_SECTOR, Stm32H7Flash,
+};
+
+/// The L4 gets its own module DESPITE sharing the C0's register block, which is the argument for
+/// the split rather than against it: same base, same offsets, same keys, same `PG`/`PER`/`STRT`
+/// bits, same 2 KB page and 8-byte granule -- and two banks whose page numbers RESTART, an eight-bit
+/// `PNB` where the C0 has seven, no `CFGBSY`, and two error flags the C0 does not report. A driver
+/// that shared the code would share the parts that match and be wrong about the parts that decide
+/// which 2 KB gets erased.
+mod l4;
+pub use l4::{
+    STM32L4_BANK, STM32L4_DBGMCU_IDCODE, STM32L4_DOUBLE_WORD, STM32L4_ERASED_WORD,
+    STM32L4_FLASH_BASE, STM32L4_FLASH_SIZE_REG, STM32L4_PAGE, STM32L4_PARTS, Stm32L4Flash,
 };
 
 use lamella_probe_core::{CallFrame, ProbeError, TargetAccess};
@@ -46,7 +63,11 @@ use lamella_probe_core::{CallFrame, ProbeError, TargetAccess};
 /// | STM32H7 | `0x1FF1_E880` | RM0399 64.2, "Flash size" |
 /// | STM32L0 | `0x1FF8_007C` | RM0377 and RM0367 34.1.1, "Flash size register" |
 /// | STM32U5 | `0x0BFA_07A0` | RM0456 76.2, "Flash size data register" |
+/// | STM32C0 | `0x1FFF_75A0` | RM0490 31.2, "Flash memory size data register (FSIZER)" |
 ///
+/// **Note how little the addresses have in common**: six families, six unrelated addresses, and the
+/// STM32C0's is nowhere near the STM32F0's despite both being Cortex-M0-class parts with 2 KB
+/// pages. There is no pattern here to infer a seventh from.
 pub const STM32F0_FLASH_SIZE_REG: u32 = 0x1FFF_F7CC;
 /// See [`STM32F0_FLASH_SIZE_REG`].
 pub const STM32F4_FLASH_SIZE_REG: u32 = 0x1FFF_7A22;
@@ -120,6 +141,13 @@ const CR_SNB_SHIFT: u32 = 3;
 /// them for a dual-bank part's 24 sectors. This is the wider of the two, so it bounds the register
 /// rather than the part -- see the refusal in `erase_sector` for why a bound belongs here at all.
 const SNB_MAX: u32 = 0b1_1111;
+/// Words handed to the probe between status polls: 16 KB, the SMALLEST erase unit any supported
+/// F4 or F7 has (an F429's first four sectors).
+///
+/// So one failed chunk is at most one sector's worth of bytes to re-erase on every geometry this
+/// crate carries, whichever table the caller is using. It is a recovery bound rather than a
+/// hardware one -- see the note in `program_words`.
+const F4_WORDS_PER_POLL: usize = 16 * 1024 / 4;
 const CR_PSIZE_X32: u32 = 0b10 << 8;
 const CR_STRT: u32 = 1 << 16;
 const CR_LOCK: u32 = 1 << 31;
@@ -177,10 +205,13 @@ impl<A: TargetAccess> Stm32F4Flash for A {
     fn program_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
         wait_not_busy(self)?;
         self.write_word(FLASH_CR, CR_PSIZE_X32 | CR_PG)?;
-        for (index, &word) in words.iter().enumerate() {
-            self.write_word(address + (index as u32) * 4, word)?;
+
+        for (index, chunk) in words.chunks(F4_WORDS_PER_POLL).enumerate() {
+            let at = address + (index * F4_WORDS_PER_POLL * 4) as u32;
+            self.write_words(at, chunk)?;
             wait_not_busy(self)?;
         }
+
         self.write_word(FLASH_CR, CR_PSIZE_X32)
     }
 }
@@ -483,10 +514,53 @@ pub const STM32L0_PAGE: u32 = 128;
 /// data to a tool that does not know the difference.
 pub const STM32L0_ERASED_WORD: u32 = 0x0000_0000;
 
+/// The half-page: 16 words, the largest unit this controller programs in one operation.
+///
+/// RM0377 3.3.4 gives it the SAME `Tprog` as a single word -- 3.2 ms for sixteen times the bytes,
+/// which is the whole reason the loader below exists.
+pub const STM32L0_HALF_PAGE: u32 = 64;
+
+/// `PECR.FPRG`: half-page programming mode.
+///
+/// SET BY THE LOADER AND NOT BY THIS FILE, which is why nothing here reads it. It is declared all
+/// the same, because the loader spells the same bit as an assembler immediate and a bit that exists
+/// in only one of the two places cannot be cross-checked. A test asserts the two agree.
+#[allow(dead_code)]
+const L0_PECR_FPRG: u32 = 1 << 10;
+
+/// The half-page programming loader, assembled from `l0-loader.s` in this directory and kept beside
+/// it so the machine code is reproducible rather than hand-encoded.
+///
+/// It exists because RM0377 3.3.4 says a FETCH from NVM aborts a half-page operation with `FWWERR`
+/// and leaves the memory unchanged -- so the sixteen stores must arrive with no instruction fetch
+/// from flash between them. Code running from RAM gets that for free and a host issuing one store
+/// per USB transaction cannot promise it at all.
+const L0_LOADER: [u32; 19] = [
+    0x00f62681, 0x4334685c, 0x2a00605c, 0x2410d013, 0x6805460f, 0x1d00603d, 0x1e641d3f,
+    0x699dd1f9, 0x42252401, 0x4c08d1fb, 0xd1064225, 0x619c2402, 0x1e523140, 0x2000e7e9,
+    0x4628e000, 0x00f62681, 0x43b4685c, 0x4770605c, 0x00032f00,
+];
+
+/// Where the loader, its trap, its stack and its buffer live in target RAM while programming.
+///
+/// WARNING: the whole window is CLOBBERED. The core must be halted before programming and is not
+/// resumable afterwards without a reset.
+///
+/// THE BUDGET IS THE SMALLEST L0's RATHER THAN THE BOARD IN FRONT OF YOU. An STM32L011 has 2 KB of
+/// SRAM, so everything here fits under `0x2000_0800`; an STM32L073 has ten times that and would
+/// take a much larger buffer. The chunk bounds how much is programmed per call, so a part with more
+/// RAM than the smallest one programs more slowly than it could.
+const L0_TRAP: u32 = 0x2000_0000;
+const L0_LOADER_ADDR: u32 = 0x2000_0010;
+const L0_BUFFER: u32 = 0x2000_0080;
+const L0_STACK_TOP: u32 = 0x2000_0800;
+/// Bytes staged per loader invocation -- a whole number of half-pages, and inside an L011's SRAM.
+const L0_CHUNK: usize = 1024;
+
 /// Where an STM32 F0 or L0 keeps `DBGMCU_IDCODE`, the register that names the die.
 ///
 /// **A debug-port IDCODE names the port's design and not the part behind it** -- every M0-class ST
-/// part answers `0x0bc11477`, an L0 and a C0 and a SAM D11 alike -- so a tool that
+/// part measured answers `0x0bc11477`, an L0 and a C0 and a SAM D11 alike -- so a tool that
 /// asks the wire what it is reaching gets an answer about Arm rather than about ST. This register
 /// is the one that answers about ST: `DEV_ID` in bits 11:0, `REV_ID` in bits 31:16, and bits 15:12
 /// reading `0b0110` on the L0 (RM0367 33.4.1, RM0377 27.4.1).
@@ -571,20 +645,52 @@ impl Stm32L0Category {
     }
 }
 
-/// Reads [`STM32L0_DBGMCU_IDCODE`] and returns `(DEV_ID, REV_ID)`.
+/// The `DEV_ID` values RM0377 27.4.1 lists, with what each names.
+///
+/// **THE SAME FOUR IDS [`Stm32L0Category::from_dev_id`] DECODES, IN THE SHAPE EVERY FAMILY USES**, so
+/// a route can ask any family the same question. It is a second spelling of one fact rather than a
+/// second fact, and `the_l0_part_table_and_the_category_decode_are_one_list` fails if they drift --
+/// a comment claiming they agree could not.
+///
+/// Each string says the id names a CATEGORY and not a board, because every L073 and L083 on a bench
+/// answers `0x447` and a caller must not read a category as an identity.
+pub const STM32L0_PARTS: &[(u32, &str)] = &[
+    (0x457, "an STM32L0 category 1 part -- the category, which every part in it answers, not this board"),
+    (0x425, "an STM32L0 category 2 part -- the category, which every part in it answers, not this board"),
+    (0x417, "an STM32L0 category 3 part -- the category, which every part in it answers, not this board"),
+    (0x447, "an STM32L0 category 5 part -- the category, which every part in it answers, not this board"),
+];
+
+/// Reads a family's DBGMCU identity register and returns `(DEV_ID, REV_ID)`.
+///
+/// **THE LAYOUT IS THE SAME ON EVERY FAMILY HERE AND THE ADDRESS IS NOT**, which is why the address
+/// is a parameter and the decode is not: `DEV_ID` in bits 11:0 and `REV_ID` in bits 31:16 is stated
+/// identically by RM0377 27.4.1 and RM0367 33.4.1 (L0), RM0399 (H7, `DBGMCU_IDC`) and RM0456 75.12.4
+/// (U5, `DBGMCU_IDCODE`). Each family names its own register constant.
 ///
 /// Refuses an all-zero or all-ones reading. Those are what an unmapped read and an undriven bus
-/// produce, and `0x000` would otherwise decode as "no category I recognize" -- a true statement
+/// produce, and `0x000` would otherwise decode as "no part I recognize" -- a true statement
 /// about a reading that never happened, which is the failure mode
 /// [`stm32_flash_size_bytes`] refuses for the same reason.
-pub fn stm32l0_dev_id<A: TargetAccess>(target: &mut A) -> Result<(u32, u32), ProbeError> {
-    let word = target.read_word(STM32L0_DBGMCU_IDCODE)?;
+pub fn stm32_dev_id<A: TargetAccess>(
+    target: &mut A,
+    register: u32,
+) -> Result<(u32, u32), ProbeError> {
+    let word = target.read_word(register)?;
     if word == 0 || word == 0xffff_ffff {
         return Err(ProbeError::Device(
             "DBGMCU_IDCODE reads blank -- the debug port answered but the part did not",
         ));
     }
     Ok((word & 0xfff, word >> 16))
+}
+
+/// Reads [`STM32L0_DBGMCU_IDCODE`] and returns `(DEV_ID, REV_ID)`.
+///
+/// The L0's spelling of [`stm32_dev_id`], kept so callers that know which family they hold do not
+/// restate its register address.
+pub fn stm32l0_dev_id<A: TargetAccess>(target: &mut A) -> Result<(u32, u32), ProbeError> {
+    stm32_dev_id(target, STM32L0_DBGMCU_IDCODE)
 }
 
 /// STM32L0x1 and STM32L0x3 flash programming through the debug port.
@@ -745,17 +851,42 @@ impl<A: TargetAccess> Stm32L0Flash for A {
             return Err(ProbeError::Device("STM32L0 programming is word granular"));
         }
         l0_wait_idle(self, FlashWait::BeforeOperation)?;
-        for (index, group) in data.chunks(4).enumerate() {
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(group);
-            let word = u32::from_le_bytes(buf);
-            if word == STM32L0_ERASED_WORD {
-                continue;
+
+        let half_page = STM32L0_HALF_PAGE as usize;
+        let head = (((half_page - (address as usize % half_page)) % half_page)).min(data.len());
+        let middle = (data.len() - head) / half_page * half_page;
+
+        l0_program_words(self, address, &data[..head])?;
+
+        if middle != 0 {
+            let at = address + head as u32;
+            self.write_words(L0_LOADER_ADDR, &L0_LOADER)?;
+            let frame = CallFrame::new(L0_STACK_TOP, L0_TRAP);
+            for (index, chunk) in data[head..head + middle].chunks(L0_CHUNK).enumerate() {
+                let words: Vec<u32> = chunk
+                    .chunks(4)
+                    .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect();
+                self.write_words(L0_BUFFER, &words)?;
+                let status = self.call_target(
+                    L0_LOADER_ADDR | 1,
+                    &[
+                        L0_BUFFER,
+                        at + (index * L0_CHUNK) as u32,
+                        (chunk.len() / half_page) as u32,
+                        L0_BASE,
+                    ],
+                    &frame,
+                )?;
+                if status != 0 {
+                    return Err(ProbeError::Device(l0_error_text(status).unwrap_or(
+                        "STM32L0 half-page programming failed with a FLASH_SR this driver does not name",
+                    )));
+                }
             }
-            self.write_word(address + index as u32 * 4, word)?;
-            l0_wait_idle(self, FlashWait::AfterOperation)?;
         }
-        Ok(())
+
+        l0_program_words(self, address + (head + middle) as u32, &data[head + middle..])
     }
 }
 
@@ -778,38 +909,66 @@ fn l0_wait_idle<A: TargetAccess>(target: &mut A, phase: FlashWait) -> Result<(),
         if phase == FlashWait::BeforeOperation {
             return Ok(());
         }
-        if sr & L0_SR_WRPERR != 0 {
-            return Err(ProbeError::Device("STM32L0 flash write protection error (WRPERR)"));
-        }
-        if sr & L0_SR_NOTZEROERR != 0 {
-            return Err(ProbeError::Device(
-                "STM32L0 wrote a word that was not erased (NOTZEROERR) -- erase the page first",
-            ));
-        }
-        if sr & L0_SR_PGAERR != 0 {
-            return Err(ProbeError::Device("STM32L0 flash alignment error (PGAERR)"));
-        }
-        if sr & L0_SR_SIZERR != 0 {
-            return Err(ProbeError::Device("STM32L0 flash size error (SIZERR)"));
-        }
-        if sr & L0_SR_FWWERR != 0 {
-            return Err(ProbeError::Device(
-                "STM32L0 write/erase was aborted to serve a fetch (FWWERR) -- retry it",
-            ));
-        }
-        if sr & L0_SR_RDERR != 0 {
-            return Err(ProbeError::Device(
-                "STM32L0 read of a PcROP-protected sector (RDERR) -- the data read back is zeros",
-            ));
-        }
-        if sr & L0_SR_OPTVERR != 0 {
-            return Err(ProbeError::Device(
-                "STM32L0 option bytes failed to load (OPTVERR) -- the part reset mid-operation",
-            ));
-        }
-        return Ok(());
+        return match l0_error_text(sr) {
+            Some(text) => Err(ProbeError::Device(text)),
+            None => Ok(()),
+        };
     }
     Err(ProbeError::Timeout("STM32L0 flash controller busy"))
+}
+
+/// Names the error a `FLASH_SR` value reports, so a failure says which rule was broken.
+///
+/// EXTRACTED RATHER THAN COPIED, and that is the point of it: the half-page loader runs on the
+/// target and hands back the `FLASH_SR` it stopped on, so there are now TWO places a status word is
+/// judged. A second spelling of these seven conditions is a second place for one of them to go
+/// missing -- and the one that would go missing is whichever was added last, in whichever copy the
+/// author was not looking at.
+fn l0_error_text(sr: u32) -> Option<&'static str> {
+    if sr & L0_SR_WRPERR != 0 {
+        return Some("STM32L0 flash write protection error (WRPERR)");
+    }
+    if sr & L0_SR_NOTZEROERR != 0 {
+        return Some("STM32L0 wrote a word that was not erased (NOTZEROERR) -- erase the page first");
+    }
+    if sr & L0_SR_PGAERR != 0 {
+        return Some("STM32L0 flash alignment error (PGAERR)");
+    }
+    if sr & L0_SR_SIZERR != 0 {
+        return Some("STM32L0 flash size error (SIZERR)");
+    }
+    if sr & L0_SR_FWWERR != 0 {
+        return Some("STM32L0 write/erase was aborted to serve a fetch (FWWERR) -- retry it");
+    }
+    if sr & L0_SR_RDERR != 0 {
+        return Some("STM32L0 read of a PcROP-protected sector (RDERR) -- the data read back is zeros");
+    }
+    if sr & L0_SR_OPTVERR != 0 {
+        return Some("STM32L0 option bytes failed to load (OPTVERR) -- the part reset mid-operation");
+    }
+    None
+}
+
+/// The word-at-a-time path, kept for the unaligned head and tail a half-page run cannot cover.
+///
+/// A word of zero is what an erased cell already holds here, and writing one is refused as a
+/// not-zero-check pass rather than performed -- so it is skipped. On a part that erases to ones
+/// that would be an optimization; on this one it is the difference between a clean program and a
+/// NOTZEROERR on every gap in the image.
+fn l0_program_words<A: TargetAccess>(
+    target: &mut A,
+    address: u32,
+    data: &[u8],
+) -> Result<(), ProbeError> {
+    for (index, group) in data.chunks(4).enumerate() {
+        let word = u32::from_le_bytes([group[0], group[1], group[2], group[3]]);
+        if word == STM32L0_ERASED_WORD {
+            continue;
+        }
+        target.write_word(address + index as u32 * 4, word)?;
+        l0_wait_idle(target, FlashWait::AfterOperation)?;
+    }
+    Ok(())
 }
 
 /// Polls `FLASH_SR` until the controller reports not busy.
@@ -825,6 +984,44 @@ fn wait_not_busy<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
+
+    /// THE LOADER IS MACHINE CODE IN A RUST ARRAY, so every fact it carries is a SECOND SPELLING of
+    /// one the driver already holds -- in a language the compiler cannot cross-check. These tie the
+    /// two together, because nothing else can: change `L0_SR_ERRORS` and the loader still watches
+    /// the old set, silently returning 0 for a half-page that failed.
+    #[test]
+    fn the_loader_watches_exactly_the_errors_the_driver_names() {
+        assert_eq!(*L0_LOADER.last().unwrap(), L0_SR_ERRORS);
+        for bit in 0..32 {
+            if L0_SR_ERRORS & (1 << bit) != 0 {
+                assert!(l0_error_text(1 << bit).is_some(), "SR bit {bit} must be named");
+            }
+        }
+        assert!(l0_error_text(0).is_none());
+        assert!(l0_error_text(L0_SR_BSY | L0_SR_EOP).is_none());
+    }
+
+    #[test]
+    fn the_loader_arms_exactly_prog_and_fprg() {
+        assert_eq!(0x81u32 << 3, L0_PECR_PROG | L0_PECR_FPRG);
+    }
+
+    #[test]
+    fn the_loader_window_fits_the_smallest_l0s_ram() {
+        assert!(L0_LOADER_ADDR + L0_LOADER.len() as u32 * 4 <= L0_BUFFER, "the loader runs into its buffer");
+        assert!(L0_BUFFER + L0_CHUNK as u32 <= L0_STACK_TOP, "the buffer runs into the stack");
+        assert_eq!(L0_STACK_TOP, 0x2000_0000 + 2 * 1024, "an L011 has 2 KB and the stack tops it");
+        assert!(L0_TRAP < L0_LOADER_ADDR, "the trap must not sit inside the loader");
+        assert_eq!(L0_CHUNK as u32 % STM32L0_HALF_PAGE, 0);
+    }
+
+    #[test]
+    fn a_half_page_is_sixteen_words_and_divides_the_page() {
+        assert_eq!(STM32L0_HALF_PAGE, 64);
+        assert_eq!(STM32L0_HALF_PAGE / 4, 16, "RM0377 3.3.4 programs 16 words per operation");
+        assert_eq!(STM32L0_PAGE % STM32L0_HALF_PAGE, 0);
+        assert_eq!(STM32L0_PAGE / STM32L0_HALF_PAGE, 2);
+    }
 
     /// THE TWO FAMILIES DISAGREE FOR EVERY IMAGE SIZE THAT MATTERS, which is why the table is a
     /// parameter rather than a constant baked into a caller. A 200 KB serve image needs SIX sectors
@@ -1308,7 +1505,7 @@ mod flash_size_register_tests {
 
     /// The measured parts, so the decode is anchored to silicon and not only to arithmetic.
     #[test]
-    fn the_boards_on_this_bench_decode_to_what_they_are() {
+    fn each_board_decodes_to_what_it_is() {
         let mut l053 = probe_returning(0x038f_0040);
         assert_eq!(stm32_flash_size_bytes(&mut l053, STM32L0_FLASH_SIZE_REG).unwrap(), 64 * 1024);
         let mut u5a5 = probe_returning(0xffff_1000);
@@ -1353,6 +1550,79 @@ mod l0_identity_tests {
         assert_ne!(STM32L0_DBGMCU_IDCODE, 0xE004_2000);
     }
 
+    /// The two spellings of the L0's device ids are one list, checked BOTH WAYS.
+    ///
+    /// `STM32L0_PARTS` exists so a route can ask every family the same question, and
+    /// [`Stm32L0Category::from_dev_id`] exists because the category decides what a program to an
+    /// unerased word does. One of them gaining an id without the other is a silent divergence: the
+    /// table's direction would route a part the category decode refuses, and the decode's direction
+    /// would leave a part the route cannot name.
+    #[test]
+    fn the_l0_part_table_and_the_category_decode_are_one_list() {
+        for (dev_id, what) in STM32L0_PARTS {
+            let category = Stm32L0Category::from_dev_id(*dev_id)
+                .unwrap_or_else(|| panic!("{dev_id:#05x} is in the part table and not a category"));
+            assert!(
+                what.contains(category.name()),
+                "{dev_id:#05x} decodes to {} and its sentence says {what:?}",
+                category.name()
+            );
+            assert!(what.contains("not this board"), "{what:?} must not read as an identity");
+        }
+        for dev_id in [0x457u32, 0x425, 0x417, 0x447] {
+            assert!(
+                STM32L0_PARTS.iter().any(|(id, _)| *id == dev_id),
+                "{dev_id:#05x} decodes to a category and has no part-table row"
+            );
+        }
+        assert_eq!(STM32L0_PARTS.len(), 4, "ST numbers four categories: 1, 2, 3 and 5");
+    }
+
+    /// The C0's two spellings of its device ids are one list, checked both ways.
+    ///
+    /// Same reason as the L0's: `STM32C0_PARTS` exists so a route can ask every family the same
+    /// question, `Stm32C0Device` exists because the sub-family decides the boundary map, and one
+    /// gaining an id without the other is a divergence nothing else would report.
+    #[test]
+    fn the_c0_part_table_and_the_device_decode_are_one_list() {
+        for (dev_id, what) in STM32C0_PARTS {
+            assert!(
+                Stm32C0Device::from_dev_id(*dev_id).is_some(),
+                "{dev_id:#05x} is in the part table and decodes to no sub-family"
+            );
+            assert!(what.contains("not this board"), "{what:?} must not read as an identity");
+        }
+        for dev_id in [0x443u32, 0x453, 0x44C, 0x493, 0x44D] {
+            assert!(
+                Stm32C0Device::from_dev_id(dev_id).is_some(),
+                "{dev_id:#05x} is one of the manual's ids and the decode refuses it"
+            );
+            assert!(
+                STM32C0_PARTS.iter().any(|(id, _)| *id == dev_id),
+                "{dev_id:#05x} decodes to a sub-family and has no part-table row"
+            );
+        }
+        assert_eq!(STM32C0_PARTS.len(), 5, "RM0490 Table 178 lists five");
+    }
+
+    /// Both per-family readers go through [`stm32_dev_id`], so the blank-reading refusal has one
+    /// implementation rather than one per family.
+    ///
+    /// **A SECOND COPY OF THAT REFUSAL IS THE FAILURE THIS PREVENTS**: an all-zero reading decodes
+    /// as "no part I recognize", a true statement about a read that never happened, and a family
+    /// whose copy of the guard was omitted reports the wrong one of the two.
+    #[test]
+    fn every_family_reads_its_identity_through_one_decode() {
+        let mut blank = probe_returning(0);
+        assert!(stm32l0_dev_id(&mut blank).is_err(), "the L0 must refuse a blank reading");
+        let mut blank = probe_returning(0);
+        assert!(stm32c0_dev_id(&mut blank).is_err(), "the C0 must refuse a blank reading");
+        let mut ones = probe_returning(0xffff_ffff);
+        assert!(stm32_dev_id(&mut ones, STM32L0_DBGMCU_IDCODE).is_err(), "and an undriven bus");
+        let mut c071 = probe_returning(0x1001_6493);
+        assert_eq!(stm32c0_dev_id(&mut c071).unwrap().0, 0x493);
+    }
+
     #[test]
     fn each_category_is_the_dev_id_its_manual_lists() {
         assert_eq!(Stm32L0Category::from_dev_id(0x457), Some(Stm32L0Category::One));
@@ -1377,8 +1647,10 @@ mod l0_identity_tests {
         }
     }
 
+    /// The parts read so far, decoded from the WHOLE word a probe returns rather than from
+    /// a device id somebody has already extracted.
     #[test]
-    fn the_boards_on_this_bench_decode_to_their_category() {
+    fn each_board_decodes_to_its_category() {
         let mut l073 = probe_returning(0x2008_6447);
         let (dev_id, rev_id) = stm32l0_dev_id(&mut l073).unwrap();
         assert_eq!(dev_id, 0x447);

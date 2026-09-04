@@ -133,7 +133,8 @@ pub fn compile_str_for_profile(
     profile: profile::Profile,
 ) -> Result<bytecode::Module, FrontendError> {
     let tokens = lexer::tokenize(source)?;
-    let ast = parser::parse(tokens)?;
+    let mut ast = parser::parse(tokens)?;
+    compile::resolve_relative_imports(&mut ast, module_name)?;
     let module = compile::compile_module(module_name, &ast)?;
     profile::check_module(&module, profile)?;
     Ok(module)
@@ -177,6 +178,7 @@ pub fn compile_str_for_board_and_profile(
     let tokens = lexer::tokenize(source)?;
     let mut ast = parser::parse(tokens)?;
     let bound = boardfacts::fold_module(&mut ast, &facts)?;
+    compile::resolve_relative_imports(&mut ast, module_name)?;
     let module = compile::compile_module(module_name, &ast)?;
     profile::check_module(&module, profile)?;
     Ok((module, bound))
@@ -219,7 +221,8 @@ pub fn compile_bundle_for_profile(
     use alloc::string::String;
     use alloc::vec::Vec;
 
-    let entry_ast = parser::parse(lexer::tokenize(entry_source)?)?;
+    let mut entry_ast = parser::parse(lexer::tokenize(entry_source)?)?;
+    compile::resolve_relative_imports(&mut entry_ast, entry_name)?;
     let entry = compile::compile_module(entry_name, &entry_ast)?;
     profile::check_module(&entry, profile)?;
 
@@ -237,8 +240,9 @@ pub fn compile_bundle_for_profile(
             module: name.clone(),
             error: alloc::boxed::Box::new(e),
         };
-        let ast = parser::parse(lexer::tokenize(&source).map_err(|e| in_module(e.into()))?)
+        let mut ast = parser::parse(lexer::tokenize(&source).map_err(|e| in_module(e.into()))?)
             .map_err(|e| in_module(e.into()))?;
+        compile::resolve_relative_imports(&mut ast, &name).map_err(|e| in_module(e.into()))?;
         for imported in top_level_imports(&ast) {
             if !seen.contains(&imported) {
                 queue.push_back(imported);
@@ -253,6 +257,13 @@ pub fn compile_bundle_for_profile(
 
 /// The module names a module imports at top level (`import m [, n]`, `from m import ...`, and
 /// `from m import *`).
+///
+/// A `from m import a` yields `m` AND `m.a`, because `a` may be a SUBMODULE rather than a name
+/// inside `m` -- `from pkg import sub` is how most packages are entered, and the submodule has to
+/// be in the bundle for the import to find it. Nothing here decides which it is: a `m.a` that names
+/// no module simply does not resolve, and the walk skips an unresolved name as native or built-in
+/// already. So the cost of the guess is one failed lookup and the cost of not guessing is a program
+/// that cannot import its own package.
 fn top_level_imports(module: &ast::ModuleAst) -> alloc::vec::Vec<alloc::string::String> {
     let mut names = alloc::vec::Vec::new();
     for stmt in &module.body {
@@ -262,8 +273,13 @@ fn top_level_imports(module: &ast::ModuleAst) -> alloc::vec::Vec<alloc::string::
                     names.push(module_name.clone());
                 }
             }
-            ast::StmtKind::ImportFrom { module, .. } => names.push(module.clone()),
-            ast::StmtKind::ImportStar { module } => names.push(module.clone()),
+            ast::StmtKind::ImportFrom { module, names: members, .. } => {
+                names.push(module.clone());
+                for (member, _bound) in members {
+                    names.push(alloc::format!("{module}.{member}"));
+                }
+            }
+            ast::StmtKind::ImportStar { module, .. } => names.push(module.clone()),
             _ => {}
         }
     }
@@ -413,6 +429,66 @@ print(fib(10))
         let bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
         let (decoded, _) = bytecode::Bundle::decode(&bytes).expect("decodes");
         assert_eq!(decoded, bundle);
+    }
+
+    #[test]
+    fn compile_bundle_resolves_relative_imports_against_each_module() {
+        let resolve = |name: &str| -> Option<String> {
+            match name {
+                "pkg.mod" => Some(String::from("from .helpers import DOUBLE\n")),
+                "pkg.sub.deep" => Some(String::from("from .helpers import DEEP\nfrom ..helpers import DOUBLE\n")),
+                "pkg.helpers" => Some(String::from("DOUBLE = 2\n")),
+                "pkg.sub.helpers" => Some(String::from("DEEP = 3\n")),
+                _ => None,
+            }
+        };
+        let bundle = compile_bundle("app", "import pkg.mod\nimport pkg.sub.deep\n", &resolve)
+            .expect("compiles");
+        let names: alloc::vec::Vec<&str> = bundle.modules.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"pkg.helpers"), "got {names:?}");
+        assert!(names.contains(&"pkg.sub.helpers"), "got {names:?}");
+        assert!(names.contains(&"pkg.mod") && names.contains(&"pkg.sub.deep"), "got {names:?}");
+        assert!(!names.contains(&"helpers"), "a relative name reached the walk: {names:?}");
+        assert!(!names.contains(&""), "an empty module name reached the walk: {names:?}");
+    }
+
+    #[test]
+    fn compile_bundle_queues_a_submodule_named_by_a_from_import() {
+        let resolve = |name: &str| -> Option<String> {
+            match name {
+                "pkg" => None,
+                "pkg.sub" => Some(String::from("VALUE = 1\n")),
+                "pkg.mod" => Some(String::from("from . import sub\nR = sub.VALUE\n")),
+                _ => None,
+            }
+        };
+        let bundle = compile_bundle("app", "import pkg.mod\n", &resolve).expect("compiles");
+        let names: alloc::vec::Vec<&str> = bundle.modules.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"pkg.sub"), "the submodule must be bundled: {names:?}");
+        assert!(names.contains(&"pkg.mod"), "got {names:?}");
+        let plain = |name: &str| -> Option<String> {
+            match name {
+                "helpers" => Some(String::from("from math import sqrt\nX = 1\n")),
+                _ => None,
+            }
+        };
+        let bundle = compile_bundle("app", "import helpers\n", &plain).expect("compiles");
+        let names: alloc::vec::Vec<&str> = bundle.modules.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["helpers"], "a non-module member must not be bundled: {names:?}");
+    }
+
+    #[test]
+    fn compile_bundle_refuses_a_relative_import_with_no_package() {
+        let resolve = |name: &str| -> Option<String> {
+            match name {
+                "loose" => Some(String::from("from . import x\n")),
+                _ => None,
+            }
+        };
+        let err = compile_bundle("app", "import loose\n", &resolve).expect_err("refuses");
+        let text = alloc::format!("{err}");
+        assert!(text.contains("loose"), "names the module it came from: {text}");
+        assert!(text.contains("no known parent package"), "got: {text}");
     }
 
     #[test]

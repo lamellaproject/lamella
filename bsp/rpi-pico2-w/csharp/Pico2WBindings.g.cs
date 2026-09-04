@@ -73,7 +73,6 @@ namespace Lamella.Generated
         public const uint CYW43439_DATA_PORT_BASE = 0xD0000000;
         public const uint CYW43439_DATA_PIN = 24;
         public const uint CYW43439_DATA_MASK = 0x1000000;
-        public const uint CYW43439_DATA_ACTIVE_LOW = 0;
         public const uint CYW43439_CS_PORT_BASE = 0xD0000000;
         public const uint CYW43439_CS_PIN = 25;
         public const uint CYW43439_CS_MASK = 0x2000000;
@@ -81,7 +80,6 @@ namespace Lamella.Generated
         public const uint CYW43439_CLK_PORT_BASE = 0xD0000000;
         public const uint CYW43439_CLK_PIN = 29;
         public const uint CYW43439_CLK_MASK = 0x20000000;
-        public const uint CYW43439_CLK_ACTIVE_LOW = 0;
 
         /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
         /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought

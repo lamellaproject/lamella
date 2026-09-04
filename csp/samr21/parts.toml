@@ -1,0 +1,37 @@
+# The SAMR21 parts table. The SAM R21 is a SAM D21 die and an AT86RF233 2.4 GHz transceiver in
+# one package, and the pairing is what makes this a family of its own rather than a SAMD21 part
+# row: the radio takes pins, an APB slot and a SERCOM off the top of the D21's budget, so the
+# part this table describes is not the part a SAMD21 row describes.
+#
+# WHAT THE RADIO COSTS, STATED IN THE ONE FIGURE THAT CARRIES IT: a SAM R21G is a 48-pin part
+# with 28 general-purpose I/O pins, where a SAMD21G is a 48-pin part with 38. The ten are spent
+# on the transceiver -- its SPI, its control and status lines, its 16 MHz crystal and the
+# differential RF pair -- and none of them is available to a board.
+
+[table]
+kind = "parts"
+family = "samr21"
+sources = [
+    "SAM R21 datasheet Atmel-42223G (05/2016): ch 1 (configuration summary), ch 4 (pinout), ch 5 (I/O multiplexing)",
+]
+notes = [
+    "SERCOM4 IS NOT AVAILABLE TO A BOARD. The part carries six SERCOM instances and the configuration summary counts them '5+1', with its own note 1 reading 'SERCOM4 is internally connected to the AT86RF233'. Its pads are the radio's SPI and reach no package pin: MOSI PB30, SEL PB31, SCLK PC18, MISO PC19, all in section 5.2's internal-signal table rather than in Table 5-1.",
+    "PA10, PA11, PB16 and PB17 CANNOT BE CONFIGURED AS OUTPUTS -- section 5.2 states it in words, and the reason is that they are permanently connected to the RFCTRL inputs. They are not in the pad list below and a pin-map row naming one must be refused rather than accommodated.",
+]
+
+[[parts]]
+part = "atsamr21g18a"
+package = "48-pin QFN"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "PA00-PA01", "PA04-PA09", "PA12-PA19", "PA22-PA25", "PA27-PA28", "PA30-PA31",
+    "PB02-PB03", "PB22-PB23",
+]
+source = "Atmel-42223G. This is a COMPLETE package pad list rather than the partial present-list the sibling families carry, and it is complete because THREE INDEPENDENT STATEMENTS IN THE DOCUMENT AGREE ON IT. (1) Table 5-1 (PORT Function Multiplexing), whose SAMR21G column numbers every pad: PA00 1, PA01 2, PA04 9, PA05 10, PA06 11, PA07 12, PA08 15, PA09 16, PA12 21, PA13 22, PA14 23, PA15 24, PA16 25, PA17 26, PA18 27, PA19 28, PA22 31, PA23 32, PA24 33, PA25 34, PB22 37, PB23 38, PA27 39, PA28 41, PA30 45, PA31 46, PB02 47, PB03 48. (2) Figure 4.1 (SAM R21G - QFN48), whose four edges name the same 28 pads at the same numbers and account for every one of the remaining 20 pins as supply, ground, RESET, the XTAL1/XTAL2 pair or the RFP/RFN differential pair. (3) The ch 1 configuration summary's own 'General Purpose I/O-pins (GPIOs)' row, which gives 28 for the SAM R21G column -- and the list above counts 28. A pad list agreeing with an independently printed COUNT is the check the sibling families' partial lists cannot make. Flash 256 KB and SRAM 32 KB are the same summary's Flash and SRAM rows for the 18 density code."
+
+
+# NOTE: THE SAM R21E IS A DIFFERENT PART AND IS NOT ROWED HERE. It is the 32-pin package with 16
+# GPIOs, four SERCOMs plus the radio's, and NO 32.768 kHz crystal oscillator at all -- the
+# configuration summary gives XOSC32K as 'No' for that column. No board on the roster carries
+# one, and a row written from the G part's facts would be wrong in each of those four ways.

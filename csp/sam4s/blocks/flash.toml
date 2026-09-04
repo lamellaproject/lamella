@@ -1,0 +1,32 @@
+# BLOCK: the SAM4S Enhanced Embedded Flash Controller (EEFC), stated only as far as the facts
+# consumers outside the controller need. Its command set, its lock bits and its GPNVM bits are not
+# described here.
+#
+# READ THE FAMILY'S OWN TABLE, NOT THE CONTROLLER'S BOILERPLATE. Every EEFC datasheet carries the
+# sentence "The embedded Flash size, the page size, the organization of lock regions and the
+# definition of GPNVM bits are specific to the device", and it is easy to read that as "this cannot
+# be a family fact". It is a statement about the CONTROLLER being reused across products, not about
+# variation within one family -- and each family then states its own page size flatly. Checked here
+# rather than assumed in either direction.
+#
+# THE UNIT A PROGRAM COMMITS IS A PAGE, AND IT IS 512 BYTES ON EVERY DEVICE IN THIS FAMILY.
+#
+# THE ERASED STATE IS ALL ONES, in the datasheet's own words: an erased state is one where "all bits
+# read as logic level 1", and the programming section says the remaining part of a partly-used page
+# "must be erased (written with 1)".
+
+[table]
+kind = "block"
+family = "sam4s"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 512
+sources = [
+    "write_unit: Atmel-11100 section 8, Memories: `Each sector is organized in pages of 512 bytes`",
+    "erased_value: Atmel-11100, which describes an erased state as one where `all bits read as logic level 1`, and its page-programming section as `the remaining part must be erased (written with 1)`",
+]
+notes = [
+    "Data reaches the array through a LATCH BUFFER filled through the plane's flash window, and the program command then commits a whole page. The width of the accesses that fill that buffer is not the size of the operation that commits one.",
+    "The ERASE unit is not declared here. This controller offers several erase granularities and which of them a caller may use depends on where in the plane the page sits, so a single number would be wrong somewhere in the array.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

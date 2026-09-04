@@ -10,6 +10,10 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+# The 96-bit System.Decimal kernel, the SAME crate the interpreter calls. A path dependency rather
+# than a copy: an image whose decimal arithmetic differed from the interpreter's would disagree
+# with the tier it was previewed on, one rounding decision at a time.
+lamella-decimal = { path = "../../../crates/lamella-decimal" }
 # The networking + TLS C-ABI layer (feature `net`): the same NetBackend/TlsBackend stacks
 # the interpreter binds, exported as lamella_net_* / lamella_tls_* archive members. Pulled
 # in HERE as a dependency (never as a second staticlib) so the image keeps exactly one
@@ -47,6 +51,28 @@ crate-type = ["staticlib"]
 [profile.release]
 opt-level = "s"
 panic = "abort"
-lto = true
+# THIN LTO AND A CODEGEN UNIT PER MODULE, BECAUSE AN ARCHIVE MEMBER IS THE UNIT A LINK CAN DECLINE
+# TO PULL. A static archive is linked member by member: the linker takes a member only to resolve a
+# symbol nothing else defines, so an entry point sitting in a member no program references costs
+# that program nothing. Fat LTO defeats that -- it merges every codegen unit into ONE object, the
+# archive then holds a single member for this crate, and every entry point in it is charged to every
+# image whether or not that image calls it.
+#
+# Measured over the linked images this archive serves, all against one corlib and one compiler: fat
+# LTO charged the eight `System.Decimal` entry points and the 96-bit kernel behind them to every
+# image, and thin LTO with those entry points in their own module takes 9,244 bytes out of every one
+# of them, to the byte. Two negatives are worth as much as the result. `codegen-units` alone changes
+# nothing while `lto` is fat, because fat LTO merges the units again afterwards -- so the setting
+# that has to move is this one, not that one. And `lto = false` does split the archive, but costs
+# 145,624 bytes per image, because nothing then prunes the parts of `core` that a formatting path
+# drags in.
+#
+# `codegen-units` is written out even though 16 is what a release profile uses anyway, because
+# setting `lto` AT ALL defaults the unit count to 1 -- so thin LTO on its own is still one member
+# and still recovers nothing, which is the arm that measured as a 4,160-byte loss and no gain. The
+# value is not tuned: 16 through 256 all produce the same members, and 16 holds the split in the
+# largest configuration this archive has, the one that also links the networking stack.
+lto = "thin"
+codegen-units = 16
 
 [workspace]

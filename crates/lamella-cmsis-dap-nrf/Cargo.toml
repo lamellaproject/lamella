@@ -15,7 +15,11 @@ workspace = true
 # The probe-neutral seam. These flash routines are written against `TargetAccess`, so they drive a
 # target through any probe family the seam supports, not just a CMSIS-DAP one.
 lamella-probe-core = { path = "../lamella-probe-core" }
-lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+# No transport features: these routines are written against the seam, and `usbhid` is the
+# CMSIS-DAP crate's DEFAULT -- so taking the default here compiles a native USB backend into a
+# crate that never names one, and refuses to build for any target that backend has no port for
+# (wasm32, where the browser supplies the transport). `lamella-probe` already states it this way.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", default-features = false }
 lamella-usbhid = { path = "../lamella-usbhid", optional = true }
 # Probe SELECTION, which is a policy rather than a transport: every micro:bit is `0d28:0204`, so
 # choosing one is the ladder `lamella-probe` already owns (explicit serial > LAMELLA_PROBE_SERIAL >
@@ -26,8 +30,10 @@ lamella-probe = { path = "../lamella-probe", optional = true }
 [features]
 # `microbit` adds the one-call flash_microbit() helper, opening the micro:bit's on-board HID probe.
 # It pulls `lamella-probe` because that helper WRITES FLASH and must therefore resolve which board
-# it means rather than take the first `0d28:0204` the OS offers.
-microbit = ["dep:lamella-usbhid", "dep:lamella-probe"]
+# it means rather than take the first `0d28:0204` the OS offers. It also turns the CMSIS-DAP
+# crate's `usbhid` back on, because that is where `impl Transport for lamella_usbhid::Device`
+# lives and this helper is the only thing here that names a concrete transport.
+microbit = ["dep:lamella-usbhid", "dep:lamella-probe", "lamella-cmsis-dap/usbhid"]
 
 [dev-dependencies]
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }

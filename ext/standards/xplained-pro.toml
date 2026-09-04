@@ -1,0 +1,168 @@
+# The Xplained Pro STANDARD EXTENSION HEADER: a dual-row, 20-pin, 100-mil connector with a fixed
+# meaning per pin. This file is the JOIN VOCABULARY between an extension board and a host board,
+# and it is the reason an extension can be described without naming a host.
+#
+# WHAT EACH SIDE STATES, AND WHY NEITHER STATES THE OTHER'S FACT:
+#
+#   an extension   names the SIGNAL it uses -- "my reset line is on gpio1" -- and never a host pad.
+#                  Its own document is written that way: every extension user guide gives a 20-row
+#                  table of EXT pin number against that extension's own signal, with no host in it.
+#   a host board   names the PAD each signal reaches on ITS silicon, per header. A host with three
+#                  headers states three such rows, because the pads differ per header.
+#   the join       the signal name below, and nothing else. One extension file therefore binds to
+#                  every host that declares a header, and adding a host adds no extension work.
+#
+# EVERY SIGNAL IS OPTIONAL ON BOTH SIDES. The standard says so in words -- "all pins are not always
+# connected on all extension headers" -- so an absent signal is a fact rather than an omission, on
+# a host and on an extension alike.
+#
+# THE DOCUMENTS DISAGREE WITH THEMSELVES ABOUT TWO OF THESE NAMES AND IT WOULD BREAK A JOIN.
+# DS70005321A's own standard table calls pins 11 and 12 I2C_SDA and I2C_SCL; its per-header tables
+# three pages later call the same two pins TWI_SDA and TWI_SCL, and the older extension guides use
+# TWI throughout. One document, one connector, two spellings. The canonical name here is the
+# `signal` column and it is the only one a file may use; `aka` records the other spelling so a
+# reader checking against a manual is not left wondering whether they have the wrong row.
+#
+# PIN 1 IS NOT NECESSARILY THE TARGET'S TO READ, WHICH IS EASY TO ASSUME AND WRONG. It reaches an
+# identification chip on the extension, and on a kit with an embedded debugger the line goes to the
+# DEBUGGER rather than to an MCU pad -- so a host tool can identify a fitted extension over the
+# probe while a program running on the target cannot. Which of the two a given host does is that
+# host's fact and is stated in its header row, not here.
+
+[table]
+kind = "header-standard"
+standard = "xplained-pro"
+sources = [
+    "SAM E54 Xplained Pro User's Guide DS70005321A section 4.5.1, Table 4-5 (Xplained Pro Standard Extension Header): all twenty pin numbers, names and descriptions, and the statement that all Xplained Pro kits carry one or more dual row 20-pin 100-mil extension header with male headers on the MCU boards and female counterparts on the extensions.",
+    "DS70005321A section 4.3 (Hardware Identification System): every Xplained Pro extension board carries an ATSHA204A identification chip holding manufacturer, product name, product revision, product serial number, minimum and maximum voltage and maximum current, and when an extension is connected that information is read and sent to the vendor's IDE.",
+    "Atmel I/O1 Xplained Pro user guide Atmel-42078B section 3.4.1 and Atmel Ethernet1 Xplained Pro user guide Atmel-42226A both state the same connector and the same pin-out, which is what makes it a standard rather than one board's connector. Those two spell pins 11 and 12 TWI_SDA and TWI_SCL.",
+]
+notes = [
+    "The three power and ground pins carry no signal a binding can reach: pin 2 and pin 19 are ground and pin 20 is the extension's supply. They are stated so the table is the connector's rather than a subset chosen by what happens to be bindable.",
+    "A power budget is a real constraint this connector carries and no row here expresses it: the identification chip states an extension's maximum current, and a host's regulator has a limit. Nothing joins those two yet, and a file that implied it did would be worse than one that does not.",
+]
+
+[[pins]]
+number = 1
+signal = "id"
+routable = false
+description = "Communication line to the identification chip on the extension board."
+
+[[pins]]
+number = 2
+signal = "gnd"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 3
+signal = "adc_p"
+routable = true
+description = "Analog-to-digital converter input; alternatively the positive terminal of a differential ADC."
+
+[[pins]]
+number = 4
+signal = "adc_n"
+routable = true
+description = "Analog-to-digital converter input; alternatively the negative terminal of a differential ADC."
+
+[[pins]]
+number = 5
+signal = "gpio1"
+routable = true
+description = "General purpose I/O."
+
+[[pins]]
+number = 6
+signal = "gpio2"
+routable = true
+description = "General purpose I/O."
+
+[[pins]]
+number = 7
+signal = "pwm_p"
+routable = true
+description = "Pulse width modulation; alternatively the positive part of a differential PWM."
+
+[[pins]]
+number = 8
+signal = "pwm_n"
+routable = true
+description = "Pulse width modulation; alternatively the negative part of a differential PWM."
+
+[[pins]]
+number = 9
+signal = "irq"
+routable = true
+description = "Interrupt request line and/or general purpose I/O."
+
+[[pins]]
+number = 10
+signal = "spi_ss_b"
+routable = true
+description = "Slave select for SPI and/or general purpose I/O. The second select, and the one an extension takes when it wants a line rather than a bus member."
+
+# Pins 11 and 12 are the two the documents spell two ways. `aka` is not decoration: a reader
+# checking this file against a manual meets whichever spelling that manual chose.
+
+[[pins]]
+number = 11
+signal = "i2c_sda"
+aka = "twi_sda"
+routable = true
+description = "Data line of the I2C interface. Always connected, bus type."
+
+[[pins]]
+number = 12
+signal = "i2c_scl"
+aka = "twi_scl"
+routable = true
+description = "Clock line of the I2C interface. Always connected, bus type."
+
+[[pins]]
+number = 13
+signal = "uart_rx"
+routable = true
+description = "Receiver line of the target device's UART."
+
+[[pins]]
+number = 14
+signal = "uart_tx"
+routable = true
+description = "Transmitter line of the target device's UART."
+
+[[pins]]
+number = 15
+signal = "spi_ss_a"
+routable = true
+description = "Slave select for SPI. The standard asks that this pin preferably not be connected to anything else, which is why it is the select an extension should take first."
+
+[[pins]]
+number = 16
+signal = "spi_mosi"
+routable = true
+description = "SPI master out, slave in. Always connected, bus type."
+
+[[pins]]
+number = 17
+signal = "spi_miso"
+routable = true
+description = "SPI master in, slave out. Always connected, bus type."
+
+[[pins]]
+number = 18
+signal = "spi_sck"
+routable = true
+description = "SPI clock. Always connected, bus type."
+
+[[pins]]
+number = 19
+signal = "gnd2"
+routable = false
+description = "Ground. The connector carries two ground pins and they are one net; the second name exists because a row is keyed by signal and two rows may not share one."
+
+[[pins]]
+number = 20
+signal = "vcc"
+routable = false
+description = "Supply for the extension board, from the host."

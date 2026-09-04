@@ -1,0 +1,36 @@
+# BLOCK: the SAM D21 non-volatile memory controller (NVMCTRL), stated only as far as the facts
+# consumers outside the controller need. Its command set, its lock regions and its EEPROM emulation
+# are not described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A PAGE, AND THE ERASE UNIT IS FOUR OF THEM. This part separates the two
+# granularities explicitly and in one sentence: `The NVM has a row-erase granularity, while the
+# write granularity is by page.` A row is four pages, and the page is 64 bytes on every SAM D21
+# variant, so the write unit is 64 and the row is 256.
+#
+# THE 64-BYTE PAGE IS NOT A CONTROLLER CONSTANT AND THE PART WILL TELL YOU SO. NVMCTRL's PARAM
+# register carries a PSZ field whose encoding runs from 8 bytes to 1024, and the datasheet says
+# plainly that not every device family provides every size. It is 64 across this family's four
+# flash densities, which is what makes it a block fact HERE and would not make it one for a
+# different SAM family.
+#
+
+[table]
+kind = "block"
+family = "samd21"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 64
+sources = [
+    "erased_value: SAM D21 Family datasheet DS40001882D section 22.6.4.5 `Erase Row`, which covers the NVM main address space and not only the RWWEE array: `Erasing the row sets all bits to 1`",
+    "write_unit: SAM D21 Family datasheet DS40001882D section 22.6.2 `Memory Organization`: `The NVM is organized into rows, where each row contains four pages` and `The NVM has a row-erase granularity, while the write granularity is by page`",
+    "write_unit: SAM D21 Family datasheet DS40001882D Table 10-2 `Flash Memory Parameters`, which gives a 64-byte page for SAMD21x18, x17, x16 and x15 alike",
+    "write_unit: SAM D21 Family datasheet DS40001882D section 22.8.3 `PARAM`, PSZ encoding: 0x3 = 64 bytes",
+]
+notes = [
+    "Data reaches the array through a PAGE BUFFER before a Write Page command commits it, and writes into that buffer must be 16 or 32 bits -- an 8-bit write to it raises a system exception. That is the width of the accesses that FILL a unit, not the size of the operation that commits one, and reading it as the write unit would give 2 where the answer is 64.",
+    "The row containing a page must be erased before the LAST write to the page buffer. Nothing here states an ordering rule; it is noted only because a consumer reasoning from the write unit alone would not find it.",
+    "The RWWEE array on the B, C, D and L variants is a separate array with its own erase and write commands. Its page is also 64 bytes, and it is still a different array -- nothing here states a value for it.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

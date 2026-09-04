@@ -33,6 +33,15 @@ use crate::wasm;
 pub enum BuildError {
     /// The CIL assembly's metadata could not be read.
     Parse,
+    /// The assembly demands that its consumer understand something this backend does not implement
+    /// -- a required custom modifier (ECMA-335 II.7.1.1) or a `CompilerFeatureRequiredAttribute`.
+    ///
+    /// **The decision is `lamella_metadata::demands`, not a copy of it here.** That crate is where
+    /// signatures and custom attributes are read, so this backend and the interpreter's loader --
+    /// which have no code in common -- answer the identical question from the identical lists. A
+    /// refusal present in one tier and absent in the other makes the lenient tier the one nobody
+    /// tests.
+    UnmetDemand(alloc::string::String),
     /// The target string is not one this build supports.
     UnsupportedTarget,
     /// A function could not be lowered to the WASM target.
@@ -231,6 +240,20 @@ pub enum MonoGap {
     },
 }
 
+/// Reads an assembly this backend is about to compile, refusing one its author marked unusable by a
+/// consumer that does not understand it.
+///
+/// Every parse this backend performs goes through here, so a demand is read the same way whether it
+/// came from the program, the corlib or a library. The check itself is `lamella_metadata::demands`,
+/// shared with the interpreter's loader.
+fn read_assembly(bytes: &[u8]) -> Result<Assembly<'_>, BuildError> {
+    let assembly = Assembly::read(bytes).map_err(|_| BuildError::Parse)?;
+    if let Some(message) = lamella_metadata::demands::unmet_demand(&assembly) {
+        return Err(BuildError::UnmetDemand(message));
+    }
+    Ok(assembly)
+}
+
 /// Compiles a CIL assembly to native bytes for `target`. `target = "wasm"` emits a WebAssembly module
 /// with the embedding ABI (per-method exports + `alloc`/`dealloc` + memory) -- the C# -> `.wasm`
 /// widget. A chip `target` ("microbit" for the nRF51 Cortex-M0, "rp2040" for the Pico / Pico H
@@ -286,7 +309,7 @@ pub fn build_riscv32(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     if target != "qemu-riscv32" {
         return Err(BuildError::UnsupportedTarget);
     }
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
     let (funcs, _plan) = lower_assembly(&assembly, entry, &[])?;
     let code = riscv32::lower_module(&funcs).map_err(BuildError::LowerRiscv)?;
@@ -358,7 +381,7 @@ pub const CH32V003_SRAM_TOP: u32 = 0x2000_0800;
 /// `examples/ch32v003-blink` drives and the one that has been on silicon.
 #[cfg(feature = "riscv32")]
 pub fn build_ch32v003(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
     let (funcs, _plan) = lower_assembly(&assembly, entry, &[])?;
     let code = riscv32::lower_module_profile(&funcs, riscv32::RiscvProfile::Rv32ec)
@@ -396,7 +419,7 @@ pub fn ch32v003_boot_image(code: &[u8]) -> Vec<u8> {
 /// Exports every public static method by name (the widget surface) plus `main` for the entry, if any.
 #[cfg(feature = "wasm")]
 pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
     let (funcs, plan) = lower_assembly(&assembly, entry, &[])?;
     let exports = method_exports(&assembly, entry.is_some());
@@ -423,7 +446,7 @@ pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     if !CORTEX_M_TARGETS.contains(&target) {
         return Err(BuildError::UnsupportedTarget);
     }
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
     let (funcs, _plan) = lower_assembly(&assembly, entry, &[])?;
     let code = arm32::lower_module(&funcs).map_err(BuildError::LowerArm)?;
@@ -508,7 +531,7 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
         "microbit" => 0x2000_4000,
         _ => return Err(BuildError::UnsupportedTarget),
     };
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
     let (funcs, maps, fails, duplicates, _plan) = lower_assembly_debug(&assembly, entry, &[])?;
     refuse_duplicate_bodies(&duplicates)?;
@@ -983,90 +1006,79 @@ pub fn build_object_with_corlib(cil: &[u8], corlib: &[u8]) -> Result<Vec<u8>, Bu
 /// a device PC to a C# file, line and function. `pdb` is the program's Portable PDB (what `lcsc`
 /// writes beside the assembly); its sequence points are resolved here, up front, so the code
 /// generator never needs the metadata layer.
+///
+/// **IT IS THE SAME BUILD, WITH DWARF ADDED.** This runs the same object build
+/// [`build_object_with_corlib`] runs and asks it for debug info; it is not a second lowering of the
+/// same program. Debug info describing a DIFFERENT build than the one flashed would be worse than
+/// none, because every address in it would resolve and be wrong.
 #[cfg(feature = "arm32")]
 pub fn build_object_with_corlib_debug(
     cil: &[u8],
     corlib: &[u8],
     pdb: &lamella_metadata::PortablePdb,
 ) -> Result<Vec<u8>, BuildError> {
-    let corlib_assembly = Assembly::read(corlib).map_err(|_| BuildError::Parse)?;
-    let references = alloc::vec![&corlib_assembly];
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
-    let entry = find_main(&assembly);
-    let (mut funcs, maps, fails, duplicates, plan) =
-        lower_assembly_debug(&assembly, entry, &references)?;
-    refuse_duplicate_bodies(&duplicates)?;
-    if let Some((rid, error)) = fails.into_iter().next() {
-        return Err(BuildError::LowerCil { rid, error });
-    }
-    let resolver = MetadataResolver::new(&assembly)
-        .with_references(&references)
-        .with_monomorphized(plan);
-    let mut descriptors = resolver.image_descriptors();
-    let mut names = object_symbol_names(&assembly, funcs.len());
-    names.extend(append_enum_to_string(
-        &assembly,
-        &resolver,
-        &mut funcs,
-        &mut descriptors,
-        "",
-    ));
-    replace_exception_message(&assembly, &mut funcs);
-    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized());
-    let qualifiers = crate::resolver::DescQualifiers::default();
+    build_object_core(cil, Some(corlib), &[], false, false, Some(pdb)).map(|(bytes, _)| bytes)
+}
 
-    let files: Vec<alloc::string::String> = (0..funcs.len())
-        .map(|rid| pdb.method_document(rid as u32).unwrap_or_default())
-        .collect();
-    let mut display: alloc::vec::Vec<alloc::string::String> =
-        alloc::vec![alloc::string::String::new(); funcs.len()];
-    for type_def in assembly.type_defs() {
-        let type_name = type_def.name().map_or("", |n| n.name);
-        for method in type_def.methods() {
-            if let Some(slot) = display.get_mut(method.rid() as usize) {
-                *slot = alloc::format!("{type_name}.{}", method.name().unwrap_or("?"));
+/// The PDB-derived text a compilation unit names, OWNED -- [`crate::debugmap::MethodSource`] borrows
+/// its file, display name and sequence points, so they need a home that outlives the borrow.
+#[cfg(feature = "arm32")]
+struct MethodSources {
+    files: Vec<alloc::string::String>,
+    display: Vec<alloc::string::String>,
+    points: Vec<Vec<(u32, u32, u32)>>,
+}
+
+#[cfg(feature = "arm32")]
+impl MethodSources {
+    /// Resolves every method's sequence points ONCE, up front, where the PDB is. `funcs` is
+    /// rid-indexed (index 0 is the entry trampoline), so each method's points land at its own index;
+    /// a method the PDB says nothing about keeps an empty entry and is simply not described.
+    fn resolve(pdb: &lamella_metadata::PortablePdb, assembly: &Assembly, count: usize) -> Self {
+        let mut display: Vec<alloc::string::String> =
+            alloc::vec![alloc::string::String::new(); count];
+        for type_def in assembly.type_defs() {
+            let type_name = type_def.name().map_or("", |n| n.name);
+            for method in type_def.methods() {
+                if let Some(slot) = display.get_mut(method.rid() as usize) {
+                    *slot = alloc::format!("{type_name}.{}", method.name().unwrap_or("?"));
+                }
             }
         }
+        Self {
+            files: (0..count)
+                .map(|rid| pdb.method_document(rid as u32).unwrap_or_default())
+                .collect(),
+            display,
+            points: (0..count)
+                .map(|rid| {
+                    pdb.sequence_points(rid as u32)
+                        .into_iter()
+                        .filter(|p| !p.is_hidden)
+                        .map(|p| (p.il_offset, p.start_line, p.start_column))
+                        .collect()
+                })
+                .collect(),
+        }
     }
-    let points: Vec<Vec<(u32, u32, u32)>> = (0..funcs.len())
-        .map(|rid| {
-            pdb.sequence_points(rid as u32)
-                .into_iter()
-                .filter(|p| !p.is_hidden)
-                .map(|p| (p.il_offset, p.start_line, p.start_column))
-                .collect()
-        })
-        .collect();
-    let methods: Vec<crate::debugmap::MethodSource> = (0..funcs.len())
-        .map(|i| crate::debugmap::MethodSource {
-            name: display[i].as_str(),
-            file: files[i].as_str(),
-            points: points[i].as_slice(),
-        })
-        .collect();
-    let unit_name = files
-        .iter()
-        .find(|f| !f.is_empty())
-        .map_or("", alloc::string::String::as_str);
-    let debug = crate::debugmap::ObjectDebug {
-        source_maps: &maps,
-        methods: &methods,
-        unit_name,
-        producer: PRODUCER,
-    };
-    arm32::lower_object_vtables_statics_debug(
-        &funcs,
-        &name_refs,
-        &[],
-        &descriptors,
-        &statics,
-        &qualifiers,
-        &debug,
-    )
-    .map(|(bytes, _)| bytes)
-    .map_err(BuildError::LowerArm)
+
+    fn rows(&self) -> Vec<crate::debugmap::MethodSource<'_>> {
+        (0..self.files.len())
+            .map(|i| crate::debugmap::MethodSource {
+                name: self.display[i].as_str(),
+                file: self.files[i].as_str(),
+                points: self.points[i].as_slice(),
+            })
+            .collect()
+    }
+
+    /// The compilation unit's name: the primary source file, i.e. the first method that has one.
+    fn unit_name(&self) -> &str {
+        self.files
+            .iter()
+            .find(|f| !f.is_empty())
+            .map_or("", alloc::string::String::as_str)
+    }
 }
 
 /// The `DW_AT_producer` string stamped into every compilation unit this backend emits.
@@ -1108,7 +1120,7 @@ pub fn build_object_with_libraries_report(
     libraries: &[&[u8]],
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
-    build_object_core(cil, Some(corlib), libraries, true, wide)
+    build_object_core(cil, Some(corlib), libraries, true, wide, None)
 }
 
 #[cfg(feature = "arm32")]
@@ -1117,7 +1129,7 @@ fn build_object_inner(
     corlib: Option<&[u8]>,
     libraries: &[&[u8]],
 ) -> Result<Vec<u8>, BuildError> {
-    build_object_core(cil, corlib, libraries, false, false).map(|(bytes, _)| bytes)
+    build_object_core(cil, corlib, libraries, false, false, None).map(|(bytes, _)| bytes)
 }
 
 #[cfg(feature = "arm32")]
@@ -1127,16 +1139,17 @@ fn build_object_core(
     libraries: &[&[u8]],
     defer: bool,
     wide: bool,
+    pdb: Option<&lamella_metadata::PortablePdb>,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let reference = match corlib {
-        Some(bytes) => Some(Assembly::read(bytes).map_err(|_| BuildError::Parse)?),
+        Some(bytes) => Some(read_assembly(bytes)?),
         None => None,
     };
     let entry = find_main(&assembly);
     let library_assemblies: Vec<Assembly> = libraries
         .iter()
-        .map(|lib| Assembly::read(lib).map_err(|_| BuildError::Parse))
+        .map(|lib| read_assembly(lib))
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference.iter().chain(library_assemblies.iter()).collect();
     let qualifiers = arm32::DescQualifiers {
@@ -1152,7 +1165,7 @@ fn build_object_core(
             .map(|bytes| alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, bytes)))
             .collect(),
     };
-    let (mut funcs, _maps, cil_fails, seams, duplicates, _thunks, plan) =
+    let (mut funcs, maps, cil_fails, seams, duplicates, _thunks, plan) =
         lower_assembly_seams(&assembly, entry, &references)?;
     refuse_duplicate_bodies(&duplicates)?;
     let cil_fail_rows: Vec<(u32, cil::CilError)> = if defer {
@@ -1183,7 +1196,7 @@ fn build_object_core(
         funcs[0] = startup_with_references(
             find_native_export(&assembly, "lamella_time_init"),
             &reference_cctors,
-            &startup_cctors(&assembly),
+            &startup_cctors(&assembly, &references),
             entry_rid,
         );
     }
@@ -1236,16 +1249,35 @@ fn build_object_core(
         }
     }
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized());
+    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized(), resolver.references());
     if !defer {
-        let bytes = arm32::lower_object_vtables_statics(
-            &funcs,
-            &name_refs,
-            &[],
-            &descriptors,
-            &statics,
-            &qualifiers,
-        )
+        let sources = pdb.map(|pdb| MethodSources::resolve(pdb, &assembly, funcs.len()));
+        let rows = sources.as_ref().map(MethodSources::rows);
+        let bytes = match (&sources, &rows) {
+            (Some(sources), Some(rows)) => arm32::lower_object_vtables_statics_debug(
+                &funcs,
+                &name_refs,
+                &[],
+                &descriptors,
+                &statics,
+                &qualifiers,
+                &crate::debugmap::ObjectDebug {
+                    source_maps: &maps,
+                    methods: rows,
+                    unit_name: sources.unit_name(),
+                    producer: PRODUCER,
+                },
+            )
+            .map(|(bytes, _)| bytes),
+            _ => arm32::lower_object_vtables_statics(
+                &funcs,
+                &name_refs,
+                &[],
+                &descriptors,
+                &statics,
+                &qualifiers,
+            ),
+        }
         .map_err(BuildError::LowerArm)?;
         return Ok((bytes, LibraryBuildReport::default()));
     }
@@ -1872,13 +1904,14 @@ fn narrow(value: i64, underlying: MirType) -> i64 {
 /// object-carrying exception model lands the same entry covers the in-flight exception reference.
 /// A library's word 0 is dead (never aliased, never written), so its record claims no root there.
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
-fn assembly_statics(
+fn assembly_statics<'x>(
     cil: &[u8],
-    assembly: &Assembly,
+    assembly: &'x Assembly<'x>,
     include_eh_row: bool,
     plan: &crate::generics::MonoPlan,
+    references: &[&'x Assembly<'x>],
 ) -> crate::stackmaps::AssemblyStatics {
-    let slots = crate::resolver::static_field_slots(assembly);
+    let slots = crate::resolver::static_field_slots(assembly, references);
     let mut roots = Vec::new();
     if include_eh_row {
         roots.push(crate::stackmaps::STACKMAP_KIND_MANAGED_PTR << 14);
@@ -1901,19 +1934,46 @@ fn assembly_statics(
             }
         }
     }
+    let mut struct_refs: alloc::collections::BTreeMap<u32, lamella_ir::RefWords> =
+        alloc::collections::BTreeMap::new();
+    for type_def in assembly.type_defs() {
+        for field in type_def.fields() {
+            if !field.is_static() || field.is_literal() {
+                continue;
+            }
+            if let Some(Ok(MirType::ValueType { refs, .. })) = field
+                .signature()
+                .map(|sig| mir_type(&sig, assembly, None, references))
+            {
+                if !refs.is_empty() {
+                    struct_refs.insert(field.token().row(), refs);
+                }
+            }
+        }
+    }
     for (row, slot, _) in &slots {
         if *slot < 0x4000 && ref_rows.contains(row) {
             roots.push((*slot as u16) | (crate::stackmaps::STACKMAP_KIND_OBJECT_REF << 14));
         }
+        if let Some(refs) = struct_refs.get(row) {
+            for offset in refs.offsets() {
+                let word = slot + offset / 4;
+                if word < 0x4000 {
+                    roots.push((word as u16) | (crate::stackmaps::STACKMAP_KIND_OBJECT_REF << 14));
+                }
+            }
+        }
     }
-    for (_, _, slot, _, is_reference) in crate::resolver::generic_static_slots(assembly, plan) {
+    for (_, _, slot, _, is_reference) in
+        crate::resolver::generic_static_slots(assembly, plan, references)
+    {
         if slot < 0x4000 && is_reference {
             roots.push((slot as u16) | (crate::stackmaps::STACKMAP_KIND_OBJECT_REF << 14));
         }
     }
     crate::stackmaps::AssemblyStatics {
         suffix: alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, cil)),
-        region_bytes: crate::resolver::static_region_words(assembly, plan) * 4,
+        region_bytes: crate::resolver::static_region_words(assembly, plan, references) * 4,
         roots,
     }
 }
@@ -1926,8 +1986,9 @@ fn assembly_statics(
 /// calls, cross-assembly calls, the descriptor object lane) build on.
 ///
 /// It is REACHABILITY-LIMITED: only methods reachable from `Main` (direct `Call` edges, the `.cctor`s
-/// the startup chains, and every this-assembly vtable/itable dispatch target) are lowered; every other
-/// rid -- notably the implicit `.ctor`, which calls `object::.ctor()` in corlib -- stays a stub. That
+/// the startup chains, an initialization thunk's trigger sites, and every this-assembly vtable/itable
+/// dispatch target) are lowered; every other rid -- notably the implicit `.ctor`, which calls
+/// `object::.ctor()` in corlib -- stays a stub. That
 /// lets a SELF-CONTAINED program (no `/reference`) build with no external call to resolve, exactly as
 /// the flat `lower_module_gc` driver does. Once the cross-assembly `Call` + gc-sections path lands this
 /// converges to the lower-all shape of [`build_object`] (the implicit `.ctor` becomes an extern the
@@ -1983,10 +2044,10 @@ fn build_object_riscv_inner(
     reference_cils: &[&[u8]],
     profile: riscv32::RiscvProfile,
 ) -> Result<Vec<u8>, BuildError> {
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let reference_assemblies: Vec<Assembly> = reference_cils
         .iter()
-        .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
+        .map(|bytes| read_assembly(bytes))
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
     let entry = find_main(&assembly).ok_or(BuildError::NoEntryPoint)?;
@@ -2038,12 +2099,12 @@ fn build_object_riscv_inner(
             total: silent_edges.len(),
         });
     }
-    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized());
+    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized(), resolver.references());
     let reference_regions: Vec<alloc::string::String> = reference_cils
         .iter()
         .zip(&reference_assemblies)
         .map(|(bytes, reference)| {
-            assembly_statics(bytes, reference, false, &crate::generics::MonoPlan::default())
+            assembly_statics(bytes, reference, false, &crate::generics::MonoPlan::default(), &[])
                 .region_symbol()
         })
         .collect();
@@ -2112,8 +2173,14 @@ pub fn lower_monomorphized_body<'a>(
         .method(body.rid)
         .ok_or_else(|| gap(MonoGap::NoDefinitionBody))?;
     let cil_body = method.body().ok_or_else(|| gap(MonoGap::NoDefinitionBody))?;
-    let (_, arguments) = crate::generics::instantiation_of(assembly, body.spec)
-        .ok_or_else(|| gap(MonoGap::NoArguments))?;
+    let arguments = match &body.arguments {
+        Some(carried) => carried.clone(),
+        None => {
+            crate::generics::instantiation_of(assembly, body.spec)
+                .ok_or_else(|| gap(MonoGap::NoArguments))?
+                .1
+        }
+    };
     let layout_arguments = rebased
         .is_some()
         .then(|| crate::resolver::caller_resolved_arguments(&arguments, assembly, resolver.references()))
@@ -2184,7 +2251,10 @@ pub fn lower_monomorphized_body<'a>(
         .map(|(func, _map)| func)
         .map_err(|error| gap(MonoGap::LowerCil(error)))?;
     if let Some(ordinal) = rebased {
-        let mints_an_identity = rebase_identities(&mut func, ordinal).map_err(gap)?;
+        let own_band_base =
+            crate::resolver::non_generic_region_words(assembly, resolver.references()) * 4;
+        let mints_an_identity =
+            rebase_identities(&mut func, ordinal, own_band_base).map_err(gap)?;
         if let Some(argument) = named_argument {
             if mints_an_identity {
                 return Err(gap(MonoGap::CrossAssemblyNamedArgument { argument }));
@@ -2215,7 +2285,11 @@ pub fn lower_monomorphized_body<'a>(
 /// this admits.
 /// Returns whether the body minted ANY type identity, which is what the named-argument backstop
 /// keys on -- a body that mints none cannot mint a wrong one.
-fn rebase_identities(func: &mut Function, ordinal: u8) -> Result<bool, MonoGap> {
+fn rebase_identities(
+    func: &mut Function,
+    ordinal: u8,
+    own_band_base: u32,
+) -> Result<bool, MonoGap> {
     let mut minted = false;
     let rebase = |handle: lamella_ir::TypeHandle| {
         crate::resolver::rebased_handle(handle, ordinal)
@@ -2247,8 +2321,12 @@ fn rebase_identities(func: &mut Function, ordinal: u8) -> Result<bool, MonoGap> 
                 | Inst::TypeDescAddr { handle }
                 | Inst::AllocArray2D { handle, .. }
                 | Inst::AllocArrayMD { handle, .. } => {
+                    let assembly_independent =
+                        handle.0 >> 24 == crate::generics::INSTANTIATION_HANDLE_TABLE;
                     *handle = rebase(*handle)?;
-                    minted = true;
+                    if !assembly_independent {
+                        minted = true;
+                    }
                 }
                 Inst::AllocArray {
                     handle, element, ..
@@ -2274,7 +2352,11 @@ fn rebase_identities(func: &mut Function, ordinal: u8) -> Result<bool, MonoGap> 
                     return Err(MonoGap::CrossAssemblyIdentity { handle: *handle });
                 }
                 Inst::StaticLoad { owner, offset, .. } | Inst::StaticStore { owner, offset, .. } => {
-                    if matches!(owner, StaticOwner::Own) && *offset != cil::G_EXCEPTION_TAG_OFFSET {
+                    let in_own_band = own_band_base != 0 && *offset >= own_band_base;
+                    if matches!(owner, StaticOwner::Own)
+                        && *offset != cil::G_EXCEPTION_TAG_OFFSET
+                        && !in_own_band
+                    {
                         return Err(MonoGap::CrossAssemblyStatic { offset: *offset });
                     }
                 }
@@ -2509,7 +2591,9 @@ pub fn lower_monomorphized_method_body<'a>(
         .map(|(func, _map)| func)
         .map_err(|error| gap(MonoGap::LowerCil(error)))?;
     if let Some(ordinal) = rebased {
-        rebase_identities(&mut func, ordinal).map_err(gap)?;
+        let own_band_base =
+            crate::resolver::non_generic_region_words(assembly, resolver.references()) * 4;
+        rebase_identities(&mut func, ordinal, own_band_base).map_err(gap)?;
     }
     Ok(func)
 }
@@ -2545,12 +2629,22 @@ fn substituted_mir_type<'x>(
 }
 
 /// Lowers the methods of a self-contained assembly REACHABLE from `entry`, rid-indexed, into a dense
-/// module for [`riscv32::lower_object`]. Index 0 is the entry [`startup`] (board-init hook, then each
-/// `.cctor`, then `Main`); each reachable method sits at its `MethodDef` rid; every unreached rid is a
-/// [`stub`]. Reachability is a BFS over direct `Call` edges seeded with `Main`, the `.cctor`s, the
-/// board-init hook, and every this-assembly vtable/itable dispatch target (an indirect call has no
-/// `Call` edge). Skipping the unreached rids keeps the implicit `.ctor`'s `object::.ctor()` corlib call
-/// out of a self-contained build -- the flat driver relies on the same property.
+/// module for [`riscv32::lower_object`]. Index 0 is the entry [`startup`] (board-init hook, then the
+/// `.cctor`s the chain still owns, then `Main`); each reachable method sits at its `MethodDef` rid;
+/// each type demanding precise initialization takes an index above the monomorphized bodies for its
+/// [`type_init_thunk_body`]; every unreached rid is a [`stub`]. Reachability is a BFS over direct
+/// `Call` edges seeded with `Main`, the CHAINED `.cctor`s, the board-init hook, and every
+/// this-assembly vtable/itable dispatch target (an indirect call has no `Call` edge). Skipping the
+/// unreached rids keeps the implicit `.ctor`'s `object::.ctor()` corlib call out of a self-contained
+/// build -- the flat driver relies on the same property.
+///
+/// **A PRECISE TYPE'S INITIALIZER IS REACHED THROUGH ITS THUNK AND NOWHERE ELSE, WHICH IS THIS
+/// PATH'S ONE STRUCTURAL DIFFERENCE FROM [`lower_assembly_seams`].** That tier lowers every planned
+/// body unconditionally, so a thunk it emits is emitted whether or not anything calls it; here a
+/// thunk is lowered only when a trigger site reaches it, and the `.cctor` only through the thunk. So
+/// the seed must NOT contain the precise `.cctor`s: seeding them keeps the bodies alive for a reason
+/// unrelated to the triggers, and a trigger site that was never emitted would then look exactly like
+/// one that was.
 ///
 /// **IT TAKES NO DESCRIPTOR LIST, AND DERIVING ITS OWN IS THE POINT RATHER THAN A CONVENIENCE.** A
 /// caller's copy is computed before the plan exists, and a virtual GENERIC method's vtable slots
@@ -2576,13 +2670,21 @@ fn lower_reachable<'a>(
         max_rid + 1,
     )
     .map_err(BuildError::Instantiations)?;
-    let mut funcs: Vec<Function> = (0..=max_rid + plan.len() as u32).map(|_| stub()).collect();
+    let precise = crate::resolver::precise_init_types(assembly, references);
+    let thunk_base = max_rid as usize + 1 + plan.len();
+    let thunk_indices: Vec<(u32, u32)> = precise
+        .iter()
+        .enumerate()
+        .map(|(i, (type_row, _, _))| (*type_row, (thunk_base + i) as u32))
+        .collect();
+    let mut funcs: Vec<Function> = (0..thunk_base + precise.len()).map(|_| stub()).collect();
     let mut lowered = vec![false; funcs.len()];
-    let cctors = find_cctors(assembly);
+    let cctors = startup_cctors(assembly, references);
     let init = find_native_export(assembly, "lamella_time_init");
     let resolver = MetadataResolver::new(assembly)
         .with_references(references)
-        .with_monomorphized(plan.clone());
+        .with_monomorphized(plan.clone())
+        .with_type_init_thunks(thunk_indices.clone());
     let instantiated = resolver.instantiation_descriptors();
     refuse_undispatchable_instantiations(&resolver)?;
     let mut worklist: Vec<u32> = core::iter::once(entry)
@@ -2611,12 +2713,19 @@ fn lower_reachable<'a>(
         }
         *seen = true;
         let func = match plan.bodies().iter().find(|body| body.index == rid) {
+            Some(body) if body.declaration_only => deferred_trap_body(),
             Some(body) => lower_monomorphized_body(assembly, &resolver, body)?,
             None => match plan.method_bodies().iter().find(|body| body.index == rid) {
                 Some(body) => lower_monomorphized_method_body(assembly, &resolver, body)?,
-                None => match lower_one_reachable(assembly, &resolver, rid)? {
-                    Some(func) => func,
-                    None => continue,
+                None => match thunk_indices.iter().position(|(_, index)| *index == rid) {
+                    Some(i) => {
+                        let (_, cctor, flag_slot) = precise[i];
+                        type_init_thunk_body(flag_slot * 4, cctor)
+                    }
+                    None => match lower_one_reachable(assembly, &resolver, rid)? {
+                        Some(func) => func,
+                        None => continue,
+                    },
                 },
             },
         };
@@ -2642,8 +2751,13 @@ fn lower_reachable<'a>(
 
 /// Lowers the method at `MethodDef` rid `rid` to MIR (its plain managed body -- the same path
 /// [`lower_assembly_debug`] takes for an ordinary method), or `Ok(None)` if there is no such method or
-/// it has no body (abstract/extern). A body that fails to lower is `Err(BuildError::LowerCil)` -- FAIL
-/// LOUD, never a silent stub (a stubbed reachable method would miscompile the program).
+/// it has no LOWERABLE body. A body that fails to lower is `Err(BuildError::LowerCil)` -- FAIL LOUD,
+/// never a silent stub (a stubbed reachable method would miscompile the program).
+///
+/// **A method with no CIL is not automatically a method with no body.** A delegate's `Invoke` is
+/// Runtime-implemented, and it gets a synthesized dispatch from the same
+/// [`delegate_invoke_synthesis`] the whole-assembly path uses. Abstract and extern methods answer
+/// `None`.
 #[cfg(feature = "riscv32")]
 fn lower_one_reachable(
     assembly: &Assembly,
@@ -2655,10 +2769,16 @@ fn lower_one_reachable(
             if method.rid() != rid {
                 continue;
             }
-            let Some(body) = method.body() else {
-                return Ok(None);
-            };
             let signature = method.signature();
+            let Some(body) = method.body() else {
+                return delegate_invoke_synthesis(
+                    assembly,
+                    resolver.references(),
+                    crate::resolver::is_delegate_type_of(assembly, &type_def),
+                    method.name(),
+                    &signature,
+                );
+            };
             let mut arg_types = Vec::new();
             if let Some(sig) = &signature {
                 if sig.has_this {
@@ -2713,10 +2833,10 @@ fn build_library_object_riscv_inner(
     cil: &[u8],
     reference_cils: &[&[u8]],
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let reference_assemblies: Vec<Assembly> = reference_cils
         .iter()
-        .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
+        .map(|bytes| read_assembly(bytes))
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
@@ -2739,12 +2859,12 @@ fn build_library_object_riscv_inner(
     replace_exception_message(&assembly, &mut funcs);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized());
+    let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized(), resolver.references());
     let reference_regions: Vec<alloc::string::String> = reference_cils
         .iter()
         .zip(&reference_assemblies)
         .map(|(bytes, reference)| {
-            assembly_statics(bytes, reference, false, &crate::generics::MonoPlan::default())
+            assembly_statics(bytes, reference, false, &crate::generics::MonoPlan::default(), &[])
                 .region_symbol()
         })
         .collect();
@@ -2994,10 +3114,10 @@ fn build_library_object_inner(
     references: &[&[u8]],
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
-    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let assembly = read_assembly(cil)?;
     let reference_assemblies: Vec<Assembly> = references
         .iter()
-        .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
+        .map(|bytes| read_assembly(bytes))
         .collect::<Result<_, _>>()?;
     let reference_list: Vec<&Assembly> = reference_assemblies.iter().collect();
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
@@ -3031,7 +3151,7 @@ fn build_library_object_inner(
     replace_exception_message(&assembly, &mut funcs);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized());
+    let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized(), resolver.references());
     let (bytes, stubs) = arm32::lower_object_library_vtables_report(
         &funcs,
         &name_refs,
@@ -3503,8 +3623,8 @@ fn find_cctors(assembly: &Assembly) -> Vec<u32> {
 /// EXISTS.** Removing a `.cctor` from this list without a site that calls it does not make the tier
 /// lazy, it makes the initializer never run: `static-init-corlib` answers 2 instead of 42 that way,
 /// a wrong answer rather than a smaller image.
-fn startup_cctors(assembly: &Assembly) -> Vec<u32> {
-    let precise = crate::resolver::precise_init_types(assembly);
+fn startup_cctors<'x>(assembly: &'x Assembly<'x>, references: &[&'x Assembly<'x>]) -> Vec<u32> {
+    let precise = crate::resolver::precise_init_types(assembly, references);
     find_cctors(assembly)
         .into_iter()
         .filter(|rid| !precise.iter().any(|(_, cctor, _)| cctor == rid))
@@ -3542,11 +3662,17 @@ fn reference_startup_cctors(assembly: &Assembly) -> Vec<u32> {
 /// The MIR type the AOT lowers a metadata signature type as.
 ///
 /// **TOTAL EXCEPT FOR ONE SHAPE, AND THE ASYMMETRY IS THE POINT.** Every signature this function
-/// does not name still falls to `int32`, exactly as before -- widening that would trade a known
-/// silent wrong answer for an unknown loud one, and which of `void`, `!n`, `!!n` and function
-/// pointers actually reaches a slot is a measurement nobody has taken. The one case that refuses is
-/// the one measured to miscompile: an instantiation of a VALUE type, whose MIR type needs a size
-/// and a trace map this tier does not have. See [`BuildError::ValueTypeInstantiationSlot`].
+/// does not name still falls to `int32` -- widening that would trade a known silent wrong answer for
+/// an unknown loud one. The one case that refuses is the one measured to miscompile: an
+/// instantiation of a VALUE type, whose MIR type needs a size and a trace map this tier does not
+/// have. See [`BuildError::ValueTypeInstantiationSlot`].
+///
+/// **AND WHAT THE FALLBACK ACTUALLY COVERS IS KNOWN RATHER THAN SUSPECTED.** Four shapes could
+/// reach it -- `void`, an open type's `!n`, a generic method's `!!n`, and a function pointer -- and
+/// only the third ever did. A `void` return is tested before the call; an open TYPE's body is
+/// skipped before lowering, and so is a generic METHOD's; and
+/// a function pointer cannot arrive at all, because `ELEMENT_TYPE_FNPTR` has no decode arm and is a
+/// loud `BadElementType` in the signature reader long before this.
 ///
 /// **THIS IS THE HALF THE IMAGE COMES FROM.** `resolver::slot_types` types what a diagnostic
 /// reads. The two are twins, they already carried comments saying so, and a refusal landed in that
@@ -3585,6 +3711,8 @@ fn mir_type<'x>(
             MirType::ObjectRef
         }
         SigType::Pointer(_) => MirType::NativeInt,
+        SigType::ByRef(_) => MirType::ManagedPtr,
+        SigType::IntPtr | SigType::UIntPtr => MirType::NativeInt,
         SigType::ValueType(token) => {
             if let Some(underlying) =
                 crate::resolver::enum_underlying(assembly, *token, references, &TargetLayout::ilp32())
@@ -4730,7 +4858,7 @@ fn synthesized_seam_body<'a>(
         if let Some(sig) = &signature {
             let Some(param_types) = seam_param_types(&sig.parameters, assembly, references)
             else {
-                return SeamEmission::Placeholder;
+                return SeamEmission::Trap(deferred_trap_body());
             };
             return SeamEmission::Synthesized(runtime_seam_body(
                 &param_types,
@@ -4745,7 +4873,7 @@ fn synthesized_seam_body<'a>(
         if let Some(sig) = &signature {
             let Some(param_types) = seam_param_types(&sig.parameters, assembly, references)
             else {
-                return SeamEmission::Placeholder;
+                return SeamEmission::Trap(deferred_trap_body());
             };
             return SeamEmission::Synthesized(net_deferred_body(&param_types, -2));
         }
@@ -4759,7 +4887,7 @@ fn synthesized_seam_body<'a>(
         ) {
             let Some(param_types) = seam_param_types(&sig.parameters, assembly, references)
             else {
-                return SeamEmission::Placeholder;
+                return SeamEmission::Trap(deferred_trap_body());
             };
             return SeamEmission::Synthesized(thread_start_body(&param_types, entry_rid));
         }
@@ -4770,7 +4898,7 @@ fn synthesized_seam_body<'a>(
         if let Some(sig) = &signature {
             let Some(param_types) = seam_param_types(&sig.parameters, assembly, references)
             else {
-                return SeamEmission::Placeholder;
+                return SeamEmission::Trap(deferred_trap_body());
             };
             return SeamEmission::Synthesized(runtime_seam_body(
                 &param_types,
@@ -4787,7 +4915,7 @@ fn synthesized_seam_body<'a>(
         if let Some(sig) = &signature {
             let Some(param_types) = seam_param_types(&sig.parameters, assembly, references)
             else {
-                return SeamEmission::Placeholder;
+                return SeamEmission::Trap(deferred_trap_body());
             };
             return SeamEmission::Synthesized(runtime_seam_body(
                 &param_types,
@@ -4964,7 +5092,7 @@ fn lower_assembly_seams<'a>(
         max_rid + 1,
     )
     .map_err(BuildError::Instantiations)?;
-    let precise = crate::resolver::precise_init_types(assembly);
+    let precise = crate::resolver::precise_init_types(assembly, references);
     let thunk_base = max_rid as usize + 1 + plan.len();
     let total = thunk_base + precise.len();
     let mut bodies = BodySlots::new(total);
@@ -4973,7 +5101,7 @@ fn lower_assembly_seams<'a>(
     if let Some(entry_rid) = entry {
         bodies.funcs[0] = startup(
             find_native_export(assembly, "lamella_time_init"),
-            &startup_cctors(assembly),
+            &startup_cctors(assembly, references),
             entry_rid,
         );
     }
@@ -4992,24 +5120,14 @@ fn lower_assembly_seams<'a>(
     for (rid, method, type_name, is_delegate) in &methods {
         let signature = method.signature();
         let Some(body) = method.body() else {
-            if *is_delegate && method.name() == Some("Invoke") {
-                if let Some(sig) = &signature {
-                    let mut params = alloc::vec![MirType::ObjectRef];
-                    for parameter in &sig.parameters {
-                        params.push(mir_type(parameter, assembly, None, resolver.references())?);
-                    }
-                    let ret = if sig.return_type == SigType::Void {
-                        None
-                    } else {
-                        Some(mir_type(
-                            &sig.return_type,
-                            assembly,
-                            None,
-                            resolver.references(),
-                        )?)
-                    };
-                    bodies.write(*rid, delegate_invoke_body(&params, ret));
-                }
+            if let Some(func) = delegate_invoke_synthesis(
+                assembly,
+                resolver.references(),
+                *is_delegate,
+                method.name(),
+                &signature,
+            )? {
+                bodies.write(*rid, func);
             }
             continue;
         };
@@ -5066,7 +5184,12 @@ fn lower_assembly_seams<'a>(
         }
     }
     for body in plan.bodies() {
-        bodies.write(body.index, lower_monomorphized_body(assembly, &resolver, body)?);
+        let func = if body.declaration_only {
+            deferred_trap_body()
+        } else {
+            lower_monomorphized_body(assembly, &resolver, body)?
+        };
+        bodies.write(body.index, func);
     }
     for body in plan.method_bodies() {
         bodies.write(
@@ -5257,6 +5380,40 @@ impl MirBuilder {
 /// Emitting the real dispatch here makes the address mean what the call already meant. It costs
 /// nothing where it is unused: no `callvirt` references the symbol, so a program that never takes
 /// `Invoke`'s address dead-strips it exactly as it dead-stripped the stub.
+/// The body a delegate's `Invoke` gets, or `None` when this method is not one -- **the decision and
+/// the construction together, so a lowering path cannot take one without the other.** Every path
+/// that lowers a program asks this rather than restating the rule, because a delegate's `Invoke`
+/// carries no CIL and each path decides separately what to do with a body-less method.
+///
+/// `is_delegate` is passed rather than derived because the question is about the TYPE and the caller
+/// holds it: the whole-assembly path asks [`crate::resolver::is_delegate_type_of`] once per
+/// `TypeDef` and would otherwise walk an extends chain once per method.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn delegate_invoke_synthesis<'x>(
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+    is_delegate: bool,
+    method_name: Option<&str>,
+    signature: &Option<lamella_metadata::MethodSig>,
+) -> Result<Option<Function>, BuildError> {
+    if !is_delegate || method_name != Some("Invoke") {
+        return Ok(None);
+    }
+    let Some(sig) = signature else {
+        return Ok(None);
+    };
+    let mut params = alloc::vec![MirType::ObjectRef];
+    for parameter in &sig.parameters {
+        params.push(mir_type(parameter, assembly, None, references)?);
+    }
+    let ret = if sig.return_type == SigType::Void {
+        None
+    } else {
+        Some(mir_type(&sig.return_type, assembly, None, references)?)
+    };
+    Ok(Some(delegate_invoke_body(&params, ret)))
+}
+
 fn delegate_invoke_body(params: &[MirType], ret: Option<MirType>) -> Function {
     let (mut mb, ids) = MirBuilder::new(params);
     let invoke = Inst::InvokeDelegate {
@@ -8047,6 +8204,52 @@ mod tests {
         for f in bodies {
             lamella_ir::verify(&f).expect("a synthesized string body verifies");
             crate::arm32::lower_object(&[f], &["s"], &[]).expect("it lowers on the object path");
+        }
+    }
+
+    /// The host guard that `debug_assert!` could not be: an IMAGE reaching a string-allocating seam
+    /// without a nameable `System.String` is refused at build time, naming the seam.
+    ///
+    /// **THIS IS THE ONLY PLACE THE GUARD CAN FIRE, WHICH IS WHY IT IS TESTED HERE.** The archive is
+    /// built `--release` with `panic = "abort"` and a `loop {}` panic handler, so an assertion inside
+    /// it either compiles out or turns a lockup at a garbage PC into a lockup at a known one -- the
+    /// same silent expiry as the comment it replaces. On the host there is an exit code.
+    ///
+    /// The two arms are the whole point: WITH a descriptor table this is an image and the build is
+    /// refused; WITHOUT one it is a bare object lowering that has no type world, nothing can dispatch
+    /// on a string it makes, and the guard must stay out of the way -- which is exactly what the two
+    /// seam-lowering tests beside this one do.
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn an_image_reaching_a_string_seam_without_a_string_descriptor_is_refused() {
+        let body = char_to_string_body();
+        lamella_ir::verify(&body).expect("the synthesized body verifies");
+
+        crate::arm32::lower_object(&[body.clone()], &["c"], &[])
+            .expect("a bare object lowering has no type world and is not guarded");
+
+        let described = [crate::resolver::TypeMeta {
+            handle: lamella_ir::TypeHandle(0x0200_0001),
+            type_tag: 0,
+            vtable: alloc::vec::Vec::new(),
+            itable: alloc::vec::Vec::new(),
+            base: None,
+            words: None,
+            exported: false,
+            full_name: None,
+        }];
+        let refused = crate::arm32::lower_object_vtables(&[body], &["c"], &[], &described);
+        match refused {
+            Err(crate::arm32::LowerError::StringSeamWithoutDescriptor { seam }) => {
+                assert_eq!(
+                    seam, "lamella_char_to_string",
+                    "the refusal names the seam that forced the descriptor, not a condition"
+                );
+            }
+            other => panic!(
+                "an image reaching a string seam with no `System.String` must be REFUSED on the \
+                 host -- the device cannot report it: {other:?}"
+            ),
         }
     }
 

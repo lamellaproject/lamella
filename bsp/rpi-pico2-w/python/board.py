@@ -85,7 +85,9 @@ FACTS = {
 # the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
 # touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
 # controller, a reset controller -- and those are one per chip, so they are stated once here.
-# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+# Each row carries whatever this family's record declares -- a base always, and per-instance
+# facts like a clock channel or a bus-enable bit where the family states them. Register offsets
+# and bit encodings belong to the driver that knows the block, not here.
 INSTANCES = {
     "xosc": {"block": "xosc", "base": 0x40048000},
     "clocks": {"block": "clocks", "base": 0x40010000},
@@ -111,9 +113,9 @@ PLANS = {
 # own idiom.
 DEVICES = {
     "cyw43439-wl-reg-on": {"port_base": 0xD0000000, "pin": 23, "mask": 0x800000, "active_low": False},
-    "cyw43439-data": {"port_base": 0xD0000000, "pin": 24, "mask": 0x1000000, "active_low": False},
+    "cyw43439-data": {"port_base": 0xD0000000, "pin": 24, "mask": 0x1000000},
     "cyw43439-cs": {"port_base": 0xD0000000, "pin": 25, "mask": 0x2000000, "active_low": True},
-    "cyw43439-clk": {"port_base": 0xD0000000, "pin": 29, "mask": 0x20000000, "active_low": False},
+    "cyw43439-clk": {"port_base": 0xD0000000, "pin": 29, "mask": 0x20000000},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until

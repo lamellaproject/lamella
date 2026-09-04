@@ -10,7 +10,7 @@ board = "nucleo-f091rc"
 vendor = "st"
 family = "stm32f091"
 part = "stm32f091rc"
-board_model = 7             # lamella_wire::board_model::STM32F091
+product_model = 7           # lamella_wire::product_model::STM32F091
 sources = ["NUCLEO-F091RC ST-LINK VCP mapping (USART2 on PA2/PA3, AF1)"]
 
 [[carriers]]

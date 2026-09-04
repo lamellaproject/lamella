@@ -5,5 +5,6 @@ namespace System
     public abstract class ValueType : Object
     {
         [Lamella.Runtime.RuntimeProvided] public override bool Equals(object obj) { return false; }
+        [Lamella.Runtime.RuntimeProvided] public override int GetHashCode() { return 0; }
     }
 }

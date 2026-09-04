@@ -39,6 +39,28 @@ pub const STM32U5_QUAD_WORD: usize = 16;
 /// The part's own flash-size register: bits 15:0 hold the size in KB (RM0456 76.2).
 pub const STM32U5_FLASH_SIZE_REG: u32 = 0x0BFA_07A0;
 
+/// `DBGMCU_IDCODE`, the register that answers about ST rather than about Arm (RM0456 75.12.4, base
+/// address `0xE004 4000`, address offset `0x00`).
+///
+/// Same field layout as every other family here -- `DEV_ID` in bits 11:0, `REV_ID` in bits 31:16 --
+/// at an address that is this family's alone, which is why [`crate::stm32_dev_id`] takes the address
+/// and shares only the decode.
+pub const STM32U5_DBGMCU_IDCODE: u32 = 0xE004_4000;
+
+/// The `DEV_ID` values RM0456 lists, with what each names.
+///
+/// **THE WHOLE LIST, BECAUSE THE MANUAL DESCRIBES ONE REGISTER MODEL FOR ALL OF THEM.** RM0456 is
+/// the source for this driver's base, keys, page size and quad-word granule, and it covers these
+/// four device ids; narrowing the list to one would refuse a part this manual says the driver fits.
+///
+/// **AN ID LISTED HERE SAYS THE MANUAL COVERS IT, NOT THAT A BOARD OF THAT ID HAS BEEN WRITTEN.**
+pub const STM32U5_PARTS: &[(u32, &str)] = &[
+    (0x455, "an STM32U535/545 -- the DEV_ID, which every part in that group answers, not this board"),
+    (0x476, "an STM32U5Fx/5Gx -- the DEV_ID, which every part in that group answers, not this board"),
+    (0x481, "an STM32U59x/5Ax -- the DEV_ID, which every part in that group answers, not this board"),
+    (0x482, "an STM32U575/585 -- the DEV_ID, which every part in that group answers, not this board"),
+];
+
 /// The FLASH option register (RM0456 7.9.13), which states how the part's banks are arranged.
 ///
 /// A NUCLEO-U5A5ZJ-Q answered `0x1FEFF8AA` here, which is exactly the "ST production value" RM0456
@@ -226,17 +248,21 @@ impl<A: TargetAccess> Stm32U5Flash for A {
         u5_wait_idle(self, FlashWait::BeforeOperation)?;
         self.write_word(U5_NSCR, U5_CR_PG)?;
 
+        let mut padded = data.to_vec();
+        while padded.len() % STM32U5_QUAD_WORD != 0 {
+            padded.push(0xff);
+        }
+        let words: Vec<u32> = padded
+            .chunks(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+
+        let per_poll = STM32U5_PAGE as usize / 4;
         let mut at = address;
-        for chunk in data.chunks(STM32U5_QUAD_WORD) {
-            let mut quad = [0xffu8; STM32U5_QUAD_WORD];
-            quad[..chunk.len()].copy_from_slice(chunk);
-            for word in 0..4u32 {
-                let i = (word * 4) as usize;
-                let value = u32::from_le_bytes([quad[i], quad[i + 1], quad[i + 2], quad[i + 3]]);
-                self.write_word(at + word * 4, value)?;
-            }
+        for chunk in words.chunks(per_poll) {
+            self.write_words(at, chunk)?;
             u5_wait_idle(self, FlashWait::AfterOperation)?;
-            at += STM32U5_QUAD_WORD as u32;
+            at += (chunk.len() * 4) as u32;
         }
 
         let cr = self.read_word(U5_NSCR)?;

@@ -32,10 +32,9 @@ const H7_SR_EOP: u32 = 1 << 16;
 /// Every error flag SR reports for a write or erase; the same bit positions clear them in CCR.
 ///
 /// RM0399 4.9.5 lists two more that are deliberately NOT here, and the omission is a scope rather
-/// than an oversight: `SNECCERR1` (25) and `DBECCERR1` (26) are ECC flags raised by a READ, not by
-/// a program or an erase. Reading erased H7 flash is itself an ECC double-detection, so folding
-/// `DBECCERR` into this mask would make a correct read-back verify of an erased region report an
-/// error against an operation that succeeded.
+/// than an oversight: `SNECCERR1` (25) and `DBECCERR1` (26) are ECC flags raised by a READ (4.7.7),
+/// and this mask is consulted after a PROGRAM or an ERASE. Folding a read's flags into an
+/// operation's verdict would let one report failure for the other's condition.
 pub(crate) const H7_SR_ERRORS: u32 =
     (1 << 17) | (1 << 18) | (1 << 19) | (1 << 21) | (1 << 22) | (1 << 23) | (1 << 24);
 
@@ -47,6 +46,28 @@ pub const STM32H7_SECTOR: u32 = 128 * 1024;
 pub const STM32H7_FLASH_BASE: u32 = 0x0800_0000;
 /// Where bank 2 begins on a 2 MB part.
 pub const STM32H7_BANK2_BASE: u32 = 0x0810_0000;
+
+/// `DBGMCU_IDC`, the register that answers about ST rather than about Arm (RM0399 "DBGMCU
+/// registers", address offset `0x000`).
+///
+/// **RM0399 GIVES THE DBGMCU TWO BASE ADDRESSES AND THIS IS THE ONE A PROBE CAN USE.** It is
+/// "accessible to the debugger via the APB-D bus at base address 0xE00E1000" and "also accessible by
+/// both processor cores at base address 0x5C001000". A memory read through an AHB-AP is a bus access
+/// with the cores' view of the map, so the core-visible address is the one that answers.
+///
+/// The reset value RM0399 states is `0xX00X6450`, so bits 15:12 read `0b0110` here as they do on the
+/// L0 -- the same shape, at a different address, which is exactly why the address is not shared.
+pub const STM32H7_DBGMCU_IDC: u32 = 0x5C00_1000;
+
+/// The `DEV_ID` values RM0399 lists for the parts this driver was written from, with what each names.
+///
+/// **ONE ENTRY, BECAUSE THE MANUAL LISTS ONE.** RM0399 covers H745/H747/H755/H757 and gives a single
+/// device id for the whole group, so this is not an abbreviated list -- an id outside it is a part
+/// RM0399 does not describe, and this driver's register model is not known to hold there.
+pub const STM32H7_PARTS: &[(u32, &str)] = &[(
+    0x450,
+    "an STM32H745/755 or STM32H747/757 -- the DEV_ID, which every part in that group answers, not this board",
+)];
 
 /// Names the error bits a failed operation left in `SR`, so a failure says which rule was broken
 /// rather than "it did not work".
@@ -92,6 +113,17 @@ fn h7_reg(address: u32, register: u32) -> u32 {
 fn h7_sector_of(address: u32) -> u32 {
     let bank_base = if address >= STM32H7_BANK2_BASE { STM32H7_BANK2_BASE } else { STM32H7_FLASH_BASE };
     (address - bank_base) / STM32H7_SECTOR
+}
+
+/// The first address after the sector containing `address` -- where a chunk must stop.
+///
+/// Programming is chunked at SECTOR boundaries rather than by a fixed size, and that is a
+/// correctness requirement rather than tidiness: the sector is the erase unit, so it is the unit a
+/// failed chunk can be recovered by, AND a sector never spans the two banks -- whose control,
+/// status and lock registers are entirely separate.
+fn h7_sector_end(address: u32) -> u32 {
+    let bank_base = if address >= STM32H7_BANK2_BASE { STM32H7_BANK2_BASE } else { STM32H7_FLASH_BASE };
+    bank_base + (h7_sector_of(address) + 1) * STM32H7_SECTOR
 }
 
 /// Waits for the bank holding `address` to go idle, then reports any error it left behind.
@@ -183,24 +215,48 @@ impl<A: TargetAccess> Stm32H7Flash for A {
         if address as usize % STM32H7_FLASH_WORD != 0 {
             return Err(ProbeError::Device("STM32H7 programming starts on a 32-byte flash-word boundary"));
         }
-        h7_wait_idle(self, address, FlashWait::BeforeOperation)?;
-        let cr_at = h7_reg(address, H7_CR);
-        self.write_word(cr_at, H7_CR_PG | H7_CR_PSIZE_WORD)?;
+        let mut padded = data.to_vec();
+        while padded.len() % STM32H7_FLASH_WORD != 0 {
+            padded.push(0xff);
+        }
+        let words: Vec<u32> = padded
+            .chunks(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
 
         let mut at = address;
-        for chunk in data.chunks(STM32H7_FLASH_WORD) {
-            let mut word = [0xffu8; STM32H7_FLASH_WORD];
-            word[..chunk.len()].copy_from_slice(chunk);
-            let words: [u32; STM32H7_FLASH_WORD / 4] = std::array::from_fn(|i| {
-                u32::from_le_bytes([word[i * 4], word[i * 4 + 1], word[i * 4 + 2], word[i * 4 + 3]])
-            });
-            self.write_words(at, &words)?;
+        let mut rest: &[u32] = &words;
+        let mut prepared: Option<u32> = None;
+        while !rest.is_empty() {
+            let cr_at = h7_reg(at, H7_CR);
+            if prepared != Some(cr_at) {
+                if let Some(previous) = prepared {
+                    let cr = self.read_word(previous)?;
+                    self.write_word(previous, cr & !H7_CR_PG)?;
+                }
+                if self.read_word(cr_at)? & H7_CR_LOCK != 0 {
+                    return Err(ProbeError::Device(
+                        "STM32H7 programming reached a locked flash bank -- unlock the bank holding the end of the image as well as the one holding its start",
+                    ));
+                }
+                h7_wait_idle(self, at, FlashWait::BeforeOperation)?;
+                self.write_word(cr_at, H7_CR_PG | H7_CR_PSIZE_WORD)?;
+                prepared = Some(cr_at);
+            }
+
+            let room = ((h7_sector_end(at) - at) / 4) as usize;
+            let take = rest.len().min(room);
+            self.write_words(at, &rest[..take])?;
             h7_wait_idle(self, at, FlashWait::AfterOperation)?;
-            at += STM32H7_FLASH_WORD as u32;
+            at += (take * 4) as u32;
+            rest = &rest[take..];
         }
 
-        let cr = self.read_word(cr_at)?;
-        self.write_word(cr_at, cr & !H7_CR_PG)
+        if let Some(cr_at) = prepared {
+            let cr = self.read_word(cr_at)?;
+            self.write_word(cr_at, cr & !H7_CR_PG)?;
+        }
+        Ok(())
     }
 }
 
@@ -238,6 +294,33 @@ mod tests {
             let field = (sector << H7_CR_SNB_SHIFT) & H7_CR_SNB_MASK;
             assert_eq!(field >> H7_CR_SNB_SHIFT, sector, "sector {sector} must survive the field");
         }
+    }
+
+    #[test]
+    fn a_chunk_stops_at_the_sector_it_started_in() {
+        assert_eq!(h7_sector_end(0x0800_0000), 0x0802_0000);
+        assert_eq!(h7_sector_end(0x0801_ffff), 0x0802_0000);
+        assert_eq!(h7_sector_end(0x0802_0000), 0x0804_0000);
+        assert_eq!(h7_sector_end(0x080e_0000), 0x0810_0000);
+        assert_eq!(h7_sector_end(0x080f_ffff), 0x0810_0000);
+        assert_eq!(h7_sector_end(0x0810_0000), 0x0812_0000);
+        assert_eq!(h7_sector_end(0x081e_0000), 0x0820_0000);
+    }
+
+    #[test]
+    fn no_chunk_boundary_can_fall_inside_a_flash_word() {
+        assert_eq!(STM32H7_SECTOR as usize % STM32H7_FLASH_WORD, 0);
+        for at in [0x0800_0000u32, 0x0802_0000, 0x080e_0000, 0x0810_0000] {
+            assert_eq!(h7_sector_end(at) as usize % STM32H7_FLASH_WORD, 0);
+        }
+    }
+
+    #[test]
+    fn the_two_banks_never_share_a_control_register() {
+        assert_ne!(h7_reg(0x080e_0000, H7_CR), h7_reg(0x0810_0000, H7_CR));
+        assert_ne!(h7_reg(0x080e_0000, H7_SR), h7_reg(0x0810_0000, H7_SR));
+        assert_ne!(h7_reg(0x080e_0000, H7_KEYR), h7_reg(0x0810_0000, H7_KEYR));
+        assert_ne!(h7_reg(0x080e_0000, H7_CCR), h7_reg(0x0810_0000, H7_CCR));
     }
 
     #[test]

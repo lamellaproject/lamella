@@ -12,7 +12,7 @@ board = "stm32f746g-disco"
 vendor = "st"
 family = "stm32f7"
 part = "stm32f746ng"
-board_model = 20            # lamella_wire::board_model::STM32F746G_DISCO
+product_model = 20          # lamella_wire::product_model::STM32F746G_DISCO
 sources = [
     "Discovery kit user manual UM1907: the pin assignment table gives PA9 = VCP_TX and PB7 = VCP_RX; the ST-LINK/V2-1 provides the virtual COM port over USB",
     "UM1907 introduction: the kit's microcontroller is the STM32F746NG (STM32F746NGH6 order code)",

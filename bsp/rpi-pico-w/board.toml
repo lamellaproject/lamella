@@ -18,7 +18,7 @@ board = "pico-w"
 vendor = "raspberry-pi"
 family = "rp2040"
 part = "rp2040"
-board_model = 22            # lamella_wire::board_model::PICO_W
+product_model = 22          # lamella_wire::product_model::PICO_W
 sources = ["Raspberry Pi Pico W datasheet (section 2.1 internal-function pin list; section 3.8 wireless interface; the Pico W Rev3 board schematic in the appendix, Figure 12)"]
 
 [memory]                    # the RP2040 has NO internal flash (chip flash = 0, gate-pinned) -- the
@@ -68,6 +68,7 @@ source = "Pico W datasheet section 2.1: 'GPIO23  OP wireless power on signal'. T
 [[devices]]
 name = "cyw43439-data"
 pin = "GP24"
+active = "none"
 source = "Pico W datasheet section 2.1: 'GPIO24  OP/IP wireless SPI data/IRQ' -- section 3.8 states why one pin carries three things: 'The Infineon CYW43439 DIN/DOUT and IRQ all share one pin on the RP2040. Only when an SPI transaction isn't in progress is it suitable to check for IRQs.' the schematic appendix, Figure 12, names the net WL_D."
 
 [[devices]]
@@ -79,6 +80,7 @@ source = "Pico W datasheet section 2.1: 'GPIO25  OP wireless SPI CS - when high 
 [[devices]]
 name = "cyw43439-clk"
 pin = "GP29"
+active = "none"
 source = "Pico W datasheet section 2.1: 'GPIO29  OP/IP wireless SPI CLK/ADC mode (ADC3) to measure VSYS/3'. Section 3.8 gives the sharing rule: 'The CLK is shared with VSYS monitor, so only when there isn't an SPI transaction in progress can VSYS be read via the ADC', and the interface 'typically runs at 33MHz'. The schematic appendix, Figure 12, names the net WL_CLK."
 
 # --- THE USER LED IS NOT ON THIS CHIP, AND THAT IS WHY THERE IS NO ROW FOR IT ------------------

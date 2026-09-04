@@ -31,7 +31,7 @@ pub const EXPRESSION_NAMES: [&str; EXPRESSION_KINDS] = [
 ///
 /// It lives on the [`Interpreter`](crate::Interpreter) rather than in a global. A global would be
 /// shared by every interpreter in the process, so a harness that builds a fresh realm per program
-/// -- which is exactly what the bench does, because the realm is a fixed cost that has to be timed
+/// -- which is exactly what the benchmark does, because the realm is a fixed cost that has to be timed
 /// separately -- would accumulate one program's counts into the next one's report.
 #[derive(Debug, Clone, Default)]
 pub struct NodeCounters {

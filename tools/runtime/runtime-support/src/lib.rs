@@ -433,6 +433,46 @@ fn format_f64(value: f64, buf: &mut [u8; F64_STR_CAP]) -> usize {
     sink.len
 }
 
+unsafe extern "C" {
+    /// The AMBIENT `System.String` descriptor, one word, laid by the AOT image (`arm32.rs`'s
+    /// `STRING_TYPEDESC_SYMBOL`). 0 when that build could not name `System.String`.
+    ///
+    /// **THIS ARCHIVE CANNOT SPELL A DESCRIPTOR SYMBOL**, which is the whole reason the word exists:
+    /// the emitter qualifies a reference-owned type's symbol with the owning build's hash, so
+    /// `System.String`'s name differs per image while this one does not.
+    static __lamella_string_typedesc: u32;
+}
+
+/// Allocate a `[len: u32][u16 units ...]` string of `units` code units, WITH ITS OBJECT HEADER.
+///
+/// **THE ONE WAY THIS ARCHIVE MAKES A STRING, AND THAT IS THE POINT RATHER THAN A TIDINESS.** Three
+/// seams each allocated their own and each passed `core::ptr::null()` as the descriptor, so a virtual
+/// call through any string they produced read its vtable through a null pointer and branched to a
+/// garbage PC -- a board LOCKUP, not a wrong answer. Extracting the allocation means a seam added
+/// later cannot get it wrong, because naming a descriptor is no longer something a seam does.
+///
+/// `None` (a null return) when the ambient descriptor is 0 -- a build that could not name
+/// `System.String` at all. **Every caller already treats a null string as the empty string**, so such
+/// an image degrades to empty text rather than hanging. That path is unreachable once the emitter
+/// refuses such a build on the host, and it is kept because a degradation that is dead is still
+/// cheaper than a hang that is not.
+fn alloc_string(units: u32) -> *mut u32 {
+    let type_desc = unsafe { core::ptr::read_volatile(&raw const __lamella_string_typedesc) };
+    if type_desc == 0 {
+        return core::ptr::null_mut();
+    }
+    let payload = match units.checked_mul(2).and_then(|n| n.checked_add(4)) {
+        Some(n) => n,
+        None => return core::ptr::null_mut(),
+    };
+    let obj = lamella_gc_alloc_impl(payload, type_desc as *const u32) as *mut u32;
+    if obj.is_null() {
+        return obj;
+    }
+    unsafe { core::ptr::write(obj, units) };
+    obj
+}
+
 /// `System.String.Substring(start, len)` on device: allocate a fresh `[len: u32][u16 units ...]` string
 /// and copy `len` code units starting at index `start` from the source string `s` (the same layout an
 /// `ldstr`/heap string presents). No bounds check -- an in-range call matches the interpreter exactly; the
@@ -440,12 +480,11 @@ fn format_f64(value: f64, buf: &mut [u8; F64_STR_CAP]) -> usize {
 /// Backs `String.Substring` and, through it, `Trim`/`TrimStart`/`TrimEnd`/`Remove`.
 #[no_mangle]
 extern "C" fn lamella_string_substring_impl(s: *const u32, start: u32, len: u32) -> *mut u32 {
-    let obj = lamella_gc_alloc_impl(4 + 2 * len, core::ptr::null()) as *mut u32;
+    let obj = alloc_string(len);
     if obj.is_null() {
         return obj;
     }
     unsafe {
-        core::ptr::write(obj, len);
         let src = (s as *const u8).add(4) as *const u16;
         let dst = (obj as *mut u8).add(4) as *mut u16;
         for i in 0..len {
@@ -458,12 +497,11 @@ extern "C" fn lamella_string_substring_impl(s: *const u32, start: u32, len: u32)
 /// `System.Char.ToString()` on device: a one-unit string holding the code unit `c`.
 #[no_mangle]
 extern "C" fn lamella_char_to_string_impl(c: u32) -> *mut u32 {
-    let obj = lamella_gc_alloc_impl(6, core::ptr::null()) as *mut u32;
+    let obj = alloc_string(1);
     if obj.is_null() {
         return obj;
     }
     unsafe {
-        core::ptr::write(obj, 1);
         core::ptr::write((obj as *mut u8).add(4) as *mut u16, c as u16);
     }
     obj
@@ -474,24 +512,445 @@ extern "C" fn lamella_char_to_string_impl(c: u32) -> *mut u32 {
 /// and every string reader / `Console.Write(string)` consumes (each ASCII digit widens to one code unit).
 /// The AOT synthesizes `Double.ToString`'s `[RuntimeProvided]` body to call this, and the managed
 /// `Console.Write/WriteLine(double)` = `Write(value.ToString())` reaches it in turn. The header word at
-/// `obj - 4` is a null type descriptor: the string is consumed only by the readers (which read `obj + 0`),
-/// never by a virtual dispatch, exactly like a string literal's descriptor-less blob.
+/// The result carries a real object header, like every other string: it is returned as a
+/// `System.String` and `Console.Write(double)` reaches it, so a caller may dispatch on it.
 #[no_mangle]
 extern "C" fn lamella_double_to_string_impl(value: f64) -> *mut u32 {
     let mut buf = [0u8; F64_STR_CAP];
     let len = format_f64(value, &mut buf);
-    let obj = lamella_gc_alloc_impl((4 + 2 * len) as u32, core::ptr::null()) as *mut u32;
+    let obj = alloc_string(len as u32);
     if obj.is_null() {
         return obj;
     }
     unsafe {
-        core::ptr::write(obj, len as u32);
         let units = (obj as *mut u8).add(4) as *mut u16;
         for (i, &b) in buf[..len].iter().enumerate() {
             core::ptr::write(units.add(i), b as u16);
         }
     }
     obj
+}
+
+/// A `core::fmt::Write` sink that widens each formatted ASCII byte to one UTF-16 code unit and writes
+/// it into a managed string's payload -- and, with a zero `cap`, MEASURES instead of writing.
+///
+/// **The two uses are the point.** A `no_std` archive cannot grow a buffer, and the length of
+/// `{:.*}` over an arbitrary `f64` is not bounded by anything this crate gets to choose: the managed
+/// `Double.Format` accumulates a precision specifier up to 1,000,000 before it clamps, so `"F1000"`
+/// is a legal call and its answer is a thousand-odd characters. A fixed stack buffer would silently
+/// TRUNCATE that -- a wrong answer, and the kind that reads as a bug in the program rather than in
+/// the runtime. So the seams run `write!` TWICE against the same value and format: once with
+/// `dst = null, cap = 0` to learn the exact byte count, then again into the string [`alloc_string`]
+/// sized from it. `core::fmt` is deterministic over the same value and spec, so the passes agree by
+/// construction.
+///
+/// `len` counts every byte OFFERED, not every byte stored, which is what makes pass 1 a measurement.
+/// `cap` still bounds the writes, so pass 2 cannot run past the allocation even if that premise were
+/// ever false -- a bound that costs one comparison and removes the need to trust the argument.
+///
+/// Byte-to-code-unit widening is exact here because every byte `core::fmt` produces for a FINITE
+/// `f64` under `{:.*}` / `{:.*e}` is ASCII (digits, `-`, `.`, `e`); the specials never reach a sink,
+/// being answered from their spelled-out text before any formatting runs.
+struct Utf16Sink {
+    dst: *mut u16,
+    cap: usize,
+    len: usize,
+}
+impl core::fmt::Write for Utf16Sink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < self.cap {
+                unsafe { core::ptr::write(self.dst.add(self.len), b as u16) };
+            }
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// How many bytes `write!(sink, "{value:.decimals$}")` would produce.
+fn measure_fixed(value: f64, decimals: usize) -> usize {
+    use core::fmt::Write;
+    let mut sink = Utf16Sink {
+        dst: core::ptr::null_mut(),
+        cap: 0,
+        len: 0,
+    };
+    let _ = write!(sink, "{value:.decimals$}");
+    sink.len
+}
+
+/// A managed string holding `text`, which must be ASCII (each byte widens to one code unit). Null
+/// when the heap or the ambient descriptor cannot serve it -- see [`alloc_string`], and note that
+/// every string READER treats a null string as the empty one.
+fn string_from_ascii(text: &[u8]) -> *mut u32 {
+    let obj = alloc_string(text.len() as u32);
+    if obj.is_null() {
+        return obj;
+    }
+    unsafe {
+        let units = (obj as *mut u8).add(4) as *mut u16;
+        for (i, &b) in text.iter().enumerate() {
+            core::ptr::write(units.add(i), b as u16);
+        }
+    }
+    obj
+}
+
+/// The spelled-out text of a non-finite `f64`, or `None` when it is finite. .NET's spelling is NOT
+/// `core::fmt`'s (`{}` gives `inf` / `-inf`), so the specials are answered from here rather than
+/// delegated -- exactly as the interpreter's `double_to_fixed` and `format_exponential` do.
+fn nonfinite_text(value: f64) -> Option<&'static [u8]> {
+    if value.is_nan() {
+        return Some(b"NaN");
+    }
+    if value.is_infinite() {
+        return Some(if value < 0.0 { b"-Infinity" } else { b"Infinity" });
+    }
+    None
+}
+
+/// `System.Double.ToFixed(double, int)` on device: the value with EXACTLY `decimals` fractional
+/// digits -- .NET's "F" body, and the digits the managed "N"/"C"/"P" specifiers then decorate.
+///
+/// The digits come from `core::fmt`'s `{:.*}`, which rounds the EXACT decimal value of the IEEE-754
+/// double half-to-even, byte-for-byte as .NET's fixed-point formatter does: `(2.005).ToString("F2")`
+/// is `2.00`, not `2.01`. That is the same call the INTERPRETER's `double_to_fixed` makes, so the two
+/// tiers agree by shared semantics rather than by two digit engines kept in step. A negative
+/// `decimals` clamps to zero, as there.
+///
+/// **`System.Single.ToFixed` has no seam of its own and must not get one**: the interpreter's Single
+/// body is `format!("{:.*}", decimals, f64::from(value))` -- this function applied to the widened
+/// value, and an `f32` widens to `f64` exactly. The AOT lowers the Single overload as a
+/// `Float32ToFloat64` convert into THIS symbol, which is one implementation instead of two that a
+/// later fix could reach only one of.
+#[no_mangle]
+extern "C" fn lamella_double_to_fixed_impl(value: f64, decimals: i32) -> *mut u32 {
+    use core::fmt::Write;
+    if let Some(text) = nonfinite_text(value) {
+        return string_from_ascii(text);
+    }
+    let decimals = if decimals > 0 { decimals as usize } else { 0 };
+    let len = measure_fixed(value, decimals);
+    let obj = alloc_string(len as u32);
+    if obj.is_null() {
+        return obj;
+    }
+    let mut sink = Utf16Sink {
+        dst: unsafe { (obj as *mut u8).add(4) as *mut u16 },
+        cap: len,
+        len: 0,
+    };
+    let _ = write!(sink, "{value:.decimals$}");
+    obj
+}
+
+/// How many bytes of `{value:.precision$e}` precede the `e`, and the exponent text that follows it.
+///
+/// `core::fmt` may deliver a formatted float in SEVERAL `write_str` chunks, so the split is tracked
+/// across calls rather than searched for in a finished buffer -- which is also why this cannot reuse
+/// [`Utf16Sink`]. `mantissa` counts the bytes before the `e`; `exp_len` bytes of `exp` hold the
+/// exponent's own text (`-308`, `0`, `100` -- Rust writes no `+` and no padding). An `f64`'s decimal
+/// exponent is at most three digits and a sign, so 8 bytes cannot overflow; the guard is kept anyway,
+/// because a dropped digit would be a silently wrong exponent rather than a visible failure.
+struct ExpScanSink {
+    mantissa: usize,
+    seen_e: bool,
+    exp: [u8; 8],
+    exp_len: usize,
+}
+impl core::fmt::Write for ExpScanSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.seen_e {
+                if self.exp_len < self.exp.len() {
+                    self.exp[self.exp_len] = b;
+                    self.exp_len += 1;
+                }
+            } else if b == b'e' {
+                self.seen_e = true;
+            } else {
+                self.mantissa += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `System.Double.ToExponential(double, int, bool)` on device: .NET's "E"/"e" layout -- a normalized
+/// mantissa carrying EXACTLY `precision` fractional digits, the `E`/`e` letter (`upper` picks the
+/// case), a MANDATORY sign, and an exponent padded to at least three digits: `1.234500E+003`.
+///
+/// `core::fmt`'s `{:.*e}` supplies the value-accurate normalized digits -- the same float engine
+/// behind `{:.*}`, so the mantissa matches .NET -- and only the exponent's sign-and-width layout is
+/// reshaped, because Rust writes `e-308` where .NET writes `E-308`, and `e0` where .NET writes
+/// `E+000`. That reshaping is character-for-character the interpreter's `format_exponential`.
+///
+/// `upper` arrives as `i32`, not `bool`: the managed parameter is a `bool`, but the AOT hands a seam
+/// the CIL representation, and an `extern "C"` `bool` holding anything but 0 or 1 is undefined
+/// behavior. It is tested `!= 0`, which is what the interpreter's
+/// `matches!(.., Value::Int32(flag) if flag != 0)` also does.
+///
+/// **`System.Single.ToExponential` has no seam of its own**, for the reason given on
+/// [`lamella_double_to_fixed_impl`]: the interpreter's Single body is this one applied to
+/// `f64::from(value)`, and the AOT widens at the call rather than duplicating the body.
+#[no_mangle]
+extern "C" fn lamella_double_to_exponential_impl(value: f64, precision: i32, upper: i32) -> *mut u32 {
+    use core::fmt::Write;
+    if let Some(text) = nonfinite_text(value) {
+        return string_from_ascii(text);
+    }
+    let precision = if precision > 0 { precision as usize } else { 0 };
+
+    let mut scan = ExpScanSink {
+        mantissa: 0,
+        seen_e: false,
+        exp: [0u8; 8],
+        exp_len: 0,
+    };
+    let _ = write!(scan, "{value:.precision$e}");
+
+    let mut tail = [0u8; 12];
+    let mut tail_len = 0usize;
+    if scan.seen_e {
+        let exp = parse_ascii_i32(&scan.exp[..scan.exp_len]).unwrap_or(0);
+        tail[0] = if upper != 0 { b'E' } else { b'e' };
+        tail[1] = if exp < 0 { b'-' } else { b'+' };
+        let mut digits = [0u8; 10];
+        let mut count = 0usize;
+        let mut magnitude = exp.unsigned_abs();
+        loop {
+            digits[count] = b'0' + (magnitude % 10) as u8;
+            count += 1;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        while count < 3 {
+            digits[count] = b'0';
+            count += 1;
+        }
+        for i in 0..count {
+            tail[2 + i] = digits[count - 1 - i];
+        }
+        tail_len = 2 + count;
+    }
+
+    let obj = alloc_string((scan.mantissa + tail_len) as u32);
+    if obj.is_null() {
+        return obj;
+    }
+    let units = unsafe { (obj as *mut u8).add(4) as *mut u16 };
+
+    let mut sink = Utf16Sink {
+        dst: units,
+        cap: scan.mantissa,
+        len: 0,
+    };
+    let _ = write!(sink, "{value:.precision$e}");
+    unsafe {
+        for (i, &b) in tail[..tail_len].iter().enumerate() {
+            core::ptr::write(units.add(scan.mantissa + i), b as u16);
+        }
+    }
+    obj
+}
+
+/// The `System.Decimal` entry points, in a module of their own so that they land in a codegen
+/// unit of their own and therefore in an archive member of their own. A program that does no
+/// decimal arithmetic references none of these names, so the link never pulls that member, and
+/// neither these entry points nor the 96-bit kernel behind them reach the image. Nothing else in
+/// this crate calls into them, which is what makes the boundary free to draw exactly here.
+///
+/// The profile section of `Cargo.toml` carries the measurement and the reason the LTO mode is what
+/// decides whether a module boundary is an archive boundary at all.
+mod decimal_seams {
+    /// `System.Decimal`'s kernel on device: the operations whose intermediates exceed 96 bits and so
+    /// cannot be done in the managed type's own `long` arithmetic -- the five arithmetic operators, the
+    /// value comparison, and the two `double` conversions. This one is `DecAdd`, behind `operator +`.
+    ///
+    /// Every one of them is `lamella_decimal`, the crate the interpreter calls for the same operation,
+    /// so a program gets the same sum whichever tier runs it and a rounding fix cannot land in one
+    /// tier and not the other. Nothing in this section reimplements any arithmetic; it is the C ABI
+    /// over that crate and nothing else.
+    ///
+    /// A `Decimal` crosses as a POINTER to the four inline words it already occupies -- `lo`, `mid`,
+    /// `hi`, `flags`, 16 bytes in field declaration order -- rather than by value. The caller is
+    /// holding those bytes already, and a pointer means the same thing in every argument position on
+    /// both instruction sets.
+    ///
+    /// Each entry point that can fail returns a STATUS and writes its result through `result` ONLY
+    /// when that status is success. A caller that ignored the status would read whatever the
+    /// destination held before, so the caller tests it and raises the exception it names instead of
+    /// loading. The numbering is `lamella_decimal`'s own -- `STATUS_OK`, and `Fault::status`, where 1
+    /// is `OverflowException` and 2 is `DivideByZeroException` -- taken from the crate rather than
+    /// restated here, so this archive and the code that calls it cannot disagree about what a 2 means.
+    ///
+    /// None of these allocates. Each writes into storage the caller already owns, so no collection can
+    /// run inside one and none needs a stack anchor, unlike the string-returning seams above, whose
+    /// allocation is exactly why they have one.
+    ///
+    /// # Safety
+    /// See [`decimal_operand`] and [`decimal_result`].
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_add(
+        a: *const u32,
+        b: *const u32,
+        result: *mut u32,
+    ) -> i32 {
+        decimal_result(
+            lamella_decimal::add(decimal_operand(a), decimal_operand(b)),
+            result,
+        )
+    }
+
+    /// `System.Decimal::DecSub(a, b)`, behind binary `operator -` and, through `Decimal.Zero - d`,
+    /// behind unary negation and `Decimal.Negate`.
+    ///
+    /// # Safety
+    /// See [`decimal_operand`] and [`decimal_result`].
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_subtract(
+        a: *const u32,
+        b: *const u32,
+        result: *mut u32,
+    ) -> i32 {
+        decimal_result(
+            lamella_decimal::subtract(decimal_operand(a), decimal_operand(b)),
+            result,
+        )
+    }
+
+    /// `System.Decimal::DecMul(a, b)`, behind `operator *`.
+    ///
+    /// # Safety
+    /// See [`decimal_operand`] and [`decimal_result`].
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_multiply(
+        a: *const u32,
+        b: *const u32,
+        result: *mut u32,
+    ) -> i32 {
+        decimal_result(
+            lamella_decimal::multiply(decimal_operand(a), decimal_operand(b)),
+            result,
+        )
+    }
+
+    /// `System.Decimal::DecDiv(a, b)`, behind `operator /`. A zero divisor produces the status for
+    /// `DivideByZeroException`, decided inside the kernel so that both tiers raise it for exactly the
+    /// same operands.
+    ///
+    /// # Safety
+    /// See [`decimal_operand`] and [`decimal_result`].
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_divide(
+        a: *const u32,
+        b: *const u32,
+        result: *mut u32,
+    ) -> i32 {
+        decimal_result(
+            lamella_decimal::divide(decimal_operand(a), decimal_operand(b)),
+            result,
+        )
+    }
+
+    /// `System.Decimal::DecRem(a, b)`, behind `operator %`. The result carries the DIVIDEND's sign,
+    /// as `Decimal.Remainder` does.
+    ///
+    /// # Safety
+    /// See [`decimal_operand`] and [`decimal_result`].
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_remainder(
+        a: *const u32,
+        b: *const u32,
+        result: *mut u32,
+    ) -> i32 {
+        decimal_result(
+            lamella_decimal::remainder(decimal_operand(a), decimal_operand(b)),
+            result,
+        )
+    }
+
+    /// `System.Decimal::Compare(a, b)`: `-1`, `0` or `1` by VALUE, so `1.0m` and `1.00m` compare
+    /// equal. Behind `CompareTo`, `Equals` and every relational operator.
+    ///
+    /// The ordering is written through `result` as one `int32` rather than returned, because the
+    /// return carries the status: aligning two scales can still overflow the working buffer, and a
+    /// caller has to be able to tell that from an answer of `1`.
+    ///
+    /// # Safety
+    /// `a` and `b` address the 16 bytes of a `Decimal`; `result` addresses a 4-byte `int32`.
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_compare(
+        a: *const u32,
+        b: *const u32,
+        result: *mut i32,
+    ) -> i32 {
+        match lamella_decimal::compare(decimal_operand(a), decimal_operand(b)) {
+            Ok(ordering) => {
+                core::ptr::write(result, ordering);
+                lamella_decimal::STATUS_OK
+            }
+            Err(fault) => fault.status(),
+        }
+    }
+
+    /// `System.Decimal::FromDouble(value)`: the `Decimal(double)` constructor and the explicit
+    /// `(decimal)d` conversion. .NET rounds the double to 15 significant decimal digits and expresses
+    /// that as a mantissa and a scale; a NaN, an infinity, or a magnitude outside the `Decimal` range
+    /// produces the status for `OverflowException`.
+    ///
+    /// # Safety
+    /// See [`decimal_result`].
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_from_double(value: f64, result: *mut u32) -> i32 {
+        decimal_result(lamella_decimal::from_double(value), result)
+    }
+
+    /// `System.Decimal::ToDouble(value)`: the `(double)dec` conversion, the 96-bit mantissa over
+    /// `10^scale`.
+    ///
+    /// It returns the `double` directly and carries no status, because it is the only operation in
+    /// this section that cannot fail: every representable `Decimal` has a nearest `double`.
+    ///
+    /// # Safety
+    /// See [`decimal_operand`].
+    #[no_mangle]
+    pub unsafe extern "C" fn lamella_decimal_to_double(value: *const u32) -> f64 {
+        lamella_decimal::to_double(decimal_operand(value))
+    }
+
+    /// Reads the four inline words a `Decimal` pointer addresses and decodes them.
+    ///
+    /// # Safety
+    /// `words` addresses the 16 bytes of a `Decimal`: four little-endian 32-bit words, `lo`, `mid`,
+    /// `hi`, `flags`.
+    unsafe fn decimal_operand(words: *const u32) -> lamella_decimal::Dec {
+        lamella_decimal::decode(*(words.cast::<[u32; 4]>()))
+    }
+
+    /// Writes the four result words on success and returns the status word either way: the one place
+    /// the seams above turn a kernel outcome into the two things a caller needs.
+    ///
+    /// The result is written only on success, and both operands have already been decoded into
+    /// registers by then, so `result` may safely alias either of them.
+    ///
+    /// # Safety
+    /// `result` addresses the 16 bytes of a `Decimal`.
+    unsafe fn decimal_result(
+        outcome: Result<[u32; 4], lamella_decimal::Fault>,
+        result: *mut u32,
+    ) -> i32 {
+        match outcome {
+            Ok(words) => {
+                core::ptr::write(result.cast::<[u32; 4]>(), words);
+                lamella_decimal::STATUS_OK
+            }
+            Err(fault) => fault.status(),
+        }
+    }
 }
 
 /// The `System.Console` output primitives the AOT backend synthesizes `[RuntimeProvided]` bodies against.
@@ -673,6 +1132,7 @@ core::arch::global_asm!(
     ".thumb",
     ".global lamella_thread_switch",
     ".thumb_func",
+    ".type  lamella_thread_switch, %function",
     "lamella_thread_switch:",
     "mov   r2, sp",
     "mov   r3, lr",
@@ -694,6 +1154,7 @@ core::arch::global_asm!(
     "subs  r1, #40",
     "ldmia r1!, {{r4-r7}}",
     "bx    r3",
+    ".size  lamella_thread_switch, . - lamella_thread_switch",
 );
 
 extern "C" {
@@ -821,6 +1282,7 @@ macro_rules! anchor_seam_shim {
             ".thumb",
             concat!(".global ", $name),
             ".thumb_func",
+            concat!(".type ", $name, ", %function"),
             concat!($name, ":"),
             "push {{r0-r3}}",
             "ldr  r0, =0x200030A4",
@@ -840,6 +1302,7 @@ macro_rules! anchor_seam_shim {
             "pop  {{r0-r3}}",
             "bx   r12",
             ".ltorg",
+            concat!(".size ", $name, ", . - ", $name),
         );
     };
 }
@@ -857,6 +1320,8 @@ anchor_seam_shim!("lamella_monitor_wait");
 anchor_seam_shim!("lamella_string_substring");
 anchor_seam_shim!("lamella_char_to_string");
 anchor_seam_shim!("lamella_double_to_string");
+anchor_seam_shim!("lamella_double_to_fixed");
+anchor_seam_shim!("lamella_double_to_exponential");
 anchor_seam_shim!("lamella_gc_walk_roots");
 anchor_seam_shim!("lamella_gc_count_roots");
 
@@ -1735,8 +2200,10 @@ core::arch::global_asm!(
     ".weak __lamella_stackmaps_start",
     ".weak __lamella_stackmaps_end",
     ".align 2",
+    ".type __lamella_stackmaps_start, %object",
     "__lamella_stackmaps_start:",
     ".word 0",
+    ".size __lamella_stackmaps_start, 4",
     "__lamella_stackmaps_end:",
 );
 

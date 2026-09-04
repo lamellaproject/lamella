@@ -14,7 +14,7 @@ publish = false
 # WireTransport for identify/status), and the wire debug backend TYPES. NO `baked` here -- see the `bake`
 # feature, which is the only thing that pulls lamella-load's `code-in-place`.
 lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb", "debug-backend"] }
-# The wire protocol types: Capabilities / Negotiated / ProfileIdentity / board_model for the HELLO identify path.
+# The wire protocol types: Capabilities / Negotiated / ProfileIdentity / product_model for the HELLO identify path.
 lamella-wire = { path = "../lamella-wire" }
 # The board/part fact tables and a board's resolution to its part row, and the RULE computed over
 # them. Both are shared with the `lamella` CLI rather than restated: a board that resolved one way

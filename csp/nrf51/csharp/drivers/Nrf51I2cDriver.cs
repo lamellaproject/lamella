@@ -109,7 +109,7 @@ public sealed class Nrf51I2cDriver : I2cDriver
 
     /// <summary>The block's write sequence: START, address+W, the bytes register-per-byte
     /// through TXD, STOP. Returns a status constant.</summary>
-    public override int Write(int address, byte[] buffer, int count)
+    public override int Write(int address, System.ReadOnlySpan<byte> buffer, int count)
     {
         Mmio.Write32(_address, (uint)(address & 0x7F));
         Mmio.Write32(_eventsTxdSent, 0);
@@ -130,7 +130,7 @@ public sealed class Nrf51I2cDriver : I2cDriver
     /// <summary>The block's read sequence: START, address+R, the bytes extracted through the
     /// SHORTS-paced RXD protocol (BB_SUSPEND between bytes, BB_STOP pre-armed so the hardware
     /// NACK-STOPs the last). Returns a status constant.</summary>
-    public override int Read(int address, byte[] buffer, int count)
+    public override int Read(int address, System.Span<byte> buffer, int count)
     {
         if (count < 1) return OtherError;
         Mmio.Write32(_address, (uint)(address & 0x7F));
@@ -145,8 +145,8 @@ public sealed class Nrf51I2cDriver : I2cDriver
     /// <summary>The block's write-then-read sequence: the write bytes go out with NO stop, then
     /// TASKS_STARTRX makes the hardware issue the REPEATED START for the read phase -- the
     /// register-read shape a sensor's sub-addressed read lives on.</summary>
-    public override int WriteRead(int address, byte[] writeBuffer, int writeCount,
-                                  byte[] readBuffer, int readCount)
+    public override int WriteRead(int address, System.ReadOnlySpan<byte> writeBuffer, int writeCount,
+                                  System.Span<byte> readBuffer, int readCount)
     {
         if (readCount < 1) return OtherError;
         Mmio.Write32(_address, (uint)(address & 0x7F));
@@ -167,7 +167,7 @@ public sealed class Nrf51I2cDriver : I2cDriver
         return DrainReceive(readBuffer, readCount);
     }
 
-    int DrainReceive(byte[] buffer, int count)
+    int DrainReceive(System.Span<byte> buffer, int count)
     {
         for (int index = 0; index < count; index++)
         {

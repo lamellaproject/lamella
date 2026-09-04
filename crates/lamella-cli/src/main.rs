@@ -25,6 +25,14 @@ fn main() -> ExitCode {
         Some("boards") => verdicts::boards_command(rest),
         Some("fit") => verdicts::fit_command(rest),
         Some("reconcile") => verdicts::reconcile_command(rest),
+        Some("--version" | "-V" | "version") => {
+            if let Some(extra) = rest.first() {
+                eprintln!("lamella version: takes no arguments, and got {extra:?}");
+                return ExitCode::FAILURE;
+            }
+            print!("{}", lamella_flash_routes::contracts::Contracts::of(TOOL_VERSION).describe());
+            ExitCode::SUCCESS
+        }
         Some("--help" | "-h" | "help") | None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -37,6 +45,9 @@ fn main() -> ExitCode {
     }
 }
 
+/// This binary's own package version.
+const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const USAGE: &str = "\
 usage:
   lamella devices [--identify]                       what is attached, and how to name it
@@ -47,6 +58,7 @@ usage:
   lamella boards                                     every board this build knows
   lamella fit --board <id> --image-bytes <n>         does an image of <n> bytes fit?
   lamella reconcile --board <id> [--read <name>=<v>] is the attached board the one assumed?
+  lamella version | --version                        this build, and the contracts it speaks
 
 THREE VERBS PUT A PROGRAM SOMEWHERE, AND THEY DIFFER IN WHAT THEY TAKE AND WHERE IT LANDS.
 
@@ -91,7 +103,9 @@ mod tests {
     /// gap between them is silent.
     #[test]
     fn the_usage_names_every_verb_the_dispatcher_accepts() {
-        for verb in ["devices", "run", "build", "flash", "deploy", "boards", "fit", "reconcile"] {
+        for verb in
+            ["devices", "run", "build", "flash", "deploy", "boards", "fit", "reconcile", "version"]
+        {
             assert!(
                 super::USAGE.contains(&format!("lamella {verb}")),
                 "the usage does not mention `lamella {verb}`"

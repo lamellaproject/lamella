@@ -17,6 +17,8 @@ thread_local! {
 /// Loads a program and starts a debug session, returning a 1-based handle, or 0 on
 /// a load failure.
 fn create(bytes: &[u8], pdb: Option<Vec<u8>>, corlib: Option<&[u8]>) -> u32 {
+    let bytes = lamella_load::resident_bytes(bytes);
+    let corlib = corlib.map(lamella_load::resident_bytes);
     let Ok(assembly) = lamella_metadata::Assembly::read(bytes) else {
         return 0;
     };
@@ -156,6 +158,7 @@ pub extern "C" fn lamella_dap_dispose(handle: u32) {
 pub extern "C" fn lamella_dap_selftest() -> i32 {
     let handle = create(
         include_bytes!("../../lamella-load/tests/fixtures/hello.dll"),
+        None,
         None,
     );
     if handle == 0 {

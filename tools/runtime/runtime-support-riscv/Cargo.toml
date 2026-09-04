@@ -12,12 +12,29 @@ name = "lamella-runtime-support-riscv"
 version = "0.0.0"
 edition = "2021"
 
+[dependencies]
+# The 96-bit System.Decimal kernel, the SAME crate the interpreter calls. A path dependency rather
+# than a copy: an image whose decimal arithmetic differed from the interpreter's would disagree
+# with the tier it was previewed on, one rounding decision at a time.
+lamella-decimal = { path = "../../../crates/lamella-decimal" }
+
 [lib]
 crate-type = ["staticlib"]
 
 [profile.release]
 opt-level = "s"
 panic = "abort"
-lto = true
+# THIN LTO AND A CODEGEN UNIT PER MODULE, for the reason this crate's own module documentation
+# already states and this profile used to prevent: the archive path pulls only the members a program
+# reaches, and fat LTO merges every codegen unit into ONE object, so there is only ever one member to
+# pull and every entry point in it is charged to every image. Thin LTO keeps a module in a member of
+# its own, which is what makes "pulled only when reached" true rather than merely intended. The unit
+# count is written out because setting `lto` at all defaults it to 1, which would undo the split.
+# `codegen-units` alone changes nothing while `lto` is fat, and `lto = false` splits the archive at a
+# per-image cost far larger than anything the split recovers; the sibling ARM archive's manifest
+# carries both numbers, measured on the ARM images the size ledger scores. There is no equivalent
+# per-image ledger on this side, so the saving here is UNMEASURED rather than assumed equal.
+lto = "thin"
+codegen-units = 16
 
 [workspace]

@@ -243,9 +243,10 @@ impl Device {
             let chosen = manager_devices(manager).into_iter().find(|&d| {
                 device_u16(d, "VendorID") == Some(vendor_id)
                     && device_u16(d, "ProductID") == Some(product_id)
-                    && serial.is_none_or(|want| {
-                        device_string(d, "SerialNumber").as_deref() == Some(want)
-                    })
+                    && crate::candidate_satisfies(
+                        serial,
+                        device_string(d, "SerialNumber").as_deref(),
+                    )
             });
             Self::open_chosen(manager, chosen)
         }

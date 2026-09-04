@@ -10,10 +10,13 @@ use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_Child, CM_Get_DevNode_PropertyW, CM_Get_DevNode_Registry_PropertyW, CM_Get_Device_IDW,
+    CM_Get_Parent, CM_Get_Sibling, CR_SUCCESS,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
 };
+use windows_sys::Win32::Devices::Properties::{DEVPROPKEY, DEVPROPTYPE};
 use windows_sys::Win32::Devices::Usb::{
     UsbdPipeTypeBulk, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetOverlappedResult,
     WinUsb_AbortPipe, WinUsb_Initialize, WinUsb_ResetPipe, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe,
@@ -47,7 +50,7 @@ const USB_DEVICE_GUID: GUID = GUID {
 };
 
 /// Device-interface paths (wide, null-terminated) for an interface-class GUID.
-unsafe fn iface_paths(guid: &GUID) -> Vec<Vec<u16>> {
+unsafe fn iface_paths(guid: &GUID) -> Vec<(Vec<u16>, u32)> {
     let mut out = Vec::new();
     let hdev = SetupDiGetClassDevsW(guid, null(), null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if hdev == INVALID_HANDLE_VALUE as isize {
@@ -66,7 +69,11 @@ unsafe fn iface_paths(guid: &GUID) -> Vec<Vec<u16>> {
             let mut buf = vec![0u8; needed as usize];
             let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
             (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
-            if SetupDiGetDeviceInterfaceDetailW(hdev, &ifd, detail, needed, null_mut(), null_mut()) != 0 {
+            let mut devinfo: SP_DEVINFO_DATA = std::mem::zeroed();
+            devinfo.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+            if SetupDiGetDeviceInterfaceDetailW(hdev, &ifd, detail, needed, null_mut(), &mut devinfo)
+                != 0
+            {
                 let p = (*detail).DevicePath.as_ptr();
                 let mut len = 0usize;
                 while *p.add(len) != 0 {
@@ -74,13 +81,198 @@ unsafe fn iface_paths(guid: &GUID) -> Vec<Vec<u16>> {
                 }
                 let mut w: Vec<u16> = std::slice::from_raw_parts(p, len).to_vec();
                 w.push(0);
-                out.push(w);
+                out.push((w, devinfo.DevInst));
             }
         }
         idx += 1;
     }
     SetupDiDestroyDeviceInfoList(hdev);
     out
+}
+
+/// A device's serial and product string, read from the PnP tree with **nothing opened**.
+///
+/// **READING THESE TWO STRINGS OUT OF THE USB DESCRIPTORS MEANS OPENING THE DEVICE, AND OPENING A
+/// DEBUG PROBE'S OWN INTERFACE MAKES IT RE-ENUMERATE -- WHICH ASSERTS NRST AND RESETS WHATEVER BOARD
+/// IT IS WIRED TO.** A listing must not disturb what it lists, and this one is reached by the
+/// command a user runs first when something is already wrong. Windows read both strings itself at
+/// enumeration time and cached them, so this asks the cache instead.
+///
+/// **THE WALK, AND IT IS ONE STEP.** A SIMPLE device's own instance id ends in the serial
+/// (`USB\VID_39E9&PID_0001\PICO-RP2040`). A COMPOSITE device's INTERFACE does not -- Windows names
+/// it `...&MI_00\7&81C4590&0&0000`, a port-derived id -- but its PARENT is the composite device
+/// itself, whose id does end in the serial:
+///
+/// ```text
+/// interface  USB\VID_0483&PID_374B&MI_00\7&81C4590&0&0000    synthesized
+/// parent     USB\VID_0483&PID_374B\0000FF000000000000000001  the serial
+/// ```
+///
+/// **THE GUARD IS THE VID/PID CHECK, and it is load-bearing rather than defensive.** One more step
+/// up from a composite device is the HUB, whose instance id is also `USB\...` and would parse as a
+/// perfectly plausible serial -- so a walk that did not check whose id it was reading would hand
+/// every device on one hub the SAME identity, and the selection ladder would then see one probe
+/// where several are attached. That is the wrong-board write this crate exists to prevent.
+///
+/// The product string is `DEVPKEY_Device_BusReportedDeviceDesc`: the USB `iProduct` string as the
+/// DEVICE reported it, not the INF's. The difference matters on a shared bench -- the INF-supplied
+/// `DEVICEDESC` reads "USB Composite Device" for every composite probe attached, while the
+/// bus-reported one distinguishes `STLINK-V3` from `STM32 STLink` from `Debug Probe (CMSIS-DAP)`.
+unsafe fn pnp_identity(devinst: u32, vendor_id: u16, product_id: u16) -> PnpIdentity {
+    let interface_name = bus_reported_name(devinst);
+    let own_id = device_instance_id(devinst);
+    let own_serial = own_id.as_deref().and_then(serial_from_instance_id);
+    if own_serial.is_some() {
+        return PnpIdentity { serial: own_serial, product: interface_name.clone(), interface_name };
+    }
+
+    let unresolved =
+        || PnpIdentity { serial: None, product: interface_name.clone(), interface_name: interface_name.clone() };
+    let mut parent: u32 = 0;
+    if CM_Get_Parent(&mut parent, devinst, 0) != CR_SUCCESS {
+        return unresolved();
+    }
+    let Some(parent_id) = device_instance_id(parent) else {
+        return unresolved();
+    };
+    if !instance_id_is_for(&parent_id, vendor_id, product_id) {
+        return unresolved();
+    }
+    let product = bus_reported_name(parent).or_else(|| interface_name.clone());
+    PnpIdentity { serial: serial_from_instance_id(&parent_id), product, interface_name }
+}
+
+/// What the PnP tree says about one interface, with nothing opened.
+struct PnpIdentity {
+    /// The DEVICE's serial, from whichever node actually carries it.
+    serial: Option<String>,
+    /// A name for the whole device, for telling one board from another.
+    product: Option<String>,
+    /// This interface's own name, for telling what the interface is FOR.
+    interface_name: Option<String>,
+}
+
+/// The devnode of this device's VENDOR-CLASS (`0xFF`) interface, if it has one.
+///
+/// **THIS IS HOW WINDOWS ANSWERS "IS THIS A VENDOR-BULK DEVICE" WITHOUT OPENING IT**. The interface
+/// class is in the node's COMPATIBLE IDS -- Windows writes `USB\Class_FF&SubClass_xx&Prot_xx` there
+/// when it enumerates the device -- so it costs a registry read and no handle.
+///
+/// Both shapes are checked, and missing the second is an easy mistake to make: a COMPOSITE device
+/// gets one child node per interface (`...&MI_00\...`), while a device with a single interface has
+/// the driver bound to the device node ITSELF and no interface children at all. Looking only at
+/// children would find every probe and miss every single-interface board, including ours.
+unsafe fn vendor_class_interface(devinst: u32) -> Option<u32> {
+    if compatible_ids(devinst).iter().any(|id| id.to_ascii_uppercase().contains("CLASS_FF")) {
+        return Some(devinst);
+    }
+    let mut child: u32 = 0;
+    if CM_Get_Child(&mut child, devinst, 0) != CR_SUCCESS {
+        return None;
+    }
+    loop {
+        if compatible_ids(child).iter().any(|id| id.to_ascii_uppercase().contains("CLASS_FF")) {
+            return Some(child);
+        }
+        let mut next: u32 = 0;
+        if CM_Get_Sibling(&mut next, child, 0) != CR_SUCCESS {
+            return None;
+        }
+        child = next;
+    }
+}
+
+/// A devnode's compatible ids -- a `REG_MULTI_SZ`, so a run of NUL-terminated strings.
+unsafe fn compatible_ids(devinst: u32) -> Vec<String> {
+    const CM_DRP_COMPATIBLEIDS: u32 = 0x03;
+    let mut len: u32 = 0;
+    CM_Get_DevNode_Registry_PropertyW(devinst, CM_DRP_COMPATIBLEIDS, null_mut(), null_mut(), &mut len, 0);
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; len as usize + 2];
+    if CM_Get_DevNode_Registry_PropertyW(
+        devinst,
+        CM_DRP_COMPATIBLEIDS,
+        null_mut(),
+        buf.as_mut_ptr().cast(),
+        &mut len,
+        0,
+    ) != CR_SUCCESS
+    {
+        return Vec::new();
+    }
+    let wide: &[u16] =
+        std::slice::from_raw_parts(buf.as_ptr().cast::<u16>(), (len as usize / 2).min(buf.len() / 2));
+    let mut out = Vec::new();
+    for part in wide.split(|&c| c == 0) {
+        if part.is_empty() {
+            continue;
+        }
+        out.push(String::from_utf16_lossy(part));
+    }
+    out
+}
+
+/// A devnode's instance id, e.g. `USB\VID_0483&PID_374B\0000FF000000000000000001`.
+unsafe fn device_instance_id(devinst: u32) -> Option<String> {
+    let mut buf = [0u16; 512];
+    if CM_Get_Device_IDW(devinst, buf.as_mut_ptr(), buf.len() as u32, 0) != CR_SUCCESS {
+        return None;
+    }
+    Some(wide_string(buf.as_ptr()))
+}
+
+/// The serial in an instance id's last segment, or `None` where that segment is Windows' own
+/// synthesized id rather than something the device reported.
+fn serial_from_instance_id(id: &str) -> Option<String> {
+    let last = id.rsplit('\\').next()?;
+    (!last.is_empty() && !is_synthesized_instance_id(last)).then(|| last.to_owned())
+}
+
+/// Whether an instance id names this exact vendor and product -- the check that keeps a parent walk
+/// from reading a HUB's identity as a device's own.
+fn instance_id_is_for(id: &str, vendor_id: u16, product_id: u16) -> bool {
+    let upper = id.to_ascii_uppercase();
+    upper.starts_with("USB\\")
+        && upper.contains(&format!("VID_{vendor_id:04X}"))
+        && upper.contains(&format!("PID_{product_id:04X}"))
+}
+
+/// `DEVPKEY_Device_BusReportedDeviceDesc` -- the USB `iProduct` string the DEVICE reported, cached
+/// by the hub driver at enumeration and readable without a handle.
+unsafe fn bus_reported_name(devinst: u32) -> Option<String> {
+    const KEY: DEVPROPKEY = DEVPROPKEY {
+        fmtid: GUID {
+            data1: 0x540B_947E,
+            data2: 0x8B40,
+            data3: 0x45BC,
+            data4: [0xA8, 0xA2, 0x6A, 0x0B, 0x89, 0x4C, 0xBD, 0xA2],
+        },
+        pid: 4,
+    };
+    let mut ty: DEVPROPTYPE = 0;
+    let mut len: u32 = 0;
+    CM_Get_DevNode_PropertyW(devinst, &KEY, &mut ty, null_mut(), &mut len, 0);
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize + 2];
+    if CM_Get_DevNode_PropertyW(devinst, &KEY, &mut ty, buf.as_mut_ptr(), &mut len, 0) != CR_SUCCESS
+    {
+        return None;
+    }
+    let s = wide_string(buf.as_ptr().cast::<u16>());
+    (!s.is_empty()).then_some(s)
+}
+
+/// A NUL-terminated wide string as a `String`.
+unsafe fn wide_string(p: *const u16) -> String {
+    let mut len = 0usize;
+    while *p.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
 }
 
 /// The VID and PID embedded in a device path ("...VID_XXXX&PID_YYYY...").
@@ -121,6 +313,7 @@ use crate::serial_matches;
 fn is_synthesized_instance_id(id: &str) -> bool {
     id.contains('&')
 }
+
 
 /// What a device path alone can say about whether this is the requested board.
 enum PathVerdict {
@@ -284,7 +477,38 @@ fn guid_from_str(s: &str) -> Option<GUID> {
 /// what a device is CALLED is worse than either being wrong alone** -- a tool selects by the name
 /// the list gave it and finds nothing.
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
-    unsafe { Ok(enumerate_iface(&DAP_V2_GUID)) }
+    unsafe { Ok(enumerate_vendor_class()) }
+}
+
+/// Every USB device with a vendor-class (`0xFF`) interface -- the SAME population macOS and Linux
+/// return, arrived at without opening anything.
+///
+/// **THE POPULATION IS THE INTERFACE CLASS, NOT A DRIVER BINDING.** A WinUSB interface GUID lists
+/// only devices whose DRIVER registered it, which is a narrower question than the one this function
+/// asks -- and a narrower one than the other two backends answer. An ST-Link is vendor-class and
+/// binds ST's own driver, so a GUID-based listing cannot see it; neither can it see a board whose
+/// interface has no driver bound at all, which is exactly the state a reflash pass has to find.
+///
+/// **BEING LISTED IS NOT BEING OPENABLE, and keeping those apart is the point.** Opening still goes
+/// through the WinUSB interface GUID, because that is what Windows can actually drive; a device
+/// listed here with no WinUSB binding fails at `open` with [`crate::diagnose`]'s `PresentUnbound`,
+/// which names the remedy. Hiding it instead reported "not attached" for a device sitting on the
+/// bus one driver install away from working.
+unsafe fn enumerate_vendor_class() -> Vec<DeviceInfo> {
+    let mut out = Vec::new();
+    for (path, devinst) in iface_paths(&USB_DEVICE_GUID) {
+        let Some((vendor_id, product_id)) = vid_pid_from_path(&path) else { continue };
+        let Some(interface) = vendor_class_interface(devinst) else { continue };
+        let identity = pnp_identity(devinst, vendor_id, product_id);
+        out.push(DeviceInfo {
+            vendor_id,
+            product_id,
+            serial_number: identity.serial.or_else(|| instance_id_from_path(&path)),
+            product: identity.product,
+            interface_name: bus_reported_name(interface).or(identity.interface_name),
+        });
+    }
+    out
 }
 
 /// List the devices registered under a caller-supplied interface GUID, with each device's
@@ -303,36 +527,16 @@ pub fn enumerate_guid(interface_guid: &str) -> Result<Vec<DeviceInfo>> {
 unsafe fn enumerate_iface(guid: &GUID) -> Vec<DeviceInfo> {
     let mut out = Vec::new();
     unsafe {
-        for path in iface_paths(guid) {
+        for (path, devinst) in iface_paths(guid) {
             let Some((vendor_id, product_id)) = vid_pid_from_path(&path) else { continue };
-            let mut info = DeviceInfo {
+            let identity = pnp_identity(devinst, vendor_id, product_id);
+            out.push(DeviceInfo {
                 vendor_id,
                 product_id,
-                serial_number: instance_id_from_path(&path),
-                product: None,
-            };
-            let h = CreateFileW(
-                path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-                null_mut(),
-            );
-            if h != INVALID_HANDLE_VALUE {
-                let mut wu: WINUSB_INTERFACE_HANDLE = null_mut();
-                if WinUsb_Initialize(h, &mut wu) != 0 {
-                    let (product, serial) = product_and_serial(wu);
-                    info.product = product;
-                    if serial.is_some() {
-                        info.serial_number = serial;
-                    }
-                    WinUsb_Free(wu);
-                }
-                CloseHandle(h);
-            }
-            out.push(info);
+                serial_number: identity.serial.or_else(|| instance_id_from_path(&path)),
+                product: identity.product,
+                interface_name: identity.interface_name,
+            });
         }
     }
     out
@@ -346,7 +550,7 @@ pub fn diagnose(interface_guid: &str, vendor_id: u16, product_id: u16) -> Result
     let matches = |guid: &GUID| unsafe {
         iface_paths(guid)
             .into_iter()
-            .any(|path| vid_pid_from_path(&path) == Some((vendor_id, product_id)))
+            .any(|(path, _)| vid_pid_from_path(&path) == Some((vendor_id, product_id)))
     };
     if matches(&guid) {
         return Ok(Binding::Bound);
@@ -463,15 +667,24 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
 
     fn open_with(guid: &GUID, vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
         unsafe {
-            for path in iface_paths(guid) {
+            for (path, devinst) in iface_paths(guid) {
                 if vid_pid_from_path(&path) != Some((vendor_id, product_id)) {
                     continue;
                 }
+                let settled_by_pnp = match pnp_identity(devinst, vendor_id, product_id).serial {
+                    Some(known) => {
+                        if !crate::candidate_satisfies(serial, Some(known.as_str())) {
+                            continue;
+                        }
+                        true
+                    }
+                    None => false,
+                };
                 let verdict = judge_path(serial, &path);
                 if matches!(verdict, PathVerdict::Mismatch) {
                     continue;
                 }
-                let matched_by_path = matches!(verdict, PathVerdict::Match);
+                let matched_by_path = settled_by_pnp || matches!(verdict, PathVerdict::Match);
                 let h = CreateFileW(
                     path.as_ptr(),
                     GENERIC_READ | GENERIC_WRITE,
@@ -633,7 +846,7 @@ impl Drop for Device {
 
 #[cfg(test)]
 mod tests {
-    use super::{judge_path, PathVerdict};
+    use super::{instance_id_is_for, judge_path, serial_from_instance_id, PathVerdict};
 
     /// A device-interface path as Windows spells it, wide and null-terminated.
     fn path(text: &str) -> Vec<u16> {
@@ -644,6 +857,37 @@ mod tests {
     const SIMPLE: &str = r"\?\usb#vid_39e9&pid_0001#7A5C9E20D14--with-a-serial#{guid}";
     /// A composite device's interface: the id is SYNTHESIZED and carries no serial at all.
     const COMPOSITE: &str = r"\?\usb#vid_0483&pid_374b#6&1a2b3c4d&0&0000#{guid}";
+
+    #[test]
+    fn a_serial_is_taken_from_an_instance_id_only_when_the_device_reported_one() {
+        assert_eq!(
+            serial_from_instance_id(r"USB\VID_0483&PID_374B\0000FF000000000000000001").as_deref(),
+            Some("0000FF000000000000000001"),
+            "a device node's last segment is the serial"
+        );
+        assert_eq!(
+            serial_from_instance_id(r"USB\VID_0483&PID_374B&MI_00\7&81C4590&0&0000"),
+            None,
+            "a synthesized id is not a serial"
+        );
+        assert_eq!(serial_from_instance_id(""), None, "an empty id is not a serial");
+        assert_eq!(serial_from_instance_id(r"USB\VID_0001&PID_0002\"), None, "nor a trailing one");
+    }
+
+    #[test]
+    fn only_a_node_naming_this_vendor_and_product_can_supply_this_devices_serial() {
+        assert!(instance_id_is_for(
+            r"USB\VID_0483&PID_374B\0000FF000000000000000001",
+            0x0483,
+            0x374b
+        ));
+        assert!(
+            !instance_id_is_for(r"USB\VID_05E3&PID_0610\6&1A396AE7&0&4", 0x0483, 0x374b),
+            "a hub names its own ids and must not answer for the device below it"
+        );
+        assert!(!instance_id_is_for(r"USB\VID_0483&PID_374E\0035004831", 0x0483, 0x374b));
+        assert!(instance_id_is_for(r"usb\vid_0483&pid_374b\0000FF00", 0x0483, 0x374b));
+    }
 
     #[test]
     fn no_requested_serial_takes_any_board() {

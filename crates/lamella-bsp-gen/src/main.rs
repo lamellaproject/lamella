@@ -14,7 +14,9 @@ fn usage() -> ExitCode {
          \x20      lamella-bsp-gen gen-family   <repo-root> <family>      write a v2 family's emissions\n\
          \x20      lamella-bsp-gen check-family <repo-root> <family>      fail if any v2 emission is stale\n\
          \x20      lamella-bsp-gen gen-parts    <repo-root> <family>      write a part family's emissions\n\
-         \x20      lamella-bsp-gen check-parts  <repo-root> <family>      fail if any part emission is stale"
+         \x20      lamella-bsp-gen check-parts  <repo-root> <family>      fail if any part emission is stale\n\
+         \x20      lamella-bsp-gen gen-ext      <repo-root> <extension>   write an extension board's emissions\n\
+         \x20      lamella-bsp-gen check-ext    <repo-root> <extension>   fail if an extension emission is stale"
     );
     ExitCode::from(2)
 }
@@ -22,7 +24,10 @@ fn usage() -> ExitCode {
 fn run_family(mode: &str, repo_root: &str, family: &str) -> ExitCode {
     let root = Path::new(repo_root);
     let parts = mode.ends_with("-parts");
-    let generated = if parts {
+    let extension = mode.ends_with("-ext");
+    let generated = if extension {
+        lamella_bsp_gen::strata::generate_extension(root, family)
+    } else if parts {
         lamella_bsp_gen::strata::generate_parts(root, family)
     } else {
         lamella_bsp_gen::strata::generate_family(root, family)
@@ -34,10 +39,20 @@ fn run_family(mode: &str, repo_root: &str, family: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let writer = if parts { "gen-parts" } else { "gen-family" };
+    let writer = if extension {
+        "gen-ext"
+    } else if parts {
+        "gen-parts"
+    } else {
+        "gen-family"
+    };
     let mut stale = false;
     for file in &generated {
         let out_path = root.join(&file.path);
+        if let Err(message) = refuse_case_fork(&out_path) {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
         if mode.starts_with("check") {
             match std::fs::read_to_string(&out_path) {
                 Ok(existing) if existing.replace("\r\n", "\n") == file.contents => {
@@ -69,12 +84,53 @@ fn run_family(mode: &str, repo_root: &str, family: &str) -> ExitCode {
     if stale { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
+/// Refuses to touch a target whose directory already holds a file differing from it only by CASE.
+///
+/// A GENERATOR THAT FORKS IS WORSE THAN ONE THAT FAILS, and this defect arrived reported from
+/// outside rather than from any gate here. A board named with an internal word boundary can be
+/// spelled two ways -- `MicrobitV1Bindings` against `MicroBitV1Bindings` -- and what happens next
+/// depends on the filesystem, with three different bad endings:
+///
+///   case-sensitive     two files. The build keeps compiling the committed one, which is now
+///                      stale and which no regeneration will ever touch again. It compiles
+///                      cleanly, because a stale binding is still valid source.
+///   case-insensitive   ONE file, whose CONTENT is replaced and whose NAME keeps the old
+///                      spelling. Nothing looks new, so the fork hides as an ordinary edit.
+///   mirrored between   whichever content the copy happens to walk last, matching neither the
+///                      generator's output nor what the repository holds.
+///
+/// `read_dir` reports the name as it is STORED, so one check covers all three: a mismatch that
+/// ignores case is the fork, whichever filesystem is underneath.
+fn refuse_case_fork(out_path: &std::path::Path) -> Result<(), String> {
+    let (Some(parent), Some(name)) = (out_path.parent(), out_path.file_name()) else {
+        return Ok(());
+    };
+    let intended = name.to_string_lossy().to_string();
+    let Ok(entries) = std::fs::read_dir(parent) else { return Ok(()) };
+    for entry in entries.filter_map(Result::ok) {
+        let present = entry.file_name().to_string_lossy().to_string();
+        if present != intended && present.eq_ignore_ascii_case(&intended) {
+            return Err(format!(
+                "{}: a file named '{present}' is already here and differs from the intended \
+                 '{intended}' only by case. Writing would FORK the artifact rather than update it \
+                 -- rename the existing file to the intended spelling first. The generated name is \
+                 the one that matches the type it declares.",
+                parent.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [mode, table_path, bsp_root] = args.as_slice() else {
         return usage();
     };
-    if matches!(mode.as_str(), "gen-family" | "check-family" | "gen-parts" | "check-parts") {
+    if matches!(
+        mode.as_str(),
+        "gen-family" | "check-family" | "gen-parts" | "check-parts" | "gen-ext" | "check-ext"
+    ) {
         return run_family(mode, table_path, bsp_root);
     }
     if mode != "gen" && mode != "check" {
