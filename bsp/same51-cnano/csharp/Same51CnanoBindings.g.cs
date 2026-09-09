@@ -10,10 +10,38 @@ namespace Lamella.Generated
         public const uint CARRIER_USB_VID = 0x03EB;
         public const uint CARRIER_USB_PID = 0x2175;
 
+        /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+        /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+        /// peripherals of the same kind can share no register at all, so a consumer that selects a
+        /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+        /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+        /// name a driver; and a uart is a different register map on every family, so the kind does
+        /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+        public const string VCP_DRIVER_FAMILY = "same54-sercom";
+
+        public const uint VCP_SERCOM_BASE = 0x43000400;
+        public const uint VCP_GCLK_PCHCTRL_REG = 0x40001D0C;
+        public const uint VCP_GCLK_PCHCTRL_VALUE = 0x40;
+        public const uint VCP_APB_MASK_REG = 0x40000820;
+        public const uint VCP_APB_MASK = 0x2;
+        public const uint VCP_PMUX_REG = 0x410080B8;
+        public const uint VCP_PMUX_PAIR = 0x22;
+        public const uint VCP_PMUX_TX_REG = 0x410080B8;
+        public const uint VCP_PMUX_TX_MASK = 0xF;
+        public const uint VCP_PMUX_TX_VALUE = 0x2;
+        public const uint VCP_PMUX_RX_REG = 0x410080B8;
+        public const uint VCP_PMUX_RX_MASK = 0xF0;
+        public const uint VCP_PMUX_RX_VALUE = 0x20;
+        public const uint VCP_PINCFG_TX_REG = 0x410080D0;
+        public const uint VCP_PINCFG_RX_REG = 0x410080D1;
+        public const uint VCP_TXPO = 0;
+        public const uint VCP_RXPO = 1;
+        public const uint VCP_BAUD_115200_DFLL48M_48MHZ = 0xF62C;
+
         public const uint LED0_PORT_BASE = 0x41008000;
         public const uint LED0_PIN = 14;
         public const uint LED0_MASK = 0x4000;
-        public const uint LED0_ACTIVE_LOW = 1;
+        public const uint LED0_ACTIVE_LOW = 0;
         public const uint BUTTON0_PORT_BASE = 0x41008000;
         public const uint BUTTON0_PIN = 15;
         public const uint BUTTON0_MASK = 0x8000;

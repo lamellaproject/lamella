@@ -78,3 +78,12 @@ pll_usb_postdiv2 = 5
 clk_peri_hz = 12000000      # DELIBERATELY UNTOUCHED: the usb bring-up leaves clk_peri on
                             # the crystal, so the uart keeps its exact 12 MHz divisor and a
                             # board running the usb wire still talks to a bridge at 115200.
+
+[debug]
+signals = ["swd"]
+exposure = "pads"
+fitted = "no"
+pitch_mm = 2.54
+onboard = "none"
+recovery = "mask-rom"
+source = "Raspberry Pi Pico Datasheet section 4.8: the RP2040 Serial Wire Debug interface reaches a 3 pin debug header on the lower edge of the board. The datasheet names a header and does not state that a connector is fitted; the same document says the board is designed to use soldered 0.1 inch pin-headers, so the three positions are a through-hole footprint rather than something a cable lands on. RP2040 Datasheet section 2.6.1: a 16 kB read-only memory at 0x00000000 whose contents are fixed at the time the silicon is manufactured, containing the flash boot sequence, the flash programming routines and a USB mass storage device with UF2 support. The recovery path is in silicon and no image written to flash can remove it."

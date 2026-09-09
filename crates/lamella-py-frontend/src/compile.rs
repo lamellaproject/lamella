@@ -276,10 +276,10 @@ fn collect_stmt_own_names(stmt: &Stmt) -> Uses {
         }
         StmtKind::ClassDef { bases, keywords, .. } => {
             for b in bases {
-                walk_expr_uses(b, &mut u);
+                walk_expr_uses(b.expr(), &mut u);
             }
-            for (_, value) in keywords {
-                walk_expr_uses(value, &mut u);
+            for keyword in keywords {
+                walk_expr_uses(keyword.expr(), &mut u);
             }
         }
         StmtKind::Decorated { decorators, inner } => {
@@ -404,23 +404,70 @@ pub fn resolve_relative_imports(
     module: &mut ModuleAst,
     module_name: &str,
 ) -> Result<(), CompileError> {
-    for stmt in &mut module.body {
-        let (relative, level) = match &mut stmt.kind {
+    resolve_relative_imports_in(&mut module.body, module_name)
+}
+
+/// The recursive half of [`resolve_relative_imports`], over ONE body.
+///
+/// EXHAUSTIVE ON PURPOSE, with no `_` arm. This pass walked `module.body` alone, so a relative
+/// import anywhere else -- inside a `def`, an `if`, a `try`, a class body -- kept its dots and
+/// reached [`check_import_resolved`], which reports an INTERNAL error about a caller that in fact
+/// called the pass correctly. `from .x import y` inside a `try` is ordinary Python and is how a
+/// package writes an optional import, so this was not an exotic position.
+///
+/// A statement kind added later that carries a body will not compile until this match is told what
+/// to do with it. That is the only thing that keeps a walk like this complete: the previous version
+/// could not have failed to compile, because it never claimed to visit anything.
+fn resolve_relative_imports_in(body: &mut [Stmt], module_name: &str) -> Result<(), CompileError> {
+    for stmt in body {
+        match &mut stmt.kind {
             StmtKind::ImportFrom { module, level, .. } | StmtKind::ImportStar { module, level } => {
-                (module, level)
+                if *level == 0 {
+                    continue;
+                }
+                let base = resolve_package(module_name, *level)?;
+                *module = if module.is_empty() { base } else { format!("{base}.{module}") };
+                *level = 0;
             }
-            _ => continue,
-        };
-        if *level == 0 {
-            continue;
+            StmtKind::FuncDef(func) => resolve_relative_imports_in(&mut func.body, module_name)?,
+            StmtKind::ClassDef { body, .. } | StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
+                resolve_relative_imports_in(body, module_name)?;
+            }
+            StmtKind::Decorated { inner, .. } => {
+                resolve_relative_imports_in(core::slice::from_mut(inner), module_name)?;
+            }
+            StmtKind::If { body, orelse, .. }
+            | StmtKind::While { body, orelse, .. }
+            | StmtKind::For { body, orelse, .. }
+            | StmtKind::ForIter { body, orelse, .. }
+            | StmtKind::AsyncFor { body, orelse, .. } => {
+                resolve_relative_imports_in(body, module_name)?;
+                resolve_relative_imports_in(orelse, module_name)?;
+            }
+            StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
+                resolve_relative_imports_in(body, module_name)?;
+                for handler in handlers {
+                    resolve_relative_imports_in(&mut handler.body, module_name)?;
+                }
+                resolve_relative_imports_in(orelse, module_name)?;
+                resolve_relative_imports_in(finalbody, module_name)?;
+            }
+            StmtKind::Return(_)
+            | StmtKind::Assign(_)
+            | StmtKind::MultiAssign { .. }
+            | StmtKind::TupleAssign { .. }
+            | StmtKind::SetItem { .. }
+            | StmtKind::SetAttr { .. }
+            | StmtKind::Expr(_)
+            | StmtKind::Delete(_)
+            | StmtKind::Nonlocal(_)
+            | StmtKind::Global(_)
+            | StmtKind::Raise { .. }
+            | StmtKind::Import { .. }
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Pass => {}
         }
-        let base = resolve_package(module_name, *level)?;
-        *relative = if relative.is_empty() {
-            base
-        } else {
-            format!("{base}.{relative}")
-        };
-        *level = 0;
     }
     Ok(())
 }
@@ -1061,9 +1108,30 @@ fn collect_class_body_bound(body: &[Stmt], bound: &mut BTreeSet<String>) {
                 collect_class_body_bound(body, bound);
                 collect_class_body_bound(orelse, bound);
             }
+            StmtKind::For { target, body, orelse, .. }
+            | StmtKind::ForIter { target, body, orelse, .. }
+            | StmtKind::AsyncFor { target, body, orelse, .. } => {
+                bound.insert(target.clone());
+                collect_class_body_bound(body, bound);
+                collect_class_body_bound(orelse, bound);
+            }
+            StmtKind::With { optional_target, body, .. }
+            | StmtKind::AsyncWith { optional_target, body, .. } => {
+                if let Some(target) = optional_target {
+                    let mut names = Vec::new();
+                    ast::target_bound_names(target, &mut names);
+                    for name in names {
+                        bound.insert(String::from(name));
+                    }
+                }
+                collect_class_body_bound(body, bound);
+            }
             StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
                 collect_class_body_bound(body, bound);
                 for handler in handlers {
+                    if let Some(name) = &handler.name {
+                        bound.insert(name.clone());
+                    }
                     collect_class_body_bound(&handler.body, bound);
                 }
                 collect_class_body_bound(orelse, bound);
@@ -1238,6 +1306,7 @@ fn compile_code_object(
         loops: Vec::new(),
         finallys: Vec::new(),
         handler_depth: 0,
+        stmt_stack_floor: 0,
         in_class_body: false,
         class_body_bound: BTreeSet::new(),
         current_class: current_class.map(String::from),
@@ -1486,9 +1555,17 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_comp_targets_expr(d, names, types);
             }
         }
+        StmtKind::Delete(targets) => {
+            for target in targets {
+                let mut bound = Vec::new();
+                delete_bound_names(target, &mut bound);
+                for name in bound {
+                    add_dynamic_local(name, names, types);
+                }
+            }
+        }
         StmtKind::Return(_)
         | StmtKind::Expr(_)
-        | StmtKind::Delete(_)
         | StmtKind::Nonlocal(_)
         | StmtKind::Global(_)
         | StmtKind::Break
@@ -1497,6 +1574,21 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
         | StmtKind::SetItem { .. }
         | StmtKind::SetAttr { .. }
         | StmtKind::Raise { .. } => {}
+    }
+}
+
+/// Collect the NAME leaves of one `del` target, descending through `(a, b)` / `[a, b]` groups.
+/// A subscript or attribute target contributes nothing: it unbinds an element of some object
+/// rather than a name in this scope.
+fn delete_bound_names<'e>(target: &'e Expr, out: &mut Vec<&'e str>) {
+    match target {
+        Expr::Name(name) => out.push(name),
+        Expr::Tuple(elems) | Expr::List(elems) => {
+            for elem in elems {
+                delete_bound_names(elem, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1936,6 +2028,7 @@ fn collect_comp_targets_expr(
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::None
+        | Expr::Ellipsis
         | Expr::Name(_) => {}
         Expr::Lambda { .. } => {}
         Expr::Yield(value) => {
@@ -2199,7 +2292,7 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
         }
         StmtKind::ClassDef { bases, body, .. } => {
             for b in bases {
-                walk_expr_uses(b, u);
+                walk_expr_uses(b.expr(), u);
             }
             walk_body_uses(body, u);
         }
@@ -2241,7 +2334,7 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
             u.direct.insert(n.clone());
         }
         Expr::Int(_) | Expr::Float(_) | Expr::Imaginary(_) | Expr::BigInt(_) | Expr::Bytes(_)
-        | Expr::Str(_) | Expr::Bool(_) | Expr::None => {}
+        | Expr::Str(_) | Expr::Bool(_) | Expr::None | Expr::Ellipsis => {}
         Expr::Lambda { params, body } => {
             let ret = synthesized(StmtKind::Return(Some((**body).clone())));
             let refs: Vec<&Stmt> = vec![&ret];
@@ -3098,6 +3191,14 @@ struct Compiler {
     /// `break`/`continue` that leaves a handler must clear that slot too -- otherwise a later bare
     /// `raise` would re-raise a stale, already-handled exception.
     handler_depth: usize,
+    /// The value-stack depth that is LIVE ACROSS statement boundaries at the current point, and so
+    /// the depth an exception handler must restore to rather than emptying the stack.
+    ///
+    /// It is 0 in a function or at module level, where a statement leaves nothing behind. A class
+    /// body is the exception: its name, base operand and any keyword values are pushed before the
+    /// body runs and are consumed by `BuildClass` after it, so they sit under every statement in
+    /// the body and a handler that truncated to 0 would discard the class being built.
+    stmt_stack_floor: u32,
     /// True while compiling the statements directly in a `class` body (not a nested def/lambda),
     /// so a bare-name read emits `LoadName` (namespace -> global -> built-in) instead of
     /// `LoadGlobal` -- letting a member read a name the body bound earlier.
@@ -3205,12 +3306,13 @@ impl Compiler {
             self.asm.emit(bc::Op::LoadName(idx));
             return;
         }
-        if self.scope == Scope::Module
-            && !self.in_class_body
-            && !self.module_def_totals.contains_key(name)
-        {
+        if self.scope == Scope::Module && !self.module_def_totals.contains_key(name) {
             let idx = self.name_index(name);
-            self.asm.emit(bc::Op::LoadGlobal(idx));
+            self.asm.emit(if self.in_class_body {
+                bc::Op::LoadName(idx)
+            } else {
+                bc::Op::LoadGlobal(idx)
+            });
             return;
         }
         if let Some(deref) = self.deref_slot(name) {
@@ -3247,6 +3349,69 @@ impl Compiler {
                 .expect("an assigned name is always a local (added by the pre-pass)");
             self.asm.emit(bc::Op::StoreFast(slot));
         }
+    }
+
+    /// Emit an unbinding of `name`, the exact mirror of [`Self::emit_store_name`]: a
+    /// `global`-declared name through `DeleteGlobal`, a class-body member through `DeleteName`, a
+    /// cell or free variable through `DeleteDeref`, and a plain local through `DeleteFast`. Each
+    /// delete op reaches the namespace its matching store op writes, so a name is always unbound
+    /// from the place it was bound.
+    ///
+    /// Both of Python's delete-by-name forms come through here: the `del` statement, and the
+    /// implicit unbinding of an `except ... as name` clause at the end of its handler.
+    fn emit_delete_name(&mut self, name: &str) {
+        if self.globals.contains(name) {
+            let idx = self.name_index(name);
+            self.asm.emit(bc::Op::DeleteGlobal(idx));
+            return;
+        }
+        if self.in_class_body {
+            let idx = self.name_index(name);
+            self.asm.emit(bc::Op::DeleteName(idx));
+            return;
+        }
+        if let Some(deref) = self.deref_slot(name) {
+            self.asm.emit(bc::Op::DeleteDeref(deref));
+        } else {
+            let slot = self
+                .local_slot(name)
+                .expect("a deleted name is always a local (added by the pre-pass)");
+            self.asm.emit(bc::Op::DeleteFast(slot));
+        }
+    }
+
+    /// Emit the unbinding of one `del` target.
+    ///
+    /// A target list is a TREE, not a flat sequence: `del a, (b, c), (d, [e, f])` deletes every
+    /// leaf, and an empty group (`del ()`) deletes nothing. Grouping carries no meaning of its own
+    /// here -- unlike an assignment target, where a group unpacks a value -- because a delete
+    /// produces no value to distribute, so `del (z)` and `del z` are the same statement.
+    fn compile_delete_target(&mut self, target: &Expr) -> Result<(), CompileError> {
+        match target {
+            Expr::Name(name) => self.emit_delete_name(name),
+            Expr::Subscript { value, index } => {
+                self.compile_expr(value)?;
+                self.compile_expr(index)?;
+                self.asm.emit(bc::Op::DeleteItem);
+            }
+            Expr::Attribute { value, attr } => {
+                self.compile_expr(value)?;
+                let name = self.name_index(attr);
+                self.asm.emit(bc::Op::DeleteAttr { name });
+            }
+            Expr::Tuple(elems) | Expr::List(elems) => {
+                for elem in elems {
+                    self.compile_delete_target(elem)?;
+                }
+            }
+            _ => {
+                return Err(error(
+                    "a del target must be a name, a subscript, an attribute, \
+                     or a group of those",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Emit one `LoadClosure` per free variable of a nested function (in that function's freevar
@@ -3434,29 +3599,7 @@ impl Compiler {
             }
             StmtKind::Delete(targets) => {
                 for target in targets {
-                    match target {
-                        Expr::Name(name) => {
-                            let slot = self.local_slot(name).ok_or_else(|| {
-                                error("cannot delete a name that is not a local in this scope")
-                            })?;
-                            self.asm.emit(bc::Op::DeleteFast(slot));
-                        }
-                        Expr::Subscript { value, index } => {
-                            self.compile_expr(value)?;
-                            self.compile_expr(index)?;
-                            self.asm.emit(bc::Op::DeleteItem);
-                        }
-                        Expr::Attribute { value, attr } => {
-                            self.compile_expr(value)?;
-                            let name = self.name_index(attr);
-                            self.asm.emit(bc::Op::DeleteAttr { name });
-                        }
-                        _ => {
-                            return Err(error(
-                                "a del target must be a name, a subscript, or an attribute",
-                            ));
-                        }
-                    }
+                    self.compile_delete_target(target)?;
                 }
                 Ok(())
             }
@@ -3810,7 +3953,7 @@ impl Compiler {
             self.compile_stmt(stmt)?;
         }
         self.asm.place(body_end);
-        self.asm.add_exc_entry(body_start, body_end, handler_start, 0);
+        self.asm.add_exc_entry(body_start, body_end, handler_start, self.stmt_stack_floor);
         for stmt in orelse {
             self.compile_stmt(stmt)?;
         }
@@ -3833,10 +3976,10 @@ impl Compiler {
             }
             self.handler_depth -= 1;
             if let Some(name) = &handler.name {
-                let slot = self
-                    .local_slot(name)
-                    .expect("the except-clause name is a local");
-                self.asm.emit(bc::Op::DeleteFast(slot));
+                let none = self.const_index(bc::Const::None);
+                self.asm.emit(bc::Op::LoadConst(none));
+                self.emit_store_name(name);
+                self.emit_delete_name(name);
             }
             self.asm.emit(bc::Op::PopExcept);
             self.asm.emit_jump(after);
@@ -4041,8 +4184,8 @@ impl Compiler {
     fn compile_classdef(
         &mut self,
         name: &str,
-        bases: &[Expr],
-        keywords: &[(String, Expr)],
+        bases: &[ast::ClassBase],
+        keywords: &[ast::ClassKeyword],
         body: &[Stmt],
         direct: bool,
     ) -> Result<(), CompileError> {
@@ -4064,26 +4207,84 @@ impl Compiler {
         };
         let name_const = self.const_index(bc::Const::Str(name.into()));
         self.asm.emit(bc::Op::LoadConst(name_const));
-        match bases {
-            [] => {
-                let none = self.const_index(bc::Const::None);
-                self.asm.emit(bc::Op::LoadConst(none));
-            }
-            [single] => self.compile_expr(single)?,
-            many => {
-                for b in many {
-                    self.compile_expr(b)?;
+        let plain_bases: Option<Vec<&Expr>> = bases
+            .iter()
+            .map(|b| match b {
+                ast::ClassBase::Plain(e) => Some(e),
+                ast::ClassBase::Star(_) => None,
+            })
+            .collect();
+        let plain_keywords: Option<Vec<(&String, &Expr)>> = keywords
+            .iter()
+            .map(|k| match k {
+                ast::ClassKeyword::Named(name, e) => Some((name, e)),
+                ast::ClassKeyword::Spread(_) => None,
+            })
+            .collect();
+        let mut ex_operands: Option<(u32, u32)> = None;
+        let mut narrow_kwnames: Vec<String> = Vec::new();
+        let header_slots;
+        match (&plain_bases, &plain_keywords) {
+            (Some(plain_bases), Some(plain_keywords)) => {
+                match plain_bases.as_slice() {
+                    [] => {
+                        let none = self.const_index(bc::Const::None);
+                        self.asm.emit(bc::Op::LoadConst(none));
+                    }
+                    [single] => self.compile_expr(single)?,
+                    many => {
+                        for b in many {
+                            self.compile_expr(b)?;
+                        }
+                        self.asm.emit(bc::Op::BuildTuple(many.len() as u32));
+                    }
                 }
-                self.asm.emit(bc::Op::BuildTuple(many.len() as u32));
+                for (name, value) in plain_keywords {
+                    self.compile_expr(value)?;
+                    narrow_kwnames.push((*name).clone());
+                }
+                header_slots = 2 + plain_keywords.len() as u32;
             }
-        }
-        for (_, value) in keywords {
-            self.compile_expr(value)?;
+            _ => {
+                let mut kinds: Vec<u8> = Vec::with_capacity(bases.len() + keywords.len());
+                let mut kwnames: Vec<String> = Vec::new();
+                for base in bases {
+                    match base {
+                        ast::ClassBase::Plain(e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(0);
+                        }
+                        ast::ClassBase::Star(e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(1);
+                        }
+                    }
+                }
+                for keyword in keywords {
+                    match keyword {
+                        ast::ClassKeyword::Named(name, e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(2);
+                            kwnames.push(name.clone());
+                        }
+                        ast::ClassKeyword::Spread(e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(3);
+                        }
+                    }
+                }
+                header_slots = 1 + kinds.len() as u32;
+                let kinds_idx = self.const_index(bc::Const::ArgKinds(kinds));
+                let kwnames_idx = self.const_index(bc::Const::KwNames(kwnames));
+                ex_operands = Some((kinds_idx, kwnames_idx));
+            }
         }
         self.asm.emit(bc::Op::SetupClassNamespace);
         let outer_in_class_body = self.in_class_body;
         let outer_class_bound = core::mem::take(&mut self.class_body_bound);
         self.in_class_body = true;
+        let outer_stack_floor = self.stmt_stack_floor;
+        self.stmt_stack_floor += header_slots;
         let doc = docstring_of(body.first())?;
         let doc_const = match doc {
             Some(text) => self.const_index(bc::Const::Str(text.into())),
@@ -4108,6 +4309,7 @@ impl Compiler {
                     let StmtKind::FuncDef(method) = &inner.kind else {
                         self.in_class_body = outer_in_class_body;
                         self.class_body_bound = outer_class_bound;
+                        self.stmt_stack_floor = outer_stack_floor;
                         return Err(error("only a method may be decorated in a class body"));
                     };
                     for decorator in decorators {
@@ -4135,12 +4337,17 @@ impl Compiler {
         }
         self.in_class_body = outer_in_class_body;
         self.class_body_bound = outer_class_bound;
-        if keywords.is_empty() {
-            self.asm.emit(bc::Op::BuildClass);
-        } else {
-            let names: Vec<String> = keywords.iter().map(|(k, _)| k.clone()).collect();
-            let kwnames = self.const_index(bc::Const::KwNames(names));
-            self.asm.emit(bc::Op::BuildClassKw { kwnames });
+        self.stmt_stack_floor = outer_stack_floor;
+        match ex_operands {
+            Some((kinds, kwnames)) => {
+                let site = self.asm.wide(kinds, kwnames);
+                self.asm.emit(bc::Op::BuildClassEx { site });
+            }
+            None if narrow_kwnames.is_empty() => self.asm.emit(bc::Op::BuildClass),
+            None => {
+                let kwnames = self.const_index(bc::Const::KwNames(narrow_kwnames));
+                self.asm.emit(bc::Op::BuildClassKw { kwnames });
+            }
         }
         self.emit_store_name(name);
         Ok(())
@@ -4647,6 +4854,10 @@ impl Compiler {
                 self.asm.emit(bc::Op::LoadConst(idx));
             }
             Expr::Name(name) => self.emit_load_name(name),
+            Expr::Ellipsis => {
+                let idx = self.const_index(bc::Const::Ellipsis);
+                self.asm.emit(bc::Op::LoadConst(idx));
+            }
             Expr::Attribute { value, attr } => {
                 self.compile_expr(value)?;
                 let name = self.name_index(attr);
@@ -5658,6 +5869,80 @@ mod tests {
         assert_eq!(resolved("top", "from math import sqrt\n").unwrap(), "math");
     }
 
+    /// The absolute name a relative import resolves to, WHEREVER it is written. [`resolved`] reads
+    /// `ast.body[0]`, so it can only ever see an import at the top of a module -- which is why the
+    /// test above could assert every dot-count and both error cases and still cover one nesting
+    /// position out of six.
+    fn resolved_anywhere(in_module: &str, source: &str) -> Result<String, CompileError> {
+        fn find(body: &[Stmt]) -> Option<(&str, u32)> {
+            for stmt in body {
+                let found = match &stmt.kind {
+                    StmtKind::ImportFrom { module, level, .. }
+                    | StmtKind::ImportStar { module, level } => Some((module.as_str(), *level)),
+                    StmtKind::FuncDef(func) => find(&func.body),
+                    StmtKind::ClassDef { body, .. }
+                    | StmtKind::With { body, .. }
+                    | StmtKind::AsyncWith { body, .. } => find(body),
+                    StmtKind::Decorated { inner, .. } => find(core::slice::from_ref(inner)),
+                    StmtKind::If { body, orelse, .. }
+                    | StmtKind::While { body, orelse, .. }
+                    | StmtKind::For { body, orelse, .. }
+                    | StmtKind::ForIter { body, orelse, .. }
+                    | StmtKind::AsyncFor { body, orelse, .. } => {
+                        find(body).or_else(|| find(orelse))
+                    }
+                    StmtKind::Try { body, handlers, orelse, finalbody, .. } => find(body)
+                        .or_else(|| handlers.iter().find_map(|h| find(&h.body)))
+                        .or_else(|| find(orelse))
+                        .or_else(|| find(finalbody)),
+                    _ => None,
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        let mut ast = parse(tokenize(source).expect("tokenizes")).expect("parses");
+        resolve_relative_imports(&mut ast, in_module)?;
+        let (module, level) = find(&ast.body).expect("the source has an import somewhere");
+        assert_eq!(level, 0, "resolution clears the level");
+        Ok(String::from(module))
+    }
+
+    #[test]
+    fn a_relative_import_resolves_at_every_nesting_position() {
+        for (position, source) in [
+            ("top level", "from .other import thing\n"),
+            ("a def", "def f():\n    from .other import thing\n"),
+            ("an if", "if True:\n    from .other import thing\n"),
+            ("an else", "if True:\n    pass\nelse:\n    from .other import thing\n"),
+            ("a while", "while True:\n    from .other import thing\n"),
+            ("a for", "for i in []:\n    from .other import thing\n"),
+            ("a for-else", "for i in []:\n    pass\nelse:\n    from .other import thing\n"),
+            ("a try", "try:\n    from .other import thing\nexcept ImportError:\n    pass\n"),
+            ("an except", "try:\n    pass\nexcept ValueError:\n    from .other import thing\n"),
+            ("a try-else", "try:\n    pass\nexcept ValueError:\n    pass\nelse:\n    from .other import thing\n"),
+            ("a finally", "try:\n    pass\nfinally:\n    from .other import thing\n"),
+            ("a with", "with x as h:\n    from .other import thing\n"),
+            ("a class body", "class C:\n    from .other import thing\n"),
+            ("a decorated def", "@tag\ndef f():\n    from .other import thing\n"),
+            ("two deep", "if True:\n    def f():\n        from .other import thing\n"),
+        ] {
+            assert_eq!(
+                resolved_anywhere("pkg.mod", source).expect(position),
+                "pkg.other",
+                "a relative import inside {position} resolves like one at the top"
+            );
+        }
+        assert_eq!(
+            resolved_anywhere("pkg.sub.deep", "def f():\n    from ..a import b\n").unwrap(),
+            "pkg.a"
+        );
+        let err = resolved_anywhere("main", "def f():\n    from . import x\n").unwrap_err();
+        assert!(err.message.contains("no known parent package"), "{}", err.message);
+    }
+
     #[test]
     fn a_relative_import_with_no_package_to_reach_is_refused_by_name() {
         let err = resolved("main", "from . import x\n").unwrap_err();
@@ -5970,6 +6255,63 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_name_is_unbound_from_the_scope_that_binds_it() {
+        let global = compile_src("g = 1\ndef f():\n    global g\n    del g\n").unwrap();
+        assert!(func(&global, "f").ops.iter().any(|op| matches!(op, Op::DeleteGlobal(_))));
+
+        let deref =
+            compile_src("def o():\n    v = 1\n    def i():\n        nonlocal v\n        del v\n")
+                .unwrap();
+        assert!(func(&deref, "o.i").ops.iter().any(|op| matches!(op, Op::DeleteDeref(_))));
+
+        let member = compile_src("class C:\n    x = 1\n    del x\n").unwrap();
+        assert!(member.body.ops.iter().any(|op| matches!(op, Op::DeleteName(_))));
+
+        let local = compile_src("def f():\n    x = 1\n    del x\n").unwrap();
+        assert!(func(&local, "f").ops.iter().any(|op| matches!(op, Op::DeleteFast(_))));
+    }
+
+    #[test]
+    fn a_del_target_list_is_a_tree_and_every_leaf_is_deleted() {
+        let nested =
+            compile_src("a=1\nb=2\nc=3\nd=4\ne=5\ndel a, (b, c), [d, e]\n").unwrap();
+        let deletes = nested.body.ops.iter().filter(|op| matches!(op, Op::DeleteFast(_))).count();
+        assert_eq!(deletes, 5, "one delete per name leaf");
+
+        let empty = compile_src("del ()\ndel []\n").unwrap();
+        assert!(!empty.body.ops.iter().any(|op| matches!(op, Op::DeleteFast(_))));
+    }
+
+    #[test]
+    fn an_except_clause_name_is_unbound_through_the_same_ladder_as_del() {
+        let in_class =
+            compile_src("class C:\n    try:\n        x = 1\n    except ValueError as e:\n        pass\n")
+                .unwrap();
+        assert!(in_class.body.ops.iter().any(|op| matches!(op, Op::DeleteName(_))));
+
+        let in_func = compile_src(
+            "def f():\n    try:\n        x = 1\n    except ValueError as e:\n        pass\n",
+        )
+        .unwrap();
+        assert!(func(&in_func, "f").ops.iter().any(|op| matches!(op, Op::DeleteFast(_))));
+    }
+
+    #[test]
+    fn a_class_bodys_handler_restores_the_stack_to_the_class_being_built() {
+        let plain =
+            compile_src("class C:\n    try:\n        x = 1\n    except ValueError:\n        pass\n")
+                .unwrap();
+        let depths: Vec<u32> = plain.body.exc_table.iter().map(|e| e.depth).collect();
+        assert_eq!(depths, vec![2], "name + base stay live under the body");
+
+        let in_func =
+            compile_src("def f():\n    try:\n        x = 1\n    except ValueError:\n        pass\n")
+                .unwrap();
+        let fn_depths: Vec<u32> = func(&in_func, "f").exc_table.iter().map(|e| e.depth).collect();
+        assert_eq!(fn_depths, vec![0]);
+    }
+
+    #[test]
     fn with_desugars_to_the_enter_exit_protocol() {
         let module = compile_src("with mgr() as x:\n    print(x)\n").unwrap();
         assert!(module.body.names.iter().any(|n| n == "__enter__"));
@@ -6011,6 +6353,40 @@ mod tests {
                     .message,
             },
         }
+    }
+
+    /// `del ...` is refused HERE, because a del target is validated where it is lowered.
+    ///
+    /// The parser refuses `... = 1` and the other assignment positions; a deletion is the one that
+    /// reaches this layer, so this is where it is asserted. The pair matters: `del Ellipsis` is
+    /// legal Python -- it unbinds an ordinary builtin name -- and only the LITERAL is refused.
+    #[test]
+    fn the_ellipsis_literal_cannot_be_deleted_but_the_name_can() {
+        assert!(
+            compile_err("del ...\n").contains("del target"),
+            "a del of the literal names what a del target may be, said {:?}",
+            compile_err("del ...\n")
+        );
+        assert!(compile_src("Ellipsis = 1\ndel Ellipsis\n").is_ok(), "the NAME is deletable");
+    }
+
+    /// `...` compiles to the singleton CONSTANT, not to a load of the builtin name.
+    ///
+    /// Those differ exactly when a program rebinds `Ellipsis`, which is legal: through the name,
+    /// `type(...)` answered `int` after `Ellipsis = 5`. The constant cannot be rebound.
+    #[test]
+    fn the_ellipsis_literal_compiles_to_a_constant() {
+        let m = compile_src("x = ...\n").expect("compiles");
+        assert!(
+            m.body.consts.contains(&bc::Const::Ellipsis),
+            "the ellipsis literal must reach the constant pool: {:?}",
+            m.body.consts
+        );
+        assert!(
+            !m.body.names.iter().any(|n| n == "Ellipsis"),
+            "and it must NOT be emitted as a load of the builtin name: {:?}",
+            m.body.names
+        );
     }
 
     #[test]
@@ -6947,6 +7323,85 @@ global x
         let f = func(&m, "C.f");
         assert!(f.ops.iter().any(|op| matches!(op, Op::LoadGlobal(_))), "method read stays global");
         assert!(!f.ops.iter().any(|op| matches!(op, Op::LoadName(_))));
+    }
+
+    #[test]
+    fn an_unpacked_class_header_takes_the_wide_op_and_nothing_else_does() {
+        for src in [
+            "class A(**d):\n    pass\n",
+            "class A(*bs):\n    pass\n",
+            "class A(B, *rest, tag=1, **kw):\n    pass\n",
+            "class A(**{}):\n    pass\n",
+        ] {
+            let module = compile_src(src).unwrap();
+            let ops = &module.body.ops;
+            assert!(
+                ops.iter().any(|op| matches!(op, Op::BuildClassEx { .. })),
+                "{src:?} unpacks, so it takes the wide op: {ops:?}"
+            );
+            assert!(!ops.iter().any(|op| matches!(op, Op::BuildClass | Op::BuildClassKw { .. })));
+        }
+        for src in ["class A:\n    pass\n", "class A(B):\n    pass\n", "class A(B, C):\n    pass\n"] {
+            let module = compile_src(src).unwrap();
+            assert!(
+                !module.body.ops.iter().any(|op| matches!(op, Op::BuildClassEx { .. })),
+                "{src:?} has no spread, so it keeps the narrow op"
+            );
+        }
+        let kw = compile_src("class A(B, tag=1):\n    pass\n").unwrap();
+        assert!(kw.body.ops.iter().any(|op| matches!(op, Op::BuildClassKw { .. })));
+        assert!(!kw.body.ops.iter().any(|op| matches!(op, Op::BuildClassEx { .. })));
+    }
+
+    #[test]
+    fn an_unpacked_class_header_tags_its_slots_bases_first() {
+        let module = compile_src("class A(B, tag=1, *rest, **kw):\n    pass\n").unwrap();
+        let site = module
+            .body
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::BuildClassEx { site } => Some(*site),
+                _ => None,
+            })
+            .expect("an unpacked header emits BuildClassEx");
+        let [kinds, kwnames] = module.body.wide_operands[site as usize];
+        assert_eq!(module.body.consts[kinds as usize], bc::Const::ArgKinds(vec![0, 1, 2, 3]));
+        assert_eq!(
+            module.body.consts[kwnames as usize],
+            bc::Const::KwNames(vec![String::from("tag")])
+        );
+    }
+
+    #[test]
+    fn a_spelled_metaclass_is_refused_and_a_spread_one_is_not_the_parsers_to_see() {
+        assert!(compile_err("class C(metaclass=M):\n    pass\n").contains("`metaclass=` is out of the subset"));
+        compile_src("class C(**{'metaclass': M}):\n    pass\n")
+            .expect("a spread metaclass compiles; the refusal is the runtime's");
+    }
+
+    #[test]
+    fn a_class_body_never_reads_a_module_slot() {
+        let module = compile_src("class C:\n    a = zip\nzip = 5\n").unwrap();
+        let ops = &module.body.ops;
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::LoadFast(_))),
+            "the class body must not read the module slot: {ops:?}"
+        );
+        assert!(ops.iter().any(|op| matches!(op, Op::LoadName(_))), "`zip` is read outward");
+        let unslotted = compile_src("class C:\n    a = zip\n").unwrap();
+        assert!(!unslotted.body.ops.iter().any(|op| matches!(op, Op::LoadFast(_))));
+    }
+
+    #[test]
+    fn a_class_body_reads_a_module_def_positionally() {
+        let src = "def which():\n    return 1\nclass D:\n    p = which\ndef which():\n    return 2\n";
+        let module = compile_src(src).unwrap();
+        assert!(
+            module.body.ops.iter().any(|op| matches!(op, Op::LoadFast(_))),
+            "a def-bound name is the one read that is positional: {:?}",
+            module.body.ops
+        );
     }
 
     #[test]

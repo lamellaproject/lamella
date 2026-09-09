@@ -58,3 +58,11 @@ kind = "gpio-in"
 pin = "PA2"
 active = "low"
 source = "SAM4E Xplained Pro user guide (Atmel-42216), mechanical buttons: SW0 on PA2; a button drives the I/O line to GND when pressed, and the guide adds that reading the button status requires the internal pull-up to be enabled. The other mechanical button is RESET, wired to NRST rather than to a port pin, so it is not a row here."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "The kit carries an EDBG that programs and debugs the part over SWD. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

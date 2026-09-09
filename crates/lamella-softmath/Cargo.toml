@@ -1,0 +1,12 @@
+[package]
+name = "lamella-softmath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The libm-free double rounding kernel shared by the interpreter's intrinsics and both AOT runtime-support archives."
+publish = false
+
+[lints]
+workspace = true

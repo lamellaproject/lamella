@@ -1,0 +1,43 @@
+# The SAMG55 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+#
+# THE TWO ROWS BELOW ARE PRESENT WHILE NO BOARD BINDS THEM, AND THAT IS DELIBERATE. This table is
+# CHIP truth -- which pad carries which peripheral signal on which function letter -- and for the
+# SAM G55 Xplained Pro's virtual COM port that is fully settled by Table 9-4. What is NOT settled
+# is FLEXCOM6's peripheral identifier, which is a field of ../instances.toml rather than of this
+# table, and which is why bsp/samg55-xpro binds no UART. Keeping the pad rows here means the
+# binding is one field away rather than one investigation away when somebody reads that id off
+# silicon.
+#
+# THE FUNCTION LETTER IS "B" AND ON THIS ARCHITECTURE THAT IS TWO REGISTER WRITES, NOT A NIBBLE.
+# blocks/pio.toml carries the encoding: ABCDSR1 holds the low bit and ABCDSR2 the high one, so
+# function B is ABCDSR1 bit set and ABCDSR2 bit clear. A driver that wrote a single selector
+# register -- which is what the sibling csp/sam3x's ABSR is -- would set the low bit correctly and
+# leave the high bit to whatever the reset value happened to be.
+
+[table]
+kind = "pins"
+family = "samg55"
+sources = [
+    "SAM G55 datasheet Atmel-11289F Table 9-4 (Multiplexing on PIO Controller B). The table has FOUR function columns -- Peripheral A, Peripheral B, Extra Function and System Function -- so a cell does not carry its own meaning and every row below records the letter alongside the pad",
+]
+notes = [
+    "PERIPHERAL A AND PERIPHERAL B ARE THE ONLY POPULATED FUNCTIONS ON THIS PART. The ABCDSR pair encodes four, and Table 9-3 and Table 9-4 print two; see blocks/pio.toml.",
+    "A FLEXCOM SIGNAL IS NAMED FOR THE MODE IT IS IN. The same pad is TXD6, SPI6_MOSI or TWD6 depending on what FLEXCOM6's mode register selects, and Table 9-4 prints all three in one cell. The `signal` field below names the USART reading because that is what a virtual COM port uses; an SPI or TWI binding on the same pad would be a different row with a different signal and the same function letter.",
+    "THE KIT GUIDE DISAGREES WITH THE DATASHEET ABOUT ONE OF THESE TWO PADS AND THE DATASHEET WINS. Atmel-42389 names PB0 as 'USART0 TXD' while naming PB1 'USART6 RXD' -- two instances for one link. Table 9-4 gives both pads to instance 6. Same class as the SAM R21 Xplained Pro guide's SERCOM0/SERCOM1 split; bsp/samg55-xpro's header states it against that board.",
+]
+
+[[pins]]
+pin = "PB0"
+function = "B"
+instance = "flexcom6"
+signal = "txd"
+source = "Atmel-11289F Table 9-4: the PB0 row carries SCK0/SPI0_SPCK in the Peripheral A column and TXD6/SPI6_MOSI/TWD6 in the Peripheral B column. The USART reading of the Peripheral B cell is TXD6, which is FLEXCOM6's transmit line. Corroborated as the board's TX pad by SAM G55 Xplained Pro user guide Atmel-42389, whose virtual COM port table names PB00 as the TX line -- while naming its instance USART0, which Table 9-4 refutes."
+
+[[pins]]
+pin = "PB1"
+function = "B"
+instance = "flexcom6"
+signal = "rxd"
+source = "Atmel-11289F Table 9-4: the PB1 row carries SCK4/SPI4_SPCK in the Peripheral A column and RXD6/SPI6_MISO/TWCK6 in the Peripheral B column. The USART reading is RXD6, FLEXCOM6's receive line. Corroborated by Atmel-42389's virtual COM port table, which names PB01 as the RX line AND names its instance USART6 -- agreeing with the datasheet where its own TX row does not."

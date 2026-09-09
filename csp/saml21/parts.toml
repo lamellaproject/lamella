@@ -1,0 +1,45 @@
+# The SAML21 parts table. The SAM L21 carries the MCLK/PCHCTRL clock architecture, as the SAM C21
+# does and the SAM D20/DA1/HA1/D21/R21 line does not -- and it shares NOT ONE ADDRESS with the C21.
+# Same architecture, different map:
+#
+#     block       SAM C21       SAM L21
+#     MCLK        0x40000800    0x40000400
+#     GCLK        0x40001C00    0x40001800
+#     PORT        0x41000000    0x40002800
+#     SERCOM0     0x42000400    0x42000000
+#
+# So "it is a PCHCTRL part" says which GENERATOR ARM resolves it and nothing about where anything
+# sits. Every value in instances.toml was read off this part's own Table 14-1.
+#
+# THIS PART HAS TWO RAM REGIONS AND THE SCHEMA HAS ONE FIGURE. Ch 2 states System SRAM and
+# Low-power SRAM as separate rows -- 32 KB and 8 KB on the 18 density code -- at different
+# addresses in different power domains. The `ram` field below is the SYSTEM SRAM alone, which is
+# the contiguous span a linker can believe, and the low-power region is documented-excluded rather
+# than summed -- because a program needing one arena cannot use a total that spans two regions it
+# would have to address separately.
+
+[table]
+kind = "parts"
+family = "saml21"
+sources = [
+    "SAM L21 Family Data Sheet DS60001477E (2023): ch 2 (configuration summary), ch 7 (I/O multiplexing), ch 14 (peripherals configuration summary)",
+]
+notes = [
+    "THE PAD LIST IS COMPLETE FOR THE J PACKAGE AND IS CHECKED AGAINST AN INDEPENDENTLY PRINTED COUNT. Table 7-1's SAML21J column numbers each pad, and ch 2's 'General Purpose I/O-pins' row gives 51 for the 64-pin part. The list counts 51.",
+    "PA28 DOES NOT EXIST ON THIS PART. It is absent from Table 7-1 entirely, which is a difference from the SAM D20, SAM DA1 and SAM C21 -- all of which bond a PA28 on their 64-pin packages. Neither do PA26 or PA29 exist here.",
+    "TWO PORT GROUPS. The pad set reaches PB and no further.",
+    "TC2 AND TC3 ARE NOT SUPPORTED ON THE SAM L21G -- Table 7-1's note 3. No board on this roster is a G part; recorded because the G shares this table with the J and a reader taking the table for the family would carry a timer the G does not have.",
+    "THE LOW-POWER SRAM IS NOT IN THE `ram` FIGURE. Ch 2 rows it separately at 8 KB for this density. A program that wants it is asking for a second region at its own address, which nothing in this schema can express yet.",
+]
+
+[[parts]]
+part = "atsaml21j18b"
+package = "64-pin TQFP"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "PA00-PA25", "PA27", "PA30-PA31",
+    "PB00-PB17", "PB22-PB23", "PB30-PB31",
+]
+source = "DS60001477E Table 7-1 (PORT Function Multiplexing), whose SAML21J column gives a package pin number for each pad above and none for PA26, PA28 or PA29. The list counts 51 and ch 2's 64-pin column states 51 General Purpose I/O-pins. Flash 256 KB and System SRAM 32 KB are ch 2's 64-pin column for the 18 density code, whose Flash row reads 256/128/64-KB and System SRAM row 32/16/8-KB. The part also carries 8 KB of Low-power SRAM, rowed separately there and deliberately not summed here."
+

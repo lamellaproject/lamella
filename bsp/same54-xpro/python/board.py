@@ -87,6 +87,7 @@ INSTANCES = {
     "portb": {"block": "port", "base": 0x41008080, "apb_mask_offset": 0x18, "apb_bit": 0x4},
     "portc": {"block": "port", "base": 0x41008100, "apb_mask_offset": 0x18, "apb_bit": 0x4},
     "portd": {"block": "port", "base": 0x41008180, "apb_mask_offset": 0x18, "apb_bit": 0x4},
+    "eic": {"block": "eic", "base": 0x42001800, "gclk_core_id": 0x7, "apb_mask_offset": 0x14, "apb_bit": 0xA},
 }
 
 PLANS = {

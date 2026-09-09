@@ -1,6 +1,7 @@
 # Builds Lamella's managed (C#) sources into the assemblies the runtime loads.
 #
 #   pwsh -File build-managed.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>]
+#   pwsh -File build-managed.ps1 -PrintSurface        # the default symbols, one per line
 #
 # The Rust side is `cargo build`; this is the other half. It compiles `corlib/` and every
 # assembly under `libs/` with `lcsc` (this repository's C# compiler, built from `crates/lcsc`),
@@ -20,7 +21,11 @@
 param(
     [string]$OutDir = 'managed',
     [string]$Lcsc,
-    [string[]]$Define
+    [string[]]$Define,
+    # Print the default surface and exit, so anything that needs to know what a plain build compiles
+    # asks this script instead of pattern-matching its text. A reader of the text cannot tell a
+    # member of the list from a symbol named anywhere else in the file.
+    [switch]$PrintSurface
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +47,7 @@ $DefaultSurface = @(
     'LAMELLA_SURFACE_NET',
     'LAMELLA_SURFACE_NET_TLS',
     'LAMELLA_NET_2_0',
+    'LAMELLA_SURFACE_GENERICS',
     'LAMELLA_SURFACE_NETFX_1_1',
     'LAMELLA_SURFACE_NETFX_2_0',
     'LAMELLA_SURFACE_NETFX_4_0',
@@ -49,17 +55,42 @@ $DefaultSurface = @(
     'LAMELLA_SURFACE_FILE_IO',
     'LAMELLA_SURFACE_SERIAL',
     'LAMELLA_SURFACE_STRING_COMPARISON',
-    'LAMELLA_SURFACE_REFLECTION'
+    'LAMELLA_SURFACE_REFLECTION',
+    # `System.Device.Gpio`'s I2C and SPI facades take `Span<byte>` and `ReadOnlySpan<byte>`, which
+    # are Microsoft's signatures for those members. The symbol brings `corlib/System/Span.cs` into
+    # the compile; without it those facades name a type that does not exist and the assembly listed
+    # below cannot be built at all.
+    'LAMELLA_SURFACE_SPAN'
 )
+if ($PrintSurface) { $DefaultSurface | ForEach-Object { Write-Output $_ }; exit 0 }
 if (-not $Define) { $Define = $DefaultSurface }
+
+# A capability that cannot stand on its own names what it rests on. A surface offering the members
+# without the capability behind them describes an image nobody can build, so it is refused here
+# rather than emerging as a missing type several assemblies later. The sources carry the same pairs
+# in their own `#if`, so the rule holds for any build path; this turns "you get an empty assembly"
+# into "you get told why".
+$SurfaceRequires = [ordered]@{
+    'LAMELLA_SURFACE_NETFX_2_0' = @('LAMELLA_SURFACE_GENERICS')
+    'LAMELLA_SURFACE_SERIAL'    = @('LAMELLA_SURFACE_NETFX_2_0')
+    'LAMELLA_SURFACE_SPAN'      = @('LAMELLA_SURFACE_GENERICS')
+}
+foreach ($symbol in $SurfaceRequires.Keys) {
+    if ($Define -notcontains $symbol) { continue }
+    foreach ($required in $SurfaceRequires[$symbol]) {
+        if ($Define -notcontains $required) {
+            throw "$symbol requires $required. Add $required to -Define, or drop $symbol."
+        }
+    }
+}
 
 # Every assembly under libs/, in an order where each is built after what it references. `references`
 # names other entries in this list; all of them reference the corlib implicitly.
 $Assemblies = @(
     @{ name = 'Lamella.Hardware';                      references = @() },
     # `System.Device.Pwm`'s sources build INTO this assembly and it gets no assembly of its own:
-    # upstream ships `PwmChannel` inside `System.Device.Gpio.dll`, and converging on upstream is the
-    # standing rule. The namespace is unchanged; only the assembly is.
+    # upstream ships `PwmChannel` inside `System.Device.Gpio.dll`. The namespace is unchanged;
+    # only the assembly is.
     @{ name = 'System.Device.Gpio';                    references = @(); extraSources = @('System.Device.Pwm') },
     @{ name = 'System.Device.Model';                   references = @() },
     @{ name = 'System.Net.NetworkInformation';         references = @() },
@@ -85,12 +116,10 @@ $Assemblies = @(
     # own name with no prefix -- unlike the nanoFramework rows above, whose namespaces are `System.*`.
     # It shims onto System.Device.Gpio and so is built after it.
     #
-    # HELD, and the hold is the same one `tools/build-corlib.ps1`'s `$buildSpot` already carries: this
-    # tier needs nested-type identity, which the compiler that builds it does not yet have. That
-    # script gates it and this one did not, so the row arrived here unconditional and took the whole
-    # script down with it. Delete the `held` line when the compiler lands it; nothing else changes.
+    # HELD: this tier needs nested-type identity, which the compiler that builds it does not yet
+    # have. The row stays in the list and is reported on every run rather than dropped.
     @{ name = 'Microsoft.SPOT.Hardware';                references = @('System.Device.Gpio');
-       held = 'nested-type identity; see $buildSpot in tools/build-corlib.ps1' }
+       held = 'nested-type identity' }
 )
 
 # An assembly present on disk but missing from the list above would be silently skipped, and a
@@ -98,9 +127,8 @@ $Assemblies = @(
 #
 # A FOLDED directory counts as listed. `extraSources` names a source set that builds INTO another
 # assembly rather than getting one of its own, so its files ARE compiled and the rot this guard
-# exists to catch cannot reach them. Reading only `name` made the first fold refuse the whole
-# script -- the guard fired on `System.Device.Pwm` the moment it stopped being an assembly, which
-# is the one shape a completeness check must not treat as absence.
+# exists to catch cannot reach them. A folded directory must therefore be read from `extraSources`
+# as well as from `name`, or the guard reports it as absent the moment it stops being an assembly.
 $onDisk = @(Get-ChildItem (Join-Path $root 'libs') -Directory |
     Where-Object { $_.Name -ne 'checks' } | ForEach-Object { $_.Name } | Sort-Object)
 $listed = @($Assemblies | ForEach-Object { $_.name; $_.extraSources } |
@@ -137,9 +165,19 @@ $defineArg = @("/define:$($Define -join ';')")
 # is compiled as C# 1.0 and refuses a 2.0 construct anywhere in these sources, which is what keeps a
 # 1.0 build honest; passing no version at all would instead inherit whatever the compiler's own
 # default is, and that default is the newest language version it supports.
+#
+# The rungs are ordered lowest first and each one overwrites the last, so the highest capability in
+# the surface decides the version. `Span<T>` is a `readonly ref struct` with byref-returning members
+# -- C# 7.2 constructs, refused at 2 with CS8023 -- so its symbol and its language version have to
+# move together. The property the paragraph above is about survives: WITHOUT the symbol you stay on
+# the lower rung, so a surface that does not offer spans still refuses a 7.2 construct anywhere in
+# these sources.
 $langArg = @('/langversion:1')
 if ($Define -contains 'LAMELLA_SURFACE_NETFX_2_0' -or $Define -contains 'LAMELLA_SURFACE_GENERICS') {
     $langArg = @('/langversion:2')
+}
+if ($Define -contains 'LAMELLA_SURFACE_SPAN') {
+    $langArg = @('/langversion:7.2')
 }
 
 # Sorted, so the emitted metadata does not depend on the filesystem's enumeration order.
@@ -179,9 +217,7 @@ if ($LASTEXITCODE -ne 0) { throw "corlib compile failed ($LASTEXITCODE)" }
 $built = @('corlib.dll')
 foreach ($assembly in $Assemblies) {
     $name = $assembly.name
-    # A held row is announced on every run rather than skipped quietly: a source set nothing
-    # compiles is the rot this script's completeness guard exists to catch, and a silent skip
-    # would reintroduce it one field lower down.
+    # A held row is reported rather than skipped quietly, so the list stays complete.
     if ($assembly.held) {
         Write-Host "$name -- HELD, not built: $($assembly.held)"
         continue
@@ -203,6 +239,13 @@ foreach ($assembly in $Assemblies) {
     $built += "$name.dll"
 }
 
+# An assembly this script STOPPED producing is the one file in $out nothing overwrites, so it sits
+# there at its old date presenting a surface no source in the tree still describes. The Pwm fold
+# left exactly that: a 6-day-old System.Device.Pwm.dll beside the System.Device.Gpio.dll that now
+# carries PwmChannel, so the type resolved from two assemblies at once and the fold looked half
+# done to anything reading the directory. Only names this script OWNS are removed -- $out also
+# holds board assemblies written by build-boards.ps1, so a blanket clean would delete another
+# script's output.
 $folded = @($Assemblies | ForEach-Object { $_.extraSources } | Where-Object { $_ })
 $heldOut = @($Assemblies | Where-Object { $_.held } | ForEach-Object { $_.name })
 foreach ($gone in @($folded + $heldOut)) {
@@ -218,6 +261,7 @@ foreach ($f in (Get-ChildItem $out -Filter *.dll | Sort-Object Name)) {
     Write-Host ("  {0,-34} {1,9:N0} bytes" -f $f.Name, $f.Length)
 }
 Write-Host ''
-# What this RUN produced, not what the directory holds. The two differ whenever a previous run
-# wrote something this one does not.
+# What this RUN produced, not what the directory holds: the two differ whenever a previous run
+# wrote something this one does not, so a count over the directory can report a stale file as a
+# fresh one.
 Write-Host "Done. $($built.Count) assemblies built into $out ($((Get-ChildItem $out -Filter *.dll).Count) .dll files there, board assemblies included)"

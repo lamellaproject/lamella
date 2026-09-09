@@ -2,13 +2,17 @@
 
 use crate::ast::{
     Accessor, AssignmentOperator, Attribute, AttributeArgument, AttributeSection, BinaryOperator,
-    CatchClause, CompilationUnit, ConstructorInitializer, ConstructorInitializerKind, LambdaBody,
+    Argument, ArgumentName,
+    TupleElement, TupleElementExpr,
+    CatchClause, CompilationUnit, ConstructorInitializer, ConstructorInitializerKind,
+    DeconstructionTarget, LambdaBody,
     LambdaParameter,
     ConversionDirection, DelegateDecl, EnumDecl, EnumMember, Expr, ExprKind, ForInitializer,
     GotoTarget, Initializer, InterpolationPart, Literal, Member, MemberInitializer,
     MemberInitializerValue, Modifier,
     NamespaceDecl, NamespaceMember, OverloadableOperator,
-    Parameter, ParameterModifier, PostfixOperator, PredefinedType, QualifiedName, RecordParts,
+    CollectionElement, Parameter, ParameterModifier, PostfixOperator, PredefinedType,
+    Pattern, QualifiedName, RecordParts, SwitchArm,
     RefPosition,
     Stmt, StmtKind,
     SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeParameter, TypeParameterConstraint,
@@ -265,6 +269,16 @@ struct Parser {
     in_unsafe_block: bool,
 }
 
+/// Which token, after the closing bracket, settles a bracketed list as a deconstruction: `=` in
+/// an expression, `in` in a `foreach` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeconstructionTerminator {
+    /// `(a, b) = t`
+    Assign,
+    /// `foreach ((a, b) in e)`
+    In,
+}
+
 impl Parser {
     /// Creates a parser over a lexed source, dropping trivia and keeping the
     /// lexer's diagnostics so the two stages report through one channel.
@@ -377,6 +391,20 @@ impl Parser {
     }
 
     /// Whether the token after the current one is `punctuator`.
+    /// Whether the `?` at the cursor -- which follows an `is` target -- opens a NULLABLE PATTERN
+    /// TYPE rather than the conditional operator. See the call site for why three tokens are
+    /// needed: `? IDENT :` is a conditional and `? IDENT` anything else is a designator.
+    fn at_nullable_pattern_type(&self) -> bool {
+        let after = self.tokens.get(self.position + 1).map(|token| &token.kind);
+        if !matches!(after, Some(TokenKind::Identifier(_))) {
+            return false;
+        }
+        !matches!(
+            self.tokens.get(self.position + 2).map(|token| &token.kind),
+            Some(TokenKind::Punctuator(Punctuator::Colon))
+        )
+    }
+
     fn next_is(&self, punctuator: Punctuator) -> bool {
         matches!(
             self.tokens.get(self.position + 1).map(|token| &token.kind),
@@ -533,18 +561,80 @@ impl Parser {
     fn parse_block(&mut self) -> Stmt {
         let start = self.current().span.start;
         self.bump();
+        let statements = self.parse_block_statements();
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        Stmt::new(StmtKind::Block(statements), Span::new(start, end))
+    }
+
+    /// The statements of a block, up to but not including its `}`.
+    ///
+    /// **SPLIT FROM [`Parser::parse_block`] SO A USING DECLARATION CAN TAKE THE REST OF THE BLOCK**
+    /// -- `using T x = e;` means `using (T x = e) { <every statement after it> }`, so the construct
+    /// needs the tail of the list it is a member of, which the statement parser cannot see and this
+    /// loop can. It recurses, which is what makes several in one block fall out for free: the
+    /// second declaration is simply the first statement of the first's body.
+    fn parse_block_statements(&mut self) -> Vec<Stmt> {
         let mut statements = Vec::new();
         while self.current_punctuator() != Some(Punctuator::CloseBrace)
             && !matches!(self.current().kind, TokenKind::EndOfFile)
         {
+            if self.using_declaration_here() {
+                statements.push(self.parse_using_declaration());
+                break;
+            }
             let before = self.position;
             statements.push(self.parse_statement());
             if self.position == before {
                 self.bump();
             }
         }
-        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
-        Stmt::new(StmtKind::Block(statements), Span::new(start, end))
+        statements
+    }
+
+    /// Whether a USING DECLARATION starts here (C# 8.0) rather than a `using` STATEMENT.
+    ///
+    /// **ONE TOKEN SEPARATES THEM AND NOTHING ELSE CAN**: a `using` statement's resource is
+    /// parenthesized and a declaration's is not, so a `(` after the keyword is the statement and
+    /// anything else is the declaration. There is no third form -- a using DIRECTIVE cannot appear
+    /// where a statement can.
+    fn using_declaration_here(&self) -> bool {
+        self.current_keyword() == Some(Keyword::Using) && !self.next_is(Punctuator::OpenParen)
+    }
+
+    /// Parses `using T x = e;` and REWRITES IT INTO THE `using` STATEMENT IT MEANS, taking the rest
+    /// of the enclosing block as its body (C# 8.0).
+    ///
+    /// **THE DESUGAR IS MEASURED AGAINST csc, NOT REASONED FROM THE SPEC TEXT.** Eight pairs, each
+    /// the declaration form beside the hand-written `using (T x = e) { rest }`, compiled by csc and
+    /// compared as IL: under `/optimize+` seven are BYTE-IDENTICAL and the eighth differs only in
+    /// which local SLOT NUMBER the variable takes -- the declaration form declares it in the
+    /// enclosing block's scope, the statement form opens a new one, so a variable declared before
+    /// it is numbered differently. The `try`/`finally`, the null test, the `Dispose` call and the
+    /// `leave` are the same instructions in the same order.
+    ///
+    ///
+    /// So nothing after the parser learns a new shape, exactly as an expression body works.
+    ///
+    fn parse_using_declaration(&mut self) -> Stmt {
+        let start = self.current().span.start;
+        self.bump();
+        self.gate_feature(Feature::UsingDeclaration, Span::empty_at(start));
+        let resource = self.parse_using_resource();
+        self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        let body_start = self.current().span.start;
+        let statements = self.parse_block_statements();
+        let body_end = statements.last().map_or(body_start, |last| last.span.end);
+        let body = Stmt::new(
+            StmtKind::Block(statements),
+            Span::new(body_start, body_end),
+        );
+        Stmt::new(
+            StmtKind::Using {
+                resource,
+                body: Box::new(body),
+            },
+            Span::new(start, body_end),
+        )
     }
 
     /// Parses a `return` statement (15.9.4): `return expression_opt ;`.
@@ -646,6 +736,256 @@ impl Parser {
         self.position = saved_position;
         self.diagnostics.truncate(saved_diagnostics);
         self.parse_expression_statement(start)
+    }
+
+    /// An OUT VARIABLE DECLARATION, `out int a` / `out var a` (C# 7.0), or `None` when the `out`
+    /// names an existing variable and the caller should parse an ordinary expression.
+    ///
+    /// The disambiguation is [`Parser::parse_declaration_or_expression_statement`]'s, for the same
+    /// reason: a TYPE FOLLOWED BY AN IDENTIFIER is a declaration and nothing else is, and only a
+    /// speculative parse can tell -- `out a` and `out A a` share their first token. Position AND
+    /// diagnostics roll back together, so a rejected reading reports nothing.
+    ///
+    fn parse_out_variable_declaration(&mut self) -> Option<Expr> {
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let start = self.current().span.start;
+        let ty = self.parse_type();
+        if !matches!(ty.kind, TypeRefKind::Error) {
+            if let TokenKind::Identifier(name) = &self.current().kind {
+                let name = name.clone();
+                let end = self.current().span.end;
+                self.bump();
+                let span = Span::new(start, end);
+                self.gate_feature(Feature::OutVariableDeclaration, span);
+                return Some(Expr::new(ExprKind::DeclarationExpression { ty, name }, span));
+            }
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        None
+    }
+
+    /// A DECONSTRUCTION -- `(a, b) = t`, `(int a, int b) = t`, `var (a, b) = t` (C# 7.0) -- or
+    /// `None` when the brackets belong to something else and the caller should parse an ordinary
+    /// expression.
+    ///
+    /// **THE DECIDING TOKEN IS THE `=` AFTER THE CLOSING BRACKET, WHICH IS NOT VISIBLE UNTIL THE
+    /// LIST HAS BEEN PARSED.** So the list is SPECULATED and rewound, the same machinery
+    /// [`Parser::parse_out_variable_declaration`] and the `new (T, T)[n]` arm in
+    /// [`Parser::parse_new`] use. Position and diagnostics roll back together, so a rejected
+    /// reading reports nothing and `(a, b)` goes on being a tuple.
+    ///
+    /// **`==` IS NOT `=`.** `(a, b) == t` is tuple equality (C# 7.3), a different feature with a
+    /// different meaning, and the punctuator table has them as distinct tokens -- so testing for
+    /// [`Punctuator::Equals`] admits one and rejects the other with no lookahead of its own. A
+    /// compound `+=` is refused for the same reason: C# gives it no deconstructing form.
+    fn try_parse_deconstruction(&mut self) -> Option<Expr> {
+        let start = self.current().span.start;
+        let designated = matches!(self.current_contextual_keyword(), Some("var"))
+            && self.next_is(Punctuator::OpenParen);
+        if !designated && self.current_punctuator() != Some(Punctuator::OpenParen) {
+            return None;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let var_span = if designated {
+            let at = self.current().span;
+            self.bump();
+            Some(at)
+        } else {
+            None
+        };
+        if !self.deconstruction_ahead(DeconstructionTerminator::Assign) {
+            self.position = saved_position;
+            return None;
+        }
+        let bracket = self.current().span.start;
+        let parsed = self.try_parse_deconstruction_targets(designated);
+        if let Some((targets, _)) = parsed
+            && self.current_punctuator() == Some(Punctuator::Equals)
+        {
+            self.gate_feature(Feature::Tuples, Span::empty_at(bracket));
+            self.bump();
+            let value = self.parse_expression();
+            let end = value.span.end;
+            return Some(Expr::new(
+                ExprKind::Deconstruction {
+                    var_span,
+                    targets,
+                    value: Box::new(value),
+                },
+                Span::new(start, end),
+            ));
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        None
+    }
+
+    /// Whether the brackets at the current `(` could possibly be a DECONSTRUCTION TARGET LIST --
+    /// a token scan with no parsing in it, run BEFORE any speculation.
+    ///
+    /// **THE SPECULATION IT GUARDS IS EXPONENTIAL IN THE BRACKET NESTING WITHOUT IT.** Trying the
+    /// target list at every `(` means parsing the bracketed expression once to reject it and again
+    /// to keep it -- and the rejected parse descends through `parse_conditional` back into
+    /// `parse_assignment`, which speculates again at the next level down. Work doubles per level,
+    /// so a deeply nested expression does not finish.
+    ///
+    /// TWO NECESSARY CONDITIONS, BOTH CHEAP. A target list holds AT LEAST TWO targets, so it has a
+    /// comma at its own bracket depth; and it is followed by the token that decides the reading --
+    /// `=` for the assignment, `in` for the `foreach` header. `(((1)))` has no comma and stops at
+    /// the first condition; `(a, b)` as a tuple expression has the comma and fails the second.
+    ///
+    /// **PERMISSIVE ON PURPOSE.** A comma at depth one may belong to something else -- a generic
+    /// argument list, whose `<` and `>` are not brackets here -- and a false positive costs only
+    /// the speculation. A false NEGATIVE would silently unbuild the feature, so every condition
+    /// here is one a real deconstruction must satisfy.
+    ///
+    fn deconstruction_ahead(&self, terminator: DeconstructionTerminator) -> bool {
+        let mut depth = 0usize;
+        let mut comma_at_top = false;
+        let mut index = self.position;
+        while let Some(token) = self.tokens.get(index) {
+            match &token.kind {
+                TokenKind::Punctuator(
+                    Punctuator::OpenParen | Punctuator::OpenBracket | Punctuator::OpenBrace,
+                ) => depth += 1,
+                TokenKind::Punctuator(
+                    Punctuator::CloseParen | Punctuator::CloseBracket | Punctuator::CloseBrace,
+                ) => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        if !comma_at_top {
+                            return false;
+                        }
+                        return match (terminator, self.tokens.get(index + 1).map(|t| &t.kind)) {
+                            (
+                                DeconstructionTerminator::Assign,
+                                Some(TokenKind::Punctuator(Punctuator::Equals)),
+                            ) => true,
+                            (
+                                DeconstructionTerminator::In,
+                                Some(TokenKind::Keyword(Keyword::In)),
+                            ) => true,
+                            _ => false,
+                        };
+                    }
+                }
+                TokenKind::Punctuator(Punctuator::Comma) if depth == 1 => comma_at_top = true,
+                TokenKind::EndOfFile => return false,
+                _ => {}
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// A bracketed DECONSTRUCTION TARGET LIST, with the scanner on the `(`; the targets and the
+    /// offset just past the closing bracket, or `None` if this is not one.
+    ///
+    /// `designated` is the `var (...)` form, in which every leaf is a DECLARATION with no written
+    /// type. That is not a shorthand this collapses for convenience -- it is what csc means by it:
+    /// `int a = 0; var (b, a) = (2, 40);` is `CS0128`, a duplicate local, and not an assignment to
+    /// the `a` already in scope (measured). So `var` distributes to every leaf, at every depth,
+    /// and recording a declaration at each one loses nothing.
+    ///
+    /// **AT LEAST TWO TARGETS, MATCHING THE TUPLE RULE ABOVE IT.** `(int a) = t` is `CS1073` from
+    /// csc rather than a one-element deconstruction, so a one-element list is not this production
+    /// and the caller rewinds to find whatever it really is.
+    fn try_parse_deconstruction_targets(
+        &mut self,
+        designated: bool,
+    ) -> Option<(Vec<DeconstructionTarget>, u32)> {
+        if !self.eat(Punctuator::OpenParen) {
+            return None;
+        }
+        let mut targets = Vec::new();
+        loop {
+            targets.push(self.try_parse_deconstruction_target(designated)?);
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        if targets.len() < 2 || self.current_punctuator() != Some(Punctuator::CloseParen) {
+            return None;
+        }
+        let end = self.current().span.end;
+        self.bump();
+        Some((targets, end))
+    }
+
+    /// One target: a nested list, a discard, a declaration, or an assignable expression.
+    fn try_parse_deconstruction_target(
+        &mut self,
+        designated: bool,
+    ) -> Option<DeconstructionTarget> {
+        let start = self.current().span.start;
+        if self.current_punctuator() == Some(Punctuator::OpenParen) {
+            let saved_position = self.position;
+            let saved_diagnostics = self.diagnostics.len();
+            if let Some((targets, end)) = self.try_parse_deconstruction_targets(designated) {
+                return Some(DeconstructionTarget::Nested {
+                    targets,
+                    span: Span::new(start, end),
+                });
+            }
+            self.position = saved_position;
+            self.diagnostics.truncate(saved_diagnostics);
+            if designated {
+                return None;
+            }
+        }
+        if designated {
+            let span = self.current().span;
+            let TokenKind::Identifier(name) = &self.current().kind else {
+                return None;
+            };
+            let name = name.clone();
+            let verbatim = self.current().verbatim;
+            self.bump();
+            if &*name == "_" && !verbatim {
+                return Some(DeconstructionTarget::Discard(span));
+            }
+            return Some(DeconstructionTarget::Declaration {
+                ty: None,
+                name,
+                span,
+            });
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let ty = self.parse_type();
+        if !matches!(ty.kind, TypeRefKind::Error)
+            && let TokenKind::Identifier(name) = &self.current().kind
+        {
+            let name = name.clone();
+            let end = self.current().span.end;
+            self.bump();
+            let ty = if matches!(&ty.kind, TypeRefKind::Name(parts) if parts.len() == 1 && &*parts[0] == "var")
+            {
+                None
+            } else {
+                Some(ty)
+            };
+            return Some(DeconstructionTarget::Declaration {
+                ty,
+                name,
+                span: Span::new(start, end),
+            });
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        if matches!(self.current_contextual_keyword(), Some("_"))
+            && (self.next_is(Punctuator::Comma) || self.next_is(Punctuator::CloseParen))
+        {
+            self.gate_feature(Feature::Discards, self.current().span);
+        }
+        let target = self.parse_conditional();
+        if matches!(target.kind, ExprKind::Error) {
+            return None;
+        }
+        Some(DeconstructionTarget::Expression(target))
     }
 
     /// Whether a statement beginning at the current non-verbatim `await` must take the
@@ -877,6 +1217,9 @@ impl Parser {
             Punctuator::OpenParen,
             DiagnosticKind::TokenExpected { expected: "(" },
         );
+        if let Some(deconstruction) = self.try_parse_foreach_deconstruction(start) {
+            return deconstruction;
+        }
         let ty = self.parse_type();
         let (name, _) = self.expect_declared_name();
         if !self.eat_keyword(Keyword::In) {
@@ -896,6 +1239,56 @@ impl Parser {
             },
             Span::new(start, end),
         )
+    }
+
+    /// A `foreach (var (a, b) in e)` / `foreach ((int a, int b) in e)` header (C# 7.0), with the
+    /// scanner just past the `(`; `None` when the header declares one ordinary variable.
+    ///
+    /// Speculated and rewound exactly as [`Parser::try_parse_deconstruction`] is, and for the same
+    /// reason -- the target list and a parenthesized type share their tokens -- with `in` in place
+    /// of the `=` as the token that settles it.
+    fn try_parse_foreach_deconstruction(&mut self, start: u32) -> Option<Stmt> {
+        let designated = matches!(self.current_contextual_keyword(), Some("var"))
+            && self.next_is(Punctuator::OpenParen);
+        if !designated && self.current_punctuator() != Some(Punctuator::OpenParen) {
+            return None;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let var_span = if designated {
+            let at = self.current().span;
+            self.bump();
+            Some(at)
+        } else {
+            None
+        };
+        if !self.deconstruction_ahead(DeconstructionTerminator::In) {
+            self.position = saved_position;
+            return None;
+        }
+        let bracket = self.current().span.start;
+        if let Some((targets, _)) = self.try_parse_deconstruction_targets(designated)
+            && self.current_keyword() == Some(Keyword::In)
+        {
+            self.gate_feature(Feature::Tuples, Span::empty_at(bracket));
+            self.bump();
+            let collection = self.parse_expression();
+            self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+            let body = Box::new(self.parse_statement());
+            let end = body.span.end;
+            return Some(Stmt::new(
+                StmtKind::ForEachDeconstruction {
+                    var_span,
+                    targets,
+                    collection,
+                    body,
+                },
+                Span::new(start, end),
+            ));
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        None
     }
 
     /// Parses a bare keyword statement terminated by `;`, used for `break` and
@@ -1059,6 +1452,24 @@ impl Parser {
 
     /// Parses a `using ( resource ) statement` (15.13).
     fn parse_using(&mut self, start: u32) -> Stmt {
+        if self.using_declaration_here() {
+            self.report(
+                DiagnosticKind::EmbeddedStatementCannotBeDeclaration,
+                Span::empty_at(start),
+            );
+            self.bump();
+            self.gate_feature(Feature::UsingDeclaration, Span::empty_at(start));
+            let resource = self.parse_using_resource();
+            let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+            let body = Stmt::new(StmtKind::Block(Vec::new()), Span::empty_at(end));
+            return Stmt::new(
+                StmtKind::Using {
+                    resource,
+                    body: Box::new(body),
+                },
+                Span::new(start, end),
+            );
+        }
         self.bump();
         self.expect(
             Punctuator::OpenParen,
@@ -1534,6 +1945,23 @@ impl Parser {
         declaration
     }
 
+    /// Consumes the OPTIONAL semicolon that may follow a type or namespace declaration's closing
+    /// brace, and reports nothing when there is none.
+    ///
+    /// **IT IS IN THE GRAMMAR OF EVERY ONE OF THEM, NOT A COURTESY** -- ECMA-334 spells
+    /// `class-body ;opt`, `struct-body ;opt`, `interface-body ;opt`, `enum-body ;opt` and
+    /// `namespace-body ;opt`, and has since the first edition. It is the C-and-C++ habit written
+    /// into C# 1.0 so that source carried over from either still compiles, which is exactly where
+    /// it turns up in practice.
+    ///
+    /// **A `;` HERE IS SILENT AND A `;;` IS NOT.** Only one is in the production, so a second still
+    /// reaches the enclosing member or namespace loop and is still a stray token there.
+    ///
+    ///
+    fn eat_declaration_semicolon(&mut self) {
+        self.eat(Punctuator::Semicolon);
+    }
+
     /// Parses an `enum` declaration (21): the kind keyword, a name, an optional
     /// `: integral-type` base, then comma-separated members allowing a trailing
     /// comma.
@@ -1581,6 +2009,7 @@ impl Parser {
             }
         }
         let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        self.eat_declaration_semicolon();
         EnumDecl {
             attributes,
             modifiers,
@@ -1591,7 +2020,20 @@ impl Parser {
         }
     }
 
-    /// Parses a `delegate` declaration (22): `delegate return-type name ( params ) ;`.
+    /// Parses a `delegate` declaration (22):
+    /// `delegate return-type name type-parameter-list? ( params ) constraints? ;`.
+    ///
+    /// **THE TYPE-PARAMETER LIST AND THE CONSTRAINT CLAUSES SIT ON EITHER SIDE OF THE PARAMETER
+    /// LIST, WHICH IS THE METHOD SHAPE AND NOT THE TYPE SHAPE** -- ECMA-334 4th ed 22.1 spells
+    /// `delegate-declaration: ... identifier type-parameter-list_opt ( formal-parameter-list_opt )
+    /// type-parameter-constraints-clauses_opt ;`. A class puts its clauses after the BASE list, and
+    /// a delegate has no base list to put them after; the parameter list is what separates them
+    /// here. Both halves come from the shared parsers, so a delegate gates and diagnoses exactly as
+    /// a generic method does.
+    ///
+    /// `delegate void D<T>()` and `delegate void D()` are DIFFERENT TYPES that may be declared side
+    /// by side, which is why the arity has to reach the model and the metadata name rather than
+    /// stopping at the parser: see [`crate::ast::DelegateDecl::type_parameters`].
     fn parse_delegate(
         &mut self,
         attributes: Vec<AttributeSection>,
@@ -1601,16 +2043,20 @@ impl Parser {
         self.bump();
         let return_type = self.parse_type();
         let (name, _) = self.expect_identifier();
+        let type_parameters = self.parse_type_parameter_list();
         let (parameters, arglist) = self.parse_parameter_list();
         if let Some(span) = arglist {
             self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
         }
+        let constraints = self.parse_type_parameter_constraint_clauses();
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         DelegateDecl {
             attributes,
             modifiers,
             return_type,
             name,
+            type_parameters,
+            constraints,
             parameters,
             span: Span::new(start, end),
         }
@@ -1652,6 +2098,7 @@ impl Parser {
             }
         }
         let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        self.eat_declaration_semicolon();
         NamespaceDecl {
             name,
             usings,
@@ -1831,10 +2278,7 @@ impl Parser {
                 }
             }
             let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
-            if record_keyword.is_some() && self.current_punctuator() == Some(Punctuator::Semicolon)
-            {
-                self.bump();
-            }
+            self.eat_declaration_semicolon();
             end
         };
         TypeDecl {
@@ -2244,8 +2688,13 @@ impl Parser {
             } else {
                 None
             };
-            let body = self.parse_required_block();
-            let end = body.span.end;
+            let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+                self.parse_expression_body(Feature::ExpressionBodiedConstructor, false)
+            } else {
+                let block = self.parse_required_block();
+                let end = block.span.end;
+                (block, end)
+            };
             return Member::Constructor {
                 modifiers,
                 name,
@@ -2264,7 +2713,7 @@ impl Parser {
             return self.parse_operator(modifiers, ty, start);
         }
         if self.current_keyword() == Some(Keyword::This) {
-            return self.parse_indexer(modifiers, ty, start);
+            return self.parse_indexer(modifiers, ty, None, start);
         }
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && (self.next_is(Punctuator::OpenParen)
@@ -2298,6 +2747,7 @@ impl Parser {
                 modifiers,
                 return_type: ty,
                 name,
+                name_span,
                 type_parameters,
                 constraints,
                 parameters,
@@ -2316,6 +2766,7 @@ impl Parser {
             let mut arguments: Vec<TypeRef> = Vec::new();
             let mut constructed = false;
             let mut interface_end = prev_end;
+            let mut member_span = Span::new(name_start, prev_end);
             if self.current_punctuator() == Some(Punctuator::LessThan)
                 && self.generic_type_name_ahead()
             {
@@ -2329,6 +2780,15 @@ impl Parser {
                 interface_end = prev_end;
                 parts.push(TypeNamePart { name, arguments });
                 arguments = Vec::new();
+                if self.current_keyword() == Some(Keyword::This) {
+                    let explicit_interface = Self::explicit_interface_type(
+                        parts,
+                        constructed,
+                        Span::new(name_start, interface_end),
+                    );
+                    return self.parse_indexer(modifiers, ty, Some(explicit_interface), start);
+                }
+                member_span = self.current().span;
                 let (part, part_end) = self.expect_identifier();
                 name = part;
                 prev_end = part_end;
@@ -2342,18 +2802,22 @@ impl Parser {
                 }
             }
             let member = name;
-            let interface_kind = if constructed {
-                TypeRefKind::Generic { parts }
-            } else {
-                TypeRefKind::Name(parts.into_iter().map(|part| part.name).collect())
-            };
-            let explicit_interface =
-                TypeRef::new(interface_kind, Span::new(name_start, interface_end));
+            let explicit_interface = Self::explicit_interface_type(
+                parts,
+                constructed,
+                Span::new(name_start, interface_end),
+            );
             if self.current_punctuator() == Some(Punctuator::OpenBrace)
                 || self.current_punctuator() == Some(Punctuator::EqualsGreaterThan)
             {
-                return self
-                    .parse_property(modifiers, ty, member, Some(explicit_interface), start);
+                return self.parse_property(
+                    modifiers,
+                    ty,
+                    member,
+                    member_span,
+                    Some(explicit_interface),
+                    start,
+                );
             }
             let was_async = self.in_async_method;
             self.in_async_method = modifiers.contains(&Modifier::Async);
@@ -2376,6 +2840,7 @@ impl Parser {
                 modifiers,
                 return_type: ty,
                 name: member,
+                name_span: member_span,
                 type_parameters,
                 constraints,
                 parameters,
@@ -2390,8 +2855,9 @@ impl Parser {
             && (self.next_is(Punctuator::OpenBrace)
                 || self.next_is(Punctuator::EqualsGreaterThan))
         {
+            let name_span = self.current().span;
             let (name, _) = self.expect_identifier();
-            return self.parse_property(modifiers, ty, name, None, start);
+            return self.parse_property(modifiers, ty, name, name_span, None, start);
         }
         if matches!(self.current().kind, TokenKind::Identifier(_)) {
             if let TypeRefKind::ByRef { .. } = ty.kind {
@@ -2463,7 +2929,25 @@ impl Parser {
         let arrow = self.current().span;
         self.gate_feature(feature, arrow);
         self.bump();
-        let expression = self.parse_expression();
+        let expression = if self.current_keyword() == Some(Keyword::Ref) {
+            let at = self.current().span;
+            self.bump();
+            if !self.in_ref_returning_member {
+                self.gate_feature(Feature::ByRefLocalsAndReturns, at);
+            }
+            let operand = self.parse_expression();
+            let span = Span::new(at.start, operand.span.end);
+            Expr::new(
+                ExprKind::RefArgument {
+                    position: RefPosition::Return,
+                    out: false,
+                    operand: Box::new(operand),
+                },
+                span,
+            )
+        } else {
+            self.parse_expression()
+        };
         let expression_span = expression.span;
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         let inner = match expression.kind {
@@ -2593,6 +3077,7 @@ impl Parser {
         modifiers: Vec<Modifier>,
         ty: TypeRef,
         name: Box<str>,
+        name_span: Span,
         explicit_interface: Option<TypeRef>,
         start: u32,
     ) -> Member {
@@ -2633,6 +3118,7 @@ impl Parser {
             modifiers,
             ty,
             name,
+            name_span,
             getter,
             setter,
             explicit_interface,
@@ -2776,8 +3262,13 @@ impl Parser {
         if let Some(span) = arglist {
             self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
         }
-        let body = self.parse_required_block();
-        let end = body.span.end;
+        let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+            self.parse_expression_body(Feature::ExpressionBodiedMethod, true)
+        } else {
+            let block = self.parse_required_block();
+            let end = block.span.end;
+            (block, end)
+        };
         Member::Operator {
             modifiers,
             return_type,
@@ -2805,8 +3296,13 @@ impl Parser {
         if let Some(span) = arglist {
             self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
         }
-        let body = self.parse_required_block();
-        let end = body.span.end;
+        let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+            self.parse_expression_body(Feature::ExpressionBodiedMethod, true)
+        } else {
+            let block = self.parse_required_block();
+            let end = block.span.end;
+            (block, end)
+        };
         Member::ConversionOperator {
             modifiers,
             direction,
@@ -2863,8 +3359,13 @@ impl Parser {
             DiagnosticKind::TokenExpected { expected: "(" },
         );
         self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-        let body = self.parse_required_block();
-        let end = body.span.end;
+        let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+            self.parse_expression_body(Feature::ExpressionBodiedConstructor, false)
+        } else {
+            let block = self.parse_required_block();
+            let end = block.span.end;
+            (block, end)
+        };
         Member::Destructor {
             modifiers,
             name,
@@ -2905,7 +3406,38 @@ impl Parser {
 
     /// Parses an indexer given the modifiers and type already parsed (17.8): the
     /// `this` keyword, a bracketed index parameter list, then an accessor body.
-    fn parse_indexer(&mut self, modifiers: Vec<Modifier>, ty: TypeRef, start: u32) -> Member {
+    /// The `TypeRef` for an explicit interface implementation's QUALIFIER, from the parts read
+    /// off the member name and whether any of them carried type arguments.
+    ///
+    /// **ONE STATEMENT OF THE RULE, FOR THE THREE MEMBER KINDS THAT REACH IT.** A method, a
+    /// property and an indexer each stop the qualifier loop at a different token, so each needs
+    /// the same `parts` turned into the same type -- and a second spelling of "generic when any
+    /// part is constructed" is exactly the shape that gains a case in one position and not the
+    /// others.
+    fn explicit_interface_type(
+        parts: Vec<TypeNamePart>,
+        constructed: bool,
+        span: Span,
+    ) -> TypeRef {
+        let kind = if constructed {
+            TypeRefKind::Generic { parts }
+        } else {
+            TypeRefKind::Name(parts.into_iter().map(|part| part.name).collect())
+        };
+        TypeRef::new(kind, span)
+    }
+
+    /// Parses an indexer (17.8) from its `this` keyword on, with `ty` its element type.
+    /// `explicit_interface` is the qualifier of `int I.this[int i]` (20.4.1) and `None` for an
+    /// ordinary indexer.
+    fn parse_indexer(
+        &mut self,
+        modifiers: Vec<Modifier>,
+        ty: TypeRef,
+        explicit_interface: Option<TypeRef>,
+        start: u32,
+    ) -> Member {
+        let name_span = self.current().span;
         self.bump();
         self.expect(
             Punctuator::OpenBracket,
@@ -2948,8 +3480,10 @@ impl Parser {
             modifiers,
             ty,
             parameters,
+            name_span,
             getter,
             setter,
+            explicit_interface,
             attributes: Vec::new(),
             span: Span::new(start, end),
         }
@@ -3205,6 +3739,9 @@ impl Parser {
         if let Some(lambda) = self.try_parse_lambda() {
             return lambda;
         }
+        if let Some(deconstruction) = self.try_parse_deconstruction() {
+            return deconstruction;
+        }
         let target = self.parse_conditional();
         let Some(operator) = self.current_punctuator().and_then(assignment_operator) else {
             return target;
@@ -3302,14 +3839,27 @@ impl Parser {
     /// `minimum` is the lowest precedence this call will accept; all the
     /// operators are left-associative.
     fn parse_binary(&mut self, minimum: u8) -> Expr {
-        const RELATIONAL: u8 = 7;
         let mut left = self.parse_unary();
         loop {
-            if RELATIONAL >= minimum {
+            if SWITCH_PRECEDENCE >= minimum
+                && matches!(self.current().kind, TokenKind::Keyword(Keyword::Switch))
+                && self.next_is(Punctuator::OpenBrace)
+            {
+                left = self.parse_switch_expression(left);
+                continue;
+            }
+            if RELATIONAL_PRECEDENCE >= minimum {
                 if let Some(operation) = type_test_operation(&self.current().kind) {
+                    let operator = self.current().span;
                     self.bump();
-                    let target = self.parse_type_inner(false);
-                    let span = Span::new(left.span.start, target.span.end);
+                    let target = match operation {
+                        TypeTestOperation::Is => {
+                            self.parse_pattern(operator, PatternPosition::TypeTest)
+                        }
+                        TypeTestOperation::As => Pattern::Type(self.parse_is_target_type()),
+                    };
+                    let end = pattern_end(&target);
+                    let span = Span::new(left.span.start, end);
                     left = Expr::new(
                         ExprKind::TypeTest {
                             operation,
@@ -3341,6 +3891,212 @@ impl Parser {
             );
         }
         left
+    }
+
+    /// Parses a PATTERN, in the position `position` names; `operator` is the span of the token
+    /// that introduced it (the `is`, or the `switch`).
+    ///
+    /// **THE ORDER OF THE TESTS IS THE GRAMMAR.** `null` is a keyword and can begin nothing else;
+    /// a token that cannot begin a TYPE settles every other literal without speculation. Only a
+    /// NAME is genuinely ambiguous, and the two positions answer that ambiguity differently.
+    ///
+    /// **THE POSITION IS A PARAMETER RATHER THAN A SECOND FUNCTION, BECAUSE THE TWO READINGS
+    /// DIFFER IN EXACTLY TWO PLACES AND SHARE EVERYTHING ELSE** -- a bare `_`, and a name with no
+    /// designator. After `is` both are C# 1.0 TYPES (measured: `o is _` is `CS0246` under csc at
+    /// every version); in a switch arm the first is a discard and the second a CONSTANT, which is
+    /// what an enum-member arm is. Two spellings of the shared part is the shape where one of them
+    /// gains a case and the other does not.
+    ///
+    /// **THE FEATURE GATE IS REPORTED AT THE INTRODUCING TOKEN, NOT AT THE PATTERN, AND THAT IS
+    /// MEASURED.** csc's `CS8059` for `o is string s` at `/langversion:6` points at the `is`
+    /// keyword, and so does the one for `x is 3` -- one position for every pattern form.
+    /// Reporting at the construct that DREW the gate reads as the natural choice and puts the
+    /// caret ten columns late on a declaration pattern.
+    fn parse_pattern(&mut self, operator: Span, position: PatternPosition) -> Pattern {
+        if matches!(self.current().kind, TokenKind::Keyword(Keyword::Null)) {
+            let at = self.current().span;
+            self.gate_feature(Feature::ConstantPattern, operator);
+            self.bump();
+            return Pattern::Constant(Box::new(Expr::new(ExprKind::Literal(Literal::Null), at)));
+        }
+        if position == PatternPosition::SwitchArm && self.at_discard_pattern(position) {
+            let at = self.current().span;
+            self.bump();
+            self.gate_feature(Feature::SwitchExpression, at);
+            return Pattern::Discard(at);
+        }
+        if !self.at_type_start() {
+            return self.parse_constant_pattern(operator);
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let ty = self.parse_is_target_type();
+        if !matches!(ty.kind, TypeRefKind::Error) && self.at_pattern_designator(position) {
+            let TokenKind::Identifier(name) = &self.current().kind else {
+                unreachable!("the designator predicate matched an identifier")
+            };
+            let name = name.clone();
+            let at = self.current().span;
+            self.bump();
+            self.gate_feature(Feature::DeclarationPattern, operator);
+            return Pattern::Declaration { ty, name, span: at };
+        }
+        if position == PatternPosition::TypeTest {
+            return Pattern::Type(ty);
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        self.parse_constant_pattern(operator)
+    }
+
+    /// Parses a SWITCH EXPRESSION's `switch { arm, ... }`, with `governing` already built and the
+    /// cursor on the `switch`.
+    ///
+    /// **A TRAILING COMMA IS LEGAL AND AN EMPTY ARM LIST IS TOO** -- both measured: `x switch { }`
+    /// compiles under csc with `CS8509`, so an empty list is an exhaustiveness question rather
+    /// than a syntax error, and refusing it here would report the wrong thing.
+    fn parse_switch_expression(&mut self, governing: Expr) -> Expr {
+        let operator = self.current().span;
+        self.bump();
+        self.gate_feature(Feature::SwitchExpression, operator);
+        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+        let mut arms = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            let pattern = self.parse_pattern(operator, PatternPosition::SwitchArm);
+            let guard = if matches!(&self.current().kind, TokenKind::Identifier(name) if &**name == "when")
+            {
+                self.bump();
+                Some(self.parse_null_coalescing())
+            } else {
+                None
+            };
+            self.expect(
+                Punctuator::EqualsGreaterThan,
+                DiagnosticKind::TokenExpected { expected: "=>" },
+            );
+            let value = self.parse_expression();
+            arms.push(SwitchArm {
+                pattern,
+                guard,
+                value,
+            });
+            if self.current_punctuator() == Some(Punctuator::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+            if self.position == before {
+                self.bump();
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        let span = Span::new(governing.span.start, end);
+        Expr::new(
+            ExprKind::SwitchExpression {
+                governing: Box::new(governing),
+                keyword: operator,
+                arms,
+            },
+            span,
+        )
+    }
+
+    /// Whether a bare `_` stands here as a whole pattern -- not `_.M`, `_[0]` or `_ x`, each of
+    /// which is a name being used as one.
+    fn at_discard_pattern(&self, position: PatternPosition) -> bool {
+        matches!(&self.current().kind, TokenKind::Identifier(name) if &**name == "_")
+            && !self.at_pattern_designator_at(self.position + 1, position)
+            && !matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Punctuator(
+                    Punctuator::Dot | Punctuator::OpenBracket | Punctuator::LessThan
+                ))
+            )
+    }
+
+    /// Whether the token at the cursor is a pattern's DESIGNATOR -- the `s` of `o is string s`.
+    fn at_pattern_designator(&self, position: PatternPosition) -> bool {
+        self.at_pattern_designator_at(self.position, position)
+    }
+
+    /// [`Self::at_pattern_designator`] at an arbitrary token index.
+    ///
+    /// **`when` IS THE ONE IDENTIFIER THAT IS USUALLY NOT A DESIGNATOR, AND ONLY IN A SWITCH
+    /// ARM.** `x switch { _ when x > 5 => 42 }` is a discard with a GUARD; reading `when` as the
+    /// designator of a declaration pattern whose type is `_` consumes it, and the arm then fails at
+    /// the `=>` that is no longer where the parser expects one -- fourteen cascading diagnostics
+    /// for a legal program, which is how this was found.
+    ///
+    /// **AFTER AN `is` THERE IS NO GUARD, so `when` is an ordinary identifier there** -- `o is
+    /// string when` declares a variable called `when` and must keep doing so. Hence the position.
+    ///
+    /// The `=>` lookahead keeps the designator reading available for the one arm that wants it:
+    /// `o switch { string when => .. }` declares `when`, because a guard cannot be followed by
+    /// `=>` with nothing between.
+    fn at_pattern_designator_at(&self, index: usize, position: PatternPosition) -> bool {
+        let Some(TokenKind::Identifier(name)) = self.tokens.get(index).map(|token| &token.kind)
+        else {
+            return false;
+        };
+        if position == PatternPosition::SwitchArm && &**name == "when" {
+            return matches!(
+                self.tokens.get(index + 1).map(|token| &token.kind),
+                Some(TokenKind::Punctuator(Punctuator::EqualsGreaterThan))
+            );
+        }
+        true
+    }
+
+    /// A CONSTANT pattern's expression, parsed one precedence level TIGHTER than relational.
+    ///
+    /// The bound matters in both directions. Looser and `x is 3 && y` takes the `&& y` into the
+    /// pattern; tighter and `case 1 + 2` -- a constant expression the language admits -- stops
+    /// after the `1`. Shift and below is the level that admits every arithmetic constant and no
+    /// operator that could continue the ENCLOSING expression.
+    fn parse_constant_pattern(&mut self, operator: Span) -> Pattern {
+        let at = Span::empty_at(self.current().span.start);
+        let before = self.diagnostics.len();
+        let value = self.parse_binary(SHIFT_PRECEDENCE);
+        if matches!(value.kind, ExprKind::Error) {
+            self.diagnostics.truncate(before);
+            self.report(DiagnosticKind::PatternMissing, at);
+            return Pattern::Constant(Box::new(value));
+        }
+        self.gate_feature(Feature::ConstantPattern, operator);
+        Pattern::Constant(Box::new(value))
+    }
+
+    /// The type on the right of an `is` or `as`, with the nullable suffix rule that position needs.
+    ///
+    /// THE `?` AFTER THE TARGET IS TWO DIFFERENT TOKENS AND ONLY THE TOKEN AFTER THE NEXT ONE
+    /// TELLS THEM APART:
+    ///
+    /// ```text
+    /// x is int ? a : b     the CONDITIONAL operator, C# 1.0
+    /// x is int? n          a NULLABLE pattern type, which is CS8116
+    /// ```
+    ///
+    /// Both are `?` IDENT. What differs is the `:` that a conditional must have, so the test is
+    /// three tokens deep. Taking the nullable reading is what lets the BINDER give csc's message
+    /// instead of the two parse errors the conditional reading collapses into.
+    fn parse_is_target_type(&mut self) -> TypeRef {
+        let ty = self.parse_type_inner(false);
+        if self.current_punctuator() == Some(Punctuator::Question) && self.at_nullable_pattern_type()
+        {
+            return self.parse_nullable_suffix(ty, true);
+        }
+        ty
+    }
+
+    /// Whether the token at the cursor could begin a TYPE -- a predefined type keyword, a name, or
+    /// the `global::` qualifier. Everything else (a literal, a sign, a parenthesis) is a constant
+    /// pattern's first token and needs no speculation to say so.
+    fn at_type_start(&self) -> bool {
+        matches!(self.current().kind, TokenKind::Identifier(_))
+            || predefined_type(&self.current().kind).is_some()
     }
 
     /// Unary expressions (14.6): a prefix operator, a cast, or a postfix chain.
@@ -3548,10 +4304,18 @@ impl Parser {
                 }
                 Some(Punctuator::OpenBracket) => {
                     self.bump();
+                    let empty = self.current_punctuator() == Some(Punctuator::CloseBracket);
+                    let at = self.current().span.start;
                     let (arguments, end) = self.parse_arguments(
                         Punctuator::CloseBracket,
                         DiagnosticKind::TokenExpected { expected: "]" },
                     );
+                    if empty {
+                        self.report(
+                            DiagnosticKind::ValueExpectedInElementAccess,
+                            Span::empty_at(at),
+                        );
+                    }
                     let span = Span::new(expr.span.start, end);
                     expr = Expr::new(
                         ExprKind::ElementAccess {
@@ -3583,6 +4347,19 @@ impl Parser {
                         },
                         span,
                     );
+                }
+                Some(Punctuator::Exclamation) => {
+                    let at = self.current().span;
+                    self.gate_feature(Feature::NullForgivingOperator, at);
+                    self.bump();
+                    while self.current_punctuator() == Some(Punctuator::Exclamation) {
+                        self.report(
+                            DiagnosticKind::DuplicateNullSuppression,
+                            self.current().span,
+                        );
+                        self.bump();
+                    }
+                    expr = Expr::new(expr.kind, Span::new(expr.span.start, at.end));
                 }
                 Some(Punctuator::PlusPlus) if !dependent_only => {
                     expr = self.finish_postfix(expr, PostfixOperator::Increment);
@@ -3874,12 +4651,34 @@ impl Parser {
             }
             TokenKind::Punctuator(Punctuator::OpenParen) => {
                 self.bump();
+                let first_name = self.take_tuple_element_name();
                 let inner = self.parse_expression();
+                if first_name.is_none() && self.current_punctuator() != Some(Punctuator::Comma) {
+                    let end =
+                        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                    return Expr::new(
+                        ExprKind::Parenthesized(Box::new(inner)),
+                        Span::new(span.start, end),
+                    );
+                }
+                self.gate_feature(Feature::Tuples, Span::empty_at(span.start));
+                let mut elements = alloc::vec![TupleElementExpr {
+                    name: first_name,
+                    value: inner,
+                }];
+                while self.eat(Punctuator::Comma) {
+                    let name = self.take_tuple_element_name();
+                    let value = self.parse_expression();
+                    elements.push(TupleElementExpr { name, value });
+                }
                 let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-                Expr::new(
-                    ExprKind::Parenthesized(Box::new(inner)),
-                    Span::new(span.start, end),
-                )
+                if elements.len() < 2 {
+                    self.report(
+                        DiagnosticKind::TupleTooFewElements,
+                        Span::empty_at(end.saturating_sub(1)),
+                    );
+                }
+                Expr::new(ExprKind::Tuple { elements }, Span::new(span.start, end))
             }
             TokenKind::Keyword(keyword)
                 if predefined_type(&TokenKind::Keyword(keyword)).is_some() =>
@@ -3909,9 +4708,54 @@ impl Parser {
         }
     }
 
+    /// The `name:` of a tuple element, when the next two tokens are one.
+    ///
+    /// Shared by the first element and the rest so the rule is written once; the lookahead is the
+    /// same one a named argument uses, and for the same reason -- a bare `:` after an identifier
+    /// belongs to no other production here.
+    fn take_tuple_element_name(&mut self) -> Option<ArgumentName> {
+        if !matches!(self.current().kind, TokenKind::Identifier(_)) || !self.next_is(Punctuator::Colon)
+        {
+            return None;
+        }
+        let TokenKind::Identifier(text) = &self.current().kind else {
+            unreachable!("the guard admitted only an identifier")
+        };
+        let name = ArgumentName {
+            text: text.clone(),
+            span: self.current().span,
+        };
+        self.bump();
+        self.bump();
+        Some(name)
+    }
+
     /// Parses a `,`-separated argument list up to and including `close` (14.4.1),
     /// returning the arguments and the offset just past the closing bracket.
-    fn parse_arguments(&mut self, close: Punctuator, missing: DiagnosticKind) -> (Vec<Expr>, u32) {
+    fn parse_arguments(&mut self, close: Punctuator, missing: DiagnosticKind) -> (Vec<Argument>, u32) {
+        self.parse_argument_list(close, missing, true)
+    }
+
+    /// The size list of an array creation `new int[e, ...]` (17.6), which is punctuated like an
+    /// argument list and is not one.
+    ///
+    /// **A NAME IS NOT PART OF THIS GRAMMAR AT ANY VERSION, SO THIS LIST DOES NOT LOOK FOR ONE.**
+    /// Because it does not, `new int[n: 3]` stops at the `:` with the missing-separator
+    /// diagnostic, which is what csc reports there and at the same column (measured: CS1003, at
+    /// the colon). Recognizing the name here and rejecting it afterwards would mean inventing a
+    /// diagnostic csc has no equivalent of.
+    fn parse_sizes(&mut self, close: Punctuator, missing: DiagnosticKind) -> (Vec<Expr>, u32) {
+        let (sizes, end) = self.parse_argument_list(close, missing, false);
+        (sizes.into_iter().map(|size| size.value).collect(), end)
+    }
+
+    /// The shared body of both: `names` says whether `name :` is part of the grammar being parsed.
+    fn parse_argument_list(
+        &mut self,
+        close: Punctuator,
+        missing: DiagnosticKind,
+        names: bool,
+    ) -> (Vec<Argument>, u32) {
         let mut arguments = Vec::new();
         if self.current_punctuator() == Some(close) {
             let end = self.current().span.end;
@@ -3920,13 +4764,20 @@ impl Parser {
         }
         loop {
             let before = self.position;
-            if matches!(self.current().kind, TokenKind::Identifier(_))
+            let mut name = None;
+            if names
+                && matches!(self.current().kind, TokenKind::Identifier(_))
                 && self.next_is(Punctuator::Colon)
             {
-                let at = self.current().span.start;
-                self.gate_feature(Feature::NamedArguments, Span::empty_at(at));
+                let TokenKind::Identifier(text) = &self.current().kind else {
+                    unreachable!("the match above admitted only an identifier")
+                };
+                let text = text.clone();
+                let span = self.current().span;
+                self.gate_feature(Feature::NamedArguments, Span::empty_at(span.start));
                 self.bump();
                 self.bump();
+                name = Some(ArgumentName { text, span });
             }
             let ref_out = match self.current_keyword() {
                 Some(Keyword::Ref) => {
@@ -3939,7 +4790,12 @@ impl Parser {
                 }
                 _ => None,
             };
-            let argument = self.parse_expression();
+            let argument = match ref_out {
+                Some(true) => self
+                    .parse_out_variable_declaration()
+                    .unwrap_or_else(|| self.parse_expression()),
+                _ => self.parse_expression(),
+            };
             let argument = match ref_out {
                 Some(out) => {
                     let span = argument.span;
@@ -3954,7 +4810,19 @@ impl Parser {
                 }
                 None => argument,
             };
-            arguments.push(argument);
+            if arguments.iter().any(|held: &Argument| held.name.is_some())
+                && name.is_none()
+                && self.version < LanguageVersion::CSharp7_2
+            {
+                self.report(
+                    DiagnosticKind::NonTrailingNamedArgument,
+                    Span::empty_at(argument.span.start),
+                );
+            }
+            arguments.push(Argument {
+                name,
+                value: argument,
+            });
             if self.eat(Punctuator::Comma) {
                 continue;
             }
@@ -4033,7 +4901,53 @@ impl Parser {
     /// Parses a non-array type (11.1): a predefined type or a type name, with no
     /// rank-specifiers. This is the element type for `new` and the base of a
     /// full type. A missing type is `CS1031`.
+    /// A TUPLE TYPE `(T, T)` / `(T name, T name)` (C# 7.0), with the scanner on the `(`.
+    ///
+    /// **A TYPE POSITION IS THE ONE PLACE `(` IS UNAMBIGUOUS**, which is why this needs no
+    /// speculation while the EXPRESSION side does: nothing else in the grammar of a type opens
+    /// with a bracket, so a `(` here can only start a tuple.
+    ///
+    /// A one-element list is not a tuple and never becomes one -- see [`TypeRefKind::Tuple`] --
+    /// and csc refuses it (CS8124, measured), so the arity is checked here rather than left for a
+    /// later pass to discover.
+    fn parse_tuple_type(&mut self) -> TypeRef {
+        let start = self.current().span.start;
+        self.gate_feature(Feature::Tuples, Span::empty_at(start));
+        self.bump();
+        let mut elements = Vec::new();
+        loop {
+            let ty = self.parse_type();
+            let name = match &self.current().kind {
+                TokenKind::Identifier(text) => {
+                    let name = ArgumentName {
+                        text: text.clone(),
+                        span: self.current().span,
+                    };
+                    self.bump();
+                    Some(name)
+                }
+                _ => None,
+            };
+            elements.push(TupleElement { name, ty });
+            if self.eat(Punctuator::Comma) {
+                continue;
+            }
+            break;
+        }
+        let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        if elements.len() < 2 {
+            self.report(
+                DiagnosticKind::TupleTooFewElements,
+                Span::empty_at(end.saturating_sub(1)),
+            );
+        }
+        TypeRef::new(TypeRefKind::Tuple(elements), Span::new(start, end))
+    }
+
     fn parse_non_array_type(&mut self) -> TypeRef {
+        if self.current_punctuator() == Some(Punctuator::OpenParen) {
+            return self.parse_tuple_type();
+        }
         if let Some(predefined) = predefined_type(&self.current().kind) {
             let span = self.current().span;
             self.bump();
@@ -4147,6 +5061,39 @@ impl Parser {
             let end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
             return Expr::new(ExprKind::Error, Span::new(start, end));
         }
+        if self.current_punctuator() == Some(Punctuator::OpenParen) {
+            let saved_position = self.position;
+            let saved_diagnostics = self.diagnostics.len();
+            let speculative = self.parse_tuple_type();
+            if self.current_punctuator() == Some(Punctuator::OpenBracket)
+                && !matches!(speculative.kind, TypeRefKind::Error)
+            {
+                return self.parse_array_creation(start, speculative);
+            }
+            self.position = saved_position;
+            self.diagnostics.truncate(saved_diagnostics);
+        }
+        if self.current_punctuator() == Some(Punctuator::OpenParen) {
+            self.gate_feature(Feature::TargetTypedNew, Span::empty_at(start));
+            self.bump();
+            let (arguments, mut end) =
+                self.parse_arguments(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+            let mut initializer = None;
+            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                self.gate_initializer_if_unsupported();
+                let (parsed, parsed_end) = self.parse_initializer();
+                initializer = Some(parsed);
+                end = parsed_end;
+            }
+            return Expr::new(
+                ExprKind::ObjectCreation {
+                    target: None,
+                    arguments,
+                    initializer,
+                },
+                Span::new(start, end),
+            );
+        }
         let element = self.parse_non_array_type();
         let element = self.parse_nullable_suffix(element, true);
         match self.current_punctuator() {
@@ -4163,7 +5110,7 @@ impl Parser {
                 }
                 Expr::new(
                     ExprKind::ObjectCreation {
-                        target: element,
+                        target: Some(element),
                         arguments,
                         initializer,
                     },
@@ -4176,7 +5123,7 @@ impl Parser {
                 let (initializer, end) = self.parse_initializer();
                 Expr::new(
                     ExprKind::ObjectCreation {
-                        target: element,
+                        target: Some(element),
                         arguments: Vec::new(),
                         initializer: Some(initializer),
                     },
@@ -4190,7 +5137,7 @@ impl Parser {
                 );
                 Expr::new(
                     ExprKind::ObjectCreation {
-                        target: element,
+                        target: Some(element),
                         arguments: Vec::new(),
                         initializer: None,
                     },
@@ -4238,7 +5185,7 @@ impl Parser {
             if assigns_member {
                 members.push(self.parse_member_initializer());
             } else {
-                elements.push(self.parse_expression());
+                elements.push(self.parse_collection_element());
             }
             if self.position == before {
                 self.bump();
@@ -4261,6 +5208,47 @@ impl Parser {
     /// The value is itself an initializer when it is written `{ ... }` -- and that form assigns INTO
     /// the member's existing object rather than constructing one, which is why it is a distinct
     /// [`MemberInitializerValue`] rather than a synthesized `new`.
+    /// One element of a collection initializer: an expression, or `{ a, b }` -- a BRACED ARGUMENT
+    /// LIST handed to a single `Add` call.
+    ///
+    /// **THE BRACED FORM IS NOT A NESTED INITIALIZER.** `new D { { 1, "a" } }` is `D.Add(1, "a")`,
+    /// which is the whole of how a dictionary initializer works: there is no dictionary construct
+    /// in the language, only an element with two arguments. Measured against csc, which takes one,
+    /// two or three, and mixes braced and bare elements in one initializer.
+    ///
+    /// Arity is not checked here. A braced element of two against a one-argument `Add` is
+    /// `CS1501`, which is ordinary overload resolution and so the binder's.
+    fn parse_collection_element(&mut self) -> CollectionElement {
+        let start = self.current().span.start;
+        if self.current_punctuator() != Some(Punctuator::OpenBrace) {
+            let expression = self.parse_expression();
+            let span = expression.span;
+            return CollectionElement {
+                arguments: alloc::vec![expression],
+                span,
+            };
+        }
+        self.bump();
+        let mut arguments = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            arguments.push(self.parse_expression());
+            if self.position == before {
+                self.bump();
+            }
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        CollectionElement {
+            arguments,
+            span: Span::new(start, end),
+        }
+    }
+
     fn parse_member_initializer(&mut self) -> MemberInitializer {
         let start = self.current().span.start;
         let (name, _) = self.expect_identifier();
@@ -4312,7 +5300,7 @@ impl Parser {
             (Vec::new(), rank, end)
         } else {
             self.bump();
-            let (sizes, end) = self.parse_arguments(
+            let (sizes, end) = self.parse_sizes(
                 Punctuator::CloseBracket,
                 DiagnosticKind::TokenExpected { expected: "]" },
             );
@@ -4991,6 +5979,45 @@ fn prefix_operator(punctuator: Punctuator) -> Option<UnaryOperator> {
 /// Maps a punctuator to its binary operator and precedence, if any. A larger
 /// precedence binds tighter (14.7 multiplicative is highest here, 14.12 the
 /// conditional-or `||` is lowest).
+/// The precedence of `<`, `>`, `<=`, `>=`, `is` and `as` in [`binary_operator`]'s table.
+///
+/// Named rather than repeated because `is` and `as` are handled OUTSIDE that table -- they take a
+/// type or a pattern on the right, not an expression -- and the loop still has to place them at
+/// the same level.
+const RELATIONAL_PRECEDENCE: u8 = 7;
+
+/// The precedence of `<<` and `>>`: one level TIGHTER than relational, and so the lowest level a
+/// constant pattern's expression may reach. See [`Parser::parse_constant_pattern`].
+const SHIFT_PRECEDENCE: u8 = 8;
+
+/// The precedence of a SWITCH EXPRESSION's `switch`: one level TIGHTER than multiplicative, the
+/// highest entry in [`binary_operator`]'s table, and looser than unary.
+///
+/// Measured rather than read off the grammar, in both directions: `2 * x switch { _ => "s" }` is
+/// `CS0019` for `int * string` under csc, so the switch took `x` and not `2 * x`; and
+/// `-x switch { _ => "s" }` compiles, so it took `-x` and not `x`.
+const SWITCH_PRECEDENCE: u8 = 11;
+
+/// Which position a pattern is being parsed in, for the two decisions that differ between them.
+/// See [`Parser::parse_pattern`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternPosition {
+    /// After an `is`, where a bare name -- `_` included -- is C# 1.0's type test.
+    TypeTest,
+    /// A switch expression's arm, where a bare name is a constant and `_` is the discard.
+    SwitchArm,
+}
+
+/// Where a pattern's text ends, for the span of the expression that contains it.
+fn pattern_end(pattern: &Pattern) -> u32 {
+    match pattern {
+        Pattern::Type(ty) => ty.span.end,
+        Pattern::Constant(value) => value.span.end,
+        Pattern::Declaration { span, .. } => span.end,
+        Pattern::Discard(at) => at.end,
+    }
+}
+
 fn binary_operator(punctuator: Punctuator) -> Option<(BinaryOperator, u8)> {
     Some(match punctuator {
         Punctuator::Asterisk => (BinaryOperator::Multiply, 10),
@@ -5147,7 +6174,7 @@ fn synth_call(receiver: Expr, arguments: Vec<Expr>, span: Span) -> Expr {
         ExprKind::Invocation {
             receiver: Box::new(receiver),
             type_arguments: Vec::new(),
-            arguments,
+            arguments: arguments.into_iter().map(Argument::positional).collect(),
         },
         span,
     )
@@ -5290,6 +6317,7 @@ fn synthesize_record_members(declaration: &mut TypeDecl) {
             modifiers: alloc::vec![Modifier::Public],
             ty: parameter.ty.clone(),
             name: parameter.name.clone(),
+            name_span: span,
             getter: Some(accessor(false)),
             setter: Some(accessor(true)),
             explicit_interface: None,
@@ -5396,6 +6424,7 @@ fn synthesize_record_equality(
         generated.push(Member::Property {
             modifiers: alloc::vec![Modifier::Protected, Modifier::Virtual],
             ty: synth_type(&["System", "Type"], span),
+            name_span: span,
             name: Box::from("EqualityContract"),
             getter: Some(Accessor {
                 attributes: Vec::new(),
@@ -5455,6 +6484,7 @@ fn synthesize_record_equality(
         modifiers: alloc::vec![Modifier::Public, Modifier::Virtual],
         return_type: record_ty.clone(),
         name: Box::from("<Clone>$"),
+        name_span: span,
         type_parameters: Vec::new(),
         constraints: Vec::new(),
         parameters: Vec::new(),
@@ -5462,8 +6492,8 @@ fn synthesize_record_equality(
         body: Some(synth_return_body(
             Expr::new(
                 ExprKind::ObjectCreation {
-                    target: record_ty.clone(),
-                    arguments: alloc::vec![this()],
+                    target: Some(record_ty.clone()),
+                    arguments: alloc::vec![Argument::positional(this())],
                     initializer: None,
                 },
                 span,
@@ -5520,6 +6550,7 @@ fn synthesize_record_equality(
             modifiers: alloc::vec![Modifier::Public, Modifier::Virtual],
             return_type: bool_ty(),
             name: Box::from("Equals"),
+            name_span: span,
             type_parameters: Vec::new(),
             constraints: Vec::new(),
             parameters: alloc::vec![synth_parameter(record_ty.clone(), "other", span)],
@@ -5533,6 +6564,7 @@ fn synthesize_record_equality(
             modifiers: alloc::vec![Modifier::Public, Modifier::Override],
             return_type: bool_ty(),
             name: Box::from("Equals"),
+            name_span: span,
             type_parameters: Vec::new(),
             constraints: Vec::new(),
             parameters: alloc::vec![synth_parameter(object_ty(), "obj", span)],
@@ -5544,7 +6576,7 @@ fn synthesize_record_equality(
                         ExprKind::TypeTest {
                             operation: TypeTestOperation::As,
                             operand: Box::new(name_expr("obj")),
-                            target: record_ty.clone(),
+                            target: Pattern::Type(record_ty.clone()),
                         },
                         span,
                     )],
@@ -5603,6 +6635,7 @@ fn synthesize_record_equality(
             modifiers: alloc::vec![Modifier::Public, Modifier::Override],
             return_type: int_ty(),
             name: Box::from("GetHashCode"),
+            name_span: span,
             type_parameters: Vec::new(),
             constraints: Vec::new(),
             parameters: Vec::new(),
@@ -5744,6 +6777,7 @@ fn synthesize_record_equality(
             modifiers: alloc::vec![Modifier::Protected, Modifier::Virtual],
             return_type: bool_ty(),
             name: Box::from("PrintMembers"),
+            name_span: span,
             type_parameters: Vec::new(),
             constraints: Vec::new(),
             parameters: alloc::vec![synth_parameter(sb_ty.clone(), "builder", span)],
@@ -5779,7 +6813,7 @@ fn synthesize_record_equality(
                     name: Box::from("builder"),
                     initializer: Some(Expr::new(
                         ExprKind::ObjectCreation {
-                            target: sb_ty.clone(),
+                            target: Some(sb_ty.clone()),
                             arguments: Vec::new(),
                             initializer: None,
                         },
@@ -5823,6 +6857,7 @@ fn synthesize_record_equality(
             modifiers: alloc::vec![Modifier::Public, Modifier::Override],
             return_type: string_ty(),
             name: Box::from("ToString"),
+            name_span: span,
             type_parameters: Vec::new(),
             constraints: Vec::new(),
             parameters: Vec::new(),
@@ -5865,6 +6900,7 @@ fn synthesize_record_equality(
             modifiers: alloc::vec![Modifier::Public],
             return_type: synth_predefined(PredefinedType::Void, span),
             name: Box::from("Deconstruct"),
+            name_span: span,
             type_parameters: Vec::new(),
             constraints: Vec::new(),
             parameters: out_parameters,
@@ -5915,6 +6951,19 @@ mod tests {
     /// on structure (and thus precedence and associativity) in one readable line.
     fn dump(expr: &Expr) -> String {
         match &expr.kind {
+            ExprKind::Tuple { elements } => {
+                let mut text = String::from("(tuple");
+                for element in elements {
+                    text.push(' ');
+                    if let Some(name) = &element.name {
+                        text.push_str(&name.text);
+                        text.push(':');
+                    }
+                    text.push_str(&dump(&element.value));
+                }
+                text.push(')');
+                text
+            }
             ExprKind::Lambda {
                 parameters, body, ..
             } => {
@@ -6086,7 +7135,7 @@ mod tests {
                 let mut text = String::from("(arglist");
                 for argument in arguments {
                     text.push(' ');
-                    text.push_str(&dump(argument));
+                    text.push_str(&dump_arg(argument));
                 }
                 text.push(')');
                 text
@@ -6100,17 +7149,54 @@ mod tests {
                     TypeTestOperation::Is => "is",
                     TypeTestOperation::As => "as",
                 };
-                format!("({text} {} {})", dump(operand), dump_type(target))
+                let right = match target {
+                    Pattern::Type(ty) => dump_type(ty),
+                    Pattern::Constant(value) => dump(value),
+                    Pattern::Discard(_) => String::from("_"),
+
+                    Pattern::Declaration { ty, name, .. } => {
+                        format!("{} {name}", dump_type(ty))
+                    }
+                };
+                format!("({text} {} {right})", dump(operand))
+            }
+            ExprKind::SwitchExpression { governing, arms, .. } => {
+                let mut out = format!("(switchexpr {}", dump(governing));
+                for arm in arms {
+                    let pattern = match &arm.pattern {
+                        Pattern::Type(ty) => dump_type(ty),
+                        Pattern::Constant(value) => dump(value),
+                        Pattern::Discard(_) => String::from("_"),
+                        Pattern::Declaration { ty, name, .. } => {
+                            format!("{} {name}", dump_type(ty))
+                        }
+                    };
+                    match &arm.guard {
+                        Some(guard) => {
+                            out.push_str(&format!(" (arm {pattern} when {} {})", dump(guard), dump(&arm.value)));
+                        }
+                        None => out.push_str(&format!(" (arm {pattern} {})", dump(&arm.value))),
+                    }
+                }
+                out.push(')');
+                out
             }
             ExprKind::Cast { target, operand } => {
                 format!("(cast {} {})", dump_type(target), dump(operand))
+            }
+            ExprKind::DeclarationExpression { ty, name } => {
+                format!("(decl {} {name})", dump_type(ty))
             }
             ExprKind::ObjectCreation {
                 target,
                 arguments,
                 initializer,
             } => {
-                let mut text = format!("(new {}{}", dump_type(target), dump_args(arguments));
+                let named = match target {
+                    Some(target) => alloc::format!(" {}", dump_type(target)),
+                    None => String::new(),
+                };
+                let mut text = format!("(new{named}{}", dump_args(arguments));
                 if let Some(initializer) = initializer {
                     text.push(' ');
                     text.push_str(&dump_initializer(initializer));
@@ -6151,15 +7237,72 @@ mod tests {
                 text.push('}');
                 text
             }
+            ExprKind::Deconstruction {
+                var_span,
+                targets,
+                value,
+            } => {
+                let mut text = String::from(if var_span.is_some() {
+                    "(deconstruct-var"
+                } else {
+                    "(deconstruct"
+                });
+                for target in targets {
+                    text.push(' ');
+                    text.push_str(&dump_target(target));
+                }
+                text.push_str(&format!(" = {})", dump(value)));
+                text
+            }
             ExprKind::Error => String::from("<error>"),
         }
     }
 
-    fn dump_args(arguments: &[Expr]) -> String {
+    /// One deconstruction target, in the same prefix form as [`dump`].
+    fn dump_target(target: &DeconstructionTarget) -> String {
+        match target {
+            DeconstructionTarget::Declaration { ty, name, .. } => match ty {
+                Some(ty) => format!("(decl {} {name})", dump_type(ty)),
+                None => format!("(decl var {name})"),
+            },
+            DeconstructionTarget::Discard(_) => String::from("_"),
+            DeconstructionTarget::Expression(expr) => dump(expr),
+            DeconstructionTarget::Nested { targets, .. } => {
+                let mut text = String::from("(nested");
+                for target in targets {
+                    text.push(' ');
+                    text.push_str(&dump_target(target));
+                }
+                text.push(')');
+                text
+            }
+        }
+    }
+
+    fn dump_exprs(expressions: &[Expr]) -> String {
+        let mut text = String::new();
+        for expression in expressions {
+            text.push(' ');
+            text.push_str(&dump(expression));
+        }
+        text
+    }
+
+    /// One argument, `name:` first when it has one. **THE ONE PLACE THAT RENDERS AN ARGUMENT** --
+    /// four call sites reached for it the moment arguments could be named, and a fifth is a matter
+    /// of time.
+    fn dump_arg(argument: &Argument) -> String {
+        match &argument.name {
+            Some(name) => format!("{}:{}", name.text, dump(&argument.value)),
+            None => dump(&argument.value),
+        }
+    }
+
+    fn dump_args(arguments: &[Argument]) -> String {
         let mut text = String::new();
         for argument in arguments {
             text.push(' ');
-            text.push_str(&dump(argument));
+            text.push_str(&dump_arg(argument));
         }
         text
     }
@@ -6168,6 +7311,19 @@ mod tests {
     /// order for the single-rank and jagged cases the tests use.
     fn dump_type(ty: &TypeRef) -> String {
         match &ty.kind {
+            TypeRefKind::Tuple(elements) => {
+                let mut text = String::from("(tuple");
+                for element in elements {
+                    text.push(' ');
+                    if let Some(name) = &element.name {
+                        text.push_str(&name.text);
+                        text.push(':');
+                    }
+                    text.push_str(&dump_type(&element.ty));
+                }
+                text.push(')');
+                text
+            }
             TypeRefKind::Predefined(predefined) => String::from(predefined_text(*predefined)),
             TypeRefKind::Name(parts) => {
                 let mut text = String::new();
@@ -6439,7 +7595,7 @@ mod tests {
                         text
                     }
                     Some(ForInitializer::Expressions(expressions)) => {
-                        format!("(exprs{})", dump_args(expressions))
+                        format!("(exprs{})", dump_exprs(expressions))
                     }
                 };
                 let cond = match condition {
@@ -6449,7 +7605,7 @@ mod tests {
                 let iters = if iterators.is_empty() {
                     String::from("_")
                 } else {
-                    format!("(iters{})", dump_args(iterators))
+                    format!("(iters{})", dump_exprs(iterators))
                 };
                 format!("(for {init} {cond} {iters} {})", dump_stmt(body))
             }
@@ -6464,6 +7620,28 @@ mod tests {
                 dump(collection),
                 dump_stmt(body)
             ),
+            StmtKind::ForEachDeconstruction {
+                var_span,
+                targets,
+                collection,
+                body,
+            } => {
+                let mut text = String::from(if var_span.is_some() {
+                    "(foreach-deconstruct-var"
+                } else {
+                    "(foreach-deconstruct"
+                });
+                for target in targets {
+                    text.push(' ');
+                    text.push_str(&dump_target(target));
+                }
+                text.push_str(&format!(
+                    " in {} {})",
+                    dump(collection),
+                    dump_stmt(body)
+                ));
+                text
+            }
             StmtKind::Break => String::from("(break)"),
             StmtKind::Continue => String::from("(continue)"),
             StmtKind::Throw(None) => String::from("(throw)"),
@@ -6587,6 +7765,56 @@ mod tests {
         assert_eq!(tree("null"), "null");
         assert_eq!(tree("foo"), "foo");
         assert_eq!(tree("this"), "this");
+    }
+
+    /// The null-forgiving operator is consumed and DISCARDED, so what it leaves is the operand's
+    /// own tree.
+    ///
+    /// It suppresses a nullable-analysis warning and does nothing else -- no type change, no
+    /// evaluation, no IL -- and this build has no nullable analysis for it to speak to. A node
+    /// would carry nothing and every later pass would have to know to look through it.
+    #[test]
+    fn a_null_forgiving_operator_leaves_the_expression_it_suppressed() {
+        assert_eq!(tree("s!"), tree("s"));
+        assert_eq!(tree("s!.Length"), tree("s.Length"));
+        assert_eq!(tree("a[0]!.Length"), tree("a[0].Length"));
+        assert_eq!(tree("s!.Trim()!.Length"), tree("s.Trim().Length"));
+        assert_eq!(tree("((string)o)!.Length"), tree("((string)o).Length"));
+    }
+
+    /// An inequality is ONE token, so it can never reach the suppression arm -- and a suppression
+    /// followed by a comparison is the case that would break if it could.
+    ///
+    /// **THE ASSERTIONS NAME THE SHAPE RATHER THAN THE SILENCE**, and the first version of this
+    /// test did not. It compared `s! != t` against `s != t`, and a perturbation that let `!=`
+    /// reach the suppression arm collapsed BOTH sides to `s` -- equal, and both wrong. Two
+    /// expressions that degrade the same way cannot check each other.
+    #[test]
+    fn an_inequality_is_not_a_null_suppression() {
+        assert_eq!(tree("a != b"), "(!= a b)");
+        assert_eq!(tree("s! != t"), "(!= s t)");
+        assert_eq!(tree("!b"), "(! b)");
+        assert_eq!(tree("!a == b"), "(== (! a) b)");
+    }
+
+    /// Asserting twice says nothing the first assertion did not, and csc refuses it rather than
+    /// folding it away. A build that treats the operator as transparent still has to count them.
+    #[test]
+    fn two_null_suppressions_in_a_row_are_refused() {
+        assert!(codes("s!").is_empty());
+        assert_eq!(codes("s!!"), vec![8715]);
+        assert_eq!(codes("s!!!"), vec![8715, 8715]);
+    }
+
+    /// C# 8.0.
+    ///
+    /// The diagnostic carries the code for the language version IN EFFECT, not for the one the
+    /// feature requires: a 7.3 compilation reports `CS8370`, which is 7.3's code, rather than an
+    /// 8.0 one.
+    #[test]
+    fn a_null_forgiving_operator_needs_csharp_8() {
+        assert_eq!(codes_at("s!", LanguageVersion::CSharp7_3), vec![8370]);
+        assert!(codes_at("s!", LanguageVersion::CSharp8).is_empty());
     }
 
     /// **THE EXPRESSION HALF OF 9.4.2, WHICH NO TOKEN-LEVEL GUARD CAN COVER.**
@@ -6810,6 +8038,34 @@ mod tests {
     }
 
     #[test]
+    fn an_argument_keeps_the_name_it_was_written_with() {
+        assert_eq!(tree("f(x: 1)"), "(call f x:1)");
+        assert_eq!(tree("f(1, y: 2)"), "(call f 1 y:2)");
+        assert_eq!(tree("c[b: 1, a: 43]"), "(index c b:1 a:43)");
+        assert_eq!(tree("new C(b: 1, a: 43)"), "(new C b:1 a:43)");
+        assert_eq!(tree("f(b: ref x)"), "(call f b:(ref x))");
+        assert_eq!(tree("f(b: out x)"), "(call f b:(out x))");
+        assert_eq!(tree("f(a ? b : c)"), "(call f (?: a b c))");
+        assert_eq!(tree("f(n: a ? b : c)"), "(call f n:(?: a b c))");
+    }
+
+    #[test]
+    fn an_element_access_needs_at_least_one_index() {
+        assert!(codes("a[]").contains(&443));
+        assert!(codes("new C()[]").contains(&443));
+        assert_eq!(tree("new int[]{1}"), "(newarr int r1 {1})");
+        assert_eq!(tree("new int[n][]"), "(newarr int r1 n +r1)");
+        assert!(codes("typeof(int[])").is_empty());
+        assert!(codes("a[0]").is_empty());
+    }
+
+    #[test]
+    fn an_array_size_list_has_no_named_form() {
+        assert_eq!(tree("new int[n]"), "(newarr int r1 n)");
+        assert!(codes("new int[n: 3]").contains(&1003));
+    }
+
+    #[test]
     fn the_conditional_is_lower_than_binary_and_chains_on_the_right() {
         assert_eq!(tree("a ? b : c"), "(?: a b c)");
         assert_eq!(tree("a || b ? c : d"), "(?: (|| a b) c d)");
@@ -6884,9 +8140,79 @@ mod tests {
     }
 
     #[test]
+    fn a_constant_pattern_takes_any_constant_and_stops_at_relational() {
+        assert_eq!(tree("x is 3"), "(is x 3)");
+        assert_eq!(tree("x is -1"), "(is x (- 1))");
+        assert_eq!(tree("s is \"a\""), "(is s str)");
+        assert_eq!(tree("c is 'z'"), "(is c char:122)");
+        assert_eq!(tree("b is true"), "(is b true)");
+        assert_eq!(tree("x is null"), "(is x null)");
+        assert_eq!(tree("x is 1 + 2"), "(is x (+ 1 2))");
+        assert_eq!(tree("x is 3 && y"), "(&& (is x 3) y)");
+        assert_eq!(tree("x is 3 == y"), "(== (is x 3) y)");
+        assert_eq!(tree("x is 3 ? a : b"), "(?: (is x 3) a b)");
+    }
+
+    #[test]
+    fn a_switch_expression_is_a_postfix_operator_between_multiplicative_and_unary() {
+        assert_eq!(
+            tree("x switch { 1 => 10, _ => 0 }"),
+            "(switchexpr x (arm 1 10) (arm _ 0))"
+        );
+        assert_eq!(
+            tree("2 * x switch { _ => 0 }"),
+            "(* 2 (switchexpr x (arm _ 0)))"
+        );
+        assert_eq!(
+            tree("-x switch { _ => 0 }"),
+            "(switchexpr (- x) (arm _ 0))"
+        );
+        assert_eq!(
+            tree("a + x switch { _ => 0 }"),
+            "(+ a (switchexpr x (arm _ 0)))"
+        );
+        assert_eq!(
+            tree("x switch { 1 => 2 } switch { 2 => 3 }"),
+            "(switchexpr (switchexpr x (arm 1 2)) (arm 2 3))"
+        );
+        assert_eq!(
+            tree("o is string switch { _ => 0 }"),
+            "(switchexpr (is o string) (arm _ 0))"
+        );
+    }
+
+    #[test]
+    fn a_switch_arm_reads_a_name_as_a_constant_and_a_when_as_a_guard() {
+        assert_eq!(
+            tree("e switch { E.A => 1, _ => 0 }"),
+            "(switchexpr e (arm (. E A) 1) (arm _ 0))"
+        );
+        assert_eq!(tree("o is A.B"), "(is o A.B)");
+        assert_eq!(
+            tree("x switch { _ when b => 1, _ => 0 }"),
+            "(switchexpr x (arm _ when b 1) (arm _ 0))"
+        );
+        assert_eq!(
+            tree("o switch { string s when b => 1, _ => 0 }"),
+            "(switchexpr o (arm string s when b 1) (arm _ 0))"
+        );
+        assert_eq!(tree("o is string when"), "(is o string when)");
+        assert_eq!(tree("x switch { 1 => 2, }"), "(switchexpr x (arm 1 2))");
+        assert_eq!(tree("x switch { }"), "(switchexpr x)");
+    }
+
+    #[test]
+    fn a_name_after_is_stays_the_c_sharp_1_type_test() {
+        assert_eq!(tree("o is A.B"), "(is o A.B)");
+        assert_eq!(tree("o is T"), "(is o T)");
+        assert_eq!(tree("o is string s"), "(is o string s)");
+    }
+
+    #[test]
     fn a_missing_type_is_cs1031() {
         assert_eq!(codes("typeof()"), vec![1031]);
-        assert_eq!(codes("x is"), vec![1031]);
+        assert_eq!(codes("x as"), vec![1031]);
+        assert_eq!(codes("x is"), vec![8504]);
     }
 
     #[test]
@@ -7253,7 +8579,7 @@ mod tests {
                         if index > 0 {
                             text.push(' ');
                         }
-                        text.push_str(&dump(argument));
+                        text.push_str(&dump_arg(argument));
                     }
                     text.push(')');
                 }
@@ -7334,11 +8660,15 @@ mod tests {
                 parameters,
                 getter,
                 setter,
+                explicit_interface,
                 ..
             } => {
                 let mut text = String::from("(indexer");
                 for modifier in modifiers {
                     text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                if let Some(interface) = explicit_interface {
+                    text.push_str(&format!(" {}.this", dump_type(interface)));
                 }
                 text.push_str(&format!(" {} [{}]", dump_type(ty), dump_params(parameters)));
                 if let Some(getter) = getter {
@@ -7458,7 +8788,11 @@ mod tests {
         for modifier in &declaration.modifiers {
             text.push_str(&format!(" {}", modifier_name(*modifier)));
         }
-        text.push_str(&format!(" {}", declaration.name));
+        text.push_str(&format!(
+            " {}{}",
+            declaration.name,
+            dump_type_parameters(&declaration.type_parameters, &declaration.constraints)
+        ));
         if let Some(parts) = &declaration.record {
             if let Some(parameters) = &parts.parameters {
                 text.push('(');
@@ -7483,7 +8817,7 @@ mod tests {
                         if index > 0 {
                             text.push_str(", ");
                         }
-                        text.push_str(&dump(argument));
+                        text.push_str(&dump_arg(argument));
                     }
                     text.push(')');
                 }
@@ -7525,6 +8859,42 @@ mod tests {
                 }
             }
             text.push(']');
+        }
+        text
+    }
+
+    /// `<T, R>` for a declaration that has type parameters, and the empty string otherwise --
+    /// followed by ` where T : C` for each constraint clause.
+    ///
+    fn dump_type_parameters(
+        parameters: &[TypeParameter],
+        clauses: &[TypeParameterConstraintClause],
+    ) -> String {
+        let mut text = String::new();
+        if !parameters.is_empty() {
+            text.push('<');
+            for (index, parameter) in parameters.iter().enumerate() {
+                if index > 0 {
+                    text.push_str(", ");
+                }
+                text.push_str(&parameter.name);
+            }
+            text.push('>');
+        }
+        for clause in clauses {
+            text.push_str(&format!(" where {} :", clause.parameter));
+            for (index, constraint) in clause.constraints.iter().enumerate() {
+                if index > 0 {
+                    text.push(',');
+                }
+                let rendered = match constraint {
+                    TypeParameterConstraint::ReferenceType(_) => String::from("class"),
+                    TypeParameterConstraint::ValueType(_) => String::from("struct"),
+                    TypeParameterConstraint::DefaultConstructor(_) => String::from("new()"),
+                    TypeParameterConstraint::Type(reference) => dump_type(reference),
+                };
+                text.push_str(&format!(" {rendered}"));
+            }
         }
         text
     }
@@ -7574,10 +8944,12 @@ mod tests {
                     text.push_str(&format!(" {}", modifier_name(*modifier)));
                 }
                 text.push_str(&format!(
-                    " {} {} ({})",
+                    " {} {}{} ({}){}",
                     dump_type(&declaration.return_type),
                     declaration.name,
-                    dump_params(&declaration.parameters)
+                    dump_type_parameters(&declaration.type_parameters, &[]),
+                    dump_params(&declaration.parameters),
+                    dump_type_parameters(&[], &declaration.constraints)
                 ));
                 text.push(')');
                 prefix_attributes(&declaration.attributes, text)
@@ -7642,7 +9014,18 @@ mod tests {
                 let mut text = String::from("{coll");
                 for element in elements {
                     text.push(' ');
-                    text.push_str(&dump(element));
+                    if element.arguments.len() == 1 {
+                        text.push_str(&dump(&element.arguments[0]));
+                    } else {
+                        text.push('{');
+                        for (index, argument) in element.arguments.iter().enumerate() {
+                            if index > 0 {
+                                text.push(' ');
+                            }
+                            text.push_str(&dump(argument));
+                        }
+                        text.push('}');
+                    }
                 }
                 text.push('}');
                 text
@@ -7658,6 +9041,130 @@ mod tests {
             parsed.diagnostics
         );
         dump_unit(&parsed.unit)
+    }
+
+    /// Expression bodies on the members that are NOT a method, property, indexer or property
+    /// accessor. All five parse; the two GROUPS sit at different rungs, which is the part a single
+    /// feature would have flattened.
+    ///
+    /// csc counts an expression-bodied OPERATOR as `expression-bodied method` and admits it at 6.0,
+    /// while a constructor, static constructor and destructor are `expression body constructor and
+    /// destructor` at 7.0. Measured, both directions.
+    #[test]
+    fn an_expression_body_is_accepted_on_every_member_that_takes_one() {
+        assert!(unit_codes("public class P { public static P operator +(P a, P b) => a; }").is_empty());
+        assert!(unit_codes("public class P { public static explicit operator int(P p) => 0; }").is_empty());
+        assert!(unit_codes("public class P { int _v; public P(int v) => _v = v; }").is_empty());
+        assert!(unit_codes("public class P { static int _n; static P() => _n = 1; }").is_empty());
+        assert!(unit_codes("public class P { static int _n; ~P() => _n++; }").is_empty());
+    }
+
+    /// The two groups are gated a rung apart, so a build that admitted them together would accept
+    /// a constructor at 6.0 that csc refuses.
+    #[test]
+    fn an_operator_body_is_a_rung_below_a_constructor_body() {
+        let operator = "public class P { public static P operator +(P a, P b) => a; }";
+        let constructor = "public class P { int _v; public P(int v) => _v = v; }";
+        assert!(unit_codes_at(operator, LanguageVersion::CSharp6).is_empty());
+        assert_eq!(
+            unit_codes_at(constructor, LanguageVersion::CSharp6),
+            vec![8059],
+            "a constructor body is C# 7.0, and 8059 is the code for the rung in effect"
+        );
+        assert!(unit_codes_at(constructor, LanguageVersion::CSharp7).is_empty());
+        assert_eq!(unit_codes_at(operator, LanguageVersion::CSharp5), vec![8026]);
+    }
+
+    /// A constructor and a destructor return nothing, so the body desugars to `{ e; }` and not to
+    /// `{ return e; }`.
+    ///
+    /// **IT ASSERTS THE TREE, BECAUSE NO DIAGNOSTIC CAN SEE THIS.** Written first against
+    /// `unit_codes` it read INERT under a perturbation that asked for a returned value: both forms
+    /// parse, and the difference only shows in the shape. A parse-level test cannot check a
+    /// parse-level choice by looking at whether anything complained.
+    #[test]
+    fn a_constructor_body_is_a_statement_expression_not_a_returned_value() {
+        let ctor = unit_tree("public class P { int _v; public P(int v) => _v = v; }");
+        assert!(
+            !ctor.contains("return"),
+            "a constructor body must not desugar to a return: {ctor}"
+        );
+        let dtor = unit_tree("public class P { static int _n; ~P() => _n++; }");
+        assert!(
+            !dtor.contains("return"),
+            "a destructor body must not desugar to a return: {dtor}"
+        );
+        let method = unit_tree("public class P { public int Go() => 42; }");
+        assert!(
+            method.contains("return"),
+            "the check cannot see a return at all: {method}"
+        );
+    }
+
+    /// `out int a` DECLARES `a`; `out a` names one. The two share their first token, so the
+    /// parser tells them apart by speculation and rolls the tokens back when the reading fails.
+    ///
+    #[test]
+    fn an_out_argument_declares_a_variable_only_when_a_type_precedes_the_name() {
+        assert_eq!(tree("M(out int a)"), "(call M (out (decl int a)))");
+        assert_eq!(tree("M(out var a)"), "(call M (out (decl var a)))");
+        assert_eq!(tree("M(out a)"), "(call M (out a))");
+        assert_eq!(tree("M(out a.b)"), "(call M (out (. a b)))");
+        assert_eq!(tree("M(ref a)"), "(call M (ref a))");
+    }
+
+    /// The declaration is C# 7.0; the `out` argument it rides on is C# 1.0.
+    #[test]
+    fn an_out_variable_declaration_is_csharp_7_and_a_plain_out_argument_is_not() {
+        assert_eq!(codes_at("M(out int a)", LanguageVersion::CSharp6), vec![8059]);
+        assert_eq!(codes_at("M(out var a)", LanguageVersion::CSharp6), vec![8059]);
+        assert!(codes_at("M(out int a)", LanguageVersion::CSharp7).is_empty());
+        assert!(codes_at("M(out a)", LanguageVersion::CSharp1).is_empty());
+    }
+
+    /// `x is T t` is a DECLARATION PATTERN and `x is T` is the C# 1.0 operator, so the designator
+    /// alone carries the gate.
+    ///
+    #[test]
+    fn a_designator_after_an_is_target_is_a_declaration_pattern() {
+        assert_eq!(tree("o is string s"), "(is o string s)");
+        assert_eq!(tree("o is int i"), "(is o int i)");
+        assert_eq!(tree("o is string"), "(is o string)");
+        assert_eq!(tree("o is int ? a : b"), "(?: (is o int) a b)");
+        assert_eq!(tree("o is int? n"), "(is o int? n)");
+    }
+
+    /// The designator is C# 7.0; the operator it rides on is C# 1.0.
+    #[test]
+    fn a_declaration_pattern_is_csharp_7_and_the_is_operator_is_not() {
+        assert_eq!(codes_at("o is string s", LanguageVersion::CSharp6), vec![8059]);
+        assert!(codes_at("o is string s", LanguageVersion::CSharp7).is_empty());
+        assert!(codes_at("o is string", LanguageVersion::CSharp1).is_empty());
+    }
+
+    /// `x is null` is a PATTERN and arrived at C# 7.0, a rung above the `is` operator it shares a
+    /// keyword with. `x is T` is C# 1.0 and must stay so.
+    #[test]
+    fn a_null_pattern_is_csharp_7_and_a_type_test_is_not() {
+        assert_eq!(codes_at("s is null", LanguageVersion::CSharp6), vec![8059]);
+        assert!(codes_at("s is null", LanguageVersion::CSharp7).is_empty());
+        assert!(codes_at("s is string", LanguageVersion::CSharp1).is_empty());
+    }
+
+    /// An element of a collection initializer is an ARGUMENT LIST, and a braced one hands `Add`
+    /// several arguments at once.
+    ///
+    /// `{ { 1, 2 } }` is `Add(1, 2)`, which is the whole of how a dictionary initializer works --
+    /// there is no dictionary construct in the language. The dump shows the braces so one call of
+    /// two arguments is distinguishable from two calls of one, which is the confusion this shape
+    /// exists to prevent.
+    #[test]
+    fn a_braced_collection_element_is_one_add_of_several_arguments() {
+        assert_eq!(tree("new D { { 1, 2 } }"), "(new D {coll {1 2}})");
+        assert_eq!(tree("new D { 1 }"), "(new D {coll 1})");
+        assert_eq!(tree("new D { { 1 } }"), "(new D {coll 1})");
+        assert_eq!(tree("new D { 1, { 2, 3 } }"), "(new D {coll 1 {2 3}})");
+        assert_eq!(tree("new D { A = 1 }"), "(new D {obj A=1})");
     }
 
     fn unit_codes(source: &str) -> Vec<u16> {
@@ -8628,8 +10135,36 @@ mod tests {
             "(class C : I (method int I.M () (block (return 1))))"
         );
         assert_eq!(
+            unit_tree("class C { void M() { C c = new(); } }"),
+            "(class C (method void M () (block (local C c=(new)))))"
+        );
+        assert_eq!(
+            unit_tree("class C { void M() { C c = new(1, 2); } }"),
+            "(class C (method void M () (block (local C c=(new 1 2)))))"
+        );
+        assert_eq!(
+            unit_tree("class C { void M() { C c = new C(); } }"),
+            "(class C (method void M () (block (local C c=(new C)))))"
+        );
+        assert_eq!(
             unit_tree("class C : N.I { int N.I.M() { return 1; } }"),
             "(class C : N.I (method int N.I.M () (block (return 1))))"
+        );
+        assert_eq!(
+            unit_tree("class C : I { int I.this[int i] { get { return i; } } }"),
+            "(class C : I (indexer I.this int [int i] (get (block (return i)))))"
+        );
+        assert_eq!(
+            unit_tree("class C : N.I { int N.I.this[int i] { get { return i; } } }"),
+            "(class C : N.I (indexer N.I.this int [int i] (get (block (return i)))))"
+        );
+        assert_eq!(
+            unit_tree("class C : I<string> { string I<string>.this[int i] { get { return null; } } }"),
+            "(class C : I<string> (indexer I<string>.this string [int i] (get (block (return null)))))"
+        );
+        assert_eq!(
+            unit_tree("class C { int this[int i] { get { return i; } } }"),
+            "(class C (indexer int [int i] (get (block (return i)))))"
         );
     }
 
@@ -8820,6 +10355,110 @@ mod tests {
             unit_tree("public delegate int F();"),
             "(delegate public int F ())"
         );
+    }
+
+    /// `delegate void D<T>(T value);` (C# 2.0; ECMA-334 4th ed 22.1). It did not parse at all --
+    /// `CS1003`, and on 11 programs of the cstest campaign -- because [`Parser::parse_delegate`]
+    /// went straight from the name to the parameter list.
+    #[test]
+    fn generic_delegate_declarations() {
+        assert_eq!(
+            unit_tree("delegate void D<T>(T value);"),
+            "(delegate void D<T> (T value))"
+        );
+        assert_eq!(
+            unit_tree("public delegate R Project<T, R>(T value);"),
+            "(delegate public R Project<T, R> (T value))"
+        );
+        assert_eq!(
+            unit_tree("delegate R P<T, R>(T value) where R : class;"),
+            "(delegate R P<T, R> (T value) where R : class)"
+        );
+        assert_eq!(
+            unit_tree("delegate T N<T>() where T : struct;"),
+            "(delegate T N<T> () where T : struct)"
+        );
+        assert_eq!(
+            unit_tree("delegate T M<T>() where T : System.IDisposable, new();"),
+            "(delegate T M<T> () where T : System.IDisposable, new())"
+        );
+        assert_eq!(unit_tree("delegate void D(int v);"), "(delegate void D (int v))");
+    }
+
+    /// `using T x = e;` (C# 8.0) is the `using` STATEMENT with its body implied, and the tree it
+    /// produces is the tree the statement spelling produces -- which is the whole feature.
+    ///
+    /// The body is THE REST OF THE ENCLOSING BLOCK, so these assertions are about where the
+    /// following statements land, not about the declaration itself.
+    #[test]
+    fn using_declarations() {
+        assert_eq!(
+            unit_tree("class C { void M() { using D d = e; f(); } }"),
+            "(class C (method void M () (block (using (local D d=e) (block (expr (call f)))))))"
+        );
+        assert_eq!(
+            unit_tree("class C { void M() { using D d = e; } }"),
+            "(class C (method void M () (block (using (local D d=e) (block)))))"
+        );
+        assert_eq!(
+            unit_tree("class C { void M() { using D a = e; using D b = e; f(); } }"),
+            "(class C (method void M () (block (using (local D a=e) (block (using (local D b=e) \
+             (block (expr (call f)))))))))"
+                .replace("             ", "")
+                .as_str()
+        );
+        assert_eq!(
+            unit_tree("class C { void M() { g(); using D d = e; f(); } }"),
+            "(class C (method void M () (block (expr (call g)) (using (local D d=e) \
+             (block (expr (call f)))))))"
+                .replace("             ", "")
+                .as_str()
+        );
+        assert_eq!(
+            unit_tree("class C { void M() { { using D d = e; f(); } h(); } }"),
+            "(class C (method void M () (block (block (using (local D d=e) \
+             (block (expr (call f))))) (expr (call h)))))"
+                .replace("             ", "")
+                .as_str()
+        );
+        assert_eq!(
+            unit_tree("class C { void M() { using (D d = e) { f(); } } }"),
+            "(class C (method void M () (block (using (local D d=e) (block (expr (call f)))))))"
+        );
+        assert_eq!(
+            unit_codes("class C { void M(bool c) { if (c) using D d = e; f(); } }"),
+            vec![1023]
+        );
+        assert_eq!(
+            unit_tree_ignoring_gates(
+                "class C { void M(bool c) { if (c) using D d = e; f(); } }",
+                LanguageVersion::DEFAULT,
+            ),
+            "(class C (method void M (bool c) (block (if c (using (local D d=e) (block))) \
+             (expr (call f)))))"
+                .replace("             ", "")
+                .as_str()
+        );
+    }
+
+    /// A type or namespace declaration may be followed by ONE optional semicolon -- ECMA-334 spells
+    /// `class-body ;opt` and the same for a struct, an interface, an enum and a namespace body.
+    ///
+    /// It was accepted after a RECORD alone (`CS1518` on the other five), which is the C-and-C++
+    /// habit refused in exactly the source that carries it over.
+    #[test]
+    fn optional_semicolon_after_a_declaration() {
+        assert_eq!(unit_tree("class C { };"), "(class C)");
+        assert_eq!(unit_tree("struct S { };"), "(struct S)");
+        assert_eq!(unit_tree("interface I { };"), "(interface I)");
+        assert_eq!(unit_tree("enum E { A };"), "(enum E A)");
+        assert_eq!(unit_tree("namespace N { class C {} };"), "(namespace N (class C))");
+        assert_eq!(
+            unit_tree("class O { class A { }; class B { } }"),
+            "(class O (class A) (class B))"
+        );
+        assert_eq!(unit_codes("class C { };"), Vec::<u16>::new());
+        assert!(!unit_codes("class C { };;").is_empty());
     }
 
     #[test]

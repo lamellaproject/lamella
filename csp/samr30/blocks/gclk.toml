@@ -1,0 +1,31 @@
+# The SAMR30 Generic Clock Controller block: the channel-routing registers the peripheral bring-up
+# paths touch (partial, append-only). Offsets are GCLK-base-relative; the base lives in
+# ../instances.toml. WHICH generator runs at WHAT rate is a PLAN fact (board.toml), never here.
+#
+# TWO ARRAYS, INDEXED BY DIFFERENT THINGS -- GENCTRL[n] by GENERATOR and PCHCTRL[m] by PERIPHERAL
+# CHANNEL. A peripheral is clocked by writing ITS channel with the generator number it should
+# listen to, and both numbers are small integers in the same range. The SAM D21 line has neither
+# array: it has ONE CLKCTRL register whose ID field selects the channel, so there the channel id is
+# a value and here it is an address.
+
+[table]
+kind = "block"
+family = "samr30"
+block = "gclk"
+sources = [
+    "SAM R30 datasheet DS70005303C section 13.5.8.4 (Peripheral Channel Control): 'Name: PCHCTRLm', 'Offset: 0x80 + m*0x04 [m=0..34]', with WRTLOCK at bit 7, CHEN at bit 6 and GEN[3:0] at bits 3:0",
+    "DS70005303C Table 13-18 (PCHCTRLm Mapping), whose printed rows run 0 to 34 and independently corroborate the array bound stated in the offset heading",
+]
+notes = [
+    "THE ARRAY BOUND IS THIS FAMILY'S AND IS NOT A CONSTANT ACROSS THE ARCHITECTURE: m runs to 34 here and on the saml21, to 45 on the samc21, to 28 on the saml22 and to 47 on the same54. The stride and the bound are both printed in the offset heading rather than derived, and a bound carried across would let a consumer address a channel the part does not have.",
+    "TWO REGISTERS IN THIS DOCUMENT SHARE THE FORMULA '0x80 + m*0x04' AND HAVE DIFFERENT BOUNDS. GCLK's PCHCTRLm is [m=0..34] on page 130; EVSYS's USERm is [m=0..41] on page 485. A search for the formula finds both, and the second is a different block in a different chapter -- so the bound must be read from the register's own heading and never from a match on the stride.",
+    "A CHANNEL IS NOT ENABLED BY SELECTING A GENERATOR. PCHCTRL.GEN chooses which generator feeds the channel and PCHCTRL.CHEN turns the channel on; writing GEN alone leaves the peripheral unclocked while the register reads back the generator that was asked for.",
+    "WRTLOCK IS ONE-WAY. Once set, further writes to that channel are discarded and the generator it names is locked with it. A driver that writes the whole register without masking can lock a peripheral's clock for the life of the power cycle.",
+    "DECLARED SUBSET: GENCTRL is NOT transcribed. Nothing here configures a generator -- a driver selecting a peripheral's generator is choosing among generators a clock plan has already set up -- and an undeclared register cannot be silently mis-strided.",
+]
+
+[registers.PCHCTRL0]
+offset = 0x80
+width = 32
+fields = { GEN = [0, 4], CHEN = [6, 1], WRTLOCK = [7, 1] }
+notes = "Element 0 of the peripheral channel array; element m is at 0x80 + m*0x04, for m up to 34. The instance rows carry each peripheral's channel id, so a driver names the peripheral it means rather than an integer."

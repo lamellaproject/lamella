@@ -9,7 +9,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use lamella_binder::{
-    Accessibility, BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, FieldReference,
+    Accessibility, BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, BoundSwitchArm,
+    FieldReference,
     MethodReference, SpecialType, TypeSymbol,
 };
 use lamella_syntax::ast::{AssignmentOperator, BinaryOperator, Literal, UnaryOperator};
@@ -477,6 +478,26 @@ fn stmt_contains_await(statement: &BoundStmt) -> bool {
 fn visit_expr(expr: &BoundExpr, f: &mut dyn FnMut(&BoundExpr)) {
     f(expr);
     match &expr.kind {
+        BoundExprKind::SwitchExpression {
+            governing,
+            arms,
+            fallback,
+            ..
+        } => {
+            visit_expr(governing, f);
+            for arm in arms {
+                if let Some(test) = &arm.test {
+                    visit_expr(test, f);
+                }
+                if let Some(guard) = &arm.guard {
+                    visit_expr(guard, f);
+                }
+                visit_expr(&arm.value, f);
+            }
+            if let Some(fallback) = fallback {
+                visit_expr(fallback, f);
+            }
+        }
         BoundExprKind::Ref { operand, .. }
         | BoundExprKind::Unary { operand, .. }
         | BoundExprKind::Postfix { operand, .. }
@@ -1845,7 +1866,7 @@ impl Rewriter {
 
 /// Structural map over an expression: `replace` answers `Some` at a leaf it substitutes, `None`
 /// to keep walking. Children rebuild around the substitutions.
-fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> Option<BoundExpr>) -> BoundExpr {
+pub(crate) fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> Option<BoundExpr>) -> BoundExpr {
     if let Some(replacement) = replace(expr) {
         return replacement;
     }
@@ -1883,10 +1904,12 @@ fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> Option<Boun
             operation,
             operand,
             target,
+            declares,
         } => BoundExprKind::TypeTest {
             operation: *operation,
             operand: Box::new(map_expr(operand, replace)),
             target: target.clone(),
+            declares: declares.clone(),
         },
         BoundExprKind::FieldAccess {
             receiver,
@@ -2009,6 +2032,26 @@ fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> Option<Boun
         BoundExprKind::Sequence { spilled, value } => BoundExprKind::Sequence {
             spilled: spilled.iter().map(|o| map_expr(o, replace)).collect(),
             value: Box::new(map_expr(value, replace)),
+        },
+        BoundExprKind::SwitchExpression {
+            governing,
+            subject,
+            arms,
+            fallback,
+        } => BoundExprKind::SwitchExpression {
+            governing: Box::new(map_expr(governing, replace)),
+            subject: subject.clone(),
+            arms: arms
+                .iter()
+                .map(|arm| BoundSwitchArm {
+                    test: arm.test.as_ref().map(|test| map_expr(test, replace)),
+                    guard: arm.guard.as_ref().map(|guard| map_expr(guard, replace)),
+                    value: map_expr(&arm.value, replace),
+                })
+                .collect(),
+            fallback: fallback
+                .as_ref()
+                .map(|fallback| Box::new(map_expr(fallback, replace))),
         },
         BoundExprKind::Checked(operand) => {
             BoundExprKind::Checked(Box::new(map_expr(operand, replace)))

@@ -18,7 +18,7 @@
 kind = "parts"
 family = "stm32c0"
 notes = [
-    "THE OTHER FOUR SUB-FAMILIES, as an address map rather than as parts. RM0490 Rev 6 gives each its own boundary table: STM32C011xx and STM32C031xx share Table 2 (32 Kbytes flash, 12 Kbytes SRAM), STM32C051xx has Table 3 (64 and 12) and STM32C091xx has Table 5 (256 and 36). Those are the extents a sub-family's map allows rather than an order code's fitted memory, and no row here names one.",
+    "THE OTHER FOUR SUB-FAMILIES, as an address map rather than as parts. RM0490 Rev 6 gives each its own boundary table: STM32C011xx and STM32C031xx share Table 2 (32 Kbytes flash, 12 Kbytes SRAM), STM32C051xx has Table 3 (64 and 12) and STM32C091xx has Table 5 (256 and 36). Those are the extents a sub-family's map allows rather than an order code's fitted memory, and no row here names one -- when a board arrives, its order code gets a row of its own with a package and a pad set.",
     "THE DEV_ID VALUES THAT TELL THE SUB-FAMILIES APART are RM0490 Rev 6 Table 178: 0x443 STM32C011xx, 0x453 STM32C031xx, 0x44C STM32C051xx, 0x493 STM32C071xx, 0x44D STM32C091xx/92xx. Each names a SUB-FAMILY rather than an order code, so no reading of one identifies the board in front of you.",
     "Bits 15:12 of this family's DBG_IDCODE are reserved and read back as 0b0110, so an STM32C071 returns 0x10016493 in that register. A whole-word comparison is therefore a die fact, a sixteen-bit mask decodes as nothing at all, and only the low TWELVE bits are the part id.",
     "PD7 IS ABSENT FROM THE LQFP64 and the range above says so: the package brings out PD0-PD6 and then PD8 and PD9. A PD0-PD9 range would claim a pad this package does not bond.",

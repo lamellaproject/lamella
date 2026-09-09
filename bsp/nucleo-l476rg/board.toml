@@ -36,3 +36,12 @@ pclk_hz = 4000000           # the APB clock feeding this board's bound USART. It
                             # for the next. Under reset prescalers it equals MSI, which the
                             # generator verifies rather than takes (state-and-verify). Firmware
                             # that raises MSI for margin states that point as its own plan.
+
+[debug]
+signals = ["swd"]
+exposure = "connectable"
+fitted = "no"
+pitch_mm = 2.54
+onboard = "st-link"
+recovery = "probe"
+source = "UM1724 section 7.3: the target part's SWD signals are available on the ST morpho connector, SWCLK on CN7 pin 15 and SWDIO on CN7 pin 13. Section 6.6 states the ST morpho connector consists of male pin headers, and the feature list names the ST morpho extension pin headers as a board feature, so those pins are fitted and a clip or jumper reaches them with no soldering. The board's own debug connector CN4 is not this: UM1724 section 7.4 describes it as the way to program an MCU in an EXTERNAL application board using the on-board ST-LINK, so it is an output rather than a way in to this part. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

@@ -20,13 +20,23 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 # and lowers the deployed program (lamella-aot) + reads its Portable PDB (lamella-metadata)
 # to compose the native -> source-line mapping at launch.
 lamella-dap = { path = "../lamella-dap", default-features = false }
-lamella-usbhid = { path = "../lamella-usbhid" }
+# PROBE ENUMERATION AND SELECTION, not one vendor id. `usbbulk` is NOT optional: without it this
+# sees CMSIS-DAP v1 (HID) probes only, and an MCU-Link or a Debug Probe is v2 over USB bulk -- so a
+# setup full of them would resolve to nothing while reporting that it had looked.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
 lamella-aot = { path = "../lamella-aot" }
 lamella-metadata = { path = "../lamella-metadata" }
+# THE OTHER PRODUCER OF THE SAME MAPPING, AND THE ONE THAT REACHES A LANGUAGE THAT IS NOT C#.
+# A Swift or RHU program is a linked ELF with DWARF and no Portable PDB, so the metadata route
+# stops at the language boundary and this one does not. `lamella-elf` flattens the image the same
+# ELF describes, so the bytes flashed and the addresses debugged come from one file.
+lamella-dwarf = { path = "../lamella-dwarf" }
+lamella-elf = { path = "../lamella-elf" }
 # device-dap-server flashes the built image on launch (F5 = deploy + debug).
 lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
 lamella-stlink = { path = "../lamella-stlink", optional = true }
 lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32", optional = true }
+lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam", optional = true }
 
 # OPTIONAL, AND THE OPTIONALITY IS THE POINT. `DeviceBackend` must not know which probes or which
 # parts exist -- that is the property the widening to `TargetAccess` bought, and a plain dependency
@@ -39,6 +49,12 @@ default = []
 ## Lets `device-dap-server` drive an ST-Link and program STM32 flash, so an ST board with an
 ## on-board debugger can be deployed to and natively debugged over its one USB cable.
 st = ["dep:lamella-stlink", "dep:lamella-cmsis-dap-stm32"]
+## Lets `device-dap-server` stop a SAM D21 with the sequence that part needs. The generic
+## reset-and-halt arms the vector catch under nRESET, which requires the debug port to stay
+## reachable while the part is held; a SAM D21 does not offer that, so `Samd21Debug::samd21_park`
+## drives the DSU's cold-plugging reset extension instead. It is written against `TargetAccess`
+## rather than against a CMSIS-DAP probe, so an ST-Link reaches it too.
+sam = ["dep:lamella-cmsis-dap-sam"]
 
 [dev-dependencies]
 # THE POINT OF WIDENING `DeviceBackend` TO `TargetAccess`, ASSERTED RATHER THAN CLAIMED: an

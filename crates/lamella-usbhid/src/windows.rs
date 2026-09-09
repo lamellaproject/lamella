@@ -30,8 +30,6 @@ use windows_sys::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows_sys::core::GUID;
 
-/// CMSIS-DAP report payload size (excludes the report-id byte).
-const REPORT_MAX: usize = 64;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 
@@ -328,8 +326,10 @@ impl Device {
             CloseHandle(handle);
             return Err(Error::Os("CreateEvent failed".into()));
         }
-        let (in_len, out_len) =
-            hid_caps(handle).map_or((1 + REPORT_MAX, 1 + REPORT_MAX), |c| (c.input_len, c.output_len));
+        let fallback = 1 + crate::DEFAULT_REPORT_LEN;
+        let caps = hid_caps(handle);
+        let in_len = crate::report_len_or_default(caps.as_ref().map(|c| c.input_len), fallback);
+        let out_len = crate::report_len_or_default(caps.as_ref().map(|c| c.output_len), fallback);
         Ok(Device {
             handle,
             event,

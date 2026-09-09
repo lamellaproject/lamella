@@ -387,7 +387,7 @@ impl<'a> Parser<'a> {
                 "try" => return self.parse_try(context, start),
                 "switch" => return self.parse_switch(context, start),
                 "function" => {
-                    let function = self.parse_function(context, start, false);
+                    let function = self.parse_function(context, start, false, false);
                     return Statement::Function(Box::new(function));
                 }
                 "debugger" => {
@@ -1168,7 +1168,13 @@ impl<'a> Parser<'a> {
         Statement::Switch { discriminant, cases, span: self.span_from(start) }
     }
 
-    fn parse_function(&mut self, context: Context, start: usize, is_async: bool) -> Function {
+    fn parse_function(
+        &mut self,
+        context: Context,
+        start: usize,
+        is_async: bool,
+        is_expression: bool,
+    ) -> Function {
         self.advance(Goal::Div);
         let is_generator = self.eat(Punctuator::Star, Goal::Div);
         let name_span = self.token.span;
@@ -1195,7 +1201,12 @@ impl<'a> Parser<'a> {
                     format!("a strict function may not be named `{name}`"),
                 );
             }
-            let effective = Context { strict: strict || context.strict, ..context };
+            let effective = Context {
+                strict: strict || context.strict,
+                allow_yield: if is_expression { is_generator } else { context.allow_yield },
+                allow_await: if is_expression { is_async } else { context.allow_await },
+                ..context
+            };
             if reserved_in(name, effective) {
                 self.early_error(
                     name_span,
@@ -1381,14 +1392,18 @@ impl<'a> Parser<'a> {
 
     fn parse_yield(&mut self, context: Context, start: usize) -> Expression {
         self.advance(Goal::RegExp);
-        let delegate = self.eat(Punctuator::Star, Goal::RegExp);
-        let argument = if self.at(Punctuator::CloseParen)
+        let broken = self.token.preceded_by_line_terminator;
+        let delegate = !broken && self.eat(Punctuator::Star, Goal::RegExp);
+        let argument = if delegate {
+            Some(self.parse_assignment(context))
+        } else if self.at(Punctuator::CloseParen)
             || self.at(Punctuator::CloseBracket)
             || self.at(Punctuator::CloseBrace)
             || self.at(Punctuator::Comma)
             || self.at(Punctuator::Semicolon)
+            || self.at(Punctuator::Colon)
             || self.at_end()
-            || self.token.preceded_by_line_terminator
+            || broken
         {
             None
         } else {
@@ -1917,7 +1932,7 @@ impl<'a> Parser<'a> {
                     Expression::This { span: self.span_from(start) }
                 }
                 "function" if !self.token.had_escape => {
-                    let function = self.parse_function(context, start, false);
+                    let function = self.parse_function(context, start, false, true);
                     Expression::Function(Box::new(function))
                 }
                 "class" if !self.token.had_escape => {
@@ -1929,7 +1944,7 @@ impl<'a> Parser<'a> {
                 }
                 "async" if !self.token.had_escape && self.async_function_follows() => {
                     self.advance(Goal::Div);
-                    let function = self.parse_function(context, start, true);
+                    let function = self.parse_function(context, start, true, true);
                     Expression::Function(Box::new(function))
                 }
                 _ => {

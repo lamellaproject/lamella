@@ -45,6 +45,17 @@ impl Slot {
 #[derive(Debug, Default)]
 pub struct Frame {
     slots: BTreeMap<Box<str>, Slot>,
+    /// Locals DECLARED INSIDE AN EXPRESSION -- an `out` variable declaration, `M(out int a)` --
+    /// which [`Frame::collect_locals`] cannot see because it walks STATEMENTS and these have no
+    /// statement. Reserved when emission reaches the declaration instead, which is why this is
+    /// behind a `RefCell` where [`Frame::slots`] is not.
+    ///
+    /// **THE ORDER IS SAFE AND DEFINITE ASSIGNMENT IS WHAT MAKES IT SO.** A read of the variable
+    /// before the call that declares it is `CS0165`, so a body that emits at all cannot reach a
+    /// use before the reservation. There is no second chance to get this right: an unreserved
+    /// name reaches `emit_local_address` as "a name with no frame slot", which is a refusal and
+    /// not a wrong answer.
+    expression_locals: RefCell<BTreeMap<Box<str>, Slot>>,
     /// The local-variable types in slot order. Behind a `RefCell` so a compiler
     /// temporary (e.g. spilling a value-type rvalue receiver) can be reserved during
     /// expression emission, which holds the frame only by shared reference.
@@ -134,7 +145,25 @@ impl Frame {
     /// The slot a name occupies, if any.
     #[must_use]
     pub fn slot(&self, name: &str) -> Option<Slot> {
-        self.slots.get(name).copied()
+        self.slots
+            .get(name)
+            .copied()
+            .or_else(|| self.expression_locals.borrow().get(name).copied())
+    }
+
+    /// Reserves and names the slot for a local declared INSIDE an expression, and returns it.
+    /// Idempotent: a variable declared in a loop body is reached once per emission of that body
+    /// and must keep one slot.
+    pub fn declare_expression_local(&self, name: &str, ty: &TypeSymbol) -> Slot {
+        if let Some(&slot) = self.expression_locals.borrow().get(name) {
+            return slot;
+        }
+        let slot = Slot::Local(self.reserve_local(ty));
+        if let Slot::Local(index) = slot {
+            self.name_local(index, name);
+        }
+        self.expression_locals.borrow_mut().insert(name.into(), slot);
+        slot
     }
 
     /// Points `name` at the local slot reserved for the declaration at `span` (a no-op if none is

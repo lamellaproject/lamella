@@ -3,6 +3,7 @@
 
 pub mod proto;
 
+use lamella_probe_core::cortex_m;
 use proto::{Ack, Port};
 
 /// A failure exchanging a packet with the probe.
@@ -24,8 +25,24 @@ pub trait Transport {
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, TransportError>;
 }
 
-/// The standard CMSIS-DAP v1 HID report size.
+/// The standard CMSIS-DAP v1 HID report size, and the FLOOR this crate assumes until a probe says
+/// otherwise. Every probe answers at least this.
 const PACKET: usize = 64;
+
+/// The reply buffer, and the ceiling a negotiated packet size is clamped to.
+///
+/// **A REPLY LONGER THAN THE BUFFER IS A TRUNCATED REPLY**, so the buffer has to lead the
+/// negotiation rather than follow it. 1 KiB covers the HID probes this crate drives -- an NXP
+/// MCU-Link reports 1024, an EDBG 512 -- and a v2 bulk probe may advertise far more and is simply
+/// used at this size, which is still 16x the floor.
+///
+/// **PUBLIC BECAUSE A CONSUMER GUARDS THIS EXACT NUMBER AT ITS OWN SEAM.** `lamella-wasm`'s host
+/// transport refuses a host that reports more bytes than the buffer it was handed -- the one
+/// failure that would otherwise decode bytes nobody wrote -- and a test of that refusal has to
+/// over-report relative to the REAL capacity. Hardcoding it there made the buffer size a fact in
+/// two places, and when this moved from 64 to 1024 the copy did not: the reply the test called
+/// over-long began to fit, and the refusal correctly did not fire.
+pub const MAX_PACKET: usize = 1024;
 
 /// How many stale replies [`Dap::command`] will discard while looking for its own echo. Small on
 /// purpose: it only has to cover the replies an abandoned session can leave queued, and each read
@@ -70,6 +87,8 @@ const VC_CORERESET: u32 = 1 << 0;
 
 const FP_CTRL: u32 = 0xe000_2000;
 const FP_COMP0: u32 = 0xe000_2008;
+const FP_CTRL_KEY: u32 = 1 << 1;
+const FP_CTRL_ENABLE: u32 = 1 << 0;
 
 #[cfg(feature = "usbhid")]
 impl Transport for lamella_usbhid::Device {
@@ -196,7 +215,10 @@ impl CallFrame {
 /// A connected CMSIS-DAP probe driving a target over SWD.
 pub struct Dap<T: Transport> {
     transport: T,
-    reply: [u8; PACKET],
+    reply: [u8; MAX_PACKET],
+    /// The probe's own maximum command/reply size, from `DAP_Info` 0xFF, learned during a connect.
+    /// [`PACKET`] until then -- the floor, which is correct for any probe and optimal for some.
+    packet_size: usize,
 }
 
 impl<T: Transport> Dap<T> {
@@ -204,7 +226,53 @@ impl<T: Transport> Dap<T> {
     pub fn new(transport: T) -> Self {
         Dap {
             transport,
-            reply: [0; PACKET],
+            reply: [0; MAX_PACKET],
+            packet_size: PACKET,
+        }
+    }
+
+    /// The probe's negotiated maximum packet size in bytes -- [`PACKET`] until a connect learns it.
+    #[must_use]
+    pub fn packet_size(&self) -> usize {
+        self.packet_size
+    }
+
+    /// How many 32-bit words one block transfer carries, read or write.
+    ///
+    /// The two framings differ by a byte -- a write command is `[cmd, 0, count_lo, count_hi,
+    /// request]` and a read REPLY is `[cmd, count_lo, count_hi, ack]` -- so a 64-byte packet truly
+    /// carries 14 words written and 15 read. **This takes the larger header for both**, so one
+    /// number describes the split.
+    ///
+    /// Deliberately, and not for tidiness: 14 is what every 64-byte probe has used since this crate
+    /// existed, and widening the FLOOR to 15 would be an unmeasured behaviour change riding along
+    /// with a change about something else. The cost at the other end is one word in 127.
+    fn words_per_packet(&self) -> usize {
+        (self.packet_size - 5) / 4
+    }
+
+    /// Asks the probe its packet size and adopts it, clamped to [`PACKET`]..=[`MAX_PACKET`].
+    ///
+    /// **A PROBE THAT DOES NOT ANSWER KEEPS THE FLOOR**, which is why this returns nothing and
+    /// cannot fail a connect: [`PACKET`] is the size every probe carries, so it is safe to assume
+    /// about one that will not say -- and a probe that will not say is a probe to believe the least
+    /// about. The clamp is not defensive dressing -- the reply buffer is fixed, and a size above it
+    /// would turn every large read into a silently truncated one.
+    ///
+    /// # What it is worth, and what it is not
+    ///
+    /// A probe answering 512 carries 126 words a packet against the floor's 14 -- about a NINTH of
+    /// the round trips. That is not a ninth of the TIME, and the difference is the useful part:
+    /// measured A/B on one board, a 1 MiB read went 27.3-29.3 s to 17.9 s and an 8 KiB write
+    /// 374.8 ms to 303.3 ms. **Roughly 1.5x on bulk reads and 1.25x on writes, because the SWD wire
+    /// time dominates and only the per-packet overhead is removed.** A probe that reports the floor
+    /// is unaffected, exactly: 41.2 s against 41.3 s on the same measurement.
+    fn adopt_packet_size(&mut self) {
+        if let Ok(bytes) = self.info_bytes(0xff)
+            && bytes.len() >= 2
+        {
+            let reported = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            self.packet_size = reported.clamp(PACKET, MAX_PACKET);
         }
     }
 
@@ -360,6 +428,9 @@ impl<T: Transport> Dap<T> {
     pub fn connect_swd_at(&mut self, clock_hz: u32) -> Result<(), DapError> {
         self.connect_port(Port::Swd)?;
         self.command(&proto::swj_clock(clock_hz))?;
+        self.command(&proto::swd_configure(0, false))?;
+        self.command(&proto::transfer_configure(0, 250, 100))?;
+        self.adopt_packet_size();
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
         self.command(&proto::swj_sequence(16, &[0x9e, 0xe7]))?;
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
@@ -518,6 +589,16 @@ impl<T: Transport> Dap<T> {
     /// target's DP briefly (a reset catch, a slow flash helper).
     pub fn configure_transfers(&mut self, idle_cycles: u8, wait_retry: u16, match_retry: u16) -> Result<(), DapError> {
         self.command(&proto::transfer_configure(idle_cycles, wait_retry, match_retry))?;
+        Ok(())
+    }
+
+    /// Sets the SWD turnaround period and data-phase behaviour ([`proto::swd_configure`]).
+    ///
+    /// Sent as part of [`connect_swd_at`](Self::connect_swd_at): the turnaround decides where the
+    /// acknowledge bits land, so a probe left on a default that does not suit the target reports a
+    /// nonsense ACK for a transfer the target answered correctly.
+    pub fn configure_swd(&mut self, turnaround: u8, data_phase: bool) -> Result<(), DapError> {
+        self.command(&proto::swd_configure(turnaround, data_phase))?;
         Ok(())
     }
 
@@ -769,12 +850,39 @@ impl<T: Transport> Dap<T> {
     }
 
     /// Sets hardware breakpoint comparator 0 at a code `address`: the core halts when its
-    /// PC reaches that instruction. Uses the Cortex-M0 Breakpoint Unit.
+    /// PC reaches that instruction.
+    ///
+    /// The comparator layout depends on which revision of the breakpoint unit the part implements,
+    /// so `FP_CTRL.REV` is read first. [`lamella_probe_core::cortex_m::comparator`] encodes the
+    /// word, and is the single place that knows either layout.
     pub fn set_breakpoint(&mut self, address: u32) -> Result<(), DapError> {
-        self.write_word(FP_CTRL, 0b11)?;
-        let bp_match = if address & 0x2 != 0 { 0b10 } else { 0b01 };
-        let comp = (bp_match << 30) | (address & 0x1fff_fffc) | 1;
-        self.write_word(FP_COMP0, comp)
+        let (revision, capacity) = self.fpb_facts()?;
+        if capacity == 0 {
+            return Err(DapError::Device("breakpoint unit reports no comparators"));
+        }
+        self.write_word(FP_CTRL, FP_CTRL_KEY | FP_CTRL_ENABLE)?;
+        self.write_word(FP_COMP0, cortex_m::comparator(revision, address))
+    }
+
+    /// Reads `FP_CTRL` once and returns both facts it carries: which comparator layout this part
+    /// implements, and how many comparators it has.
+    ///
+    /// One read for both, because they live in one register and a caller needs both. A reserved
+    /// revision is refused rather than guessed, for the reason on
+    /// [`lamella_probe_core::cortex_m::fpb_revision`]: a comparator written in the wrong layout
+    /// arms a breakpoint somewhere else instead of failing.
+    fn fpb_facts(&mut self) -> Result<(cortex_m::FpbRevision, usize), DapError> {
+        let fp_ctrl = self.read_word(FP_CTRL)?;
+        let revision = match fp_ctrl >> 28 {
+            0 => cortex_m::FpbRevision::V1,
+            1 => cortex_m::FpbRevision::V2,
+            _ => {
+                return Err(DapError::Device(
+                    "unknown FP_CTRL.REV -- breakpoint unit not recognized",
+                ));
+            }
+        };
+        Ok((revision, cortex_m::fpb_num_code(fp_ctrl) as usize))
     }
 
     /// Disables hardware breakpoint comparator 0.
@@ -782,20 +890,25 @@ impl<T: Transport> Dap<T> {
         self.write_word(FP_COMP0, 0)
     }
 
-    /// Replaces every hardware breakpoint with `addresses`, one per comparator (the
-    /// Cortex-M0 BPU has four). Enables the FPB; comparators past `addresses` are cleared,
-    /// and any address beyond the fourth is dropped.
+    /// Replaces every hardware breakpoint with `addresses`, driving every comparator the unit
+    /// reports and clearing the ones `addresses` does not name.
+    ///
+    /// **More addresses than the unit has comparators is an ERROR, not a truncation.** This drove a
+    /// fixed four and indexed `addresses` with `get`, so a caller asking for more got four armed and
+    /// silence about the rest.
     pub fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), DapError> {
-        self.write_word(FP_CTRL, 0b11)?;
-        for i in 0..4u32 {
-            let comp = match addresses.get(i as usize) {
-                Some(&address) => {
-                    let bp_match = if address & 0x2 != 0 { 0b10 } else { 0b01 };
-                    (bp_match << 30) | (address & 0x1fff_fffc) | 1
-                }
-                None => 0,
-            };
-            self.write_word(FP_COMP0 + i * 4, comp)?;
+        let (revision, capacity) = self.fpb_facts()?;
+        if addresses.len() > capacity {
+            return Err(DapError::Device(
+                "more breakpoints requested than the breakpoint unit has comparators",
+            ));
+        }
+        let enable = if addresses.is_empty() { FP_CTRL_KEY } else { FP_CTRL_KEY | FP_CTRL_ENABLE };
+        self.write_word(FP_CTRL, enable)?;
+        for i in 0..capacity {
+            let comp =
+                addresses.get(i).map_or(0, |&address| cortex_m::comparator(revision, address));
+            self.write_word(FP_COMP0 + i as u32 * 4, comp)?;
         }
         Ok(())
     }
@@ -952,9 +1065,7 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
         address: u8,
         values: &[u32],
     ) -> Result<(), lamella_probe_core::ProbeError> {
-        /// 64-byte packet: 5 header bytes + 14 x 4-byte values.
-        const WORDS_PER_PACKET: usize = 14;
-        for chunk in values.chunks(WORDS_PER_PACKET) {
+        for chunk in values.chunks(self.words_per_packet()) {
             let reply = self.command(&proto::transfer_block_write(proto::ap_write(address), chunk))?;
             let (done, ack) = proto::parse_block_write(reply)?;
             if ack != Ack::Ok || done as usize != chunk.len() {
@@ -971,11 +1082,10 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
         address: u8,
         out: &mut [u32],
     ) -> Result<(), lamella_probe_core::ProbeError> {
-        /// 64-byte reply packet: 4 header bytes + 14 x 4-byte values.
-        const WORDS_PER_PACKET: usize = 14;
+        let per_packet = self.words_per_packet();
         let mut remaining = out;
         while !remaining.is_empty() {
-            let batch = remaining.len().min(WORDS_PER_PACKET);
+            let batch = remaining.len().min(per_packet);
             let reply =
                 self.command(&proto::transfer_block_read(proto::ap_read(address), batch as u16))?;
             let (done, ack) = proto::parse_block_read(reply, &mut remaining[..batch])?;
@@ -1309,6 +1419,9 @@ mod tests {
         let replies = vec![
             echo(proto::cmd::CONNECT, &[Port::Swd as u8]),
             echo(proto::cmd::SWJ_CLOCK, &[0x00]),
+            echo(proto::cmd::SWD_CONFIGURE, &[0x00]),
+            echo(proto::cmd::TRANSFER_CONFIGURE, &[0x00]),
+            vec![proto::cmd::INFO, 0x02, 0x00, 0x02],
             echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
             echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
             echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
@@ -1318,6 +1431,37 @@ mod tests {
         let mut dap = Dap::new(Mock::new(replies));
         dap.connect_swd().unwrap();
         assert_eq!(dap.read_idcode().unwrap(), 0x0bb1_1477);
+        assert_eq!(dap.packet_size(), 512, "the reported size must be ADOPTED, not merely read");
+        assert_eq!(dap.words_per_packet(), 126, "and spent: 126 words a packet, against 14");
+    }
+
+    /// A probe that will not say keeps the floor, and a probe that overstates is clamped to the
+    /// reply buffer -- because a reply longer than the buffer is a TRUNCATED reply, and truncation
+    /// here would corrupt a bulk read rather than fail it.
+    #[test]
+    fn an_unreported_or_oversized_packet_size_falls_back_to_something_the_buffer_can_hold() {
+        let connect = |last: Vec<u8>| {
+            vec![
+                echo(proto::cmd::CONNECT, &[Port::Swd as u8]),
+                echo(proto::cmd::SWJ_CLOCK, &[0x00]),
+                echo(proto::cmd::SWD_CONFIGURE, &[0x00]),
+                echo(proto::cmd::TRANSFER_CONFIGURE, &[0x00]),
+                last,
+                echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
+                echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
+                echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
+                echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
+            ]
+        };
+
+        let mut silent = Dap::new(Mock::new(connect(vec![proto::cmd::INFO, 0x00])));
+        silent.connect_swd().unwrap();
+        assert_eq!(silent.packet_size(), PACKET, "no answer means the floor, not a guess");
+        assert_eq!(silent.words_per_packet(), 14, "which is the width this crate always used");
+
+        let mut huge = Dap::new(Mock::new(connect(vec![proto::cmd::INFO, 0x02, 0x00, 0x80])));
+        huge.connect_swd().unwrap();
+        assert_eq!(huge.packet_size(), MAX_PACKET, "clamped to what the buffer can actually hold");
     }
 
     #[test]
@@ -1609,25 +1753,125 @@ mod tests {
         );
     }
 
+    /// A `DAP_Transfer` read reply carrying `value` -- how the mock answers a `read_word`.
+    fn read_reply(value: u32) -> Vec<u8> {
+        let mut reply = vec![proto::cmd::TRANSFER, 0x01, 0x01];
+        reply.extend_from_slice(&value.to_le_bytes());
+        reply
+    }
+
+    /// An `FP_CTRL` value reporting revision `rev` in bits [31:28] and `num_code` comparators in
+    /// its split [14:12]:[7:4] field -- the two facts one read of this register carries.
+    fn fp_ctrl(rev: u32, num_code: u32) -> Vec<u8> {
+        read_reply((rev << 28) | (((num_code >> 4) & 0x7) << 12) | ((num_code & 0xf) << 4))
+    }
+
+    /// Every breakpoint write now costs a preceding `FP_CTRL` READ, because the comparator layout
+    /// is a property of the part rather than of the architecture we assumed. That read is a
+    /// `TAR` write plus a `DRW` read, so it occupies the first two packets and every later index
+    /// here is two further along than it was.
     #[test]
-    fn set_breakpoint_enables_fpb_and_sets_comp() {
+    fn set_breakpoint_reads_the_revision_then_enables_fpb_and_sets_comp() {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let mut dap = Dap::new(Mock::new(vec![ack.clone(), ack.clone(), ack.clone(), ack]));
+        let replies =
+            vec![ack.clone(), fp_ctrl(0, 4), ack.clone(), ack.clone(), ack.clone(), ack];
+        let mut dap = Dap::new(Mock::new(replies));
         dap.set_breakpoint(0x0000_0030).unwrap();
-        assert_eq!(&dap.transport.sent[1][4..8], &0b11u32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[3][4..8], &0b11u32.to_le_bytes());
         let expected = (0b01u32 << 30) | (0x30 & 0x1fff_fffc) | 1;
-        assert_eq!(&dap.transport.sent[3][4..8], &expected.to_le_bytes());
+        assert_eq!(&dap.transport.sent[5][4..8], &expected.to_le_bytes());
+    }
+
+    /// ASKING FOR MORE BREAKPOINTS THAN THE PART HAS COMPARATORS IS A REFUSAL, NOT A QUIET
+    /// TRUNCATION. A caller asking for more comparators than the target has must be told so: arming
+    /// the first few and dropping the rest silently looks, in a debug session, like a target that
+    /// ignores breakpoints.
+    #[test]
+    fn more_breakpoints_than_comparators_is_refused_rather_than_truncated() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut dap = Dap::new(Mock::new(vec![ack, fp_ctrl(1, 4)]));
+        let six = [0x100, 0x200, 0x300, 0x400, 0x500, 0x600];
+        assert!(matches!(dap.set_breakpoints(&six), Err(DapError::Device(_))));
+        assert_eq!(dap.transport.sent.len(), 2);
+    }
+
+    /// The capacity comes off the part, so a unit reporting more than four gets more than four --
+    /// and the count is read from the SPLIT field, which is where a 16-comparator part used to
+    /// read back as zero.
+    #[test]
+    fn a_unit_reporting_more_than_four_comparators_gets_all_of_them_programmed() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut replies = vec![ack.clone(), fp_ctrl(1, 16)];
+        replies.extend(vec![ack; 2 + 32]);
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.set_breakpoints(&[0x0800_1000, 0x0800_2000]).unwrap();
+        assert_eq!(&dap.transport.sent[5][4..8], &0x0800_1001u32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[7][4..8], &0x0800_2001u32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[35][4..8], &0u32.to_le_bytes());
+    }
+
+    /// THE CASE THAT WAS SILENTLY WRONG BEFORE. On a part reporting revision 1 the comparator is
+    /// `BPADDR` in bits [31:1] with no match field, so the V1 word -- which sets bit 30 or 31 and
+    /// drops the address above bit 28 -- would have armed a breakpoint at some other address
+    /// entirely while every transfer acknowledged.
+    #[test]
+    fn a_revision_2_part_gets_the_bpaddr_layout_and_not_the_match_field() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies =
+            vec![ack.clone(), fp_ctrl(1, 4), ack.clone(), ack.clone(), ack.clone(), ack];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.set_breakpoint(0x0800_1235).unwrap();
+        assert_eq!(&dap.transport.sent[5][4..8], &0x0800_1235u32.to_le_bytes());
+        let v1 = (0b10u32 << 30) | (0x0800_1235 & 0x1fff_fffc) | 1;
+        assert_ne!(&dap.transport.sent[5][4..8], &v1.to_le_bytes());
+    }
+
+    /// A revision the architecture reserves is refused, not guessed. Planting a comparator in an
+    /// unknown layout does not fail loudly -- it breaks somewhere else.
+    #[test]
+    fn a_reserved_revision_is_refused_rather_than_encoded() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut dap = Dap::new(Mock::new(vec![ack, fp_ctrl(0xd, 4)]));
+        assert!(matches!(dap.set_breakpoint(0x0000_0030), Err(DapError::Device(_))));
+    }
+
+    /// AN EMPTY SET LEAVES THE UNIT OFF. Arming anything turns the FPB on and nothing used to turn
+    /// it off again, so "remove my last breakpoint" left the part enabled -- inert, because a
+    /// cleared comparator matches nothing, and still not the state the debugger found.
+    #[test]
+    fn an_empty_breakpoint_set_disables_the_unit_rather_than_only_clearing_it() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut replies = vec![ack.clone(), fp_ctrl(1, 4)];
+        replies.extend(vec![ack; 10]);
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.set_breakpoints(&[]).unwrap();
+        assert_eq!(&dap.transport.sent[3][4..8], &FP_CTRL_KEY.to_le_bytes());
+        assert_eq!(&dap.transport.sent[5][4..8], &0u32.to_le_bytes());
+    }
+
+    /// The counterpart, so the pair shows the enable bit tracks the SET and not the call: a
+    /// non-empty set must still turn the unit on.
+    #[test]
+    fn a_non_empty_breakpoint_set_enables_the_unit() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut replies = vec![ack.clone(), fp_ctrl(1, 4)];
+        replies.extend(vec![ack; 10]);
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.set_breakpoints(&[0x0800_1000]).unwrap();
+        assert_eq!(&dap.transport.sent[3][4..8], &(FP_CTRL_KEY | FP_CTRL_ENABLE).to_le_bytes());
     }
 
     #[test]
     fn set_breakpoints_programs_four_comparators() {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let mut dap = Dap::new(Mock::new(vec![ack; 10]));
+        let mut replies = vec![ack.clone(), fp_ctrl(0, 4)];
+        replies.extend(vec![ack; 10]);
+        let mut dap = Dap::new(Mock::new(replies));
         dap.set_breakpoints(&[0x0000_0030, 0x0000_0050]).unwrap();
         let comp0 = (0b01u32 << 30) | (0x30 & 0x1fff_fffc) | 1;
         let comp1 = (0b01u32 << 30) | (0x50 & 0x1fff_fffc) | 1;
-        assert_eq!(&dap.transport.sent[3][4..8], &comp0.to_le_bytes());
-        assert_eq!(&dap.transport.sent[5][4..8], &comp1.to_le_bytes());
-        assert_eq!(&dap.transport.sent[9][4..8], &0u32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[5][4..8], &comp0.to_le_bytes());
+        assert_eq!(&dap.transport.sent[7][4..8], &comp1.to_le_bytes());
+        assert_eq!(&dap.transport.sent[11][4..8], &0u32.to_le_bytes());
     }
 }

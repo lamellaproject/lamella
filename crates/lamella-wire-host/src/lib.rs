@@ -68,7 +68,7 @@ fn trace_received(bytes: &[u8]) {
 /// Two states with different remedies, so they are two variants rather than one failure: "plug the
 /// board in / check the serial" against "say which of these you meant". It lives HERE, in the host
 /// crate, and deliberately not in [`TransportError`] -- that type is shared with `no_std` firmware,
-/// where this lane has measured a payload-carrying enum variant at ~1,950 bytes of flash for a
+/// where a payload-carrying enum variant measures ~1,950 bytes of flash for a
 /// condition no device can ever be in.
 #[cfg(feature = "serial")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +280,12 @@ impl UsbTransport {
     /// product + serial strings where the OS reports them -- the picker's data source.
     ///
     /// # A board carries the identity it was flashed with, and the list has to hold both
+    ///
+    /// A board enumerates under whichever vendor id it was flashed with, so the scan matches more
+    /// than the current pair: **a scan that matched only the current one would not report an older
+    /// board as old -- it would not report it at all**, and a board that is not listed is a board
+    /// nobody thinks to reprogram. [`lamella_wire::usb::identify`] says which a given board is, so
+    /// a picker can tell an operator why one of them needs attention.
     ///
     /// # Errors
     /// [`TransportError::Carrier`] if the platform cannot enumerate by interface GUID.
@@ -788,7 +794,10 @@ pub fn open_target(
                 return TcpTransport::connect(target, timeout).map(AnyTransport::Tcp);
             }
             #[cfg(not(feature = "tcp"))]
-            Err(TransportError::Carrier)
+            {
+                let _ = timeout;
+                Err(TransportError::Carrier)
+            }
         }
         TargetKind::Usb => {
             #[cfg(feature = "usb")]
@@ -866,7 +875,7 @@ pub fn version_mismatch(host: u16, target_min: u16, target_max: u16) -> String {
         format!("versions {target_min} to {target_max}")
     };
     let remedy = if target_max < host {
-        "the BOARD is behind this tool -- reflash its serve firmware from this tree"
+        "the BOARD is behind this tool -- reflash its serve firmware"
     } else {
         "this TOOL is behind the board -- update the tools, the board is newer"
     };
@@ -928,6 +937,7 @@ pub fn hello_blocking(
                         reason: frame.payload.first().copied().unwrap_or(0),
                         msg_type: lamella_wire::error::refused_message_type(&frame.payload)
                             .unwrap_or(0),
+                        holder: lamella_wire::error::session_holder(&frame.payload),
                     });
                 }
                 _ => {}
@@ -1395,7 +1405,8 @@ pub fn try_recv_bundle_ack(
         if msg_type == msg::ERROR {
             return Err(TransportError::Refused {
                 reason: payload.first().copied().unwrap_or(0),
-                msg_type: payload.get(1).copied().unwrap_or(0),
+                msg_type: lamella_wire::error::refused_message_type(&payload).unwrap_or(0),
+                holder: lamella_wire::error::session_holder(&payload),
             });
         }
     }
@@ -1611,6 +1622,56 @@ mod tests {
                 assert_eq!((target_min, target_max), (7, 9), "the target's own range survives");
             }
             other => panic!("a version refusal must not arrive as {other:?}"),
+        }
+    }
+
+    /// A HELD TARGET ARRIVES NAMING WHO HOLDS IT, AND THE HOLDER IS NOT REPORTED AS A MESSAGE TYPE.
+    ///
+    /// `SESSION_HELD` and `UNKNOWN_MESSAGE_TYPE` put DIFFERENT things in the same payload byte, so
+    /// there are two ways to get this wrong and this asserts against both at once. Reading byte 1
+    /// as a message type renders "somebody has this board on a cable" as a type code the host never
+    /// sent; reading it with the message-type accessor -- which matches only an
+    /// `UNKNOWN_MESSAGE_TYPE` payload -- yields nothing, and the refusal whose whole purpose is to
+    /// be actionable arrives naming nobody.
+    ///
+    /// The second is the one that hides: a dropped holder degrades the MESSAGE and nothing else, so
+    /// every gate stays green and the tool prints its "declined to say" wording on a target that
+    /// said.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn a_held_session_names_the_holding_carrier_and_does_not_report_it_as_a_message_type() {
+        use lamella_wire::session::ChannelClass;
+        use lamella_wire::{error, msg};
+
+        let mut transport = MemTransport::new();
+        let payload = error::session_held(ChannelClass::Physical as u8);
+        let frame = lamella_wire::encode_frame(msg::ERROR, 0, &payload).expect("frames");
+        transport.feed(&frame);
+
+        let refusal = hello_blocking(
+            &mut transport,
+            0,
+            lamella_wire::Capabilities(0),
+            Duration::from_millis(200),
+        )
+        .expect_err("a refusal is not a session");
+
+        match refusal {
+            TransportError::Refused { reason, msg_type, holder } => {
+                assert_eq!(reason, error::SESSION_HELD, "the reason byte survives");
+                assert_eq!(
+                    holder,
+                    Some(ChannelClass::Physical as u8),
+                    "the holding carrier's class must reach the caller: without it the tool can \
+                     only say an unnamed carrier has the board"
+                );
+                assert_eq!(
+                    msg_type, 0,
+                    "the holder must NOT arrive as a message type -- byte 1 means a carrier class \
+                     under this reason, and 0 is the sentinel for a refusal that named no type"
+                );
+            }
+            other => panic!("a held session must not arrive as {other:?}"),
         }
     }
 

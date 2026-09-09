@@ -247,6 +247,20 @@ pub fn transfer_configure(idle_cycles: u8, wait_retry: u16, match_retry: u16) ->
     [cmd::TRANSFER_CONFIGURE, idle_cycles, w[0], w[1], m[0], m[1]]
 }
 
+/// Encodes `DAP_SWD_Configure`: the SWD turnaround period in bits [1:0] (the value is one less
+/// than the clock cycles, so `0` means one cycle) and the data-phase request in bit 2.
+///
+/// # Why this is not optional even though a probe has a default
+///
+/// The turnaround decides WHERE THE ACKNOWLEDGE BITS ARE SAMPLED. A probe whose default does not
+/// match the target reads the three ACK bits shifted, so a perfectly good `OK` (`0b001`) comes back
+/// as a value that is not a legal acknowledgement at all -- and from the host that is
+/// indistinguishable from a target that never drove the line. Leaving it unsent leaves it to
+/// whatever the probe powered up with, which differs between vendors.
+pub fn swd_configure(turnaround: u8, data_phase: bool) -> [u8; 2] {
+    [cmd::SWD_CONFIGURE, (turnaround & 0b11) | (u8::from(data_phase) << 2)]
+}
+
 /// Encodes a write `DAP_TransferBlock` on DAP index 0: one `request` byte repeated by the
 /// probe for every 32-bit value in `values` -- the bulk sibling of [`transfer_one`], used to
 /// stream a buffer through an auto-incrementing MEM-AP `DRW`.

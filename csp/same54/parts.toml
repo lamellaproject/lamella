@@ -2,8 +2,8 @@
 #
 # THE PRESENT-LIST IS COMPLETE, WHICH IS A CLAIM AND NOT A CONVENIENCE. A partial list refuses
 # safely and a complete one promises that everything absent from it is absent from the silicon, so
-# it is written only when a whole package pinout has been read. That happened here because the
-# first consumer needed forty-three pads at once -- a board with three extension sockets.
+# it is written only when a whole package pinout has been read. That happened here because a board
+# carrying three extension sockets needed forty-three pads at once.
 #
 # THE PART NUMBER DOES NOT SETTLE THE PACKAGE, AND THE ORDERING SCHEME SAYS SO. Section 1's
 # ordering information decodes the pin-count letter as G = 48, J = 64, N = 100 and P = 120/128 --

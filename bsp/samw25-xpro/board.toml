@@ -41,3 +41,11 @@ gclk0_hz = 8000000
 name = "usb-48mhz"
 source = "dfll48m-usb-recovery"
 gclk1_hz = 48000000
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "The kit carries an EDBG that programs and debugs the part over SWD. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

@@ -16,6 +16,10 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Compile `path` and run it on the firmware at `target`, streaming its output.
 pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
+    if let Some(what) = crate::deploy::uncompilable_source(path) {
+        eprintln!("{}", cannot_run_on_a_target(path, &what));
+        return ExitCode::FAILURE;
+    }
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) => {
@@ -23,13 +27,6 @@ pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if path.extension().and_then(|extension| extension.to_str()) != Some("cs") {
-        eprintln!(
-            "lamella run: running on a --target is a C# path today; a Python program reaches a \
-             board as a\nbundle, whose host-side send is not a library call yet."
-        );
-        return ExitCode::FAILURE;
-    }
 
     let compiler = match lamella_wire_host::engine::LcscCompiler::discover() {
         Ok(compiler) => compiler,
@@ -71,6 +68,31 @@ pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
 
     println!("running on {target}; output follows.\n");
     stream(&mut backend)
+}
+
+/// `run --target`'s wording for a source it cannot compile.
+///
+/// **IT IS NOT `deploy`'s SENTENCE AND MUST NOT BECOME IT.** Sharing the finished message across
+/// the two verbs put `deploy`'s wording under `lamella run:`, where it said *"`--board` builds one
+/// ahead of time"* -- **false here.** `run --board` executes on THIS machine against a board's
+/// generated `board` module, which is a fact table rather than hardware, and it is the one mode a
+/// Python program DOES have. So the verb that shares the predicate points its reader somewhere the
+/// other verb cannot: at itself, without `--target`.
+fn cannot_run_on_a_target(path: &Path, what: &crate::deploy::Uncompilable) -> String {
+    match what {
+        crate::deploy::Uncompilable::Python => format!(
+            "lamella run: {} is a Python program, and running ON a board compiles C#.\n\n\
+             A Python program reaches a board as a BUNDLE, whose host-side send is not a library \
+             call\nthis tool can make yet. What DOES work today, on this machine:\n\
+             \x20   lamella run {} --board <id>      against that board's generated `board` module",
+            path.display(),
+            path.display()
+        ),
+        crate::deploy::Uncompilable::Other => format!(
+            "lamella run: {} is not a C# file, and running ON a board compiles C#.",
+            path.display()
+        ),
+    }
 }
 
 /// Drive the program to its end, printing output as it arrives.

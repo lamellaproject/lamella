@@ -1,0 +1,77 @@
+# The SAM D20 Xplained Pro (ATSAMD20-XPRO): board truth only -- what is wired to what. Chip
+# truth lives in csp/samd20/.
+#
+# THE VIRTUAL COM PORT'S TWO PADS WERE CHECKED AGAINST THE PART DATASHEET AND THE TWO DOCUMENTS
+# AGREE. Atmel-42102D Table 4-8 gives SERCOM3 PAD[2] on PA24 and SERCOM3 PAD[3] on PA25, and
+# DS60001504K Table 6-1 gives both pads in column C against SERCOM3. The check is run on every
+# kit because the SIBLING KIT FAILED IT -- the SAM R21 Xplained Pro's guide puts one UART's two
+# pads on two different SERCOM instances -- so agreement here is a result rather than a default.
+
+[table]
+kind = "board"
+board = "samd20-xpro"
+vendor = "microchip"
+family = "samd20"
+part = "atsamd20j18a"
+product_model = 48          # lamella_wire::product_model::SAMD20_XPLAINED_PRO
+sources = [
+    "SAM D20 Xplained Pro user guide Atmel-42102D (04/2016) section 4.2.3 and Table 4-6 (LED Connections): one yellow LED0 on PA14, and the section states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'.",
+    "Atmel-42102D section 4.2.2 and Table 4-5 (Mechanical Buttons): two buttons, RESET on the part's RESETN line and a generic user-configurable SW0 on PA15. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'.",
+    "Atmel-42102D section 4.3.1 and Table 4-7 (SWD Connections): SWD clock on PA30 and SWD data on PA31.",
+    "Atmel-42102D section 4.3.2 and Table 4-8 (Virtual COM Port Connections), corroborated against SAM D20 Family Data Sheet DS60001504K Table 6-1 for the instance and the function column -- see the header above.",
+    "Atmel-42102D section 4.2.1 and Table 4-4 (External 32.768kHz Crystal): XIN32 on PA00 and XOUT32 on PA01.",
+]
+notes = [
+    "THE 32.768 kHz CRYSTAL COSTS TWO PADS. PA00 and PA01 are ordinary PORT pads that this kit populates with the crystal, so they are not available as I/O on a stock board. Nothing here binds them; recorded because a pad list says a pin exists and cannot say what is soldered to it.",
+    "THERE IS NO SECOND CRYSTAL ON THIS BOARD, which is the difference from the SAMR21 kit beside it. That board carries a 16 MHz crystal as well, wired to its RF die; this part has no radio and the guide's Table 4-4 lists one crystal.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP. It states the polarity and stops there, where the SAM D21 and E51 Curiosity Nano guides both state outright that no pull-up is fitted and that the internal one must be enabled. The absence of the statement is not the presence of a resistor: this is recorded so that a program opening PA15 as a plain input is understood to be relying on something this document does not establish.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
+baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
+plan = "osc8m-8mhz"         # Atmel-42096 describes the composite device without giving an id
+default = true              # table. Nor can a sibling supply it -- same54-xpro and samw25-xpro
+                            # both answer 0x2111 while samd21-xpro answers 0x2169, so an
+                            # Xplained Pro's product id does not follow from being one. It is
+                            # read off the kit, the way same54-xpro's row records having been.
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom3"
+function = "C"              # SERCOM, not SERCOM-ALT. Both pads also carry a SERCOM5 pad in column
+gclk_gen = 0                # D, so on this board the letter IS a choice between two instances and
+tx = { pin = "PA24", pad = 2 }   # naming the wrong one would bind a UART that reaches no connector.
+rx = { pin = "PA25", pad = 3 }
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PA14"
+active = "low"
+source = "Atmel-42102D section 4.2.3 and Table 4-6: one yellow LED0 on PA14. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA15"
+active = "low"
+source = "Atmel-42102D section 4.2.2 and Table 4-5: the generic user-configurable button SW0 on PA15, silkscreened SW0. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "unknown"
+pitch_mm = 1.27
+onboard = "edbg"
+recovery = "probe"
+source = "Atmel-42102 SAM D20 Xplained Pro user guide: the kit features a Cortex Debug Connector (10-pin) for programming and debugging, and the guide states the debug connector is connected to the on-board EDBG through level shifters and switches. Whether a connector is soldered to that position is not stated: the guide gives the connector a numbered section and a full pin table but never says it is mounted, and the same guide marks its crystals mounted and not mounted in the feature list, so the silence cannot be read either way. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

@@ -1,0 +1,30 @@
+# The SAMHA1 Generic Clock Controller block: the channel-routing registers the peripheral
+# bring-up paths touch (partial, append-only). Offsets are GCLK-base-relative; the base lives in
+# ../instances.toml. WHICH generator runs at WHAT rate is a PLAN fact (board.toml), never here.
+
+[table]
+kind = "block"
+family = "samha1"
+block = "gclk"
+sources = [
+    "ATSAMHAxGXXA datasheet DS20005841E section 17.8.2 (Status): Offset 0x1, SYNCBUSY bit 7",
+    "DS20005841E section 17.8.3 (Generic Clock Control): Offset 0x2, ID[5:0], GEN[3:0] at 11:8, CLKEN bit 14, WRTLOCK bit 15",
+    "ATSAMHAxEXXA datasheet DS20005902B sections 17.8.2 and 17.8.3, which state the same offsets and fields for the E series",
+]
+notes = [
+    "CLKCTRL is 16-bit at an UNALIGNED offset (base + 0x2) and STATUS is 8-bit at base + 0x1 -- sub-word access only on this M0+ family.",
+    "Route a generator to a peripheral channel: write CLKCTRL = ID | (GEN << 8) | CLKEN, then wait STATUS.SYNCBUSY clear. Each instance row carries its CLKCTRL ID.",
+    "THE GCLK CHAPTER IS 17 ON THIS FAMILY AND ON THE SAMDA1, 14 ON THE SAMD20, 13 ON THE SAMR21 AND 15 ON THE SAMD21. Five relatives, four chapter numbers, one register layout -- so a source line copied from the wrong one cites a chapter describing something else, which is a citation nobody can check.",
+]
+
+[registers.CLKCTRL]
+offset = 0x2
+width = 16
+fields = { ID = [0, 6], GEN = [8, 4], CLKEN = [14, 1], WRTLOCK = [15, 1] }
+notes = "Peripheral channel control: ID selects the peripheral channel, GEN the source generator, CLKEN enables the route. WRTLOCK is transcribed because it is one-way -- once set it locks the channel, its generator and that generator's division factor until a power reset, and generic clock generator 0 is the sole exception. A driver that writes the whole register without masking it can lock a clock for the life of the board's power cycle."
+
+[registers.STATUS]
+offset = 0x1
+width = 8
+fields = { SYNCBUSY = [7, 1] }
+notes = "Wait SYNCBUSY clear after a CLKCTRL write."

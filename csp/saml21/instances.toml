@@ -1,0 +1,129 @@
+# The SAML21 instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# THE RECORD IS THE PCHCTRL FAMILIES', because on this architecture which APB mask register gates
+# an instance is per-instance rather than always APBC. On this part it is three different registers
+# for the blocks below: PORT is gated from APBAMASK, SERCOM0..4 from APBCMASK, and SERCOM5 from
+# APBDMASK. A row therefore states `apb_mask_offset` -- WHICH register, as an offset from MCLK's
+# base -- alongside its bit.
+#
+# EVERY VALUE WAS READ OFF THIS PART'S OWN TABLE 14-1, AND NOT ONE OF THEM MATCHES THE SAM C21's
+# despite the two families sharing an architecture. The C21 puts MCLK at 0x40000800, GCLK at
+# 0x40001C00, PORT at 0x41000000 and SERCOM0 at 0x42000400; this part puts them at 0x40000400,
+# 0x40001800, 0x40002800 and 0x42000000. Sharing a generator arm is a statement about SHAPE.
+
+[table]
+kind = "instances"
+family = "saml21"
+record = ["base", "gclk_core_id", "apb_mask_offset", "apb_bit", "irq"]
+sources = [
+    "SAM L21 Family Data Sheet DS60001477E Table 14-1 (Peripherals Configuration Summary) for base address, IRQ line, APB index and generic-clock index",
+    "DS60001477E sections 18.8.9 (APBA Mask), 18.8.11 (APBC Mask) and 18.8.12 (APBD Mask) for the gate bit positions, stated one bit at a time in prose rather than read out of the register-summary table",
+    "DS60001477E section 18.8 for the mask register offsets: AHBMASK 0x10, APBAMASK 0x14, APBBMASK 0x18, APBCMASK 0x1C, APBDMASK 0x20, APBEMASK 0x24",
+]
+notes = [
+    "SERCOM0..4 stride 0x400 from 0x42000000 and are gated from APBCMASK bits 0..4. SERCOM5 is at 0x43000400 behind AHB-APB Bridge D and is gated from APBDMASK bit 1. Each row is still stated explicitly -- a table is data, not a formula.",
+    "SERCOM5's GENERIC-CLOCK ID IS 24 AND A STRIDE WOULD PREDICT 23. Table 14-1 gives SERCOM0..4 the CORE ids 18..22 over a shared SLOW id of 17, and gives SERCOM5 '24: CORE' over '23: SLOW'. So the number a formula produces is that instance's own slow clock -- a real channel id that clocks the wrong thing. The sibling samc21 has the same trap at its own SERCOM5 with different numbers.",
+    "SERCOM5 IS ALSO IN A DIFFERENT POWER DOMAIN. Table 14-1 puts SERCOM0..4 in PD1 and SERCOM5 in PD0. Nothing here acts on that; recorded because it is a second axis on which that instance is not like the others.",
+    "PORT IS GATED FROM APBAMASK, NOT APBC. It sits at 0x40002800 behind Bridge A on this family, where the SAM D21 line puts it at 0x41004400 behind Bridge B and the SAM C21 puts it at 0x41000000, also behind B. Three families, three answers, and the mask register follows the bridge.",
+    "THIS FAMILY HAS FIVE APB MASK REGISTERS, A THROUGH E. The samc21 has four. Only the three a row below names are transcribed in blocks/mclk.toml.",
+    "TWO PORT GROUPS ON THE DIE, and the pad set reaches PB -- see parts.toml.",
+]
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000000
+gclk_core_id = 18
+apb_mask_offset = 0x1C
+apb_bit = 0
+irq = 8
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000400
+gclk_core_id = 19
+apb_mask_offset = 0x1C
+apb_bit = 1
+irq = 9
+
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 20
+apb_mask_offset = 0x1C
+apb_bit = 2
+irq = 10
+
+[[instances]]
+name = "sercom3"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 21
+apb_mask_offset = 0x1C
+apb_bit = 3
+irq = 11
+
+[[instances]]
+name = "sercom4"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 22
+apb_mask_offset = 0x1C
+apb_bit = 4
+irq = 12
+
+# THE ODD ONE OUT, ON THREE AXES AT ONCE: a different bridge (D, at 0x43000000), a different gate
+# register (APBDMASK), a different power domain (PD0), and a core clock id that skips the number a
+# stride would give it because its own slow clock takes that number.
+[[instances]]
+name = "sercom5"
+block = "sercom"
+base = 0x43000400
+gclk_core_id = 24
+apb_mask_offset = 0x20
+apb_bit = 1
+irq = 13
+
+[[instances]]
+name = "mclk"
+block = "mclk"
+base = 0x40000400
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40001800
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+# PORT SITS BEHIND BRIDGE A ON THIS FAMILY, which is why its gate is APBAMASK bit 10 and not an
+# APBC bit. Nothing consumes that gate today -- the GPIO driver assumes the reset state, where
+# Table 14-1 marks PORT's APB clock 'Enabled at Reset: Y' -- and the row states it so that a
+# consumer which ever needs to gate it has the register rather than a guess.
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x40002800
+gclk_core_id = -1
+apb_mask_offset = 0x14
+apb_bit = 10
+irq = -1
+
+[[instances]]
+name = "portb"
+block = "port"
+base = 0x40002880
+gclk_core_id = -1
+apb_mask_offset = 0x14
+apb_bit = 10
+irq = -1

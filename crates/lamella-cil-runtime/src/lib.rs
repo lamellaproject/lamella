@@ -28,10 +28,14 @@ pub mod value;
 #[cfg(feature = "exceptions")]
 pub use exception::{exception_tag, tag_is_exact, tag_is_subtype};
 pub use interp::{
-    CodeLocation, FrameView, NamedValue, PInvokeArg, PInvokeHostFn, PendingOp, Ran, Session, Status,
-    Stop, StopReason, Vm, boot_baked, run, run_interruptible, run_method, run_serviced,
-    take_pending_op,
+    CodeLocation, FrameView, NamedValue, PInvokeArg, PInvokeHostFn, PendingOp, PinEventSource, Ran,
+    Session, Status, Stop, StopReason, Vm, boot_baked, run, run_interruptible, run_method,
+    run_serviced, set_wall_clock, take_pending_op, wall_clock_source,
 };
+/// The pin-change event a board's interrupt handler queues, re-exported from the crate that owns
+/// the queue's RULE so an embedder installing a [`PinEventSource`] can name it without taking a
+/// second dependency for one two-field struct.
+pub use lamella_pin_events::PinEvent;
 pub use module::{
     CastElem, CastPrim, IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn,
     PInvokeTarget, TypeId, asm_key, baked_image_checksum,

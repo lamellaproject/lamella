@@ -1,0 +1,114 @@
+# BLOCK: the SAM D21 external interrupt controller, plus the two facts an ISR needs that are not
+# registers at all -- which NVIC vector the controller is delivered on, and which clock gate feeds it.
+#
+# WHY THIS BLOCK IS THE THING BLOCKING GPIO EVENTS. A pin-change callback needs three layers under
+# it: a managed surface, a runtime seam from an interrupt to a delegate, and a chip fact saying
+# which interrupt a pad can even raise. The third is this file, and until it existed no driver on
+# this family had a line number to configure.
+#
+# A LINE IS NOT A PAD ON THIS VENDOR, AND THAT IS THE WHOLE DIFFICULTY. EXTINT is a PERIPHERAL
+# FUNCTION selected in the pad's PMUX, and THE EXTINT NUMBER DOES NOT FOLLOW THE PAD NUMBER. It
+# looks as though it does -- for most pads the line is the pad index modulo sixteen, and PA16 raising
+# EXTINT[0] fits that -- and SIX PADS BREAK IT: PA24 raises EXTINT[12] where the pattern says 8,
+# PA25 raises 13 where it says 9, PA27 raises 15 where it says 11, PA28 raises 8 where it says 12,
+# PA30 raises 10 where it says 14, and PA31 raises 11 where it says 15. A derivation calibrated on
+# the pads that fit is wrong on those six and right everywhere a casual check would look, so the
+# mapping is transcribed per pad and never computed.
+#
+# SEVERAL PADS SHARE ONE EXTINT NUMBER and only one of them can be live, because the line is the
+# thing that interrupts and the pad merely feeds it. Nothing in the chip reports the competition.
+# That is the same class of conflict as a pad serving two peripherals, and it belongs to whatever
+# resolves pin bindings rather than to this table.
+#
+# SIXTEEN LINES, AND THE REGISTERS ARE WIDER THAN THAT. The device states 16 external interrupts and
+# names them EXTINT[15:0] in its feature list and its signal table. The interrupt and wake registers
+# below carry bits up to 17 -- WAKEUP's own field description reads [x=17..0] -- and this family has
+# nothing behind bits 16 and 17. A register layout is a SUPERSET of what a device implements, in the
+# same way a memory map is a superset of what a package bonds, and a consumer that sized a line
+# count from the register width would invent two lines.
+#
+# ONE INTERRUPT FOR ALL SIXTEEN, WHICH DECIDES THE SHAPE OF A HANDLER. The whole controller is
+# delivered on a single NVIC line, so an ISR is entered without yet knowing which pad fired and must
+# read INTFLAG to find out. A handler may therefore have to service SEVERAL lines from one entry.
+# NMI is separate and is not an NVIC line at all.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "eic"
+sources = [
+    "SAM D21 Family Data Sheet DS40001882D section 21.7 (EIC Register Summary): CTRL 0x00, STATUS 0x01, NMICTRL 0x02, NMIFLAG 0x03, EVCTRL 0x04, INTENCLR 0x08, INTENSET 0x0C, INTFLAG 0x10, WAKEUP 0x14, CONFIG 0x18.",
+    "DS40001882D section 21.8.10 'Configuration n', which names the register CONFIG and gives its offset as 0x18. The section title carries the array 'n' and the offset line omits the [n=0..x] bound that this document's other array registers state -- PMUX at '0x30 + n*0x01 [n=0..15]' and PINCFG at '0x40 + n*0x01 [n=0..31]' both carry it. The bound here is two, established below rather than assumed.",
+    "DS40001882D section 21.2 (EIC Features) and section 21.8.9 (WAKEUP), whose field description reads 'Bits 17,16,15,...,0 - WAKEUPENx ... [x=17..0]' while the device feature list on page 1 states '16 external interrupts' and the signal description table names EXTINT[15:0].",
+    "DS40001882D Table 11-3 (Interrupt Line Mapping), section 11.2.2: 'EIC - External Interrupt Controller' is NVIC line 4, and 'EIC NMI - External Interrupt Controller' is NMI. The table's rows run PM 0, SYSCTRL 1, WDT 2, RTC 3, EIC 4, NVMCTRL 5 without a gap.",
+    "DS40001882D Figure 9-1 (SAM D21 Product Mapping): AHB-APB Bridge A places EIC at 0x40001800, between RTC at 0x40001400 and the bridge's reserved region at 0x40001C00.",
+    "DS40001882D section 16.8.8 (APBA Mask), which states its own name APBAMASK and offset 0x18 within PM, gives bit 6 as 'EIC APB Clock Enable', and a reset value of 0x0000007F.",
+    "DS40001882D GCLK clock source table: peripheral channel 0x05 is GCLK_EIC, feeding the EIC.",
+]
+notes = [
+    "THE CONFIG BOUND IS DERIVED AND THE DERIVATION IS STATED BECAUSE THE DOCUMENT DOES NOT. Each line occupies four bits of CONFIG -- FILTENx plus SENSEx[2:0] -- so one 32-bit register configures eight lines and sixteen lines need two. That arithmetic alone would be a guess dressed as a fact, so it is anchored against the same IP in the SAM D5x/E5x family, whose section 23.8.10 spells the array out in the notation this book omits: 'Offset: 0x1C + n*0x04 [n=0..1]'. TWO REGISTERS, EIGHT LINES EACH, ON BOTH. The BASE OFFSET DIFFERS between the two families -- 0x18 here against 0x1C there -- so the sibling confirms the SHAPE and not the address, and carrying its offset across would place CONFIG one register too high.",
+    "THE APB CLOCK IS ON OUT OF RESET. APBAMASK's reset value is 0x0000007F, setting bits 0 through 6, and EIC is bit 6, so a driver configures a line without touching PM. THE GCLK PERIPHERAL CHANNEL IS A SEPARATE GATE AND THAT RESET VALUE SAYS NOTHING ABOUT IT: filtering and synchronous sensing need GCLK_EIC running, asynchronous edge detection does not.",
+    "THE PAC WRITE-PROTECT REGISTER HAS THE IDENTICAL BIT ORDER AND IS A DIFFERENT REGISTER. PAC0's write-protect word also lays out PM 1, SYSCTRL 2, GCLK 3, WDT 4, RTC 5, EIC 6, two pages from APBAMASK in the same book, and its bit 6 means 'write-protection for the EIC' rather than 'clock for the EIC'. THE BIT LAYOUT CANNOT SEPARATE THEM AND THE PROSE UNDER IT CAN.",
+    "NMI IS A SEPARATE PIN, A SEPARATE FLAG AND A SEPARATE VECTOR. NMICTRL and NMIFLAG are 8-bit registers of their own, NMI is not in INTFLAG, and it reaches the core's NMI request rather than an NVIC line -- so it cannot be masked and cannot be serviced by the same handler this block's other lines use.",
+    "THE FIRST FOUR REGISTERS ARE BYTE-WIDE AND THE REST ARE WORDS. CTRL, STATUS, NMICTRL and NMIFLAG occupy 0x00 through 0x03 as four separate 8-bit registers rather than one word, which is why EVCTRL starts at 0x04 rather than 0x08.",
+]
+
+[registers.CTRL]
+offset = 0x00
+width = 8
+fields = { SWRST = [0, 1], ENABLE = [1, 1] }
+notes = "Enable and software reset. The controller is disabled out of reset, so a line configured before ENABLE is set raises nothing."
+
+[registers.STATUS]
+offset = 0x01
+width = 8
+fields = { SYNCBUSY = [7, 1] }
+notes = "SYNCBUSY at bit 7. ENABLE and SWRST are write-synchronized, so a driver that sets ENABLE and immediately writes CONFIG can have the write discarded while this bit is set."
+
+[registers.NMICTRL]
+offset = 0x02
+width = 8
+fields = { NMISENSE = [0, 3], NMIFILTEN = [3, 1] }
+notes = "The non-maskable pin's own sense and filter, in the same encoding CONFIG uses for the other lines. Separate because NMI is not one of the sixteen."
+
+[registers.NMIFLAG]
+offset = 0x03
+width = 8
+fields = { NMI = [0, 1] }
+notes = "The NMI's own flag, write-one-to-clear like INTFLAG. It is NOT in INTFLAG, so a handler that services the NVIC line never sees it."
+
+[registers.EVCTRL]
+offset = 0x04
+width = 32
+fields = { EXTINTEO = [0, 18] }
+notes = "One event-output enable per line, routing a detection to the event system instead of, or as well as, an interrupt. Bits 16 and 17 have no line behind them on this family."
+
+[registers.INTENCLR]
+offset = 0x08
+width = 32
+fields = { EXTINT = [0, 18] }
+notes = "Write ones to DISABLE lines. Paired with INTENSET so a driver never read-modify-writes an enable word and cannot lose a concurrent change to another line."
+
+[registers.INTENSET]
+offset = 0x0C
+width = 32
+fields = { EXTINT = [0, 18] }
+notes = "Write ones to ENABLE lines. Enabling is what connects a configured line to the single NVIC vector; CONFIG alone only decides what counts as a detection."
+
+[registers.INTFLAG]
+offset = 0x10
+width = 32
+fields = { EXTINT = [0, 18] }
+notes = "WRITE-ONE-TO-CLEAR, AND CLEARING IT IS NOT OPTIONAL: a handler that returns without writing the bit re-enters immediately. It is also the only way to learn WHICH line fired, because all sixteen share one vector -- so a handler reads this, services every set bit, and clears each one it serviced."
+
+[registers.WAKEUP]
+offset = 0x14
+width = 32
+fields = { WAKEUPEN = [0, 18] }
+notes = "One wake enable per line, for sleep modes where the interrupt clock is stopped. Independent of INTENSET: a line can wake the device without raising an interrupt, and can raise an interrupt without being able to wake it."
+
+[registers.CONFIG]
+offset = 0x18
+width = 32
+fields = { SENSE0 = [0, 3], FILTEN0 = [3, 1], SENSE1 = [4, 3], FILTEN1 = [7, 1], SENSE2 = [8, 3], FILTEN2 = [11, 1], SENSE3 = [12, 3], FILTEN3 = [15, 1], SENSE4 = [16, 3], FILTEN4 = [19, 1], SENSE5 = [20, 3], FILTEN5 = [23, 1], SENSE6 = [24, 3], FILTEN6 = [27, 1], SENSE7 = [28, 3], FILTEN7 = [31, 1] }
+notes = "AN ARRAY OF TWO AT 0x18 AND 0x1C, eight lines each, four bits per line. The suffixes here are the position WITHIN one register and not the line number: CONFIG[1]'s SENSE0 configures EXTINT[8]. SENSE selects none, rising, falling, both, high or low; FILTEN adds a majority filter that needs GCLK_EIC running, which asynchronous edge detection does not."

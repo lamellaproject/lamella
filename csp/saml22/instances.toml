@@ -1,0 +1,131 @@
+# The SAML22 instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# SERCOM2's BASE IS 0x42000C00 AND THE PERIPHERALS TABLE SAYS 0x42000A00. The table is wrong; see
+# parts.toml, which states the evidence in full. In short: every other SERCOM in Table 12-1 strides
+# by 0x400 and that value would make two consecutive steps 0x200 and 0x600, while Figure 8-1's
+# Bridge C column -- read as a picture -- gives a uniform stride and puts SERCOM3 exactly one
+# stride above SERCOM2. Nothing on this roster's board binds SERCOM2; the row is correct anyway,
+# because the next reader to bind it will consult Table 12-1 and have no reason to doubt it.
+
+[table]
+kind = "instances"
+family = "saml22"
+record = ["base", "gclk_core_id", "apb_mask_offset", "apb_bit", "irq"]
+sources = [
+    "SAM L22 Family Data Sheet DS60001465D Table 12-1 (Peripherals Configuration Summary) for IRQ line, APB index and generic-clock index, and for every base address EXCEPT SERCOM2's",
+    "DS60001465D Figure 8-1 (Product Mapping) for SERCOM2's base, and as an independent second statement of the others",
+    "DS60001465D section 16.8.8 (APBB Mask) for PORT's gate bit and 16.8.9 (APBC Mask) for the SERCOM gate bits; the APBC positions are corroborated by Table 12-1's own APB Clock Index column",
+    "DS60001465D section 16.8 for the mask register offsets: AHBMASK 0x10, APBAMASK 0x14, APBBMASK 0x18, APBCMASK 0x1C",
+]
+notes = [
+    "SERCOM0..5 stride 0x400 from 0x42000400 once SERCOM2's misprint is corrected, and are gated from APBCMASK bits 1..6. Each row is still stated explicitly -- a table is data, not a formula, and on this family the formula is the only thing that catches the table being wrong.",
+    "THE SERCOM SLOW CLOCK IS ID 15 AND IS SHARED BY ALL SIX. Table 12-1 prints each instance's own CORE id over a common '15: SLOW'. Only the CORE id belongs in the record below. Unlike the SAM C21 and SAM L21, no instance here takes a core id that a stride would misplace.",
+    "APBCMASK COMES UP MOSTLY SET ON THIS FAMILY. Its reset value is 0x0007FFFF, so the SERCOM gate bits are ENABLED out of reset -- where the SAM D21 line's come up clear. A read-modify-write is still the correct way to touch it, and a driver that assumes it must enable the clock is not wrong, only redundant.",
+    "PORT IS GATED FROM APBBMASK BIT 3. It sits at 0x41006000 behind AHB-APB Bridge B.",
+    "THREE PORT GROUPS, and this family's board uses group C for its LED, its button and both virtual-COM-port pads.",
+    "FOUR APB MASK REGISTERS, A THROUGH C PLUS AHB. The SAM L21 has five and the SAM C21 four; none of the three agree on which register gates PORT.",
+]
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000400
+gclk_core_id = 16
+apb_mask_offset = 0x1C
+apb_bit = 1
+irq = 9
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 17
+apb_mask_offset = 0x1C
+apb_bit = 2
+irq = 10
+
+# 0x42000C00, NOT Table 12-1's 0x42000A00 -- see the header and parts.toml.
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 18
+apb_mask_offset = 0x1C
+apb_bit = 3
+irq = 11
+
+[[instances]]
+name = "sercom3"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 19
+apb_mask_offset = 0x1C
+apb_bit = 4
+irq = 12
+
+[[instances]]
+name = "sercom4"
+block = "sercom"
+base = 0x42001400
+gclk_core_id = 20
+apb_mask_offset = 0x1C
+apb_bit = 5
+irq = 13
+
+[[instances]]
+name = "sercom5"
+block = "sercom"
+base = 0x42001800
+gclk_core_id = 21
+apb_mask_offset = 0x1C
+apb_bit = 6
+irq = 14
+
+[[instances]]
+name = "mclk"
+block = "mclk"
+base = 0x40000800
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40001C00
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x41006000
+gclk_core_id = -1
+apb_mask_offset = 0x18
+apb_bit = 3
+irq = -1
+
+[[instances]]
+name = "portb"
+block = "port"
+base = 0x41006080
+gclk_core_id = -1
+apb_mask_offset = 0x18
+apb_bit = 3
+irq = -1
+
+# GROUP 2, and on this family it is not the spare one: the board's LED, its button and both
+# virtual-COM-port pads are all here.
+[[instances]]
+name = "portc"
+block = "port"
+base = 0x41006100
+gclk_core_id = -1
+apb_mask_offset = 0x18
+apb_bit = 3
+irq = -1

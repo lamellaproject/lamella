@@ -59,14 +59,14 @@ name = "led0"
 kind = "gpio-out"
 pin = "PC18"
 active = "low"
-source = "DS70005321A section 5.3.3 and Table 5-15: one yellow LED0 on PC18. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic. The pad is shared with the PDEC and with EDBG GPIO2, so a design using either reaches the same wire."
+source = "DS70005321A section 5.3.3 and Table 5-15: one yellow LED0 on PC18. 'The LED can be activated by driving the connected I/O line to GND'. THE POLARITY IS MEASURED, AND IT AGREES WITH THE DOCUMENT. Driven from a probe with the core halted, PC18 was held high for five seconds and low for one in a repeating cycle, sampled at both ends of every window so that exclusive control of the pad is established for the whole time it was watched rather than only at the instant of the write: the diode is lit for the one-second stretch, so it lights when the pin is LOW. The polarity is measured rather than taken from the guide, because this vendor repeats the same sentence across kit guides and it does not hold for every one of them. The board under test was identified from the silicon and not from its debugger's USB product id, which several Xplained Pro kits share: CPUID reads 0x410fc241, a Cortex-M4, and the DSU DID at 0x41002018 reads 0x61840300, which DS60001507F section 12.13.8 decodes as processor 6, family 3, series 4, die 0, revision 3, device 0x00. The pad is shared with the PDEC and with EDBG GPIO2, so a design using either reaches the same wire."
 
 [[devices]]
 name = "button0"
 kind = "gpio-in"
 pin = "PB31"
 active = "low"
-source = "DS70005321A section 5.3.2 and Table 5-14: the generic user button, silkscreened SW0, on PB31 and shared with EDBG GPIO3. 'When a button is pressed it will drive the I/O line to GND'. THERE IS NO EXTERNAL PULL-UP: the section's own note says no pull-up resistor is connected to this button and that the internal pull-up in the device must be enabled to use it, so a program opening this pin as a plain input reads a floating pad."
+source = "DS70005321A section 5.3.2 and Table 5-14: the generic user button, silkscreened SW0, on PB31 and shared with EDBG GPIO3. 'When a button is pressed it will drive the I/O line to GND'. THE POLARITY IS MEASURED AND THE GUIDE IS RIGHT: with the pad parked as an input it rests HIGH and a press takes it LOW, observed nine times across a fifteen-second window with holds from 80 ms to 775 ms, so the button drives its line to ground and is ACTIVE LOW. THE PULL IS MEASURED AND THE GUIDE IS WRONG. Its note says no pull-up resistor is connected and that the part's internal pull-up must be enabled to use the button -- which would mean a plain input reads a floating pad. IT DOES NOT FLOAT: read from a probe with the core halted, PB31 stays HIGH in all four parked states including against the part's own internal pull-down, which a floating pad cannot do. WHAT HOLDS IT IS NOT ESTABLISHED AND THE DISTINCTION MATTERS. A fitted resistor and another device on the same net read identically from a probe, and this pad is shared with EDBG GPIO3, so an attached debugger is a candidate the copper is not. What IS established is that the hold is high-impedance rather than a driven output: a press takes the pad cleanly to zero for hundreds of milliseconds, which contention with a push-pull driver would not allow. A consumer should still enable the internal pull-up -- doing so costs nothing here and is required on the sibling boards -- but must not expect this pin to float without it. The shortest excursions are around 80 ms, so a consumer of this pin owes it a debounce."
 
 # --- peripheral bindings ---------------------------------------------------------------------------
 #
@@ -350,3 +350,11 @@ pin = "PC07"
 [[connectors.ext3.pins]]
 signal = "spi_sck"
 pin = "PC05"
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "DS70005321A documents the EDBG that programs and debugs the part over SWD. Its debug connector section has not been read here, so the exposure is unknown. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

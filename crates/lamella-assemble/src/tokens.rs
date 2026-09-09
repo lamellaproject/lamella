@@ -129,6 +129,28 @@ pub struct Tokens {
     /// Per-enclosing-type counter over async methods, so `<M>d__N` names two same-named
     /// overloads apart. Keyed like `types`.
     pub(crate) async_counters: BTreeMap<String, usize>,
+    /// Lambda-bearing methods whose bodies land after their closure type; see
+    /// `compile::emit_closure_types`.
+    pub(crate) pending_lambdas: Vec<crate::compile::PendingLambda>,
+    /// `this`-capturing lambda bodies awaiting a `MethodDef` row in their ENCLOSING type's own
+    /// method run -- not on a synthesized type, so the row cannot wait for the global drain.
+    /// Added by `emit_type_inner` once every declared member of that type, and of every other
+    /// part of it, has been emitted, which is where csc puts them.
+    pub(crate) pending_instance_rows: Vec<(TypeSymbol, crate::lambdalower::LoweredLambda)>,
+    /// The same sites once their rows exist: bodies to land in the global drain, beside the
+    /// closure ones. Deferred for the same reason those are -- a body may name a `<>c` member,
+    /// and no closure type exists until every source type has been emitted.
+    pub(crate) pending_instance_bodies:
+        Vec<(TypeSymbol, Token, crate::lambdalower::LoweredLambda)>,
+    /// Each member's ORDINAL within its declaring type -- its position in a running count over the
+    /// type's members in SOURCE order, which is what csc names a synthesized closure member after
+    /// (`<M>b__N_M`). Keyed like `methods`, so an overload pair gets two ordinals rather than one.
+    ///
+    /// **IT IS A COUNT OVER MEMBERS, NOT OVER METHODS**, and the difference is most of the rule:
+    /// a field, a nested type and a constructor each advance it by one without being nameable
+    /// here at all. Measured against csc member kind by member kind; see
+    /// `compile::record_member_ordinals`.
+    member_ordinals: BTreeMap<String, usize>,
     types: BTreeMap<String, Token>,
     methods: BTreeMap<String, Token>,
     fields: BTreeMap<String, Token>,
@@ -530,6 +552,35 @@ impl Tokens {
     }
 
     /// Records `token` as the field named by this identity.
+    /// Records `ordinal` as the position of this member within its declaring type.
+    pub(crate) fn insert_member_ordinal(
+        &mut self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+        ordinal: usize,
+    ) {
+        let key = method_key(&self.canonical(declaring), name, &self.canonical_params(parameters));
+        self.member_ordinals.insert(key, ordinal);
+    }
+
+    /// This member's ordinal within its declaring type, or 0 when nothing recorded one.
+    ///
+    /// **ZERO IS A REAL ANSWER, NOT AN ERROR CODE**, and it is the right one for the members that
+    /// reach here without a source declaration to count -- a synthesized accessor of a type built
+    /// by the record lowering, say. Such a member holds no lambda, so the ordinal it gets names
+    /// nothing.
+    #[must_use]
+    pub(crate) fn member_ordinal(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> usize {
+        let key = method_key(&self.canonical(declaring), name, &self.canonical_params(parameters));
+        self.member_ordinals.get(&key).copied().unwrap_or(0)
+    }
+
     /// The next `<M>d__N` index for an async method of `enclosing` -- a per-type counter, so two
     /// same-named overloads get distinct machines.
     pub(crate) fn next_async_index(&mut self, enclosing: &TypeSymbol) -> usize {

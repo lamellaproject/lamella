@@ -1,0 +1,24 @@
+# The SAMDA1 Power Manager block: only the register the peripheral bring-up paths touch is
+# transcribed here (partial, append-only, schema total). Offsets are PM-base-relative; the base
+# lives in ../instances.toml.
+
+[table]
+kind = "block"
+family = "samda1"
+block = "pm"
+sources = [
+    "SAM DA1 datasheet 40001895A section 18.8.10 (APBC Mask): Offset 0x20, Reset 0x00010000, and one prose paragraph per bit naming the peripheral it gates",
+    "40001895A Table 14-1 (Peripherals Configuration Summary), whose APB Clock Index column states the same six SERCOM positions independently",
+]
+notes = [
+    "APBCMASK gates each peripheral's APB (bus) clock; SERCOM0..5 = bits 2..7. Read-modify-write in drivers (other peripherals share the register).",
+    "THE BIT POSITIONS WERE TAKEN FROM THE PER-BIT PROSE, NOT FROM THE BIT-FIELD DIAGRAM. The diagram's rows extract with Access and Reset lines interleaved between the bit numbers and the names, which is how a name comes to sit under the wrong number; 18.8.10's numbered paragraphs each name one bit and one peripheral and cannot desynchronize.",
+    "THIS DOCUMENT'S PER-BIT PROSE IS CLEAN, WHICH IS WORTH RECORDING BECAUSE THE SIBLING'S IS NOT. csp/samd20's block carries a note about DS60001504K heading bit 5 SERCOM3 and then describing it as the SERCOM2 APB Clock Enable. Here every heading and description agree, so the prose alone would have sufficed -- and there was no way to know that without reading both.",
+    "THE PM CHAPTER IS 18 ON THIS PART AND 15 ON THE SAMD20. The register agrees bit for bit and the chapter numbers do not, so a source line copied from the sibling would cite a chapter that describes something else in this document.",
+]
+
+[registers.APBCMASK]
+offset = 0x20
+width = 32
+fields = { SERCOM0 = [2, 1], SERCOM1 = [3, 1], SERCOM2 = [4, 1], SERCOM3 = [5, 1], SERCOM4 = [6, 1], SERCOM5 = [7, 1] }
+notes = "One gate bit per APBC peripheral; a driver ORs in its instance's bit (the instance row carries the bit index). Reset value is 0x00010000 -- the ADC's bit 16 comes up set and every SERCOM bit comes up clear, so a read-modify-write is required rather than a plain store."

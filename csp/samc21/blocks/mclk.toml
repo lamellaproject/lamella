@@ -1,0 +1,54 @@
+# The SAMC21 Main Clock block: the peripheral-bus gate registers. Offsets are MCLK-base-relative;
+# the base lives in ../instances.toml.
+#
+# THIS IS WHERE THE SAM D21 LINE'S `pm` BLOCK WENT. On those families the Power Manager holds one
+# APBCMASK and the SERCOMs are all behind it. Here the clock gates moved to a controller of their
+# own and there are FOUR of them, so which register gates an instance is a per-instance fact --
+# the instance rows carry `apb_mask_offset` for exactly this reason. The Power Manager still
+# exists on this part and is now about sleep modes; nothing modelled here touches it, so it is
+# not rowed.
+
+[table]
+kind = "block"
+family = "samc21"
+block = "mclk"
+sources = [
+    "SAM C20/C21 Family Data Sheet DS60001479M section 17.8 (MCLK Register Description), per-register Offset headings: AHBMASK 0x10, APBAMASK 0x14, APBBMASK 0x18, APBCMASK 0x1C, APBDMASK 0x20",
+    "DS60001479M section 17.8.9 (APBC Mask) and 17.8.10 (APBD Mask) per-bit prose, one numbered paragraph per bit naming the peripheral it gates",
+]
+notes = [
+    "FOUR APB MASK REGISTERS, AND A SERCOM IS NOT ALWAYS IN THE SAME ONE. SERCOM0..5 are APBCMASK bits 1..6; SERCOM6 and SERCOM7 -- which exist only on the 100-pin part -- are APBDMASK bits 0 and 1. PORT is in APBBMASK. A consumer that assumed one gate register would be right for six instances and wrong for two.",
+    "THE BIT POSITIONS WERE TAKEN FROM THE PER-BIT PROSE, NOT FROM THE BIT-FIELD DIAGRAM. The diagram's rows extract with Access and Reset lines interleaved between the bit numbers and the names, which is how a name comes to sit under the wrong number; the numbered paragraphs each name one bit and one peripheral and cannot desynchronize.",
+    "THE SERCOM BITS ARE OFF BY ONE FROM THE SAM D21 LINE'S. There, SERCOM0 is APBCMASK bit 2; here it is bit 1. Read from this document's own 17.8.9 rather than carried, and it is the kind of difference that produces a peripheral which never clocks while every register reads back what was written.",
+    "DECLARED SUBSET: only the mask registers are transcribed, and their bit FIELDS are left unenumerated except where an instance row names a bit. Nothing here configures a clock source or a divider -- that is a plan's business -- so enumerating those registers would oblige reading tables no consumer uses.",
+]
+
+[registers.AHBMASK]
+offset = 0x10
+width = 32
+fields = { }
+notes = "AHB bus clock gates. Transcribed for completeness of the register set a reader checks an offset against; no instance row names a bit in it today."
+
+[registers.APBAMASK]
+offset = 0x14
+width = 32
+fields = { }
+notes = "APB-A gates -- the always-on core of the clock and reset system."
+
+[registers.APBBMASK]
+offset = 0x18
+width = 32
+fields = { }
+notes = "APB-B gates, which is where PORT sits on this family."
+
+[registers.APBCMASK]
+offset = 0x1C
+width = 32
+fields = { SERCOM0 = [1, 1], SERCOM1 = [2, 1], SERCOM2 = [3, 1], SERCOM3 = [4, 1], SERCOM4 = [5, 1], SERCOM5 = [6, 1] }
+notes = "APB-C gates. SERCOM0..5 are bits 1..6 -- one lower than the SAM D21 line's numbering for the same instances. Read-modify-write in drivers, since other peripherals share the register."
+
+[registers.APBDMASK]
+offset = 0x20
+width = 32
+fields = { SERCOM6 = [0, 1], SERCOM7 = [1, 1] }
+notes = "APB-D gates, reached over AHB-APB Bridge D at 0x43000000. Only the 100-pin part carries the two instances this register gates; on a 64-pin part the bits exist and gate nothing a package pin can reach."

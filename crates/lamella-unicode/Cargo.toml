@@ -23,6 +23,13 @@ normalization = []
 # StringComparison.InvariantCulture). RESERVED tier: the collation module + its (large) tables
 # compile only when this feature is enabled, so non-collation consumers never link them.
 collation = []
+# Unicode character NAMES, for a `\N{NAME}` escape. Off by default because the table is ~420 KB
+# of strings and this crate is compiled into firmware that never resolves one. The DEFAULT cut is
+# every named code point below U+3000 plus the emoji blocks; `char-names-full` swaps in every
+# named code point instead and needs `tools/unicode/gen_char_names.py --full` run first, because
+# that table is not committed.
+char-names = []
+char-names-full = ["char-names"]
 
 [dependencies]
 

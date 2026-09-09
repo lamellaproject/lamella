@@ -94,3 +94,11 @@ pin = "PA14"
 active = "unknown"          # the PAD is established twice over; the asserted level is not, and
                             # `unknown` is how that is said instead of assuming the SPI convention.
 source = "P1AM_100_REVA sheet 2 pin table (IDE 28 = PA14 = SD Card CS) and variant.cpp index 28 = PORTA 14, commented 'SS: as GPIO'. Those two establish the pad. Neither states the asserted level, and unlike the base-controller select there is no vendor library driving this line to read it off -- so the level is recorded as unestablished rather than inferred from what an SD host usually does."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "none"
+recovery = "flash-bootloader"
+source = "The board carries no on-board debugger and no bridge UART, and is programmed through its own SAM-BA bootloader, which a double-tap of the reset button enters. That bootloader is in flash, so its survival depends on the region a write reaches. The board schematic held here does not place the part's SWD signals, so the exposure is recorded as unknown."

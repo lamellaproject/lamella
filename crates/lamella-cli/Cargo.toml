@@ -31,6 +31,8 @@ lamella-flash-backend = { path = "../lamella-flash-backend" }
 # the same table -- a board that means one thing to `lamella flash` and another to `lamella_flash`
 # is the failure that split prevents.
 lamella-flash-routes = { path = "../lamella-flash-routes" }
+# The ECMAScript engine `lamella run <file.js>` executes on this machine.
+lamella-js-frontend = { path = "../lamella-js-frontend" }
 lamella-probe-core = { path = "../lamella-probe-core" }
 # The host compile-and-run seam (LcscCompiler + the REPL engine's LoopbackLink), the device
 # enumeration behind `devices`, and the target grammar every verb taking `--target` shares. The

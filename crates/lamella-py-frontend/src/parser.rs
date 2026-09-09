@@ -7,8 +7,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ast::{
-    self, Assign, AssignTarget, BinOp, BoolOp, CallArg, CmpOp, CompClause, ExceptHandler, Expr,
-    ForBinding, FuncDef, Keyword, ModuleAst, ParamDef, Stmt, StmtKind, UnaryOp,
+    self, Assign, AssignTarget, BinOp, BoolOp, CallArg, ClassBase, ClassKeyword, CmpOp, CompClause,
+    ExceptHandler, Expr, ForBinding, FuncDef, Keyword, ModuleAst, ParamDef, Stmt, StmtKind, UnaryOp,
 };
 use crate::lexer::{FStringPart, Tok, Token};
 use lamella_py_bytecode::PyStr;
@@ -56,8 +56,31 @@ impl core::fmt::Display for ParseError {
 
 /// Parse a token stream (ending in [`Tok::Eof`]) into a module AST.
 pub fn parse(tokens: Vec<Token>) -> Result<ModuleAst, ParseError> {
-    let mut parser = Parser { tokens, pos: 0, temp_seq: 0, line_ended: true, func_ctx: None };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        temp_seq: 0,
+        line_ended: true,
+        func_ctx: None,
+        await_sinks: Vec::new(),
+    };
     parser.parse_module()
+}
+
+/// One `await` (or one `async for` clause) whose legality is not yet decided.
+///
+/// It cannot be decided where it is written: the enclosing brackets have not yet said whether they
+/// are a display or a comprehension, and if a comprehension, of which kind. The debt travels
+/// outward until a scope discharges it or a function refuses it.
+#[derive(Clone, Copy)]
+struct AwaitDebt {
+    /// The line to report, which is where the `await` or the `async` was written and not where the
+    /// enclosing construct finally settled it.
+    line: u32,
+    /// Whether the debt has passed out through a list, set or dict comprehension. Once it has,
+    /// CPython's complaint is no longer about the `await`: it is that the comprehension the `await`
+    /// made asynchronous is running somewhere that cannot await it.
+    from_comprehension: bool,
 }
 
 struct Parser {
@@ -78,6 +101,15 @@ struct Parser {
     /// says so ("'await' outside async function"). The three-state shape is what separates that
     /// message from the module-level one ("'await' outside function").
     func_ctx: Option<bool>,
+    /// Undecided [`AwaitDebt`]s, one bucket per bracketed display currently being read, innermost
+    /// last.
+    ///
+    /// An `await` inside brackets cannot be judged against [`Self::func_ctx`] where it is written,
+    /// because the same tokens are a plain display element -- which does belong to the enclosing
+    /// function -- or a comprehension element, which belongs to the implicit function the
+    /// comprehension compiles to. Only the token AFTER the element tells the two apart. So a
+    /// display opens a bucket, and settles everything in it once it knows what it is.
+    await_sinks: Vec<Vec<AwaitDebt>>,
 }
 
 /// A `case` pattern in the supported match subset. Structural (sequence / class / mapping) patterns
@@ -240,6 +272,22 @@ fn or_tests(acc: Option<Expr>, next: Option<Expr>) -> Option<Expr> {
     match (acc, next) {
         (None, _) | (_, None) => None,
         (Some(a), Some(b)) => Some(bool_or(a, b)),
+    }
+}
+
+/// Whether `expr` is a REAL number literal -- the left half of a complex literal pattern.
+///
+/// [`Expr::Imaginary`] is deliberately absent, which is what refuses `case 1j + 2j:` and
+/// `case 2j + 1:`. A leading `-` is accepted because PEP 634 signs the real half (`signed_real_number`)
+/// and only the real half; the imaginary half takes its sign from the joining operator instead.
+fn is_real_number_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Int(_) | Expr::Float(_) | Expr::BigInt(_) => true,
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => matches!(**operand, Expr::Int(_) | Expr::Float(_) | Expr::BigInt(_)),
+        _ => false,
     }
 }
 
@@ -600,6 +648,101 @@ enum DisplayElem {
 }
 
 /// `list(e)` / `set(e)` -- materialize an iterable as a new list / set (to spread `*e` in a display).
+/// Split a NESTED replacement field's source into `(expression, conversion, spec, debug)`.
+///
+/// A field nested in a format spec is a WHOLE replacement field, not a bare expression: `{w!r}`,
+/// `{w:d}`, `{w!r:>3}` and `{w=}` are all legal inside one, and the four pieces mean there exactly
+/// what they mean in the outer field. The lexer splits the outer field as it scans; this one
+/// arrives as captured text, so the same split is made over a char slice.
+///
+/// String literals are skipped, because a `!`, `:` or `=` inside one belongs to the string --
+/// the same reason the scan that captured this text skips them.
+fn split_nested_field(chars: &[char]) -> (String, Option<char>, Option<String>, Option<String>) {
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut conversion = None;
+    let mut expr_end = chars.len();
+    let mut spec_start = None;
+    let mut debug_seen = false;
+    let mut debug_end = None;
+    while i < chars.len() {
+        match chars[i] {
+            '"' | '\'' => i = skip_string_literal(chars, i),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '!' if depth == 0
+                && matches!(chars.get(i + 1), Some('r' | 's' | 'a'))
+                && chars.get(i + 2).is_none_or(|c| *c == ':') =>
+            {
+                if debug_seen {
+                    debug_end = Some(i);
+                } else {
+                    expr_end = i;
+                }
+                conversion = chars.get(i + 1).copied();
+                if chars.get(i + 2) == Some(&':') {
+                    spec_start = Some(i + 3);
+                }
+                break;
+            }
+            ':' if depth == 0 => {
+                if debug_seen {
+                    debug_end = Some(i);
+                } else {
+                    expr_end = i;
+                }
+                spec_start = Some(i + 1);
+                break;
+            }
+            '=' if depth == 0
+                && !debug_seen
+                && chars.get(i + 1) != Some(&'=')
+                && !matches!(chars[..i].iter().next_back(), Some('=' | '!' | '<' | '>')) =>
+            {
+                expr_end = i;
+                debug_seen = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let expr: String = chars[..expr_end.min(chars.len())].iter().collect();
+    let spec: Option<String> = spec_start.map(|s| chars[s.min(chars.len())..].iter().collect());
+    let debug = debug_seen
+        .then(|| chars[..debug_end.unwrap_or(chars.len()).min(chars.len())].iter().collect());
+    (expr, conversion, spec, debug)
+}
+
+/// The index of a string literal's CLOSING quote, given the index of its opening one.
+///
+/// Used when re-scanning a captured f-string format spec for its nested fields: the scan needs to
+/// step over a string without reading the braces inside it as structure. Returns the last index of
+/// the literal, so the caller's own `i += 1` lands past it; an unterminated literal returns the
+/// last index, and the caller's bracket bookkeeping then reports it as the unterminated FIELD it
+/// is -- which is the more useful complaint, because the field is what the reader wrote.
+fn skip_string_literal(chars: &[char], open: usize) -> usize {
+    let quote = chars[open];
+    let triple = chars.get(open + 1) == Some(&quote) && chars.get(open + 2) == Some(&quote);
+    let width = if triple { 3 } else { 1 };
+    let mut i = open + width;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            c if c == quote => {
+                if !triple {
+                    return i;
+                }
+                if chars.get(i + 1) == Some(&quote) && chars.get(i + 2) == Some(&quote) {
+                    return i + 2;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    chars.len() - 1
+}
+
 fn call1(func: &str, arg: Expr) -> Expr {
     Expr::Call {
         func: Box::new(Expr::Name(String::from(func))),
@@ -668,6 +811,7 @@ fn describe_target(expr: &Expr) -> (&'static str, bool) {
         Expr::Call { .. } | Expr::CallEx { .. } => ("function call", true),
         Expr::Int(_) | Expr::Float(_) | Expr::Imaginary(_) | Expr::BigInt(_) => ("literal", true),
         Expr::Str(_) | Expr::Bytes(_) => ("literal", true),
+        Expr::Ellipsis => ("ellipsis", true),
         Expr::Conditional { .. } => ("conditional expression", true),
         Expr::Lambda { .. } => ("lambda", true),
         Expr::ListComp { .. } => ("list comprehension", true),
@@ -1088,7 +1232,50 @@ impl Parser {
             Tok::Reserved(s) if s == "import" => self.parse_import(),
             Tok::Reserved(s) if s == "from" => self.parse_from_import(),
             Tok::Name(n) if n == "match" && self.looks_like_match() => self.parse_match(),
+            Tok::Name(n) if n == "type" && self.looks_like_type_alias() => {
+                Err(self.error("a `type` alias statement is out of the subset"))
+            }
             _ => self.parse_small_stmt(),
+        }
+    }
+
+    /// Disambiguate the soft keyword `type`: it opens a PEP 695 alias statement only in the shape
+    /// `type NAME [type_params] "="`. `type` is otherwise the builtin, so `type(x)`, `type = C`,
+    /// `type[int]`, `type.mro` and `type: T = C` all stay ordinary expressions and assignments --
+    /// and `type[x] = 5` is a subscript assignment, because what follows `type` there is not a NAME.
+    ///
+    /// This exists only so the refusal can name the construct. Without it the statement reaches the
+    /// expression grammar, which reports "expected end of line" at the second name -- the same
+    /// complaint a PEP 750 t-string makes, so the two features shared one bucket in the CPython
+    /// suite measurement and one of them went missing from a ranked list because of it.
+    fn looks_like_type_alias(&self) -> bool {
+        let kind = |i: usize| self.tokens.get(i).map(|t| &t.kind);
+        if !matches!(kind(self.pos + 1), Some(Tok::Name(_))) {
+            return false;
+        }
+        match kind(self.pos + 2) {
+            Some(Tok::Assign) => true,
+            Some(Tok::LBracket) => {
+                let mut depth: i32 = 0;
+                let mut i = self.pos + 2;
+                loop {
+                    match kind(i) {
+                        Some(Tok::LParen | Tok::LBracket | Tok::LBrace) => depth += 1,
+                        Some(Tok::RParen | Tok::RBrace) => depth -= 1,
+                        Some(Tok::RBracket) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return matches!(kind(i + 1), Some(Tok::Assign));
+                            }
+                        }
+                        Some(Tok::Newline) if depth <= 0 => return false,
+                        Some(Tok::Eof) | None => return false,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            _ => false,
         }
     }
 
@@ -1223,6 +1410,33 @@ impl Parser {
         matches!(kind(j), Some(Tok::Name(n)) if n == "case")
     }
 
+    /// The SUBJECT of a `match` is PEP 634's `subject_expr`, which is an OPEN TUPLE -- the same shape
+    /// a bare-tuple expression statement has: `match x, y:` matches the tuple `(x, y)` and `match x,:`
+    /// the one-tuple `(x,)`. It is not a parenthesized expression that happens to be allowed without
+    /// its parentheses; the comma is what builds the tuple, so the trailing one in `match x,:` is
+    /// load-bearing and NOT decoration.
+    ///
+    /// A lone `*a` with no comma is a syntax error rather than a one-tuple, which is the rule the
+    /// bare-tuple statement already states -- and it carries that message rather than a second
+    /// wording of the same refusal.
+    fn parse_match_subject(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_display_elem()?;
+        if !self.at(&Tok::Comma) {
+            return match first {
+                DisplayElem::Plain(subject) => Ok(subject),
+                DisplayElem::Star(_) => Err(self.error("can't use a starred expression here")),
+            };
+        }
+        let mut elems = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.at(&Tok::Colon) {
+                break;
+            }
+            elems.push(self.parse_display_elem()?);
+        }
+        Ok(build_tuple_display(elems))
+    }
+
     /// A fresh synthetic local name (dotted, so it cannot collide with a user identifier).
     fn fresh_temp(&mut self, tag: &str) -> String {
         let n = self.temp_seq;
@@ -1236,7 +1450,7 @@ impl Parser {
     fn parse_match(&mut self) -> Result<StmtKind, ParseError> {
         let line = self.current_line();
         self.advance();
-        let subject = self.parse_expr()?;
+        let subject = self.parse_match_subject()?;
         self.expect(&Tok::Colon, "':' after the match subject")?;
         self.expect_newline()?;
         self.expect(&Tok::Indent, "an indented block of `case` clauses")?;
@@ -1268,7 +1482,7 @@ impl Parser {
             Tok::Name(n) if n == "case" => self.advance(),
             _ => return Err(self.error("expected a `case` clause in the match block")),
         }
-        let pattern = self.parse_pattern()?;
+        let pattern = self.parse_open_sequence_pattern()?;
         let guard = if self.eat(&Tok::KwIf) {
             Some(self.parse_expr()?)
         } else {
@@ -1286,6 +1500,27 @@ impl Parser {
     /// One case pattern: an OR pattern (`a | b | ...`) or a single closed pattern, optionally
     /// followed by `as name` to also capture the matched value (`[1, 2] as pair`). `as` binds looser
     /// than `|`, so `a | b as c` is `(a | b) as c`.
+    /// The top of a `case` is PEP 634's `patterns`, which is `pattern` OR an OPEN sequence -- a
+    /// comma-separated sequence written with no brackets, so `case 0, *x:` means `case (0, *x):`.
+    ///
+    /// **Only this position allows it.** A sub-pattern inside a sequence, class or mapping pattern is
+    /// a plain `pattern`, which is why this is a layer above [`Parser::parse_pattern`] rather than a
+    /// case inside it -- putting it there would let `[0, (1, 2)]` be written `[0, 1, 2]`.
+    fn parse_open_sequence_pattern(&mut self) -> Result<MatchPattern, ParseError> {
+        let ends = [Tok::Colon, Tok::KwIf];
+        if ends.iter().any(|t| self.at(t)) {
+            return Err(self.error("expected a pattern after `case`"));
+        }
+        let (elems, star, trailing_comma) = self.parse_pattern_sequence(&ends)?;
+        if elems.len() == 1 && !trailing_comma && star.is_none() {
+            return Ok(elems.into_iter().next().expect("one pattern"));
+        }
+        if star.is_some() && elems.len() == 1 && !trailing_comma {
+            return Err(self.error("a `*` pattern is only valid inside a sequence pattern"));
+        }
+        Ok(MatchPattern::Sequence { elems, star })
+    }
+
     fn parse_pattern(&mut self) -> Result<MatchPattern, ParseError> {
         let pattern = self.parse_or_pattern()?;
         if self.eat(&Tok::KwAs) {
@@ -1353,13 +1588,13 @@ impl Parser {
             }
             Tok::LBracket => {
                 self.advance();
-                let (elems, star, _) = self.parse_pattern_sequence(&Tok::RBracket)?;
+                let (elems, star, _) = self.parse_pattern_sequence(&[Tok::RBracket])?;
                 self.expect(&Tok::RBracket, "']' closing the sequence pattern")?;
                 Ok(MatchPattern::Sequence { elems, star })
             }
             Tok::LParen => {
                 self.advance();
-                let (elems, star, trailing_comma) = self.parse_pattern_sequence(&Tok::RParen)?;
+                let (elems, star, trailing_comma) = self.parse_pattern_sequence(&[Tok::RParen])?;
                 self.expect(&Tok::RParen, "')' closing the pattern")?;
                 if elems.len() == 1 && !trailing_comma && star.is_none() {
                     Ok(elems.into_iter().next().expect("one grouped pattern"))
@@ -1379,6 +1614,23 @@ impl Parser {
                 } else {
                     lit
                 };
+                if matches!(self.peek(), Tok::Plus | Tok::Minus) {
+                    let op = if self.at(&Tok::Plus) { BinOp::Add } else { BinOp::Sub };
+                    if !is_real_number_literal(&value) {
+                        return Err(self.error("real number required in complex literal"));
+                    }
+                    self.advance();
+                    let Tok::Imaginary(bits) = self.peek() else {
+                        return Err(self.error("imaginary number required in complex literal"));
+                    };
+                    let bits = *bits;
+                    self.advance();
+                    return Ok(MatchPattern::Value(Expr::Binary {
+                        op,
+                        lhs: Box::new(value),
+                        rhs: Box::new(Expr::Imaginary(bits)),
+                    }));
+                }
                 Ok(MatchPattern::Value(value))
             }
         }
@@ -1482,13 +1734,18 @@ impl Parser {
     /// list (to tell a 1-group `(p)` from a 1-sequence `(p,)`). A `|` (or) directly inside a sequence
     /// is out of the subset; each non-star element is a capture / wildcard / value / nested sequence /
     /// class pattern (matched recursively).
+    /// `terminators` is a SET because the open form has two ends: a `case`'s sequence stops at the
+    /// `:` or at the `if` of a guard, where a bracketed one stops at its own closing bracket. One
+    /// implementation serves all three, so a rule added here reaches every position that has a
+    /// sequence pattern rather than the one whose call site was edited.
     fn parse_pattern_sequence(
         &mut self,
-        terminator: &Tok,
+        terminators: &[Tok],
     ) -> Result<(Vec<MatchPattern>, Option<usize>, bool), ParseError> {
+        let at_end = |p: &Self| terminators.iter().any(|t| p.at(t));
         let mut elems = Vec::new();
         let mut star = None;
-        if self.at(terminator) {
+        if at_end(self) {
             return Ok((elems, star, false));
         }
         let mut trailing_comma = false;
@@ -1509,7 +1766,7 @@ impl Parser {
             if !self.eat(&Tok::Comma) {
                 break;
             }
-            if self.at(terminator) {
+            if at_end(self) {
                 trailing_comma = true;
                 break;
             }
@@ -2367,51 +2624,51 @@ impl Parser {
         })
     }
 
+    /// Refuse a PEP 695 type parameter list -- `[T]`, `[T: int]`, `[*Ts]`, `[**P]`, `[T = int]` --
+    /// by naming the construct, where `carrier` is what the list is attached to.
+    ///
+    /// It is refused rather than read because **none of the three carriers is a parse-only
+    /// feature**: each binds a `typing` object when the definition RUNS. `def f[T]` builds a
+    /// `TypeVar` and `type X = ...` a `TypeAliasType` -- neither imports anything -- while
+    /// `class C[T]` additionally takes `typing.Generic` into its MRO through `__mro_entries__`,
+    /// which this object model does not implement.
+    ///
+    /// The message names the construct rather than the punctuation the reader stopped on, because
+    /// the punctuation is not specific to it: `type X = ...` and a PEP 750 t-string both leave the
+    /// reader at the start of an unexpected name, and a complaint about that position cannot tell
+    /// the two apart.
+    fn refuse_type_params(&mut self, carrier: &str) -> Result<(), ParseError> {
+        if self.at(&Tok::LBracket) {
+            return Err(self.error(format!(
+                "type parameters on {carrier} are out of the subset"
+            )));
+        }
+        Ok(())
+    }
+
     fn parse_classdef(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwClass, "'class'")?;
         let name = self.expect_name()?;
-        let mut keywords: Vec<(String, Expr)> = Vec::new();
-        let bases = if self.eat(&Tok::LParen) {
-            let mut bases = Vec::new();
-            while !self.at(&Tok::RParen) {
-                if let (Tok::Name(kw), Tok::Assign) = (self.peek().clone(), self.peek2()) {
-                    if kw == "metaclass" {
-                        return Err(self.error("`metaclass=` is out of the subset"));
-                    }
-                    self.advance();
-                    self.advance();
-                    keywords.push((kw, self.parse_expr()?));
-                } else {
-                    if !keywords.is_empty() {
-                        return Err(
-                            self.error("a base class cannot follow a keyword argument in a class header")
-                        );
-                    }
-                    bases.push(self.parse_expr()?);
-                }
-                if !self.eat(&Tok::Comma) {
-                    break;
+        self.refuse_type_params("a class")?;
+        let mut bases: Vec<ClassBase> = Vec::new();
+        let mut keywords: Vec<ClassKeyword> = Vec::new();
+        if self.eat(&Tok::LParen) {
+            for arg in self.parse_args_refusing(Some("metaclass"))? {
+                match arg {
+                    CallArg::Positional(e) => bases.push(ClassBase::Plain(e)),
+                    CallArg::Star(e) => bases.push(ClassBase::Star(e)),
+                    CallArg::Keyword(kw, e) => keywords.push(ClassKeyword::Named(kw, e)),
+                    CallArg::DoubleStar(e) => keywords.push(ClassKeyword::Spread(e)),
                 }
             }
             self.expect(&Tok::RParen, "')' closing the base list")?;
-            bases
-        } else {
-            Vec::new()
-        };
+        }
         self.expect(&Tok::Colon, "':' after the class header")?;
         let outer = self.func_ctx;
         self.func_ctx = None;
         let body = self.parse_suite();
         self.func_ctx = outer;
         let body = body?;
-        for stmt in &body {
-            if matches!(stmt.kind, StmtKind::Delete(_)) {
-                return Err(self.error(
-                    "`del` in a class body is not supported in this subset (unbinding a class \
-                     member needs a delete-by-name op the bytecode does not have)",
-                ));
-            }
-        }
         Ok(StmtKind::ClassDef {
             name,
             bases,
@@ -2621,6 +2878,7 @@ impl Parser {
         }
         self.expect(&Tok::KwDef, "'def'")?;
         let name = self.expect_name()?;
+        self.refuse_type_params("a function")?;
         self.expect(&Tok::LParen, "'(' after the function name")?;
         let params = self.parse_params()?;
         self.expect(&Tok::RParen, "')'")?;
@@ -2671,6 +2929,69 @@ impl Parser {
             Some(false) => Err(self.error(format!("'{what}' outside async function"))),
             None => Err(self.error(format!("'{what}' outside function"))),
         }
+    }
+
+    /// Open a bucket for a bracketed display whose first element may turn out to be a
+    /// comprehension's. See [`Parser::await_sinks`].
+    fn defer_awaits(&mut self) {
+        self.await_sinks.push(Vec::new());
+    }
+
+    /// Settle the open bucket: the element WAS a comprehension's, of `kind`.
+    ///
+    /// A GENERATOR EXPRESSION discharges every debt raised inside it. It compiles to an
+    /// asynchronous generator when it contains one, and none of its body runs until something
+    /// iterates it, so there is nothing for the enclosing function to await -- which is why
+    /// `def f(g): return (i async for i in g)` is legal, and has been since Python 3.7. It is also
+    /// why a list comprehension NESTED in one is legal: the scope enclosing that comprehension is
+    /// the asynchronous generator, not the plain `def` further out.
+    ///
+    /// A LIST, SET or DICT comprehension discharges nothing. It runs to completion where it stands,
+    /// so an `await` inside makes the comprehension itself asynchronous and the debt travels on
+    /// outward -- now complaining about the comprehension rather than about the `await`.
+    fn settle_comprehension_awaits(&mut self, kind: &str) -> Result<(), ParseError> {
+        let debts = self.await_sinks.pop().unwrap_or_default();
+        if kind == "generator expression" {
+            return Ok(());
+        }
+        self.raise_awaits(debts.into_iter().map(|debt| AwaitDebt {
+            from_comprehension: true,
+            ..debt
+        }))
+    }
+
+    /// Settle the open bucket: the element was NOT a comprehension's, so its debts belong to
+    /// whatever encloses the display -- a plain list, tuple, set, dict or grouping carries them out
+    /// unchanged.
+    fn settle_display_awaits(&mut self) -> Result<(), ParseError> {
+        let debts = self.await_sinks.pop().unwrap_or_default();
+        self.raise_awaits(debts.into_iter())
+    }
+
+    /// Hand debts to the next display out, or -- when this is the outermost one -- judge them
+    /// against the function they have finally reached.
+    fn raise_awaits(&mut self, debts: impl Iterator<Item = AwaitDebt>) -> Result<(), ParseError> {
+        if let Some(outer) = self.await_sinks.last_mut() {
+            outer.extend(debts);
+            return Ok(());
+        }
+        if matches!(self.func_ctx, Some(true)) {
+            return Ok(());
+        }
+        let Some(debt) = debts.into_iter().next() else {
+            return Ok(());
+        };
+        let message = if debt.from_comprehension {
+            "asynchronous comprehension outside of an asynchronous function"
+        } else if self.func_ctx.is_some() {
+            "'await' outside async function"
+        } else {
+            "'await' outside function"
+        };
+        Err(ParseError {
+            line: debt.line,
+            message: String::from(message),
+        })
     }
 
     /// `parameter ("," parameter)* [","]`, where `parameter: identifier [":"
@@ -2754,7 +3075,12 @@ impl Parser {
                 if let Tok::Name(_) = self.peek() {
                     let name = self.expect_name()?;
                     let annotation = if allow_annotations && self.eat(&Tok::Colon) {
-                        Some(self.parse_expr()?)
+                        if self.eat(&Tok::Star) {
+                            self.parse_bitor()?;
+                            None
+                        } else {
+                            Some(self.parse_expr()?)
+                        }
                     } else {
                         None
                     };
@@ -2932,7 +3258,9 @@ impl Parser {
         self.expect(&Tok::Colon, "':' after the lambda parameters")?;
         let outer = self.func_ctx;
         self.func_ctx = Some(false);
+        let sinks = core::mem::take(&mut self.await_sinks);
         let body = self.parse_expr();
+        self.await_sinks = sinks;
         self.func_ctx = outer;
         let body = body?;
         Ok(Expr::Lambda {
@@ -3251,7 +3579,14 @@ impl Parser {
         if !self.at(&Tok::KwAwait) {
             return self.parse_trailer();
         }
-        self.require_async_context("await")?;
+        let line = self.current_line();
+        match self.await_sinks.last_mut() {
+            Some(sink) => sink.push(AwaitDebt {
+                line,
+                from_comprehension: false,
+            }),
+            None => self.require_async_context("await")?,
+        }
         self.advance();
         Ok(Expr::Await(Box::new(self.parse_trailer()?)))
     }
@@ -3427,7 +3762,7 @@ impl Parser {
     /// For a `{expr=}` self-documenting field, `debug` is the literal prefix (e.g. `x=`) prepended
     /// to the value, and the default rendering (no conversion, no spec) is `repr`, not `str`.
     fn fstring_field(
-        &self,
+        &mut self,
         text: &str,
         conversion: Option<char>,
         spec: Option<&str>,
@@ -3448,25 +3783,21 @@ impl Parser {
             };
         }
         let value = if let Some(spec) = spec {
-            let template = match self.fstring_spec_expr(spec)? {
-                None => Expr::Str(format!("{{:{spec}}}").into()),
-                Some(spec_expr) => Expr::Binary {
-                    op: BinOp::Add,
-                    lhs: Box::new(Expr::Binary {
-                        op: BinOp::Add,
-                        lhs: Box::new(Expr::Str("{:".into())),
-                        rhs: Box::new(spec_expr),
+            let known_spec = self.fstring_spec_expr(spec)?;
+            match known_spec {
+                None => Expr::Call {
+                    func: Box::new(Expr::Attribute {
+                        value: Box::new(Expr::Str(format!("{{:{spec}}}").into())),
+                        attr: String::from("format"),
                     }),
-                    rhs: Box::new(Expr::Str("}".into())),
+                    args: vec![node],
+                    keywords: Vec::new(),
                 },
-            };
-            Expr::Call {
-                func: Box::new(Expr::Attribute {
-                    value: Box::new(template),
-                    attr: String::from("format"),
-                }),
-                args: vec![node],
-                keywords: Vec::new(),
+                Some(spec_expr) => Expr::Call {
+                    func: Box::new(Expr::Name(String::from("format"))),
+                    args: vec![node, spec_expr],
+                    keywords: Vec::new(),
+                },
             }
         } else if conversion.is_some() {
             node
@@ -3501,7 +3832,7 @@ impl Parser {
     /// nested field, concatenated left to right. Returns `None` for a plain spec with no nested
     /// field (the caller then uses a compile-time template). A nested field is a plain expression
     /// (its own conversion/spec is out of the subset); `{{`/`}}` are literal braces.
-    fn fstring_spec_expr(&self, spec: &str) -> Result<Option<Expr>, ParseError> {
+    fn fstring_spec_expr(&mut self, spec: &str) -> Result<Option<Expr>, ParseError> {
         if !spec.contains('{') {
             return Ok(None);
         }
@@ -3528,6 +3859,7 @@ impl Parser {
                     let mut depth = 0i32;
                     while i < chars.len() && !(chars[i] == '}' && depth == 0) {
                         match chars[i] {
+                            '"' | '\'' => i = skip_string_literal(&chars, i),
                             '(' | '[' | '{' => depth += 1,
                             ')' | ']' | '}' => depth -= 1,
                             _ => {}
@@ -3537,14 +3869,15 @@ impl Parser {
                     if i >= chars.len() {
                         return Err(self.error("unterminated nested field in an f-string format spec"));
                     }
-                    let src: String = chars[start..i].iter().collect();
+                    let src: Vec<char> = chars[start..i].to_vec();
                     i += 1;
-                    let expr = self.parse_embedded_expr(&src)?;
-                    parts.push(Expr::Call {
-                        func: Box::new(Expr::Name(String::from("str"))),
-                        args: vec![expr],
-                        keywords: Vec::new(),
-                    });
+                    let (expr_src, conversion, spec, debug) = split_nested_field(&src);
+                    parts.push(self.fstring_field(
+                        &expr_src,
+                        conversion,
+                        spec.as_deref(),
+                        debug.as_deref(),
+                    )?);
                 }
                 c => {
                     literal.push(c);
@@ -3568,20 +3901,24 @@ impl Parser {
     /// `f"{a,}"` a 1-tuple, and `f"{*a,}"` spreads -- while a lone `f"{*a}"` is refused, because a
     /// spread with nothing to be a surplus of is an error here exactly as it is anywhere else.
     /// Reading it with the value grammar is what gets all four right from one rule.
-    fn parse_embedded_expr(&self, raw: &str) -> Result<Expr, ParseError> {
-        let tokens = crate::lexer::tokenize(raw.trim())
+    fn parse_embedded_expr(&mut self, raw: &str) -> Result<Expr, ParseError> {
+        let tokens = crate::lexer::tokenize_field(raw.trim())
             .map_err(|e| self.error(format!("in f-string expression: {}", e.message)))?;
+        let deferring = !self.await_sinks.is_empty();
         let mut sub = Parser {
             tokens,
             pos: 0,
             temp_seq: 0,
             line_ended: true,
             func_ctx: self.func_ctx,
+            await_sinks: if deferring { vec![Vec::new()] } else { Vec::new() },
         };
         let expr = sub.parse_rhs_value()?;
         if !matches!(sub.peek(), Tok::Newline | Tok::Eof) {
             return Err(self.error("unexpected trailing tokens in an f-string expression"));
         }
+        let debts = sub.await_sinks.pop().unwrap_or_default();
+        self.raise_awaits(debts.into_iter())?;
         Ok(expr)
     }
 
@@ -3610,11 +3947,13 @@ impl Parser {
     ) -> Result<Vec<CompClause>, ParseError> {
         let mut clauses = Vec::new();
         loop {
+            let async_line = self.current_line();
             let is_async = self.eat(&Tok::KwAsync);
-            if is_async && kind != "generator expression" && !matches!(self.func_ctx, Some(true)) {
-                return Err(self.error(
-                    "asynchronous comprehension outside of an asynchronous function",
-                ));
+            if is_async && kind != "generator expression" {
+                self.raise_awaits(core::iter::once(AwaitDebt {
+                    line: async_line,
+                    from_comprehension: true,
+                }))?;
             }
             if !self.eat(&Tok::KwFor) {
                 if is_async {
@@ -3624,10 +3963,21 @@ impl Parser {
             }
             let targets = self.parse_for_target_list(self.current_line())?;
             self.expect(&Tok::KwIn, "'in' in the comprehension")?;
+            let inner = !clauses.is_empty();
+            if inner {
+                self.defer_awaits();
+            }
             let iterable = self.parse_or()?;
+            if inner {
+                self.settle_comprehension_awaits(kind)?;
+            }
             let mut conditions = Vec::new();
-            while self.eat(&Tok::KwIf) {
-                conditions.push(self.parse_or()?);
+            if self.at(&Tok::KwIf) {
+                self.defer_awaits();
+                while self.eat(&Tok::KwIf) {
+                    conditions.push(self.parse_or()?);
+                }
+                self.settle_comprehension_awaits(kind)?;
             }
             clauses.push(CompClause {
                 targets,
@@ -3776,9 +4126,11 @@ impl Parser {
             let first = self.parse_display_elem()?;
             return self.finish_set(first);
         }
+        self.defer_awaits();
         let key = self.parse_expr()?;
         if !self.eat(&Tok::Colon) {
             if self.at_comp_clause() {
+                self.settle_comprehension_awaits("set comprehension")?;
                 let clauses = self.parse_comp_clauses("set comprehension", &[&key])?;
                 self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
                 return Ok(Expr::SetComp {
@@ -3786,10 +4138,12 @@ impl Parser {
                     clauses,
                 });
             }
+            self.settle_display_awaits()?;
             return self.finish_set(DisplayElem::Plain(key));
         }
         let value = self.parse_expr()?;
         if self.at_comp_clause() {
+            self.settle_comprehension_awaits("dict comprehension")?;
             let clauses = self.parse_comp_clauses("dict comprehension", &[&key, &value])?;
             self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
             return Ok(Expr::DictComp {
@@ -3798,6 +4152,7 @@ impl Parser {
                 clauses,
             });
         }
+        self.settle_display_awaits()?;
         self.finish_dict(DictItem::Pair(key, value))
     }
 
@@ -3844,6 +4199,17 @@ impl Parser {
     /// arguments `name=value`. A positional argument after a keyword argument, and a repeated
     /// keyword, are syntax errors (matching CPython).
     fn parse_args(&mut self) -> Result<Vec<CallArg>, ParseError> {
+        self.parse_args_refusing(None)
+    }
+
+    /// [`Self::parse_args`], with one keyword name the CALLING position does not allow -- today only
+    /// the class header, whose `metaclass=` is out of this subset.
+    ///
+    /// The policy belongs to the caller and the POSITION belongs here, which is the whole reason for
+    /// the parameter: refused after the list is parsed, the error can only name the token the parser
+    /// happens to be sitting on, and a class header written over several lines then reports the
+    /// wrong one. Refused where the name is READ, it carries that name's own line.
+    fn parse_args_refusing(&mut self, refused: Option<&str>) -> Result<Vec<CallArg>, ParseError> {
         let mut out: Vec<CallArg> = Vec::new();
         let mut seen_keyword = false;
         if self.at(&Tok::RParen) {
@@ -3856,7 +4222,14 @@ impl Parser {
             } else if self.eat(&Tok::Star) {
                 out.push(CallArg::Star(self.parse_expr()?));
             } else if matches!(self.peek(), Tok::Name(_)) && matches!(self.peek2(), Tok::Assign) {
+                let name_line = self.current_line();
                 let name = self.expect_name()?;
+                if refused == Some(name.as_str()) {
+                    return Err(ParseError {
+                        line: name_line,
+                        message: format!("`{name}=` is out of the subset"),
+                    });
+                }
                 self.advance();
                 if out
                     .iter()
@@ -3870,6 +4243,7 @@ impl Parser {
                 if seen_keyword {
                     return Err(self.error("positional argument follows keyword argument"));
                 }
+                self.defer_awaits();
                 let first = self.parse_expr()?;
                 if self.at_comp_clause() {
                     if !out.is_empty() {
@@ -3877,6 +4251,7 @@ impl Parser {
                             "a generator expression must be parenthesized unless it is the sole argument",
                         ));
                     }
+                    self.settle_comprehension_awaits("generator expression")?;
                     let clauses = self.parse_comp_clauses("generator expression", &[&first])?;
                     out.push(CallArg::Positional(Expr::GeneratorExp {
                         element: Box::new(first),
@@ -3884,6 +4259,7 @@ impl Parser {
                     }));
                     break;
                 }
+                self.settle_display_awaits()?;
                 out.push(CallArg::Positional(first));
             }
             if self.eat(&Tok::Comma) {
@@ -3958,7 +4334,7 @@ impl Parser {
             }
             Tok::Ellipsis => {
                 self.advance();
-                Ok(Expr::Name(String::from("Ellipsis")))
+                Ok(Expr::Ellipsis)
             }
             Tok::Str(_) | Tok::FString(_) => self.parse_string_literal_run(),
             Tok::LBracket => {
@@ -3967,11 +4343,13 @@ impl Parser {
                     self.advance();
                     return Ok(Expr::List(Vec::new()));
                 }
+                self.defer_awaits();
                 let first = self.parse_display_elem()?;
                 if matches!(first, DisplayElem::Plain(_)) && self.at_comp_clause() {
                     let DisplayElem::Plain(element) = first else {
                         unreachable!("guarded to a plain element")
                     };
+                    self.settle_comprehension_awaits("list comprehension")?;
                     let clauses = self.parse_comp_clauses("list comprehension", &[&element])?;
                     self.expect(&Tok::RBracket, "']' closing the comprehension")?;
                     Ok(Expr::ListComp {
@@ -3979,6 +4357,7 @@ impl Parser {
                         clauses,
                     })
                 } else {
+                    self.settle_display_awaits()?;
                     let mut elems = vec![first];
                     while self.eat(&Tok::Comma) {
                         if self.at(&Tok::RBracket) {
@@ -4012,8 +4391,15 @@ impl Parser {
                     self.advance();
                     return Ok(Expr::Tuple(Vec::new()));
                 }
+                self.defer_awaits();
                 let first = self.parse_display_elem()?;
-                if matches!(first, DisplayElem::Plain(_)) && self.at_comp_clause() {
+                let is_generator = matches!(first, DisplayElem::Plain(_)) && self.at_comp_clause();
+                if is_generator {
+                    self.settle_comprehension_awaits("generator expression")?;
+                } else {
+                    self.settle_display_awaits()?;
+                }
+                if is_generator {
                     let DisplayElem::Plain(element) = first else {
                         unreachable!("guarded to a plain element")
                     };
@@ -4084,7 +4470,7 @@ mod tests {
     /// Every statement carries the line it BEGAN on, and nested bodies carry their own.
     ///
     /// Without this the line field is plumbing nothing checks -- it would compile, round-trip and
-    /// look finished while every statement reported the same number. That is the shape this lane has
+    /// look finished while every statement reported the same number. That is a shape this parser has
     /// already paid for three times: a field faithfully carried and never verified.
     #[test]
     fn every_statement_carries_the_line_it_began_on() {
@@ -4484,16 +4870,13 @@ z = 0
     }
 
     #[test]
-    fn fstring_nested_spec_builds_a_dynamic_template() {
+    fn fstring_nested_spec_is_applied_by_the_two_argument_format() {
         let m = parse_ok("f\"{x:{w}}\"\n");
         let StmtKind::Expr(Expr::Call { func, args, .. }) = &m.body[0].kind else {
-            panic!("expected a .format(...) call");
+            panic!("expected a format(...) call");
         };
-        let Expr::Attribute { value, attr } = &**func else {
-            panic!("expected an attribute call");
-        };
-        assert_eq!(attr, "format");
-        assert!(matches!(&**value, Expr::Binary { op: BinOp::Add, .. }));
+        assert!(matches!(&**func, Expr::Name(n) if n == "format"), "the two-argument builtin");
+        assert_eq!(args.len(), 2, "the value and the computed spec");
         assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
         let plain = parse_ok("f\"{x:.2f}\"\n");
         let StmtKind::Expr(Expr::Call { func, .. }) = &plain.body[0].kind else {
@@ -4935,6 +5318,148 @@ z = 0
         }
     }
 
+    /// A t-string nested in an f-string FIELD is refused by name, from the parser.
+    ///
+    /// CPython 3.14 accepts `f"{t"v={a}"}"` -- PEP 701 allows the inner quotes and the inner literal
+    /// is a `Template` -- so this is a GAP and must be a NAMED refusal rather than a mis-lex.
+    /// A field's source is captured as TEXT and lexed only when the field is parsed, so `tokenize`
+    /// of the outer line succeeds and the parser is the layer that sees it.
+    #[test]
+    fn a_t_string_in_an_f_string_field_is_refused_by_name() {
+        let err = parse_src("x = f\"{t\"v={a}\"}\"\n").expect_err("a nested t-string is a GAP");
+        let text = format!("{err:?}");
+        assert!(text.contains("t-string"), "must name the construct, said {text}");
+        assert!(parse_src("x = f\"{t}\"\n").is_ok());
+        assert!(parse_src("x = f\"{t!r:>{t}}\"\n").is_ok());
+    }
+
+    /// `...` is a literal, so it cannot be assigned to -- but the NAME `Ellipsis` still can.
+    ///
+    /// The two are one character apart in meaning and they are not the same: `Ellipsis = 1` rebinds
+    /// an ordinary builtin name and is legal Python, while `... = 1` is a syntax error. Desugaring
+    /// `...` to that name where it was READ threw the distinction away, so the target check saw a
+    /// bindable name and bound it -- `...` became `1` for the rest of the scope, silently, in source
+    /// CPython refuses outright. Both directions are asserted because a fix for either alone is
+    /// wrong: refusing the name would break legal code, and accepting the literal is the defect.
+    #[test]
+    fn the_ellipsis_literal_is_not_a_target_but_the_name_still_is() {
+        for src in [
+            "... = 1\n",
+            "[...] = [1]\n",
+            "(...) = 1\n",
+            "... += 1\n",
+            "for ... in [1]:\n    pass\n",
+            "with open('f') as ...:\n    pass\n",
+            "a, ... = 1, 2\n",
+        ] {
+            assert!(parse_src(src).is_err(), "should reject: {src:?}");
+        }
+        let err = parse_src("... = 1\n").expect_err("rejected");
+        assert!(
+            format!("{err:?}").contains("cannot assign to ellipsis"),
+            "must name the ellipsis, said {err:?}"
+        );
+        for src in [
+            "Ellipsis = 1\n",
+            "a = ...\n",
+            "x = {}\nx[...] = 1\n",
+            "print(...)\n",
+            "x = [..., 1]\n",
+            "def f(y=...):\n    return y\n",
+            "def f() -> ...:\n    pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+    }
+
+    /// A complex literal pattern is ONE literal spelled with an operator, not an expression.
+    ///
+    /// PEP 634's `complex_number` is `signed_real ('+' | '-') imaginary`, and both halves are checked
+    /// as literal TOKENS -- which is why `case 1 + 2:` is a syntax error rather than a pattern that
+    /// compares unequal, and why the real half may carry a sign while the imaginary half may not.
+    /// The two refusal messages are CPython's own words, verified against 3.14.6.
+    #[test]
+    fn a_complex_literal_pattern_is_a_literal_and_not_an_expression() {
+        for src in [
+            "match p:\n    case 0 + 0j:\n        pass\n",
+            "match p:\n    case 1 + 2j:\n        pass\n",
+            "match p:\n    case -1 + 3j:\n        pass\n",
+            "match p:\n    case 5 - 4j:\n        pass\n",
+            "match p:\n    case 1.5 + 2j:\n        pass\n",
+            "match p:\n    case 2j:\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        for (src, expected) in [
+            ("match p:\n    case 1 + 2:\n        pass\n", "imaginary number required"),
+            ("match p:\n    case 1j + 2j:\n        pass\n", "real number required"),
+            ("match p:\n    case 2j + 1:\n        pass\n", "real number required"),
+            ("match p:\n    case -1j + 2j:\n        pass\n", "real number required"),
+            ("match p:\n    case 1 + -2j:\n        pass\n", "imaginary number required"),
+        ] {
+            let err = parse_src(src).expect_err("should reject");
+            assert!(
+                format!("{err:?}").contains(expected),
+                "{src:?} should say {expected:?}, said {err:?}"
+            );
+        }
+        assert!(parse_src("match p:\n    case 0 + 0j + 1j:\n        pass\n").is_err());
+    }
+
+    /// The top of a `case` takes PEP 634's `patterns`, so a sequence may be written WITHOUT brackets.
+    ///
+    /// `case 0, *x:` means `case (0, *x):`. The one-element rules are the parenthesized form's:
+    /// `case 0:` is that pattern and `case 0,:` is a one-item SEQUENCE, so the trailing comma is
+    /// load-bearing. A lone star is not a sequence until a comma makes it one.
+    #[test]
+    fn an_open_sequence_pattern_needs_no_brackets() {
+        for src in [
+            "match p:\n    case 0, *x:\n        pass\n",
+            "match p:\n    case *x,:\n        pass\n",
+            "match p:\n    case 0,:\n        pass\n",
+            "match p:\n    case 0, 1:\n        pass\n",
+            "match p:\n    case 0, 1,:\n        pass\n",
+            "match p:\n    case *_,:\n        pass\n",
+            "match p:\n    case 0, *x, 1:\n        pass\n",
+            "match p:\n    case 0, 1 if p:\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        for src in [
+            "match p:\n    case *x:\n        pass\n",
+            "match p:\n    case :\n        pass\n",
+            "match p:\n    case 0, *x, *y:\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_err(), "should reject: {src:?}");
+        }
+        let nested = parse_src("match p:\n    case [a, [b, c]]:\n        pass\n");
+        assert!(nested.is_ok(), "a nested sequence keeps its brackets");
+    }
+
+    /// A `match` SUBJECT is an open tuple too -- PEP 634's `subject_expr`.
+    ///
+    /// `match w, x:` matches the tuple `(w, x)`; `match x,:` the one-tuple. A lone starred expression
+    /// with no comma is refused with the same words the bare-tuple statement uses, because it is the
+    /// same rule rather than a second one that happens to agree.
+    #[test]
+    fn a_match_subject_is_an_open_tuple() {
+        for src in [
+            "match w, x:\n    case _:\n        pass\n",
+            "match w, x,:\n    case _:\n        pass\n",
+            "match x,:\n    case _:\n        pass\n",
+            "match *a, b:\n    case _:\n        pass\n",
+            "match *a,:\n    case _:\n        pass\n",
+            "match x:\n    case _:\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        let err = parse_src("match *a:\n    case _:\n        pass\n").expect_err("should reject");
+        assert!(
+            format!("{err:?}").contains("starred expression"),
+            "a lone starred subject carries the bare-tuple statement's message, said {err:?}"
+        );
+    }
+
     #[test]
     fn class_patterns_parse_and_gate_the_subset() {
         for src in [
@@ -5307,19 +5832,14 @@ z = 0
         }
     }
 
-    /// The one form still refused, and the refusal NAMES a missing mechanism rather than a taste.
-    ///
-    /// Unbinding a class member needs a delete-by-name op the bytecode does not have: a class body
-    /// binds through `StoreName` into its namespace, and the delete ops are `DeleteFast` (a frame
-    /// slot), `DeleteItem` and `DeleteAttr`. There is nothing that removes a name from the namespace
-    /// a class body is building, so `del` there is refused where the refusal can say why.
+    /// A class body takes `del` like any other statement, because a class body's names live in a
+    /// namespace and `DeleteName` removes one from it -- the mirror of the `StoreName` that bound
+    /// it. The parser therefore holds no list of statement kinds a class body may contain.
     #[test]
-    fn a_class_body_refuses_only_what_has_no_mechanism() {
-        let deleted = parse_src("class C:\n    x = 1\n    del x\n").expect_err("refused");
-        assert!(
-            format!("{deleted}").contains("delete-by-name"),
-            "the refusal must name the mechanism, got: {deleted}"
-        );
+    fn a_class_body_takes_del() {
+        parse_src("class C:\n    x = 1\n    del x\n").expect("a class body takes `del`");
+        parse_src("class C:\n    class D:\n        y = 1\n        del y\n")
+            .expect("including inside a nested class body");
     }
 
     #[test]
@@ -5458,11 +5978,8 @@ z = 0
     }
 
     #[test]
-    fn ellipsis_parses_to_the_ellipsis_name() {
-        assert_eq!(
-            parse_ok("...\n").body[0].kind,
-            StmtKind::Expr(Expr::Name("Ellipsis".into()))
-        );
+    fn ellipsis_parses_to_its_own_node_and_not_to_the_name() {
+        assert_eq!(parse_ok("...\n").body[0].kind, StmtKind::Expr(Expr::Ellipsis));
         assert!(parse_src("def f():\n    ...\n").is_ok());
         assert!(parse_src("x = [..., 1]\n").is_ok());
     }
@@ -6001,6 +6518,51 @@ else:
     }
 
     #[test]
+    fn the_yield_outside_a_function_rule_holds_at_every_position() {
+        for refused in [
+            "class C:\n    yield 1\n",
+            "class C:\n    x = (yield)\n",
+            "def g():\n    class C:\n        yield 1\n",
+            "class A:\n    class B:\n        yield 1\n",
+            "class C:\n    if True:\n        yield 1\n",
+            "class C:\n    for i in []:\n        yield 1\n",
+            "class C:\n    try:\n        yield 1\n    except ValueError:\n        pass\n",
+            "class C:\n    while True:\n        yield 1\n",
+            "class C:\n    with open('x'):\n        yield 1\n",
+            "x = (yield)\n",
+            "x = [i for i in (yield)]\n",
+        ] {
+            let err = parse_src(refused).expect_err("CPython refuses this");
+            assert_eq!(err.message, "'yield' outside function", "for {refused:?}");
+        }
+        let err = parse_src("class C:\n    yield from [1]\n").expect_err("refused");
+        assert_eq!(err.message, "'yield from' outside function");
+
+        for accepted in [
+            "class C:\n    def f(self):\n        yield 1\n",
+            "class C:\n    def f(self):\n        yield from [1]\n",
+            "class A:\n    class B:\n        def f(self):\n            yield 1\n",
+            "def g():\n    class C:\n        def f(self):\n            yield 1\n",
+            "class C:\n    async def f(self):\n        yield 1\n",
+            "class C:\n    x = [i for i in range(3)]\n",
+            "class C:\n    def f(self):\n        return 1\n",
+        ] {
+            assert!(parse_src(accepted).is_ok(), "CPython accepts {accepted:?}");
+        }
+
+        for both_rules in [
+            "class C:\n    x = [(yield i) for i in range(3)]\n",
+            "x = [(yield i) for i in range(3)]\n",
+            "x = ((yield i) for i in range(3))\n",
+        ] {
+            let err = parse_src(both_rules).expect_err("refused");
+            assert_eq!(err.message, "'yield' outside function", "for {both_rules:?}");
+        }
+        let err = parse_src("f = lambda: [(yield i) for i in range(3)]\n").expect_err("refused");
+        assert_eq!(err.message, "'yield' inside list comprehension");
+    }
+
+    #[test]
     fn a_yield_reaches_only_a_comprehensions_first_iterable() {
         assert!(
             parse_src("def f():
@@ -6347,5 +6909,276 @@ for d['k'] in [1, 2, 3]:
         assert_eq!(body.len(), 1, "the inner with is the outer's whole body");
         let StmtKind::With { optional_target: inner, .. } = &body[0].kind else { panic!("a nested with") };
         assert_eq!(inner.as_ref(), Some(&AssignTarget::Name(String::from("y"))));
+    }
+
+    /// A generator expression is LAZY, so an `await` written inside one is the generator's and not
+    /// the enclosing function's. Every other display is eager and carries the `await` outward.
+    ///
+    /// The two read alike, which is why this is a table rather than one case: the difference is a
+    /// single bracket, and the position of the `await` within the comprehension matters as much as
+    /// the bracket does.
+    #[test]
+    fn a_generator_expression_discharges_an_await_and_a_container_comprehension_does_not() {
+        let async_comp = "asynchronous comprehension outside of an asynchronous function";
+        assert!(parse_src("def f(g):\n    return (await i for i in g)\n").is_ok());
+        assert!(parse_src("x = (await i for i in g)\n").is_ok());
+        assert!(parse_src("def f(g):\n    return (i for i in g if await k(i))\n").is_ok());
+        assert!(parse_src("def f(g):\n    return (b for a in g for b in await p(a))\n").is_ok());
+        for source in [
+            "def f(g):\n    return [await i for i in g]\n",
+            "def f(g):\n    return {await i for i in g}\n",
+            "def f(g):\n    return {i: await k(i) for i in g}\n",
+            "def f(g):\n    return [i for i in g if await k(i)]\n",
+            "def f(g):\n    return [b for a in g for b in await p(a)]\n",
+        ] {
+            assert_eq!(refusal(source), async_comp, "for {source:?}");
+        }
+        assert!(parse_src("async def f(g):\n    return [await i for i in g]\n").is_ok());
+    }
+
+    /// The FIRST iterable is the one thing a comprehension does not evaluate inside itself, so an
+    /// `await` there belongs to the enclosing function even in a generator expression.
+    #[test]
+    fn the_first_iterable_of_a_comprehension_belongs_to_the_enclosing_scope() {
+        assert_eq!(
+            refusal("def f():\n    return (i for i in await w())\n"),
+            "'await' outside async function"
+        );
+        assert_eq!(
+            refusal("x = (i for i in await w())\n"),
+            "'await' outside function"
+        );
+        assert!(parse_src("async def f():\n    return (i for i in await w())\n").is_ok());
+    }
+
+    /// What encloses a comprehension is a SCOPE, not the nearest `def`. A container comprehension
+    /// nested in a generator expression is legal because the generator expression is what encloses
+    /// it -- and the same comprehension nested in another one is not.
+    #[test]
+    fn a_comprehension_is_enclosed_by_the_scope_around_it_not_by_the_nearest_def() {
+        assert!(parse_src("def f(g):\n    return ([await v for v in r] for r in g)\n").is_ok());
+        assert!(parse_src("def f(g):\n    return [(await v for v in r) for r in g]\n").is_ok());
+        assert_eq!(
+            refusal("def f(g):\n    return [[await v for v in r] for r in g]\n"),
+            "asynchronous comprehension outside of an asynchronous function"
+        );
+    }
+
+    /// A lambda is a function boundary, so it stops a debt from reaching the comprehension around
+    /// it -- and the complaint goes back to being about the `await` itself.
+    #[test]
+    fn a_lambda_stops_an_await_from_reaching_the_comprehension_around_it() {
+        assert_eq!(
+            refusal("def f(g):\n    return (lambda: await v for v in g)\n"),
+            "'await' outside async function"
+        );
+        assert_eq!(
+            refusal("def f(g):\n    return [lambda: await v for v in g]\n"),
+            "'await' outside async function"
+        );
+    }
+
+    /// A replacement field is part of the element it sits in, so it is judged by the display around
+    /// the STRING and not by anything inside it.
+    #[test]
+    fn an_await_in_an_fstring_field_is_judged_by_the_display_around_the_string() {
+        assert!(parse_src("def f(g):\n    return (f\"{await n(v)}\" for v in g)\n").is_ok());
+        assert_eq!(
+            refusal("def f(g):\n    return [f\"{await n(v)}\" for v in g]\n"),
+            "asynchronous comprehension outside of an asynchronous function"
+        );
+    }
+
+    /// `async for` is the OTHER way a comprehension becomes asynchronous, and it takes the same
+    /// route: the rule is about the comprehension, not about which token made it one.
+    ///
+    /// This is the position the rule was missing. `async for` was judged against the enclosing
+    /// FUNCTION, which is right until a generator expression is what encloses it.
+    #[test]
+    fn an_async_for_clause_is_judged_by_the_same_rule_an_await_is() {
+        assert!(parse_src("def f(g):\n    return (v async for v in g)\n").is_ok());
+        assert!(parse_src("def f(g):\n    return ([v async for v in r] for r in g)\n").is_ok());
+        assert!(parse_src("def f(g):\n    return ([v for q in p async for v in r] for r in g)\n").is_ok());
+        assert_eq!(
+            refusal("def f(g):\n    return [v async for v in g]\n"),
+            "asynchronous comprehension outside of an asynchronous function"
+        );
+        assert_eq!(
+            refusal("def f(g):\n    return [[v async for v in r] for r in g]\n"),
+            "asynchronous comprehension outside of an asynchronous function"
+        );
+    }
+
+    /// A brace inside a STRING inside a NESTED FIELD of a format spec closes nothing.
+    ///
+    /// DEPTH is what separates the two readings of a quote in a spec, and both are asserted: at the
+    /// spec's top level a quote is the FILL CHARACTER, and inside a nested field it delimits a
+    /// string. Getting only the first right is what made `f"{x:{'}'}>10}"` a syntax error while
+    /// `f"{x:'^10}"` worked.
+    #[test]
+    fn a_brace_in_a_nested_spec_field_is_a_string_and_not_the_end_of_the_field() {
+        assert!(parse_src("x = f'{3:{\"}\"}>10}'\n").is_ok(), "a close brace in a nested spec field");
+        assert!(parse_src("x = f'{3:{\"{\"}>10}'\n").is_ok(), "an open brace in a nested spec field");
+        assert!(parse_src("x = f'{3:{\"{\"}<{w}}'\n").is_ok(), "and more spec after it");
+        assert!(parse_src("x = f'{3:\"^10}'\n").is_ok(), "a quote as the fill character");
+        assert!(parse_src("x = f'{3:\"^{w}}'\n").is_ok(), "a fill quote AND a nested field");
+        assert!(refusal("x = f'}'\n").contains("single '}'"), "a bare close brace in the text");
+        assert!(refusal("x = f'{3:}>10}'\n").contains("single '}'"), "a bare close brace in a spec");
+    }
+
+    /// A field nested in a format spec is a WHOLE replacement field, not a bare expression.
+    ///
+    /// It may carry a conversion, its own spec, or both, and may nest again -- so it is split and
+    /// desugared by the same routine the outer field uses. Reading it as a bare expression made
+    /// `!r` inside a spec a syntax error while the identical `!r` outside one worked, which is the
+    /// same construct answered two ways depending only on where it sat.
+    #[test]
+    fn a_field_nested_in_a_spec_is_a_whole_replacement_field() {
+        for source in [
+            "x = f'{v:{w!r}.{p}}'\n",
+            "x = f'{v:{w!s}}'\n",
+            "x = f'{v:{w!a}}'\n",
+            "x = f'{v:{w:d}}'\n",
+            "x = f'{v:{a:{b}}}'\n",
+            "x = f'{v!r:{w}}'\n",
+            "x = f'{v:>{d[\"k\"]}}'\n",
+        ] {
+            assert!(parse_src(source).is_ok(), "should parse: {source:?}");
+        }
+        assert!(parse_src("x = f'{v:{a != b}}'\n").is_ok(), "a `!=` comparison");
+    }
+
+    /// A COMPUTED format spec is applied with the two-argument `format`, never by embedding it in a
+    /// template.
+    ///
+    /// The spec is allowed to contain a brace and a template is not, so `("{:" + spec + "}")` turns
+    /// a legal spec into a malformed template -- and the failure is at RUN TIME, in a string the
+    /// source never wrote. A FIXED spec still goes through `"{:spec}".format(value)`, which keeps a
+    /// user `__format__` on the same path as a plain `{}` field.
+    #[test]
+    fn a_computed_format_spec_is_applied_by_format_not_by_a_template() {
+        let call_name = |source: &str| {
+            let m = parse_ok(source);
+            let StmtKind::Assign(a) = &m.body[0].kind else { panic!("an assignment") };
+            match a.value.as_ref().expect("a value") {
+                Expr::Call { func, .. } => match func.as_ref() {
+                    Expr::Name(n) => n.clone(),
+                    Expr::Attribute { attr, .. } => alloc::format!(".{attr}"),
+                    other => panic!("unexpected callee {other:?}"),
+                },
+                other => panic!("expected a call, got {other:?}"),
+            }
+        };
+        assert_eq!(call_name("x = f'{v:{w}}'\n"), "format", "a computed spec");
+        assert_eq!(call_name("x = f'{v:{\"}\"}>10}'\n"), "format", "and one holding a brace character");
+        assert_eq!(call_name("x = f'{v:>10}'\n"), ".format", "a fixed spec keeps the template");
+    }
+
+    /// Each of the three carriers of a PEP 695 type parameter list refuses by NAMING the construct.
+    ///
+    /// The exact wording is asserted, not just the refusal, because a complaint about the
+    /// punctuation the reader stopped on cannot tell these apart from a PEP 750 t-string, which
+    /// leaves it in the same position. Anything counting refusals by their message needs the three
+    /// to be distinguishable from each other and from that.
+    #[test]
+    fn a_pep695_type_parameter_list_is_refused_by_naming_the_construct() {
+        assert_eq!(
+            refusal("class C[T]:\n    pass\n"),
+            "type parameters on a class are out of the subset"
+        );
+        assert_eq!(
+            refusal("def f[T](a):\n    return a\n"),
+            "type parameters on a function are out of the subset"
+        );
+        assert_eq!(
+            refusal("async def f[T](a):\n    return a\n"),
+            "type parameters on a function are out of the subset"
+        );
+        assert_eq!(
+            refusal("type Alias = int\n"),
+            "a `type` alias statement is out of the subset"
+        );
+        assert_eq!(
+            refusal("type Pair[T] = tuple[T, T]\n"),
+            "a `type` alias statement is out of the subset"
+        );
+        assert_eq!(
+            refusal("type Pair[T: tuple[int, str]] = list[T]\n"),
+            "a `type` alias statement is out of the subset"
+        );
+        for header in ["class C[T: int]:", "class C[*Ts]:", "class C[**P]:", "class C[T = int]:"] {
+            assert_eq!(
+                refusal(&alloc::format!("{header}\n    pass\n")),
+                "type parameters on a class are out of the subset",
+                "for {header}"
+            );
+        }
+    }
+
+    /// The `*args` slot is the ONE parameter whose annotation may itself be starred, which is how a
+    /// variadic type is spelled. Both negatives matter as much as the positive: a starred annotation
+    /// is a syntax error on an ordinary parameter and on `**kwargs`, and a bare starred expression
+    /// is one in any value position, so accepting it here must not widen any of those.
+    ///
+    /// The parameter is left UNANNOTATED rather than carrying the inner expression, and that is
+    /// asserted: the star unpacks a type rather than decorating one, so keeping `list[int]` out of
+    /// `*list[int]` would type the vararg as the thing being unpacked into it.
+    #[test]
+    fn only_the_vararg_slot_takes_a_starred_annotation() {
+        let vararg = |source: &str| {
+            let m = parse_ok(source);
+            let StmtKind::FuncDef(f) = &m.body[0].kind else { panic!("a def") };
+            f.params
+                .iter()
+                .find(|p| p.is_vararg)
+                .expect("a vararg parameter")
+                .clone()
+        };
+        let p = vararg("def f(*args: *ts):\n    pass\n");
+        assert_eq!(p.name, "args");
+        assert_eq!(p.annotation, None, "the star unpacks a type, so none is resolved");
+        assert_eq!(vararg("def f(*args: *tuple[int, ...]):\n    pass\n").annotation, None);
+        assert_eq!(vararg("def f(*args: *a | b):\n    pass\n").annotation, None);
+        assert_eq!(
+            vararg("def f(*args: int):\n    pass\n").annotation,
+            Some(Expr::Name(String::from("int")))
+        );
+        assert!(parse_src("def f(*args: *ts, k=1):\n    pass\n").is_ok());
+        assert!(parse_src("def f(*args: *ts, **kw):\n    pass\n").is_ok());
+        assert!(parse_src("def f(*args: *ts,):\n    pass\n").is_ok());
+        assert!(parse_src("def f(x: *a):\n    pass\n").is_err(), "a plain parameter");
+        assert!(parse_src("def f(**kw: *a):\n    pass\n").is_err(), "**kwargs");
+        assert!(parse_src("x = *a\n").is_err(), "a bare starred expression");
+        assert!(parse_src("def f(*args: *):\n    pass\n").is_err(), "a star with nothing after it");
+    }
+
+    /// `type` is a SOFT keyword, and the alias statement is the only shape it may swallow. A soft
+    /// keyword that over-triggers turns working programs into syntax errors, so the negative cases
+    /// are the ones that need writing down.
+    #[test]
+    fn type_stays_an_ordinary_name_outside_the_alias_shape() {
+        for source in [
+            "type = int\n",
+            "print(type(1))\n",
+            "x = type[int]\n",
+            "type[x] = 5\n",
+            "x = type.__name__\n",
+            "type: int = 5\n",
+            "type, x = a, b\n",
+            "def f(type):\n    return type\n",
+            "del type\n",
+        ] {
+            assert!(parse_src(source).is_ok(), "should parse: {source:?}");
+        }
+    }
+
+    /// A deferred judgement still reports the line the `await` was WRITTEN on, not the line the
+    /// display that settled it happened to end on. Without this the mechanism would compile, agree
+    /// with CPython on every verdict, and point at the wrong line in a multi-line comprehension.
+    #[test]
+    fn a_deferred_await_reports_the_line_it_was_written_on() {
+        let source = "def f(g):\n    return [\n        await v\n        for v in g\n    ]\n";
+        let error = parse(tokenize(source).expect("tokenizes")).expect_err("refused");
+        assert_eq!(error.line, 3, "the line of the `await`, not of the `]`");
     }
 }

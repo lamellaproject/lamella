@@ -8,6 +8,12 @@ authors.workspace = true
 description = "Lamella's Python 3 front end: lexer, parser, our versioned bytecode, and the typed Python-to-MIR lowering."
 publish = false
 
+[features]
+# Unicode character NAMES for a `\N{...}` escape. OFF by default: the table is hundreds of
+# kilobytes of strings, and this crate is compiled into serve firmware that has no room for it.
+# A build without it refuses the escape by saying so, rather than calling the name unknown.
+char-names = ["lamella-unicode/char-names"]
+
 [dependencies]
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 lamella-ir = { path = "../lamella-ir" }
@@ -21,7 +27,7 @@ lamella-flash-format = { path = "../lamella-flash-format" }
 lamella-aot = { path = "../lamella-aot" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32" }
 lamella-elf = { path = "../lamella-elf" }
-lamella-link = { path = "../lamella-link" }
+lamella-linker = { path = "../lamella-linker" }
 
 [lints]
 workspace = true

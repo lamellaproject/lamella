@@ -4,19 +4,17 @@
 //! and the `DebugBackend` trait -- driven here by a `DeviceBackend` over a real probe.
 
 use lamella_aot::build;
-use lamella_cmsis_dap::Dap;
 use lamella_probe_core::{ArmDap, TargetAccess};
 use lamella_cmsis_dap_nrf::Nrf51Flash;
 use lamella_debug_device::DeviceBackend;
 use lamella_metadata::{Assembly, PortablePdb};
-use lamella_usbhid::Device;
 
 /// build_debug's line-table offsets are image-relative (the code sits at image offset 8, after the
 /// [SP][reset] vector table, and the image flashes at address 0), so a raw PC indexes the tables
 /// directly -- no base to subtract.
 /// Which probe family to open. Selected explicitly rather than by trying ids in order: on a bench
 /// with several probes attached, a server that opens whichever answers first can flash a board
-/// another lane is using.
+/// someone else is using.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProbeKind {
     CmsisDap,
@@ -24,10 +22,15 @@ enum ProbeKind {
     StLink,
 }
 
-/// Which part's flash to program, and therefore where the image lands.
+/// Which part is being driven: it selects the part-specific handling this binary has, which is a
+/// flash algorithm for some variants and a reset sequence for others.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Part {
     Nrf51,
+    /// Selects how the part is STOPPED rather than how it is programmed -- stopping is the one
+    /// thing the generic sequence cannot do here (see `--reset` below).
+    #[cfg(feature = "sam")]
+    Samd21,
     #[cfg(feature = "st")]
     Stm32F0,
     #[cfg(feature = "st")]
@@ -44,18 +47,24 @@ impl Part {
     fn flash_base(self) -> u32 {
         match self {
             Part::Nrf51 => 0,
+            #[cfg(feature = "sam")]
+            Part::Samd21 => 0,
             #[cfg(feature = "st")]
             _ => 0x0800_0000,
         }
     }
 }
 
-const USAGE: &str = "usage: device-dap-server [--probe cmsis|stlink] [--part nrf51|f0|f4|f7|h7] \
-                     [--pid 0xNNNN] <program.dll> [<Type> <Method>] [probe-serial]";
+const USAGE: &str = "usage: device-dap-server [--probe cmsis|stlink] \
+                     [--part nrf51|samd21|f0|f4|f7|h7] [--pid 0xNNNN] [--attach [--reset]] \
+                     <program.dll|program.elf> [<Type> <Method>] [probe-serial]";
 
 fn main() -> std::io::Result<()> {
     let mut probe = ProbeKind::CmsisDap;
     let mut part = Part::Nrf51;
+    let mut part_named = false;
+    let mut attach = false;
+    let mut reset = false;
     #[cfg(feature = "st")]
     let mut stlink_pid = lamella_stlink::product_id::V2_1;
     let mut positional: Vec<String> = Vec::new();
@@ -72,9 +81,14 @@ fn main() -> std::io::Result<()> {
                     other => panic!("--probe takes cmsis or stlink, not {other:?}"),
                 };
             }
+            "--attach" => attach = true,
+            "--reset" => reset = true,
             "--part" => {
+                part_named = true;
                 part = match raw.next().as_deref() {
                     Some("nrf51") => Part::Nrf51,
+                    #[cfg(feature = "sam")]
+                    Some("samd21") => Part::Samd21,
                     #[cfg(feature = "st")]
                     Some("f0") => Part::Stm32F0,
                     #[cfg(feature = "st")]
@@ -103,6 +117,13 @@ fn main() -> std::io::Result<()> {
     }
     let mut args = positional.into_iter();
     let program = args.next().expect(USAGE);
+    if reset && !part_named {
+        eprintln!(
+            "reset: no --part was named, so the generic sequence is what will run. A part with a \
+             sequence of its own needs naming to get it."
+        );
+    }
+
     let rest: Vec<String> = args.collect();
     let (target, serial): (Option<(String, String)>, Option<String>) = match rest.len() {
         0 => (None, None),
@@ -112,7 +133,58 @@ fn main() -> std::io::Result<()> {
         _ => panic!("{USAGE}"),
     };
 
-    let (lines, names, image, file, entry) = source_lines(&program, target.as_ref());
+    let bytes = std::fs::read(&program).expect("read the program");
+    let debug = if bytes.starts_with(b"\x7fELF") {
+        let elf = lamella_debug_device::program::from_elf(&bytes)
+            .unwrap_or_else(|error| panic!("{program}: {error}"));
+        assert!(
+            attach || elf.image_base == part.flash_base(),
+            "{program} is linked to load at {:#010x} and --part puts this part's flash at {:#010x} \
+             -- either the wrong --part or an image built for another board",
+            elf.image_base,
+            part.flash_base()
+        );
+        assert!(
+            attach || part_named,
+            "{program} is an ELF and no --part was given, so the default would choose a flash \
+             algorithm rather than the right one -- and a matching base does not distinguish two \
+             parts that both boot from zero.
+
+             Either name the part with --part, or deploy it with `lamella flash` and debug the \
+             running program with --attach."
+        );
+        elf
+    } else {
+        let (lines, names, image, file, entry) = source_lines(&program, target.as_ref());
+        let ends: Vec<u32> = names
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                names.get(index + 1).map_or(u32::MAX, |&(start, _)| start)
+            })
+            .collect();
+        let names: Vec<(u32, u32, String)> = names
+            .into_iter()
+            .zip(ends)
+            .map(|((start, name), end)| (start, end, name))
+            .collect();
+        lamella_debug_device::program::DebugProgram {
+            image,
+            image_base: part.flash_base(),
+            lines: lines
+                .into_iter()
+                .map(|(offset, line)| lamella_debug_device::LineRow { offset, line, file: 0 })
+                .collect(),
+            names,
+            files: vec![file],
+            entry,
+            frames: Vec::new(),
+            locals: lamella_debug_device::program::LocalSections::default(),
+        }
+    };
+    let lamella_debug_device::program::DebugProgram {
+        image, image_base, lines, names, files, entry, frames, locals,
+    } = debug;
 
     match probe {
         #[cfg(feature = "st")]
@@ -122,12 +194,21 @@ fn main() -> std::io::Result<()> {
                 serial.as_deref(),
             )
             .expect("open the ST-Link");
-            serve(stlink, part, &image, lines, names, file, entry)
+            serve(stlink, part, image_base, attach, reset, &image, lines, names, files, entry, frames, locals)
         }
         ProbeKind::CmsisDap => {
-            let device = Device::open(0x0d28, 0x0204, serial.as_deref())
-                .expect("open the DAPLink (CMSIS-DAP) probe");
-            serve(ArmDap::new(Dap::new(device)), part, &image, lines, names, file, entry)
+            let selector = serial
+                .as_deref()
+                .map_or_else(lamella_probe::Selector::from_environment, lamella_probe::Selector::by_serial);
+            let session = lamella_probe::open(&selector).expect("open a CMSIS-DAP probe");
+            eprintln!(
+                "probe: {:?} {:04x}:{:04x} serial {:?}",
+                session.info.product,
+                session.info.vendor_id,
+                session.info.product_id,
+                session.info.serial
+            );
+            serve(ArmDap::new(session.into_dap()), part, image_base, attach, reset, &image, lines, names, files, entry, frames, locals)
         }
     }
 }
@@ -138,14 +219,46 @@ fn main() -> std::io::Result<()> {
 fn serve<A: TargetAccess + 'static>(
     mut probe: A,
     part: Part,
+    image_base: u32,
+    attach: bool,
+    reset: bool,
     image: &[u8],
-    lines: Vec<(u32, u32)>,
-    names: Vec<(u32, String)>,
-    file: String,
+    lines: Vec<lamella_debug_device::LineRow>,
+    names: Vec<(u32, u32, String)>,
+    files: Vec<String>,
     entry: String,
+    frames: Vec<u8>,
+    locals: lamella_debug_device::program::LocalSections,
 ) -> std::io::Result<()> {
-    flash(&mut probe, part, image);
-    let backend = DeviceBackend::new(probe, lines, part.flash_base(), names, file, entry);
+    if attach {
+        probe.connect().expect("connect SWD");
+        probe.init_mem().expect("init MEM-AP");
+        if reset {
+            #[cfg(feature = "sam")]
+            let outcome = if part == Part::Samd21 {
+                use lamella_cmsis_dap_sam::Samd21Debug;
+                probe.samd21_park()
+            } else {
+                probe.reset_and_halt()
+            };
+            #[cfg(not(feature = "sam"))]
+            let outcome = probe.reset_and_halt();
+
+            match outcome {
+                Ok(()) => eprintln!("reset: the part is halted at its entry"),
+                Err(error) => eprintln!(
+                    "reset: could not reset this part and hold it ({error:?}). The session is \
+                     attached to the RUNNING program instead, so a stop reported as \"entry\" is \
+                     wherever it happens to be, and a breakpoint on anything that has already run \
+                     will not be hit."
+                ),
+            }
+        }
+    } else {
+        flash(&mut probe, part, image);
+    }
+    let backend = DeviceBackend::new(probe, lines, image_base, names, files, entry, frames)
+        .with_locals(locals);
 
     let mut debugger = lamella_dap::Debugger::with_backend(Box::new(backend));
     lamella_dap::serve_polled(
@@ -176,6 +289,12 @@ fn flash<A: TargetAccess>(target: &mut A, part: Part, image: &[u8]) {
     let base = part.flash_base();
 
     match part {
+        #[cfg(feature = "sam")]
+        Part::Samd21 => panic!(
+            "--part samd21 selects this part's RESET sequence and there is no SAM flash algorithm \
+             in this binary. Deploy the image with `lamella flash` and debug the running program \
+             with --attach."
+        ),
         Part::Nrf51 => {
             let pages = (words.len() * 4).div_ceil(0x400);
             for page in 0..pages as u32 {

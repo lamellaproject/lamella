@@ -1,0 +1,107 @@
+# The SAMD20 PORT block: the pin-mux and pin-config machinery, one PORT group per port letter
+# (the porta/portb instance rows carry the group bases). PMUX and PINCFG are PER-PIN ARRAYS:
+# the offsets below are the n = 0 element; element addresses derive as
+#   PMUX[n]   = group_base + 0x30 + n        (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
+#   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
+# The generator owns those derivations; drivers receive resolved addresses through their bindings.
+#
+# EVERY OFFSET HERE CAME OFF THE SAM D20'S OWN 21.9 REGISTER DESCRIPTIONS, WHICH STATE ONE
+# OFFSET EACH IN PROSE, AND NOT OFF THE 21.7 REGISTER-SUMMARY TABLE. In that table each register
+# occupies four rows, one per byte lane, and carries its name and its offset on only the first of
+# them -- so the Offset column and the Name column advance at different rates, and a reader
+# checking a value against it has to track which lane a row belongs to.
+#
+# THE GROUP COUNT COMES FROM THE PAD SET, AND ON THIS FAMILY IT HAS TO. The sibling samr21 block
+# takes its count from the register descriptions themselves, which print each offset as
+# '0x..+x*0x80 [x=0..2]' and so state the stride and the bound in one expression. THIS DOCUMENT
+# DOES NOT WRITE THEM THAT WAY: 21.9's offsets carry no x term at all, and 21.8 states the stride
+# in a Tip that ends 'group 1 is for the PB pins, etc.' -- an open-ended etc. with no bound. So
+# the bound is taken from the only statement that carries one: Table 6-1's pad set reaches PB and
+# stops, giving two groups. A recipe that names the offset expression as the source for the count
+# does not transfer to this family, and reading the count off the sibling would be reading it off
+# a part with a third group.
+
+[table]
+kind = "block"
+family = "samd20"
+block = "port"
+sources = [
+    "SAM D20 Family Data Sheet DS60001504K section 21.9 register descriptions, each stating its own offset: DIR 0x00, DIRCLR 0x04, DIRSET 0x08, DIRTGL 0x0C, OUT 0x10, OUTCLR 0x14, OUTSET 0x18, OUTTGL 0x1C, IN 0x20, CTRL 0x24, WRCONFIG 0x28",
+    "DS60001504K section 21.9.12 PMUX ('Offset: 0x30 + n*0x01 [n=0..15]') and 21.9.13 PINCFG ('Offset: 0x40 + n*0x01 [n=0..31]')",
+    "DS60001504K section 21.8 (PORT Pin Groups and Register Repetition) for the 0x80 group spacing, stated in prose: 'Each pin group has its own PORT registers, with a 0x80 address spacing'",
+]
+notes = [
+    "PMUX[n] covers pins 2n (PMUXE, low nibble) and 2n+1 (PMUXO, high nibble); function values A..H = 0..7.",
+    "PINCFG: PMUXEN hands the pin to the muxed function; INEN enables the input buffer (required for any pin the peripheral READS -- an RX line, MISO).",
+    "TWO GROUPS ON THIS PART. Section 21.8 names group 0 as PA and group 1 as PB and then writes 'etc.' rather than a bound, so the count is taken from the pad set: Table 6-1 reaches PB and stops. The sibling samr21 has THREE and states its own count in its offset expressions, which is why the group bases are enumerated in instances.toml rather than derived by a consumer that assumes a number.",
+    "DRVSTR (PINCFG bit 6) is transcribed because it is stated, not because a driver uses it: the field list is what a reader checks a write against, and a register described with a hole where a documented bit lives invites the assumption that the hole is reserved.",
+]
+
+[registers.DIR]
+offset = 0x00
+width = 32
+fields = { DIR = [0, 32] }
+notes = "The direction word, readable: 1 = output. A driver reporting a pin's CURRENT mode reads this rather than shadowing it, so a pin another driver configured is described honestly."
+
+[registers.DIRCLR]
+offset = 0x04
+width = 32
+fields = { DIRCLR = [0, 32] }
+notes = "Write 1s to make pins INPUTS."
+
+[registers.DIRSET]
+offset = 0x08
+width = 32
+fields = { DIRSET = [0, 32] }
+notes = "Write 1s to make pins outputs."
+
+[registers.OUT]
+offset = 0x10
+width = 32
+fields = { OUT = [0, 32] }
+notes = "The output drive level, readable. Load-bearing beyond writing a level: with PINCFG.PULLEN set on an INPUT pin, this bit SELECTS THE PULL DIRECTION (1 = pull-up, 0 = pull-down), so a driver offering InputPullUp/InputPullDown cannot be written without it."
+
+[registers.OUTCLR]
+offset = 0x14
+width = 32
+fields = { OUTCLR = [0, 32] }
+notes = "Write 1s to drive pins low."
+
+[registers.OUTSET]
+offset = 0x18
+width = 32
+fields = { OUTSET = [0, 32] }
+notes = "Write 1s to drive pins high."
+
+[registers.IN]
+offset = 0x20
+width = 32
+fields = { IN = [0, 32] }
+notes = "The input samples (INEN pins only). Reset value 0x40000000 as printed in 21.9.9, which is a sampled state rather than a configured one."
+
+[registers.PMUX0]
+offset = 0x30
+width = 8
+fields = { PMUXE = [0, 4], PMUXO = [4, 4] }
+notes = "Element 0 of the per-pin-pair mux array; see the block header for the element derivation."
+
+[registers.PINCFG0]
+offset = 0x40
+width = 8
+fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
+notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
+
+# Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
+# NOTE: THE LETTERS DO NOT SELECT WHAT THEY SELECT ON A SAMD21 -- the VALUES are the same 0..7,
+# but this part has no TCC at all, so Table 6-1 spends BOTH E and F on TC where the SAMD21 spends
+# F on TCC. A pin-map row carries the letter and this table turns it into a nibble; what the
+# letter SELECTS is Table 6-1's business.
+[constants]
+FUNC_A = 0
+FUNC_B = 1
+FUNC_C = 2
+FUNC_D = 3
+FUNC_E = 4
+FUNC_F = 5
+FUNC_G = 6
+FUNC_H = 7

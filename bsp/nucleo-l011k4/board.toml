@@ -44,3 +44,11 @@ default = true
 source = "msi"
 msi_hz = 2097000            # the reset clock: RM0377 7.2.3 gives MSI 2.097 MHz as the system clock
 pclk_hz = 2097000           # source after power reset, with all prescalers at 1
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "UM1956 states the embedded ST-LINK/V2-1 is directly connected to the SWD port of the target part and supports only SWD. The manual does not place those signals on any connector reachable by an external probe, so the exposure is unknown. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

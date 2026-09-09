@@ -7,11 +7,6 @@ namespace System
 
 
 #if LAMELLA_SURFACE_REFLECTION
-        public string FullName
-        {
-            [Lamella.Runtime.RuntimeProvided] get { return null; }
-        }
-
         public string Namespace
         {
             [Lamella.Runtime.RuntimeProvided] get { return null; }
@@ -20,26 +15,6 @@ namespace System
         public System.Reflection.Assembly Assembly
         {
             [Lamella.Runtime.RuntimeProvided] get { return null; }
-        }
-
-        public bool IsEnum
-        {
-            [Lamella.Runtime.RuntimeProvided] get { return false; }
-        }
-
-        public bool IsValueType
-        {
-            [Lamella.Runtime.RuntimeProvided] get { return false; }
-        }
-
-        public bool IsClass
-        {
-            [Lamella.Runtime.RuntimeProvided] get { return false; }
-        }
-
-        public bool IsInterface
-        {
-            [Lamella.Runtime.RuntimeProvided] get { return false; }
         }
 
         public bool IsAbstract
@@ -57,16 +32,6 @@ namespace System
             [Lamella.Runtime.RuntimeProvided] get { return false; }
         }
 
-        public bool IsArray
-        {
-            [Lamella.Runtime.RuntimeProvided] get { return false; }
-        }
-
-        public Type BaseType
-        {
-            [Lamella.Runtime.RuntimeProvided] get { return null; }
-        }
-
         public string AssemblyQualifiedName
         {
             get
@@ -77,24 +42,6 @@ namespace System
                 if ((object)owner == null) return full;
                 return full + ", " + owner.FullName;
             }
-        }
-
-        public bool IsSubclassOf(Type c)
-        {
-            if ((object)c == null) throw new ArgumentNullException("c");
-            if (HandleEquals(this, c)) return false;
-            Type walk = BaseType;
-            while ((object)walk != null)
-            {
-                if (HandleEquals(walk, c)) return true;
-                walk = walk.BaseType;
-            }
-            return HandleEquals(c, typeof(object));
-        }
-
-        public override string ToString()
-        {
-            return FullName;
         }
 
         [Lamella.Runtime.RuntimeProvided] public System.Reflection.FieldInfo GetField(string name) { return null; }
@@ -235,6 +182,82 @@ namespace System
         }
 
 #endif
+
+
+
+        public bool IsPointer
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        [Lamella.Runtime.RuntimeProvided] public Type GetElementType() { return null; }
+
+        public int GetArrayRank()
+        {
+            if (!IsArray) throw new ArgumentException("The current Type is not an array.");
+            return 1;
+        }
+
+        [Lamella.Runtime.RuntimeProvided] public bool IsAssignableFrom(Type c) { return false; }
+
+        public bool IsInstanceOfType(object o)
+        {
+            if ((object)o == null) return false;
+            return IsAssignableFrom(o.GetType());
+        }
+
+        public string FullName
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return null; }
+        }
+
+        public bool IsEnum
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        public bool IsValueType
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        public bool IsClass
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        public bool IsInterface
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        public bool IsArray
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        public Type BaseType
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return null; }
+        }
+
+        public bool IsSubclassOf(Type c)
+        {
+            if ((object)c == null) throw new ArgumentNullException("c");
+            if (HandleEquals(this, c)) return false;
+            Type walk = BaseType;
+            while ((object)walk != null)
+            {
+                if (HandleEquals(walk, c)) return true;
+                walk = walk.BaseType;
+            }
+            return HandleEquals(c, typeof(object));
+        }
+
+        public override string ToString()
+        {
+            return FullName;
+        }
 
         [Lamella.Runtime.RuntimeProvided] public static Type GetTypeFromHandle(RuntimeTypeHandle handle) { return null; }
 

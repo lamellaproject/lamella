@@ -3,6 +3,7 @@
 //! identity (picking the right interface when a probe is a composite USB device), negotiates its
 //! `DAP_Info` capabilities, and hands back a connected [`lamella_cmsis_dap::Dap`].
 
+use std::fmt;
 use std::time::Duration;
 
 use lamella_cmsis_dap::{Dap, DapError, Transport, TransportError};
@@ -20,6 +21,23 @@ pub enum Wire {
     CmsisDapV1Hid,
     /// CMSIS-DAP v2 over USB bulk (a WinUSB vendor interface).
     CmsisDapV2Bulk,
+}
+
+impl Wire {
+    /// The short name a tool prints for this wire.
+    ///
+    /// Here rather than at each print site so a listing and an opened session cannot describe the
+    /// same transport with two different words -- and because the transport is worth printing at
+    /// all: a probe's product string is NOT a reliable stand-in for it. One physical board can
+    /// present both wires, a listing may represent it by one while `open` resolves it to the
+    /// other, and the difference is invisible unless something says which was used.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Wire::CmsisDapV1Hid => "hid-v1",
+            Wire::CmsisDapV2Bulk => "bulk-v2",
+        }
+    }
 }
 
 /// A discovered probe interface -- the transport-neutral identity a caller selects on. One physical
@@ -180,10 +198,10 @@ impl std::fmt::Display for ProbeError {
             ProbeError::NotFound => write!(f, "no matching probe found"),
             ProbeError::Ambiguous(serials) => write!(
                 f,
-                "{} probes match; name one with a serial argument or by exporting {}={}",
+                "{} probes match and none was named; pass a serial or export {}=<one of>: {}",
                 serials.len(),
                 PROBE_SERIAL_ENV,
-                serials.first().map_or("<serial>", String::as_str)
+                serials.join(", ")
             ),
             ProbeError::Transport(msg) => write!(f, "probe transport error: {msg}"),
             ProbeError::NoHidDapInterface { serial } => write!(
@@ -329,6 +347,66 @@ pub fn open_hid(
     lamella_usbhid::Device::open_id(&id).map_err(|e| ProbeError::Transport(format!("{e:?}")))
 }
 
+/// Resolves a probe across SEVERAL product ids of one vendor, weighing ambiguity over the WHOLE set.
+///
+/// # Why a loop over [`open_hid`] is not this
+///
+/// [`resolve_serial`] narrows the population with `with_vid_pid`, so its refusal -- *several match,
+/// so name one* -- only ever weighs probes of ONE product id against each other. A caller that
+/// iterates product ids therefore evaluates each population in isolation, and the refusal cannot
+/// fire across the set: with two of a vendor's debugger models attached and no serial given, the
+/// first id that opens wins and the second board is never weighed against it. **That is a first
+/// match, not a decision**, and one of the callers doing it WRITES FLASH.
+///
+/// The population here is every probe of `vendor_id` whose product id appears in `product_ids`, and
+/// the ladder runs ONCE over all of it. A model that is not attached costs nothing, so a caller
+/// passes every id it can drive rather than guessing which is present.
+///
+/// Returns the winning product id beside the serial, because the caller still has to open it --
+/// through [`open_hid`], which stays the only place in this crate that opens a HID probe.
+pub fn resolve_among(
+    vendor_id: u16,
+    product_ids: &[u16],
+    requested: Option<&str>,
+) -> Result<(u16, String), ProbeError> {
+    choose_among(&list(), vendor_id, product_ids, &Selector::named_or_environment(requested))
+}
+
+/// The DECISION half of [`resolve_among`], over an explicit probe list.
+///
+/// Split out for the reason [`choose_serial`] is: the rung that matters is the REFUSAL, and a test
+/// can only reach it by supplying the probes. A selection rule that has never been shown to refuse
+/// has not been shown to do its job, and refusing across a product-id set is the case that is easy
+/// to get wrong.
+fn choose_among(
+    probes: &[ProbeInfo],
+    vendor_id: u16,
+    product_ids: &[u16],
+    selector: &Selector,
+) -> Result<(u16, String), ProbeError> {
+    let population: Vec<&ProbeInfo> = probes
+        .iter()
+        .filter(|p| p.vendor_id == vendor_id && product_ids.contains(&p.product_id))
+        .collect();
+    let candidates: Vec<Candidate> = population.iter().map(|p| p.as_candidate()).collect();
+    match selection::choose(&candidates, selector) {
+        selection::Selection::Unique(Some(serial)) => {
+            let product_id = population
+                .iter()
+                .find(|p| {
+                    p.serial.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&serial))
+                })
+                .map(|p| p.product_id)
+                .ok_or(ProbeError::NotFound)?;
+            Ok((product_id, serial))
+        }
+        selection::Selection::Unique(None) | selection::Selection::NotFound => {
+            Err(ProbeError::NotFound)
+        }
+        selection::Selection::Ambiguous(names) => Err(ProbeError::Ambiguous(names)),
+    }
+}
+
 /// The DECISION half of [`open_hid`]: which HID interface of one physical probe speaks DAP.
 ///
 /// Split out for the same reason [`choose_serial`] is -- **the rung that matters can only be
@@ -381,19 +459,71 @@ pub fn open_bulk(
 /// like a probe (standard desktop HID) are filtered out; whether a candidate truly speaks DAP is
 /// confirmed at [`open`] time. For the raw per-interface view, enumerate the transports directly.
 pub fn list() -> Vec<ProbeInfo> {
-    list_reporting(&mut 0)
+    list_reporting(&mut Vec::new())
 }
 
-/// [`list`], also reporting how many vendor-class devices were recognized as NOT probes.
+/// A vendor-class USB device the probe filter declined, kept so a listing can SHOW it.
+///
+/// **A count alone hands the reader a bucket they cannot see into.** Telling somebody whose probe
+/// is missing that it is "among 3 other vendor-class devices" is only useful if they can find out
+/// what those three are -- otherwise the sentence names a place to look and then refuses to open
+/// it, which is worse than saying nothing.
+///
+/// [`interface_name`](Self::interface_name) is the field that decided it, so it is the field a
+/// reader needs: the filter tests it for `CMSIS-DAP`, and a probe that arrives here has either a
+/// name without that token or no name at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassedOver {
+    /// USB vendor id.
+    pub vendor_id: u16,
+    /// USB product id.
+    pub product_id: u16,
+    /// Serial number, if the OS reported one.
+    pub serial: Option<String>,
+    /// Product string, if the OS reported one.
+    pub product: Option<String>,
+    /// The vendor-class interface's own name -- what the filter read and rejected.
+    pub interface_name: Option<String>,
+}
+
+impl fmt::Display for PassedOver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04x}:{:04x}", self.vendor_id, self.product_id)?;
+        if let Some(serial) = &self.serial {
+            write!(f, " serial {serial}")?;
+        }
+        write!(f, "  {}", self.product.as_deref().unwrap_or("(no product string)"))?;
+        match &self.interface_name {
+            Some(name) => write!(f, "  interface {name:?}"),
+            None => f.write_str("  (the OS published no interface name)"),
+        }
+    }
+}
+
+/// [`list`], also reporting the vendor-class devices that were recognized as NOT probes.
 ///
 /// **FOR A CALLER THAT PRINTS A LISTING, SO THE FILTER IS ACCOUNTABLE.** `lamella devices` is the
 /// command someone runs when they are already confused, and the worst thing it can do is quietly
-/// leave out the probe they are looking for. A count lets it say "and 3 other vendor-class devices"
-/// rather than silently presenting a filtered list as the whole bus: keep it visible, just do not 
-/// let it block.
-pub fn list_reporting(unrecognized: &mut usize) -> Vec<ProbeInfo> {
+/// leave out the probe they are looking for. This lets it say what it passed over rather than
+/// silently presenting a filtered list as the whole bus -- the same discipline the release gate's
+/// known-gaps list applies to a red: keep it visible, just do not let it block.
+///
+/// # What it does NOT account for, stated rather than left to be discovered
+///
+/// **Only the vendor-BULK half is recorded.** Two exclusions sit outside it:
+///
+/// * A HID interface rejected by [`is_cmsis_dap_v1`] is not listed. Widening to it would put every
+///   attached keyboard and mouse into the listing -- their hotkey and media-key collections carry
+///   vendor usage pages with 1-3 byte reports, which is the case that filter exists for. The
+///   narrower widening is the vendor-page interfaces rejected ONLY on report length: a probe with
+///   an unusual descriptor is among those, and so is an unknown number of ordinary devices. That
+///   number decides whether the widening helps or buries the listing, and it is measurable.
+/// * Without the `usbbulk` feature there is no bulk enumeration at all, so this is always empty --
+///   which reads identically to "nothing was passed over". `lamella-cli` and `lamella-flash-routes`
+///   both enable it; a consumer that does not will get a silence it did not ask for.
+pub fn list_reporting(passed_over: &mut Vec<PassedOver>) -> Vec<ProbeInfo> {
     let mut best: Vec<ProbeInfo> = Vec::new();
-    for cand in all_candidates_counting(unrecognized) {
+    for cand in all_candidates_reporting(passed_over) {
         match best.iter_mut().find(|p| {
             p.vendor_id == cand.vendor_id
                 && p.product_id == cand.product_id
@@ -430,17 +560,18 @@ fn distinct_probes(candidates: &[ProbeInfo]) -> Vec<String> {
 /// Every probe-like interface across the native transports -- one entry per interface, so a
 /// composite probe appears several times. The candidate set [`open`] selects from.
 fn all_candidates() -> Vec<ProbeInfo> {
-    all_candidates_counting(&mut 0)
+    all_candidates_reporting(&mut Vec::new())
 }
 
-/// [`all_candidates`], also counting the vendor-class devices it passed over.
+/// [`all_candidates`], also recording the vendor-class devices it passed over.
 ///
-/// **THE COUNT EXISTS SO A FILTER CANNOT HIDE A PROBE IN SILENCE.** Recognizing a probe means
+/// **THE RECORD EXISTS SO A FILTER CANNOT HIDE A PROBE IN SILENCE.** Recognizing a probe means
 /// declining to list something, and the thing this project keeps paying for is a listing that
-/// omits what it could not account for and reports the survivors as the whole set. A number a
-/// caller can print costs nothing and makes an unrecognized probe visible as a discrepancy
-/// instead of as an absence.
-fn all_candidates_counting(unrecognized: &mut usize) -> Vec<ProbeInfo> {
+/// omits what it could not account for and reports the survivors as the whole set. A list a caller
+/// can print costs nothing and makes an unrecognized probe visible as a discrepancy instead of as
+/// an absence.
+fn all_candidates_reporting(passed_over: &mut Vec<PassedOver>) -> Vec<ProbeInfo> {
+    let _ = &passed_over;
     let mut out = Vec::new();
     if let Ok(hids) = lamella_usbhid::enumerate() {
         for hid in hids {
@@ -454,7 +585,13 @@ fn all_candidates_counting(unrecognized: &mut usize) -> Vec<ProbeInfo> {
         for device in bulk {
             match is_cmsis_dap_v2(&device) {
                 Some(true) => out.push(ProbeInfo::from_bulk(device)),
-                Some(false) => *unrecognized += 1,
+                Some(false) => passed_over.push(PassedOver {
+                    vendor_id: device.vendor_id,
+                    product_id: device.product_id,
+                    serial: device.serial_number,
+                    product: device.product,
+                    interface_name: device.interface_name,
+                }),
                 None => out.push(ProbeInfo::from_bulk(device)),
             }
         }
@@ -713,6 +850,116 @@ mod tests {
             &Selector::by_serial("b0ard0002").with_vid_pid(0x0d28, 0x0204),
         );
         assert_eq!(chosen.unwrap(), "b0ard0002");
+    }
+
+    /// A Microchip on-board debugger. The EDBG (`0x2111`) and the Curiosity Nano's nEDBG
+    /// (`0x2175`) are DIFFERENT product ids driven by the SAME tools, which is what makes the
+    /// product-id set the population rather than one id at a time.
+    fn microchip(product_id: u16, serial: &str) -> ProbeInfo {
+        ProbeInfo {
+            vendor_id: 0x03eb,
+            product_id,
+            serial: Some(serial.into()),
+            ..hid_probe(Some(0xff00), Some(0x01), Some(65), Some("CMSIS-DAP"))
+        }
+    }
+
+    const MICROCHIP_DEBUGGERS: [u16; 2] = [0x2111, 0x2175];
+
+    #[test]
+    fn two_models_of_one_vendor_are_refused_rather_than_first_match() {
+        let err = choose_among(
+            &[microchip(0x2111, "ATML0000000000000002"), microchip(0x2175, "MC000000000AAA000001")],
+            0x03eb,
+            &MICROCHIP_DEBUGGERS,
+            &Selector::any(),
+        )
+        .unwrap_err();
+        let ProbeError::Ambiguous(named) = err else { panic!("expected a refusal, got {err:?}") };
+        assert_eq!(named.len(), 2, "the refusal must NAME both models, not just count them");
+    }
+
+    #[test]
+    fn a_refusal_shows_every_candidate_and_not_just_the_first() {
+        let err = choose_among(
+            &[microchip(0x2111, "ATML0000000000000002"), microchip(0x2175, "MC000000000AAA000001")],
+            0x03eb,
+            &MICROCHIP_DEBUGGERS,
+            &Selector::any(),
+        )
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("ATML0000000000000002") && rendered.contains("MC000000000AAA000001"),
+            "the refusal must show BOTH candidates, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_single_id_rung_cannot_see_the_other_model_which_is_why_resolve_among_exists() {
+        let mixed =
+            [microchip(0x2111, "ATML0000000000000002"), microchip(0x2175, "MC000000000AAA000001")];
+
+        assert_eq!(
+            choose_serial(&mixed, &Selector::any().with_vid_pid(0x03eb, 0x2111)).unwrap(),
+            "ATML0000000000000002",
+            "the single-id rung answers uniquely here, which is the defect and not a feature"
+        );
+
+        assert!(
+            matches!(
+                choose_among(&mixed, 0x03eb, &MICROCHIP_DEBUGGERS, &Selector::any()),
+                Err(ProbeError::Ambiguous(_))
+            ),
+            "over the whole product-id set the same bench must refuse"
+        );
+    }
+
+    #[test]
+    fn a_serial_picks_its_model_out_of_the_set() {
+        let (product_id, serial) = choose_among(
+            &[microchip(0x2111, "ATML0000000000000002"), microchip(0x2175, "MC000000000AAA000001")],
+            0x03eb,
+            &MICROCHIP_DEBUGGERS,
+            &Selector::by_serial("MC000000000AAA000001"),
+        )
+        .expect("a named probe resolves out of a mixed set");
+        assert_eq!(serial, "MC000000000AAA000001");
+        assert_eq!(product_id, 0x2175, "the WINNING product id must come back, not the first tried");
+    }
+
+    #[test]
+    fn a_sole_model_of_the_set_needs_no_serial() {
+        let (product_id, serial) = choose_among(
+            &[microchip(0x2175, "MC000000000AAA000001")],
+            0x03eb,
+            &MICROCHIP_DEBUGGERS,
+            &Selector::any(),
+        )
+        .expect("a sole attached debugger needs no serial");
+        assert_eq!((product_id, serial.as_str()), (0x2175, "MC000000000AAA000001"));
+    }
+
+    #[test]
+    fn a_probe_outside_the_set_does_not_count_toward_ambiguity() {
+        let (_, serial) = choose_among(
+            &[microchip(0x2175, "MC000000000AAA000001"), microbit("b0ard0001")],
+            0x03eb,
+            &MICROCHIP_DEBUGGERS,
+            &Selector::any(),
+        )
+        .expect("an unrelated probe must not make a sole debugger ambiguous");
+        assert_eq!(serial, "MC000000000AAA000001");
+    }
+
+    #[test]
+    fn a_vendor_id_outside_the_set_is_not_found_rather_than_taken() {
+        let err = choose_among(&[microbit("b0ard0001")], 0x03eb, &MICROCHIP_DEBUGGERS, &Selector::any())
+            .unwrap_err();
+        assert!(
+            matches!(err, ProbeError::NotFound),
+            "a bench with none of the named models must report NotFound, got {err:?}"
+        );
     }
 
     #[test]

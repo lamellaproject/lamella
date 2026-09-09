@@ -197,12 +197,13 @@ fn execute<H: Haystack>(
                 true
             }
 
-            Instruction::Assert { assertion, multiline } => {
-                holds(*assertion, *multiline, haystack, pos, program, state)
+            Instruction::Assert { assertion, multiline, fold } => {
+                holds(*assertion, *multiline, *fold, haystack, pos, program, state)
             }
 
-            Instruction::Backreference { group, direction, fold } => {
-                match backreference(haystack, state, *group, pos, *direction, *fold) {
+            Instruction::Backreference { start, len, direction, fold } => {
+                let groups = &program.groups[*start as usize..(*start + *len) as usize];
+                match backreference(haystack, state, groups, pos, *direction, *fold) {
                     Some(next) => {
                         pos = next;
                         true
@@ -355,14 +356,32 @@ fn is_line_terminator(ch: u32) -> bool {
     matches!(ch, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
 
-/// Word characters for the boundary assertion, which the standard pins to ASCII.
-fn is_word(ch: u32) -> bool {
-    matches!(ch, 0x30..=0x39 | 0x41..=0x5A | 0x5F | 0x61..=0x7A)
+/// Word characters for the boundary assertion.
+///
+/// # THE SET IS NOT ASCII
+///
+/// `WordCharacters` is the ASCII word characters UNION every character that is not one but whose
+/// canonicalization is -- so under a Unicode fold the long s (U+017F, folds to `s`) and the Kelvin
+/// sign (U+212A, folds to `k`) are word characters, and `/\bs/iu` matches at the start of `"ſ"`.
+/// A function that tested the ASCII list directly answers `false` there, and `\B` answers `true` in
+/// the same position.
+///
+/// **`\b` AND `\w` ARE BUILT FROM THE SAME SET AND MUST READ THE SAME FOLD.** The standard defines
+/// both over `WordCharacters`, so the widening belongs to the set rather than to either syntax, and
+/// a fold applied in one of them is a rule with two implementations.
+///
+/// Applying the fold to the SUBJECT and testing the ASCII set is the whole of it, and it is exactly
+/// the standard's construction read the other way round: asking "does anything in the set
+/// canonicalize to this" needs a reverse table, while asking "does this canonicalize into the set"
+/// needs the forward one this matcher already holds.
+fn is_word(ch: u32, fold: Fold) -> bool {
+    matches!(fold.canonical(ch), 0x30..=0x39 | 0x41..=0x5A | 0x5F | 0x61..=0x7A)
 }
 
 fn holds<H: Haystack>(
     assertion: Assertion,
     multiline: bool,
+    fold: Fold,
     haystack: &H,
     pos: usize,
     _program: &Program,
@@ -379,8 +398,8 @@ fn holds<H: Haystack>(
                 || (multiline && haystack.at(pos).is_some_and(|(ch, _)| is_line_terminator(ch)))
         }
         Assertion::WordBoundary | Assertion::NotWordBoundary => {
-            let before = haystack.before(pos).is_some_and(|(ch, _)| is_word(ch));
-            let after = haystack.at(pos).is_some_and(|(ch, _)| is_word(ch));
+            let before = haystack.before(pos).is_some_and(|(ch, _)| is_word(ch, fold));
+            let after = haystack.at(pos).is_some_and(|(ch, _)| is_word(ch, fold));
             (before != after) == matches!(assertion, Assertion::WordBoundary)
         }
     }
@@ -391,19 +410,28 @@ fn holds<H: Haystack>(
 /// A group that did not participate matches the empty string. That is not an edge case to be
 /// tolerated -- `/(?:(a)|b)\1/` relies on it -- and treating it as a failure changes which strings
 /// the pattern accepts.
+/// # SEVERAL GROUPS, AT MOST ONE OF WHICH PARTICIPATED
+///
+/// `groups` is a list because a name can belong to more than one capturing group -- see
+/// [`crate::ast::Node::Backreference`]. The front end admits that only when the groups cannot both
+/// participate, so scanning for the first one that captured is a search for the ONLY one, and a
+/// list in which none captured is the ordinary did-not-participate case that matches empty.
 fn backreference<H: Haystack>(
     haystack: &H,
     state: &State,
-    group: u32,
+    groups: &[u32],
     pos: usize,
     direction: Direction,
     fold: Fold,
 ) -> Option<usize> {
-    let start = state.slots.get(group as usize * 2).copied().flatten();
-    let end = state.slots.get(group as usize * 2 + 1).copied().flatten();
-    let (start, end) = match (start, end) {
-        (Some(start), Some(end)) => (start, end),
-        _ => return Some(pos),
+    let captured = groups.iter().find_map(|group| {
+        let start = (*state.slots.get(*group as usize * 2)?)?;
+        let end = (*state.slots.get(*group as usize * 2 + 1)?)?;
+        Some((start, end))
+    });
+    let (start, end) = match captured {
+        Some(span) => span,
+        None => return Some(pos),
     };
 
     let length = end.saturating_sub(start);

@@ -13,7 +13,6 @@ pub mod complete;
 pub mod exc;
 pub mod lexer;
 pub mod lower;
-mod named_chars;
 pub mod parser;
 pub mod profile;
 

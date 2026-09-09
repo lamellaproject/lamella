@@ -4,7 +4,7 @@
 //! The Lamella WASM tier's DRIVER BRIDGE: a `lamella_i2c` import world whose host side is the
 //! CIL INTERPRETER running the real, unmodified layer-1 C# driver stack -- so a wasm guest
 //! reads a peripheral through the very driver a C# program uses, with no sensor logic ported
-//! by hand. **THIS TIER IS EXPERIMENTAL AND SHIPS AS A PREVIEW:** one bus is granted here
+//! by hand. **THIS TIER IS EXPERIMENTAL:** one bus is granted here
 //! today, the scope is expected to expand well beyond that, and the API may change in any
 //! release -- treat it as provisional rather than settled. A guest's bus transactions cross
 //! the boundary as `(ptr, len)` pairs -- copied in, copied out, with nothing aliased and no

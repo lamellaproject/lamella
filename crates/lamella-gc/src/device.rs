@@ -440,6 +440,26 @@ mod tests {
 
     #[cfg(feature = "gc-collect")]
     #[test]
+    fn a_rootless_oom_collect_reclaims_objects_the_mutator_still_holds() {
+        let _guard = lock();
+        let capacity = (ALIGN + 3 * (HEADER_SIZE + 4)) as usize;
+        lamella_gc_init(capacity, vec![leaf()]);
+        let live = lamella_gc_alloc(4, 0);
+        assert_ne!(live, Ref::NULL.0, "the first allocation must succeed");
+        let _ = lamella_gc_alloc(4, 0);
+        let _ = lamella_gc_alloc(4, 0);
+
+        let reused = lamella_gc_alloc(4, 0);
+
+        assert_eq!(
+            reused, live,
+            "with no roots the OOM collect reclaims a LIVE object and the retry reuses its address"
+        );
+        lamella_gc_teardown();
+    }
+
+    #[cfg(feature = "gc-collect")]
+    #[test]
     fn oom_collect_with_no_roots_reclaims_then_retry_succeeds() {
         let _guard = lock();
         let capacity = (ALIGN + 3 * (HEADER_SIZE + 4)) as usize;
@@ -471,7 +491,9 @@ mod tests {
         let entry = StackMapEntry {
             return_pc: 0x100,
             frame_size: 32,
+            saved_bytes: 4,
             ref_offsets: vec![4, 12],
+            tagged_offsets: Vec::new(),
             pinned_offsets: vec![],
         };
         let maps = StackMapTable::from_entries(vec![entry]);

@@ -1,0 +1,25 @@
+[package]
+name = "lamella-debug-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The on-target Lamella Link debug agent: the carrier-agnostic half that answers debug frames from inside a running image, over the lamella-wire Transport seam. no_std + alloc, and it names no interpreter -- so the SAME agent serves an interpreted image through the runner and an AOT-compiled image with no runtime at all."
+publish = false
+
+[dependencies]
+lamella-wire = { path = "../lamella-wire" }
+# The volatile byte access the agent makes into the target's address space (feature `device`).
+# Optional because a HOST build of this crate cannot express a target address at all -- a 64-bit
+# test machine has no buffer whose address fits the `u32` the wire carries -- so the host tests
+# drive the same code through the `LiveMemory` seam instead.
+lamella-mmio = { path = "../lamella-mmio", optional = true }
+
+[features]
+# The real target-memory implementation ([`TargetMemory`]). Off by default so a host build of this
+# crate does not pull the MMIO primitive it can never legitimately call.
+device = ["dep:lamella-mmio"]
+
+[lints]
+workspace = true

@@ -78,7 +78,14 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public static double Abs(double value) { return 0; }
         [Lamella.Runtime.RuntimeProvided] public static double Max(double a, double b) { return 0; }
         [Lamella.Runtime.RuntimeProvided] public static double Min(double a, double b) { return 0; }
-        [Lamella.Runtime.RuntimeProvided] public static int Sign(double value) { return 0; }
+
+        public static int Sign(double value)
+        {
+            if (value < 0) return -1;
+            if (value > 0) return 1;
+            if (value == 0) return 0;
+            throw new ArithmeticException("Function does not accept floating point Not-a-Number values.");
+        }
 
         [Lamella.Runtime.RuntimeProvided] public static double Floor(double d) { return 0; }
         [Lamella.Runtime.RuntimeProvided] public static double Ceiling(double a) { return 0; }

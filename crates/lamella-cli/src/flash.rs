@@ -312,7 +312,8 @@ but NOTHING READ THE FLASH BACK: this route hands over a ",
         }
         lamella_flash_backend::Verification::Skipped => format!(
             "wrote {} B ({units}); the board is running it.
-VERIFICATION WAS SKIPPED at your              request -- this route can read every byte back and was told not to.",
+VERIFICATION WAS SKIPPED at your \
+             request -- this route can read every byte back and was told not to.",
             report.bytes
         ),
     }
@@ -390,6 +391,10 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
+    if let Some(what) = crate::deploy::uncompilable_source(path) {
+        eprintln!("{}", crate::deploy::deploy_refusal(path, &what));
+        return ExitCode::FAILURE;
+    }
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) => {
@@ -917,6 +922,10 @@ class Program
         assert!(text.contains("not yet stated in any board file"), "and why the list is short");
         assert!(text.contains("lamella build"), "and what still works for that board");
         assert!(text.contains("rpi-pico2"), "and names the board asked for");
+        assert!(
+            !text.contains("this build"),
+            "no build writes a board another refuses, so the refusal must not imply one does: {text}"
+        );
     }
 
     #[test]

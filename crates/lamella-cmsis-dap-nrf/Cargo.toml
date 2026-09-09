@@ -45,5 +45,4 @@ lamella-py-frontend = { path = "../lamella-py-frontend" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32" }
 lamella-ir = { path = "../lamella-ir" }
 lamella-elf = { path = "../lamella-elf" }
-lamella-link = { path = "../lamella-link" }
-lamella-firmware = { path = "../lamella-firmware" }
+lamella-linker = { path = "../lamella-linker" }

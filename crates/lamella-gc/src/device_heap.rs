@@ -58,7 +58,7 @@ impl DeviceTypeDesc {
     /// FOUR fixed header words `payload_size@0`, `nrefs@4`, `type_tag@8`, `base_ptr@12`.
     ///
     #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
-    const REF_OFFSETS_BASE: usize = 4 * 4;
+    pub(crate) const REF_OFFSETS_BASE: usize = 4 * 4;
 
     /// Reads the `i`th reference offset out of the descriptor at `desc` (a raw `*const
     /// TypeDesc` from an object header). `i` must be `< nrefs`.
@@ -105,8 +105,6 @@ pub const ELEMENT_KIND_REFERENCE: u32 = 0;
 /// deliberately carries NO width, so this scheme can neither stride it nor scan it.
 pub const ELEMENT_KIND_OPAQUE: u32 = 0xFF;
 
-/// The byte offset of an array's first element: past the element-count word at payload offset 0.
-const ARRAY_ELEMENTS_BASE: u32 = 4;
 
 /// A descriptor's `(rank, element_kind)` when word 0 marks it an ARRAY, else `None` (a class).
 #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
@@ -145,24 +143,28 @@ fn element_width(element_kind: u32) -> Option<u32> {
 /// the addressable range. Refusing is deliberate -- a wrong footprint does not corrupt one object,
 /// it desynchronizes the walk over every object above it.
 #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
-fn payload_extent(word0: u32, word1: u32, payload_head: u32) -> u32 {
+fn payload_extent(word0: u32, word1: u32, leading: &[u32]) -> u32 {
     let Some((rank, element_kind)) = array_shape(word0, word1) else {
         return word0;
     };
-    assert!(
-        rank == 1,
-        "only a single-dimensional array carries its length in one word",
-    );
     let width = element_width(element_kind)
         .expect("an array of value-type elements carries no element width");
-    payload_head
+    let dims = leading
+        .get(..rank as usize)
+        .expect("a rank-N array must present its N dimensions to be sized");
+    let count = dims
+        .iter()
+        .try_fold(1u32, |acc, &dim| acc.checked_mul(dim))
+        .expect("array element count exceeds the addressable range");
+    count
         .checked_mul(width)
-        .and_then(|bytes| bytes.checked_add(ARRAY_ELEMENTS_BASE))
+        .and_then(|bytes| bytes.checked_add(4 * rank))
         .expect("array footprint exceeds the addressable range")
 }
 
-/// Invokes `f` with the byte offset of each REFERENCE slot of an array of `element_kind` holding
-/// `length` elements: `[count][e0][e1]...`, so element `i` sits at `4 + 4 * i`. An array of
+/// Invokes `f` with the byte offset of each REFERENCE slot of an array of `element_kind` whose
+/// dimensions are `dims`: `[dim0]..[dim(N-1)][e0][e1]...`, so element `i` sits at
+/// `4 * rank + 4 * i` and the element count is the product of the dimensions. An array of
 /// primitives holds no references and yields nothing.
 ///
 /// # Panics
@@ -170,13 +172,19 @@ fn payload_extent(word0: u32, word1: u32, payload_head: u32) -> u32 {
 /// runs before compaction, so an array the walk cannot step over must be refused at the first
 /// question asked about it, not the second.
 #[cfg(feature = "gc-collect")]
-fn for_each_array_ref_offset(rank: u32, element_kind: u32, length: u32, f: &mut dyn FnMut(u32)) {
-    let _ = payload_extent(ARRAY_DESC_MARK | rank, element_kind, length);
+fn for_each_array_ref_offset(rank: u32, element_kind: u32, dims: &[u32], f: &mut dyn FnMut(u32)) {
+    let _ = payload_extent(ARRAY_DESC_MARK | rank, element_kind, dims);
     if element_kind != ELEMENT_KIND_REFERENCE {
         return;
     }
-    for i in 0..length {
-        f(ARRAY_ELEMENTS_BASE + i * 4);
+    let count = dims
+        .iter()
+        .take(rank as usize)
+        .try_fold(1u32, |acc, &dim| acc.checked_mul(dim))
+        .expect("array element count exceeds the addressable range");
+    let elements_base = 4 * rank;
+    for i in 0..count {
+        f(elements_base + i * 4);
     }
 }
 
@@ -190,17 +198,26 @@ struct PtrResolver;
 
 #[cfg(feature = "gc-collect")]
 impl TypeResolver for PtrResolver {
-    fn payload_size(&self, header_word: u32, payload_head: u32) -> u32 {
+    /// A class depends on no payload word; an array depends on its RANK of them, which is stated in
+    /// its own descriptor. Reading the descriptor here rather than guessing is what lets a rank-N
+    /// array be sized at all -- see [`payload_extent`].
+    fn leading_words(&self, header_word: u32) -> u32 {
         let desc = header_word as *const DeviceTypeDesc;
         let (word0, word1) = unsafe { DeviceTypeDesc::header_words(desc) };
-        payload_extent(word0, word1, payload_head)
+        array_shape(word0, word1).map_or(1, |(rank, _)| rank.max(1))
     }
 
-    fn for_each_ref_offset(&self, header_word: u32, payload_head: u32, f: &mut dyn FnMut(u32)) {
+    fn payload_size(&self, header_word: u32, leading: &[u32]) -> u32 {
+        let desc = header_word as *const DeviceTypeDesc;
+        let (word0, word1) = unsafe { DeviceTypeDesc::header_words(desc) };
+        payload_extent(word0, word1, leading)
+    }
+
+    fn for_each_ref_offset(&self, header_word: u32, leading: &[u32], f: &mut dyn FnMut(u32)) {
         let desc = header_word as *const DeviceTypeDesc;
         let (word0, word1) = unsafe { DeviceTypeDesc::header_words(desc) };
         if let Some((rank, element_kind)) = array_shape(word0, word1) {
-            for_each_array_ref_offset(rank, element_kind, payload_head, f);
+            for_each_array_ref_offset(rank, element_kind, leading, f);
             return;
         }
         let nrefs = word1;
@@ -236,15 +253,27 @@ impl TypeResolver for PtrResolver {
 /// type representation. Bump-allocates `[header][payload]` blocks and mark-compacts on
 /// out-of-memory, reusing the host engine ([`mark_compact`]) through [`PtrResolver`].
 ///
-/// Addresses are offsets into the region (address `0` reserved as the null reference, so
-/// allocation begins at [`ALIGN`]); the region's base pointer turns an offset into the
-/// real `*mut u8` a [`crate::ObjectRef`]/payload pointer needs.
+/// A reference is an ABSOLUTE ADDRESS -- `base + offset` -- because that is what the mutator holds:
+/// `lamella_gc_alloc` hands the emitted code a payload pointer, and that code stores it verbatim and
+/// dereferences it directly. [`Self::payload_ptr`] turns an address back into a pointer into the
+/// STORAGE, and it is the only line that knows the two can differ.
+///
+/// # The address space is not the storage
+///
+/// On device they coincide: `base` is the region's real address, so `base + offset` IS where the
+/// bytes are. On a 64-bit host they cannot -- a region address does not fit a `u32`, and a `Ref` is
+/// 32 bits by the backend's ABI and may not widen. So the host reasons in a SYNTHETIC device-shaped
+/// space ([`Self::HOST_BASE`]) over `Vec` storage: the engine's arithmetic is byte-for-byte the one
+/// the device runs, nothing truncates and nothing wraps, and only `payload_ptr` differs.
+///
 pub struct DeviceHeap {
     /// The raw heap region as a slice. Held as `&'static mut [u8]` because the device
-    /// heap lives for the whole program; offsets into it are addresses, and the
-    /// mark-compact engine operates on it safely.
+    /// heap lives for the whole program, and it is the STORAGE the addresses below index.
     region: &'static mut [u8],
-    /// The bump pointer: the next free address (offset). Survivors compact below it.
+    /// The base of this heap's ADDRESS SPACE: the region's real address on device, and
+    /// [`Self::HOST_BASE`] on a host too wide to hold one. A `Ref` is `base + offset`.
+    base: u32,
+    /// The bump pointer, an OFFSET from `base`. Survivors compact below it.
     top: u32,
 }
 
@@ -268,8 +297,29 @@ impl DeviceHeap {
         let region = unsafe { slice::from_raw_parts_mut(base, len) };
         region.fill(0);
         DeviceHeap {
+            base: Self::base_of(base),
             region,
             top: ALIGN,
+        }
+    }
+
+    /// A device-shaped base address for a host to reason in, when the real one does not fit a `u32`.
+    /// Cortex-M SRAM, so a heap address sits above every flash literal exactly as it does on a board
+    /// -- which is the property the collector's range test depends on.
+    pub const HOST_BASE: u32 = 0x2000_0000;
+
+    /// This heap's address-space base: the region's real address where that fits a `u32` (every
+    /// target the backend emits for), and [`Self::HOST_BASE`] where it does not.
+    ///
+    fn base_of(region: *mut u8) -> u32 {
+        #[cfg(target_pointer_width = "32")]
+        {
+            region as usize as u32
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            let _ = region;
+            Self::HOST_BASE
         }
     }
 
@@ -277,6 +327,13 @@ impl DeviceHeap {
     /// the real `*mut u8` the backend's emitted code dereferences.
     fn base_ptr(&self) -> *mut u8 {
         self.region.as_ptr() as *mut u8
+    }
+
+    /// The base of this heap's address space -- see the type doc. A `Ref` this heap hands out is
+    /// `base() + offset`, and `payload_ptr` is what takes one back to the storage.
+    #[must_use]
+    pub fn base(&self) -> u32 {
+        self.base
     }
 
     /// The bump pointer (the next free address/offset). Equals [`ALIGN`] on an empty
@@ -318,7 +375,7 @@ impl DeviceHeap {
         let at = object_start as usize;
         self.region[at..at + 4].copy_from_slice(&header_word.to_le_bytes());
         self.top = next;
-        Some(Ref(object_start + HEADER_SIZE))
+        Some(Ref(self.base + object_start + HEADER_SIZE))
     }
 
     /// Reclaims unreachable objects and compacts survivors, with the roots reported by
@@ -345,6 +402,7 @@ impl DeviceHeap {
         let top = self.top;
         self.top = mark_compact(
             self.region,
+            self.base,
             top,
             &PtrResolver,
             enumerate_roots,
@@ -386,7 +444,7 @@ impl DeviceHeap {
         if reference.is_null() {
             core::ptr::null_mut()
         } else {
-            unsafe { self.base_ptr().add(reference.0 as usize) }
+            unsafe { self.base_ptr().add((reference.0 - self.base) as usize) }
         }
     }
 
@@ -405,9 +463,9 @@ mod tests {
     /// **Built from the EMITTER's shape, deliberately.** Writing a two-word
     /// header -- the READER's assumption -- so every test here compared the reader against a
     /// replica of itself and passed while the reader disagreed with both backends. One of them was
-    /// even named for the property it was not checking. The words below mirror
-    /// `riscv32.rs`'s `emit_type_desc` (`DESC_HEADER_WORDS = 4`), which is the conformant emitter;
-    /// if the emitted header ever changes, these tests must fail, and that is the point.
+    /// even named for the property it was not checking. The words below mirror what both emitters
+    /// write (`riscv32.rs`'s `emit_type_desc` and `arm32.rs`'s descriptor-emission loop); if the
+    /// emitted header ever changes, these tests must fail, and that is the point.
     fn make_desc(payload_size: u32, ref_offsets: &[u32]) -> *const DeviceTypeDesc {
         let mut words: Vec<u32> = Vec::with_capacity(4 + ref_offsets.len());
         words.push(payload_size);
@@ -480,13 +538,13 @@ mod tests {
         assert_eq!(heap.top(), ALIGN);
 
         let a = unsafe { heap.alloc(4, leaf) }.unwrap();
-        assert_eq!(a, Ref(ALIGN + HEADER_SIZE));
-        assert_eq!(heap.payload_ptr(a), unsafe { base.add(a.0 as usize) });
+        assert_eq!(a, Ref(heap.base() + ALIGN + HEADER_SIZE));
+        assert_eq!(heap.payload_ptr(a), unsafe { base.add((a.0 - heap.base()) as usize) });
         assert_eq!(heap.top(), ALIGN + HEADER_SIZE + 4);
         assert_eq!(unsafe { core::slice::from_raw_parts(heap.payload_ptr(a), 4) }, &[0u8; 4]);
 
         let b = unsafe { heap.alloc(5, pad) }.unwrap();
-        assert_eq!(b, Ref(ALIGN + 2 * HEADER_SIZE + 4));
+        assert_eq!(b, Ref(heap.base() + ALIGN + 2 * HEADER_SIZE + 4));
         assert_eq!(heap.top(), ALIGN + 2 * HEADER_SIZE + 4 + 8);
         assert!(heap.payload_ptr(Ref::NULL).is_null());
     }
@@ -535,12 +593,12 @@ mod tests {
 
     #[test]
     fn an_array_is_sized_from_its_element_count_not_from_word_zero() {
-        assert_eq!(payload_extent(ARRAY_RANK1, 5, 3), 16);
-        assert_eq!(payload_extent(ARRAY_RANK1, 2, 7), 11);
-        assert_eq!(payload_extent(ARRAY_RANK1, 4, 5), 14);
-        assert_eq!(payload_extent(ARRAY_RANK1, 6, 2), 20);
-        assert_eq!(payload_extent(ARRAY_RANK1, ELEMENT_KIND_REFERENCE, 4), 20);
-        assert_eq!(payload_extent(ARRAY_RANK1, 5, 0), 4);
+        assert_eq!(payload_extent(ARRAY_RANK1, 5, &[3]), 16);
+        assert_eq!(payload_extent(ARRAY_RANK1, 2, &[7]), 11);
+        assert_eq!(payload_extent(ARRAY_RANK1, 4, &[5]), 14);
+        assert_eq!(payload_extent(ARRAY_RANK1, 6, &[2]), 20);
+        assert_eq!(payload_extent(ARRAY_RANK1, ELEMENT_KIND_REFERENCE, &[4]), 20);
+        assert_eq!(payload_extent(ARRAY_RANK1, 5, &[0]), 4);
     }
 
     #[test]
@@ -549,7 +607,7 @@ mod tests {
             for length in [0u32, 1, 3, 64] {
                 let emitted = length * element_size + 4;
                 assert_eq!(
-                    payload_extent(ARRAY_RANK1, kind, length),
+                    payload_extent(ARRAY_RANK1, kind, &[length]),
                     emitted,
                     "element kind {kind}, length {length}",
                 );
@@ -559,8 +617,8 @@ mod tests {
 
     #[test]
     fn a_class_is_still_sized_from_word_zero() {
-        assert_eq!(payload_extent(12, 2, 0xDEAD_BEEF), 12);
-        assert_eq!(payload_extent(0, 0, 0xDEAD_BEEF), 0);
+        assert_eq!(payload_extent(12, 2, &[0xDEAD_BEEF]), 12);
+        assert_eq!(payload_extent(0, 0, &[0xDEAD_BEEF]), 0);
     }
 
     /// An array descriptor now carries `System.Array`'s VTABLE, laid BEFORE its words so that a
@@ -598,7 +656,7 @@ mod tests {
             (ARRAY_RANK1, 5),
             "the reader must start at word 0, not at the symbol the vtable now begins"
         );
-        assert_eq!(payload_extent(word0, word1, 3), 16, "int[3] is still 4 + 3 * 4");
+        assert_eq!(payload_extent(word0, word1, &[3]), 16, "int[3] is still 4 + 3 * 4");
 
         assert_eq!(
             array_shape(leaked[1], leaked[2]),
@@ -610,7 +668,7 @@ mod tests {
     #[cfg(feature = "gc-collect")]
     fn collected_ref_offsets(word1: u32, length: u32) -> Vec<u32> {
         let mut seen: Vec<u32> = Vec::new();
-        for_each_array_ref_offset(1, word1, length, &mut |offset| seen.push(offset));
+        for_each_array_ref_offset(1, word1, &[length], &mut |offset| seen.push(offset));
         seen
     }
 
@@ -632,18 +690,39 @@ mod tests {
     #[test]
     #[should_panic(expected = "value-type elements")]
     fn a_value_type_array_is_refused_rather_than_mis_strided() {
-        let _ = payload_extent(ARRAY_RANK1, ELEMENT_KIND_OPAQUE, 3);
+        let _ = payload_extent(ARRAY_RANK1, ELEMENT_KIND_OPAQUE, &[3]);
     }
 
+    /// A rank-N array is sized from the PRODUCT of its dimensions, and the elements begin after all
+    /// N of them.
+    ///
+    /// This replaces `a_multi_dimensional_array_is_refused`, which asserted that a rank-2 descriptor
+    /// PANICS. That refusal was never a rule about arrays -- it was `payload_extent` being handed a
+    /// single payload word, which is a vector's length and cannot be a product. The interface now
+    /// carries the dimensions, so the refusal it pinned no longer exists and a test asserting it
+    /// would pin the old limit rather than any behavior.
+    ///
     #[test]
-    #[should_panic(expected = "single-dimensional")]
-    fn a_multi_dimensional_array_is_refused() {
-        let _ = payload_extent(ARRAY_DESC_MARK | 2, 5, 3);
+    fn a_rank_n_array_is_sized_from_the_product_of_its_dimensions() {
+        assert_eq!(payload_extent(ARRAY_DESC_MARK | 2, 5, &[2, 3]), 32);
+        assert_eq!(payload_extent(ARRAY_DESC_MARK | 2, 5, &[3, 2]), 32);
+        assert_eq!(payload_extent(ARRAY_DESC_MARK | 3, 2, &[2, 3, 4]), 36);
+        assert_eq!(payload_extent(ARRAY_DESC_MARK | 2, 5, &[0, 7]), 8);
+        assert_eq!(payload_extent(ARRAY_RANK1, 5, &[3]), 16);
+    }
+
+    /// A rank-2 array of REFERENCES yields every element slot, past both dimension words.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_rank_two_reference_array_yields_every_element_slot() {
+        let mut seen: Vec<u32> = Vec::new();
+        for_each_array_ref_offset(2, ELEMENT_KIND_REFERENCE, &[2, 3], &mut |o| seen.push(o));
+        assert_eq!(seen, vec![8, 12, 16, 20, 24, 28]);
     }
 
     #[test]
     #[should_panic(expected = "addressable range")]
     fn an_array_whose_footprint_overflows_is_refused() {
-        let _ = payload_extent(ARRAY_RANK1, 6, u32::MAX / 4);
+        let _ = payload_extent(ARRAY_RANK1, 6, &[u32::MAX / 4]);
     }
 }

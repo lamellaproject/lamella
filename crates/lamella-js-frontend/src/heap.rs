@@ -242,10 +242,10 @@ mod the_id_mapping {
     ///
     /// # THIS IS THE EVIDENCE THAT THE TABLES ARE POSSIBLE AT ALL
     ///
-    /// Nothing carrying a `JsString` could appear in a `static` while its units were a `Vec`, so this
-    /// fixture was a `Box::leak` and every claim about flash residency rested on the borrowed ARM
-    /// being the same one a `static` would produce. It no longer has to: **this really is in
-    /// `.rodata`**, and the assertions below read a realm out of it.
+    /// A `JsString` whose units are a `Vec` cannot appear in a `static` at all, so a fixture built
+    /// on the heap can only assert that a borrowed arm BEHAVES like the one a `static` would
+    /// produce. **This really is in `.rodata`**, and the assertions below read a realm out of it --
+    /// which is what makes it evidence about flash residency rather than about borrowing.
     ///
     /// `KIND` is the key text as UTF-16 code units, because a property key is a String value. Writing
     /// it as bytes would build a key that compares equal to nothing -- which is why the constructor is

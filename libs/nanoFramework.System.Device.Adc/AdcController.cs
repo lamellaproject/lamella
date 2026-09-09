@@ -2,8 +2,9 @@
 namespace System.Device.Adc
 {
     /// <summary>Represents an analog-to-digital converter (ADC) controller on the system, in
-    /// <b>nanoFramework's</b> shape. .NET has no core ADC class at all, so nothing here corresponds
-    /// to a .NET API.</summary>
+    /// <b>nanoFramework's</b> shape. This is the COMPATIBILITY surface; the Microsoft one is
+    /// <see cref="T:System.Device.Analog.AnalogController"/>, which is what a Lamella user should
+    /// reach for.</summary>
     /// <remarks>
     /// <para>The namespace is <c>System.Device.Adc</c> because that is nanoFramework's own, which is
     /// what lets nanoFramework source compile here unchanged -- so the namespace alone will not tell

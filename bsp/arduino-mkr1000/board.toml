@@ -30,3 +30,11 @@ gclk0_hz = 8000000
 name = "usb-48mhz"
 source = "dfll48m-usb-recovery"
 gclk1_hz = 48000000
+
+[debug]
+signals = ["swd"]
+exposure = "pads"
+fitted = "no"
+onboard = "none"
+recovery = "flash-bootloader"
+source = "The board carries no EDBG and no debug bridge; the wire is the chip's native USB and flashing takes an external SWD probe. The schematic states no debug connector position, so the signals are recorded as reaching pads rather than a header."

@@ -1,0 +1,167 @@
+# The SAMG55 PIO block: the Parallel I/O Controller. Offsets are PIO-base-relative; the two
+# controller bases live in ../instances.toml. THIS IS NOT THE SAM D/L `PORT` BLOCK and shares no
+# register with it -- different names, different offsets, and a different way of saying everything.
+#
+# WHAT A READER COMING FROM THE SAM D/L FAMILIES NEEDS TO UNMAP:
+#
+#     SAM D/L PORT                        SAM G55 PIO
+#     DIRSET / DIRCLR   set direction     OER / ODR       Output Enable / Disable Register
+#     OUTSET / OUTCLR   drive a level     SODR / CODR     Set / Clear Output Data Register
+#     IN                read the pad      PDSR            Pin Data Status Register
+#     PINCFG.PULLEN     enable a pull     PUER / PUDR     and the DIRECTION is a SEPARATE
+#       + the OUT bit     and pick a way                    register pair, PPDER / PPDDR
+#     PMUX nibble       pick a function   ABCDSR1/ABCDSR2 two registers, one BIT each
+#
+# THE PULL DIRECTION IS ITS OWN REGISTER HERE AND THAT IS A SIMPLIFICATION, NOT A COMPLICATION.
+# On the SAM D/L architecture PINCFG.PULLEN says only that "a resistor is enabled" and the pin's
+# OUT bit decides which way it pulls. This family has PUER/PUDR for up and PPDER/PPDDR for down, so
+# the choice is a register rather than a side effect, and it is where a reader expects it.
+#
+# THE PERIPHERAL SELECT IS TWO REGISTERS OF ONE BIT, NOT ONE FIELD OF FOUR. ABCDSR1 and ABCDSR2
+# each carry one bit per line, and the pair spells the function: 00 = A, 01 = B, 10 = C, 11 = D,
+# with ABCDSR1 the low bit. The sibling csp/sam3x has a SINGLE `ABSR` register at this same
+# offset 0x70 selecting between two functions, so a driver written against that block would set
+# ABCDSR1 correctly and leave ABCDSR2 unwritten -- which is right only while the reset value holds.
+# AND THIS PART USES ONLY A AND B: Table 9-3 and Table 9-4 have Peripheral A and Peripheral B
+# columns and no C or D, so ABCDSR2 is always 0 on a documented binding.
+#
+# A PIN IS THE PIO's OR THE PERIPHERAL's, AND THAT IS AN EXPLICIT CHOICE. PER/PDR/PSR hand a line
+# to the PIO controller or to the multiplexed peripheral. On the SAM D/L line the equivalent is
+# PINCFG.PMUXEN. A driver that sets a direction without first claiming the line in PER is
+# configuring a pin the peripheral still owns.
+
+[table]
+kind = "block"
+family = "samg55"
+block = "pio"
+sources = [
+    "SAM G55 datasheet Atmel-11289F section 31.7 (PIO Controller Register Description), each register stating its own absolute Address for PIOA -- PIO_PER 0x400E0E00, PDR 0x400E0E04, PSR 0x400E0E08, OER 0x400E0E10, ODR 0x400E0E14, OSR 0x400E0E18, SODR 0x400E0E30, CODR 0x400E0E34, ODSR 0x400E0E38, PDSR 0x400E0E3C, PUDR 0x400E0E60, PUER 0x400E0E64, PUSR 0x400E0E68, ABCDSR1 0x400E0E70, ABCDSR2 0x400E0E74, PPDDR 0x400E0E90, PPDER 0x400E0E94, PPDSR 0x400E0E98",
+    "Atmel-11289F Table 9-3 and Table 9-4 for the fact that only Peripheral A and Peripheral B are populated on this part",
+]
+notes = [
+    "THE OFFSETS BELOW ARE DERIVED FROM PIOA's ABSOLUTE ADDRESSES BY SUBTRACTING 0x400E0E00, which is PIOA's base and is itself the address the PIO_PER description prints. PIOB's registers sit at the same offsets from 0x400E1000; the two bases are enumerated in ../instances.toml rather than derived from a stride, because nothing in this document states a stride.",
+    "WRITE-ONLY AND READ-ONLY REGISTERS ARE PAIRED WITH A STATUS REGISTER, WHICH IS THE HOUSE STYLE ON THIS ARCHITECTURE. PER and PDR are write-only and PSR reads back; OER/ODR/OSR and PUER/PUDR/PUSR and PPDER/PPDDR/PPDSR are the same shape. A driver reporting a pin's CURRENT mode reads the STATUS register rather than shadowing what it wrote.",
+    "SODR AND CODR ARE ATOMIC and are what a driver writes to drive a level. ODSR is the readable output data, and PDSR is the PAD, which is what a read of an output should return so that a shorted or contended pin reads as what it actually is.",
+    "ABCDSR1 AND ABCDSR2 SPELL THE FUNCTION TOGETHER -- see the block header. Only A and B occur on this part.",
+    "DECLARED SUBSET. The interrupt machinery (IER/IDR/IMR/ISR, the additional-mode and edge/level registers), the input filter (IFER/IFDR/IFSR, IFSCDR/IFSCER/IFSCSR, SCDR), the multi-driver registers (MDER/MDDR/MDSR), output-write enable (OWER/OWDR/OWSR) and the write-protect pair (WPMR/WPSR) all exist and are not transcribed: no binding below reaches them, and a register this table does not declare cannot be silently mis-strided. Their offsets are in the source cited above if a consumer ever needs them.",
+]
+
+[registers.PER]
+offset = 0x00
+width = 32
+fields = { PER = [0, 32] }
+notes = "PIO Enable: write 1s to give lines to the PIO controller rather than to a multiplexed peripheral. Write-only; PSR reads back."
+
+[registers.PDR]
+offset = 0x04
+width = 32
+fields = { PDR = [0, 32] }
+notes = "PIO Disable: write 1s to hand lines to the multiplexed peripheral selected by ABCDSR1/ABCDSR2. Write-only."
+
+[registers.PSR]
+offset = 0x08
+width = 32
+fields = { PSR = [0, 32] }
+notes = "PIO Status, readable: 1 = the line belongs to the PIO controller. This is the register that answers whether a pin is GPIO at all."
+
+[registers.OER]
+offset = 0x10
+width = 32
+fields = { OER = [0, 32] }
+notes = "Output Enable: write 1s to make lines outputs. Write-only. The SAM D/L equivalent is DIRSET."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { ODR = [0, 32] }
+notes = "Output Disable: write 1s to make lines INPUTS. Write-only. The SAM D/L equivalent is DIRCLR."
+
+[registers.OSR]
+offset = 0x18
+width = 32
+fields = { OSR = [0, 32] }
+notes = "Output Status, readable: 1 = output. A driver reporting a pin's current direction reads this rather than shadowing it."
+
+[registers.SODR]
+offset = 0x30
+width = 32
+fields = { SODR = [0, 32] }
+notes = "Set Output Data: write 1s to drive lines high. Atomic -- no read-modify-write, so a concurrent driver touching another line in the same controller cannot lose a write."
+
+[registers.CODR]
+offset = 0x34
+width = 32
+fields = { CODR = [0, 32] }
+notes = "Clear Output Data: write 1s to drive lines low. Atomic, as SODR is."
+
+[registers.ODSR]
+offset = 0x38
+width = 32
+fields = { ODSR = [0, 32] }
+notes = "Output Data Status, readable: the level the controller is DRIVING. Not the same question as PDSR -- this is what was asked for, PDSR is what the pad is at."
+
+[registers.PDSR]
+offset = 0x3C
+width = 32
+fields = { PDSR = [0, 32] }
+notes = "Pin Data Status, readable: the level AT THE PAD. This is what a read should return for an input and for an output alike, so that a contended or shorted line reads as what it actually is."
+
+[registers.PUDR]
+offset = 0x60
+width = 32
+fields = { PUDR = [0, 32] }
+notes = "Pull-Up Disable: write 1s to remove the pull-up. Write-only."
+
+[registers.PUER]
+offset = 0x64
+width = 32
+fields = { PUER = [0, 32] }
+notes = "Pull-Up Enable: write 1s to fit a pull-up. Write-only. UNLIKE THE SAM D/L LINE, the direction of the pull is chosen by WHICH REGISTER is written rather than by the pin's output bit."
+
+[registers.PUSR]
+offset = 0x68
+width = 32
+fields = { PUSR = [0, 32] }
+notes = "Pull-Up Status, readable. NOTE THE POLARITY: this register reads 0 where a pull-up IS enabled, which is the opposite of the reflex reading and is stated in the register description."
+
+[registers.ABCDSR1]
+offset = 0x70
+width = 32
+fields = { ABCDSR1 = [0, 32] }
+notes = "Peripheral Select 1, the LOW bit of the two-bit function selector. With ABCDSR2: 00 = A, 01 = B, 10 = C, 11 = D. Only A and B occur on this part."
+
+[registers.ABCDSR2]
+offset = 0x74
+width = 32
+fields = { ABCDSR2 = [0, 32] }
+notes = "Peripheral Select 2, the HIGH bit. Always 0 for a documented binding on this part, and transcribed anyway because a driver that leaves it unwritten is relying on the reset value rather than setting the function it means."
+
+[registers.PPDDR]
+offset = 0x90
+width = 32
+fields = { PPDDR = [0, 32] }
+notes = "Pad Pull-Down Disable: write 1s to remove the pull-down. Write-only."
+
+[registers.PPDER]
+offset = 0x94
+width = 32
+fields = { PPDER = [0, 32] }
+notes = "Pad Pull-Down Enable: write 1s to fit a pull-down. Write-only. A pull-up and a pull-down are separate registers here, so enabling one does not disable the other -- a driver switching between them must clear the one it is leaving."
+
+[registers.PPDSR]
+offset = 0x98
+width = 32
+fields = { PPDSR = [0, 32] }
+notes = "Pad Pull-Down Status, readable. Same inverted polarity as PUSR: 0 where the pull-down IS enabled."
+
+# Function-letter values for the ABCDSR pair. The value is a TWO-BIT number spread across two
+# registers -- ABCDSR1 carries bit 0 and ABCDSR2 bit 1 -- so a consumer writes one bit into each
+# rather than a nibble into one field, which is the whole difference from the SAM D/L PMUX.
+# ONLY A AND B ARE POPULATED ON THIS PART: Table 9-3 and Table 9-4 have two peripheral columns.
+# C and D are declared because the register encodes them and a reader checking a write needs the
+# full set; a pin-map row naming either would be refused by the absence of a documented pad.
+[constants]
+FUNC_A = 0
+FUNC_B = 1
+FUNC_C = 2
+FUNC_D = 3

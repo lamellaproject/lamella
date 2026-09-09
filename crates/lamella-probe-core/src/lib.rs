@@ -6,6 +6,8 @@ use std::fmt;
 
 pub mod selection;
 
+pub mod coresight;
+
 /// The acknowledge a DP/AP transfer returned. `Ok` is success; the others are the ADIv5 wire-level
 /// responses a probe reports back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +35,7 @@ pub enum Ack {
 /// build against it. The attribute is free at the moment it is added only while nothing matches
 /// exhaustively -- after that it breaks every such match -- so it is taken here ahead of the first
 /// variant that would need it, rather than discovered to be needed once it is already too late.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProbeError {
     /// The packet transport to the probe failed.
@@ -72,10 +74,10 @@ impl fmt::Display for ProbeError {
             ProbeError::Unusable(remedy) => write!(f, "probe present but not usable: {remedy}"),
             ProbeError::Ambiguous(names) => write!(
                 f,
-                "{} probes match; name one with a serial argument or by exporting {}={}",
+                "{} probes match and none was named; pass a serial or export {}=<one of>: {}",
                 names.len(),
                 selection::PROBE_SERIAL_ENV,
-                names.join(" | ")
+                names.join(", ")
             ),
         }
     }
@@ -410,9 +412,60 @@ pub trait CoreMemory {
 pub mod cortex_m {
     use super::{
         AIRCR, AIRCR_SYSRESETREQ, C_DEBUGEN, C_HALT, C_MASKINTS, C_STEP, CallFrame, CoreMemory,
-        DBGKEY, DCRDR, DCRSR, DCRSR_WRITE, DEMCR, DHCSR, FP_COMP0, FP_CTRL, ProbeError, S_HALT,
-        S_REGRDY, VC_CORERESET,
+        DBGKEY, DCRDR, DCRSR, DCRSR_WRITE, DEMCR, DEMCR_TRCENA, DHCSR, DWT_CTRL, DWT_CYCCNT,
+        DWT_CYCCNTENA, DWT_NOCYCCNT, FP_COMP0, FP_CTRL, FP_CTRL_ENABLE, FP_CTRL_KEY, ProbeError,
+        S_HALT, S_REGRDY, VC_CORERESET,
     };
+
+    /// What [`cycle_counter_begin`] turned on, so [`cycle_counter_end`] can put it back.
+    pub struct CycleCounter {
+        demcr: u32,
+        dwt_ctrl: u32,
+    }
+
+    /// Turn on the core's cycle counter, returning what to restore -- or `None` when the part
+    /// declares it has no counter (`DWT_CTRL.NOCYCCNT`).
+    ///
+    /// This is how you learn what rate a core is ACTUALLY running at when its clock tree cannot be
+    /// read as an equation -- a part running from a ring oscillator has a rate that is a range
+    /// rather than a number, and a firmware that never programs its tree inherits whichever state
+    /// it booted into. Sample this against a HOST clock and the answer is measured rather than
+    /// assumed.
+    ///
+    /// The half that gets copied wrong is the RESTORE: a counter left enabled is a change to the
+    /// firmware under test, made by a tool whose whole claim is that it changes nothing. Hence a
+    /// saved value the caller has to hand back rather than a bare enable.
+    pub fn cycle_counter_begin<M: CoreMemory>(
+        core: &mut M,
+    ) -> Result<Option<CycleCounter>, ProbeError> {
+        let demcr = core.read_word(DEMCR)?;
+        let dwt_ctrl = core.read_word(DWT_CTRL)?;
+        if dwt_ctrl & DWT_NOCYCCNT != 0 {
+            return Ok(None);
+        }
+        core.write_word(DEMCR, demcr | DEMCR_TRCENA)?;
+        core.write_word(DWT_CTRL, dwt_ctrl | DWT_CYCCNTENA)?;
+        Ok(Some(CycleCounter { demcr, dwt_ctrl }))
+    }
+
+    /// The cycle counter's current value. It is 32 bits and WRAPS with no flag, so a caller
+    /// measuring a rate must subtract with `wrapping_sub` and bound its own interval -- at 150 MHz
+    /// the counter turns over about every 28 seconds. It also does not advance while the core is
+    /// halted, or while its clock is gated in a sleep state, both of which read as a slow core
+    /// rather than as no measurement.
+    pub fn cycle_counter_read<M: CoreMemory>(core: &mut M) -> Result<u32, ProbeError> {
+        core.read_word(DWT_CYCCNT)
+    }
+
+    /// Put `DWT_CTRL` and `DEMCR` back as they were found.
+    pub fn cycle_counter_end<M: CoreMemory>(
+        core: &mut M,
+        saved: CycleCounter,
+    ) -> Result<(), ProbeError> {
+        core.write_word(DWT_CTRL, saved.dwt_ctrl)?;
+        core.write_word(DEMCR, saved.demcr)?;
+        Ok(())
+    }
 
     /// Polls DHCSR until `flag` is set (S_HALT after a step, S_REGRDY after a register transfer).
     pub fn poll_dhcsr<M: CoreMemory>(core: &mut M, flag: u32, what: &'static str) -> Result<(), ProbeError> {
@@ -484,6 +537,7 @@ pub mod cortex_m {
                 }
             }
         }
+        let _ = disarm_reset_catch(core);
         Err(ProbeError::Timeout("reset catch"))
     }
 
@@ -512,33 +566,119 @@ pub mod cortex_m {
         core.write_word(DEMCR, 0)
     }
 
-    /// The FPB comparator word selecting `address`: BP_MATCH (bits 31:30) picks the halfword --
-    /// 01 lower, 10 upper -- COMP carries address[28:2], and bit 0 enables.
-    fn comparator(address: u32) -> u32 {
-        let bp_match: u32 = if address & 0x2 != 0 { 0b10 } else { 0b01 };
-        (bp_match << 30) | (address & 0x1fff_fffc) | 1
+    /// Which revision of the breakpoint unit a part implements, from `FP_CTRL.REV` (bits [31:28]).
+    ///
+    /// **THE TWO REVISIONS SHARE NO COMPARATOR LAYOUT, so a comparator word cannot be built without
+    /// knowing which one is present**, and the register that says so is the same one the enable is
+    /// written to. Nothing here can be derived from the part's name: it is read from the part.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum FpbRevision {
+        /// `FP_CTRL.REV == 0` -- Armv6-M and Armv7-M. A comparator carries `BP_MATCH` in bits
+        /// [31:30] selecting which halfword to break on, and `COMP` in bits [28:2], so the unit
+        /// reaches only the low 512 MB and needs the halfword picked for it.
+        V1,
+        /// `FP_CTRL.REV == 1` -- Armv8-M (Cortex-M23, Cortex-M33 and later). A comparator carries
+        /// `BPADDR` in bits [31:1] and there is NO match field: the whole address space, and the
+        /// halfword falls out of the address itself. Literal remapping does not exist on Armv8-M.
+        ///
+        /// Armv8-M ARM (DDI 0553B.y), D1.2 -- `FP_COMP{0..125}` and `FP_CTRL`.
+        V2,
     }
 
-    /// Sets a hardware breakpoint at `address`.
+    /// Reads `FP_CTRL` and reports which breakpoint-unit revision the part implements.
+    ///
+    /// **A reserved value is refused rather than guessed.** Planting a comparator in a layout the
+    /// part does not implement does not fail loudly -- it arms a breakpoint at some other address,
+    /// or at none, and the next person debugs the debugger. A refusal names the problem.
+    pub fn fpb_revision<M: CoreMemory>(core: &mut M) -> Result<FpbRevision, ProbeError> {
+        fpb_revision_of(core.read_word(FP_CTRL)?)
+    }
+
+    /// [`fpb_revision`] from an `FP_CTRL` word already in hand, so a caller that also wants the
+    /// comparator count pays for one read rather than two. Both facts live in this register.
+    pub fn fpb_revision_of(fp_ctrl: u32) -> Result<FpbRevision, ProbeError> {
+        match fp_ctrl >> 28 {
+            0 => Ok(FpbRevision::V1),
+            1 => Ok(FpbRevision::V2),
+            _ => Err(ProbeError::Device("unknown FP_CTRL.REV -- breakpoint unit not recognized")),
+        }
+    }
+
+    /// How many code comparators the unit implements, from the `FP_CTRL` word already read.
+    ///
+    /// `NUM_CODE` is split across two fields: bits [14:12] carry its high three bits and bits [7:4]
+    /// its low four. Both are needed -- the low field alone saturates at 15, and an Armv8-M unit
+    /// may implement up to 126.
+    pub fn fpb_num_code(fp_ctrl: u32) -> u32 {
+        (((fp_ctrl >> 12) & 0x7) << 4) | ((fp_ctrl >> 4) & 0xf)
+    }
+
+    /// The FPB comparator word breaking at `address`, in the layout `revision` implements.
+    ///
+    /// V1: `BP_MATCH` (bits [31:30]) picks the halfword -- 01 lower, 10 upper -- `COMP` carries
+    /// address[28:2], and bit 0 enables.
+    ///
+    /// V2: `BPADDR` (bits [31:1]) carries address[31:1] and `BE` (bit 0) enables. There is no match
+    /// field and no truncation of the address.
+    pub fn comparator(revision: FpbRevision, address: u32) -> u32 {
+        match revision {
+            FpbRevision::V1 => {
+                let bp_match: u32 = if address & 0x2 != 0 { 0b10 } else { 0b01 };
+                (bp_match << 30) | (address & 0x1fff_fffc) | 1
+            }
+            FpbRevision::V2 => (address & 0xffff_fffe) | 1,
+        }
+    }
+
+    /// Sets a hardware breakpoint at `address`, on comparator 0.
+    ///
+    /// A unit reporting no comparators is refused rather than written to: the writes would be
+    /// accepted and the breakpoint would never fire.
     pub fn set_breakpoint<M: CoreMemory>(core: &mut M, address: u32) -> Result<(), ProbeError> {
-        core.write_word(FP_CTRL, 0b11)?;
-        core.write_word(FP_COMP0, comparator(address))
+        let fp_ctrl = core.read_word(FP_CTRL)?;
+        let revision = fpb_revision_of(fp_ctrl)?;
+        if fpb_num_code(fp_ctrl) == 0 {
+            return Err(ProbeError::Device("breakpoint unit reports no comparators"));
+        }
+        core.write_word(FP_CTRL, FP_CTRL_KEY | FP_CTRL_ENABLE)?;
+        core.write_word(FP_COMP0, comparator(revision, address))
     }
 
     /// Clears the hardware breakpoint.
+    ///
+    /// Zero to the WHOLE register, which the architecture requires when disabling a comparator
+    /// rather than merely clearing the enable bit.
     pub fn clear_breakpoint<M: CoreMemory>(core: &mut M) -> Result<(), ProbeError> {
         core.write_word(FP_COMP0, 0)
     }
 
     /// Replaces every hardware breakpoint with `addresses`, one per comparator.
+    ///
+    /// Drives every comparator the unit reports, programming `addresses` and clearing the rest.
+    ///
+    /// **More addresses than the unit has comparators is an ERROR, not a truncation.** This drove a
+    /// fixed four and took `addresses.get(i)`, so a caller asking for more got the first four armed,
+    /// no error, and no indication anywhere that the rest had been dropped -- a debug session where
+    /// breakpoints five and up simply never fire, which reads as a target fault rather than as a
+    /// refusal. The capacity is read from the part, so it is the hardware's cap and not a constant.
+    ///
+    /// Every comparator up to the capacity is written on every call, which is what makes the clear
+    /// half correct: a comparator armed by a previous call and not named by this one has to be
+    /// cleared, and nothing here tracks what a previous call armed.
     pub fn set_breakpoints<M: CoreMemory>(core: &mut M, addresses: &[u32]) -> Result<(), ProbeError> {
-        core.write_word(FP_CTRL, 0b11)?;
-        for i in 0..4u32 {
-            let comp = match addresses.get(i as usize) {
-                Some(&address) => comparator(address),
-                None => 0,
-            };
-            core.write_word(FP_COMP0 + i * 4, comp)?;
+        let fp_ctrl = core.read_word(FP_CTRL)?;
+        let revision = fpb_revision_of(fp_ctrl)?;
+        let capacity = fpb_num_code(fp_ctrl) as usize;
+        if addresses.len() > capacity {
+            return Err(ProbeError::Device(
+                "more breakpoints requested than the breakpoint unit has comparators",
+            ));
+        }
+        let enable = if addresses.is_empty() { FP_CTRL_KEY } else { FP_CTRL_KEY | FP_CTRL_ENABLE };
+        core.write_word(FP_CTRL, enable)?;
+        for i in 0..capacity {
+            let comp = addresses.get(i).map_or(0, |&address| comparator(revision, address));
+            core.write_word(FP_COMP0 + i as u32 * 4, comp)?;
         }
         Ok(())
     }
@@ -584,6 +724,14 @@ const AP_DRW: u8 = 0x0c;
 const CSW_WORD: u32 = 0x2300_0052;
 const CSW_BYTE: u32 = 0x2300_0040;
 const CSW_HALF: u32 = 0x2300_0041;
+/// `BASE` sits at offset `0xF8` in the MEM-AP register file (ADIv5.2 IHI 0031G, C2.6.1), which is
+/// the third word of bank `0xF` -- `CSW`, `TAR` and `DRW` are all in bank 0, so it is the first
+/// register in this crate that needs the bank switched at all.
+const AP_BASE_IN_BANK: u8 = 0x08;
+/// `SELECT.APBANKSEL`, bits[7:4] (IHI 0031G, B2.2.9), set to bank `0xF` and leaving `APSEL` and
+/// `DPBANKSEL` alone. On an ADIv6 DP the same bits are part of the AP ADDRESS rather than a bank
+/// field, and replacing them with `0xF` lands on the same `+0xF8` -- so one expression serves both.
+const AP_BANK_F: u32 = 0x0000_00f0;
 /// The MEM-AP auto-increments `TAR` only within a 1 KB window (ADIv5), so block transfers restart
 /// `TAR` at every boundary.
 const TAR_WINDOW: u32 = 0x400;
@@ -592,6 +740,15 @@ const DP_IDCODE: u8 = 0x0;
 const DP_ABORT: u8 = 0x0;
 const DP_CTRL_STAT: u8 = 0x4;
 const DP_SELECT: u8 = 0x8;
+/// `SELECT.DPBANKSEL`, bits[3:0] (IHI 0074E, B2.2.11). The three DP banks below hold registers at
+/// DP offset `0x0`, which is `DPIDR`'s offset in bank `0x0`.
+const DP_BANK_MASK: u32 = 0x0000_000f;
+/// `DPIDR1` lives at DP offset `0x0` in this bank (IHI 0074E, B2.2.7).
+const DP_BANK_DPIDR1: u32 = 0x1;
+/// `BASEPTR0` lives at DP offset `0x0` in this bank (IHI 0074E, B2.2.2).
+const DP_BANK_BASEPTR0: u32 = 0x2;
+/// `BASEPTR1` lives at DP offset `0x0` in this bank (IHI 0074E, B2.2.2).
+const DP_BANK_BASEPTR1: u32 = 0x3;
 const ABORT_CLEAR_STICKY: u32 = 0x0000_001e;
 const CTRL_POWERUP_REQ: u32 = 0x5000_0000;
 const CTRL_POWERUP_ACK: u32 = 0xa000_0000;
@@ -611,7 +768,21 @@ const AIRCR: u32 = 0xe000_ed0c;
 const AIRCR_SYSRESETREQ: u32 = 0x05fa_0004;
 const DEMCR: u32 = 0xe000_edfc;
 const VC_CORERESET: u32 = 1 << 0;
+/// `DEMCR.TRCENA` gates the trace/debug block; with it clear the DWT registers below may read as
+/// zero and never advance.
+const DEMCR_TRCENA: u32 = 1 << 24;
+/// The Data Watchpoint and Trace cycle counter. `CTRL` enables it in bit 0 and declares its
+/// ABSENCE in bit 25; `CYCCNT` is the counter, the word immediately after `CTRL`. Architectural on
+/// every Cortex-M that has a DWT, which is why it lives here and not in a part's own crate.
+const DWT_CTRL: u32 = 0xe000_1000;
+const DWT_CYCCNT: u32 = 0xe000_1004;
+const DWT_CYCCNTENA: u32 = 1 << 0;
+const DWT_NOCYCCNT: u32 = 1 << 25;
 const FP_CTRL: u32 = 0xe000_2000;
+/// `FP_CTRL.KEY` -- a write to `FP_CTRL` is ignored unless this is set in the same write.
+const FP_CTRL_KEY: u32 = 1 << 1;
+/// `FP_CTRL.ENABLE` -- the breakpoint unit's global enable.
+const FP_CTRL_ENABLE: u32 = 1 << 0;
 const FP_COMP0: u32 = 0xe000_2008;
 
 /// The ARM bridge: turns raw [`DapAccess`] (DP/AP registers) into [`TargetAccess`] (memory and run
@@ -626,12 +797,19 @@ const FP_COMP0: u32 = 0xe000_2008;
 /// blanket impl would collide the moment a probe wants to offer both layers.
 pub struct ArmDap<D: DapAccess> {
     dap: D,
+    /// The DP `SELECT` value [`init_mem_select`](Self::init_mem_select) last wrote.
+    ///
+    /// Held so a register outside the MEM-AP's bank 0 can be reached and the selection put back --
+    /// [`rom_table_base`](Self::rom_table_base) is the only such register today. **Remembering it
+    /// is what lets that work on an ADIv6 DP too**, where the selection is an AP ADDRESS rather
+    /// than an index and no caller of this type would have it to hand.
+    select: u32,
 }
 
 impl<D: DapAccess> ArmDap<D> {
     /// Wraps a raw DP/AP accessor.
     pub fn new(dap: D) -> Self {
-        ArmDap { dap }
+        ArmDap { dap, select: 0 }
     }
 
     /// The underlying accessor, for probe-specific operations outside this trait.
@@ -655,6 +833,7 @@ impl<D: DapAccess> ArmDap<D> {
     pub fn init_mem_select(&mut self, select: u32) -> Result<(), ProbeError> {
         self.dap.write_dp(DP_ABORT, ABORT_CLEAR_STICKY)?;
         self.dap.write_dp(DP_SELECT, select)?;
+        self.select = select;
         self.dap.write_dp(DP_CTRL_STAT, CTRL_POWERUP_REQ)?;
         for _ in 0..128 {
             if self.dap.read_dp(DP_CTRL_STAT)? & CTRL_POWERUP_ACK == CTRL_POWERUP_ACK {
@@ -662,6 +841,84 @@ impl<D: DapAccess> ArmDap<D> {
             }
         }
         Err(ProbeError::Timeout("debug power-up"))
+    }
+
+    /// Reads this MEM-AP's `BASE` register -- where the AP says its debug components are described.
+    ///
+    /// **This is the one step of CoreSight discovery that is not a memory read**, and the reason the
+    /// walk lives in [`coresight`] while this lives here: `BASE` is an AP register, so only a probe
+    /// that hands us the DP/AP layer can read it. A high-level probe reaches the same ROM table
+    /// through [`coresight::walk`] once it has the address by some other route.
+    ///
+    /// ADIv5.2 (IHI 0031G), C2.6.1 puts `BASE` at offset `0xF8` in the AP register file, which is
+    /// bank `0xF`; `CSW`, `TAR` and `DRW` are all in bank 0, so this switches `SELECT.APBANKSEL`
+    /// and puts it back. **Restoring it is not tidiness** -- every memory access this type makes
+    /// afterwards addresses `TAR` and `DRW` by their offsets within the selected bank, so leaving
+    /// bank `0xF` selected would silently redirect them.
+    ///
+    /// WARNING: **only the 32-bit `BASE` is read.** IHI 0031G, C2.6.1 places the upper word at
+    /// offset `0xF0` when the Large Physical Address extension is implemented, and states in the
+    /// same section that "Armv7-R, Armv6-M, Armv7-M, and Armv8-M processors can access only a
+    /// 32-bit physical address space" -- so on every part this crate drives there is no upper word
+    /// to read. A 64-bit target reaches this and gets the low half, which is the wrong answer; the
+    /// call to add is `0xF0`, and it wants a 64-bit address to return it in.
+    ///
+    /// Call it after [`init_mem`](TargetAccess::init_mem) or
+    /// [`init_mem_select`](Self::init_mem_select): the AP must be powered and selected first, and
+    /// this restores the selection those made rather than assuming AP 0.
+    pub fn rom_table_base(&mut self) -> Result<coresight::DebugBase, ProbeError> {
+        let banked = (self.select & !AP_BANK_F) | AP_BANK_F;
+        self.dap.write_dp(DP_SELECT, banked)?;
+        let word = self.dap.read_ap(AP_BASE_IN_BANK);
+        let restored = self.dap.write_dp(DP_SELECT, self.select);
+        let word = word?;
+        restored?;
+        Ok(coresight::decode_base(word))
+    }
+
+    /// Asks the DEBUG PORT where its debug components are described, which an ADIv6 target can
+    /// answer before any AP has been selected.
+    ///
+    /// **This is the read that breaks the ADIv6 chicken-and-egg.** An ADIv5 MEM-AP's `BASE` is
+    /// reachable only once an AP is selected, and an ADIv6 DP selects an AP by ADDRESS rather than
+    /// by index -- so a caller with no prior knowledge of the part cannot select one, and asking
+    /// for ADIv5 AP 0 on such a target selects an AP that does not exist. Every register then reads
+    /// as zero, which is [`coresight::DebugBase::Zero`] and is what the ADIv5 path reports.
+    /// `BASEPTR` is a DP register, so it needs nothing selected first.
+    ///
+    /// Four reads, in three banks (IHI 0074E, B2.2.2, B2.2.6 and B2.2.7): `DPIDR` at `DPBANKSEL`
+    /// `0x0`, `DPIDR1` at `0x1`, `BASEPTR0` at `0x2` and `BASEPTR1` at `0x3`, all at DP register
+    /// offset `0x0`. **The version gate is not a courtesy**: offset `0x0` reads `DPIDR` on a
+    /// pre-DPv3 port whatever the bank field holds, so a port that is not a DPv3 would answer its
+    /// own id and it would decode as an address.
+    ///
+    /// The DP `SELECT` value is put back, for the reason
+    /// [`rom_table_base`](Self::rom_table_base) puts it back: everything else this type does
+    /// addresses AP registers through the selection, so leaving another bank selected would
+    /// silently redirect them.
+    ///
+    /// # Errors
+    /// When a DP register access fails.
+    pub fn debug_base_pointer(&mut self) -> Result<coresight::DebugBasePointer, ProbeError> {
+        let dpidr = self.dap.read_dp(DP_IDCODE)?;
+        if (dpidr >> 12) as u8 & 0xf != coresight::DPV3 {
+            return Ok(coresight::decode_base_pointer(dpidr, 0, 0, 0));
+        }
+        let selected = self.select & !DP_BANK_MASK;
+        let banked = |dap: &mut D| -> Result<(u32, u32, u32), ProbeError> {
+            dap.write_dp(DP_SELECT, selected | DP_BANK_DPIDR1)?;
+            let dpidr1 = dap.read_dp(DP_IDCODE)?;
+            dap.write_dp(DP_SELECT, selected | DP_BANK_BASEPTR0)?;
+            let low = dap.read_dp(DP_IDCODE)?;
+            dap.write_dp(DP_SELECT, selected | DP_BANK_BASEPTR1)?;
+            let high = dap.read_dp(DP_IDCODE)?;
+            Ok((dpidr1, low, high))
+        };
+        let read = banked(&mut self.dap);
+        let restored = self.dap.write_dp(DP_SELECT, self.select);
+        let (dpidr1, low, high) = read?;
+        restored?;
+        Ok(coresight::decode_base_pointer(dpidr, dpidr1, low, high))
     }
 
     /// Points `TAR` at `address` and reads `DRW`.
@@ -692,8 +949,25 @@ impl<D: DapAccess> ArmDap<D> {
 }
 
 impl<D: DapAccess> TargetAccess for ArmDap<D> {
+    /// Brings the wire up AND reads `DPIDR`, because ADIv5 does not let anything else go first.
+    ///
+    /// After the JTAG-to-SWD switch and line reset the debug port answers exactly one transaction:
+    /// a read of `DPIDR`. Anything else is not acknowledged. So a `connect` that stops at the
+    /// switch leaves a link that LOOKS up and refuses the next access -- and the refusal is
+    /// `NoAck`, which is also what a board with no target wired to it returns. **A host-side
+    /// protocol slip, reported as an absent board.**
+    ///
+    /// It belongs here rather than at the call sites because the requirement is ADIv5's, and this
+    /// is the ADIv5 bridge; the transport below has no DP registers to know about. A requirement
+    /// every caller happens to satisfy is not enforced anywhere, and the caller that omits it is
+    /// invisible -- the others working is the same coincidence repeated, not evidence.
+    ///
+    /// The id itself is discarded here. [`TargetAccess::read_idcode`] is how a caller that wants
+    /// the value asks for it, and asking twice costs one transaction and is not an error.
     fn connect(&mut self) -> Result<(), ProbeError> {
-        self.dap.connect()
+        self.dap.connect()?;
+        self.dap.read_dp(DP_IDCODE)?;
+        Ok(())
     }
 
     fn read_idcode(&mut self) -> Result<u32, ProbeError> {
@@ -847,7 +1121,7 @@ impl<D: DapAccess> CoreMemory for ArmDap<D> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArmDap, DapAccess, ProbeError, TargetAccess};
+    use super::{ArmDap, DP_IDCODE, DapAccess, ProbeError, TargetAccess};
 
     /// What a probe was asked to do to its reset line, in order.
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -900,6 +1174,64 @@ mod tests {
             self.log.push(Pin::Extension);
             Ok(true)
         }
+    }
+
+    /// ADIv5 answers exactly one transaction after the switch, and it must be the `DPIDR` read.
+    ///
+    /// The defect this pins was silent for as long as it existed: every bench tool called
+    /// `read_idcode` between `connect` and `init_mem` out of habit, so only the two probe ROUTES --
+    /// which did not -- were wrong, and they failed with `NoAck`, the same answer a board with
+    /// nothing wired to it gives. Asserting the ORDER is the only way to catch it, because both
+    /// spellings of the sequence return `Ok` against a fake that does not care.
+    #[test]
+    fn connect_reads_dpidr_first_because_the_port_answers_nothing_else() {
+        #[derive(PartialEq, Debug)]
+        enum Op {
+            Connect,
+            ReadDp(u8),
+            WriteDp(u8),
+        }
+        struct Recorder(Vec<Op>);
+        impl DapAccess for Recorder {
+            fn connect(&mut self) -> Result<(), ProbeError> {
+                self.0.push(Op::Connect);
+                Ok(())
+            }
+            fn read_dp(&mut self, address: u8) -> Result<u32, ProbeError> {
+                self.0.push(Op::ReadDp(address));
+                Ok(u32::MAX)
+            }
+            fn write_dp(&mut self, address: u8, _value: u32) -> Result<(), ProbeError> {
+                self.0.push(Op::WriteDp(address));
+                Ok(())
+            }
+            fn read_ap(&mut self, _address: u8) -> Result<u32, ProbeError> {
+                Ok(0)
+            }
+            fn write_ap(&mut self, _address: u8, _value: u32) -> Result<(), ProbeError> {
+                Ok(())
+            }
+            fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+                Ok(0)
+            }
+        }
+
+        let mut dap = ArmDap::new(Recorder(Vec::new()));
+        dap.connect().expect("connect");
+        assert_eq!(
+            dap.inner().0,
+            vec![Op::Connect, Op::ReadDp(DP_IDCODE)],
+            "the switch must be followed by the DPIDR read and nothing else"
+        );
+
+        dap.init_mem().expect("init_mem");
+        let ops = &dap.inner().0;
+        let first_write = ops.iter().position(|op| matches!(op, Op::WriteDp(_)));
+        let first_read = ops.iter().position(|op| op == &Op::ReadDp(DP_IDCODE));
+        assert!(
+            first_read < first_write,
+            "DPIDR must precede the first DP write; got {ops:?}"
+        );
     }
 
     /// A probe that cannot drive the pair still resets the target, and SAYS it could not hold
@@ -978,5 +1310,53 @@ mod tests {
             "a borrowed probe must not silently fall back to the pulse"
         );
         assert_eq!(probe.log, vec![Pin::Extension]);
+    }
+}
+
+#[cfg(test)]
+mod fpb_tests {
+    use super::cortex_m::{FpbRevision, comparator, fpb_num_code};
+
+    /// The two revisions must not agree on a comparator word, because that is the whole reason the
+    /// revision has to be read. Asserted on an address that exercises every difference at once:
+    /// bit 1 set (V1 needs the upper-halfword selector), and bits above 28 set (V1 cannot carry
+    /// them at all).
+    #[test]
+    fn the_two_revisions_encode_the_same_address_differently() {
+        let address = 0x8000_0002;
+        let v1 = comparator(FpbRevision::V1, address);
+        let v2 = comparator(FpbRevision::V2, address);
+        assert_ne!(v1, v2);
+        assert_eq!(v1, (0b10u32 << 30) | (address & 0x1fff_fffc) | 1);
+        assert_eq!(v2, (address & 0xffff_fffe) | 1);
+    }
+
+    /// V1's `COMP` field is bits [28:2], so it cannot carry an address at or above 512 MB; V2's
+    /// `BPADDR` is bits [31:1] and can. An execute-in-place alias high in the map is the realistic
+    /// case that separates them.
+    ///
+    #[test]
+    fn only_revision_2_keeps_an_address_above_the_v1_field() {
+        let address = 0x9000_2468;
+        assert_eq!(comparator(FpbRevision::V2, address) & 0xffff_fffe, address);
+        assert_ne!(comparator(FpbRevision::V1, address) & 0x1fff_fffc, address);
+    }
+
+    /// Every comparator word enables its comparator, on both revisions -- V1's ENABLE and V2's BE
+    /// are the same bit, which is the one thing the two layouts do share.
+    #[test]
+    fn both_revisions_set_the_enable_bit() {
+        for revision in [FpbRevision::V1, FpbRevision::V2] {
+            assert_eq!(comparator(revision, 0x0000_1000) & 1, 1);
+        }
+    }
+
+    /// NUM_CODE is split across bits [14:12] and [7:4]. Reading the low nibble alone truncates at
+    /// 15, which is why this is a function rather than a shift at each call site.
+    #[test]
+    fn num_code_is_read_from_both_of_its_fields() {
+        assert_eq!(fpb_num_code(0x0000_0060), 6);
+        assert_eq!(fpb_num_code(0x0000_7080), 0x78);
+        assert_eq!(fpb_num_code(0x1000_0080), 8);
     }
 }

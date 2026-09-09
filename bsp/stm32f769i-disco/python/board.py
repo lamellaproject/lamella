@@ -65,6 +65,8 @@ INSTANCES = {
     "gpioa": {"block": "gpio", "base": 0x40020000, "rcc_en_off": 0x30, "rcc_en_bit": 0x0},
     "gpioj": {"block": "gpio", "base": 0x40022400, "rcc_en_off": 0x30, "rcc_en_bit": 0x9},
     "rcc": {"block": "rcc", "base": 0x40023800},
+    "exti": {"block": "exti", "base": 0x40013C00},
+    "syscfg": {"block": "syscfg", "base": 0x40013800, "rcc_en_off": 0x44, "rcc_en_bit": 0xE},
 }
 
 PLANS = {

@@ -1,0 +1,39 @@
+# The SAMD20 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+
+[table]
+kind = "pins"
+family = "samd20"
+sources = [
+    "SAM D20 Family Data Sheet DS60001504K Table 6-1 (PORT Function Multiplexing). The distinction between column C (SERCOM) and column D (SERCOM-ALT) lives in the table's header row, so a cell in this table does not carry its own meaning and every row below records the letter alongside the pad",
+]
+notes = [
+    "COLUMN C IS SERCOM AND COLUMN D IS SERCOM-ALT. A pin carrying a pad of each has two rows here and they are told apart only by the letter, so a row without its function letter is not a fact.",
+    "COLUMNS E AND F ARE BOTH TC ON THIS PART. The SAM D21 spends F on TCC and has no TCC here to spend it on, so a function letter carried across from that family selects a different peripheral class rather than a missing one.",
+]
+
+# ---- the SAM D20 Xplained Pro's EDBG virtual COM port -------------------------------------------
+#
+# THE KIT GUIDE AND THE PART DATASHEET AGREE HERE, AND THE AGREEMENT WAS CHECKED RATHER THAN
+# ASSUMED. Atmel-42102D Table 4-8 gives the virtual COM port as SERCOM3 PAD[2] on PA24 and
+# SERCOM3 PAD[3] on PA25; Table 6-1 gives both pads in column C against SERCOM3. One instance
+# owns both pads and the two documents name the same one.
+#
+# The check is run on every kit because the SIBLING KIT FAILED IT: the SAM R21 Xplained Pro's
+# guide puts a UART's two pads on two different SERCOM instances, and csp/samr21/pins.toml
+# carries the correction. A guide agreeing with its datasheet is a result here, not a default.
+
+[[pins]]
+pin = "PA24"
+function = "C"
+instance = "sercom3"
+signal = "pad2"
+source = "DS60001504K Table 6-1: the PA24 row (SAM D20J pin 45) carries SERCOM3/PAD[2] in column C and SERCOM5/PAD[2] in column D. Corroborated by SAM D20 Xplained Pro user guide Atmel-42102D Table 4-8, which names the same instance and pad for the EDBG's TX line."
+
+[[pins]]
+pin = "PA25"
+function = "C"
+instance = "sercom3"
+signal = "pad3"
+source = "DS60001504K Table 6-1: the PA25 row (SAM D20J pin 46) carries SERCOM3/PAD[3] in column C and SERCOM5/PAD[3] in column D. Corroborated by Atmel-42102D Table 4-8 for the EDBG's RX line."

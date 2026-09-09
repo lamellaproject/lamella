@@ -42,6 +42,7 @@ INSTANCES = {
     "gclk": {"block": "gclk", "base": 0x40000C00},
     "porta": {"block": "port", "base": 0x41004400},
     "portb": {"block": "port", "base": 0x41004480},
+    "eic": {"block": "eic", "base": 0x40001800, "gclk_core_id": 0x5, "irq": 0x4},
 }
 
 PLANS = {

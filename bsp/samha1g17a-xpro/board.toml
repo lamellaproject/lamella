@@ -1,0 +1,81 @@
+# The SAM HA1G17A Xplained Pro (EV47P31A): board truth only -- what is wired to what. Chip truth
+# lives in csp/samha1/.
+#
+# THE ORDER CODE IS EV47P31A AND THE BOARD NAME IS NOT. Microchip's roster entry for this kit is an
+# EV-code rather than the -XPRO form its siblings carry; the guide's own title is "SAMHA1G17A
+# Xplained Pro". Recorded because a search for "ATSAMHA1G17A-XPRO" finds nothing.
+#
+# THE PART IS A SAM D21 RELATIVE AND A LIN SYSTEM BASIS CHIP IN ONE PACKAGE. On this G-series part
+# the transceiver is wired to SERCOM5 at PB30 and PB23, neither of which is a package pin, so a
+# board has five SERCOMs rather than six. Nothing here binds SERCOM5.
+#
+# THIS BOARD AND samha1g16a-xpro ARE THE SAME WIRING ON A LARGER PART. Both put LED0 on PA00, SW0
+# on PB03 and the virtual COM port on SERCOM1 at PA27/PA28, and the two guides agree pad for pad.
+# What differs is the silicon: 128 KB flash against 64, 16 KB SRAM against 8, and a TCC3 this part
+# has and its sibling does not.
+
+[table]
+kind = "board"
+board = "samha1g17a-xpro"
+vendor = "microchip"
+family = "samha1"
+part = "atsamha1g17a"
+product_model = 51          # lamella_wire::product_model::SAMHA1G17A_XPLAINED_PRO
+sources = [
+    "SAMHA1G17A Xplained Pro user guide 50003184 (2021) section 3.3.2 and Table 3-7 (LED Connection): one yellow LED0 on PA00, commented 'Pin is shared with EXT1', and the section states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'.",
+    "50003184 section 3.3.1 and its Mechanical Buttons table: two buttons, RESET on the part's reset line and a generic user-configurable SW0 on PB03, with the polarity stated in words.",
+    "50003184 section 3.4.1 and its SWD Connections table: SWD clock on PA30 and SWD data on PA31.",
+    "50003184 section 3.4.2 and its Virtual COM Port Connections table, corroborated against ATSAMHAxGXXA datasheet DS20005841E Table 7-1 for the function column.",
+]
+notes = [
+    "NO 32.768 kHz CRYSTAL IS FITTED, AND THE LED SITS ON THE PAD ONE WOULD USE. DS20005841E Table 7-3 gives XOSC32K XIN32 on PA00; this guide mentions a crystal only in a design note about calculations being the customer's, and it puts LED0 on PA00. No conflict on this board today.",
+    "LED0's PAD IS SHARED WITH THE EXT1 HEADER, which the guide states in its own comment column.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP, exactly as its sibling's does not.",
+    "TCC3 EXISTS ONLY ON THIS PART OF THE FAMILY -- DS20005841E Table 7-1's note 4. Nothing here binds a TCC; recorded because it is the one peripheral difference between this board and samha1g16a-xpro that a shared family table cannot show.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION -- see samha1g16a-xpro, whose note states the reasoning and
+baud = 115200               # the evidence that a sibling kit's id cannot be borrowed.
+plan = "osc8m-8mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom1"
+function = "C"              # SERCOM, not SERCOM-ALT. Neither pad carries a column-D SERCOM at all.
+gclk_gen = 0
+tx = { pin = "PA27", pad = 0 }
+rx = { pin = "PA28", pad = 1 }
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PA00"
+active = "low"
+source = "50003184 section 3.3.2 and Table 3-7: one yellow LED0 on PA00. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic. The table's own comment column adds that the pin is shared with EXT1."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PB03"
+active = "low"
+source = "50003184 section 3.3.1 and its Mechanical Buttons table: the generic user-configurable button SW0 on PB03, silkscreened SW0. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "unknown"
+pitch_mm = 1.27
+onboard = "edbg"
+recovery = "probe"
+source = "50003184 SAM HA1G17A Xplained Pro user guide section 3.2.4: the kit has a 10-pin 50-mil Cortex Debug Connector that can be used to attach an external debugger, and section 3.4.1 gives SWD clock on PA30 and SWD data on PA31. Whether a connector is soldered to that position is not stated: the guide gives the connector a numbered section and a full pin table but never says it is mounted, and the same guide marks its crystals mounted and not mounted in the feature list, so the silence cannot be read either way. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

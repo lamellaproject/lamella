@@ -71,11 +71,19 @@ name = "led0"
 kind = "gpio-out"
 pin = "PB10"
 active = "low"
-source = "DS70005409D section 4.2.1 and Table 4-1: one yellow LED0 on PB10 with no shared functionality. 'The LED can be activated by driving the connected I/O line to the GND', which is the polarity stated in words rather than inferred from a schematic."
+source = "DS70005409D section 4.2.1 and Table 4-1: one yellow LED0 on PB10 with no shared functionality. 'The LED can be activated by driving the connected I/O line to the GND'. THE POLARITY IS MEASURED, AND IT AGREES WITH THE DOCUMENT. Driven from a probe with the core halted, PB10 was held high for five seconds and low for one in a repeating cycle, sampled at both ends of each window so that exclusive control of the pad is established for the whole time it was watched rather than only at the instant of the write: the diode is lit for the one-second stretch, so it lights when the pin is LOW. The polarity is measured rather than taken from the guide, because this vendor repeats the same sentence across kit guides and it does not hold for every one of them. Two boards, one tool, opposite answers -- so the tool discriminates rather than assumes, and this row is confirmed rather than merely cited."
 
 [[devices]]
 name = "button0"
 kind = "gpio-in"
 pin = "PB11"
 active = "low"
-source = "DS70005409D section 4.2.2 and Table 4-2: the generic user-configurable switch SW0 on PB11, shared with DBG2 and the edge connector. 'When this switch is pressed, it will drive the I/O line to ground (GND)'. THERE IS NO EXTERNAL PULL-UP: the section's Note says no pull-up resistor is connected to this switch and that the internal pull-up in the part must be enabled to use it, so a program opening this pin as a plain input reads a floating pad."
+source = "DS70005409D section 4.2.2 and Table 4-2: the generic user-configurable switch SW0 on PB11, shared with DBG2 and the edge connector. 'When this switch is pressed, it will drive the I/O line to ground (GND)'. BOTH HALVES ARE MEASURED AND THE GUIDE IS RIGHT ON BOTH. Read from a probe with the core halted: with the internal pull-up enabled the pad rests HIGH and a press takes it LOW, seen nine times across a fifteen-second window with holds from 116 ms to 624 ms, so the switch is ACTIVE LOW. THERE IS NO EXTERNAL PULL-UP, as the section's Note says: parked as an input the pad follows whichever internal pull is enabled, and with no pull at all it keeps whichever level was applied last -- a pad holding its own gate charge, which is only possible with nothing outside the chip driving it. So a program opening this pin as a plain input reads a floating pad and must enable the internal pull-up itself. That failure has no symptom: the button appears to work, intermittently, like a worn switch. The shortest excursion seen is 116 ms, so a consumer owes this pin a debounce."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "The on-board debugger is an nEDBG, which presents the same virtual COM port as an EDBG and reaches the part's SWD lines on PA31 and PA30. The kit's user guide does not place those signals on a connector for an external probe, so the exposure is unknown. The edge connector shares lines with the debugger and is not a debug header. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

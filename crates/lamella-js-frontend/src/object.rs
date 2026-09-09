@@ -214,6 +214,21 @@ pub enum Callable {
     /// constructor decides whether to call it at all -- and a constructor that never does is
     /// exactly the case `NewPromiseCapability` must reject.
     CapabilityExecutor { state: ObjectId },
+    /// The `thenFinally` / `catchFinally` wrapper `Promise.prototype.finally` inserts.
+    ///
+    /// BOTH CAPTURES ARE OBJECTS, SO THERE IS NO STATE OBJECT HERE. It needs the species
+    /// constructor and the handler, and a constructor and a callable are both `ObjectId` -- which
+    /// is what lets this variant stay `Copy` without the indirection [`Callable::Combinator`]
+    /// needs for a results array.
+    FinallyHandler { constructor: ObjectId, on_finally: ObjectId, rejects: bool },
+    /// The inner thunk that re-delivers the ORIGINAL outcome once the handler's promise settles.
+    ///
+    /// THIS ONE DOES NEED A STATE OBJECT, because what it captures is a `JsValue` rather than an
+    /// object: `p.finally(f)` on a promise fulfilled with `1` has to hand `1` back afterwards. The
+    /// value lives as a property of `state` under a key containing a space, the same device
+    /// `generator_transform::FRAME` uses -- the lexer cannot produce such an identifier, so no
+    /// program can read or overwrite it, and the heap traces the object like any other.
+    FinallyThunk { state: ObjectId, throws: bool },
     /// A Proxy whose target is callable, whose `[[Call]]` is the `apply` trap.
     ///
     /// **THE VARIANT CARRIES NOTHING BECAUSE THE PAIR IS IN [`Object::proxy`], AND IT EXISTS AT

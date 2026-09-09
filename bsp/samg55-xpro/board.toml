@@ -1,0 +1,93 @@
+# The SAM G55 Xplained Pro (ATSAMG55-XPRO, ATSAMG55J19): board truth only -- what is wired to
+# what. Chip truth lives in csp/samg55/.
+#
+# THIS BOARD BINDS GPIO AND DOES NOT BIND ITS VIRTUAL COM PORT, AND THE REASON IS A DATASHEET
+# CONTRADICTION RATHER THAN MISSING WORK. The EDBG's serial gateway is wired to PB0 and PB1, which
+# Table 9-4 gives as TXD6 and RXD6 on Peripheral B -- the pads are not in doubt. What is in doubt is
+# FLEXCOM6's peripheral identifier, which is the bit a driver must set in PMC_PCER0 to clock it:
+#
+#     Table 9-1 (Peripheral Identifiers)   id 22 = USART6, SPI6, TWI6
+#     Figure 6-1 (Product Mapping)         disagrees with Table 9-1 on SIX of the eight FLEXCOM
+#                                          instances, and annotates no id at all on this one
+#
+# csp/samg55/instances.toml states both readings in full. A WRONG PMC BIT DOES NOT FAULT -- the
+# peripheral never clocks while every register reads back what was written -- so binding this on a
+# contested number would ship the failure mode that reads as a wiring problem. The carrier row
+# below is kept because the port is a board fact; the binding lands when somebody reads the
+# identifier off silicon, which is minutes of work with this board on a bench.
+#
+# THE KIT GUIDE ALSO MISNAMES ONE OF THE TWO PADS AND THE DATASHEET SETTLES IT. Atmel-42389's
+# connection table reads "PB00 USART0 TXD" against "PB01 USART6 RXD" -- two instances for one link,
+# which cannot be right. Table 9-4 gives PB0 TXD6/SPI6_MOSI/TWD6 and PB1 RXD6/SPI6_MISO/TWCK6, both
+# on Peripheral B, so the instance is USART6 on both pads and the guide's TX row is the error. Same
+# class as the SAM R21 Xplained Pro guide's SERCOM0/SERCOM1 split, recorded in csp/samr21/pins.toml.
+
+[table]
+kind = "board"
+board = "samg55-xpro"
+vendor = "microchip"
+family = "samg55"
+part = "atsamg55j19"
+product_model = 60          # lamella_wire::product_model::SAMG55_XPLAINED_PRO
+sources = [
+    "SAM G55 Xplained Pro user guide Atmel-42389: the LED connection table gives one yellow LED0 on PA06, and the board section states the polarity in words -- the LED is driven by the I/O line going to GND.",
+    "Atmel-42389: the mechanical buttons table gives two buttons, RESET on the SAM G55 reset line and a generic user-configurable SW0 on PA02. 'When a button is pressed it will drive the I/O line to GND'.",
+    "Atmel-42389 section on the Embedded Debugger: the SWD interface is connected between the EDBG and the ATSAMG55J19, and the EDBG acts as a Virtual COM Port gateway using one of the part's UARTs.",
+    "Atmel-42389's virtual COM port table, CORRECTED against SAM G55 datasheet Atmel-11289F Table 9-4 for the instance on PB0 -- see the header above.",
+    "Atmel-11289F ch 18 (PMC) for the reset master clock, stated in the PMC description: 'By default, at startup, the chip runs out of the master clock using the 8/16/24 MHz RC oscillator running at 8 MHz'.",
+]
+notes = [
+    "PIN NAMES HERE FOLLOW THE DATASHEET AND NOT THE KIT GUIDE. Atmel-42389 writes PA06 and PA02; Atmel-11289F writes PA6 and PA2, and so does every table in csp/samg55. The pads are the same and the zero-padding is not, which is worth stating because a reader checking one document against the other will otherwise think two different pins are meant.",
+    "NO UART BINDING, AND IT IS A REFUSAL RATHER THAN AN OMISSION -- see the header. The pads and the instance are known; the peripheral identifier is contested by the part's own datasheet.",
+    "THE CARRIER ROW HAS NO BINDING BEHIND IT AND THAT IS DELIBERATE. The EDBG really does present a CDC virtual port, so the row is true; what is missing is the MCU-side peripheral that would drive it.",
+    "LED0 IS ON PA6 AND THE PART HAS 48 I/O LINES, so nothing about this board's pad budget is tight.",
+    "THE 16 KB OF CACHE AND I/D RAM IS NOT IN THE PART'S `ram` FIGURE. csp/samg55/parts.toml records the 160 KB contiguous span alone and says why.",
+]
+
+# NO `role` ON THIS CARRIER, AND THAT IS THE SHAPE A CARRIER TAKES WHEN NOTHING BINDS IT. A role
+# is what ties a carrier to the MCU peripheral behind it, and this board declares no binding -- see
+# the header. The generator refuses a carrier whose role no binding declares, which is the right
+# refusal: a role with nothing behind it would claim a driver that does not exist.
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+baud = 115200               # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
+plan = "rc8m-master"        # this kit's user guide never prints one, and the EDBG user guide
+default = true              # Atmel-42096 describes the composite device without giving an id
+                            # table. Nor can a sibling supply it: 0x2111 answers for seven
+                            # different Xplained Pro kits and 0x2175 for two Curiosity Nanos of
+                            # DIFFERENT ARCHITECTURES, so a product id read off one board is not
+                            # a fact about another. It is read from the kit it belongs to.
+
+# THE RESET MASTER CLOCK. The PMC description names the oscillator and the rate together: the chip
+# starts on the 8/16/24 MHz RC oscillator running at 8 MHz. Nothing here derives a baud divisor
+# from it today -- there is no UART binding -- and the plan is recorded because the carrier names
+# one and because the rate is a board-visible fact the moment a binding lands.
+[[plans]]
+name = "rc8m-master"
+default = true
+source = "rc8m"
+gclk0_hz = 8000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PA6"
+active = "low"
+source = "Atmel-42389's LED connection table: one yellow LED0 on the pad the guide spells PA06, which is PA6 in the datasheet's spelling. The guide states the polarity in words -- the LED is activated by driving the connected I/O line to GND."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA2"
+active = "low"
+source = "Atmel-42389's mechanical buttons table: the generic user-configurable button SW0 on the pad the guide spells PA02, which is PA2 in the datasheet's spelling. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "unknown"
+pitch_mm = 1.27
+onboard = "edbg"
+recovery = "probe"
+source = "Atmel-42389 SAM G55 Xplained Pro user guide: Xplained Pro kits featuring a 10-pin 50-mil debug connector can use external debug tools with a pinout compatible with the Cortex Debug Connector. Whether a connector is soldered to that position is not stated: the guide gives the connector a numbered section and a full pin table but never says it is mounted, and the same guide marks its crystals mounted and not mounted in the feature list, so the silence cannot be read either way. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

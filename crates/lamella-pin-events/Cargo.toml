@@ -1,0 +1,14 @@
+[package]
+name = "lamella-pin-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The pin-change event queue behind lamella_isr_notify: what a board's interrupt handler hands the runtime, and what a managed PinChangeEventHandler is eventually called with. no_std, no allocation and no statics -- it owns the RULE and its host owns the storage, so the interpreted and ahead-of-time tiers share one implementation."
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -4,7 +4,7 @@
 //! A WebAssembly 1.0 (MVP) interpreter for the Lamella WASM tier: it loads and RUNS modules
 //! (`lamella-asm-wasm` is the emitting half), executing a guest against a host-granted import
 //! world so a program compiled from any WASM-targeting language can drive real peripherals.
-//! **THIS TIER IS EXPERIMENTAL AND SHIPS AS A PREVIEW.** It does work on hardware today, but
+//! **THIS TIER IS EXPERIMENTAL.** It does work on hardware today, but
 //! its scope is expected to expand considerably, and its API may change in any release --
 //! treat everything here as provisional rather than settled. Two things to know up front.
 //! Its SCOPE is WASM 1.0 plus the three post-MVP features current `rustc` emits by

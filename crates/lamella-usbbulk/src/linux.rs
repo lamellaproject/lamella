@@ -308,6 +308,7 @@ mod tests {
             pid: PID,
             serial: serial.map(String::from),
             product: None,
+            interface_name: None,
             interface: 0,
             ep_in: 0x81,
             ep_out: 0x01,

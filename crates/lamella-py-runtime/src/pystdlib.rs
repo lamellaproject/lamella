@@ -185,14 +185,24 @@ mod tests {
     fn every_module_the_catalogue_offers_actually_resolves() {
         let profile = crate::profile_of_this_build();
         let offered = importable_modules(profile);
-        assert!(offered.len() >= 10, "the catalogue reader is broken, not the registries");
+        assert!(
+            offered.len() >= PUBLIC_NATIVE_MODULES.len(),
+            "the catalogue offers {} names and there are {} public native modules alone -- the \n             reader is broken, not the registries",
+            offered.len(),
+            PUBLIC_NATIVE_MODULES.len()
+        );
         let mut model = crate::ObjectModel::new(alloc::vec::Vec::new(), 1024 * 1024);
         for name in &offered {
             let native = crate::stdlib::build_module(name, &mut model).is_some();
-            let bundled = bundled_module(name).is_some();
+            #[cfg(feature = "bundled-stdlib")]
             assert!(
-                native || bundled,
+                native || bundled_module(name).is_some(),
                 "`import {name}` is offered by the catalogue and resolves to nothing"
+            );
+            #[cfg(not(feature = "bundled-stdlib"))]
+            assert!(
+                native || BUNDLED_MODULES.contains(name),
+                "`import {name}` is offered by the catalogue and is neither native here nor a name a                  host-compiled bundle could carry"
             );
         }
         for name in PUBLIC_NATIVE_MODULES {

@@ -74,10 +74,40 @@ pub enum Node {
 
     /// Matches what a capturing group matched. Answers the empty string when the group has not
     /// participated, which is not the same as failing.
-    Backreference(u32),
+    ///
+    /// # SEVERAL GROUPS, BECAUSE A NAME CAN BELONG TO MORE THAN ONE OF THEM
+    ///
+    /// `/(?<x>a)|(?<x>b)/` gives two capturing groups one name, which a language may allow when
+    /// the two cannot both participate -- they are in different alternatives, so at most one of
+    /// them ever captured anything. A reference to that name is then a reference to whichever one
+    /// did, and it cannot be resolved to a single index until the match has run.
+    ///
+    /// A front end that has no such construct emits a one-element list and pays nothing for this.
+    Backreference(Vec<u32>),
 
     /// A lookaround. `behind` runs the body right to left; `negate` succeeds when the body fails.
     Look { behind: bool, negate: bool, node: Box<Node> },
+
+    /// A subexpression compiled under DIFFERENT flags from the ones around it -- `(?i:a)`.
+    ///
+    /// # ONLY THE TWO FLAGS THE COMPILER STILL READS ARE HERE
+    ///
+    /// A scoped modifier can change exactly `i`, `m` and `s` (ECMA-262 17th ed, 22.2.2.7.4
+    /// `UpdateModifiers` sets `[[IgnoreCase]]`, `[[Multiline]]` and `[[DotAll]]` and nothing
+    /// else). Two of the three never reach the compiler as flags at all:
+    ///
+    /// ```text
+    ///     s   resolved by the front end into `Any { dot_all }`, per node already
+    ///     i   resolved by the front end into the WIDENED class entries it emits ...
+    ///         ... and by the compiler into the `Fold` on Char / Class / Backreference / Assert
+    ///     m   read by the compiler from its options when it emits an Assert
+    /// ```
+    ///
+    /// So a front end that widens its own classes has already scoped `s` and half of `i` by the
+    /// time it builds the tree. What is left is the pair the COMPILER still resolves, and that is
+    /// what this node carries. Adding the other two here would be a second place to say what a
+    /// node already says.
+    Modified { fold: crate::Fold, multiline: bool, node: Box<Node> },
 }
 
 impl Node {
@@ -118,6 +148,7 @@ impl Node {
             Node::Alternate(parts) => parts.iter().any(Node::matches_empty),
             Node::Repeat { node, min, .. } => *min == 0 || node.matches_empty(),
             Node::Group { node, .. } => node.matches_empty(),
+            Node::Modified { node, .. } => node.matches_empty(),
         }
     }
 }
@@ -170,6 +201,6 @@ mod tests {
     /// over one can spin unless it is treated as nullable.
     #[test]
     fn a_backreference_is_nullable_because_a_missing_group_matches_nothing() {
-        assert!(Node::Backreference(1).matches_empty());
+        assert!(Node::Backreference(crate::vec![1]).matches_empty());
     }
 }

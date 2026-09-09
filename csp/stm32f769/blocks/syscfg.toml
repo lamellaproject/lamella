@@ -1,0 +1,59 @@
+# BLOCK: the STM32F76x/F77x system configuration controller, recorded here for the four registers
+# that bind an external interrupt line to a port. The peripheral has other registers -- a memory
+# remap, a peripheral mode config, a compensation cell control -- and this table states only the
+# EXTICR bank, because that is what an interrupt binding needs and a partial table that says which
+# part it is beats a complete one nobody checked.
+#
+# IT IS A SEPARATE PERIPHERAL FROM EXTI AND THAT IS THE WHOLE REASON IT HAS ITS OWN FILE. EXTI
+# decides what counts as an edge and which vector it reaches; SYSCFG decides WHICH PORT'S pin drives
+# the line. They sit at adjacent base addresses, 0x40013800 and 0x40013C00, which makes them easy to
+# conflate and gives a wrong guess a plausible-looking address.
+#
+# ONLY THIS ONE IS CLOCKED. EXTI has no enable bit in RCC; SYSCFG is gated at RCC_APB2ENR bit 14.
+# Writing EXTICR with that clock off loses the write silently, and because the reset value of every
+# EXTICR field is zero -- which selects port A rather than nothing -- the line stays bound to a port
+# A pin. The failure presents as an interrupt from the wrong pin, not as no interrupt.
+#
+# FOUR REGISTERS, FOUR LINES EACH, FOUR BITS PER LINE. EXTICR1 covers lines 0 to 3, EXTICR2 lines 4
+# to 7, EXTICR3 lines 8 to 11, EXTICR4 lines 12 to 15. Only the sixteen GPIO lines are selectable;
+# EXTI's remaining lines are internal sources and reach it without passing through here.
+
+[table]
+kind = "block"
+family = "stm32f769"
+block = "syscfg"
+sources = [
+    "STM32F76xxx/F77xxx reference manual RM0410 Rev 5 sections 7.2.3 to 7.2.6, each stating its own address offset: SYSCFG_EXTICR1 0x08, SYSCFG_EXTICR2 0x0C, SYSCFG_EXTICR3 0x10, SYSCFG_EXTICR4 0x14.",
+    "RM0410 Rev 5 section 7.2.3, which gives the field layout as EXTIx[3:0] for x = 0 to 3 and the port encoding in the manual's own words: 'These bits are written by software to select the source input for the EXTIx external interrupt', 0000 PA[x], 0001 PB[x], 0010 PC[x], 0011 PD[x], 0100 PE[x], 0101 PF[x], 0110 PG[x], 0111 PH[x], 1000 PI[x], 1001 PJ[x], 1010 PK[x].",
+    "RM0410 Rev 5 memory map: SYSCFG at 0x40013800-0x40013BFF on APB2.",
+    "RM0410 Rev 5 section 5.3.14, RCC_APB2ENR bit 14 SYSCFGEN, 'System configuration controller clock enable'.",
+]
+notes = [
+    "ELEVEN PORT CODES, WHERE THE SMALLER ST FAMILIES IN THIS STRATA HAVE SIX. This part encodes up to PK; a category 5 STM32L0 stops at PH and a category 3 has no port E to select at all. That is precisely why the EXTICR encoding cannot be shared between families even though the EXTI registers beside it are identical: a shared table would hand a consumer port codes its silicon does not bond.",
+    "THE RESET VALUE IS ZERO AND ZERO IS A SELECTION. Every field resets to 0000, which selects PA[x]. There is no encoding for 'unbound', so a line is always attached to some port's pin and the question is only which.",
+    "A FOUR-BIT FIELD HOLDS ELEVEN VALID CODES AND FIVE UNUSED ONES. The manual lists 0000 through 1010 and says nothing about 1011 through 1111, so a consumer must not treat the field as a free four-bit port index.",
+]
+
+[registers.EXTICR1]
+offset = 0x08
+width = 32
+fields = { EXTI0 = [0, 4], EXTI1 = [4, 4], EXTI2 = [8, 4], EXTI3 = [12, 4] }
+notes = "Lines 0 to 3. Bits 31:16 are reserved and must be kept at their reset value."
+
+[registers.EXTICR2]
+offset = 0x0C
+width = 32
+fields = { EXTI4 = [0, 4], EXTI5 = [4, 4], EXTI6 = [8, 4], EXTI7 = [12, 4] }
+notes = "Lines 4 to 7. The suffix is the LINE number rather than a position within the register, unlike the SAM families' CONFIG banks."
+
+[registers.EXTICR3]
+offset = 0x10
+width = 32
+fields = { EXTI8 = [0, 4], EXTI9 = [4, 4], EXTI10 = [8, 4], EXTI11 = [12, 4] }
+notes = "Lines 8 to 11. Lines 8 and 9 reach the EXTI9_5 vector and 10 and 11 the EXTI15_10 vector, so this one register spans a vector boundary."
+
+[registers.EXTICR4]
+offset = 0x14
+width = 32
+fields = { EXTI12 = [0, 4], EXTI13 = [4, 4], EXTI14 = [8, 4], EXTI15 = [12, 4] }
+notes = "Lines 12 to 15, all of which reach the EXTI15_10 vector."

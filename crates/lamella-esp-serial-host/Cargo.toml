@@ -23,5 +23,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

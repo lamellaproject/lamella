@@ -518,6 +518,116 @@ pub enum Feature {
     /// -- no hyphens on "expression body", and the noun is *property* even for an indexer's
     /// accessor.
     ExpressionBodiedAccessor,
+    /// An expression-bodied CONSTRUCTOR, static constructor or destructor. Introduced in
+    /// **C# 7.0**, a rung later than the method and property forms.
+    ///
+    /// The body is a statement expression rather than a returned value -- none of these three
+    /// members returns anything -- so it desugars to `{ e; }` and not to `{ return e; }`.
+    ///
+    /// csc gates all three under one name, which this variant copies. An OPERATOR is not among
+    /// them: csc counts an expression-bodied operator as part of `expression-bodied method` and
+    /// admits it at 6.0, so it belongs to [`Feature::ExpressionBodiedMethod`].
+    ExpressionBodiedConstructor,
+    /// A CONSTANT pattern: `x is null`, `x is 3`, `s is "a"`, `c is 'x'`. Introduced in
+    /// **C# 7.0**.
+    ///
+    /// **IT IS NOT `x == null`.** The pattern ignores a user-defined `operator ==`: measured, a
+    /// type whose `==` returns `true` unconditionally still tests FALSE against `is null`, because
+    /// csc emits `ldnull; ceq` for the pattern and `call op_Equality` for the comparison. Binding
+    /// one as the other is a wrong answer no diagnostic reports.
+    ///
+    /// **A STRING CONSTANT IS THE EXCEPTION AND csc MEASURES IT: `s is "a"` emits
+    /// `call String::op_Equality`.** String equality IS the built-in one for `string`, so the
+    /// pattern uses it; what the pattern refuses is a `==` a USER declared on some other type,
+    /// and no user type can have a constant to be matched against.
+    ///
+    /// **THE NAME IS WIDER THAN THIS VARIANT AND THAT IS DELIBERATE.** csc gates every pattern
+    /// form under one name, `pattern matching`; the name is what the diagnostic renders, so it is
+    /// csc's. The C# 9 combinators (`or`, `and`, `not`), relational patterns and recursive
+    /// patterns remain refused, each as its own form.
+    ConstantPattern,
+    /// An OUT VARIABLE DECLARATION, `M(out int x)` and `M(out var x)`. Introduced in **C# 7.0**.
+    ///
+    /// **THE DECLARATION IS THE FEATURE, NOT THE `out`.** Passing `out` to an already-declared
+    /// variable is C# 1.0 and stays there; what arrives at 7.0 is a variable declared INSIDE an
+    /// expression, whose scope is the enclosing block rather than the argument list. `ref` has no
+    /// such form at any version -- `M(ref int x)` is `CS1525`, measured -- so this is `out` alone.
+    ///
+    /// **THE DISCARD IS A DIFFERENT FEATURE AND csc SAYS SO.** `M(out _)` at `/langversion:6` is
+    /// `Feature 'discards'`, not this name, so it is not admitted by this variant.
+    OutVariableDeclaration,
+    /// A TUPLE type or expression -- `(int, string)`, `(1, "x")`, `(a: 1, b: 2)`. Introduced in
+    /// **C# 7.0**.
+    ///
+    /// **csc's NOUN IS PLURAL AND THE DIAGNOSTIC RENDERS IT**, so this is `tuples` and not
+    /// `tuple`: measured at `/langversion:6`, which answers *Feature 'tuples' is not available in
+    /// C# 6*. The neighbouring `ref structs` carries the same warning for the same reason.
+    ///
+    /// **DECONSTRUCTION SHARES THE BRACKETS AND SHARES THIS GATE.** `(a, b) = t`,
+    /// `(int a, int b) = t` and `var (a, b) = t` are a different FEATURE -- the census counts
+    /// them as their own row -- but csc does not give them their own NAME: at
+    /// `/langversion:6` all three answer *Feature 'tuples' is not available in C# 6*, reported
+    /// at the opening bracket of the target list, measured on one program apiece. Only the `_`
+    /// has a name of its own, [`Feature::Discards`]. So the bracket is gated here wherever it is
+    /// written, and there is deliberately no `Feature::Deconstruction`: a variant whose name
+    /// csc never prints could only make a diagnostic that is not csc's.
+    ///
+    Tuples,
+    /// A DISCARD, `_`, in a deconstruction target list. Introduced in **C# 7.0**.
+    ///
+    /// **THE ONE PART OF A DECONSTRUCTION csc NAMES SEPARATELY.** `int a; (a, _) = (40, 2);` at
+    /// `/langversion:6` draws three gates: `tuples` at each bracket and *Feature 'discards' is
+    /// not available in C# 6* at the `_` itself, measured. Everything else about the construct
+    /// is [`Feature::Tuples`].
+    ///
+    /// **NARROWER THAN THE NAME IT PRINTS**, like the pattern features above it: csc's
+    /// `discards` also covers `_` as a standalone assignment target and as an `out` argument,
+    /// neither of which is gated here yet.
+    Discards,
+    /// A DECLARATION PATTERN, `x is T t`. Introduced in **C# 7.0**.
+    ///
+    /// **THE OPERATOR IS C# 1.0 AND THE DESIGNATOR IS NOT**, which is the whole of the gate:
+    /// `x is T` compiles at every version and `x is T t` at 7.0 and later. csc prints one name for
+    /// every pattern form, so this variant renders the same `pattern matching` as
+    /// [`Feature::ConstantPattern`] and is, like it, narrower than the name it prints.
+    DeclarationPattern,
+    /// A SWITCH EXPRESSION, `governing switch { pattern => value, ... }`. Introduced in
+    /// **C# 8.0**.
+    ///
+    /// **csc CALLS IT `recursive patterns` AND SO DOES THIS.** Measured at `/langversion:7.3`:
+    /// `x switch { _ => 0 }` is *"Feature 'recursive patterns' is not available in C# 7.3"*,
+    /// twice -- once for the switch and once for the discard, which arrived in the same csc
+    /// feature. The name is what the diagnostic renders, so it is csc's however oddly it reads for
+    /// a construct with no recursion in it.
+    ///
+    /// **THE DISCARD PATTERN GATES UNDER THIS NAME TOO**, for the same reason: csc admits `_` as a
+    /// pattern at 8.0 and not before, under this one feature. It is not a variant of its own
+    /// because csc does not gate it as one.
+    ///
+    /// **WHAT IS BUILT IS THE CONSTANT / DISCARD / DECLARATION ARM WITH AN OPTIONAL `when`.**
+    /// Measured on dotnet/iot: 130 of its 172 switch expressions use only those forms and are
+    /// closed by a catch-all. The C# 9 forms -- `or`, `and`, `not`, relational (`< n`) and
+    /// recursive (`{ P: v }`, `(a, b)`) -- are refused, each as its own gap.
+    SwitchExpression,
+    /// A USING DECLARATION, `using T x = e;` without parentheses or a body. Introduced in
+    /// **C# 8.0**.
+    ///
+    /// **IT IS THE `using` STATEMENT WITH ITS BODY IMPLIED**, and that is measured rather than
+    /// assumed: `using T x = e;` followed by the rest of a block compiles to the same IL as
+    /// `using (T x = e) { <the rest of that block> }`. Under `/optimize+` seven of eight measured
+    /// pairs are BYTE-IDENTICAL; the eighth differs only in which local slot number the variable
+    /// gets, because the declaration form is declared in the enclosing block's scope and the
+    /// statement form opens a new one. Same `try`/`finally`, same null test, same `Dispose` call,
+    /// same `leave`.
+    ///
+    /// So the parser desugars it and no later pass learns a new shape -- the same treatment an
+    /// expression body gets, and for the same reason.
+    ///
+    /// **THE POSITIONS IT MAY NOT STAND IN ARE NOT THE `using` STATEMENT'S.** A `using` statement
+    /// is legal as an embedded statement and inside a switch section; the DECLARATION is refused
+    /// in both -- `CS1023` in the first, `CS8647` in the second.
+    ///
+    UsingDeclaration,
     /// A THROW EXPRESSION, `s ?? throw new ArgumentNullException(nameof(s))`. Introduced in
     /// **C# 7.0**.
     ///
@@ -637,6 +747,17 @@ pub enum Feature {
     NamedArguments,
     /// The null-conditional operators `?.` and `?[`. Introduced in C# 6.0.
     NullConditional,
+    /// The null-forgiving operator, `s!`. Introduced in **C# 8.0**.
+    ///
+    /// It suppresses a nullable-analysis warning about its operand and does nothing else: the
+    /// operand's type, value and evaluation are unchanged, and it emits no IL. A build with no
+    /// nullable analysis has nothing for it to suppress, so parsing it and discarding it is the
+    /// whole implementation -- and refusing it would refuse ordinary modern C#.
+    ///
+    /// **A SEPARATE VARIANT FROM THE `T?` ANNOTATION HALF, WHICH IS NOT BUILT**, even though csc
+    /// gates both as one feature and prints one name for both. One variant would have to answer
+    /// [`Feature::is_implemented`] for the pair at once, and the honest answer differs.
+    NullForgivingOperator,
     /// A `using static` directive (`using static System.Math;`), importing a type's static
     /// members into scope. Introduced in C# 6.0.
     UsingStatic,
@@ -727,6 +848,15 @@ pub enum Feature {
     /// it -- a positional record's properties are `{ get; init; }` -- but it stands on its own and
     /// a program may use it with no record in sight.
     InitOnlySetters,
+    /// TARGET-TYPED OBJECT CREATION, `C c = new();` -- C# 9.0, and csc's own name for it is
+    /// `'target-typed object creation'`, measured at 7.3 (CS8370) and 8.0 (CS8400).
+    ///
+    /// **THE FEATURE IS NOT THE SYNTAX, IT IS WHERE THE TYPE COMES FROM.** `new(args)` has no type
+    /// of its own; it takes the one the CONTEXT is converting it to, exactly as a lambda takes its
+    /// delegate. So it enters the language through [`Binder::bind_target_typed`] rather than
+    /// through the general expression binder, and every position that supplies a target is a
+    /// position this feature reaches.
+    TargetTypedNew,
     /// A default (bodied) member on an interface -- C# 8.0. Gated in the BINDER rather than the
     /// parser: the syntax is an ordinary member with a body and only the enclosing type's kind
     /// makes it a feature.
@@ -767,6 +897,57 @@ pub enum Feature {
     /// split: the state machine for a generic method is a synthesized generic type, which lands
     /// beside `Task<T>` (in real code the two populations are nearly the same methods).
     AsyncGenericMethod,
+    /// A lambda whose body reads `this` and nothing else from around it -- lowered by csc to a
+    /// private INSTANCE METHOD of the enclosing type, with no synthesized type at all.
+    ///
+    /// csc has no gate for this (it is simply part of lambda expressions); the variant exists so
+    /// lcsc's PHASE SPLIT can refuse it by name. The three capture shapes are three lowerings, not
+    /// three degrees of one, and the non-capturing shape is the one that is built -- so
+    /// [`Feature::LambdaExpression`] cannot stand for all three without claiming two it lacks.
+    /// The description is OURS, in csc's style, because there is no csc message to copy.
+    LambdaCapturingThis,
+    /// A lambda whose body reads an enclosing LOCAL or PARAMETER -- lowered by csc to a
+    /// `<>c__DisplayClass` the enclosing method allocates, holding one field per capture (and
+    /// `<>4__this` as well, when the body reads `this` too).
+    ///
+    /// Also csc-gateless and also a phase split: a display class has to be allocated at the right
+    /// point in the enclosing method's flow, and every read of a captured name in that method
+    /// becomes a field access on it. That rewrite is the whole feature and it is separate from
+    /// [`Feature::LambdaCapturingThis`], which needs no type at all.
+    ///
+    /// **THIS VARIANT IS THE METHOD-BODY SCOPE ONLY**; a capture from anywhere else is
+    /// [`Feature::LambdaCapturingNestedScope`]. The two are one construct to a reader and two
+    /// lowerings to an emitter, which is the same split the three capture shapes already are.
+    LambdaCapturingLocals,
+    /// A lambda capturing a local declared somewhere OTHER than the enclosing method's own body
+    /// scope: an inner block, a `for`/`foreach`/`using`/`catch`/`fixed` header, or an enclosing
+    /// LAMBDA's parameter.
+    ///
+    /// **THE SECOND DISPLAY CLASS IS THE FEATURE, NOT THE SECOND SCOPE.** One capturing scope
+    /// needs one class, allocated at the top of the body. A second needs a class per scope, each
+    /// allocated where its scope OPENS, and every one but the outermost carries a
+    /// `CS$<>8__locals{S}` field pointing at its parent -- because a body that reads an outer
+    /// capture WALKS that chain (`ldarg.0; ldfld CS$<>8__locals1; ldfld a`) rather than holding a
+    /// copy. Measured: copying would break the shared storage that makes a write through one path
+    /// visible through the other.
+    ///
+    /// The suffix is not a depth: two SIBLING scopes under one captured outer local get `_1` and
+    /// `_2`, so the classes are counted in the order scopes OPEN, over the whole method.
+    LambdaCapturingNestedScope,
+    /// A lambda written inside a GENERIC type or a generic method.
+    ///
+    /// Not a capture question and not csc's gate either -- a third phase split, and the widest of
+    /// the three. A lambda in a generic context needs its closure type to be generic as well
+    /// whenever anything the lambda's signature or body names reaches a type parameter, because
+    /// the synthesized fields and methods live on that type and a signature there spells `!0`, not
+    /// a name. A lambda inside a generic METHOD needs the method's own `!!n` scope restored around
+    /// its deferred body as well.
+    ///
+    /// **REFUSED MORE BROADLY THAN THE DEFECT STRICTLY REQUIRES.** A lambda in a generic type
+    /// that touches no type parameter would lower correctly, and is refused anyway: the safe
+    /// subset is a claim about every type the lambda's body can reach, and nothing here can check
+    /// that claim.
+    LambdaInGenericScope,
     /// A CALLER-INFO ATTRIBUTE on an optional parameter -- `[CallerMemberName]`,
     /// `[CallerFilePath]`, `[CallerLineNumber]` (**C# 5.0**).
     ///
@@ -860,19 +1041,28 @@ impl Feature {
             | Feature::ExpressionBodiedProperty
             | Feature::ExpressionBodiedIndexer
             | Feature::ExpressionBodiedAccessor
+            | Feature::ExpressionBodiedConstructor
+            | Feature::ConstantPattern
+            | Feature::OutVariableDeclaration
+            | Feature::DeclarationPattern
+            | Feature::Tuples
+            | Feature::Discards
+            | Feature::UsingDeclaration
+            | Feature::SwitchExpression
             | Feature::ThrowExpression
             | Feature::RefStruct => true,
             Feature::RequiredMembers | Feature::LeadingDigitSeparator => true,
             Feature::NullConditional => true,
+            Feature::NullForgivingOperator => true,
             Feature::UsingStatic => true,
             Feature::DefaultParameterValues => true,
             Feature::AutoPropertyInitializer | Feature::ReadonlyAutoProperty => true,
             Feature::ExceptionFilter => true,
+            Feature::LambdaExpression => true,
+            Feature::NamedArguments => true,
             Feature::AnonymousMethods
             | Feature::NamespaceAlias
-            | Feature::LambdaExpression
             | Feature::AnonymousObjectCreation
-            | Feature::NamedArguments
             | Feature::SwitchOnBool
             | Feature::TopLevelStatements
             | Feature::RecordStructs
@@ -884,6 +1074,7 @@ impl Feature {
             Feature::ByRefLocalsAndReturns => true,
             Feature::RefReassignment => true,
             Feature::InitOnlySetters => true,
+            Feature::TargetTypedNew => true,
             Feature::AsyncFunction => true,
             Feature::PartialTypes => true,
             Feature::AsyncMain => false,
@@ -891,6 +1082,9 @@ impl Feature {
             | Feature::AsyncGenericMethod
             | Feature::AwaitInCatchOrFinally
             | Feature::CallerInfoAttribute => false,
+            Feature::LambdaCapturingThis => true,
+            Feature::LambdaCapturingLocals => true,
+            Feature::LambdaCapturingNestedScope | Feature::LambdaInGenericScope => false,
             Feature::NameOf => true,
             Feature::InterpolatedStrings => true,
             Feature::ConstantInterpolatedStrings => true,
@@ -909,7 +1103,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 55] = [
+    pub const ALL: [Feature; 69] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -940,6 +1134,15 @@ impl Feature {
         Feature::DefaultParameterValues,
         Feature::NamedArguments,
         Feature::NullConditional,
+        Feature::NullForgivingOperator,
+        Feature::ExpressionBodiedConstructor,
+        Feature::ConstantPattern,
+        Feature::OutVariableDeclaration,
+        Feature::Tuples,
+        Feature::Discards,
+        Feature::DeclarationPattern,
+        Feature::SwitchExpression,
+        Feature::UsingDeclaration,
         Feature::UsingStatic,
         Feature::AutoProperties,
         Feature::SwitchOnBool,
@@ -953,12 +1156,17 @@ impl Feature {
         Feature::RecordStructs,
         Feature::RecordInheritance,
         Feature::InitOnlySetters,
+        Feature::TargetTypedNew,
         Feature::DefaultInterfaceImplementation,
         Feature::ParameterlessStructConstructor,
         Feature::AsyncFunction,
         Feature::AsyncMain,
         Feature::AsyncTaskOfT,
         Feature::AsyncGenericMethod,
+        Feature::LambdaCapturingThis,
+        Feature::LambdaCapturingLocals,
+        Feature::LambdaCapturingNestedScope,
+        Feature::LambdaInGenericScope,
         Feature::AwaitInCatchOrFinally,
         Feature::PartialTypes,
         Feature::CallerInfoAttribute,
@@ -1000,6 +1208,15 @@ impl Feature {
             Feature::RefReassignment => LanguageVersion::CSharp7_3,
             Feature::ReadOnlyReferences => LanguageVersion::CSharp7_2,
             Feature::RefFields => LanguageVersion::CSharp11,
+            Feature::ExpressionBodiedConstructor => LanguageVersion::CSharp7,
+            Feature::ConstantPattern
+            | Feature::OutVariableDeclaration
+            | Feature::Tuples
+            | Feature::Discards
+            | Feature::DeclarationPattern => LanguageVersion::CSharp7,
+            Feature::NullForgivingOperator
+            | Feature::UsingDeclaration
+            | Feature::SwitchExpression => LanguageVersion::CSharp8,
             Feature::NullConditional
             | Feature::UsingStatic
             | Feature::NameOf
@@ -1013,6 +1230,7 @@ impl Feature {
             Feature::RecordStructs => LanguageVersion::CSharp10,
             Feature::RecordInheritance => LanguageVersion::CSharp9,
             Feature::InitOnlySetters => LanguageVersion::CSharp9,
+            Feature::TargetTypedNew => LanguageVersion::CSharp9,
             Feature::FileScopedNamespaces => LanguageVersion::CSharp10,
             Feature::RequiredMembers => LanguageVersion::CSharp11,
             Feature::DefaultInterfaceImplementation => LanguageVersion::CSharp8,
@@ -1020,6 +1238,10 @@ impl Feature {
             Feature::AsyncFunction => LanguageVersion::CSharp5,
             Feature::AsyncMain => LanguageVersion::CSharp7_1,
             Feature::AsyncTaskOfT | Feature::AsyncGenericMethod => LanguageVersion::CSharp5,
+            Feature::LambdaCapturingThis
+            | Feature::LambdaCapturingLocals
+            | Feature::LambdaCapturingNestedScope
+            | Feature::LambdaInGenericScope => LanguageVersion::CSharp3,
             Feature::CallerInfoAttribute => LanguageVersion::CSharp5,
             Feature::AwaitInCatchOrFinally => LanguageVersion::CSharp6,
         }
@@ -1068,8 +1290,16 @@ impl Feature {
             Feature::ExpressionBodiedProperty => "expression-bodied property",
             Feature::ExpressionBodiedIndexer => "expression-bodied indexer",
             Feature::ExpressionBodiedAccessor => "expression body property accessor",
+            Feature::ExpressionBodiedConstructor => "expression body constructor and destructor",
+            Feature::ConstantPattern => "pattern matching",
+            Feature::OutVariableDeclaration => "out variable declaration",
+            Feature::Tuples => "tuples",
+            Feature::Discards => "discards",
+            Feature::DeclarationPattern => "pattern matching",
             Feature::ThrowExpression => "throw expression",
             Feature::RefStruct => "ref structs",
+            Feature::UsingDeclaration => "using declarations",
+            Feature::SwitchExpression => "recursive patterns",
             Feature::AutoPropertyInitializer => "auto property initializer",
             Feature::ByRefLocalsAndReturns => "byref locals and returns",
             Feature::RefReassignment => "ref reassignment",
@@ -1082,6 +1312,7 @@ impl Feature {
             Feature::DefaultParameterValues => "optional parameter",
             Feature::NamedArguments => "named argument",
             Feature::NullConditional => "null propagating operator",
+            Feature::NullForgivingOperator => "nullable reference types",
             Feature::StaticClasses => "static classes",
             Feature::UsingStatic => "using static",
             Feature::AutoProperties => "automatically implemented properties",
@@ -1096,11 +1327,18 @@ impl Feature {
             Feature::RecordStructs => "record structs",
             Feature::RecordInheritance => "records",
             Feature::InitOnlySetters => "init-only setters",
+            Feature::TargetTypedNew => "target-typed object creation",
             Feature::DefaultInterfaceImplementation => "default interface implementation",
             Feature::ParameterlessStructConstructor => "parameterless struct constructors",
             Feature::AsyncFunction => "async function",
             Feature::PartialTypes => "partial types",
             Feature::AsyncMain => "async main",
+            Feature::LambdaCapturingThis => "lambda capturing the enclosing instance",
+            Feature::LambdaCapturingLocals => "lambda capturing a local variable",
+            Feature::LambdaCapturingNestedScope => {
+                "lambda capturing a local from a nested scope"
+            }
+            Feature::LambdaInGenericScope => "lambda in a generic type or method",
             Feature::AsyncTaskOfT => "async method returning Task<T>",
             Feature::AsyncGenericMethod => "generic async method",
             Feature::CallerInfoAttribute => "caller information attribute",
@@ -1307,6 +1545,15 @@ mod tests {
                 | Feature::DefaultParameterValues
                 | Feature::NamedArguments
                 | Feature::NullConditional
+                | Feature::NullForgivingOperator
+                | Feature::ExpressionBodiedConstructor
+                | Feature::ConstantPattern
+                | Feature::OutVariableDeclaration
+                | Feature::Tuples
+                | Feature::Discards
+                | Feature::DeclarationPattern
+                | Feature::SwitchExpression
+                | Feature::UsingDeclaration
                 | Feature::UsingStatic
                 | Feature::AutoProperties
                 | Feature::SwitchOnBool
@@ -1320,12 +1567,17 @@ mod tests {
                 | Feature::RecordStructs
                 | Feature::RecordInheritance
                 | Feature::InitOnlySetters
+                | Feature::TargetTypedNew
                 | Feature::DefaultInterfaceImplementation
                 | Feature::ParameterlessStructConstructor
                 | Feature::AsyncFunction
                 | Feature::AsyncMain
                 | Feature::AsyncTaskOfT
                 | Feature::AsyncGenericMethod
+                | Feature::LambdaCapturingThis
+                | Feature::LambdaCapturingLocals
+                | Feature::LambdaCapturingNestedScope
+                | Feature::LambdaInGenericScope
                 | Feature::AwaitInCatchOrFinally
                 | Feature::CallerInfoAttribute
                 | Feature::NameOf
@@ -1336,7 +1588,7 @@ mod tests {
         }
         assert_eq!(
             Feature::ALL.len(),
-            55,
+            69,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }

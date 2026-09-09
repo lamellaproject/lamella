@@ -1,0 +1,114 @@
+# The SAMDA1 instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# EVERY VALUE BELOW WAS READ OFF THE SAM DA1'S OWN TABLE 14-1, AND THE RESULT IS THAT THEY ALL
+# AGREE WITH THE SAM D21'S. That agreement is a FINDING rather than a shortcut taken, and saying
+# so matters because the SAM D20 is out of the same lineage and its SERCOM generic-clock ids and
+# NVIC lines DISAGREE with the D21's while its bases agree.
+#
+#     field           SAM DA1      SAM D20      SAM D21 / SAM R21
+#     SERCOM0 base    0x42000800   0x42000800   0x42000800
+#     SERCOM0 APBC    bit 2        bit 2        bit 2
+#     SERCOM0 GCLK    20           13           20
+#     SERCOM0 IRQ     9            7            9
+#
+# Two relatives of one part, read back to back: one matches the D21 in every column and one does
+# not. Nothing about either resemblance predicts which, so a value carried across from a sibling
+# is right or wrong by luck, and it fails at run time either way.
+
+[table]
+kind = "instances"
+family = "samda1"
+record = ["base", "gclk_core_id", "apbc_bit", "irq"]
+sources = [
+    "SAM DA1 datasheet 40001895A Table 14-1 (Peripherals Configuration Summary) for base address, IRQ line, APB-C index and generic-clock index",
+    "40001895A section 18.8.10 (APBC Mask) for the APB-C bit positions, stated one bit at a time in prose rather than read out of the register-summary table",
+    "40001895A section 24.1 (PORT overview) for the group structure; the 0x80 spacing is the family's and the group COUNT comes from the pad set -- see blocks/port.toml",
+]
+notes = [
+    "SERCOM bases stride 0x400 from 0x42000800; GCLK core-clock IDs stride 1 from 20; APBC bits stride 1 from bit 2; NVIC lines stride 1 from 9. Each row is still stated explicitly -- a table is data, not a formula.",
+    "THE SERCOM SLOW CLOCK IS ID 19 AND IS SHARED BY ALL SIX INSTANCES. Table 14-1 prints both against each SERCOM row ('20: CORE' over '19: SLOW'). Only the CORE id belongs in the record below; the slow clock is one channel feeding every instance and is not a per-instance fact.",
+    "TWO PORT GROUPS ON THIS PART. The pad set reaches PB and no further.",
+    "THIS PART HAS USB, WHICH THE SAMD20 BESIDE IT DOES NOT. It is not rowed here because nothing binds it yet, and its two pads carry the DRVSTR and erratum-12368 notes recorded in parts.toml.",
+]
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 20
+apbc_bit = 2
+irq = 9
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 21
+apbc_bit = 3
+irq = 10
+
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 22
+apbc_bit = 4
+irq = 11
+
+[[instances]]
+name = "sercom3"
+block = "sercom"
+base = 0x42001400
+gclk_core_id = 23
+apbc_bit = 5
+irq = 12
+
+[[instances]]
+name = "sercom4"
+block = "sercom"
+base = 0x42001800
+gclk_core_id = 24
+apbc_bit = 6
+irq = 13
+
+[[instances]]
+name = "sercom5"
+block = "sercom"
+base = 0x42001C00
+gclk_core_id = 25
+apbc_bit = 7
+irq = 14
+
+[[instances]]
+name = "pm"
+block = "pm"
+base = 0x40000400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40000C00
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x41004400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "portb"
+block = "port"
+base = 0x41004480
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1

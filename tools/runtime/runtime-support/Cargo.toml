@@ -2,7 +2,7 @@
 # helpers the backend's float ops emit. A STANDALONE crate (own [workspace]) so the host workspace's
 # `crates/*` glob does not adopt this thumbv6m-only staticlib. Build:
 #   cargo build --release --target thumbv6m-none-eabi
-# then link the resulting target/thumbv6m-none-eabi/release/liblamella_runtime_support.a via lamella-link
+# then link the resulting target/thumbv6m-none-eabi/release/liblamella_runtime_support.a via lamella-linker
 # (the AOT crate's object-link verification example drives exactly this path).
 [package]
 name = "lamella-runtime-support"
@@ -14,11 +14,20 @@ edition = "2021"
 # than a copy: an image whose decimal arithmetic differed from the interpreter's would disagree
 # with the tier it was previewed on, one rounding decision at a time.
 lamella-decimal = { path = "../../../crates/lamella-decimal" }
+# The libm-free double rounding kernel, shared with the interpreter so the two round identically.
+# A path dependency rather than a copy, for the reason stated just above: a device that rounded
+# differently from the tier a program was previewed on would disagree one last digit at a time.
+lamella-softmath = { path = "../../../crates/lamella-softmath" }
 # The networking + TLS C-ABI layer (feature `net`): the same NetBackend/TlsBackend stacks
 # the interpreter binds, exported as lamella_net_* / lamella_tls_* archive members. Pulled
 # in HERE as a dependency (never as a second staticlib) so the image keeps exactly one
 # panic handler and one set of lang items.
 lamella-runtime-support-net = { path = "../../../crates/lamella-runtime-support-net", optional = true }
+# The Lamella Link layer (features `link-host` / `debug-agent`): the frame loop, the codec and the
+# on-target debug agent, as lamella_debug_rt_* archive members. Here for the same reason as the net
+# layer -- as a DEPENDENCY and never as a second staticlib, so the image keeps exactly one panic
+# handler and one set of lang items.
+lamella-runtime-support-debug = { path = "../../../crates/lamella-runtime-support-debug", optional = true }
 
 [features]
 # The console_sink knob: where an AOT image's `Console.Write*` bytes GO. Every console entry point
@@ -41,7 +50,40 @@ default = ["console-semihosting"]
 console-semihosting = []
 console-board = []
 console-none = []
+# The monotonic clock seam. A board's millisecond counter is a board FACT -- which timer peripheral,
+# what tick rate, which prescaler -- and this archive is built once per ISA for every board, so it
+# cannot name one. Under `clock-board` the image supplies `lamella_board_now_ms` and every timed
+# operation in this archive reads it; selecting the feature without the symbol fails the LINK, which
+# is the loud failure. The alternative is what this archive did before: with no clock,
+# `Thread.Sleep(1000)` returned AT ONCE and nothing reported anything.
+#
+# Its ABSENCE is not an error, because a program that never sleeps needs no clock. What is an
+# error is selecting it and not providing the symbol.
+clock-board = []
 net = ["dep:lamella-runtime-support-net"]
+# The image SPEAKS Lamella Link: carrier frame loop + codec. This is the knob that costs flash, and
+# it is a prerequisite for both of the others below. It supplies no board carrier of its own -- the
+# image defines `lamella_board_link_read` / `lamella_board_link_write`, and an image that selects
+# this and defines neither fails the LINK rather than shipping a debugger that answers nothing.
+link-host = ["dep:lamella-runtime-support-debug"]
+# The image ANSWERS debug frames. Requires `link-host`.
+#
+# Off by default, and separate from `link-host` deliberately: most boards have an on-board debugger
+# and should not pay for a second one. Firmware update rides on the same link, so folding this into
+# `link-host` would make "no debugging by default" mean "no recovery by default" as well, which is a
+# much larger claim.
+debug-agent = ["link-host", "lamella-runtime-support-debug/debug-agent"]
+# The image ACCEPTS A FIRMWARE IMAGE over the wire (FW_WRITE / FW_COMMIT). Requires `link-host`.
+#
+# The THIRD knob, and the one the whole decomposition is for: an image that must not answer a
+# debugger may still need to be replaced, so this is separate from `debug-agent` rather than folded
+# into it. Off by default like the agent.
+#
+# It supplies no flash driver: the image defines `lamella_board_fw_write_unit` / `_erase` / `_write`
+# / `_read` / `_erased_byte`, because which controller, which granule and where the update region
+# sits are BOARD facts and this archive is built once per ISA. Selecting it without them fails the
+# LINK rather than shipping an image that advertises recovery and refuses every chunk.
+fw-update = ["link-host", "lamella-runtime-support-debug/fw-update"]
 # TLS entry points too (the vendored mbedTLS C cross-build; wants an ARM GCC on the path).
 tls = ["net", "lamella-runtime-support-net/tls"]
 

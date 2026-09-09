@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use lamella_esp_serial::session::Dialect;
 use lamella_esp_serial::{deflate, Connector, FlashParams, ResetInto, Session, StatusLen};
-use lamella_esp_serial_host::{drive, Outcome, Port, PortError, WindowsPort};
+use lamella_esp_serial_host::{drive, NativePort, Outcome, Port, PortError};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,7 +63,9 @@ COMMANDS
     flash       Write an image and verify it against the target's own read-back.
 
 OPTIONS
-    --port <name>        Serial port (e.g. COM25). REQUIRED -- never auto-detected, because
+    --port <name>        Serial port: COM25 on Windows, /dev/ttyUSB0 on Linux,
+                         /dev/cu.usbserial-0001 on macOS. A name with no leading '/' is
+                         looked for in /dev. REQUIRED -- never auto-detected, because
                          auto-detection is how the wrong board gets written.
     --baud <rate>        Line rate (default 115200).
     --connector <which>  'bridge' (a board's USB-to-UART chip) or 'chip' (the part's own USB
@@ -181,8 +183,8 @@ impl Options {
     }
 
     /// The port, opened.
-    fn open(&self) -> Result<WindowsPort, PortError> {
-        WindowsPort::open(&self.port, self.baud)
+    fn open(&self) -> Result<NativePort, PortError> {
+        NativePort::open(&self.port, self.baud)
     }
 
     /// The per-part protocol variations to speak.

@@ -1,0 +1,72 @@
+# The SAMHA1 parts table. The SAM HA1 is a Cortex-M0+ SAM D21 relative and a LIN System Basis
+# Chip -- a LIN transceiver with an integrated voltage regulator -- in one package. The pairing
+# is what makes this a family of its own rather than a SAMD21 part row, and it costs the same
+# kind of thing the SAM R21's radio costs: a SERCOM, and pads that reach no package pin.
+#
+# WHICH SERCOM THE SBC TAKES IS NOT A FAMILY FACT. IT DIFFERS BY SERIES, AND THAT IS THE ONE
+# THING ABOUT THIS FAMILY MOST LIKELY TO BE GOT WRONG:
+#
+#     series   SBC TXD              SBC RXD              instance spent
+#     G (48)   PB30  SERCOM5/PAD[0] PB23  SERCOM5/PAD[3]  SERCOM5
+#     E (32)   PA13  SERCOM4/PAD[2] PB11  SERCOM4/PAD[3]  SERCOM4
+#
+# Both are stated in their own document's Table 7-2 (Internal Connections). None of those four
+# pads is a package pin on the series that uses it, which is why they are absent from every pin
+# list below.
+#
+# THIS IS ALSO WHY THE CONFIGURATION SUMMARY SAYS FIVE SERCOMS AND TABLE 14-1 ROWS SIX. Six are
+# placed silicon and one of them is spent inside the package, exactly as the SAM R21's summary
+# counts its SERCOMs "5+1". instances.toml rows all six because they are all real; a BOARD may
+# bind five, and which five depends on the series.
+
+[table]
+kind = "parts"
+family = "samha1"
+sources = [
+    "ATSAMHAxGXXA datasheet DS20005841E (2021-2023): ch 2 (configuration summary), ch 7 (I/O multiplexing incl. Table 7-2 Internal Connections 48-Pin and Table 7-3 Oscillator Pinout), ch 14 (peripherals configuration summary)",
+    "ATSAMHAxEXXA datasheet DS20005902B (2022): the same chapters for the 32-pin series, incl. its own Table 7-2 Internal Connections 32-pin",
+]
+notes = [
+    "TWO DATASHEETS, ONE FAMILY. The E and G series are documented apart and their Table 14-1 peripheral maps are IDENTICAL -- same bases, same IRQ lines, same generic-clock ids, same APB-C indices -- which was checked row by row rather than assumed. What differs is the package, the pad set, and which SERCOM the SBC takes.",
+    "EACH PIN LIST IS COMPLETE FOR ITS PACKAGE AND IS CHECKED AGAINST AN INDEPENDENTLY PRINTED COUNT. Each series' ch 2 configuration summary carries a 'General Purpose I/O pins (GPIOs)' row: 32 for the G, 19 for the E. The lists below count 32 and 19.",
+    "THE E SERIES BONDS NO PB PAD AT ALL. Its 19 pads are every one in group A. The PORT block still has two groups on the die -- the silicon is shared -- so this is a package fact and not a chip one, and it lives here rather than in blocks/port.toml.",
+    "PA00 IS THE XIN32 PAD AND ON THE G BOARDS IT CARRIES THE LED. Table 7-3 gives XOSC32K XIN32 on PA00 and XOUT32 on PA01. No Xplained Pro in this family fits a 32.768 kHz crystal, so nothing is in conflict today -- recorded because a pad list says a pin exists and cannot say what a board did with it.",
+    "TCC3 EXISTS ONLY ON THE G17A. Table 7-1's note 4 states it outright, so the F column of several rows is populated on one part of this family and empty on the others. Nothing here binds a TCC.",
+]
+
+# ---- the G series: 48-pin, 32 GPIOs, SBC on SERCOM5 --------------------------------------------
+
+[[parts]]
+part = "atsamha1g17a"
+package = "48-pin QFN"
+flash = 0x20000
+ram = 0x4000
+pins = [
+    "PA00-PA11", "PA14-PA21", "PA27-PA28", "PA30-PA31",
+    "PB03", "PB06-PB07", "PB10-PB11", "PB16-PB17", "PB22",
+]
+source = "DS20005841E Table 7-1, whose 48-pin column gives a package pin number for each pad above; the list counts 32 and ch 2's SAMHAxG column states 32 GPIOs on 48 pins. Flash 128 KB and SRAM 16 KB are ch 2's G17 column, whose Flash row reads 128/64/32/16 KB and SRAM row 16/8/4/4 KB across the G17/G16/G15/G14 density codes."
+
+[[parts]]
+part = "atsamha1g16a"
+package = "48-pin QFN"
+flash = 0x10000
+ram = 0x2000
+pins = [
+    "PA00-PA11", "PA14-PA21", "PA27-PA28", "PA30-PA31",
+    "PB03", "PB06-PB07", "PB10-PB11", "PB16-PB17", "PB22",
+]
+source = "DS20005841E Table 7-1, the same 48-pin column as the G17A -- the two parts share a package and a pad set and differ in memory. Flash 64 KB and SRAM 8 KB are ch 2's G16 column. Note that TCC3 is absent on this part per Table 7-1's note 4, which does not affect any pad's identity, only what its F column offers."
+
+# ---- the E series: 32-pin, 19 GPIOs, ALL IN GROUP A, SBC on SERCOM4 ----------------------------
+
+[[parts]]
+part = "atsamha1e16a"
+package = "32-pin QFN"
+flash = 0x10000
+ram = 0x2000
+pins = [
+    "PA00-PA03", "PA06-PA09", "PA14-PA20", "PA27-PA28", "PA30-PA31",
+]
+source = "DS20005902B Table 7-1, whose 32-pin column gives a package pin number for each pad above and none for any PB pad; the list counts 19 and ch 2's SAMHAxE column states 19 GPIOs on 32 pins. Flash 64 KB and SRAM 8 KB are ch 2's E16 column, whose Flash row reads 64/32/16 KB across the E16/E15/E14 density codes."
+

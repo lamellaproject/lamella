@@ -105,3 +105,11 @@ pin = "PE5"
 active = "unknown"          # the PAD is established twice over; the asserted level is not, and
                             # `unknown` is how that is said instead of assuming an indicator sinks.
 source = "ArduinoCore-mbed's OPTA variant defines LED_USER as LEDB = 25 = PE_5, whose own table comment reads LED_BLE; the schematic's U3A symbol gives pin PE5 the net LED_BLE. This is the indicator above the user button, which the datasheet notes is fitted only on the Opta WiFi -- the variant this file describes. Those sources establish the pad. None of them states which level lights it: the user manual's HIGH-lights-it sketch drives the four FACEPLATE status LEDs, which are not this indicator and are not on pins at all, so borrowing their polarity would be reading one component's wiring off another's."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "none"
+recovery = "flash-bootloader"
+source = "The board is programmed over the USB-C connector its datasheet calls USB-C for programming and data logging, with no bridge between it and the host, and nothing on the board is a debug probe. The schematic names the part's debug pins on PA13 (JTMS/SWDIO), PA14 (JTCK/SWCLK) and PB3 (JTDO/TRACESWO), and does not establish where those nets terminate, so the exposure is recorded as unknown."

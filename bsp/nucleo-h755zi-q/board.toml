@@ -120,3 +120,11 @@ kind = "gpio-out"
 pin = "PB14"
 active = "high"
 source = "UM2408 Rev 6 section 7.6: user LD3, a red user LED, is connected to PB14, and Table 16 gives R75 as the resistor that connects it. The same section carries a Caution that LD3 cannot be used if Zio D65 is used, in which case R75 must be removed -- PB14 is Zio D65 on this board's connector table. The polarity is that section's own sentence: these user LEDs are on when the I/O is HIGH value, and are off when the I/O is LOW."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "The board carries an on-board ST-LINK that programs and debugs the part over SWD. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

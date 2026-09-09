@@ -4,6 +4,8 @@ use crate::args::{self, Spec};
 use lamella_catalog::{self as catalog, BOARD_PYTHON};
 use lamella_bsp_gen::fit::fit;
 use lamella_wire_host::engine::{LcscCompiler, LoopbackLink, Outcome, Repl};
+use lamella_js_frontend::interpreter::{Completion, Interpreter};
+use lamella_js_frontend::value::JsValue;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -12,28 +14,48 @@ use std::process::ExitCode;
 enum Language {
     CSharp,
     Python,
+    JavaScript,
 }
 
 impl Language {
     /// The language `path`'s extension names.
     ///
     /// # Errors
-    /// An extension no language claims. The message lists the ones that work, because a reader
-    /// holding a `.ts` or a `.rs` needs to know which of their files this tool takes.
+    /// An extension no language claims. The message lists the ones that work AND where an image
+    /// another toolchain has already produced goes, because a reader holding a `.swift`, a `.ts`
+    /// or a `.rs` is asking two questions at once -- which files this verb takes, and where theirs
+    /// is handled. Naming only the first answers half of it and reads as the second.
     fn of(path: &Path) -> Result<Language, String> {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("cs") => Ok(Language::CSharp),
             Some("py") => Ok(Language::Python),
+            Some("js") => Ok(Language::JavaScript),
             _ => Err(format!(
-                "{}: this tool reads .cs (C#) and .py (Python)",
+                "{}: lamella run and lamella build read .cs (C#), .py (Python) and .js (JavaScript).\n\n\
+An image another toolchain has already produced -- .elf, .bin, .hex or .s19 -- is written by\n\
+`lamella flash <image> --board <id>`, which compiles nothing. A linked .elf is taken directly\n\
+and flattened by physical address, so it needs no conversion step first.",
                 path.display()
             )),
         }
     }
 }
 
+/// The redirect for `--board`, which this verb no longer has.
+///
+/// **IT SAYS WHERE THE FLAG WENT AND WHAT IT DID, WITHOUT IMPLYING IT REACHED HARDWARE.** A reader
+/// meets this at the moment an invocation that worked stopped working, so "unknown option" would
+/// be the wrong answer and so would silence about what they lose.
+const BOTH_MODES: &str = "\
+--board is no longer an option of this verb. It ran the program on THIS machine with a board's
+generated `board` module on the import path -- a fact table, with nothing behind the addresses --
+which is not what `run` means to a reader.
+
+    (neither)         run it on this machine
+    --target <t>      run it ON the board at <t>, with its output here";
+
 const RUN_USAGE: &str = "\
-usage: lamella run <file.cs|file.py> [--board <id> | --target <t>]
+usage: lamella run <file.cs|file.py|file.js> [--target <t>]
 
 Compiles and runs the program, and STAYS until it ends -- its output appears here as it is
 printed. A program written to loop forever runs until you stop this tool.
@@ -43,10 +65,7 @@ find out whether a program compiles and does what you meant.
 
 --target <t> runs it ON a board that already has firmware, with the output still appearing here.
 `lamella devices` prints the word to pass. A cycle is about a second, and the board keeps its
-firmware.
-
---board <id> runs it HERE, against that board's generated `board` module -- that model's pins and
-peripherals, on this machine, with no hardware attached and nothing written to any board.
+firmware. C# only: a Python or JavaScript program runs on this machine.
 
 Two questions this verb does not answer: whether a program FITS a board is `build --board <id>`,
 and putting it on one is `deploy`.";
@@ -66,23 +85,11 @@ pub fn run_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let board = parsed.value("--board");
-    if let Some(id) = board
-        && let Err(error) = catalog::resolve(id)
-    {
-        eprintln!("lamella run: {error}");
+    if parsed.value("--board").is_some() {
+        eprintln!("lamella run: {BOTH_MODES}");
         return ExitCode::FAILURE;
     }
     if let Some(target) = parsed.value("--target") {
-        if board.is_some() {
-            eprintln!(
-                "lamella run: --board and --target name different places to run.\n\n\
-                 \x20   (neither)         run it on this machine\n\
-                 \x20   --board <id>      run it here against that board's generated `board` module\n\
-                 \x20   --target <t>      run it ON the board at <t>, with its output here"
-            );
-            return ExitCode::FAILURE;
-        }
         return run_on_target(&path, target);
     }
 
@@ -94,19 +101,100 @@ pub fn run_command(args: &[String]) -> ExitCode {
         }
     };
     match language {
-        Language::CSharp => {
-            if board.is_some() {
-                eprintln!(
-                    "lamella run: --board is a Python option today; a C# program reaches a board \
-                     through a generated assembly, which this verb does not link yet.\n\
-                     Run it without --board to execute on the host."
-                );
-                return ExitCode::FAILURE;
-            }
-            run_csharp(&source)
-        }
-        Language::Python => run_python(&path, &source, board),
+        Language::CSharp => run_csharp(&source),
+        Language::Python => run_python(&path, &source, None),
+        Language::JavaScript => run_javascript(&path, &source),
     }
+}
+
+/// `lamella run <file.js>` on this machine.
+///
+/// # THE ENGINE IS A LANGUAGE, NOT A PLATFORM, AND THE HOST SEAMS FAIL SILENTLY
+///
+/// ECMA-262 defines no output at all -- no `console`, no `print` -- so a host that installs nothing
+/// ships a verb whose programs cannot say anything. That is not an error and not a crash: the
+/// program runs and produces nothing, which reads as a broken tool. The clock is the same shape,
+/// where `Date.now()` would sit at the epoch and never advance.
+///
+/// **`print` and not `console.log`**: `console` is not in the standard either, and inventing that
+/// namespace on the realm would put a browser's shape where the standard has none.
+fn run_javascript(path: &Path, source: &str) -> ExitCode {
+    let parsed = lamella_js_frontend::parse_script(source);
+    if parsed.has_errors() {
+        for diagnostic in parsed.diagnostics.iter().filter(|d| d.is_error()) {
+            eprintln!("{}: {}", path.display(), diagnostic.message);
+        }
+        return ExitCode::FAILURE;
+    }
+
+    let mut interpreter = javascript_realm();
+    interpreter.define_host_function("print", 1, |interpreter, _this, arguments| {
+        let text = match arguments.first() {
+            Some(value) => interpreter.describe(value),
+            None => String::new(),
+        };
+        println!("{text}");
+        Completion::Normal(JsValue::Undefined)
+    });
+
+    match interpreter.run_source(source) {
+        Ok(Completion::Throw(value)) => {
+            eprintln!("{}: uncaught {}", path.display(), interpreter.describe(&value));
+            ExitCode::FAILURE
+        }
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}: {error}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The realm `lamella run <file.js>` executes in, minus output.
+///
+/// **A SEPARATE FUNCTION SO THE SEAMS CAN BE OBSERVED.** A seam that is never installed fails
+/// silently by construction -- the program runs and simply behaves as though the host had nothing
+/// to offer -- so what a test needs is the realm the verb actually builds, not a second one
+/// assembled beside it that can agree with the code while the verb disagrees. `print` is the one
+/// seam left out: it writes to THIS process's stdout, which a test cannot read back.
+fn javascript_realm() -> Interpreter {
+    let mut interpreter = Interpreter::new();
+    interpreter.set_host_clock(Some(epoch_millis()), monotonic_millis);
+    interpreter.set_host_entropy(seed());
+    interpreter
+}
+
+/// Milliseconds since the Unix epoch: the ANCHOR `Date.now()` counts from.
+fn epoch_millis() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_millis() as f64)
+}
+
+/// The elapsed-time source, which is a DIFFERENT clock from the anchor above and must be.
+///
+/// A wall clock can step backwards -- an NTP correction, a manual change -- so using it for elapsed
+/// time lets `Date.now()` go down between two calls, and code that subtracts two readings gets a
+/// negative duration. The engine anchors once and adds elapsed monotonic time, which is exactly why
+/// it asks for the two separately.
+fn monotonic_millis() -> f64 {
+    host_monotonic_ns() as f64 / 1_000_000.0
+}
+
+/// The per-run seed for `Math.random`, which the engine takes ONCE rather than as a source.
+///
+/// **THE MONOTONIC SOURCE ABOVE CANNOT BE USED HERE**, and that is the trap this exists to avoid:
+/// it counts from the first call in this process, so it reads near zero at start-up on every run
+/// and would seed every run alike -- the exact failure a seed is for. The wall clock is read
+/// instead, at nanosecond resolution, because what a seed needs is to DIFFER between runs and not
+/// to move forwards within one.
+///
+/// **NOT FOR CRYPTOGRAPHY**, and the standard says so about `Math.random` itself. A clock is
+/// guessable; anything that needs unguessable bits needs a different seam.
+fn seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |since| since.as_nanos() as u64)
 }
 
 /// Run on a board in a build that can, and name the missing feature in one that cannot.
@@ -236,6 +324,118 @@ fn report_trap(model: &mut lamella_py_runtime::ObjectModel, trap: &lamella_py_ru
     }
 }
 
+/// Refuses every `#:` file-based-app directive this tool does not act on, by name.
+///
+/// **NOTHING IS ACCEPTED AND IGNORED, AND THAT IS THE WHOLE POINT OF THE FUNCTION.** The compiler
+/// validates no directive name at all -- it lexes `#:` as a name plus the rest of the line and
+/// hands both through untouched, so `#:pacakge Newtonsoft.Json` compiles clean and does nothing.
+/// A program that builds while the dependency it asked for was silently dropped is a worse answer
+/// than one that does not build, so a recognized-but-unhonored directive is refused with what it
+/// asks for, exactly as an unrecognized one is.
+///
+/// # Errors
+/// Any `#:` directive at all, today: none is honored yet. The two shapes are told apart because
+/// they call for opposite next steps -- a misspelling is fixed by the author, an unhonored
+/// directive is not.
+fn refuse_unhonored_directives(
+    source: &str,
+    options: lamella_syntax::lexer::LexOptions,
+) -> Result<(), String> {
+    let tokenized = lamella_syntax::lexer::tokenize_with(source, options);
+    if !tokenized.diagnostics.is_empty() {
+        return Ok(());
+    }
+    let Some(directive) = tokenized.file_directives.first() else {
+        return Ok(());
+    };
+    let asks_for = match &*directive.name {
+        "package" => "a package by name, which needs a feed, version resolution and a restore step",
+        "project" => "another project to reference, which needs a project system to resolve into",
+        "include" => "another source file to compile with this one",
+        "property" => "a build property",
+        "sdk" => "an SDK to build against",
+        other => return Err(format!("Unrecognized directive '{other}'.")),
+    };
+    Err(format!(
+        "`#:{}` asks for {asks_for}, and this tool does not honor it.\n\n\
+         It is refused rather than ignored: a program that built while the thing it asked for was \
+         dropped\nwould run against something it did not ask for.",
+        directive.name
+    ))
+}
+
+/// `lamella board-module-run <file.py> --board <id>`.
+///
+/// **UNDOCUMENTED AND FOR THIS PROJECT'S OWN USE.** It is deliberately absent from `USAGE` and
+/// from `lamella --help`, and the test beside the verb list asserts that absence so it cannot drift
+/// back into the documented set by accident.
+///
+/// It runs the program on THIS machine with a board's generated `board` module on the import path.
+/// That module is a fact table -- roles, pins, register addresses -- and nothing stands behind the
+/// addresses, so what it answers is whether a program names a board's facts correctly, and never
+/// what the hardware would do. **That is a check wearing a run-shaped verb, which is why it is no
+/// longer one of `run`'s modes.**
+///
+/// **IT PRINTS NOTHING FOR A PROGRAM THAT DOES NOT TERMINATE**, which is most device programs:
+/// output is buffered in the object model and flushed after the program returns, so a `while True:`
+/// loop interrupted at the keyboard loses everything it printed.
+pub fn board_module_run_command(args: &[String]) -> ExitCode {
+    eprintln!(
+        "lamella board-module-run: DEPRECATED and internal. It runs the program on this machine \
+         with\n<id>'s generated `board` module on the import path -- a fact table, with nothing \
+         behind the\naddresses. It answers whether a program NAMES a board's facts correctly and \
+         nothing else.\nDo not build on it."
+    );
+    let spec = Spec { verb: "board-module-run", usage: None, values: &["--board"], flags: &[] };
+    let parsed = match args::parse_or_halt(args, &spec) {
+        Ok(parsed) => parsed,
+        Err(halt) => return halt.code(),
+    };
+    let path = match parsed.only_positional("board-module-run", "source file") {
+        Ok(path) => Path::new(path).to_path_buf(),
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(id) = parsed.value("--board") else {
+        eprintln!("lamella board-module-run: --board <id> is required; it is the whole point.");
+        return ExitCode::FAILURE;
+    };
+    if let Err(error) = catalog::resolve(id) {
+        eprintln!("lamella board-module-run: {error}");
+        return ExitCode::FAILURE;
+    }
+    let (language, source) = match read(&path) {
+        Ok(read) => read,
+        Err(error) => {
+            eprintln!("lamella board-module-run: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match language {
+        Language::CSharp => {
+            eprintln!(
+                "lamella board-module-run: {} is C#. This path serves a generated `board` MODULE, \
+                 which is Python's\nshape; a C# program reaches a board surface through a \
+                 generated assembly it does not link.",
+                path.display()
+            );
+            ExitCode::FAILURE
+        }
+        Language::Python => run_python(&path, &source, Some(id)),
+        Language::JavaScript => {
+            eprintln!(
+                "lamella board-module-run: {} is JavaScript. This path serves a generated `board`                  MODULE, which is
+Python's shape; this JavaScript profile has no module loader at \
+                 all, so nothing could import it.",
+                path.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `lamella build <file> [--board <id>] [--out <path>]`: produce the artifact a device runs.
 pub fn build_command(args: &[String]) -> ExitCode {
     let spec =
@@ -274,6 +474,12 @@ pub fn build_command(args: &[String]) -> ExitCode {
     let built = match language {
         Language::CSharp => build_csharp(&path, &source, parsed.flag("--unsafe")),
         Language::Python => build_python(&path, &source, parsed.value("--board")),
+        Language::JavaScript => Err(format!(
+            "{}: lamella build produces a device artifact, and the JavaScript tier runs on this \
+             machine only.
+Use lamella run to execute it here.",
+            path.display()
+        )),
     };
     let built = match built {
         Ok(built) => built,
@@ -463,7 +669,12 @@ pub fn compile_csharp_assembly(
         .filter_map(|bytes| lamella_metadata::Assembly::read(bytes).ok())
         .collect();
     let name = assembly_name(path);
-    let options = lamella_syntax::lexer::LexOptions { unsafe_code, ..Default::default() };
+    let options = lamella_syntax::lexer::LexOptions {
+        unsafe_code,
+        file_based: true,
+        ..Default::default()
+    };
+    refuse_unhonored_directives(source, options.clone())?;
     let compiled = lamella_assemble::compile_source_with(
         source,
         &path.display().to_string(),
@@ -611,14 +822,168 @@ fn host_sleep_ns(nanos: i64) {
 mod tests {
     use super::*;
 
+    thread_local! {
+        static PRINTED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A JavaScript program runs, and reaches the host's output seam.
+    ///
+    /// **THE OUTPUT SEAM IS THE POINT.** ECMA-262 defines no `print` and no `console`, so a verb
+    /// that wires the language and stops there runs programs that cannot say anything -- and does
+    /// it without erroring, which reads as a broken tool rather than a missing seam. This asserts
+    /// the seam is installed by calling it and reading back what arrived.
+    #[test]
+    fn a_javascript_program_runs_and_can_print() {
+        let mut interpreter = Interpreter::new();
+        interpreter.define_host_function("print", 1, |interpreter, _this, arguments| {
+            let text = arguments.first().map_or_else(String::new, |v| interpreter.describe(v));
+            PRINTED.with(|printed| printed.borrow_mut().push(text));
+            Completion::Normal(JsValue::Undefined)
+        });
+        interpreter.set_host_clock(Some(epoch_millis()), monotonic_millis);
+
+        let outcome = interpreter
+            .run_source("let t = 0; for (let i = 1; i <= 5; i++) { t += i * i; } print(t);");
+        assert!(matches!(outcome, Ok(Completion::Normal(_))), "{outcome:?}");
+        PRINTED.with(|printed| {
+            assert_eq!(printed.borrow().as_slice(), ["55"], "the host function was reached");
+        });
+    }
+
+    /// The elapsed-time source is monotonic, which the wall clock is not.
+    ///
+    /// `Date.now()` anchors on the wall clock and ADDS elapsed monotonic time. Feeding the wall
+    /// clock to both lets a backwards step make `Date.now()` go down between two calls, and code
+    /// that subtracts two readings gets a negative duration.
+    #[test]
+    fn the_elapsed_time_source_never_goes_backwards() {
+        let first = monotonic_millis();
+        for _ in 0..1000 {
+            assert!(monotonic_millis() >= first, "the monotonic source stepped backwards");
+        }
+    }
+
+    /// The seed counts from the epoch and not from this process, which is what makes it VARY.
+    ///
+    /// **THE SEAM BESIDE IT IS THE TRAP.** `host_monotonic_ns` counts from the first call in this
+    /// process, so it reads near zero at start-up on every run: wiring entropy to it compiles,
+    /// looks wired, and seeds every run alike -- which is indistinguishable from not wiring it at
+    /// all. And no reading taken INSIDE one run can tell the two apart, because an elapsed
+    /// counter advances within a process exactly as a wall clock does. What separates them is the
+    /// ORIGIN, so that is what is asserted.
+    #[test]
+    fn the_seed_counts_from_the_epoch_and_not_from_this_process() {
+        const NANOS_AT_2020: u64 = 1_577_836_800_000_000_000;
+        let first = seed();
+        assert!(
+            first > NANOS_AT_2020,
+            "the seed is process-relative, so every run starts from the same place: {first}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(seed() > first, "the seed is fixed, so every run would seed alike");
+    }
+
+    /// And the seed reaches `Math.random`, which is what the verb was missing.
+    ///
+    /// An unseeded realm starts from a fixed constant deliberately -- the engine documents that as
+    /// a stated deviation -- so a verb that installs output and a clock and stops there ships a
+    /// `Math.random()` that returns the same sequence on every boot. The comparison is against
+    /// THE VERB'S OWN REALM rather than one seeded here, so deleting the line from the verb is
+    /// what turns this red.
+    #[test]
+    fn the_verbs_realm_moves_math_random_off_the_unseeded_sequence() {
+        fn first_value(mut interpreter: Interpreter) -> String {
+            match interpreter.run_source("Math.random()") {
+                Ok(Completion::Normal(value)) => interpreter.describe(&value),
+                other => panic!("Math.random() did not evaluate: {other:?}"),
+            }
+        }
+
+        assert_ne!(
+            first_value(Interpreter::new()),
+            first_value(javascript_realm()),
+            "the verb's realm did not install the seed, so Math.random() repeats across runs"
+        );
+    }
+
     #[test]
     fn the_language_comes_from_the_extension_and_an_unknown_one_names_the_known_ones() {
         assert_eq!(Language::of(Path::new("Program.cs")), Ok(Language::CSharp));
         assert_eq!(Language::of(Path::new("main.py")), Ok(Language::Python));
+        assert_eq!(Language::of(Path::new("blink.js")), Ok(Language::JavaScript));
         let error = Language::of(Path::new("app.ts")).expect_err("refuses");
         assert!(error.contains(".cs") && error.contains(".py"), "got {error}");
         let bare = Language::of(Path::new("Makefile")).expect_err("refuses");
         assert!(bare.contains(".cs"), "a file with no extension is refused too: {bare}");
+
+        let swift = Language::of(Path::new("greeting.swift")).expect_err("refuses");
+        assert!(
+            swift.contains("lamella flash") && swift.contains(".elf"),
+            "an already-built image has somewhere to go and the refusal says where: {swift}"
+        );
+    }
+
+    fn directives(source: &str) -> Result<(), String> {
+        refuse_unhonored_directives(
+            source,
+            lamella_syntax::lexer::LexOptions { file_based: true, ..Default::default() },
+        )
+    }
+
+    /// The compiler validates no directive name -- it hands `name` through untouched -- so this
+    /// is the only thing between a misspelling and a program that builds without the dependency
+    /// it asked for. Both shapes are refused, and they are told apart because the fixes differ.
+    #[test]
+    fn no_file_directive_is_accepted_and_ignored() {
+        directives("class P { static void Main() { } }").expect("a file with none compiles");
+
+        let typo = directives("#:pacakge Newtonsoft.Json\nclass P { static void Main() { } }")
+            .expect_err("a misspelling is refused");
+        assert!(typo.contains("Unrecognized directive 'pacakge'"), "named back: {typo}");
+        assert!(!typo.contains("CS"), "no CS code on an SDK-layer error: {typo}");
+
+        let known = directives("#:package Newtonsoft.Json\nclass P { static void Main() { } }")
+            .expect_err("a recognized directive we do not honor is refused too");
+        assert!(known.contains("#:package"), "names the directive: {known}");
+        assert!(known.contains("feed"), "and what honoring it would take: {known}");
+        assert!(
+            !known.contains("Unrecognized"),
+            "a directive we know is not a misspelling, and the fixes differ: {known}"
+        );
+
+        let shouted = directives("#:PROPERTY Lang=x\nclass P { static void Main() { } }")
+            .expect_err("case matters");
+        assert!(shouted.contains("Unrecognized directive 'PROPERTY'"), "verbatim: {shouted}");
+    }
+
+    /// A misplaced directive is CS9297 and one without the mode is CS9298 -- both the compiler's,
+    /// with a precise code. Refusing here first would replace them with a vaguer sentence.
+    #[test]
+    fn a_file_that_did_not_lex_gets_the_compilers_diagnostics_rather_than_this_one() {
+        let after_a_token = "using System;\n#:package Newtonsoft.Json\nclass P { }";
+        assert!(
+            directives(after_a_token).is_ok(),
+            "the placement error belongs to the compiler, which reports CS9297 for it"
+        );
+    }
+
+    /// The redirect for `--board` has one job: say the flag is gone and say what it did, without
+    /// implying it reached hardware.
+    #[test]
+    fn the_removed_flag_is_redirected_rather_than_answered_with_unknown_option() {
+        assert!(
+            BOTH_MODES.contains("no longer an option"),
+            "a flag that worked yesterday says where it went: {BOTH_MODES}"
+        );
+        assert!(
+            BOTH_MODES.contains("fact table") && BOTH_MODES.contains("THIS machine"),
+            "and what it actually was: {BOTH_MODES}"
+        );
+        assert!(
+            !BOTH_MODES.lines().any(|line| line.trim_start().starts_with("--board <id>")),
+            "it must not still be listed as a mode of this verb: {BOTH_MODES}"
+        );
     }
 
     /// An assembly name goes into metadata and another assembly writes it down, so every path a
@@ -705,7 +1070,7 @@ mod tests {
             !RUN_USAGE.contains("would FIT"),
             "`run --board` does not answer fit -- `build --board` does:\n{RUN_USAGE}"
         );
-        for (flag, language) in [("--target <t>", "C#"), ("--board <id>", "Python")] {
+        for (flag, language) in [("--target <t>", "C#")] {
             let paragraph = RUN_USAGE
                 .split("\n\n")
                 .find(|block| block.starts_with(flag))

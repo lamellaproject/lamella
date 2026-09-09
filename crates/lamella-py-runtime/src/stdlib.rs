@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_py_bytecode::{CodeObject, Functions};
+use lamella_py_bytecode::Functions;
 
 use lamella_net_core::{Interest, NetBackend, NetResult, SocketHandle};
 use crate::bigint::BigInt;
@@ -206,6 +206,7 @@ enum StdlibFn {
     /// `from_id` has no row for it, so it can never be produced from an id; its `python_name` is
     /// empty, which the guard separately refuses for anything the table does return.
     #[doc(hidden)]
+    #[allow(dead_code)]
     Count,
 }
 

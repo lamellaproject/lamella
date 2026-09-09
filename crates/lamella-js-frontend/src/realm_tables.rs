@@ -173,6 +173,12 @@ fn callable(callable: Option<Callable>) -> String {
             format!("combinator {} {index} {}", state.0, flag(rejects))
         }
         Some(Callable::CapabilityExecutor { state }) => format!("capability-executor {}", state.0),
+        Some(Callable::FinallyHandler { constructor, on_finally, rejects }) => {
+            format!("finally-handler {} {} {}", constructor.0, on_finally.0, flag(rejects))
+        }
+        Some(Callable::FinallyThunk { state, throws }) => {
+            format!("finally-thunk {} {}", state.0, flag(throws))
+        }
         Some(Callable::Proxy) => "proxy".into(),
         Some(Callable::ProxyRevoker { proxy }) => format!("proxy-revoker {}", proxy.0),
     }

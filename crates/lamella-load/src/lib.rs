@@ -41,6 +41,7 @@ macro_rules! intrinsic {
     };
 }
 use lamella_cil_runtime::intrinsics::{
+    app_domain_friendly_name,
     array_clear_range, array_clone, array_copy_range, array_create_instance, array_empty,
     array_get_value, array_rank, array_set_value,
     boolean_to_string,
@@ -52,7 +53,7 @@ use lamella_cil_runtime::intrinsics::{
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
     console_write_line_uint32, console_write_line_uint64, debug_write,
-    clock_is_set, clock_set_ticks,
+    clock_is_set, clock_monotonic_millis, clock_set_ticks,
     datetime_now_ticks, delegate_combine, delegate_equals, delegate_not_equals, delegate_remove,
     environment_get_variable, environment_processor_count, environment_tick_count,
     enum_format, enum_get_name,
@@ -72,7 +73,7 @@ use lamella_cil_runtime::intrinsics::{
     string_intern, string_is_interned,
     string_create_from_chars, string_not_equals, string_substring, string_substring_len,
     type_from_handle, type_get_name,
-    thread_start, thread_join, thread_join_timeout, thread_yield, thread_sleep,
+    thread_start, thread_finished, thread_join, thread_join_timeout, thread_yield, thread_sleep,
     monitor_enter, monitor_exit,
     monitor_try_enter, monitor_try_enter_timeout, monitor_wait, monitor_wait_timeout,
     monitor_wait_timed_out, monitor_pulse,
@@ -110,18 +111,23 @@ use lamella_cil_runtime::intrinsics::{arg_iterator_cookie, arg_iterator_get, arg
 use lamella_cil_runtime::intrinsics::{
     reregister_finalize, suppress_finalize, wait_for_pending_finalizers,
 };
+use lamella_cil_runtime::intrinsics::{
+    reflect_handle_equals, reflect_handle_not_equals, type_get_base_type, type_get_element_type,
+    type_get_full_name, type_is_array, type_is_assignable_from, type_is_class, type_is_enum,
+    type_is_interface, type_is_pointer, type_is_value_type,
+};
 #[cfg(feature = "reflection")]
 use lamella_cil_runtime::intrinsics::{
-    activator_create_instance, assembly_full_name, assembly_get_type, assembly_get_types,
+    activator_create_instance, app_domain_assemblies, assembly_full_name, assembly_get_type,
+    assembly_get_types,
     constructor_invoke, field_get_raw_constant, field_get_value, field_is_literal,
     field_is_static, field_set_value, member_get_type, method_invoke, method_is_abstract,
     method_is_final, method_is_public, method_is_static, method_is_virtual,
     method_parameter_count, method_parameter_custom_attributes, method_parameter_name,
-    method_parameter_type, reflect_handle_equals, reflect_handle_not_equals, type_get_assembly,
-    type_get_base_type, type_get_constructor, type_get_field, type_get_fields,
-    type_get_full_name, type_get_method, type_get_methods, type_get_namespace,
-    type_get_property, type_is_abstract, type_is_array, type_is_class, type_is_enum,
-    type_is_interface, type_is_not_public, type_is_public, type_is_value_type,
+    method_parameter_type, type_get_assembly,
+    type_get_constructor, type_get_field, type_get_fields,
+    type_get_method, type_get_methods, type_get_namespace,
+    type_get_property, type_is_abstract, type_is_not_public, type_is_public,
 };
 #[cfg(feature = "text")]
 use lamella_cil_runtime::intrinsics::{
@@ -152,13 +158,15 @@ use lamella_cil_runtime::intrinsics::{
     decimal_from_double, decimal_to_double, double_parse, double_to_exponential, double_to_fixed,
     double_to_string, single_parse, single_to_exponential, single_to_fixed, single_to_string,
 };
-#[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+#[cfg(feature = "float")]
 use lamella_cil_runtime::intrinsics::{
     bitconverter_double_to_int64_bits, bitconverter_int32_bits_to_single,
-    bitconverter_int64_bits_to_double, bitconverter_single_to_int32_bits, convert_to_int32_double,
-    math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64, math_round_f64,
-    math_sign_f64, math_truncate_f64,
+    bitconverter_int64_bits_to_double, bitconverter_single_to_int32_bits, math_abs_f64,
+    math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64, math_round_f64,
+    math_truncate_f64,
 };
+#[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+use lamella_cil_runtime::intrinsics::convert_to_int32_double;
 #[cfg(feature = "math-transcendental")]
 use lamella_cil_runtime::intrinsics::{
     math_acos_f64, math_asin_f64, math_atan2_f64, math_atan_f64, math_cos_f64, math_cosh_f64,
@@ -3217,6 +3225,10 @@ struct GenericBaseHeir<'pe> {
     virtuals: Vec<VirtualMethod>,
     /// Its OWN non-virtual instance methods, in declaration order.
     nonvirtuals: Vec<VirtualMethod>,
+    /// The signature keys the interfaces THIS TYPE ITSELF lists declare -- ECMA-334 20.4.2's
+    /// re-listing set, carried here because this pass rebuilds the dispatch map `build_sig_methods`
+    /// wrote and would otherwise apply the rule with an empty set, which reads as "nothing re-lists".
+    relisted: BTreeSet<String>,
 }
 
 /// How a [`GenericBaseHeir`] reaches its base: directly, as the constructed generic it names, or
@@ -3359,19 +3371,19 @@ fn load_assembly_collecting<'pe>(
             }
             module.bind_type_name(asm, Token::new(TYPE_DEF, type_row), name.name.into());
             module.bind_type_full_name(type_id, full_type_name(name));
+            if module.assembly_name(asm).is_none() {
+                let simple = assembly.assembly_name().unwrap_or("");
+                module.bind_assembly_name(
+                    asm,
+                    alloc::format!(
+                        "{simple}, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+                    ),
+                );
+            }
             #[cfg(feature = "NETMFv4_4")]
             {
                 if name.name != "<Module>" {
                     module.add_assembly_type(asm, asm_key(asm, Token::new(TYPE_DEF, type_row).0));
-                }
-                if module.assembly_name(asm).is_none() {
-                    let simple = assembly.assembly_name().unwrap_or("");
-                    module.bind_assembly_name(
-                        asm,
-                        alloc::format!(
-                            "{simple}, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
-                        ),
-                    );
                 }
             }
             if let Some(kind) = primitive_value_kind(name.namespace, name.name) {
@@ -3686,6 +3698,7 @@ fn load_assembly_collecting<'pe>(
         &type_extends,
         &type_virtuals,
     );
+    let relisted = relisted_interface_keys(assembly, type_extends.len(), &type_interfaces);
     build_sig_methods(
         module,
         assembly,
@@ -3694,6 +3707,7 @@ fn load_assembly_collecting<'pe>(
         &type_extends,
         &type_virtuals,
         &type_nonvirtuals,
+        &relisted,
     );
     bind_call_targets(module, assembly, asm, &callvirt_tokens, &methoddef_sigs);
     bind_explicit_overrides(module, assembly, asm, type_offset);
@@ -3741,6 +3755,7 @@ fn load_assembly_collecting<'pe>(
             own_fields: own_fields[local].clone(),
             virtuals: type_virtuals[local].clone(),
             nonvirtuals: type_nonvirtuals[local].clone(),
+            relisted: relisted[local].clone(),
         });
     }
     bind_types(
@@ -3761,6 +3776,9 @@ fn load_assembly_collecting<'pe>(
         &type_interfaces,
     );
     record_custom_attributes(assembly, module, asm, type_index);
+    if entry.is_some() {
+        module.bind_entry_assembly(asm);
+    }
     entry
 }
 
@@ -4225,6 +4243,74 @@ mod same_assembly_list_ctor_tests {
     }
 }
 
+
+#[cfg(test)]
+mod type_baseline_binding_tests {
+    //! `System.Type`'s ECMA-335 1st-ed BCL-BASELINE members must reach an intrinsic on a build with
+    //! NO reflection capability, and the member-lookup surface must not.
+
+    /// Does this build bind `System.Type::method` to an intrinsic at all?
+    fn binds(method: &str) -> bool {
+        super::bcl_intrinsic("System", "Type", method, None).is_some()
+    }
+
+    /// The baseline members, which must bind at EVERY tier. `GetArrayRank` and `IsInstanceOfType`
+    /// are absent on purpose: both are managed methods written over the seams below, so neither has
+    /// an arm here and neither should.
+    #[test]
+    fn the_bcl_baseline_of_system_type_binds_without_the_reflection_capability() {
+        for method in [
+            "GetTypeFromHandle",
+            "get_Name",
+            "get_FullName",
+            "get_BaseType",
+            "get_IsEnum",
+            "get_IsValueType",
+            "get_IsClass",
+            "get_IsInterface",
+            "get_IsArray",
+            "get_IsPointer",
+            "GetElementType",
+            "IsAssignableFrom",
+            "op_Equality",
+            "op_Inequality",
+            "HandleEquals",
+        ] {
+            assert!(
+                binds(method),
+                "System.Type::{method} does not reach an intrinsic in this build. It is BCL \
+                 baseline -- Partition IV leaves it unmarked, so the Kernel Profile owes it with \
+                 the reflection knob off -- and an unbound [RuntimeProvided] member does not fail: \
+                 it keeps its placeholder body and answers null / false / 0."
+            );
+        }
+    }
+
+    /// And the other direction, which is what keeps the split a split rather than an ungating.
+    /// These are exactly the members Partition IV marks, so they must be absent without the
+    /// capability and present with it.
+    #[test]
+    fn the_member_lookup_surface_follows_the_reflection_capability() {
+        for method in [
+            "get_Namespace",
+            "get_Assembly",
+            "get_IsAbstract",
+            "get_IsPublic",
+            "get_IsNotPublic",
+            "GetFields",
+            "GetMethods",
+        ] {
+            assert_eq!(
+                binds(method),
+                cfg!(feature = "reflection"),
+                "System.Type::{method} is a member Partition IV marks \"must be implemented if the \
+                 Reflection library is present\", so it should bind exactly when this build has \
+                 that capability and not otherwise."
+            );
+        }
+    }
+}
+
 /// Maps a recognized BCL member -- by declaring type, method name, and signature --
 /// to a runtime intrinsic and its argument count. Returns `None` for anything not
 /// implemented yet; that call stays unbound and only traps if executed.
@@ -4369,6 +4455,7 @@ fn bcl_intrinsic(
     }
     if namespace == "Lamella.Runtime" && type_name == "Clock" {
         match (method, parameters_of(signature)) {
+            ("MonotonicMilliseconds", []) => return Some(intrinsic!(clock_monotonic_millis)),
             ("SetTicks", [SigType::I8]) => return Some(intrinsic!(clock_set_ticks)),
             ("IsSet", []) => return Some(intrinsic!(clock_is_set)),
             _ => {}
@@ -4383,9 +4470,18 @@ fn bcl_intrinsic(
             _ => None,
         };
     }
+    if namespace == "System" && type_name == "AppDomain" {
+        match method {
+            "DomainFriendlyName" => return Some(intrinsic!(app_domain_friendly_name)),
+            #[cfg(feature = "reflection")]
+            "DomainAssemblies" => return Some(intrinsic!(app_domain_assemblies)),
+            _ => {}
+        }
+    }
     if namespace == "System.Threading" && type_name == "Thread" {
         match method {
             "StartThread" => return Some(intrinsic!(thread_start)),
+            "ThreadFinished" => return Some(intrinsic!(thread_finished)),
             "JoinThread" => return Some(intrinsic!(thread_join)),
             "JoinThreadTimeout" => return Some(intrinsic!(thread_join_timeout)),
             "JoinTimedOut" => return Some(intrinsic!(monitor_wait_timed_out)),
@@ -4633,21 +4729,15 @@ fn bcl_intrinsic(
         ("WeakReference", "WriteWeakCell") => Some(intrinsic!(weak_write_cell)),
         ("Type", "GetTypeFromHandle") => Some(intrinsic!(type_from_handle)),
         ("Type", "get_Name") => Some(intrinsic!(type_get_name)),
-        #[cfg(feature = "reflection")]
         ("Type", "get_FullName") => Some(intrinsic!(type_get_full_name)),
         #[cfg(feature = "reflection")]
         ("Type", "get_Namespace") => Some(intrinsic!(type_get_namespace)),
         #[cfg(feature = "reflection")]
         ("Type", "get_Assembly") => Some(intrinsic!(type_get_assembly)),
-        #[cfg(feature = "reflection")]
         ("Type", "get_BaseType") => Some(intrinsic!(type_get_base_type)),
-        #[cfg(feature = "reflection")]
         ("Type", "get_IsEnum") => Some(intrinsic!(type_is_enum)),
-        #[cfg(feature = "reflection")]
         ("Type", "get_IsValueType") => Some(intrinsic!(type_is_value_type)),
-        #[cfg(feature = "reflection")]
         ("Type", "get_IsClass") => Some(intrinsic!(type_is_class)),
-        #[cfg(feature = "reflection")]
         ("Type", "get_IsInterface") => Some(intrinsic!(type_is_interface)),
         #[cfg(feature = "reflection")]
         ("Type", "get_IsAbstract") => Some(intrinsic!(type_is_abstract)),
@@ -4655,13 +4745,12 @@ fn bcl_intrinsic(
         ("Type", "get_IsPublic") => Some(intrinsic!(type_is_public)),
         #[cfg(feature = "reflection")]
         ("Type", "get_IsNotPublic") => Some(intrinsic!(type_is_not_public)),
-        #[cfg(feature = "reflection")]
         ("Type", "get_IsArray") => Some(intrinsic!(type_is_array)),
-        #[cfg(feature = "reflection")]
+        ("Type", "get_IsPointer") => Some(intrinsic!(type_is_pointer)),
+        ("Type", "GetElementType") => Some(intrinsic!(type_get_element_type)),
+        ("Type", "IsAssignableFrom") => Some(intrinsic!(type_is_assignable_from)),
         ("Type", "op_Equality") => Some(intrinsic!(reflect_handle_equals)),
-        #[cfg(feature = "reflection")]
         ("Type", "op_Inequality") => Some(intrinsic!(reflect_handle_not_equals)),
-        #[cfg(feature = "reflection")]
         ("Type", "HandleEquals") => Some(intrinsic!(reflect_handle_equals)),
         #[cfg(feature = "reflection")]
         ("Type", "GetField") => match parameters_of(signature) {
@@ -4790,22 +4879,22 @@ fn bcl_intrinsic(
             [] => Some(intrinsic!(datetime_now_ticks)),
             _ => None,
         },
-        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+        #[cfg(feature = "float")]
         ("BitConverter", "DoubleToInt64Bits") => match parameters_of(signature) {
             [SigType::R8] => Some(intrinsic!(bitconverter_double_to_int64_bits)),
             _ => None,
         },
-        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+        #[cfg(feature = "float")]
         ("BitConverter", "Int64BitsToDouble") => match parameters_of(signature) {
             [SigType::I8] => Some(intrinsic!(bitconverter_int64_bits_to_double)),
             _ => None,
         },
-        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+        #[cfg(feature = "float")]
         ("BitConverter", "SingleToInt32Bits") => match parameters_of(signature) {
             [SigType::R4] => Some(intrinsic!(bitconverter_single_to_int32_bits)),
             _ => None,
         },
-        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+        #[cfg(feature = "float")]
         ("BitConverter", "Int32BitsToSingle") => match parameters_of(signature) {
             [SigType::I4] => Some(intrinsic!(bitconverter_int32_bits_to_single)),
             _ => None,
@@ -4836,11 +4925,11 @@ fn bcl_intrinsic(
     if base.is_some() {
         return base;
     }
-    #[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
+    #[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections", feature = "float"))]
     {
         extended::extended_intrinsic(type_name, method, signature)
     }
-    #[cfg(not(any(feature = "NETMFv4_4", feature = "text", feature = "collections")))]
+    #[cfg(not(any(feature = "NETMFv4_4", feature = "text", feature = "collections", feature = "float")))]
     {
         None
     }
@@ -5460,6 +5549,26 @@ fn record_custom_attributes(
             let token = Token::new(METHOD_DEF, method.rid());
             let handle = asm_key(asm, token.0);
             record_target_attributes(assembly, module, asm, handle, token);
+            if is_wall_clock_setter(&type_def, &method) {
+                if let Some(setter) = module.resolve_by_handle(handle) {
+                    module.bind_wall_clock_setter(setter);
+                }
+            }
+            if is_wall_clock_source(&type_def, &method) {
+                if let Some(reader) = module.resolve_by_handle(handle) {
+                    module.bind_wall_clock_source(reader);
+                }
+            }
+            if is_pin_event_dispatch(&type_def, &method) {
+                if let Some(dispatch) = module.resolve_by_handle(handle) {
+                    module.bind_pin_event_dispatch(dispatch);
+                }
+            }
+            if is_pin_event_lost(&type_def, &method) {
+                if let Some(report) = module.resolve_by_handle(handle) {
+                    module.bind_pin_event_lost(report);
+                }
+            }
             #[cfg(feature = "reflection")]
             for param in method.params() {
                 record_target_attributes(
@@ -6162,9 +6271,12 @@ fn relink_one(module: &mut Module, heir: &GenericBaseHeir<'_>, base: TypeId) {
 
         let mut virtuals: BTreeMap<String, MethodId> = module.sig_method_keys(base).into_iter().collect();
         for method in &heir.virtuals {
-            virtuals.insert(
+            insert_virtual_dispatch_entry(
+                &mut virtuals,
                 sig_encode(&heir.assembly, &method.name, &method.params, method.generic_arity, &[]),
                 method.id,
+                method.newslot,
+                &heir.relisted,
             );
         }
         if !virtuals.is_empty() {
@@ -6358,6 +6470,74 @@ fn is_enum_type(assembly: &Assembly, extends: Token) -> bool {
 /// identity, so the formatter can no longer name the constant.
 fn is_special_reference_base(name: Option<TypeName<'_>>) -> bool {
     name.is_some_and(|name| name.namespace == "System" && matches!(name.name, "ValueType" | "Enum"))
+}
+
+/// Whether `method` is `Lamella.Runtime.Clock::SetTicks(long)` -- the managed wall clock's setter,
+/// which an embedder installs the time through.
+///
+/// Matched on the declaring type's FULL name and the parameter shape, not the member name alone:
+/// `SetTicks` is an ordinary identifier and a program is free to declare its own. The one-argument
+/// overload is the one recorded, because the two-argument form names a `ClockSource` a runtime
+/// caller has no basis to choose -- an embedder that knows its source calls the managed surface
+/// directly and says so.
+/// Whether `method` is `Lamella.Runtime.Clock::SourceCode()` -- the read half of the wall-clock
+/// door, answering the source as its underlying int so a caller need not name the managed enum.
+fn is_wall_clock_source(type_def: &TypeDef<'_>, method: &Method<'_>) -> bool {
+    method.name() == Some("SourceCode")
+        && is_wall_clock_type(type_def)
+        && parameters_of(method.signature().as_ref()).is_empty()
+}
+
+/// Whether `type_def` is `Lamella.Runtime.Clock`. Matched on the FULL name: `SetTicks` and
+/// `SourceCode` are ordinary identifiers and a program is free to declare its own.
+fn is_wall_clock_type(type_def: &TypeDef<'_>) -> bool {
+    type_def
+        .name()
+        .is_some_and(|name| name.namespace == "Lamella.Runtime" && name.name == "Clock")
+}
+
+/// Whether `type_def` is `Lamella.Hardware.PinEvents`. Matched on the FULL name, exactly as the
+/// clock's is: `Dispatch` is an ordinary identifier and a program is free to declare its own.
+fn is_pin_events_type(type_def: &TypeDef<'_>) -> bool {
+    type_def
+        .name()
+        .is_some_and(|name| name.namespace == "Lamella.Hardware" && name.name == "PinEvents")
+}
+
+/// Whether `method` is `Lamella.Hardware.PinEvents::Dispatch(int, bool)` -- the door a queued
+/// pin-change event reaches managed code through.
+///
+/// The parameter shape is matched as well as the name because it is the runtime's own calling
+/// convention: the token crosses as an `int` and the pad level as a `bool`, which is an I4 slot
+/// (III.1.1.1). A future overload would be a different contract and must not silently bind here.
+fn is_pin_event_dispatch(type_def: &TypeDef<'_>, method: &Method<'_>) -> bool {
+    method.name() == Some("Dispatch")
+        && is_pin_events_type(type_def)
+        && matches!(
+            parameters_of(method.signature().as_ref()),
+            [SigType::I4, SigType::Boolean]
+        )
+}
+
+/// Whether `method` is `Lamella.Hardware.PinEvents::ReportLost()` -- the overflow half of the same
+/// door, called once per drain that dropped something rather than once per event.
+fn is_pin_event_lost(type_def: &TypeDef<'_>, method: &Method<'_>) -> bool {
+    method.name() == Some("ReportLost")
+        && is_pin_events_type(type_def)
+        && parameters_of(method.signature().as_ref()).is_empty()
+}
+
+fn is_wall_clock_setter(
+    type_def: &TypeDef<'_>,
+    method: &Method<'_>,
+) -> bool {
+    if method.name() != Some("SetTicks") {
+        return false;
+    }
+    if !is_wall_clock_type(type_def) {
+        return false;
+    }
+    matches!(parameters_of(method.signature().as_ref()), [SigType::I8])
 }
 
 /// Whether the type `type_token` (a `TypeDef`) carries `[System.FlagsAttribute]`, by scanning its
@@ -6686,18 +6866,27 @@ fn build_sig_methods(
     extends: &[Token],
     virtuals: &[Vec<VirtualMethod>],
     nonvirtuals: &[Vec<VirtualMethod>],
+    relisted: &[BTreeSet<String>],
 ) {
+    let no_relisting: Vec<BTreeSet<String>> = alloc::vec![BTreeSet::new(); extends.len()];
     let mut virtual_memo: Vec<Option<BTreeMap<String, MethodId>>> =
         alloc::vec![None; extends.len()];
     let mut nonvirtual_memo: Vec<Option<BTreeMap<String, MethodId>>> =
         alloc::vec![None; extends.len()];
     for local in 0..extends.len() {
-        let methods = compute_sig_methods(assembly, local, extends, virtuals, &mut virtual_memo);
+        let methods =
+            compute_sig_methods(assembly, local, extends, virtuals, relisted, &mut virtual_memo);
         if !methods.is_empty() {
             module.set_sig_methods((type_offset + local) as u32, methods);
         }
-        let nonvirtual =
-            compute_sig_methods(assembly, local, extends, nonvirtuals, &mut nonvirtual_memo);
+        let nonvirtual = compute_sig_methods(
+            assembly,
+            local,
+            extends,
+            nonvirtuals,
+            &no_relisting,
+            &mut nonvirtual_memo,
+        );
         if !nonvirtual.is_empty() {
             module.set_sig_methods_nonvirtual((type_offset + local) as u32, nonvirtual);
         }
@@ -6705,29 +6894,97 @@ fn build_sig_methods(
 }
 
 /// The memoized signature-keyed method map of `type_id`: its base's map plus its own
-/// virtual methods (a derived method's key replaces the inherited one).
+/// virtual methods.
+///
+/// **A derived method's key replaces the inherited one ONLY WHERE THE LANGUAGE SAYS IT DOES**, and
+/// that is not "always": every insert goes through [`insert_virtual_dispatch_entry`], which is where
+/// ECMA-334 20.4.2's re-listing rule lives for this builder and the two others.
 fn compute_sig_methods(
     assembly: &Assembly,
     type_id: usize,
     extends: &[Token],
     virtuals: &[Vec<VirtualMethod>],
+    relisted: &[BTreeSet<String>],
     memo: &mut [Option<BTreeMap<String, MethodId>>],
 ) -> BTreeMap<String, MethodId> {
     if let Some(methods) = &memo[type_id] {
         return methods.clone();
     }
     let mut methods = match base_type_id(extends[type_id], extends.len()) {
-        Some(base) => compute_sig_methods(assembly, base, extends, virtuals, memo),
+        Some(base) => compute_sig_methods(assembly, base, extends, virtuals, relisted, memo),
         None => BTreeMap::new(),
     };
     for method in &virtuals[type_id] {
-        methods.insert(
-            sig_encode(assembly, &method.name, &method.params, method.generic_arity, &[]),
+        let key = sig_encode(assembly, &method.name, &method.params, method.generic_arity, &[]);
+        insert_virtual_dispatch_entry(
+            &mut methods,
+            key,
             method.id,
+            method.newslot,
+            &relisted[type_id],
         );
     }
     memo[type_id] = Some(methods.clone());
     methods
+}
+
+/// Files a derived virtual method into a signature-keyed dispatch map, honoring ECMA-334 20.4.2.
+///
+/// **A derived method's key replaces the inherited one ONLY WHERE THE LANGUAGE SAYS IT DOES.** A
+/// class that hides a base method with `new virtual` WITHOUT re-listing the interface leaves the
+/// base's interface mapping in force -- the hiding method is what the STATIC type calls and NOT what
+/// the interface reaches. These maps are consulted where the static target has no vtable slot
+/// (interface and abstract dispatch: see `resolve_callvirt`), so an unconditional insert hands the
+/// interface the hiding method and breaks that rule.
+///
+///
+fn insert_virtual_dispatch_entry(
+    methods: &mut BTreeMap<String, MethodId>,
+    key: String,
+    id: MethodId,
+    newslot: bool,
+    relisted: &BTreeSet<String>,
+) {
+    if newslot && methods.contains_key(&key) && !relisted.contains(&key) {
+        return;
+    }
+    methods.insert(key, id);
+}
+
+/// For each local type, the signature keys declared by the interfaces THAT TYPE ITSELF lists.
+///
+/// This is the "re-listed" set ECMA-334 20.4.2 turns on: a type re-implements an interface method
+/// only when the type's own `InterfaceImpl` rows name an interface declaring that signature.
+/// Inherited interfaces are deliberately NOT included -- inheriting the interface is exactly the
+/// case where the base's mapping stays in force.
+///
+fn relisted_interface_keys(
+    assembly: &Assembly,
+    type_count: usize,
+    type_interfaces: &[Vec<Token>],
+) -> Vec<BTreeSet<String>> {
+    let mut per_type: Vec<BTreeSet<String>> = alloc::vec![BTreeSet::new(); type_count];
+    for (local, tokens) in type_interfaces.iter().enumerate() {
+        for token in tokens {
+            if token.table() != TYPE_DEF {
+                continue;
+            }
+            let Some(iface) = assembly.type_def(token.row()) else {
+                continue;
+            };
+            for method in iface.methods() {
+                let name: String = method.name().unwrap_or("").into();
+                let method_sig = method.signature();
+                let params: Vec<SigType> = method_sig
+                    .as_ref()
+                    .map(|sig| sig.parameters.clone())
+                    .unwrap_or_default();
+                let generic_arity = method_sig.as_ref().map_or(0, |sig| sig.generic_param_count);
+                per_type[local].insert(sig_encode(assembly, &name, &params, generic_arity, &[]));
+            }
+        }
+    }
+    per_type
 }
 
 /// Records each `callvirt` token's target signature key and argument count, so the
@@ -7238,7 +7495,12 @@ fn string_ctor_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u
 /// The NETMFv4_4-profile BCL bindings beyond the Kernel Profile, gated by
 /// `NETMFv4_4`: the overload pickers plus the `extended_intrinsic` dispatch `bcl_intrinsic`
 /// delegates to.
-#[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
+#[cfg(any(
+    feature = "NETMFv4_4",
+    feature = "text",
+    feature = "collections",
+    feature = "float"
+))]
 mod extended {
     use super::*;
 
@@ -7296,20 +7558,19 @@ mod extended {
         }
     }
 
-    #[cfg(feature = "NETMFv4_4")]
-    /// `Math.Abs(int)` / `Abs(long)` -- the integer overloads (float/double need libm).
+#[cfg(any(feature = "NETMFv4_4", feature = "float"))]
+    /// `Math.Abs` over `int`, `long` or `double` -- whichever of the three this build carries.
     fn math_abs_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::I4] => Some(intrinsic!(math_abs_int32)),
-            [SigType::I8] => Some(intrinsic!(math_abs_int64)),
-            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            [SigType::R8] => Some(intrinsic!(math_abs_f64)),
+            [SigType::I4] => MATH_ABS_I32,
+            [SigType::I8] => MATH_ABS_I64,
+            [SigType::R8] => MATH_ABS_F64,
             _ => None,
         }
     }
 
     /// A unary `double -> double` `Math` overload (`Floor` / `Ceiling` / `Truncate` / `Round`).
-    #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+    #[cfg(feature = "float")]
     fn math_unary_f64_overload(
         intrinsic: (IntrinsicFn, u32),
         signature: Option<&MethodSig>,
@@ -7320,41 +7581,72 @@ mod extended {
         }
     }
 
-    #[cfg(feature = "NETMFv4_4")]
-    /// A binary `Math` overload (`Max` / `Min`) over two ints or two longs.
+#[cfg(any(feature = "NETMFv4_4", feature = "float"))]
+    /// A binary `Math` overload (`Max` / `Min`) over two ints, two longs or two doubles.
     fn math_binary_overload(
-        int32: (IntrinsicFn, u32),
-        int64: (IntrinsicFn, u32),
+        int32: Option<(IntrinsicFn, u32)>,
+        int64: Option<(IntrinsicFn, u32)>,
         float: Option<(IntrinsicFn, u32)>,
         signature: Option<&MethodSig>,
     ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::I4, SigType::I4] => Some(int32),
-            [SigType::I8, SigType::I8] => Some(int64),
+            [SigType::I4, SigType::I4] => int32,
+            [SigType::I8, SigType::I8] => int64,
             [SigType::R8, SigType::R8] => float,
             _ => None,
         }
     }
 
-    /// The double `Math.Max` / `Math.Min` intrinsics, present only with `float` (and, since they live
-    /// in the NETMFv4_4 `extended` module, only with reflection on).
-    #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+    #[cfg(feature = "NETMFv4_4")]
+    const MATH_ABS_I32: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_abs_int32));
+    #[cfg(not(feature = "NETMFv4_4"))]
+    const MATH_ABS_I32: Option<(IntrinsicFn, u32)> = None;
+    #[cfg(feature = "NETMFv4_4")]
+    const MATH_ABS_I64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_abs_int64));
+    #[cfg(not(feature = "NETMFv4_4"))]
+    const MATH_ABS_I64: Option<(IntrinsicFn, u32)> = None;
+    #[cfg(feature = "float")]
+    const MATH_ABS_F64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_abs_f64));
+    #[cfg(not(feature = "float"))]
+    const MATH_ABS_F64: Option<(IntrinsicFn, u32)> = None;
+    #[cfg(feature = "NETMFv4_4")]
+    const MATH_MAX_I32: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_max_int32));
+    #[cfg(not(feature = "NETMFv4_4"))]
+    const MATH_MAX_I32: Option<(IntrinsicFn, u32)> = None;
+    #[cfg(feature = "NETMFv4_4")]
+    const MATH_MAX_I64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_max_int64));
+    #[cfg(not(feature = "NETMFv4_4"))]
+    const MATH_MAX_I64: Option<(IntrinsicFn, u32)> = None;
+    #[cfg(feature = "NETMFv4_4")]
+    const MATH_MIN_I32: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_min_int32));
+    #[cfg(not(feature = "NETMFv4_4"))]
+    const MATH_MIN_I32: Option<(IntrinsicFn, u32)> = None;
+    #[cfg(feature = "NETMFv4_4")]
+    const MATH_MIN_I64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_min_int64));
+    #[cfg(not(feature = "NETMFv4_4"))]
+    const MATH_MIN_I64: Option<(IntrinsicFn, u32)> = None;
+
+    /// The double `Math.Max` / `Math.Min` intrinsics, present exactly with `float` -- the capability
+    /// the declaration is gated on, which is what makes presence and function agree.
+    #[cfg(feature = "float")]
     const MATH_MAX_F64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_max_f64));
-    #[cfg(not(all(feature = "NETMFv4_4", feature = "float")))]
+    #[cfg(not(feature = "float"))]
     const MATH_MAX_F64: Option<(IntrinsicFn, u32)> = None;
-    #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+    #[cfg(feature = "float")]
     const MATH_MIN_F64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_min_f64));
-    #[cfg(not(all(feature = "NETMFv4_4", feature = "float")))]
+    #[cfg(not(feature = "float"))]
     const MATH_MIN_F64: Option<(IntrinsicFn, u32)> = None;
 
     #[cfg(feature = "NETMFv4_4")]
     /// `Math.Sign(int)` / `Sign(long)` -- both return an `int`.
+    ///
+    /// There is deliberately no `R8` arm: `Math.Sign(double)` throws `ArithmeticException` on NaN,
+    /// and an intrinsic cannot name an exception type -- so the corlib carries a managed body for
+    /// it instead, and both tiers run that one body.
     fn math_sign_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [SigType::I4] => Some(intrinsic!(math_sign_int32)),
             [SigType::I8] => Some(intrinsic!(math_sign_int64)),
-            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            [SigType::R8] => Some(intrinsic!(math_sign_f64)),
             _ => None,
         }
     }
@@ -7624,25 +7916,25 @@ mod extended {
                 }
                 _ => None,
             },
-            #[cfg(feature = "NETMFv4_4")]
+            #[cfg(any(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Abs") => math_abs_overload(signature),
-            #[cfg(feature = "NETMFv4_4")]
+            #[cfg(any(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Max") => {
-                math_binary_overload(intrinsic!(math_max_int32), intrinsic!(math_max_int64), MATH_MAX_F64, signature)
+                math_binary_overload(MATH_MAX_I32, MATH_MAX_I64, MATH_MAX_F64, signature)
             }
-            #[cfg(feature = "NETMFv4_4")]
+            #[cfg(any(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Min") => {
-                math_binary_overload(intrinsic!(math_min_int32), intrinsic!(math_min_int64), MATH_MIN_F64, signature)
+                math_binary_overload(MATH_MIN_I32, MATH_MIN_I64, MATH_MIN_F64, signature)
             }
             #[cfg(feature = "NETMFv4_4")]
             ("Math", "Sign") => math_sign_overload(signature),
             #[cfg(feature = "float")]
             ("Math", "Floor") => math_unary_f64_overload(intrinsic!(math_floor_f64), signature),
-            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+            #[cfg(feature = "float")]
             ("Math", "Ceiling") => math_unary_f64_overload(intrinsic!(math_ceiling_f64), signature),
-            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+            #[cfg(feature = "float")]
             ("Math", "Truncate") => math_unary_f64_overload(intrinsic!(math_truncate_f64), signature),
-            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+            #[cfg(feature = "float")]
             ("Math", "Round") => math_unary_f64_overload(intrinsic!(math_round_f64), signature),
             #[cfg(feature = "math-transcendental")]
             ("Math", "Sqrt") => math_unary_f64_overload(intrinsic!(math_sqrt_f64), signature),

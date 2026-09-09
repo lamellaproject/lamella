@@ -12,6 +12,7 @@ sources = [
 ]
 notes = [
     "SERCOM bases stride 0x400 from 0x42000800; GCLK core-clock IDs stride 1 from 0x14; APBCMASK bits stride 1 from bit 2; NVIC lines stride 1 from 9 -- each row is still stated explicitly (a table is data, not a formula).",
+    "THE RECORD NAMES AN APB *C* BIT AND THE EIC IS ON APB A, so its clock gate cannot be expressed in a row here. It is PM.APBAMASK bit 6, stated in blocks/eic.toml, and that bit is SET at reset -- the reset value is 0x0000007F -- so nothing has to enable it and nothing currently reads it. The gap is recorded rather than closed because widening the record touches every row in this file and changes what every samd21 board emits; the sibling family csp/same54 carries a general apb_mask_offset plus apb_bit pair and has no such limitation, which is where the shape should come from when this is widened.",
 ]
 
 [[instances]]
@@ -93,3 +94,18 @@ base = 0x41004480
 gclk_core_id = -1
 apbc_bit = -1
 irq = -1
+
+# --- the external interrupt controller ------------------------------------------------------------
+#
+# ON APB A RATHER THAN APB C, which is why `apbc_bit` is -1 on this row and not an omission: the
+# gate exists and this record cannot name it. See the table note above and blocks/eic.toml.
+
+[[instances]]
+name = "eic"
+block = "eic"
+base = 0x40001800          # DS40001882D Figure 9-1, AHB-APB Bridge A
+gclk_core_id = 0x05        # GCLK_EIC. Needed only for filtering and synchronous sensing; asynchronous
+                           # edge detection runs without it.
+apbc_bit = -1              # NOT ABSENT: PM.APBAMASK bit 6, which this record cannot express
+irq = 4                    # DS40001882D Table 11-3. ONE line for all sixteen EXTINTs; NMI is separate
+                           # and is not an NVIC line at all.

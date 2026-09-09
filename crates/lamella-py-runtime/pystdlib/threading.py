@@ -7,13 +7,26 @@
 #
 # THE CAP IS FOUR, and it is a property of the family rather than of this tier. The compiled tier's
 # threads carry preallocated native stacks at a fixed address, so four is a hard limit there -- and
-# an interpreter that accepted a fifth would run programs the deployed image refuses, which is the
-# preview inverting in the direction nobody checks. `Thread.start` past the cap raises RuntimeError.
+# an interpreter that accepted a fifth would run programs the deployed image refuses -- the same
+# source behaving differently on the two tiers of one language. `Thread.start` past the cap raises
+# RuntimeError.
 #
 # WHY THESE LOCKS ARE NOT asyncio's. `asyncio.Lock` never blocks a thread: it suspends a coroutine
 # and lets the loop keep running. A lock here BLOCKS the green thread that asked for it, and only a
 # release wakes it. Building one out of the other gives Python a lock that deadlocks an event loop,
 # so they are two primitives that happen to share a name.
+#
+# WHAT IS NOT HERE, named rather than discovered:
+#   * TIMEOUTS. `Lock.acquire(timeout=...)`, `Event.wait(timeout=...)` and `Thread.join(timeout=...)`
+#     raise NotImplementedError. A bounded wait needs a deadline the thread scheduler can park on,
+#     and the deadline machinery in this runtime belongs to the asyncio reactor, which threads do not
+#     go through.
+#   * `threading.local`. It needs `object.__setattr__` to keep its per-thread store out of its own
+#     attribute lookup, and this runtime has no `object.__setattr__`. Keying the store by `id(self)`
+#     instead is unsound here: the collector COMPACTS, so an object's address changes during a run.
+#   * `Condition`, `Semaphore`, `Barrier`, `Timer`, and daemon-thread semantics -- `daemon` is
+#     accepted and remembered, and nothing acts on it. `asyncio` carries the coordination shapes for
+#     the coroutine world; these are the thread ones.
 
 import _thread
 
@@ -159,8 +172,10 @@ class Thread:
     # `Thread(target=fn, args=(...))`, or a subclass overriding `run`.
 
     def __init__(self, group=None, target=None, name=None, args=(), kwargs=None, daemon=None):
-        if group is not None:
-            raise ValueError("group argument must be None for now")
+        # CPython's own line, kept verbatim including the `assert`: it raises AssertionError, not
+        # ValueError, and a program that catches one does not catch the other. Written as an assert
+        # rather than a raise so the shape as well as the message matches upstream.
+        assert group is None, "group argument must be None for now"
         if kwargs:
             raise NotImplementedError(
                 "keyword arguments to a thread target are not supported; bind them with a closure"

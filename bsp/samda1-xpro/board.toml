@@ -1,0 +1,81 @@
+# The SAMDA1 Xplained Pro (ATSAMDA1-XPRO): board truth only -- what is wired to what. Chip
+# truth lives in csp/samda1/.
+#
+# THE VIRTUAL COM PORT'S TWO PADS WERE CHECKED AGAINST THE PART DATASHEET AND THE TWO DOCUMENTS
+# AGREE. Atmel-9400B Table 4-9 gives SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23, and
+# 40001895A Table 7-1 gives both pads in column C against SERCOM3. The check is run on every kit
+# because the SAM R21 Xplained Pro's guide FAILED it -- it puts one UART's two pads on two
+# different SERCOM instances.
+#
+# THIS GUIDE HAS A DEFECT OF ITS OWN, IN A CAPTION RATHER THAN IN A FACT. Its Table 4-7 is titled
+# "External 32.768kHz Crystals" and its contents are the LED connection: one row, PB30, Yellow
+# LED0. The caption is a copy of the crystal table's. The FACT is corroborated independently by
+# the EXT1 header table, which also names PB30 as the onboard LED0, so the binding below is safe
+# -- but anyone reconciling this file against the guide's table titles will not find an LED table.
+
+[table]
+kind = "board"
+board = "samda1-xpro"
+vendor = "microchip"
+family = "samda1"
+part = "atsamda1j16a"
+product_model = 49          # lamella_wire::product_model::SAMDA1_XPLAINED_PRO
+sources = [
+    "SAMDA1 Xplained Pro user guide Atmel-9400B (10/2016) section 4.2.3 and its Table 4-7 (captioned 'External 32.768kHz Crystals', contents the LED connection): one yellow LED0 on PB30, and the section states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'. Corroborated by the EXT1 header table, which names PB30 'Onboard LED0'.",
+    "Atmel-9400B section 4.2.2 and Table 4-6 (Mechanical Buttons): two buttons, RESET on the part's RESETN line and a generic user-configurable SW0 on PA15. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'. Corroborated by the EXT1 header table, which names PA15 'Onboard SW0'.",
+    "Atmel-9400B section 4.3.1 and its SWD Connections table: SWD clock on PA30, SWD data on PA31, and Target Reset on RESETN.",
+    "Atmel-9400B section 4.3.2 and Table 4-9 (Virtual COM Port Connections), corroborated against SAM DA1 datasheet 40001895A Table 7-1 for the instance and the function column -- see the header above.",
+]
+notes = [
+    "ONE CRYSTAL ON THIS KIT, AND THE GUIDE DESCRIBES IT WITHOUT GIVING IT PADS IN A TABLE THIS FILE CAN CITE. Section 4.2.1 says the kit contains one crystal usable as a clock source and describes its cut-strap for measuring the oscillator safety factor. Nothing here binds it, and no pad is reserved on its account, because the pads are not stated where the sibling kits state theirs.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP. It states the polarity and stops there, where the SAM D21 and E51 Curiosity Nano guides both state outright that no pull-up is fitted and that the internal one must be enabled. The absence of the statement is not the presence of a resistor: this is recorded so that a program opening PA15 as a plain input is understood to be relying on something this document does not establish.",
+    "THIS PART HAS USB AND THIS BOARD HAS A RECEPTACLE, AND NOTHING HERE BINDS IT. The USB pads are PA24 and PA25, which carry both the no-DRVSTR limitation and erratum 12368 recorded in csp/samda1/parts.toml. A binding added later owes the erratum's ordering: clear the pull BEFORE enabling the alternative function.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
+baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
+plan = "osc8m-8mhz"         # Atmel-42096 describes the composite device without giving an id
+default = true              # table. Nor can a sibling supply it -- same54-xpro and samw25-xpro
+                            # both answer 0x2111 while samd21-xpro answers 0x2169, so an
+                            # Xplained Pro's product id does not follow from being one. It is
+                            # read off the kit, the way same54-xpro's row records having been.
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom3"
+function = "C"              # SERCOM, not SERCOM-ALT. Both pads also carry a SERCOM5 pad in column
+gclk_gen = 0                # D, so on this board the letter IS a choice between two instances and
+tx = { pin = "PA22", pad = 0 }   # naming the wrong one would bind a UART that reaches no connector.
+rx = { pin = "PA23", pad = 1 }
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB30"
+active = "low"
+source = "Atmel-9400B section 4.2.3: one yellow LED0 on PB30. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic. The pad is stated twice in the guide -- in section 4.2.3's own table and in the EXT1 header table -- which is what makes the mis-captioned table safe to take."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA15"
+active = "low"
+source = "Atmel-9400B section 4.2.2 and Table 4-6: the generic user-configurable button SW0 on PA15, silkscreened SW0. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "Atmel-9400B section 4.3.1 and its SWD Connections table give SWD clock on PA30 and SWD data on PA31 with Target Reset. The guide held here does not document a Cortex Debug Connector section, so the exposure is unknown rather than assumed from sibling kits. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

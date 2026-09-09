@@ -11,7 +11,9 @@ namespace System
             _typeName = fullTypeName;
         }
 
-        [Lamella.Runtime.RuntimeProvided] private string RuntimeTypeName() { return null; }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        private string RuntimeTypeName() { return null; }
 
         public string TypeName
         {

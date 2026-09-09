@@ -1,0 +1,45 @@
+# The SAML22 parts table. The SAM L22 carries the MCLK/PCHCTRL clock architecture, so it rides the
+# same generator arm as the SAM C21 and SAM L21 -- and it agrees with neither about where anything
+# sits. Four families on that architecture now, four PORT bases:
+#
+#     SAM D20/DA1/HA1/R21   0x41004400      SAM C21   0x41000000
+#     SAM L21               0x40002800      SAM L22   0x41006000
+#
+# WARNING: THIS DATASHEET MISPRINTS ONE SERCOM BASE, AND IT IS THE KIND THAT FAILS SILENTLY.
+# Table 12-1 gives SERCOM2 as 0x42000A00. Every other SERCOM in that table strides by 0x400 --
+# 0x42000400, 0x42000800, then 0x42000A00, then 0x42001000 -- which is a 0x200 step followed by a
+# 0x600 one. Figure 8-1 (Product Mapping), READ AS A PICTURE, gives Bridge C as SERCOM0 0x42000400,
+# SERCOM1 0x42000800, SERCOM2 0x42000C00, SERCOM3 0x42001000: a uniform 0x400 stride, and the only
+# value that puts SERCOM3 exactly one stride above SERCOM2. instances.toml takes 0x42000C00.
+#
+# A driver built on the table's value would address the gap between two instances. Reads return
+# whatever is there and writes land nowhere, with no fault and no error bit -- it presents as a
+# wiring or baud problem forever.
+#
+
+[table]
+kind = "parts"
+family = "saml22"
+sources = [
+    "SAM L22 Family Data Sheet DS60001465D (2023): ch 2 (configuration summary), ch 6 (I/O multiplexing), ch 8 (product mapping), ch 12 (peripherals configuration summary)",
+]
+notes = [
+    "THE PAD LIST IS COMPLETE FOR THE N PACKAGE AND IS CHECKED AGAINST AN INDEPENDENTLY PRINTED COUNT. Table 6-1 carries exactly 82 distinct pads and ch 2's 100-pin column states 82 General Purpose I/O-pins. The equality is also the check that no pad in that table belongs only to a smaller package: the N is the largest, so a table carrying more pads than the N has would exceed the count.",
+    "THREE PORT GROUPS, AND THIS BOARD'S LED AND VIRTUAL COM PORT ARE BOTH IN GROUP C. That is new for this family line -- the SAM C21's third group exists only on its 100-pin part and carries its LED; here group C carries the LED, the button and both VCP pads.",
+    "PB10 DOES NOT EXIST ON THIS PART, which is worth naming because it is the SAM L21's LED pad. Nor do PA26, PA28, PA29, PC04, PC22 or PC23.",
+    "SIX SERCOMS ON THE N AND FOUR ON THE SMALLER PARTS. Table 6-1's note 6: 'SAM L22N: SERCOM[0:5]. SAM L22G, L22J: SERCOM[0:3].' No board on this roster is a G or J; recorded because those packages share this table and a reader taking it for the family would carry two instances they do not have.",
+    "EIGHT PADS ARE HIGH SINK AND HAVE DIFFERENT ELECTRICAL PROPERTIES -- Table 6-1's note 3 names PA12, PA13, PA22, PA23, PA27, PA31, PB30 and PB31. Nothing here binds one; recorded because a pad list cannot say what a pad's drive characteristics are and a display or relay would care.",
+]
+
+[[parts]]
+part = "atsaml22n18a"
+package = "100-pin TQFP"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "PA00-PA25", "PA27", "PA30-PA31",
+    "PB00-PB09", "PB11-PB25", "PB30-PB31",
+    "PC00-PC03", "PC05-PC21", "PC24-PC28",
+]
+source = "DS60001465D Table 6-1 (PORT Function Multiplexing), whose L22N column gives a package pin number for each pad above. The list counts 82 and ch 2's 100-pin column states 82 General Purpose I/O-pins. Flash 256 KB and System SRAM 32 KB are ch 2's 100-pin column for the 18 density code, whose Flash row reads 256/128/64KB and System SRAM row 32/16/8KB."
+

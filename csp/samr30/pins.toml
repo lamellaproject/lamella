@@ -1,0 +1,42 @@
+# The SAMR30 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+
+[table]
+kind = "pins"
+family = "samr30"
+sources = [
+    "SAM R30 datasheet DS70005303C Table 7-1 (Port Function Multiplexing). The distinction between column C (SERCOM) and column D (SERCOM-ALT) lives in the table's header row, so a cell in this table does not carry its own meaning and every row below records the letter alongside the pad",
+]
+notes = [
+    "COLUMN C IS SERCOM AND COLUMN D IS SERCOM-ALT. A pin carrying a pad of each has two rows here and they are told apart only by the letter, so a row without its function letter is not a fact.",
+    "NINE FUNCTION LETTERS ON THIS FAMILY, A THROUGH I. Column I is CCL -- Configurable Custom Logic -- and column A is EIC/RSTC rather than the SAM D21 line's plain EIC, because this part can wake from a reset controller input on the same pads.",
+    "THE VCP PADS CARRY A SERCOM IN COLUMN D ONLY, so the letter here is forced rather than chosen: PA04 and PA05 are EMPTY in column C. That is the same shape the sibling samr21 has and the opposite of the saml21's, where both columns are occupied and naming the wrong one binds a different instance.",
+    "NEITHER MAY SERCOM4 GAIN A ROW FOR THE RADIO'S OWN PADS. Its MOSI, SEL, SCLK and MISO are inside the package on peripheral function F -- PB30, PB31, PC18 and PC19 -- and Table 7-1 does not carry them at all; they are in Table 7-2, which is the internal-signal table. Table 7-1 DOES place SERCOM4/PAD[0..3] on PA12..PA15 in column D, and those four pads are real. A row for one of them is not refused on principle; it would simply be a row that takes the transceiver's bus away, and csp/samr30/parts.toml is where that trade is stated.",
+]
+
+# ---- the SAM R30 Xplained Pro's EDBG virtual COM port -------------------------------------------
+#
+# DS50002612A Table 4-12 names SERCOM0 PAD[0] on PA04 and SERCOM0 PAD[1] on PA05 and does not name
+# a function column. Table 7-1 leaves column C empty on both pads and carries SERCOM0 in column D,
+# so the guide's instance is right and the letter it omits is D.
+#
+# THE SIBLING KIT GUIDE GETS THIS WRONG AND THIS ONE DOES NOT. The SAM R21 Xplained Pro guide's
+# same table names SERCOM0 for its TX line and SERCOM1 for its RX line -- two instances for one
+# link, which cannot be right, and csp/samr21/pins.toml records taking the datasheet over it. This
+# kit's guide names SERCOM0 on both rows and agrees with Table 7-1. Checked rather than assumed,
+# because "the R21's guide had a typo here" is a reason to look, not a reason to expect one.
+
+[[pins]]
+pin = "PA04"
+function = "D"
+instance = "sercom0"
+signal = "pad0"
+source = "DS70005303C Table 7-1: the PA04 row (SAMR30G pin 9) is empty in column C and carries SERCOM0/PAD[0] in column D, SERCOM-ALT. Corroborated on the instance and pad by SAM R30 Xplained Pro user guide DS50002612A Table 4-12, which names 'SERCOM0 PAD[0] UART TXD (SAM R30 TX line)' without naming the column."
+
+[[pins]]
+pin = "PA05"
+function = "D"
+instance = "sercom0"
+signal = "pad1"
+source = "DS70005303C Table 7-1: the PA05 row (SAMR30G pin 10) is empty in column C and carries SERCOM0/PAD[1] in column D, SERCOM-ALT. Corroborated by DS50002612A Table 4-12 for the EDBG's RX line, which names the same instance as its TX row."

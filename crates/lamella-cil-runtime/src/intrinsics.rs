@@ -840,6 +840,30 @@ pub fn clock_set_ticks(
     Ok(None)
 }
 
+/// `Lamella.Runtime.Clock.MonotonicMilliseconds()` -> milliseconds from an arbitrary origin that
+/// only ever increases, or `0` where the embedder installed no clock.
+///
+/// THE ONLY RUNTIME SEAM THE WALL CLOCK HAS LEFT. Setting, reading and the anchoring arithmetic are
+/// managed code in `Lamella.Runtime.Clock`; this answers the one question managed code cannot,
+/// because the interpreter core is `no_std` and the counter belongs to the embedder -- a host's
+/// `std::time`, a board's timer peripheral. Both tiers compile the same managed body over this, so
+/// an interpreted program and an ahead-of-time compiled one cannot disagree about a date.
+///
+/// `0` for "no clock" rather than an error: it is the value that makes the elapsed term vanish, so
+/// a never-set clock answers the epoch exactly and a set one answers the instant it was set. A
+/// frozen reading is the documented degradation for a board with no timer.
+///
+/// # Errors
+/// Never; the signature matches the intrinsic ABI (it takes no arguments).
+pub fn clock_monotonic_millis(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let millis = vm.now_millis().unwrap_or(0);
+    Ok(Some(Value::Int64(i64::try_from(millis).unwrap_or(i64::MAX))))
+}
+
 /// `Lamella.Runtime.Clock.IsSet()` -> `1` if the wall clock has been set (RTC / seed / sync), else
 /// `0` (never set -> reading the epoch). The adaptive TLS clock policy keys on this (full
 /// cert-date validation when set, leap-of-faith only when unset).
@@ -851,10 +875,17 @@ pub fn clock_is_set(
     Ok(Some(Value::Int32(i32::from(vm.clock_is_set()))))
 }
 
-/// The additional NETMFv4_4-profile BCL surface, beyond the ECMA-335 Kernel
-/// Profile. Gated by `NETMFv4_4` so a Kernel-only build omits it entirely; its public
-/// intrinsics are re-exported below so `crate::intrinsics::*` paths are unchanged.
-#[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
+/// The BCL surface beyond the ECMA-335 Kernel Profile: the NETMFv4_4 profile's, and the
+/// text, collections and float capabilities'. Compiled when ANY of those is selected, so a
+/// Kernel-only build omits it entirely and a capability-only build still gets its own share;
+/// every intrinsic inside carries its own single-feature gate. Its public intrinsics are
+/// re-exported below so `crate::intrinsics::*` paths are unchanged.
+#[cfg(any(
+    feature = "NETMFv4_4",
+    feature = "text",
+    feature = "collections",
+    feature = "float"
+))]
 mod extended {
     use super::string_arg_chars;
     use crate::interp::Vm;
@@ -1359,8 +1390,7 @@ mod extended {
     /// `System.Math.Sign(double)`: -1, 0, or 1 (returned as an `int`).
     ///
     /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-double argument; [`Trap::InvalidArgument`] for NaN
-    /// (.NET throws `ArithmeticException`).
+    /// [`Trap::TypeMismatch`] for a non-double argument; [`Trap::InvalidArgument`] for NaN.
     #[cfg(feature = "float")]
     pub fn math_sign_f64(
         _vm: &mut Vm,
@@ -1380,6 +1410,7 @@ mod extended {
         };
         Ok(Some(Value::Int32(sign)))
     }
+
 
     /// Truncates `value` toward zero (no libm): an already-integral magnitude (>= 2^52, where
     /// a double has no fractional bits) is returned as-is, else round-tripped through `i64`.
@@ -2768,7 +2799,12 @@ mod extended {
     }
 }
 
-#[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
+#[cfg(any(
+    feature = "NETMFv4_4",
+    feature = "text",
+    feature = "collections",
+    feature = "float"
+))]
 pub use extended::*;
 
 /// `System.Object.ReferenceEquals(object, object)`: reference identity (two nulls are
@@ -2815,6 +2851,15 @@ pub fn object_reference_equals(
 /// cannot re-enter managed dispatch, so [`struct_fields_equal`] answers that walk directly: nested
 /// value types recurse, a field holding a STRING compares by its characters, and any other object
 /// reference compares by reference.
+///
+/// DIVERGES FROM .NET, WHICH THE STANDARD DOES NOT DECIDE EITHER WAY: a field holding an instance
+/// of a CLASS that overrides `Equals` compares equal here only when the two fields are the same
+/// object, where .NET calls that override. ECMA-335 7.2.5.2 asks only that equality be an
+/// equivalence operator, that identity imply equality, and that a boxed operand be unboxed before
+/// comparison -- all of which this satisfies. The field walk itself is described in the standard's
+/// XML library specification rather than in the partition text, so .NET's behavior is the
+/// reference here and the clause is not. Every other field shape -- the numeric, `char`, `bool`,
+/// `string` and nested-value-type fields a value type is normally made of -- agrees with .NET.
 ///
 /// # Errors
 /// Never; the signature matches the intrinsic ABI.
@@ -3815,6 +3860,25 @@ pub fn thread_start(
     let id = vm.alloc_thread_id();
     vm.request_spawn(id, method, target, background);
     Ok(Some(Value::Int32(id as i32)))
+}
+
+/// `System.Threading.Thread.ThreadFinished(int)`: whether thread `id` has run to completion.
+///
+/// Backs `Thread.IsAlive`, which answered a hard-coded `true` before this existed -- so an unstarted
+/// thread and a finished one both reported themselves alive. The scheduler publishes this at the one
+/// site that marks a thread `Done`; see `Vm::mark_thread_finished`.
+///
+/// It is NOT consumed on read, unlike the timed-park verdict beside it: a thread stays finished and
+/// `IsAlive` may be asked any number of times.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an int.
+pub fn thread_finished(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(id)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let finished = vm.is_thread_finished(id as u32);
+    Ok(Some(Value::Int32(i32::from(finished))))
 }
 
 /// `System.Threading.Thread.JoinThread(int)`: blocks the running thread until thread `id` finishes.
@@ -6351,7 +6415,6 @@ pub fn type_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a type handle or names no recorded type.
-#[cfg(feature = "reflection")]
 fn reflect_type_of(
     module: &Module,
     args: &[Value],
@@ -6366,7 +6429,6 @@ fn reflect_type_of(
 
 /// Reads a boolean kind bit from the receiver `Type`'s recorded reflection metadata (a C# `bool`
 /// is a 0/1 `int32` on the stack).
-#[cfg(feature = "reflection")]
 fn type_kind_bit(
     module: &Module,
     args: &[Value],
@@ -6380,7 +6442,6 @@ fn type_kind_bit(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "reflection")]
 pub fn type_get_full_name(
     vm: &mut Vm,
     module: &Module,
@@ -6414,7 +6475,6 @@ pub fn type_get_namespace(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "reflection")]
 pub fn type_is_enum(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     type_kind_bit(module, args, |info| info.is_enum)
 }
@@ -6423,7 +6483,6 @@ pub fn type_is_enum(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "reflection")]
 pub fn type_is_value_type(
     _vm: &mut Vm,
     module: &Module,
@@ -6436,7 +6495,6 @@ pub fn type_is_value_type(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "reflection")]
 pub fn type_is_class(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     type_kind_bit(module, args, |info| !info.is_interface && !info.is_value_type)
 }
@@ -6445,7 +6503,6 @@ pub fn type_is_class(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Op
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "reflection")]
 pub fn type_is_interface(
     _vm: &mut Vm,
     module: &Module,
@@ -6499,13 +6556,93 @@ pub fn type_is_not_public(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "reflection")]
 pub fn type_is_array(
     _vm: &mut Vm,
     _module: &Module,
     _args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     Ok(Some(Value::Int32(0)))
+}
+
+/// `System.Type.get_IsPointer` (`Type.IsPointer`): false, for the same reason `type_is_array`
+/// answers false -- a `Type` here is a `TypeDef` handle, and a pointer type is a `TypeSpec`.
+///
+/// KEPT AS A SEAM RATHER THAN A MANAGED `return false`, and that is the whole point of writing it
+/// this way: the constant belongs to the runtime's TYPE MODEL, not to the class library. When a
+/// `Type` can name a `TypeSpec`, this function and `type_is_array` become real together, and a
+/// managed constant would have had to be found and changed instead.
+///
+/// # Errors
+/// Never errors.
+pub fn type_is_pointer(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(0)))
+}
+
+/// `System.Type.GetElementType()`: the array/pointer/byref element type, or null.
+///
+/// Null on this runtime, and the standard says null is the right answer rather than a failure:
+/// Partition IV gives the element type when the receiver represents an array, a pointer or an
+/// argument passed by reference, and specifies "Otherwise, returns null" for anything else. A
+/// `TypeDef` handle is none of those three, so every receiver reachable here takes the
+/// "otherwise" arm. Same seam reasoning as `type_is_pointer`.
+///
+/// # Errors
+/// Never errors.
+pub fn type_get_element_type(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Null))
+}
+
+/// `System.Type.IsAssignableFrom(Type)`: whether an instance of the receiver can be assigned from
+/// an instance of `c`.
+///
+/// Partition IV gives three true-cases and one false-case, and this implements exactly those:
+/// false when `c` is null; otherwise true if `c` and the receiver are the same type, if the
+/// receiver is in `c`'s INHERITANCE HIERARCHY, or if the receiver is an interface and `c` supports
+/// it. `Module::is_subtype` covers the first two together (its walk starts at `c` itself, so
+/// identity falls out of it) and `Module::implements_interface` covers the third, walking both the
+/// base chain and the interface-extends graph.
+///
+/// THE DIRECTION IS THE THING TO GET RIGHT AND IT READS BACKWARDS: the RECEIVER is the target being
+/// assigned TO, and `c` is the source. So the subtype question is "is `c` a subtype of the
+/// receiver", not the reverse -- `typeof(object).IsAssignableFrom(typeof(string))` is true and the
+/// swap is silently false for every pair that is not identical.
+///
+/// An unresolvable handle on either side answers FALSE rather than trapping. A `Type` the module
+/// cannot resolve is one this program cannot have an instance of, so nothing is assignable from it
+/// -- and a predicate that traps where .NET answers a boolean would turn a legal test into a fault.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle.
+pub fn type_is_assignable_from(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(receiver)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let source = match args.get(1) {
+        Some(&Value::NativeInt(handle)) => handle as u64,
+        Some(&Value::Null) | None => return Ok(Some(Value::Int32(0))),
+        Some(_) => return Err(Trap::TypeMismatch(Opcode::Callvirt)),
+    };
+    let (Some(target_id), Some(source_id)) = (
+        module.type_id_by_handle(receiver as u64),
+        module.type_id_by_handle(source),
+    ) else {
+        return Ok(Some(Value::Int32(i32::from(receiver as u64 == source))));
+    };
+    let assignable = module.is_subtype(source_id, target_id)
+        || module.implements_interface(source_id, target_id);
+    Ok(Some(Value::Int32(i32::from(assignable))))
 }
 
 /// `System.Type.get_Assembly` (`Type.Assembly`): the declaring assembly, modeled as the
@@ -6639,7 +6776,6 @@ pub fn member_get_type(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "reflection")]
 pub fn type_get_base_type(
     _vm: &mut Vm,
     module: &Module,
@@ -6756,6 +6892,61 @@ pub fn assembly_full_name(
     let asm = (reflect_handle(args.first()) as u64 >> 32) as u8;
     let name = module.assembly_name(asm).unwrap_or("");
     Ok(Some(alloc_str(vm, name)))
+}
+
+/// `System.AppDomain.DomainFriendlyName()`: the ENTRY ASSEMBLY'S SIMPLE NAME, which is what .NET
+/// answers for `AppDomain.CurrentDomain.FriendlyName` (measured: a program built as `ad-oracle.dll`
+/// reports `ad-oracle`).
+///
+/// The loader records assembly names in their `Assembly.FullName` form -- `name, Version=...,
+/// Culture=..., PublicKeyToken=...` -- so the simple name is the head of that, up to the first
+/// comma. Trimmed rather than re-derived, because the loader's spelling is the one `Assembly`
+/// itself answers and a second derivation could disagree with it.
+///
+/// Empty when nothing entered an assembly (a library loaded for inspection, or a session driven at
+/// a method the caller chose): .NET always has an entry assembly and this runtime need not.
+///
+/// # Errors
+/// Never errors.
+pub fn app_domain_friendly_name(
+    vm: &mut Vm,
+    module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let full = module
+        .entry_assembly()
+        .and_then(|asm| module.assembly_name(asm))
+        .unwrap_or("");
+    let simple = match full.find(',') {
+        Some(comma) => &full[..comma],
+        None => full,
+    };
+    Ok(Some(alloc_str(vm, simple)))
+}
+
+/// `System.AppDomain.DomainAssemblies()`: every loaded assembly as an `Assembly[]` of handles, in
+/// load order (corlib, then each deployed library, then the program -- which is ascending assembly
+/// id).
+///
+/// An `Assembly` handle is its assembly id in the high 32 bits with a zero token, the same shape
+/// `Type.get_Assembly` produces by masking a type handle -- so a handle from here and one reached
+/// through `typeof(T).Assembly` compare equal for the same assembly.
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "reflection")]
+pub fn app_domain_assemblies(
+    vm: &mut Vm,
+    module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let elements: Vec<Value> = module
+        .assembly_ids()
+        .into_iter()
+        .map(|asm| Value::NativeInt(((u64::from(asm)) << 32) as i64))
+        .collect();
+    let array = vm.heap_mut().alloc_array(elements);
+    Ok(Some(Value::Object(array)))
 }
 
 /// `Assembly.GetTypes()`: the assembly's declared types as a `Type[]` of their handles (the loader
@@ -7164,14 +7355,12 @@ fn reflect_handle(arg: Option<&Value>) -> i64 {
 /// One operand of a reflection `==`/`!=`, by representation: most reflection references are
 /// token-only HANDLES (a native int), but a composed member (the managed `PropertyInfo` /
 /// `EventInfo`) is a heap INSTANCE -- so `info != null` must see the reference, not a handle.
-#[cfg(feature = "reflection")]
 enum ReflectOperand {
     Handle(i64),
     Reference(ObjectRef),
     Null,
 }
 
-#[cfg(feature = "reflection")]
 fn reflect_operand(arg: Option<&Value>) -> ReflectOperand {
     match arg {
         Some(&Value::NativeInt(handle)) => ReflectOperand::Handle(handle),
@@ -7183,7 +7372,6 @@ fn reflect_operand(arg: Option<&Value>) -> ReflectOperand {
 /// Reflection reference equality across both representations: handles compare canonicalized
 /// (a `TypeRef` and its defining `TypeDef` are the same type), instances compare by reference,
 /// and a null equals only null. Mixed shapes are never equal.
-#[cfg(feature = "reflection")]
 fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&Value>) -> bool {
     match (reflect_operand(left), reflect_operand(right)) {
         (ReflectOperand::Handle(left), ReflectOperand::Handle(right)) => {
@@ -7202,7 +7390,6 @@ fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&
 /// exact type identity, matching .NET's reference equality. A non-type handle (a member's `Field`/
 /// `MethodDef` token, an `Assembly`, an untracked array/pointer `TypeSpec`) has no `TypeId` and is
 /// compared by its own token -- which is exactly the member/assembly identity reflection wants.
-#[cfg(feature = "reflection")]
 fn canonical_reflect_handle(module: &Module, handle: i64) -> i64 {
     module
         .canonical_type_handle(handle as u64)
@@ -7215,7 +7402,6 @@ fn canonical_reflect_handle(module: &Module, handle: i64) -> i64 {
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "reflection")]
 pub fn reflect_handle_equals(
     _vm: &mut Vm,
     module: &Module,
@@ -7229,7 +7415,6 @@ pub fn reflect_handle_equals(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "reflection")]
 pub fn reflect_handle_not_equals(
     _vm: &mut Vm,
     module: &Module,
@@ -8472,6 +8657,96 @@ mod tests {
     use alloc::vec;
     use lamella_cil::{Instruction, MethodBodyImage, Operand};
     use lamella_token::Token;
+
+    /// `Type.IsAssignableFrom` -- the only one of the five BCL-baseline members that carries real
+    /// logic rather than a type-model constant, so it is the one that can be wrong. Partition IV gives three true-cases and one false-case and each
+    /// is asserted here, IN BOTH DIRECTIONS: the direction is the part of this contract that reads
+    /// backwards, and a swapped implementation passes every reflexive test while failing every
+    /// interesting one.
+    ///
+    /// UNGATED, deliberately. These members are floor -- the standard requires them with the
+    /// reflection knob off -- so a test behind `#[cfg(feature = "reflection")]` would run in
+    /// exactly the builds that do not need the guarantee.
+    #[test]
+    fn is_assignable_from_answers_the_four_partition_iv_cases() {
+        let mut module = Module::new();
+        let base = module.add_type(Vec::new());
+        let derived = module.add_type(Vec::new());
+        let unrelated = module.add_type(Vec::new());
+        let iface = module.add_type(Vec::new());
+        let implementor = module.add_type(Vec::new());
+
+        module.set_type_base(derived, Some(base));
+        module.set_type_interfaces(implementor, Vec::from([iface]));
+
+        let handle = |n: u32| crate::module::asm_key(0, 0x0200_0000 | n);
+        for (n, id) in [(1u32, base), (2, derived), (3, unrelated), (4, iface), (5, implementor)] {
+            module.bind_type_token(0, Token(0x0200_0000 | n), id);
+        }
+
+        let mut vm = Vm::new();
+        let ask = |vm: &mut Vm, target: u32, source: Option<u32>| {
+            let args = match source {
+                Some(s) => vec![
+                    Value::NativeInt(handle(target) as i64),
+                    Value::NativeInt(handle(s) as i64),
+                ],
+                None => vec![Value::NativeInt(handle(target) as i64), Value::Null],
+            };
+            match type_is_assignable_from(vm, &module, &args) {
+                Ok(Some(Value::Int32(n))) => n != 0,
+                other => panic!("IsAssignableFrom returned {other:?}"),
+            }
+        };
+
+        assert!(!ask(&mut vm, 1, None), "IsAssignableFrom(null) is false, never a trap");
+
+        assert!(ask(&mut vm, 1, Some(1)), "a type is assignable from itself");
+
+        assert!(ask(&mut vm, 1, Some(2)), "base IsAssignableFrom derived");
+        assert!(
+            !ask(&mut vm, 2, Some(1)),
+            "derived is NOT assignable from base -- the direction, which is the whole test"
+        );
+
+        assert!(ask(&mut vm, 4, Some(5)), "an interface IsAssignableFrom its implementor");
+        assert!(
+            !ask(&mut vm, 5, Some(4)),
+            "an implementor is NOT assignable from the interface"
+        );
+
+        assert!(!ask(&mut vm, 1, Some(3)));
+        assert!(!ask(&mut vm, 3, Some(1)));
+    }
+
+    /// The three members that answer from the runtime's TYPE MODEL rather than from metadata: a
+    /// `Type` here is a `TypeDef` handle, and an array/pointer/byref type is a `TypeSpec`. They are
+    /// asserted together with `type_is_array`, which has always answered this way, because the
+    /// three of them are one claim and the day it stops being true they must move together.
+    #[test]
+    fn the_type_model_answers_array_and_pointer_shapes_consistently() {
+        let mut module = Module::new();
+        let a_type = module.add_type(Vec::new());
+        module.bind_type_token(0, Token(0x0200_0001), a_type);
+        let args = vec![Value::NativeInt(crate::module::asm_key(0, 0x0200_0001) as i64)];
+        let mut vm = Vm::new();
+
+        assert_eq!(
+            type_is_array(&mut vm, &module, &args),
+            Ok(Some(Value::Int32(0))),
+            "a TypeDef handle never names an array type"
+        );
+        assert_eq!(
+            type_is_pointer(&mut vm, &module, &args),
+            Ok(Some(Value::Int32(0))),
+            "nor a pointer type -- same reason, and IsArray already answered it"
+        );
+        assert_eq!(
+            type_get_element_type(&mut vm, &module, &args),
+            Ok(Some(Value::Null)),
+            "so GetElementType takes Partition IV's `otherwise, returns null` arm"
+        );
+    }
 
     /// .NET notation anchors for the default (no-format) float rendering: fixed-point
     /// inside (-5, 17) for a double and (-5, 9) for a single, scientific outside,

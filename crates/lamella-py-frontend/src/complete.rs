@@ -152,7 +152,7 @@ const BUILTINS: &[BuiltinName] = &[
         label: "dir",
         signature: "dir([obj])",
         is_type: false,
-        needs: Some(Capability::Introspection),
+        needs: Some(Capability::Reflection),
     },
     BuiltinName { label: "divmod", signature: "divmod(a, b)", is_type: false, needs: None },
     BuiltinName {
@@ -931,7 +931,7 @@ mod tests {
         assert!(!labels(&at_profile("comp|\n", no_float)).contains(&"complex"));
         assert!(labels(&at_profile("comp|\n", Profile::FULL)).contains(&"complex"));
 
-        let no_dir = Profile::FULL.without(Capability::Introspection);
+        let no_dir = Profile::FULL.without(Capability::Reflection);
         assert!(labels(&at_profile("di|\n", Profile::FULL)).contains(&"dir"));
         assert!(!labels(&at_profile("di|\n", no_dir)).contains(&"dir"));
     }

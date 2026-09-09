@@ -26,6 +26,12 @@ namespace Lamella.Generated
         public const uint VCP_APBC_MASK = 0x40;
         public const uint VCP_PMUX_REG = 0x410044B5;
         public const uint VCP_PMUX_PAIR = 0x33;
+        public const uint VCP_PMUX_TX_REG = 0x410044B5;
+        public const uint VCP_PMUX_TX_MASK = 0xF;
+        public const uint VCP_PMUX_TX_VALUE = 0x3;
+        public const uint VCP_PMUX_RX_REG = 0x410044B5;
+        public const uint VCP_PMUX_RX_MASK = 0xF0;
+        public const uint VCP_PMUX_RX_VALUE = 0x30;
         public const uint VCP_PINCFG_TX_REG = 0x410044CA;
         public const uint VCP_PINCFG_RX_REG = 0x410044CB;
         public const uint VCP_TXPO = 1;

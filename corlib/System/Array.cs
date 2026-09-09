@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Array
 namespace System
 {
-    public abstract class Array : ICloneable
+    public abstract class Array : ICloneable, System.Collections.IEnumerable
     {
         public int Length { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
         public int Rank { [Lamella.Runtime.RuntimeProvided] get { return 0; } }

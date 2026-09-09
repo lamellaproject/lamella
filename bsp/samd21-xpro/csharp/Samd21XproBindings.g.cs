@@ -25,10 +25,25 @@ namespace Lamella.Generated
         public const uint VCP_APBC_MASK = 0x20;
         public const uint VCP_PMUX_REG = 0x4100443B;
         public const uint VCP_PMUX_PAIR = 0x22;
+        public const uint VCP_PMUX_TX_REG = 0x4100443B;
+        public const uint VCP_PMUX_TX_MASK = 0xF;
+        public const uint VCP_PMUX_TX_VALUE = 0x2;
+        public const uint VCP_PMUX_RX_REG = 0x4100443B;
+        public const uint VCP_PMUX_RX_MASK = 0xF0;
+        public const uint VCP_PMUX_RX_VALUE = 0x20;
         public const uint VCP_PINCFG_TX_REG = 0x41004456;
         public const uint VCP_PINCFG_RX_REG = 0x41004457;
         public const uint VCP_TXPO = 0;
         public const uint VCP_RXPO = 1;
         public const uint VCP_BAUD_115200_OSC8M_8MHZ = 0xC505;
+
+        public const uint LED0_PORT_BASE = 0x41004480;
+        public const uint LED0_PIN = 30;
+        public const uint LED0_MASK = 0x40000000;
+        public const uint LED0_ACTIVE_LOW = 1;
+        public const uint BUTTON0_PORT_BASE = 0x41004400;
+        public const uint BUTTON0_PIN = 15;
+        public const uint BUTTON0_MASK = 0x8000;
+        public const uint BUTTON0_ACTIVE_LOW = 1;
     }
 }

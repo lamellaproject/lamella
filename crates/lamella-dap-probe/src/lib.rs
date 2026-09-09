@@ -10,8 +10,12 @@ use lamella_probe_core::{ProbeError, TargetAccess};
 /// The DCRSR selector of the program counter. Selectors 0-15 are `r0`-`r15`, 16 is `xPSR`.
 const PC: u8 = 15;
 
-/// The Flash Patch and Breakpoint unit's control register: bit 0 ENABLE, bit 1 KEY, bits [7:4]
-/// NUM_CODE (how many code comparators the unit implements).
+/// The Flash Patch and Breakpoint unit's control register: bit 0 ENABLE, bit 1 KEY, and NUM_CODE
+/// (how many code comparators the unit implements) SPLIT across bits [14:12] and [7:4].
+///
+/// The split is why the count is decoded by `cortex_m::fpb_num_code` rather than by a shift here: a
+/// low-nibble read returns a plausible number for every part with fewer than 16 comparators, which
+/// is most of them, so the truncation shows up only on the parts nobody tested it against.
 const FP_CTRL: u32 = 0xe000_2000;
 
 /// The core registers reported to a debugger, in DCRSR selector order.
@@ -64,6 +68,10 @@ pub struct ProbeBackend<T: TargetAccess> {
     pc: u32,
     /// Whether the target was left running by a `resume`, so `poll` knows to look.
     running: bool,
+    /// Whether a `launch` has put the target under control. Distinguishes "there is nothing to
+    /// program yet" -- where a stored breakpoint set is normal and is armed by `launch` -- from
+    /// "the programming failed", which are the same silence without it.
+    launched: bool,
 }
 
 impl<T: TargetAccess> ProbeBackend<T> {
@@ -77,6 +85,7 @@ impl<T: TargetAccess> ProbeBackend<T> {
             comparators: None,
             pc: 0,
             running: false,
+            launched: false,
         }
     }
 
@@ -115,25 +124,40 @@ impl<T: TargetAccess> ProbeBackend<T> {
     }
 
     /// Pushes the current breakpoint set to the unit.
+    ///
+    /// # Refusing a part with no comparators
+    ///
+    /// A unit reporting zero comparators cannot hold a breakpoint, and `take(0)` would quietly send
+    /// an EMPTY set -- which the target accepts, because zero requested against zero available is
+    /// not an overflow. **The caller would be told nothing and nothing would be armed.** So the
+    /// truthful capacity from [`Self::read_comparators`] and this refusal have to land together:
+    /// reporting zero honestly makes the failure QUIETER unless something acts on it.
     fn arm(&mut self) -> Result<(), ProbeError> {
         let armed: Vec<u32> = match self.comparators {
+            Some(0) if !self.breakpoints.is_empty() => {
+                return Err(ProbeError::Device(
+                    "the target's breakpoint unit reports no comparators, so no breakpoint can be set",
+                ));
+            }
             Some(limit) => self.breakpoints.iter().copied().take(limit).collect(),
             None => self.breakpoints.clone(),
         };
         self.target.borrow_mut().set_breakpoints(&armed)
     }
 
-    /// Reads the breakpoint unit's comparator count from `FP_CTRL`, or `None` if the register does
-    /// not read back a plausible count -- in which case no limit is claimed, since claiming a wrong
-    /// one is worse than claiming none.
+    /// Reads the breakpoint unit's comparator count from `FP_CTRL`, or `None` if the register could
+    /// not be read at all.
+    ///
+    /// # Zero is an answer, not a failure
+    ///
+    /// The architecture assigns zero a meaning: "Zero indicates no Instruction Address comparators
+    /// are implemented" (Armv8-M ARM, `FP_CTRL.NUM_CODE`). So a part reporting zero is telling us
+    /// its capacity precisely, and reporting that as "no limit known" inverts it -- the most
+    /// definite answer the register can give would become the least. **`None` here means only that
+    /// the read failed, which is also the pre-launch state.**
     fn read_comparators(&mut self) -> Option<usize> {
         let ctrl = self.target.borrow_mut().read_word(FP_CTRL).ok()?;
-        let count = ((ctrl >> 4) & 0xf) as usize;
-        if count == 0 {
-            None
-        } else {
-            Some(count)
-        }
+        Some(lamella_probe_core::cortex_m::fpb_num_code(ctrl) as usize)
     }
 }
 
@@ -155,6 +179,7 @@ impl<T: TargetAccess> DebugBackend for ProbeBackend<T> {
         self.comparators = self.read_comparators();
         self.sync_pc();
         self.running = false;
+        self.launched = true;
         self.arm().is_ok()
     }
 
@@ -220,12 +245,25 @@ impl<T: TargetAccess> DebugBackend for ProbeBackend<T> {
         1
     }
 
-    fn set_breakpoints(&mut self, addresses: &[u64]) {
+    fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
         self.breakpoints = addresses
             .iter()
             .filter_map(|&address| u32::try_from(address).ok())
             .collect();
-        let _ = self.arm();
+        let dropped = addresses.len() - self.breakpoints.len();
+
+        if self.launched {
+            self.arm()
+                .map_err(|error| format!("could not arm breakpoints on the target: {error}"))?;
+        }
+
+        if dropped > 0 {
+            return Err(format!(
+                "{dropped} of {} breakpoints are outside this target's 32-bit address space and were not armed",
+                addresses.len()
+            ));
+        }
+        Ok(())
     }
 
     fn max_breakpoints(&self) -> Option<usize> {
@@ -323,6 +361,8 @@ mod tests {
         /// Where the target lands when it stops running.
         lands_at: u32,
         fail_connect: bool,
+        /// A unit that refuses the write, so the test can distinguish "armed" from "asked to arm".
+        fail_breakpoints: bool,
     }
 
     impl FakeTarget {
@@ -444,6 +484,9 @@ mod tests {
             Ok(())
         }
         fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+            if self.fail_breakpoints {
+                return Err(ProbeError::Device("the unit refused the write"));
+            }
             self.armed = addresses.to_vec();
             Ok(())
         }
@@ -488,22 +531,44 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_that_reports_no_comparators_claims_no_limit() {
+    fn a_unit_that_reports_no_comparators_reports_zero_rather_than_unknown() {
         let mut target = FakeTarget::with_pc(0x1000);
         target.memory.insert(FP_CTRL, 0x0000_0003);
         let mut backend = ProbeBackend::new(target, Start::Reset);
         assert!(backend.launch());
         assert_eq!(
             backend.max_breakpoints(),
-            None,
-            "an implausible count must not be reported as a real limit"
+            Some(0),
+            "the architecture gives zero a meaning -- no comparators implemented -- so reporting it \
+             as `None` would turn the register's most definite answer into its least"
+        );
+    }
+
+    #[test]
+    fn a_unit_with_no_comparators_refuses_a_breakpoint_instead_of_arming_nothing() {
+        let mut target = FakeTarget::with_pc(0x1000);
+        target.memory.insert(FP_CTRL, 0x0000_0003);
+        let mut backend = ProbeBackend::new(target, Start::Reset);
+        assert!(backend.launch());
+        backend.breakpoints = vec![0x2100];
+        let refused = backend.arm();
+        assert!(
+            refused.is_err(),
+            "a part that implements no comparators must refuse a breakpoint, not silently arm none"
+        );
+        assert!(
+            backend.into_target().armed.is_empty(),
+            "and it must refuse BEFORE touching the unit"
         );
     }
 
     #[test]
     fn breakpoints_set_before_launch_are_armed_by_it() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x2000), Start::Reset);
-        backend.set_breakpoints(&[0x2100, 0x2200]);
+        assert!(
+            backend.set_breakpoints(&[0x2100, 0x2200]).is_ok(),
+            "before launch there is no target to program, so this is not a failure to report"
+        );
         assert!(backend.launch());
         let armed = backend.into_target().armed;
         assert_eq!(
@@ -517,7 +582,10 @@ mod tests {
     fn breakpoints_past_the_comparator_count_are_not_sent_to_the_unit() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x2000), Start::Reset);
         assert!(backend.launch());
-        backend.set_breakpoints(&[1, 2, 3, 4, 5, 6]);
+        assert!(
+            backend.set_breakpoints(&[1, 2, 3, 4, 5, 6]).is_ok(),
+            "truncation at max_breakpoints is the PREDICTED case, already greyed by the adapter"
+        );
         assert_eq!(backend.max_breakpoints(), Some(4));
         let armed = backend.into_target().armed;
         assert_eq!(armed.len(), 4, "only as many as the unit implements");
@@ -525,26 +593,51 @@ mod tests {
     }
 
     #[test]
-    fn without_a_known_limit_every_breakpoint_is_armed() {
+    fn with_room_to_spare_every_breakpoint_is_armed() {
         let mut target = FakeTarget::with_pc(0x2000);
-        target.memory.insert(FP_CTRL, 0x0000_0003);
+        target.memory.insert(FP_CTRL, 0x0000_0083);
         let mut backend = ProbeBackend::new(target, Start::Reset);
         assert!(backend.launch());
-        assert_eq!(backend.max_breakpoints(), None);
-        backend.set_breakpoints(&[1, 2, 3, 4, 5, 6]);
-        assert_eq!(backend.into_target().armed.len(), 6);
+        assert_eq!(backend.max_breakpoints(), Some(8));
+        assert!(backend.set_breakpoints(&[1, 2, 3, 4, 5, 6]).is_ok());
+        assert_eq!(
+            backend.into_target().armed.len(),
+            6,
+            "eight comparators hold six breakpoints, so the limit must not truncate here"
+        );
+    }
+
+    #[test]
+    fn a_unit_that_refuses_the_write_is_reported_rather_than_swallowed() {
+        let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x2000), Start::Reset);
+        assert!(backend.launch());
+        backend.target.borrow_mut().fail_breakpoints = true;
+        let Err(reason) = backend.set_breakpoints(&[0x2100]) else {
+            panic!("a unit that refused the write must say so, not report an armed breakpoint");
+        };
+        assert!(
+            reason.contains("the unit refused the write"),
+            "and the target's own reason must survive to the editor: {reason}"
+        );
     }
 
     #[test]
     fn an_address_too_wide_for_the_target_is_dropped_not_truncated() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x2000), Start::Reset);
         assert!(backend.launch());
-        backend.set_breakpoints(&[0x1_0000_2100, 0x2200]);
+        let outcome = backend.set_breakpoints(&[0x1_0000_2100, 0x2200]);
         let armed = backend.into_target().armed;
         assert_eq!(
             armed,
             vec![0x2200],
             "truncating would arm 0x2100 -- a real address nobody asked for"
+        );
+        let Err(reason) = outcome else {
+            panic!("an address this target cannot hold must be reported, not just dropped");
+        };
+        assert!(
+            reason.contains("1 of 2"),
+            "the reason must say how many were dropped, not merely that something was: {reason}"
         );
     }
 
@@ -555,7 +648,7 @@ mod tests {
         target.lands_at = 0x3400;
         let mut backend = ProbeBackend::new(target, Start::Reset);
         assert!(backend.launch());
-        backend.set_breakpoints(&[0x3400]);
+        assert!(backend.set_breakpoints(&[0x3400]).is_ok());
 
         assert!(matches!(backend.resume(), Stop::Running), "a probe target is free-running");
         assert!(matches!(backend.poll(), Stop::Running));
@@ -573,7 +666,7 @@ mod tests {
         target.lands_at = 0x3fff;
         let mut backend = ProbeBackend::new(target, Start::Reset);
         assert!(backend.launch());
-        backend.set_breakpoints(&[0x3400]);
+        assert!(backend.set_breakpoints(&[0x3400]).is_ok());
         assert!(matches!(backend.resume(), Stop::Running));
         assert!(
             matches!(backend.poll(), Stop::Step),

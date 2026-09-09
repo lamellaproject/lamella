@@ -5,12 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The shared garbage-collection contract: root reporting, the trace and allocator seams."
+description = "A garbage-collection contract and its mark-compact collector: root reporting, the trace and allocator seams."
 
-# A leaf: the GC contract both the interpreter (lamella-cil-runtime) and the AOT backend
-# (lamella-aot) implement against. No dependencies -- it only defines the shapes.
+# A leaf: the GC contract and engine, with no dependencies of its own.
 publish = false
 [dependencies]
+
+# Tests only, and one test only: `tests/the_backend_writes_what_this_crate_reads.rs` decodes bytes
+# produced by the emitter itself rather than by a copy of it. A dev-dependency does not reach a
+# consumer, so the crate stays the leaf its description claims.
+[dev-dependencies]
+lamella-aot = { path = "../lamella-aot" }
 
 [features]
 default = ["gc-collect"]

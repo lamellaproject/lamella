@@ -278,10 +278,10 @@ impl Debugger {
     /// the backend's single comparator set, so both kinds must be re-applied together;
     /// applying only one would erase the other (VS Code sends an empty
     /// `setInstructionBreakpoints` right after `setBreakpoints`, which otherwise wipes them).
-    fn apply_breakpoints(&mut self) {
+    fn apply_breakpoints(&mut self) -> Result<(), String> {
         let mut all = self.source_breakpoints.clone();
         all.extend_from_slice(&self.instruction_breakpoints);
-        self.backend.set_breakpoints(&all);
+        self.backend.set_breakpoints(&all)
     }
 
     /// Replaces the instruction breakpoints. Each is an opaque code address carried in
@@ -320,7 +320,9 @@ impl Debugger {
             }
         }
         self.instruction_breakpoints = addresses;
-        self.apply_breakpoints();
+        if let Err(reason) = self.apply_breakpoints() {
+            withdraw_verification(&mut results, &reason);
+        }
         json!({ "breakpoints": results })
     }
 
@@ -385,7 +387,9 @@ impl Debugger {
         }
         self.source_breakpoints = addresses;
         self.breakpoint_meta = meta;
-        self.apply_breakpoints();
+        if let Err(reason) = self.apply_breakpoints() {
+            withdraw_verification(&mut results, &reason);
+        }
         json!({ "breakpoints": results })
     }
 
@@ -779,6 +783,22 @@ impl Debugger {
     }
 }
 
+/// Withdraws the verification granted before the backend was asked to program the set, once it
+/// answers that it could not.
+///
+/// The backend reports one reason for the whole set because it cannot say which address failed,
+/// so every breakpoint this request had marked verified is greyed and carries that reason. Only
+/// those: a breakpoint already unverified keeps the more specific message it was given (past the
+/// hardware limit, or a line that carries no code), which is the truer explanation of the two.
+fn withdraw_verification(results: &mut [Json], reason: &str) {
+    for breakpoint in results {
+        if breakpoint["verified"] == json!(true) {
+            breakpoint["verified"] = json!(false);
+            breakpoint["message"] = json!(reason);
+        }
+    }
+}
+
 /// The message shown on a breakpoint left unverified because the target's hardware
 /// comparators are all in use -- the editor displays it on the greyed breakpoint.
 fn over_capacity_message(cap: Option<usize>) -> String {
@@ -937,6 +957,10 @@ mod tests {
     /// N and reports a fixed hardware-breakpoint limit. Everything else is an inert stub.
     struct CapBackend {
         max: usize,
+        /// The reason this backend refuses to program a set, or `None` to accept every set --
+        /// which is the difference between a target the adapter may report armed and one it
+        /// may not.
+        refuse: Option<&'static str>,
     }
 
     impl DebugBackend for CapBackend {
@@ -952,7 +976,9 @@ mod tests {
         fn depth(&self) -> usize {
             1
         }
-        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            self.refuse.map_or(Ok(()), |reason| Err(reason.to_string()))
+        }
         fn max_breakpoints(&self) -> Option<usize> {
             Some(self.max)
         }
@@ -1011,7 +1037,9 @@ mod tests {
         fn depth(&self) -> usize {
             1
         }
-        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
         fn resolve_source_breakpoint(&self, _document: &str, _line: u32) -> Option<u64> {
             None
         }
@@ -1051,7 +1079,9 @@ mod tests {
         fn depth(&self) -> usize {
             1
         }
-        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
         fn resolve_source_breakpoint(&self, _document: &str, _line: u32) -> Option<u64> {
             None
         }
@@ -1174,8 +1204,9 @@ mod tests {
         fn depth(&self) -> usize {
             1
         }
-        fn set_breakpoints(&mut self, addresses: &[u64]) {
+        fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
             self.address = addresses.first().copied().unwrap_or(0);
+            Ok(())
         }
         fn resolve_source_breakpoint(&self, _document: &str, line: u32) -> Option<u64> {
             Some(u64::from(line))
@@ -1249,7 +1280,9 @@ mod tests {
         fn depth(&self) -> usize {
             if self.source { 1 } else { 1 + self.steps }
         }
-        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
         fn stack(&self) -> Vec<Frame> {
             Vec::new()
         }
@@ -1391,8 +1424,90 @@ mod tests {
     }
 
     #[test]
+    fn a_backend_that_could_not_program_the_set_leaves_no_breakpoint_reported_armed() {
+        let mut dbg = Debugger::with_backend(Box::new(CapBackend {
+            max: 8,
+            refuse: Some("the unit refused the write"),
+        }));
+        dbg.handle(&request(1, "launch", None));
+        let out = dbg.handle(&request(
+            2,
+            "setBreakpoints",
+            Some(json!({
+                "source": { "path": "Program.cs" },
+                "breakpoints": [ { "line": 10 }, { "line": 11 } ],
+            })),
+        ));
+        let Message::Response(r) = &out[0] else {
+            panic!("expected a response");
+        };
+        let bps = r.body.as_ref().unwrap()["breakpoints"].as_array().unwrap();
+        assert_eq!(bps.len(), 2, "both breakpoints are still reported, greyed rather than dropped");
+        for (index, breakpoint) in bps.iter().enumerate() {
+            assert_eq!(
+                breakpoint["verified"],
+                json!(false),
+                "breakpoint {index} was within the limit, so only the backend's answer can grey it"
+            );
+            assert_eq!(
+                breakpoint["message"],
+                json!("the unit refused the write"),
+                "and the editor shows the backend's own reason, not a generic one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backend_that_programmed_the_set_leaves_the_same_breakpoints_verified() {
+        let mut dbg = Debugger::with_backend(Box::new(CapBackend { max: 8, refuse: None }));
+        dbg.handle(&request(1, "launch", None));
+        let out = dbg.handle(&request(
+            2,
+            "setBreakpoints",
+            Some(json!({
+                "source": { "path": "Program.cs" },
+                "breakpoints": [ { "line": 10 }, { "line": 11 } ],
+            })),
+        ));
+        let Message::Response(r) = &out[0] else {
+            panic!("expected a response");
+        };
+        let bps = r.body.as_ref().unwrap()["breakpoints"].as_array().unwrap();
+        assert_eq!(bps[0]["verified"], json!(true));
+        assert_eq!(bps[1]["verified"], json!(true));
+    }
+
+    #[test]
+    fn a_refusal_does_not_overwrite_the_more_specific_reason_a_breakpoint_already_carried() {
+        let mut dbg = Debugger::with_backend(Box::new(CapBackend {
+            max: 2,
+            refuse: Some("the wire dropped"),
+        }));
+        dbg.handle(&request(1, "launch", None));
+        let out = dbg.handle(&request(
+            2,
+            "setBreakpoints",
+            Some(json!({
+                "source": { "path": "Program.cs" },
+                "breakpoints": [ { "line": 10 }, { "line": 11 }, { "line": 12 } ],
+            })),
+        ));
+        let Message::Response(r) = &out[0] else {
+            panic!("expected a response");
+        };
+        let bps = r.body.as_ref().unwrap()["breakpoints"].as_array().unwrap();
+        assert_eq!(bps[0]["message"], json!("the wire dropped"));
+        assert_eq!(bps[1]["message"], json!("the wire dropped"));
+        assert!(
+            bps[2]["message"].as_str().expect("a message").contains("hardware breakpoints"),
+            "the one that never fit keeps the reason that explains why: {}",
+            bps[2]["message"]
+        );
+    }
+
+    #[test]
     fn source_breakpoints_past_the_hardware_limit_are_unverified_with_a_message() {
-        let mut dbg = Debugger::with_backend(Box::new(CapBackend { max: 2 }));
+        let mut dbg = Debugger::with_backend(Box::new(CapBackend { max: 2, refuse: None }));
         dbg.handle(&request(1, "launch", None));
         let out = dbg.handle(&request(
             2,
@@ -1420,7 +1535,7 @@ mod tests {
 
     #[test]
     fn continue_notes_inactive_breakpoints_once() {
-        let mut dbg = Debugger::with_backend(Box::new(CapBackend { max: 2 }));
+        let mut dbg = Debugger::with_backend(Box::new(CapBackend { max: 2, refuse: None }));
         dbg.handle(&request(1, "launch", None));
         dbg.handle(&request(
             2,

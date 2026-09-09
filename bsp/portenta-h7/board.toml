@@ -97,3 +97,11 @@ kind = "gpio-out"
 pin = "PK7"
 active = "low"
 source = "The full pinout's RGB LED table gives the blue leg against ball D7 under the net name LEDB. The schematics sheet STM32H747XIH6 gives ball D7 as PK7, and DS12930 Rev 1 Table 7's TFBGA240+25 column gives PK7 at ball D7. The same schematic runs PK7 through R13, 330 ohm, to a cathode of DL1, whose anodes sit on the +3V1 rail, so the pin sinks and the leg lights when it is driven low. This leg is read from the schematic in its own right rather than by analogy with the other two: the sheet draws all three cathodes."
+
+[debug]
+signals = ["swd"]
+exposure = "connectable"
+fitted = "no"
+onboard = "none"
+recovery = "flash-bootloader"
+source = "This is a module rather than a board with headers. Nothing on the module is a debugger and nothing on it is a serial bridge; the debug signals leave through the two 80-pin high-density connectors, whose pinout carries SWDIO and SWCK. A probe reaches the part through a carrier that breaks those connectors out, so no soldering to the module itself is involved and no connector on the module takes a debug cable directly."

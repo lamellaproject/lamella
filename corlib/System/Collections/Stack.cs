@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Collections.Stack
 namespace System.Collections
 {
-    public class Stack : IEnumerable
+    public class Stack : ICollection, ICloneable
     {
         private object[] items;
         private int size;
@@ -58,6 +58,28 @@ namespace System.Collections
                 else if (item != null && item.Equals(value)) return true;
             }
             return false;
+        }
+
+        /// <summary>Copies the elements, top first, into <paramref name="array"/> at <paramref name="index"/>.</summary>
+        public void CopyTo(System.Array array, int index)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            if (array.Rank != 1) throw new ArgumentException("array");
+            if (index < 0) throw new ArgumentOutOfRangeException("index");
+            if (index > array.Length - size) throw new ArgumentException();
+            for (int i = 0; i < size; i++) array.SetValue(items[size - 1 - i], index + i);
+        }
+
+        public bool IsSynchronized { get { return false; } }
+        public object SyncRoot { get { return this; } }
+
+        public object Clone()
+        {
+            Stack copy = new Stack();
+            copy.items = new object[size > 0 ? size : 4];
+            for (int i = 0; i < size; i++) copy.items[i] = items[i];
+            copy.size = size;
+            return copy;
         }
     }
 }

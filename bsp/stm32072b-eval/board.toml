@@ -137,3 +137,11 @@ kind = "gpio-in"
 pin = "PE3"
 active = "high"
 source = "UM1714 Rev 1 Table 34: PE3 is JOY_RIGHT. Figure 26 sheet 8: input pins with pull-down."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "UM1714 documents this board's debugger as an ST-LINK/V2 rather than a V2-1, which is why the board states no virtual COM port and therefore no carrier row: the debugger is present and the serial console is not. Where the part's SWD signals reach a connector is not established here. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

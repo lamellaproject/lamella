@@ -35,7 +35,7 @@ use lamella_syntax::ast::{
     explicit_interface_member_name, is_auto_property,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
-use lamella_syntax::lexer::LexOptions;
+use lamella_syntax::lexer::{LexOptions, OutputKind};
 use lamella_syntax::parser::parse_compilation_unit_with;
 use lamella_syntax::span::Span;
 use lamella_token::Token;
@@ -93,6 +93,7 @@ fn nested_visibility(modifiers: &[Modifier]) -> u32 {
 }
 const METHOD_PUBLIC: u16 = 0x0006;
 const METHOD_PRIVATE: u16 = 0x0001;
+const METHOD_ASSEMBLY: u16 = 0x0003;
 const METHOD_STATIC: u16 = 0x0010;
 const METHOD_VIRTUAL: u16 = 0x0040;
 const METHOD_HIDEBYSIG: u16 = 0x0080;
@@ -214,7 +215,17 @@ pub fn compile_unit_with_references(
     assembly_name: &str,
     references: &[Assembly],
 ) -> Compilation {
-    compile(unit, module_name, assembly_name, references, None, false, false, false, LanguageVersion::DEFAULT)
+    compile(
+        unit,
+        module_name,
+        assembly_name,
+        references,
+        None,
+        false,
+        false,
+        false,
+        LanguageVersion::DEFAULT,
+    )
 }
 
 /// Like [`compile_unit_with_references`], but also emits a standalone Portable PDB
@@ -281,6 +292,7 @@ pub fn compile_source_with(
 ) -> Compilation {
     let native_interop = options.native_interop;
     let language_version = options.version;
+    let target = options.target;
     let unsafe_option_missing = !options.unsafe_code;
     let embed_pdb = options.embed_pdb;
     let parsed = parse_compilation_unit_with(source, options);
@@ -299,7 +311,7 @@ pub fn compile_source_with(
     }
     let debug = emit_debug.then_some((source, source_path));
     let pragmas = parsed.pragma_warnings.clone();
-    let mut compiled = compile(
+    let mut compiled = compile_with_target(
         &parsed.unit,
         module_name,
         assembly_name,
@@ -309,6 +321,7 @@ pub fn compile_source_with(
         unsafe_option_missing,
         embed_pdb,
         language_version,
+        target,
     );
     if !parse_diagnostics.is_empty() {
         let mut diagnostics = parse_diagnostics;
@@ -358,6 +371,11 @@ fn without_suppressed_warnings(
         .collect()
 }
 
+/// [`compile_with_target`] for a caller that named no `/target:` -- an in-process entry point, or
+/// a test whose subject is not the output kind. The sources decide, which is what
+/// [`OutputKind::Inferred`] means and what this compiler did everywhere before the flag was
+/// honored.
+#[allow(clippy::too_many_arguments)]
 fn compile(
     unit: &CompilationUnit,
     module_name: &str,
@@ -369,6 +387,33 @@ fn compile(
     embed_pdb: bool,
     language_version: LanguageVersion,
 ) -> Compilation {
+    compile_with_target(
+        unit,
+        module_name,
+        assembly_name,
+        references,
+        debug,
+        native_interop,
+        unsafe_option_missing,
+        embed_pdb,
+        language_version,
+        OutputKind::Inferred,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_with_target(
+    unit: &CompilationUnit,
+    module_name: &str,
+    assembly_name: &str,
+    references: &[Assembly],
+    debug: Option<(&str, &str)>,
+    native_interop: bool,
+    unsafe_option_missing: bool,
+    embed_pdb: bool,
+    language_version: LanguageVersion,
+    target: OutputKind,
+) -> Compilation {
     let diagnostics: Vec<Diagnostic> = lamella_binder::bind_compilation_unit_with_options(
         unit,
         references,
@@ -376,6 +421,7 @@ fn compile(
             unsafe_option_missing,
             language_version,
             compiling_assembly: assembly_name,
+            target,
         },
     )
     .iter()
@@ -393,7 +439,15 @@ fn compile(
     };
     let debug_sources = debug.map(|pair| [pair]);
     let debug = debug_sources.as_ref().map(|slice| &slice[..]);
-    match build_image(&program, module_name, assembly_name, debug, native_interop, embed_pdb) {
+    match build_image(
+        &program,
+        module_name,
+        assembly_name,
+        debug,
+        native_interop,
+        embed_pdb,
+        target,
+    ) {
         Ok((image, pdb)) => Compilation {
             diagnostics,
             image: Some(image),
@@ -445,6 +499,7 @@ pub fn compile_sources_with(
     let mut syntax_error = false;
     let native_interop = options.native_interop;
     let language_version = options.version;
+    let target = options.target;
     let embed_pdb = options.embed_pdb;
     let unsafe_option_missing = !options.unsafe_code;
     let mut pragmas: Vec<Vec<lamella_syntax::lexer::PragmaWarning>> =
@@ -479,6 +534,7 @@ pub fn compile_sources_with(
                 unsafe_option_missing,
                 language_version,
                 compiling_assembly: assembly_name,
+                target,
             },
         ))
     {
@@ -507,6 +563,7 @@ pub fn compile_sources_with(
         debug,
         native_interop,
         embed_pdb,
+        target,
     ) {
         Ok((image, pdb)) => MultiCompilation {
             diagnostics,
@@ -592,6 +649,7 @@ fn build_image(
     debug: Option<&[(&str, &str)]>,
     native_interop: bool,
     embed_pdb: bool,
+    target: OutputKind,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let units = program.units;
     let references = program.references;
@@ -640,6 +698,10 @@ fn build_image(
             &partials,
         )?;
     }
+    let pending_lambdas = core::mem::take(&mut tokens.pending_lambdas);
+    if !pending_lambdas.is_empty() || !tokens.pending_instance_bodies.is_empty() {
+        emit_closure_types(&mut image, &mut binder, &mut tokens, pending_lambdas)?;
+    }
     let pending_async = core::mem::take(&mut tokens.pending_async);
     for pending in pending_async {
         emit_async_machine(&mut image, &mut binder, &mut tokens, pending)?;
@@ -649,7 +711,11 @@ fn build_image(
         emit_global_attributes(&mut image, &binder, &mut tokens, &unit.global_attributes);
     }
     emit_exception_base_chains(&mut image, binder.model(), &tokens);
-    let is_dll = entry_point.is_none();
+    let (is_dll, entry_point) = match target {
+        OutputKind::Executable => (false, entry_point),
+        OutputKind::Library => (true, None),
+        OutputKind::Inferred => (entry_point.is_none(), entry_point),
+    };
     let entry = entry_point.unwrap_or(Token::new(0, 0));
     let documents: Option<Vec<DebugDocument>> = debug.map(|sources| {
         sources
@@ -2052,6 +2118,12 @@ fn emit_interface(
 /// runtime supplies both bodies; `new D(method)` is `ldftn`/`ldvirtftn` + `newobj .ctor`, and
 /// `d(args)` is `callvirt Invoke`. A `ref`/`out` delegate parameter carries its byref (`&`)
 /// through to the `Invoke` signature, so it agrees with the byref target and the call site.
+///
+/// **A GENERIC DELEGATE IS THIS AND A `GenericParam` RUN, NOT A SECOND KIND OF TYPE.** Its
+/// parameters are the DECLARING type's, so `Invoke`'s signature encodes them as `!n` (`VAR`) and
+/// never as `!!n` -- which is why the scope entered below is a TYPE scope and why the model gives
+/// `Invoke` no type parameters of its own. `.ctor` names only `object` and `native int`, so it is
+/// the one signature here that a type parameter cannot reach.
 fn emit_delegate(
     image: &mut ImageBuilder,
     binder: &Binder,
@@ -2059,20 +2131,32 @@ fn emit_delegate(
     namespace: &str,
     declaration: &DelegateDecl,
 ) -> Result<(), crate::EmitError> {
-    let inherited = enclosing_type_parameters(binder, &named_symbol(namespace, &declaration.name));
+    let delegate_ty = declared_delegate_symbol(namespace, declaration);
+    let own: Vec<Box<str>> = declaration
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect();
+    let inherited = enclosing_type_parameters(binder, &delegate_ty);
     mint_signature_type(
         binder,
         &binder.canonicalize(&bind_type(&declaration.return_type)),
-        &[],
+        &[&own],
         &inherited,
         image,
         tokens,
     )?;
     for parameter in &declaration.parameters {
-        mint_signature_type(binder, &binder.canonicalize(&bind_type(&parameter.ty)), &[], &inherited, image, tokens)?;
+        mint_signature_type(
+            binder,
+            &binder.canonicalize(&bind_type(&parameter.ty)),
+            &[&own],
+            &inherited,
+            image,
+            tokens,
+        )?;
     }
     let base = system_base(image, tokens, "MulticastDelegate");
-    let delegate_ty = named_symbol(namespace, &declaration.name);
     let enclosing_type = binder
         .model()
         .get_by_symbol(&delegate_ty)
@@ -2080,7 +2164,19 @@ fn emit_delegate(
     let metadata_namespace = if enclosing_type.is_some() { "" } else { namespace };
     let flags = (DELEGATE_TYPE_FLAGS & !0x0000_0007)
         | type_visibility(&declaration.modifiers, enclosing_type.is_some());
-    let delegate_token = image.add_type(metadata_namespace, &declaration.name, base, flags);
+    let delegate_token = image.add_type(
+        metadata_namespace,
+        &declared_delegate_name(declaration),
+        base,
+        flags,
+    );
+    emit_generic_parameters(
+        image,
+        tokens,
+        delegate_token,
+        &delegate_type_parameter_names(binder, &delegate_ty, declaration),
+        &declaration.constraints,
+    );
     if let Some(enclosing_full) = &enclosing_type {
         if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
             image.add_nested_class(delegate_token, enclosing_token);
@@ -2094,12 +2190,20 @@ fn emit_delegate(
         DELEGATE_CTOR_FLAGS,
         &[DELEGATE_CTOR_TARGET.into(), DELEGATE_CTOR_METHOD.into()],
     );
-    let return_sig = type_sig(tokens, &binder.canonicalize(&bind_type(&declaration.return_type)))?;
+    let return_sig = member_type_sig(
+        tokens,
+        &delegate_ty,
+        &binder.canonicalize(&bind_type(&declaration.return_type)),
+    )?;
     let parameter_sigs: Vec<TypeSig> = declaration
         .parameters
         .iter()
         .map(|parameter| {
-            let base = type_sig(tokens, &binder.canonicalize(&bind_type(&parameter.ty)))?;
+            let base = member_type_sig(
+                tokens,
+                &delegate_ty,
+                &binder.canonicalize(&bind_type(&parameter.ty)),
+            )?;
             Ok(
                 if matches!(
                     parameter.modifier,
@@ -2119,7 +2223,14 @@ fn emit_delegate(
         DELEGATE_INVOKE_FLAGS,
         &parameter_names(&declaration.parameters),
     );
-    emit_declared_parameter_metadata(image, binder, tokens, &named_symbol(namespace, &declaration.name), invoke, &declaration.parameters);
+    emit_declared_parameter_metadata(
+        image,
+        binder,
+        tokens,
+        &delegate_ty,
+        invoke,
+        &declaration.parameters,
+    );
     Ok(())
 }
 
@@ -2455,6 +2566,184 @@ fn emit_type(
 /// parts, which this emits immediately after its own members, each under its own file's context,
 /// because a row written between them would end the type's range (II.22.37).
 #[allow(clippy::too_many_arguments)]
+/// Records each member's ORDINAL within `declaration` -- its position in a running count over the
+/// type's members in SOURCE order, which csc names a synthesized closure member after
+/// (`<M>b__N_M`, `<>9__N_M`).
+///
+/// **THE COUNT IS OVER MEMBERS, AND OVER SYNTHESIZED ONES TOO**, which is most of the rule and
+/// none of it is guessable. Measured against csc, member kind by member kind, each with a probe
+/// that puts one member ahead of a lambda-bearing method and reads the name back:
+///
+/// ```text
+///     field, per declarator            1     `static int a, b;` advances the count by two
+///     const field                      1
+///     method / operator / destructor   1
+///     constructor                      1
+///     nested type                      1
+///     property, accessors written      1 + one per accessor
+///     property, auto                   1 + one per accessor + one for the backing field
+///     indexer                          1 + one per accessor
+///     event, either spelling           3     -- and NOT four: a field-like event's backing
+///                                               field does not count, though a property's does
+/// ```
+///
+/// The ordinal decides a NAME and nothing else -- no token, no signature, no behavior. A member
+/// kind whose contribution is ever wrong here misnames a closure member and changes nothing a
+/// program can observe; `emit_closure_types` refuses a COLLISION, which is the only way an
+/// ordinal could do harm.
+fn record_member_ordinals(
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    declaration: &TypeDecl,
+    later: &[PartialPart<'_>],
+) {
+    let is_interface = matches!(declaration.kind, TypeKind::Interface);
+    let mut ordinal = 0usize;
+    let all_members = declaration
+        .members
+        .iter()
+        .chain(later.iter().flat_map(|part| part.declaration.members.iter()));
+    for member in all_members {
+        match member {
+            Member::Field { declarators, .. } => ordinal += declarators.len(),
+            Member::Method {
+                name,
+                parameters,
+                type_parameters,
+                constraints,
+                explicit_interface,
+                ..
+            } => {
+                let entered = binder.enter_type_parameters(type_parameters, constraints);
+                let params = ordinal_params(binder, parameters);
+                binder.exit_type_parameters(entered);
+                let name = match explicit_interface {
+                    Some(interface) => explicit_interface_member_name(interface, name),
+                    None => alloc::string::String::from(&**name),
+                };
+                tokens.insert_member_ordinal(enclosing, &name, &params, ordinal);
+                ordinal += 1;
+            }
+            Member::Constructor {
+                modifiers,
+                parameters,
+                ..
+            } => {
+                let params = ordinal_params(binder, parameters);
+                let name = if modifiers.contains(&Modifier::Static) {
+                    ".cctor"
+                } else {
+                    ".ctor"
+                };
+                tokens.insert_member_ordinal(enclosing, name, &params, ordinal);
+                ordinal += 1;
+            }
+            Member::Property {
+                modifiers,
+                name,
+                getter,
+                setter,
+                explicit_interface,
+                ..
+            } => {
+                if is_auto_property(modifiers, getter.as_ref(), setter.as_ref(), is_interface) {
+                    ordinal += 1;
+                }
+                ordinal += 1;
+                for (prefix, present) in [("get_", getter.is_some()), ("set_", setter.is_some())] {
+                    if present {
+                        let key = explicit_accessor_name(
+                            explicit_interface.as_ref(),
+                            &accessor_name(prefix, name),
+                        );
+                        tokens.insert_member_ordinal(enclosing, &key, &[], ordinal);
+                        ordinal += 1;
+                    }
+                }
+            }
+            Member::Indexer {
+                parameters,
+                getter,
+                setter,
+                explicit_interface,
+                attributes,
+                ..
+            } => {
+                let property_name = indexer_name(attributes);
+                let params = ordinal_params(binder, parameters);
+                ordinal += 1;
+                if getter.is_some() {
+                    let key = explicit_accessor_name(
+                        explicit_interface.as_ref(),
+                        &accessor_name("get_", &property_name),
+                    );
+                    tokens.insert_member_ordinal(enclosing, &key, &params, ordinal);
+                    ordinal += 1;
+                }
+                if setter.is_some() {
+                    ordinal += 1;
+                }
+            }
+            Member::EventField { declarators, .. } => {
+                for declarator in declarators {
+                    ordinal += 1;
+                    for prefix in ["add_", "remove_"] {
+                        tokens.insert_member_ordinal(
+                            enclosing,
+                            &format!("{prefix}{}", declarator.name),
+                            &[],
+                            ordinal,
+                        );
+                        ordinal += 1;
+                    }
+                }
+            }
+            Member::Event { name, .. } => {
+                ordinal += 1;
+                for prefix in ["add_", "remove_"] {
+                    tokens.insert_member_ordinal(
+                        enclosing,
+                        &format!("{prefix}{name}"),
+                        &[],
+                        ordinal,
+                    );
+                    ordinal += 1;
+                }
+            }
+            Member::Operator { .. }
+            | Member::ConversionOperator { .. }
+            | Member::Destructor { .. }
+            | Member::NestedType(_) => ordinal += 1,
+            Member::Error => {}
+        }
+    }
+    let declares_constructor = |is_static: bool| {
+        declaration
+            .members
+            .iter()
+            .chain(later.iter().flat_map(|part| part.declaration.members.iter()))
+            .any(|member| {
+                matches!(member, Member::Constructor { modifiers, .. }
+                    if modifiers.contains(&Modifier::Static) == is_static)
+            })
+    };
+    if !declares_constructor(false) {
+        ordinal += 1;
+    }
+    if !declares_constructor(true) {
+        tokens.insert_member_ordinal(enclosing, ".cctor", &[], ordinal);
+    }
+}
+
+/// A member's parameter symbols, bound the way emission binds them, for an ordinal key.
+fn ordinal_params(binder: &mut Binder, parameters: &[Parameter]) -> Vec<TypeSymbol> {
+    parameters
+        .iter()
+        .map(|parameter| binder.canonicalize(&bind_type(&parameter.ty)))
+        .collect()
+}
+
 fn emit_type_inner(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -2476,6 +2765,9 @@ fn emit_type_inner(
             let spec = image.type_spec(&type_signature(&TypeSig::Var(index)));
             tokens.insert_var_spec(index, spec);
         }
+    }
+    if continuation.is_none() {
+        record_member_ordinals(binder, tokens, &enclosing, declaration, later);
     }
     if matches!(declaration.kind, TypeKind::Interface) {
         mint_member_signature_types(
@@ -2796,6 +3088,8 @@ fn emit_type_inner(
                 if entry_point.is_none()
                     && &**name == "Main"
                     && modifiers.contains(&Modifier::Static)
+                    && own_parameters.is_empty()
+                    && type_parameters.is_empty()
                     && is_entry_point_signature(parameters, return_type)
                 {
                     *entry_point = Some(token);
@@ -2825,9 +3119,24 @@ fn emit_type_inner(
                 body: None,
                 attributes,
                 ..
+            } if modifiers.contains(&Modifier::Extern) => {
+                let token = emit_bodyless_method(
+                    image, binder, tokens, &enclosing, modifiers, name, return_type, parameters,
+                )?;
+                emit_attributes(image, binder, tokens, &enclosing, token, attributes);
+            }
+            Member::Method {
+                modifiers,
+                return_type,
+                name,
+                type_parameters,
+                parameters,
+                body: None,
+                attributes,
+                ..
             } if modifiers.contains(&Modifier::Abstract) => {
                 let token =
-                    emit_abstract_method(
+                    emit_bodyless_method(
                         image, binder, tokens, &enclosing, modifiers, name, return_type, parameters,
                     )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
@@ -2982,6 +3291,7 @@ fn emit_type_inner(
             parameters,
             getter,
             setter,
+            explicit_interface,
             attributes,
             ..
         } = member
@@ -2997,6 +3307,7 @@ fn emit_type_inner(
                 parameters,
                 getter.as_ref(),
                 setter.as_ref(),
+                explicit_interface.as_ref(),
                 debug,
             )?;
             first_property.get_or_insert(property);
@@ -3085,6 +3396,71 @@ fn emit_type_inner(
         leave_part(binder, part_scope);
         emitted?;
     }
+    if continuation.is_none() {
+        emit_instance_lambda_rows(image, tokens, &enclosing)?;
+    }
+    Ok(())
+}
+
+/// Adds a `MethodDef` row for each `this`-capturing lambda of `enclosing`, and hands the site to
+/// the global drain to have its bytes landed.
+///
+/// **THE ROW NOW, THE BODY LATER, AND BOTH HALVES ARE FORCED.** The row has to be here because a
+/// type's method rows are contiguous and this type's run ends with this call. The body cannot be
+/// here because it may name a `<>c` member, and no closure type exists until every source type has
+/// been emitted -- which is the same reason the enclosing method's own body is deferred.
+///
+/// csc's flags, measured: `private hidebysig` INSTANCE, and -- unlike a `<>c` body, where the
+/// marker sits on the type -- each of these carries `[CompilerGenerated]` itself.
+fn emit_instance_lambda_rows(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+) -> Result<(), crate::EmitError> {
+    let mut mine = Vec::new();
+    let mut rest = Vec::new();
+    for (ty, site) in core::mem::take(&mut tokens.pending_instance_rows) {
+        if &ty == enclosing {
+            mine.push(site);
+        } else {
+            rest.push((ty, site));
+        }
+    }
+    tokens.pending_instance_rows = rest;
+    if mine.is_empty() {
+        return Ok(());
+    }
+    let declaring_parameters = tokens.type_parameters(enclosing).to_vec();
+    let scope = GenericScope {
+        method: &[],
+        declaring: &declaring_parameters,
+    };
+    for site in mine {
+        let parameter_sigs: Vec<TypeSig> = site
+            .parameters
+            .iter()
+            .map(|(_, ty)| open_type_sig(tokens, ty, scope))
+            .collect::<Result<_, _>>()?;
+        let return_sig = open_type_sig(tokens, &site.return_type, scope)?;
+        let signature = method_signature(true, &parameter_sigs, &return_sig);
+        let token = image.add_method_deferred_body(
+            &site.method_name,
+            &signature,
+            METHOD_PRIVATE | METHOD_HIDEBYSIG,
+            IL_MANAGED,
+            &by_value_parameter_names(&site.parameters),
+        );
+        tokens.insert_method(
+            enclosing,
+            &site.method_name,
+            &site.parameters.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
+            token,
+        );
+        emit_compiler_generated_marker(image, tokens, token);
+        tokens
+            .pending_instance_bodies
+            .push((enclosing.clone(), token, site));
+    }
     Ok(())
 }
 
@@ -3130,7 +3506,11 @@ fn emit_event(
                 slot_flags(modifiers, member_visibility(modifiers))
             }
     };
-    let params = [(Box::<str>::from("value"), event_ty.clone())];
+    let params = [(
+        Box::<str>::from("value"),
+        event_ty.clone(),
+        Vec::new(),
+    )];
     let (add, remove) = if modifiers.contains(&Modifier::Abstract) {
         let signature = method_signature(
             true,
@@ -3237,7 +3617,11 @@ fn emit_custom_event(
                 slot_flags(modifiers, member_visibility(modifiers))
             }
     };
-    let params = [(Box::<str>::from("value"), event_ty.clone())];
+    let params = [(
+        Box::<str>::from("value"),
+        event_ty.clone(),
+        Vec::new(),
+    )];
     let accessor_token = |prefix: &str,
                           body: Option<&lamella_syntax::ast::Stmt>,
                           image: &mut ImageBuilder,
@@ -3313,7 +3697,7 @@ fn event_accessor_body(field: &str, operator: AssignmentOperator) -> Stmt {
 /// Emits an abstract method as a bodyless `MethodDef` (RVA 0) whose flags carry
 /// Abstract | Virtual | NewSlot (II.23.1.10), so a `callvirt` through the declaring type
 /// dispatches to the overriding method in a derived type.
-fn emit_abstract_method(
+fn emit_bodyless_method(
     image: &mut ImageBuilder,
     binder: &Binder,
     tokens: &mut Tokens,
@@ -3333,7 +3717,10 @@ fn emit_abstract_method(
     let return_sig = bodyless_return_sig(return_type, return_sig, image, tokens);
     let signature = method_signature(true, &parameter_sigs, &return_sig);
     let visibility = member_visibility(modifiers);
-    let flags = visibility | slot_flags(modifiers, visibility);
+    let mut flags = visibility | slot_flags(modifiers, visibility) | METHOD_HIDEBYSIG;
+    if modifiers.contains(&Modifier::Static) {
+        flags |= METHOD_STATIC;
+    }
     let method = image.add_abstract_method(name, &signature, flags, &parameter_names(parameters));
     if is_readonly_ref(return_type) {
         mark_readonly_return(image, tokens, method);
@@ -3434,9 +3821,15 @@ fn emit_one_method_in_scope(
     let method_constraints = constraints;
     let is_async = modifiers.contains(&Modifier::Async);
     let return_symbol = binder.canonicalize(&bind_type(return_type));
-    let params: Vec<(Box<str>, TypeSymbol)> = parameters
+    let params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> = parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), binder.canonicalize(&bind_type(&parameter.ty))))
+        .map(|parameter| {
+            (
+                parameter.name.clone(),
+                binder.canonicalize(&bind_type(&parameter.ty)),
+                lamella_binder::bind::tuple_element_names(&parameter.ty),
+            )
+        })
         .collect();
     let byref_flags = byref_flags(parameters);
     if let Some(interface) = explicit_interface {
@@ -3493,7 +3886,7 @@ fn emit_one_method_in_scope(
         && binder.member_implements_interface(
             enclosing,
             name,
-            &params.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
+            &params.iter().map(|(_, ty, _)| ty.clone()).collect::<Vec<_>>(),
         )
     {
         flags |= METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_HIDEBYSIG;
@@ -3841,7 +4234,7 @@ fn emit_declared_parameter_metadata(
 /// -- and different things to a consumer, and collapsing them to "is it byref" is what left the
 /// `Out` flag with nowhere to come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParamPassing {
+pub(crate) enum ParamPassing {
     ByValue,
     Ref,
     Out,
@@ -3988,9 +4381,15 @@ fn emit_constructor(
     header_span: Option<Span>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
-    let params: Vec<(Box<str>, TypeSymbol)> = parameters
+    let params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> = parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), binder.canonicalize(&bind_type(&parameter.ty))))
+        .map(|parameter| {
+            (
+                parameter.name.clone(),
+                binder.canonicalize(&bind_type(&parameter.ty)),
+                lamella_binder::bind::tuple_element_names(&parameter.ty),
+            )
+        })
         .collect();
     let implicit_base = implicit_base_chain(image, binder, tokens, enclosing);
     let base_prologue = || match &implicit_base {
@@ -4052,7 +4451,7 @@ fn emit_constructor(
     let mut prologue = match initializer {
         Some(init) => Some(
             binder
-                .bind_constructor_chain(enclosing, &params, init)
+                .bind_constructor_chain(enclosing, &param_pairs(&params), init)
                 .map(|(method, arguments)| {
                     let chain_key = if method.is_vararg {
                         crate::expr::vararg_lookup_params(&method.parameters, &[])
@@ -4270,6 +4669,13 @@ fn apply_init_only_modifier(
 /// Wraps a `ref readonly T` return in its `modreq`, when the member being emitted was written that
 /// way. The sibling of [`apply_init_only_modifier`], and deliberately the same shape.
 ///
+/// **`ref readonly T` IS `T&` PLUS A REQUIRED MODIFIER ON
+/// `System.Runtime.InteropServices.InAttribute`** (II.23.2.7), applied OUTSIDE the byref so the blob
+/// reads modifier-then-type -- the same order `mint_instantiated_member_ref` writes when it
+/// REPRODUCES one from an imported signature, which is the encoding that made `ReadOnlySpan<T>`'s
+/// indexer resolve where a bare `!0&` matched nothing. One encoding, proven against real .NET
+/// metadata from the consuming side, now used from the declaring side too.
+///
 /// The modifier NAMES a type, so the type has to exist: a reference set that does not declare
 /// `InAttribute` cannot express the feature at all, and the modifier is then left off rather
 /// than a fabricated reference being minted.
@@ -4471,6 +4877,38 @@ fn is_readonly_ref(return_type: &TypeRef) -> bool {
     )
 }
 
+/// A method's parameter TYPES alone -- the shape `Tokens` keys a member on.
+/// The `(name, type)` pairs of a parameter list, WITHOUT the tuple element names.
+///
+/// For the consumers that only ever wanted the signature -- the constructor chain and the closure
+/// lowering. Both re-bind a body of their own, so a tuple PARAMETER read by element name inside a
+/// constructor initializer or a lambda is not resolved there; that is a narrower gap than the one
+/// this list closes, and it is asserted as a gate row rather than left to be met.
+fn param_pairs(
+    params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
+) -> Vec<(Box<str>, TypeSymbol)> {
+    params
+        .iter()
+        .map(|(name, ty, _)| (name.clone(), ty.clone()))
+        .collect()
+}
+
+/// A pair list widened with NO tuple element names -- for a SYNTHESIZED parameter list, where
+/// there was no declaration to write a name on: a lambda's own parameters, an async state
+/// machine's. Empty is the honest answer for those, not a gap.
+fn param_triples(
+    pairs: &[(Box<str>, TypeSymbol)],
+) -> Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> {
+    pairs
+        .iter()
+        .map(|(name, ty)| (name.clone(), ty.clone(), Vec::new()))
+        .collect()
+}
+
+fn param_symbols(params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)]) -> Vec<TypeSymbol> {
+    params.iter().map(|(_, ty, _)| ty.clone()).collect()
+}
+
 fn emit_method_body(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -4480,7 +4918,7 @@ fn emit_method_body(
     method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     name: &str,
     return_symbol: &TypeSymbol,
-    params: &[(Box<str>, TypeSymbol)],
+    params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
     byref_flags: &[ParamPassing],
     body: &lamella_syntax::ast::Stmt,
     is_static: bool,
@@ -4503,6 +4941,25 @@ fn emit_method_body(
         is_async,
         body,
     );
+    let ordinal = tokens.member_ordinal(enclosing, name, &param_symbols(params));
+    let mut bound = bound;
+    let mut lambda_sites = Vec::new();
+    let mut owes_instance_rows = false;
+    let mut display: Option<crate::lambdalower::DisplayClass> = None;
+    if let Some(lowering) = crate::lambdalower::lower_lambdas(enclosing, name, ordinal, &bound, &param_pairs(params), &*binder)? {
+        bound = lowering.body;
+        for site in lowering.sites {
+            match site.home {
+                crate::lambdalower::LambdaHome::ClosureType
+                | crate::lambdalower::LambdaHome::DisplayClass => lambda_sites.push(site),
+                crate::lambdalower::LambdaHome::EnclosingType => {
+                    owes_instance_rows = true;
+                    tokens.pending_instance_rows.push((enclosing.clone(), site));
+                }
+            }
+        }
+        display = lowering.display;
+    }
     if is_async {
         let returns_task = !return_symbol.is_void();
         let machine_index = tokens.next_async_index(enclosing);
@@ -4512,7 +4969,7 @@ fn emit_method_body(
             &machine_name,
             is_static,
             returns_task,
-            params,
+            &param_pairs(params),
             &bound,
         )?;
         let scope = GenericScope {
@@ -4522,7 +4979,7 @@ fn emit_method_body(
         let parameter_sigs: Vec<TypeSig> = params
             .iter()
             .enumerate()
-            .map(|(index, (_, ty))| {
+            .map(|(index, (_, ty, _))| {
                 let sig = open_type_sig(tokens, ty, scope)?;
                 Ok(if byref_flags.get(index).copied().unwrap_or(ParamPassing::ByValue).is_byref() {
                     TypeSig::ByRef(Box::new(sig))
@@ -4539,12 +4996,81 @@ fn emit_method_body(
             &signature,
             flags,
             IL_MANAGED,
-            &by_value_parameter_names(params),
+            &by_value_parameter_names(&param_pairs(params)),
         );
         tokens.pending_async.push(PendingAsync {
             stub_token,
             lowering,
             enclosing: enclosing.clone(),
+            params: params.to_vec(),
+            byref_flags: byref_flags.to_vec(),
+            return_symbol: return_symbol.clone(),
+            is_static,
+            flags,
+        });
+        if !lambda_sites.is_empty() {
+            tokens.pending_lambdas.push(PendingLambda {
+                stub_token: None,
+                body: BoundStmt {
+                    kind: lamella_binder::BoundStmtKind::Block(Vec::new()),
+                    span: bound.span,
+                },
+                sites: lambda_sites,
+                display,
+                prologue: prologue.cloned(),
+                enclosing: enclosing.clone(),
+                name: Box::from(name),
+                params: params.to_vec(),
+                byref_flags: byref_flags.to_vec(),
+                return_symbol: return_symbol.clone(),
+                is_static,
+                flags,
+            });
+        }
+        return Ok(stub_token);
+    }
+    if !lambda_sites.is_empty() || owes_instance_rows {
+        let scope = GenericScope {
+            method: method_type_parameters,
+            declaring: &tokens.type_parameters(enclosing).to_vec(),
+        };
+        let parameter_sigs: Vec<TypeSig> = params
+            .iter()
+            .enumerate()
+            .map(|(index, (_, ty, _))| {
+                let sig = open_type_sig(tokens, ty, scope)?;
+                Ok(
+                    if byref_flags
+                        .get(index)
+                        .copied()
+                        .unwrap_or(ParamPassing::ByValue)
+                        .is_byref()
+                    {
+                        TypeSig::ByRef(Box::new(sig))
+                    } else {
+                        sig
+                    },
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let return_sig = open_type_sig(tokens, return_symbol, scope)?;
+        let return_sig = apply_return_modifiers(image, tokens, return_sig)?;
+        let signature = method_signature(!is_static, &parameter_sigs, &return_sig);
+        let stub_token = image.add_method_deferred_body(
+            name,
+            &signature,
+            flags,
+            IL_MANAGED,
+            &by_value_parameter_names(&param_pairs(params)),
+        );
+        tokens.pending_lambdas.push(PendingLambda {
+            stub_token: Some(stub_token),
+            body: bound,
+            sites: lambda_sites,
+            display,
+            prologue: prologue.cloned(),
+            enclosing: enclosing.clone(),
+            name: Box::from(name),
             params: params.to_vec(),
             byref_flags: byref_flags.to_vec(),
             return_symbol: return_symbol.clone(),
@@ -4591,7 +5117,7 @@ fn emit_bound_body(
     method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     name: &str,
     return_symbol: &TypeSymbol,
-    params: &[(Box<str>, TypeSymbol)],
+    params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
     byref_flags: &[ParamPassing],
     bound: &BoundStmt,
     is_static: bool,
@@ -4643,11 +5169,12 @@ fn emit_bound_body_into(
     enclosing: &TypeSymbol,
     name: &str,
     return_symbol: &TypeSymbol,
-    params: &[(Box<str>, TypeSymbol)],
+    params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
     byref_flags: &[ParamPassing],
     bound: &BoundStmt,
     is_static: bool,
     flags: u16,
+    prologue: Option<&ConstructorPrologue>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let declaring_parameters = tokens.type_parameters(enclosing).to_vec();
@@ -4666,7 +5193,7 @@ fn emit_bound_body_into(
         is_static,
         false,
         flags,
-        None,
+        prologue,
         debug,
         Some(into),
     );
@@ -4685,7 +5212,7 @@ fn emit_bound_body_in_scope(
     method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     name: &str,
     return_symbol: &TypeSymbol,
-    params: &[(Box<str>, TypeSymbol)],
+    params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
     byref_flags: &[ParamPassing],
     bound: &BoundStmt,
     is_static: bool,
@@ -4707,12 +5234,12 @@ fn emit_bound_body_in_scope(
         declaring: declaring_parameters,
     };
     let arg_base = u16::from(!is_static);
-    let parameter_names = bound_parameter_names(params, byref_flags);
-    let byref_params: Vec<(Box<str>, TypeSymbol)> = params
+    let parameter_names = bound_parameter_names(&param_pairs(params), byref_flags);
+    let byref_params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> = params
         .iter()
         .enumerate()
         .filter(|(index, _)| byref_flags.get(*index).copied().unwrap_or(ParamPassing::ByValue).is_byref())
-        .map(|(_, (name, ty))| (name.clone(), ty.clone()))
+        .map(|(_, (name, ty, names))| (name.clone(), ty.clone(), names.clone()))
         .collect();
     let debug_source = debug.map(|context| context.source.as_bytes());
     let EmittedBody {
@@ -4724,7 +5251,7 @@ fn emit_bound_body_in_scope(
         pinned_slots,
     } = emit_body(
         &param_row_names(&parameter_names),
-        &byref_params,
+        &param_pairs(&byref_params),
         scope.declaring,
         bound,
         tokens,
@@ -4787,7 +5314,7 @@ fn emit_bound_body_in_scope(
     let parameter_sigs: Vec<TypeSig> = params
         .iter()
         .enumerate()
-        .map(|(index, (_, ty))| {
+        .map(|(index, (_, ty, _))| {
             let sig = open_type_sig(tokens, ty, scope)?;
             Ok(if byref_flags.get(index).copied().unwrap_or(ParamPassing::ByValue).is_byref() {
                 TypeSig::ByRef(Box::new(sig))
@@ -4829,6 +5356,462 @@ fn emit_bound_body_in_scope(
     Ok(method)
 }
 
+/// One lambda-bearing method awaiting its closure type: the members it contributes to `<>c`, and
+/// everything needed to land its own body once that type's tokens exist.
+///
+/// **QUEUED FOR THE SAME REASON THE ASYNC MACHINE IS** -- a type's field and method rows are
+/// contiguous (II.22), so a closure type discovered mid-way through its enclosing type cannot
+/// emit in place. The difference is that `<>c` is shared: every non-capturing lambda in a TYPE
+/// lands on one closure type, however many of its methods wrote one.
+#[derive(Debug)]
+pub(crate) struct PendingLambda {
+    /// The enclosing method's own `MethodDef`, added with a deferred body in its type's method
+    /// run. `None` for an ASYNC method, whose body is `MoveNext`'s and is landed by
+    /// `emit_async_machine` -- this entry then contributes closure members and nothing else.
+    pub(crate) stub_token: Option<Token>,
+    /// The rewritten body, with each lambda site replaced by its cached-delegate creation.
+    pub(crate) body: BoundStmt,
+    /// The closure members this method contributes.
+    pub(crate) sites: Vec<crate::lambdalower::LoweredLambda>,
+    /// The display class this method needs, if anything in it captures.
+    pub(crate) display: Option<crate::lambdalower::DisplayClass>,
+    /// The constructor chain call, carried to the drain that emits the deferred body. A
+    /// constructor holding a lambda has its body deferred, and the drain has no prologue of its
+    /// own to give it.
+    pub(crate) prologue: Option<crate::method::ConstructorPrologue>,
+    /// The declaring type: whose `<>c` this is, and the scope the body emits in.
+    pub(crate) enclosing: TypeSymbol,
+    /// The method's frame facts, fixed when its row was added.
+    pub(crate) name: Box<str>,
+    pub(crate) params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)>,
+    pub(crate) byref_flags: Vec<ParamPassing>,
+    pub(crate) return_symbol: TypeSymbol,
+    pub(crate) is_static: bool,
+    pub(crate) flags: u16,
+}
+
+/// Emits every queued closure type, then lands the deferred bodies that name them.
+///
+/// **ONE `<>c` PER ENCLOSING TYPE, NOT PER METHOD**, which is why this drains the whole queue at
+/// once rather than an entry at a time: two methods of one type contribute members to the same
+/// closure type, and a type's rows have to be written in one run.
+///
+/// The order inside is forced. Every closure type is emitted BEFORE any deferred body, because a
+/// body names its type's `<>c` members by token; and the closure types come before the async
+/// machines (`build_image` calls this first) because an async method's `MoveNext` may hold a
+/// lambda site too, and `emit_async_machine` emits that body.
+fn emit_closure_types(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    pending: Vec<PendingLambda>,
+) -> Result<(), crate::EmitError> {
+    let mut order: Vec<TypeSymbol> = Vec::new();
+    let mut grouped: Vec<Vec<crate::lambdalower::LoweredLambda>> = Vec::new();
+    for entry in &pending {
+        if !entry
+            .sites
+            .iter()
+            .any(|site| site.home == crate::lambdalower::LambdaHome::ClosureType)
+        {
+            continue;
+        }
+        let index = match order.iter().position(|ty| ty == &entry.enclosing) {
+            Some(index) => index,
+            None => {
+                order.push(entry.enclosing.clone());
+                grouped.push(Vec::new());
+                order.len() - 1
+            }
+        };
+        grouped[index].extend(
+            entry
+                .sites
+                .iter()
+                .filter(|site| site.home == crate::lambdalower::LambdaHome::ClosureType)
+                .cloned(),
+        );
+    }
+    for sites in &mut grouped {
+        sites.sort_by_key(|site| site.ordinal);
+    }
+    for (enclosing, sites) in order.iter().zip(grouped) {
+        emit_closure_type(image, binder, tokens, enclosing, &sites)?;
+    }
+    for entry in &pending {
+        let Some(display) = &entry.display else {
+            continue;
+        };
+        let sites: Vec<crate::lambdalower::LoweredLambda> = entry
+            .sites
+            .iter()
+            .filter(|site| site.home == crate::lambdalower::LambdaHome::DisplayClass)
+            .cloned()
+            .collect();
+        emit_display_class(image, binder, tokens, &entry.enclosing, display, &sites)?;
+    }
+    for (enclosing, token, site) in core::mem::take(&mut tokens.pending_instance_bodies) {
+        mint_references(&site.body, image, tokens);
+        emit_bound_body_into(
+            token,
+            image,
+            tokens,
+            &enclosing,
+            &site.method_name,
+            &site.return_type,
+            &param_triples(&site.parameters),
+            &[],
+            &site.body,
+            false,
+            METHOD_PRIVATE | METHOD_HIDEBYSIG,
+            None,
+            None,
+        )?;
+    }
+    for entry in pending {
+        let Some(stub_token) = entry.stub_token else {
+            continue;
+        };
+        mint_references(&entry.body, image, tokens);
+        emit_bound_body_into(
+            stub_token,
+            image,
+            tokens,
+            &entry.enclosing,
+            &entry.name,
+            &entry.return_symbol,
+            &entry.params,
+            &entry.byref_flags,
+            &entry.body,
+            entry.is_static,
+            entry.flags,
+            entry.prologue.as_ref(),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Emits one `<>c__DisplayClass{N}_{S}`: the TypeDef, one public field per capture, a
+/// parameterless `.ctor`, and one instance method per body that landed on it.
+///
+/// csc's shape, measured member for member:
+///
+/// ```text
+///     <>c__DisplayClass{N}_{S}   nested private, sealed, beforefieldinit, [CompilerGenerated]
+///     {name}                     PUBLIC instance, one per capture, named as the source wrote it
+///     <>4__this                  PUBLIC instance, only when a body on this class reads `this`
+///     .ctor                      public hidebysig specialname rtspecialname
+///     <M>b__{K}                  ASSEMBLY instance hidebysig, and NO attribute of its own
+/// ```
+///
+/// **NOT `Serializable`, WHERE `<>c` IS.** `tdSerializable` (0x2000) is set on the closure type
+/// and not on a display class. The asymmetry is csc's.
+///
+/// **NO `.cctor` AND NO CACHE.** The delegate closes over a particular instance, so a second
+/// evaluation has nothing to reuse; `ReferenceEquals` over two evaluations of one such lambda is
+/// `false` under csc, where the same test on a non-capturing one is `true`.
+fn emit_display_class(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    display: &crate::lambdalower::DisplayClass,
+    sites: &[crate::lambdalower::LoweredLambda],
+) -> Result<(), crate::EmitError> {
+    let base = system_base(image, tokens, "Object");
+    let name: String = match &display.symbol {
+        TypeSymbol::Named(path) => path.last().map_or_else(String::new, |last| (**last).into()),
+        _ => String::new(),
+    };
+    let token = image.add_type("", &name, base, 0x0000_0003 | TYPE_SEALED | TYPE_BEFORE_FIELD_INIT);
+    tokens.insert_type(&display.symbol, token);
+    if let Some(enclosing_token) = tokens.type_token(enclosing) {
+        image.add_nested_class(token, enclosing_token);
+    }
+    emit_compiler_generated_marker(image, tokens, token);
+    for (field, ty) in &display.fields {
+        mint_signature_type(binder, ty, &[], &[], image, tokens)?;
+        let signature = field_signature(&type_sig(tokens, ty)?);
+        let field_token = image.add_field(field, &signature, FIELD_PUBLIC);
+        tokens.insert_field(&display.symbol, field, field_token);
+    }
+    if display.hoists_this {
+        let signature = field_signature(&type_sig(tokens, enclosing)?);
+        let field_token = image.add_field(
+            crate::lambdalower::THIS_FIELD,
+            &signature,
+            FIELD_PUBLIC,
+        );
+        tokens.insert_field(&display.symbol, crate::lambdalower::THIS_FIELD, field_token);
+    }
+    let span = lamella_syntax::span::Span::empty_at(0);
+    let ctor_prologue = ConstructorPrologue {
+        ctor: object_base_ctor(image, tokens),
+        span: None,
+        arguments: Vec::new(),
+        leading_body: 0,
+        zero_initialize: None,
+    };
+    let empty_body = BoundStmt {
+        kind: lamella_binder::BoundStmtKind::Block(Vec::new()),
+        span,
+    };
+    let ctor_token = emit_bound_body(
+        image,
+        tokens,
+        &display.symbol,
+        &[],
+        &[],
+        ".ctor",
+        &TypeSymbol::Special(SpecialType::Void),
+        &[],
+        &[],
+        &empty_body,
+        false,
+        false,
+        ctor_flags(&[Modifier::Public]),
+        Some(&ctor_prologue),
+        None,
+    )?;
+    tokens.insert_method(&display.symbol, ".ctor", &[], ctor_token);
+    for site in sites {
+        mint_references(&site.body, image, tokens);
+        let body_token = emit_bound_body(
+            image,
+            tokens,
+            &display.symbol,
+            &[],
+            &[],
+            &site.method_name,
+            &site.return_type,
+            &param_triples(&site.parameters),
+            &[],
+            &site.body,
+            false,
+            false,
+            METHOD_ASSEMBLY | METHOD_HIDEBYSIG,
+            None,
+            None,
+        )?;
+        let parameter_types: Vec<TypeSymbol> =
+            site.parameters.iter().map(|(_, ty)| ty.clone()).collect();
+        tokens.insert_method(
+            &display.symbol,
+            &site.method_name,
+            &parameter_types,
+            body_token,
+        );
+    }
+    Ok(())
+}
+
+/// Emits one `<>c`: the TypeDef, the singleton and cache fields, `.cctor`, `.ctor`, and one
+/// instance method per lambda body.
+///
+/// csc's shape, measured at `/optimize+` and reproduced flag for flag:
+///
+/// ```text
+///     <>c              nested private, sealed, serializable, beforefieldinit
+///                      [CompilerGenerated], extends System.Object
+///     <>9              public static initonly <>c        -- the singleton
+///     <>9__N_M         public static D                   -- one cache slot per lambda
+///     .cctor           private static hidebysig specialname rtspecialname
+///     .ctor            public hidebysig specialname rtspecialname
+///     <M>b__N_M        ASSEMBLY instance hidebysig       -- and NO [CompilerGenerated]
+/// ```
+///
+/// The bodies are INSTANCE methods on the singleton rather than statics, which is csc's choice and
+/// not an arbitrary one: a delegate over a static method stores `null` as its target and takes the
+/// slower of the runtime's two invocation paths.
+fn emit_closure_type(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    sites: &[crate::lambdalower::LoweredLambda],
+) -> Result<(), crate::EmitError> {
+    for (index, site) in sites.iter().enumerate() {
+        if site.cache_name.is_some()
+            && sites[..index].iter().any(|earlier| earlier.cache_name == site.cache_name)
+        {
+            return Err(crate::EmitError::Unsupported(
+                "two lambdas in one type were given the same closure cache field",
+            ));
+        }
+    }
+    let closure = crate::lambdalower::closure_symbol(enclosing);
+    let base = system_base(image, tokens, "Object");
+    let closure_token = image.add_type(
+        "",
+        crate::lambdalower::CLOSURE_TYPE,
+        base,
+        0x0000_0003 | TYPE_SEALED | 0x0000_2000 | 0x0010_0000,
+    );
+    tokens.insert_type(&closure, closure_token);
+    if let Some(enclosing_token) = tokens.type_token(enclosing) {
+        image.add_nested_class(closure_token, enclosing_token);
+    }
+    emit_compiler_generated_marker(image, tokens, closure_token);
+    let singleton = crate::lambdalower::singleton_field(enclosing);
+    let singleton_sig = field_signature(&type_sig(tokens, &closure)?);
+    let singleton_token = image.add_field(
+        crate::lambdalower::SINGLETON_FIELD,
+        &singleton_sig,
+        FIELD_PUBLIC | FIELD_STATIC | FIELD_INITONLY,
+    );
+    tokens.insert_field(&closure, &singleton.name, singleton_token);
+    for site in sites {
+        let Some(cache_name) = &site.cache_name else {
+            mint_signature_type(binder, &site.delegate_type, &[], &[], image, tokens)?;
+            continue;
+        };
+        mint_signature_type(binder, &site.delegate_type, &[], &[], image, tokens)?;
+        let signature = field_signature(&type_sig(tokens, &site.delegate_type)?);
+        let token = image.add_field(cache_name, &signature, FIELD_PUBLIC | FIELD_STATIC);
+        tokens.insert_field(&closure, cache_name, token);
+    }
+    let span = lamella_syntax::span::Span::empty_at(0);
+    let cctor_body = BoundStmt {
+        kind: lamella_binder::BoundStmtKind::Block(alloc::vec![BoundStmt {
+            kind: lamella_binder::BoundStmtKind::Expression(BoundExpr {
+                ty: closure.clone(),
+                kind: BoundExprKind::Assignment {
+                    operator: lamella_syntax::ast::AssignmentOperator::Assign,
+                    target: Box::new(BoundExpr {
+                        ty: closure.clone(),
+                        kind: BoundExprKind::FieldAccess {
+                            receiver: Box::new(BoundExpr {
+                                ty: closure.clone(),
+                                kind: BoundExprKind::TypeReference(closure.clone()),
+                            }),
+                            field: Some(singleton.clone()),
+                            name: Box::from(crate::lambdalower::SINGLETON_FIELD),
+                        },
+                    }),
+                    value: Box::new(BoundExpr {
+                        ty: closure.clone(),
+                        kind: BoundExprKind::ObjectCreation {
+                            constructor: Some(lamella_binder::MethodReference {
+                                declaring_type: closure.clone(),
+                                name: Box::from(".ctor"),
+                                parameters: Vec::new(),
+                                return_type: TypeSymbol::Special(SpecialType::Void),
+                                is_static: false,
+                                is_vararg: false,
+                                instantiation: None,
+                                declaring_instantiation: None,
+                            }),
+                            arguments: Vec::new(),
+                            initializer: None,
+                        },
+                    }),
+                    checked: false,
+                },
+            }),
+            span,
+        }]),
+        span,
+    };
+    let cctor_signature = method_signature(false, &[], &TypeSig::Void);
+    let cctor_token =
+        image.add_method_deferred_body(".cctor", &cctor_signature, CCTOR_FLAGS, IL_MANAGED, &[]);
+    tokens.insert_method(&closure, ".cctor", &[], cctor_token);
+    let ctor_prologue = ConstructorPrologue {
+        ctor: object_base_ctor(image, tokens),
+        span: None,
+        arguments: Vec::new(),
+        leading_body: 0,
+        zero_initialize: None,
+    };
+    let empty_body = BoundStmt {
+        kind: lamella_binder::BoundStmtKind::Block(Vec::new()),
+        span,
+    };
+    let ctor_token = emit_bound_body(
+        image,
+        tokens,
+        &closure,
+        &[],
+        &[],
+        ".ctor",
+        &TypeSymbol::Special(SpecialType::Void),
+        &[],
+        &[],
+        &empty_body,
+        false,
+        false,
+        ctor_flags(&[Modifier::Public]),
+        Some(&ctor_prologue),
+        None,
+    )?;
+    tokens.insert_method(&closure, ".ctor", &[], ctor_token);
+    mint_references(&cctor_body, image, tokens);
+    emit_bound_body_into(
+        cctor_token,
+        image,
+        tokens,
+        &closure,
+        ".cctor",
+        &TypeSymbol::Special(SpecialType::Void),
+        &[],
+        &[],
+        &cctor_body,
+        true,
+        CCTOR_FLAGS,
+        None,
+        None,
+    )?;
+    let mut body_tokens = Vec::with_capacity(sites.len());
+    for site in sites {
+        let scope = GenericScope {
+            method: &[],
+            declaring: &[],
+        };
+        let parameter_sigs: Vec<TypeSig> = site
+            .parameters
+            .iter()
+            .map(|(_, ty)| open_type_sig(tokens, ty, scope))
+            .collect::<Result<_, _>>()?;
+        let return_sig = open_type_sig(tokens, &site.return_type, scope)?;
+        let signature = method_signature(true, &parameter_sigs, &return_sig);
+        let token = image.add_method_deferred_body(
+            &site.method_name,
+            &signature,
+            METHOD_ASSEMBLY | METHOD_HIDEBYSIG,
+            IL_MANAGED,
+            &by_value_parameter_names(&site.parameters),
+        );
+        tokens.insert_method(
+            &closure,
+            &site.method_name,
+            &site.parameters.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
+            token,
+        );
+        body_tokens.push(token);
+    }
+    let byref_flags: Vec<ParamPassing> = Vec::new();
+    for (site, token) in sites.iter().zip(body_tokens) {
+        mint_references(&site.body, image, tokens);
+        emit_bound_body_into(
+            token,
+            image,
+            tokens,
+            &closure,
+            &site.method_name,
+            &site.return_type,
+            &param_triples(&site.parameters),
+            &byref_flags,
+            &site.body,
+            false,
+            METHOD_ASSEMBLY | METHOD_HIDEBYSIG,
+            None,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 /// One async method awaiting its machine: everything `emit_async_machine` needs once every
 /// source type's rows are placed. Queued on [`Tokens`] by `emit_method_body`'s async arm.
 #[derive(Debug)]
@@ -4840,7 +5823,7 @@ pub(crate) struct PendingAsync {
     /// The declaring type, for the `NestedClass` row and the stub's emission scope.
     pub(crate) enclosing: TypeSymbol,
     /// The stub's frame facts, fixed when its row was added.
-    pub(crate) params: Vec<(Box<str>, TypeSymbol)>,
+    pub(crate) params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)>,
     pub(crate) byref_flags: Vec<ParamPassing>,
     pub(crate) return_symbol: TypeSymbol,
     pub(crate) is_static: bool,
@@ -4932,6 +5915,7 @@ fn emit_async_machine(
         false,
         METHOD_PUBLIC | METHOD_HIDEBYSIG,
         None,
+        None,
     )?;
     mint_references(&lowering.stub_body, image, tokens);
     emit_bound_body_into(
@@ -4946,6 +5930,7 @@ fn emit_async_machine(
         &lowering.stub_body,
         is_static,
         flags,
+        None,
         None,
     )?;
     Ok(())
@@ -5047,6 +6032,7 @@ fn emit_property(
     let property_ty = binder.canonicalize(&bind_type(ty));
     let is_static = explicit_interface.is_none() && modifiers.contains(&Modifier::Static);
     let is_abstract = modifiers.contains(&Modifier::Abstract);
+    let is_bodyless = is_abstract || modifiers.contains(&Modifier::Extern);
 
     let property_name = match explicit_interface {
         Some(interface) => explicit_interface_member_name(interface, name),
@@ -5099,9 +6085,9 @@ fn emit_property(
                 )?;
             }
             Some(token)
-        } else if is_abstract {
+        } else if is_bodyless {
             let signature = method_signature(true, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
-            Some(image.add_abstract_method(&method_name, &signature, flags, &[]))
+            Some(image.add_abstract_method(&method_name, &signature, bodyless_flags(flags), &[]))
         } else if let Some(field) = backing {
             let signature =
                 method_signature(!is_static, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
@@ -5144,7 +6130,7 @@ fn emit_property(
             &[property_ty.clone()],
         );
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
-        let params = [(Box::from("value"), property_ty.clone())];
+        let params = [(Box::from("value"), property_ty.clone(), Vec::new())];
         let setter_void = if setter.is_init {
             let marker = named_symbol("System.Runtime.CompilerServices", "IsExternalInit");
             mint_named_type_token(&marker, image, tokens);
@@ -5178,10 +6164,10 @@ fn emit_property(
                 )?;
             }
             Some(token)
-        } else if is_abstract {
+        } else if is_bodyless {
             let signature =
                 method_signature(true, &[member_type_sig(tokens, enclosing, &property_ty)?], &setter_void);
-            Some(image.add_abstract_method(&method_name, &signature, flags, &by_value_parameter_names(&params)))
+            Some(image.add_abstract_method(&method_name, &signature, bodyless_flags(flags), &by_value_parameter_names(&param_pairs(&params))))
         } else if let Some(field) = backing {
             let signature = method_signature(
                 !is_static,
@@ -5193,7 +6179,7 @@ fn emit_property(
                 &method_name,
                 &signature,
                 flags,
-                &by_value_parameter_names(&params),
+                &by_value_parameter_names(&param_pairs(&params)),
                 field,
                 is_static,
                 true,
@@ -5380,6 +6366,16 @@ fn self_type_token(
 /// -- its name + signature match one -- so an accessor implementing nothing stays non-virtual even
 /// on an interface-implementing type (its vtable-slot flags follow its own modifiers).
 #[allow(clippy::too_many_arguments)]
+/// A bodyless accessor's flags: `property_accessor_flags`' answer plus `hidebysig`.
+///
+/// **THE BIT ARRIVES FROM `slot_flags` FOR AN ABSTRACT ACCESSOR AND FROM NOWHERE FOR AN EXTERN
+/// ONE**, because an extern accessor takes no vtable slot. csc marks both -- an extern getter
+/// reads `0x0886` (public specialname hidebysig), measured -- so it is added here rather than at
+/// the four branches that would each have to remember.
+fn bodyless_flags(flags: u16) -> u16 {
+    flags | METHOD_HIDEBYSIG
+}
+
 fn property_accessor_flags(
     binder: &Binder,
     enclosing: &TypeSymbol,
@@ -5442,32 +6438,49 @@ fn emit_indexer(
     parameters: &[Parameter],
     getter: Option<&lamella_syntax::ast::Accessor>,
     setter: Option<&lamella_syntax::ast::Accessor>,
+    explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let element_ty = binder.canonicalize(&bind_type(ty));
-    let index_params: Vec<(Box<str>, TypeSymbol)> = parameters
+    let index_params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> = parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), binder.canonicalize(&bind_type(&parameter.ty))))
+        .map(|parameter| {
+            (
+                parameter.name.clone(),
+                binder.canonicalize(&bind_type(&parameter.ty)),
+                lamella_binder::bind::tuple_element_names(&parameter.ty),
+            )
+        })
         .collect();
-    let is_abstract = modifiers.contains(&Modifier::Abstract);
+    let is_bodyless =
+        modifiers.contains(&Modifier::Abstract) || modifiers.contains(&Modifier::Extern);
     let index_param_types: Vec<TypeSymbol> =
-        index_params.iter().map(|(_, ty)| ty.clone()).collect();
+        index_params.iter().map(|(_, ty, _)| ty.clone()).collect();
     let index_sigs: Vec<TypeSig> = index_params
         .iter()
-        .map(|(_, ty)| member_type_sig(tokens, enclosing, ty))
+        .map(|(_, ty, _)| member_type_sig(tokens, enclosing, ty))
         .collect::<Result<_, _>>()?;
     let element_sig = member_type_sig(tokens, enclosing, &element_ty)?;
     let property_sig = bodyless_return_sig(ty, element_sig.clone(), image, tokens);
-    let property =
-        image.add_property(name, &property_signature(true, &index_sigs, &property_sig), 0);
+    let property_name = match explicit_interface {
+        Some(interface) => explicit_interface_member_name(interface, name),
+        None => String::from(name),
+    };
+    let property = image.add_property(
+        &property_name,
+        &property_signature(true, &index_sigs, &property_sig),
+        0,
+    );
     if is_readonly_ref(ty) {
         attach_is_readonly(tokens, property);
     }
     let void = TypeSymbol::Special(SpecialType::Void);
     if let Some(getter) = getter {
-        let getter_name = accessor_name("get_", name);
+        let getter_member = accessor_name("get_", name);
+        let getter_name = explicit_accessor_name(explicit_interface, &getter_member);
         let flags = property_accessor_flags(
-            binder, enclosing, modifiers, &getter.modifiers, false, false, &getter_name,
+            binder, enclosing, modifiers, &getter.modifiers, false,
+            explicit_interface.is_some(), &getter_member,
             &index_param_types,
         );
         let token = if let Some(body) = &getter.body {
@@ -5476,18 +6489,24 @@ fn emit_indexer(
                 image, binder, tokens, enclosing, &[], &[], &getter_name, &element_ty, &index_params, &[],
                 body, false, false, false, flags, None, debug,
             )?)
-        } else if is_abstract {
+        } else if is_bodyless {
             let signature = method_signature(true, &index_sigs, &element_sig);
             Some(image.add_abstract_method(
                 &getter_name,
                 &signature,
-                flags,
-                &by_value_parameter_names(&index_params),
+                bodyless_flags(flags),
+                &by_value_parameter_names(&param_pairs(&index_params)),
             ))
         } else {
             None
         };
         if let Some(token) = token {
+            if let Some(interface) = explicit_interface {
+                emit_explicit_interface_impl(
+                    image, binder, tokens, enclosing, interface, &getter_member,
+                    &index_param_types, &element_ty, token,
+                )?;
+            }
             emit_attributes(image, binder, tokens, enclosing, token, &getter.attributes);
             emit_declared_parameter_metadata(image, binder, tokens, enclosing, token, parameters);
             image.add_method_semantics(SEMANTICS_GETTER, token, property);
@@ -5495,12 +6514,14 @@ fn emit_indexer(
     }
     if let Some(setter) = setter {
         let mut params = index_params.clone();
-        params.push((Box::from("value"), element_ty.clone()));
-        let setter_name = accessor_name("set_", name);
+        params.push((Box::from("value"), element_ty.clone(), Vec::new()));
+        let setter_member = accessor_name("set_", name);
+        let setter_name = explicit_accessor_name(explicit_interface, &setter_member);
         let mut setter_param_types = index_param_types.clone();
         setter_param_types.push(element_ty.clone());
         let flags = property_accessor_flags(
-            binder, enclosing, modifiers, &setter.modifiers, false, false, &setter_name,
+            binder, enclosing, modifiers, &setter.modifiers, false,
+            explicit_interface.is_some(), &setter_member,
             &setter_param_types,
         );
         let token = if let Some(body) = &setter.body {
@@ -5508,20 +6529,26 @@ fn emit_indexer(
                 image, binder, tokens, enclosing, &[], &[], &setter_name, &void, &params, &[],
                 body, false, false, false, flags, None, debug,
             )?)
-        } else if is_abstract {
+        } else if is_bodyless {
             let mut signature_params = index_sigs.clone();
             signature_params.push(element_sig.clone());
             let signature = method_signature(true, &signature_params, &TypeSig::Void);
             Some(image.add_abstract_method(
                 &setter_name,
                 &signature,
-                flags,
-                &by_value_parameter_names(&params),
+                bodyless_flags(flags),
+                &by_value_parameter_names(&param_pairs(&params)),
             ))
         } else {
             None
         };
         if let Some(token) = token {
+            if let Some(interface) = explicit_interface {
+                emit_explicit_interface_impl(
+                    image, binder, tokens, enclosing, interface, &setter_member,
+                    &setter_param_types, &void, token,
+                )?;
+            }
             emit_attributes(image, binder, tokens, enclosing, token, &setter.attributes);
             emit_declared_parameter_metadata(image, binder, tokens, enclosing, token, parameters);
             image.add_method_semantics(SEMANTICS_SETTER, token, property);
@@ -5592,7 +6619,11 @@ fn emit_default_member_attribute(
     members: &[Member],
 ) {
     let Some(name) = members.iter().find_map(|member| match member {
-        Member::Indexer { attributes, .. } => Some(indexer_name(attributes)),
+        Member::Indexer {
+            attributes,
+            explicit_interface: None,
+            ..
+        } => Some(indexer_name(attributes)),
         _ => None,
     }) else {
         return;
@@ -6118,8 +7149,64 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
 }
 
 /// Mints tokens an expression and its sub-expressions reference.
+/// Mints the `MemberRef` for a delegate's runtime constructor, keyed `(delegate, ".ctor", &[])` --
+/// the unique-ctor convention `emit_delegate_creation`, `emit_cached_delegate` and the
+/// source-delegate pre-pass all use (`native int` is not a [`TypeSymbol`], so it cannot be a key).
+///
+/// **A CONSTRUCTED GENERIC DELEGATE IS PARENTED ON A `TypeSpec`, NOT A `TypeRef`**, and getting
+/// there through `split_type_name` was impossible rather than merely wrong: that function answers
+/// `None` for an `Instantiation`, so `Func<int,int> f = Twice;` minted NO constructor at all and
+/// the emitter refused it with `delegate constructor was not emitted` -- an UNCODED refusal, on a
+/// program csc compiles. The two shapes are alternatives and never a fall-through, exactly as
+/// `mint_member_ref` says of the member case it already distinguishes.
+///
+/// The SIGNATURE does not change with the instantiation: a delegate's runtime constructor is
+/// `(object, native int)` in every delegate ever declared, and neither parameter can mention a
+/// type parameter. So there is no open-signature step here -- the definition's signature and the
+/// substituted one are the same bytes.
+fn mint_delegate_ctor(delegate_type: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    if tokens.method(delegate_type, ".ctor", &[]).is_some() {
+        return;
+    }
+    let ctor_sig = method_signature(true, &[TypeSig::Object, TypeSig::NativeInt], &TypeSig::Void);
+    let parent = match delegate_type {
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => mint_type_spec(delegate_type, definition, arguments, image, tokens),
+        _ => split_type_name(delegate_type).map(|(namespace, name)| {
+            mint_named_type_token(delegate_type, image, tokens);
+            image.type_ref(&namespace, &name)
+        }),
+    };
+    if let Some(parent) = parent {
+        let ctor = image.member_ref(parent, ".ctor", &ctor_sig);
+        tokens.insert_method(delegate_type, ".ctor", &[], ctor);
+    }
+}
+
 fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens) {
     match &expr.kind {
+        BoundExprKind::SwitchExpression {
+            governing,
+            arms,
+            fallback,
+            ..
+        } => {
+            mint_in_expr(governing, image, tokens);
+            for arm in arms {
+                if let Some(test) = &arm.test {
+                    mint_in_expr(test, image, tokens);
+                }
+                if let Some(guard) = &arm.guard {
+                    mint_in_expr(guard, image, tokens);
+                }
+                mint_in_expr(&arm.value, image, tokens);
+            }
+            if let Some(fallback) = fallback {
+                mint_in_expr(fallback, image, tokens);
+            }
+        }
         BoundExprKind::Literal(Literal::String(text)) => {
             let token = image.user_string(text);
             tokens.insert_string(text, token);
@@ -6292,24 +7379,10 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             {
                 mint_member_ref(target, image, tokens);
             }
-            if tokens.method(delegate_type, ".ctor", &[]).is_none() {
-                let ctor_sig =
-                    method_signature(true, &[TypeSig::Object, TypeSig::NativeInt], &TypeSig::Void);
-                let parent = match delegate_type {
-                    TypeSymbol::Instantiation {
-                        definition,
-                        arguments,
-                    } => mint_type_spec(delegate_type, definition, arguments, image, tokens),
-                    _ => split_type_name(delegate_type).map(|(namespace, name)| {
-                        mint_named_type_token(delegate_type, image, tokens);
-                        image.type_ref(&namespace, &name)
-                    }),
-                };
-                if let Some(parent) = parent {
-                    let ctor = image.member_ref(parent, ".ctor", &ctor_sig);
-                    tokens.insert_method(delegate_type, ".ctor", &[], ctor);
-                }
-            }
+            mint_delegate_ctor(delegate_type, image, tokens);
+        }
+        BoundExprKind::CachedDelegate { delegate_type, .. } => {
+            mint_delegate_ctor(delegate_type, image, tokens);
         }
         BoundExprKind::FieldAccess {
             receiver, field, ..
@@ -6625,7 +7698,17 @@ fn mint_in_initializer(
     match initializer {
         lamella_binder::BoundInitializer::Collection(elements) => {
             for element in elements {
-                mint_in_expr(element, image, tokens);
+                for argument in &element.arguments {
+                    mint_in_expr(argument, image, tokens);
+                }
+                if let Some(add) = &element.add {
+                    if tokens
+                        .method(&add.declaring_type, &add.name, &add.parameters)
+                        .is_none()
+                    {
+                        mint_member_ref(add, image, tokens);
+                    }
+                }
             }
         }
         lamella_binder::BoundInitializer::Object(members) => {
@@ -8986,6 +10069,7 @@ fn collect_type_tokens(
             parameters,
             getter,
             setter,
+            explicit_interface,
             attributes,
             ..
         } = member
@@ -9002,19 +10086,26 @@ fn collect_type_tokens(
                 .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
                 .collect();
             let accessor = indexer_name(attributes);
+            let key = |prefix: &str| -> String {
+                explicit_accessor_name(explicit_interface.as_ref(), &accessor_name(prefix, "Item"))
+            };
             if emitted(getter) {
                 *next_method += 1;
                 let token = Token::new(METHOD_DEF, *next_method);
-                tokens.insert_method(&declaring, "get_Item", &indices, token);
-                alias_renamed_accessor(tokens, &declaring, "get_", &accessor, &indices, token);
+                tokens.insert_method(&declaring, &key("get_"), &indices, token);
+                if explicit_interface.is_none() {
+                    alias_renamed_accessor(tokens, &declaring, "get_", &accessor, &indices, token);
+                }
             }
             if emitted(setter) {
                 *next_method += 1;
                 let token = Token::new(METHOD_DEF, *next_method);
                 let mut parameters = indices;
                 parameters.push(binder.canonicalize(&bind_type(ty)));
-                tokens.insert_method(&declaring, "set_Item", &parameters, token);
-                alias_renamed_accessor(tokens, &declaring, "set_", &accessor, &parameters, token);
+                tokens.insert_method(&declaring, &key("set_"), &parameters, token);
+                if explicit_interface.is_none() {
+                    alias_renamed_accessor(tokens, &declaring, "set_", &accessor, &parameters, token);
+                }
             }
         }
     }
@@ -9233,9 +10324,13 @@ fn collect_tokens(
                 *next_field += 1 + declaration.members.len() as u32;
             }
             NamespaceMember::Delegate(declaration) => {
-                let declaring = named_symbol(namespace, &declaration.name);
+                let declaring = declared_delegate_symbol(namespace, declaration);
                 *next_type += 1;
                 tokens.insert_type(&declaring, Token::new(TYPE_DEF, *next_type));
+                tokens.insert_type_parameters(
+                    &declaring,
+                    delegate_type_parameter_names(binder, &declaring, declaration),
+                );
                 *next_method += 1;
                 tokens.insert_method(
                     &declaring,
@@ -9284,6 +10379,41 @@ fn declared_type_name(declaration: &TypeDecl) -> String {
 /// [`declared_type_name`] as the symbol the token table and the model are keyed by.
 fn declared_type_symbol(namespace: &str, declaration: &TypeDecl) -> TypeSymbol {
     named_symbol(namespace, &declared_type_name(declaration))
+}
+
+/// [`declared_type_name`] for a DELEGATE, which is a class in metadata and mangles identically.
+///
+/// Every word of [`declared_type_name`]'s warning applies here: a generic delegate emitted under
+/// its bare name puts `Transform` in the image while the model, `declaration.rs` and every
+/// signature lookup ask for `` Transform`1 ``, and that miss is silent.
+///
+fn declared_delegate_name(declaration: &DelegateDecl) -> String {
+    lamella_binder::metadata_type_name(&declaration.name, declaration.type_parameters.len())
+}
+
+/// [`declared_delegate_name`] as the symbol the token table and the model are keyed by.
+fn declared_delegate_symbol(namespace: &str, declaration: &DelegateDecl) -> TypeSymbol {
+    named_symbol(namespace, &declared_delegate_name(declaration))
+}
+
+/// The `!n` names a delegate declaration owns, enclosing chain first (II.9.2) -- the delegate twin
+/// of [`type_parameter_names`], and split for the same reason that one exists: the POSITION in this
+/// slice is the number a signature encodes, so it must be built once and used by both the
+/// `GenericParam` rows and the signature writer.
+fn delegate_type_parameter_names(
+    binder: &Binder,
+    enclosing: &TypeSymbol,
+    declaration: &DelegateDecl,
+) -> Vec<Box<str>> {
+    enclosing_type_parameters(binder, enclosing)
+        .into_iter()
+        .chain(
+            declaration
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone()),
+        )
+        .collect()
 }
 
 fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
@@ -10120,7 +11250,7 @@ mod tests {
         );
         let program = ValidatedProgram::from_clean_bind(&units, &references, false)
             .expect("the barrier is minted from the assertion above");
-        let (image, _) = build_image(&program, "test.dll", "test", None, false, false)
+        let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("an optional parameter emits");
         image
     }
@@ -10218,7 +11348,7 @@ mod tests {
         }
         let program = ValidatedProgram::from_clean_bind(&units, &references, false)
             .expect("the barrier is minted from the assertion above, not from a bare `false`");
-        let (image, _) = build_image(&program, "test.dll", "test", None, false, false)
+        let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("a generic declaration emits");
         image
     }
@@ -10761,7 +11891,7 @@ mod tests {
         }
         let program = ValidatedProgram::from_clean_bind(&units, &references, false)
             .expect("the barrier is minted from the assertion above");
-        let (image, _) = build_image(&program, "test.dll", "test", None, false, false)
+        let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("an imported generic in a signature emits");
         image
     }
@@ -11226,8 +12356,9 @@ mod tests {
     /// AGAINST A LITERAL, AND THAT IS THE POINT OF THE ROW.** II.23.2.1 requires the `MemberRef` to
     /// carry the DEFINITION's signature -- `!0`, not the substituted `int32` -- so the definition
     /// already holds an independent copy of the right answer, written by the declaration path
-    /// rather than by the minting path under test. A literal would be a second transcription of my
-    /// own reading; this is two producers agreeing.
+    /// rather than by the minting path under test. **Two producers agreeing is an assertion; one
+    /// value checked against a copy of itself is a restatement.**
+    ///
     ///
     /// The three shapes are here together because they took three different routes to the same
     /// defect: the ctor was REFUSED outright, the instance call named the open `MethodDef`, and the

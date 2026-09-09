@@ -1,7 +1,7 @@
 //! Collecting the types and members declared in source (ECMA-334 1st ed,
 //! clauses 16-18).
 
-use crate::bind::{bind_type, parameter_symbol};
+use crate::bind::{bind_type, parameter_symbol, tuple_element_names};
 use crate::bound::{coerce_constant, integer_literal, literal_int_value};
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
 use crate::resolve::TypeTable;
@@ -89,6 +89,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 next_value = value.wrapping_add(1);
                 prior.insert(member.name.clone(), value);
                 info.fields.push(FieldSymbol {
+                    tuple_names: Vec::new(),
                     name: member.name.clone(),
                     ty: enum_ty.clone(),
                     is_static: true,
@@ -102,10 +103,19 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             model.insert(info);
         }
         NamespaceMember::Delegate(declaration) => {
-            let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Delegate);
+            let mut info =
+                TypeInfo::new(namespace, &declared_delegate_name(declaration), TypeKind::Delegate);
+            info.type_parameters = declaration
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect();
+            info.type_parameter_constraints =
+                constraints_by_parameter(&info.type_parameters, &declaration.constraints);
             info.accessibility = accessibility_of(&declaration.modifiers);
             info.is_sealed = true;
             info.methods.push(MethodSymbol {
+                return_tuple_names: tuple_element_names(&declaration.return_type),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: "Invoke".into(),
@@ -157,14 +167,25 @@ pub(crate) fn declared_type_name(declaration: &TypeDecl) -> alloc::string::Strin
     metadata_type_name(&declaration.name, declaration.type_parameters.len())
 }
 
+/// The metadata name a DELEGATE declaration is collected under, arity mangled in exactly as
+/// [`declared_type_name`] does it for a class.
+///
+/// A delegate is a class in metadata, so its arity mangles by the same II.10.7.2 rule and there is
+/// no second convention to keep straight -- the two functions differ only in the AST node they
+/// read, which is why this one is three lines rather than a parameter on that one.
+pub(crate) fn declared_delegate_name(
+    declaration: &lamella_syntax::ast::DelegateDecl,
+) -> alloc::string::String {
+    metadata_type_name(&declaration.name, declaration.type_parameters.len())
+}
+
 /// The metadata name of a nested type member (a class/struct/interface/enum/delegate). An enum
-/// and a delegate cannot declare type parameters in the grammar we parse, so only a `Type` can
-/// carry an arity here.
+/// cannot declare type parameters, so it alone is collected under its bare name here.
 fn nested_member_name(member: &NamespaceMember) -> Option<alloc::string::String> {
     match member {
         NamespaceMember::Type(declaration) => Some(declared_type_name(declaration)),
         NamespaceMember::Enum(declaration) => Some(declaration.name.to_string()),
-        NamespaceMember::Delegate(declaration) => Some(declaration.name.to_string()),
+        NamespaceMember::Delegate(declaration) => Some(declared_delegate_name(declaration)),
         NamespaceMember::Namespace(_) => None,
     }
 }
@@ -1214,6 +1235,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 ..
             } => {
                 let field_ty = bind_type(ty);
+                let field_tuple_names = tuple_element_names(ty);
                 let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
                 let is_static = is_static(modifiers) || is_const;
                 let accessibility = access(modifiers);
@@ -1230,6 +1252,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         prior_consts.insert(declarator.name.clone(), literal.clone());
                     }
                     info.fields.push(FieldSymbol {
+                        tuple_names: field_tuple_names.clone(),
                         name: declarator.name.clone(),
                         ty: field_ty.clone(),
                         is_static,
@@ -1248,10 +1271,12 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 ..
             } => {
                 let field_ty = bind_type(ty);
+                let field_tuple_names = tuple_element_names(ty);
                 let is_static = is_static(modifiers);
                 let accessibility = access(modifiers);
                 for declarator in declarators {
                     info.fields.push(FieldSymbol {
+                        tuple_names: field_tuple_names.clone(),
                         name: declarator.name.clone(),
                         ty: field_ty.clone(),
                         is_static,
@@ -1263,6 +1288,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     });
                     info.events.push(EventSymbol {
                         name: declarator.name.clone(),
+                        explicit_interface: None,
                         ty: field_ty.clone(),
                         is_static,
                         accessibility,
@@ -1284,6 +1310,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     Some(interface) => explicit_interface_member_name(interface, name).into(),
                     None => name.clone(),
                 },
+                explicit_interface: explicit_interface.as_ref().map(bind_type),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
                 accessibility: match explicit_interface {
@@ -1307,6 +1334,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 attributes,
                 ..
             } => info.methods.push(MethodSymbol {
+                return_tuple_names: tuple_element_names(return_type),
                 return_required_modifiers: Vec::new(),
                 name: match explicit_interface {
                     Some(interface) => explicit_interface_member_name(interface, name).into(),
@@ -1347,6 +1375,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                return_tuple_names: tuple_element_names(return_type),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: operator.method_name(parameters.len()).into(),
@@ -1372,6 +1401,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                return_tuple_names: tuple_element_names(target),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: direction.method_name().into(),
@@ -1402,6 +1432,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             } => {
                 if is_auto_property(modifiers, getter.as_ref(), setter.as_ref(), is_interface) {
                     info.fields.push(FieldSymbol {
+                        tuple_names: tuple_element_names(ty),
                         name: auto_property_backing_field_name(explicit_interface.as_ref(), name)
                             .into(),
                         ty: bind_type(ty),
@@ -1414,6 +1445,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     });
                 }
                 info.properties.push(PropertySymbol {
+                tuple_names: tuple_element_names(ty),
                 name: name.clone(),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
@@ -1441,20 +1473,36 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 getter,
                 setter,
+                explicit_interface,
                 ..
             } => {
                 let element = bind_type(ty);
+                let element_tuple_names = tuple_element_names(ty);
                 let indices: Vec<TypeSymbol> = parameters.iter().map(parameter_symbol).collect();
-                let accessibility = access(modifiers);
+                let interface_symbol = explicit_interface.as_ref().map(bind_type);
+                let accessor = |prefix: &str| -> Box<str> {
+                    let plain = alloc::format!("{prefix}Item");
+                    match explicit_interface {
+                        Some(interface) => {
+                            explicit_interface_member_name(interface, &plain).into()
+                        }
+                        None => plain.into(),
+                    }
+                };
+                let accessibility = match explicit_interface {
+                    Some(_) => Accessibility::Private,
+                    None => access(modifiers),
+                };
                 let indexer_is_virtual = is_virtual(modifiers);
                 let indexer_is_abstract = is_abstract_member(modifiers, info.kind);
                 let indexer_is_override = is_override(modifiers);
                 let indexer_is_sealed = is_sealed_member(modifiers);
                 if getter.is_some() {
                     info.methods.push(MethodSymbol {
+                        return_tuple_names: element_tuple_names.clone(),
                         return_required_modifiers: Vec::new(),
-                        explicit_interface: None,
-                        name: "get_Item".into(),
+                        explicit_interface: interface_symbol.clone(),
+                        name: accessor("get_"),
                         return_type: element.clone(),
                         parameters: indices.clone(),
                         parameter_info: crate::bind::parameter_infos(parameters),
@@ -1478,17 +1526,19 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         "value".into(),
                         crate::symbols::ParameterMode::Value,
                     ));
+                    let indexer_has_params = has_params_array(parameters);
                     let mut parameters = indices;
                     parameters.push(element);
                     info.methods.push(MethodSymbol {
+                        return_tuple_names: Vec::new(),
                         return_required_modifiers: Vec::new(),
-                        explicit_interface: None,
-                        name: "set_Item".into(),
+                        explicit_interface: interface_symbol,
+                        name: accessor("set_"),
                         return_type: TypeSymbol::Special(SpecialType::Void),
                         parameters,
                         parameter_info: info_with_value,
                         is_static: false,
-                        is_params: false,
+                        is_params: indexer_has_params,
                         is_vararg: false,
                         is_virtual: indexer_is_virtual,
                         is_abstract: indexer_is_abstract,
@@ -1541,6 +1591,7 @@ fn constructor(
     accessibility: Accessibility,
 ) -> MethodSymbol {
     MethodSymbol {
+        return_tuple_names: Vec::new(),
         return_required_modifiers: Vec::new(),
         explicit_interface: None,
         name: ".ctor".into(),

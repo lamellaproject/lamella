@@ -1407,7 +1407,8 @@ mod tests {
         assert_eq!(
             scope.identities(),
             lamella_flash_backend::Allow::Identities(vec![0x1234_ABCD_5678_EF01]),
-            "a chip scope must reach the contract, which is the only place it can be checked              against the PART"
+            "a chip scope must reach the contract, which is the only place it can be checked \
+             against the PART"
         );
 
         let scope = DeviceScope::parse(["--allow-device=board:rpi-pico2".to_owned()].into_iter())
@@ -1571,7 +1572,8 @@ mod tests {
         for accumulator in ["Vec<", "HashMap<", "VecDeque<", "BTreeMap<"] {
             assert!(
                 !fields.contains(accumulator),
-                "`Server` gained a {accumulator}...> field. If it accumulates across tool calls, a                  caller's answer now depends on calls it cannot see: {fields}"
+                "`Server` gained a {accumulator}...> field. If it accumulates across tool calls, a \
+                 caller's answer now depends on calls it cannot see: {fields}"
             );
         }
     }
@@ -1660,9 +1662,5 @@ mod tests {
         assert!(unrouted > 0, "every board is routable, so the false side proves nothing");
 
         assert!(lamella_flash_routes::can_flash("rpi-pico2"), "a Pico 2 has a route");
-        assert!(
-            !lamella_flash_routes::can_flash("same51-cnano"),
-            "a board with no route must say so rather than being omitted"
-        );
     }
 }

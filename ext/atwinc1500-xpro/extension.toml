@@ -2,7 +2,7 @@
 # extension board. Every line below names a SIGNAL of the ../standards/xplained-pro.toml standard
 # and never a host pad, because this board carries no host: its own guide says it "connects to any
 # Xplained Pro standard extension header on any Xplained Pro MCU board". Which pad a signal reaches
-# is the HOST's fact and lives in that host's `[[headers]]` row.
+# is the HOST's fact and lives in that host's `[[connectors]]` row.
 #
 # SPI IS THE ONLY HOST INTERFACE, and the guide says so outright. The UART and I2C lines this
 # connector carries are development and debug paths, not the way a program talks to the radio -- and

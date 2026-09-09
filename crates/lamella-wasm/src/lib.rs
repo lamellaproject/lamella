@@ -104,7 +104,7 @@ fn run_static(assembly_bytes: &'static [u8], corlib_bytes: Option<&'static [u8]>
     };
 
     let mut vm = Vm::new();
-    clock::install(&mut vm);
+    clock::install(&program.module, &mut vm);
     console::install(&mut vm);
     match run(&program.module, &mut vm, program.entry, Vec::new()) {
         Ok(result) => RunResult {

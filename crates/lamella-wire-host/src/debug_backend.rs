@@ -463,7 +463,11 @@ impl WireHostBackend {
 
     /// Send the breakpoint set (each address = packed method_id|offset) to the target. DBG_BREAK REPLACES all
     /// breakpoints, so callers pass the FULL set they want armed.
-    fn send_breakpoints(&mut self, addresses: &[u64]) {
+    /// Programs the device's breakpoint set, reporting a wire failure rather than swallowing it:
+    /// both halves are silent otherwise, and they fail differently. A `send` error is a dead
+    /// transport; a missing `DBG_ACK` is a device that took the frame and did not answer, which is
+    /// the case that leaves the host believing a breakpoint is armed.
+    fn send_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
         let mut payload = Vec::with_capacity(2 + addresses.len() * 8);
         payload.extend_from_slice(&(addresses.len() as u16).to_le_bytes());
         for &address in addresses {
@@ -472,8 +476,12 @@ impl WireHostBackend {
             payload.extend_from_slice(&offset.to_le_bytes());
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_BREAK, seq, &payload).is_ok() {
-            self.await_type(debug::DBG_ACK);
+        if self.transport.send(debug::DBG_BREAK, seq, &payload).is_err() {
+            return Err("the wire dropped while sending breakpoints".to_string());
+        }
+        match self.await_type(debug::DBG_ACK) {
+            Some(_) => Ok(()),
+            None => Err("the target did not acknowledge the breakpoints".to_string()),
         }
     }
 
@@ -655,7 +663,7 @@ fn decode_value(payload: &[u8], at: &mut usize) -> Option<WireValue> {
 #[must_use]
 pub fn decode_vars(payload: &[u8]) -> Option<(Vec<WireValue>, Vec<WireValue>)> {
     let mut at = 0;
-    let mut count = |at: &mut usize| -> Option<usize> {
+    let count = |at: &mut usize| -> Option<usize> {
         let bytes = payload.get(*at..*at + 2)?;
         *at += 2;
         Some(u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
@@ -742,7 +750,14 @@ impl DebugBackend for WireHostBackend {
             return false;
         };
         self.session_live = true;
-        !matches!(self.on_stopped(&stop), Stop::Fault(_))
+        if matches!(self.on_stopped(&stop), Stop::Fault(_)) {
+            return false;
+        }
+        if self.user_bps.is_empty() {
+            return true;
+        }
+        let pending = self.user_bps.clone();
+        self.send_breakpoints(&pending).is_ok()
     }
 
     fn resume(&mut self) -> Stop {
@@ -813,17 +828,21 @@ impl DebugBackend for WireHostBackend {
         self.frames.len().max(1)
     }
 
-    fn set_breakpoints(&mut self, addresses: &[u64]) {
+    fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
         self.user_bps = addresses.to_vec();
-        if self.session_live && self.running {
+        if !self.session_live {
+            return Ok(());
+        }
+        if self.running {
             self.pause();
-            self.send_breakpoints(addresses);
+            self.send_breakpoints(addresses)?;
             let seq = self.next_seq();
             if self.transport.send(debug::DBG_RESUME, seq, &[]).is_ok() {
                 self.running = true;
             }
+            Ok(())
         } else {
-            self.send_breakpoints(addresses);
+            self.send_breakpoints(addresses)
         }
     }
 
@@ -843,7 +862,9 @@ impl DebugBackend for WireHostBackend {
         }
         let mut armed = self.user_bps.clone();
         armed.extend_from_slice(&temps);
-        self.send_breakpoints(&armed);
+        if let Err(reason) = self.send_breakpoints(&armed) {
+            return Stop::Fault(reason);
+        }
         let seq = self.next_seq();
         if self.transport.send(debug::DBG_RESUME, seq, &[]).is_err() {
             return Stop::Fault("the wire dropped".to_string());
@@ -854,7 +875,9 @@ impl DebugBackend for WireHostBackend {
             None => Stop::Fault("run-to-return timed out".to_string()),
         };
         let restore = self.user_bps.clone();
-        self.send_breakpoints(&restore);
+        if let Err(reason) = self.send_breakpoints(&restore) {
+            return Stop::Fault(reason);
+        }
         match stop {
             Stop::Breakpoint => {
                 let at = self.frames.first().map(|&(method, offset)| pack(method, offset));
@@ -951,7 +974,8 @@ impl DebugBackend for WireHostBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{SrcMap, WireHostBackend, WireTransport, debug};
+    use super::{SrcMap, WireHostBackend, WireTransport, debug, pack};
+    use lamella_debug_backend::DebugBackend;
     use lamella_wire::{MemTransport, Transport};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -959,11 +983,22 @@ mod tests {
     /// A backend wired to an in-memory board, with a live session and one `DBG_ACK` already
     /// waiting -- so a detach completes instead of sitting out its timeout.
     fn backend_with_a_live_session() -> (WireHostBackend, Arc<Mutex<MemTransport>>) {
-        let mut board = MemTransport::new();
-        board.send(debug::DBG_ACK, 1, &[]).expect("queue the board's ack");
-        let acked = board.take_sent();
+        live_session(1)
+    }
+
+    /// Queues one `DBG_ACK` per acknowledgement the test expects the board to give. Zero is the
+    /// silent board: every wait runs out its timeout, which is the case a swallowed result cannot
+    /// be told apart from a working one.
+    fn live_session(acks: usize) -> (WireHostBackend, Arc<Mutex<MemTransport>>) {
         let mut host = MemTransport::new();
-        host.feed(&acked);
+        for index in 0..acks {
+            let mut board = MemTransport::new();
+            board
+                .send(debug::DBG_ACK, index as u16 + 1, &[])
+                .expect("queue the board's ack");
+            let acked = board.take_sent();
+            host.feed(&acked);
+        }
 
         let shared = Arc::new(Mutex::new(host));
         let backend = WireHostBackend {
@@ -994,6 +1029,39 @@ mod tests {
             types.push(frame.msg_type);
         }
         types
+    }
+
+    #[test]
+    fn a_target_that_never_acknowledges_the_breakpoints_is_reported() {
+        let (mut backend, _shared) = live_session(0);
+        let Err(reason) = backend.set_breakpoints(&[pack(1, 0)]) else {
+            panic!("an unacknowledged breakpoint set must not be reported as armed");
+        };
+        assert!(
+            reason.contains("acknowledge"),
+            "and the reason must distinguish a silent device from a dead wire: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_breakpoint_set_reports_success() {
+        let (mut backend, _shared) = live_session(1);
+        assert!(
+            backend.set_breakpoints(&[pack(1, 0)]).is_ok(),
+            "an acknowledged set is armed, and saying otherwise would grey working breakpoints"
+        );
+    }
+
+    #[test]
+    fn breakpoints_set_before_the_session_exists_are_not_reported_as_a_failure() {
+        let (mut backend, shared) = live_session(0);
+        backend.session_live = false;
+        assert!(backend.set_breakpoints(&[pack(1, 0)]).is_ok());
+        assert_eq!(
+            sent_types(&shared).iter().filter(|&&t| t == debug::DBG_BREAK).count(),
+            0,
+            "and nothing is sent into a session that does not exist -- launch arms it instead"
+        );
     }
 
     #[test]

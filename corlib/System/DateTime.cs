@@ -105,7 +105,7 @@ namespace System
 
         public long Ticks { get { return InternalTicks; } }
 
-        [Lamella.Runtime.RuntimeProvided] private static long NowTicks() { return 0; }
+        private static long NowTicks() { return Lamella.Runtime.Clock.NowTicks(); }
 
         public static DateTime Now { get { return FromDateData(CheckedTicks(NowTicks()) | KindBitsLocal); } }
 

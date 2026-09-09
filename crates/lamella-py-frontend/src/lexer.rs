@@ -298,6 +298,29 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
         indents: vec![0],
         open_brackets: Vec::new(),
         tokens: Vec::new(),
+        synthetic_bracket: false,
+    };
+    lexer.run()?;
+    Ok(lexer.tokens)
+}
+
+/// Tokenize the source of one f-string replacement FIELD.
+///
+/// A field is an expression, not a line. PEP 701 lets one span source lines, so a `{` and its `}`
+/// may sit on different ones and the addition between them is still one expression -- and a line
+/// ending inside it is no more a terminator than one inside a list
+/// display is. So the field is lexed as what it is: content INSIDE a bracket, the brace being the
+/// bracket. That reuses the implicit-continuation rule already in this lexer rather than adding a
+/// second way to spell it, and it keeps indentation out of the field, which has none to speak of.
+pub(crate) fn tokenize_field(source: &str) -> Result<Vec<Token>, LexError> {
+    let mut lexer = Lexer {
+        chars: source.chars().collect(),
+        pos: 0,
+        line: 1,
+        indents: vec![0],
+        open_brackets: vec![('{', 1)],
+        tokens: Vec::new(),
+        synthetic_bracket: true,
     };
     lexer.run()?;
     Ok(lexer.tokens)
@@ -380,15 +403,28 @@ struct Lexer {
     /// far from where the input ran out; and a closer can only be known to mismatch by comparing it
     /// against the opener it was meant to match.
     open_brackets: Vec<(char, u32)>,
+    /// Whether [`Self::open_brackets`] was seeded with a bracket the SOURCE does not contain, which
+    /// is how a replacement field is lexed as the bracketed content it is. It is dropped before the
+    /// end-of-input check so it can never be reported as unclosed.
+    synthetic_bracket: bool,
     tokens: Vec<Token>,
 }
 
-/// The kind of a (possibly prefixed) string literal -- a plain string, a `bytes`, or an f-string.
+/// The kind of a (possibly prefixed) string literal -- a plain string, a `bytes`, an f-string, or a
+/// t-string.
+///
+/// [`StrKind::TString`] is recognized but not lexed: a `t"..."` literal builds a `Template`, which
+/// this runtime has no type for. **It is named here rather than left out** -- an unrecognized prefix
+/// is not an error, it is an ordinary NAME followed by a string, so leaving `t` out does not refuse
+/// t-strings, it mis-parses them into whatever the next token makes of the pair. That produced two
+/// unrelated messages for one missing feature (`expected end of line` where a t-string was assigned,
+/// `expected ')'` where one annotated a parameter), neither naming the construct.
 #[derive(Clone, Copy)]
 enum StrKind {
     Str,
     Bytes,
     FString,
+    TString,
 }
 
 impl Lexer {
@@ -398,6 +434,9 @@ impl Lexer {
                 break;
             }
             self.scan_logical_line()?;
+        }
+        if self.synthetic_bracket && self.open_brackets.len() == 1 {
+            self.open_brackets.pop();
         }
         if let Some((opener, opened)) = self.open_brackets.last().copied() {
             return Err(LexError {
@@ -586,6 +625,9 @@ impl Lexer {
                 StrKind::Str => self.lex_string(raw, triple),
                 StrKind::Bytes => self.lex_bytes(raw, triple),
                 StrKind::FString => self.lex_fstring(raw, triple),
+                StrKind::TString => {
+                    Err(self.err("a t-string (template literal) is out of the subset"))
+                }
             }
         } else if is_identifier_start(c) {
             self.lex_name();
@@ -595,8 +637,9 @@ impl Lexer {
         }
     }
 
-    /// Recognize the start of a string literal: an optional prefix -- `r`/`b`/`f`/`u` (single) or
-    /// `rb`/`br`/`rf`/`fr` (raw bytes / raw f-string, either order, any case) -- then a quote, single
+    /// Recognize the start of a string literal: an optional prefix -- `r`/`b`/`f`/`t`/`u` (single)
+    /// or `rb`/`br`/`rf`/`fr`/`rt`/`tr` (raw bytes / raw f-string / raw t-string, either order, any
+    /// case) -- then a quote, single
     /// or triple. Returns `(prefix_len, raw, kind, triple)`, or `None` when the cursor is not at a
     /// string (an ordinary name or an operator). A doubled / `bf` / `uu` letter combination is not a
     /// prefix.
@@ -609,6 +652,7 @@ impl Lexer {
                 'r' | 'R' => (true, StrKind::Str),
                 'b' | 'B' => (false, StrKind::Bytes),
                 'f' | 'F' => (false, StrKind::FString),
+                't' | 'T' => (false, StrKind::TString),
                 'u' | 'U' => (false, StrKind::Str),
                 _ => return None,
             };
@@ -619,6 +663,7 @@ impl Lexer {
             let kind = match pair {
                 ['b', 'r'] => StrKind::Bytes,
                 ['f', 'r'] => StrKind::FString,
+                ['r', 't'] => StrKind::TString,
                 _ => return None,
             };
             (2, true, kind)
@@ -656,9 +701,6 @@ impl Lexer {
                     self.pos += 1;
                     match self.peek() {
                         None => return Err(self.err("unterminated string literal")),
-                        Some('\n' | '\r') if !triple => {
-                            return Err(self.err("unterminated string literal"))
-                        }
                         Some(_) => self.push_string_char(&mut value),
                     }
                 }
@@ -721,9 +763,6 @@ impl Lexer {
                     self.pos += 1;
                     match self.peek() {
                         None => return Err(self.err("unterminated bytes literal")),
-                        Some('\n' | '\r') if !triple => {
-                            return Err(self.err("unterminated bytes literal"))
-                        }
                         Some(_) => self.push_bytes_char(&mut out)?,
                     }
                 }
@@ -909,8 +948,13 @@ impl Lexer {
         Ok(())
     }
 
-    /// `\N{NAME}`: the character with Unicode name NAME (a curated set of the common names; see
-    /// [`crate::named_chars`]). The `N` is already consumed. An unrecognized name is a clear error.
+    /// `\N{NAME}`: the character with Unicode name NAME. The `N` is already consumed.
+    ///
+    /// The names come from `lamella-unicode`, generated from the same `UnicodeData.txt` as the
+    /// property tables beside them, and they are behind the `char-names` feature because the table
+    /// is hundreds of kilobytes of strings and a build that compiles Python onto a microcontroller
+    /// has no room for it. **A build without the feature says so** rather than reporting the name
+    /// as unknown: the two are different facts and only one of them is about the name.
     fn lex_named_escape(&mut self, out: &mut StrBuf) -> Result<(), LexError> {
         if !matches!(self.peek(), Some('{')) {
             return Err(self.err("invalid '\\N' escape: expected '{' then a Unicode name"));
@@ -932,15 +976,25 @@ impl Lexer {
                 }
             }
         }
-        match crate::named_chars::char_from_name(&name.to_ascii_uppercase()) {
+        #[cfg(not(feature = "char-names"))]
+        {
+            let _ = (name, &mut *out);
+            return Err(self.err(
+                "'\\N{...}' Unicode names are not compiled into this build; use a '\\u'/'\\U' \
+                 code-point escape",
+            ));
+        }
+        #[cfg(feature = "char-names")]
+        match lamella_unicode::char_names::lookup(&name.to_ascii_uppercase()) {
             Some(ch) => {
                 out.push(ch);
                 Ok(())
             }
-            None => Err(self.err(
-                "unknown Unicode character name in '\\N{...}' (only common names are supported; \
+            None => Err(self.err(alloc::format!(
+                "unknown Unicode character name in '\\N{{...}}' ({} names are compiled in; \
                  use a '\\u'/'\\U' code-point escape)",
-            )),
+                lamella_unicode::char_names::len()
+            ))),
         }
     }
 
@@ -1015,7 +1069,6 @@ impl Lexer {
                     match self.peek() {
                         Some('{' | '}') => {}
                         None => return Err(self.err("unterminated f-string")),
-                        Some('\n' | '\r') if !triple => return Err(self.err("unterminated f-string")),
                         Some(_) => self.push_string_char(&mut literal),
                     }
                 }
@@ -1057,6 +1110,10 @@ impl Lexer {
                 Some('}') if depth == 0 => {
                     self.pos += 1;
                     return Ok((text, conversion, spec, debug));
+                }
+                Some('"' | '\'') if spec.is_some() && depth > 0 => {
+                    let target = spec.as_mut().expect("spec is Some");
+                    self.scan_fstring_nested_string(target)?;
                 }
                 Some(c) if spec.is_some() => {
                     match c {
@@ -2066,5 +2123,139 @@ mod tests {
         assert!(tokenize("0o8\n").is_err());
         assert!(tokenize("0b2\n").is_err());
         assert!(tokenize("0xG\n").is_err());
+    }
+
+    /// A backslash before a line ending continues a SINGLE-QUOTED literal onto the next source
+    /// line, in a raw literal exactly as in a plain one. What `r` changes is only what the literal
+    /// CONTAINS: both characters are kept, where a plain literal drops them both.
+    ///
+    /// A table over all three scanners, because the rule has three independent implementations. A
+    /// non-raw literal reaches it through the escape resolver, which a raw one never enters, so
+    /// each raw branch answers for itself and a table is the only way to hold all three to the same
+    /// answer. The negative cases below are part of the rule: a BARE newline still ends a
+    /// single-quoted literal, so this is not "raw literals may span lines".
+    #[test]
+    fn a_backslash_before_a_newline_continues_a_raw_literal_and_keeps_both_characters() {
+        let cont = "\\\n";
+        let src = alloc::format!("x = r'a{cont}b'\n");
+        assert_eq!(kinds(&src)[2], Tok::Str("a\\\nb".into()), "raw string");
+
+        let src = alloc::format!("x = 'a{cont}b'\n");
+        assert_eq!(kinds(&src)[2], Tok::Str("ab".into()), "plain string drops both");
+
+        let src = alloc::format!("x = R'a{cont}b'\n");
+        assert_eq!(kinds(&src)[2], Tok::Str("a\\\nb".into()), "the prefix is case-insensitive");
+
+        let src = alloc::format!("x = rb'a{cont}b'\n");
+        assert_eq!(kinds(&src)[2], Tok::Bytes(b"a\\\nb".to_vec()), "raw bytes");
+        let src = alloc::format!("x = br'a{cont}b'\n");
+        assert_eq!(kinds(&src)[2], Tok::Bytes(b"a\\\nb".to_vec()), "either prefix order");
+
+        let src = alloc::format!("x = rf'a{cont}b'\n");
+        match &kinds(&src)[2] {
+            Tok::FString(parts) => assert_eq!(
+                parts.as_slice(),
+                [FStringPart::Literal("a\\\nb".into())],
+                "raw f-string"
+            ),
+            other => panic!("expected an f-string, got {other:?}"),
+        }
+
+        let src = alloc::format!("x = r\"\"\"a{cont}b\"\"\"\n");
+        assert_eq!(kinds(&src)[2], Tok::Str("a\\\nb".into()), "raw triple");
+
+        assert!(tokenize("x = r'a\nb'\n").is_err(), "raw, no backslash");
+        assert!(tokenize("x = 'a\nb'\n").is_err(), "plain, no backslash");
+        assert!(tokenize("x = rb'a\nb'\n").is_err(), "raw bytes, no backslash");
+    }
+
+    /// `\N{NAME}` resolves through `lamella-unicode`'s generated table when this build carries it.
+    ///
+    /// Both halves are asserted, because they are different claims: with the names compiled in an
+    /// unknown NAME is the error, and without them the NAMES are what is missing and the message
+    /// has to say so. A build that reported "unknown name" for every name would look like a
+    /// vocabulary gap instead of an absent table.
+    #[cfg(feature = "char-names")]
+    #[test]
+    fn a_named_escape_resolves_through_the_generated_table() {
+        let resolves = |src: &str, expected: &str| {
+            assert_eq!(kinds(src)[0], Tok::Str(expected.into()), "for {src:?}");
+        };
+        resolves("'\\N{BULLET}'\n", "\u{2022}");
+        resolves("'\\N{GREEK SMALL LETTER PI}'\n", "\u{3C0}");
+        resolves("'\\N{EURO SIGN}'\n", "\u{20AC}");
+        resolves("'\\N{OX}'\n", "\u{1F402}");
+        resolves("'\\N{bullet}'\n", "\u{2022}");
+        let e = tokenize("'\\N{NO SUCH NAME AT ALL}'\n").expect_err("refused");
+        assert!(e.message.contains("unknown Unicode character name"), "{}", e.message);
+    }
+
+    /// A t-string is refused BY NAME, at the prefix, in every position it can appear.
+    ///
+    /// An unrecognized string prefix is not an error in itself: `t"x"` lexes as an ordinary NAME
+    /// followed by a string, so a refusal falls out of whatever the next token makes of that pair,
+    /// and it names the punctuation rather than the construct. Refusing at the prefix is what makes
+    /// the message name the feature.
+    #[test]
+    fn a_t_string_is_refused_by_name_wherever_it_appears() {
+        for src in [
+            "t = t\"Hello\"\n",
+            "def f(x: t\"{a}\"):\n    pass\n",
+            "x = t'single'\n",
+            "x = T\"upper prefix\"\n",
+            "x = rt\"raw\"\n",
+            "x = tr\"raw, other order\"\n",
+            "x = tR\"mixed case\"\n",
+            "x = t\"\"\"triple\"\"\"\n",
+            "print(t\"{a}\")\n",
+            "x = [t\"in a list\"]\n",
+        ] {
+            let e = tokenize(src).expect_err("a t-string is out of the subset");
+            assert!(
+                e.message.contains("t-string"),
+                "{src:?} must name the construct, said {:?}",
+                e.message
+            );
+        }
+        for src in [
+            "t = 1\n",
+            "t += 1\n",
+            "print(t)\n",
+            "t = \"not a t-string\"\n",
+            "def t():\n    pass\n",
+            "x = t\n",
+            "tt = 2\n",
+            "x = t[0]\n",
+            "x = t.attr\n",
+            "x = f\"{t}\"\n",
+            "x = f\"{t!r}\"\n",
+            "x = f\"{t:>10}\"\n",
+            "x = f\"{d['t']}\"\n",
+            "x = f\"{t}{t}\"\n",
+        ] {
+            assert!(tokenize(src).is_ok(), "should lex: {src:?}");
+        }
+        assert!(tokenize("x = bt\"x\"\n").is_ok(), "`bt` is a name, not a prefix");
+        assert!(tokenize("x = ft\"x\"\n").is_ok(), "`ft` is a name, not a prefix");
+    }
+
+    /// Without the table the escape is refused for the RIGHT reason -- the names are absent, which
+    /// is not a statement about the name the source wrote.
+    #[cfg(not(feature = "char-names"))]
+    #[test]
+    fn a_named_escape_says_the_names_are_absent_rather_than_unknown() {
+        let e = tokenize("'\\N{BULLET}'\n").expect_err("refused");
+        assert!(e.message.contains("not compiled into this build"), "{}", e.message);
+        assert!(tokenize("'\\N'\n").is_err());
+        assert!(tokenize("'\\N{unterminated'\n").is_err());
+    }
+
+    /// A continuation inside a raw literal still advances the LINE COUNTER, so a later error is
+    /// reported where it was written. The characters are kept, which is exactly the case where it
+    /// would be easy to keep them and forget the line.
+    #[test]
+    fn a_raw_literal_continuation_still_counts_the_line() {
+        let err = tokenize("x = r'a\\\nb'\ny = 0xG\n").expect_err("the bad hex literal is refused");
+        assert_eq!(err.line, 3, "the line `y` is on, counting the continued literal");
     }
 }

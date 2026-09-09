@@ -1,5 +1,5 @@
 //! Runtime-support object for the AOT linked image, cross-compiled for thumbv6m and linked in on demand
-//! (lamella-link's archive path pulls only the members a program reaches). It supplies the two runtime
+//! (lamella-linker's archive path pulls only the members a program reaches). It supplies the two runtime
 //! symbol groups the backend emits but does not define itself: `lamella_gc_alloc`, the device GC-alloc
 //! entry, and the `__aeabi_*` soft-float helpers a `double`/`float` op lowers to.
 #![no_std]
@@ -36,6 +36,25 @@ mod net_alloc {
     static ALLOCATOR: NetHeap = NetHeap;
 }
 
+#[cfg(feature = "link-host")]
+pub use lamella_runtime_support_debug as debug_support;
+
+#[cfg(all(feature = "link-host", not(feature = "net")))]
+mod link_alloc {
+    struct LinkHeap;
+
+    unsafe impl core::alloc::GlobalAlloc for LinkHeap {
+        unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+            crate::debug_support::rt_alloc(layout)
+        }
+
+        unsafe fn dealloc(&self, _pointer: *mut u8, _layout: core::alloc::Layout) {}
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: LinkHeap = LinkHeap;
+}
+
 /// A RAM word holding the bump allocator's high-water pointer (the reset stub seeds it before the entry).
 const HEAP_PTR: *mut u32 = 0x2000_0100 as *mut u32;
 
@@ -58,13 +77,19 @@ const HEAP_END: *mut u32 = 0x2000_0104 as *mut u32;
 /// `lamella_gc_alloc(payload_size [r0], &TypeDesc [r1]) -> payload* [r0]`. Bumps the fixed-RAM heap,
 /// writes the descriptor at the object header (base+0), and returns the payload (base+4).
 ///
-/// **Returns NULL when the request does not fit below [`HEAP_END`]** -- the AOT already emits a
-/// null test after every allocation call, so a null is what turns exhaustion into a defined event
-/// at the allocation that could not be served. Without the bound the cursor runs past the end of
-/// the heap and overwrites whatever sits above it, which is not a failure a program can observe:
-/// it is a program that keeps running on corrupted memory, and it presents as whatever happens to
-/// occupy that address -- a statics window looks like a backend fault, a stack looks like a codegen
-/// defect.
+/// **Returns NULL when the request does not fit below [`HEAP_END`], and nothing above this seam
+/// looks at the result.** The AOT emits no test after an allocation call, so exhaustion reaches the
+/// program as a null reference it never compares: a field store through it is discarded, and a
+/// field read answers whatever occupies low memory -- which on a Cortex-M part is the vector table,
+/// so the value comes back looking like an ordinary number. **An exhausted heap therefore produces
+/// a plausible wrong answer rather than a stop**, and a program that cannot afford one must bound
+/// its own allocation or test the reference itself.
+///
+/// Refusing is still the right behavior here, because the alternative is worse and is not
+/// observable at all. Without the bound the cursor runs past the end of the heap and overwrites
+/// whatever sits above it: a program that keeps running on corrupted memory, presenting as whatever
+/// happens to occupy that address -- a statics window looks like a backend fault, a stack looks
+/// like a codegen defect.
 ///
 /// Every arithmetic step is checked. `payload_size` reaches this seam from a managed `newarr`
 /// count, so a hostile or merely wrong length must not wrap the rounding (or the sum) into a
@@ -89,30 +114,61 @@ extern "C" fn lamella_gc_alloc_impl(payload_size: u32, type_desc: *const u32) ->
     }
 }
 
-/// `abs()` of a Python typed `float`: clears the IEEE-754 sign bit. Branch-free and correct for the
-/// signed-zero case (`-0.0 -> +0.0`, matching CPython), which a `x < 0.0 ? -x : x` select is not. The
-/// Python frontend emits an `Inst::PInvoke` to this for `abs(<float>)` -- the lowering cannot compute
-/// fabs itself (no F64 bitwise op, and its abstract-interp pass cannot emit a mid-expression branch).
+/// The magnitude of a double: clears the IEEE-754 sign bit. Branch-free and correct for the
+/// signed-zero case (`-0.0 -> +0.0`), which a `x < 0.0 ? -x : x` select is not -- that select answers
+/// `-0.0`, because `-0.0 < 0.0` is false.
+///
+/// **Serves two languages, which agree here rather than by coincidence**: Python's `abs(<float>)`
+/// and C#'s `System.Math.Abs(double)` are the same function, and both specify the signed-zero case
+/// the same way. The Python frontend emits an `Inst::PInvoke` to this; the C# AOT backend
+/// synthesizes `Math.Abs`'s `[RuntimeProvided]` body as a call to it. Neither lowering can compute
+/// it inline -- there is no F64 bitwise op in the IR.
 #[no_mangle]
 pub extern "C" fn lamella_fabs(x: f64) -> f64 {
-    f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff)
+    lamella_softmath::abs(x)
 }
 
-/// Round to the nearest integer, ties to EVEN (banker's rounding) -- Python's `round(<float>)` rule
-/// (`round(2.5) == 2`, `round(3.5) == 4`), returned as an f64 the frontend then converts to int. Uses
-/// the classic `(x + 2^52) - 2^52` identity: adding then subtracting 2^52 forces the soft-float adder's
-/// default IEEE round-to-nearest-EVEN to snap `x` to an integer. A magnitude at or above 2^52 is already
-/// integral (and the trick would lose bits), and NaN/inf pass through unchanged. Sign is carried onto
-/// the magic constant so negatives round symmetrically. The Python frontend PInvokes this for `round`.
+/// Round to the nearest integer, ties to EVEN (banker's rounding).
+///
+/// **Serves two languages that specify the same rule**: Python's `round(<float>)` and C#'s
+/// `System.Math.Round(double)`, whose default is `MidpointRounding.ToEven`. Both give
+/// `round(2.5) == 2` and `round(3.5) == 4`. The Python frontend PInvokes this for `round`; the C#
+/// AOT backend synthesizes `Math.Round(double)`'s `[RuntimeProvided]` body as a call to it, so one
+/// archive member serves both rather than two rounding rules being maintained in parallel.
 #[no_mangle]
 pub extern "C" fn lamella_rint(x: f64) -> f64 {
-    const TWO_POW_52: f64 = 4503599627370496.0;
-    let magnitude = f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff);
-    if !(magnitude < TWO_POW_52) {
-        return x;
-    }
-    let magic = f64::from_bits(TWO_POW_52.to_bits() | (x.to_bits() & 0x8000_0000_0000_0000));
-    (x + magic) - magic
+    lamella_softmath::round_half_to_even(x)
+}
+
+/// `System.Math.Truncate(double)` on device: the integer part, toward zero.
+#[no_mangle]
+pub extern "C" fn lamella_math_truncate(value: f64) -> f64 {
+    lamella_softmath::truncate(value)
+}
+
+/// `System.Math.Floor(double)` on device: the largest integer not greater than `value`.
+#[no_mangle]
+pub extern "C" fn lamella_math_floor(value: f64) -> f64 {
+    lamella_softmath::floor(value)
+}
+
+/// `System.Math.Ceiling(double)` on device: the smallest integer not less than `value`.
+#[no_mangle]
+pub extern "C" fn lamella_math_ceiling(value: f64) -> f64 {
+    lamella_softmath::ceiling(value)
+}
+
+/// `System.Math.Max(double, double)` on device: the larger, or NaN when either operand is NaN --
+/// .NET propagates NaN where IEEE `fmax` returns the other operand.
+#[no_mangle]
+pub extern "C" fn lamella_math_max(a: f64, b: f64) -> f64 {
+    lamella_softmath::max(a, b)
+}
+
+/// `System.Math.Min(double, double)` on device: the smaller, or NaN when either operand is NaN.
+#[no_mangle]
+pub extern "C" fn lamella_math_min(a: f64, b: f64) -> f64 {
+    lamella_softmath::min(a, b)
 }
 
 /// Ensure a growable Python list's backing has room for `needed_cap` elements, growing it if not:
@@ -297,7 +353,7 @@ fn write_string(s: *const u32) {
     }
 }
 
-/// Powers of ten from 10^19 down to 1 (10^19 < u64::MAX), in `.rodata` -- lamella-link now lays out
+/// Powers of ten from 10^19 down to 1 (10^19 < u64::MAX), in `.rodata` -- lamella-linker now lays out
 /// read-only data and resolves the `.rodata` section-symbol relocation that loads this table.
 static POW10: [u64; 20] = [
     10_000_000_000_000_000_000,
@@ -757,6 +813,155 @@ extern "C" fn lamella_double_to_exponential_impl(value: f64, precision: i32, upp
     obj
 }
 
+/// The float PARSE entry points, in a module of their own so that they land in a codegen unit of
+/// their own and therefore in an archive member of their own -- the same boundary
+/// [`decimal_seams`] draws, and for a much larger reason.
+///
+/// `f64::from_str` is the correct decimal-to-nearest rounding and it is not small: it carries
+/// `core::num::dec2flt`, whose slow path is a big-decimal fallback, and that path divides -- which
+/// pulls `compiler_builtins`' float division in behind it, including a 3,640-byte `f128` routine.
+/// Written INLINE in this file the whole of that landed in the member every image already links, and
+/// measured over the linked images it charged **+26,732 bytes to every one of them, including a
+/// program whose only statement prints a string literal**.
+///
+/// A program that parses no numbers references neither of these names, so with the boundary here the
+/// link never pulls the member and none of it reaches the image. The profile section of `Cargo.toml`
+/// carries the measurement behind why the LTO mode is what decides whether a module boundary is an
+/// archive boundary at all.
+mod float_parse_seams {
+    /// The cap, in ASCII bytes, on a validated number literal this tier will convert -- measured after
+    /// padding is trimmed and group separators are removed.
+    ///
+    /// A BOUND IS NECESSARY AND IT IS NOT FREE. The managed validator accepts an unbounded digit run, so
+    /// there is no length this cannot be handed; a `no_std` archive cannot grow a buffer to meet it. .NET
+    /// itself bounds the same problem at 769 significant digits, because beyond that the digits cannot
+    /// change an `f64` except through a sticky bit it tracks separately. This cap is well above that and
+    /// far above any literal a program writes.
+    ///
+    /// A literal LONGER than this is REFUSED (NaN) rather than truncated. Truncation would answer a
+    /// different number and look like a successful parse; refusing is wrong in one visible way instead of
+    /// silently wrong. See the seams below for the disposition and the follow-up.
+    const PARSE_TEXT_CAP: usize = 1024;
+
+    /// The padding a number parse trims, which is `NumberText.IsPad`'s set: ASCII 0x09-0x0D and 0x20.
+    /// Rust's own `str::trim` removes exactly these from ASCII text, so the device and the interpreter
+    /// agree on the boundary for every string the managed validator can pass through.
+    const fn is_number_pad(b: u8) -> bool {
+        (b >= 0x09 && b <= 0x0D) || b == 0x20
+    }
+
+    /// Narrow a managed `[len: u32][u16 units ...]` string into `buf` as the ASCII text a float parser
+    /// wants, applying the two normalizations the interpreter applies and in its order: trim the padding
+    /// from both ends, then drop GROUP SEPARATORS.
+    ///
+    /// The separator rule is not this function's to police. `Double.Parse`'s default style is
+    /// `NumberStyles.Float | NumberStyles.AllowThousands`, so `"1,5"` is fifteen; WHERE a separator is
+    /// legal is decided by the managed validator, which has already run. This only has to remove them.
+    ///
+    /// Returns the byte count, or `None` when the text does not fit `buf` or carries a unit outside
+    /// ASCII -- neither of which a validated literal can be, which is why both are refusals rather than
+    /// best-effort conversions.
+    fn managed_number_text(s: *const u32, buf: &mut [u8; PARSE_TEXT_CAP]) -> Option<usize> {
+        if s.is_null() {
+            return None;
+        }
+        let len = unsafe { core::ptr::read_volatile(s) } as usize;
+        let units = unsafe { (s as *const u8).add(4) as *const u16 };
+        let at = |i: usize| unsafe { core::ptr::read_volatile(units.add(i)) };
+
+        let mut start = 0usize;
+        let mut end = len;
+        while start < end && at(start) < 0x80 && is_number_pad(at(start) as u8) {
+            start += 1;
+        }
+        while end > start && at(end - 1) < 0x80 && is_number_pad(at(end - 1) as u8) {
+            end -= 1;
+        }
+
+        let mut n = 0usize;
+        for i in start..end {
+            let unit = at(i);
+            if unit == u16::from(b',') {
+                continue;
+            }
+            if unit >= 0x80 || n == buf.len() {
+                return None;
+            }
+            buf[n] = unit as u8;
+            n += 1;
+        }
+        Some(n)
+    }
+
+    /// `System.Double.ParseValid(string)` on device: the decimal-to-nearest-`f64` rounding behind the
+    /// managed `Double.Parse` and `Double.TryParse`.
+    ///
+    /// Those two have ALREADY validated the format, so the only work left is the rounding managed C#
+    /// cannot do without `unsafe`. The .NET specials are recognized here as the interpreter recognizes
+    /// them -- `NaN`, `Infinity` and `+Infinity`/`-Infinity`, case-insensitively, after trimming -- and
+    /// everything else goes to the same `from_str` the interpreter uses, so the two tiers round
+    /// identically rather than similarly.
+    ///
+    /// No `anchor_seam_shim!`: this neither parks nor allocates, so it is not a safepoint and it is not
+    /// on the string-allocating seam list. `lamella_fabs` and `lamella_rint` are the same shape.
+    ///
+    /// NaN IS RETURNED FOR THE INPUTS THIS CANNOT CONVERT -- a literal past [`PARSE_TEXT_CAP`], a
+    /// non-ASCII unit, a null receiver -- and that answer is ambiguous, because `"NaN"` is itself a
+    /// valid input producing NaN. It is chosen over `0.0` because zero is a value real input produces
+    /// constantly and NaN is not, so a wrong answer here is far likelier to be noticed. The unambiguous
+    /// fix is an error channel through the managed seam signature, which is a corlib change.
+    #[no_mangle]
+    pub extern "C" fn lamella_double_parse(s: *const u32) -> f64 {
+        let mut buf = [0u8; PARSE_TEXT_CAP];
+        let Some(n) = managed_number_text(s, &mut buf) else {
+            return f64::NAN;
+        };
+        let text = &buf[..n];
+        if text.eq_ignore_ascii_case(b"nan") {
+            return f64::NAN;
+        }
+        if text.eq_ignore_ascii_case(b"infinity") || text.eq_ignore_ascii_case(b"+infinity") {
+            return f64::INFINITY;
+        }
+        if text.eq_ignore_ascii_case(b"-infinity") {
+            return f64::NEG_INFINITY;
+        }
+        match core::str::from_utf8(text) {
+            Ok(t) => t.parse::<f64>().unwrap_or(f64::NAN),
+            Err(_) => f64::NAN,
+        }
+    }
+
+    /// `System.Single.ParseValid(string)` on device: the `f32` twin of [`lamella_double_parse`].
+    ///
+    /// A SEPARATE ENTRY POINT RATHER THAN A NARROWED `f64`, and that is the whole reason it exists.
+    /// Parsing to `f64` and then narrowing rounds TWICE, and the two roundings do not compose: a decimal
+    /// exactly between two `f32` values can round to an `f64` that then rounds the other way. The
+    /// interpreter parses `f32` directly for the same reason. (Contrast the FORMAT seams, where widening
+    /// `f32` to `f64` is exact and one implementation serves both.)
+    #[no_mangle]
+    pub extern "C" fn lamella_single_parse(s: *const u32) -> f32 {
+        let mut buf = [0u8; PARSE_TEXT_CAP];
+        let Some(n) = managed_number_text(s, &mut buf) else {
+            return f32::NAN;
+        };
+        let text = &buf[..n];
+        if text.eq_ignore_ascii_case(b"nan") {
+            return f32::NAN;
+        }
+        if text.eq_ignore_ascii_case(b"infinity") || text.eq_ignore_ascii_case(b"+infinity") {
+            return f32::INFINITY;
+        }
+        if text.eq_ignore_ascii_case(b"-infinity") {
+            return f32::NEG_INFINITY;
+        }
+        match core::str::from_utf8(text) {
+            Ok(t) => t.parse::<f32>().unwrap_or(f32::NAN),
+            Err(_) => f32::NAN,
+        }
+    }
+}
+
 /// The `System.Decimal` entry points, in a module of their own so that they land in a codegen
 /// unit of their own and therefore in an archive member of their own. A program that does no
 /// decimal arithmetic references none of these names, so the link never pulls that member, and
@@ -1085,7 +1290,7 @@ pub extern "C" fn lamella_net_local_port(_handle: i32) -> i32 {
 pub extern "C" fn lamella_net_close(_handle: i32) {}
 
 /// Never called -- it exists only to force the soft-float helpers a float method references into this
-/// archive from `compiler_builtins`, so lamella-link can pull whichever a given program reaches:
+/// archive from `compiler_builtins`, so lamella-linker can pull whichever a given program reaches:
 /// `__aeabi_dmul`/`dsub`/`dadd`/`dcmpeq`/`dcmplt`, `__aeabi_fcmpeq`, and the int<->float conversions a
 /// `conv.r8`/`conv.r4`/`conv.r.un` lowers to (`i2d`/`l2d`/`f2d`, `d2f`/`l2f`, unsigned `ui2d`/`ul2d`).
 #[allow(clippy::eq_op)]
@@ -1438,6 +1643,85 @@ pub extern "C" fn lamella_sched_demo() -> u32 {
 }
 
 
+/// A board's monotonic millisecond counter, supplied by the IMAGE.
+///
+/// A board's timebase is a board fact -- which timer peripheral, what tick rate, which prescaler --
+/// and this archive is built once per ISA for every board, so it cannot name one. Under
+/// `clock-board` the image supplies this symbol and every timed operation here reads it. Selecting
+/// the feature without providing it fails the LINK, which is the loud failure: the alternative is an
+/// image whose `Thread.Sleep` returns at once and reports nothing.
+#[cfg(feature = "clock-board")]
+unsafe extern "C" {
+    fn lamella_board_now_ms() -> u64;
+}
+
+/// The monotonic millisecond reading a TIMED OPERATION may rely on, or `None` where this build has
+/// no real clock.
+///
+/// # WHY THIS IS NOT `reactor_env::now_millis`, WHICH LOOKS LIKE THE SAME QUESTION
+///
+/// That one answers "what time does the reactor think it is", and on the featureless build it
+/// answers from a MOCK the block point advances by whatever it was asked to wait -- which is what
+/// makes the self-contained demo deterministic and is exactly the wrong thing to compute a sleep
+/// deadline from on real silicon. A mock clock that advances only when something sleeps reports
+/// that the sleep happened; nothing did.
+///
+/// So this is the narrower question -- **is there a clock a deadline can be trusted to reach** --
+/// and it is deliberately answered by REAL sources only.
+///
+/// # WHY A BOARD SYMBOL RATHER THAN THE NET STACK'S CLOCK
+///
+/// The wall clock is a VES-global resource, not a networking feature. The other monotonic source
+/// an image can have is `lamella_net_now_ms`, which lives in the NETWORKING support crate and
+/// answers 0 until a firmware registers one -- so an image with no net stack has no monotonic
+/// reading through that route.
+///
+/// The net stack's clock is a FALLBACK: an image that registers one and selects no board clock still
+/// has a monotonic reading. A firmware providing BOTH should hand the net backend the same source it
+/// exports here -- then the reactor's timers and the stack's own read agree by construction rather
+/// than by luck, which is the property `lamella_net_now_ms`'s own documentation asks for.
+fn monotonic_now_ms() -> Option<u64> {
+    #[cfg(feature = "clock-board")]
+    {
+        let now = unsafe { lamella_board_now_ms() };
+        if now != 0 {
+            return Some(now);
+        }
+    }
+    #[cfg(feature = "net")]
+    {
+        let now = net_support::lamella_net_now_ms();
+        if now != 0 {
+            return Some(now);
+        }
+    }
+    None
+}
+
+/// The monotonic millisecond read an AOT image's managed clock reaches, in milliseconds since some
+/// origin this archive does not define.
+///
+/// # WHY THE COMPILED CODE CALLS THIS AND NOT THE BOARD SYMBOL DIRECTLY
+///
+/// `Lamella.Runtime.Clock.MonotonicMilliseconds` is `[RuntimeProvided]`, and the back end
+/// synthesizes a call to whatever names the clock. If that call named `lamella_board_now_ms`, then
+/// EVERY image using `DateTime` would fail to link unless its board supplied one -- turning a
+/// documented degradation into a build error for programs that never asked for a clock.
+///
+/// So the compiled code calls THIS, and the archive decides where the reading comes from: the
+/// board's counter where `clock-board` is selected, the net stack's where it is not, and `0` where
+/// neither exists. **The feature question stays inside the archive**, which is the same shape as the
+/// console sink -- one entry point, a build-time choice behind it, and nothing in the emitted code
+/// that names a peripheral.
+///
+/// `0` means "no clock", which is what the managed side reads as an unset clock: `DateTime.UtcNow`
+/// answers the epoch and `Clock.IsSet()` stays false. That is the documented no-clock behavior and
+/// it is the honest one -- a program with no timebase should not be told a plausible time.
+#[no_mangle]
+extern "C" fn lamella_clock_now_ms() -> u64 {
+    monotonic_now_ms().unwrap_or(0)
+}
+
 /// Mock monotonic clock (ms) for the self-contained reactor demo; the `net` build reads the real clock seam.
 #[cfg(not(feature = "net"))]
 const REACTOR_NOW: *mut u64 = 0x2000_3800 as *mut u64;
@@ -1456,8 +1740,7 @@ mod reactor_env {
     use super::net_support;
 
     pub fn now_millis() -> Option<u64> {
-        let now = net_support::lamella_net_now_ms();
-        (now != 0).then_some(now)
+        super::monotonic_now_ms()
     }
 
     pub fn sleep_millis(millis: u64) {
@@ -1491,6 +1774,9 @@ mod reactor_env {
     use super::{REACTOR_NET_READY, REACTOR_NOW};
 
     pub fn now_millis() -> Option<u64> {
+        if let Some(now) = super::monotonic_now_ms() {
+            return Some(now);
+        }
         Some(unsafe { core::ptr::read_volatile(REACTOR_NOW) })
     }
 
@@ -1793,15 +2079,53 @@ extern "C" fn lamella_thread_join_impl(id: i32) {
     }
 }
 
-/// C# `Thread.Sleep(ms)` on the `net` build (Tier 2): a REAL timed park -- `Sleep(now + ms)` on the
-/// reactor against the `lamella_net_now_ms` clock (the SAME monotonic clock the net stack runs on);
-/// the block point's timed wait wakes it. With no clock registered yet (or a non-positive `ms`),
-/// degrade to one cooperative yield -- the managed surface's documented no-clock behavior.
-#[cfg(feature = "net")]
+/// C# `Thread.IsAlive`'s backing seam: has thread `id` finished? Reads the scheduler's `done`
+/// bitmask -- the SAME word [`lamella_thread_join_impl`] spins on -- so "finished" here means
+/// exactly what a returned `Join()` means, by construction rather than by two rules kept in step.
+///
+/// An id no spawn returned answers FINISHED, matching `lamella_thread_join_impl`'s treatment of the
+/// same input: it returns at once rather than hanging, so a thread nothing can ever wait for is not
+/// alive. That is also the answer an UNSTARTED thread needs -- reporting one alive is the defect
+/// this seam exists to remove, and before it `IsAlive` was a hard-coded `true` for every state.
+///
+/// No `anchor_seam_shim!`: this neither parks nor allocates, so it is not a safepoint and there is
+/// nothing here for a stack walk to anchor on.
+///
+/// Which is also why it is not named `..._impl`. That suffix is not a house style, it is the
+/// ANCHORED half of a pair: `anchor_seam_shim!("x")` emits the symbol `x`, which records the
+/// safepoint and tail-calls `x_impl`. Seams that park are spelled that way
+/// (`lamella_thread_join_impl`); seams that do not are named directly, as `lamella_monitor_exit`
+/// and `lamella_monitor_pulse` are.
+#[no_mangle]
+pub extern "C" fn lamella_thread_finished(id: i32) -> i32 {
+    unsafe {
+        if id < 1 || id as u32 >= (*SCHED).count {
+            return 1;
+        }
+        i32::from((*SCHED).done & (1u32 << id) != 0)
+    }
+}
+
+/// C# `Thread.Sleep(ms)`: a REAL timed park -- `Sleep(now + ms)` on the reactor against whatever
+/// monotonic source this build has -- degrading to one cooperative yield where there is no clock a
+/// deadline could be trusted to reach.
+///
+/// # WITHOUT A CLOCK IT YIELDS, AND THAT IS THE HONEST ANSWER RATHER THAN A CHEAP ONE
+///
+/// A build with no monotonic source cannot wait for a stated duration, so it performs one
+/// cooperative yield and returns. That is visibly wrong -- a program runs too fast and somebody
+/// notices -- which is the point: for a delay, running at the wrong speed IS the whole of the
+/// behavior, and it is better met loudly than covered over.
+///
+/// It reads [`monotonic_now_ms`] and NOT `reactor_env::now_millis`, and the difference is the reason
+/// for this paragraph. The latter answers from a mock on a build with no real clock, and the block
+/// point advances that mock by whatever it was asked to wait -- so a deadline computed from it would
+/// report that a sleep happened when nothing did. **A plausible number nobody can question is worse
+/// than a wrong one anybody can see.**
 #[no_mangle]
 extern "C" fn lamella_thread_sleep_impl(milliseconds: i32) {
     if milliseconds > 0 {
-        if let Some(now) = reactor_env::now_millis() {
+        if let Some(now) = monotonic_now_ms() {
             unsafe {
                 sched_ensure_init();
                 sched_park(ParkReason::Sleep(now.saturating_add(milliseconds as u64)));
@@ -1809,15 +2133,6 @@ extern "C" fn lamella_thread_sleep_impl(milliseconds: i32) {
             return;
         }
     }
-    lamella_thread_yield_impl();
-}
-
-/// C# `Thread.Sleep(ms)` on the featureless build: no board clock is wired to this scheduler, so a
-/// timed park could never truly wait; degrade to one cooperative yield (the managed surface's
-/// documented no-clock behavior). The `net` build parks for real against `lamella_net_now_ms`.
-#[cfg(not(feature = "net"))]
-#[no_mangle]
-extern "C" fn lamella_thread_sleep_impl(_milliseconds: i32) {
     lamella_thread_yield_impl();
 }
 

@@ -44,3 +44,11 @@ kind = "gpio-out"           # owns the waveform; the board fact is only which pi
 pin = "PA06"
 active = "high"
 source = "Adafruit Feather M0 Express guide ('The NeoPixel is connected to pin #8 in Arduino') + variant.cpp (Arduino D8 = PORTA 6)"
+
+[debug]
+signals = ["swd"]
+exposure = "pads"
+fitted = "no"
+onboard = "none"
+recovery = "flash-bootloader"
+source = "The board's own guide, Debug Interface: "SWCLK & SWDIO - These pads on the bottom are used to program the chip. They can also be connected to an SWD debugger." The pads are on the underside and the guide states no connector, so reaching them needs soldering. The board ships with a UF2 bootloader reached by double-tapping reset, which lives in flash rather than in ROM, so its survival depends on the region a write reaches."

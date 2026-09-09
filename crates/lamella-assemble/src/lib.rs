@@ -10,6 +10,7 @@ pub mod compile;
 pub mod debug;
 pub mod expr;
 pub mod frame;
+pub(crate) mod lambdalower;
 pub mod method;
 pub mod session;
 pub mod tokens;

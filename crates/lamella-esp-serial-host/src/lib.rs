@@ -7,11 +7,32 @@ use std::time::Duration;
 
 use lamella_esp_serial::{Action, Session, Step};
 
+#[cfg(unix)]
+pub mod posix;
 #[cfg(windows)]
 pub mod windows;
 
+#[cfg(unix)]
+pub use posix::PosixPort;
 #[cfg(windows)]
 pub use windows::WindowsPort;
+
+/// The [`Port`] implementation for the host this was built for.
+///
+/// Every host reaches a real serial port through this name, so a tool that drives one is written
+/// once and compiled everywhere -- including on a host that has no implementation here, where the
+/// tool still compiles, is still type-checked, and refuses at the point it would have opened a port
+/// rather than being absent from the build.
+#[cfg(unix)]
+pub type NativePort = PosixPort;
+
+/// The [`Port`] implementation for the host this was built for.
+#[cfg(windows)]
+pub type NativePort = WindowsPort;
+
+/// The [`Port`] implementation for the host this was built for.
+#[cfg(not(any(unix, windows)))]
+pub type NativePort = UnsupportedPort;
 
 /// What went wrong with the port itself, as distinct from anything the protocol reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +75,10 @@ pub enum PortError {
         /// The operating system's error code.
         code: u32,
     },
+    /// **This host has no serial port implementation here.** Reported at the point a port would have
+    /// been opened, which is the only place the answer differs -- everything above it in the tool is
+    /// host-neutral and is compiled and checked on every platform.
+    UnsupportedHost,
 }
 
 impl std::fmt::Display for PortError {
@@ -67,6 +92,9 @@ impl std::fmt::Display for PortError {
                 write!(f, "write stalled after {after} bytes -- the transmitter never became ready")
             }
             PortError::Read { code } => write!(f, "read failed (error {code})"),
+            PortError::UnsupportedHost => {
+                write!(f, "serial ports are not implemented for this operating system")
+            }
         }
     }
 }
@@ -121,6 +149,61 @@ pub trait Port {
 
     /// How to name this port in a report.
     fn describe(&self) -> String;
+}
+
+/// A [`Port`] for a host with no implementation here.
+///
+/// It exists so that a tool written against [`NativePort`] compiles and is type-checked on every
+/// platform, including the ones this crate cannot drive. **It has no constructor that succeeds**:
+/// [`UnsupportedPort::open`] is the only way to reach one and it always refuses, so the refusal
+/// lands where a port would have been opened rather than as a binary that was never built.
+///
+/// It is defined unconditionally, not only on the hosts that need it, so that a change to the
+/// [`Port`] trait breaks it on the platform doing the change rather than on a platform nobody here
+/// compiles for.
+#[derive(Debug)]
+pub struct UnsupportedPort {
+    _private: (),
+}
+
+impl UnsupportedPort {
+    /// Refuses, always.
+    ///
+    /// # Errors
+    /// Always [`PortError::UnsupportedHost`].
+    pub fn open(_name: &str, _baud: u32) -> Result<UnsupportedPort, PortError> {
+        Err(PortError::UnsupportedHost)
+    }
+}
+
+impl Port for UnsupportedPort {
+    fn write(&mut self, _bytes: &[u8]) -> Result<(), PortError> {
+        Err(PortError::UnsupportedHost)
+    }
+
+    fn read(&mut self, _buffer: &mut [u8], _timeout_ms: u32) -> Result<usize, PortError> {
+        Err(PortError::UnsupportedHost)
+    }
+
+    fn set_dtr(&mut self, _on: bool) -> Result<(), PortError> {
+        Err(PortError::UnsupportedHost)
+    }
+
+    fn set_rts(&mut self, _on: bool) -> Result<(), PortError> {
+        Err(PortError::UnsupportedHost)
+    }
+
+    fn reopen(&mut self, _baud: u32) -> Result<(), PortError> {
+        Err(PortError::UnsupportedHost)
+    }
+
+    fn discard_buffers(&mut self) -> Result<(), PortError> {
+        Err(PortError::UnsupportedHost)
+    }
+
+    fn describe(&self) -> String {
+        String::from("no serial port on this operating system")
+    }
 }
 
 /// How a driven session ended.

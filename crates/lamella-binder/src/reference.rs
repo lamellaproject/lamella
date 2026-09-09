@@ -212,6 +212,7 @@ fn type_info(
         if let (Some(field_name), Some(signature)) = (field.name(), field.signature()) {
             let constant = field.constant().and_then(constant_to_literal);
             info.fields.push(FieldSymbol {
+                tuple_names: Vec::new(),
                 name: field_name.into(),
                 ty: sigtype_to_symbol(assembly, &signature, &[], own_parameters),
                 is_static: field.flags() & 0x0010 != 0
@@ -257,6 +258,7 @@ fn type_info(
             .map(|modifier| token_type_symbol(assembly, *modifier))
             .collect();
         let symbol = MethodSymbol {
+            return_tuple_names: Vec::new(),
             explicit_interface: None,
             return_required_modifiers,
             name: method_name.into(),
@@ -319,6 +321,7 @@ fn type_info(
             }
             if info.find_property(property_name).is_none() {
                 info.properties.push(PropertySymbol {
+                    tuple_names: Vec::new(),
                     name: property_name.into(),
                     ty,
                     is_static: symbol.is_static,
@@ -349,6 +352,7 @@ fn type_info(
         if let Some((event_name, ty)) = event {
             if info.find_event(event_name).is_none() {
                 info.events.push(EventSymbol {
+                    explicit_interface: None,
                     name: event_name.into(),
                     ty,
                     is_static: symbol.is_static,

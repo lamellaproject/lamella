@@ -1,0 +1,24 @@
+# The SAMD20 Power Manager block: only the register the peripheral bring-up paths touch is
+# transcribed here (partial, append-only, schema total). Offsets are PM-base-relative; the base
+# lives in ../instances.toml.
+
+[table]
+kind = "block"
+family = "samd20"
+block = "pm"
+sources = [
+    "SAM D20 Family Data Sheet DS60001504K section 15.8.10 (APBC Mask): 'Offset: 0x20', 'Reset: 0x00010000', and one prose paragraph per bit naming the peripheral it gates",
+    "DS60001504K Table 11-1 (Peripherals Configuration Summary), whose APB Clock Index column states the same six SERCOM positions independently",
+]
+notes = [
+    "APBCMASK gates each peripheral's APB (bus) clock; SERCOM0..5 = bits 2..7. Read-modify-write in drivers (other peripherals share the register).",
+    "THE BIT POSITIONS WERE TAKEN FROM THE PER-BIT PROSE, NOT FROM THE BIT-FIELD DIAGRAM. The diagram's rows extract with Access and Reset lines interleaved between the bit numbers and the names, which is how a name comes to sit under the wrong number; 15.8.10's numbered paragraphs each name one bit and one peripheral and cannot desynchronize.",
+    "AND THE PER-BIT PROSE ITSELF CARRIES ONE ERROR ON THIS PART, WHICH IS WHY IT WAS NOT THE ONLY SOURCE USED. Bit 5's paragraph is headed 'SERCOM3' and then reads 'SERCOM2 APB Clock Enable' -- the heading and the description name different instances. Two statements outvote it: the bit NAME in the same paragraph says SERCOM3, and Table 11-1 gives SERCOM3 an APB Clock Index of 5. Bit 5 is SERCOM3 and the description is the wrong half.",
+    "THE SAM D21's RFCTRL BIT HAS NO COUNTERPART HERE and neither does anything else above bit 19: this part has no radio and no TCC, so a mask value carried across from a sibling would set bits this register does not implement.",
+]
+
+[registers.APBCMASK]
+offset = 0x20
+width = 32
+fields = { SERCOM0 = [2, 1], SERCOM1 = [3, 1], SERCOM2 = [4, 1], SERCOM3 = [5, 1], SERCOM4 = [6, 1], SERCOM5 = [7, 1] }
+notes = "One gate bit per APBC peripheral; a driver ORs in its instance's bit (the instance row carries the bit index). Reset value is 0x00010000 -- the ADC's bit 16 comes up set and every SERCOM bit comes up clear, so a read-modify-write is required rather than a plain store."

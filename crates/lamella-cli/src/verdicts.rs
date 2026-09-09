@@ -54,7 +54,12 @@ pub fn boards_command(args: &[String]) -> ExitCode {
         let can = if crate::flash::can_flash(id) { "yes" } else { "-" };
         match parse(text) {
             Ok(Strata::Board(board)) => {
-                let part = if board.part.is_empty() { "-" } else { &board.part };
+                let resolved = catalog::load_part(&board).map(|row| row.part);
+                let part = resolved
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .or(Some(board.part.as_str()).filter(|p| !p.is_empty()))
+                    .unwrap_or("-");
                 println!("{id:<28} {part:<14} {can}");
             }
             _ => println!("{id:<28} {:<14} {can}", "(unreadable)"),
@@ -314,6 +319,39 @@ mod tests {
     ///
     /// Asserting the FIRST LINE rather than the presence of a string also catches the likelier
     /// drift: a usage block copied from a neighbouring verb and not renamed.
+    #[test]
+    /// EVERY board in the listing resolves to a part, including the ones that name a MODULE.
+    ///
+    /// A board names either a bare chip (`family` + `part`) or a module, and the two are exclusive.
+    /// This verb read `board.part` off the file, so both module boards printed `-` in the PART
+    /// column as though the part were unknown -- while `lamella flash` routed one of them happily.
+    /// It was not caught by any test because a dash is a plausible rendering: two of sixty rows
+    /// looked like boards nobody had filled in yet.
+    ///
+    /// The assertion is over ALL boards rather than the two, because the failure is a class: a
+    /// module board added tomorrow with no `csp/*/module.toml` behind it fails here rather than
+    /// printing a dash for the rest of its life.
+    #[test]
+    fn every_board_in_the_listing_resolves_to_a_part() {
+        let mut unresolved: Vec<&str> = Vec::new();
+        let mut modules = 0;
+        for (id, text) in BOARDS {
+            let Ok(Strata::Board(board)) = parse(text) else {
+                unresolved.push(id);
+                continue;
+            };
+            if !board.module.is_empty() {
+                modules += 1;
+            }
+            match catalog::load_part(&board) {
+                Some(row) if !row.part.is_empty() => {}
+                _ => unresolved.push(id),
+            }
+        }
+        assert!(unresolved.is_empty(), "these boards resolve to no part: {unresolved:?}");
+        assert!(modules > 0, "no board names a module, so this proves nothing about that hop");
+    }
+
     #[test]
     fn the_usage_opens_with_the_verb_it_belongs_to() {
         assert!(

@@ -355,6 +355,47 @@ mod tests {
         assert!(parse(&text).is_ok(), "{text}");
     }
 
+    /// THE OTHER PRODUCER'S OWN RECORD, COPIED RATHER THAN COMPOSED.
+    ///
+    /// Every test above builds a record from `record_for`, which is this tree's idea of the shape.
+    /// **A fixture written from one side of a contract agrees with that side by construction**, and
+    /// what a two-party record needs is the other party's bytes. This is the illustrative record
+    /// from RHU's build contract, field for field and in its order, with only its two placeholders
+    /// filled in -- so nine fields this reader does not know arrive together, an emulator board id
+    /// it cannot route arrives in `board`, and `base` arrives as the padded `0x00000000` rather
+    /// than the `0x0` every test above writes.
+    #[test]
+    fn the_other_producers_record_reads() {
+        let bytes = b"image";
+        let text = r#"{
+  "schema": 1,
+  "kind": "flash-image",
+  "board": "mps2-an500",
+  "format": "bin",
+  "base": "0x00000000",
+  "sha256": "<sha256>",
+  "bytes": <bytes>,
+  "producer": "ilc+rhu-link",
+  "elf": "app.elf",
+  "map": "app.map",
+  "image_kind": "monolith",
+  "layout_version": 1,
+  "abi": 31,
+  "debug_layout_version": 2,
+  "codegen_profile": "ship",
+  "runtime": "11.0.0-preview.7.26381.103",
+  "runtime_tested": true
+}"#
+        .replace("<sha256>", &hex(lamella_pe::sha256::sha256(bytes)))
+        .replace("<bytes>", &bytes.len().to_string());
+
+        let manifest = parse(&text).expect("the other producer's record reads");
+        assert_eq!(manifest.board, "mps2-an500");
+        assert_eq!(manifest.base, Some(0), "the padded spelling is the same address");
+        assert_eq!(manifest.producer.as_deref(), Some("ilc+rhu-link"));
+        assert!(check_identity(&manifest, bytes, Some("bin")).is_ok());
+    }
+
     #[test]
     fn identity_passes_on_the_bytes_the_record_describes() {
         let manifest = parse(&record_for(b"image", "bin", "\"0x0\"")).unwrap();
@@ -444,7 +485,11 @@ mod tests {
                     !line.starts_with("  ") || line.starts_with("\x20\x20\x20 "),
                     "a continuation kept its source indentation:\n{message}"
                 );
-                assert!(!line.contains("  ") || line.contains("\x20\x20\x20 "), "{message}");
+                assert!(
+                    !line.contains("\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20"),
+                    "a run of spaces sits mid-sentence, so a continuation collapsed:\n\
+                     {message}"
+                );
             }
         }
     }

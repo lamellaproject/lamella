@@ -1,0 +1,15 @@
+[package]
+name = "lamella-dwarf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DWARF debug-info reading: the line-number program and subprogram ranges, for debuggers and stack symbolization."
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+lamella-elf = { path = "../lamella-elf" }

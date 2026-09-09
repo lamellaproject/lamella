@@ -7,6 +7,7 @@ use crate::declaration::{
     qualified_type_name, resolve_constants,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition};
+use lamella_syntax::lexer::OutputKind;
 use lamella_syntax::version::{Feature, LanguageVersion};
 use crate::reference::load_assembly;
 use crate::special::SpecialType;
@@ -54,6 +55,9 @@ pub struct BindOptions<'a> {
     /// reference's `internal` members are imported at all. `""` where the compilation produces no
     /// assembly (a diagnostics-only bind), which no friend declaration can match.
     pub compiling_assembly: &'a str,
+    /// What the compilation produces -- csc's `/target:`. It decides the entry-point rules and
+    /// nothing else here; see [`report_entry_point_rules`].
+    pub target: OutputKind,
 }
 
 impl Default for BindOptions<'_> {
@@ -62,6 +66,7 @@ impl Default for BindOptions<'_> {
             unsafe_option_missing: false,
             language_version: LanguageVersion::DEFAULT,
             compiling_assembly: "",
+            target: OutputKind::Inferred,
         }
     }
 }
@@ -130,6 +135,7 @@ pub fn bind_compilation_unit_with_dialect(
             unsafe_option_missing,
             language_version,
             compiling_assembly: "",
+            target: OutputKind::Inferred,
         },
     )
 }
@@ -152,13 +158,16 @@ pub fn bind_compilation_unit_with_options(
     qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
     binder.model_mut().link_bases();
     resolve_constants(binder.model_mut(), core::slice::from_ref(unit));
+    let target = options.target;
     apply_bind_options(&mut binder, options);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
-    report_multiple_entry_points(&mut binder);
     binder.report_unused_fields();
-    let mut units = [binder.into_diagnostics()];
+    let entry_points = entry_point_diagnostics(binder.model(), target);
+    let mut diagnostics = binder.into_diagnostics();
+    diagnostics.extend(entry_points);
+    let mut units = [diagnostics];
     withhold_body_diagnostics_after_declaration_error(&mut units);
     let [diagnostics] = units;
     diagnostics
@@ -179,9 +188,11 @@ pub fn bind_compilation_unit_with_model(
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
-    report_multiple_entry_points(&mut binder);
     binder.report_unused_fields();
-    let mut units = [binder.into_diagnostics()];
+    let entry_points = entry_point_diagnostics(binder.model(), OutputKind::Inferred);
+    let mut diagnostics = binder.into_diagnostics();
+    diagnostics.extend(entry_points);
+    let mut units = [diagnostics];
     withhold_body_diagnostics_after_declaration_error(&mut units);
     let [diagnostics] = units;
     diagnostics
@@ -299,7 +310,10 @@ fn report_duplicate_types(
             ),
             NamespaceMember::Delegate(declaration) => (
                 declaration.name.clone(),
-                String::from(&*declaration.name),
+                crate::symbols::metadata_type_name(
+                    &declaration.name,
+                    declaration.type_parameters.len(),
+                ),
                 DeclaredType::plain(&declaration.name, declaration.span),
             ),
         };
@@ -727,14 +741,48 @@ fn report_restricted_parameter(binder: &mut Binder, parameter: &Parameter) {
     }
 }
 
-fn report_multiple_entry_points(binder: &mut Binder) {
-    if binder.model().entry_point_count() > 1 {
-        binder.report(Diagnostic::new(
-            DiagnosticKind::MultipleEntryPoints,
-            lamella_syntax::span::Span::new(0, 0),
-        ));
+/// The whole-program entry-point rules: `CS0017` for more than one, `CS5001` for none where one is
+/// required. Both are conditions on the FINISHED model, so both belong here rather than at any
+/// declaration site.
+///
+/// **ONE FUNCTION FOR THREE CALLERS, AND THE SPLIT IS WHY IT IS ONE.** The `CS0017` half had two
+/// implementations -- this helper and an inline copy in the multi-unit path -- so the target rule
+/// below would have reached whichever one the next reader happened to edit. Extracting it makes
+/// "every bind checks its entry points the same way" true by construction.
+///
+/// **`CS5001` NEEDS AN EXPLICIT EXECUTABLE TARGET AND `CS0017` DOES NOT**, which is the one
+/// asymmetry here and it is not arbitrary:
+///
+/// ```text
+///     /target:library, two Mains     csc OK      -- a library has no entry point to be ambiguous
+///     /target:library, no Main       csc OK      -- nor one to be missing
+///     /target:exe,     no Main       csc CS5001
+///     no /target:,     two Mains     csc CS0017  -- csc defaults to exe, and the inference
+///                                                   agrees: two Mains is an executable either way
+/// ```
+///
+/// So `CS0017` fires wherever an executable is being produced -- asked for, or inferred -- and
+/// `CS5001` only where one was ASKED for. An inferred kind cannot demand what it read off the
+/// sources: [`OutputKind::Inferred`] with no `Main` is a library, and a library is not missing
+/// anything.
+fn entry_point_diagnostics(model: &Model, target: OutputKind) -> Vec<Diagnostic> {
+    let mut into = Vec::new();
+    let count = model.entry_point_count();
+    let produces_executable = match target {
+        OutputKind::Executable => true,
+        OutputKind::Library => false,
+        OutputKind::Inferred => count > 0,
+    };
+    let at = lamella_syntax::span::Span::new(0, 0);
+    if produces_executable && count > 1 {
+        into.push(Diagnostic::new(DiagnosticKind::MultipleEntryPoints, at));
     }
+    if matches!(target, OutputKind::Executable) && count == 0 {
+        into.push(Diagnostic::new(DiagnosticKind::NoEntryPoint, at));
+    }
+    into
 }
+
 
 /// Binds several compilation units as ONE program (a multi-file compilation, 16.1):
 /// every unit's declared types enter one model first -- so each file names the others'
@@ -791,6 +839,7 @@ pub fn bind_compilation_units_with_options(
     for unit in units {
         collect_into(&mut model, unit);
     }
+    let target = options.target;
     let mut binder = Binder::with_model(model);
     for unit in units {
         qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
@@ -808,13 +857,9 @@ pub fn bind_compilation_units_with_options(
             binder.take_diagnostics()
         })
         .collect();
-    if binder.model().entry_point_count() > 1 {
-        if let Some(first) = per_unit.first_mut() {
-            first.push(Diagnostic::new(
-                DiagnosticKind::MultipleEntryPoints,
-                lamella_syntax::span::Span::new(0, 0),
-            ));
-        }
+    let entry_points = entry_point_diagnostics(binder.model(), target);
+    if let Some(first) = per_unit.first_mut() {
+        first.extend(entry_points);
     }
     withhold_body_diagnostics_after_declaration_error(&mut per_unit);
     per_unit
@@ -865,7 +910,7 @@ pub fn qualify_declared_signatures(
                 qualify_type_declaration(binder, namespace, declaration);
             }
             NamespaceMember::Delegate(declaration) => {
-                qualify_model_info(binder, namespace, &declaration.name);
+                qualify_delegate_declaration(binder, namespace, declaration);
             }
             NamespaceMember::Enum(declaration) => {
                 qualify_model_info(binder, namespace, &declaration.name);
@@ -873,6 +918,29 @@ pub fn qualify_declared_signatures(
         }
     }
     binder.restore_import_scope(scope);
+}
+
+/// Qualifies a delegate's `Invoke` signature with the delegate's OWN type parameters in scope.
+///
+/// **WITHOUT THE SCOPE, `T` QUALIFIES INTO A TYPE NAME.** `qualify_model_info` canonicalizes every
+/// signature name against the imports in force, and a bare `T` that nothing declares is exactly
+/// what an unqualified type name looks like -- so `delegate T D<T>(T value)` would come out of the
+/// model naming a type `T` in the enclosing namespace, and every use of `D<int>` would then bind
+/// its `Invoke` against a type that does not exist. The class path has entered the scope here
+/// since generics landed ([`qualify_type_declaration`]); the delegate path had no scope to enter.
+fn qualify_delegate_declaration(
+    binder: &mut Binder,
+    namespace: &str,
+    declaration: &DelegateDecl,
+) {
+    let entered =
+        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    qualify_model_info(
+        binder,
+        namespace,
+        &crate::declaration::declared_delegate_name(declaration),
+    );
+    binder.exit_type_parameters(entered);
 }
 
 /// Qualifies one type declaration's model signatures under its scope, then recurses into its
@@ -892,7 +960,7 @@ fn qualify_type_declaration(binder: &mut Binder, namespace: &str, declaration: &
                     qualify_type_declaration(binder, &enclosing_full, inner);
                 }
                 NamespaceMember::Delegate(inner) => {
-                    qualify_model_info(binder, &enclosing_full, &inner.name);
+                    qualify_delegate_declaration(binder, &enclosing_full, inner);
                 }
                 NamespaceMember::Enum(inner) => {
                     qualify_model_info(binder, &enclosing_full, &inner.name);
@@ -1901,6 +1969,43 @@ pub fn withhold_body_diagnostics_after_declaration_error(units: &mut [Vec<Diagno
     }
 }
 
+/// CS0415: `[IndexerName("X")]` on an EXPLICIT interface implementation, which csc refuses.
+///
+/// **THE REFUSAL IS LOAD-BEARING, NOT COSMETIC PARITY.** The attribute renames an indexer's
+/// accessors, and an explicit implementation's accessors take the name of the INTERFACE member
+/// they implement -- so honoring it emitted `I.get_Chars` against an interface declaring
+/// `get_Item`, and the `MethodImpl` then named a member no interface has. Measured: the assembly
+/// compiled clean and threw `TypeLoadException` at the first use, which is the worst shape a
+/// defect can take. Refusing at the attribute makes the whole class unreachable.
+///
+/// The attribute's own span, where csc points.
+fn validate_indexer_name_attribute(binder: &mut Binder, declaration: &TypeDecl) {
+    for member in &declaration.members {
+        let Member::Indexer {
+            attributes,
+            explicit_interface: Some(_),
+            ..
+        } = member
+        else {
+            continue;
+        };
+        for section in attributes {
+            for attribute in &section.attributes {
+                let Some(last) = attribute.name.parts.last() else {
+                    continue;
+                };
+                if &**last != "IndexerName" && &**last != "IndexerNameAttribute" {
+                    continue;
+                }
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::IndexerNameOnExplicitImplementation,
+                    attribute.span,
+                ));
+            }
+        }
+    }
+}
+
 /// CS0579 / CS0182: the attribute rules that need no knowledge of the attribute CLASS. A section
 /// may not name the same attribute twice (24.2), and every argument must be a compile-time
 /// constant, a `typeof`, or an array creation -- an attribute is baked into metadata, so nothing
@@ -1988,7 +2093,7 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
 ///
 /// MEASURED, AND IT DISSOLVED THE HAZARD THIS RULE WAS EXPECTED TO CARRY. The worry was that a
 /// name like `Missing` would be found as `System.Reflection.Missing` by an unqualified lookup into
-/// an un-imported namespace -- the trap that has cost this lane twice. It does not arise: csc
+/// an un-imported namespace -- an easy trap. It does not arise: csc
 /// answers CS0246 for `Missing` and for a pure nonsense name alike, so the diagnostic does not
 /// depend on type lookup at all, and neither does this. The test is membership in the ATTRIBUTE
 /// CLASS, which is a scoped question with one answer.
@@ -2061,6 +2166,7 @@ fn validate_attribute_arguments(
         &constructors,
         &argument_types,
         &arg_constants,
+        &[],
         span,
     ) else {
         return (false, Some(arguments));
@@ -2865,6 +2971,104 @@ fn validate_destructors(binder: &mut Binder, declaration: &TypeDecl) {
 /// parameters share one declaration space (10.3), so the repeat names nothing new -- and the body
 /// could not tell the two apart. Every member kind that takes parameters is covered; the report
 /// lands on the SECOND declaration, as csc's does.
+/// The `extern` modifier's two diagnostics, over every member kind that can carry it.
+///
+/// **`CS0626` FIRES ON "NO ATTRIBUTES AT ALL", NOT ON "NO `DllImport`"**, which is csc's wording
+/// and csc's behavior -- measured: `[Obsolete] public static extern void M();` warns nothing,
+/// while the bare form warns. An attribute is taken as a promise that something supplies the body.
+///
+/// **A CONSTRUCTOR GETS ITS OWN CODE AND A DIFFERENT SENTENCE.** csc says `CS0824 Constructor
+/// 'C.C()' is marked external` and stops -- no advice about `DllImport`, where every other member
+/// kind gets it. Two codes because csc has two, not because the condition differs.
+///
+/// **`CS0179` IS THE OTHER DIRECTION AND IS AN ERROR**: `extern` says the implementation comes
+/// from elsewhere, so a body is a second answer to the question the modifier already answered.
+fn check_extern_members(binder: &mut Binder, declaration: &TypeDecl) {
+    fn is_extern(modifiers: &[Modifier]) -> bool {
+        modifiers.iter().any(|m| matches!(m, Modifier::Extern))
+    }
+    for member in &declaration.members {
+        match member {
+            Member::Method {
+                modifiers,
+                name,
+                name_span,
+                parameters,
+                body,
+                attributes,
+                ..
+            } if is_extern(modifiers) => {
+                let rendered = method_signature(&declaration.name, name, parameters);
+                if body.is_some() {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::ExternMemberHasBody {
+                            member: rendered.clone(),
+                        },
+                        *name_span,
+                    ));
+                } else if attributes.is_empty() {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::ExternMemberHasNoAttributes { member: rendered },
+                        *name_span,
+                    ));
+                }
+            }
+            Member::Property {
+                modifiers,
+                name,
+                getter,
+                setter,
+                attributes,
+                span,
+                ..
+            } if is_extern(modifiers) => {
+                for (accessor, suffix) in [(getter, "get"), (setter, "set")] {
+                    let Some(accessor) = accessor else { continue };
+                    let rendered: Box<str> =
+                        alloc::format!("{}.{}.{}", declaration.name, name, suffix).into();
+                    if accessor.body.is_some() {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::ExternMemberHasBody { member: rendered },
+                            accessor.span,
+                        ));
+                    } else if attributes.is_empty() {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::ExternMemberHasNoAttributes { member: rendered },
+                            accessor.span,
+                        ));
+                    }
+                }
+            }
+            Member::Indexer {
+                modifiers,
+                getter,
+                setter,
+                attributes,
+                span,
+                ..
+            } if is_extern(modifiers) => {
+                for (accessor, suffix) in [(getter, "get"), (setter, "set")] {
+                    let Some(accessor) = accessor else { continue };
+                    let rendered: Box<str> =
+                        alloc::format!("{}.this[].{}", declaration.name, suffix).into();
+                    if accessor.body.is_some() {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::ExternMemberHasBody { member: rendered },
+                            accessor.span,
+                        ));
+                    } else if attributes.is_empty() {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::ExternMemberHasNoAttributes { member: rendered },
+                            accessor.span,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn validate_parameter_names(binder: &mut Binder, parameters: &[Parameter]) {
     let mut seen: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
     for parameter in parameters {
@@ -2958,6 +3162,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             validate_attributes(binder, attributes);
         }
     }
+    validate_indexer_name_attribute(binder, declaration);
     validate_operator_pairs(binder, declaration);
     validate_conditional_methods(binder, declaration);
     validate_top_level_type_modifiers(binder, namespace, declaration);
@@ -3057,7 +3262,10 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 ..
             } => Some((name.clone(), parameters, span)),
             Member::Indexer {
-                parameters, span, ..
+                parameters,
+                explicit_interface: None,
+                span,
+                ..
             } => Some((Box::from("this"), parameters, span)),
             _ => None,
         };
@@ -3191,6 +3399,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             _ => {}
         }
     }
+    check_extern_members(binder, declaration);
     if declaration.kind != TypeKind::Interface {
         for member in &declaration.members {
             if let Member::Method {
@@ -3350,12 +3559,13 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     getter,
                     setter,
                     parameters,
+                    explicit_interface,
                     ..
                 } => (
                     modifiers,
                     getter,
                     setter,
-                    None,
+                    explicit_interface.as_ref(),
                     alloc::format!(
                         "{}.this[{}]",
                         declaration.name,
@@ -4307,7 +4517,11 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                         Some(enclosing.clone()),
                         &accessor_name("set_", name),
                         TypeSymbol::Special(SpecialType::Void),
-                        &[(Box::from("value"), property_ty.clone())],
+                        &[(
+                            Box::from("value"),
+                            property_ty.clone(),
+                            crate::bind::tuple_element_names(ty),
+                        )],
                         &[],
                         is_static,
                         false,
@@ -4335,7 +4549,11 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             } => {
                 let event_ty = bind_type(ty);
                 let is_static = is_static_member(modifiers);
-                let value = [(Box::from("value"), event_ty)];
+                let value = [(
+                    Box::from("value"),
+                    event_ty,
+                    crate::bind::tuple_element_names(ty),
+                )];
                 let accessors = [("add_", adder), ("remove_", remover)];
                 for (prefix, accessor) in accessors {
                     if let Some(body) = accessor.as_ref().and_then(|accessor| accessor.body.as_ref())
@@ -4377,7 +4595,11 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 }
                 if let Some(body) = setter.as_ref().and_then(|accessor| accessor.body.as_ref()) {
                     let mut indices = indices.clone();
-                    indices.push((Box::from("value"), element.clone()));
+                    indices.push((
+                        Box::from("value"),
+                        element.clone(),
+                        crate::bind::tuple_element_names(ty),
+                    ));
                     binder.bind_method(
                         Some(enclosing.clone()),
                         "set_Item",
@@ -4481,6 +4703,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
         binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
     binder.enter_type(enclosing.clone());
     binder.check_interface_implementations(&enclosing, declaration);
+    binder.check_explicit_interface_accessors(declaration);
     binder.check_overrides_have_base(&enclosing, declaration);
     binder.check_property_overrides_have_base(&enclosing, declaration);
     binder.check_event_overrides_have_base(&enclosing, declaration);
@@ -4597,12 +4820,21 @@ fn accessor_name(prefix: &str, property: &str) -> String {
     name
 }
 
-fn bound_parameters(parameters: &[lamella_syntax::ast::Parameter]) -> Vec<(Box<str>, TypeSymbol)> {
+fn bound_parameters(
+    parameters: &[lamella_syntax::ast::Parameter],
+) -> Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> {
     parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
+        .map(|parameter| {
+            (
+                parameter.name.clone(),
+                bind_type(&parameter.ty),
+                crate::bind::tuple_element_names(&parameter.ty),
+            )
+        })
         .collect()
 }
+
 
 /// The names of the `ref` parameters in a list. `return ref x;` naming one is legal, because that
 /// storage is the CALLER's, where naming a by-value parameter is `CS8166`.
@@ -8239,6 +8471,65 @@ mod tests {
         );
     }
 
+    /// The entry-point rules the TARGET decides: `CS5001` for none where one was asked for, and
+    /// `CS0017` only where an executable is actually being produced.
+    ///
+    /// **THE LIBRARY ROWS ARE THE ONES TO KEEP.** Both diagnostics are conditioned on the target,
+    /// and getting that wrong is silent in opposite directions: `CS0017` fired regardless of target
+    /// refuses a two-`Main` LIBRARY that csc compiles, while no `CS5001` accepts every unusable
+    /// `Main` under `/target:exe`.
+    #[test]
+    fn the_target_decides_the_entry_point_rules() {
+        let codes = |unit: &str, target: OutputKind| {
+            let parsed = parse_compilation_unit(unit).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit_with_options(
+                &parsed,
+                &[],
+                BindOptions {
+                    target,
+                    ..BindOptions::default()
+                },
+            )
+            .iter()
+            .map(Diagnostic::code)
+            .collect();
+            codes.sort_unstable();
+            codes
+        };
+        let good = "class P { static void Main() {} }";
+        let none = "class P { static void Go() {} }";
+        let two = "class A { static void Main() {} } class B { static void Main() {} }";
+
+        assert_eq!(codes(good, OutputKind::Executable), []);
+        assert_eq!(codes(none, OutputKind::Executable), [5001]);
+        assert_eq!(codes(two, OutputKind::Executable), [17]);
+
+        assert_eq!(codes(good, OutputKind::Library), []);
+        assert_eq!(codes(none, OutputKind::Library), []);
+        assert_eq!(codes(two, OutputKind::Library), []);
+
+        assert_eq!(codes(none, OutputKind::Inferred), []);
+        assert_eq!(codes(two, OutputKind::Inferred), [17]);
+
+        assert_eq!(codes("class P<T> { static void Main() {} }", OutputKind::Executable), [5001]);
+        assert_eq!(
+            codes("class O<T> { class I { static void Main() {} } }", OutputKind::Executable),
+            [5001]
+        );
+        assert_eq!(codes("class P { static void Main<T>() {} }", OutputKind::Executable), [5001]);
+        assert_eq!(
+            codes("class O { class I { static void Main() {} } }", OutputKind::Executable),
+            []
+        );
+        assert_eq!(
+            codes(
+                "class G<T> { static void Main() {} } class P { static void Main() {} }",
+                OutputKind::Executable
+            ),
+            []
+        );
+    }
+
     #[test]
     fn instance_member_in_static_method_is_cs0120() {
         assert_eq!(
@@ -8459,7 +8750,7 @@ mod tests {
             sorted_codes("abstract class C { public abstract void M(); }"),
             []
         );
-        assert_eq!(sorted_codes("class C { static extern int E(); }"), []);
+        assert_eq!(sorted_codes("class C { static extern int E(); }"), [626]);
         assert_eq!(sorted_codes("interface I { void M(); }"), []);
         assert_eq!(sorted_codes("class C { void M() {} }"), []);
         assert_eq!(sorted_codes("class C { const int X; }"), [145]);
@@ -8477,7 +8768,7 @@ mod tests {
             []
         );
         assert_eq!(sorted_codes("interface I { int P { get; set; } }"), []);
-        assert_eq!(sorted_codes("class C { extern int P { get; set; } }"), []);
+        assert_eq!(sorted_codes("class C { extern int P { get; set; } }"), [626, 626]);
         assert_eq!(
             sorted_codes("class C { int _f; int P { get { return _f; } set { _f = value; } } }"),
             []
@@ -8554,6 +8845,7 @@ mod tests {
             let mut model = Model::new();
             let mut object = TypeInfo::new("System", "Object", TypeKind::Class);
             object.methods.push(MethodSymbol {
+                return_tuple_names: Vec::new(),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: "ToString".into(),
@@ -8782,6 +9074,7 @@ mod tests {
             let mut model = Model::new();
             let mut object = TypeInfo::new("System", "Object", TypeKind::Class);
             object.methods.push(MethodSymbol {
+                return_tuple_names: Vec::new(),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: "ToString".into(),
@@ -8805,6 +9098,7 @@ mod tests {
             let mut seam = TypeInfo::new("", "Seam", TypeKind::Class);
             seam.is_external = seam_is_external;
             seam.methods.push(MethodSymbol {
+                return_tuple_names: Vec::new(),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
                 name: "Read".into(),
@@ -8892,6 +9186,7 @@ mod tests {
         let mut bcl = Model::new();
         let mut console = TypeInfo::new("System", "Console", TypeKind::Class);
         console.methods.push(MethodSymbol {
+            return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "WriteLine".into(),

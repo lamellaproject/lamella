@@ -64,8 +64,8 @@ pub fn profile_of_this_build() -> Profile {
     if cfg!(feature = "complex") {
         profile = profile.with(Capability::Complex);
     }
-    if cfg!(feature = "introspection") {
-        profile = profile.with(Capability::Introspection);
+    if cfg!(feature = "reflection") {
+        profile = profile.with(Capability::Reflection);
     }
     if cfg!(feature = "threading") {
         profile = profile.with(Capability::Threading);

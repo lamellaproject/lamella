@@ -9,6 +9,13 @@ use core::cmp::Ordering;
 #[allow(dead_code)]
 mod tables;
 
+#[cfg(feature = "char-names")]
+pub mod char_names;
+#[cfg(all(feature = "char-names", not(feature = "char-names-full")))]
+mod char_names_table;
+#[cfg(feature = "char-names-full")]
+mod char_names_table_full;
+
 /// The Unicode version these tables are generated from (matches CPython 3.14.6's
 /// `unicodedata.unidata_version`).
 pub const UNICODE_VERSION: &str = "16.0.0";

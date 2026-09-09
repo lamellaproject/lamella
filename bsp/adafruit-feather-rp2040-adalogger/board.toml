@@ -101,3 +101,11 @@ pin = "GP2"
 [[connectors.qt.pins]]
 signal = "scl"
 pin = "GP3"
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "none"
+recovery = "mask-rom"
+source = "No document for this board is held, so where its debug signals reach is not established and is recorded as unknown rather than assumed from the other boards in the same product line. The recovery path is a property of the part and is established without the board document: RP2040 Datasheet section 2.6.1: a 16 kB read-only memory at 0x00000000 whose contents are fixed at the time the silicon is manufactured, containing the flash boot sequence, the flash programming routines and a USB mass storage device with UF2 support. The recovery path is in silicon and no image written to flash can remove it."

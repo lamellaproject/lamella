@@ -54,6 +54,9 @@ pub enum ErrorKind {
     PropertyEscapesUnavailable,
     /// The `v` flag's set notation.
     UnicodeSetsUnavailable,
+    /// A scoped inline modifier group that is not well formed: `(?-:)` with both lists empty,
+    /// a letter repeated within one list, or a letter named as both added and removed.
+    InvalidModifiers,
     /// A case-insensitive pattern reaching beyond ASCII, which needs a case-folding table the
     /// shared Unicode home does not ship.
     CaseFoldingUnavailable,
@@ -94,8 +97,9 @@ const V_FLAG: Absent = Absent {
 const CASE_FOLDING: Absent = Absent {
     id: "regexp-case-folding",
     reason: "a class RANGE that crosses out of ASCII under `i`, in any mode; and WITHOUT `u`, any \
-             cased character beyond ASCII -- under `u` a literal, a class member and a \
-             backreference all fold correctly, and a caseless character always matched",
+             cased character beyond ASCII -- under `u` a literal, a class member, a backreference \
+             and a word-boundary assertion all fold correctly, and a caseless character always \
+             matched",
 };
 
 impl ErrorKind {
@@ -128,6 +132,7 @@ impl ErrorKind {
             | ErrorKind::InvalidNamedReference
             | ErrorKind::DuplicateGroupName
             | ErrorKind::InvalidGroupName
+            | ErrorKind::InvalidModifiers
             | ErrorKind::InvalidUnicodeEscape
             | ErrorKind::InvalidClassRange
             | ErrorKind::QuantifiedAssertion => None,
@@ -180,6 +185,9 @@ impl ErrorKind {
             ErrorKind::InvalidUnicodeEscape => String::from("a `\\u` escape is malformed"),
             ErrorKind::InvalidClassRange => String::from("a character class range is not in order"),
             ErrorKind::QuantifiedAssertion => String::from("an assertion cannot be quantified"),
+            ErrorKind::InvalidModifiers => String::from(
+                "a scoped modifier group names no flags, repeats one, or both adds and removes the same one",
+            ),
             ErrorKind::PropertyEscapesUnavailable => String::from(
                 "Unicode property escapes need General_Category and Script tables that are not \
                  present in this build",
@@ -208,7 +216,16 @@ pub fn parse(source: &str, flags: Flags) -> Result<Pattern, Error> {
     let units: Vec<u16> = source.encode_utf16().collect();
     let (groups, names) = prescan(&units)?;
 
-    let mut parser = Parser { units: &units, pos: 0, flags, groups, names: &names, next_group: 0 };
+    let mut parser = Parser {
+        units: &units,
+        pos: 0,
+        flags,
+        groups,
+        names: &names,
+        next_group: 0,
+        alternative_path: Vec::new(),
+        named_here: Vec::new(),
+    };
     let node = parser.disjunction()?;
     if parser.pos < parser.units.len() {
         return Err(Error { kind: ErrorKind::UnmatchedCloseParen, at: parser.pos });
@@ -244,12 +261,6 @@ fn prescan(units: &[u16]) -> Result<(u32, Vec<(String, u32)>), Error> {
                     if third == Some(0x3C) && fourth != Some(0x3D) && fourth != Some(0x21) {
                         groups += 1;
                         let (name, after) = read_group_name(units, index + 3)?;
-                        if names.iter().any(|(existing, _)| *existing == name) {
-                            return Err(Error {
-                                kind: ErrorKind::DuplicateGroupName,
-                                at: index + 3,
-                            });
-                        }
                         names.push((name, groups));
                         index = after - 1;
                     }
@@ -269,6 +280,68 @@ fn prescan(units: &[u16]) -> Result<(u32, Vec<(String, u32)>), Error> {
 ///
 /// It takes no mode. A name's alphabet is the language's identifier alphabet and its escapes are
 /// always unicode-mode ([`name_escape`] says why), so nothing here depends on the pattern's flags.
+/// The three letters a scoped modifier can name, as a bit each.
+///
+/// `RegularExpressionModifier :: one of i m s` -- and `UpdateModifiers` sets `[[IgnoreCase]]`,
+/// `[[Multiline]]` and `[[DotAll]]` and nothing else. `u`, `v`, `g`, `y` and `d` are pattern-wide
+/// by construction and are not spellable here.
+const MODIFIER_I: u8 = 1;
+const MODIFIER_M: u8 = 2;
+const MODIFIER_S: u8 = 4;
+
+/// Reads a run of modifier letters, answering their set and where it ended.
+///
+/// An EMPTY run is a match, not a failure: `(?:` and `(?-i:` both have one, and the grammar makes
+/// `RegularExpressionModifiers` nullable on purpose. The caller decides whether empty is legal
+/// where it found it.
+fn read_modifier_set(units: &[u16], start: usize) -> Option<(u8, usize)> {
+    let mut bits = 0u8;
+    let mut at = start;
+    while let Some(unit) = units.get(at).copied() {
+        bits |= match unit {
+            0x69 => MODIFIER_I,
+            0x6D => MODIFIER_M,
+            0x73 => MODIFIER_S,
+            _ => break,
+        };
+        at += 1;
+    }
+    Some((bits, at))
+}
+
+/// Whether the letters in `units[start..end]` contain a repeat.
+///
+/// **A BIT SET CANNOT ANSWER THIS**, which is why it takes the source range rather than the bits:
+/// `(?ii:a)` and `(?i:a)` produce the identical set, and the standard makes the first a Syntax
+/// Error. The rule is about the source text matched, in those words.
+fn repeats(units: &[u16], start: usize, end: usize) -> bool {
+    let mut seen = 0u8;
+    for at in start..end {
+        let bit = match units.get(at).copied() {
+            Some(0x69) => MODIFIER_I,
+            Some(0x6D) => MODIFIER_M,
+            Some(0x73) => MODIFIER_S,
+            _ => continue,
+        };
+        if seen & bit != 0 {
+            return true;
+        }
+        seen |= bit;
+    }
+    false
+}
+
+/// One flag through `UpdateModifiers`: REMOVE is checked first, then ADD, then it stays as it was.
+fn update(current: bool, add: u8, remove: u8, bit: u8) -> bool {
+    if remove & bit != 0 {
+        false
+    } else if add & bit != 0 {
+        true
+    } else {
+        current
+    }
+}
+
 fn read_group_name(units: &[u16], start: usize) -> Result<(String, usize), Error> {
     let mut name = String::new();
     let mut index = start;
@@ -413,6 +486,16 @@ struct Parser<'a> {
     groups: u32,
     names: &'a [(String, u32)],
     next_group: u32,
+    /// Which alternative of each enclosing disjunction the cursor is in, outermost first.
+    ///
+    /// **THE DUPLICATE-NAME RULE IS THE ONE EARLY ERROR THAT NEEDS THE SHAPE OF THE PATTERN**, so
+    /// it cannot live in the prescan with the other name work. Two groups may share a name only
+    /// when they cannot both participate, and that is defined over alternation: they must sit in
+    /// different alternatives of some disjunction. A prescan that could answer it would have to
+    /// track `|` and nesting, which is a second parser -- the thing the prescan exists not to be.
+    alternative_path: Vec<u32>,
+    /// Every named group, in source order, with the path above recorded where it was opened.
+    named_here: Vec<(String, Vec<u32>)>,
 }
 
 impl<'a> Parser<'a> {
@@ -452,11 +535,28 @@ impl<'a> Parser<'a> {
 
     fn disjunction(&mut self) -> Result<Node, Error> {
         let mut parts = Vec::new();
+        self.alternative_path.push(0);
         parts.push(self.alternative()?);
         while self.eat(0x7C) {
+            if let Some(branch) = self.alternative_path.last_mut() {
+                *branch += 1;
+            }
             parts.push(self.alternative()?);
         }
+        self.alternative_path.pop();
         Ok(Node::alternate(parts))
+    }
+
+    /// Whether two groups could both capture in one match, which is what lets them share a name.
+    ///
+    /// `MightBothParticipate` (22.2.1.4) asks whether some disjunction has one of them in its
+    /// Alternative and the other in its trailing Disjunction. Over these paths that is exactly
+    /// "the two diverge somewhere": both are rooted at the pattern, so where the paths first
+    /// differ they are in two alternatives of the SAME disjunction. It follows that the paths
+    /// might both participate precisely when one is a prefix of the other -- which includes their
+    /// being equal, the two-groups-side-by-side case.
+    fn might_both_participate(left: &[u32], right: &[u32]) -> bool {
+        left.iter().zip(right.iter()).all(|(a, b)| a == b)
     }
 
     fn alternative(&mut self) -> Result<Node, Error> {
@@ -610,8 +710,17 @@ impl<'a> Parser<'a> {
                 return Ok(Node::Group { index: None, node: Box::new(node) });
             }
             if self.peek() == Some(0x3C) {
-                let (_, after) = read_group_name(self.units, self.pos + 1)?;
+                let at = self.pos + 1;
+                let (name, after) = read_group_name(self.units, at)?;
                 self.pos = after;
+                for (existing, path) in &self.named_here {
+                    if *existing == name
+                        && Self::might_both_participate(path, &self.alternative_path)
+                    {
+                        return Err(Error { kind: ErrorKind::DuplicateGroupName, at });
+                    }
+                }
+                self.named_here.push((name, self.alternative_path.clone()));
                 self.next_group += 1;
                 let index = self.next_group;
                 let node = self.disjunction()?;
@@ -619,6 +728,9 @@ impl<'a> Parser<'a> {
                     return self.error(ErrorKind::UnterminatedGroup);
                 }
                 return Ok(Node::Group { index: Some(index), node: Box::new(node) });
+            }
+            if let Some((add, remove)) = self.read_modifiers()? {
+                return self.modified_group(add, remove);
             }
             return self.error(ErrorKind::InvalidEscape);
         }
@@ -630,6 +742,72 @@ impl<'a> Parser<'a> {
             return self.error(ErrorKind::UnterminatedGroup);
         }
         Ok(Node::Group { index: Some(index), node: Box::new(node) })
+    }
+
+    /// Reads `Modifiers :` or `Modifiers - Modifiers :`, answering the added and removed sets.
+    ///
+    /// `Ok(None)` means this was not a modifier group at all and NOTHING WAS CONSUMED -- the
+    /// caller falls through to its own error. A malformed one that clearly meant to be a modifier
+    /// group is an `Err`, because reporting "invalid escape" for `(?ii:a)` would send an author
+    /// looking at the wrong thing.
+    fn read_modifiers(&mut self) -> Result<Option<(u8, u8)>, Error> {
+        let start = self.pos;
+        let Some((add, after_add)) = read_modifier_set(self.units, self.pos) else {
+            return Ok(None);
+        };
+        let (remove, after) = if self.units.get(after_add).copied() == Some(0x2D) {
+            match read_modifier_set(self.units, after_add + 1) {
+                Some((remove, after_remove)) => (remove, after_remove),
+                None => {
+                    self.pos = start;
+                    return Ok(None);
+                }
+            }
+        } else {
+            (0u8, after_add)
+        };
+        if self.units.get(after).copied() != Some(0x3A) {
+            self.pos = start;
+            return Ok(None);
+        }
+        let dual = self.units.get(after_add).copied() == Some(0x2D);
+        self.pos = after + 1;
+        if repeats(self.units, start, after_add) {
+            return self.error(ErrorKind::InvalidModifiers);
+        }
+        if dual {
+            if repeats(self.units, after_add + 1, after) {
+                return self.error(ErrorKind::InvalidModifiers);
+            }
+            if add == 0 && remove == 0 {
+                return self.error(ErrorKind::InvalidModifiers);
+            }
+            if add & remove != 0 {
+                return self.error(ErrorKind::InvalidModifiers);
+            }
+        }
+        Ok(Some((add, remove)))
+    }
+
+    /// Parses the body of `(?i:...)` with the modified flags in force, and wraps it.
+    ///
+    /// **THE FLAGS ARE FLIPPED FOR THE PARSE AND RESTORED AFTER**, because this front end resolves
+    /// two of the three itself: `dot_all` is baked into each `Any` and case-insensitivity is baked
+    /// into the class entries it widens. Only what the COMPILER still resolves travels in the node.
+    fn modified_group(&mut self, add: u8, remove: u8) -> Result<Node, Error> {
+        let outer = self.flags;
+        self.flags.ignore_case = update(outer.ignore_case, add, remove, MODIFIER_I);
+        self.flags.multiline = update(outer.multiline, add, remove, MODIFIER_M);
+        self.flags.dot_all = update(outer.dot_all, add, remove, MODIFIER_S);
+        let fold = super::pattern_fold(self.flags);
+        let multiline = self.flags.multiline;
+        let node = self.disjunction();
+        self.flags = outer;
+        let node = node?;
+        if !self.eat(0x29) {
+            return self.error(ErrorKind::UnterminatedGroup);
+        }
+        Ok(Node::Modified { fold, multiline, node: Box::new(node) })
     }
 
     fn quantifier(&mut self) -> Result<Option<(u32, Option<u32>, Greed)>, Error> {
@@ -743,7 +921,7 @@ impl Parser<'_> {
                 self.pos = start;
                 return self.error(ErrorKind::InvalidBackreference);
             }
-            return Ok(Node::Backreference(value));
+            return Ok(Node::Backreference(crate::vec![value]));
         }
 
         if unit == 0x6B && !self.names.is_empty() {
@@ -754,13 +932,13 @@ impl Parser<'_> {
             }
             let (name, after) = read_group_name(self.units, self.pos + 1)?;
             self.pos = after;
-            match self.names.iter().find(|(existing, _)| *existing == name) {
-                Some((_, index)) => return Ok(Node::Backreference(*index)),
-                None => {
-                    self.pos = start;
-                    return self.error(ErrorKind::InvalidNamedReference);
-                }
+            let indices: Vec<u32> =
+                self.names.iter().filter(|(existing, _)| *existing == name).map(|(_, i)| *i).collect();
+            if indices.is_empty() {
+                self.pos = start;
+                return self.error(ErrorKind::InvalidNamedReference);
             }
+            return Ok(Node::Backreference(indices));
         }
 
         let ch = self.character_escape()?;

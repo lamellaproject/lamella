@@ -92,6 +92,16 @@ pub enum Expr {
     /// A float literal, stored as its IEEE-754 f64 bit pattern. Heap-boxed in the interpreter; the
     /// typed AOT lane lowers it to a native `f64` (annotated or inferred `float`).
     Float(u64),
+    /// The `...` literal, kept as its own node rather than desugared to the name `Ellipsis` where it
+    /// is read.
+    ///
+    /// It evaluates to exactly that builtin and [`crate::compile`] lowers it there, so the two are
+    /// interchangeable everywhere a value is READ. They are not interchangeable as an assignment
+    /// TARGET, and that is the whole reason this variant exists: `Ellipsis = 1` is legal Python --
+    /// it rebinds an ordinary builtin name -- while `... = 1` is a syntax error. Desugaring at the
+    /// point of reading threw away the only thing that tells them apart, so the target check saw a
+    /// bindable name and bound it, and `...` became `1` for the rest of the scope.
+    Ellipsis,
     /// An imaginary literal `Nj` -- the imaginary part's `f64` bits. Dynamic (a heap `complex`).
     Imaginary(u64),
     /// An integer literal too large for `i64` -- its decimal digits. Dynamic (an arbitrary-precision int).
@@ -313,6 +323,62 @@ pub enum CallArg {
     DoubleStar(Expr),
 }
 
+/// One entry in a class header's base list, in source order.
+///
+/// A class header is parsed by the same grammar a call's argument list is, but it is NOT stored as
+/// one, and the difference is the evaluation order rather than tidiness. CPython evaluates every
+/// base -- spreads included -- before any keyword, even where the source writes a keyword first:
+/// `class A(B, tag=f(), *g())` runs `g` before `f`. Splitting the header into these two lists at
+/// parse time makes that order a property of the shape, so no later walk has to reproduce it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassBase {
+    /// A plain base class, `Base`.
+    Plain(Expr),
+    /// An iterable unpacked into the base list, `*bases`. Any iterable, not only a tuple.
+    Star(Expr),
+}
+
+/// One entry in a class header's keyword list, in source order -- what a base's
+/// `__init_subclass__(cls, **kw)` receives. See [`ClassBase`] for why the two are separate lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassKeyword {
+    /// A named keyword argument, `tag="x"`.
+    Named(String, Expr),
+    /// A mapping unpacked into the keyword arguments, `**kw`. Its keys do not exist until it is
+    /// evaluated, which is why a header holding one cannot compile to [`Op::BuildClassKw`]'s
+    /// compile-time name list.
+    ///
+    /// [`Op::BuildClassKw`]: lamella_py_bytecode::Op::BuildClassKw
+    Spread(Expr),
+}
+
+impl ClassBase {
+    /// The expression this entry evaluates, whichever form it is. Every walk over a class header
+    /// wants exactly this and nothing else -- what the entry MEANS is the compiler's business, and
+    /// four hand-written matches for it would be four places to miss a third form.
+    pub fn expr(&self) -> &Expr {
+        match self {
+            Self::Plain(e) | Self::Star(e) => e,
+        }
+    }
+
+    /// The expression this entry evaluates, for a walk that REWRITES the tree.
+    pub fn expr_mut(&mut self) -> &mut Expr {
+        match self {
+            Self::Plain(e) | Self::Star(e) => e,
+        }
+    }
+}
+
+impl ClassKeyword {
+    /// The expression this entry evaluates. See [`ClassBase::expr`].
+    pub fn expr(&self) -> &Expr {
+        match self {
+            Self::Named(_, e) | Self::Spread(e) => e,
+        }
+    }
+}
+
 /// One `for target(s) in iterable [if cond ...]` clause of a comprehension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompClause {
@@ -531,8 +597,10 @@ pub enum StmtKind {
     },
     /// An expression evaluated for its effect; its value is discarded.
     Expr(Expr),
-    /// `del target, ...` -- unbind each target. A bare name is supported (it unbinds the local);
-    /// subscript / attribute targets (`del xs[i]`, `del o.x`) are unsupported (need interp ops).
+    /// `del target, ...` -- unbind each target. A name is unbound from the scope that binds it (a
+    /// local, a cell, the module globals under `global`, or a class body's namespace); `del xs[i]`
+    /// removes a container element and `del o.x` an attribute. A target may also be a group,
+    /// `del a, (b, c)`, which unbinds every name inside it.
     Delete(Vec<Expr>),
     /// `nonlocal name, ...` -- declare that these names bind to the nearest enclosing FUNCTION's
     /// variables (a shared cell), so an assignment in this function writes through rather than
@@ -664,13 +732,16 @@ pub enum StmtKind {
     ClassDef {
         /// The class name.
         name: String,
-        /// The base-class expressions, in order (empty inherits `object`); more than one is
-        /// multiple inheritance, resolved by the runtime's C3 MRO.
-        bases: Vec<Expr>,
+        /// The base-class entries, in order (empty inherits `object`); more than one is multiple
+        /// inheritance, resolved by the runtime's C3 MRO. A [`ClassBase::Star`] contributes however
+        /// many bases its iterable yields, which is not known until it is evaluated.
+        bases: Vec<ClassBase>,
         /// Keyword arguments in the class header (`class C(Base, tag="x")`), in source order --
-        /// what a base's `__init_subclass__(cls, **kw)` receives. `metaclass` is not among them:
-        /// it is outside this subset, and the parser refuses that name specifically.
-        keywords: Vec<(String, Expr)>,
+        /// what a base's `__init_subclass__(cls, **kw)` receives. A SPELLED `metaclass` is not among
+        /// them: it is outside this subset, and the parser refuses that name specifically. One
+        /// spread from a [`ClassKeyword::Spread`] is refused at RUN TIME instead, by the arm that
+        /// flattens the mapping -- the parser cannot see through a dict.
+        keywords: Vec<ClassKeyword>,
         /// The class body.
         body: Vec<Stmt>,
     },

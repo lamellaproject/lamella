@@ -37,6 +37,12 @@ FACTS = {
         "apbc_mask": 0x40,
         "pmux_reg": 0x410044B5,
         "pmux_pair": 0x33,
+        "pmux_tx_reg": 0x410044B5,
+        "pmux_tx_mask": 0xF,
+        "pmux_tx_value": 0x3,
+        "pmux_rx_reg": 0x410044B5,
+        "pmux_rx_mask": 0xF0,
+        "pmux_rx_value": 0x30,
         "pincfg_tx_reg": 0x410044CA,
         "pincfg_rx_reg": 0x410044CB,
         "txpo": 1,
@@ -87,6 +93,7 @@ INSTANCES = {
     "gclk": {"block": "gclk", "base": 0x40000C00},
     "porta": {"block": "port", "base": 0x41004400},
     "portb": {"block": "port", "base": 0x41004480},
+    "eic": {"block": "eic", "base": 0x40001800, "gclk_core_id": 0x5, "irq": 0x4},
 }
 
 PLANS = {

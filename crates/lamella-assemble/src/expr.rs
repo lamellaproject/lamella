@@ -7,7 +7,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_binder::{
     BoundExpr, BoundExprKind, BoundInitializer, BoundInitializerTarget, BoundMemberInitializer,
-    BoundMemberInitializerValue, ConversionKind, FieldReference, MethodReference, SpecialType,
+    BoundMemberInitializerValue, BoundSwitchArm, ConversionKind, FieldReference, MethodReference,
+    SpecialType,
     TypeSymbol,
 };
 use lamella_cil::{Instruction, Opcode, Operand};
@@ -202,7 +203,7 @@ pub fn emit_expression(
                 {
                     emit_string_equality(*operator == BinaryOperator::NotEqual, tokens, out)
                 } else {
-                    emit_binary(*operator, &left.ty, *checked, out)
+                    emit_binary(*operator, &left.ty, *checked, tokens, out)
                 }
             }
         },
@@ -327,6 +328,12 @@ pub fn emit_expression(
             tokens,
             out,
         ),
+        BoundExprKind::CachedDelegate {
+            cache,
+            singleton,
+            target,
+            delegate_type,
+        } => emit_cached_delegate(cache, singleton, target, delegate_type, tokens, out),
         BoundExprKind::ArrayCreation { lengths, elements } => {
             emit_array_creation(&expr.ty, lengths, elements, frame, tokens, out)
         }
@@ -389,10 +396,31 @@ pub fn emit_expression(
                 "address-of a non-addressable expression",
             )),
         },
+        BoundExprKind::SwitchExpression {
+            governing,
+            subject,
+            arms,
+            fallback,
+        } => emit_switch_expression(
+            governing,
+            subject,
+            arms,
+            fallback.as_deref(),
+            frame,
+            tokens,
+            out,
+        ),
+        BoundExprKind::TypeTest {
+            operand,
+            target,
+            declares: Some(name),
+            ..
+        } => emit_declaration_pattern(operand, target, name, frame, tokens, out),
         BoundExprKind::TypeTest {
             operation,
             operand,
             target,
+            ..
         } => {
             emit_expression(operand, frame, tokens, out)?;
             if operand.ty.is_void() {
@@ -488,6 +516,9 @@ pub fn emit_expression(
         BoundExprKind::Await { .. } => Err(EmitError::Unsupported(
             "an await expression is not lowered yet (the async state machine is in flight)",
         )),
+        BoundExprKind::Lambda { .. } => Err(EmitError::Unsupported(
+            "a lambda in this position was not reached by the closure lowering",
+        )),
         _ => Err(EmitError::Unsupported(
             "this expression form is not lowered yet",
         )),
@@ -518,6 +549,171 @@ fn emit_short_circuit(
     out[short].operand = Operand::Target(out.len() as u32);
     out.push(load_i4(i32::from(is_or)));
     out[to_end].operand = Operand::Target(out.len() as u32);
+    Ok(())
+}
+
+/// Lowers `x is T t`, a DECLARATION PATTERN (C# 7.0): the type test, and the converted value
+/// stored in `name` on the branch where it succeeded.
+///
+/// **TWO SHAPES, AND WHICH ONE IS DECIDED BY THE TARGET RATHER THAN BY TASTE.** `isinst` yields a
+/// reference or null, which IS the value a reference-typed variable wants -- so the reference case
+/// is `stloc` and a null test, and csc emits exactly what `T t = x as T; t != null` emits, measured
+/// byte for byte. A VALUE-typed variable cannot hold that reference: the boxed value has to be
+/// unboxed, which can only happen where the test already passed, so that case needs a branch.
+///
+/// ```text
+///     REFERENCE TARGET                   VALUE TARGET
+///     <operand>                          <operand>
+///     isinst T                           stloc tmp        the operand, evaluated ONCE
+///     stloc t                            ldloc tmp
+///     ldloc t                            isinst T
+///     ldnull                             brfalse no
+///     cgt.un                             ldloc tmp
+///                                        unbox.any T
+///                                        stloc t
+///                                        ldc.i4.1
+///                                        br end
+///                                    no: ldc.i4.0
+///                                   end:
+/// ```
+///
+/// **THE TEMPORARY IS NOT AN OPTIMIZATION, IT IS THE ONE-EVALUATION RULE.** The value shape needs
+/// the operand twice -- once to test, once to unbox -- and `M() is int i` must call `M` once.
+fn emit_declaration_pattern(
+    operand: &BoundExpr,
+    target: &TypeSymbol,
+    name: &str,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let token = tokens
+        .instruction_type_token(target)
+        .ok_or(EmitError::Unsupported(
+            "a declaration pattern against a type with no metadata token",
+        ))?;
+    let variable = match frame.slot(name) {
+        Some(slot) => slot,
+        None => frame.declare_expression_local(name, target),
+    };
+    if is_value_type(&operand.ty, tokens) && operand.ty == *target {
+        emit_expression(operand, frame, tokens, out)?;
+        out.push(variable.store());
+        out.push(load_i4(1));
+        return Ok(());
+    }
+    if !is_value_type(target, tokens) {
+        emit_expression(operand, frame, tokens, out)?;
+        if is_value_type(&operand.ty, tokens) {
+            let box_token = tokens
+                .instruction_type_token(&operand.ty)
+                .ok_or(EmitError::Unsupported(
+                    "boxing a value type for a declaration pattern with no metadata token",
+                ))?;
+            out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
+        }
+        out.push(Instruction::new(Opcode::Isinst, Operand::Token(token)));
+        out.push(variable.store());
+        out.push(variable.load());
+        out.push(Instruction::simple(Opcode::Ldnull));
+        out.push(Instruction::simple(Opcode::CgtUn));
+        return Ok(());
+    }
+    if is_value_type(&operand.ty, tokens) {
+        return Err(EmitError::Unsupported(
+            "a declaration pattern between two different value types",
+        ));
+    }
+    let spilled = Slot::Local(frame.reserve_local(&operand.ty));
+    emit_expression(operand, frame, tokens, out)?;
+    out.push(spilled.store());
+    out.push(spilled.load());
+    out.push(Instruction::new(Opcode::Isinst, Operand::Token(token)));
+    let to_false = out.len();
+    out.push(Instruction::new(Opcode::Brfalse, Operand::Target(0)));
+    out.push(spilled.load());
+    out.push(Instruction::new(Opcode::UnboxAny, Operand::Token(token)));
+    out.push(variable.store());
+    out.push(load_i4(1));
+    let to_end = out.len();
+    out.push(Instruction::new(Opcode::Br, Operand::Target(0)));
+    out[to_false].operand = Operand::Target(out.len() as u32);
+    out.push(load_i4(0));
+    out[to_end].operand = Operand::Target(out.len() as u32);
+    Ok(())
+}
+
+/// Lowers a SWITCH EXPRESSION: spill the governing value, then test each arm in order.
+///
+/// ```text
+/// <governing>
+/// stloc  subject          THE SPILL, and it is the one-evaluation rule
+/// -- per arm --
+/// <test>                  omitted for a discard, which tests nothing
+/// brfalse next
+/// <guard>                 omitted when there is no `when`
+/// brfalse next
+/// <value>
+/// br     end
+/// next:
+/// -- after the last arm --
+/// <fallback>              `newobj SwitchExpressionException; throw`, absent when an arm is a
+///                         catch-all -- nothing can reach it then
+/// end:
+/// ```
+///
+/// **EVERY ARM LEAVES EXACTLY ONE VALUE AND THE FALLBACK LEAVES NONE**, which is what makes the
+/// merge at `end` well formed: the throw does not reach it. The binder converted every arm to the
+/// switch's type, so the values agree as well as the depths.
+///
+/// **THE TESTS ARE SEQUENTIAL**, so a switch expression over n constants costs up to n
+/// comparisons. A large STRING switch is where that shows: the usual implementation hashes the
+/// governing string once and jumps, which is constant in the number of arms. The answers are the
+/// same either way -- this is a cost, not a difference in meaning.
+fn emit_switch_expression(
+    governing: &BoundExpr,
+    subject: &str,
+    arms: &[BoundSwitchArm],
+    fallback: Option<&BoundExpr>,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let slot = match frame.slot(subject) {
+        Some(slot) => slot,
+        None => frame.declare_expression_local(subject, &governing.ty),
+    };
+    emit_expression(governing, frame, tokens, out)?;
+    out.push(slot.store());
+
+    let mut to_end = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let mut to_next = Vec::with_capacity(2);
+        if let Some(test) = &arm.test {
+            emit_expression(test, frame, tokens, out)?;
+            to_next.push(out.len());
+            out.push(Instruction::new(Opcode::Brfalse, Operand::Target(0)));
+        }
+        if let Some(guard) = &arm.guard {
+            emit_expression(guard, frame, tokens, out)?;
+            to_next.push(out.len());
+            out.push(Instruction::new(Opcode::Brfalse, Operand::Target(0)));
+        }
+        emit_expression(&arm.value, frame, tokens, out)?;
+        to_end.push(out.len());
+        out.push(Instruction::new(Opcode::Br, Operand::Target(0)));
+        let next = out.len() as u32;
+        for index in to_next {
+            out[index].operand = Operand::Target(next);
+        }
+    }
+    if let Some(fallback) = fallback {
+        emit_expression(fallback, frame, tokens, out)?;
+    }
+    let end = out.len() as u32;
+    for index in to_end {
+        out[index].operand = Operand::Target(end);
+    }
     Ok(())
 }
 
@@ -1041,6 +1237,82 @@ fn emit_delegate_creation(
     Ok(())
 }
 
+/// Lowers a non-capturing lambda's site: read the cached delegate, and create it on the first
+/// evaluation only.
+///
+/// ```text
+///     ldsfld  <>9__N_M          the cache
+///     dup
+///     brtrue  L                 already created -- the copy on the stack IS the value
+///     pop
+///     ldsfld  <>9               the singleton the body method hangs off
+///     ldftn   <>c::<M>b__N_M
+///     newobj  D::.ctor(object, native int)
+///     dup
+///     stsfld  <>9__N_M
+///   L:
+/// ```
+///
+/// **THE `dup`/`brtrue`/`pop` IS NOT AN OPTIMIZATION AND NEITHER IS THE CACHE.** Two evaluations
+/// of one non-capturing lambda must yield the SAME delegate -- csc's do, because both read this
+/// field -- so `ReferenceEquals` over them answers `true`. Allocating per evaluation would be a
+/// visible behavior difference, not a slower correct answer.
+///
+/// The store leaves its value on the stack with a bare `dup` rather than the temp-local round
+/// trip [`keep_assigned`] takes for an assignment written in source: there is no user expression
+/// here whose result could be observed mid-store, so the shorter form is exact.
+fn emit_cached_delegate(
+    cache: &FieldReference,
+    singleton: &FieldReference,
+    target: &lamella_binder::MethodReference,
+    delegate_type: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let cache_token = tokens
+        .field(&cache.declaring_type, &cache.name)
+        .ok_or(EmitError::Unsupported("a lambda cache field was not emitted"))?;
+    let singleton_token = tokens
+        .field(&singleton.declaring_type, &singleton.name)
+        .ok_or(EmitError::Unsupported(
+            "the closure singleton field was not emitted",
+        ))?;
+    let target_token = tokens
+        .method(&target.declaring_type, &target.name, &target.parameters)
+        .ok_or(EmitError::Unsupported(
+            "a synthesized lambda body was not emitted",
+        ))?;
+    let ctor_token = tokens
+        .method(delegate_type, ".ctor", &[])
+        .ok_or(EmitError::Unsupported(
+            "delegate constructor was not emitted",
+        ))?;
+    out.push(Instruction::new(
+        Opcode::Ldsfld,
+        Operand::Token(cache_token),
+    ));
+    out.push(Instruction::simple(Opcode::Dup));
+    let to_end = out.len();
+    out.push(Instruction::new(Opcode::Brtrue, Operand::Target(0)));
+    out.push(Instruction::simple(Opcode::Pop));
+    out.push(Instruction::new(
+        Opcode::Ldsfld,
+        Operand::Token(singleton_token),
+    ));
+    out.push(Instruction::new(
+        Opcode::Ldftn,
+        Operand::Token(target_token),
+    ));
+    out.push(Instruction::new(Opcode::Newobj, Operand::Token(ctor_token)));
+    out.push(Instruction::simple(Opcode::Dup));
+    out.push(Instruction::new(
+        Opcode::Stsfld,
+        Operand::Token(cache_token),
+    ));
+    out[to_end].operand = Operand::Target(out.len() as u32);
+    Ok(())
+}
+
 /// Lowers a call. An instance call pushes the receiver first and dispatches with
 /// `callvirt`; a static call uses `call`. Then the arguments are pushed and the
 /// target named by token. Same-module targets only for now; external calls follow.
@@ -1163,6 +1435,9 @@ pub(crate) fn emit_ref_argument(
         if let Some((slot, _)) = frame.byref(name) {
             out.push(slot.load());
             return Ok(());
+        }
+        if frame.slot(name).is_none() {
+            frame.declare_expression_local(name, &operand.ty);
         }
     }
     emit_value_type_receiver(operand, frame, tokens, out)
@@ -1424,11 +1699,17 @@ fn emit_initializer(
     match initializer {
         BoundInitializer::Collection(elements) => {
             for element in elements {
-                out.push(Instruction::simple(Opcode::Dup));
-                emit_expression(element, frame, tokens, out)?;
+                let add = element
+                    .add
+                    .as_ref()
+                    .ok_or(EmitError::Unsupported("collection element with no resolved Add"))?;
                 let token = tokens
-                    .method(target_ty, "Add", core::slice::from_ref(&element.ty))
+                    .method(&add.declaring_type, &add.name, &add.parameters)
                     .ok_or(EmitError::Unsupported("collection Add outside this module"))?;
+                out.push(Instruction::simple(Opcode::Dup));
+                for argument in &element.arguments {
+                    emit_expression(argument, frame, tokens, out)?;
+                }
                 out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
             }
             Ok(())
@@ -2561,11 +2842,15 @@ pub(crate) fn emit_binary(
     operator: BinaryOperator,
     operand_ty: &TypeSymbol,
     checked: bool,
+    tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     use BinaryOperator as Op;
-    let unsigned = matches!(operand_ty, TypeSymbol::Special(special) if special.is_unsigned())
-        || matches!(operand_ty, TypeSymbol::Pointer(_));
+    let effective = tokens
+        .enum_underlying(operand_ty)
+        .map_or_else(|| operand_ty.clone(), TypeSymbol::Special);
+    let unsigned = matches!(&effective, TypeSymbol::Special(special) if special.is_unsigned())
+        || matches!(&effective, TypeSymbol::Pointer(_));
     let opcode = match operator {
         Op::Add => checked_or(checked, unsigned, Opcode::AddOvfUn, Opcode::AddOvf, Opcode::Add),
         Op::Subtract => checked_or(checked, unsigned, Opcode::SubOvfUn, Opcode::SubOvf, Opcode::Sub),
@@ -2594,6 +2879,23 @@ pub(crate) fn emit_binary(
         }
     };
     out.push(Instruction::simple(opcode));
+    if matches!(
+        operator,
+        Op::Add
+            | Op::Subtract
+            | Op::Multiply
+            | Op::Divide
+            | Op::Modulo
+            | Op::BitwiseAnd
+            | Op::BitwiseOr
+            | Op::BitwiseXor
+            | Op::LeftShift
+            | Op::RightShift
+    ) {
+        if let Some(underlying) = tokens.enum_underlying(operand_ty) {
+            narrow_subint(&TypeSymbol::Special(underlying), out);
+        }
+    }
     Ok(())
 }
 

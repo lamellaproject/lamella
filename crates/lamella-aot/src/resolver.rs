@@ -16,7 +16,7 @@ use lamella_token::Token;
 use crate::cil::{
     Array2DOp, ArrayCastTest, ArrayElement, ArrayElementTest, ArrayMDOp, CallInfo, CallResolver,
     CallTarget, CilError, Intrinsic,
-    PInvokeCall, ReferenceLayout, lower_method_typed,
+    PInvokeCall, ReferenceLayout, StringCtorForm, lower_method_typed,
 };
 
 /// Reference-owned [`TypeHandle`]s ride table byte 0x03: a handle only ever carries a TypeRef
@@ -255,10 +255,12 @@ pub(crate) const STRING_TYPEDESC_SYMBOL: &str = "__lamella_string_typedesc";
 /// The runtime seams that ALLOCATE a `System.String` and therefore need [`STRING_TYPEDESC_SYMBOL`]
 /// to hold a real descriptor. Named here so a host refusal can say which one forced the build to
 /// need it.
-pub(crate) const STRING_ALLOCATING_SEAMS: [&str; 3] = [
+pub(crate) const STRING_ALLOCATING_SEAMS: [&str; 5] = [
     "lamella_string_substring",
     "lamella_char_to_string",
     "lamella_double_to_string",
+    "lamella_double_to_fixed",
+    "lamella_double_to_exponential",
 ];
 
 /// The canonical symbol for `handle`'s descriptor under `qualifiers` (see [`DescQualifiers`]).
@@ -717,7 +719,7 @@ impl<'a> MetadataResolver<'a> {
     /// `List<T>` -- bound to the monomorphized body for the instantiation in force.
     ///
     /// **A DEFINITION CALLING ITS OWN MEMBER NEED NOT NAME AN INSTANTIATION, AND THE TWO SPELLINGS
-    /// ARE BOTH LEGAL.** csc, and lcsc since `5fd7f35ea0`, emit a `MemberRef` parented by a
+    /// ARE BOTH LEGAL.** csc and lcsc both emit a `MemberRef` parented by a
     /// `TypeSpec` over the type's own parameters, which [`Self::monomorphized_call`] resolves. An
     /// older lcsc emits the definition's own `MethodDef` row, which carries no instantiation at all
     /// -- the enclosing body supplies it. Without this arm that spelling reached `resolve_method`,
@@ -902,7 +904,7 @@ impl<'a> MetadataResolver<'a> {
         let result_type = if has_result {
             let closed =
                 crate::generics::substitute_sig_with(&signature.return_type, &[], &arguments)?;
-            Some(mir_type(&closed, self.assembly, &TargetLayout::ilp32())?)
+            Some(self.slot_type(&closed)?)
         } else {
             None
         };
@@ -1512,6 +1514,23 @@ impl<'a> MetadataResolver<'a> {
     /// required parameter enumerates the CALLERS of `param_key` and cannot reach a site that does
     /// not call it. **A format has one implementation or it has none.**
     #[must_use]
+    /// The index of a REFERENCE-owned type's nullary virtual `name`, in the SAME numbering
+    /// [`Self::reference_type_meta`] fills its vtable with.
+    ///
+    /// [`Self::nullary_vtable_slot`] cannot answer this: it walks `self.assembly`'s slots, and a
+    /// referenced type's are numbered inside its OWNER (that is the whole reason
+    /// `reference_vtable_slots` exists). Asking the wrong one returns either `None` or an index into
+    /// a different vtable, and the second is the dangerous answer.
+    pub fn reference_nullary_vtable_slot(&self, handle: TypeHandle, name: &str) -> Option<usize> {
+        let (ordinal, token) = reference_handle_parts(handle)?;
+        let reference = *self.references.get(ordinal)?;
+        let type_def = reference.type_def(token & 0x00ff_ffff)?;
+        let key = param_key(reference, 0, &[]);
+        reference_vtable_slots(&self.references, reference, type_def)
+            .iter()
+            .position(|slot| slot.name == Some(name) && slot.key == key)
+    }
+
     pub fn nullary_vtable_slot(&self, type_def: TypeDef<'a>, name: &str) -> Option<usize> {
         let key = param_key(self.assembly, 0, &[]);
         self.vtable_methods(type_def)
@@ -2645,6 +2664,7 @@ impl<'a> MetadataResolver<'a> {
     ) -> Vec<(u32, VtableEntry)> {
         {
             let mut entries: Vec<(u32, VtableEntry)> = Vec::new();
+            let own_rows: alloc::vec::Vec<_> = type_def.interfaces().collect();
             for (iface_token, in_force) in self.interface_closure(assembly, type_def, arguments) {
                 let Some((iface_assembly, iface, identity)) =
                     self.interface_link(assembly, iface_token, &in_force)
@@ -2660,10 +2680,14 @@ impl<'a> MetadataResolver<'a> {
                     for (tag, key) in
                         self.interface_method_keys(iface_assembly, &iface_name, name, &signature)
                     {
-                        let Some(slot) = impls
-                            .iter()
-                            .find(|slot| slot.name == Some(name) && slot.key == key)
-                        else {
+                        let matches_key =
+                            |slot: &&VSlot<'_>| slot.name == Some(name) && slot.key == key;
+                        let found = if own_rows.contains(&iface_token) {
+                            impls.iter().rev().find(matches_key)
+                        } else {
+                            impls.iter().find(matches_key)
+                        };
+                        let Some(slot) = found else {
                             continue;
                         };
                         if let Some(func_index) = module_slot_index(slot, resolve) {
@@ -2843,7 +2867,7 @@ enum SlotImpl {
 /// assembly rather than an exotic one -- on the .NET 8 reference assemblies they run to a fifth of
 /// `System.Runtime` and nearly all of `System.Linq`.
 ///
-/// The sibling fix in `lamella-binder` (`LAM0002`, `e29c813709`) does NOT cover this crate:
+/// The sibling handling in `lamella-binder` (`LAM0002`) does NOT cover this crate:
 /// `lamella-aot` has no dependency on `lamella-binder`, direct or transitive, and reaches
 /// `lamella-metadata` itself.
 #[must_use]
@@ -3032,6 +3056,12 @@ fn assembly_base_chain<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) ->
 /// The canonical spelling and CLOSED arguments of a constructed base, composed under the arguments
 /// in force at the link that spells it: `` Derived : Base<int> : Mid`1<!0> `` writes its far edge
 /// open, and it closes only under what the near link supplied.
+///
+/// **ONE SPELLER, BECAUSE THE RESULT IS A LOOKUP KEY INTO THE PLAN.** Both callers -- the base-chain
+/// walk that records what reached a link, and `vtable_methods`' seed for a base declared next door
+/// -- need the string a `MonoBody` carries, and two spellings that must agree is the bug class this
+/// backend keeps paying for. A spec whose arguments do not close spells nothing, and each caller
+/// then treats the link exactly as it treats a plain `TypeDef` edge, which is the safe answer.
 fn composed_base_instantiation(
     assembly: &Assembly<'_>,
     base: Token,
@@ -3438,6 +3468,28 @@ fn type_spec_element_kind(signature: Option<&SigType>) -> u32 {
     }
 }
 
+/// The array descriptor's word-1 element KIND for an element spelled by a SIGNATURE rather than
+/// named by a token -- the rank-N case, whose element arrives inside the TypeSpec's
+/// `SigType::Array { element, rank }`.
+///
+/// THE SIGNATURE-SIDE TWIN OF [`MetadataResolver::array_element`]'s token-side derivation, and the
+/// two must agree. They share the part that could drift: both bottom out in
+/// [`primitive_element_kind`], the frozen table, so a primitive cannot be coded two ways. Only how
+/// the element's identity ARRIVES differs -- a name off a token there, a lead byte here -- and for
+/// the cases a signature spells it is the more direct of the two: `Class` and `ValueType` state
+/// class-or-struct outright, where the token path resolves a row and asks `is_value_type()`.
+#[must_use]
+fn sig_element_kind(element: &SigType) -> u32 {
+    if let Some((namespace, name)) = primitive_sig_name(element) {
+        return primitive_element_kind(namespace, name).unwrap_or(ELEMENT_KIND_REFERENCE);
+    }
+    match element {
+        SigType::Class(_) => ELEMENT_KIND_REFERENCE,
+        SigType::ValueType(_) => ELEMENT_KIND_OPAQUE,
+        other => type_spec_element_kind(Some(other)),
+    }
+}
+
 /// The frozen primitive element code for a `System` primitive by name, or `None` if it is not one.
 ///
 /// MIRRORS `lamella_cil_runtime::object::PrimKind` (`object.rs:195`), whose codes are FROZEN for the
@@ -3537,6 +3589,35 @@ pub struct TypeMeta {
 }
 
 impl<'a> MetadataResolver<'a> {
+    /// The MIR slot a signature occupies IN THIS RESOLVER'S WORLD -- its own assembly, its argument
+    /// world, and its REFERENCES. Every question of the form "what does this signature type look
+    /// like here" goes through it.
+    ///
+    /// **IT EXISTS BECAUSE THE REFERENCES ARE LOAD-BEARING AND SEVEN CALLERS WERE DROPPING THEM.**
+    /// [`mir_type`] is [`mir_type_across`] with an empty reference list, so a signature naming a
+    /// REFERENCED assembly's value type -- `System.Decimal`, `System.Guid`,
+    /// `System.Collections.DictionaryEntry` -- answered `None`, and each caller's own
+    /// `unwrap_or(MirType::I32)` then turned "I could not resolve this" into "it is an `int32`".
+    /// The LOCAL such a value is stored into is typed by `build::mir_type`, which does pass the
+    /// references, so the two met at a verifier `TypeMismatch { expected: ValueType { size: 16 },
+    /// found: I32 }` and the whole method was refused.
+    ///
+    /// **AND IT IS ONE RULE WITH SEVERAL POSITIONS, WHICH IS WHY IT IS EXTRACTED RATHER THAN
+    /// CORRECTED PER SITE.** `static_slot_words` says the same sentence about static WIDTHS
+    /// ("without them a `SigType::ValueType` naming a cross-assembly struct answers `None`, which
+    /// is indistinguishable here from a scalar") and `field_type` has always passed them; the
+    /// call-RESULT positions were the ones left. Going through here means the next position cannot
+    /// be added without this answer.
+    fn slot_type(&self, sig: &SigType) -> Option<MirType> {
+        mir_type_across(
+            sig,
+            self.assembly,
+            self.argument_assembly,
+            &self.references,
+            &TargetLayout::ilp32(),
+        )
+    }
+
     /// The reference layout of `type_def` (declared in `owner`) -- payload size and
     /// reference-field offsets; `None` for a value type. Used for a `newobj` of either a
     /// this-assembly class or a referenced-assembly class. The payload spans the WHOLE extends
@@ -4186,15 +4267,12 @@ impl<'a> MetadataResolver<'a> {
 /// `callvirt IFoo::Bar(args)` and every implementing type's itable entry for it derive the SAME tag, so
 /// dispatch needs no shared registry.
 ///
-/// SCOPE, corrected: this is the AOT's tag and nothing else computes it. An earlier revision of this
-/// note said the interpreter computes it identically; it does not -- `lamella-cil-runtime` reproduces
-/// the EXCEPTION tag (`exception.rs`) and dispatches interfaces by signature key, never by this hash.
-/// What the tag IS, is cross-ASSEMBLY ABI: it is baked into emitted code and into itable entries in
-/// type descriptors, so a program object and a library object built at different times must agree
-/// about every byte of it. That is why its encoding cannot change once artifacts exist in the wild.
-/// The constraint is that ONE boundary and not a cross-tier one: the interpreter carries the
-/// EXCEPTION tag and dispatches interfaces by signature key, so nothing outside the AOT object ABI
-/// reads this hash.
+/// SCOPE: this is the AOT's tag and nothing else computes it. What the tag IS, is cross-ASSEMBLY
+/// ABI: it is baked into emitted code and into itable entries in type descriptors, so a program
+/// object and a library object built at different times must agree about every byte of it. That is
+/// why its encoding cannot change once artifacts exist in the wild. The constraint is that ONE
+/// boundary and not a cross-tier one: the interpreter carries the EXCEPTION tag and dispatches
+/// interfaces by signature key, so nothing outside the AOT object ABI reads this hash.
 ///
 /// WHAT GENERICS MUST SETTLE BEFORE THAT POINT, because it cannot be settled after. The interface's
 /// identity here is its NAME, and a name carries no type arguments -- so `IList<Foo>::Add` and
@@ -4452,13 +4530,7 @@ impl CallResolver for MetadataResolver<'_> {
         let args = signature.parameters.len() + usize::from(signature.has_this);
         let has_result = !matches!(signature.return_type, SigType::Void);
         let result_type = has_result
-            .then(|| {
-                mir_type(
-                    &signature.return_type,
-                    self.assembly,
-                    &TargetLayout::ilp32(),
-                )
-            })
+            .then(|| self.slot_type(&signature.return_type))
             .flatten();
         let target = match method.kind {
             MethodKind::Definition(_) | MethodKind::Reference if is_int32_tostring(&method) => {
@@ -4845,6 +4917,21 @@ impl CallResolver for MetadataResolver<'_> {
         })
     }
 
+    fn newobj_string_ctor(&self, operand: &Operand) -> Option<StringCtorForm> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let method = self.assembly.resolve_method(*token)?;
+        if method.name != Some(".ctor") {
+            return None;
+        }
+        let declaring = method.declaring_type?;
+        if (declaring.namespace, declaring.name) != ("System", "String") {
+            return None;
+        }
+        string_ctor_form(&method.signature?.parameters)
+    }
+
     fn delegate_invoke_args(&self, operand: &Operand) -> Option<(usize, Option<MirType>)> {
         let Operand::Token(token) = operand else {
             return None;
@@ -4869,10 +4956,7 @@ impl CallResolver for MetadataResolver<'_> {
         let result_type = if sig.return_type == SigType::Void {
             None
         } else {
-            Some(
-                mir_type(&sig.return_type, self.assembly, &TargetLayout::ilp32())
-                    .unwrap_or(MirType::I32),
-            )
+            Some(self.slot_type(&sig.return_type).unwrap_or(MirType::I32))
         };
         Some((sig.parameters.len(), result_type))
     }
@@ -4889,7 +4973,7 @@ impl CallResolver for MetadataResolver<'_> {
         let result_type = if sig.return_type == SigType::Void {
             None
         } else {
-            mir_type(&sig.return_type, self.assembly, &TargetLayout::ilp32())
+            self.slot_type(&sig.return_type)
         };
         let param_is_string = sig
             .parameters
@@ -4989,12 +5073,12 @@ impl CallResolver for MetadataResolver<'_> {
             ".ctor" => Some(Array2DOp::New {
                 handle: TypeHandle(parent.0),
                 element_size,
+                element_kind: sig_element_kind(&element),
             }),
             "Get" => Some(Array2DOp::Get {
                 element_size,
                 signed,
-                element_type: mir_type(&element, self.assembly, &TargetLayout::ilp32())
-                    .unwrap_or(MirType::I32),
+                element_type: self.slot_type(&element).unwrap_or(MirType::I32),
             }),
             "Set" => Some(Array2DOp::Set { element_size }),
             "Address" => Some(Array2DOp::Address { element_size }),
@@ -5023,13 +5107,13 @@ impl CallResolver for MetadataResolver<'_> {
             ".ctor" => Some(ArrayMDOp::New {
                 handle: TypeHandle(parent.0),
                 element_size,
+                element_kind: sig_element_kind(&element),
                 rank,
             }),
             "Get" => Some(ArrayMDOp::Get {
                 element_size,
                 signed,
-                element_type: mir_type(&element, self.assembly, &TargetLayout::ilp32())
-                    .unwrap_or(MirType::I32),
+                element_type: self.slot_type(&element).unwrap_or(MirType::I32),
                 rank,
             }),
             "Set" => Some(ArrayMDOp::Set { element_size, rank }),
@@ -5765,13 +5849,7 @@ impl CallResolver for MetadataResolver<'_> {
             has_result,
             has_this: true,
             result_type: has_result
-                .then(|| {
-                    mir_type(
-                        &signature.return_type,
-                        self.assembly,
-                        &TargetLayout::ilp32(),
-                    )
-                })
+                .then(|| self.slot_type(&signature.return_type))
                 .flatten(),
             target: self.own_call_target(own.rid())?,
         })
@@ -6410,14 +6488,91 @@ pub(crate) fn enum_underlying<'x>(
     mir_type(&underlying, owner, target)
 }
 
+/// The argument and local narrowing tables for one method -- ECMA-335 III.1.1.1 case (1), as
+/// [`crate::cil::Narrowing`] wants them.
+///
+/// The argument table is indexed the way `ldarg`/`starg` index: an instance method's `this` is slot
+/// zero and is never a short integer, so it contributes a `None` and the declared parameters follow
+/// it. Getting that offset wrong would narrow the wrong slot, which is why it is derived from the
+/// same `has_this` the argument TYPES are built from rather than assumed.
+///
+/// A GENERIC LOCAL IS NOT NARROWED BY THIS. The declared signature of such a local is a type
+/// VARIABLE, which carries no width, so it answers `None` even where the instantiation is a short
+/// integer. Narrowing that case needs the SUBSTITUTED slot type, which these tables are not built
+/// from.
+#[must_use]
+pub fn narrowing_of<'x>(
+    assembly: &'x Assembly<'x>,
+    method: &Method<'x>,
+    references: &[&'x Assembly<'x>],
+) -> (Vec<Option<lamella_ir::ConvKind>>, Vec<Option<lamella_ir::ConvKind>>) {
+    let mut args = Vec::new();
+    if let Some(sig) = method.signature() {
+        if sig.has_this {
+            args.push(None);
+        }
+        for parameter in &sig.parameters {
+            args.push(declared_narrow(parameter, assembly, references));
+        }
+    }
+    let locals = method
+        .local_variables()
+        .iter()
+        .map(|sig| declared_narrow(sig, assembly, references))
+        .collect();
+    (args, locals)
+}
+
+/// The width conversion a SHORT-INTEGER declared type requires on assignment, or `None` when the
+/// type is not a short integer.
+///
+/// ECMA-335 III.1.1.1 case (1): *"Assignment to a local (`stloc`) or argument (`starg`) whose type is
+/// declared to be a short integer type automatically truncates to the size specified for the local or
+/// argument."* The declared type is the ONLY place that size is written down -- `MirType` collapses
+/// `unsigned int8` to `I32` -- which is why this reads the SIGNATURE and why it has to be asked
+/// before the type is lowered.
+///
+/// **THE SIGNED KINDS ARE NOT A DETAIL AND THEY ARE WHY CASE (2) NEEDS NOTHING.**
+/// [`ConvKind::SignExtend8`] does not merely truncate: it takes the low 8 bits and sign-extends them
+/// back across the 32-bit slot, so an `sbyte` local assigned 128 holds -128 and a later `ldloc`
+/// already sees the right value. The slot stays canonical, nothing is discarded, and III.1.1.1's
+/// case (2) -- sign-extend on load -- has nothing to reconstruct. Choosing the unsigned kind for a
+/// signed declared type would break that quietly, in the reload rather than the store.
+///
+/// AN ENUM IS ITS UNDERLYING TYPE HERE, which is the case the corpus actually exercises: a
+/// `enum Small : byte` local stepping past 255 must wrap to 0, and it arrives as a
+/// `SigType::ValueType` whose width is one resolve away through [`enum_underlying_sig`].
+#[must_use]
+pub(crate) fn declared_narrow<'x>(
+    sig: &SigType,
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+) -> Option<lamella_ir::ConvKind> {
+    let resolved;
+    let effective = match sig {
+        SigType::ValueType(token) => {
+            resolved = enum_underlying_sig(assembly, *token, references)?.1;
+            &resolved
+        }
+        other => other,
+    };
+    match effective {
+        SigType::I1 => Some(lamella_ir::ConvKind::SignExtend8),
+        SigType::U1 | SigType::Boolean => Some(lamella_ir::ConvKind::ZeroExtend8),
+        SigType::I2 => Some(lamella_ir::ConvKind::SignExtend16),
+        SigType::U2 | SigType::Char => Some(lamella_ir::ConvKind::ZeroExtend16),
+        _ => None,
+    }
+}
+
 /// [`enum_underlying`] stopping one step earlier: the enum's underlying SIGNATURE and the assembly
 /// that declares it, before anything turns it into a `MirType`.
 ///
 /// **AN EXTRACTION RATHER THAN A SECOND READER.** Two callers need the same three facts -- resolve
 /// the token, check the base is `System.Enum`, take the first instance field -- and one of them wants
 /// the answer as a signature. Written out twice, the enum test would be a rule with two
-/// implementations, which is this lane's recurring defect; asked once, the second cannot drift.
-fn enum_underlying_sig<'x>(
+/// implementations, which is the defect that shape invites; asked once, the second cannot drift.
+pub(crate) fn enum_underlying_sig<'x>(
     assembly: &'x Assembly<'x>,
     token: Token,
     references: &[&'x Assembly<'x>],
@@ -6790,7 +6945,18 @@ pub fn lower_methods_with_references<'a>(
         .map(|method| {
             let body = method.body().ok_or(CilError::MissingBody)?;
             let (arg_types, local_types) = slot_types(assembly, method, &target)?;
-            lower_method_typed(&body, &resolver, &arg_types, &local_types).map(|(func, _)| func)
+            let (arg_narrow, local_narrow) = narrowing_of(assembly, method, references);
+            lower_method_typed(
+                &body,
+                &resolver,
+                &arg_types,
+                &local_types,
+                crate::cil::Narrowing {
+                    args: &arg_narrow,
+                    locals: &local_narrow,
+                },
+            )
+            .map(|(func, _)| func)
         })
         .collect()
 }
@@ -6811,7 +6977,17 @@ pub fn lower_methods_debug(
     for method in methods {
         let body = method.body().ok_or(CilError::MissingBody)?;
         let (arg_types, local_types) = slot_types(assembly, method, &target)?;
-        let (func, map) = lower_method_typed(&body, &resolver, &arg_types, &local_types)?;
+        let (arg_narrow, local_narrow) = narrowing_of(assembly, method, &[]);
+        let (func, map) = lower_method_typed(
+            &body,
+            &resolver,
+            &arg_types,
+            &local_types,
+            crate::cil::Narrowing {
+                args: &arg_narrow,
+                locals: &local_narrow,
+            },
+        )?;
         funcs.push(func);
         maps.push(map);
     }
@@ -6999,6 +7175,41 @@ mod tests {
     /// a tree that does. Reading at run time compiles everywhere and runs wherever the fixture
     /// exists.
     ///
+    /// The `String` constructor rule is keyed on parameter TYPES, and the case that decides it is the
+    /// one that must NOT match.
+    ///
+    /// `String(char c, int count)` repeats a single code unit; it is not a copy out of an array. An
+    /// arity-keyed rule cannot tell it from `String(char[])` by count alone at one parameter, and a
+    /// rule that checked only "three parameters" would take it if a fourth overload ever arrived.
+    /// Lowering it as this seam would hand the string-alloc helper a CHARACTER where it expects an
+    /// array address and copy `count` units from whatever that value names -- a silent read of
+    /// arbitrary memory, which is the failure mode this rule is shaped to refuse.
+    #[test]
+    fn the_string_ctor_rule_takes_the_char_array_forms_and_refuses_the_repeat_form() {
+        use SigType::{Char, I4, SzArray};
+        let arr = |t: SigType| SzArray(alloc::boxed::Box::new(t));
+
+        assert_eq!(
+            string_ctor_form(&[arr(Char)]),
+            Some(StringCtorForm::WholeArray),
+            "String(char[])"
+        );
+        assert_eq!(
+            string_ctor_form(&[arr(Char), I4, I4]),
+            Some(StringCtorForm::Window),
+            "String(char[], int, int)"
+        );
+
+        assert_eq!(
+            string_ctor_form(&[Char, I4]),
+            None,
+            "String(char, int) repeats a unit and is not this seam"
+        );
+        assert_eq!(string_ctor_form(&[arr(I4), I4, I4]), None, "int[] is not char[]");
+        assert_eq!(string_ctor_form(&[SigType::String]), None, "String(string)");
+        assert_eq!(string_ctor_form(&[]), None, "the parameterless form");
+    }
+
     /// **A MISSING FIXTURE SKIPS ONLY WHERE SKIPPING IS RIGHT.** If the DIRECTORY is gone -- exactly
     /// the stripped drop and nowhere else -- the caller returns early. If the directory exists and
     /// the FILE does not, that is a real breakage and this panics by name. Without that split,
@@ -7487,7 +7698,7 @@ mod tests {
     /// `primitive_sig_name` is the INVERSE of `primitive_sig_type`, walked rather than read.
     ///
     /// Two spellings of one table is the shape where a case gets added to one and not the other, and
-    /// this lane has paid for that more than once. The loop is over the forward table's own names, so
+    /// that is easy to get wrong. The loop is over the forward table's own names, so
     /// a primitive added there and forgotten here fails HERE -- which is the direction that matters,
     /// because the reverse map is what decides an array element's width and its collector kind.
     #[test]
@@ -7971,5 +8182,27 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), used.len(), "two parameter kinds share one byte");
+    }
+}
+
+/// Which [`StringCtorForm`] a `System.String` constructor's PARAMETER LIST names, or `None` for one
+/// this backend does not lower to the string-alloc seam.
+///
+/// Keyed on the parameter TYPES rather than on the count, and the third constructor is why:
+/// `String` declares `String(char[])`, `String(char[], int, int)` and `String(char c, int count)`.
+/// The last repeats one code unit and is a different operation entirely, so an arity-keyed match
+/// would lower a `char` as though it were an array reference and copy from whatever address the
+/// character's value happens to name. Free-standing rather than inline in the resolver so that rule
+/// can be tested without an assembly to read a token out of.
+fn string_ctor_form(params: &[SigType]) -> Option<StringCtorForm> {
+    let is_char_array =
+        matches!(params.first(), Some(SigType::SzArray(element)) if **element == SigType::Char);
+    if !is_char_array {
+        return None;
+    }
+    match params {
+        [_] => Some(StringCtorForm::WholeArray),
+        [_, SigType::I4, SigType::I4] => Some(StringCtorForm::Window),
+        _ => None,
     }
 }

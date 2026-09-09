@@ -1,0 +1,80 @@
+# The SAM HA1E16A Xplained Pro (ATSAMHA1E16A-XPRO): board truth only -- what is wired to what.
+# Chip truth lives in csp/samha1/.
+#
+# WARNING: ON THIS BOARD THE VIRTUAL COM PORT AND THE PART'S OWN LIN TRANSCEIVER ARE THE SAME
+# SERCOM INSTANCE, AND THEY CANNOT BOTH BE USED.
+#
+# The SAM HA1 is a Cortex-M0+ and a LIN System Basis Chip in one package. On the E series the SBC
+# is wired to SERCOM4, reaching it at PA13 and PB11 -- neither a package pin (DS20005902B Table
+# 7-2, Internal Connections 32-pin). This kit routes the SAME instance, SERCOM4, out to the EDBG's
+# virtual COM port at PA14 and PA15 instead. SERCOM4's PAD[2] and PAD[3] can be muxed to the
+# internal pair or the external pair, not to both, so opening the virtual COM port on this board
+# spends the LIN transceiver's UART.
+#
+# THAT IS NOT TRUE OF THE G-SERIES KITS BESIDE THIS ONE. They spend SERCOM5 on the transceiver and
+# bind SERCOM1 for the virtual COM port, so nothing is in contention there. It is a per-SERIES
+# fact, which is why csp/samha1/parts.toml states the SBC instance per PART rather than once.
+
+[table]
+kind = "board"
+board = "samha1e16a-xpro"
+vendor = "microchip"
+family = "samha1"
+part = "atsamha1e16a"
+product_model = 52          # lamella_wire::product_model::SAMHA1E16A_XPLAINED_PRO
+sources = [
+    "SAMHA1E16A Xplained Pro user guide 50002698A (2018) section 3.3.2 and Table 3-6 (LED Connection): one yellow LED0 on PA17, and the section states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'.",
+    "50002698A section 3.3.1 and Table 3-5 (Mechanical Buttons): two buttons, RESET on the part's reset line and a generic user-configurable SW0 on PA18. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'.",
+    "50002698A section 3.4.1 and its SWD Connections table: SWD clock on PA30 and SWD data on PA31.",
+    "50002698A section 3.4.2 and Table 3-8 (Virtual COM Port Connections): SERCOM4 PAD[2] on PA14 and PAD[3] on PA15, corroborated against ATSAMHAxEXXA datasheet DS20005902B Table 7-1, which places both in column D (SERCOM-ALT) -- the guide names no column and the pads carry SERCOM2 in column C, so the letter had to come from the datasheet.",
+]
+notes = [
+    "THE VIRTUAL COM PORT SPENDS THE LIN TRANSCEIVER'S SERCOM -- see the header. This is the one thing about this board most likely to surprise someone who has used its G-series siblings.",
+    "THIS PART BONDS NO GROUP-B PAD. All 19 of its GPIOs are in group A, so every device and binding on this board is a PA pad. That does NOT make it a one-group part: the die has both groups and the SBC's own RXD is PB11, which is why csp/samha1's driver spans both.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP, exactly as this family's other two guides do not.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION -- see samha1g16a-xpro, whose note states the reasoning and
+baud = 115200               # the evidence that a sibling kit's id cannot be borrowed.
+plan = "osc8m-8mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom4"        # THE SBC's INSTANCE ON THIS SERIES -- see the header. Binding it here
+function = "D"              # is what the kit wires, and it is exclusive with the LIN transceiver.
+gclk_gen = 0                # SERCOM-ALT: both pads carry SERCOM2 in column C, so the letter IS a
+tx = { pin = "PA14", pad = 2 }   # choice between two instances and the guide does not state it.
+rx = { pin = "PA15", pad = 3 }
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PA17"
+active = "low"
+source = "50002698A section 3.3.2 and Table 3-6: one yellow LED0 on PA17. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA18"
+active = "low"
+source = "50002698A section 3.3.1 and Table 3-5: the generic user-configurable button SW0 on PA18, silkscreened SW0. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "50002698A section 3.4.1 and its SWD Connections table give SWD clock on PA30 and SWD data on PA31, reached by the on-board EDBG. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

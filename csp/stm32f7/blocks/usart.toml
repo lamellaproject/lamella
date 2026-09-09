@@ -9,8 +9,8 @@
 # read from THIS part's own manual. ST shares the design but not bit-for-bit: the design is shared
 # but the lines are not bit-for-bit identical -- one line implements CR3.UCESM where another
 # reserves that bit, and some fields exist only on particular part numbers. The register map and
-# every field a polled 8N1 driver touches did agree here, which is a result rather than an
-# assumption.
+# every field a polled 8N1 driver touches did agree here, and that agreement was checked in each
+# manual rather than carried across.
 
 [table]
 kind = "block"

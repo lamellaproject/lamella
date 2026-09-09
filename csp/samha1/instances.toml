@@ -1,0 +1,113 @@
+# The SAMHA1 instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# ONE MAP SERVES BOTH SERIES, AND THAT IS A MEASUREMENT RATHER THAN AN ASSUMPTION. The E and G
+# are documented in two separate datasheets, and their Table 14-1 peripheral maps were compared
+# row by row: the bases, the IRQ lines, the generic-clock ids and the APB-C indices are identical
+# in every row this file carries. What differs between the series is the package, the pad set and
+# which SERCOM the SBC takes -- all three of which live in parts.toml, where the PART is named.
+#
+# THE VALUES ALSO AGREE WITH THE SAM D21'S, as the sibling samda1's do and the sibling samd20's
+# do not. Read off this family's own tables; recorded as a result.
+
+[table]
+kind = "instances"
+family = "samha1"
+record = ["base", "gclk_core_id", "apbc_bit", "irq"]
+sources = [
+    "ATSAMHAxGXXA datasheet DS20005841E Table 14-1 (Peripherals Configuration Summary) for base address, IRQ line, APB-C index and generic-clock index",
+    "ATSAMHAxEXXA datasheet DS20005902B Table 14-1, compared row by row against the G's and identical in every row below",
+    "DS20005841E section 18.8.10 (APBC Mask) for the APB-C bit positions, stated one bit at a time in prose rather than read out of the register-summary table",
+]
+notes = [
+    "SERCOM bases stride 0x400 from 0x42000800; GCLK core-clock IDs stride 1 from 20; APBC bits stride 1 from bit 2; NVIC lines stride 1 from 9. Each row is still stated explicitly -- a table is data, not a formula.",
+    "THE SERCOM SLOW CLOCK IS ID 19 AND IS SHARED BY ALL SIX INSTANCES. Table 14-1 prints both against each SERCOM row. Only the CORE id belongs in the record below.",
+    "ALL SIX SERCOMS ARE ROWED AND ONE OF THEM IS NOT A BOARD'S TO BIND -- WHICH ONE DEPENDS ON THE SERIES. The G spends SERCOM5 on the LIN SBC and the E spends SERCOM4. Both are real placed instances with real bases, gate bits and IRQ lines, so omitting either would misdescribe the silicon; binding it would drive the on-package transceiver from a board file. The refusal is stated per PART in parts.toml, because it is not a family fact.",
+    "TWO PORT GROUPS ON THE DIE. The G package bonds pads in both; the E package bonds none in group B at all. That is a package fact and lives in parts.toml.",
+]
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 20
+apbc_bit = 2
+irq = 9
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 21
+apbc_bit = 3
+irq = 10
+
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 22
+apbc_bit = 4
+irq = 11
+
+[[instances]]
+name = "sercom3"
+block = "sercom"
+base = 0x42001400
+gclk_core_id = 23
+apbc_bit = 5
+irq = 12
+
+# THE E SERIES' SBC SERCOM. Rowed because it is placed silicon on both series, and bindable on
+# the G. On an E part its PAD[2] and PAD[3] are the LIN transceiver's TXD and RXD, reached at
+# PA13 and PB11, neither of which is a package pin there.
+[[instances]]
+name = "sercom4"
+block = "sercom"
+base = 0x42001800
+gclk_core_id = 24
+apbc_bit = 6
+irq = 13
+
+# THE G SERIES' SBC SERCOM. Same shape, other series: on a G part its PAD[0] and PAD[3] are the
+# transceiver's TXD and RXD at PB30 and PB23, neither of which is a package pin there.
+[[instances]]
+name = "sercom5"
+block = "sercom"
+base = 0x42001C00
+gclk_core_id = 25
+apbc_bit = 7
+irq = 14
+
+[[instances]]
+name = "pm"
+block = "pm"
+base = 0x40000400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40000C00
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x41004400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "portb"
+block = "port"
+base = 0x41004480
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1

@@ -87,3 +87,12 @@ kind = "gpio-out"
 pin = "P0.13"
 active = "low"
 source = "The full pinout's LED table gives P013 as the RX LED. The schematics sheet TOP.SchDoc puts the ANODE of DL2, a KPT-1608YC yellow LED, on the same +5V rail as DL1, and runs its cathode through R15, 330 ohm, to the net P013. The pin sinks and the LED lights when it is driven low. This row is read from the schematic in its own right rather than by analogy with led_tx: the sheet draws both cathodes."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "unknown"
+pitch_mm = 1.27
+onboard = "none"
+recovery = "flash-bootloader"
+source = "The board exposes SWD directly and carries neither a debugger nor a serial bridge: a ten-pin SWD/JTAG connector, J2, whose pin 2 is SWDIO and pin 4 SWCLK. The document names the connector position and does not state that one is fitted."

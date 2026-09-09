@@ -115,7 +115,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-debug-agent"
+version = "0.0.0"
+dependencies = [
+ "lamella-mmio",
+ "lamella-wire",
+]
+
+[[package]]
 name = "lamella-decimal"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-fw-store"
+version = "0.0.0"
+dependencies = [
+ "lamella-wire",
+]
+
+[[package]]
+name = "lamella-mmio"
 version = "0.0.0"
 
 [[package]]
@@ -139,7 +158,18 @@ name = "lamella-runtime-support"
 version = "0.0.0"
 dependencies = [
  "lamella-decimal",
+ "lamella-runtime-support-debug",
  "lamella-runtime-support-net",
+ "lamella-softmath",
+]
+
+[[package]]
+name = "lamella-runtime-support-debug"
+version = "0.0.0"
+dependencies = [
+ "lamella-debug-agent",
+ "lamella-fw-store",
+ "lamella-wire",
 ]
 
 [[package]]
@@ -153,6 +183,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-softmath"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-tls-mbedtls"
 version = "0.0.0"
 dependencies = [
@@ -162,6 +196,10 @@ dependencies = [
 
 [[package]]
 name = "lamella-token"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-wire"
 version = "0.0.0"
 
 [[package]]

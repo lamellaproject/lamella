@@ -23,6 +23,9 @@ pub struct Tokenized {
     /// The preprocessor symbols defined by `#define` and not later `#undef`'d (9.5.3) -- the
     /// set a `[Conditional("X")]` call is checked against to decide inclusion (24.4.2).
     pub defined_symbols: BTreeSet<Box<str>>,
+    /// Every `#:` file-based-app directive in this file, in source order. Empty unless
+    /// [`LexOptions::file_based`] is on, since the directives are an error otherwise.
+    pub file_directives: Vec<FileDirective>,
     /// Every `#pragma warning disable|restore` in this file, in source order.
     ///
     /// **THE LEXER CANNOT APPLY THESE ITSELF, WHICH IS WHY THEY TRAVEL.** The warnings a pragma
@@ -31,6 +34,29 @@ pub struct Tokenized {
     /// warning back for everything below it. So the directives ride out to the compilation, which
     /// is the one place that has both the regions and the diagnostics.
     pub pragma_warnings: Vec<PragmaWarning>,
+}
+
+/// One `#:` file-based-app directive: its name and everything after it on the line.
+///
+/// **THE LEXER DOES NOT INTERPRET EITHER PART, AND THAT IS csc's DIVISION RATHER THAN LAZINESS.**
+/// Measured against SDK 10.0.301: with file-based mode on, `#:nosuchthing Foo` and
+/// `#:property NoEqualsSign` both compile clean. The compiler owns the SYNTAX -- that a directive
+/// is here, what it is called, and where it may appear -- and the tooling that acts on directives
+/// owns which names exist and what their arguments must look like. Validating a name here would
+/// put the closed set in two places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDirective {
+    /// The offset of the `#`.
+    pub position: u32,
+    /// The name between `#:` and the first following white space -- `package`, `property`, and so
+    /// on. Case is preserved: the tooling that reads these matches case-sensitively.
+    pub name: Box<str>,
+    /// Everything after the name on the line, trimmed at both ends and otherwise VERBATIM.
+    ///
+    /// Not tokenized, and it cannot be: a documented `#:property` value is
+    /// `$([MSBuild]::ValueOrDefault('$(LOG_LEVEL)', 'Information'))`, which carries parens,
+    /// quotes, `::` and a comma.
+    pub argument: Box<str>,
 }
 
 /// One `#pragma warning disable|restore`, and the position it takes effect from (9.5.8).
@@ -61,6 +87,36 @@ pub enum Normalization {
     Nfc,
 }
 
+/// What the compilation produces -- csc's `/target:`.
+///
+/// **THIS IS NOT A DIALECT KNOB AND IT RIDES [`LexOptions`] FOR THE REASON `unsafe_code` DOES**:
+/// the front end threads one options value, so a driver switch becomes a field rather than a
+/// parameter on every `*_with` entry point.
+///
+/// **[`OutputKind::Inferred`] IS THE DEFAULT AND IS NOT csc's.** csc defaults to `exe` and answers
+/// `CS5001` when no entry point is found. This compiler defaults to reading the SOURCES -- a static
+/// `Main` with an entry-point signature makes an executable, and its absence makes a library --
+/// because `lcsc` has no project system to carry the answer, and because the corlib build names no
+/// target at all on its command line. Adopting csc's default would refuse that build.
+///
+/// The distinction only holds where the driver was TOLD: `Inferred` cannot demand an entry point,
+/// so `CS5001` is reported for an explicit executable target and never for an inferred one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputKind {
+    /// No `/target:` was given: the output kind follows from the sources.
+    #[default]
+    Inferred,
+    /// `/target:exe`, and `/target:winexe`.
+    ///
+    /// **THE TWO ARE ONE KIND HERE, AND THE PART THAT DIFFERS IS INERT FOR US.** csc separates them
+    /// only by the PE subsystem field -- Windows CUI against Windows GUI -- which the Windows
+    /// loader reads and nothing else does. A Lamella image is run by the Lamella runtime or compiled
+    /// ahead of time for a microcontroller, so no consumer of one has ever read that field.
+    Executable,
+    /// `/target:library`.
+    Library,
+}
+
 /// The lexer-level dialect knobs, gathered so they thread through the front end as one
 /// value (and so a new knob is a field, not another parameter on every `*_with`).
 ///
@@ -86,6 +142,17 @@ pub struct LexOptions {
     /// predates it is rejected with a `Feature requires C# N` diagnostic instead of munching as
     /// the 1.0 tokens it would otherwise split into (so the error names the feature, not `=` `>`).
     pub version: LanguageVersion,
+    /// Whether this compilation is a FILE-BASED PROGRAM -- csc's `-features:FileBasedProgram`.
+    ///
+    /// **`#:` AND `#!` ARE NOT PLAIN C# AND THIS IS THE SWITCH THAT ADMITS THEM.** Off by default,
+    /// as csc's is: a `#:` in an ordinary compilation is `CS9298` and a `#!` is `CS9314`, even
+    /// when well placed. The knob does not change what is LEXED -- both are recognized either way,
+    /// so the diagnostic can name the real problem instead of a syntax error -- only whether the
+    /// compilation may contain them.
+    ///
+    /// It follows the INPUT KIND rather than the file count: a single `.cs` run or built
+    /// directly is a file-based program, and a project is not one however few files it lists.
+    pub file_based: bool,
     /// Whether unsafe code is permitted -- csc's `/unsafe`. **Off by default, as csc's is**: an
     /// `unsafe` modifier or block written without it is `CS0227`. The knob does not change what is
     /// PARSED -- unsafe C# is fully implemented -- only whether the compilation is allowed to
@@ -93,6 +160,9 @@ pub struct LexOptions {
     /// than a language rule. A host that parses no command line -- a test harness, an in-process
     /// compile -- sets it explicitly for what it is compiling.
     pub unsafe_code: bool,
+    /// What the compilation produces -- csc's `/target:`. See [`OutputKind`], including why the
+    /// default is not csc's.
+    pub target: OutputKind,
     /// Whether unmanaged native interop is enabled: `[DllImport]` P/Invoke (an `ImplMap`), and later
     /// explicit `[StructLayout]`/`[FieldOffset]` and `[MarshalAs]`. Off by default -- pure-managed
     /// code (and the NETMFv4_4 profile) does not need it, so a constrained target stays free of an
@@ -145,10 +215,12 @@ pub fn tokenize_with(source: &str, options: LexOptions) -> Tokenized {
     }
     let defined_symbols = core::mem::take(&mut lexer.defined_symbols);
     let pragma_warnings = core::mem::take(&mut lexer.pragma_warnings);
+    let file_directives = core::mem::take(&mut lexer.file_directives);
     Tokenized {
         tokens,
         defined_symbols,
         pragma_warnings,
+        file_directives,
         diagnostics: lexer.into_diagnostics(),
     }
 }
@@ -176,6 +248,8 @@ pub struct Lexer<'a> {
     /// Every `#pragma warning disable|restore` seen in an INCLUDED region, in source order --
     /// one inside a skipped `#if` never happened, exactly as a `#define` there never happened.
     pragma_warnings: Vec<PragmaWarning>,
+    /// Every `#:` directive seen in an INCLUDED region, in source order.
+    file_directives: Vec<FileDirective>,
     /// The stack of open `#if`/`#region` constructs, innermost last (9.5.4). Its
     /// top decides whether source is currently being included or skipped.
     conditionals: Vec<Conditional>,
@@ -275,6 +349,7 @@ impl<'a> Lexer<'a> {
             seen_token: false,
             defined_symbols: BTreeSet::new(),
             pragma_warnings: Vec::new(),
+            file_directives: Vec::new(),
             conditionals: Vec::new(),
             options: LexOptions::default(),
         }
@@ -388,6 +463,11 @@ impl<'a> Lexer<'a> {
     fn scan_directive(&mut self, start: usize) -> TokenKind {
         let active = self.including();
         self.bump();
+        match self.peek() {
+            Some(':') => return self.scan_file_directive(start, active),
+            Some('!') => return self.scan_shebang(start),
+            _ => {}
+        }
         self.skip_inline_whitespace();
         match DirectiveKind::from_text(self.read_directive_name()) {
             Some(DirectiveKind::Define) => self.scan_define_or_undef(start, active, true),
@@ -407,6 +487,56 @@ impl<'a> Lexer<'a> {
                 self.consume_to_line_end();
             }
         }
+        TokenKind::PreprocessingDirective
+    }
+
+    /// Scans a `#:` file-based-app directive: `#:` then a NAME then the rest of the line.
+    ///
+    /// **THE COMPILER'S WHOLE SHARE OF THIS FEATURE IS HERE**, and it is three things: recognize
+    /// the directive, require the mode, and enforce placement. Measured against SDK 10.0.301 --
+    /// with the mode on, csc accepts an unknown NAME and a malformed ARGUMENT without complaint,
+    /// so neither is checked here. What the directives MEAN belongs to whatever acts on them.
+    ///
+    /// BOTH DIAGNOSTICS CAN FIRE ON ONE DIRECTIVE: a misplaced directive in a non-file-based
+    /// compilation reports the mode error and then the placement error, in that order.
+    fn scan_file_directive(&mut self, start: usize, active: bool) -> TokenKind {
+        let colon = self.position;
+        self.bump();
+        if !self.options.file_based {
+            self.report(DiagnosticKind::FileDirectiveOutsideFileBasedProgram, colon);
+        }
+        if active && self.seen_token {
+            self.report(DiagnosticKind::FileDirectiveAfterFirstToken, colon);
+        }
+        self.skip_inline_whitespace();
+        let name = self.read_directive_name();
+        self.skip_inline_whitespace();
+        let argument_start = self.position;
+        self.consume_to_line_end();
+        let argument = self.source[argument_start..self.position].trim_end();
+        if active && self.options.file_based {
+            self.file_directives.push(FileDirective {
+                position: start as u32,
+                name: name.into(),
+                argument: argument.into(),
+            });
+        }
+        TokenKind::PreprocessingDirective
+    }
+
+    /// Scans a `#!` shebang line, which Unix execution of a single-file program uses.
+    ///
+    /// **VALID ONLY AT OFFSET ZERO**, which is stricter than `#:` gets: `CS1040` covers a
+    /// shebang on any later line AND one INDENTED on the first, where a `#:` directive may be
+    /// indented freely. Not "the first line" and not "the first non-white-space character" --
+    /// the first byte of the file.
+    fn scan_shebang(&mut self, start: usize) -> TokenKind {
+        if start != 0 {
+            self.report(DiagnosticKind::DirectiveNotFirstOnLine, start);
+        } else if !self.options.file_based {
+            self.report(DiagnosticKind::ShebangOutsideFileBasedProgram, start);
+        }
+        self.consume_to_line_end();
         TokenKind::PreprocessingDirective
     }
 
@@ -3379,6 +3509,205 @@ class C { }
             tokenize("// c\n#define A\n#if A\nyes\n#endif")
                 .diagnostics
                 .is_empty()
+        );
+    }
+
+    /// Scans `source` as a file-based program (or not), and returns the diagnostic codes.
+    ///
+    /// Every expectation in the tests below was READ OFF SDK 10.0.301 and the csc it ships, not
+    /// off the documentation page -- which says only "place these at the top of the C# file" and
+    /// states no rule at all for a misplaced one.
+    fn directive_codes(source: &str, file_based: bool) -> Vec<u16> {
+        let options = LexOptions {
+            file_based,
+            ..LexOptions::default()
+        };
+        tokenize_with(source, options)
+            .diagnostics
+            .iter()
+            .map(Diagnostic::code)
+            .collect()
+    }
+
+    fn directives(source: &str) -> Vec<(String, String)> {
+        let options = LexOptions {
+            file_based: true,
+            ..LexOptions::default()
+        };
+        tokenize_with(source, options)
+            .file_directives
+            .into_iter()
+            .map(|d| (d.name.to_string(), d.argument.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_file_directive_needs_the_file_based_mode() {
+        assert_eq!(
+            directive_codes("#:property Lang=x
+class C { }", false),
+            vec![9298]
+        );
+        assert!(directive_codes("#:property Lang=x
+class C { }", true).is_empty());
+    }
+
+    #[test]
+    fn a_file_directive_must_precede_the_first_token_not_the_first_line() {
+        assert!(directive_codes("// a header
+#:property Lang=x
+class C { }", true).is_empty());
+        assert!(directive_codes("
+
+#:property Lang=x
+class C { }", true).is_empty());
+        assert!(directive_codes("#define FOO
+#:property Lang=x
+class C { }", true).is_empty());
+        assert!(directive_codes("    #:property Lang=x
+class C { }", true).is_empty());
+        assert_eq!(
+            directive_codes("using System;
+#:property Lang=x
+class C { }", true),
+            vec![9297]
+        );
+        assert_eq!(
+            directive_codes("class C { }
+#:property Lang=x", true),
+            vec![9297]
+        );
+    }
+
+    #[test]
+    fn both_directive_errors_can_fire_on_one_line() {
+        assert_eq!(
+            directive_codes("using System;
+#:property Lang=x", false),
+            vec![9298, 9297]
+        );
+    }
+
+    #[test]
+    fn the_colon_must_be_adjacent_to_the_hash() {
+        assert_eq!(directive_codes("# :property Lang=x
+class C { }", true), vec![1024]);
+        assert!(directive_codes("#: property Lang=x
+class C { }", true).is_empty());
+    }
+
+    #[test]
+    fn the_compiler_validates_neither_the_name_nor_the_argument() {
+        assert!(directive_codes("#:nosuchthing Foo
+class C { }", true).is_empty());
+        assert!(directive_codes("#:property NoEqualsSign
+class C { }", true).is_empty());
+        assert!(directive_codes("#:
+class C { }", true).is_empty());
+    }
+
+    #[test]
+    fn a_directive_carries_its_name_and_the_rest_of_the_line_verbatim() {
+        assert_eq!(
+            directives("#:package Serilog@3.1.1
+class C { }"),
+            vec![("package".to_string(), "Serilog@3.1.1".to_string())]
+        );
+        assert_eq!(
+            directives(
+                "#:property LogLevel=$([MSBuild]::ValueOrDefault('$(LOG_LEVEL)', 'Information'))
+class C { }"
+            ),
+            vec![(
+                "property".to_string(),
+                "LogLevel=$([MSBuild]::ValueOrDefault('$(LOG_LEVEL)', 'Information'))".to_string()
+            )]
+        );
+        assert_eq!(
+            directives("#:PROPERTY Lang=x
+class C { }"),
+            vec![("PROPERTY".to_string(), "Lang=x".to_string())]
+        );
+        assert_eq!(
+            directives("#:property Lang=
+class C { }"),
+            vec![("property".to_string(), "Lang=".to_string())]
+        );
+    }
+
+    /// A directive line ends at ANY line terminator (9.3.2), not only at a line feed.
+    ///
+    /// `line_terminators_collapse_crlf` already pins the terminator SET for the token scanner.
+    /// This is the DIRECTIVE path, which reads its argument with `consume_to_line_end` and a
+    /// trim -- a different reader of the same rule.
+    ///
+    /// The CRLF row is regression cover. The LONE CR row is the one that can fail: with CRLF the
+    /// stop and the trim each hide a break in the other, measured -- removing the trim changes no
+    /// answer at all. Only a terminator with real content after it tells them apart.
+    #[test]
+    fn a_directive_line_ends_at_any_line_terminator_not_only_a_newline() {
+        assert_eq!(
+            directives("#:package Serilog@3.1.1\r\nclass C { }"),
+            vec![("package".to_string(), "Serilog@3.1.1".to_string())]
+        );
+        assert_eq!(
+            directives("#:package A@1\rclass C { }"),
+            vec![("package".to_string(), "A@1".to_string())]
+        );
+        assert_eq!(
+            directives("#:package B@1\u{2028}class C { }"),
+            vec![("package".to_string(), "B@1".to_string())]
+        );
+        assert!(directive_codes("// header\r\n#:property Lang=x\r\nclass C { }", true).is_empty());
+        assert_eq!(
+            directives("#!/usr/bin/env dotnet\r\n#:package P@1\r\nclass C { }"),
+            vec![("package".to_string(), "P@1".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_directive_in_a_skipped_region_never_happened() {
+        assert!(directives("#if FALSE
+#:package Nope
+#endif
+class C { }").is_empty());
+    }
+
+    #[test]
+    fn a_shebang_is_valid_only_at_the_very_first_byte() {
+        assert!(directive_codes("#!/usr/bin/env -S dotnet --
+class C { }", true).is_empty());
+        assert_eq!(
+            directive_codes("#!/usr/bin/env -S dotnet --
+class C { }", false),
+            vec![9314]
+        );
+        assert_eq!(
+            directive_codes("  #!/usr/bin/env dotnet
+class C { }", true),
+            vec![1040]
+        );
+        assert_eq!(
+            directive_codes("// hi
+#!/usr/bin/env dotnet
+class C { }", true),
+            vec![1040]
+        );
+        assert_eq!(
+            directive_codes("class C { }
+#!/usr/bin/env dotnet", true),
+            vec![1040]
+        );
+    }
+
+    #[test]
+    fn a_shebang_may_be_followed_by_directives() {
+        let found = directives("#!/usr/bin/env -S dotnet --
+#:package Spectre.Console@*
+class C { }");
+        assert_eq!(
+            found,
+            vec![("package".to_string(), "Spectre.Console@*".to_string())]
         );
     }
 }

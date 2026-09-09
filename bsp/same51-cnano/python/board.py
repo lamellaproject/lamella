@@ -8,11 +8,13 @@ BOARD_VENDOR = "Microchip"
 # Role handles: the ONLY peripheral names an app sees. The value of a
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
 # below, never through a surface-private enum.
+VCP = "vcp"
 
 CARRIER = {
     "kind": "edbg-vcp",
     "usb_vid": 0x03EB,
     "usb_pid": 0x2175,
+    "role": "vcp",
 }
 
 # Per-role descriptor dicts, grouped by the role each belongs to.
@@ -24,6 +26,28 @@ CARRIER = {
 # it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
 # name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
+    "vcp": {
+        "driver_family": "same54-sercom",
+        "instance": sercom5,
+        "sercom_base": 0x43000400,
+        "gclk_pchctrl_reg": 0x40001D0C,
+        "gclk_pchctrl_value": 0x40,
+        "apb_mask_reg": 0x40000820,
+        "apb_mask": 0x2,
+        "pmux_reg": 0x410080B8,
+        "pmux_pair": 0x22,
+        "pmux_tx_reg": 0x410080B8,
+        "pmux_tx_mask": 0xF,
+        "pmux_tx_value": 0x2,
+        "pmux_rx_reg": 0x410080B8,
+        "pmux_rx_mask": 0xF0,
+        "pmux_rx_value": 0x20,
+        "pincfg_tx_reg": 0x410080D0,
+        "pincfg_rx_reg": 0x410080D1,
+        "txpo": 0,
+        "rxpo": 1,
+        "baud_115200_dfll48m_48mhz": 0xF62C,
+    },
 }
 
 # The chip's instance map: every block this family places, with its base address and
@@ -51,6 +75,7 @@ INSTANCES = {
     "portb": {"block": "port", "base": 0x41008080, "apb_mask_offset": 0x18, "apb_bit": 0x4},
     "portc": {"block": "port", "base": 0x41008100, "apb_mask_offset": 0x18, "apb_bit": 0x4},
     "portd": {"block": "port", "base": 0x41008180, "apb_mask_offset": 0x18, "apb_bit": 0x4},
+    "eic": {"block": "eic", "base": 0x42001800, "gclk_core_id": 0x7, "apb_mask_offset": 0x14, "apb_bit": 0xA},
 }
 
 PLANS = {
@@ -61,6 +86,6 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led0": {"kind": "gpio-out", "port_base": 0x41008000, "pin": 14, "mask": 0x4000, "active_low": True},
+    "led0": {"kind": "gpio-out", "port_base": 0x41008000, "pin": 14, "mask": 0x4000, "active_low": False},
     "button0": {"kind": "gpio-in", "port_base": 0x41008000, "pin": 15, "mask": 0x8000, "active_low": True},
 }

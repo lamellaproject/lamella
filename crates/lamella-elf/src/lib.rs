@@ -1,4 +1,4 @@
-//! ELF object reading + writing for the Lamella linker (`lamella-link`) and the AOT backend.
+//! ELF object reading + writing for the Lamella linker (`lamella-linker`) and the AOT backend.
 
 #![no_std]
 
@@ -86,6 +86,31 @@ impl Machine {
             Machine::Arm => 40,
         }
     }
+
+    /// `e_flags` -- the target's ABI, which is NOT decoration on ARM.
+    ///
+    /// # A ZERO HERE MADE gdb READ EVERY `double` BACKWARDS
+    ///
+    /// On ARM, `e_flags` is where a file says it is EABI. With no version declared, a consumer is
+    /// entitled to read the file as the OLD ARM ABI -- and the old ABI stores a double as two words
+    /// in the opposite order to the modern one. Measured: with `e_flags` zero, a frame slot holding
+    /// the correct bytes for 2.25 was printed as `5.3056370591364978e-315`, from the right address,
+    /// with the right type. The memory was right, the ABI declaration was missing, and what came out
+    /// was a plausible number that looked exactly like a code-generation bug.
+    ///
+    ///
+    /// `EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT`: version 5 is what every current ARM toolchain
+    /// emits, and the soft-float bit is the truth about these images -- there is no hardware FPU in
+    /// the profile this back end targets and every floating operation goes through a helper.
+    ///
+    /// RISC-V keeps zero, which is its own correct answer: no compressed instructions, and the
+    /// soft-float ABI is what a clear `EF_RISCV_FLOAT_ABI` field means.
+    fn e_flags(self) -> u32 {
+        match self {
+            Machine::RiscV => 0,
+            Machine::Arm => 0x0500_0000 | 0x0000_0200,
+        }
+    }
 }
 
 /// A symbol's binding -- the high nibble of `st_info`.
@@ -131,7 +156,7 @@ pub const TYPE_DESC_PREFIX: &str = "__lamella_typedesc_";
 pub const STACKMAP_RECORD_PREFIX: &str = "__lamella_smrec_";
 
 /// The CARRIED section holding per-function RETURN-ADDRESS stack-map fragments, from which
-/// `lamella-link` synthesizes the whole-program [`STACKMAP_BLOB_SYMBOL`] map.
+/// `lamella-linker` synthesizes the whole-program [`STACKMAP_BLOB_SYMBOL`] map.
 ///
 /// **THIS IS A DIFFERENT MAP FROM [`STACKMAP_RECORD_PREFIX`], NOT A SECOND ENCODING OF IT.** A
 /// `__lamella_smrec_*` record is per-METHOD and answers "how do I step past this frame"; this map is
@@ -168,13 +193,13 @@ pub const STACKMAP_RECORD_PREFIX: &str = "__lamella_smrec_";
 pub const STACKMAP_GCMAP_SECTION: &str = ".lamella_gcmap";
 
 /// The whole-program return-address stack map a collector binary-searches (`__lamella_gc_stackmaps`),
-/// synthesized by `lamella-link` from [`STACKMAP_GCMAP_SECTION`] over the functions that SURVIVED
+/// synthesized by `lamella-linker` from [`STACKMAP_GCMAP_SECTION`] over the functions that SURVIVED
 /// dead-stripping. Its wire format is the GC ABI's and is unchanged by where it is
 /// built.
 pub const STACKMAP_BLOB_SYMBOL: &str = "__lamella_gc_stackmaps";
 
 /// The image's `.text` start (`__lamella_text_base`), the base a collector subtracts from a runtime
-/// return address to get a [`STACKMAP_BLOB_SYMBOL`] lookup key. Defined by `lamella-link` at image
+/// return address to get a [`STACKMAP_BLOB_SYMBOL`] lookup key. Defined by `lamella-linker` at image
 /// offset 0 whenever it synthesizes the map.
 ///
 /// **THE LINKER DEFINES IT AND THE BACKEND DELIBERATELY DOES NOT.** A backend-emitted definition
@@ -202,7 +227,7 @@ pub const STACKMAP_STATICS_PREFIX: &str = "__lamella_smstat_";
 /// that prefixes a library object's internal symbols). The AOT backend references it UNDEFINED from
 /// every `ldsfld`/`stsfld` pool word (addend = the field's dense slot offset) and from the mode-2
 /// statics record's base word, carrying the region's byte size in the reference's `st_size`;
-/// `lamella-link` lays each referenced region out in a RAM window, defines the symbol, and brackets
+/// `lamella-linker` lays each referenced region out in a RAM window, defines the symbol, and brackets
 /// the span with [`STATICS_START_SYMBOL`]/[`STATICS_END_SYMBOL`]. Word 0 of every region is
 /// RESERVED (dense slots start at 1): offset 0 is the MIR-level EH-tag marker, split out to
 /// [`EH_TAG_SYMBOL`].
@@ -211,7 +236,7 @@ pub const STATICS_BASE_PREFIX: &str = "__lamella_statics_";
 /// The ONE VES-global in-flight exception word, shared by EVERY assembly's throw/catch lowering
 /// (`__lamella_eh_tag`). Splitting it out of the per-assembly static regions is what keeps EH
 /// working across assemblies: a corlib `throw` and a program `catch` must read the SAME word, so
-/// it cannot be "row 0 of the thrower's region". `lamella-link` defines it as the ENTRY object's
+/// it cannot be "row 0 of the thrower's region". `lamella-linker` defines it as the ENTRY object's
 /// region word 0 (reserved by the dense layout, and covered by that record's row-0 ManagedPtr
 /// root), falling back to the first laid region / a standalone word.
 pub const EH_TAG_SYMBOL: &str = "__lamella_eh_tag";
@@ -226,7 +251,7 @@ pub const STATICS_START_SYMBOL: &str = "__lamella_statics_start";
 pub const STATICS_END_SYMBOL: &str = "__lamella_statics_end";
 
 /// The symbol bracketing the gathered stack-map pointer table's first word (its `u32` record count).
-/// `lamella-link` defines it (Global) on any image whose objects carry stack-map records; the
+/// `lamella-linker` defines it (Global) on any image whose objects carry stack-map records; the
 /// runtime-support walker declares it extern with a WEAK empty-table fallback for images without one.
 pub const STACKMAP_START_SYMBOL: &str = "__lamella_stackmaps_start";
 
@@ -520,7 +545,7 @@ pub fn write_relocatable_object_with_sections(
     push_u32(&mut out, 0);
     push_u32(&mut out, 0);
     push_u32(&mut out, shoff);
-    push_u32(&mut out, 0);
+    push_u32(&mut out, machine.e_flags());
     push_u16(&mut out, EHDR_SIZE as u16);
     push_u16(&mut out, 0);
     push_u16(&mut out, 0);
@@ -676,14 +701,14 @@ fn encode_rela(relocations: &[Relocation], final_index: &[u32]) -> Vec<u8> {
 /// The file offset (and, since the file maps at `base`, the `base`-relative virtual offset) of
 /// `.text` in a [`write_executable`] image: the 52-byte ELF header plus the 32-byte program header.
 /// So `.text` offset 0 lives at virtual address `base + EXEC_TEXT_OFFSET` -- what an absolute
-/// relocation needs (`lamella_link::link_at_base`).
+/// relocation needs (`lamella_linker::link_at_base`).
 pub const EXEC_TEXT_OFFSET: u32 = EHDR_SIZE + 32;
 
 /// Emits a minimal ELF32 EXECUTABLE (`ET_EXEC`): one `PT_LOAD` segment mapping the whole file at
 /// `base` (read + execute), with `e_entry` at `base + headers + entry_offset`. Runnable under a
 /// user-mode loader (e.g. `qemu-<arch>`). The linked `text` must be correct for this `base` --
-/// PC-relative code (what `lamella_link` produces) is, regardless of `base`; absolute relocations need
-/// the matching `lamella_link::link_at_base`. `base` must be page-aligned (a multiple of `p_align`
+/// PC-relative code (what `lamella_linker` produces) is, regardless of `base`; absolute relocations need
+/// the matching `lamella_linker::link_at_base`. `base` must be page-aligned (a multiple of `p_align`
 /// = 0x1000) so the file-offset-0 mapping satisfies the loader.
 pub fn write_executable(machine: Machine, text: &[u8], entry_offset: u32, base: u32) -> Vec<u8> {
     write_executable_impl(machine, text, entry_offset, base, false, None)
@@ -720,18 +745,23 @@ pub fn write_executable_arm_thumb_with_heap(
 /// Emits an `ET_EXEC` like [`write_executable`], but WITH a section table carrying the linked
 /// `.debug_*` sections -- the artifact a debugger opens.
 ///
-/// This is the outlet for the linker's DWARF passthrough: `lamella_link::LinkedImage` comes back
+/// This is the outlet for the linker's DWARF passthrough: `lamella_linker::LinkedImage` comes back
 /// with the debug sections concatenated and relocated, and until they are written into a container
 /// with section headers, nothing can read them. The loaded image is UNAFFECTED -- the `PT_LOAD`
 /// segment still covers only the headers plus `.text`, so the debug bytes ride along in the file
 /// and cost the target nothing. Flash the same `.text`; hand a debugger this.
 ///
 /// `text_addr` IS THE ADDRESS `.text` GETS, not a file base: pass the address the code was LINKED
-/// at (`lamella_link`'s `text_base`), and the load segment is placed so `.text` lands exactly there.
+/// at (`lamella_linker`'s `text_base`), and the load segment IS `.text`, at exactly that address.
 /// That is what makes the DWARF and the section table agree -- every address in the debug info was
 /// resolved against the link base, and a `.text` placed anywhere else describes the wrong bytes at
-/// every lookup. Unlike [`write_executable`], nothing LOADS this file, so there is no file base to
-/// express and the headers simply precede `.text` in its address space.
+/// every lookup.
+///
+/// Unlike [`write_executable`], the segment does not begin at file offset 0: it starts where `.text`
+/// starts. A file whose segment covers the headers describes them as loadable, and a consumer that
+/// asks the file where its image begins is then told a value below `text_addr` and handed the ELF
+/// header as the first bytes of the program -- an image that is wrong at the front and short at the
+/// back, by the size of the headers, with nothing in the file contradicting it.
 ///
 /// `debug` is `(section name, bytes)`, taken straight from `LinkedImage::debug_sections`.
 /// `entry_thumb` sets `e_entry`'s low bit, as [`write_executable_arm_thumb`] does.
@@ -749,8 +779,6 @@ pub fn write_debuggable_executable(
 ) -> Vec<u8> {
     const PHDR_SIZE: u32 = 32;
     let text_off = EHDR_SIZE + PHDR_SIZE;
-    let base = text_addr - text_off;
-    let loaded = text_off + text.len() as u32;
     let entry = (text_addr + entry_offset) | entry_thumb as u32;
 
     let mut shstrtab: Vec<u8> = alloc::vec![0];
@@ -772,7 +800,7 @@ pub fn write_debuggable_executable(
     push_u32(&mut out, EHDR_SIZE);
     let e_shoff_at = out.len();
     push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
+    push_u32(&mut out, machine.e_flags());
     push_u16(&mut out, EHDR_SIZE as u16);
     push_u16(&mut out, PHDR_SIZE as u16);
     push_u16(&mut out, 1);
@@ -780,11 +808,11 @@ pub fn write_debuggable_executable(
     push_u16(&mut out, debug.len() as u16 + 3);
     push_u16(&mut out, debug.len() as u16 + 2);
     push_u32(&mut out, 1);
-    push_u32(&mut out, 0);
-    push_u32(&mut out, base);
-    push_u32(&mut out, base);
-    push_u32(&mut out, loaded);
-    push_u32(&mut out, loaded);
+    push_u32(&mut out, text_off);
+    push_u32(&mut out, text_addr);
+    push_u32(&mut out, text_addr);
+    push_u32(&mut out, text.len() as u32);
+    push_u32(&mut out, text.len() as u32);
     push_u32(&mut out, 0x4 | 0x1);
     push_u32(&mut out, 0x1000);
 
@@ -810,7 +838,7 @@ pub fn write_debuggable_executable(
             name: text_name,
             typ: 1,
             flags: 0x2 | 0x4,
-            addr: base + text_off,
+            addr: text_addr,
             offset: text_off,
             size: text.len() as u32,
             link: 0,
@@ -877,7 +905,7 @@ fn write_executable_impl(
     push_u32(&mut out, entry);
     push_u32(&mut out, EHDR_SIZE);
     push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
+    push_u32(&mut out, machine.e_flags());
     push_u16(&mut out, EHDR_SIZE as u16);
     push_u16(&mut out, PHDR_SIZE as u16);
     push_u16(&mut out, 1);
@@ -1496,6 +1524,202 @@ fn resolve_ar_name(raw: &[u8], long_names: &[u8]) -> Result<String, ElfError> {
     Ok(String::from_utf8_lossy(name).into_owned())
 }
 
+/// Locates the `.debug_*` sections of an ELF file and borrows their bytes.
+///
+/// Deliberately more permissive than [`read_object`], which is the LINKER's input path and so
+/// requires an `ET_REL` ELF32. Debug info is read out of finished files as well: a linked
+/// executable, and one from a 64-bit toolchain. Both classes and every `e_type` are accepted here,
+/// because the question this answers -- where does a named section's payload start -- does not
+/// depend on either.
+///
+/// Sections that occupy no file bytes (`SHT_NOBITS`) are skipped: their `sh_offset` addresses
+/// whatever the file put next, and reading it would hand back another section's bytes under this
+/// one's name.
+///
+/// Returns the sections in the order the file lists them, as `(name, bytes)`.
+#[must_use]
+pub fn debug_sections(bytes: &[u8]) -> Vec<(&str, &[u8])> {
+    let mut out = Vec::new();
+    if bytes.len() < 64 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] || bytes[5] != 1 {
+        return out;
+    }
+    let elf64 = match bytes[4] {
+        1 => false,
+        2 => true,
+        _ => return out,
+    };
+
+    let rd32 = |o: usize| -> Option<u32> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let rd64 = |o: usize| -> Option<u64> {
+        bytes.get(o..o + 8).map(|b| {
+            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        })
+    };
+    let rd16 = |o: usize| -> Option<u16> { bytes.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])) };
+
+    let (shoff, shentsize, shnum, shstrndx) = if elf64 {
+        (
+            rd64(40).map(|v| v as usize),
+            rd16(58).map(usize::from),
+            rd16(60).map(usize::from),
+            rd16(62).map(usize::from),
+        )
+    } else {
+        (
+            rd32(32).map(|v| v as usize),
+            rd16(46).map(usize::from),
+            rd16(48).map(usize::from),
+            rd16(50).map(usize::from),
+        )
+    };
+    let (Some(shoff), Some(shentsize), Some(shnum), Some(shstrndx)) =
+        (shoff, shentsize, shnum, shstrndx)
+    else {
+        return out;
+    };
+    if shentsize == 0 || shnum == 0 || shstrndx >= shnum {
+        return out;
+    }
+
+    let (off_offset, off_size, off_type) = if elf64 { (24, 32, 4) } else { (16, 20, 4) };
+    let header = |i: usize| -> Option<(u32, u32, usize, usize)> {
+        let base = shoff.checked_add(i.checked_mul(shentsize)?)?;
+        let name = rd32(base)?;
+        let kind = rd32(base + off_type)?;
+        let (offset, size) = if elf64 {
+            (rd64(base + off_offset)? as usize, rd64(base + off_size)? as usize)
+        } else {
+            (rd32(base + off_offset)? as usize, rd32(base + off_size)? as usize)
+        };
+        Some((name, kind, offset, size))
+    };
+
+    let Some((_, _, strtab_offset, strtab_size)) = header(shstrndx) else {
+        return out;
+    };
+    let Some(strtab) = strtab_offset
+        .checked_add(strtab_size)
+        .and_then(|end| bytes.get(strtab_offset..end))
+    else {
+        return out;
+    };
+
+    for i in 0..shnum {
+        let Some((name_offset, kind, offset, size)) = header(i) else {
+            continue;
+        };
+        const SHT_NOBITS: u32 = 8;
+        if kind == SHT_NOBITS {
+            continue;
+        }
+        let Some(rest) = strtab.get(name_offset as usize..) else {
+            continue;
+        };
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let Ok(name) = core::str::from_utf8(&rest[..end]) else {
+            continue;
+        };
+        if !name.starts_with(".debug_") {
+            continue;
+        }
+        let Some(data) = offset.checked_add(size).and_then(|e| bytes.get(offset..e)) else {
+            continue;
+        };
+        out.push((name, data));
+    }
+    out
+}
+
+/// The address ranges of a linked ELF's executable sections, as `[start, end)` pairs.
+///
+/// # WHAT THIS ANSWERS, AND WHY A DEBUGGER NEEDS IT
+///
+/// **A linked image contains debug information for code the linker removed.** `--gc-sections`
+/// discards a section that nothing references, and a relocation against a symbol in a discarded
+/// section resolves to zero -- so the `.debug_line` rows and `DW_TAG_subprogram` entries that
+/// described it survive in the file, all of them now naming address 0. They are indistinguishable
+/// from real rows by their contents: a plausible line number, a real file, a real function name.
+///
+/// A section table separates them, because it says which addresses hold instructions and no other
+/// part of the file does. An address in no executable section describes nothing that is in the
+/// image, whatever the debug information says about it.
+///
+/// An address inside the image is not thereby code. A Cortex-M image begins with its vector table,
+/// so the image's own first bytes are data at an address a caller may legitimately be asked about;
+/// the section flag is what separates them, and it separates a row relocated anywhere else too.
+///
+/// Returns the ranges in the order the file lists them. **An empty result means the file said
+/// nothing** -- a stripped executable has no section headers -- and a caller that filters by these
+/// must treat that as "cannot tell" rather than as "no code", or it discards a whole program.
+#[must_use]
+pub fn executable_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
+    /// `SHF_EXECINSTR` -- the section holds instructions.
+    const SHF_EXECINSTR: u64 = 0x4;
+    /// `SHF_ALLOC` -- the section occupies memory when the program runs. A debug section carries
+    /// neither flag, and an `.ARM.attributes` carries neither; requiring both keeps this to
+    /// sections that are actually part of the running image.
+    const SHF_ALLOC: u64 = 0x2;
+
+    let mut out = Vec::new();
+    if bytes.len() < 64 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] || bytes[5] != 1 {
+        return out;
+    }
+    let elf64 = match bytes[4] {
+        1 => false,
+        2 => true,
+        _ => return out,
+    };
+
+    let rd16 = |o: usize| -> Option<u16> { bytes.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])) };
+    let rd32 = |o: usize| -> Option<u32> {
+        bytes.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let rd64 = |o: usize| -> Option<u64> {
+        bytes.get(o..o + 8).map(|b| {
+            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        })
+    };
+
+    let (shoff, shentsize, shnum) = if elf64 {
+        (rd64(40).map(|v| v as usize), rd16(58).map(usize::from), rd16(60).map(usize::from))
+    } else {
+        (rd32(32).map(|v| v as usize), rd16(46).map(usize::from), rd16(48).map(usize::from))
+    };
+    let (Some(shoff), Some(shentsize), Some(shnum)) = (shoff, shentsize, shnum) else {
+        return out;
+    };
+    if shentsize == 0 {
+        return out;
+    }
+
+    for i in 0..shnum {
+        let Some(base) = i.checked_mul(shentsize).and_then(|o| shoff.checked_add(o)) else {
+            continue;
+        };
+        let (flags, addr, size) = if elf64 {
+            (rd64(base + 8), rd64(base + 16), rd64(base + 32))
+        } else {
+            (
+                rd32(base + 8).map(u64::from),
+                rd32(base + 12).map(u64::from),
+                rd32(base + 20).map(u64::from),
+            )
+        };
+        let (Some(flags), Some(addr), Some(size)) = (flags, addr, size) else {
+            continue;
+        };
+        if flags & SHF_EXECINSTR == 0 || flags & SHF_ALLOC == 0 || size == 0 {
+            continue;
+        }
+        out.push((addr, addr.saturating_add(size)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1750,15 +1974,22 @@ mod tests {
             u32::from_le_bytes([exe[24], exe[25], exe[26], exe[27]]),
             0x1_0000 | 1
         );
+        let p_offset = u32::from_le_bytes([exe[56], exe[57], exe[58], exe[59]]);
+        assert_eq!(p_offset, 84, "the segment starts at .text, not at the headers");
         assert_eq!(
             u32::from_le_bytes([exe[60], exe[61], exe[62], exe[63]]),
-            0x1_0000 - 84,
-            "p_vaddr is placed so that .text lands on text_addr"
+            0x1_0000,
+            "p_vaddr is the address .text was linked at"
+        );
+        assert_eq!(
+            &exe[p_offset as usize..p_offset as usize + text.len()],
+            &text[..],
+            "the bytes the segment covers are the code, and a loader that trusts it gets the code"
         );
 
         let p_filesz = u32::from_le_bytes([exe[68], exe[69], exe[70], exe[71]]);
         let p_memsz = u32::from_le_bytes([exe[72], exe[73], exe[74], exe[75]]);
-        assert_eq!(p_filesz, 84 + text.len() as u32);
+        assert_eq!(p_filesz, text.len() as u32);
         assert_eq!(p_memsz, p_filesz);
         assert!(exe.len() as u32 > p_filesz, "debug data follows the segment");
 
@@ -1944,5 +2175,89 @@ mod tests {
         assert!(by_name(".debug_abbrev").relocations.is_empty());
         assert_eq!(by_name(".debug_line").relocations.len(), 1);
         assert_eq!(by_name(".debug_line").relocations[0].offset, 4);
+    }
+
+    /// Rewrites one section's header to say "loaded, and not code" -- what a vector table's says.
+    ///
+    /// `write_debuggable_executable` emits `.text` as the only allocated section, so a fixture
+    /// built from it cannot distinguish `SHF_ALLOC | SHF_EXECINSTR` from `SHF_ALLOC`. This gives it
+    /// the second kind. `Elf32_Shdr` field offsets: name 0, type 4, flags 8, addr 12, size 20.
+    fn with_section_as_allocated_data(elf: &[u8], name: &str, addr: u32) -> alloc::vec::Vec<u8> {
+        let mut out = elf.to_vec();
+        let rd32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let rd16 = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let shoff = rd32(&out, 32) as usize;
+        let shentsize = rd16(&out, 46) as usize;
+        let shnum = rd16(&out, 48) as usize;
+        let shstrndx = rd16(&out, 50) as usize;
+        let strtab = rd32(&out, shoff + shstrndx * shentsize + 16) as usize;
+        for i in 0..shnum {
+            let header = shoff + i * shentsize;
+            let at = strtab + rd32(&out, header) as usize;
+            let end = at + out[at..].iter().position(|&b| b == 0).expect("terminated");
+            if &out[at..end] == name.as_bytes() {
+                out[header + 8..header + 12].copy_from_slice(&2u32.to_le_bytes());
+                out[header + 12..header + 16].copy_from_slice(&addr.to_le_bytes());
+                return out;
+            }
+        }
+        panic!("no section named {name}");
+    }
+
+    /// `executable_ranges` names the sections that hold instructions and nothing else.
+    ///
+    /// **WHAT THIS SEPARATES.** A linked image contains loaded bytes that are not code -- a
+    /// Cortex-M vector table, a constant pool, a build hash -- and it contains debug sections that
+    /// are not loaded at all. A consumer asking "is this address an instruction" gets a wrong
+    /// answer from every other part of the file: the flat image covers the vector table, and the
+    /// debug sections all report an address of zero, so a range taken from them would claim that
+    /// zero is code.
+    ///
+    /// The fixture below has exactly that shape: an allocated section at an address BELOW the code,
+    /// holding no instructions, which every wrong version of this rule would include.
+    ///
+    #[test]
+    fn executable_ranges_are_the_code_and_not_the_rest_of_the_image() {
+        let text = [0x00u8, 0xBF, 0x00, 0xBF];
+        let elf = write_debuggable_executable(
+            Machine::Arm,
+            &text,
+            0,
+            0x0800_0100,
+            true,
+            &[(".debug_line", &[0u8; 8]), (".debug_info", &[0u8; 8])],
+        );
+        let elf = with_section_as_allocated_data(&elf, ".debug_info", 0x0800_0000);
+
+        let ranges = executable_ranges(&elf);
+        assert_eq!(
+            ranges,
+            alloc::vec![(0x0800_0100, 0x0800_0104)],
+            "one range: `.text` -- not the allocated, non-executable section beside it"
+        );
+
+        assert!(
+            !ranges
+                .iter()
+                .any(|&(start, end)| 0x0800_0000 >= start && 0x0800_0000 < end),
+            "the allocated non-executable section is in the image and outside the code"
+        );
+    }
+
+    /// A file that carries no section headers says nothing, and saying nothing is not "no code".
+    ///
+    /// **A CALLER MUST BE ABLE TO TELL THE TWO APART.** A consumer that filtered by an empty result
+    /// would discard every address in a stripped executable -- reporting a program with no code
+    /// rather than a file it cannot answer from.
+    #[test]
+    fn a_file_with_no_section_headers_yields_no_ranges_rather_than_a_wrong_one() {
+        assert!(executable_ranges(&[]).is_empty());
+        assert!(executable_ranges(b"MZ\x90\x00\x03\x00\x00\x00").is_empty());
+        let elf = write_executable_arm_thumb(&[0x00, 0xBF], 0, 0x0800_0000);
+        let ranges = executable_ranges(&elf);
+        assert!(
+            ranges.is_empty() || ranges.iter().all(|&(start, end)| start < end),
+            "either it has no opinion, or every range it gives is well formed: {ranges:?}"
+        );
     }
 }

@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Collections.Hashtable
 namespace System.Collections
 {
-    public class Hashtable : IDictionary
+    public class Hashtable : IDictionary, ICloneable
     {
         private object[] keys;
         private object[] values;
@@ -14,6 +14,17 @@ namespace System.Collections
         public Hashtable()
         {
             Initialize(8);
+        }
+
+        /// <summary>A table sized for about <paramref name="capacity"/> entries.</summary>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is negative.</exception>
+        public Hashtable(int capacity)
+        {
+            if (capacity < 0) throw new ArgumentOutOfRangeException("capacity");
+            if (capacity > 0x40000000) throw new ArgumentException("capacity");
+            int slots = 8;
+            while (slots < capacity) slots = slots * 2;
+            Initialize(slots);
         }
 
         private void Initialize(int capacity)
@@ -30,6 +41,9 @@ namespace System.Collections
 
         public bool IsFixedSize { get { return false; } }
         public bool IsReadOnly { get { return false; } }
+
+        public bool IsSynchronized { get { return false; } }
+        public object SyncRoot { get { return this; } }
 
         private static void CheckKey(object key)
         {
@@ -157,6 +171,16 @@ namespace System.Collections
 
         public void Add(object key, object value) { this[key] = value; }
 
+        public object Clone()
+        {
+            Hashtable copy = new Hashtable(count);
+            for (int i = 0; i < hashes.Length; i++)
+            {
+                if (hashes[i] >= 0) copy[keys[i]] = values[i];
+            }
+            return copy;
+        }
+
         public void Remove(object key)
         {
             CheckKey(key);
@@ -187,7 +211,7 @@ namespace System.Collections
                 object[] snapshot = new object[count];
                 int n = 0;
                 for (int i = 0; i < hashes.Length; i++) if (hashes[i] >= 0) snapshot[n++] = keys[i];
-                return new ObjectArrayCollection(snapshot, count);
+                return new ObjectArrayCollection(snapshot, count, this);
             }
         }
 
@@ -198,7 +222,7 @@ namespace System.Collections
                 object[] snapshot = new object[count];
                 int n = 0;
                 for (int i = 0; i < hashes.Length; i++) if (hashes[i] >= 0) snapshot[n++] = values[i];
-                return new ObjectArrayCollection(snapshot, count);
+                return new ObjectArrayCollection(snapshot, count, this);
             }
         }
 
@@ -219,6 +243,10 @@ namespace System.Collections
 
         public void CopyTo(System.Array array, int index)
         {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            if (array.Rank != 1) throw new ArgumentException("array");
+            if (index < 0) throw new ArgumentOutOfRangeException("arrayIndex");
+            if (index > array.Length - count) throw new ArgumentException();
             int n = 0;
             for (int i = 0; i < hashes.Length; i++)
             {

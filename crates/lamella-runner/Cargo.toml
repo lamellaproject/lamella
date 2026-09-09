@@ -10,6 +10,12 @@ publish = false
 
 [dependencies]
 lamella-wire = { path = "../lamella-wire" }
+# The on-target LIVE debug agent. It is a separate crate because an AOT-compiled image is debugged
+# over the same wire and cannot depend on this one -- this crate IS the interpreter -- so the
+# memory-window rule would otherwise have to exist twice, once for each tier. `device` supplies the
+# volatile byte access; a HOST build of the runner drives the same code through the agent's
+# `LiveMemory` seam instead.
+lamella-debug-agent = { path = "../lamella-debug-agent" }
 # The runner is the DEVICE crate, so it controls the BCL surface as a profile knob (below): the
 # interpreter + loader take NO surface by default here -- a profile feature forwards exactly the
 # tier the target needs, so a 16 KB part links the kernel floor and a roomy part the full NETMF set.
@@ -28,18 +34,26 @@ lamella-mmio = { path = "../lamella-mmio" }
 default = ["profile-full", "debug-names"]
 debug-names = ["lamella-load/debug-names"]
 # The BCL surface tier (pick ONE). profile-full = the desktop / roomy-device NETMF surface (the host
-# reference runner + the SAME54/L476 serve firmwares). profile-minimal = the kernel-tier floor
-# (intrinsic BCL + exceptions + GC, no float / math / finalizers / varargs) for the tightest parts
-# (micro:bit v1, 256 KB flash) so the interpreter leaves room for a deployed image.
+# reference runner, and every serve firmware whose part feature selects it). profile-minimal = the
+# kernel-tier floor (intrinsic BCL + exceptions + GC, no float / math / finalizers / varargs) for
+# the tightest parts (micro:bit v1, 256 KB flash) so the interpreter leaves room for a deployed
+# image.
 profile-full = [
     "lamella-load/NETMFv4_4", "lamella-load/exceptions", "float", "lamella-load/gc",
     "lamella-load/finalizers", "lamella-load/math-transcendental", "typed-references",
-    "lamella-load/varargs",
+    "lamella-load/varargs", "generics",
 ]
 # cfg-testable passthroughs for the Value variants the debug `<val>` encoder names: the encoder
 # compiles on every profile and emits the float/typedref tags only where the tier carries them.
 float = ["lamella-load/float"]
 typed-references = ["lamella-load/typed-references"]
+# Closed generic instantiations, monomorphized at bake time -- `List<int>` and a user's own
+# `Box<T>` alike. A CAPABILITY AXIS rather than a rung of the surface tier, so a build answers it
+# separately from how much BCL it takes: both profiles carrying the NETMF surface name it, and a
+# floor-tier board with the flash for it can add it without taking that surface too. Without it the
+# loader refuses a generic program instead of mis-running one, so leaving it off costs a program
+# that will not run, never a wrong answer.
+generics = ["lamella-load/generics"]
 # profile-full's surface WITHOUT floating point: the full NETMF type/exception/collection surface,
 # no `float` and no transcendentals. It exists because a part can be roomy enough for the surface and
 # not for the float BCL on top of it -- float costs roughly 62 KiB of flash, which can be the
@@ -48,14 +62,14 @@ typed-references = ["lamella-load/typed-references"]
 # from `float` / `math-transcendental`.
 profile-no-float = [
     "lamella-load/NETMFv4_4", "lamella-load/exceptions", "lamella-load/gc",
-    "lamella-load/finalizers", "typed-references", "lamella-load/varargs",
+    "lamella-load/finalizers", "typed-references", "lamella-load/varargs", "generics",
 ]
 profile-minimal = ["lamella-load/bcl", "lamella-load/exceptions", "lamella-load/gc"]
 # RUN_IMAGE support: boot + run a baked flash image (Module::from_baked) as the runner's execution
 # path -- the PE-less constrained-target story. Forwards the loader's code-in-place (XIP) knob, which
 # pins the load API to Assembly<'static>; run_program then leaks its per-call inputs, matching the
 # one-image-per-process host pattern. The host DRIVER half (send_image / RUN_IMAGE) is unconditional.
-baked-image = ["lamella-load/code-in-place"]
+baked-image = ["lamella-load/code-in-place", "lamella-debug-agent/device"]
 # corlib_resolution = lazy, forwarded to the loader: a deployed bare PE resolves its corlib
 # references out of the FLASH-RESIDENT corlib, materializing only the members it reaches, instead of
 # loading the whole corlib into RAM. This is what lets a 256 KB part take a program PE rather than a

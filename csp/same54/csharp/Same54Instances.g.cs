@@ -85,5 +85,10 @@ namespace Lamella.Generated
         public const uint PORTD_APB_MASK_OFFSET = 24;
         public const uint PORTD_APB_BIT = 4;
         public const uint PORTD_APB_MASK = 0x10;
+        public const uint EIC_BASE = 0x42001800;
+        public const uint EIC_GCLK_CORE_ID = 7;
+        public const uint EIC_APB_MASK_OFFSET = 20;
+        public const uint EIC_APB_BIT = 10;
+        public const uint EIC_APB_MASK = 0x400;
     }
 }

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "ELF object read + write for the Lamella linker (lamella-link) and the AOT backend."
+description = "ELF object read + write for the Lamella linker (lamella-linker) and the AOT backend."
 publish = false
 
 [lints]

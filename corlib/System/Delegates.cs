@@ -10,6 +10,9 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public static Delegate Combine(Delegate a, Delegate b) { return null; }
 
         [Lamella.Runtime.RuntimeProvided] public static Delegate Remove(Delegate source, Delegate value) { return null; }
+
+        [Lamella.Runtime.RuntimeProvided] public static bool operator ==(Delegate a, Delegate b) { return false; }
+        [Lamella.Runtime.RuntimeProvided] public static bool operator !=(Delegate a, Delegate b) { return true; }
     }
 
     public abstract class MulticastDelegate : Delegate

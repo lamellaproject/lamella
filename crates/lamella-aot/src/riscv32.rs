@@ -67,6 +67,21 @@ pub enum LowerError {
         /// The imported seam symbol whose presence made the descriptor necessary.
         seam: alloc::string::String,
     },
+    /// A DISPATCHED call -- `callvirt`, an interface call, `calli`, a delegate invoke -- whose result
+    /// is a value type wider than the two registers a result is returned in. `Call` and `CallNative`
+    /// pass a hidden result pointer ([`emit_sret_arg`]); these four do not, because a0 already
+    /// carries the receiver or the dispatch target.
+    ///
+    /// **REFUSED RATHER THAN EMITTED, AND THE REASON IS THAT THE WRONG ANSWER IS SILENT**: without
+    /// the convention the caller stores a0:a1 into a slot several words wide and leaves the rest of
+    /// it whatever it was. The arm32 twin
+    /// (`crate::arm32::LowerError::BigStructResultUnsupported`) refuses on the same terms.
+    ///
+    /// Carries the call kind, so the message names what cannot be lowered rather than a condition.
+    BigStructResultUnsupported {
+        /// The dispatch kind, in CIL terms.
+        call: &'static str,
+    },
     /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
     /// surrogate under `string-utf8`. Refused rather than replaced with U+FFFD -- see
     /// `stringgen::encode_string_bytes` for why a compiler refuses where the interpreter throws.
@@ -368,6 +383,8 @@ fn soft_float_convert(kind: ConvKind) -> Option<(&'static str, u32, u32)> {
         ConvKind::Float64ToInt => ("__fixdfsi", 2, 1),
         ConvKind::Float32ToLong => ("__fixsfdi", 1, 2),
         ConvKind::Float64ToLong => ("__fixdfdi", 2, 2),
+        ConvKind::Float32ToULong => ("__fixunssfdi", 1, 2),
+        ConvKind::Float64ToULong => ("__fixunsdfdi", 2, 2),
         ConvKind::Float32ToFloat64 => ("__extendsfdf2", 1, 2),
         ConvKind::Float64ToFloat32 => ("__truncdfsf2", 2, 1),
         _ => return None,
@@ -500,6 +517,36 @@ enum AllocSite {
 }
 
 /// Interns `name` into the module's extern-symbol table, returning its index (deduplicating a repeat).
+/// The first DISPATCHED call in `func` whose result is a value type wider than the two registers a
+/// result comes back in, named in CIL terms -- or `None`, which is every function today.
+///
+/// `Call` and `CallNative` implement the sret convention ([`emit_sret_arg`]: a0 = &result, arguments
+/// marshalled from a1); `CallVirtual`, `CallInterface`, `CallIndirect` and `InvokeDelegate` do not,
+/// because a0 already carries the receiver or the dispatch target. Emitting one anyway stores a0:a1
+/// into a wider slot and leaves the rest of it stale -- see
+/// [`LowerError::BigStructResultUnsupported`]. A program build refuses; a library build stubs the
+/// method and reports it, which is this backend's existing contract for a method it cannot lower.
+fn big_struct_result_without_sret(func: &Function) -> Option<&'static str> {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|(result, inst)| {
+            if value_words(&func.value_types, *result) <= 2 {
+                return None;
+            }
+            if !matches!(func.value_type(*result), Some(MirType::ValueType { .. })) {
+                return None;
+            }
+            match inst {
+                Inst::CallVirtual { .. } => Some("callvirt"),
+                Inst::CallInterface { .. } => Some("interface call"),
+                Inst::CallIndirect { .. } => Some("calli"),
+                Inst::InvokeDelegate { .. } => Some("delegate invoke"),
+                _ => None,
+            }
+        })
+}
+
 /// The RISC-V twin of the ARM backend's helper: a `CallNative { symbol: i }` names `externs[i]`.
 fn intern_extern(externs: &mut Vec<alloc::string::String>, name: &str) -> u32 {
     if let Some(i) = externs.iter().position(|s| s == name) {
@@ -765,7 +812,7 @@ fn lower_module_to_image(
         offsets.push(enc.position());
         let source_map = debug
             .and_then(|d| d.source_maps.get(index))
-            .map(|m| m.0.as_slice())
+            .map(|m| m.rows.as_slice())
             .unwrap_or(&[]);
         let mut lines: Vec<(u32, u32)> = Vec::new();
         if tolerant {
@@ -1656,6 +1703,11 @@ fn lower_object_relocatable(
                     file: dbg.methods[*index].file,
                     rows,
                     code_size: symbols[*index].size,
+                    entry: crate::debugmap::entry_position(dbg.methods[*index].points),
+                    locals: dbg.methods[*index].locals,
+                    locations: &[],
+                    params: dbg.methods[*index].params,
+                    param_locations: &[],
                 })
                 .collect();
             if functions.is_empty() {
@@ -1669,10 +1721,10 @@ fn lower_object_relocatable(
                 let first = described[0].0;
                 let last = described[described.len() - 1].0;
                 let span = Some(offsets[last] + symbols[last].size - offsets[first]);
-                let line = crate::dwarf::line_program(&functions);
-                let (info, abbrev) =
+                let line = crate::dwarf::line_program(dbg.unit_name, &functions);
+                let (info, abbrev, loclists) =
                     crate::dwarf::compilation_unit(dbg.unit_name, dbg.producer, span, &functions);
-                let generated = [line, info, abbrev];
+                let generated = [line, info, abbrev, loclists];
                 let first_section_symbol = symbols.len() as u32;
                 for i in 0..generated.len() {
                     symbols.push(lamella_elf::Symbol {
@@ -1692,7 +1744,7 @@ fn lower_object_relocatable(
                                 offset: *at,
                                 symbol: described[*function].0 as u32,
                                 kind: lamella_elf::riscv::R_RISCV_32,
-                                addend: 0,
+                                addend: crate::dwarf::site_addend(section, *at),
                             }
                         });
                         let cross = section.section_relocs.iter().map(|(at, target)| {
@@ -1704,7 +1756,7 @@ fn lower_object_relocatable(
                                         .position(|s| s.name == *target)
                                         .unwrap_or(0) as u32,
                                 kind: lamella_elf::riscv::R_RISCV_32,
-                                addend: 0,
+                                addend: crate::dwarf::site_addend(section, *at),
                             }
                         });
                         code.chain(cross).collect()
@@ -1764,6 +1816,9 @@ fn lower_function(
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
 ) -> Result<Option<MethodRecordInfo>, LowerError> {
+    if let Some(call) = big_struct_result_without_sret(func) {
+        return Err(LowerError::BigStructResultUnsupported { call });
+    }
     let pool = allocatable(profile);
     let value_count = func.value_types.len();
     let allocates = func_allocates(func);
@@ -2916,6 +2971,7 @@ fn lower_inst_spilled(
             dim0,
             dim1,
             element_size,
+            element_kind,
         } => {
             let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                 Some((_, l)) => *l,
@@ -2924,7 +2980,7 @@ fn lower_inst_spilled(
                     type_descs.push(DescEmit {
                         label: l,
                         vtable: Vec::new(),
-                        words: alloc::vec![*element_size, 0, 0],
+                        words: alloc::vec![crate::resolver::ARRAY_DESC_MARK | 2, *element_kind, 0],
                         itable: Vec::new(),
                         base: None,
                         element: None,
@@ -3015,6 +3071,7 @@ fn lower_inst_spilled(
             handle,
             dims,
             element_size,
+            element_kind,
         } => {
             if matches!(profile, RiscvProfile::Rv32ec) {
                 return Err(LowerError::Unsupported);
@@ -3028,7 +3085,11 @@ fn lower_inst_spilled(
                     type_descs.push(DescEmit {
                         label: l,
                         vtable: Vec::new(),
-                        words: alloc::vec![*element_size, 0, 0],
+                        words: alloc::vec![
+                            crate::resolver::ARRAY_DESC_MARK | u32::try_from(dims.len()).unwrap_or(1),
+                            *element_kind,
+                            0
+                        ],
                         itable: Vec::new(),
                         base: None,
                         element: None,
@@ -4114,6 +4175,8 @@ fn emit_convert(enc: &mut Encoder, dest: Reg, src: Reg, kind: ConvKind) -> Resul
         | ConvKind::Float64ToInt
         | ConvKind::Float32ToLong
         | ConvKind::Float64ToLong
+        | ConvKind::Float32ToULong
+        | ConvKind::Float64ToULong
         | ConvKind::IntToFloat64
         | ConvKind::LongToFloat64
         | ConvKind::Float32ToFloat64
@@ -6670,6 +6733,7 @@ mod tests {
                             dim0: n(0),
                             dim1: n(1),
                             element_size: 4,
+                            element_kind: 5,
                         },
                     ),
                     (
@@ -7305,6 +7369,7 @@ mod tests {
                             dim0: n(0),
                             dim1: n(0),
                             element_size: 8,
+                            element_kind: 5,
                         },
                     ),
                     (
@@ -8050,13 +8115,13 @@ mod tests {
         let funcs = [body(1), body(2)];
         let names = ["first", "second"];
         let maps = [
-            crate::cil::CilSourceMap(vec![vec![7]]),
-            crate::cil::CilSourceMap(vec![vec![7]]),
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
         ];
         let points = [(7u32, 11u32, 5u32)];
         let sources = [
-            crate::debugmap::MethodSource { name: "T.first", file: "t.cs", points: &points },
-            crate::debugmap::MethodSource { name: "T.second", file: "t.cs", points: &points },
+            crate::debugmap::MethodSource { name: "T.first", file: "t.cs", points: &points, locals: &[], params: &[] },
+            crate::debugmap::MethodSource { name: "T.second", file: "t.cs", points: &points, locals: &[], params: &[] },
         ];
         let debug = crate::debugmap::ObjectDebug {
             source_maps: &maps,
@@ -8083,7 +8148,17 @@ mod tests {
         assert_eq!(with_obj.text, plain_obj.text, "debug info must not move a byte of code");
         assert!(plain_obj.sections.is_empty(), "the plain build carries no debug sections");
         let emitted: Vec<&str> = with_obj.sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(emitted, [".debug_line", ".debug_info", ".debug_abbrev"]);
+        assert_eq!(
+            emitted,
+            [".debug_line", ".debug_info", ".debug_abbrev", ".debug_loclists"]
+        );
+        assert!(
+            with_obj
+                .sections
+                .iter()
+                .any(|s| s.name == ".debug_loclists" && s.data.is_empty()),
+            "RISC-V describes no homes, so its location-list section must be empty"
+        );
 
         assert_eq!(lines.len(), 2);
         for (index, name) in names.iter().enumerate() {

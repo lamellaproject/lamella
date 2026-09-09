@@ -1,0 +1,82 @@
+# The SAMC21N Xplained Pro (ATSAMC21N-XPRO): board truth only -- what is wired to what. Chip truth
+# lives in csp/samc21/.
+#
+# THIS IS THE 100-PIN PART AND IT IS NOT A BIGGER VERSION OF ITS SIBLING BOARD. samc21-xpro is the
+# 64-pin J; this is the N, and the differences are silicon rather than layout: a THIRD PORT GROUP,
+# which is where this board's LED sits, and TWO EXTRA SERCOMS behind a fourth APB bridge. The two
+# boards also read from DIFFERENT TABLES in the same datasheet -- Table 6-1 and Table 12-1 here,
+# Table 6-2 and Table 12-3 there.
+#
+# THE VIRTUAL COM PORT IS THE ONE THING THE TWO BOARDS SHARE. Both put it on SERCOM4 at PB10/PB11,
+# and that was checked in both tables rather than carried across.
+
+[table]
+kind = "board"
+board = "samc21n-xpro"
+vendor = "microchip"
+family = "samc21"
+part = "atsamc21n18a"
+product_model = 54          # lamella_wire::product_model::SAMC21N_XPLAINED_PRO
+sources = [
+    "SAMC21N Xplained Pro user guide 70005318A section 4.3.1 and Table 4-13 (LED Connection): one yellow user LED on PC05, and the section states the polarity in words -- 'The LED is activated by driving the connected I/O line to low'. The table's Function column reads 'TCC2/WO1 for User LED (Yellow color)'.",
+    "70005318A section 4.3.2 and its Mechanical Buttons table: two buttons, RESET on RESETN and a generic user-configurable button on PB19. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'.",
+    "70005318A section 4.5.1 and its SWD Connections table: SWCLK on PA30 and SWDIO on PA31.",
+    "70005318A section 4.5.2 and its Virtual COM Port Connections table, corroborated against DS60001479M Table 6-1 for the function column.",
+    "70005318A section 4.3.3 (Crystals): the kit contains one MOUNTED 32.768 kHz crystal and a FOOTPRINT for a higher-frequency crystal that is not populated.",
+    "SAM C20/C21 Family Data Sheet DS60001479M ch 18 (OSC48M) for the default plan's rate, stated in words: 'After reset, OSC48M is enabled and serves as the default clock source at 4MHz.'",
+]
+notes = [
+    "THE LED IS ON PORT GROUP C, WHICH THE SIBLING BOARD'S PACKAGE DOES NOT HAVE. PC05 is a pad only the 100-pin part bonds, so this board's LED constant cannot be derived from, or compared with, samc21-xpro's.",
+    "THE GUIDE DESCRIBES THE LED PAD BY A TIMER OUTPUT -- 'TCC2/WO1 for User LED'. That is what the pad can ALSO do, not how this board drives it: nothing here binds a TCC, and the device row below is a plain GPIO output. Recorded because a reader meeting that Function column could reasonably think a timer is required to light it.",
+    "THIS PART HAS EIGHT SERCOMS AND NOTHING HERE BINDS THE EXTRA TWO. SERCOM6 and SERCOM7 sit behind AHB-APB Bridge D at 0x43000000 and are gated from APBDMASK; they exist only on this package. See csp/samc21/parts.toml, which also records that they share NVIC lines with SERCOM0 and SERCOM1.",
+    "THE GUIDE DOES NOT SAY WHETHER THE USER BUTTON HAS AN EXTERNAL PULL-UP. It states the polarity and stops there. The absence of the statement is not the presence of a resistor.",
+    "THE GUIDE CALLS IT 'GPIO for User Button' AND SILKSCREENS NO SW0. It is a generic user-configurable button either way; the device row below carries the guide's own words in its source, so the naming is recoverable from the document rather than only from the row.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION -- see samc21-xpro, whose note states the reasoning and the
+baud = 115200               # evidence that a sibling kit's product id cannot be borrowed.
+plan = "osc48m-4mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom4"
+function = "D"              # SERCOM-ALT, read off DS60001479M Table 6-1's 100-pin column. Neither
+gclk_gen = 0                # pad carries a column-C SERCOM, and the guide names no letter.
+tx = { pin = "PB10", pad = 2 }
+rx = { pin = "PB11", pad = 3 }
+
+# THE DEFAULT CLOCK PLAN. Same family, same reset oscillator, same rate as samc21-xpro -- and
+# stated here from the datasheet rather than pointed at the sibling, because a plan is a BOARD fact
+# and two boards agreeing about one is a result rather than an inheritance.
+[[plans]]
+name = "osc48m-4mhz"
+default = true
+source = "osc48m"
+gclk0_hz = 4000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PC05"
+active = "low"
+source = "70005318A section 4.3.1 and Table 4-13: one yellow user LED on PC05, whose Function column reads 'TCC2/WO1 for User LED (Yellow color)'. 'The LED is activated by driving the connected I/O line to low', which is the polarity stated in words rather than inferred from a schematic. This board drives it as a plain GPIO; the timer output is what the pad can also do."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PB19"
+active = "low"
+source = "70005318A section 4.3.2 and its Mechanical Buttons table, whose row reads 'PB19 -- GPIO for User Button'. 'When a button is pressed it will drive the I/O line to GND'. The guide silkscreens no SW0 for it and says nothing about an external pull-up, in either direction."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "70005318A section 4.5.1 and its SWD Connections table give SWCLK on PA30 and SWDIO on PA31, reached by the on-board EDBG. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

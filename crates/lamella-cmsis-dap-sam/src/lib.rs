@@ -161,6 +161,12 @@ pub const EDBG_VENDOR_ID: u16 = 0x03eb;
 /// rather than as a SAM-wide fact.
 pub const SAM_NVMCTRL_FLASH_BASE: u32 = 0x0000_0000;
 
+/// The `DID` register in the DSU's INTERNAL address range -- the die identity a D/E/L/C part
+/// reports about itself (SAM D21 DS40001882, 14.12.7).
+///
+/// It is `pub` because a flash route reads it to refuse a board that is not the one it was built
+/// for, and that check has to happen outside this crate. Its external-range twin below is the one
+/// to use on a part whose security bit is set.
 pub const SAM_DSU_DID: u32 = 0x4100_2018;
 /// The same `DID` through the DSU's EXTERNAL view.
 ///
@@ -237,7 +243,9 @@ impl SamDeviceId {
     /// The exact part, for the rows a document or a measurement sources.
     ///
     /// `None` is not a failure and not an unknown part: it means this table has no sourced row for
-    /// that `DEVSEL`, while the fields above still give the family, series, die and revision.
+    /// that `DEVSEL`, while the fields above still give the family, series, die and revision. The
+    /// alternative -- transcribing a vendor tool's table -- puts numbers here that no document
+    /// sources and no part confirms.
     pub fn part(&self) -> Option<&'static str> {
         match self.raw & DID_PART_KEY {
             0x1003_0000 => Some("ATSAMD11D14AM (24-pin QFN)"),
@@ -252,6 +260,7 @@ impl SamDeviceId {
             0x1002_0007 => Some("ATSAMD10C13A (14-pin SOIC)"),
             0x1002_0009 => Some("ATSAMD10D14AU (20-ball WLCSP)"),
             0x1001_0000 => Some("ATSAMD21J18A"),
+            0x1001_0093 => Some("ATSAMD21G17D"),
             0x6181_0004 => Some("ATSAME51J20A"),
             _ => None,
         }
@@ -275,34 +284,28 @@ impl SamDeviceId {
     /// D21 puts its configuration register.
     ///
     /// **Measured, not tabulated.** DS60001507 documents what the `DID` FIELDS mean but publishes
-    /// no table of their values, so this is the identity read off the SAM E54 Xplained Pro:
+    /// no table of their values, so this is the identity read off a SAM E54 Xplained Pro:
     /// `DID 0x61840300`, processor `0x6`, family `0x3`, series `0x4`.
     ///
-    /// # The SAM E51 is deliberately NOT claimed, and the reason is a measurement
+    /// Series `0x1` (E51) and `0x4` (E54) are claimed. `SERIES` names the 51/53/54 in the ordering
+    /// code and selects no controller, and the family has one NVMCTRL chapter with no per-device
+    /// qualifier -- but the entry here is each die that has been driven through these routines on a
+    /// board, not each die the chapter covers. D51 and E53 are absent for that reason alone.
     ///
-    /// Every document says it should be. `SERIES` is "the product series part of the ordering
-    /// code" -- it names the 51/53/54 in the part number and selects no controller -- and the
-    /// family has ONE NVMCTRL chapter covering every member with no per-device qualifier. On that
-    /// reading this predicate was widened to accept series `0x1`, and the part refuted it.
+    /// # A caveat this predicate cannot express, for any part it claims
     ///
-    /// On an ATSAME51J20A (`DID 0x61810604`), driven by these exact routines, with register states
-    /// sampled at every step and compared against an E54 running the same code:
+    /// **A D5x/E5x part can report a clean write that did not happen.** A SAM E51 has been observed
+    /// to erase correctly, load its page buffer, report `DONE` with no error bit, and read back ALL
+    /// ZEROS. The cause is not known, and the signature has not recurred under any condition tried.
+    /// **An unexplained fault that has gone quiet is not a fault that has gone.**
     ///
-    /// - **erase works** -- the block reads all ones afterward;
-    /// - **the page buffer loads** -- `STATUS.LOAD` sets, `ADDR` tracks to the last word written;
-    /// - **the write page command completes** -- `INTFLAG` shows `DONE` and NO error bit;
-    /// - **and the flash reads back all zeros.** Both banks, whether the buffer is filled by
-    ///   `DAP_TransferBlock` or one word at a time, and it survives a reset.
-    ///
-    /// The E54 control produced the wanted data with byte-identical registers at every step. The
-    /// cause is not yet known, and until it is, claiming this part would make `flash_routine` name
-    /// a routine that erases correctly and then programs zeros without reporting anything wrong --
-    /// which is worse than refusing, because a refusal is visible.
-    ///
-    /// D51 and E53 stay unclaimed on the older discipline the D21 `DEVSEL` rows follow: nobody has
-    /// read one off a part. The E51 is unclaimed on a stronger one.
+    /// So verify what you write. [`Same54Flash::write_flash`] does NOT -- it reports the
+    /// controller's error bits, and those were clean throughout the episode. The flash route reads
+    /// the image back and compares it, which is what turns that signature into a mismatch rather
+    /// than a silent wrong write, and is why **a D5x/E5x route must never be given a skip-verify
+    /// policy.**
     pub fn drives_same54_nvmctrl(&self) -> bool {
-        self.processor == 0x6 && self.family == 0x3 && self.series == 0x4
+        self.processor == 0x6 && self.family == 0x3 && matches!(self.series, 0x1 | 0x4)
     }
 
     /// Which flash routine in this crate drives this part, if either does.
@@ -398,7 +401,6 @@ impl<A: TargetAccess> SamIdentify for A {
 const SAME54_CTRLA: u32 = 0x4100_4000;
 const SAME54_CTRLB: u32 = 0x4100_4004;
 const SAME54_INTFLAG: u32 = 0x4100_4010;
-const SAME54_STATUS: u32 = 0x4100_4012;
 const SAME54_ADDR: u32 = 0x4100_4014;
 const SAME54_CMDEX: u32 = 0xa500;
 const SAME54_CMD_EB: u32 = 0x01;
@@ -802,6 +804,12 @@ pub struct Sam4sFlashDescriptor {
 /// verified word for word against an ADDRESS-DERIVED pattern -- so a word landing in the wrong page
 /// mismatches instead of coinciding -- and was restored, with a full 1 MB dump before and after
 /// hashing identical on both boards.
+///
+/// **THE REFUSALS WERE EXERCISED, NOT JUST THE HAPPY PATH.** The page-size and plane-count asserts
+/// were each perturbed against a live SAM4E and each stopped the tool before it erased anything;
+/// the family guard was then tested for real rather than by perturbation, by pointing the SAM4E
+/// tool at the SAM4N, which it refused while naming the part it had actually found. A guard that
+/// has only ever passed is a guard nobody has tested.
 pub trait Sam4sFlash {
     /// Erases 8 pages (4 KiB) starting at `first_page` (a multiple of 8), via EPA.
     fn sam4s_erase_pages8(&mut self, eefc: u32, first_page: u32) -> Result<(), ProbeError>;
@@ -2196,28 +2204,32 @@ mod tests {
     /// D21 routines, which drive a controller whose command register sits where the E51 keeps its
     /// configuration register. The E54 case cannot catch that: its series does not collide.
     ///
-    /// **And it is claimed by NEITHER routine, on purpose.** Every document says the D5x/E5x
-    /// NVMCTRL is family-wide, this predicate was widened on that reading, and the part refuted it
-    /// -- erase works, the page buffer loads, `WP` reports `DONE` with no error, and the flash
-    /// reads back zeros. The assertion below is what stops the widening from being reapplied by
-    /// someone who reads the datasheet and not the board.
+    /// **The collision is the point, and it outlives the claim question.** Series `0x1` names a
+    /// SAM D21 in one family and a SAM E51 in another, so `series` alone decides nothing here --
+    /// only the (processor, family, series) triple does. That half of this test never changed.
+    ///
+    /// The E51's CLAIM is the other half, and it is asserted here rather than described: see
+    /// [`SamDeviceId::drives_same54_nvmctrl`] for what that claim rests on and for the caveat that
+    /// travels with it.
     #[test]
-    fn the_e51_shares_a_series_number_with_the_d21_and_is_claimed_by_neither_routine() {
+    fn the_e51_shares_a_series_number_with_the_d21_and_only_the_triple_tells_them_apart() {
         let e51 = SamDeviceId::decode(0x6181_0604);
         assert_eq!((e51.processor, e51.family, e51.series), (0x6, 0x3, 0x1));
         assert_eq!(e51.revision_letter(), 'G');
-        assert_eq!(e51.part(), Some("ATSAME51J20A"), "identifying it is not the same as driving it");
+        assert_eq!(e51.part(), Some("ATSAME51J20A"));
 
         let d21 = SamDeviceId::decode(0x1001_0000);
         assert_eq!(e51.series, d21.series, "the collision this test is about");
         assert!(!e51.drives_samd21_nvmctrl(), "an E51 driven as a D21 writes the wrong registers");
         assert!(d21.drives_samd21_nvmctrl());
+        assert!(!d21.drives_same54_nvmctrl(), "and the collision must not run the other way either");
 
         assert!(
-            !e51.drives_same54_nvmctrl(),
-            "the E51 programs ZEROS through these routines and reports no error -- measured on              silicon 2026-09-02 against an E54 control. Do not re-widen this on the datasheet."
+            e51.drives_same54_nvmctrl(),
+            "an E51 is driven by the E54 routine, which is verified against an E54 control across \
+             both banks"
         );
-        assert_eq!(e51.flash_routine(), None);
+        assert_eq!(e51.flash_routine(), Some("Same54Flash"));
     }
 
     /// The two routines must claim DISJOINT parts, and a part neither claims must report neither.

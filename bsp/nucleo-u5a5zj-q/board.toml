@@ -47,3 +47,11 @@ default = true
 source = "msis"
 msis_hz = 4000000           # RM0456: "MSIS is used as system clock source after startup from
 pclk_hz = 4000000           # reset, configured at 4 MHz", with reset prescalers at 1
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "The board carries an on-board ST-LINK that programs and debugs the part over SWD. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

@@ -1,7 +1,9 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
-//! The shared garbage-collection contract, and the collector that implements it.
+//! A garbage-collection contract and the mark-compact collector that implements it:
+//! [`Heap`] for a host or a RAM-resident device heap, [`DeviceHeap`] for the
+//! descriptor-driven device form.
 
 pub mod heap;
 

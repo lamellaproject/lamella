@@ -168,3 +168,11 @@ kind = "gpio-out"
 pin = "P0.12"
 active = "low"
 source = "microbit-dal MicroBitMatrixMaps.h: column 9 of 9, contiguous from COL1 = p4"
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "cmsis-dap"
+recovery = "probe"
+source = "The board carries an interface processor running a CMSIS-DAP debugger, which this toolchain speaks over USB. Where the target part's SWD signals reach on the board is not established by a document held here. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

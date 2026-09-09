@@ -1,0 +1,40 @@
+# The SAML1X pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+
+[table]
+kind = "pins"
+family = "saml1x"
+sources = [
+    "SAM L10/L11 Family Data Sheet DS60001513J Table 4-1 (Pinout Multiplexing). The distinction between column C (SERCOM) and column D (SERCOM ALTERNATIVE) lives in the table's header row, so a cell in this table does not carry its own meaning and every row below records the letter alongside the pad",
+]
+notes = [
+    "COLUMN C IS SERCOM AND COLUMN D IS SERCOM ALTERNATIVE. A pin carrying a pad of each has two rows here and they are told apart only by the letter, so a row without its function letter is not a fact.",
+    "EIGHT FUNCTION LETTERS AND NO F -- A, B, C, D, E, G, H, I. The nibble encoding does NOT compact; blocks/port.toml carries the register table and the reason a row must never name F.",
+    "THE VCP PADS ARE NOT ON PADS 0 AND 1, WHICH IS A FIRST ON THIS ARM. Both roster boards put the virtual COM port on SERCOM0 PAD[2] and PAD[3]. Every other Xplained Pro on this roster uses PAD[0]/PAD[1], so the TXPO and RXPO the generator derives are 1 and 3 here rather than 0 and 1 -- and TXPO is NOT the pad number: the USART encodes TX-on-pad0 as 0 and TX-on-pad2 as 1.",
+    "BOTH VCP PADS ALSO CARRY A SERCOM IN COLUMN D, so the letter is a real choice rather than a formality. PA24 and PA25 are SERCOM0 in column C and SERCOM2 in column D; naming the wrong letter binds a different instance, on a family where the 24-pin packages do not have that instance at all.",
+]
+
+# ---- the SAM L10/L11 Xplained Pro virtual COM port ----------------------------------------------
+#
+# ONE TABLE FOR BOTH BOARDS. The kit user guide DS70005359C documents the SAM L10 Xplained Pro and
+# the SAM L11 Xplained Pro together and its pin column is headed "SAML10/SAML11 pin", so the two
+# boards are wired identically and these rows serve both.
+#
+# THE GUIDE NAMES THE PADS AND NOT THE COLUMN. Table 4-14 gives SERCOM0/PAD[2] on PA24 and
+# SERCOM0/PAD[3] on PA25. Table 4-1 places SERCOM0 in column C on both pads and SERCOM2 in column
+# D, so the guide's instance is right and the letter it omits is C.
+
+[[pins]]
+pin = "PA24"
+function = "C"
+instance = "sercom0"
+signal = "pad2"
+source = "DS60001513J Table 4-1: the PA24 row (TQFP32/VQFN32 pin 23) carries SERCOM0/PAD[2] in column C and SERCOM2/PAD[2] in column D, SERCOM ALTERNATIVE. Corroborated on the instance and pad by SAM L10/L11 Xplained Pro user guide DS70005359C Table 4-14, which names 'SERCOM0/PAD[2]/UART TX' without naming the column."
+
+[[pins]]
+pin = "PA25"
+function = "C"
+instance = "sercom0"
+signal = "pad3"
+source = "DS60001513J Table 4-1: the PA25 row (TQFP32/VQFN32 pin 24) carries SERCOM0/PAD[3] in column C and SERCOM2/PAD[3] in column D, SERCOM ALTERNATIVE. Corroborated by DS70005359C Table 4-14 for the UART RX line, which names the same instance as its TX row."

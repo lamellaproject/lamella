@@ -10,8 +10,8 @@ use crate::{Transport, TransportError};
 /// A message type's own name, from the wire crate's allocation table.
 ///
 /// **READ OUT OF [`msg::ALL`] RATHER THAN TRANSCRIBED**, because a second list of these names would
-/// be a second thing to keep in step with a byte allocation that just moved wholesale. A byte absent
-/// from the table is unallocated, which is itself worth printing plainly.
+/// be a second thing to keep in step with the byte allocation, which does move. A byte absent from
+/// the table is unallocated, which is itself worth printing plainly.
 fn name_of(msg_type: u8) -> &'static str {
     msg::ALL
         .iter()

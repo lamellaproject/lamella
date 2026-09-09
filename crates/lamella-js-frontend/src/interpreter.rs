@@ -820,6 +820,13 @@ pub struct NativeFunction {
 /// The signature every built-in has: the interpreter, the `this` it was called on, its arguments.
 pub type NativeFn = fn(&mut Interpreter, JsValue, &[JsValue]) -> Completion;
 
+/// The seed a realm starts with when the embedder installs none.
+///
+/// ITS VALUE IS ARBITRARY AND ITS FIXEDNESS IS NOT. Any constant makes an unseeded realm repeat
+/// itself across boots, which is the deviation `published_list` records; a constant that looked
+/// meaningful would invite a reader to think it was chosen for a property it does not have.
+const DEFAULT_ENTROPY_SEED: u64 = 0x2545_F491_4F6C_DD1D;
+
 /// An anchor plus a monotonic source. See `Interpreter::set_host_clock` for why it is two numbers.
 struct HostClock {
     /// `None` when only the monotonic half was installed: the clock counts from the epoch.
@@ -1137,6 +1144,14 @@ pub struct Interpreter {
     host_prints: Vec<String>,
     /// The embedder's clock, if one was installed. `None` means the epoch, not advancing.
     host_clock: Option<HostClock>,
+    /// `Math.random`'s generator state, advanced by every call.
+    ///
+    /// **IT IS SEEDED RATHER THAN OPTIONAL, AND THE DEFAULT SEED IS A PUBLISHED DEVIATION.** A
+    /// realm with no host entropy still answers `Math.random()` -- the standard asks for "randomly
+    /// or PSEUDO randomly", so a generator is conforming and a refusal is not. What an unseeded
+    /// realm cannot do is differ between boots, which is why that is written down beside the
+    /// unset-clock deviation rather than left for a program to discover.
+    entropy: u64,
     /// The object heap. A `JsValue::Object` is an id it resolves.
     ///
     /// **THE REALM IS WHY THIS IS NOT A FLAT `Vec<Object>`.** Every realm object would cost its
@@ -1245,6 +1260,22 @@ pub struct Interpreter {
     /// The body environment a generator RESUMPTION must run in, handed to the walk that would
     /// otherwise derive a fresh one. See `GeneratorContext::body_scope`.
     pending_generator_body_scope: Option<Scope>,
+    /// The prototype every generator frame is given, carrying the iteration operations a flattened
+    /// `for`-`of` calls. Built on first use and shared by every frame after that.
+    ///
+    /// # WHY THE OPERATIONS LIVE HERE AND NOT IN THE GENERATED SOURCE
+    ///
+    /// A `for`-`of` needs `GetIterator`, which reads `%Symbol.iterator%`, and it needs a `TypeError`
+    /// when a step's result is not an Object. The transform emits ordinary JavaScript, and the only
+    /// names it could write are `Symbol` and `TypeError` -- **which a program is entitled to shadow
+    /// or replace**, so a generator running in a realm where someone assigned `Symbol = 1` would
+    /// iterate through that assignment. These operations are the engine's own, reached through an
+    /// object no source file can name.
+    ///
+    /// **SHARED RATHER THAN PER FRAME, WHICH IS WHAT MAKES THIS AFFORDABLE.** Seeding the operations
+    /// into each frame would charge every generator for a feature most of them do not use; a
+    /// prototype is one pointer the frame already had.
+    generator_frame_prototype: Option<ObjectId>,
     /// The `arguments` object built for a sloppy call, waiting for its parameter list to be read.
     ///
     /// Mapped or unmapped depends on whether the parameter list is SIMPLE, which is a fact about
@@ -1374,6 +1405,7 @@ impl Interpreter {
             jobs: Vec::new(),
             host_prints: Vec::new(),
             host_clock: None,
+            entropy: DEFAULT_ENTROPY_SEED,
             heap: crate::heap::Heap::new(REALM_OBJECT_HINT),
             replay: None,
             #[cfg(feature = "mutation-census")]
@@ -1393,6 +1425,7 @@ impl Interpreter {
             pending_callee: None,
             pending_params_simple: None,
             pending_generator_frame: None,
+            generator_frame_prototype: None,
             pending_generator_body_scope: None,
             pending_arguments: None,
             template_objects: BTreeMap::new(),
@@ -1921,6 +1954,41 @@ impl Interpreter {
     /// belongs in a `Lamella.*` namespace rather than on `Date` -- which is ECMA-262's and not ours
     /// to extend -- and **its name is not settled**. Until then a program cannot distinguish 1970
     /// from a real date, which is a stated gap.
+    /// Seeds `Math.random` for this realm.
+    ///
+    /// # A SEED, NOT A SOURCE, AND THAT IS THE WHOLE INTERFACE
+    ///
+    /// The clock beside this takes a `fn()` because time must be re-read; entropy must not be. A
+    /// realm that called into the host on every `Math.random()` would put an embedder's blocking
+    /// hardware RNG on the path of an ordinary expression -- on a part where that read can be
+    /// milliseconds. One seed at start-up, advanced in-realm, is what every engine of this size
+    /// does and is what the standard's "pseudo randomly" describes.
+    ///
+    /// **IT IS PER REALM AND PER INTERPRETER**, so two realms seeded alike produce alike, which is
+    /// the property a test harness wants and the property a product must not rely on.
+    ///
+    /// WARNING: NOT FOR CRYPTOGRAPHY. The standard says so about `Math.random` itself -- it "must
+    /// not" be used for security purposes -- and this seam does not change that, however good the
+    /// seed fed into it is.
+    pub fn set_host_entropy(&mut self, seed: u64) {
+        self.entropy = seed;
+    }
+
+    /// The next value of the realm's generator, in `[0, 1)`.
+    ///
+    /// SplitMix64: one add and two multiply-xorshift rounds, chosen because it is small enough to
+    /// read at a glance and has no state beyond the counter this advances. The result takes the
+    /// TOP 53 bits, which is exactly the mantissa a `Number` carries -- taking the low bits of a
+    /// generator whose low bits are its weakest is the standard way to get a subtly bad answer.
+    pub(crate) fn next_random(&mut self) -> f64 {
+        self.entropy = self.entropy.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.entropy;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+    }
+
     pub fn set_host_clock(&mut self, epoch_millis: Option<f64>, monotonic_millis: fn() -> f64) {
         self.host_clock = Some(HostClock {
             anchor_epoch_millis: epoch_millis,
@@ -2096,6 +2164,18 @@ impl Interpreter {
             Callable::CapabilityExecutor { state } => {
                 crate::promise::call_capability_executor(self, state, &arguments)
             }
+            Callable::FinallyHandler { constructor, on_finally, rejects } => {
+                crate::promise::call_finally_handler(
+                    self,
+                    constructor,
+                    on_finally,
+                    rejects,
+                    &arguments,
+                )
+            }
+            Callable::FinallyThunk { state, throws } => {
+                crate::promise::call_finally_thunk(self, state, throws)
+            }
             Callable::Proxy => crate::proxy::call(self, *id, this, arguments),
             Callable::ProxyRevoker { proxy } => {
                 crate::proxy::revoke(self, proxy);
@@ -2195,6 +2275,8 @@ impl Interpreter {
             Callable::Resolver { .. }
             | Callable::Combinator { .. }
             | Callable::CapabilityExecutor { .. }
+            | Callable::FinallyHandler { .. }
+            | Callable::FinallyThunk { .. }
             | Callable::ProxyRevoker { .. } => self.type_error("not a constructor"),
             Callable::Proxy => {
                 if self.is_constructor(id) {
@@ -4347,7 +4429,7 @@ impl Interpreter {
     ///
     /// It copies OWN ENUMERABLE properties, symbol keys included, and it copies VALUES -- an
     /// accessor's getter runs and the result lands as a plain data property.
-    fn copy_data_properties(
+    pub(crate) fn copy_data_properties(
         &mut self,
         target: ObjectId,
         source: &JsValue,
@@ -4417,11 +4499,17 @@ impl Interpreter {
         let Some((simple, this)) = self.pending_generator_frame.take() else {
             return self.internal_defect("binding a generator's parameters recorded no frame");
         };
-        let frame = self.allocate(Object::new(Some(self.intrinsics.object_prototype)));
+        let prototype = self.generator_frame_prototype();
+        let frame = self.allocate(Object::new(Some(prototype)));
         let _ = self.create_data_property(
             frame,
             PropertyKey::from_str(crate::generator_transform::STATE),
             JsValue::Number(0.0),
+        );
+        let _ = self.create_data_property(
+            frame,
+            PropertyKey::from_str(crate::generator_transform::SENT),
+            JsValue::Undefined,
         );
         scope.borrow_mut().bindings.insert(
             crate::generator_transform::FRAME.to_string(),
@@ -4433,6 +4521,182 @@ impl Interpreter {
             function,
             GeneratorContext { closure: index, scope, body_scope, simple, this, frame },
         )
+    }
+
+    /// The shared frame prototype, built on first use.
+    ///
+    /// Its own prototype is `%Object.prototype%`, which is what a frame had before this existed, so
+    /// nothing a frame could already do changed.
+    fn generator_frame_prototype(&mut self) -> ObjectId {
+        if let Some(id) = self.generator_frame_prototype {
+            return id;
+        }
+        let object_prototype = self.intrinsics.object_prototype;
+        let id = self.allocate(Object::new(Some(object_prototype)));
+        self.define_method(id, crate::generator_transform::ITER_OPEN, 2, |interpreter, this, arguments| {
+            let Some(frame) = frame_of(this) else {
+                return interpreter.internal_defect("an iteration operation ran off a frame");
+            };
+            let slot = slot_index(&crate::builtins::arg(arguments, 0));
+            let source = crate::builtins::arg(arguments, 1);
+            let record = match crate::iterator::get_iterator(interpreter, &source) {
+                Ok(record) => record,
+                Err(abrupt) => return abrupt,
+            };
+            store_record(interpreter, frame, slot, &record);
+            Completion::Normal(JsValue::Undefined)
+        });
+        self.define_method(id, crate::generator_transform::ITER_STEP, 1, |interpreter, this, arguments| {
+            let Some(frame) = frame_of(this) else {
+                return interpreter.internal_defect("an iteration operation ran off a frame");
+            };
+            let slot = slot_index(&crate::builtins::arg(arguments, 0));
+            let mut record = load_record(interpreter, frame, slot);
+            let stepped = crate::iterator::iterator_step(interpreter, &mut record);
+            store_record(interpreter, frame, slot, &record);
+            match stepped {
+                Ok(None) => Completion::Normal(JsValue::Boolean(false)),
+                Ok(Some(result)) => Completion::Normal(JsValue::Object(result)),
+                Err(abrupt) => abrupt,
+            }
+        });
+        self.define_method(id, crate::generator_transform::ITER_VALUE, 1, |interpreter, _this, arguments| {
+            let JsValue::Object(result) = crate::builtins::arg(arguments, 0) else {
+                return interpreter.internal_defect("an iteration result was not an object");
+            };
+            match crate::iterator::iterator_value(interpreter, result) {
+                Ok(value) => Completion::Normal(value),
+                Err(abrupt) => abrupt,
+            }
+        });
+        self.define_method(id, crate::generator_transform::ITER_CLOSE, 2, |interpreter, this, arguments| {
+            let Some(frame) = frame_of(this) else {
+                return interpreter.internal_defect("an iteration operation ran off a frame");
+            };
+            let slot = slot_index(&crate::builtins::arg(arguments, 0));
+            let record = load_record(interpreter, frame, slot);
+            let quietly = crate::abstract_ops::to_boolean(&crate::builtins::arg(arguments, 1));
+            let under = if quietly {
+                Completion::Throw(JsValue::Undefined)
+            } else {
+                Completion::Normal(JsValue::Undefined)
+            };
+            match crate::iterator::iterator_close(interpreter, &record, under) {
+                Completion::Throw(_) if quietly => Completion::Normal(JsValue::Undefined),
+                Completion::Normal(_) => Completion::Normal(JsValue::Undefined),
+                abrupt => abrupt,
+            }
+        });
+        self.define_method(id, crate::generator_transform::OBJECT_OPEN, 0, |interpreter, _this, _arguments| {
+            let object = interpreter.allocate(Object::new(Some(interpreter.intrinsics.object_prototype)));
+            Completion::Normal(JsValue::Object(object))
+        });
+        self.define_method(id, crate::generator_transform::OBJECT_ADD, 3, |interpreter, _this, arguments| {
+            let JsValue::Object(target) = crate::builtins::arg(arguments, 0) else {
+                return interpreter.internal_defect("an object literal operation lost its target");
+            };
+            let key = match interpreter.to_property_key_value(&crate::builtins::arg(arguments, 1)) {
+                Ok(key) => key,
+                Err(abrupt) => return abrupt,
+            };
+            let _ = interpreter.create_data_property(target, key, crate::builtins::arg(arguments, 2));
+            Completion::Normal(JsValue::Object(target))
+        });
+        self.define_method(id, crate::generator_transform::OBJECT_SPREAD, 2, |interpreter, _this, arguments| {
+            let JsValue::Object(target) = crate::builtins::arg(arguments, 0) else {
+                return interpreter.internal_defect("an object literal operation lost its target");
+            };
+            let source = crate::builtins::arg(arguments, 1);
+            match interpreter.copy_data_properties(target, &source, &[]) {
+                Ok(()) => Completion::Normal(JsValue::Object(target)),
+                Err(abrupt) => abrupt,
+            }
+        });
+
+        self.define_method(id, crate::generator_transform::PATTERN_STEP, 1, |interpreter, this, arguments| {
+            let Some(frame) = frame_of(this) else {
+                return interpreter.internal_defect("a pattern operation ran off a frame");
+            };
+            let slot = slot_index(&crate::builtins::arg(arguments, 0));
+            let mut record = load_record(interpreter, frame, slot);
+            if record.done {
+                return Completion::Normal(JsValue::Undefined);
+            }
+            let stepped = crate::iterator::iterator_step(interpreter, &mut record);
+            store_record(interpreter, frame, slot, &record);
+            match stepped {
+                Ok(None) => Completion::Normal(JsValue::Undefined),
+                Ok(Some(result)) => match crate::iterator::iterator_value(interpreter, result) {
+                    Ok(value) => Completion::Normal(value),
+                    Err(abrupt) => abrupt,
+                },
+                Err(abrupt) => abrupt,
+            }
+        });
+        self.define_method(id, crate::generator_transform::PATTERN_REST, 1, |interpreter, this, arguments| {
+            let Some(frame) = frame_of(this) else {
+                return interpreter.internal_defect("a pattern operation ran off a frame");
+            };
+            let slot = slot_index(&crate::builtins::arg(arguments, 0));
+            let mut record = load_record(interpreter, frame, slot);
+            let mut values = Vec::new();
+            while !record.done {
+                match crate::iterator::iterator_step(interpreter, &mut record) {
+                    Ok(None) => break,
+                    Ok(Some(result)) => {
+                        match crate::iterator::iterator_value(interpreter, result) {
+                            Ok(value) => values.push(value),
+                            Err(abrupt) => {
+                                store_record(interpreter, frame, slot, &record);
+                                return abrupt;
+                            }
+                        }
+                    }
+                    Err(abrupt) => {
+                        store_record(interpreter, frame, slot, &record);
+                        return abrupt;
+                    }
+                }
+            }
+            store_record(interpreter, frame, slot, &record);
+            let array = interpreter.new_array(values);
+            Completion::Normal(JsValue::Object(array))
+        });
+        self.define_method(id, crate::generator_transform::PATTERN_CLOSE, 1, |interpreter, this, arguments| {
+            let Some(frame) = frame_of(this) else {
+                return interpreter.internal_defect("a pattern operation ran off a frame");
+            };
+            let slot = slot_index(&crate::builtins::arg(arguments, 0));
+            let record = load_record(interpreter, frame, slot);
+            if record.done {
+                return Completion::Normal(JsValue::Undefined);
+            }
+            match crate::iterator::iterator_close(
+                interpreter,
+                &record,
+                Completion::Normal(JsValue::Undefined),
+            ) {
+                Completion::Normal(_) => Completion::Normal(JsValue::Undefined),
+                abrupt => abrupt,
+            }
+        });
+        self.define_method(id, crate::generator_transform::REQUIRE_OBJECT, 1, |interpreter, _this, arguments| {
+            let value = crate::builtins::arg(arguments, 0);
+            if matches!(value, JsValue::Undefined | JsValue::Null) {
+                return interpreter
+                    .type_error("a destructuring pattern requires a coercible value");
+            }
+            Completion::Normal(value)
+        });
+        self.define_method(id, crate::generator_transform::DELEGATE_STEP, 1, |interpreter, this, arguments| {
+            let Some(frame) = frame_of(this) else {
+                return interpreter.internal_defect("a delegation operation ran off a frame");
+            };
+            let slot = slot_index(&crate::builtins::arg(arguments, 0));
+            delegate_step(interpreter, frame, slot)
+        });
+        self.generator_frame_prototype = Some(id);
+        id
     }
 
     /// Runs a generator's body to completion, in the environment its parameters were bound into.
@@ -5789,3 +6053,175 @@ fn compound_operator(operator: AssignmentOperator) -> Option<BinaryOperator> {
 
 
 
+
+/// The frame an iteration operation was called on.
+///
+/// `this` is the frame because the generated call is `FRAME.op(...)`, a member call, and the frame
+/// is already an object -- so no receiver substitution can reach it in either mode.
+fn frame_of(this: JsValue) -> Option<ObjectId> {
+    match this {
+        JsValue::Object(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// Which iteration a call is about. The transform numbers them, so this is always a small integer
+/// it wrote itself.
+fn slot_index(value: &JsValue) -> usize {
+    match value {
+        JsValue::Number(number) if *number >= 0.0 => *number as usize,
+        _ => 0,
+    }
+}
+
+/// Reads an `IteratorRecord` back out of the frame slots it was parked in.
+///
+/// **THE RECORD CANNOT LIVE IN RUST, WHICH IS THE WHOLE REASON THIS PAIR EXISTS.** A `for`-`of` in a
+/// generator suspends inside its own loop, and every Rust frame is gone by the time the consumer
+/// calls `next()` again. All three fields are therefore properties of the generator's frame, which
+/// is the one thing that does survive.
+fn load_record(
+    interpreter: &mut Interpreter,
+    frame: ObjectId,
+    slot: usize,
+) -> crate::iterator::IteratorRecord {
+    let read = |interpreter: &Interpreter, name: crate::String| {
+        match interpreter.object(frame).own(&PropertyKey::from_str(&name)).map(|p| &p.kind) {
+            Some(PropertyKind::Data { value, .. }) => value.clone(),
+            _ => JsValue::Undefined,
+        }
+    };
+    let iterator = match read(interpreter, crate::generator_transform::iterator_slot(slot)) {
+        JsValue::Object(id) => id,
+        _ => frame,
+    };
+    crate::iterator::IteratorRecord {
+        iterator,
+        next_method: read(interpreter, crate::generator_transform::next_method_slot(slot)),
+        done: crate::abstract_ops::to_boolean(&read(
+            interpreter,
+            crate::generator_transform::iteration_done_slot(slot),
+        )),
+    }
+}
+
+/// The value parked in one of a frame's own slots, or `undefined` where it has none.
+fn read_slot(interpreter: &Interpreter, frame: ObjectId, name: &str) -> JsValue {
+    match interpreter.object(frame).own(&PropertyKey::from_str(name)).map(|p| &p.kind) {
+        Some(PropertyKind::Data { value, .. }) => value.clone(),
+        _ => JsValue::Undefined,
+    }
+}
+
+/// One turn of the `yield*` loop -- 15.5.5 step 7 -- with the branch chosen by the resumption the
+/// frame is carrying and the outcome written where the desugared body can route it.
+///
+/// # THE THREE BRANCHES SHARE A TAIL, AND THE TAIL IS WHERE THE OBSERVABLE ORDER LIVES
+///
+/// `next`, `throw` and `return` are reached differently and then do the same four things: call,
+/// require an Object back, read `done`, and read `value` ONLY if `done` was true. Both of those
+/// reads are ordinary `Get`s on an object a program wrote, so their number and their order are
+/// observable -- which is why the tail is written once here instead of three times, and why
+/// `value` is never read speculatively.
+fn delegate_step(interpreter: &mut Interpreter, frame: ObjectId, slot: usize) -> Completion {
+    use crate::generator_transform as transform;
+
+    let record = load_record(interpreter, frame, slot);
+    let iterator = JsValue::Object(record.iterator);
+    let mode = match read_slot(interpreter, frame, &transform::delegate_mode_slot(slot)) {
+        JsValue::Number(mode) => mode,
+        _ => 0.0,
+    };
+    let sent = read_slot(interpreter, frame, &transform::delegate_sent_slot(slot));
+
+    let called = if mode == transform::KIND_THROW {
+        match crate::iterator::get_method(interpreter, &iterator, &PropertyKey::from_str("throw")) {
+            Err(abrupt) => return abrupt,
+            Ok(Some(method)) => interpreter.call_value(&method, iterator, crate::vec![sent]),
+            Ok(None) => {
+                match crate::iterator::iterator_close(
+                    interpreter,
+                    &record,
+                    Completion::Normal(JsValue::Undefined),
+                ) {
+                    Completion::Normal(_) => {}
+                    abrupt => return abrupt,
+                }
+                return interpreter.type_error("the delegate of a `yield*` has no `throw` method");
+            }
+        }
+    } else if mode == transform::KIND_RETURN {
+        match crate::iterator::get_method(interpreter, &iterator, &PropertyKey::from_str("return"))
+        {
+            Err(abrupt) => return abrupt,
+            Ok(Some(method)) => interpreter.call_value(&method, iterator, crate::vec![sent]),
+            Ok(None) => return answer(interpreter, frame, slot, transform::DISPOSITION_RETURN, sent),
+        }
+    } else {
+        interpreter.call_value(&record.next_method, iterator, crate::vec![sent])
+    };
+
+    let result = match called {
+        Completion::Normal(result) => result,
+        abrupt => return abrupt,
+    };
+    let JsValue::Object(result) = result else {
+        return interpreter.type_error("a `yield*` delegate did not answer an object");
+    };
+    let done =
+        match interpreter.get_member(&JsValue::Object(result), &PropertyKey::from_str("done")) {
+            Completion::Normal(done) => crate::abstract_ops::to_boolean(&done),
+            abrupt => return abrupt,
+        };
+    if !done {
+        return answer(
+            interpreter,
+            frame,
+            slot,
+            transform::DISPOSITION_YIELD,
+            JsValue::Object(result),
+        );
+    }
+    let value = match crate::iterator::iterator_value(interpreter, result) {
+        Ok(value) => value,
+        Err(abrupt) => return abrupt,
+    };
+    let disposition = if mode == transform::KIND_RETURN {
+        transform::DISPOSITION_RETURN
+    } else {
+        transform::DISPOSITION_VALUE
+    };
+    answer(interpreter, frame, slot, disposition, value)
+}
+
+/// Records which of the three things a step's payload is, and answers the payload.
+fn answer(
+    interpreter: &mut Interpreter,
+    frame: ObjectId,
+    slot: usize,
+    disposition: f64,
+    payload: JsValue,
+) -> Completion {
+    let _ = interpreter.create_data_property(
+        frame,
+        PropertyKey::from_str(&crate::generator_transform::delegate_disposition_slot(slot)),
+        JsValue::Number(disposition),
+    );
+    Completion::Normal(payload)
+}
+
+/// Parks an `IteratorRecord` in the frame slots [`load_record`] reads.
+fn store_record(
+    interpreter: &mut Interpreter,
+    frame: ObjectId,
+    slot: usize,
+    record: &crate::iterator::IteratorRecord,
+) {
+    for (name, value) in [
+        (crate::generator_transform::iterator_slot(slot), JsValue::Object(record.iterator)),
+        (crate::generator_transform::next_method_slot(slot), record.next_method.clone()),
+        (crate::generator_transform::iteration_done_slot(slot), JsValue::Boolean(record.done)),
+    ] {
+        let _ = interpreter.create_data_property(frame, PropertyKey::from_str(&name), value);
+    }
+}

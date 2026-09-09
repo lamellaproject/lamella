@@ -40,6 +40,9 @@ namespace System.Collections
         public bool IsFixedSize { get { return false; } }
         public bool IsReadOnly { get { return false; } }
 
+        public bool IsSynchronized { get { return false; } }
+        public object SyncRoot { get { return this; } }
+
         private IComparer EffectiveComparer()
         {
             if (comparer == null) return Comparer.Default;
@@ -201,7 +204,7 @@ namespace System.Collections
             {
                 object[] snapshot = new object[size];
                 for (int i = 0; i < size; i++) snapshot[i] = keys[i];
-                return new ObjectArrayCollection(snapshot, size);
+                return new ObjectArrayCollection(snapshot, size, this);
             }
         }
 
@@ -211,7 +214,7 @@ namespace System.Collections
             {
                 object[] snapshot = new object[size];
                 for (int i = 0; i < size; i++) snapshot[i] = values[i];
-                return new ObjectArrayCollection(snapshot, size);
+                return new ObjectArrayCollection(snapshot, size, this);
             }
         }
 
@@ -225,6 +228,10 @@ namespace System.Collections
 
         public void CopyTo(System.Array array, int index)
         {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            if (array.Rank != 1) throw new ArgumentException("array");
+            if (index < 0) throw new ArgumentOutOfRangeException("arrayIndex");
+            if (index > array.Length - size) throw new ArgumentException();
             for (int i = 0; i < size; i++) array.SetValue(new DictionaryEntry(keys[i], values[i]), index + i);
         }
     }

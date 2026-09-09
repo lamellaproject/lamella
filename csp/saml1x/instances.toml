@@ -1,0 +1,105 @@
+# The SAML1X instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# ONE MAP FOR BOTH PARTS. Table 12-1 carries a SINGLE base-address column and the SAM L10 and SAM
+# L11 share every value below -- see parts.toml, which states the difference table that settles it.
+#
+# THE RECORD IS THE PCHCTRL FAMILIES', because on this architecture which APB mask register gates
+# an instance is per-instance rather than always APBC. On this part it is two different registers
+# for the blocks below: PORT is gated from APBAMASK and SERCOM0..2 from APBCMASK.
+#
+# THIS FAMILY HAS FOUR NVIC LINES PER SERCOM AND THE `irq` FIELD HOLDS ONE. That is a schema
+# limit and it is stated here rather than resolved by choosing one:
+#
+#     SERCOM0   22: INTFLAG bit 0   23: bit 1   24: bit 2   25: bits 3-6
+#     SERCOM1   26: bit 0           27: bit 1   28: bit 2   29: bits 3-6
+#     SERCOM2   30: bit 0           31: bit 1   32: bit 2   33: bits 3-6
+#
+# Every other SAM family on this arm gives a SERCOM ONE line, so a reader who has seen those will
+# not expect four. `irq = -1` below therefore means "THE SCHEMA HAS ONE SLOT AND THIS PART HAS
+# FOUR" and NOT "this instance has no interrupt" -- which is what -1 means everywhere else, and is
+# why it is spelled out. Nothing consumes a SERCOM's IRQ constant today (the generator emits it and
+# no driver reads it), so emitting nothing is honest rather than lossy; emitting ONE of four would
+# be a published constant that is wrong three ways out of four.
+
+[table]
+kind = "instances"
+family = "saml1x"
+record = ["base", "gclk_core_id", "apb_mask_offset", "apb_bit", "irq"]
+sources = [
+    "SAM L10/L11 Family Data Sheet DS60001513J Table 12-1 (Peripherals Configuration Summary) for base address, IRQ line, APB index and generic-clock index -- the table spans pages 50, 51 and 52",
+    "DS60001513J Table 18-9 (PCHCTRLm Mapping) for the generic-clock channel ids independently, read as a channel-indexed list rather than as a column of Table 12-1",
+    "DS60001513J sections 19.8.9 (APBA Mask) and 19.8.11 (APBC Mask) for the gate bit positions, stated one bit at a time in prose rather than read out of the register-summary table",
+    "DS60001513J section 19.8 for the mask register offsets: AHBMASK 0x10, APBAMASK 0x14, APBBMASK 0x18, APBCMASK 0x1C",
+]
+notes = [
+    "SERCOM0..2 STRIDE 0x400 FROM 0x42000400 -- note the ORIGIN, which is not 0x42000000. EVSYS sits at 0x42000000 ahead of them, where on the SAM L21 the first SERCOM takes that address. Each row is still stated explicitly; a table is data, not a formula.",
+    "THE CORE CLOCK IDS DO NOT SKIP HERE, AND THAT IS WORTH SAYING BECAUSE THEY DO ON THE SIBLINGS. Table 12-1 gives SERCOM0..2 the CORE ids 11..13 over a shared SLOW id of 10, and Table 18-9 says the same from the other side: index 10 is GCLK_SERCOM[0,1,2]_SLOW and 11/12/13 are the three CORE channels. The samc21, saml21 and samr30 each have a SERCOM whose CORE id skips a number because its own SLOW clock takes it; this family has no SERCOM behind a second bridge and so no gap. The absence of the trap is measured, not assumed.",
+    "PORT IS GATED FROM APBAMASK BIT 12, NOT FROM AN APBC BIT. It sits at 0x40003000 behind AHB-APB Bridge A. Table 12-1 marks its APB clock 'Enabled at Reset: Y', so a GPIO driver that assumes the reset state is correct today; the bit is stated so a consumer which ever gates it has the register rather than a guess.",
+    "THIS FAMILY HAS THREE APB MASK REGISTERS, A THROUGH C. The samc21 has four and the saml21 five. There is no APBD and no APBE, and blocks/mclk.toml transcribes exactly the four registers that exist.",
+    "PORT'S OWN IRQ LINE IS 10 AND IT IS NSCHK -- a Non-Secure CHecK fault, not a pin-change interrupt. Pin change is the EIC's, as on every SAM. The row below carries -1 because nothing here binds a PORT interrupt, and because a consumer meeting '10' would reasonably take it for something it is not.",
+    "ONE PORT GROUP -- see parts.toml. There is no portb row because Table 4-1 reaches PA31 and stops.",
+    "TRAM (TrustRAM) IS ROWED NOWHERE. Table 12-1 places it at 0x42003400 and Table 1-2 gives it 256 bytes on BOTH parts, so it is not an L11 marker. Nothing in this schema binds it and a row would invite one.",
+]
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000400
+gclk_core_id = 11
+apb_mask_offset = 0x1C
+apb_bit = 1
+irq = -1
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 12
+apb_mask_offset = 0x1C
+apb_bit = 2
+irq = -1
+
+# PRESENT ON THE 32-PIN PARTS ONLY. Table 4-1's note 3 states that 24-pin packages carry SERCOM0
+# and SERCOM1 alone, and Table 1-1's SERCOM column reads 2 for every D part. Both parts declared in
+# parts.toml are 32-pin E parts, so this row is real for both of them; a later D part would need
+# the refusal stated per PART, the way csp/samha1 states which SERCOM its series spends.
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 13
+apb_mask_offset = 0x1C
+apb_bit = 3
+irq = -1
+
+[[instances]]
+name = "mclk"
+block = "mclk"
+base = 0x40000800
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40001C00
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+# THE ONLY PORT GROUP. Its base matches no relative on this arm -- see parts.toml's table. The
+# 0x80 group stride is printed in the register descriptions and is not used here, because there is
+# no second group to derive.
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x40003000
+gclk_core_id = -1
+apb_mask_offset = 0x14
+apb_bit = 12
+irq = -1

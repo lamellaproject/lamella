@@ -1,0 +1,32 @@
+# The SAMDA1 parts table. The SAM DA1 is a SAM D21 relative aimed at automotive use, and its
+# per-instance numbers turn out to agree with the SAM D21's value for value. THAT IS A RESULT
+# AND NOT A REASON TO HAVE DERIVED IT: the sibling samd20 was read on the same day out of the
+# same lineage and DISAGREES with the D21 on the generic-clock ids and the NVIC lines of every
+# SERCOM. Two families, one ancestor, and nothing but reading tells them apart -- which is why
+# instances.toml states each value with its own source rather than inheriting one.
+
+[table]
+kind = "parts"
+family = "samda1"
+sources = [
+    "SAM DA1 datasheet 40001895A (2017): ch 2 (configuration summary), ch 7 (I/O multiplexing), ch 14 (peripherals configuration summary)",
+]
+notes = [
+    "THE PAD LIST BELOW IS COMPLETE FOR THE J PACKAGE AND THREE INDEPENDENT STATEMENTS AGREE ON IT. Table 7-1's SAMDA1J column numbers each pad; ch 1's feature list says 'Up to 52 programmable I/O pins'; and ch 2's configuration summary gives the SAM DA1J column a 'General Purpose I/O-pins (GPIOs)' row of 52. The list counts 52.",
+    "PA26 AND PA29 DO NOT EXIST ON THIS PART, exactly as on the samd20. They are absent from Table 7-1 entirely rather than merely absent from the J column.",
+    "PA24 AND PA25 HAVE NO DRIVE STRENGTH OPTION. Ch 7 states it outright: 'The port PA24 and PA25 doesn't have Drive Strength option.' The PINCFG.DRVSTR bit is transcribed for the family in blocks/port.toml because the register has it; on these two pads writing it means nothing.",
+    "AND THEY CARRY ERRATUM 12368, WHICH IS A SEQUENCING REQUIREMENT RATHER THAN A PROHIBITION. The datasheet's errata: 'On pin PA24 and PA25 the pull-up and pull-down configuration is not disabled automatically when alternative pin function is enabled except for USB', with the workaround 'the GPIO pull-up and pull-down must be disabled before enabling alternative functions on them'. So a pad may hold a pull AND may take a muxed function -- what it may not do is acquire the second while still holding the first. Nothing on this roster's board muxes either pad, so it is recorded rather than worked around.",
+    "THE E AND G PACKAGES ARE NOT ROWED. Ch 2 gives them 26 and 38 GPIOs against the J's 52; no board on the roster carries one.",
+]
+
+[[parts]]
+part = "atsamda1j16a"
+package = "64-pin TQFP"
+flash = 0x10000
+ram = 0x2000
+pins = [
+    "PA00-PA25", "PA27-PA28", "PA30-PA31",
+    "PB00-PB17", "PB22-PB23", "PB30-PB31",
+]
+source = "40001895A Table 7-1 (PORT Function Multiplexing), whose SAMDA1J column gives a package pin number for each pad above and none for PA26 or PA29. Flash 64 KB and SRAM 8 KB are ch 2's SAM DA1J column, whose Flash row reads '64/32/16KB' and SRAM row '8/4/4KB' in the order of the density codes; the 16 code is the 64 KB part. The device identity is stated separately: ch 2's DEVSEL table gives SAMDA1J16A DEVSEL 0x29, DID 0x10011429."
+

@@ -86,3 +86,401 @@ function = "D"
 instance = "sercom5"
 signal = "pad3"
 source = "DS40001882 Table 7-1"
+
+# --- EIC: the COMPLETE pad-to-EXTINT map for this die ------------------------------------------
+#
+# EVERY PAD ON THE DIE IS HERE, AND THAT IS THE WHOLE POINT OF THE SECTION. Which EXTINT a pad can
+# raise is a property of the silicon, so it does not depend on any board and must not be limited to
+# the pads some particular board happens to wire. This part appears on a great many designs -- more
+# than any catalog enumerates -- and an engineer who prototypes on an evaluation kit and then lays
+# out their own hardware needs every pad, not the subset somebody else used first.
+#
+# The rest of this table is grown as bindings appear, because a pin x function map has hundreds of
+# combinations and most are never used. THIS SECTION IS DIFFERENT AND CHEAPLY SO: a pad has exactly
+# one function-A entry and the set is bounded at 52, so completeness costs one transcription and
+# spares every future design a refusal it could do nothing about.
+#
+# FUNCTION A IS THE EIC COLUMN, so a pad raises its EXTINT only with PINCFG.PMUXEN set and PMUX
+# selecting A.
+#
+# THE LINE IS NOT THE PAD AND A DERIVATION IS WRONG ON SIX PADS. For 45 of the 51 the line is the
+# pad index modulo sixteen, which is exactly enough to make the rule look right; PA24 raises
+# EXTINT[12] where that says 8, PA25 raises 13 for 9, PA27 raises 15 for 11, PA28 raises 8 for 12,
+# PA30 raises 10 for 14 and PA31 raises 11 for 15.
+#
+# PA08 IS NMI AND NOT AN EXTINT, alone on this die. A consumer treating function A as "the external
+# interrupt line" arms the non-maskable interrupt there: unmaskable, absent from INTFLAG, and not
+# serviced by the handler the other sixteen share.
+#
+# SIXTEEN LINES ACROSS 51 PADS MEANS PADS SHARE, and only one of a line's pads can be the live
+# source. Nothing in the chip reports the competition.
+#
+# Every row: DS40001882D Table 7-1 (A/B/C/D variants), column A
+# Anchored three ways -- the 52 pads are exactly the atsamd21j18a pad set in parts.toml, all sixteen
+# lines 0 to 15 occur, and exactly one pad carries NMI. Table 7-2 states the L variants separately
+# and its EIC column agrees on every pad the two tables share.
+
+[[pins]]
+pin = "PA00"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA01"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA02"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA03"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA04"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA05"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA06"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA07"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA08"
+function = "A"
+instance = "eic"
+signal = "nmi"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA09"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA10"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA11"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA12"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA13"
+function = "A"
+instance = "eic"
+signal = "extint13"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA14"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA15"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA16"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA17"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA18"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA19"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA20"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA21"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA22"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA23"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA24"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA25"
+function = "A"
+instance = "eic"
+signal = "extint13"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA27"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA28"
+function = "A"
+instance = "eic"
+signal = "extint8"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA30"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PA31"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB00"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB01"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB02"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB03"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB04"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB05"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB06"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB07"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB08"
+function = "A"
+instance = "eic"
+signal = "extint8"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB09"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB10"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB11"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB12"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB13"
+function = "A"
+instance = "eic"
+signal = "extint13"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB14"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB15"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB16"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB17"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB22"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB23"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB30"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS40001882D Table 7-1, column A (EIC)"
+
+[[pins]]
+pin = "PB31"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS40001882D Table 7-1, column A (EIC)"
+

@@ -1,0 +1,40 @@
+# The SAMDA1 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+
+[table]
+kind = "pins"
+family = "samda1"
+sources = [
+    "SAM DA1 datasheet 40001895A Table 7-1 (PORT Function Multiplexing). The distinction between column C (SERCOM) and column D (SERCOM-ALT) lives in the table's header row, so a cell in this table does not carry its own meaning and every row below records the letter alongside the pad",
+]
+notes = [
+    "COLUMN C IS SERCOM AND COLUMN D IS SERCOM-ALT. A pin carrying a pad of each has two rows here and they are told apart only by the letter, so a row without its function letter is not a fact.",
+    "PA24 AND PA25 CARRY ERRATUM 12368 AND HAVE NO ROWS TODAY. If one ever gains one, the mux path owes an explicit pull-disable BEFORE it sets PMUXEN -- see parts.toml, which states the erratum and its workaround in the document's own words.",
+]
+
+# ---- the SAM DA1 Xplained Pro's EDBG virtual COM port -------------------------------------------
+#
+# THE KIT GUIDE AND THE PART DATASHEET AGREE HERE, AND THE AGREEMENT WAS CHECKED RATHER THAN
+# ASSUMED. Atmel-9400B Table 4-9 gives SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23; Table
+# 7-1 gives both pads in column C against SERCOM3. One instance owns both pads and the two
+# documents name the same one.
+#
+# The check is run on every kit because the SAM R21 Xplained Pro's guide FAILED it -- it puts one
+# UART's two pads on two different SERCOM instances. Two of the three Microchip kits read so far
+# agree with their datasheets and one does not, which is the ratio that makes the check worth
+# running rather than a formality.
+
+[[pins]]
+pin = "PA22"
+function = "C"
+instance = "sercom3"
+signal = "pad0"
+source = "40001895A Table 7-1: the PA22 row (SAMDA1J pin 43) carries SERCOM3/PAD[0] in column C and SERCOM5/PAD[0] in column D. Corroborated by SAMDA1 Xplained Pro user guide Atmel-9400B Table 4-9, which names the same instance and pad for the EDBG's TX line."
+
+[[pins]]
+pin = "PA23"
+function = "C"
+instance = "sercom3"
+signal = "pad1"
+source = "40001895A Table 7-1: the PA23 row (SAMDA1J pin 44) carries SERCOM3/PAD[1] in column C and SERCOM5/PAD[1] in column D. Corroborated by Atmel-9400B Table 4-9 for the EDBG's RX line."

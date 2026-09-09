@@ -83,3 +83,11 @@ kind = "gpio-in"
 pin = "PC13"
 active = "high"
 source = "UM1974: B1 USER is connected to the I/O PC13 by default (SB173). MB1137 rev B-01 sheet 2: the switch's far side is VDD and R58, a 220K, pulls PC13 to ground -- so the pin rests LOW and reads HIGH while the button is held, which is the opposite of the usual arrangement."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "The board carries an on-board ST-LINK that programs and debugs the part over SWD. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

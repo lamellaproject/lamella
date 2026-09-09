@@ -62,29 +62,7 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
         let JsValue::Object(receiver) = this else {
             return interpreter.type_error("Promise.resolve must be called on an object");
         };
-        let value = arg(arguments, 0);
-        if let JsValue::Object(id) = &value {
-            if interpreter.object(*id).promise.is_some() {
-                let key = PropertyKey::from_str("constructor");
-                match interpreter.get_property(*id, &key) {
-                    Completion::Normal(JsValue::Object(owner)) if owner == receiver => {
-                        return Completion::Normal(value)
-                    }
-                    Completion::Normal(_) => {}
-                    abrupt => return abrupt,
-                }
-            }
-        }
-        let capability = match new_capability_from(interpreter, &JsValue::Object(receiver)) {
-            Ok(capability) => capability,
-            Err(abrupt) => return abrupt,
-        };
-        let resolve = capability.resolve.clone();
-        let completion = interpreter.call_value(&resolve, JsValue::Undefined, crate::vec![value]);
-        if completion.is_abrupt() {
-            return completion;
-        }
-        Completion::Normal(JsValue::Object(capability.promise))
+        promise_resolve(interpreter, receiver, arg(arguments, 0))
     });
 
     interpreter.define_method(constructor, "reject", 1, |interpreter, this, arguments| {
@@ -197,8 +175,25 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
         )
     });
 
-    interpreter.define_method(prototype, "finally", 1, |interpreter, _this, _arguments| {
-        interpreter.refuse(crate::absence::Absence::PromiseFinally)
+    interpreter.define_method(prototype, "finally", 1, |interpreter, this, arguments| {
+        let JsValue::Object(promise) = &this else {
+            return interpreter.type_error("Promise.prototype.finally must be called on an object");
+        };
+        let promise = *promise;
+        let default = interpreter.intrinsics.promise_constructor;
+        let constructor = match interpreter.species_constructor(promise, default) {
+            Ok(constructor) => constructor,
+            Err(abrupt) => return abrupt,
+        };
+        let on_finally = arg(arguments, 0);
+        let (on_fulfilled, on_rejected) = match &on_finally {
+            JsValue::Object(id) if interpreter.is_callable(&on_finally) => (
+                JsValue::Object(finally_handler(interpreter, constructor, *id, false)),
+                JsValue::Object(finally_handler(interpreter, constructor, *id, true)),
+            ),
+            _ => (on_finally.clone(), on_finally.clone()),
+        };
+        interpreter.invoke(&this, "then", crate::vec![on_fulfilled, on_rejected])
     });
 }
 
@@ -330,6 +325,46 @@ fn attach_element(
     interpreter.call_value(&then_method, element_promise, crate::vec![on_ok, on_err])
 }
 
+/// `PromiseResolve(C, value)` -- 27.2.4.7.1.
+///
+/// **EXTRACTED RATHER THAN COPIED, BECAUSE IT NOW HAS TWO CALLERS.** `Promise.resolve` is defined
+/// as this operation applied to its receiver, and `Promise.prototype.finally` calls it directly on
+/// the species constructor. Writing the second one beside the first is how a rule with several
+/// implementations gains a fix in only one of them -- and the identity rule below is exactly the
+/// kind of clause a second copy would simplify away.
+///
+/// NOTE: it is NOT `Invoke(C, "resolve", ...)`. For a subclass that overrides `resolve` the two
+/// differ, and the standard specifies the abstract operation here -- so routing `finally` through
+/// the method would call user code the standard does not call.
+fn promise_resolve(
+    interpreter: &mut Interpreter,
+    constructor: ObjectId,
+    value: JsValue,
+) -> Completion {
+    if let JsValue::Object(id) = &value {
+        if interpreter.object(*id).promise.is_some() {
+            let key = PropertyKey::from_str("constructor");
+            match interpreter.get_property(*id, &key) {
+                Completion::Normal(JsValue::Object(owner)) if owner == constructor => {
+                    return Completion::Normal(value)
+                }
+                Completion::Normal(_) => {}
+                abrupt => return abrupt,
+            }
+        }
+    }
+    let capability = match new_capability_from(interpreter, &JsValue::Object(constructor)) {
+        Ok(capability) => capability,
+        Err(abrupt) => return abrupt,
+    };
+    let resolve = capability.resolve.clone();
+    let completion = interpreter.call_value(&resolve, JsValue::Undefined, crate::vec![value]);
+    if completion.is_abrupt() {
+        return completion;
+    }
+    Completion::Normal(JsValue::Object(capability.promise))
+}
+
 /// `GetPromiseResolve(C)`: read `resolve` off the constructor ONCE, before the loop.
 ///
 /// IT IS THE CONSTRUCTOR'S `resolve`, NOT THE INTRINSIC ONE, AND THAT IS LOAD-BEARING RATHER
@@ -393,6 +428,85 @@ fn resolve_through(
     match interpreter.call_value(promise_resolve, constructor.clone(), crate::vec![element]) {
         Completion::Normal(promise) => Ok(promise),
         abrupt => Err(abrupt),
+    }
+}
+
+/// The property the thunk keeps its captured outcome under.
+///
+/// **IT CONTAINS A SPACE, SO NO PROGRAM CAN NAME IT** -- the same device
+/// `generator_transform::FRAME` uses. The state object is unreachable from JavaScript anyway, but
+/// a key a program could spell is a key a program could be handed by some future reflection path.
+const FINALLY_VALUE: &str = " finally value";
+
+/// `thenFinally` / `catchFinally` -- 27.2.5.3 steps 6.a and 6.c.
+fn finally_handler(
+    interpreter: &mut Interpreter,
+    constructor: ObjectId,
+    on_finally: ObjectId,
+    rejects: bool,
+) -> ObjectId {
+    let function_prototype = interpreter.intrinsics.function_prototype;
+    let mut object = Object::new(Some(function_prototype));
+    object.callable =
+        Some(crate::object::Callable::FinallyHandler { constructor, on_finally, rejects });
+    let id = interpreter.allocate(object);
+    interpreter.set_function_shape(id, "", 1);
+    id
+}
+
+/// `valueThunk` / `thrower` -- 27.2.5.3 steps 6.a.iii and 6.c.iii.
+fn finally_thunk(interpreter: &mut Interpreter, value: JsValue, throws: bool) -> ObjectId {
+    let state = interpreter.allocate(Object::new(None));
+    let _ = interpreter.create_data_property(state, PropertyKey::from_str(FINALLY_VALUE), value);
+    let function_prototype = interpreter.intrinsics.function_prototype;
+    let mut object = Object::new(Some(function_prototype));
+    object.callable = Some(crate::object::Callable::FinallyThunk { state, throws });
+    let id = interpreter.allocate(object);
+    interpreter.set_function_shape(id, "", 0);
+    id
+}
+
+/// The handler ran; now wait for whatever it returned before re-delivering the original outcome.
+///
+/// **THE ARGUMENT IS THE ORIGINAL OUTCOME AND IT IS NOT PASSED TO THE HANDLER.** `onFinally` is
+/// called with NO arguments -- that is what makes `finally` different from `then`, and a program
+/// can see it.
+pub(crate) fn call_finally_handler(
+    interpreter: &mut Interpreter,
+    constructor: ObjectId,
+    on_finally: ObjectId,
+    rejects: bool,
+    arguments: &[JsValue],
+) -> Completion {
+    let outcome = arg(arguments, 0);
+    let handler = JsValue::Object(on_finally);
+    let result = match interpreter.call_value(&handler, JsValue::Undefined, crate::vec![]) {
+        Completion::Normal(result) => result,
+        abrupt => return abrupt,
+    };
+    let promise = match promise_resolve(interpreter, constructor, result) {
+        Completion::Normal(promise) => promise,
+        abrupt => return abrupt,
+    };
+    let thunk = JsValue::Object(finally_thunk(interpreter, outcome, rejects));
+    interpreter.invoke(&promise, "then", crate::vec![thunk])
+}
+
+/// Re-delivers the outcome the wrapper captured: returning it, or throwing it again.
+pub(crate) fn call_finally_thunk(
+    interpreter: &mut Interpreter,
+    state: ObjectId,
+    throws: bool,
+) -> Completion {
+    let value = interpreter
+        .object(state)
+        .own(&PropertyKey::from_str(FINALLY_VALUE))
+        .and_then(|property| property.data_value().cloned())
+        .unwrap_or(JsValue::Undefined);
+    if throws {
+        Completion::Throw(value)
+    } else {
+        Completion::Normal(value)
     }
 }
 

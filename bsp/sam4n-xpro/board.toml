@@ -62,3 +62,11 @@ kind = "gpio-in"
 pin = "PA30"
 active = "low"
 source = "SAM4N Xplained Pro user guide (Atmel-42104) section 4.2.2 and table 4-9: SW0 on PA30; a button drives the I/O line to GND when pressed. The other mechanical button is RESET, wired to NRST rather than to a port pin, so it is not a row here."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "The kit carries an EDBG that programs and debugs the part over SWD. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

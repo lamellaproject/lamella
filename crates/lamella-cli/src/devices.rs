@@ -27,7 +27,7 @@ struct Attached {
 }
 
 const USAGE: &str = "\
-usage: lamella devices [--identify]
+usage: lamella devices [--identify] [--all-devices]
 
 Lists what is attached and, for each, THE WORD YOU PASS TO ANOTHER VERB -- so the first column can
 be copied straight into --target or --probe rather than translated.
@@ -37,17 +37,25 @@ holding a new board is most likely to be looking for.
 
 --identify asks each board what it is, over the wire, rather than reporting what the operating
 system said about the port. That costs a round trip per board and is the answer worth having when
-two boards look alike.";
+two boards look alike.
+
+--all-devices also lists the vendor-class USB devices this build decided are not debug probes. Use
+it when a probe of yours is missing from the listing above: it is either not attached, or it is in
+that list and this build did not recognize it.";
 
 pub fn devices_command(args: &[String]) -> ExitCode {
-    let spec =
-        Spec { verb: "devices", usage: Some(USAGE), values: &[], flags: &["--identify"] };
+    let spec = Spec {
+        verb: "devices",
+        usage: Some(USAGE),
+        values: &[],
+        flags: &["--identify", "--all-devices"],
+    };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
         Err(halt) => return halt.code(),
     };
 
-    let (mut attached, unrecognized) = enumerate();
+    let (mut attached, passed_over) = enumerate();
     for waiting in lamella_flash_routes::bootsel::waiting() {
         let what = format!("{}  ({})", waiting.state(), waiting.volume);
         attached.push(Attached { target: waiting.describe(), carrier: "volume", what });
@@ -63,12 +71,20 @@ pub fn devices_command(args: &[String]) -> ExitCode {
         println!("{:<width$}  {:<7}  {}", board.target, board.carrier, board.what, width = width);
     }
     println!("\n{} attached. Paste a TARGET into --target.", attached.len());
-    if unrecognized > 0 {
+    if !passed_over.is_empty() {
+        let count = passed_over.len();
         println!(
-            "{unrecognized} other vendor-class USB device(s) attached are not debug probes. A\n\
-             CMSIS-DAP interface names itself as one and these did not, so they are something\n\
-             else -- but if a probe of yours is missing above, it is among them."
+            "{count} other vendor-class USB device(s) attached are not debug probes. A CMSIS-DAP\n\
+             interface names itself as one and these did not, so they are something else -- but if\n\
+             a probe of yours is missing above, it is among them."
         );
+        if parsed.flag("--all-devices") {
+            for device in &passed_over {
+                println!("  {device}");
+            }
+        } else {
+            println!("  Pass --all-devices to list them.");
+        }
     }
     if attached.iter().any(|board| board.carrier == "volume") {
         println!(
@@ -95,10 +111,13 @@ pub fn devices_command(args: &[String]) -> ExitCode {
 }
 
 /// Every attached board, native-USB Lamella Link devices first and then the OS serial ports.
-fn enumerate() -> (Vec<Attached>, usize) {
+///
+/// Also returns the vendor-class devices the probe filter declined, so the listing can account for
+/// them rather than presenting a filtered bus as the whole one.
+fn enumerate() -> (Vec<Attached>, Vec<lamella_probe::PassedOver>) {
     let mut attached = Vec::new();
-    let mut unrecognized = 0usize;
-    let probes = lamella_probe::list_reporting(&mut unrecognized);
+    let mut passed_over = Vec::new();
+    let probes = lamella_probe::list_reporting(&mut passed_over);
     for probe in &probes {
         let target = match &probe.serial {
             Some(serial) => format!("--probe {serial}"),
@@ -137,7 +156,7 @@ fn enumerate() -> (Vec<Attached>, usize) {
         }
         attached.push(Attached { target, carrier: "serial", what });
     }
-    (attached, unrecognized)
+    (attached, passed_over)
 }
 
 /// The target to print for `port`, and a note when it is not the obvious one.

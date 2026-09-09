@@ -154,9 +154,10 @@ struct PnpIdentity {
 
 /// The devnode of this device's VENDOR-CLASS (`0xFF`) interface, if it has one.
 ///
-/// **THIS IS HOW WINDOWS ANSWERS "IS THIS A VENDOR-BULK DEVICE" WITHOUT OPENING IT**. The interface
-/// class is in the node's COMPATIBLE IDS -- Windows writes `USB\Class_FF&SubClass_xx&Prot_xx` there
-/// when it enumerates the device -- so it costs a registry read and no handle.
+/// **THIS IS HOW WINDOWS ANSWERS "IS THIS A VENDOR-BULK DEVICE" WITHOUT OPENING IT**, matching what
+/// the Linux and macOS backends do. The interface class is in the node's COMPATIBLE IDS -- Windows
+/// writes `USB\Class_FF&SubClass_xx&Prot_xx` there when it enumerates the device -- so it costs a
+/// registry read and no handle.
 ///
 /// Both shapes are checked, and missing the second is an easy mistake to make: a COMPOSITE device
 /// gets one child node per interface (`...&MI_00\...`), while a device with a single interface has

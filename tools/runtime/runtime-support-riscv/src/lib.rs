@@ -1,5 +1,5 @@
 //! Soft-float support for the RISC-V AOT linked image, cross-compiled for riscv32im and linked in on
-//! demand (lamella-link's archive path pulls only the members a program reaches). The FPU-less RV32IM cores
+//! demand (lamella-linker's archive path pulls only the members a program reaches). The FPU-less RV32IM cores
 //! lower every `double`/`float` op to a `compiler_builtins` helper; this crate references each one by its C
 //! name in [`__lamella_force_softfloat_riscv`] (never called) so the archive carries the unmangled symbol
 //! for the linker to pull.
@@ -57,7 +57,7 @@ extern "C" {
 }
 
 /// Never called -- it exists only to force each soft-float helper's unmangled C symbol into this archive, so
-/// lamella-link can pull whichever a given program reaches. `black_box` on every argument and on the running
+/// lamella-linker can pull whichever a given program reaches. `black_box` on every argument and on the running
 /// sum blocks LTO from folding an op away, so every referenced symbol stays a real archive member.
 #[no_mangle]
 pub extern "C" fn __lamella_force_softfloat_riscv() -> i64 {
@@ -179,6 +179,58 @@ extern "C" fn worker_entry_riscv() -> ! {
             lamella_thread_switch_riscv(CTX_WORKER, CTX_MAIN);
         }
     }
+}
+
+/// The `double` rounding group, exported under the same names the ARM archive exports them under
+/// and backed by the same kernel crate, because the AOT backend's synthesis table is TARGET-
+/// INDEPENDENT: it emits a call to `lamella_math_floor` for `Math.Floor(double)` whichever backend
+/// is lowering. A symbol present in one archive and absent from the other turns a clean seam
+/// refusal on one target into a link failure on the other, which is the same defect wearing a
+/// different message.
+///
+/// `lamella_fabs` and `lamella_rint` are here for the same reason and close a gap that predates the
+/// C# group: the Python front end has emitted calls to both since it gained typed floats, and this
+/// archive has never defined either.
+#[no_mangle]
+pub extern "C" fn lamella_fabs(x: f64) -> f64 {
+    lamella_softmath::abs(x)
+}
+
+/// Round to the nearest integer, ties to even -- Python's `round(<float>)` and C#'s
+/// `System.Math.Round(double)`, which specify the same rule.
+#[no_mangle]
+pub extern "C" fn lamella_rint(x: f64) -> f64 {
+    lamella_softmath::round_half_to_even(x)
+}
+
+/// `System.Math.Truncate(double)`: the integer part, toward zero.
+#[no_mangle]
+pub extern "C" fn lamella_math_truncate(value: f64) -> f64 {
+    lamella_softmath::truncate(value)
+}
+
+/// `System.Math.Floor(double)`: the largest integer not greater than `value`.
+#[no_mangle]
+pub extern "C" fn lamella_math_floor(value: f64) -> f64 {
+    lamella_softmath::floor(value)
+}
+
+/// `System.Math.Ceiling(double)`: the smallest integer not less than `value`.
+#[no_mangle]
+pub extern "C" fn lamella_math_ceiling(value: f64) -> f64 {
+    lamella_softmath::ceiling(value)
+}
+
+/// `System.Math.Max(double, double)`: the larger, or NaN when either operand is NaN.
+#[no_mangle]
+pub extern "C" fn lamella_math_max(a: f64, b: f64) -> f64 {
+    lamella_softmath::max(a, b)
+}
+
+/// `System.Math.Min(double, double)`: the smaller, or NaN when either operand is NaN.
+#[no_mangle]
+pub extern "C" fn lamella_math_min(a: f64, b: f64) -> f64 {
+    lamella_softmath::min(a, b)
 }
 
 /// The RISC-V twin of the thumb ping-pong proof: spawn one worker green thread and ping-pong 21 times.
@@ -1726,6 +1778,155 @@ extern "C" fn lamella_double_to_exponential_impl(value: f64, precision: i32, upp
         }
     }
     obj
+}
+
+/// The float PARSE entry points, in a module of their own so that they land in a codegen unit of
+/// their own and therefore in an archive member of their own -- the same boundary
+/// [`decimal_seams`] draws, and for a much larger reason.
+///
+/// `f64::from_str` is the correct decimal-to-nearest rounding and it is not small: it carries
+/// `core::num::dec2flt`, whose slow path is a big-decimal fallback, and that path divides -- which
+/// pulls `compiler_builtins`' float division in behind it, including a 3,640-byte `f128` routine.
+/// Written INLINE in this file the whole of that landed in the member every image already links, and
+/// measured over the linked images it charged **+26,732 bytes to every one of them, including a
+/// program whose only statement prints a string literal**.
+///
+/// A program that parses no numbers references neither of these names, so with the boundary here the
+/// link never pulls the member and none of it reaches the image. The profile section of `Cargo.toml`
+/// carries the measurement behind why the LTO mode is what decides whether a module boundary is an
+/// archive boundary at all.
+mod float_parse_seams {
+    /// The cap, in ASCII bytes, on a validated number literal this tier will convert -- measured after
+    /// padding is trimmed and group separators are removed.
+    ///
+    /// A BOUND IS NECESSARY AND IT IS NOT FREE. The managed validator accepts an unbounded digit run, so
+    /// there is no length this cannot be handed; a `no_std` archive cannot grow a buffer to meet it. .NET
+    /// itself bounds the same problem at 769 significant digits, because beyond that the digits cannot
+    /// change an `f64` except through a sticky bit it tracks separately. This cap is well above that and
+    /// far above any literal a program writes.
+    ///
+    /// A literal LONGER than this is REFUSED (NaN) rather than truncated. Truncation would answer a
+    /// different number and look like a successful parse; refusing is wrong in one visible way instead of
+    /// silently wrong. See the seams below for the disposition and the follow-up.
+    const PARSE_TEXT_CAP: usize = 1024;
+
+    /// The padding a number parse trims, which is `NumberText.IsPad`'s set: ASCII 0x09-0x0D and 0x20.
+    /// Rust's own `str::trim` removes exactly these from ASCII text, so the device and the interpreter
+    /// agree on the boundary for every string the managed validator can pass through.
+    const fn is_number_pad(b: u8) -> bool {
+        (b >= 0x09 && b <= 0x0D) || b == 0x20
+    }
+
+    /// Narrow a managed `[len: u32][u16 units ...]` string into `buf` as the ASCII text a float parser
+    /// wants, applying the two normalizations the interpreter applies and in its order: trim the padding
+    /// from both ends, then drop GROUP SEPARATORS.
+    ///
+    /// The separator rule is not this function's to police. `Double.Parse`'s default style is
+    /// `NumberStyles.Float | NumberStyles.AllowThousands`, so `"1,5"` is fifteen; WHERE a separator is
+    /// legal is decided by the managed validator, which has already run. This only has to remove them.
+    ///
+    /// Returns the byte count, or `None` when the text does not fit `buf` or carries a unit outside
+    /// ASCII -- neither of which a validated literal can be, which is why both are refusals rather than
+    /// best-effort conversions.
+    fn managed_number_text(s: *const u32, buf: &mut [u8; PARSE_TEXT_CAP]) -> Option<usize> {
+        if s.is_null() {
+            return None;
+        }
+        let len = unsafe { core::ptr::read_volatile(s) } as usize;
+        let units = unsafe { (s as *const u8).add(4) as *const u16 };
+        let at = |i: usize| unsafe { core::ptr::read_volatile(units.add(i)) };
+
+        let mut start = 0usize;
+        let mut end = len;
+        while start < end && at(start) < 0x80 && is_number_pad(at(start) as u8) {
+            start += 1;
+        }
+        while end > start && at(end - 1) < 0x80 && is_number_pad(at(end - 1) as u8) {
+            end -= 1;
+        }
+
+        let mut n = 0usize;
+        for i in start..end {
+            let unit = at(i);
+            if unit == u16::from(b',') {
+                continue;
+            }
+            if unit >= 0x80 || n == buf.len() {
+                return None;
+            }
+            buf[n] = unit as u8;
+            n += 1;
+        }
+        Some(n)
+    }
+
+    /// `System.Double.ParseValid(string)` on device: the decimal-to-nearest-`f64` rounding behind the
+    /// managed `Double.Parse` and `Double.TryParse`.
+    ///
+    /// Those two have ALREADY validated the format, so the only work left is the rounding managed C#
+    /// cannot do without `unsafe`. The .NET specials are recognized here as the interpreter recognizes
+    /// them -- `NaN`, `Infinity` and `+Infinity`/`-Infinity`, case-insensitively, after trimming -- and
+    /// everything else goes to the same `from_str` the interpreter uses, so the two tiers round
+    /// identically rather than similarly.
+    ///
+    /// No `anchor_seam_shim!`: this neither parks nor allocates, so it is not a safepoint and it is not
+    /// on the string-allocating seam list. `lamella_fabs` and `lamella_rint` are the same shape.
+    ///
+    /// NaN IS RETURNED FOR THE INPUTS THIS CANNOT CONVERT -- a literal past [`PARSE_TEXT_CAP`], a
+    /// non-ASCII unit, a null receiver -- and that answer is ambiguous, because `"NaN"` is itself a
+    /// valid input producing NaN. It is chosen over `0.0` because zero is a value real input produces
+    /// constantly and NaN is not, so a wrong answer here is far likelier to be noticed. The unambiguous
+    /// fix is an error channel through the managed seam signature, which is a corlib change.
+    #[no_mangle]
+    pub extern "C" fn lamella_double_parse(s: *const u32) -> f64 {
+        let mut buf = [0u8; PARSE_TEXT_CAP];
+        let Some(n) = managed_number_text(s, &mut buf) else {
+            return f64::NAN;
+        };
+        let text = &buf[..n];
+        if text.eq_ignore_ascii_case(b"nan") {
+            return f64::NAN;
+        }
+        if text.eq_ignore_ascii_case(b"infinity") || text.eq_ignore_ascii_case(b"+infinity") {
+            return f64::INFINITY;
+        }
+        if text.eq_ignore_ascii_case(b"-infinity") {
+            return f64::NEG_INFINITY;
+        }
+        match core::str::from_utf8(text) {
+            Ok(t) => t.parse::<f64>().unwrap_or(f64::NAN),
+            Err(_) => f64::NAN,
+        }
+    }
+
+    /// `System.Single.ParseValid(string)` on device: the `f32` twin of [`lamella_double_parse`].
+    ///
+    /// A SEPARATE ENTRY POINT RATHER THAN A NARROWED `f64`, and that is the whole reason it exists.
+    /// Parsing to `f64` and then narrowing rounds TWICE, and the two roundings do not compose: a decimal
+    /// exactly between two `f32` values can round to an `f64` that then rounds the other way. The
+    /// interpreter parses `f32` directly for the same reason. (Contrast the FORMAT seams, where widening
+    /// `f32` to `f64` is exact and one implementation serves both.)
+    #[no_mangle]
+    pub extern "C" fn lamella_single_parse(s: *const u32) -> f32 {
+        let mut buf = [0u8; PARSE_TEXT_CAP];
+        let Some(n) = managed_number_text(s, &mut buf) else {
+            return f32::NAN;
+        };
+        let text = &buf[..n];
+        if text.eq_ignore_ascii_case(b"nan") {
+            return f32::NAN;
+        }
+        if text.eq_ignore_ascii_case(b"infinity") || text.eq_ignore_ascii_case(b"+infinity") {
+            return f32::INFINITY;
+        }
+        if text.eq_ignore_ascii_case(b"-infinity") {
+            return f32::NEG_INFINITY;
+        }
+        match core::str::from_utf8(text) {
+            Ok(t) => t.parse::<f32>().unwrap_or(f32::NAN),
+            Err(_) => f32::NAN,
+        }
+    }
 }
 
 /// The `System.Decimal` entry points, in a module of their own so that they land in a codegen

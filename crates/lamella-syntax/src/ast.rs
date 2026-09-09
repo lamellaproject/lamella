@@ -189,15 +189,53 @@ pub enum ExprKind {
         /// `MethodSpec`. A site that loses them still binds -- to the OPEN method, with `!!0`
         /// unsubstituted -- so dropping this field is silent rather than a compile error.
         type_arguments: Vec<TypeRef>,
-        /// The argument expressions, in order.
-        arguments: Vec<Expr>,
+        /// The arguments, in SOURCE order -- which is not necessarily parameter order once
+        /// any of them is named (C# 4.0). The binder does the mapping; the tree keeps what was
+        /// written.
+        arguments: Vec<Argument>,
+    },
+    /// A TUPLE expression -- `(1, "x")`, `(a: 1, b: 2)` (C# 7.0).
+    ///
+    /// **AT LEAST TWO ELEMENTS, WHICH IS WHAT KEEPS THIS APART FROM A PARENTHESIZED EXPRESSION.**
+    /// `(e)` is `e` in brackets and has no tuple in it; the comma is the whole difference, and the
+    /// parser decides on exactly that.
+    Tuple {
+        /// The elements, in source order; at least two.
+        elements: Vec<TupleElementExpr>,
+    },
+    /// A DECONSTRUCTION -- `(a, b) = t`, `(int a, int b) = t`, `var (a, b) = t` (C# 7.0).
+    ///
+    /// **ONE NODE FOR ALL THREE SPELLINGS, BECAUSE THEY DIFFER ONLY IN HOW EACH TARGET IS
+    /// WRITTEN.** `var (a, b)` makes every leaf a declaration with no written type; `(int a, b)`
+    /// declares the first and assigns the second; `(a, b)` assigns both. Measured against csc,
+    /// all three run the same lowering and `(var b, a) = t` compiles -- so a representation that
+    /// split them would have to rejoin them to bind the mixed form.
+    ///
+    /// **`var (...)` IS NOT A DISTRIBUTED TYPE, IT IS A DESIGNATION**, and that is why the
+    /// parser normalizes it away: under it, `(b, a)` with an `a` already in scope is `CS0128`
+    /// rather than an assignment to that `a` (measured). Every leaf under a `var` is a
+    /// declaration, so recording one at each leaf loses nothing and gives the binder one rule.
+    ///
+    /// **A DECLARATION TARGET MAKES THE WHOLE FORM STATEMENT-ONLY.** `var q = (var (a, b) = t)`
+    /// and `var q = ((int a, int b) = t)` are both `CS8185`, while `M((a, b) = t)` compiles --
+    /// so the value form is exactly the one with no declaration in it. `var_span` records where
+    /// to report that, since csc puts it at the `var` rather than at the assignment.
+    Deconstruction {
+        /// The `var` of a `var (a, b)` designation, when the form was written that way. `None`
+        /// for `(a, b) = t` and `(int a, int b) = t`, which carry their types at the leaves.
+        var_span: Option<Span>,
+        /// The targets, in source order; at least two.
+        targets: Vec<DeconstructionTarget>,
+        /// The value being deconstructed.
+        value: Box<Expr>,
     },
     /// An element access `receiver[arguments]` (14.5.6).
     ElementAccess {
         /// The expression being indexed.
         receiver: Box<Expr>,
-        /// The index argument expressions, in order.
-        arguments: Vec<Expr>,
+        /// The index arguments, in source order. An indexer takes named arguments exactly as
+        /// a method does (measured: `c[b: 1, a: 43]`).
+        arguments: Vec<Argument>,
     },
     /// A prefix unary operation, including pre-increment and pre-decrement (14.6).
     Unary {
@@ -378,15 +416,61 @@ pub enum ExprKind {
     /// vararg member's fixed parameters. Legal only as the final argument of a call or object
     /// creation whose target is a vararg member (CS0226 elsewhere); the argument types ride in
     /// the call-site signature after the sentinel.
-    ArgListCall(Vec<Expr>),
-    /// An `is` or `as` type test (14.9.9, 14.9.10): the operand against a type.
+    ArgListCall(Vec<Argument>),
+    /// An `is` or `as` test (14.9.9, 14.9.10): the operand against a PATTERN, or -- for `as` --
+    /// against a type.
+    ///
+    /// **AN `as` CARRIES ONLY [`Pattern::Type`], AND THE BINDER SAYS SO RATHER THAN TRUSTING THE
+    /// PARSER.** `x as 3` is not a form and the parser never builds one; an invariant kept by
+    /// construction alone is one refactor from being false, and the pass that would then read a
+    /// constant as a conversion target is the emitter.
     TypeTest {
         /// Whether this is `is` or `as`.
         operation: TypeTestOperation,
         /// The expression being tested or converted.
         operand: Box<Expr>,
-        /// The type tested against.
-        target: TypeRef,
+        /// What it is tested against.
+        target: Pattern,
+    },
+    /// A VARIABLE DECLARED INSIDE AN EXPRESSION (C# 7.0): the `int a` of `M(out int a)` and the
+    /// `var a` of `M(out var a)`.
+    ///
+    /// **ITS SCOPE IS THE ENCLOSING BLOCK, NOT THE EXPRESSION** -- that is the whole point of the
+    /// form, and what makes it a declaration rather than a temporary. Measured against csc:
+    /// `M(out int a); return a;` compiles, and a later `int a;` in the same block is `CS0128`.
+    ///
+    /// **`var` IS NOT RESOLVED HERE AND CANNOT BE.** An implicitly typed out variable takes its
+    /// type from the parameter of the overload that is SELECTED, so the type is known only after
+    /// overload resolution -- which is why the type rides as written and the binder fills it in.
+    DeclarationExpression {
+        /// The declared type as written, or the contextual `var` for an inferred one.
+        ty: TypeRef,
+        /// The variable's name.
+        name: Box<str>,
+    },
+    /// A SWITCH EXPRESSION, `governing switch { pattern => value, ... }` (C# 8.0).
+    ///
+    /// **IT IS A POSTFIX OPERATOR AND ITS PRECEDENCE IS NOT THE SWITCH STATEMENT'S ANYTHING.**
+    /// Measured against csc: `2 * x switch { _ => "s" }` is `CS0019` for `int * string`, so the
+    /// switch binds TIGHTER than `*`; `-x switch { _ => "s" }` compiles, so it binds LOOSER than
+    /// unary. That places it between multiplicative and unary, which is where the grammar puts it
+    /// (`multiplicative_expression : switch_expression | ...`).
+    ///
+    /// **THE GOVERNING EXPRESSION IS EVALUATED ONCE**, which the emitter guarantees with a spill:
+    /// `M() switch { 1 => .., _ => .. }` calls `M` once however many arms test it.
+    SwitchExpression {
+        /// The value being matched.
+        governing: Box<Expr>,
+        /// The `switch` keyword's own span.
+        ///
+        /// **CARRIED BECAUSE THE DIAGNOSTIC POSITION NEEDS IT AND THE NODE'S SPAN IS NOT IT.**
+        /// csc reports `CS8509` at the keyword, and the node's span starts at the governing
+        /// expression -- two columns apart in the shortest program and arbitrarily far apart in a
+        /// real one.
+        keyword: Span,
+        /// The arms, in source order. Order is semantic: the first arm whose pattern matches and
+        /// whose guard holds is the one that runs.
+        arms: Vec<SwitchArm>,
     },
     /// A cast `( type ) operand` (14.6.6).
     Cast {
@@ -397,10 +481,22 @@ pub enum ExprKind {
     },
     /// An object (or delegate) creation `new type ( arguments )` (14.5.10.1).
     ObjectCreation {
-        /// The type being created (a non-array type).
-        target: TypeRef,
-        /// The constructor arguments, in order.
-        arguments: Vec<Expr>,
+        /// The type being created (a non-array type), or `None` for a TARGET-TYPED `new()`
+        /// (C# 9.0), which takes the type the context is converting it to.
+        ///
+        /// **AN `Option` RATHER THAN A SECOND `ExprKind`, AND THAT CHOICE IS THE SAFETY.** A new
+        /// variant is invisible to a `_ => {}` arm, and every pass over this tree has one; a field
+        /// that changed TYPE is a compile error at each of the 35 places that read it. The two
+        /// forms are one construct with one emission -- once the target is known there is nothing
+        /// left that distinguishes them -- so a variant would also have to be collapsed again
+        /// immediately.
+        ///
+        /// **`None` NEVER REACHES THE EMITTER.** The binder resolves it against the target type or
+        /// refuses it by name (`CS8754`), so `lamella-assemble` sees a resolved creation either
+        /// way and its arms may assume a type.
+        target: Option<TypeRef>,
+        /// The constructor arguments, in source order.
+        arguments: Vec<Argument>,
         /// The object or collection initializer `{ ... }` that follows (C# 3.0), if written.
         ///
         /// Independent of `arguments`: `new C(1) { F = 2 }` has both, `new C { F = 2 }` has only
@@ -432,6 +528,68 @@ pub enum ExprKind {
     /// A placeholder for an expression that could not be parsed. It is emitted
     /// with a diagnostic so the parser can keep building a tree for the rest.
     Error,
+}
+
+/// A PATTERN (ECMA-334 12.x): what the right side of an `is` names, and what a switch arm matches.
+///
+/// **`x is null` IS NOT `x == null`.** The pattern ignores a user-defined `operator ==`, so a type
+/// whose `==` answers `true` for a null operand still tests false against the pattern -- measured:
+/// csc emits `ldnull; ceq` for the pattern and `call op_Equality` for the comparison. Binding the
+/// two the same way is a silent wrong answer, which is why the right side is a choice here rather
+/// than a `TypeRef` the binder reinterprets.
+///
+/// **THE SAME TOKENS MEAN DIFFERENT PATTERNS AFTER `is` THAN IN A SWITCH ARM, AND THAT IS THE
+/// LANGUAGE'S RULE RATHER THAN A PARSER CONVENIENCE.** `x is T` has been a type test since C# 1.0,
+/// so a bare or dotted NAME after `is` stays [`Pattern::Type`]; in a switch arm there is no such
+/// legacy and the same name is a [`Pattern::Constant`] -- which is what an enum-member arm
+/// (`E.B => ...`) is, and 387 of the 949 corpus arms are exactly that. One parse function decides
+/// both from a position parameter, so the two readings cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    /// `x is T`, and every `x as T`.
+    Type(TypeRef),
+    /// A CONSTANT pattern: `null`, `3`, `'c'`, `"a"`, `true`, and -- in a switch arm -- a named
+    /// constant such as `E.B`.
+    ///
+    /// The expression rides as written because a pattern's constant is a CONSTANT EXPRESSION,
+    /// which the parser cannot fold: `E.B` is a member access until a model resolves it.
+    Constant(Box<Expr>),
+    /// `_` -- a DISCARD pattern, which matches anything and binds nothing.
+    ///
+    /// **IT IS A SWITCH ARM'S FORM AND NOT AN `is`'s**, which is the language's rule and not this
+    /// parser's: measured, `o is _` is `CS0246` under csc at every version, because a bare name
+    /// after `is` was a type long before it could be a discard.
+    Discard(Span),
+    /// `x is T t` -- a DECLARATION PATTERN (C# 7.0): the type test, and a variable holding the
+    /// converted value on the branch where it succeeded.
+    ///
+    /// **THE NAME IS PART OF THE `is`, NOT A SEPARATE STATEMENT**, and its scope is the enclosing
+    /// block: measured against csc, `if (o is string s) { }` followed by `string s;` is `CS0128`.
+    /// What confines it to the true branch is definite assignment and not scope -- reading it in
+    /// the `else` is `CS0165`, which is why this needed the two-state lattice first.
+    ///
+    /// `as` never carries one: `x as T t` is not a form, and the parser offers the designator
+    /// only after `is`.
+    Declaration {
+        /// The type tested against, and the declared variable's type.
+        ty: TypeRef,
+        /// The variable's name.
+        name: Box<str>,
+        /// The name's own span, for the redeclaration diagnostics.
+        span: Span,
+    },
+}
+
+/// One arm of a [`ExprKind::SwitchExpression`]: `pattern when guard => value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchArm {
+    /// The pattern the governing value is matched against.
+    pub pattern: Pattern,
+    /// The `when` guard, if written. A guarded arm is not a catch-all however wide its pattern is
+    /// -- which is why exhaustiveness has to look at both.
+    pub guard: Option<Expr>,
+    /// The value the arm yields.
+    pub value: Expr,
 }
 
 /// Whether a [`ExprKind::TypeTest`] is an `is` or an `as` (14.9.9, 14.9.10).
@@ -492,6 +650,19 @@ impl TypeRef {
 /// The kind of a [`TypeRef`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeRefKind {
+    /// A TUPLE type -- `(int, string)`, `(int x, string y)` (C# 7.0).
+    ///
+    /// **A TUPLE TYPE IS SYNTAX FOR AN INSTANTIATION AND NOT A TYPE OF ITS OWN.** `(int, string)`
+    /// IS `System.ValueTuple<int, string>`; the two are the same type, convert to one another
+    /// without conversion, and share every member. That is why this variant exists only in the
+    /// SYNTAX tree and has no counterpart in the binder's `TypeSymbol` -- the binder rewrites it
+    /// to the instantiation, and everything downstream (conversions, overload resolution,
+    /// metadata, emission) needs to know nothing about tuples at all.
+    ///
+    /// **AT LEAST TWO ELEMENTS.** `(int)` is a parenthesized type, not a one-tuple, and C# gives
+    /// no syntax for `ValueTuple<int>` -- so a one-element list here would be a shape the grammar
+    /// cannot produce.
+    Tuple(Vec<TupleElement>),
     /// A predefined type keyword, such as `int` or `string` (11.1.4).
     Predefined(PredefinedType),
     /// A type name, its parts in order: `A.B.C` is `["A", "B", "C"]` (11.1).
@@ -744,6 +915,26 @@ pub enum StmtKind {
         /// The loop body.
         body: Box<Stmt>,
     },
+    /// A `foreach ( targets in collection ) body` whose iteration variables are DECONSTRUCTED
+    /// from each element -- `foreach (var (a, b) in pairs)`, `foreach ((int a, int b) in pairs)`
+    /// (C# 7.0).
+    ///
+    /// **A SEPARATE STATEMENT AND NOT A `ForEach` WITH A FUNNY NAME, BECAUSE IT DECLARES MORE
+    /// THAN ONE VARIABLE.** [`StmtKind::ForEach`] carries a single name and a single type, which
+    /// is what every pass over it reads; widening those to lists would make every consumer answer
+    /// a question that only this form asks. The binder lowers this one INTO that one, with a
+    /// synthesized iteration variable and the targets deconstructed from it at the top of the
+    /// body -- so nothing below the binder sees this variant at all.
+    ForEachDeconstruction {
+        /// The `var` of a `var (a, b)` designation, when the form was written that way.
+        var_span: Option<Span>,
+        /// The targets, in source order; at least two.
+        targets: Vec<DeconstructionTarget>,
+        /// The collection iterated over.
+        collection: Expr,
+        /// The loop body.
+        body: Box<Stmt>,
+    },
     /// A `break ;` statement (15.9.1).
     Break,
     /// A `continue ;` statement (15.9.2).
@@ -903,6 +1094,112 @@ pub struct QualifiedName {
     pub span: Span,
 }
 
+/// One element of a TUPLE TYPE: `int` or `int x` (C# 7.0).
+///
+/// The name is optional and, unlike a parameter name, is part of no signature: `(int a, int b)`
+/// and `(int c, int d)` are THE SAME TYPE, and a conversion between them is the identity. Names
+/// exist for the reader and for member access, and they survive into metadata as
+/// `TupleElementNamesAttribute` on the DECLARATION rather than on the type -- which is the same
+/// statement from the other side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TupleElement {
+    /// The element's name, if it was written.
+    pub name: Option<ArgumentName>,
+    /// The element's type.
+    pub ty: TypeRef,
+}
+
+/// One element of a TUPLE EXPRESSION: `1` or `a: 1` (C# 7.0).
+///
+/// Deliberately NOT an [`Argument`], though the two look alike in source. A tuple element admits no
+/// `ref`, no `out` and no argument-list rule; sharing the type would make every one of those a
+/// question this grammar has to answer, and the answer would have to be "no" at each of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TupleElementExpr {
+    /// The element's name, if it was written.
+    pub name: Option<ArgumentName>,
+    /// The element's value.
+    pub value: Expr,
+}
+
+/// One target of a DECONSTRUCTION: `int a`, `a`, `_`, or a nested `(b, c)` (C# 7.0).
+///
+/// **A TREE, NOT A LIST, BECAUSE THE TARGETS NEST AND THE VALUES THEY MATCH NEST WITH THEM.**
+/// `var (a, (b, c)) = (1, (2, 3))` deconstructs the second element again, to any depth, and a
+/// flat list could not say which element the inner pair belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeconstructionTarget {
+    /// A variable declared by the deconstruction: `int a`, `var a`, or a bare `a` under a
+    /// `var (...)` designation.
+    Declaration {
+        /// The written type, or `None` for a leaf under `var (...)` and for `var a`, both of
+        /// which take their type from the element they match.
+        ty: Option<TypeRef>,
+        /// The variable's name.
+        name: Box<str>,
+        /// The byte range the whole target covers, type included.
+        span: Span,
+    },
+    /// An assignable expression -- `a`, `c.F`, `arr[0]`.
+    ///
+    /// **A BARE `_` REACHES THE BINDER AS THIS AND NOT AS A [`DeconstructionTarget::Discard`]**,
+    /// because only the binder knows whether a variable named `_` is in scope: `int _ = 0;
+    /// (a, _) = (40, 2);` ASSIGNS to that `_` and csc runs it (measured). Under a `var (...)`
+    /// designation there is no such question and the parser records the discard directly.
+    Expression(Expr),
+    /// `_` under a `var (...)` designation -- the element is computed and dropped.
+    Discard(Span),
+    /// A nested target list, `(b, c)`, matching one element of the value.
+    Nested {
+        /// The nested targets; at least two, by the same rule as the outer list.
+        targets: Vec<DeconstructionTarget>,
+        /// The byte range the bracketed list covers.
+        span: Span,
+    },
+}
+
+/// One argument in an argument list (12.6.2): a value, and the parameter NAME it was written
+/// with, if any.
+///
+/// **A STRUCT AROUND THE VALUE RATHER THAN A WRAPPING `ExprKind`, AND THAT CHOICE IS THE SAFETY.**
+/// A new expression variant is invisible to a `_ => {}` arm and every pass over this tree has one,
+/// so a pass that never learned about names would go on compiling and bind the argument by
+/// POSITION -- which is the one outcome this feature exists to prevent. Changing what an argument
+/// list contains is instead a compile error at every place that reads one.
+///
+/// A `ref`/`out` argument is an [`ExprKind::RefArgument`] in `value`, and the name is written
+/// outside it (`b: ref x`), so the two are independent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Argument {
+    /// The `name:` written before the value (C# 4.0), or `None` for a positional argument.
+    pub name: Option<ArgumentName>,
+    /// The argument value.
+    pub value: Expr,
+}
+
+impl Argument {
+    /// A positional argument -- what every argument was before C# 4.0, and still nearly all of
+    /// them. Named so the far more common construction stays the shorter one to write.
+    pub fn positional(value: Expr) -> Argument {
+        Argument { name: None, value }
+    }
+}
+
+/// The name of a named argument, with the extent its diagnostics point at.
+///
+/// **CARRIED SEPARATELY FROM THE VALUE'S SPAN BECAUSE EVERY DIAGNOSTIC THIS FEATURE OWNS NAMES THE
+/// IDENTIFIER, NOT THE ARGUMENT.** `CS1739` for a parameter no overload has, `CS1744` for one a
+/// positional argument already filled, `CS8323` for one out of position ahead of an unnamed
+/// argument: measured against csc, all three point at the identifier, and none of them would be
+/// reachable from the value's span alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgumentName {
+    /// The identifier written before the `:`.
+    pub text: Box<str>,
+    /// The byte range the identifier covers, not including the `:`.
+    pub span: Span,
+}
+
 /// An object or collection initializer following a `new` (C# 3.0).
 ///
 /// **Which one it is comes from the FIRST element, and csc names them differently in its
@@ -917,7 +1214,25 @@ pub enum Initializer {
     ///
     /// The type must implement `IEnumerable` (csc CS1922) and have an applicable `Add`
     /// (CS1061); neither is a syntactic condition, so both are the binder's to enforce.
-    Collection(Vec<Expr>),
+    Collection(Vec<CollectionElement>),
+}
+
+/// One element of a collection initializer: the arguments one `Add` call receives.
+///
+/// **AN ELEMENT IS AN ARGUMENT LIST, NOT AN EXPRESSION.** `{ 1 }` hands `Add` one argument and
+/// `{ { 1, 2 } }` hands it two, which is the whole of how a dictionary initializer works -- there
+/// is no separate dictionary construct, only an element with two arguments. Measured: csc accepts
+/// a braced element of one, two or three values, and mixes braced and bare in one initializer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionElement {
+    /// The arguments, in source order.
+    ///
+    /// Plain expressions and not [`Argument`]s: a braced element has no named form at any version
+    /// (measured -- `{ b: 1, a: 43 }` is CS1003 at the colon, the same refusal an array size list
+    /// gives), so there is nowhere here for a name to come from.
+    pub arguments: Vec<Expr>,
+    /// The element's extent -- the braces when it has them, the expression when it does not.
+    pub span: Span,
 }
 
 /// One `name = value` inside an object initializer.
@@ -1031,12 +1346,25 @@ pub struct DelegateDecl {
     pub return_type: TypeRef,
     /// The delegate's name.
     pub name: Box<str>,
+    /// The type parameters declared after the name (C# 2.0): `delegate void D<T>(T x)` holds one.
+    /// Empty for an ordinary delegate, which is what every C# 1.0 declaration is.
+    ///
+    /// **THE ARITY IS PART OF THE TYPE'S IDENTITY, NOT DECORATION ON IT.** `D` and `` D`1 `` are
+    /// two types that may be declared in one namespace, so this count reaches the model key and the
+    /// metadata name the same way [`TypeDecl::type_parameters`] does -- a delegate is a class in
+    /// metadata (sealed, extending `MulticastDelegate`) and is generic by the same mechanism.
+    pub type_parameters: Vec<TypeParameter>,
+    /// The `where` clauses written after the PARAMETER list (22.1). Empty for an ordinary delegate,
+    /// and empty for a generic one that constrains nothing.
+    ///
+    /// They follow the parameter list rather than preceding it, unlike a type's, because a
+    /// delegate has no base list for them to follow -- the grammar is the METHOD's.
+    pub constraints: Vec<TypeParameterConstraintClause>,
     /// The delegate's formal parameters.
     pub parameters: Vec<Parameter>,
     /// The byte range the declaration covers.
     pub span: Span,
 }
-
 
 /// A `namespace` declaration (16.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1112,7 +1440,7 @@ pub struct RecordParts {
     /// The argument list on a base record -- the `(X)` of `record D(int X, int Y) : B(X)` (14.5.11
     /// applies to the arguments; the base type itself is the first entry in [`TypeDecl::bases`]).
     /// `None` when the base list carries no argument list.
-    pub base_arguments: Option<Vec<Expr>>,
+    pub base_arguments: Option<Vec<Argument>>,
     /// Whether the `class` or `struct` keyword was written after `record` -- `record class R` and
     /// `record struct R`, which are a SEPARATE csc feature at C# 10 called `'record structs'`,
     /// PLURAL, for the class form too. Measured one compilation per rung.
@@ -1297,6 +1625,14 @@ pub enum Member {
         return_type: TypeRef,
         /// The method name.
         name: Box<str>,
+        /// The NAME's own span, which is where csc anchors a diagnostic about the method itself.
+        ///
+        /// **NOT [`Member::Method::span`], AND THE TWO ARE FAR APART.** The member's span starts at
+        /// its first modifier or attribute; csc's `CS0626` and `CS0179` put the caret on the name,
+        /// twenty-six columns later in the shortest program that has both. A synthesized member
+        /// has no name in any source, so it carries whatever span its synthesis site has -- nothing
+        /// reports on one.
+        name_span: Span,
         /// The type parameters declared after the name (C# 2.0): the `T` in `T M<T>(T x)`. Empty
         /// for an ordinary method. These are the method's OWN parameters, distinct from any the
         /// enclosing type declares -- the distinction the metadata encoding spells `!!0` against
@@ -1357,6 +1693,14 @@ pub enum Member {
         ty: TypeRef,
         /// The property name.
         name: Box<str>,
+        /// The byte range of the NAME alone -- the identifier, and for an explicit implementation
+        /// the part after the last dot rather than the whole qualified name.
+        ///
+        /// A member-level diagnostic about the property AS A WHOLE lands here, which is where csc
+        /// puts one: `CS0551` points at the `P` of `int I.P { get { } }`, not at the `int`. The
+        /// member's own [`Member::Property::span`] starts at its modifiers and is four to a dozen
+        /// columns earlier, so it is not a substitute.
+        name_span: Span,
         /// The `get` accessor, if present.
         getter: Option<Accessor>,
         /// The `set` accessor, if present.
@@ -1419,10 +1763,21 @@ pub enum Member {
         ty: TypeRef,
         /// The index formal parameters (at least one).
         parameters: Vec<Parameter>,
+        /// The byte range of the `this` KEYWORD, which is an indexer's name (17.8) and where csc
+        /// points a member-level diagnostic -- see [`Member::Property::name_span`], whose job this
+        /// is for the member kind beside it.
+        name_span: Span,
         /// The `get` accessor, if present.
         getter: Option<Accessor>,
         /// The `set` accessor, if present.
         setter: Option<Accessor>,
+        /// The explicitly implemented interface for `int I.this[int i] { ... }` (20.4.1),
+        /// naming its accessors `I.get_Item`/`I.set_Item`. `None` for an ordinary indexer.
+        ///
+        /// The FOURTH member kind to carry one, and the last: `Method`, `Property` and `Event`
+        /// each had it while the indexer -- which C# qualifies exactly as they are qualified --
+        /// did not, so `int I.this[int i]` was a parse error rather than a member.
+        explicit_interface: Option<TypeRef>,
         /// The member's attribute sections (e.g. `[IndexerName("Chars")]`, which renames the
         /// accessors to `get_Chars`/`set_Chars`).
         attributes: Vec<AttributeSection>,
@@ -1629,6 +1984,16 @@ fn write_type_arguments(text: &mut String, arguments: &[TypeRef]) {
 /// [`explicit_interface_member_name`].
 fn write_type_ref(text: &mut String, ty: &TypeRef) {
     match &ty.kind {
+        TypeRefKind::Tuple(elements) => {
+            text.push_str("System.ValueTuple<");
+            for (index, element) in elements.iter().enumerate() {
+                if index > 0 {
+                    text.push(',');
+                }
+                write_type_ref(text, &element.ty);
+            }
+            text.push('>');
+        }
         TypeRefKind::Predefined(predefined) => text.push_str(predefined.keyword()),
         TypeRefKind::Name(parts) => {
             for (index, part) in parts.iter().enumerate() {
@@ -1797,8 +2162,9 @@ impl OverloadableOperator {
 pub struct ConstructorInitializer {
     /// Whether the initializer calls a base or a sibling constructor.
     pub kind: ConstructorInitializerKind,
-    /// The argument expressions.
-    pub arguments: Vec<Expr>,
+    /// The arguments, in source order. `base(b: 1, a: 43)` is legal (measured), so a
+    /// constructor initializer carries names like any other call.
+    pub arguments: Vec<Argument>,
     /// The `base`/`this` keyword's span, for a debug build's sequence point on the chain
     /// call (a breakpoint on `: base(...)` / `: this(...)`).
     pub span: Span,

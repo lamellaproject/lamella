@@ -802,9 +802,17 @@ impl Func {
     pub fn i64_trunc_f32_s(&mut self) {
         self.op(0xAE);
     }
+    /// `i64.trunc_f32_u` -- truncate an f32 to an UNSIGNED i64.
+    pub fn i64_trunc_f32_u(&mut self) {
+        self.op(0xAF);
+    }
     /// `i64.trunc_f64_s` -- truncate an f64 to a signed i64.
     pub fn i64_trunc_f64_s(&mut self) {
         self.op(0xB0);
+    }
+    /// `i64.trunc_f64_u` -- truncate an f64 to an UNSIGNED i64.
+    pub fn i64_trunc_f64_u(&mut self) {
+        self.op(0xB1);
     }
     /// `f32.convert_i32_s` -- convert a signed i32 to an f32.
     pub fn f32_convert_i32_s(&mut self) {
@@ -1200,11 +1208,12 @@ mod tests {
         }
     }
 
-    /// The two float-to-i64 truncations, pinned by byte. Their values are not transcribed from
+    /// The FOUR float-to-i64 truncations, pinned by byte. Their values are not transcribed from
     /// anywhere -- the numeric section of the opcode table is DENSE, and both neighbours are
     /// already in this file: `i64.extend_i32_u` is 0xAD and `f32.convert_i32_s` is 0xB2, and the
     /// four opcodes between them are `i64.trunc_f32_s`, `_u`, `i64.trunc_f64_s`, `_u` in that
-    /// order. So 0xAE and 0xB0 are forced by entries the assembler already emits.
+    /// order. So 0xAE..=0xB1 are forced by entries the assembler already emits, and the two
+    /// UNSIGNED ones are the only values the gap leaves for them.
     ///
     /// The gap they fill was a BUILD BREAK rather than a wrong encoding: `wasm::emit_convert`
     /// called both methods, neither existed, and nothing compiled `lamella-aot --features wasm`
@@ -1216,6 +1225,11 @@ mod tests {
         body.i64_trunc_f32_s();
         body.i64_trunc_f64_s();
         assert_eq!(body.code, [0xAE, 0xB0]);
+
+        let mut unsigned = Func::new(0);
+        unsigned.i64_trunc_f32_u();
+        unsigned.i64_trunc_f64_u();
+        assert_eq!(unsigned.code, [0xAF, 0xB1]);
 
         let mut neighbours = Func::new(0);
         neighbours.i64_extend_i32_u();

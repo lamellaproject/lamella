@@ -999,6 +999,8 @@ pub(crate) fn monomorphize<'pe>(
             .unwrap_or_default();
         let mut virtuals: BTreeMap<String, MethodId> = vtable.iter().cloned().collect();
         let mut nonvirtuals: BTreeMap<String, MethodId> = BTreeMap::new();
+        let mut own_keys: BTreeSet<String> = BTreeSet::new();
+        let relisted = relisted_dispatch_keys(assembly, entry.def_row);
         let mut slots: Vec<(MethodId, u32)> = Vec::new();
         for (position, method) in methods.iter().enumerate() {
             let Some(Some(id)) = entry.methods.get(position).copied() else {
@@ -1018,13 +1020,14 @@ pub(crate) fn monomorphize<'pe>(
                 let overridden = (!method.newslot)
                     .then(|| vtable.iter().position(|(slot, _)| *slot == key))
                     .flatten();
-                if overridden.is_none() && virtuals.contains_key(&key) {
+                if overridden.is_none() && own_keys.contains(&key) {
                     lowering.refusals.push(Refusal::SubstitutedKeyCollision {
                         instantiation: want.name.clone(),
                         key: key.clone(),
                     });
                     continue;
                 }
+                own_keys.insert(key.clone());
                 let slot = match overridden {
                     Some(slot) => {
                         vtable[slot].1 = id;
@@ -1036,7 +1039,13 @@ pub(crate) fn monomorphize<'pe>(
                     }
                 };
                 slots.push((id, slot));
-                virtuals.insert(key, id);
+                super::insert_virtual_dispatch_entry(
+                    &mut virtuals,
+                    key,
+                    id,
+                    method.newslot,
+                    &relisted,
+                );
             } else if !method.is_static && method.name != ".ctor" {
                 if nonvirtuals.contains_key(&key) {
                     lowering.refusals.push(Refusal::SubstitutedKeyCollision {
@@ -2107,6 +2116,40 @@ struct DeferredMethodSite {
 
 /// The dispatch key a member of an instantiation answers to: its name and its parameter types with
 /// the instantiation's arguments substituted in.
+/// The signature keys the interfaces a generic DEFINITION lists itself declare -- ECMA-334 20.4.2's
+/// re-listing set, for the map [`insert_virtual_dispatch_entry`] builds at each instantiation.
+///
+/// The loader has the same function for ordinary types (`relisted_interface_keys`); this is the
+/// instantiation-side reader, and it deliberately answers about the DEFINITION rather than the
+/// closed type. A definition's `InterfaceImpl` rows are what the language reads for the re-listing
+/// question, and they do not change when the type arguments do.
+///
+fn relisted_dispatch_keys(assembly: &Assembly<'_>, def_row: u32) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let Some(type_def) = assembly.type_def(def_row) else {
+        return keys;
+    };
+    for token in type_def.interfaces() {
+        if token.table() != TYPE_DEF {
+            continue;
+        }
+        let Some(interface) = assembly.type_def(token.row()) else {
+            continue;
+        };
+        for method in interface.methods() {
+            let name: String = method.name().unwrap_or("").into();
+            let signature = method.signature();
+            let params: Vec<SigType> = signature
+                .as_ref()
+                .map(|sig| sig.parameters.clone())
+                .unwrap_or_default();
+            let generic_arity = signature.as_ref().map_or(0, |sig| sig.generic_param_count);
+            keys.insert(super::sig_encode(assembly, &name, &params, generic_arity, &[]));
+        }
+    }
+    keys
+}
+
 fn substituted_sig_key<'pe>(
     assembly: &Assembly<'pe>,
     name: &str,

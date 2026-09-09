@@ -158,7 +158,8 @@ namespace System.Collections
 
         public void CopyTo(System.Array array, int index)
         {
-            for (int i = 0; i < size; i++) array.SetValue(items[i], index + i);
+            if ((object)array != null && array.Rank != 1) throw new ArgumentException("array");
+            System.Array.Copy(items, 0, array, index, size);
         }
 
         public void CopyTo(System.Array array) { CopyTo(array, 0); }

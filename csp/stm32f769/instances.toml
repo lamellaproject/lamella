@@ -63,3 +63,28 @@ block = "rcc"
 base = 0x40023800
 rcc_en_off = -1
 rcc_en_bit = -1
+
+# --- the external interrupt controller and the register that routes pins to it ------------------
+#
+# TWO INSTANCES BECAUSE THEY ARE TWO PERIPHERALS AND ONLY ONE OF THEM HAS A CLOCK. EXTI is not
+# gated in RCC at all, so its row states no enable; SYSCFG is, and a pin cannot be routed to a line
+# without it. A driver that enables only what it thinks of as "the interrupt peripheral" gets an
+# EXTICR write that goes nowhere and a line still bound to port A by the reset value.
+#
+# THE RECORD CANNOT NAME THE NVIC VECTORS AND NO SINGLE FIELD COULD: sixteen GPIO lines arrive on
+# SEVEN vectors -- one each for lines 0 to 4, one shared by 5 to 9, one shared by 10 to 15. The
+# mapping is stated in blocks/exti.toml.
+
+[[instances]]
+name = "exti"
+block = "exti"
+base = 0x40013C00          # RM0410 Rev 5 memory map, APB2
+rcc_en_off = -1            # NOT ABSENT: EXTI has no enable bit in any RCC register
+rcc_en_bit = -1
+
+[[instances]]
+name = "syscfg"
+block = "syscfg"           # its EXTICR bank is what binds a line to a port
+base = 0x40013800          # RM0410 Rev 5 memory map, APB2
+rcc_en_off = 0x44          # RCC_APB2ENR
+rcc_en_bit = 14            # SYSCFGEN, RM0410 Rev 5 section 5.3.14

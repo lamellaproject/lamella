@@ -41,4 +41,7 @@ public enum Samd21Instances {
     public static let GCLK_BASE: UInt32 = 0x40000C00
     public static let PORTA_BASE: UInt32 = 0x41004400
     public static let PORTB_BASE: UInt32 = 0x41004480
+    public static let EIC_BASE: UInt32 = 0x40001800
+    public static let EIC_GCLK_CORE_ID: UInt32 = 5
+    public static let EIC_IRQ: UInt32 = 4
 }

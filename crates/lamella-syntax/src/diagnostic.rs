@@ -55,6 +55,29 @@ pub enum DiagnosticKind {
     DirectiveNotFirstOnLine,
     /// A `#` was followed by something other than a known directive name (9.5).
     PreprocessorDirectiveExpected,
+    /// A `#:` file-based-app directive in a compilation that is not a file-based program.
+    ///
+    /// `#:` is not plain C#: it is lexed anywhere but ACCEPTED only in file-based mode, which
+    /// `dotnet` spells `-features:FileBasedProgram`. A project compilation reports this even for
+    /// a well-placed directive, because nothing in a project would ever act on one.
+    FileDirectiveOutsideFileBasedProgram,
+    /// A `#:` directive after the first TOKEN of the file.
+    ///
+    /// The rule is the first TOKEN, not the first line: a comment, blank lines, a `#define` and
+    /// leading indentation may all precede a directive, and `using System;` may not.
+    FileDirectiveAfterFirstToken,
+    /// A `#!` shebang in a compilation that is not a file-based program.
+    ///
+    /// A separate code from [`Self::FileDirectiveOutsideFileBasedProgram`], and csc's wording
+    /// names scripts as well -- the two features share the mode and not the diagnostic.
+    ShebangOutsideFileBasedProgram,
+    /// Two null-suppression operators in a row, `s!!`.
+    ///
+    /// The operator is an assertion to the nullable analysis and asserting twice says nothing the
+    /// first did not, so csc refuses it rather than accepting it as a no-op -- measured. A build
+    /// with no nullable analysis at all still has to refuse it, or it accepts a program csc does
+    /// not.
+    DuplicateNullSuppression,
     /// A directive line carried tokens past its content where only white space,
     /// a single-line comment, or the end of the line was allowed (9.5).
     EndOfLineExpected,
@@ -76,6 +99,31 @@ pub enum DiagnosticKind {
     EndRegionDirectiveExpected,
     /// A pre-processing expression in an `#if` or `#elif` was malformed (9.5.2).
     InvalidPreprocessorExpression,
+    /// A tuple written with fewer than two elements -- `(int)`, `(a: 1)` (C# 7.0).
+    ///
+    /// `(e)` and `(T)` are a parenthesized expression and a parenthesized type, and stay so; this
+    /// is the case where a NAME or the tuple grammar has already been committed to and the arity
+    /// then falls short. C# gives no syntax for a one-tuple at all -- `ValueTuple<T>` exists but
+    /// has no surface form -- so the shortfall is a syntax error rather than a missing type.
+    TupleTooFewElements,
+    /// An element access supplied NO index -- `a[]` (12.8.11.2).
+    ///
+    /// **`[]` IS A RANK SPECIFIER EVERYWHERE ELSE, WHICH IS WHY THIS IS EASY TO ACCEPT BY
+    /// ACCIDENT.** `int[] a`, `new int[]{1}` and `typeof(int[])` all contain the same two tokens
+    /// and all are legal; only after a VALUE do they have to hold at least one index. An empty
+    /// argument list is a perfectly good empty list, so nothing upstream objects and the access
+    /// binds -- against a `params` indexer it even binds to an empty array and runs. csc refuses
+    /// it at the `]`, and the message is about the missing value rather than about indexers.
+    ValueExpectedInElementAccess,
+    /// A named argument was followed by an unnamed one, below C# 7.2 (12.6.2.1).
+    ///
+    /// **A CONDITION ABOUT THE ARGUMENT LIST AND NOTHING ELSE, WHICH IS WHY IT IS A SYNTAX
+    /// DIAGNOSTIC.** No method, no overload and no parameter is consulted: from C# 4.0 to 7.1 a
+    /// named argument may be followed only by named ones, and that is visible in the tokens. csc
+    /// reports it at the offending POSITIONAL argument, and at every version below 7.2 --
+    /// including the versions with no named arguments at all, where it lands ALONGSIDE the version
+    /// code rather than instead of it (measured at C# 3, which gives CS8024 and this).
+    NonTrailingNamedArgument,
     /// A parenthesised pre-processing expression was missing its `)` (9.5.2).
     CloseParenExpected,
     /// A `#line` directive had no valid line number, file name, or `default`
@@ -154,11 +202,28 @@ pub enum DiagnosticKind {
         /// The expected token's spelling, for example `]` or `:`.
         expected: &'static str,
     },
-    /// A type was expected, for example inside `typeof( )` or after `is`/`as`
+    /// A type was expected, for example inside `typeof( )` or after `as`
     /// (ECMA-334 1st ed, clause 11).
     TypeExpected,
+    /// `CS8504`: an `is` had no PATTERN after it.
+    ///
+    /// **THE `is` AND `as` SIDES OF THE SAME GAP HAVE DIFFERENT CODES, AND BOTH ARE MEASURED.**
+    /// `x as;` is `CS1031 Type expected` because `as` takes a type; `x is;` is this, because `is`
+    /// takes a pattern and a pattern is more than a type. Reporting `CS1031` for both -- which is
+    /// what this parser did while `is` could only carry a type -- sends the reader looking for a
+    /// missing type name where a constant would also have done.
+    PatternMissing,
     /// A statement was not terminated by the required `;` (clause 15).
     SemicolonExpected,
+    /// A DECLARATION stood where an EMBEDDED statement was required -- the single statement of an
+    /// `if`, `while`, `for`, `foreach`, `using`, `lock` or `else`, which opens no scope for a
+    /// declaration to live in (clause 15.2).
+    ///
+    /// **REPORTED HERE ONLY FOR A USING DECLARATION**, which is the form that can otherwise
+    /// SWALLOW the enclosing block: its body is "the rest of the block", and in an embedded
+    /// position there is no block whose rest is its own. A local declaration in the same position
+    /// is a pre-existing gap this parser still accepts.
+    EmbeddedStatementCannotBeDeclaration,
     /// A block or similar construct was not closed by the required `}`.
     CloseBraceExpected,
     /// A token appeared in a class/struct/interface member declaration where a member name
@@ -359,7 +424,14 @@ impl DiagnosticKind {
             DiagnosticKind::UnterminatedStringLiteral => 1039,
             DiagnosticKind::IdentifierExpected => 1001,
             DiagnosticKind::PreprocessorDirectiveExpected => 1024,
+            DiagnosticKind::FileDirectiveAfterFirstToken => 9297,
+            DiagnosticKind::FileDirectiveOutsideFileBasedProgram => 9298,
+            DiagnosticKind::ShebangOutsideFileBasedProgram => 9314,
+            DiagnosticKind::DuplicateNullSuppression => 8715,
             DiagnosticKind::EndOfLineExpected => 1025,
+            DiagnosticKind::TupleTooFewElements => 8124,
+            DiagnosticKind::ValueExpectedInElementAccess => 443,
+            DiagnosticKind::NonTrailingNamedArgument => 1738,
             DiagnosticKind::CloseParenExpected => 1026,
             DiagnosticKind::EndIfDirectiveExpected => 1027,
             DiagnosticKind::UnexpectedDirective => 1028,
@@ -383,7 +455,9 @@ impl DiagnosticKind {
             DiagnosticKind::ExpressionExpected => 1525,
             DiagnosticKind::TokenExpected { .. } => 1003,
             DiagnosticKind::TypeExpected => 1031,
+            DiagnosticKind::PatternMissing => 8504,
             DiagnosticKind::SemicolonExpected => 1002,
+            DiagnosticKind::EmbeddedStatementCannotBeDeclaration => 1023,
             DiagnosticKind::CloseBraceExpected => 1513,
             DiagnosticKind::InvalidTokenInMemberDeclaration { .. } => 1519,
             DiagnosticKind::DuplicateModifier { .. } => 1004,
@@ -446,9 +520,33 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::PreprocessorDirectiveExpected => {
                 f.write_str("Preprocessor directive expected")
             }
+            DiagnosticKind::FileDirectiveAfterFirstToken => {
+                f.write_str("'#:' directives cannot be after first token in file")
+            }
+            DiagnosticKind::FileDirectiveOutsideFileBasedProgram => f.write_str(
+                "'#:' directives can be only used in file-based programs \
+                 ('-features:FileBasedProgram')",
+            ),
+            DiagnosticKind::ShebangOutsideFileBasedProgram => {
+                f.write_str("'#!' directives can be only used in scripts or file-based programs")
+            }
+            DiagnosticKind::DuplicateNullSuppression => {
+                f.write_str("Duplicate null suppression operator ('!')")
+            }
             DiagnosticKind::EndOfLineExpected => {
                 f.write_str("Single-line comment or end-of-line expected")
             }
+            DiagnosticKind::TupleTooFewElements => {
+                f.write_str("Tuple must contain at least two elements.")
+            }
+            DiagnosticKind::ValueExpectedInElementAccess => {
+                f.write_str("Syntax error; value expected")
+            }
+            DiagnosticKind::NonTrailingNamedArgument => f.write_str(
+                "Named argument specifications must appear after all fixed arguments have been \
+                 specified. Please use language version 7.2 or greater to allow non-trailing \
+                 named arguments.",
+            ),
             DiagnosticKind::CloseParenExpected => f.write_str(") expected"),
             DiagnosticKind::EndIfDirectiveExpected => f.write_str("#endif directive expected"),
             DiagnosticKind::UnexpectedDirective => f.write_str("Unexpected preprocessor directive"),
@@ -503,7 +601,11 @@ impl fmt::Display for DiagnosticKind {
                 write!(f, "Syntax error, '{expected}' expected")
             }
             DiagnosticKind::TypeExpected => f.write_str("Type expected"),
+            DiagnosticKind::PatternMissing => f.write_str("Pattern missing"),
             DiagnosticKind::SemicolonExpected => f.write_str("; expected"),
+            DiagnosticKind::EmbeddedStatementCannotBeDeclaration => {
+                f.write_str("Embedded statement cannot be a declaration or labeled statement")
+            }
             DiagnosticKind::CloseBraceExpected => f.write_str("} expected"),
             DiagnosticKind::InvalidTokenInMemberDeclaration { token } => {
                 write!(f, "Invalid token '{token}' in a member declaration")

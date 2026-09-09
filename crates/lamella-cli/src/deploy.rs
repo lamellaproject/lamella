@@ -133,6 +133,39 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
     }
 }
 
+#[cfg(test)]
+mod source_refusal_tests {
+    use super::{Uncompilable, deploy_refusal, uncompilable_source};
+    use std::path::Path;
+
+    /// Three routes across two verbs compile C# ahead of time, and the rule lived in two of them:
+    /// `deploy --board` read a `.py`, handed it to the C# compiler and printed thirty Roslyn
+    /// diagnostics naming a language the author never used. One predicate, every caller.
+    #[test]
+    fn every_route_that_compiles_ahead_of_time_agrees_on_what_it_cannot_take() {
+        assert_eq!(uncompilable_source(Path::new("Blink.cs")), None, "C# is what they compile");
+        assert_eq!(uncompilable_source(Path::new("app.py")), Some(Uncompilable::Python));
+        assert_eq!(uncompilable_source(Path::new("notes.txt")), Some(Uncompilable::Other));
+    }
+
+    /// The predicate is shared and the SENTENCE is not. An earlier unification shared the finished
+    /// message, which put this verb's wording under `lamella run:` -- where it read "`--board`
+    /// builds one ahead of time", false of a verb whose `--board` runs on the host and is the one
+    /// mode a Python program has. This holds deploy's half to deploy's meaning.
+    #[test]
+    fn the_deploy_refusal_speaks_for_deploys_own_routes_only() {
+        let python = deploy_refusal(Path::new("app.py"), &Uncompilable::Python);
+        assert!(python.starts_with("lamella deploy: "), "its own verb: {python}");
+        assert!(python.contains("BUNDLE") && python.contains("wire-py"), "and the real route");
+        assert!(
+            !python.contains("deploy path is separate"),
+            "it must not point at a route that also refuses Python: {python}"
+        );
+        let other = deploy_refusal(Path::new("notes.txt"), &Uncompilable::Other);
+        assert!(other.contains("not a C# file"), "and says so plainly: {other}");
+    }
+}
+
 const USAGE: &str = "\
 usage: lamella deploy <file.cs> --target <t> [--no-run]   into firmware already on the board
        lamella deploy <file.cs> --board <id> [--via probe|volume] [--probe <s>]  onto the bare chip
@@ -176,15 +209,59 @@ fn send_payload(path: &Path, target: &str, no_run: bool) -> ExitCode {
     send_image(&image, target, no_run)
 }
 
-/// Compile `path` and send it to Lamella firmware already running at `target`.
-#[cfg(feature = "bake")]
-fn to_running_firmware(path: &Path, target: &str, no_run: bool) -> ExitCode {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("cs") {
-        eprintln!(
+/// What a source file is, when it is not something the ahead-of-time paths can compile.
+///
+/// **A LANGUAGE, NOT A SENTENCE.** Which sources can be compiled ahead of time is one fact and is
+/// shared. What to tell the reader is not: `--board` names a board MODEL to `deploy` and a module
+/// on THIS machine to `run`, so a consequence written for one verb is wrong in the other.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Uncompilable {
+    /// A language this project supports, on a path that cannot carry it.
+    Python,
+    /// Anything else -- no language claims the extension.
+    Other,
+}
+
+/// Whether `path` names a source the ahead-of-time paths cannot compile.
+///
+/// **ONE RULE, EVERY CALLER THAT COMPILES A SOURCE AHEAD OF TIME.** A route that answered this
+/// question for itself could disagree with the others by omission, and the answer is a property of
+/// the compiler rather than of any one verb.
+#[must_use]
+pub fn uncompilable_source(path: &Path) -> Option<Uncompilable> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("cs") => None,
+        Some("py") => Some(Uncompilable::Python),
+        _ => Some(Uncompilable::Other),
+    }
+}
+
+/// `deploy`'s wording for [`uncompilable_source`]. Both of ITS routes put a compiled image on a
+/// board, so neither takes Python and saying "use the other one" would be a circle.
+pub fn deploy_refusal(path: &Path, what: &Uncompilable) -> String {
+    match what {
+        Uncompilable::Python => format!(
+            "lamella deploy: {} is a Python program, and this verb compiles C#.\n\n\
+             Neither route of this verb takes one: `--target` sends a baked C# image and \
+             `--board`\nbuilds one ahead of time. A Python program reaches a board as a BUNDLE, \
+             which `lamella build`\nproduces, and whose host-side send is not a library call this \
+             tool can make yet -- `cargo run -p\nlamella-wire-host --example wire-py` drives it \
+             today.",
+            path.display()
+        ),
+        Uncompilable::Other => format!(
             "lamella deploy: {} is not a C# file. This verb deploys the baked C# image today; \
              `lamella build` produces the Python bundle, whose deploy path is separate.",
             path.display()
-        );
+        ),
+    }
+}
+
+/// Compile `path` and send it to Lamella firmware already running at `target`.
+#[cfg(feature = "bake")]
+fn to_running_firmware(path: &Path, target: &str, no_run: bool) -> ExitCode {
+    if let Some(what) = uncompilable_source(path) {
+        eprintln!("{}", deploy_refusal(path, &what));
         return ExitCode::FAILURE;
     }
     let source = match std::fs::read_to_string(&path) {

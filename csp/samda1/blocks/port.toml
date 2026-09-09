@@ -1,0 +1,102 @@
+# The SAMDA1 PORT block: the pin-mux and pin-config machinery, one PORT group per port letter
+# (the porta/portb instance rows carry the group bases). PMUX and PINCFG are PER-PIN ARRAYS:
+# the offsets below are the n = 0 element; element addresses derive as
+#   PMUX[n]   = group_base + 0x30 + n        (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
+#   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
+# The generator owns those derivations; drivers receive resolved addresses through their bindings.
+#
+# EVERY OFFSET HERE CAME OFF THE SAM DA1'S OWN 25.8 REGISTER DESCRIPTIONS, WHICH STATE ONE OFFSET
+# EACH IN PROSE, AND NOT OFF THE 25.7 REGISTER-SUMMARY TABLE. In that table each register occupies
+# four rows, one per byte lane, and carries its name and its offset on only the first of them -- so
+# the Offset column and the Name column advance at different rates.
+#
+# THE GROUP COUNT COMES FROM THE PAD SET, AS IT DOES ON THE SAMD20 AND UNLIKE ON THE SAMR21. This
+# document states the 0x80 group spacing twice -- 25.1 and 25.8.12 -- and bounds it neither time:
+# "Group 0 consists of the PA pins, group 1 is for the PB pins, etc.", and "The number of PORT
+# groups on a device may depend on the package/number of pins." So the bound is taken from the only
+# statement that carries one: Table 7-1's pad set reaches PB and stops, giving two groups.
+
+[table]
+kind = "block"
+family = "samda1"
+block = "port"
+sources = [
+    "SAM DA1 datasheet 40001895A section 25.8 register descriptions, each stating its own offset: DIR 0x00, DIRCLR 0x04, DIRSET 0x08, DIRTGL 0x0C, OUT 0x10, OUTCLR 0x14, OUTSET 0x18, OUTTGL 0x1C, IN 0x20, CTRL 0x24, WRCONFIG 0x28",
+    "40001895A section 25.8.12 PMUX (Offset: 0x30 + n*0x01 [n=0..15]) and 25.8.13 PINCFG (Offset: 0x40 + n*0x01 [n=0..31])",
+    "40001895A sections 25.1 and 25.8.12 for the 0x80 group spacing, stated in prose both times and bounded neither time",
+]
+notes = [
+    "PMUX[n] covers pins 2n (PMUXE, low nibble) and 2n+1 (PMUXO, high nibble); function values A..H = 0..7.",
+    "PINCFG: PMUXEN hands the pin to the muxed function; INEN enables the input buffer (required for any pin the peripheral READS -- an RX line, MISO).",
+    "TWO GROUPS ON THIS PART, and the count is the pad set's rather than the register descriptions'. The sibling samr21 states its own count in its offset expressions, as [x=0..2]; this document does not write them that way. The group bases are enumerated in instances.toml rather than derived by a consumer that assumes a number.",
+    "DRVSTR IS TRANSCRIBED FOR THE FAMILY AND IS MEANINGLESS ON TWO PADS. Ch 7 states that the port PA24 and PA25 does not have a Drive Strength option. The bit exists in the register, so it belongs in the field list a reader checks a write against; what does not follow is that every pad honours it.",
+    "PA24 AND PA25 ALSO CARRY ERRATUM 12368, WHICH BINDS THE MUX PATH RATHER THAN THIS BLOCK: a pull must be disabled BEFORE an alternative function is enabled on either pad, because the hardware does not disable it automatically. See parts.toml for the document's own words.",
+]
+
+[registers.DIR]
+offset = 0x00
+width = 32
+fields = { DIR = [0, 32] }
+notes = "The direction word, readable: 1 = output. A driver reporting a pin's CURRENT mode reads this rather than shadowing it, so a pin another driver configured is described honestly."
+
+[registers.DIRCLR]
+offset = 0x04
+width = 32
+fields = { DIRCLR = [0, 32] }
+notes = "Write 1s to make pins INPUTS."
+
+[registers.DIRSET]
+offset = 0x08
+width = 32
+fields = { DIRSET = [0, 32] }
+notes = "Write 1s to make pins outputs."
+
+[registers.OUT]
+offset = 0x10
+width = 32
+fields = { OUT = [0, 32] }
+notes = "The output drive level, readable. Load-bearing beyond writing a level: with PINCFG.PULLEN set on an INPUT pin, this bit SELECTS THE PULL DIRECTION (1 = pull-up, 0 = pull-down), so a driver offering InputPullUp/InputPullDown cannot be written without it."
+
+[registers.OUTCLR]
+offset = 0x14
+width = 32
+fields = { OUTCLR = [0, 32] }
+notes = "Write 1s to drive pins low."
+
+[registers.OUTSET]
+offset = 0x18
+width = 32
+fields = { OUTSET = [0, 32] }
+notes = "Write 1s to drive pins high."
+
+[registers.IN]
+offset = 0x20
+width = 32
+fields = { IN = [0, 32] }
+notes = "The input samples (INEN pins only)."
+
+[registers.PMUX0]
+offset = 0x30
+width = 8
+fields = { PMUXE = [0, 4], PMUXO = [4, 4] }
+notes = "Element 0 of the per-pin-pair mux array; see the block header for the element derivation. Section 25.8.12 states there are up to 16 of them per group, one for every set of two subsequent I/O lines."
+
+[registers.PINCFG0]
+offset = 0x40
+width = 8
+fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
+notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
+
+# Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
+# NOTE: THIS PART HAS TCC AND THE SAMD20 BESIDE IT DOES NOT, so Table 7-1 spends column F on TCC
+# where the samd20's Table 6-1 spends it on a second TC. A pin-map row carries the letter and this
+# table turns it into a nibble; what the letter SELECTS is Table 7-1's business.
+[constants]
+FUNC_A = 0
+FUNC_B = 1
+FUNC_C = 2
+FUNC_D = 3
+FUNC_E = 4
+FUNC_F = 5
+FUNC_G = 6
+FUNC_H = 7

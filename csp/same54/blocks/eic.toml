@@ -1,0 +1,133 @@
+# BLOCK: the SAM D5x/E5x external interrupt controller.
+#
+# IT IS NOT THE SAM D21's EIC AND THE TWO MUST NOT SHARE A LAYOUT. They carry the same name, the
+# same sixteen EXTINT lines and the same SENSE encoding, and their register maps agree at almost no
+# offset. The dangerous one is 0x14: it is WAKEUP on the SAM D21 and INTFLAG here. INTFLAG is
+# write-one-to-clear, so a driver carried across writes wake-enable bits into a pending-flag
+# register and silently discards interrupts it believed it was arming. The base differs too --
+# 0x40001800 there against 0x42001800 here, a different APB bridge.
+#
+# ONE NVIC LINE PER EXTINT, WHICH IS THE OTHER STRUCTURAL DIFFERENCE. EXTINT n is delivered on NVIC
+# line 12 + n, so sixteen vectors serve sixteen lines and the vector alone identifies which pad
+# fired. The SAM D21 delivers all sixteen on ONE line, where a handler is entered knowing nothing
+# and must read INTFLAG to find out. A dispatch design that assumes either shape is wrong on the
+# other: one needs a scan and the other must not pay for one.
+#
+# A LINE IS NOT A PAD. EXTINT is a peripheral function selected in the pad's PMUX, several pads
+# share one line, and only one of them can be the live source. The pad-to-line map is per-pad data
+# and lives in pins.toml.
+#
+# SIXTEEN LINES AND THE REGISTERS ARE SIXTEEN BITS WIDE, unlike the SAM D21's, whose interrupt and
+# wake registers carry bits up to 17 with nothing behind them. A consumer that sized a line count
+# from register width would get the right answer here and the wrong one there.
+#
+# PINSTATE IS A FACILITY THE SAM D21 DOES NOT HAVE, and it matters to anything that reports WHICH
+# WAY a pin moved. It returns the state of each EXTINT pin, so a handler can read the level from
+# this block rather than from PORT -- which means it does not depend on the pad's PINCFG.INEN being
+# set, and on that other family a cleared INEN makes PORT's IN read zero for ever whatever the pad
+# is doing. DEBOUNCEN and DPRESCALER are likewise absent there.
+
+[table]
+kind = "block"
+family = "same54"
+block = "eic"
+sources = [
+    "SAM D5x/E5x Family Data Sheet DS60001507F section 23.7 (EIC Register Summary): CTRLA 0x00, NMICTRL 0x01, NMIFLAG 0x02, SYNCBUSY 0x04, EVCTRL 0x08, INTENCLR 0x0C, INTENSET 0x10, INTFLAG 0x14, ASYNCH 0x18, CONFIG0 0x1C, CONFIG1 0x20, reserved through 0x2F, DEBOUNCEN 0x30, DPRESCALER 0x34, PINSTATE 0x38.",
+    "DS60001507F section 23.8.10, which states the CONFIG array as 'Offset: 0x1C + n*0x04 [n=0..1]' -- two registers, eight lines each, four bits per line.",
+    "DS60001507F section 23.8.13 (Pin State): 'These bits return the valid pin state of the debounced external interrupt pin EXTINTx', PINSTATE[15:0] at offset 0x38, read-only.",
+    "DS60001507F section 11 interrupt line mapping: the EIC module's sixteen sources EXTINT 0 through EXTINT 15 occupy NVIC lines 12 through 27, one line each, with RTC on line 11 below and FREQM on line 28 above.",
+    "DS60001507F product mapping: EIC at 0x42001800, between RTC at 0x42001400 and FREQM at 0x42001C00.",
+    "DS60001507F section 15.8.7 (APBA Mask), which states its own name APBAMASK, offset 0x14 within MCLK, and reset value 0x000007FF; bit 10 is 'EIC APBA Clock Enable'.",
+    "DS60001507F generic clock table: peripheral channel 7 is GCLK_EIC.",
+]
+notes = [
+    "THE APB CLOCK IS ON OUT OF RESET. APBAMASK's reset value is 0x000007FF, setting bits 0 through 10, and EIC is bit 10. GCLK_EIC is a separate gate that reset value says nothing about: the block's own description notes some functions need either a generic clock or the ultra-low-power 32 kHz clock, and that both are asynchronous to the APB interface clock.",
+    "THE PAC PROTECT REGISTER USES THE SAME BIT NUMBER FOR THE SAME PERIPHERAL. Bit 10 is 'EIC APBA Clock Enable' in MCLK's APBAMASK and 'EIC APB Protect Enable' in the peripheral access controller. The bit position cannot distinguish them and the sentence under it can, so an offset taken from a bit-layout figure without its prose is a coin flip between a clock and a write lock.",
+    "CTRLA CARRIES A CLOCK SELECT THE SAM D21's CTRL DOES NOT. CKSEL chooses between the generic clock and the ultra-low-power 32 kHz clock for the parts of this block that need one, which is a choice the older family does not offer and a driver written against it will not make.",
+    "THERE IS NO STATUS REGISTER. Synchronization is reported by a 32-bit SYNCBUSY at 0x04 rather than by a single byte, so a driver polling one byte for a busy flag is reading a different register than it thinks.",
+    "NMI IS A SEPARATE PIN, FLAG AND VECTOR, as on the older family: NMICTRL and NMIFLAG are its own registers, NMI is not in INTFLAG, and it reaches the core's NMI request rather than any of the sixteen NVIC lines.",
+]
+
+[registers.CTRLA]
+offset = 0x00
+width = 8
+fields = { SWRST = [0, 1], ENABLE = [1, 1], CKSEL = [4, 1] }
+notes = "Enable, software reset, and the clock select absent from the SAM D21's equivalent. The block is disabled out of reset, so a line configured before ENABLE raises nothing."
+
+[registers.NMICTRL]
+offset = 0x01
+width = 8
+fields = { NMISENSE = [0, 3], NMIFILTEN = [3, 1], NMIASYNCH = [4, 1] }
+notes = "The non-maskable pin's sense, filter and asynchronous-detection controls. NMIASYNCH has no counterpart on the SAM D21."
+
+[registers.NMIFLAG]
+offset = 0x02
+width = 16
+fields = { NMI = [0, 1] }
+notes = "SIXTEEN BITS WIDE HERE AND EIGHT ON THE SAM D21, which is why the register after it starts at 0x04 rather than 0x03. Write-one-to-clear, and not part of INTFLAG."
+
+[registers.SYNCBUSY]
+offset = 0x04
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1] }
+notes = "Synchronization status for the two write-synchronized bits in CTRLA. A driver that sets ENABLE and immediately writes CONFIG can have the write discarded while either bit is set."
+
+[registers.EVCTRL]
+offset = 0x08
+width = 32
+fields = { EXTINTEO = [0, 16] }
+notes = "One event-output enable per line, routing a detection to the event system instead of or as well as an interrupt."
+
+[registers.INTENCLR]
+offset = 0x0C
+width = 32
+fields = { EXTINT = [0, 16] }
+notes = "Write ones to DISABLE lines. Paired with INTENSET so an enable is never a read-modify-write and a concurrent change to another line cannot be lost."
+
+[registers.INTENSET]
+offset = 0x10
+width = 32
+fields = { EXTINT = [0, 16] }
+notes = "Write ones to ENABLE lines. Enabling connects a configured line to its own NVIC vector; CONFIG alone only decides what counts as a detection."
+
+[registers.INTFLAG]
+offset = 0x14
+width = 32
+fields = { EXTINT = [0, 16] }
+notes = "WRITE-ONE-TO-CLEAR, and clearing it is not optional: a handler returning without writing the bit re-enters immediately. THIS OFFSET IS WAKEUP ON THE SAM D21, so a driver carried between the two families writes wake-enable bits here and clears pending interrupts instead."
+
+[registers.ASYNCH]
+offset = 0x18
+width = 32
+fields = { ASYNCH = [0, 16] }
+notes = "Per-line asynchronous detection, which lets a line be detected with no clock running at all. Absent on the SAM D21, where asynchronous edge detection is a property of the sense configuration rather than a separate enable."
+
+[registers.CONFIG0]
+offset = 0x1C
+width = 32
+fields = { SENSE0 = [0, 3], FILTEN0 = [3, 1], SENSE1 = [4, 3], FILTEN1 = [7, 1], SENSE2 = [8, 3], FILTEN2 = [11, 1], SENSE3 = [12, 3], FILTEN3 = [15, 1], SENSE4 = [16, 3], FILTEN4 = [19, 1], SENSE5 = [20, 3], FILTEN5 = [23, 1], SENSE6 = [24, 3], FILTEN6 = [27, 1], SENSE7 = [28, 3], FILTEN7 = [31, 1] }
+notes = "Lines 0 through 7. The suffix is the position within the register rather than the line number, which matters only for CONFIG1. SENSE selects none, rising, falling, both, high or low; FILTEN adds a majority filter that needs a clock."
+
+[registers.CONFIG1]
+offset = 0x20
+width = 32
+fields = { SENSE0 = [0, 3], FILTEN0 = [3, 1], SENSE1 = [4, 3], FILTEN1 = [7, 1], SENSE2 = [8, 3], FILTEN2 = [11, 1], SENSE3 = [12, 3], FILTEN3 = [15, 1], SENSE4 = [16, 3], FILTEN4 = [19, 1], SENSE5 = [20, 3], FILTEN5 = [23, 1], SENSE6 = [24, 3], FILTEN6 = [27, 1], SENSE7 = [28, 3], FILTEN7 = [31, 1] }
+notes = "Lines 8 through 15. Its SENSE0 configures EXTINT[8], which is the one place the within-register suffix and the line number part company."
+
+[registers.DEBOUNCEN]
+offset = 0x30
+width = 32
+fields = { DEBOUNCEN = [0, 16] }
+notes = "A per-line hardware debouncer with no counterpart on the SAM D21, whose timing comes from DPRESCALER. Note the gap: 0x24 through 0x2F are reserved, so this does not follow CONFIG1 contiguously."
+
+[registers.DPRESCALER]
+offset = 0x34
+width = 32
+fields = { PRESCALER0 = [0, 3], STATES0 = [3, 1], PRESCALER1 = [4, 3], STATES1 = [7, 1], TICKON = [16, 1] }
+notes = "The debouncer's sampling period and the number of agreeing samples it requires, in two groups covering lines 0-7 and 8-15, plus TICKON selecting which clock ticks it."
+
+[registers.PINSTATE]
+offset = 0x38
+width = 32
+fields = { PINSTATE = [0, 16] }
+notes = "READ-ONLY, and the register that lets a handler answer which way a pin moved without touching PORT. Its own description is precise about what it returns: the valid pin state of the DEBOUNCED external interrupt pin, so a consumer not using the debouncer should establish that is the reading it wants."

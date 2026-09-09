@@ -4,10 +4,93 @@ use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use lamella_syntax::ast::{Parameter, ParameterModifier, TypeRef, TypeRefKind};
 
+/// The most elements one `System.ValueTuple` holds before the rest nest inside it.
+///
+/// ECMA-335 has no tuple; `ValueTuple` is eight ordinary generic structs, and the eighth's last
+/// type parameter is `TRest`, which by convention holds another one. So a tuple of nine is
+/// `ValueTuple<T1..T7, ValueTuple<T8, T9>>` -- and the runtime, `ToString`, equality and
+/// `TupleElementNamesAttribute` all agree on that shape because they were all written to it.
+const TUPLE_CHUNK: usize = 7;
+
+/// The `System.ValueTuple<...>` a tuple type IS (C# 7.0, 8.3.11).
+///
+/// **NOT A CONVERSION AND NOT A LOWERING -- AN IDENTITY.** `(int, string)` and
+/// `System.ValueTuple<int, string>` are the same type: each converts to the other by the identity
+/// conversion, they share every member, and metadata has only the second name for either. So the
+/// binder answers with the instantiation and no pass after this one has to know what a tuple is.
+///
+/// Past seven elements the rest nest in `TRest`, one chunk of seven at a time, which is what csc
+/// emits and what the runtime's own `ToString` walks.
+/// One `System.ValueTuple` over exactly these arguments, WITHOUT the chunking.
+///
+/// For a caller whose list is already in the eight-slot shape -- seven elements and a nested rest
+/// -- because [`value_tuple`] would then split it a SECOND time and wrap the rest twice. That is
+/// not hypothetical: it is what a fifteen-element tuple did, producing a
+/// `ValueTuple<ValueTuple<int>>` where the type said `ValueTuple<int>`.
+#[must_use]
+pub fn value_tuple_exact(arguments: &[TypeSymbol]) -> TypeSymbol {
+    TypeSymbol::Instantiation {
+        definition: alloc::vec![
+            alloc::boxed::Box::from("System"),
+            alloc::boxed::Box::from("ValueTuple")
+        ]
+        .into_boxed_slice(),
+        arguments: arguments.to_vec().into_boxed_slice(),
+    }
+}
+
+#[must_use]
+pub fn value_tuple(elements: &[TypeSymbol]) -> TypeSymbol {
+    let definition: alloc::boxed::Box<[alloc::boxed::Box<str>]> =
+        alloc::vec![alloc::boxed::Box::from("System"), alloc::boxed::Box::from("ValueTuple")]
+            .into_boxed_slice();
+    if elements.len() > TUPLE_CHUNK {
+        let mut arguments: alloc::vec::Vec<TypeSymbol> = elements[..TUPLE_CHUNK].to_vec();
+        arguments.push(value_tuple(&elements[TUPLE_CHUNK..]));
+        return TypeSymbol::Instantiation {
+            definition,
+            arguments: arguments.into_boxed_slice(),
+        };
+    }
+    TypeSymbol::Instantiation {
+        definition,
+        arguments: elements.to_vec().into_boxed_slice(),
+    }
+}
+
+/// The element names a TUPLE TYPE was written with, or EMPTY when the type is not a tuple.
+///
+/// Empty means NOT A NAMED TUPLE, never "a tuple whose elements are all unnamed": a tuple that
+/// named NONE of its elements has no names to record and needs none, so the two collapse and the
+/// distinction has nothing to decide. An element the source left unnamed inside one that named
+/// others is `None` in place -- `(int a, int)` is legal and is `[Some("a"), None]`.
+///
+/// SHALLOW. `((int a, int b) x, int y)` records `x` and `y`, and the inner pair's names ride with
+/// the inner TYPE REFERENCE wherever that is recorded. Flattening them here would produce a list
+/// that no longer lines up with the tuple's own elements, which is what every consumer indexes by.
+#[must_use]
+pub fn tuple_element_names(type_ref: &TypeRef) -> alloc::vec::Vec<Option<alloc::boxed::Box<str>>> {
+    let TypeRefKind::Tuple(elements) = &type_ref.kind else {
+        return alloc::vec::Vec::new();
+    };
+    if elements.iter().all(|element| element.name.is_none()) {
+        return alloc::vec::Vec::new();
+    }
+    elements
+        .iter()
+        .map(|element| element.name.as_ref().map(|name| name.text.clone()))
+        .collect()
+}
+
 /// Binds a syntactic type reference to a [`TypeSymbol`] (11.1).
 #[must_use]
 pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
     match &type_ref.kind {
+        TypeRefKind::Tuple(elements) => {
+            let bound: alloc::vec::Vec<TypeSymbol> =
+                elements.iter().map(|element| bind_type(&element.ty)).collect();
+            value_tuple(&bound)
+        }
         TypeRefKind::Predefined(predefined) => {
             TypeSymbol::Special(SpecialType::from_predefined(*predefined))
         }

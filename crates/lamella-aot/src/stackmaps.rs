@@ -1,7 +1,7 @@
 //! The GC stack-map RECORD MODEL shared by every record-emitting backend: the `.lamella_stackmaps`
 //! record modes and root kinds, the record encoder, the anchor-seam extern list the PINNED analysis
 //! keys on, and one assembly's GLOBAL-roots statics record. ARM32 and RISC-V emit the SAME
-//! byte format (`lamella-link` gathers both machines' records into one pointer table, and each
+//! byte format (`lamella-linker` gathers both machines' records into one pointer table, and each
 //! target's runtime-support walker reads the same layout), so the model lives here rather than
 //! being forked per backend. Per-target pieces stay in the backends: which slot a value lives in
 //! ([`crate::arm32`]'s `spilled_slot_offsets` vs the RISC-V spilled frame) and each function's
@@ -42,8 +42,8 @@ pub const STACKMAP_KIND_MANAGED_PTR: u16 = 1;
 /// live, because the frame (a runtime seam body) derived a raw native pointer from it that a parked
 /// native callee still holds (e.g. `recv_poll`'s buffer across an Io park).
 pub const STACKMAP_KIND_PINNED: u16 = 2;
-/// Root kind: a Python tagged value -- traced only when its tag marks a heap pointer (reserved on
-/// the C# lane; the Python lowering's `PyValue` slots take it).
+/// Root kind: a Python tagged value -- traced only when its tag marks a heap pointer (reserved for
+/// the C# tier; the Python lowering's `PyValue` slots take it).
 pub const STACKMAP_KIND_TAGGED: u16 = 3;
 
 /// The sentinel `ValueType` layout handle marking a one-word ObjectRef CELL: an ADDRESS-taken
@@ -161,6 +161,8 @@ pub(crate) const ANCHOR_SEAM_EXTERNS: &[&str] = &[
     "lamella_string_substring",
     "lamella_char_to_string",
     "lamella_double_to_string",
+    "lamella_double_to_fixed",
+    "lamella_double_to_exponential",
     "lamella_gc_walk_roots",
     "lamella_gc_count_roots",
 ];
@@ -168,7 +170,7 @@ pub(crate) const ANCHOR_SEAM_EXTERNS: &[&str] = &[
 /// One assembly's static region as the OBJECT path emits it: the linker-placed region
 /// symbol's identity, its byte size, and its GLOBAL-roots (mode 2) stack-map record rows. The
 /// region has NO fixed address -- every `ldsfld`/`stsfld` and the record's base word carry
-/// relocations against `__lamella_statics_<suffix>`, and `lamella-link` places the region in a RAM
+/// relocations against `__lamella_statics_<suffix>`, and `lamella-linker` places the region in a RAM
 /// window and defines the symbol. The record's `func_addr` word is therefore emitted 0 + reloc
 /// (exactly like a method record's), so the walker reads the LINKED base with no format change.
 #[derive(Debug, Clone, Default)]

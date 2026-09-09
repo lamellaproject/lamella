@@ -94,3 +94,12 @@ pll_sys_postdiv2 = 2
 pll_usb_fbdiv = 100
 pll_usb_postdiv1 = 5
 pll_usb_postdiv2 = 5
+
+[debug]
+signals = ["swd"]
+exposure = "pads"
+fitted = "no"
+pitch_mm = 2.54
+onboard = "none"
+recovery = "mask-rom"
+source = "Raspberry Pi Pico 2 Datasheet: the RP2350 Serial Wire Debug interface reaches a 3 pin debug header on the lower edge of the board. The datasheet names a header and does not state that a connector is fitted; the same document says the board is designed to use soldered 0.1 inch pin-headers, so the three positions are a through-hole footprint rather than something a cable lands on. RP2350 Datasheet section 4.1: 32 kB of mask ROM, a physically immutable memory resource, and the datasheet states elsewhere that the mask ROM is inherently unwritable. The recovery path is in silicon and no image written to flash can remove it."

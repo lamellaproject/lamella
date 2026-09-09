@@ -9,11 +9,9 @@ use crate::{format, String};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Absence {
     Await,
-    PromiseFinally,
     Eval,
     FunctionConstructor,
     StringNormalize,
-    MathRandom,
 }
 
 impl Absence {
@@ -22,11 +20,9 @@ impl Absence {
     pub fn id(self) -> &'static str {
         match self {
             Absence::Await => "await",
-            Absence::PromiseFinally => "promise-finally",
             Absence::Eval => "eval",
             Absence::FunctionConstructor => "function-constructor",
             Absence::StringNormalize => "string-normalize",
-            Absence::MathRandom => "math-random",
         }
     }
 
@@ -35,15 +31,11 @@ impl Absence {
     pub fn message(self) -> &'static str {
         match self {
             Absence::Await => "await is not in this profile",
-            Absence::PromiseFinally => "Promise.prototype.finally is not in this profile",
             Absence::Eval => "eval compiles source at run time and is not in this profile",
             Absence::FunctionConstructor => {
                 "the Function constructor compiles source at run time and is not in this profile"
             }
             Absence::StringNormalize => "String.prototype.normalize is not in this profile",
-            Absence::MathRandom => {
-                "Math.random needs a per-realm entropy source and is not in this profile"
-            }
         }
     }
 
@@ -88,11 +80,9 @@ impl Absence {
     pub fn all() -> &'static [Absence] {
         &[
             Absence::Await,
-            Absence::PromiseFinally,
             Absence::Eval,
             Absence::FunctionConstructor,
             Absence::StringNormalize,
-            Absence::MathRandom,
         ]
     }
 }
@@ -105,24 +95,33 @@ impl Absence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxAbsence {
     Class(&'static str),
-    /// A `yield` that is not a statement of its own: one in an OPERAND, inside a loop or a `try`,
-    /// or a delegating `yield*`.
+    /// A `yield` in a position the state-machine transform cannot cut the body at.
     ///
     /// **SUSPENSION IS PRESENT.** `function* g() { a; yield x; b; }` is rewritten into a state
     /// machine and runs one step per `next()`, and the generator object, its protocol and all four
-    /// states behave as the standard says. What is absent is every shape that needs machinery the
-    /// dispatch does not have:
+    /// states behave as the standard says. So do `while`, `do`, `for`, `if`, `break`, `continue`,
+    /// `for`-`of`, `try`/`catch`, and `try`/`finally` -- including a finalizer that itself suspends,
+    /// and one run because the consumer called `return()` -- and a `yield` standing as the value of an
+    /// assignment, a declarator or a `return`.
     ///
-    /// - **an operand** -- `var a = yield x`, `f(yield x)` -- needs the partly-evaluated operand
-    ///   stack spilled into the frame, because `a + (yield b)` suspends with `a` already computed;
-    /// - **a loop** -- the loop's own state has to become states of the machine;
-    /// - **a `try`** -- the handler stack has to be re-entered on resumption, and a `finally` around
-    ///   a `yield` must run when the consumer calls `return()` rather than only on the normal path;
-    /// - **`yield*`** -- a forwarding loop over the inner iterator, with the `IteratorClose` rules.
+    /// **A `yield*` RUNS IN THOSE SAME FOUR POSITIONS.** It delegates to the inner iterator as
+    /// 15.5.5 specifies: `throw()` and `return()` are handed to the delegate's own methods rather
+    /// than acted on in the outer body, a delegate with no `throw` method is closed before the
+    /// protocol violation is reported, a delegate may decline to finish, and the result object the
+    /// delegate answers is forwarded to the consumer unchanged rather than rebuilt.
+    ///
+    /// **AND A SUSPENSION NESTED INSIDE A LARGER EXPRESSION RUNS.** `f(yield x)`, `a + (yield b)`,
+    /// `yield yield 1`, `yield [...yield]` and `{ [yield k]: v }` are linearized: the operands
+    /// evaluated before the suspension are parked in frame slots and the expression is rebuilt from
+    /// them afterwards, so `a` in `a + (yield b)` keeps the value it had when it was read.
     ///
     /// Each is refused where it is written rather than mis-executed, and by the transform itself:
     /// a shape is supported exactly when the transform rewrites it, so this list cannot drift from
     /// what the engine does.
+    ///
+    /// A refusal names the ONE position it found, in these same words. Naming every position at
+    /// once told a user nothing about which one they had written, and left the compiler unable to
+    /// count them.
     Yield,
     AsyncFunctions,
     BigIntLiterals,
@@ -152,8 +151,26 @@ impl SyntaxAbsence {
             SyntaxAbsence::Class("class-static-blocks") => "class static blocks",
             SyntaxAbsence::Class(_) => "a class feature",
             SyntaxAbsence::Yield => {
-                "a `yield` in an operand, inside a loop or a `try`, or a delegating `yield*` -- a \
-                 `yield` between statements is rewritten into a state machine and runs"
+                "a `yield` in a loop or `if` condition, in a `for` header, in a `for`-`in`, in a \
+                 `for`-`of` head, in a `catch` parameter, inside a `catch` that destructures \
+                 its parameter or assigns it, inside a labelled statement, a `switch` or a \
+                 `with`, in the operand of a `throw`, or in a class's computed member name; and, \
+                 among the positions inside a larger expression, \
+                 in an array spread that a later suspension follows, in a template substitution \
+                 that a later suspension follows, in an argument of a method call, in the \
+                 arguments of a `new`, in a tagged template's substitution, in the operand of an \
+                 increment, in the value of a compound assignment to a member, or in an arrow's \
+                 parameter \
+                 default; a `return` written in a `catch` that a `finally` encloses, and a `break` \
+                 or `continue` whose loop is outside the `finally` it would have to leave; and a \
+                 `let` or `const` in a body that suspends -- a `yield`, or a delegating `yield*`, \
+                 standing as a whole statement, as the whole value of a declarator, a `return`, \
+                 or a plain assignment to a name, to a member or to a destructuring pattern, \
+                 or nested inside a larger expression whose other operands can be \
+                 parked in the frame, is rewritten into a control-flow graph and runs, including \
+                 inside `while`, `do`, `for`, `if`, the BODY of a `for`-`of`, a `try` whose \
+                 handler is a `catch`, and a `try` that has a `finally`, and across `break` and \
+                 `continue`"
             }
             SyntaxAbsence::AsyncFunctions => "async functions and methods",
             SyntaxAbsence::BigIntLiterals => "BigInt literals, whose arithmetic is a second numeric tower",

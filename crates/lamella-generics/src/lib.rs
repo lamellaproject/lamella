@@ -889,7 +889,7 @@ impl<'a> Program<'a> {
     ///
     /// This module walked the blob itself for a few hours because `lamella-metadata` exposed no
     /// decoder for this one shape, finding each argument's end by the shortest prefix `parse_type`
-    /// accepted. `parse_method_spec` landed in `5eeb2dd961` and retires that: **one decoder owns
+    /// accepted. `parse_method_spec` retires that: **one decoder owns
     /// the format, with no shape left over.**
     fn method_spec_arguments(
         &self,
@@ -1467,7 +1467,7 @@ pub struct MonoBody {
 ///
 /// # Why this is carried rather than re-derived
 ///
-/// **THE COLLECTOR ALREADY KNOWS, AND ASKING AGAIN IS THIS LANE'S RECURRING BUG CLASS.** Deciding
+/// **THE COLLECTOR ALREADY KNOWS, AND ASKING AGAIN IS A RECURRING BUG CLASS.** Deciding
 /// "which assembly is this rid in" a second time, at the emitter, means two answers that agree
 /// until one of them meets a case the other does not -- and the disagreement is silent, because
 /// `assembly.method(rid)` returns a perfectly good method from the WRONG assembly. So the owner is

@@ -25,7 +25,6 @@ const KERN_SUCCESS: IOReturn = 0;
 const REPORT_TYPE_OUTPUT: u32 = 1;
 const CF_NUMBER_SINT32: CFIndex = 3;
 const UTF8: CFStringEncoding = 0x0800_0100;
-const REPORT_MAX: usize = 64;
 
 /// The C input-report callback: `(context, result, sender, type, reportID, report, length)`.
 type InputReportCallback =
@@ -212,7 +211,9 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
 /// The input state shared with the IOKit callback. Boxed so its address is stable: the
 /// report buffer is registered with IOKit and `context` points back at this struct.
 struct Inner {
-    report: [u8; REPORT_MAX],
+    /// The buffer IOKit was told to deliver input reports INTO, sized from the device's own
+    /// `MaxInputReportSize` -- see [`Device::open_chosen`] for why the size is not a constant.
+    report: Vec<u8>,
     received: CFIndex,
 }
 
@@ -228,6 +229,23 @@ extern "C" fn on_input_report(
     unsafe {
         (*context.cast::<Inner>()).received = length;
     }
+}
+
+/// The input-report size to register for `device`: what the device says, or the crate's fallback
+/// where it says nothing.
+///
+/// **The device's own answer, not a constant, because HID report sizes are not 64 across probes.**
+/// A CMSIS-DAP v1 interface is classically 64 bytes, and an Atmel/Microchip EDBG -- which every
+/// Xplained Pro kit carries -- uses 512. IOKit will not deliver a report larger than the buffer
+/// registered for it, so a fixed 64-byte registration on such a probe silently receives nothing.
+/// The rule, and why it lives one layer up, is [`crate::report_len_or_default`].
+///
+/// `MaxInputReportSize` is the report PAYLOAD size here. Windows reports the same thing INCLUDING
+/// the leading report-id byte, so each backend sizes for its own API and the two numbers
+/// legitimately differ by one for the same device.
+unsafe fn input_report_len(device: IOHIDDeviceRef) -> usize {
+    let reported = unsafe { device_u16(device, "MaxInputReportSize") };
+    crate::report_len_or_default(reported.map(usize::from), crate::DEFAULT_REPORT_LEN)
 }
 
 pub struct Device {
@@ -278,15 +296,16 @@ impl Device {
                 CFRelease(manager);
                 return Err(Error::Os("IOHIDDeviceOpen failed".into()));
             }
+            let in_len = input_report_len(device);
             let mut inner = Box::new(Inner {
-                report: [0; REPORT_MAX],
+                report: vec![0u8; in_len],
                 received: -1,
             });
             let context: *mut c_void = (&mut *inner as *mut Inner).cast();
             IOHIDDeviceRegisterInputReportCallback(
                 device,
                 inner.report.as_mut_ptr(),
-                REPORT_MAX as CFIndex,
+                in_len as CFIndex,
                 on_input_report,
                 context,
             );
@@ -322,7 +341,9 @@ impl Device {
         unsafe {
             loop {
                 if self.inner.received >= 0 {
-                    let n = (self.inner.received as usize).min(buf.len());
+                    let n = (self.inner.received as usize)
+                        .min(buf.len())
+                        .min(self.inner.report.len());
                     buf[..n].copy_from_slice(&self.inner.report[..n]);
                     return Ok(n);
                 }

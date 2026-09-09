@@ -25,9 +25,10 @@ lamella-token = { path = "../lamella-token" }
 lamella-elf = { path = "../lamella-elf" }
 
 [dev-dependencies]
+lamella-dwarf = { path = "../lamella-dwarf" }
 lamella-flash-format = { path = "../lamella-flash-format" }
 lamella-wasm-interp = { path = "../lamella-wasm-interp" }
-lamella-link = { path = "../lamella-link" }
+lamella-linker = { path = "../lamella-linker" }
 lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam" }

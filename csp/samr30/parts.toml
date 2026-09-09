@@ -1,0 +1,65 @@
+# The SAMR30 parts table. The SAM R30 is a SAM L21 die and an AT86RF212B sub-1 GHz transceiver in
+# one package, and the classification is not a guess from the name: THE DOCUMENT'S OWN RUNNING
+# HEADER READS "SAM R30 -- Reference Guide - SAM L21" on all 1,163 pages. So the sibling by name is
+# the SAM R21 and the sibling by silicon is the SAM L21, and where the two disagree the L21 wins.
+#
+#     block       SAM R21       SAM R30
+#     PORT        0x41004400    0x40002800     <- the L21's, behind AHB-APB Bridge A
+#     SERCOM0     0x42000800    0x42000000     <- the L21's
+#     clock       SYSCTRL       MCLK/PCHCTRL   <- the L21's arm, not the R21's
+#
+# WHAT THE RADIO COSTS, STATED IN THE ONE FIGURE THAT CARRIES IT, AND IT IS THE SAME FIGURE IN BOTH
+# PACKAGES. Ch 2 of each family's own datasheet gives the general-purpose I/O count per pin count:
+#
+#     package    SAM L21     SAM R30     spent on the transceiver
+#     48-pin       37          28                 9
+#     32-pin       25          16                 9
+#
+# Nine pads either way -- the radio's SPI, its control and status lines, its own 16 MHz crystal and
+# the RF differential pair. The sibling SAM R21 costs ten against its SAM D21 host and also lands on
+# 28 in a 48-pin package, which is a coincidence of two different subtractions rather than a shared
+# fact.
+#
+# THE RADIO SPENDS SERCOM4, AND THE REFUSAL HERE IS WEAKER THAN THE SAM R21'S BY A REAL AMOUNT.
+# On the R21, SERCOM4's pads reach NO package pin at all -- the instance is unreachable from
+# outside the package and the refusal is absolute. On this part Table 7-1 ALSO places SERCOM4 on
+# four bonded pads, PA12..PA15 in column D, so the instance is CONTENDED rather than unreachable:
+# a program may have the radio or those four pads, never both. The two parts differ by a countable
+# amount: SERCOM4 appears ZERO times in the R21's Table 5-1 and FOUR times in this part's Table 7-1.
+#
+# THIS PART HAS TWO RAM REGIONS AND THE SCHEMA HAS ONE FIGURE, exactly as its SAM L21 host die
+# does. Ch 2 states System SRAM and Low Power SRAM as separate rows -- 32 KB and 8 KB -- at
+# different addresses in different power domains. The `ram` field below is the SYSTEM SRAM alone,
+# which is the contiguous span a linker can believe, and the low-power region is
+# documented-excluded rather than summed.
+
+[table]
+kind = "parts"
+family = "samr30"
+sources = [
+    "SAM R30 IEEE 802.15.4 Sub-GHz System-in-Package Datasheet DS70005303C (2021): ch 1 (description), ch 2 (configuration summary), ch 7 (I/O multiplexing and considerations), ch 13.2 (peripherals configuration summary)",
+    "SAM L21 Family Data Sheet DS60001477E ch 2, for the General Purpose I/O-pins row alone -- 51/37/25 across its 64/48/32-pin packages -- which is what the pad-cost table in the header above subtracts from. No other value here comes from that document.",
+]
+notes = [
+    "THE PAD LIST IS COMPLETE FOR THE G PACKAGE AND IS CHECKED AGAINST AN INDEPENDENTLY PRINTED COUNT. Table 7-1's SAMR30G column numbers each pad, and ch 2's 'General Purpose I/O-pins (GPIOs)' row gives 28 for the 48-pin part. The list counts 28.",
+    "SERCOM4 IS THE RADIO'S AND A BOARD MUST NOT BIND IT. Ch 2 counts the instances '5+1' for the G and '4+1' for the E, and its own note 1 reads 'SERCOM4 is internally connected to the AT86RF212B'. Table 7-2 shows the whole SPI on peripheral function F: MISO PC19 PAD[0], SEL PB31 PAD[1], MOSI PB30 PAD[2], SCLK PC18 PAD[3].",
+    "AND THAT REFUSAL IS CONTENTION, NOT UNREACHABILITY -- SEE THE HEADER. Table 7-1 puts SERCOM4/PAD[0..3] on PA12, PA13, PA14 and PA15 in column D, all four bonded on the G. The SAM R21's identical-sounding refusal rests on a stronger fact that is NOT true here.",
+    "PA10, PA11, PB16 AND PB17 CANNOT BE CONFIGURED AS OUTPUTS -- section 7.2 states it in words, and the reason is that they are permanently connected to the RFCTRL inputs. They are not in the pad list below and a pin-map row naming one must be refused rather than accommodated.",
+    "THREE PORT GROUPS ON THE DIE AND THE PAD SET REACHES TWO. Group C exists -- Table 7-2 names PC16, PC18 and PC19 as the transceiver's CLKM, SCLK and MISO -- and no package pin on either part reaches it.",
+    "TABLE 7-4 NAMES TWO PADS THIS PART DOES NOT BOND, AND IT IS THE ONLY PLACE THEY APPEAR. Its XOSC32K jitter recommendation for the 48-pin package reads 'PB02, PB03, PA02, PA03'. PA02 and PA03 occur exactly twice in 1,163 pages, both in that one row, and never in the kit guide; Table 7-1 gives them no package pin and ch 2's count of 28 is satisfied without them. Two sources agree against one, so the pad list omits them -- recorded because a reader meeting Table 7-4 first would add two pads that do not exist.",
+    "THE E PART IS NOT DECLARED HERE. Ch 2 gives the SAM R30E 32 pins, 16 GPIOs and '4+1' SERCOM instances against the G's '5+1', and the document does not say which instance the smaller count drops. No board on this roster is an E part, and a part row would have to state that number without a source for it.",
+    "THE LOW POWER SRAM IS NOT IN THE `ram` FIGURE. Ch 2 rows it separately at 8 KB. A program that wants it is asking for a second region at its own address, which nothing in this schema can express yet.",
+]
+
+[[parts]]
+part = "atsamr30g18a"
+package = "48-pin QFN"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "PA00-PA01", "PA04-PA09", "PA12-PA19", "PA22-PA25",
+    "PA27-PA28", "PA30-PA31",
+    "PB02-PB03", "PB22-PB23",
+]
+source = "DS70005303C Table 7-1 (Port Function Multiplexing), whose SAMR30G column gives a package pin number for each pad above: PA00 1, PA01 2, PA04 9, PA05 10, PA06 11, PA07 12, PA08 15, PA09 16, PA12 21, PA13 22, PA14 23, PA15 24, PA16 25, PA17 26, PA18 27, PA19 28, PA22 31, PA23 32, PA24 33, PA25 34, PB22 37, PB23 38, PA27 39, PA28 41, PA30 45, PA31 46, PB02 47, PB03 48. The list counts 28 and ch 2's SAM R30G column states 28 General Purpose I/O-pins. Flash 256 KB and System SRAM 32 KB are ch 2's rows for the G; the part also carries an 8 KB Flash RWW section and 8 KB of Low Power SRAM, both rowed separately there and deliberately not summed here."
+

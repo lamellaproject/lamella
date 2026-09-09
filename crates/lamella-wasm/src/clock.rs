@@ -51,7 +51,7 @@ fn wall_unix_millis() -> u64 {
 
 /// Installs the host clock seam on `vm`. Call this on every `Vm` this crate creates -- a `Vm` without it
 /// reports a frozen clock and a `Thread.Sleep` that does not sleep, with no diagnostic.
-pub fn install(vm: &mut lamella_cil_runtime::Vm) {
+pub fn install(module: &lamella_cil_runtime::Module, vm: &mut lamella_cil_runtime::Vm) {
     vm.set_clock(now_millis, sleep_millis);
 
     let unix_millis = wall_unix_millis();
@@ -62,7 +62,7 @@ pub fn install(vm: &mut lamella_cil_runtime::Vm) {
             .and_then(|ms| ms.checked_mul(10_000))
             .and_then(|t| t.checked_add(UNIX_EPOCH_IN_NET_TICKS));
         if let Some(ticks) = ticks {
-            vm.set_now_ticks(ticks);
+            lamella_cil_runtime::set_wall_clock(module, vm, ticks);
         }
     }
 }

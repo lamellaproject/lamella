@@ -299,6 +299,7 @@ impl Folder<'_> {
     fn children(&mut self, expr: &mut Expr) -> Result<(), BoardFactError> {
         match expr {
             Expr::Int(_)
+            | Expr::Ellipsis
             | Expr::Float(_)
             | Expr::Imaginary(_)
             | Expr::BigInt(_)
@@ -504,7 +505,7 @@ impl Folder<'_> {
             }
             StmtKind::ClassDef { bases, body, .. } => {
                 for base in bases {
-                    self.expr(base)?;
+                    self.expr(base.expr_mut())?;
                 }
                 self.body(body)
             }

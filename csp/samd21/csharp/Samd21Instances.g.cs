@@ -39,5 +39,8 @@ namespace Lamella.Generated
         public const uint GCLK_BASE = 0x40000C00;
         public const uint PORTA_BASE = 0x41004400;
         public const uint PORTB_BASE = 0x41004480;
+        public const uint EIC_BASE = 0x40001800;
+        public const uint EIC_GCLK_CORE_ID = 5;
+        public const uint EIC_IRQ = 4;
     }
 }

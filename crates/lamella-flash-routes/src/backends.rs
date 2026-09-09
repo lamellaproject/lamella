@@ -1,4 +1,4 @@
-//! The flashing backends this lane owns, implemented against the contract.
+//! The flashing backends, implemented against the contract.
 
 use lamella_cmsis_dap_nrf::Nrf51Flash;
 use lamella_cmsis_dap_sam::{
@@ -424,7 +424,8 @@ impl FlashBackend for Uf2Volume {
             None => match mounted.as_slice() {
                 [] => {
                     return Err(FlashError::Refused(
-                        "no board is in its bootloader. Hold BOOTSEL while plugging the board in                          (or press RESET
+                        "no board is in its bootloader. Hold BOOTSEL while plugging the board in \
+                         (or press RESET
 with BOOTSEL held), and it will appear as a drive."
                             .to_owned(),
                     ));
@@ -434,10 +435,12 @@ with BOOTSEL held), and it will appear as a drive."
                     let list: Vec<&str> =
                         several.iter().map(|found| found.volume.as_str()).collect();
                     return Err(FlashError::Refused(format!(
-                        "{} boards are in their bootloader and nothing on a volume tells them                          apart: {}
+                        "{} boards are in their bootloader and nothing on a volume tells them \
+                         apart: {}
 
 Name one with --probe <volume>. Their labels and their                          INFO_UF2.TXT files are identical, so
-this will not guess -- the wrong                          choice puts your program on somebody else's board.",
+this will not guess -- the wrong \
+                         choice puts your program on somebody else's board.",
                         several.len(),
                         list.join(", ")
                     )));
@@ -447,7 +450,8 @@ this will not guess -- the wrong                          choice puts your progr
         self.chosen = Some(std::path::PathBuf::from(volume));
         Ok(PartIdentity {
             value: u64::from(self.family),
-            what: "a UF2 family, which every board of that family shares and which settles                    nothing about WHICH board is attached",
+            what: "a UF2 family, which every board of that family shares and which settles \
+                   nothing about WHICH board is attached",
         })
     }
 
@@ -1007,7 +1011,7 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
 /// **So what is shared here is the CONTRACT, not the sequence**, and this type is honest about that:
 /// [`read_back`](FlashBackend::read_back), [`finish`](FlashBackend::finish) and the identify-refusal
 /// shape are written once, and erase and program dispatch to arms that are allowed to differ in
-/// shape rather than only in constants. Forcing them into one walk is the mistake this lane already
+/// shape rather than only in constants. Forcing them into one walk is the mistake already
 /// made once by comparing two mechanisms and getting the comparison wrong.
 ///
 /// # The connect happens before construction
@@ -1333,8 +1337,22 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
             return Ok(PartIdentity { value: u64::from(cidr), what: part });
         }
         if let crate::SamIdentity::Sam4Chipid(families) = self.family.identity_register() {
-            let cidr = self.target.read_word(SAM4_CHIPID_CIDR)?;
-            let exid = self.target.read_word(SAM4_CHIPID_EXID)?;
+            let chipid = |what: &str, why: &dyn core::fmt::Debug| {
+                FlashError::Refused(format!(
+                    "reading the SAM4 {what} at {SAM4_CHIPID_CIDR:#010x} failed: {why:?}.\n\n\
+                     Two things do this and they call for opposite next steps. The part may not \
+                     BE a SAM4 --\nthat address is a CHIPID on a SAM4 and unimplemented on a SAM \
+                     D5x/E5x, and six Xplained Pro\nkits share one USB id, so a serial names a KIT \
+                     SHAPE and never a part. Or the probe reached\nnothing at all, which reads \
+                     identically here.\n\n\
+                     `lamella devices` lists what is attached; naming a different --board for the \
+                     same probe\nwill say which of the two it is."
+                ))
+            };
+            let cidr =
+                self.target.read_word(SAM4_CHIPID_CIDR).map_err(|why| chipid("CHIPID", &why))?;
+            let exid =
+                self.target.read_word(SAM4_CHIPID_EXID).map_err(|why| chipid("EXID", &why))?;
             if !families.iter().any(|family| sam4_family_matches(cidr, family)) {
                 return Err(FlashError::Refused(format!(
                     "CHIPID reports CIDR {cidr:#010x} / EXID {exid:#010x}, which is not the {} \

@@ -1,0 +1,69 @@
+# The SAMG55 Power Management Controller: the peripheral clock gates. Offsets are PMC-base-relative;
+# the base lives in ../instances.toml.
+#
+# ONE NUMBER GATES AND INTERRUPTS. On this architecture the peripheral id from Table 9-1 is both
+# the bit position in PMC_PCER0 and the NVIC line, which is why ../instances.toml carries a single
+# `pid` field where the SAM D/L families carry a mask register, a bit and an IRQ separately.
+#
+# TWO BANKS, AND THIS PART ONLY NEEDS THE FIRST. PCER0/PCDR0/PCSR0 cover ids 0..31 and
+# PCER1/PCDR1/PCSR1 cover 32..63. The highest id this part defines is 29 (ADC), so every gate a
+# consumer here will ever set is in bank 0. Bank 1 is transcribed because it is part of the offset
+# set a reader checks an address against, and because a family that later adds an id above 31 would
+# otherwise find the register undeclared.
+#
+# A FLEXCOM's GATE CANNOT BE SET FROM THIS TABLE TODAY, AND THAT IS DELIBERATE. The bit is
+# the peripheral id, and this datasheet gives two different ids for six of the eight FLEXCOM
+# instances -- see ../instances.toml, which states both readings and withholds the field. PIOA,
+# PIOB and the rest are unaffected: their ids are agreed by both sources.
+
+[table]
+kind = "block"
+family = "samg55"
+block = "pmc"
+sources = [
+    "SAM G55 datasheet Atmel-11289F section 18.20 (PMC Register Description), each register stating its own absolute Address: PMC_PCER0 0x400E0410, PMC_PCDR0 0x400E0414, PMC_PCSR0 0x400E0418, PMC_PCER1 0x400E0500, PMC_PCDR1 0x400E0504, PMC_PCSR1 0x400E0508",
+    "Atmel-11289F Table 9-1 for the statement that the peripheral identifier is what enables the clock through PMC_PCERx and what selects the NVIC interrupt",
+]
+notes = [
+    "THE OFFSETS ARE DERIVED FROM THE PRINTED ABSOLUTE ADDRESSES BY SUBTRACTING 0x400E0400, the PMC base that Figure 6-1 gives and that both documents agree on.",
+    "PCER AND PCDR ARE WRITE-ONLY AND PCSR READS BACK -- the same set/clear/status shape the PIO block uses. A consumer asking whether a peripheral is clocked reads PCSR rather than remembering what it wrote.",
+    "A WRITE TO PCER0 IS A BIT, NOT A VALUE. Bit n enables peripheral id n. Writing zeros changes nothing, so there is no read-modify-write and no risk of clearing another driver's gate -- which is why these are three registers rather than one.",
+    "THE PMC IS NOT ITSELF GATED. Table 9-1 marks its PMC Clock Control column '-', as it does for SUPC, RSTC, RTC, RTT, WDT and EFC; those peripherals still carry an id because the id is also the NVIC line.",
+    "DECLARED SUBSET. The oscillator and PLL machinery (CKGR_MOR, CKGR_MCFR, CKGR_PLLAR), the master clock register (PMC_MCKR), the status and interrupt registers, the programmable clock outputs, the sleepwalking banks and the write-protect pair all exist and are not transcribed. No consumer configures a clock on this family today -- a board runs from the reset master clock -- and an undeclared register cannot be silently mis-strided.",
+]
+
+[registers.PCER0]
+offset = 0x10
+width = 32
+fields = { PCER0 = [0, 32] }
+notes = "Peripheral Clock Enable 0: write a 1 in bit `pid` to clock peripheral id `pid`, for ids 0..31. Write-only."
+
+[registers.PCDR0]
+offset = 0x14
+width = 32
+fields = { PCDR0 = [0, 32] }
+notes = "Peripheral Clock Disable 0: write a 1 in bit `pid` to stop that peripheral's clock. Write-only."
+
+[registers.PCSR0]
+offset = 0x18
+width = 32
+fields = { PCSR0 = [0, 32] }
+notes = "Peripheral Clock Status 0, readable: 1 = that peripheral is clocked. The register a driver reads to find out, rather than tracking its own writes."
+
+[registers.PCER1]
+offset = 0x100
+width = 32
+fields = { PCER1 = [0, 32] }
+notes = "Peripheral Clock Enable 1, for ids 32..63 -- bit n is id 32+n. NO PERIPHERAL ON THIS PART REACHES IT: the highest id Table 9-1 defines is 29. Transcribed for the completeness of the offset set."
+
+[registers.PCDR1]
+offset = 0x104
+width = 32
+fields = { PCDR1 = [0, 32] }
+notes = "Peripheral Clock Disable 1. Unused on this part, for the reason PCER1's note gives."
+
+[registers.PCSR1]
+offset = 0x108
+width = 32
+fields = { PCSR1 = [0, 32] }
+notes = "Peripheral Clock Status 1. Unused on this part, for the reason PCER1's note gives."

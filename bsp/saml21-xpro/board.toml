@@ -1,0 +1,82 @@
+# The SAM L21 Xplained Pro (ATSAML21-XPRO-B): board truth only -- what is wired to what. Chip
+# truth lives in csp/saml21/.
+#
+# THE VIRTUAL COM PORT'S FUNCTION COLUMN MATTERS ON THIS FAMILY AND THE GUIDE DOES NOT STATE IT.
+# Atmel-42405 Table 4-10 names SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23 and stops there.
+# DS60001477E Table 7-1 puts SERCOM3 in column C on both pads AND SERCOM5 in column D, so the
+# letter is a real choice: naming D would bind SERCOM5, which on this part sits behind a different
+# APB bridge with a different gate register and a different power domain.
+
+[table]
+kind = "board"
+board = "saml21-xpro"
+vendor = "microchip"
+family = "saml21"
+part = "atsaml21j18b"
+product_model = 55          # lamella_wire::product_model::SAML21_XPLAINED_PRO
+sources = [
+    "SAM L21 Xplained Pro user guide Atmel-42405 section 4.2.3 and its LED Connection table: one yellow LED0 on PB10, whose Shared functionality column reads 'EXT3'. The section states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'.",
+    "Atmel-42405 section 4.2.2 and its Mechanical Buttons table: two buttons, RESET on the part's reset line and a generic user-configurable SW0 on PA02, whose Shared functionality column reads 'EXT1'. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'.",
+    "Atmel-42405 section 4.4.1 and its SWD Connections table: SWD clock on PA30 and SWD data on PA31, both shared with the Cortex debug connector.",
+    "Atmel-42405 section 4.4.2 and Table 4-10 (Virtual COM Port Connections), corroborated against SAM L21 Family Data Sheet DS60001477E Table 7-1 for the function column -- see the header above.",
+    "DS60001477E Table 7-2 (Oscillator Pinout): XOSC on PA14/PA15 and XOSC32K on PA00/PA01, which is chip truth and is recorded here because it bears on which pads a board may treat as free.",
+    "DS60001477E (OSCCTRL and GCLK) for the default plan's rate, stated three ways: 'After reset, OSC16M is enabled and serves as the default clock source at 4MHz', 'OSC16M ... is enabled and configured at 4MHz after a reset by default', and -- naming the generator this plan is about -- 'Generator 0 is using OSC16M at 4MHz as source and generates GCLK_MAIN'.",
+]
+notes = [
+    "LED0 AND SW0 ARE EACH SHARED WITH AN EXTENSION HEADER -- LED0 with EXT3 and SW0 with EXT1, per the guide's own Shared functionality column. A program driving either is also driving whatever an extension board presents on that line.",
+    "SW0 IS ON PA02, WHICH IS ALSO THE DAC OUTPUT AND AN OPAMP INPUT. Table 7-1 gives PA02 VOUT[0] and OA_NEG[0] in column B along with AIN[0]. Nothing here binds any of them, and the pad is a plain input for the button; recorded because this is a pad with unusually many claims on it and a later analog binding would collide with the button rather than with nothing.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP. It states the polarity and stops there, where the SAM D21 and E51 Curiosity Nano guides both state outright that no pull-up is fitted. The absence of the statement is not the presence of a resistor.",
+    "THIS PART HAS A SECOND RAM REGION THAT NOTHING HERE CAN NAME. Ch 2 rows 8 KB of Low-power SRAM separately from the 32 KB of System SRAM, at its own address in its own power domain. csp/saml21/parts.toml records the System SRAM alone as the `ram` figure and says why.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
+baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
+plan = "osc16m-4mhz"        # Atmel-42096 describes the composite device without giving an id
+default = true              # table. Nor can a sibling supply it -- same54-xpro and samw25-xpro
+                            # both answer 0x2111 while samd21-xpro answers 0x2169, so an
+                            # Xplained Pro's product id does not follow from being one.
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom3"
+function = "C"              # SERCOM, not SERCOM-ALT -- and here that IS a choice between two real
+gclk_gen = 0                # instances. Both pads carry SERCOM5 in column D, and SERCOM5 on this
+tx = { pin = "PA22", pad = 0 }   # part is behind a different APB bridge entirely.
+rx = { pin = "PA23", pad = 1 }
+
+# THE DEFAULT CLOCK PLAN, AND THE DATASHEET NAMES THE GENERATOR RATHER THAN LEAVING IT INFERRED:
+# "Generator 0 is using OSC16M at 4MHz as source and generates GCLK_MAIN". So GCLK0 is 4 MHz at
+# reset -- the same rate as the SAM C21 reaches by a different oscillator, and not the SAM D21
+# line's 8 MHz. Every baud divisor the generator derives rides that rate.
+[[plans]]
+name = "osc16m-4mhz"
+default = true
+source = "osc16m"
+gclk0_hz = 4000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB10"
+active = "low"
+source = "Atmel-42405 section 4.2.3 and its LED Connection table: one yellow LED0 on PB10, Shared functionality 'EXT3'. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA02"
+active = "low"
+source = "Atmel-42405 section 4.2.2 and its Mechanical Buttons table: the generic user-configurable button SW0 on PA02, silkscreened SW0, Shared functionality 'EXT1'. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "unknown"
+pitch_mm = 1.27
+onboard = "edbg"
+recovery = "probe"
+source = "Atmel-42405 SAM L21 Xplained Pro user guide section 4.1.5: the kit has a 10-pin 50-mil Cortex Debug Connector that can be used to attach external debuggers to the part, with Table 4-6 giving SWD data on PA31 and SWD clock on PA30, both shared with the EDBG's SWD. Whether a connector is soldered to that position is not stated: the guide gives the connector a numbered section and a full pin table but never says it is mounted, and the same guide marks its crystals mounted and not mounted in the feature list, so the silence cannot be read either way. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

@@ -25,6 +25,12 @@ lamella-token = { path = "../lamella-token" }
 # reason with a sharper edge: a compiled program on a device links the SAME arithmetic without a
 # value stack to unpack, so an implementation that lived here would have to exist twice.
 lamella-decimal = { path = "../lamella-decimal", default-features = false }
+# The pin-change event queue's RULE -- ordering, capacity, what overflow means, how many events one
+# drain takes. A leaf like the reactor, and for the sharpest version of the same reason: the two
+# tiers store the queue differently and neither may impose on the other, so the rule lives apart
+# from the storage. This crate takes the rule and never a static; the queue itself is the
+# embedder's, reached through the fn pointers of `PinEventSource`.
+lamella-pin-events = { path = "../lamella-pin-events" }
 # Accurate no_std transcendental math (sqrt/sin/cos/pow/log/exp), behind `math-transcendental`.
 # A MUSL/fdlibm port (the accurate option; a fast/approximate alternative is a future knob).
 libm = { version = "0.2.16", optional = true }

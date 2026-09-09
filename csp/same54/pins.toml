@@ -58,3 +58,751 @@ function = "B"
 instance = "adc1"
 signal = "ain6"
 source = "DS60001507F Table 6-1 (Multiplexed Peripheral Signals), the PB04 row: the function B cell is ADC1/AIN[6]."
+
+# ---- SERCOM5 IOSET 1: the pads the SAM E51 Curiosity Nano wires its debugger UART to -------------
+#
+# THE SAME INSTANCE THIS TABLE ALREADY REACHES BY ANOTHER ROUTE. SERCOM5 is already here on PA22 and
+# PA23 in column D, which is Table 6-15's IOSET 2. These two rows are IOSET 1 of the same instance,
+# in column C -- so the letter and the pad pair move together and a row that took one from each set
+# would name a pin the instance does not drive.
+#
+# ONE NUMBER TELLS THE TWO SETS APART AND IT IS NOT THE PAD: the IOSET is which PINS carry the pads,
+# and Table 6-15 lists six of them for SERCOM5. What a binding names is a pin and a function letter,
+# so the IOSET is implied by the pins rather than stated -- which is why both rows below record
+# which IOSET they came from.
+
+[[pins]]
+pin = "PB16"
+function = "C"
+instance = "sercom5"
+signal = "pad0"
+source = "DS60001507F Table 6-1 (I/O Multiplexing and Considerations): the PB16 row carries SERCOM5/PAD[0] in column C, the SERCOM column, and nothing in column D. Corroborated by Table 6-15 (SERCOM5 IO SET Configuration), whose IOSET 1 column gives PAD0 = PB16. The pad is bonded on the 64-pin package: the ch 4 pinout numbers it pin 39 on TQFP/VQFN/WLCSP 64, which is the package atsame51j20a comes in."
+
+[[pins]]
+pin = "PB17"
+function = "C"
+instance = "sercom5"
+signal = "pad1"
+source = "DS60001507F Table 6-1: the PB17 row carries SERCOM5/PAD[1] in column C and nothing in column D. Corroborated by Table 6-15, whose IOSET 1 column gives PAD1 = PB17. Bonded on the 64-pin package at pin 40, adjacent to PB16."
+
+# --- EIC: the COMPLETE pad-to-EXTINT map for this die ------------------------------------------
+#
+# EVERY PAD ON THE DIE IS HERE. Which EXTINT a pad can raise is a property of the silicon, so it
+# does not depend on any board and must not be limited to the pads some particular board wires. An
+# engineer who prototypes on an evaluation kit and then lays out their own hardware needs every pad.
+#
+# FUNCTION A IS THE EIC COLUMN, so a pad raises its EXTINT only with PINCFG.PMUXEN set and PMUX
+# selecting A.
+#
+# 99 PADS, 16 LINES, SO PADS SHARE AND ONLY ONE OF A LINE'S PADS CAN BE THE LIVE SOURCE. Six pads
+# compete for most lines here against three or four on the smaller family, and nothing in the chip
+# reports the competition.
+#
+# PA08 IS NMI AND NOT AN EXTINT, alone on this die as on the SAM D21 -- the one pad whose function A
+# reaches the non-maskable interrupt, which cannot be masked, does not appear in INTFLAG, and is not
+# serviced by any of the sixteen EXTINT vectors.
+#
+# THE LINE IS NOT THE PAD AND A DERIVATION IS WRONG ON TWELVE PADS. For 86 of the 98 EXTINT pads the
+# line is the pad index modulo sixteen, which is more than enough to make the rule look right under
+# any spot check. It fails on PB26, PB27, PB28 and PB29, which raise 12 through 15 rather than 10
+# through 13; on PC07, which raises 9 rather than 7; on PD08 through PD12, which raise 3 through 7
+# rather than 8 through 12; and on PD20 and PD21, which raise 10 and 11 rather than 4 and 5.
+# The SAM D21 breaks the same rule on six of its own pads, in different places.
+#
+# Every row: DS60001507F Table 6-1 (Multiplexed Peripheral Signals), column A. ANCHORED FOUR WAYS:
+# the 99 pads are exactly the atsame54p20a pad set in parts.toml, the 64-pin atsame51j20a's 51 pads
+# are a subset of them, all sixteen lines occur, and exactly one pad carries NMI.
+
+[[pins]]
+pin = "PA00"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA01"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA02"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA03"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA04"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA05"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA06"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA07"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA08"
+function = "A"
+instance = "eic"
+signal = "nmi"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA09"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA10"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA11"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA12"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA13"
+function = "A"
+instance = "eic"
+signal = "extint13"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA14"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA15"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA16"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA17"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA18"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA19"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA20"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA21"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA22"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA23"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA24"
+function = "A"
+instance = "eic"
+signal = "extint8"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA25"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA27"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA30"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PA31"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB00"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB01"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB02"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB03"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB04"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB05"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB06"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB07"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB08"
+function = "A"
+instance = "eic"
+signal = "extint8"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB09"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB10"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB11"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB12"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB13"
+function = "A"
+instance = "eic"
+signal = "extint13"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB14"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB15"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB16"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB17"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB18"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB19"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB20"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB21"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB22"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB23"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB24"
+function = "A"
+instance = "eic"
+signal = "extint8"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB25"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB26"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB27"
+function = "A"
+instance = "eic"
+signal = "extint13"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB28"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB29"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB30"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PB31"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC00"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC01"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC02"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC03"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC04"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC05"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC06"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC07"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC10"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC11"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC12"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC13"
+function = "A"
+instance = "eic"
+signal = "extint13"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC14"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC15"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC16"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC17"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC18"
+function = "A"
+instance = "eic"
+signal = "extint2"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC19"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC20"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC21"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC22"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC23"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC24"
+function = "A"
+instance = "eic"
+signal = "extint8"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC25"
+function = "A"
+instance = "eic"
+signal = "extint9"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC26"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC27"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC28"
+function = "A"
+instance = "eic"
+signal = "extint12"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC30"
+function = "A"
+instance = "eic"
+signal = "extint14"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PC31"
+function = "A"
+instance = "eic"
+signal = "extint15"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD00"
+function = "A"
+instance = "eic"
+signal = "extint0"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD01"
+function = "A"
+instance = "eic"
+signal = "extint1"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD08"
+function = "A"
+instance = "eic"
+signal = "extint3"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD09"
+function = "A"
+instance = "eic"
+signal = "extint4"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD10"
+function = "A"
+instance = "eic"
+signal = "extint5"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD11"
+function = "A"
+instance = "eic"
+signal = "extint6"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD12"
+function = "A"
+instance = "eic"
+signal = "extint7"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD20"
+function = "A"
+instance = "eic"
+signal = "extint10"
+source = "DS60001507F Table 6-1, column A (EIC)."
+
+[[pins]]
+pin = "PD21"
+function = "A"
+instance = "eic"
+signal = "extint11"
+source = "DS60001507F Table 6-1, column A (EIC)."
+

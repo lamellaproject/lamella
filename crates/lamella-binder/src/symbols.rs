@@ -62,6 +62,19 @@ pub struct FieldSymbol {
     pub name: Box<str>,
     /// The field's type.
     pub ty: TypeSymbol,
+    /// The TUPLE ELEMENT NAMES of the field's type, when it is a tuple that named any of them.
+    ///
+    /// INVARIANT: EMPTY, or exactly as long as the tuple is wide -- the same shape and the same
+    /// meaning as [`MethodSymbol::parameter_info`], and empty means NOT A NAMED TUPLE rather than
+    /// "a tuple that named nothing". A single element may still be `None`: `(int a, int)` names
+    /// one and not the other, and csc accepts that.
+    ///
+    /// **NAMES ARE NOT PART OF THE TYPE, WHICH IS WHY THEY ARE HERE AND NOT ON `TypeSymbol`.**
+    /// `(int a, int b)` and `(int c, int d)` are ONE type -- each converts to the other by the
+    /// identity conversion -- so a type carrying names would make two types where C# has one, and
+    /// every derived comparison in the binder would part them. Names belong to the DECLARATION,
+    /// which is where `TupleElementNamesAttribute` puts them in metadata for the same reason.
+    pub tuple_names: Vec<Option<Box<str>>>,
     /// Whether the field is `static`.
     pub is_static: bool,
     /// Whether the field is `readonly` (assignable only in a constructor or initializer).
@@ -91,6 +104,19 @@ pub struct PropertySymbol {
     pub name: Box<str>,
     /// The property's type.
     pub ty: TypeSymbol,
+    /// The TUPLE ELEMENT NAMES of the property's type, when it is a tuple that named any of them.
+    ///
+    /// INVARIANT: EMPTY, or exactly as long as the tuple is wide -- the same shape and the same
+    /// meaning as [`MethodSymbol::parameter_info`], and empty means NOT A NAMED TUPLE rather than
+    /// "a tuple that named nothing". A single element may still be `None`: `(int a, int)` names
+    /// one and not the other, and csc accepts that.
+    ///
+    /// **NAMES ARE NOT PART OF THE TYPE, WHICH IS WHY THEY ARE HERE AND NOT ON `TypeSymbol`.**
+    /// `(int a, int b)` and `(int c, int d)` are ONE type -- each converts to the other by the
+    /// identity conversion -- so a type carrying names would make two types where C# has one, and
+    /// every derived comparison in the binder would part them. Names belong to the DECLARATION,
+    /// which is where `TupleElementNamesAttribute` puts them in metadata for the same reason.
+    pub tuple_names: Vec<Option<Box<str>>>,
     /// Whether the property is `static`.
     pub is_static: bool,
     /// The property's accessibility.
@@ -159,8 +185,23 @@ pub struct PropertySymbol {
 /// the accessors and any other use is `CS0070`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSymbol {
-    /// The event's name.
+    /// The event's name. **MANGLED `I.E` for an explicit implementation**, unlike a
+    /// [`PropertySymbol`], whose explicit form is stored under its PLAIN name -- the two member
+    /// kinds really do differ here, and a rule written against one is wrong about the other.
     pub name: Box<str>,
+    /// The interface an EXPLICIT implementation names (`event H I.E { ... }`), as written; `None`
+    /// for an ordinary event.
+    ///
+    /// **THE FOURTH MEMBER KIND TO CARRY ONE, AND THE LAST.** [`MethodSymbol`] and
+    /// [`PropertySymbol`] have had it for the reason each states: a rule that needs the interface
+    /// cannot recover it from the name. Splitting the mangled name at its dots yields `IBox` and
+    /// can never yield `IBox<int>`, and the arguments are the whole of what tells the two members
+    /// of `class C : IBox<int>, IBox<string>` apart.
+    ///
+    /// Matching the mangled name by SUFFIX is not a substitute: that is the lenient credit
+    /// [`Binder::explicitly_implements`] was written to stop giving, and it credits another
+    /// interface's member.
+    pub explicit_interface: Option<TypeSymbol>,
     /// The event's (delegate) type.
     pub ty: TypeSymbol,
     /// Whether the event is `static`.
@@ -269,6 +310,19 @@ pub struct MethodSymbol {
     /// is why this is a separate vector rather than fields on the type list. A consumer must treat
     /// empty as absence of information, never as "no parameters": see [`MethodSymbol::parameter_name`].
     pub parameter_info: Vec<ParameterInfo>,
+    /// The TUPLE ELEMENT NAMES of the RETURN type, when it is a tuple that named any of them.
+    ///
+    /// INVARIANT: EMPTY, or exactly as long as the tuple is wide -- the same shape and the same
+    /// meaning as [`MethodSymbol::parameter_info`], and empty means NOT A NAMED TUPLE rather than
+    /// "a tuple that named nothing". A single element may still be `None`: `(int a, int)` names
+    /// one and not the other, and csc accepts that.
+    ///
+    /// **NAMES ARE NOT PART OF THE TYPE, WHICH IS WHY THEY ARE HERE AND NOT ON `TypeSymbol`.**
+    /// `(int a, int b)` and `(int c, int d)` are ONE type -- each converts to the other by the
+    /// identity conversion -- so a type carrying names would make two types where C# has one, and
+    /// every derived comparison in the binder would part them. Names belong to the DECLARATION,
+    /// which is where `TupleElementNamesAttribute` puts them in metadata for the same reason.
+    pub return_tuple_names: Vec<Option<Box<str>>>,
     /// Whether the method is `static`.
     pub is_static: bool,
     /// Whether the last parameter is a `params` array (a variable-length trailing
@@ -1018,6 +1072,7 @@ pub struct Model {
 /// collector is upstream of it.
 fn implicit_constructor() -> MethodSymbol {
     MethodSymbol {
+        return_tuple_names: Vec::new(),
         return_required_modifiers: Vec::new(),
         explicit_interface: None,
         name: ".ctor".into(),
@@ -1092,15 +1147,25 @@ impl Model {
 
     /// The number of program entry points declared in THIS compilation (10.1): a `static Main`
     /// returning `void` or `int` and taking no parameters or a single `string[]`. Types loaded
-    /// from a reference assembly are excluded. Two or more is a CS0017 (multiple entry points).
+    /// from a reference assembly are excluded. Two or more is a CS0017 (multiple entry points);
+    /// none, for an executable target, is a CS5001.
+    ///
+    /// **GENERICS DISQUALIFY IT THREE WAYS AND csc ANSWERS CS5001 FOR ALL THREE**, measured: a
+    /// `Main` in a generic type, a `Main` in a type NESTED inside a generic one, and a generic
+    /// `Main<T>` itself. The type's own list already carries its enclosing type's parameters, so
+    /// the nested case needs no separate test.
+    ///
     #[must_use]
     pub fn entry_point_count(&self) -> usize {
         self.types
             .values()
-            .filter(|info| !info.is_external)
+            .filter(|info| !info.is_external && info.type_parameters.is_empty())
             .flat_map(|info| info.methods.iter())
             .filter(|method| {
-                &*method.name == "Main" && method.is_static && is_entry_point_method(method)
+                &*method.name == "Main"
+                    && method.is_static
+                    && method.type_parameters.is_empty()
+                    && is_entry_point_method(method)
             })
             .count()
     }
@@ -1804,6 +1869,7 @@ mod tests {
     fn widget() -> TypeInfo {
         let mut info = TypeInfo::new("Shapes", "Widget", TypeKind::Class);
         info.fields.push(FieldSymbol {
+            tuple_names: Vec::new(),
             name: "count".into(),
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
@@ -1814,6 +1880,7 @@ mod tests {
             is_required: false,
         });
         info.methods.push(MethodSymbol {
+            return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Area".into(),
@@ -1834,6 +1901,7 @@ mod tests {
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Scale".into(),
@@ -1854,6 +1922,7 @@ mod tests {
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: "Scale".into(),

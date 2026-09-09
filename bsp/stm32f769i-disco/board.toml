@@ -127,3 +127,11 @@ kind = "gpio-in"
 pin = "PA0"
 active = "high"
 source = "UM2033 Rev 5 section 5.16: the blue button B1 is available as a digital input, and when the button is depressed the logic state is 1, otherwise the logic state is 0. Its pin is PA0 -- the manual's pin table gives PA0/WKUP the board label B_USER."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "The board carries an on-board ST-LINK that programs and debugs the part over SWD. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

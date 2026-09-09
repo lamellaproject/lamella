@@ -247,18 +247,44 @@ pub struct BoundDeclarator {
     pub initializer: Option<BoundExpr>,
 }
 
+/// The element names a TUPLE LITERAL was written with, or EMPTY when the expression is not one.
+///
+/// The counterpart of [`crate::bind::tuple_element_names`] for the other place a name can be
+/// written: `var t = (a: 1, b: 2)` says `var`, so the literal is all there is to read.
+///
+/// A PARENTHESIZED literal is looked through -- `var t = ((a: 1, b: 2))` names the same two -- and
+/// nothing else is, because no other expression carries element names of its own.
+fn tuple_literal_names(expr: &Expr) -> Vec<Option<Box<str>>> {
+    match &expr.kind {
+        ExprKind::Parenthesized(inner) => tuple_literal_names(inner),
+        ExprKind::Tuple { elements } => {
+            if elements.iter().all(|element| element.name.is_none()) {
+                return Vec::new();
+            }
+            elements
+                .iter()
+                .map(|element| element.name.as_ref().map(|name| name.text.clone()))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 impl Binder {
     /// Binds a statement (15).
     pub fn bind_statement(&mut self, stmt: &Stmt) -> BoundStmt {
         let kind = match &stmt.kind {
             StmtKind::Block(statements) => {
-                self.enter_scope();
+                self.enter_scope_at(stmt.span);
                 let bound = statements.iter().map(|s| self.bind_statement(s)).collect();
                 self.exit_scope();
                 BoundStmtKind::Block(bound)
             }
             StmtKind::Empty => BoundStmtKind::Empty,
             StmtKind::Expression(expr) => {
+                if let Some(kind) = self.bind_deconstruction_statement(expr) {
+                    return BoundStmt { kind, span: stmt.span };
+                }
                 if let Some(kind) = self.bind_conditional_access_statement(expr) {
                     return BoundStmt { kind, span: stmt.span };
                 }
@@ -348,7 +374,13 @@ impl Binder {
                 condition,
                 iterators,
                 body,
-            } => self.bind_for(initializer.as_ref(), condition.as_ref(), iterators, body),
+            } => self.bind_for(stmt.span, initializer.as_ref(), condition.as_ref(), iterators, body),
+            StmtKind::ForEachDeconstruction {
+                var_span,
+                targets,
+                collection,
+                body,
+            } => self.bind_foreach_deconstruction(*var_span, targets, collection, body, stmt.span),
             StmtKind::ForEach {
                 ty,
                 name,
@@ -384,7 +416,7 @@ impl Binder {
                             stmt.span,
                         ));
                     }
-                    self.enter_scope();
+                    self.enter_scope_at(stmt.span);
                     self.declare_local(name, element_type.clone());
                     self.enter_loop();
                     let body = Box::new(self.bind_statement(body));
@@ -451,7 +483,7 @@ impl Binder {
                         switch_span,
                     ));
                 }
-                self.enter_scope();
+                self.enter_scope_at(stmt.span);
                 self.enter_switch();
                 let mut seen_values: Vec<i64> = Vec::new();
                 let mut seen_strings: Vec<Box<[u16]>> = Vec::new();
@@ -558,13 +590,13 @@ impl Binder {
                 }),
             },
             StmtKind::Lock { expression, body } => self.bind_lock(expression, body),
-            StmtKind::Using { resource, body } => self.bind_using(resource, body),
+            StmtKind::Using { resource, body } => self.bind_using(stmt.span, resource, body),
             StmtKind::Fixed {
                 ty,
                 name,
                 init,
                 body,
-            } => self.bind_fixed(ty, name, init, body),
+            } => self.bind_fixed(stmt.span, ty, name, init, body),
             StmtKind::Checked(inner) => {
                 let saved_checked = self.checked_context;
                 let saved_unchecked = self.unchecked_context;
@@ -750,6 +782,7 @@ impl Binder {
     }
 
     fn bind_catch(&mut self, catch: &CatchClause) -> BoundCatch {
+        let scope_span = catch.span;
         let exception_type = catch
             .exception_type
             .as_ref()
@@ -762,7 +795,7 @@ impl Binder {
                 ));
             }
         }
-        self.enter_scope();
+        self.enter_scope_at(scope_span);
         if let Some(name) = &catch.name {
             let ty = exception_type.clone().unwrap_or(TypeSymbol::Error);
             self.declare_local(name, ty);
@@ -878,7 +911,7 @@ impl Binder {
             ty: element_type.clone(),
         };
 
-        self.enter_scope();
+        self.enter_scope_at(span);
         self.declare_local(name, element_type.clone());
         self.enter_loop();
         let bound_body = self.bind_statement(body);
@@ -932,6 +965,7 @@ impl Binder {
                                     operation: lamella_syntax::ast::TypeTestOperation::As,
                                     operand: Box::new(enumerator_ref()),
                                     target: idisposable.clone(),
+                                    declares: None,
                                 },
                                 ty: idisposable.clone(),
                             }),
@@ -1091,8 +1125,8 @@ impl Binder {
         }
     }
 
-    fn bind_using(&mut self, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {
-        self.enter_scope();
+    fn bind_using(&mut self, span: Span, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {
+        self.enter_scope_at(span);
         let mut resource_decls: alloc::vec::Vec<BoundStmt> = Vec::new();
         let mut resources: alloc::vec::Vec<(Box<str>, TypeSymbol)> = Vec::new();
         match resource {
@@ -1192,6 +1226,7 @@ impl Binder {
                                     ty: resource_ty.clone(),
                                 }),
                                 target: idisposable.clone(),
+                                declares: None,
                             },
                             ty: idisposable.clone(),
                         }),
@@ -1254,6 +1289,7 @@ impl Binder {
     /// is a `T*` bound (definitely assigned) in the body's scope.
     fn bind_fixed(
         &mut self,
+        span: Span,
         ty: &lamella_syntax::ast::TypeRef,
         name: &str,
         init: &Expr,
@@ -1265,7 +1301,7 @@ impl Binder {
             _ => TypeSymbol::Error,
         };
         let init = self.bind_expression(init);
-        self.enter_scope();
+        self.enter_scope_at(span);
         self.declare_local(name, pointer_ty);
         let body = Box::new(self.bind_statement(body));
         self.exit_scope();
@@ -1279,12 +1315,13 @@ impl Binder {
 
     fn bind_for(
         &mut self,
+        span: Span,
         initializer: Option<&ForInitializer>,
         condition: Option<&Expr>,
         iterators: &[Expr],
         body: &Stmt,
     ) -> BoundStmtKind {
-        self.enter_scope();
+        self.enter_scope_at(span);
         let initializer = match initializer {
             None => Vec::new(),
             Some(ForInitializer::Declaration { ty, declarators }) => {
@@ -1365,6 +1402,7 @@ impl Binder {
                 self.convert(value, &declared)
             });
             self.declare_local(&declarator.name, declared.clone());
+            self.record_local_tuple_names(&declarator.name, crate::bind::tuple_element_names(ty));
             bound.push(BoundDeclarator {
                 name: declarator.name.clone(),
                 initializer,
@@ -1516,9 +1554,9 @@ impl Binder {
     /// CS0246, measured -- while `var x = 5;` infers. The lexer drops the `@` (9.4.2, correctly:
     /// the identifier it denotes is `var`, and it has to bind to a type actually called that), so
     /// the name alone cannot say which was written; `TypeRef::verbatim_name` is the parser
-    /// recording what only the parser can see. Until it existed this compiler ACCEPTED that
-    /// program.
-    fn is_implicitly_typed(&mut self, ty: &TypeRef) -> bool {
+    /// recording what only the parser can see. Without it, `@var x = 5;` is accepted -- a program
+    /// csc refuses.
+    pub(crate) fn is_implicitly_typed(&mut self, ty: &TypeRef) -> bool {
         if ty.verbatim_name {
             return false;
         }
@@ -1626,6 +1664,17 @@ impl Binder {
                     .map_or(TypeSymbol::Error, |value| value.ty.clone());
             }
             self.declare_local(&declarator.name, declared.clone());
+            let mut names = declarator
+                .initializer
+                .as_ref()
+                .map(tuple_literal_names)
+                .unwrap_or_default();
+            if names.is_empty()
+                && let Some(value) = &initializer
+            {
+                names = self.tuple_names_of(value);
+            }
+            self.record_local_tuple_names(&declarator.name, names);
             bound.push(BoundDeclarator {
                 name: declarator.name.clone(),
                 initializer,
@@ -1766,7 +1815,13 @@ impl Binder {
         ));
     }
 
-    fn bind_condition(&mut self, condition: &Expr) -> BoundExpr {
+    /// Binds a BOOLEAN CONDITION (14.11.2): the value itself when it converts to `bool`, an
+    /// `op_Implicit` call when a user conversion reaches one, an `op_True` call when the type
+    /// declares one, and a diagnostic otherwise.
+    ///
+    /// `pub(crate)` because a switch expression's `when` guard is the same question, and a second
+    /// implementation of it would be a second place for the `op_True` rule to be forgotten.
+    pub(crate) fn bind_condition(&mut self, condition: &Expr) -> BoundExpr {
         let bound = self.bind_expression(condition);
         let boolean = TypeSymbol::Special(SpecialType::Boolean);
         if bound.ty.is_error() || crate::conversion::converts(self.model(), &bound.ty, &boolean) {
@@ -1807,7 +1862,16 @@ fn section_anchor(section: &SwitchSection, fallback: Span) -> Span {
 /// list (`await t;` discards the result, exactly as a call statement does). `checked`/
 /// `unchecked` wrappers and a binding error are admitted conservatively, so an
 /// odd-but-legal form is a gap, not a false CS0201.
+///
+/// **A `Sequence` IS A WRAPPER AND NOT A FORM OF ITS OWN, so the question passes through it to the
+/// value.** It appears wherever a lowering had to name an operand more than once, and the source
+/// never writes one: a named call that reordered its arguments, a lifted operator, a `?.` chain.
+/// Answering `false` for it refused `c[b: 1, a: 43] = 0;` -- an assignment the source wrote
+/// correctly -- with a message about what may stand as a statement.
 pub(crate) fn is_statement_expression(kind: &BoundExprKind) -> bool {
+    if let BoundExprKind::Sequence { value, .. } = kind {
+        return is_statement_expression(&value.kind);
+    }
     matches!(
         kind,
         BoundExprKind::Assignment { .. }

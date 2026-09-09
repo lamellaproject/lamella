@@ -167,10 +167,10 @@ nvm_calib_lsb = -1
 # That clock is enabled out of reset, which is why a GPIO driver on this family works having
 # touched no clock register at all.
 #
-# THE SAMD21 USES THE SAME 0x80 SPACING AT A DIFFERENT BASE, which is exactly the near-miss this
-# tree keeps paying for: 0x41004400 there against 0x41008000 here, with the stride identical. A row
-# carried across would have TWO of its three values right and the one that matters wrong, and every
-# gate would stay green. Every number below is from this family's own manual.
+# THE SAMD21 USES THE SAME 0x80 SPACING AT A DIFFERENT BASE, which is the hazardous kind of
+# near-miss: 0x41004400 there against 0x41008000 here, with the stride identical. A row carried
+# across would have TWO of its three values right and the one that matters wrong, and every gate
+# would stay green. Every number below is from this family's own manual.
 
 [[instances]]
 name = "porta"
@@ -206,4 +206,21 @@ base = 0x41008180   # PORT group 3, the PD pins
 gclk_core_id = -1
 apb_mask_offset = 0x18
 apb_bit = 4
+nvm_calib_lsb = -1
+
+# --- the external interrupt controller ------------------------------------------------------------
+#
+# THE RECORD CANNOT NAME THIS INSTANCE'S NVIC LINES AND NO SINGLE FIELD COULD. Every other
+# peripheral here is delivered on one vector; the EIC has SIXTEEN, one per EXTINT, on lines 12
+# through 27. The mapping is stated in blocks/eic.toml, which is where a consumer looking for a
+# vector will be reading anyway.
+
+[[instances]]
+name = "eic"
+block = "eic"
+base = 0x42001800          # DS60001507F product mapping, between RTC 0x42001400 and FREQM 0x42001C00
+gclk_core_id = 7           # GCLK_EIC. Needed only where a function requires a clock; the block also
+                           # offers the ultra-low-power 32 kHz source, selected by CTRLA.CKSEL.
+apb_mask_offset = 0x14     # MCLK.APBAMASK, DS60001507F 15.8.7
+apb_bit = 10               # SET at reset: APBAMASK resets to 0x000007FF, bits 0 through 10
 nvm_calib_lsb = -1

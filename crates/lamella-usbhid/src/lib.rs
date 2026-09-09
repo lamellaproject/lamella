@@ -138,6 +138,86 @@ impl Device {
     }
 }
 
+/// The classic CMSIS-DAP report payload size, excluding any report-id byte.
+///
+/// **A FALLBACK, never an assumption, and the name says so because the old one did not.** Each
+/// backend called this `REPORT_MAX`, which reads as "the largest report there is" -- and that is
+/// precisely the belief the code acted on. It is what to use for a device that does not say how
+/// long its reports are; it is not what any particular device uses, and it is not a ceiling.
+///
+/// Windows adds one to it for the report-id byte its API counts. That is a per-backend convention
+/// on top of this number, not a different number.
+pub(crate) const DEFAULT_REPORT_LEN: usize = 64;
+
+/// The report length to size a buffer from, given what the operating system said about a device.
+///
+/// **ONE FUNCTION, CALLED BY EVERY BACKEND.** The rule is easy to get wrong per-platform: a device
+/// reports its own length, and a buffer sized to anything else silently fails to carry a report.
+/// An Atmel/Microchip EDBG uses 512-byte reports, and IOKit will not deliver one into a 64-byte
+/// buffer -- so a backend that registers a fixed size cannot reach those probes at all. Deciding
+/// this in one place is what keeps the three platforms agreeing.
+///
+/// `None` and `Some(0)` are the same answer -- the device has told us nothing, rather than told us
+/// zero -- and a zero-length buffer is not a small buffer, it is no buffer. **That clause is the
+/// non-obvious half, and it was in none of the three backends.**
+///
+/// `fallback` is passed rather than taken from [`DEFAULT_REPORT_LEN`] because the backends do not
+/// agree on what a length counts: Windows includes the report-id byte and the others do not, so its
+/// fallback is one larger for the same device. The convention belongs at the call site; the rule
+/// about zero does not.
+pub(crate) fn report_len_or_default(os_reported: Option<usize>, fallback: usize) -> usize {
+    os_reported.filter(|&len| len != 0).unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_REPORT_LEN, report_len_or_default};
+
+    /// The case the whole rule exists for: an EDBG's 512, taken rather than replaced by 64.
+    #[test]
+    fn a_device_that_states_its_report_length_gets_that_length() {
+        let d = DEFAULT_REPORT_LEN;
+        assert_eq!(report_len_or_default(Some(512), d), 512, "an EDBG's own report size");
+        assert_eq!(report_len_or_default(Some(64), d), 64);
+        assert_eq!(report_len_or_default(Some(1024), d), 1024);
+    }
+
+    /// A device that says nothing gets the fallback it was given, which is the only thing left to
+    /// guess.
+    ///
+    /// The second assertion is what makes this a test rather than a restatement: comparing
+    /// `report_len_or_default(None, DEFAULT_REPORT_LEN)` against `DEFAULT_REPORT_LEN` holds for any
+    /// implementation that returns its own argument, including one that ignores the device
+    /// entirely. A literal on both sides is what a perturbation can move.
+    #[test]
+    fn silence_falls_back_to_the_fallback_it_was_given() {
+        assert_eq!(report_len_or_default(None, DEFAULT_REPORT_LEN), 64, "the classic length");
+        assert_eq!(report_len_or_default(None, 999), 999, "and not a constant of its own");
+    }
+
+    /// Zero is silence, not a size. A zero-length buffer registered with a HID API is not a smaller
+    /// buffer than 64 -- it is one that can never receive anything.
+    #[test]
+    fn a_reported_zero_is_treated_as_silence_rather_than_as_a_size() {
+        let d = DEFAULT_REPORT_LEN;
+        assert_eq!(report_len_or_default(Some(0), d), d, "zero is not a size");
+        assert_ne!(report_len_or_default(Some(0), d), 0);
+    }
+
+    /// The report-id byte is a per-backend convention carried by the FALLBACK, never folded into
+    /// the rule -- which is why Windows and macOS legitimately differ by one for one device.
+    #[test]
+    fn the_caller_supplies_the_fallback_so_the_report_id_convention_stays_theirs() {
+        assert_eq!(report_len_or_default(None, DEFAULT_REPORT_LEN), 64, "macOS and Linux");
+        assert_eq!(report_len_or_default(None, 1 + DEFAULT_REPORT_LEN), 65, "Windows");
+        assert_eq!(
+            report_len_or_default(Some(513), 1 + DEFAULT_REPORT_LEN),
+            513,
+            "and a device's own answer is taken as given, in whichever convention it came in"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[path = "macos.rs"]
 mod imp;

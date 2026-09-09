@@ -17,56 +17,7 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 
 /// The binary format version. Bumped when the container or instruction encoding
 /// changes incompatibly; readers reject a version they do not recognize.
-///
-/// Version 14 added closures: the three deref ops, `CodeObject`'s `cellvars`/`freevars`,
-/// and the `CLOSURE` bit on [`Op::MakeFunction`]'s flags.
-///
-/// Version 15 added the class-body namespace: `SetupClassNamespace` / `StoreName` / `LoadName`,
-/// so a class body can read a name it just bound (namespace -> global -> built-in).
-///
-/// Version 16 added the import system: `ImportName` (import a module and push it) and
-/// `ImportFrom` (read a name off the module on top of the stack), so `import m` and
-/// `from m import a` bind their names.
-///
-/// Version 18 added `StoreGlobal` (a `global x` assignment inside a function stores to the module
-/// namespace). 17 is skipped: it was once a bundle container's version, back when the two numbers
-/// were independent and shared one dispatch space. See [`BUNDLE_FORMAT_VERSION`].
-///
-/// Version 19 added `YieldFrom` (`yield from iterable` -- a generator delegates to a sub-iterator).
-///
-/// Version 20 added `ImportStar` (`from m import *` -- bind a module's public names into the current
-/// module namespace).
-///
-/// Version 21 added `InplaceBinOp` (augmented assignment `x OP= y` -- the in-place binary operator).
-///
-/// Version 22 added a code object's `doc` (a function's docstring, which `__doc__` reads) and
-/// `BuildClassKw` (keyword arguments in a class header).
-///
-/// Version 23 added a code object's `is_coroutine` (an `async def` body) and [`Op::Await`]. The
-/// coroutine bit is INDEPENDENT of `is_generator` rather than a refinement of it -- CPython's
-/// `CO_COROUTINE` and `CO_GENERATOR` are separate flags, and an `async def` with no `yield` has
-/// only the former set.
-///
-/// Version 24 packed a code object's four boolean properties into ONE [`CodeFlags`] byte, where
-/// each had cost a whole byte. Done while 23 was hours old and nothing persisted had been built
-/// against it -- and done as a BUMP rather than by redefining 23, because a version identifies a
-/// layout, and the check below compares for EQUALITY: a silently-changed 23 would have decoded as
-/// garbage where a bumped one is refused. The four spare bits are the point, not the three bytes;
-/// see [`CodeFlags`].
-///
-/// Version 25 added [`Op::ListGrow`], which separates a growable list's CAPACITY step from its
-/// STORE so a heap exhaustion can be caught between them.
-///
-/// Version 26 dropped [`Op::CallEx`]'s `argc`, which restated the length of the argument-tag list it
-/// already points at. The four wire bytes are incidental; what it buys is in memory, where an enum
-/// is as wide as its widest variant and a three-word payload sets that width.
-///
-/// This version gave a module a trailing length-prefixed DEBUG SECTION, empty in every artifact this
-/// build writes. It costs four bytes a module and buys the ability to add source positions later
-/// without moving this number. It shipped EMPTY and now carries line tables, which is the
-/// reservation paying out rather than a second format change.
-///
-pub const FORMAT_VERSION: u16 = 29;
+pub const FORMAT_VERSION: u16 = 31;
 
 /// The capability bits an artifact's header carries: what its bytecode REQUIRES of the runtime that
 /// loads it. A reader that does not implement a required capability refuses the artifact by name
@@ -126,7 +77,7 @@ pub const SUPPORTED_FEATURES: FeatureFlags = FeatureFlags::FIRST_LIGHT;
 /// **A capability belongs here exactly when the knob removes something a BUNDLE CANNOT SUPPLY.**
 /// That is the sharp form of "there must be a consequence", and it sorts the real knobs cleanly:
 ///
-/// * `float`, `complex`, `introspection` and `threading` gate NATIVE code -- the type, the arithmetic,
+/// * `float`, `complex`, `reflection` and `threading` gate NATIVE code -- the type, the arithmetic,
 ///   the per-type name lists, the `_thread` seam. Nothing a host can put in an artifact substitutes
 ///   for them, so a program that reaches for one is wrong before it is written and the front end is
 ///   the only place that can say so.
@@ -137,7 +88,7 @@ pub const SUPPORTED_FEATURES: FeatureFlags = FeatureFlags::FIRST_LIGHT;
 /// * The GC tier is not per-construct at all: `gc-none` fails every allocation, which is nearly
 ///   every construct, so refusing them one at a time says nothing a reader can act on.
 ///
-/// Minting a name before there is a consequence for it is what this lane argued against for
+/// Minting a name before there is a consequence for it is what this format avoids for
 /// [`FeatureFlags`]' bits, and the argument does not change because the enum is a different one.
 /// Adding a variant is additive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -151,10 +102,10 @@ pub enum Capability {
     /// A complex is a PAIR of `f64`, so it cannot outlive [`Capability::Float`] -- the cargo feature
     /// says `complex = ["float"]` and [`Profile`] enforces the same implication.
     Complex,
-    /// `dir()` and the per-type name lists it reports from (the `introspection` feature). Off, every
+    /// `dir()` and the per-type name lists it reports from (the `reflection` feature). Off, every
     /// method stays callable and only the ASKING goes away, so this gates what an editor offers and
     /// refuses nothing at compile time.
-    Introspection,
+    Reflection,
     /// The `_thread` seam the `threading` module is written over (the `threading` feature): green
     /// threads, `join`, and the lock / event primitives.
     ///
@@ -163,6 +114,9 @@ pub enum Capability {
     /// carry, but its first line is `import _thread`, and no artifact can supply that. So a program
     /// that imports `threading` against an image without this capability is one the front end can
     /// see is wrong, and the interpreter would otherwise answer at the import.
+    ///
+    /// Off, the interpreter still PREEMPTS -- the driver's switch point is not this feature's. What
+    /// is absent is the seam that asks for a second thread.
     Threading,
 }
 
@@ -173,7 +127,7 @@ impl Capability {
     /// profile for every caller and narrows it silently. The guard below is what makes that a
     /// compile error rather than a behavior change.
     pub const ALL: &'static [Capability] =
-        &[Capability::Float, Capability::Complex, Capability::Introspection, Capability::Threading];
+        &[Capability::Float, Capability::Complex, Capability::Reflection, Capability::Threading];
 
     /// Which capabilities cannot be provided without which others, as `(dependent, prerequisite)`.
     ///
@@ -197,7 +151,7 @@ impl Capability {
         match self {
             Capability::Float => "float",
             Capability::Complex => "complex",
-            Capability::Introspection => "introspection",
+            Capability::Reflection => "reflection",
             Capability::Threading => "threading",
         }
     }
@@ -207,7 +161,7 @@ impl Capability {
         match self {
             Capability::Float => 0x0001,
             Capability::Complex => 0x0002,
-            Capability::Introspection => 0x0004,
+            Capability::Reflection => 0x0004,
             Capability::Threading => 0x0008,
         }
     }
@@ -226,7 +180,7 @@ const fn _every_capability_is_in_all(capability: Capability) -> usize {
     match capability {
         Capability::Float => 0,
         Capability::Complex => 1,
-        Capability::Introspection => 2,
+        Capability::Reflection => 2,
         Capability::Threading => 3,
     }
 }
@@ -317,6 +271,36 @@ impl Profile {
         Profile(Self::close_over_dependents(self.0 & !capability.bit(), Capability::REQUIRES))
     }
 
+    /// What `capability` rests on: everything [`Profile::with`] would have to add to supply it.
+    ///
+    /// Derived from the same [`Capability::REQUIRES`] table the closures read, and transitively --
+    /// so a chain answers in full rather than one link at a time. Exposed because a caller that has
+    /// to EXPLAIN a profile should not be re-deriving the edges from the closure's behavior:
+    /// "`complex` needs `float`" is a fact about the table, and a tool that has to discover it by
+    /// calling `with` and diffing is one that will drift from it.
+    pub fn requires(capability: Capability) -> impl Iterator<Item = Capability> {
+        let closed = Self::close_over_prerequisites(capability.bit(), Capability::REQUIRES);
+        Capability::ALL
+            .iter()
+            .copied()
+            .filter(move |c| *c != capability && closed & c.bit() != 0)
+    }
+
+    /// What rests on `capability`: everything [`Profile::without`] would have to drop with it.
+    ///
+    /// The same table read from the other end, and the reason it is one table: these two answers
+    /// are a single edge asked from each side, so they cannot disagree about an edge that exists.
+    pub fn dependents(capability: Capability) -> impl Iterator<Item = Capability> {
+        let dropped = Self::close_over_dependents(
+            Profile::FULL.0 & !capability.bit(),
+            Capability::REQUIRES,
+        );
+        Capability::ALL
+            .iter()
+            .copied()
+            .filter(move |c| *c != capability && Profile::FULL.0 & c.bit() != 0 && dropped & c.bit() == 0)
+    }
+
     /// Add the prerequisite of every capability present, until nothing more is owed.
     ///
     /// Both closures iterate to a fixed point rather than making a single pass, which is what makes
@@ -382,7 +366,7 @@ pub enum Knob {
     /// The `complex` type and `1j` literals.
     Complex,
     /// `dir()` and the per-type name lists it reports from.
-    Introspection,
+    Reflection,
     /// The pure-Python module sources carried in the image, so an import resolves with no
     /// filesystem.
     BundledStdlib,
@@ -398,7 +382,7 @@ impl Knob {
     pub const ALL: &'static [Knob] = &[
         Knob::Float,
         Knob::Complex,
-        Knob::Introspection,
+        Knob::Reflection,
         Knob::BundledStdlib,
         Knob::GcEngine,
         Knob::Threading,
@@ -412,7 +396,7 @@ impl Knob {
         match self {
             Knob::Float => "float",
             Knob::Complex => "complex",
-            Knob::Introspection => "introspection",
+            Knob::Reflection => "reflection",
             Knob::BundledStdlib => "bundled-stdlib",
             Knob::GcEngine => "gc-collect",
             Knob::Threading => "threading",
@@ -429,7 +413,7 @@ impl Knob {
         match self {
             Knob::Float => Some(Capability::Float),
             Knob::Complex => Some(Capability::Complex),
-            Knob::Introspection => Some(Capability::Introspection),
+            Knob::Reflection => Some(Capability::Reflection),
             Knob::Threading => Some(Capability::Threading),
             Knob::BundledStdlib | Knob::GcEngine => None,
         }
@@ -451,7 +435,7 @@ impl Knob {
         match self {
             Knob::Float => 0,
             Knob::Complex => 3_268,
-            Knob::Introspection => 3_616,
+            Knob::Reflection => 3_616,
             Knob::BundledStdlib => 0,
             Knob::GcEngine => 9_724,
             Knob::Threading => 1_656,
@@ -471,7 +455,7 @@ const fn _every_knob_is_in_all(knob: Knob) -> usize {
     match knob {
         Knob::Float => 0,
         Knob::Complex => 1,
-        Knob::Introspection => 2,
+        Knob::Reflection => 2,
         Knob::BundledStdlib => 3,
         Knob::GcEngine => 4,
         Knob::Threading => 5,
@@ -1009,6 +993,7 @@ impl UnaryOp {
 /// |     58 | Await | async |
 /// |     59 | ListGrow | growable lists |
 /// |     60 | DeleteName | del: class-body namespace |
+/// |     61 | BuildClassEx | class headers with unpacked bases/keywords |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -1115,6 +1100,37 @@ pub enum Op {
     BuildClassKw {
         /// The index into `consts` of the [`Const::KwNames`] naming the keywords in order.
         kwnames: u32,
+    },
+    /// A class header whose bases or keywords are UNPACKED at run time -- `class A(**d)`,
+    /// `class A(*bases)`, `class A(B, *rest, **kw)`. This is to [`Op::BuildClassKw`] exactly what
+    /// [`Op::CallEx`] is to [`Op::CallKw`], and it carries the same two operands.
+    ///
+    /// `consts[kinds]` (a [`Const::ArgKinds`]) tags each stack slot positional / `*` / keyword /
+    /// `**`, and `consts[kwnames]` (a [`Const::KwNames`]) names the keyword-tagged slots in order.
+    /// The stack holds `[name, bases.., kwvals..]` and then the namespace, as [`Op::BuildClassKw`]
+    /// takes it. The runtime flattens the tags -- positional and `*` slots into the base tuple,
+    /// keyword and `**` slots into one mapping -- and then runs the same tail a plain class header
+    /// runs.
+    ///
+    /// **Why `BuildClassKw` cannot be widened to cover this.** Its `kwnames` is a COMPILE-TIME
+    /// [`Const::KwNames`]; a `**` spread is a runtime mapping whose keys are not known until it is
+    /// evaluated. The difference is not a field, it is when the names exist.
+    ///
+    /// WARNING: `metaclass` is refused at RUN TIME by the arm that flattens the mapping, not by the
+    /// compiler. `metaclass=` is outside this subset, and a compile-time refusal cannot see through
+    /// a dict -- `class A(**{'metaclass': M})` and `class A(metaclass=M)` mean the same thing, so a
+    /// refusal catching only the spelled-out form would leave a hole shaped like a dict literal. The
+    /// flattened mapping is the one place the information exists. An implementation must REFUSE by
+    /// name rather than drop the key, which would return a class whose metaclass was specified and
+    /// silently ignored.
+    ///
+    /// One `site`, not two fields, for the reason [`Op::CallEx`] gives: an enum is as wide as its
+    /// widest variant, so a second payload word here would cost four bytes on every op for the sake
+    /// of the rarest one. `no_op_variant_is_wider_than_one_payload_word` holds that.
+    BuildClassEx {
+        /// This site's entry in [`CodeObject::wide_operands`]: `[kinds, kwnames]`, the
+        /// [`Const::ArgKinds`] and [`Const::KwNames`] indices.
+        site: u32,
     },
     /// Pop the object, then the value, and do `object.<names[name]> = value` (`cache` is the
     /// inline-cache slot). For an attribute assignment `obj.attr = value`.
@@ -1337,6 +1353,13 @@ pub enum Op {
 pub enum Const {
     /// The singleton `None`.
     None,
+    /// The singleton `Ellipsis`, the value of the `...` literal.
+    ///
+    /// It is a CONSTANT and not a load of the builtin name `Ellipsis`, because those are not the
+    /// same thing: `Ellipsis = 5` rebinds an ordinary builtin name and is legal Python, while `...`
+    /// keeps meaning the singleton. Reading the literal through the name made the two move together,
+    /// so `type(...)` answered `int` after a rebinding.
+    Ellipsis,
     /// `True` or `False`.
     Bool(bool),
     /// An integer literal. The compiler keeps it in an `i64`; the interpreter materializes it as a
@@ -1384,6 +1407,7 @@ impl Const {
             Const::Float(_) => Some(Capability::Float),
             Const::Imaginary(_) => Some(Capability::Complex),
             Const::None
+            | Const::Ellipsis
             | Const::Bool(_)
             | Const::Int(_)
             | Const::Str(_)
@@ -2177,6 +2201,7 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
 fn put_const(buf: &mut Vec<u8>, c: &Const) {
     match c {
         Const::None => buf.push(0),
+        Const::Ellipsis => buf.push(10),
         Const::Bool(b) => {
             buf.push(1);
             buf.push(u8::from(*b));
@@ -2324,6 +2349,12 @@ fn put_op(buf: &mut Vec<u8>, op: &Op, wide: &[[u32; 2]]) {
         Op::BuildClassKw { kwnames } => {
             buf.push(57);
             put_u32(buf, *kwnames);
+        }
+        Op::BuildClassEx { site } => {
+            buf.push(61);
+            let [kinds, kwnames] = wide[*site as usize];
+            put_u32(buf, kinds);
+            put_u32(buf, kwnames);
         }
         Op::SetAttr { site } => {
             buf.push(32);
@@ -2911,6 +2942,7 @@ impl<'a> Reader<'a> {
         let tag = self.u8()?;
         let c = match tag {
             0 => Const::None,
+            10 => Const::Ellipsis,
             1 => Const::Bool(self.u8()? != 0),
             2 => Const::Int(self.i64()?),
             3 => {
@@ -3055,6 +3087,14 @@ impl<'a> Reader<'a> {
             58 => Op::Await,
             59 => Op::ListGrow { list: self.u32()? },
             57 => Op::BuildClassKw { kwnames: self.u32()? },
+            61 => {
+                let kinds = self.u32()?;
+                let kwnames = self.u32()?;
+                wide.push([kinds, kwnames]);
+                Op::BuildClassEx {
+                    site: (wide.len() - 1) as u32,
+                }
+            }
             56 => {
                 let b = self.u8()?;
                 Op::InplaceBinOp(BinOp::from_u8(b).ok_or(DecodeError::BadTag("BinOp", b))?)
@@ -3806,9 +3846,14 @@ mod tests {
             Op::InplaceBinOp(BinOp::Add),
             Op::Await,
             Op::ListGrow { list: 2 },
+            Op::BuildClassEx { site: 5 },
+            Op::DeleteGlobal(4),
+            Op::DeleteDeref(1),
+            Op::BuildClassKw { kwnames: 6 },
+            Op::DeleteName(7),
             Op::Return,
         ];
-        let wide = [[4, 5], [0, 7], [1, 1], [2, 1], [2, 1]];
+        let wide = [[4, 5], [0, 7], [1, 1], [2, 1], [2, 1], [3, 6]];
 
         let mut buf = Vec::new();
         for op in &ops {
@@ -3825,6 +3870,29 @@ mod tests {
         assert_eq!(
             decoded_wide, wide,
             "the side table must come back with the same entries in the same order"
+        );
+
+        let mut tags: Vec<u8> = ops
+            .iter()
+            .map(|op| {
+                let mut one = Vec::new();
+                put_op(&mut one, op, &wide);
+                one[0]
+            })
+            .collect();
+        tags.sort_unstable();
+        let unique = {
+            let mut t = tags.clone();
+            t.dedup();
+            t
+        };
+        assert_eq!(tags, unique, "an op tag is listed twice; the list should name each op once");
+        let highest = *tags.last().expect("the list is not empty");
+        assert_eq!(
+            tags,
+            (0..=highest).collect::<Vec<u8>>(),
+            "op tags must be contiguous 0..={highest} and each must appear here -- a gap means an \
+             op exists that this test does not round-trip, and the test's own name would be false"
         );
     }
 
@@ -4059,7 +4127,7 @@ mod tests {
         let no_float = Profile::FULL.without(Capability::Float);
         assert!(!no_float.supports(Capability::Float));
         assert!(!no_float.supports(Capability::Complex), "no float means no complex");
-        assert!(no_float.supports(Capability::Introspection), "and nothing else moved");
+        assert!(no_float.supports(Capability::Reflection), "and nothing else moved");
 
         let complex_only = Profile::BARE.with(Capability::Complex);
         assert!(complex_only.supports(Capability::Float), "asking for complex asks for float");
@@ -4144,21 +4212,56 @@ mod tests {
         assert!(Knob::COST_MEASURED_ON.contains("microbit-v2-py"));
     }
 
+    /// The edges are inspectable from both ends, and both answers come from the one table.
+    ///
+    /// A caller that has to EXPLAIN a profile -- an editor, a `--why` flag, a refusal message --
+    /// would otherwise re-derive the edges by calling `with`/`without` and diffing, and a
+    /// re-derivation drifts from the thing it re-derives. Asked of the live table these are small,
+    /// which is the point: the table is one edge today and the accessors say so rather than
+    /// implying more.
+    #[test]
+    fn the_dependency_edges_are_readable_from_either_end() {
+        let requires: Vec<_> = Profile::requires(Capability::Complex).collect();
+        assert_eq!(requires, vec![Capability::Float], "a complex is a pair of floats");
+        assert_eq!(Profile::requires(Capability::Float).count(), 0, "float rests on nothing");
+
+        let dependents: Vec<_> = Profile::dependents(Capability::Float).collect();
+        assert_eq!(dependents, vec![Capability::Complex], "dropping float drops complex");
+        assert_eq!(Profile::dependents(Capability::Complex).count(), 0, "nothing rests on complex");
+
+        for c in Capability::ALL {
+            assert!(!Profile::requires(*c).any(|x| x == *c), "{c:?} requires itself");
+            assert!(!Profile::dependents(*c).any(|x| x == *c), "{c:?} depends on itself");
+        }
+
+        for c in Capability::ALL {
+            for needed in Profile::requires(*c) {
+                assert!(Profile::BARE.with(*c).supports(needed), "with({c:?}) must add {needed:?}");
+            }
+            for resting in Profile::dependents(*c) {
+                assert!(
+                    !Profile::FULL.without(*c).supports(resting),
+                    "without({c:?}) must drop {resting:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_chain_of_prerequisites_closes_from_either_end() {
         let up = &[
             (Capability::Complex, Capability::Float),
-            (Capability::Introspection, Capability::Complex),
+            (Capability::Reflection, Capability::Complex),
         ];
-        let closed = Profile::close_over_prerequisites(Capability::Introspection.bit(), up);
-        let chain = Capability::Float.bit() | Capability::Complex.bit() | Capability::Introspection.bit();
+        let closed = Profile::close_over_prerequisites(Capability::Reflection.bit(), up);
+        let chain = Capability::Float.bit() | Capability::Complex.bit() | Capability::Reflection.bit();
         assert_eq!(
             closed, chain,
             "taking the end of a chain takes the whole chain, not just the next link"
         );
 
         let down = &[
-            (Capability::Introspection, Capability::Complex),
+            (Capability::Reflection, Capability::Complex),
             (Capability::Complex, Capability::Float),
         ];
         let fallen = Profile::close_over_dependents(chain & !Capability::Float.bit(), down);
@@ -4173,8 +4276,9 @@ mod tests {
     fn only_the_constants_an_image_cannot_materialize_need_a_capability() {
         assert_eq!(Const::Float(0).required_capability(), Some(Capability::Float));
         assert_eq!(Const::Imaginary(0).required_capability(), Some(Capability::Complex));
-        for konst in [
+        let free = [
             Const::None,
+            Const::Ellipsis,
             Const::Bool(true),
             Const::Int(7),
             Const::Str(PyStr::from_wtf8(vec![b's'])),
@@ -4182,8 +4286,27 @@ mod tests {
             Const::KwNames(vec![String::from("k")]),
             Const::BigInt(String::from("123")),
             Const::Bytes(vec![1, 2]),
-        ] {
+        ];
+        for konst in &free {
             assert_eq!(konst.required_capability(), None, "{konst:?} needs nothing");
         }
+
+        let mut tags: Vec<u8> = free
+            .iter()
+            .chain([Const::Float(0), Const::Imaginary(0)].iter())
+            .map(|k| {
+                let mut one = Vec::new();
+                put_const(&mut one, k);
+                one[0]
+            })
+            .collect();
+        tags.sort_unstable();
+        let highest = *tags.last().expect("the population is not empty");
+        assert_eq!(
+            tags,
+            (0..=highest).collect::<Vec<u8>>(),
+            "constant tags must be contiguous 0..={highest} and each must be classified here -- a \
+             gap means a constant exists whose capability requirement nothing checks"
+        );
     }
 }

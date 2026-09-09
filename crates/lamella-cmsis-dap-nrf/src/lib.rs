@@ -236,7 +236,13 @@ pub fn flash_and_run<A: TargetAccess>(
 
 /// The BBC micro:bit's on-board CMSIS-DAP HID probe. **Every micro:bit ever made presents these
 /// same two numbers**, which is why nothing here may open by them alone.
-#[cfg(feature = "microbit")]
+///
+/// **NOT BEHIND `microbit`.** This is a pair of integers describing hardware: a routing table
+/// reads it to say which probe a board carries, and reading it needs no USB stack. Behind the
+/// feature it would pull `lamella-usbhid`, `lamella-probe` and `lamella-cmsis-dap/usbhid` into
+/// every consumer that wants only the FACT -- which is what keeps `lamella-flash-routes`
+/// buildable for `wasm32`, so a browser reaches these families through the same code the command
+/// line runs.
 pub const MICROBIT_DAPLINK: (u16, u16) = (0x0d28, 0x0204);
 
 /// Open a micro:bit's on-board probe and [`flash_and_run`] `image` at flash 0 -- the one-call
@@ -452,10 +458,14 @@ mod erase_all_tests {
         let mut replies = vec![
             echo(proto::cmd::CONNECT, &[proto::Port::Swd as u8]),
             echo(proto::cmd::SWJ_CLOCK, &[0x00]),
+            echo(proto::cmd::SWD_CONFIGURE, &[0x00]),
+            echo(proto::cmd::TRANSFER_CONFIGURE, &[0x00]),
+            vec![proto::cmd::INFO, 0x02, 0x40, 0x00],
             echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
             echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
             echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
             echo(proto::cmd::SWJ_SEQUENCE, &[0x00]),
+            idcode.clone(),
             idcode,
         ];
         replies.extend(std::iter::repeat_n(ack(), 40));

@@ -134,14 +134,14 @@ fn validate(interpreter: &mut Interpreter, this: &JsValue) -> Result<GeneratorSt
 
 /// `%GeneratorPrototype%.next`.
 ///
-/// **THE ARGUMENT IS DISCARDED, AND THE STANDARD DISCARDS IT TOO.** `next(v)` delivers `v` as the
-/// value of the `yield` the generator is suspended at -- and a generator in `suspendedStart` is not
-/// suspended at one, so `GeneratorStart` drops the first resumption's value however it is spelled.
-/// Since `suspendedYield` cannot be reached while a `yield` does not parse, every resumption this
-/// profile can perform is a first one. It stops being right at the same moment `yield` lands, which
-/// is why the parameter is named rather than elided from the signature.
+/// **THE ARGUMENT IS DELIVERED AS THE VALUE OF THE `yield` THE GENERATOR IS SUSPENDED AT**, by
+/// writing it into the frame the desugared body reads through. `GeneratorStart` discards the FIRST
+/// resumption's value, and that happens here without a check: a `FRAME.sent` read is only ever
+/// emitted at a resume point, so case 0 -- the only case a `suspendedStart` generator can enter --
+/// has nowhere to observe it.
+///
 fn next(interpreter: &mut Interpreter, this: JsValue, arguments: &[JsValue]) -> Completion {
-    let _ = arguments;
+    let sent = arguments.first().cloned().unwrap_or(JsValue::Undefined);
     let state = match validate(interpreter, &this) {
         Ok(state) => state,
         Err(abrupt) => return abrupt,
@@ -152,7 +152,7 @@ fn next(interpreter: &mut Interpreter, this: JsValue, arguments: &[JsValue]) -> 
     match state {
         GeneratorState::Completed => iter_result(interpreter, JsValue::Undefined, true),
         GeneratorState::SuspendedStart | GeneratorState::SuspendedYield => {
-            resume_to_completion(interpreter, id)
+            resume_to_completion(interpreter, id, sent)
         }
         GeneratorState::Executing => {
             interpreter.internal_defect("a validated generator is executing")
@@ -175,9 +175,14 @@ fn return_(interpreter: &mut Interpreter, this: JsValue, arguments: &[JsValue]) 
         return interpreter.internal_defect("a validated generator is not an object");
     };
     match state {
-        GeneratorState::SuspendedStart
-        | GeneratorState::SuspendedYield
-        | GeneratorState::Completed => {
+        GeneratorState::SuspendedYield => {
+            let Some(frame) = generator_frame(interpreter, id) else {
+                return interpreter.internal_defect("a suspended generator has no frame");
+            };
+            deliver(interpreter, frame, crate::generator_transform::KIND_RETURN, value);
+            resume_to_completion(interpreter, id, JsValue::Undefined)
+        }
+        GeneratorState::SuspendedStart | GeneratorState::Completed => {
             complete(interpreter, id);
             iter_result(interpreter, value, true)
         }
@@ -189,8 +194,15 @@ fn return_(interpreter: &mut Interpreter, this: JsValue, arguments: &[JsValue]) 
 
 /// `%GeneratorPrototype%.throw`.
 ///
-/// The argument is thrown FROM the generator, so a `suspendedStart` one completes and the
-/// exception comes straight back out -- there is no body between the caller and the throw.
+/// # A SUSPENDED GENERATOR IS RESUMED, BECAUSE THE BODY MAY CATCH
+///
+/// The argument is thrown AT the suspension point, which is inside the body. A body containing a
+/// `try` around its `yield` can handle it and carry on, so `throw` resumes the machine with the
+/// exception in hand and lets the resume block raise it -- see [`generator_transform::RAISE`].
+///
+/// `suspendedStart` and `completed` do NOT resume: `GeneratorResumeAbrupt` steps 2 and 3 complete
+/// the generator and return the abrupt completion without executing anything, and a body that has
+/// not started has no suspension point for the exception to arrive at.
 fn throw(interpreter: &mut Interpreter, this: JsValue, arguments: &[JsValue]) -> Completion {
     let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
     let state = match validate(interpreter, &this) {
@@ -201,9 +213,14 @@ fn throw(interpreter: &mut Interpreter, this: JsValue, arguments: &[JsValue]) ->
         return interpreter.internal_defect("a validated generator is not an object");
     };
     match state {
-        GeneratorState::SuspendedStart
-        | GeneratorState::SuspendedYield
-        | GeneratorState::Completed => {
+        GeneratorState::SuspendedYield => {
+            let Some(frame) = generator_frame(interpreter, id) else {
+                return interpreter.internal_defect("a suspended generator has no frame");
+            };
+            deliver(interpreter, frame, crate::generator_transform::KIND_THROW, value);
+            resume_to_completion(interpreter, id, JsValue::Undefined)
+        }
+        GeneratorState::SuspendedStart | GeneratorState::Completed => {
             complete(interpreter, id);
             Completion::Throw(value)
         }
@@ -220,7 +237,11 @@ fn throw(interpreter: &mut Interpreter, this: JsValue, arguments: &[JsValue]) ->
 /// `var g = f(); function* f() { g.next(); }` -- a TypeError rather than unbounded recursion, and
 /// clearing it is what leaves the generator `completed` rather than permanently locked when the
 /// body throws.
-fn resume_to_completion(interpreter: &mut Interpreter, id: ObjectId) -> Completion {
+fn resume_to_completion(
+    interpreter: &mut Interpreter,
+    id: ObjectId,
+    sent: JsValue,
+) -> Completion {
     let Some(context) = interpreter
         .object(id)
         .generator
@@ -229,16 +250,24 @@ fn resume_to_completion(interpreter: &mut Interpreter, id: ObjectId) -> Completi
     else {
         return interpreter.internal_defect("a suspended generator has no context to resume");
     };
-    let before = frame_state(interpreter, context.frame);
+    let _ = interpreter.create_data_property(
+        context.frame,
+        PropertyKey::from_str(crate::generator_transform::SENT),
+        sent,
+    );
+    clear_suspended(interpreter, context.frame);
     set_state(interpreter, id, GeneratorState::Executing);
     let completion = interpreter.run_generator_body(&context);
-    let after = frame_state(interpreter, context.frame);
-    let suspended = after != before;
+    let suspended = read_suspended(interpreter, context.frame);
     match completion {
         Completion::Normal(value) => {
             if suspended {
                 set_state(interpreter, id, GeneratorState::SuspendedYield);
-                iter_result(interpreter, value, false)
+                if read_verbatim(interpreter, context.frame) {
+                    Completion::Normal(value)
+                } else {
+                    iter_result(interpreter, value, false)
+                }
             } else {
                 complete(interpreter, id);
                 iter_result(interpreter, value, true)
@@ -251,20 +280,80 @@ fn resume_to_completion(interpreter: &mut Interpreter, id: ObjectId) -> Completi
     }
 }
 
-/// Reads the resume state out of the frame the desugared body dispatches on.
+/// Puts an abrupt resumption on the frame for the resume block to act on.
 ///
-/// A MISSING OR NON-NUMERIC STATE READS AS `NaN`, which compares unequal to everything including
-/// itself -- so a frame a program somehow damaged reports "suspended" rather than "finished", and
-/// the generator stops rather than being resumed against a state nobody wrote.
-fn frame_state(interpreter: &mut Interpreter, frame: ObjectId) -> f64 {
-    match interpreter
-        .object(frame)
-        .own(&PropertyKey::from_str(crate::generator_transform::STATE))
-        .and_then(|property| property.data_value().cloned())
-    {
-        Some(JsValue::Number(state)) => state,
-        _ => f64::NAN,
+/// The two abrupt kinds carry their value in the same slot because they are never live at once --
+/// see [`generator_transform::KIND`].
+fn deliver(interpreter: &mut Interpreter, frame: ObjectId, kind: f64, value: JsValue) {
+    let _ = interpreter.create_data_property(
+        frame,
+        PropertyKey::from_str(crate::generator_transform::THROWN),
+        value,
+    );
+    let _ = interpreter.create_data_property(
+        frame,
+        PropertyKey::from_str(crate::generator_transform::KIND),
+        JsValue::Number(kind),
+    );
+}
+
+/// The frame a suspended generator's machine dispatches on.
+fn generator_frame(interpreter: &mut Interpreter, id: ObjectId) -> Option<ObjectId> {
+    interpreter
+        .object(id)
+        .generator
+        .as_ref()
+        .and_then(|data| data.context.as_ref())
+        .map(|context| context.frame)
+}
+
+/// Clears the suspension marker before a step runs, and the forwarding marker beside it.
+///
+/// **BOTH, BECAUSE BOTH DESCRIBE THE STEP THAT JUST RAN.** A delegation sets the second one and an
+/// ordinary `yield` does not, so a delegation left uncleared would make the NEXT plain `yield` hand
+/// its value back unwrapped -- a generator answering `1` where the protocol requires
+/// `{value: 1, done: false}`.
+fn clear_suspended(interpreter: &mut Interpreter, frame: ObjectId) {
+    for name in [
+        crate::generator_transform::SUSPENDED,
+        crate::generator_transform::VERBATIM,
+    ] {
+        let _ = interpreter.create_data_property(
+            frame,
+            PropertyKey::from_str(name),
+            JsValue::Boolean(false),
+        );
     }
+}
+
+/// Whether the value the step handed back is already an iteration result object.
+///
+/// See [`generator_transform::VERBATIM`]: a `yield*` forwards the delegate's own result object, and
+/// its identity is observable.
+fn read_verbatim(interpreter: &mut Interpreter, frame: ObjectId) -> bool {
+    matches!(
+        interpreter
+            .object(frame)
+            .own(&PropertyKey::from_str(crate::generator_transform::VERBATIM))
+            .and_then(|property| property.data_value().cloned()),
+        Some(JsValue::Boolean(true))
+    )
+}
+
+/// Whether the step that just ran reached a `yield`.
+///
+/// **ANYTHING OTHER THAN THE `true` THE TRANSFORM WRITES READS AS "DID NOT SUSPEND".** The value is
+/// written by generated code one statement before the matching `return`, so the two cannot come
+/// apart; a frame that somehow held something else has not suspended, and reporting `done` finishes
+/// the generator rather than resuming it against a frame nobody wrote.
+fn read_suspended(interpreter: &mut Interpreter, frame: ObjectId) -> bool {
+    matches!(
+        interpreter
+            .object(frame)
+            .own(&PropertyKey::from_str(crate::generator_transform::SUSPENDED))
+            .and_then(|property| property.data_value().cloned()),
+        Some(JsValue::Boolean(true))
+    )
 }
 
 /// Moves a generator to `completed` and DROPS its context.

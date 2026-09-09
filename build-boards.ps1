@@ -66,7 +66,11 @@ foreach ($r in $BoardReferences) {
         throw "'$r.dll' is not in '$out'. Run build-managed.ps1 -OutDir '$OutDir' first."
     }
 }
-$defineArg = if ($Define) { @("/define:$($Define -join ';')") } else { @() }
+# `@()` WRAPS THE WHOLE `if`, not each branch. PowerShell unrolls a statement's output, so an `if`
+# whose taken branch yields a one-element array assigns a bare STRING -- and splatting a string
+# passes it one CHARACTER at a time, which the compiler reports as `unknown option '/'`. This is the
+# same hazard `Get-Sources` documents below, in the form a statement rather than a function takes.
+$defineArg = @(if ($Define) { "/define:$($Define -join ';')" })
 
 # Sorted by the path RELATIVE to $dir, separators normalized, ORDINAL -- so emitted metadata does
 # not depend on the filesystem's enumeration order or on the host's culture. `build-managed.ps1`
@@ -211,7 +215,14 @@ foreach ($boardDir in $boards) {
     $extNote = if ($extSrc.Count) { " + $($extSrc.Count) ext" } else { '' }
     Write-Host "Lamella.Boards.$qualified ($($src.Count) sources: csp/$family + bsp/$($boardDir.Name)$extNote) -> $dll"
     & $Lcsc @src @defineArg @refs /target:library "/out:$dll" /debug-
-    if ($LASTEXITCODE -ne 0) { throw "Lamella.Boards.$qualified compile failed ($LASTEXITCODE)" }
+    # The argument vector goes in the message. A compiler that rejects its COMMAND LINE prints no
+    # `error CS` diagnostic at all, so an exit code on its own reads as a crash in sources the line
+    # above has just reported as found; the arguments are what tell the two apart.
+    if ($LASTEXITCODE -ne 0) {
+        $shown = @($defineArg) + @($refs) + @("/target:library", "/out:$dll", "/debug-")
+        throw "Lamella.Boards.$qualified compile failed ($LASTEXITCODE)`n" +
+              "  $($src.Count) sources, then: $($shown -join ' ')"
+    }
     $built += [pscustomobject]@{ Board = $boardDir.Name; Assembly = "Lamella.Boards.$qualified"; Bytes = (Get-Item $dll).Length }
 }
 

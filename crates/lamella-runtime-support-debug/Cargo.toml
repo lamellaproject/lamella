@@ -1,0 +1,46 @@
+[package]
+name = "lamella-runtime-support-debug"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The AOT image's Lamella Link layer: the frame loop and codec (link-host) plus the on-target debug agent (debug-agent), as C-ABI entry points over a board-supplied byte carrier. Compiled into the per-target runtime-support archive (tools/runtime/runtime-support); an image that does not ask for it links none of it."
+publish = false
+
+[dependencies]
+# The protocol: framing, the HELLO handshake, the message types. This is the `link-host` half --
+# the thing that costs flash -- and it is the SAME crate the serve firmwares and the host tools
+# speak, so a wire that works against one works against the other by construction.
+lamella-wire = { path = "../lamella-wire" }
+# The agent that answers the frames. It names no interpreter, which is why an AOT image can host it.
+lamella-debug-agent = { path = "../lamella-debug-agent", optional = true }
+# The on-device firmware store: the region arithmetic, the read-back checksum and the write-status
+# ladder behind FW_WRITE / FW_COMMIT. Its own header says the dispatch that turns a frame into a
+# call belongs to whoever owns the frame loop -- on this tier that is this crate.
+lamella-fw-store = { path = "../lamella-fw-store", optional = true }
+
+[features]
+# The agent answers DEBUG frames. Requires the link layer, which is unconditional here.
+#
+# It is separate from speaking Link at all, and the separation is deliberate: an image that must not
+# answer a debugger may still need to be replaced over the wire, and firmware update rides on the
+# same link. One knob for both would make "no debugging" mean "no recovery" too. So this crate is
+# the link layer and this feature is the agent.
+default = []
+debug-agent = ["dep:lamella-debug-agent", "lamella-debug-agent/device"]
+# The image ACCEPTS A FIRMWARE IMAGE over the wire (FW_WRITE / FW_COMMIT).
+#
+# A third knob rather than part of either other one, and the separation is the point of the whole
+# decomposition: an image that must not answer a debugger may still need to be replaced over the
+# wire, so folding this into `debug-agent` would make "no debugging by default" mean "no recovery
+# by default". It rides the same link, which is why it needs the layer and not the agent.
+#
+# It supplies no flash driver of its own -- the image defines the `lamella_board_fw_*` symbols,
+# because which controller, which granule and where the update region sits are BOARD facts and this
+# archive is built once per ISA for every board. Selecting this and defining none of them fails the
+# LINK rather than shipping an image that advertises firmware update and refuses every chunk.
+fw-update = ["dep:lamella-fw-store"]
+
+[lints]
+workspace = true

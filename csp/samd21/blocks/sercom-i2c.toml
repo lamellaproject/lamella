@@ -2,7 +2,7 @@
 # are SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
 # plan. Instance bases/ids live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
 #
-# Authored 2026-07-20 from the datasheet, NOT from the sibling sercom-usart.toml: the two modes
+# Authored from the datasheet, NOT from the sibling sercom-usart.toml: the two modes
 # share a SERCOM and a CTRLA.MODE field position, and share nothing else worth assuming. Every
 # offset below is taken from the per-register DESCRIPTION headings in 28.10 ("Offset: 0x.."), which
 # is deliberate -- the first note below says why, and which value it changes.

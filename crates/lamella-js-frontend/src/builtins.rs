@@ -750,27 +750,38 @@ fn install_object(interpreter: &mut Interpreter) {
         if matches!(iterable, JsValue::Undefined | JsValue::Null) {
             return interpreter.type_error("Object.fromEntries requires an iterable");
         }
-        let entries = match crate::iterator::iterate_to_list(interpreter, &iterable) {
-            Ok(entries) => entries,
+        let mut record = match crate::iterator::get_iterator(interpreter, &iterable) {
+            Ok(record) => record,
             Err(abrupt) => return abrupt,
         };
         let object_prototype = interpreter.intrinsics.object_prototype;
         let target = interpreter.allocate(Object::new(Some(object_prototype)));
-        for entry in entries {
+        loop {
+            let result = match crate::iterator::iterator_step(interpreter, &mut record) {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(abrupt) => return abrupt,
+            };
+            let entry = match crate::iterator::iterator_value(interpreter, result) {
+                Ok(entry) => entry,
+                Err(abrupt) => return abrupt,
+            };
             let JsValue::Object(pair) = entry else {
-                return interpreter.type_error("Object.fromEntries needs each entry to be an object");
+                let error = interpreter
+                    .type_error("Object.fromEntries needs each entry to be an object");
+                return crate::iterator::iterator_close(interpreter, &record, error);
             };
             let key = match interpreter.get_property(pair, &PropertyKey::from_str("0")) {
                 Completion::Normal(value) => value,
-                abrupt => return abrupt,
+                abrupt => return crate::iterator::iterator_close(interpreter, &record, abrupt),
             };
             let value = match interpreter.get_property(pair, &PropertyKey::from_str("1")) {
                 Completion::Normal(value) => value,
-                abrupt => return abrupt,
+                abrupt => return crate::iterator::iterator_close(interpreter, &record, abrupt),
             };
             let key = match interpreter.to_property_key_value(&key) {
                 Ok(key) => key,
-                Err(abrupt) => return abrupt,
+                Err(abrupt) => return crate::iterator::iterator_close(interpreter, &record, abrupt),
             };
             interpreter.object_mut(target).set_own(key, Property::data(value));
         }
@@ -1089,7 +1100,8 @@ fn install_errors(interpreter: &mut Interpreter) {
         }
 
         let make = ERROR_MAKERS[index];
-        let constructor = interpreter.native_constructor(kind, 1, make, make);
+        let arity = if *kind == "AggregateError" { 2 } else { 1 };
+        let constructor = interpreter.native_constructor(kind, arity, make, make);
         interpreter.intrinsics.native_error_constructors[index] = constructor;
         if index > 0 {
             let error = interpreter.intrinsics.native_error_constructors[0];
@@ -2769,8 +2781,10 @@ fn array_species_create(
     let JsValue::Object(source) = original else {
         return new_array_of_length(interpreter, length);
     };
-    if !interpreter.object(*source).is_array {
-        return new_array_of_length(interpreter, length);
+    match interpreter.is_array(*source) {
+        Ok(true) => {}
+        Ok(false) => return new_array_of_length(interpreter, length),
+        Err(abrupt) => return Err(abrupt),
     }
     let constructor = match interpreter.get_member(original, &PropertyKey::from_str("constructor")) {
         Completion::Normal(value) => value,
@@ -3465,14 +3479,17 @@ fn install_string(interpreter: &mut Interpreter) {
     });
 
     interpreter.define_method(prototype, "replace", 2, |interpreter, this, arguments| {
-        let text = match coerce_to_string(interpreter, &this) {
-            Ok(text) => text,
-            Err(abrupt) => return abrupt,
-        };
+        if let Some(abrupt) = require_coercible(interpreter, &this) {
+            return abrupt;
+        }
         let pattern = arg(arguments, 0);
         if let Some(completion) = dispatch_replace(interpreter, &this, &pattern, arguments) {
             return completion;
         }
+        let text = match coerce_to_string(interpreter, &this) {
+            Ok(text) => text,
+            Err(abrupt) => return abrupt,
+        };
         let pattern = match interpreter.to_string_value(&pattern) {
             Ok(pattern) => pattern,
             Err(abrupt) => return abrupt,
@@ -3527,10 +3544,9 @@ fn install_string(interpreter: &mut Interpreter) {
     });
 
     interpreter.define_method(prototype, "replaceAll", 2, |interpreter, this, arguments| {
-        let text = match coerce_to_string(interpreter, &this) {
-            Ok(text) => text,
-            Err(abrupt) => return abrupt,
-        };
+        if let Some(abrupt) = require_coercible(interpreter, &this) {
+            return abrupt;
+        }
         let pattern = arg(arguments, 0);
         if is_regexp(interpreter, &pattern) {
             let JsValue::Object(id) = &pattern else {
@@ -3554,6 +3570,10 @@ fn install_string(interpreter: &mut Interpreter) {
         if let Some(completion) = dispatch_replace(interpreter, &this, &pattern, arguments) {
             return completion;
         }
+        let text = match coerce_to_string(interpreter, &this) {
+            Ok(text) => text,
+            Err(abrupt) => return abrupt,
+        };
         let pattern = match interpreter.to_string_value(&pattern) {
             Ok(pattern) => pattern,
             Err(abrupt) => return abrupt,
@@ -4040,6 +4060,17 @@ fn this_string_value(interpreter: &mut Interpreter, this: &JsValue) -> Completio
         },
         _ => interpreter.type_error("String.prototype.toString requires a string"),
     }
+}
+
+/// `RequireObjectCoercible` ALONE, for the methods that hand their receiver on unconverted.
+///
+/// **THE TWO ARE A DIFFERENT STEP AND A DIFFERENT OBSERVABLE.** A method that dispatches through a
+/// hook -- `replace`, `replaceAll`, `match`, `search`, `split` -- checks the receiver at step 2 and
+/// converts it at step 4, with the hook lookup between. Converting early runs a user `toString` at
+/// the wrong moment, which is visible whenever both the receiver and the pattern would throw.
+fn require_coercible(interpreter: &mut Interpreter, this: &JsValue) -> Option<Completion> {
+    matches!(this, JsValue::Undefined | JsValue::Null)
+        .then(|| interpreter.type_error("a String method requires a coercible receiver"))
 }
 
 /// `RequireObjectCoercible` then `ToString`: what a generic String method does to its receiver.
@@ -4658,7 +4689,7 @@ fn install_math(interpreter: &mut Interpreter) {
     });
 
     interpreter.define_method(math, "random", 0, |interpreter, _this, _arguments| {
-        interpreter.refuse(Absence::MathRandom)
+        Completion::Normal(JsValue::Number(interpreter.next_random()))
     });
 
     interpreter.define_method(math, "imul", 2, |interpreter, _this, arguments| {

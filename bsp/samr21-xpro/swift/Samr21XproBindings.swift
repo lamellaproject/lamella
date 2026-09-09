@@ -27,6 +27,12 @@ public enum Samr21XproBindings {
     public static let VCP_APBC_MASK: UInt32 = 0x4
     public static let VCP_PMUX_REG: UInt32 = 0x41004432
     public static let VCP_PMUX_PAIR: UInt32 = 0x33
+    public static let VCP_PMUX_TX_REG: UInt32 = 0x41004432
+    public static let VCP_PMUX_TX_MASK: UInt32 = 0xF
+    public static let VCP_PMUX_TX_VALUE: UInt32 = 0x3
+    public static let VCP_PMUX_RX_REG: UInt32 = 0x41004432
+    public static let VCP_PMUX_RX_MASK: UInt32 = 0xF0
+    public static let VCP_PMUX_RX_VALUE: UInt32 = 0x30
     public static let VCP_PINCFG_TX_REG: UInt32 = 0x41004444
     public static let VCP_PINCFG_RX_REG: UInt32 = 0x41004445
     public static let VCP_TXPO: UInt32 = 0

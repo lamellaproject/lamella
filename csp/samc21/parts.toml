@@ -1,0 +1,64 @@
+# The SAMC21 parts table. The SAM C21 is NOT a SAM D21 relative in the way the D20, DA1 and HA1
+# are: it carries the newer clock architecture -- MCLK, OSCCTRL, OSC32KCTRL, SUPC and RSTC where
+# those families have PM and SYSCTRL -- and its generic clock controller addresses a peripheral
+# channel as an ARRAY ELEMENT rather than through one indexed register. Its PORT sits at
+# 0x41000000 where theirs sit at 0x41004400. Nothing about it can be read off a D21.
+#
+# THE TWO ROSTER BOARDS ARE DIFFERENT PACKAGES AND THEIR DOCUMENTS ARE DIFFERENT TABLES.
+# DS60001479 splits its tables on TWO axes -- C20 against C21, and N against E/G/J -- so it carries
+# four peripheral summaries and four mux tables. The J board reads Table 12-3 and Table 6-2; the N
+# board reads Table 12-1 and Table 6-1. Reading the first table of each kind gives the N's map and
+# would apply it to the J.
+#
+# AND THE TWO PACKAGES DO NOT CARRY THE SAME SILICON. Compared row by row rather than spot-checked:
+#
+#     the two tables AGREE on   MCLK, GCLK, PORT, and SERCOM0..5 in every column
+#     they DISAGREE on          the N has SERCOM6 and SERCOM7 -- EIGHT instances, not six, on a
+#                               different APB bridge at 0x43000000
+#                               PAC's base: 0x40000000 on the N, 0x44000000 on the E/G/J
+#                               the EIC's external interrupt count: 0..16 against 0..15
+#
+# A reader who checked SERCOM0, found it identical and concluded "same map" would be right about
+# the rows bound here today and wrong about the part.
+
+[table]
+kind = "parts"
+family = "samc21"
+sources = [
+    "SAM C20/C21 Family Data Sheet DS60001479M (2025): ch 2 (configuration summary), ch 6 (I/O multiplexing -- Table 6-1 for the N, Table 6-2 for the E/G/J), ch 12 (peripherals configuration summary -- Table 12-1 for the N, Table 12-3 for the E/G/J)",
+]
+notes = [
+    "EACH PIN LIST IS COMPLETE FOR ITS PACKAGE AND IS CHECKED AGAINST AN INDEPENDENTLY PRINTED COUNT. Ch 2's configuration summary gives a 'General Purpose I/O-pins (GPIOs)' row per package: 84 for the 100-pin N and 52 for the 64-pin J. The lists below count 84 and 52.",
+    "THE J HAS TWO PORT GROUPS AND THE N HAS THREE. Table 6-2 reaches PB and stops; Table 6-1 carries PC00..PC28. That is a package difference on shared silicon, so instances.toml rows all three group bases and the pin lists here decide what a board may name.",
+    "SERCOM6 AND SERCOM7 EXIST ONLY ON THE N, and they are not merely two more of the same: they sit behind AHB-APB Bridge D at 0x43000000, so they are gated from APBDMASK rather than APBCMASK. A board on a J part that named either would be naming silicon its package does not have.",
+    "SERCOM6 AND SERCOM0 SHARE AN NVIC LINE, AND SO DO SERCOM7 AND SERCOM1. Table 12-1 gives SERCOM6 IRQ 9 and SERCOM0 IRQ 9; SERCOM7 and SERCOM1 both take 10. An interrupt handler on an N part cannot infer which instance raised it from the vector alone. Nothing here uses interrupts yet; recorded because the instance rows carry both numbers and a reader would reasonably assume they are unique.",
+    "SERCOM4 AND SERCOM5 ARE NOT SUPPORTED ON THE SAM C21E -- Table 6-2's note 4. No board on this roster is an E part, so no row here describes one; recorded because the E shares Table 6-2 with the J and a reader taking that table for 'the E/G/J' would carry the J's SERCOM set onto a part that lacks two of them.",
+]
+
+# ---- the 64-pin J: two PORT groups, six SERCOMs ------------------------------------------------
+
+[[parts]]
+part = "atsamc21j18a"
+package = "64-pin TQFP"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "PA00-PA25", "PA27-PA28", "PA30-PA31",
+    "PB00-PB17", "PB22-PB23", "PB30-PB31",
+]
+source = "DS60001479M Table 6-2 (PORT Function Multiplexing for SAM C21 E/G/J), whose SAM C21J column gives a package pin number for each pad above and none for any PC pad. The list counts 52 and ch 2's 64-pin column states 52 GPIOs. Flash 256 KB and SRAM 32 KB are ch 2's 64-pin column for the 18 density code, whose Flash row reads 256/128/64/32 KB and System SRAM row 32/16/8/4 KB."
+
+# ---- the 100-pin N: three PORT groups, EIGHT SERCOMs -------------------------------------------
+
+[[parts]]
+part = "atsamc21n18a"
+package = "100-pin TQFP"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "PA00-PA25", "PA27-PA28", "PA30-PA31",
+    "PB00-PB25", "PB30-PB31",
+    "PC00-PC03", "PC05-PC21", "PC24-PC28",
+]
+source = "DS60001479M Table 6-1 (PORT Function Multiplexing for SAM C21 N), whose 100-pin column gives a package pin number for each pad above. The list counts 84 and ch 2's 100-pin column states 84 GPIOs. PC04, PC22 and PC23 are absent from the table entirely. Flash 256 KB and SRAM 32 KB are ch 2's 100-pin column for the 18 density code, whose Flash row reads 256/128 KB and System SRAM row 32/16 KB."
+

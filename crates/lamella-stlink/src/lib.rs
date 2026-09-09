@@ -272,6 +272,9 @@ const MAX_TRANSFER: usize = 1024;
 
 /// How long to let the reset line settle either side of driving it.
 ///
+/// Not tuned: this is the value the H755 attach was first measured working at. A shorter one may
+/// work and was not tried, because a settle time that is too short fails intermittently, which is
+/// the worst way for a flash tool to fail.
 const RESET_SETTLE: Duration = Duration::from_millis(50);
 
 /// How long to wait for a reply before calling the probe unresponsive.

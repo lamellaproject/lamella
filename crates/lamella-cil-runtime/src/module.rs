@@ -919,6 +919,18 @@ pub struct Module {
     /// `MemberInfo` whose `GetCustomAttributes` then reads `custom_attributes`. Three separate
     /// maps so a field, a method, and a property of the same name do not collide.
     type_fields_by_name: BTreeMap<(u64, String), u64>,
+    /// `Lamella.Runtime.Clock::SetTicks(long)`, recorded at load so an EMBEDDER can install the wall
+    /// clock through the managed setter rather than into a runtime field the managed clock no longer
+    /// reads. See [`Module::bind_wall_clock_setter`].
+    wall_clock_setter: Option<MethodId>,
+    /// `Lamella.Runtime.Clock::SourceCode()`, the read half of the same door.
+    wall_clock_source: Option<MethodId>,
+    /// `Lamella.Hardware.PinEvents::Dispatch(int, bool)`, recorded at load so a pin-change event a
+    /// board's interrupt handler queued can reach the delegate a driver registered for it. See
+    /// [`Module::bind_pin_event_dispatch`].
+    pin_event_dispatch: Option<MethodId>,
+    /// `Lamella.Hardware.PinEvents::ReportLost()`, the overflow half of the same door.
+    pin_event_lost: Option<MethodId>,
     type_methods_by_name: BTreeMap<(u64, String), u64>,
     type_properties_by_name: BTreeMap<(u64, String), u64>,
     /// Reflection introspection metadata per type (the `System.Type` `Namespace`/`FullName`/`Is*`
@@ -943,6 +955,13 @@ pub struct Module {
     /// Each loaded assembly's display name (`Assembly.FullName`), keyed by its assembly id. The
     /// `NETMFv4_4` reflection tier only.
     assembly_names: BTreeMap<u8, String>,
+    /// The assembly that carried the entry point (`AppDomain.FriendlyName`).
+    ///
+    /// Deliberately NOT a frozen table and NOT a baked-image word: an image already records the
+    /// entry method and every method's assembly, so [`Module::from_baked`] recovers this from what
+    /// it has read rather than from a new field. Adding a word would have moved a positional image
+    /// format for a fact the image already contains.
+    entry_assembly: Option<u8>,
     /// Each loaded assembly's declared type handles (`Assembly.GetTypes`, `<Module>` excluded), keyed
     /// by its assembly id. The `NETMFv4_4` reflection tier only.
     assembly_types: BTreeMap<u8, Vec<u64>>,
@@ -3884,7 +3903,13 @@ impl Module {
         };
         #[cfg(not(feature = "float"))]
         let _ = primitive_float;
-        Ok((module, entry.checked_sub(1).map(|method| method as MethodId)))
+        let entry = entry.checked_sub(1).map(|method| method as MethodId);
+        let mut module = module;
+        if let Some(entry) = entry {
+            let asm = module.method_asm(entry);
+            module.bind_entry_assembly(asm);
+        }
+        Ok((module, entry))
     }
 
     /// Marks the methods and types the program can actually reach, for the bake-time trim:
@@ -6044,6 +6069,73 @@ impl Module {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Records the managed wall clock's setter -- `Lamella.Runtime.Clock::SetTicks(long)`.
+    ///
+    /// # Why the runtime records a corlib method by name at all
+    ///
+    /// The wall clock's whole state is managed: the anchor, the source and
+    /// the arithmetic live in that class, so an embedder seeding the time -- a host from
+    /// `std::time`, a board from its RTC -- has to reach it rather than write a runtime field the
+    /// managed code does not read. Invoking the setter keeps the anchoring rule in exactly one
+    /// place; poking the statics directly would put a second copy of it here.
+    ///
+    /// UNGATED, unlike the reflection name tables beside it in the loader: the clock is not a
+    /// reflection feature and must work on a build that carries no metadata inspection at all.
+    pub fn bind_wall_clock_setter(&mut self, method: MethodId) {
+        self.wall_clock_setter = Some(method);
+    }
+
+    /// The managed wall clock's setter, or `None` when no corlib declaring one is loaded.
+    #[must_use]
+    pub fn wall_clock_setter(&self) -> Option<MethodId> {
+        self.wall_clock_setter
+    }
+
+    /// Records the managed wall clock's source reader -- `Lamella.Runtime.Clock::SourceCode()`.
+    pub fn bind_wall_clock_source(&mut self, method: MethodId) {
+        self.wall_clock_source = Some(method);
+    }
+
+    /// The managed wall clock's source reader, or `None`.
+    #[must_use]
+    pub fn wall_clock_source(&self) -> Option<MethodId> {
+        self.wall_clock_source
+    }
+
+    /// Records the managed pin-change dispatcher -- `Lamella.Hardware.PinEvents::Dispatch(int, bool)`.
+    ///
+    /// # Why the runtime records this method by name
+    ///
+    /// A board's interrupt handler hands the runtime an opaque token and a pad level, and only
+    /// managed code knows what the token means: the driver minted it and holds the delegate. So the
+    /// runtime carries the pair up rather than resolving it, and this is the door it carries it
+    /// through. Keeping the token undecoded here is what keeps every per-chip interrupt table out
+    /// of the interpreter.
+    ///
+    /// UNGATED, like the wall clock's and for the same reason: it is not a reflection feature and
+    /// must work on a build carrying no metadata inspection at all.
+    pub fn bind_pin_event_dispatch(&mut self, method: MethodId) {
+        self.pin_event_dispatch = Some(method);
+    }
+
+    /// The managed pin-change dispatcher, or `None` when no assembly declaring one is loaded --
+    /// which is every program that references no GPIO assembly.
+    #[must_use]
+    pub fn pin_event_dispatch(&self) -> Option<MethodId> {
+        self.pin_event_dispatch
+    }
+
+    /// Records the managed pin-change overflow reporter -- `Lamella.Hardware.PinEvents::ReportLost()`.
+    pub fn bind_pin_event_lost(&mut self, method: MethodId) {
+        self.pin_event_lost = Some(method);
+    }
+
+    /// The managed pin-change overflow reporter, or `None`.
+    #[must_use]
+    pub fn pin_event_lost(&self) -> Option<MethodId> {
+        self.pin_event_lost
+    }
+
     /// Records that the type whose handle is `type_handle` has a field named `name` whose
     /// asm-folded `Field` token is `field_handle` -- what `Type.GetField(name)` returns.
     pub fn bind_type_field_name(&mut self, type_handle: u64, name: &str, field_handle: u64) {
@@ -6399,6 +6491,43 @@ impl Module {
         self.assembly_names.insert(asm, name);
     }
 
+    /// Records that assembly `asm` carried the entry point (`AppDomain.FriendlyName`). The FIRST
+    /// binding wins: a REPL's incremental deltas load after the program and must not rename the
+    /// domain, and a library that happens to carry an entry token is not the program either.
+    pub fn bind_entry_assembly(&mut self, asm: u8) {
+        if self.entry_assembly.is_none() {
+            self.entry_assembly = Some(asm);
+        }
+    }
+
+    /// The assembly that carried the entry point, or `None` when nothing entered one (a library
+    /// loaded for inspection, or a session driven at a method the caller chose).
+    #[must_use]
+    pub fn entry_assembly(&self) -> Option<u8> {
+        self.entry_assembly
+    }
+
+    /// Every loaded assembly's id, ascending -- which IS load order: corlib is 0, each deployed
+    /// library takes the next id in deployment order, and the program takes the last.
+    /// (`AppDomain.GetAssemblies`.)
+    #[must_use]
+    pub fn assembly_ids(&self) -> Vec<u8> {
+        let mut ids: Vec<u8> = self
+            .frozen
+            .assembly_names
+            .entries_of(&self.arena)
+            .into_iter()
+            .map(|(key, _)| key as u8)
+            .collect();
+        for &asm in self.assembly_names.keys() {
+            if !ids.contains(&asm) {
+                ids.push(asm);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
     /// Assembly `asm`'s display name, if recorded.
     #[must_use]
     pub fn assembly_name(&self, asm: u8) -> Option<&str> {
@@ -6531,6 +6660,32 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The entry assembly is FIRST-WINS, and the case that needs it is the REPL: an incremental
+    /// delta loads AFTER the program and carries an entry token of its own, so a last-wins rule
+    /// would rename the domain to whichever fragment the user typed most recently. Nothing else
+    /// exercises a second binding, so without this the rule is a comment on an untaken branch.
+    #[test]
+    fn the_entry_assembly_is_the_first_one_bound_not_the_last() {
+        let mut module = Module::new();
+        assert_eq!(module.entry_assembly(), None, "nothing has entered an assembly");
+        module.bind_entry_assembly(1);
+        module.bind_entry_assembly(2);
+        assert_eq!(module.entry_assembly(), Some(1), "a later delta must not take the domain");
+    }
+
+    /// The loaded-assembly ids are ascending, which IS load order, and a name bound twice for one
+    /// assembly does not list it twice.
+    #[test]
+    fn assembly_ids_are_ascending_and_unique() {
+        let mut module = Module::new();
+        assert!(module.assembly_ids().is_empty());
+        module.bind_assembly_name(2, String::from("program, Version=0.0.0.0"));
+        module.bind_assembly_name(0, String::from("corlib, Version=0.0.0.0"));
+        module.bind_assembly_name(1, String::from("library, Version=0.0.0.0"));
+        module.bind_assembly_name(1, String::from("library, Version=0.0.0.0"));
+        assert_eq!(module.assembly_ids(), alloc::vec![0, 1, 2]);
+    }
 
     #[test]
     fn method_debug_names_round_trip() {

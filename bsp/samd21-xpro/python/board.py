@@ -36,6 +36,12 @@ FACTS = {
         "apbc_mask": 0x20,
         "pmux_reg": 0x4100443B,
         "pmux_pair": 0x22,
+        "pmux_tx_reg": 0x4100443B,
+        "pmux_tx_mask": 0xF,
+        "pmux_tx_value": 0x2,
+        "pmux_rx_reg": 0x4100443B,
+        "pmux_rx_mask": 0xF0,
+        "pmux_rx_value": 0x20,
         "pincfg_tx_reg": 0x41004456,
         "pincfg_rx_reg": 0x41004457,
         "txpo": 0,
@@ -62,6 +68,7 @@ INSTANCES = {
     "gclk": {"block": "gclk", "base": 0x40000C00},
     "porta": {"block": "port", "base": 0x41004400},
     "portb": {"block": "port", "base": 0x41004480},
+    "eic": {"block": "eic", "base": 0x40001800, "gclk_core_id": 0x5, "irq": 0x4},
 }
 
 PLANS = {
@@ -72,4 +79,6 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
+    "led0": {"kind": "gpio-out", "port_base": 0x41004480, "pin": 30, "mask": 0x40000000, "active_low": True},
+    "button0": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 15, "mask": 0x8000, "active_low": True},
 }

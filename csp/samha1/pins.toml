@@ -1,0 +1,67 @@
+# The SAMHA1 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+#
+# THIS FAMILY'S ROWS COME OUT OF TWO DIFFERENT DOCUMENTS. The G-series rows are read from
+# DS20005841E's Table 7-1 and the E-series rows from DS20005902B's, and each row's source says
+# which. The two tables are NOT interchangeable: they describe different packages with different
+# pad sets, and the E bonds no PB pad at all.
+
+[table]
+kind = "pins"
+family = "samha1"
+sources = [
+    "ATSAMHAxGXXA datasheet DS20005841E Table 7-1 (Port Function Multiplexing), 48-pin column",
+    "ATSAMHAxEXXA datasheet DS20005902B Table 7-1 (PORT Function Multiplexing), 32-pin column",
+]
+notes = [
+    "COLUMN C IS SERCOM AND COLUMN D IS SERCOM-ALT. A pin carrying a pad of each has two rows here and they are told apart only by the letter, so a row without its function letter is not a fact. Both kit guides in this family name an instance and a pad and NOT a function letter, so the letter below always comes from the datasheet.",
+    "NO ROW HERE MAY NAME AN SBC PAD. PB30 and PB23 (G) and PA13 and PB11 (E) are the LIN transceiver's, they are not package pins on the series that uses them, and Table 7-1 does not carry them.",
+]
+
+# ---- the G-series kits' EDBG virtual COM port (SAMHA1G16A-XPRO and SAMHA1G17A-XPRO) -------------
+#
+# Both G kits put the virtual COM port on the same two pads, and both guides name SERCOM1 without
+# naming a function column. DS20005841E Table 7-1 resolves it: PA27 and PA28 carry SERCOM1 PAD[0]
+# and PAD[1] in column C and have no column-D SERCOM at all, so the letter is not a choice here.
+
+[[pins]]
+pin = "PA27"
+function = "C"
+instance = "sercom1"
+signal = "pad0"
+source = "DS20005841E Table 7-1: the PA27 row (48-pin pin 39) carries SERCOM1/PAD[0] in column C and is empty in column D. Corroborated by SAM HA1G16A Xplained Pro user guide Atmel-9426 Table 4-8 and SAM HA1G17A Xplained Pro user guide 50003184, both of which name SERCOM1 PAD[0] for the EDBG's TX line."
+
+[[pins]]
+pin = "PA28"
+function = "C"
+instance = "sercom1"
+signal = "pad1"
+source = "DS20005841E Table 7-1: the PA28 row (48-pin pin 41) carries SERCOM1/PAD[1] in column C and is empty in column D. Corroborated by Atmel-9426 and 50003184 for the EDBG's RX line."
+
+# ---- the E-series kit's EDBG virtual COM port (SAMHA1E16A-XPRO) ---------------------------------
+#
+# WARNING: THIS KIT'S VIRTUAL COM PORT AND THE PART'S OWN LIN TRANSCEIVER ARE THE SAME SERCOM
+# INSTANCE. On the E series the SBC is wired to SERCOM4 at PA13 and PB11; this kit routes SERCOM4
+# to the EDBG at PA14 and PA15 instead. One instance cannot serve both, so a program that opens
+# the virtual COM port on this board has spent the LIN transceiver's UART. That is a real
+# exclusion rather than a caution, and bsp/samha1e16a-xpro/board.toml states it again from the
+# board side.
+#
+# The function letter matters here and the guide does not give it: PA14 and PA15 carry SERCOM2 in
+# column C and SERCOM4 in column D, so naming the wrong letter binds a different instance
+# entirely.
+
+[[pins]]
+pin = "PA14"
+function = "D"
+instance = "sercom4"
+signal = "pad2"
+source = "DS20005902B Table 7-1: the PA14 row (32-pin pin 15) carries SERCOM2/PAD[2] in column C and SERCOM4/PAD[2] in column D, SERCOM-ALT. Corroborated on the instance and pad by SAMHA1E16A Xplained Pro user guide 50002698A Table 3-8, which names SERCOM4 PAD[2] for the EDBG's TX line without naming the column."
+
+[[pins]]
+pin = "PA15"
+function = "D"
+instance = "sercom4"
+signal = "pad3"
+source = "DS20005902B Table 7-1: the PA15 row (32-pin pin 16) carries SERCOM2/PAD[3] in column C and SERCOM4/PAD[3] in column D, SERCOM-ALT. Corroborated by 50002698A Table 3-8 for the EDBG's RX line."

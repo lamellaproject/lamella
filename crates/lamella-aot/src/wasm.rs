@@ -41,7 +41,8 @@ pub enum LowerError {
     ///
     /// CARRIES THE VERIFIER'S OWN ERRORS rather than collapsing them: a bare "not well formed" names
     /// neither the malformed instruction nor the types that disagreed, so a refusing row reported no
-    /// reason at all.
+    /// reason at all. The verifier has always returned a `Vec<VerifyError>`; only this boundary threw
+    /// it away.
     NotWellFormed {
         /// What [`lamella_ir::verify`] rejected. Never empty -- it is constructed only from an `Err`.
         errors: Vec<VerifyError>,
@@ -1627,6 +1628,7 @@ fn lower_inst(
             dim0,
             dim1,
             element_size,
+            element_kind: _,
         } => {
             let desc = ctx
                 .desc_addr
@@ -1983,6 +1985,7 @@ fn lower_inst(
             handle,
             dims,
             element_size,
+            element_kind: _,
         } => {
             let desc = ctx
                 .desc_addr
@@ -2522,6 +2525,8 @@ fn emit_convert(body: &mut Func, kind: ConvKind) -> Result<(), LowerError> {
         ConvKind::Float64ToInt => body.i32_trunc_f64_s(),
         ConvKind::Float32ToLong => body.i64_trunc_f32_s(),
         ConvKind::Float64ToLong => body.i64_trunc_f64_s(),
+        ConvKind::Float32ToULong => body.i64_trunc_f32_u(),
+        ConvKind::Float64ToULong => body.i64_trunc_f64_u(),
         ConvKind::IntToFloat64 => body.f64_convert_i32_s(),
         ConvKind::LongToFloat64 => body.f64_convert_i64_s(),
         ConvKind::Float32ToFloat64 => body.f64_promote_f32(),
@@ -3784,6 +3789,7 @@ mod tests {
                             dim0: ValueId(0),
                             dim1: ValueId(1),
                             element_size: 4,
+                            element_kind: 5,
                         },
                     ),
                     (
@@ -3861,6 +3867,7 @@ mod tests {
                             handle: lamella_ir::TypeHandle(1),
                             dims: alloc::vec![n(0), n(1), n(2)].into_boxed_slice(),
                             element_size: 4,
+                            element_kind: 5,
                         },
                     ),
                     (n(4), c(1)),
@@ -4113,6 +4120,7 @@ mod tests {
                             dim0: ValueId(0),
                             dim1: ValueId(0),
                             element_size: 4,
+                            element_kind: 5,
                         },
                     ),
                 ],

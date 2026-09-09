@@ -1,0 +1,86 @@
+# The SAM L22 Xplained Pro (ATSAML22-XPRO-B): board truth only -- what is wired to what. Chip
+# truth lives in csp/saml22/.
+#
+# EVERYTHING THIS BOARD BINDS IS IN PORT GROUP C. The LED, the button and both virtual-COM-port
+# pads are PC pads, which is new for this family line -- the SAM C21's third group exists only on
+# its 100-pin part and carries just an LED.
+#
+# THE VIRTUAL COM PORT'S FUNCTION COLUMN CAME FROM THE DATASHEET. Atmel-42474 Table 4-11 names
+# SERCOM4 PAD[2] on PC24 and PAD[3] on PC25 and stops there; DS60001465D Table 6-1 puts SERCOM4 in
+# column D on both pads and SERCOM0 in column C, so the letter is a real choice and the guide does
+# not make it.
+#
+# AND THE PART DATASHEET MISPRINTS SERCOM2's BASE -- see csp/saml22/parts.toml. Nothing on this
+# board binds SERCOM2, so no value here depends on it.
+
+[table]
+kind = "board"
+board = "saml22-xpro"
+vendor = "microchip"
+family = "saml22"
+part = "atsaml22n18a"
+product_model = 56          # lamella_wire::product_model::SAML22_XPLAINED_PRO
+sources = [
+    "SAM L22 Xplained Pro user guide Atmel-42474 section 4.3.3 and its LED Connection table: one yellow LED0 on PC27, whose Shared functionality column reads 'SLCD'. The section states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'.",
+    "Atmel-42474 section 4.3.2 and its Mechanical Buttons table: two buttons, RESET on the part's reset line and a generic user-configurable SW0 on PC01, whose Shared functionality column reads 'EXT2, Shield, and EDBG GPIO3'. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'.",
+    "Atmel-42474 section 4.4.1 and its SWD Connections table: SWD clock on PA30 and SWD data on PA31, both shared with the Cortex debug connector.",
+    "Atmel-42474 section 4.4.2 and Table 4-11 (Virtual COM Port Connections), corroborated against SAM L22 Family Data Sheet DS60001465D Table 6-1 for the function column -- see the header above.",
+    "DS60001465D (OSCCTRL) for the default plan's rate, stated in words: 'After reset, OSC16M is enabled and serves as the default clock source at 4MHz.'",
+]
+notes = [
+    "THE LED'S PAD IS SHARED WITH THE SEGMENT LCD, which the guide states in its own Shared functionality column. This part drives an SLCD that its relatives do not have, and many group-C pads carry no function but EIC and SLCD; a program driving the LED is using a pad the display controller also claims.",
+    "SW0 IS SHARED THREE WAYS -- EXT2, the shield header, and an EDBG GPIO -- per the guide's own column. That is more claims than any other button on this roster, and a program reading it is reading a line three other things can drive.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP. It states the polarity and stops there, where the SAM D21 and E51 Curiosity Nano guides both state outright that no pull-up is fitted. The absence of the statement is not the presence of a resistor.",
+    "THIS PART HAS SIX SERCOMS AND THE SMALLER PACKAGES HAVE FOUR. DS60001465D Table 6-1's note 6 gives the L22G and L22J SERCOM[0:3] against the N's SERCOM[0:5]. This board is the N; a binding written against it does not transfer to a smaller part of the same family.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
+baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
+plan = "osc16m-4mhz"        # Atmel-42096 describes the composite device without giving an id
+default = true              # table. Nor can a sibling supply it -- same54-xpro and samw25-xpro
+                            # both answer 0x2111 while samd21-xpro answers 0x2169, so an
+                            # Xplained Pro's product id does not follow from being one.
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom4"
+function = "D"              # Both pads carry SERCOM0 in column C, so the letter IS a choice here
+gclk_gen = 0                # and the kit guide does not state it.
+tx = { pin = "PC24", pad = 2 }
+rx = { pin = "PC25", pad = 3 }
+
+# THE DEFAULT CLOCK PLAN. The same oscillator and rate as the SAM L21 reaches, stated here from
+# this part's own datasheet rather than pointed at the sibling: "After reset, OSC16M is enabled and
+# serves as the default clock source at 4MHz." Every baud divisor the generator derives rides it.
+[[plans]]
+name = "osc16m-4mhz"
+default = true
+source = "osc16m"
+gclk0_hz = 4000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PC27"
+active = "low"
+source = "Atmel-42474 section 4.3.3 and its LED Connection table: one yellow LED0 on PC27, Shared functionality 'SLCD'. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PC01"
+active = "low"
+source = "Atmel-42474 section 4.3.2 and its Mechanical Buttons table: the generic user-configurable button SW0 on PC01, silkscreened SW0, Shared functionality 'EXT2, Shield, and EDBG GPIO3'. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "unknown"
+pitch_mm = 1.27
+onboard = "edbg"
+recovery = "probe"
+source = "Atmel-42474 SAM L22 Xplained Pro user guide section 4.2.5, Cortex Debug Connector, and the board's own SWD Connections table giving SWD clock on PA30 and SWD data on PA31, both shared with that connector. Whether a connector is soldered to that position is not stated: the guide gives the connector a numbered section and a full pin table but never says it is mounted, and the same guide marks its crystals mounted and not mounted in the feature list, so the silence cannot be read either way. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

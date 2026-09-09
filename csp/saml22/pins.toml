@@ -1,0 +1,35 @@
+# The SAML22 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+
+[table]
+kind = "pins"
+family = "saml22"
+sources = [
+    "SAM L22 Family Data Sheet DS60001465D Table 6-1 (PORT Function Multiplexing)",
+]
+notes = [
+    "BOTH SERCOM COLUMNS ARE HEADED 'SERCOM' ON THIS FAMILY. Its relatives head column C 'SERCOM' and column D 'SERCOM-ALT'; here the two are told apart only by POSITION in the header row. A flowed extraction that loses the header therefore loses the distinction entirely rather than merely losing a label, which is why the table was read as a picture and why every row below records its letter.",
+    "THE VCP PADS CARRY A SERCOM IN BOTH COLUMNS, so the letter is a real choice. PC24 and PC25 are SERCOM0 in column C and SERCOM4 in column D; the kit guide names the instance and pad and no letter.",
+    "NINE FUNCTION LETTERS, A THROUGH I. Column I is CCL and column B carries an SLCD sub-column -- this part drives a segment LCD, which its relatives do not, and many group-C pads have no function but EIC and SLCD.",
+]
+
+# ---- the SAM L22 Xplained Pro's EDBG virtual COM port -------------------------------------------
+#
+# Atmel-42474 Table 4-11 names SERCOM4 PAD[2] on PC24 and SERCOM4 PAD[3] on PC25 and stops there.
+# Table 6-1 places SERCOM4 in column D on both pads and SERCOM0 in column C, so the guide's
+# instance is right and the letter it omits is D.
+
+[[pins]]
+pin = "PC24"
+function = "D"
+instance = "sercom4"
+signal = "pad2"
+source = "DS60001465D Table 6-1: the PC24 row (L22N pin 82) carries SERCOM0/PAD[2] in column C and SERCOM4/PAD[2] in column D. Corroborated on the instance and pad by SAM L22 Xplained Pro user guide Atmel-42474 Table 4-11, which names SERCOM4 PAD[2] for the EDBG's TX line without naming the column."
+
+[[pins]]
+pin = "PC25"
+function = "D"
+instance = "sercom4"
+signal = "pad3"
+source = "DS60001465D Table 6-1: the PC25 row (L22N pin 83) carries SERCOM0/PAD[3] in column C and SERCOM4/PAD[3] in column D. Corroborated by Atmel-42474 Table 4-11 for the EDBG's RX line."

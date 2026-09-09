@@ -41,6 +41,14 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
     interpreter.define_builtin(prototype, "constructor", JsValue::Object(constructor));
     interpreter.define_global("RegExp", JsValue::Object(constructor));
     interpreter.intrinsics.regexp_constructor = constructor;
+    interpreter.define_species_getter(constructor);
+
+    interpreter.define_method(constructor, "escape", 1, |interpreter, _this, arguments| {
+        let JsValue::String(subject) = arguments.first().unwrap_or(&JsValue::Undefined) else {
+            return interpreter.type_error("RegExp.escape requires a string");
+        };
+        Completion::Normal(JsValue::String(escape_for_pattern(subject)))
+    });
 
     interpreter.define_method(prototype, "exec", 1, |interpreter, this, arguments| {
         let subject = match string_argument(interpreter, arguments) {
@@ -319,6 +327,140 @@ fn string_argument(
     interpreter.to_string_value(&value)
 }
 
+/// `RegExp.escape`'s body -- 22.2.5.1 steps 2 to 5.
+///
+/// # IT IS NOT `EscapeRegExpPattern`, AND THE STANDARD CARRIES A NOTE ON EACH SAYING SO
+///
+/// The two names are one word apart and run in OPPOSITE directions. `EscapeRegExpPattern` takes a
+/// pattern and makes it safe to print as a string -- that is what `source` reports. This takes an
+/// arbitrary string and makes it safe to paste INTO a pattern. Both clauses say it in a note
+/// because the pair invites the confusion, and an engine that reached for the existing one here
+/// would produce something that looked escaped and matched the wrong text.
+///
+/// # THE LEADING CHARACTER IS ESCAPED FOR SOMETHING THAT IS NOT IN THE STRING
+///
+/// A leading digit or ASCII letter becomes `\xNN` even though neither is special. The reason is the
+/// SURROUNDING pattern the result is pasted into: after a `\0`, a `\1` or a `\c`, a following digit
+/// or letter EXTENDS that escape rather than starting a new atom, so `"1"` pasted after `\0` would
+/// read as `\01`. Escaping the first code point makes the result self-delimiting, and the condition
+/// is written against the output being empty rather than the index being zero because that is what
+/// the standard says -- the two agree only because no code point encodes to nothing.
+fn escape_for_pattern(subject: &JsString) -> JsString {
+    let units = subject.units();
+    let mut escaped = JsString::new();
+    let mut index = 0;
+    while index < units.len() {
+        let (code_point, width) = code_point_at(units, index);
+        index += width;
+        if escaped.is_empty() && matches!(code_point, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A) {
+            push_hex_escape(&mut escaped, code_point);
+        } else {
+            encode_for_regexp_escape(&mut escaped, code_point);
+        }
+    }
+    escaped
+}
+
+/// `EncodeForRegExpEscape` -- 22.2.5.1.1, four escaping cases and an identity.
+///
+/// **The order of the cases is observable**, because two of them can match one code point and
+/// produce different text. U+0009 is both a `ControlEscape` row and `WhiteSpace`: case 2 gives `\t`
+/// and case 5 would give `\x09`. Both match the same input, so nothing would fail -- the output
+/// would just stop being the one every other engine produces, which is the kind of difference a
+/// corpus catches and a reader does not.
+fn encode_for_regexp_escape(escaped: &mut JsString, code_point: u32) {
+    if matches!(
+        code_point,
+        0x5E | 0x24 | 0x5C | 0x2E | 0x2A | 0x2B | 0x3F | 0x28 | 0x29 | 0x5B | 0x5D | 0x7B | 0x7D
+            | 0x7C | 0x2F
+    ) {
+        escaped.push_char('\\');
+        push_code_point(escaped, code_point);
+        return;
+    }
+    let control_escape = match code_point {
+        0x09 => Some('t'),
+        0x0A => Some('n'),
+        0x0B => Some('v'),
+        0x0C => Some('f'),
+        0x0D => Some('r'),
+        _ => None,
+    };
+    if let Some(letter) = control_escape {
+        escaped.push_char('\\');
+        escaped.push_char(letter);
+        return;
+    }
+    const OTHER_PUNCTUATORS: &[u32] = &[
+        0x2C, 0x2D, 0x3D, 0x3C, 0x3E, 0x23, 0x26, 0x21, 0x25, 0x3A, 0x3B, 0x40, 0x7E, 0x27, 0x60,
+        0x22,
+    ];
+    if OTHER_PUNCTUATORS.contains(&code_point)
+        || lamella_regexp::js::is_white_space(code_point)
+        || lamella_regexp::js::is_line_terminator(code_point)
+        || (0xD800..0xE000).contains(&code_point)
+    {
+        if code_point <= 0xFF {
+            push_hex_escape(escaped, code_point);
+        } else {
+            let mut pair = JsString::new();
+            push_code_point(&mut pair, code_point);
+            for &unit in pair.units() {
+                escaped.push_str("\\u");
+                push_padded_hex(escaped, u32::from(unit), 4);
+            }
+        }
+        return;
+    }
+    push_code_point(escaped, code_point);
+}
+
+/// `\x` plus exactly two lowercase hex digits.
+fn push_hex_escape(escaped: &mut JsString, code_point: u32) {
+    escaped.push_str("\\x");
+    push_padded_hex(escaped, code_point, 2);
+}
+
+/// A lowercase hex number, left-padded with zeroes to `width` digits.
+fn push_padded_hex(escaped: &mut JsString, value: u32, width: u32) {
+    for shift in (0..width).rev() {
+        let nibble = (value >> (shift * 4)) & 0xF;
+        escaped.push_char(char::from_digit(nibble, 16).unwrap_or('0'));
+    }
+}
+
+/// `UTF16EncodeCodePoint`, which for a lone surrogate value is the surrogate itself.
+fn push_code_point(escaped: &mut JsString, code_point: u32) {
+    if code_point <= 0xFFFF {
+        escaped.push_code_unit(code_point as u16);
+    } else {
+        let adjusted = code_point - 0x10000;
+        escaped.push_code_unit(0xD800 + (adjusted >> 10) as u16);
+        escaped.push_code_unit(0xDC00 + (adjusted & 0x3FF) as u16);
+    }
+}
+
+/// The code point beginning at `index`, and how many units it occupies.
+///
+/// **An unpaired surrogate is a code point here, and that is the difference from `uri.rs`'s
+/// decoder**, which answers `None` for exactly this case. `StringToCodePoints` yields the
+/// surrogate's own numeric value, and `EncodeForRegExpEscape` has a case reading that value -- so
+/// borrowing the stricter decoder would have dropped precisely the input this function exists to
+/// escape.
+fn code_point_at(units: &[u16], index: usize) -> (u32, usize) {
+    let unit = u32::from(units[index]);
+    if !(0xD800..0xDC00).contains(&unit) {
+        return (unit, 1);
+    }
+    match units.get(index + 1) {
+        Some(&trailing) if (0xDC00..0xE000).contains(&trailing) => (
+            0x1_0000 + ((unit - 0xD800) << 10) + (u32::from(trailing) - 0xDC00),
+            2,
+        ),
+        _ => (unit, 1),
+    }
+}
+
 /// `RegExpBuiltinExec`: the search, and the `lastIndex` bookkeeping around it.
 pub(crate) fn exec(
     interpreter: &mut Interpreter,
@@ -436,17 +578,17 @@ fn build_result(
         JsValue::Undefined
     } else {
         let holder = interpreter.allocate(Object::new(None));
-        for (name, index) in &data.compiled.names {
+        for (name, index) in group_name_writes(&data.compiled.names, slots) {
             let value = match (
-                slots.get(*index as usize * 2).copied().flatten(),
-                slots.get(*index as usize * 2 + 1).copied().flatten(),
+                slots.get(index as usize * 2).copied().flatten(),
+                slots.get(index as usize * 2 + 1).copied().flatten(),
             ) {
                 (Some(start), Some(end)) => {
                     JsValue::String(JsString::from_units(&units[start..end]))
                 }
                 _ => JsValue::Undefined,
             };
-            set_own(interpreter, holder, name.as_str(), value);
+            set_own(interpreter, holder, name, value);
         }
         JsValue::Object(holder)
     };
@@ -458,6 +600,49 @@ fn build_result(
     }
 
     array
+}
+
+/// Which named groups write to a `groups` object, and which capture each one reads.
+///
+/// # THE STANDARD RESOLVES THIS ONCE AND HANDS THE SAME ANSWER TO BOTH OBJECTS
+///
+/// A name may belong to several capturing groups, since a pattern may reuse one across
+/// alternatives that cannot both participate. `groups.x` must then answer from whichever group
+/// captured. `RegExpBuiltinExec` (22.2.7.2) settles that in step 34.e, building a `groupNames`
+/// list that it uses for the match result and PASSES to `MakeMatchIndicesIndexPairArray`
+/// (22.2.7.8), which reads it at step 9.e rather than deciding again. Two independent
+/// computations of one rule is how `result.groups` and `result.indices.groups` would come to
+/// disagree about the same pattern.
+///
+/// # A SKIPPED GROUP AND AN OVERWRITTEN ONE ARE BOTH LOAD-BEARING
+///
+/// A group whose name has already captured is skipped; every other one writes, `undefined`
+/// included. So a name whose groups all missed is written `undefined` by the last of them, and a
+/// name with a participating group is written by that group, over whatever an earlier miss left
+/// there. Redefining a property keeps its original position, so the keys still enumerate in
+/// first-occurrence order.
+///
+/// A pattern that names each group once produces one write per name and pays a comparison for it.
+fn group_name_writes<'a>(
+    names: &'a [(crate::String, u32)],
+    slots: &[Option<usize>],
+) -> Vec<(&'a str, u32)> {
+    let captured = |group: u32| {
+        slots.get(group as usize * 2).copied().flatten().is_some()
+            && slots.get(group as usize * 2 + 1).copied().flatten().is_some()
+    };
+    let mut answered: Vec<&str> = Vec::new();
+    let mut writes = Vec::new();
+    for (name, group) in names {
+        if answered.contains(&name.as_str()) {
+            continue;
+        }
+        if captured(*group) {
+            answered.push(name.as_str());
+        }
+        writes.push((name.as_str(), *group));
+    }
+    writes
 }
 
 /// `MakeMatchIndicesIndexPairArray` (22.2.7.8): the `[start, end]` pair per capture, under `d`.
@@ -502,9 +687,9 @@ fn build_indices(
         JsValue::Undefined
     } else {
         let holder = interpreter.allocate(Object::new(None));
-        for (name, index) in data.compiled.names.clone() {
+        for (name, index) in group_name_writes(&data.compiled.names, slots) {
             let value = at(interpreter, index as usize);
-            set_own(interpreter, holder, name.as_str(), value);
+            set_own(interpreter, holder, name, value);
         }
         JsValue::Object(holder)
     };

@@ -1076,11 +1076,15 @@ fn the_routed_microchip_kits_carry_their_own_product_ids() {
         ("atsamd11-xpro", 0x2111),
         ("atsamd10-xmini", 0x2145),
         ("samw25-xpro", 0x2111),
+        ("same51-cnano", 0x2175),
         ("same54-xpro", 0x2111),
         ("sam4e-xpro", 0x2111),
         ("sam4n-xpro", 0x2111),
         ("sam4l8-xpro", 0x2111),
         ("sam4s-xpro", 0x2111),
+        ("arduino-zero", 0x2157),
+        ("samd21-cnano", 0x2175),
+        ("samr21-xpro", 0x2111),
     ];
     for (board, id) in expected {
         let row = PROGRAMMING

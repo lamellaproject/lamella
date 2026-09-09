@@ -11,4 +11,9 @@ name = "lamella-runtime-support-riscv"
 version = "0.0.0"
 dependencies = [
  "lamella-decimal",
+ "lamella-softmath",
 ]
+
+[[package]]
+name = "lamella-softmath"
+version = "0.0.0"

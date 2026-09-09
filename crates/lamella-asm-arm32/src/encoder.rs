@@ -126,10 +126,91 @@ impl Assembled {
     }
 }
 
+/// The DWARF register number of the link register on ARM, which is what a saved return address is
+/// recorded under.
+const DWARF_LR: u8 = 14;
+
+/// The stack a function builds and gives back, accumulated as the instructions that move it are
+/// encoded.
+///
+/// # WHY THIS IS RECORDED HERE AND NOT COMPUTED BY THE CALLER
+///
+/// The frame is a fact about the emitted instructions, and there is more than one lowering that
+/// emits them. A rule reimplemented once per lowering gains a new case in none of them: the one that
+/// was edited gets it right and the others go on silently describing a frame they no longer build.
+/// Recording it where the instruction is ENCODED means every lowering contributes by construction,
+/// including one written later that nobody thinks to update.
+///
+/// It is deliberately not the safepoint records the collector uses. Those exist only where a call
+/// exists to create one, so a function that calls nothing has no record at all, and the width they
+/// state includes the link register whether or not this function saved it.
+///
+/// # EVERY MOVEMENT, NOT JUST THE PROLOGUE'S
+///
+/// A frame recorded once is wrong from the next stack instruction onward, and functions move the
+/// stack in three places: the prologue builds it, a body that spills around a call takes more and
+/// gives it back, and the epilogue returns all of it. The epilogue is the end that matters. Once
+/// the stack is restored, a frame address stated from the prologue points into the CALLER's frame,
+/// so a saved return address read through it comes out of a word belonging to somebody else -- and
+/// unlike a stale link register, nothing about that word says so. It reports a caller the program
+/// never had, confidently.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FrameTrack {
+    /// The registers the PROLOGUE pushed, in the order the pushes named them -- ascending, in DWARF
+    /// numbering with 14 for the link register, which is the order a push stores them in.
+    ///
+    /// Their rules are stated relative to the frame address rather than the stack pointer, so they
+    /// hold for as long as the registers are on the stack however far the stack pointer moves.
+    pub saved: Vec<u8>,
+    /// Where the caller's stack pointer stands after each instruction that moved it, as a LABEL
+    /// id and the frame in force from there: `(label, bytes above this function's stack pointer)`.
+    ///
+    /// # A LABEL AND NOT AN OFFSET, BECAUSE `finish` MOVES CODE
+    ///
+    /// Branch relaxation and far-branch veneers both INSERT bytes, and a veneer is spliced into the
+    /// middle of a function. A position captured while encoding is therefore stale for everything
+    /// after the splice, and stale in a way with no symptom: the rows still parse, still sit in the
+    /// right function, and land on ordinary instructions and on literal-pool words. Resolving a
+    /// label after `finish` is the same mechanism a safepoint's return address already uses, for
+    /// the same reason.
+    pub transitions: Vec<(u32, u32)>,
+    /// The byte offset just past the last stack-moving instruction of the opening run.
+    pub prologue_end: u32,
+    /// The frame the prologue built, which is what a new path through the function starts with.
+    settled: u32,
+    /// Where the caller's stack pointer stands right now.
+    cfa: u32,
+    /// The offset the function started at, so the offsets above can be made relative.
+    start: u32,
+    /// Whether the opening run is still running. It ends at the first instruction that is not
+    /// stack movement, which is the same boundary an instruction decoder reading the emitted bytes
+    /// would find -- and that agreement is what lets the two be compared.
+    open: bool,
+}
+
+impl FrameTrack {
+    /// The prologue's length, as an offset within the function rather than within the image.
+    #[must_use]
+    pub fn prologue_length(&self) -> u32 {
+        self.prologue_end.saturating_sub(self.start)
+    }
+
+    /// The frame the prologue built -- the one in force through the function's body.
+    #[must_use]
+    pub fn cfa_offset(&self) -> u32 {
+        self.settled
+    }
+}
+
 /// Accumulates Thumb machine code and the references into it.
 #[derive(Debug, Clone, Default)]
 pub struct Encoder {
     bytes: Vec<u8>,
+    /// What the current function's prologue has put on the stack -- see [`FrameTrack`].
+    frame: FrameTrack,
+    /// Set while a stack-moving instruction is being encoded, so the emit primitive it goes through
+    /// does not read it as the instruction that ends the prologue.
+    in_stack_op: bool,
     /// `labels[i]` is the bound byte offset of label `i`, or `None` until bound.
     labels: Vec<Option<u32>>,
     /// Internal references to patch in `finish`: `(site, kind, label index)`.
@@ -194,6 +275,94 @@ impl Encoder {
         self.bytes.len() as u32
     }
 
+    /// Starts a new function's frame record at the current position.
+    ///
+    /// One encoder lays many functions end to end, so without this the second function's prologue
+    /// would be read as more of the first one's -- which has already been closed by then, so the
+    /// second would report no frame at all rather than a wrong one.
+    pub fn begin_function(&mut self) {
+        self.frame = FrameTrack {
+            start: self.position(),
+            prologue_end: self.position(),
+            open: true,
+            ..FrameTrack::default()
+        };
+        let entry = self.safepoint_label();
+        self.frame.transitions.push((entry, 0));
+    }
+
+    /// What the current function's prologue built.
+    #[must_use]
+    pub fn frame(&self) -> &FrameTrack {
+        &self.frame
+    }
+
+    /// Records a stack movement of `delta` bytes -- positive when the stack pointer goes DOWN, as
+    /// a push or a reservation does -- and marks the instruction about to be encoded as one.
+    ///
+    /// `saved` names the registers a push put on the stack, and is recorded only while the opening
+    /// run lasts: a push in the middle of a function moves the stack, which this tracks, but does
+    /// not save a caller's register into the frame's saved block.
+    fn stack_op(&mut self, delta: i64, saved: &[u8]) {
+        if self.frame.open {
+            self.frame.saved.extend_from_slice(saved);
+        }
+        self.frame.cfa = self.frame.cfa.saturating_add_signed(
+            i32::try_from(delta).unwrap_or(if delta < 0 { i32::MIN } else { i32::MAX }),
+        );
+        self.in_stack_op = true;
+    }
+
+    /// Closes a stack movement: the frame just recorded is in force from the NEXT instruction, so
+    /// the transition is stamped at the position after this one.
+    fn end_stack_op(&mut self) {
+        self.in_stack_op = false;
+        if self.frame.open {
+            self.frame.prologue_end = self.position();
+            self.frame.settled = self.frame.cfa;
+        }
+        self.record_frame_here();
+    }
+
+    /// Records that control leaves here, so what follows in the layout is another path through the
+    /// same function and starts with the frame the prologue built.
+    ///
+    /// Without this a second return's epilogue would be tracked from the first one's restored
+    /// stack, and every row after it would describe a stack pointer no path ever has.
+    fn returns_here(&mut self) {
+        self.frame.cfa = self.frame.settled;
+        self.record_frame_here();
+    }
+
+    /// Marks the current position as one where the frame changed, under a label so the position
+    /// survives whatever `finish` does to the layout.
+    ///
+    /// Two stack instructions in a row -- a push then a reservation, or one chunked reservation --
+    /// describe ONE boundary, not several. A run collapses onto its last instruction, which is both
+    /// the only address anything reaches with the intermediate frames and the difference between a
+    /// section that grows with the number of frames and one that grows with the length of a
+    /// prologue.
+    fn record_frame_here(&mut self) {
+        let here = self.position();
+        if let Some(&(label, _)) = self.frame.transitions.last() {
+            if self.labels.get(label as usize).copied().flatten() == Some(here) {
+                if let Some(last) = self.frame.transitions.last_mut() {
+                    last.1 = self.frame.cfa;
+                }
+                return;
+            }
+        }
+        let label = self.safepoint_label();
+        self.frame.transitions.push((label, self.frame.cfa));
+    }
+
+    /// Ends the opening run at the first instruction that is not stack movement.
+    fn close_prologue(&mut self) {
+        if !self.in_stack_op {
+            self.frame.open = false;
+        }
+    }
+
     /// The bytes emitted so far, before relocations are resolved.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -229,6 +398,7 @@ impl Encoder {
 
     /// Appends one 16-bit halfword, low byte first.
     pub fn emit_u16(&mut self, halfword: u16) {
+        self.close_prologue();
         self.bytes.extend_from_slice(&halfword.to_le_bytes());
     }
 
@@ -243,6 +413,9 @@ impl Encoder {
     /// canonical return. 16-bit encoding T1 (Armv6-M ARM (DDI 0419E), A6.7.15).
     pub fn bx(&mut self, rm: Reg) {
         self.emit_u16(0x4700 | (u16::from(rm.number()) << 3));
+        if rm.number() == 14 {
+            self.returns_here();
+        }
     }
 
     /// `NOP` -- the hint that does nothing. 16-bit encoding T1 (A6.7.47).
@@ -253,26 +426,42 @@ impl Encoder {
     /// `PUSH {LR}` -- the leaf-call prologue, saving the return address. 16-bit
     /// encoding T1 with the M bit set (A6.7.50).
     pub fn push_lr(&mut self) {
+        self.stack_op(4, &[DWARF_LR]);
         self.emit_u16(0xB500);
+        self.end_stack_op();
     }
 
     /// `POP {PC}` -- the matching epilogue, returning by loading the saved
     /// address into the program counter. 16-bit encoding T1 with the P bit set
     /// (A6.7.49).
     pub fn pop_pc(&mut self) {
+        self.stack_op(-4, &[]);
         self.emit_u16(0xBD00);
+        self.end_stack_op();
+        self.returns_here();
     }
 
     /// `PUSH {registers}` -- push the given low registers, and LR when `lr` is set.
     /// 16-bit encoding T1 (A6.7.50); `registers` is a bitmask of R0-R7.
     pub fn push_registers(&mut self, registers: u8, lr: bool) {
+        let mut pushed: Vec<u8> = (0..8u8).filter(|r| registers & (1 << r) != 0).collect();
+        if lr {
+            pushed.push(DWARF_LR);
+        }
+        self.stack_op(4 * i64::from(registers.count_ones() + u32::from(lr)), &pushed);
         self.emit_u16(0xB400 | (u16::from(lr) << 8) | u16::from(registers));
+        self.end_stack_op();
     }
 
     /// `POP {registers}` -- pop the given low registers, and PC when `pc` is set.
     /// 16-bit encoding T1 (A6.7.49); `registers` is a bitmask of R0-R7.
     pub fn pop_registers(&mut self, registers: u8, pc: bool) {
+        self.stack_op(-4 * i64::from(registers.count_ones() + u32::from(pc)), &[]);
         self.emit_u16(0xBC00 | (u16::from(pc) << 8) | u16::from(registers));
+        self.end_stack_op();
+        if pc {
+            self.returns_here();
+        }
     }
 
     /// `ADDS Rd, Rn, Rm` -- add two registers, setting flags. 16-bit encoding T1
@@ -797,7 +986,9 @@ impl Encoder {
         if imm % 4 != 0 || imm > 508 {
             return Err(AssembleError::UnencodableOperand);
         }
+        self.stack_op(-i64::from(imm), &[]);
         self.emit_u16(0xB000 | (imm / 4));
+        self.end_stack_op();
         Ok(())
     }
 
@@ -819,7 +1010,9 @@ impl Encoder {
         if imm % 4 != 0 || imm > 508 {
             return Err(AssembleError::UnencodableOperand);
         }
+        self.stack_op(i64::from(imm), &[]);
         self.emit_u16(0xB080 | (imm / 4));
+        self.end_stack_op();
         Ok(())
     }
 
@@ -875,12 +1068,14 @@ impl Encoder {
     /// Emits a literal 32-bit little-endian word -- a vector-table entry, an
     /// inline constant, or a literal-pool datum.
     pub fn emit_word(&mut self, value: u32) {
+        self.close_prologue();
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     /// Appends raw, already-encoded bytes -- for example a separately lowered
     /// function body -- to the image.
     pub fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.close_prologue();
         self.bytes.extend_from_slice(bytes);
     }
 
@@ -2758,5 +2953,117 @@ mod tests {
                 addend: -8
             }]
         );
+    }
+
+
+    #[test]
+    fn a_push_and_a_reservation_add_up_to_one_frame() {
+        let mut enc = Encoder::new();
+        enc.begin_function();
+        enc.push_registers(0b0011_0000, true);
+        enc.sub_sp(16).unwrap();
+        enc.bx(Reg::LR);
+        let frame = enc.frame();
+        assert_eq!(frame.saved, vec![4, 5, 14], "ascending, which is slot order");
+        assert_eq!(frame.cfa_offset(), 12 + 16);
+        assert_eq!(frame.prologue_length(), 4, "two halfwords of prologue");
+    }
+
+    #[test]
+    fn a_reservation_too_large_for_one_instruction_is_still_one_frame() {
+        let mut enc = Encoder::new();
+        enc.begin_function();
+        enc.push_registers(0b1000_0000, true);
+        enc.sub_sp_far(1144).unwrap();
+        enc.bx(Reg::LR);
+        let frame = enc.frame();
+        assert_eq!(frame.cfa_offset(), 8 + 1144);
+        assert_eq!(
+            frame.prologue_length(),
+            2 + 3 * 2,
+            "the push, then three subtracts"
+        );
+    }
+
+    #[test]
+    fn a_push_without_the_link_register_does_not_claim_one() {
+        let mut enc = Encoder::new();
+        enc.begin_function();
+        enc.push_registers(0b0011_0000, false);
+        enc.bx(Reg::LR);
+        let frame = enc.frame();
+        assert_eq!(frame.saved, vec![4, 5], "the link register was not saved");
+        assert_eq!(frame.cfa_offset(), 8, "and the frame is eight bytes, not twelve");
+    }
+
+    #[test]
+    fn a_function_that_moves_no_stack_reports_no_frame() {
+        let mut enc = Encoder::new();
+        enc.begin_function();
+        enc.bx(Reg::LR);
+        let frame = enc.frame();
+        assert_eq!(frame.cfa_offset(), 0);
+        assert!(frame.saved.is_empty());
+        assert_eq!(frame.prologue_length(), 0);
+    }
+
+    #[test]
+    fn a_push_after_the_prologue_does_not_extend_it() {
+        let mut enc = Encoder::new();
+        enc.begin_function();
+        enc.push_registers(0b0001_0000, true);
+        enc.bx(Reg::LR);
+        enc.push_registers(0b0010_0000, false);
+        let frame = enc.frame();
+        assert_eq!(frame.saved, vec![4, 14], "the later push is not in the frame");
+        assert_eq!(frame.cfa_offset(), 8);
+        assert_eq!(frame.prologue_length(), 2);
+    }
+
+    #[test]
+    fn each_function_gets_its_own_frame_from_one_encoder() {
+        let mut enc = Encoder::new();
+        enc.begin_function();
+        enc.push_registers(0b0001_0000, true);
+        enc.bx(Reg::LR);
+        assert_eq!(enc.frame().cfa_offset(), 8);
+
+        enc.begin_function();
+        enc.push_registers(0b0111_0000, true);
+        enc.sub_sp(8).unwrap();
+        enc.bx(Reg::LR);
+        let frame = enc.frame();
+        assert_eq!(frame.saved, vec![4, 5, 6, 14]);
+        assert_eq!(frame.cfa_offset(), 16 + 8);
+        assert_eq!(
+            frame.prologue_length(),
+            4,
+            "measured from this function's start, not the image's"
+        );
+    }
+
+    #[test]
+    fn a_frame_transition_after_a_spliced_veneer_still_names_its_own_instruction() {
+        let mut enc = Encoder::new();
+        enc.begin_function();
+        enc.push_registers(0b0001_0000, true);
+        let target = enc.new_label();
+        enc.b(target);
+        for _ in 0..1500 {
+            enc.nop();
+        }
+        enc.bind_label(target);
+        enc.sub_sp(8).unwrap();
+        enc.nop();
+        let transitions = enc.frame().transitions.clone();
+        let out = enc.finish().expect("a far branch veneers rather than failing");
+
+        let (label, cfa) = *transitions.last().expect("the reservation was recorded");
+        assert_eq!(cfa, 8 + 8, "two saved registers and an eight-byte reservation");
+        let at = out
+            .label_position_by_id(label)
+            .expect("the label survives the splice") as usize;
+        let before = u16::from_le_bytes([out.bytes[at - 2], out.bytes[at - 1]]);
+        assert_eq!(before, 0xB082, "SUB SP, #8 -- the instruction this transition is about");
     }
 }

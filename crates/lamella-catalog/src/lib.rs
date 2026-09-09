@@ -67,6 +67,10 @@ pub fn resolve(id: &str) -> Result<(BoardTable, PartRow), String> {
 
 /// Every part row this build knows, as `(family, row)`, in catalog order.
 ///
+/// THE CHIP REGISTRY, AND IT IS DERIVED RATHER THAN STORED. `lamella://chips` is built from the
+/// part definitions themselves, so it cannot become a second source of truth about silicon that
+/// disagrees with the identity values the probe and DAP crates work from.
+///
 /// A consumer wanting silicon identity reads [`PartRow::dp_idcode`] and the `device_id*` group,
 /// and must read `device_id_identifies` before naming a part from either -- a debug-port IDCODE
 /// names a port design, and on some families even the vendor register names a category rather than

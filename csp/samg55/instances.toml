@@ -1,0 +1,130 @@
+# The SAMG55 instance map: every placed block copy, its base, and its peripheral id. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml.
+#
+# THE RECORD IS THE SAM3X's AND NOT THE SAM D/L ONE. On this architecture the peripheral id (Table 9-1)
+# is BOTH the PMC clock-control bit (PMC_PCER0 bit `pid` for pid < 32) AND the NVIC interrupt line
+# -- one number, so one field. -1 marks a row with no id, or an id this document does not settle;
+# where it is the second, the row says so.
+#
+# THIS DATASHEET CONTRADICTS ITSELF ABOUT WHICH FLEXCOM CARRIES WHICH PERIPHERAL ID, AND THE
+# CONTRADICTION IS THE REASON EVERY USART ROW BELOW CARRIES pid = -1.
+#
+#     Table 9-1 (Peripheral Identifiers)   id 8 = USART0    id 21 = USART5    id 14 = USART2
+#     Figure 6-1 (Product Mapping)         id 8 = USART5    id 21 = USART2    id 14 = USART3
+#
+# Six of the eight disagree. EVERY NON-USART PERIPHERAL AGREES between the two -- PIOA 11, PIOB 12,
+# PMC 5, EFC 6, every TC, every I2SC, the ADC -- so this is not a document that is unreliable
+# everywhere; it is wrong in one column, and neither source says which.
+#
+# WHAT IS SETTLED, AND BY A THIRD SOURCE STRONGER THAN EITHER: the instance NAMES and their
+# BASES. The FLEXCOM and USART register descriptions print their own instance-indexed address
+# lists, and both agree with Figure 6-1's names on all eight:
+#
+#     FLEXCOM_MR (29.7.1)  0x4000C000 (0)  0x40020000 (1)  0x40024000 (2)  0x40018000 (3)
+#                          0x4001C000 (4)  0x40008000 (5)  0x40040000 (6)  0x40034000 (7)
+#     US_CR      (30.7.1)  the same eight bases PLUS 0x200
+#
+# So a driver can find any USART; what nothing here can tell it is which PMC bit to set to clock
+# it. A WRONG PMC BIT DOES NOT FAULT -- the peripheral simply never clocks while every register
+# reads back what was written -- so a guessed id is exactly the silent-wrong-answer shape, and no
+# board binds a USART on this family until somebody reads the id off silicon.
+
+[table]
+kind = "instances"
+family = "samg55"
+record = ["base", "pid"]
+sources = [
+    "SAM G55 datasheet Atmel-11289F Figure 6-1 (Product Mapping) for the System Controller and peripheral base addresses",
+    "Atmel-11289F Table 9-1 (Peripheral Identifiers) for the peripheral id, which is both the PMC_PCER bit and the NVIC line",
+    "Atmel-11289F section 29.7.1 (FLEXCOM_MR) and 30.7.1 (US_CR), whose Address lines enumerate every instance's base -- the only source that ties a FLEXCOM instance NUMBER to an ADDRESS, and the one that confirms Figure 6-1's names",
+]
+notes = [
+    "PIOA, PIOB, PMC AND EFC ARE FULLY SOURCED AND BOTH DOCUMENTS AGREE ON THEM. PIOA 0x400E0E00 id 11, PIOB 0x400E1000 id 12, PMC 0x400E0400 id 5, EFC 0x400E0A00 id 6. That is everything the GPIO path needs, which is why this family is onboarded for GPIO and not for a UART.",
+    "EVERY USART ROW CARRIES pid = -1 AND IT DOES NOT MEAN THE INSTANCE HAS NO ID. It means TWO SOURCES DISAGREE AND NEITHER IS DECISIVE -- see the header. The bases ARE settled and are stated, so the rows describe real placed silicon; what is withheld is the one number that would let something clock it wrongly.",
+    "THE USART SITS AT THE FLEXCOM BASE PLUS 0x200. Each instance is a FLEXCOM wrapper whose mode register selects USART, SPI or TWI, and the chosen peripheral's register file follows at +0x200. The base recorded below is the FLEXCOM's, which is what Figure 6-1 and Table 9-1 both name.",
+    "THE INSTANCE NUMBERS ARE NOT IN ADDRESS ORDER. FLEXCOM5 sits at the lowest of the eight bases and FLEXCOM0 at the second lowest; a consumer deriving a base from an instance number by stride gets six of eight wrong.",
+    "TWO PIO CONTROLLERS, both fully populated -- see parts.toml. PIOA covers PA0..PA31 and PIOB PB0..PB15.",
+    "THE PMC IS NOT GATED BY ITS OWN ID. It is the clock controller; Table 9-1 marks its PMC Clock Control column '-' as it does for SUPC, RSTC, RTC, RTT, WDT and EFC. Those rows carry their id anyway because the id is ALSO the NVIC line.",
+]
+
+# ---- fully sourced: both documents agree, and these are what the GPIO path uses ----------------
+
+[[instances]]
+name = "pioa"
+block = "pio"
+port = "A"          # this instance IS the group pins named PA<n> resolve to. Stated as DATA
+                    # because this family spells its groups `pioa`/`piob`, which is neither of
+                    # the two spellings the generator would otherwise guess at.
+base = 0x400E0E00
+pid = 11
+
+[[instances]]
+name = "piob"
+block = "pio"
+port = "B"          # this instance IS the group pins named PB<n> resolve to
+base = 0x400E1000
+pid = 12
+
+[[instances]]
+name = "pmc"
+block = "pmc"
+base = 0x400E0400
+pid = 5
+
+# ---- the eight FLEXCOM instances: bases SETTLED, ids CONTESTED ---------------------------------
+#
+# Rowed because they are placed silicon and a map that omitted them would misdescribe the part --
+# the samr21's SERCOM4 precedent. NOT rowed with an id, because the id is the one field two
+# sources disagree about and it is the field that would fail silently. The order below is the
+# INSTANCE order, which is deliberately not the address order; see the note above.
+
+[[instances]]
+name = "flexcom0"
+block = "flexcom"
+base = 0x4000C000
+pid = -1
+
+[[instances]]
+name = "flexcom1"
+block = "flexcom"
+base = 0x40020000
+pid = -1
+
+[[instances]]
+name = "flexcom2"
+block = "flexcom"
+base = 0x40024000
+pid = -1
+
+[[instances]]
+name = "flexcom3"
+block = "flexcom"
+base = 0x40018000
+pid = -1
+
+[[instances]]
+name = "flexcom4"
+block = "flexcom"
+base = 0x4001C000
+pid = -1
+
+[[instances]]
+name = "flexcom5"
+block = "flexcom"
+base = 0x40008000
+pid = -1
+
+# THE ONE THE SAM G55 XPLAINED PRO WIRES ITS VIRTUAL COM PORT TO, and the reason that board binds
+# no UART. Table 9-4 puts TXD6 on PB0 and RXD6 on PB1, both on Peripheral B, so the pads are not
+# in doubt; the id is.
+[[instances]]
+name = "flexcom6"
+block = "flexcom"
+base = 0x40040000
+pid = -1
+
+[[instances]]
+name = "flexcom7"
+block = "flexcom"
+base = 0x40034000
+pid = -1

@@ -274,12 +274,16 @@ impl DebugBackend for InterpreterBackend {
         self.session.as_ref().map_or(0, Session::depth)
     }
 
-    fn set_breakpoints(&mut self, addresses: &[u64]) {
+    /// Always `Ok`: the breakpoint set is a list the session owns, there is no unit with a
+    /// capacity and no wire to lose, so there is no way for the programming to fail. An
+    /// unbounded backend is the case the seam's promise is trivially true for.
+    fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
         self.breakpoints = addresses
             .iter()
             .map(|&address| decode_address(address))
             .collect();
         self.apply_breakpoints();
+        Ok(())
     }
 
     fn stack(&self) -> Vec<Frame> {

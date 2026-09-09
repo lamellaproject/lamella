@@ -1,0 +1,24 @@
+# The SAMHA1 Power Manager block: only the register the peripheral bring-up paths touch is
+# transcribed here (partial, append-only, schema total). Offsets are PM-base-relative; the base
+# lives in ../instances.toml.
+
+[table]
+kind = "block"
+family = "samha1"
+block = "pm"
+sources = [
+    "ATSAMHAxGXXA datasheet DS20005841E section 18.8.10 (APBC Mask): Offset 0x20, Reset 0x00010000, and one prose paragraph per bit naming the peripheral it gates",
+    "ATSAMHAxEXXA datasheet DS20005902B section 18.8.10, which states the same offset, reset and bit assignments for the E series",
+    "DS20005841E Table 14-1 (Peripherals Configuration Summary), whose APB Clock Index column states the same six SERCOM positions independently",
+]
+notes = [
+    "APBCMASK gates each peripheral's APB (bus) clock; SERCOM0..5 = bits 2..7. Read-modify-write in drivers (other peripherals share the register).",
+    "THE BIT POSITIONS WERE TAKEN FROM THE PER-BIT PROSE, NOT FROM THE BIT-FIELD DIAGRAM. The diagram's rows extract with Access and Reset lines interleaved between the bit numbers and the names, which is how a name comes to sit under the wrong number; 18.8.10's numbered paragraphs each name one bit and one peripheral and cannot desynchronize. Both datasheets' prose is clean here, unlike the samd20's.",
+    "ONE OF THESE SIX GATES BELONGS TO THE ON-PACKAGE LIN TRANSCEIVER, AND WHICH ONE DEPENDS ON THE SERIES -- bit 7 on a G part, bit 6 on an E part. The register is the same either way; what differs is whether a board may set that bit for its own purposes. parts.toml states the refusal per part.",
+]
+
+[registers.APBCMASK]
+offset = 0x20
+width = 32
+fields = { SERCOM0 = [2, 1], SERCOM1 = [3, 1], SERCOM2 = [4, 1], SERCOM3 = [5, 1], SERCOM4 = [6, 1], SERCOM5 = [7, 1] }
+notes = "One gate bit per APBC peripheral; a driver ORs in its instance's bit (the instance row carries the bit index). Reset value is 0x00010000 -- the ADC's bit 16 comes up set and every SERCOM bit comes up clear, so a read-modify-write is required rather than a plain store."

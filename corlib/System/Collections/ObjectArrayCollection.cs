@@ -5,11 +5,13 @@ namespace System.Collections
     {
         private object[] items;
         private int count;
+        private object owner;
 
-        public ObjectArrayCollection(object[] items, int count)
+        public ObjectArrayCollection(object[] items, int count, object owner)
         {
             this.items = items;
             this.count = count;
+            this.owner = owner;
         }
 
         public int Count { get { return count; } }
@@ -20,5 +22,8 @@ namespace System.Collections
         {
             for (int i = 0; i < count; i++) array.SetValue(items[i], index + i);
         }
+
+        public bool IsSynchronized { get { return false; } }
+        public object SyncRoot { get { return owner; } }
     }
 }

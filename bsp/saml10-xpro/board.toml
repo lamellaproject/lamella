@@ -1,0 +1,94 @@
+# The SAM L10 Xplained Pro (ATSAML10-XPRO, ATSAML10E16A): board truth only -- what is wired to
+# what. Chip truth lives in csp/saml1x/.
+#
+# THIS BOARD AND saml11-xpro ARE WIRED IDENTICALLY AND THAT IS THE GUIDE'S OWN POSITION, not an
+# inference from resemblance: DS70005359C documents both kits in one book and heads its pin column
+# "SAML10/SAML11 pin". Every row below is read from that shared column. What differs between the
+# two boards is the PART fitted, and everything that follows from it is a chip fact rather than a
+# board one -- see csp/saml1x/parts.toml.
+#
+# THE VIRTUAL COM PORT IS NOT ON PADS 0 AND 1, WHICH IS A FIRST ON THIS ROSTER. SERCOM0 PAD[2] is
+# TX and PAD[3] is RX, so the generator derives TXPO = 1 and RXPO = 3. TXPO IS NOT THE PAD
+# NUMBER -- the USART encodes TX-on-pad0 as 0 and TX-on-pad2 as 1, and the generator refuses any
+# other TX pad rather than inventing an encoding for it.
+#
+# THE MAIN CRYSTAL FOOTPRINT IS EMPTY ON THIS BOARD. Section 4.2.1 fits one 32.768 kHz crystal and
+# provides "a footprint for higher frequency crystals" on PA14/PA15. Nothing is soldered there, so
+# those two pads are ordinary I/O here and the part runs from its internal oscillator.
+
+[table]
+kind = "board"
+board = "saml10-xpro"
+vendor = "microchip"
+family = "saml1x"
+part = "atsaml10e16a"
+product_model = 58          # lamella_wire::product_model::SAML10_XPLAINED_PRO
+sources = [
+    "SAM L10/L11 Xplained Pro user guide DS70005359C (2019) section 4.2.3 and Table 4-11 (LED Connection): one yellow LED0 on PA07, schematics net USER_LED, Shared Functionality 'DGI SPI'. The section states the polarity in words -- 'The LED can be activated by driving the connected I/O line to GND'.",
+    "DS70005359C section 4.2.2 and Table 4-10 (Mechanical Buttons Connections): two buttons, RESET on the part's /RESET line and a generic user-configurable SW0 on PA27, schematics net USER_BUTTON, Shared Functionality 'DGI GPIO, EXT2'. The section states the polarity in words -- 'When a button is pressed it will drive the I/O line to GND'.",
+    "DS70005359C section 4.3.1 and Table 4-13 (Serial Wire Debug Connection): Serial Wire Clock on PA30 and Serial Wire Data IN/OUT on PA31, both shared with the Cortex debug connector. Corroborated by SAM L10/L11 Family Data Sheet DS60001513J Table 4-4, which gives the same two pads.",
+    "DS70005359C section 4.3.2 and Table 4-14 (Virtual COM Port Connection), corroborated against DS60001513J Table 4-1 for the function column -- see the header above.",
+    "DS70005359C section 4.2.1 with Table 4-8 and Table 4-9: ONE 32.768 kHz crystal is mounted, on PA00 (XIN32) and PA01 (XOUT32); the higher-frequency crystal on PA14 (XIN) and PA15 (XOUT) is a FOOTPRINT, described as 'a footprint for higher frequency crystals'.",
+    "DS60001513J (OSCCTRL and GCLK) for the default plan's rate, stated three times in three chapters: 'After reset, OSC16M is enabled and serves as the default clock source at 4MHz', and twice as 'the device selects the OSC16M oscillator which is enabled by default after reset and configured at 4 MHz'.",
+]
+notes = [
+    "THE MAIN CRYSTAL IS A FOOTPRINT, NOT A PART. PA14 and PA15 carry XIN and XOUT and this kit solders nothing to them, so they are ordinary I/O here -- the guide's own Shared Functionality column lists them against EXT1, EXT2, DGI SPI, mikroBUS and X32, which a populated oscillator would forbid. A board file that recorded a crystal frequency for this pad pair would describe a component that is not fitted, and one that recorded nothing would not distinguish this board from one with no footprint at all.",
+    "LED0 AND SW0 ARE EACH SHARED. LED0's line is the DGI SPI slave select and SW0's is a DGI GPIO and an EXT2 pin, per the guide's own Shared Functionality column. A program driving either is also driving whatever the debugger's data gateway or an extension board presents on that line.",
+    "THE GUIDE DOES NOT SAY WHETHER SW0 HAS AN EXTERNAL PULL-UP. It states the polarity and stops there, where the SAM D21 and E51 Curiosity Nano guides both state outright that no pull-up is fitted. The absence of the statement is not the presence of a resistor.",
+    "PA30 AND PA31 ARE THE DEBUG PADS AND THEY ARRIVE MUXED. csp/saml1x/blocks/port.toml records that PMUX15 resets to 0x06, function G, which is SWCLK and SWDIO. On this board those two pads are the ONLY debug path, so a program that takes them for general-purpose I/O ends its own session.",
+    "THIS BOARD HAS A mikroBUS HEADER. DS70005359C's feature list on page 3 names it outright and its pin tables carry a full mikroBUS pinout -- ADC on PA02, PWM on PA18, IRQ on PA22, SPI on PA04/PA05/PA14/PA15, I2C on PA16/PA17, UART on PA08/PA09. Nothing here binds any of it; recorded because this roster's standing position has been that no onboarded board carries a mikroBUS socket, and that stops being true when this board lands.",
+    "THE DATA FLASH IS NOT IN THE PART'S `flash` FIGURE. csp/saml1x/parts.toml records the 64 KB main array alone and says why the 2 KB Data Flash is not summed into it.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
+usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
+baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
+plan = "osc16m-4mhz"        # Atmel-42096 describes the composite device without giving an id
+default = true              # table. Nor can a sibling supply it: 0x2111 answers for seven
+                            # different Xplained Pro kits and 0x2175 for two Curiosity Nanos of
+                            # DIFFERENT ARCHITECTURES, so a product id read off one board is not
+                            # a fact about another. It is read from the kit it belongs to.
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom0"
+function = "C"              # SERCOM, not SERCOM ALTERNATIVE -- and here that IS a choice between
+gclk_gen = 0                # two real instances. Both pads carry SERCOM2 in column D, and SERCOM2
+tx = { pin = "PA24", pad = 2 }   # does not exist at all on this family's 24-pin packages.
+rx = { pin = "PA25", pad = 3 }   # PADS 2 AND 3, NOT 0 AND 1 -- see the header.
+
+# THE DEFAULT CLOCK PLAN. The datasheet states the rate three times in three chapters and names the
+# oscillator each time: OSC16M, enabled by default after reset and configured at 4 MHz. So GCLK0 is
+# 4 MHz at reset -- the SAM L21, SAM L22 and SAM R30 rate by the same oscillator, and NOT the SAM
+# D21 line's 8 MHz. Every baud divisor the generator derives rides that rate.
+[[plans]]
+name = "osc16m-4mhz"
+default = true
+source = "osc16m"
+gclk0_hz = 4000000
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PA07"
+active = "low"
+source = "DS70005359C section 4.2.3 and Table 4-11: one yellow LED0 on PA07, silkscreened LED0, schematics net USER_LED, Shared Functionality 'DGI SPI'. 'The LED can be activated by driving the connected I/O line to GND'. THE POLARITY IS MEASURED, AND IT AGREES WITH THE DOCUMENT. That sentence is quoted rather than relied on: it appears word for word across this vendor's kit guides and is wrong on at least one of them, where the same instrument reports the opposite. Driven from a probe with the core halted, PA07 was held high for five seconds and low for one in a repeating cycle, sampled at both ends of every window across twenty-four cycles: the diode is lit for the one-second stretch, so it lights when the pin is LOW. A PROGRAM RESIDENT ON THE BOARD ALSO DRIVES THIS PIN, and it was characterized rather than assumed away, because an observer reporting a resident demo's pattern instead of the instrument's is a real way to get this answer backwards: sampled over seven seconds with the core running, PA07 transitions about every 500 ms, a symmetric blink near 1 Hz, which is not a pattern anybody would describe as lit briefly against a long dark stretch. The part answering on the probe reads CPUID 0x411cd200, a Cortex-M23, with the DSU DID at 0x41002018 reading 0x20840100 -- processor 2, family 1, series 4, die 0, revision 1, device 0x00."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA27"
+active = "low"
+source = "DS70005359C section 4.2.2 and Table 4-10: the generic user-configurable button on PA27, silkscreened SW0, schematics net USER_BUTTON, Shared Functionality 'DGI GPIO, EXT2'. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "yes"
+pitch_mm = 1.27
+onboard = "edbg"
+recovery = "probe"
+source = "DS70005359C SAM L10/L11 Xplained Pro user guide section 4.1.5: the kit has a 10-pin, 50-mil Cortex Debug Connector for attaching external debuggers, and section 4.3.1 gives Serial Wire Clock on PA30 and Serial Wire Data on PA31, both shared with that connector. THE CONNECTOR IS FITTED, AND THAT IS FROM LOOKING AT THE BOARD RATHER THAN FROM THE GUIDE. The document could not have answered it: it gives the connector a numbered section and a full pin table and never says it is mounted, and the same guide marks its crystals mounted and not mounted in the feature list, so its silence reads either way. A person with the kit in hand reports a soldered connector that a ten-pin ribbon plugs into, as opposed to the bare footprint that the same wording describes on other kits. The board also carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

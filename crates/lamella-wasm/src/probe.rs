@@ -505,13 +505,21 @@ mod tests {
     /// the seam, and the refusal has to name both numbers.
     #[test]
     fn a_reply_longer_than_the_buffer_is_refused_at_the_seam() {
+        let capacity = lamella_cmsis_dap::MAX_PACKET;
+        let over_long = capacity + 32;
         let handle = fresh_session();
-        queue_reply(vec![proto::cmd::TRANSFER; 96]);
+        queue_reply(vec![proto::cmd::TRANSFER; over_long]);
         let reply = request(handle, &json!({ "op": "readWords", "address": 0u32, "count": 1 }));
         assert_eq!(reply["ok"], json!(false), "{reply}");
         let error = reply["error"].as_str().unwrap_or_default();
-        assert!(error.contains("96"), "the refusal names the reported length: {reply}");
-        assert!(error.contains("64"), "the refusal names the buffer: {reply}");
+        assert!(
+            error.contains(&over_long.to_string()),
+            "the refusal names the reported length: {reply}"
+        );
+        assert!(
+            error.contains(&capacity.to_string()),
+            "the refusal names the buffer: {reply}"
+        );
         lamella_probe_dispose(handle);
     }
 

@@ -1,0 +1,35 @@
+# The SAMC21 Generic Clock Controller block: the channel-routing registers the peripheral bring-up
+# paths touch (partial, append-only). Offsets are GCLK-base-relative; the base lives in
+# ../instances.toml. WHICH generator runs at WHAT rate is a PLAN fact (board.toml), never here.
+#
+# TWO ARRAYS, INDEXED BY DIFFERENT THINGS -- the same hazard the SAM E54 block records, and why
+# this family cannot ride the SAM D21 line's UART arm:
+#
+#   GENCTRL[n]   n is a GENERATOR. A generator takes a clock source and divides it.
+#   PCHCTRL[m]   m is a PERIPHERAL CHANNEL. A channel selects which generator feeds one
+#                particular peripheral's core clock.
+#
+# So a peripheral is clocked by writing ITS channel with the generator number it should listen to,
+# and both numbers are small integers in the same range. The SAM D21 line has neither array: it has
+# ONE CLKCTRL register whose ID field selects the channel, so there the id is a value and here it
+# is an address. That is the whole difference between the two generator arms.
+
+[table]
+kind = "block"
+family = "samc21"
+block = "gclk"
+sources = [
+    "SAM C20/C21 Family Data Sheet DS60001479M section 16.8.4 (Peripheral Channel Control): 'Name: PCHCTRLm', 'Offset: 0x80 + m*0x04 [m=0..45]', with WRTLOCK at bit 7, CHEN at bit 6 and GEN[3:0] at bits 3:0",
+]
+notes = [
+    "THE ARRAY STRIDE AND BOUND ARE THE MANUAL'S OWN, printed in the offset heading rather than derived: PCHCTRLm at 0x80 + m*0x04 for m up to 45. The sibling same54 runs to 47; the two are not interchangeable and neither number is a family constant.",
+    "A CHANNEL IS NOT ENABLED BY SELECTING A GENERATOR. PCHCTRL.GEN chooses which generator feeds the channel and PCHCTRL.CHEN turns the channel on; writing GEN alone leaves the peripheral unclocked while the register reads back the generator that was asked for.",
+    "WRTLOCK IS ONE-WAY. Once set, further writes to that channel are discarded and the generator it names is locked with it. A driver that writes the whole register without masking can lock a peripheral's clock for the life of the power cycle.",
+    "DECLARED SUBSET: GENCTRL is NOT transcribed. Nothing here configures a generator -- a driver selecting a peripheral's generator is choosing among generators a clock plan has already set up -- and an undeclared register cannot be silently mis-strided.",
+]
+
+[registers.PCHCTRL0]
+offset = 0x80
+width = 32
+fields = { GEN = [0, 4], CHEN = [6, 1], WRTLOCK = [7, 1] }
+notes = "Element 0 of the peripheral channel array; element m is at 0x80 + m*0x04, for m up to 45. The instance rows carry each peripheral's channel id, so a driver names the peripheral it means rather than an integer."

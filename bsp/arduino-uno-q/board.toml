@@ -2,9 +2,9 @@
 # form factor -- a microcontroller sharing one board with a Qualcomm Dragonwing QRB2210 application
 # processor that runs Debian Linux.
 #
-# THIS BOARD STATES NO CARRIER, AND THAT IS THE WHOLE FINDING RATHER THAN A GAP. Every other
-# board here reaches a host through a wire this schema can name: an on-board debugger, a bare SWD
-# header, or the microcontroller's own USB. This one reaches a host through NONE of them.
+# THIS BOARD STATES NO CARRIER, AND THAT IS THE WHOLE FINDING RATHER THAN A GAP. A board reaches a
+# host through a wire this schema can name: an on-board debugger, a bare SWD header, or the
+# microcontroller's own USB. This one reaches a host through NONE of them.
 #   * The microcontroller's own USB does not reach the connector. The USB-C is the application
 #     processor's, and what the host sees when the board is plugged in is that processor's Linux
 #     gadget -- VID_2341&PID_0078, an ADB interface beside a CDC serial -- with nothing from the
@@ -14,10 +14,10 @@
 #   * There is no debug connector. The manual documents none, and the schematic level-shifts
 #     MCU_JTAG_SWDIO, MCU_JTAG_SWCLK, MCU_NRST and MCU_BOOT0 from 3.3 V to 1.8 V (sheet 7, TXS0101
 #     and TXS0104) straight into the application processor's GPIO (sheet 9).
-# So the application processor IS the microcontroller's debugger, which is a FOURTH debug kind
-# beside an on-board debugger chip, a bare SWD header and a native-USB bootloader. A carrier row
-# would have to name a wire, and stating one here would invent the wire. The Giga precedent is
-# refusing to invent a rate for a wire that has none; this is the same refusal one level up.
+# So the application processor IS the microcontroller's debugger, which is a debug arrangement
+# distinct from an on-board debugger chip, a bare SWD header and a native-USB bootloader. A carrier
+# row would have to name a wire, and stating one here would invent the wire. Declining to invent a
+# wire that does not exist is the same refusal as declining to state a rate for a wire that has none.
 #
 # FOUR RGB LEDS ARE POPULATED AND ONLY TWO ARE THIS BOARD'S TO BIND, because the OTHER TWO
 # BELONG TO A DIFFERENT PROCESSOR. RGB LEDs 1 and 2 in the schematic's naming (D27301, D27302) are
@@ -33,8 +33,8 @@
 # own 22 ohm resistor, and LED_MATRIX_11 is marked "not use". Eleven tri-stated pins give 11 x 10 =
 # 110 addressable LEDs, which is how 104 pixels are reached; row-and-column scanning across eleven
 # pins reaches at most 30. So a pixel here is an ORDERED PAIR OF PINS, not the intersection of a row
-# and a column, and the micro:bit's display-row/display-col rows -- the one matrix precedent in this
-# tree -- describe a scan this board does not perform. The sheet's own numbered 1..104 grid is the
+# and a column: a display described by row and column rows would state a scan this board does not
+# perform. The sheet's own numbered 1..104 grid is the
 # LOGICAL 8 x 13 the manual describes; the triangular array is the ELECTRICAL truth, and they are
 # different things. This is the FOURTH KIND `[[devices]]` stops at, and it is stated rather than bent.
 #
@@ -129,3 +129,11 @@ kind = "gpio-out"
 pin = "PH15"
 active = "low"
 source = "Schematic sheet 19 puts MCU_LED2_BLU on PH15, ball A13, and DS13086 Rev 10 Table 27 gives PH15 the ball A13 in the non-SMPS UFBGA169 column. Sheet 21 draws this leg's cathode through R2733, 820 ohm, back to the net. The pin sinks. The manual names it LED4_B. PH15 is the last pin of the port and the last of the six: the schematic marks PH4 to PH9 unconnected, so the driven block is exactly PH10 to PH15 and nothing lies beyond it."
+
+[debug]
+signals = []
+exposure = "none"
+fitted = "no"
+onboard = "proprietary"
+recovery = "unknown"
+source = "The board's manual documents no debug connector and the schematic level-shifts MCU_JTAG_SWDIO, MCU_JTAG_SWCLK, MCU_NRST and MCU_BOOT0 from 3.3 V to 1.8 V straight into the application processor's GPIO. So the microcontroller's debug lines reach the on-board application processor and no connector at all: a probe has nowhere to attach. The debug path that exists is not one this toolchain speaks, which is what the onboard value records; driving it would need software running on the application processor. What recovers the part after a deploy therefore depends on that software and is not established here."

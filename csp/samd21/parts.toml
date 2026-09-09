@@ -1,7 +1,12 @@
-# The SAMD21 parts table. Pin lists are PARTIAL present-lists: they carry the pins the
-# boards bind today, so a consumer must not read one as the package. Validation covers every
-# current binding, and a pin-map row naming a pin outside every present-list is refused rather
-# than assumed.
+# The SAMD21 parts table. A pin list is a PARTIAL present-list unless its own `source` says
+# otherwise: it carries the pins the boards bind today, so a consumer must not read one as the
+# package. Validation covers every current binding, and a pin-map row naming a pin outside every
+# present-list is refused rather than assumed.
+#
+# EACH ROW STATES ITS OWN COMPLETENESS AND THEY DIFFER. atsamd21j18a is now the complete 64-pin
+# pad set, transcribed from the package diagram and anchored against a pin count from a
+# second chapter; the two 48-pin rows are still partial. A blanket claim in this header would have
+# to be the weakest of the three, which is why the claim lives per row.
 
 [table]
 kind = "parts"
@@ -31,5 +36,8 @@ part = "atsamd21j18a"
 package = "64-pin"
 flash = 0x40000
 ram = 0x8000
-pins = ["PA22-PA23"]
-source = "DS40001882 ch 5 (64-pin) -- PARTIAL present-list; complete from the datasheet before authoring further bindings."
+pins = [
+    "PA00-PA25", "PA27-PA28", "PA30-PA31",
+    "PB00-PB17", "PB22-PB23", "PB30-PB31",
+]
+source = "DS40001882 section 5.1.1, the QFN64/TQFP64 diagram under the '5.1 SAM D21J' heading -- COMPLETE for this package. Taken from that diagram and NOT from the ch 7 I/O multiplexing table, which runs its SAMD21E / SAMD21G / SAMD21J columns together so that a row for a pin the E variant does not carry presents its G and J numbers where a reader expects E and G. Transcribed by side: pins 1-16 PA00, PA01, PA02, PA03, PB04, PB05, GNDANA, VDDANA, PB06, PB07, PB08, PB09, PA04, PA05, PA06, PA07; 17-32 PA08, PA09, PA10, PA11, VDDIO, GND, PB10, PB11, PB12, PB13, PB14, PB15, PA12, PA13, PA14, PA15; 33-48 GND, VDDIO, PA16, PA17, PA18, PA19, PB16, PB17, PA20, PA21, PA22, PA23, PA24, PA25, GND, VDDIO; 49-64 PB22, PB23, PA27, RESET, PA28, GND, VDDCORE, VDDIN, PA30, PA31, PB30, PB31, PB00, PB01, PB02, PB03. PA26 and PA29 are absent from the package, as are PB18-PB21 and PB24-PB29. TWO ANCHORS, because a diagram read once is one reading: the twelve non-I/O positions leave 52 I/O pads, and the ch 3 configuration summary independently gives the 64-pin SAMD21J row 52 I/O pins -- the same table giving the 48-pin G parts 38, which matches the atsamd21g18a row above. The previously listed PA22 and PA23 fall at pins 43 and 44 of this diagram, which is what confirms the figure being read is this package's."

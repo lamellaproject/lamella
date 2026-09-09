@@ -28,6 +28,12 @@ public enum Atsamd10XminiBindings {
     public static let VCP_APBC_MASK: UInt32 = 0x4
     public static let VCP_PMUX_REG: UInt32 = 0x41004435
     public static let VCP_PMUX_PAIR: UInt32 = 0x22
+    public static let VCP_PMUX_TX_REG: UInt32 = 0x41004435
+    public static let VCP_PMUX_TX_MASK: UInt32 = 0xF
+    public static let VCP_PMUX_TX_VALUE: UInt32 = 0x2
+    public static let VCP_PMUX_RX_REG: UInt32 = 0x41004435
+    public static let VCP_PMUX_RX_MASK: UInt32 = 0xF0
+    public static let VCP_PMUX_RX_VALUE: UInt32 = 0x20
     public static let VCP_PINCFG_TX_REG: UInt32 = 0x4100444A
     public static let VCP_PINCFG_RX_REG: UInt32 = 0x4100444B
     public static let VCP_TXPO: UInt32 = 1

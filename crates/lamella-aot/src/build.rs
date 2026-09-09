@@ -298,7 +298,7 @@ const RISCV_VIRT_FINISHER: u32 = 0x0010_0000;
 ///
 /// This is the flat, linker-free fast path, exactly as [`build_cortex_m`] is: no external calls, so
 /// no soft-float helpers, no GC seam, no P/Invoke. The linked object pipeline for this backend is
-/// [`riscv32::lower_object`] plus `lamella-link`, which is what the differential harness drives.
+/// [`riscv32::lower_object`] plus `lamella-linker`, which is what the differential harness drives.
 ///
 /// **It is QEMU, not silicon.** The RV32IM code it emits is the same code the 519-row differential
 /// runs, but a real RISC-V part boots its own way (an ESP32-C6 wants an ESP image header and its
@@ -377,7 +377,7 @@ pub const CH32V003_SRAM_TOP: u32 = 0x2000_0800;
 /// unaffected, by two different mechanisms: a single-dimension index scales by a power-of-two
 /// element size, which is a shift, and the multi-dimensional index/alloc arithmetic goes through an
 /// INLINE shift-and-add multiply instead of the routine. The linked pipeline that DOES resolve those
-/// routines is [`build_object_riscv_profile`] plus `lamella-link`, which is the path
+/// routines is [`build_object_riscv_profile`] plus `lamella-linker`, which is the path
 /// `examples/ch32v003-blink` drives and the one that has been on silicon.
 #[cfg(feature = "riscv32")]
 pub fn build_ch32v003(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
@@ -439,8 +439,20 @@ pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 /// loop forever, since an embedded reset handler never returns.
 ///
 /// This is the flat, linker-free fast path: it cannot resolve external or cross-object calls, so float
-/// helpers, the GC seam, P/Invoke, and `CallNative` are unavailable. For the full object pipeline, build
-/// the device image through `lamella-firmware`'s `build_cortex_m_image` (object lowering + link).
+/// helpers, the GC seam, P/Invoke, and `CallNative` are unavailable. That limit is inherent rather than
+/// unfinished -- a path that resolves no external symbol cannot reach a seam defined outside the object
+/// -- and it is why this function takes no input but the program, which is what a browser or any other
+/// caller with nothing else on hand needs.
+///
+/// **Those capabilities are reached by the linked path instead**, which is three steps rather than one:
+/// [`build_object_with_corlib`] lowers the assembly to a relocatable object, `lamella-linker` resolves it
+/// against the corlib object and the runtime-support archive built for the target's ISA, and a per-part
+/// boot image builder ([`rp2350_boot_image`], [`rp2040_boot_image`]) wraps the linked text in that
+/// part's vector table and reset stub.
+///
+/// The reset stub is not packaging. It seeds the allocator's heap window and clears the statics band
+/// before managed code runs, and an image without it links cleanly and then fails at its first
+/// allocation -- so a boot image builder is part of the linked path rather than a wrapper over it.
 #[cfg(feature = "arm32")]
 pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     if !CORTEX_M_TARGETS.contains(&target) {
@@ -501,7 +513,7 @@ fn cortex_m_boot_image(target: &str, code: &[u8]) -> Result<Vec<u8>, BuildError>
 /// build -- and a `PyIntrinsic` (`getattr`/`len`/`call`) errors as `CallUnsupported`, because
 /// [`arm32::PySupport`] carries ADDRESSES and a flat image has no linker to resolve them against.
 /// What it does cover is the shape that has been on silicon: a self-contained typed function doing
-/// MMIO in a loop. The object path (`arm32::lower_object` + `lamella_link::link_with_archives`,
+/// MMIO in a loop. The object path (`arm32::lower_object` + `lamella_linker::link_with_archives`,
 /// which `lamella-py-frontend`'s `microbit-run` example drives end to end) is the one that lifts
 /// those limits, and it is not reachable from here either.
 #[cfg(feature = "arm32")]
@@ -1027,6 +1039,8 @@ struct MethodSources {
     files: Vec<alloc::string::String>,
     display: Vec<alloc::string::String>,
     points: Vec<Vec<(u32, u32, u32)>>,
+    locals: Vec<Vec<crate::debugmap::LocalSlot>>,
+    params: Vec<Vec<crate::debugmap::LocalSlot>>,
 }
 
 #[cfg(feature = "arm32")]
@@ -1037,15 +1051,34 @@ impl MethodSources {
     fn resolve(pdb: &lamella_metadata::PortablePdb, assembly: &Assembly, count: usize) -> Self {
         let mut display: Vec<alloc::string::String> =
             alloc::vec![alloc::string::String::new(); count];
+        let mut locals: Vec<Vec<crate::debugmap::LocalSlot>> = alloc::vec![Vec::new(); count];
+        let mut params: Vec<Vec<crate::debugmap::LocalSlot>> = alloc::vec![Vec::new(); count];
         for type_def in assembly.type_defs() {
             let type_name = type_def.name().map_or("", |n| n.name);
             for method in type_def.methods() {
                 if let Some(slot) = display.get_mut(method.rid() as usize) {
                     *slot = alloc::format!("{type_name}.{}", method.name().unwrap_or("?"));
                 }
+                if let Some(slot) = locals.get_mut(method.rid() as usize) {
+                    *slot = crate::debugmap::local_slots(
+                        &pdb.local_variables(method.rid()),
+                        &method.local_variables(),
+                    );
+                }
+                if let (Some(slot), Some(signature)) =
+                    (params.get_mut(method.rid() as usize), method.signature())
+                {
+                    let named: alloc::vec::Vec<(u32, &str)> = method
+                        .params()
+                        .filter_map(|param| Some((param.sequence(), param.name()?)))
+                        .collect();
+                    *slot = crate::debugmap::param_slots(&named, &signature);
+                }
             }
         }
         Self {
+            locals,
+            params,
             files: (0..count)
                 .map(|rid| pdb.method_document(rid as u32).unwrap_or_default())
                 .collect(),
@@ -1068,6 +1101,8 @@ impl MethodSources {
                 name: self.display[i].as_str(),
                 file: self.files[i].as_str(),
                 points: self.points[i].as_slice(),
+                locals: self.locals[i].as_slice(),
+                params: self.params[i].as_slice(),
             })
             .collect()
     }
@@ -1182,7 +1217,7 @@ fn build_object_core(
     if let (Some(entry_rid), Some(reference), Some(bytes)) = (entry, reference.as_ref(), corlib) {
         let mut reference_cctors: Vec<alloc::string::String> = Vec::new();
         let mut chain = |bytes: &[u8], assembly: &Assembly| {
-            let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, bytes));
+            let prefix = library_prefix(bytes);
             reference_cctors.extend(
                 reference_startup_cctors(assembly)
                     .into_iter()
@@ -1249,6 +1284,13 @@ fn build_object_core(
         }
     }
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
+    {
+        let owner_images: Vec<&[u8]> = corlib
+            .into_iter()
+            .chain(libraries.iter().copied())
+            .collect();
+        point_referenced_enums_at_their_owner(&resolver, &owner_images, &mut descriptors);
+    }
     let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized(), resolver.references());
     if !defer {
         let sources = pdb.map(|pdb| MethodSources::resolve(pdb, &assembly, funcs.len()));
@@ -1330,6 +1372,92 @@ fn build_object_core(
 /// dedupe, breaking every virtual dispatch through it. Array and unresolved handles pass through
 /// untouched (`reference_type_meta` only answers for reference-owned handles).
 #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+/// The symbol prefix a LIBRARY object's names carry: `L{fnv1a32 of the assembly's CIL}.`, which
+/// discriminates one library's `f{rid}` from another's. A program object passes `""`.
+///
+/// ONE FUNCTION FOR THE SAME REASON [`enum_tostring_symbol`] IS: the formula was spelled out at every
+/// site that needed it, and a consumer reconstructing a producer's symbol has to derive the identical
+/// string from the identical bytes or the link fails somewhere neither site can see.
+fn library_prefix(image: &[u8]) -> alloc::string::String {
+    alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, image))
+}
+
+/// The symbol an assembly's synthesized enum `ToString` is exported under: `prefix` is the library
+/// discriminator (`L{fnv1a32(CIL)}.`, empty for a program object) and `token` the enum's TypeDef.
+///
+/// ONE FUNCTION BECAUSE TWO SITES MUST AGREE ON IT AND THEY ARE IN DIFFERENT PASSES:
+/// [`append_enum_to_string`] emits the definition, and [`point_referenced_enums_at_their_owner`]
+/// reconstructs the same name in a CONSUMER build to point a reference descriptor at it. Spelled
+/// twice they could drift by a character and the failure would land at a third party's link, in a
+/// program that did nothing wrong.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn enum_tostring_symbol(prefix: &str, token: u32) -> alloc::string::String {
+    alloc::format!("{prefix}__lamella_enum_tostring_{token:08x}")
+}
+
+/// Point every REFERENCED enum's `ToString` slot at the body its OWNER already exports.
+///
+/// THE NAMED GAP [`append_enum_to_string`] CARRIES. A consumer builds its own copy of a referenced
+/// type's descriptor and fills the vtable from the OWNER'S METADATA, which knows nothing of the body
+/// the owner's build appended and patched into its own `TypeMeta`. So a corlib enum dispatched to the
+/// inherited `Object.ToString` and rendered as its TYPE NAME: `System.DayOfWeek` where .NET prints
+/// `Wednesday`, on the box-and-`WriteLine(object)` path and on a direct `.ToString()` alike, for every
+/// enum corlib declares. A program's OWN enums were always right, which is what made it look like
+/// enum rendering worked.
+///
+/// REPOINTED RATHER THAN RE-SYNTHESIZED, so one body per enum serves every assembly that links it.
+/// The owner exports it under a name this build can reconstruct without asking the owner anything:
+/// `L{fnv1a32(owner CIL)}.__lamella_enum_tostring_{token}`, the discriminated form
+/// [`append_enum_to_string`] emits for a library. `owner_images` is the reference assemblies' raw
+/// bytes IN REFERENCE ORDER, because the ordinal in a reference-owned handle indexes that list and
+/// the hash is taken over those bytes.
+///
+/// The predicate is the OWNER's, deliberately: an enum with an underlying type, at least one member,
+/// and a nullary `ToString` slot -- the same three conditions that decide whether the symbol was
+/// emitted at all. A fourth condition would repoint a slot at a name nothing defines, and while that
+/// fails LOUDLY at the link rather than silently at run time, it fails in a program that did nothing
+/// wrong.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn point_referenced_enums_at_their_owner(
+    resolver: &MetadataResolver,
+    owner_images: &[&[u8]],
+    descriptors: &mut [crate::resolver::TypeMeta],
+) {
+    let target = TargetLayout::ilp32();
+    for meta in descriptors.iter_mut() {
+        let Some((ordinal, _)) = crate::resolver::reference_handle_parts(meta.handle) else {
+            continue;
+        };
+        let Some(image) = owner_images.get(ordinal) else {
+            continue;
+        };
+        let Some(owner) = resolver.references().get(ordinal).copied() else {
+            continue;
+        };
+        let Some((_, token)) = crate::resolver::reference_handle_parts(meta.handle) else {
+            continue;
+        };
+        let Some(type_def) = owner.type_def(token & 0x00ff_ffff) else {
+            continue;
+        };
+        let own_token = type_def.token();
+        if crate::resolver::enum_underlying(owner, own_token, &[], &target).is_none() {
+            continue;
+        }
+        if enum_members(&type_def).is_empty() {
+            continue;
+        }
+        let Some(slot) = resolver.reference_nullary_vtable_slot(meta.handle, "ToString") else {
+            continue;
+        };
+        let Some(entry) = meta.vtable.get_mut(slot) else {
+            continue;
+        };
+        let prefix = library_prefix(image);
+        *entry = crate::resolver::VtableEntry::Extern(enum_tostring_symbol(&prefix, own_token.0));
+    }
+}
+
 fn append_reference_descriptors(
     funcs: &[Function],
     resolver: &MetadataResolver,
@@ -1480,10 +1608,7 @@ fn append_enum_to_string(
             enum_to_string_body(&members, underlying, fallback)
         });
         *entry = crate::resolver::VtableEntry::Func(index);
-        names.push(alloc::format!(
-            "{prefix}__lamella_enum_tostring_{:08x}",
-            token.0
-        ));
+        names.push(enum_tostring_symbol(prefix, token.0));
     }
     names
 }
@@ -1560,7 +1685,7 @@ fn exception_message_body() -> Function {
 /// Declaration order is what makes a DUPLICATE value answer the way .NET does: `Enum.GetName` reads a
 /// by-value sort of the same rows, and a stable sort leaves equal values in metadata order, so the
 /// FIRST-DECLARED name wins there and in the compare chain below.
-#[cfg(any(feature = "arm32", feature = "riscv32"))]
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
 fn enum_members(type_def: &lamella_metadata::TypeDef) -> Vec<(alloc::string::String, i64)> {
     let mut members = Vec::new();
     for field in type_def.fields() {
@@ -1981,7 +2106,7 @@ fn assembly_statics<'x>(
 /// Compiles a self-contained CIL assembly to ONE RV32IM relocatable ELF object through the RELOCATING
 /// path ([`riscv32::lower_object`]): every reachable method becomes an `f<rid>` `STT_FUNC` symbol
 /// (`f0` is the entry trampoline -> `Main`), and each cross-method call becomes an `R_RISCV_CALL_PLT`
-/// relocation `lamella_link` resolves. This is the RISC-V twin of the ARM [`build_object`] -- it proves the
+/// relocation `lamella_linker` resolves. This is the RISC-V twin of the ARM [`build_object`] -- it proves the
 /// object path handles real compiler output, and it is the substrate the linked-path bricks (native
 /// calls, cross-assembly calls, the descriptor object lane) build on.
 ///
@@ -2055,7 +2180,7 @@ fn build_object_riscv_inner(
     let mut descriptors = resolver.type_descriptors();
     let mut reference_cctors: Vec<alloc::string::String> = Vec::new();
     for (bytes, reference) in reference_cils.iter().zip(&reference_assemblies) {
-        let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, bytes));
+        let prefix = library_prefix(bytes);
         reference_cctors.extend(
             reference_startup_cctors(reference)
                 .into_iter()
@@ -2077,6 +2202,7 @@ fn build_object_riscv_inner(
     ));
     replace_exception_message(&assembly, &mut funcs);
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
+    point_referenced_enums_at_their_owner(&resolver, reference_cils, &mut descriptors);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let imports = pinvoke_imports(&funcs);
     let import_names: Vec<&str> = imports.iter().map(|(name, _)| name.as_str()).collect();
@@ -2247,9 +2373,15 @@ pub fn lower_monomorphized_body<'a>(
     let instantiated = definitions
         .with_type_arguments(arguments)
         .with_layout_arguments(layout_arguments);
-    let mut func = cil::lower_method_typed(&cil_body, &instantiated, &arg_types, &local_types)
-        .map(|(func, _map)| func)
-        .map_err(|error| gap(MonoGap::LowerCil(error)))?;
+    let mut func = cil::lower_method_typed(
+        &cil_body,
+        &instantiated,
+        &arg_types,
+        &local_types,
+        cil::Narrowing::default(),
+    )
+    .map(|(func, _map)| func)
+    .map_err(|error| gap(MonoGap::LowerCil(error)))?;
     if let Some(ordinal) = rebased {
         let own_band_base =
             crate::resolver::non_generic_region_words(assembly, resolver.references()) * 4;
@@ -2271,7 +2403,7 @@ pub fn lower_monomorphized_body<'a>(
 ///
 /// A handle is minted at a dozen places in the resolver -- an `Alloc`, a cast target, an array's
 /// element, a delegate's layout, a boxed value's slot type -- and a flag threaded through all of
-/// them is this lane's recurring bug class: the thirteenth site gains no case, keeps the own-assembly
+/// them is a recurring bug class here: the thirteenth site gains no case, keeps the own-assembly
 /// answer, and the result is a descriptor named for whichever of the CALLER's types shares that row.
 /// Here the correction is applied once, to the finished body, by a rule that is TOTAL over the handle
 /// encoding -- so a shape with no arm REFUSES rather than passing through. The three corrections
@@ -2474,7 +2606,7 @@ fn library_function_symbols<'a>(
     owner_references: &[&'a Assembly<'a>],
 ) -> Option<Vec<Option<alloc::string::String>>> {
     let bytes = owner.file()?;
-    let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, bytes));
+    let prefix = library_prefix(bytes);
     let count = owner
         .tables()
         .row_count(lamella_metadata::tables::table::METHOD_DEF) as usize
@@ -2587,9 +2719,15 @@ pub fn lower_monomorphized_method_body<'a>(
         local_types.push(typed(local)?);
     }
     let instantiated = definitions.with_method_arguments(body.arguments.clone());
-    let mut func = cil::lower_method_typed(&cil_body, &instantiated, &arg_types, &local_types)
-        .map(|(func, _map)| func)
-        .map_err(|error| gap(MonoGap::LowerCil(error)))?;
+    let mut func = cil::lower_method_typed(
+        &cil_body,
+        &instantiated,
+        &arg_types,
+        &local_types,
+        cil::Narrowing::default(),
+    )
+    .map(|(func, _map)| func)
+    .map_err(|error| gap(MonoGap::LowerCil(error)))?;
     if let Some(ordinal) = rebased {
         let own_band_base =
             crate::resolver::non_generic_region_words(assembly, resolver.references()) * 4;
@@ -2793,7 +2931,18 @@ fn lower_one_reachable(
                 .iter()
                 .map(|sig| mir_type(sig, assembly, None, resolver.references()))
                 .collect::<Result<_, BuildError>>()?;
-            return match cil::lower_method_typed(&body, resolver, &arg_types, &local_types) {
+            let (arg_narrow, local_narrow) =
+                crate::resolver::narrowing_of(assembly, &method, resolver.references());
+            return match cil::lower_method_typed(
+                &body,
+                resolver,
+                &arg_types,
+                &local_types,
+                cil::Narrowing {
+                    args: &arg_narrow,
+                    locals: &local_narrow,
+                },
+            ) {
                 Ok((func, _map)) => Ok(Some(func)),
                 Err(error) => Err(BuildError::LowerCil { rid, error }),
             };
@@ -2842,7 +2991,7 @@ fn build_library_object_riscv_inner(
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
         lower_assembly_seams(&assembly, None, &references)?;
     refuse_duplicate_bodies(&duplicates)?;
-    let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
+    let prefix = library_prefix(cil);
     let resolver = MetadataResolver::new(&assembly)
         .with_references(&references)
         .with_monomorphized(plan);
@@ -2859,6 +3008,7 @@ fn build_library_object_riscv_inner(
     replace_exception_message(&assembly, &mut funcs);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
+    point_referenced_enums_at_their_owner(&resolver, reference_cils, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized(), resolver.references());
     let reference_regions: Vec<alloc::string::String> = reference_cils
         .iter()
@@ -3123,7 +3273,7 @@ fn build_library_object_inner(
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
         lower_assembly_seams(&assembly, None, &reference_list)?;
     refuse_duplicate_bodies(&duplicates)?;
-    let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
+    let prefix = library_prefix(cil);
     let mut names = library_symbol_names(&assembly, &reference_list, funcs.len(), &prefix);
     name_type_init_thunks(&assembly, &thunks, &mut names);
     let qualifiers = arm32::DescQualifiers {
@@ -3151,6 +3301,7 @@ fn build_library_object_inner(
     replace_exception_message(&assembly, &mut funcs);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
+    point_referenced_enums_at_their_owner(&resolver, references, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized(), resolver.references());
     let (bytes, stubs) = arm32::lower_object_library_vtables_report(
         &funcs,
@@ -3587,6 +3738,11 @@ fn name_type_init_thunks(
 
 /// The MethodDef row of a static `Main` (the run-once widget entry), if the assembly has one.
 fn find_main(assembly: &Assembly) -> Option<u32> {
+    let token = assembly.image().entry_point_token();
+    let rid = token & 0x00ff_ffff;
+    if u8::try_from(token >> 24) == Ok(table::METHOD_DEF) && rid != 0 {
+        return Some(rid);
+    }
     for type_def in assembly.type_defs() {
         for method in type_def.methods() {
             if method.is_static() && method.name() == Some("Main") {
@@ -3670,7 +3826,7 @@ fn reference_startup_cctors(assembly: &Assembly) -> Vec<u32> {
 /// **AND WHAT THE FALLBACK ACTUALLY COVERS IS KNOWN RATHER THAN SUSPECTED.** Four shapes could
 /// reach it -- `void`, an open type's `!n`, a generic method's `!!n`, and a function pointer -- and
 /// only the third ever did. A `void` return is tested before the call; an open TYPE's body is
-/// skipped before lowering, and so is a generic METHOD's; and
+/// skipped before lowering, and so is a generic METHOD's, which is what closed the one live case; and
 /// a function pointer cannot arrive at all, because `ELEMENT_TYPE_FNPTR` has no decode arm and is a
 /// loud `BadElementType` in the signature reader long before this.
 ///
@@ -4127,6 +4283,61 @@ fn find_native_export(assembly: &Assembly, export: &str) -> Option<u32> {
     None
 }
 
+/// The fault edge both `String.Substring` overloads branch to when their bounds check fails: store
+/// `ArgumentOutOfRangeException`'s tag into the in-flight exception word, then return.
+///
+/// ONE function rather than an arm per overload, deliberately. A bounds rule written out twice gains
+/// its next case in one of the two, and the one that keeps the stale rule is the one nobody reads.
+///
+/// The tag is derived from the NAME by the same function a `catch` clause's tag comes from, so
+/// `catch (ArgumentOutOfRangeException)` matches by construction rather than by a shared constant
+/// somebody has to keep in step.
+///
+/// The reference returned is null rather than `this`. A raise still has to hand back something of the
+/// method's own type, and the caller reads the in-flight tag rather than this value -- but if a caller
+/// ever failed to, a null faults where the original string would have been silently accepted as the
+/// result of a call that did not happen. A loud wrong answer is preferable to a quiet one.
+fn out_of_range_block(tag: ValueId, store: ValueId, zero: ValueId, null: ValueId) -> BasicBlock {
+    BasicBlock {
+        params: Vec::new(),
+        insts: vec![
+            (
+                tag,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: i64::from(lamella_metadata::exception_tag_for_name(
+                        "System",
+                        "ArgumentOutOfRangeException",
+                    )),
+                },
+            ),
+            (
+                store,
+                Inst::StaticStore {
+                    owner: StaticOwner::Own,
+                    offset: cil::G_EXCEPTION_TAG_OFFSET,
+                    value: tag,
+                },
+            ),
+            (
+                zero,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ),
+            (
+                null,
+                Inst::Convert {
+                    value: zero,
+                    kind: ConvKind::IntToRef,
+                },
+            ),
+        ],
+        terminator: Some(Terminator::Return(Some(null))),
+    }
+}
+
 /// A synthesized MIR body for a `[RuntimeProvided]` `System.String` / `System.Array` reader, over the
 /// AOT `[len: u32][data ...]` layout both share (an ObjectRef points at the `len` word). `get_Length`
 /// loads the len word at `this + 0` -- for `String` the unit count, for `Array` the element count.
@@ -4150,6 +4361,7 @@ fn synthesize_runtime_reader(
         return None;
     }
     match (method_name, param_count) {
+        (Some("get_Length"), 0) if type_name == "Array" => Some(array_total_length_body()),
         (Some("get_Length"), 0) => Some(Function {
             params: vec![MirType::ObjectRef],
             ret: Some(MirType::I32),
@@ -4261,45 +4473,97 @@ fn synthesize_runtime_reader(
                 MirType::I32,
                 MirType::I32,
                 MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
                 MirType::ObjectRef,
             ],
             entry: BlockId(0),
-            blocks: vec![BasicBlock {
-                params: vec![ValueId(0), ValueId(1)],
-                insts: vec![
-                    (
-                        ValueId(2),
-                        Inst::Convert {
-                            value: ValueId(0),
-                            kind: ConvKind::RefToInt,
-                        },
-                    ),
-                    (
-                        ValueId(3),
-                        Inst::Load {
-                            address: ValueId(2),
-                            width: 4,
-                            signed: false,
-                        },
-                    ),
-                    (
-                        ValueId(4),
-                        Inst::Binary {
-                            op: BinOp::Sub,
-                            lhs: ValueId(3),
-                            rhs: ValueId(1),
-                        },
-                    ),
-                    (
-                        ValueId(5),
+            blocks: vec![
+                BasicBlock {
+                    params: vec![ValueId(0), ValueId(1)],
+                    insts: vec![
+                        (
+                            ValueId(2),
+                            Inst::Convert {
+                                value: ValueId(0),
+                                kind: ConvKind::RefToInt,
+                            },
+                        ),
+                        (
+                            ValueId(3),
+                            Inst::Load {
+                                address: ValueId(2),
+                                width: 4,
+                                signed: false,
+                            },
+                        ),
+                        (
+                            ValueId(4),
+                            Inst::Binary {
+                                op: BinOp::Sub,
+                                lhs: ValueId(3),
+                                rhs: ValueId(1),
+                            },
+                        ),
+                        (
+                            ValueId(5),
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: 0,
+                            },
+                        ),
+                        (
+                            ValueId(6),
+                            Inst::Compare {
+                                op: CmpOp::SignedLt,
+                                lhs: ValueId(1),
+                                rhs: ValueId(5),
+                            },
+                        ),
+                        (
+                            ValueId(7),
+                            Inst::Compare {
+                                op: CmpOp::SignedGt,
+                                lhs: ValueId(1),
+                                rhs: ValueId(3),
+                            },
+                        ),
+                        (
+                            ValueId(8),
+                            Inst::Binary {
+                                op: BinOp::Or,
+                                lhs: ValueId(6),
+                                rhs: ValueId(7),
+                            },
+                        ),
+                    ],
+                    terminator: Some(Terminator::Branch {
+                        cond: ValueId(8),
+                        if_true: BlockId(2),
+                        true_args: Vec::new(),
+                        if_false: BlockId(1),
+                        false_args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![(
+                        ValueId(9),
                         Inst::PInvoke {
                             import: "lamella_string_substring".into(),
                             args: vec![ValueId(2), ValueId(1), ValueId(4)],
                         },
-                    ),
-                ],
-                terminator: Some(Terminator::Return(Some(ValueId(5)))),
-            }],
+                    )],
+                    terminator: Some(Terminator::Return(Some(ValueId(9)))),
+                },
+                out_of_range_block(ValueId(10), ValueId(11), ValueId(12), ValueId(13)),
+            ],
         }),
         (Some("Substring"), 2) => Some(Function {
             params: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
@@ -4309,29 +4573,135 @@ fn synthesize_runtime_reader(
                 MirType::I32,
                 MirType::I32,
                 MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
                 MirType::ObjectRef,
             ],
             entry: BlockId(0),
-            blocks: vec![BasicBlock {
-                params: vec![ValueId(0), ValueId(1), ValueId(2)],
-                insts: vec![
-                    (
-                        ValueId(3),
-                        Inst::Convert {
-                            value: ValueId(0),
-                            kind: ConvKind::RefToInt,
-                        },
-                    ),
-                    (
-                        ValueId(4),
+            blocks: vec![
+                BasicBlock {
+                    params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                    insts: vec![
+                        (
+                            ValueId(3),
+                            Inst::Convert {
+                                value: ValueId(0),
+                                kind: ConvKind::RefToInt,
+                            },
+                        ),
+                        (
+                            ValueId(4),
+                            Inst::Load {
+                                address: ValueId(3),
+                                width: 4,
+                                signed: false,
+                            },
+                        ),
+                        (
+                            ValueId(5),
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: 0,
+                            },
+                        ),
+                        (
+                            ValueId(6),
+                            Inst::Compare {
+                                op: CmpOp::SignedLt,
+                                lhs: ValueId(1),
+                                rhs: ValueId(5),
+                            },
+                        ),
+                        (
+                            ValueId(7),
+                            Inst::Compare {
+                                op: CmpOp::SignedLt,
+                                lhs: ValueId(2),
+                                rhs: ValueId(5),
+                            },
+                        ),
+                        (
+                            ValueId(8),
+                            Inst::Compare {
+                                op: CmpOp::SignedGt,
+                                lhs: ValueId(1),
+                                rhs: ValueId(4),
+                            },
+                        ),
+                        (
+                            ValueId(9),
+                            Inst::Binary {
+                                op: BinOp::Sub,
+                                lhs: ValueId(4),
+                                rhs: ValueId(2),
+                            },
+                        ),
+                        (
+                            ValueId(10),
+                            Inst::Compare {
+                                op: CmpOp::SignedGt,
+                                lhs: ValueId(1),
+                                rhs: ValueId(9),
+                            },
+                        ),
+                        (
+                            ValueId(11),
+                            Inst::Binary {
+                                op: BinOp::Or,
+                                lhs: ValueId(6),
+                                rhs: ValueId(7),
+                            },
+                        ),
+                        (
+                            ValueId(12),
+                            Inst::Binary {
+                                op: BinOp::Or,
+                                lhs: ValueId(11),
+                                rhs: ValueId(8),
+                            },
+                        ),
+                        (
+                            ValueId(13),
+                            Inst::Binary {
+                                op: BinOp::Or,
+                                lhs: ValueId(12),
+                                rhs: ValueId(10),
+                            },
+                        ),
+                    ],
+                    terminator: Some(Terminator::Branch {
+                        cond: ValueId(13),
+                        if_true: BlockId(2),
+                        true_args: Vec::new(),
+                        if_false: BlockId(1),
+                        false_args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![(
+                        ValueId(14),
                         Inst::PInvoke {
                             import: "lamella_string_substring".into(),
                             args: vec![ValueId(3), ValueId(1), ValueId(2)],
                         },
-                    ),
-                ],
-                terminator: Some(Terminator::Return(Some(ValueId(4)))),
-            }],
+                    )],
+                    terminator: Some(Terminator::Return(Some(ValueId(14)))),
+                },
+                out_of_range_block(ValueId(15), ValueId(16), ValueId(17), ValueId(18)),
+            ],
         }),
         (Some("CreateFromChars"), 3) => Some(Function {
             params: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
@@ -4454,6 +4824,165 @@ fn synthesize_type_seam(
     }
 }
 
+/// A synthesized MIR body for `[RuntimeProvided] System.Object.ReferenceEquals(object, object)` --
+/// reference identity, which is the two operands' addresses compared as words. Two nulls are equal
+/// (both are the zero word); a null and an object are not; two separately boxed copies of one value
+/// compare unequal, because boxing allocates and the addresses differ.
+///
+/// The same shape as `System.Type.HandleEquals` above, and for the same reason: the CLI's reference
+/// equality IS a pointer compare once the references are in registers, so the body is one `Compare`
+/// over the two words. `RefToInt` is a pure retype that costs no instruction.
+///
+/// Left as the placeholder the corlib declares it as, it returns `false` for every pair, including a
+/// reference compared with itself. It is also not EXPORTED in that state -- an unsynthesized seam is
+/// deliberately kept out of the library object's symbol table so a caller gets a loud link error
+/// rather than a silent constant -- so a program that calls it does not link at all.
+/// The `[RuntimeProvided]` body for one of `System.Math`'s `double` methods, or `None` for a method
+/// this backend does not back.
+///
+/// **Matched on the parameter SIGNATURE, never on the arity, and that is load-bearing here more than
+/// anywhere else in this table.** `Math.Max` has eleven overloads and only the `(double, double)` one
+/// is a seam; the rest carry real managed bodies. An arity match would hand the `(int, int)`
+/// overload a body that reads its arguments as doubles, which is not a diagnosable error at any
+/// later stage -- the words are the right size and the answer is simply wrong.
+///
+/// `Sign(double)` is deliberately ABSENT. It is the one member of this group that is not a total
+/// function: .NET throws `ArithmeticException` for NaN, and a synthesized body has no way to raise
+/// one -- the IR has `Jump`, `Branch`, `Return` and `Unreachable` and no throw. Returning a sign for
+/// NaN instead would be a silent wrong answer, and answering 0 would disagree with the interpreter,
+/// which refuses. Left unsynthesized it keeps the loud refusal a caller already gets.
+fn math_seam_body(name: Option<&str>, params: &[SigType]) -> Option<Function> {
+    let import = match (name?, params) {
+        ("Abs", [SigType::R8]) => "lamella_fabs",
+        ("Round", [SigType::R8]) => "lamella_rint",
+        ("Floor", [SigType::R8]) => "lamella_math_floor",
+        ("Ceiling", [SigType::R8]) => "lamella_math_ceiling",
+        ("Truncate", [SigType::R8]) => "lamella_math_truncate",
+        ("Max", [SigType::R8, SigType::R8]) => "lamella_math_max",
+        ("Min", [SigType::R8, SigType::R8]) => "lamella_math_min",
+        _ => return None,
+    };
+    Some(float_seam_call(import, u32::try_from(params.len()).ok()?))
+}
+
+/// A body that hands its `double` arguments straight to a `runtime-support` symbol and returns the
+/// `double` it answers: one block, one call, no conversion. Every member of the `Math` group above
+/// has that shape, so they share one builder rather than seven near-copies that could drift.
+fn float_seam_call(import: &str, arity: u32) -> Function {
+    let params = vec![MirType::F64; arity as usize];
+    let mut value_types = params.clone();
+    value_types.push(MirType::F64);
+    let args: Vec<ValueId> = (0..arity).map(ValueId).collect();
+    let result = ValueId(arity);
+    Function {
+        params,
+        ret: Some(MirType::F64),
+        value_types,
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: args.clone(),
+            insts: vec![(
+                result,
+                Inst::PInvoke {
+                    import: import.into(),
+                    args,
+                },
+            )],
+            terminator: Some(Terminator::Return(Some(result))),
+        }],
+    }
+}
+
+/// `Lamella.Runtime.Clock`'s `[RuntimeProvided]` monotonic read, as a call to the board's counter.
+///
+/// This is the ONE seam the managed clock leaves. `SetTicks`, `IsSet` and `NowTicks` are ordinary
+/// managed members over private statics, so the AOT compiles them like any other corlib code and
+/// needs no entry here -- the anchoring arithmetic lives in one place and this tier inherits it.
+/// What it cannot inherit is a reading of real time.
+///
+/// # WHAT THIS FIXES, WHICH IS NOT A ROUNDING ERROR
+///
+/// Without it the member falls through to its `[IntendedDefault]` body -- `return 0` -- so a clock
+/// anchored to zero elapsed makes `DateTime.UtcNow` answer the epoch forever. Two failures follow
+/// and they point opposite ways: a `Thread.Sleep` deadline is already past and returns AT ONCE, and
+/// a timeout comparing `UtcNow.Ticks < deadline` is true forever and NEVER returns. Neither reports
+/// anything.
+///
+/// `lamella_clock_now_ms` is the archive's one clock entry point, and the archive decides what is
+/// behind it -- a board counter, the net stack's, or 0. Naming the BOARD symbol here would make
+/// every image using `DateTime` fail to link unless its board supplied one.
+///
+/// The counter is `u64` and the managed member returns `long`; no conversion is emitted because
+/// on this target both are two registers and a millisecond count does not reach the sign bit for
+/// roughly 292 million years. The interpreter's intrinsic saturates instead, which is the same
+/// answer by a different route.
+fn clock_seam_body(name: Option<&str>, params: &[SigType]) -> Option<Function> {
+    if name? != "MonotonicMilliseconds" || !params.is_empty() {
+        return None;
+    }
+    let result = ValueId(0);
+    Some(Function {
+        params: Vec::new(),
+        ret: Some(MirType::I64),
+        value_types: vec![MirType::I64],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: Vec::new(),
+            insts: vec![(
+                result,
+                Inst::PInvoke {
+                    import: "lamella_clock_now_ms".into(),
+                    args: Vec::new(),
+                },
+            )],
+            terminator: Some(Terminator::Return(Some(result))),
+        }],
+    })
+}
+
+fn reference_equals_body() -> Function {
+    Function {
+        params: vec![MirType::ObjectRef, MirType::ObjectRef],
+        ret: Some(MirType::I32),
+        value_types: vec![
+            MirType::ObjectRef,
+            MirType::ObjectRef,
+            MirType::I32,
+            MirType::I32,
+            MirType::I32,
+        ],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0), ValueId(1)],
+            insts: vec![
+                (
+                    ValueId(2),
+                    Inst::Convert {
+                        value: ValueId(0),
+                        kind: ConvKind::RefToInt,
+                    },
+                ),
+                (
+                    ValueId(3),
+                    Inst::Convert {
+                        value: ValueId(1),
+                        kind: ConvKind::RefToInt,
+                    },
+                ),
+                (
+                    ValueId(4),
+                    Inst::Compare {
+                        op: CmpOp::Eq,
+                        lhs: ValueId(2),
+                        rhs: ValueId(3),
+                    },
+                ),
+            ],
+            terminator: Some(Terminator::Return(Some(ValueId(4)))),
+        }],
+    }
+}
+
 /// A synthesized MIR body for a `System.Console` output overload. It threads an optional argument
 /// (`param`) -- reinterpreted from an ObjectRef to a raw pointer first when `ref_to_int` (the string
 /// form) -- into a runtime-support value-writer (`writer`), then optionally a trailing newline. So
@@ -4533,6 +5062,326 @@ fn console_body(
 /// returns a GC-allocated `[len: u32][u16 units ...]` string. The object path rewrites the `PInvoke` to a
 /// `CallNative` the linker resolves against `tools/runtime/runtime-support`. `this` is dead by the allocating call,
 /// so nothing improper is a GC root there; the returned ObjectRef is rooted as the live result.
+/// A synthesized MIR body for one of `System.BitConverter`'s bit-reinterpretation seams: the same
+/// bits read as the other type of the same width, which is what `Double.NaN`'s own definition
+/// (`Int64BitsToDouble(0x7FF8000000000000L)`) is written in terms of.
+///
+/// **IT GOES THROUGH MEMORY BECAUSE MIR HAS NO BITCAST, AND EVERY `Convert` KIND IS A VALUE
+/// CONVERSION.** `ConvKind::LongToFloat64` computes the nearest `double` TO an integer -- for
+/// `0x7FF8000000000000` that is about 9.2e18, not a NaN -- which is the opposite of what this asks.
+/// A one-cell value type of the operand's width, written as one type and read back as the other, is
+/// the reinterpretation; the cell is the same memory-backing an address-taken scalar local gets.
+///
+/// `width` comes from the DESTINATION rather than being passed, so the two halves of a pair cannot
+/// be given different sizes: a 4-byte cell written with an `f64` would keep half the bits.
+fn bit_reinterpret_body(from: MirType, to: MirType) -> Function {
+    let cell = MirType::ValueType {
+        handle: TypeHandle(0),
+        refs: lamella_ir::RefWords::NONE,
+        size: to.stack_slot_bytes(),
+    };
+    Function {
+        params: alloc::vec![from],
+        ret: Some(to),
+        value_types: alloc::vec![from, cell, MirType::I32, to],
+        entry: BlockId(0),
+        blocks: alloc::vec![BasicBlock {
+            params: alloc::vec![ValueId(0)],
+            insts: alloc::vec![
+                (ValueId(1), Inst::InitStruct),
+                (
+                    ValueId(2),
+                    Inst::FieldStore {
+                        base: ValueId(1),
+                        offset: 0,
+                        value: ValueId(0),
+                    },
+                ),
+                (
+                    ValueId(3),
+                    Inst::FieldLoad {
+                        base: ValueId(1),
+                        offset: 0,
+                    },
+                ),
+            ],
+            terminator: Some(Terminator::Return(Some(ValueId(3)))),
+        }],
+    }
+}
+
+/// The runtime-support symbol behind one `System.Decimal` seam, or `None` for a marked method of
+/// that type which is not one of the eight.
+///
+/// Both archives export exactly these, from a module of their own so that they land in an archive
+/// member of their own: a program that does no decimal arithmetic references none of the names and
+/// the link never pulls the 96-bit kernel into the image.
+fn decimal_seam_import(name: Option<&str>, params: usize) -> Option<&'static str> {
+    match (name?, params) {
+        ("DecAdd", 2) => Some("lamella_decimal_add"),
+        ("DecSub", 2) => Some("lamella_decimal_subtract"),
+        ("DecMul", 2) => Some("lamella_decimal_multiply"),
+        ("DecDiv", 2) => Some("lamella_decimal_divide"),
+        ("DecRem", 2) => Some("lamella_decimal_remainder"),
+        ("Compare", 2) => Some("lamella_decimal_compare"),
+        ("FromDouble", 1) => Some("lamella_decimal_from_double"),
+        ("ToDouble", 1) => Some("lamella_decimal_to_double"),
+        _ => None,
+    }
+}
+
+/// The MIR slot an `int32` occupies when its ADDRESS is needed: a one-cell value type, which is the
+/// same memory-backing an address-taken scalar local gets (`cil`'s `mem_elem` pre-pass). Only
+/// `lamella_decimal_compare` needs one -- its `-1`/`0`/`1` is written through a pointer because its
+/// RETURN carries the status.
+const INT_OUT_CELL: MirType = MirType::ValueType {
+    handle: TypeHandle(0),
+    refs: lamella_ir::RefWords::NONE,
+    size: 4,
+};
+
+/// A synthesized MIR body for one `System.Decimal` seam: marshal the managed signature onto the
+/// C ABI the two runtime-support archives export, then raise on the status it answers.
+///
+/// **THE CONTRACT IS THE ARCHIVES', NOT THIS FUNCTION'S.** A `Decimal` crosses as a POINTER to the
+/// four inline words it already occupies -- `lo`, `mid`, `hi`, `flags`, 16 bytes in field
+/// declaration order -- so every value-type argument becomes a `FieldAddr` at offset 0 of the
+/// caller's own storage and no copy is made. Seven of the eight return an `i32` STATUS and write
+/// their result through a trailing out pointer ONLY on success; `lamella_decimal_to_double` returns
+/// its `double` directly, because it is the only one that cannot fail.
+///
+/// **THE STATUS BRANCH IS THE WHOLE REASON THIS IS NOT A ONE-LINE `PInvoke`.** A body that loaded
+/// the destination unconditionally would read whatever it held on a fault, which for `1m / 0m` is
+/// the zeroed buffer -- a `0` where .NET raises. The fault edge stores the exception's tag into the
+/// in-flight word and returns, which is how every other raise on this tier reaches its caller.
+///
+/// The tag for a status comes from `exception_tag_for_name`, the SAME function a `catch` clause's
+/// tag comes from, so `catch (DivideByZeroException)` matches by construction. The status numbering
+/// is `lamella_decimal`'s own (`STATUS_OK`, `Fault::status`), read here as `1 = OverflowException`
+/// and `2 = DivideByZeroException` -- the one place this tier spells it, mirroring the archives'.
+///
+/// `None` declines a result shape that is not the value type the seam writes into. Declining is
+/// the LOUD outcome -- the seam stays unsynthesized, the census records it, and
+/// [`BuildError::SilentSeamCallEdge`] refuses any build whose code calls it.
+///
+/// It takes MIR types rather than the signature it came from so that the STRUCTURE can be pinned by
+/// a `cargo test` with no assembly to hand. The decode is the caller's, beside the placeholder
+/// decision a failed one has to make.
+fn decimal_seam_body(import: &str, param_types: Vec<MirType>, ret: MirType) -> Option<Function> {
+    fn next(types: &mut Vec<MirType>, ty: MirType) -> ValueId {
+        types.push(ty);
+        ValueId((types.len() - 1) as u32)
+    }
+
+    let returns_double_directly = import == "lamella_decimal_to_double";
+
+    let out_type = if returns_double_directly {
+        None
+    } else if import == "lamella_decimal_compare" {
+        Some(INT_OUT_CELL)
+    } else {
+        matches!(ret, MirType::ValueType { .. }).then_some(ret)?.into()
+    };
+
+    let mut types = param_types.clone();
+    let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+    let out_cell = out_type.map(|ty| {
+        let id = next(&mut types, ty);
+        insts.push((id, Inst::InitStruct));
+        id
+    });
+
+    let mut args: Vec<ValueId> = Vec::new();
+    for (index, ty) in param_types.iter().enumerate() {
+        let value = ValueId(index as u32);
+        if matches!(ty, MirType::ValueType { .. }) {
+            let addr = next(&mut types, MirType::I32);
+            insts.push((
+                addr,
+                Inst::FieldAddr {
+                    base: value,
+                    offset: 0,
+                },
+            ));
+            args.push(addr);
+        } else {
+            args.push(value);
+        }
+    }
+    if let Some(cell) = out_cell {
+        let addr = next(&mut types, MirType::I32);
+        insts.push((
+            addr,
+            Inst::FieldAddr {
+                base: cell,
+                offset: 0,
+            },
+        ));
+        args.push(addr);
+    }
+
+    let call = next(&mut types, if returns_double_directly { ret } else { MirType::I32 });
+    insts.push((
+        call,
+        Inst::PInvoke {
+            import: import.into(),
+            args,
+        },
+    ));
+
+    let entry_params: Vec<ValueId> = (0..param_types.len() as u32).map(ValueId).collect();
+    if returns_double_directly {
+        return Some(Function {
+            params: param_types,
+            ret: Some(ret),
+            value_types: types,
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: entry_params,
+                insts,
+                terminator: Some(Terminator::Return(Some(call))),
+            }],
+        });
+    }
+
+    const OK: u32 = 1;
+    const FAULT: u32 = 2;
+    const OVERFLOW: u32 = 3;
+    const DIVIDE_BY_ZERO: u32 = 4;
+    let cell = out_cell?;
+
+    let (ok_value, fault_value, mut ok_insts) = if import == "lamella_decimal_compare" {
+        let loaded = next(&mut types, MirType::I32);
+        let zero = next(&mut types, MirType::I32);
+        (
+            loaded,
+            zero,
+            vec![(
+                loaded,
+                Inst::FieldLoad {
+                    base: cell,
+                    offset: 0,
+                },
+            )],
+        )
+    } else {
+        (cell, cell, Vec::new())
+    };
+    if import == "lamella_decimal_compare" {
+        insts.push((
+            fault_value,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: 0,
+            },
+        ));
+    }
+    ok_insts.shrink_to_fit();
+
+    let divide_by_zero_status = next(&mut types, MirType::I32);
+    let is_divide_by_zero = next(&mut types, MirType::I32);
+    let overflow_tag = next(&mut types, MirType::I32);
+    let raised_overflow = next(&mut types, MirType::I32);
+    let divide_by_zero_tag = next(&mut types, MirType::I32);
+    let raised_divide_by_zero = next(&mut types, MirType::I32);
+
+    let tag_of = |name: &str| i64::from(lamella_metadata::exception_tag_for_name("System", name));
+
+    Some(Function {
+        params: param_types,
+        ret: Some(ret),
+        value_types: types,
+        entry: BlockId(0),
+        blocks: vec![
+            BasicBlock {
+                params: entry_params,
+                insts,
+                terminator: Some(Terminator::Branch {
+                    cond: call,
+                    if_true: BlockId(FAULT),
+                    true_args: Vec::new(),
+                    if_false: BlockId(OK),
+                    false_args: Vec::new(),
+                }),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: ok_insts,
+                terminator: Some(Terminator::Return(Some(ok_value))),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        divide_by_zero_status,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 2,
+                        },
+                    ),
+                    (
+                        is_divide_by_zero,
+                        Inst::Compare {
+                            op: CmpOp::Eq,
+                            lhs: call,
+                            rhs: divide_by_zero_status,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Branch {
+                    cond: is_divide_by_zero,
+                    if_true: BlockId(DIVIDE_BY_ZERO),
+                    true_args: Vec::new(),
+                    if_false: BlockId(OVERFLOW),
+                    false_args: Vec::new(),
+                }),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        overflow_tag,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: tag_of("OverflowException"),
+                        },
+                    ),
+                    (
+                        raised_overflow,
+                        Inst::StaticStore {
+                            owner: StaticOwner::Own,
+                            offset: cil::G_EXCEPTION_TAG_OFFSET,
+                            value: overflow_tag,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(fault_value))),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        divide_by_zero_tag,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: tag_of("DivideByZeroException"),
+                        },
+                    ),
+                    (
+                        raised_divide_by_zero,
+                        Inst::StaticStore {
+                            owner: StaticOwner::Own,
+                            offset: cil::G_EXCEPTION_TAG_OFFSET,
+                            value: divide_by_zero_tag,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(fault_value))),
+            },
+        ],
+    })
+}
+
 fn double_to_string_body() -> Function {
     Function {
         params: vec![MirType::ManagedPtr],
@@ -4559,6 +5408,226 @@ fn double_to_string_body() -> Function {
                 ),
             ],
             terminator: Some(Terminator::Return(Some(ValueId(2)))),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Double.ToFixed(value, decimals)` -- the fixed-point digit engine
+/// behind the managed `"F"` and `"N"` specifiers.
+///
+/// STATIC, so there is no `this` and the two arguments arrive directly; contrast
+/// [`double_to_string_body`], which loads its `f64` through a managed pointer. The runtime seam
+/// `lamella_double_to_fixed` rounds the EXACT decimal value of the IEEE double half-to-even, which is
+/// why `(2.005).ToString("F2")` is `"2.00"` -- the nearest double to 2.005 sits just below it, and a
+/// scale-then-round would answer `"2.01"`.
+///
+/// **THE DEVICE HALF OF THIS SEAM HAS EXISTED IN `runtime-support` ALL ALONG, SHIM AND ALL.** Only
+/// the backend body was missing, so a program calling it lowered the assembly's own placeholder and
+/// got `null` back from a formatter that was linked and ready.
+fn double_to_fixed_body() -> Function {
+    Function {
+        params: vec![MirType::F64, MirType::I32],
+        ret: Some(MirType::ObjectRef),
+        value_types: vec![MirType::F64, MirType::I32, MirType::ObjectRef],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0), ValueId(1)],
+            insts: vec![(
+                ValueId(2),
+                Inst::PInvoke {
+                    import: "lamella_double_to_fixed".into(),
+                    args: vec![ValueId(0), ValueId(1)],
+                },
+            )],
+            terminator: Some(Terminator::Return(Some(ValueId(2)))),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Double.ToExponential(value, precision, upper)` -- the E-notation
+/// digit engine behind the managed `"E"`/`"e"` specifiers.
+///
+/// `upper` is a `bool` and arrives as an `I32`: MIR has no boolean type, and the CLI already widens a
+/// `bool` argument to `int32` on the evaluation stack, so the seam takes the same word the caller
+/// pushed. The runtime side reads it as "nonzero picks `E`".
+fn double_to_exponential_body() -> Function {
+    Function {
+        params: vec![MirType::F64, MirType::I32, MirType::I32],
+        ret: Some(MirType::ObjectRef),
+        value_types: vec![
+            MirType::F64,
+            MirType::I32,
+            MirType::I32,
+            MirType::ObjectRef,
+        ],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0), ValueId(1), ValueId(2)],
+            insts: vec![(
+                ValueId(3),
+                Inst::PInvoke {
+                    import: "lamella_double_to_exponential".into(),
+                    args: vec![ValueId(0), ValueId(1), ValueId(2)],
+                },
+            )],
+            terminator: Some(Terminator::Return(Some(ValueId(3)))),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Single.ToFixed(value, decimals)` -- the `f32` twin of
+/// [`double_to_fixed_body`], which it reaches by WIDENING rather than by a seam of its own.
+///
+/// **THE WIDEN IS EXACT AND IT IS NOT A SHORTCUT.** Every `f32` is representable in `f64`, so the
+/// real number is unchanged and a fixed-point rendering of it to the same decimal count is the same
+/// text. corlib already argues this for the `C` and `P` specifiers in its own comment ("an f32 is a
+/// subset of f64"), and the INTERPRETER's `single_to_fixed` is literally
+/// `format!("{:.*}", decimals, f64::from(value))` -- so widening here does not approximate the
+/// interpreter, it performs the same operation. The device seam handles NaN and the infinities
+/// before formatting, exactly as the interpreter does, and a widened `f32` NaN or infinity is still
+/// one.
+///
+/// THE SAME REASONING DOES NOT REACH `Single.ToString()`. The general form is shortest-round-trip at
+/// the SOURCE type's precision -- 7 significant digits for a float against 17 for a double -- so
+/// `3000000000f` renders as `"3E+09"` where the double holding the same value renders as
+/// `"3000000000"`. Widening cannot express that difference, because the two renderings differ in
+/// how many digits are asked for and not in the value. That one needs an `f32` formatter of its own.
+fn single_to_fixed_body() -> Function {
+    Function {
+        params: vec![MirType::F32, MirType::I32],
+        ret: Some(MirType::ObjectRef),
+        value_types: vec![
+            MirType::F32,
+            MirType::I32,
+            MirType::F64,
+            MirType::ObjectRef,
+        ],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0), ValueId(1)],
+            insts: vec![
+                (
+                    ValueId(2),
+                    Inst::Convert {
+                        value: ValueId(0),
+                        kind: ConvKind::Float32ToFloat64,
+                    },
+                ),
+                (
+                    ValueId(3),
+                    Inst::PInvoke {
+                        import: "lamella_double_to_fixed".into(),
+                        args: vec![ValueId(2), ValueId(1)],
+                    },
+                ),
+            ],
+            terminator: Some(Terminator::Return(Some(ValueId(3)))),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Single.ToExponential(value, precision, upper)` -- the `f32`
+/// twin of [`double_to_exponential_body`], reached by the same exact widen
+/// ([`single_to_fixed_body`] carries the argument for why that is not an approximation).
+fn single_to_exponential_body() -> Function {
+    Function {
+        params: vec![MirType::F32, MirType::I32, MirType::I32],
+        ret: Some(MirType::ObjectRef),
+        value_types: vec![
+            MirType::F32,
+            MirType::I32,
+            MirType::I32,
+            MirType::F64,
+            MirType::ObjectRef,
+        ],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0), ValueId(1), ValueId(2)],
+            insts: vec![
+                (
+                    ValueId(3),
+                    Inst::Convert {
+                        value: ValueId(0),
+                        kind: ConvKind::Float32ToFloat64,
+                    },
+                ),
+                (
+                    ValueId(4),
+                    Inst::PInvoke {
+                        import: "lamella_double_to_exponential".into(),
+                        args: vec![ValueId(3), ValueId(1), ValueId(2)],
+                    },
+                ),
+            ],
+            terminator: Some(Terminator::Return(Some(ValueId(4)))),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Double.ParseValid(string)` -- the decimal-to-nearest-`f64`
+/// rounding behind the managed `Double.Parse` and `TryParse`.
+///
+/// STATIC and single-argument: the managed string arrives as the only parameter and goes straight to
+/// the runtime seam, which trims, drops group separators, recognizes the .NET specials and rounds
+/// with the same `from_str` the interpreter uses.
+///
+/// UNLIKE THE FORMAT SEAMS THIS ONE DOES NOT ALLOCATE -- it takes a reference and returns a number --
+/// so it is NOT a safepoint, is not on `STRING_ALLOCATING_SEAMS`, and its runtime half carries no
+/// `anchor_seam_shim!`. The receiver is dead by the call and nothing improper can be a root there.
+///
+/// Unsynthesized, this lowered the assembly's placeholder `return 0`, so on this tier
+/// `Double.Parse("1.5")` was 0 and so was every string a program parsed -- silently, because zero is
+/// what a great deal of real input legitimately produces.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn double_parse_body() -> Function {
+    Function {
+        params: vec![MirType::ObjectRef],
+        ret: Some(MirType::F64),
+        value_types: vec![MirType::ObjectRef, MirType::F64],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0)],
+            insts: vec![(
+                ValueId(1),
+                Inst::PInvoke {
+                    import: "lamella_double_parse".into(),
+                    args: vec![ValueId(0)],
+                },
+            )],
+            terminator: Some(Terminator::Return(Some(ValueId(1)))),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Single.ParseValid(string)` -- the `f32` twin of
+/// [`double_parse_body`], and a SEPARATE runtime seam rather than a narrowed `f64`.
+///
+/// Parsing to `f64` and narrowing rounds TWICE, and the two roundings do not compose: a decimal
+/// exactly between two `f32` values can round to an `f64` that then rounds the other way. The
+/// interpreter parses `f32` directly for that reason and so does the seam this calls.
+///
+/// This is the opposite disposition from the FORMAT seams, where widening `f32` to `f64` is exact
+/// and one implementation serves both. Widening is lossless; narrowing is not, and which direction a
+/// seam travels decides whether it may share.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn single_parse_body() -> Function {
+    Function {
+        params: vec![MirType::ObjectRef],
+        ret: Some(MirType::F32),
+        value_types: vec![MirType::ObjectRef, MirType::F32],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0)],
+            insts: vec![(
+                ValueId(1),
+                Inst::PInvoke {
+                    import: "lamella_single_parse".into(),
+                    args: vec![ValueId(0)],
+                },
+            )],
+            terminator: Some(Terminator::Return(Some(ValueId(1)))),
         }],
     }
 }
@@ -4795,6 +5864,15 @@ fn synthesized_seam_body<'a>(
             }],
         });
     }
+    if (type_name.namespace, type_name.name) == ("System", "Object")
+        && method.name() == Some("ReferenceEquals")
+        && matches!(
+            signature.as_ref().map(|sig| sig.parameters.as_slice()),
+            Some([SigType::Object, SigType::Object])
+        )
+    {
+        return SeamEmission::Synthesized(reference_equals_body());
+    }
     if (type_name.namespace, type_name.name) == ("System", "Console") {
         let params = signature
             .as_ref()
@@ -4804,11 +5882,46 @@ fn synthesized_seam_body<'a>(
             return SeamEmission::Synthesized(func);
         }
     }
-    if (type_name.namespace, type_name.name) == ("System", "Double")
-        && method.name() == Some("ToString")
-        && params == 0
-    {
-        return SeamEmission::Synthesized(double_to_string_body());
+    if (type_name.namespace, type_name.name) == ("Lamella.Runtime", "Clock") {
+        let params = signature
+            .as_ref()
+            .map(|s| s.parameters.as_slice())
+            .unwrap_or(&[]);
+        if let Some(func) = clock_seam_body(method.name(), params) {
+            return SeamEmission::Synthesized(func);
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Math") {
+        let params = signature
+            .as_ref()
+            .map(|s| s.parameters.as_slice())
+            .unwrap_or(&[]);
+        if let Some(func) = math_seam_body(method.name(), params) {
+            return SeamEmission::Synthesized(func);
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Double") {
+        let core = match (method.name(), params) {
+            (Some("ToString"), 0) => Some(double_to_string_body()),
+            (Some("ToFixed"), 2) => Some(double_to_fixed_body()),
+            (Some("ToExponential"), 3) => Some(double_to_exponential_body()),
+            (Some("ParseValid"), 1) => Some(double_parse_body()),
+            _ => None,
+        };
+        if let Some(body) = core {
+            return SeamEmission::Synthesized(body);
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Single") {
+        let core = match (method.name(), params) {
+            (Some("ToFixed"), 2) => Some(single_to_fixed_body()),
+            (Some("ToExponential"), 3) => Some(single_to_exponential_body()),
+            (Some("ParseValid"), 1) => Some(single_parse_body()),
+            _ => None,
+        };
+        if let Some(body) = core {
+            return SeamEmission::Synthesized(body);
+        }
     }
     if (type_name.namespace, type_name.name) == ("System", "Char")
         && method.name() == Some("ToString")
@@ -4824,6 +5937,32 @@ fn synthesized_seam_body<'a>(
             return SeamEmission::Synthesized(delegate_remove_body());
         }
     }
+    if (type_name.namespace, type_name.name) == ("System", "BitConverter") {
+        let bits = match (method.name(), params) {
+            (Some("Int64BitsToDouble"), 1) => Some((MirType::I64, MirType::F64)),
+            (Some("DoubleToInt64Bits"), 1) => Some((MirType::F64, MirType::I64)),
+            (Some("Int32BitsToSingle"), 1) => Some((MirType::I32, MirType::F32)),
+            (Some("SingleToInt32Bits"), 1) => Some((MirType::F32, MirType::I32)),
+            _ => None,
+        };
+        if let Some((from, to)) = bits {
+            return SeamEmission::Synthesized(bit_reinterpret_body(from, to));
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Decimal") {
+        if let Some(import) = decimal_seam_import(method.name(), params) {
+            if let Some(sig) = signature {
+                let decoded = seam_param_types(&sig.parameters, assembly, references)
+                    .zip(mir_type(&sig.return_type, assembly, None, references).ok());
+                if let Some((param_types, ret)) = decoded {
+                    if let Some(body) = decimal_seam_body(import, param_types, ret) {
+                        return SeamEmission::Synthesized(body);
+                    }
+                }
+                return SeamEmission::Placeholder;
+            }
+        }
+    }
     if (type_name.namespace, type_name.name) == ("Lamella.Hardware", "Mmio") {
         let mmio_body = match (method.name(), params) {
             (Some("Read8"), 1) => Some(mmio_read_body(1)),
@@ -4835,6 +5974,16 @@ fn synthesized_seam_body<'a>(
             _ => None,
         };
         if let Some(body) = mmio_body {
+            return SeamEmission::Synthesized(body);
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Buffer") {
+        let core = match (method.name(), params) {
+            (Some("ByteLengthInternal"), 1) => Some(buffer_byte_length_body()),
+            (Some("BlockCopyInternal"), 5) => Some(buffer_block_copy_body()),
+            _ => None,
+        };
+        if let Some(body) = core {
             return SeamEmission::Synthesized(body);
         }
     }
@@ -4929,7 +6078,26 @@ fn synthesized_seam_body<'a>(
     if (type_name.namespace, type_name.name) == ("System", "Array") {
         return SeamEmission::Trap(deferred_trap_body());
     }
+    if timed_seam_placeholder_lies(type_name.namespace, type_name.name, method.name()) {
+        return SeamEmission::Trap(deferred_trap_body());
+    }
     SeamEmission::Placeholder
+}
+
+/// The unmapped TIMED thread seams whose placeholder is a false statement about another thread,
+/// rather than a degraded answer about this one -- see the trap site's note for the distinction and
+/// for why `SleepThread` is deliberately absent.
+///
+/// Free-standing so the line can be tested directly. The corpus cannot test it: the whole reason
+/// these four went unnoticed is that no program in it calls `Monitor.Wait(o, ms)` or
+/// `Thread.Join(ms)`, so the differential measures that the trap breaks nothing and CANNOT measure
+/// that it fires. A gate that only shows "no rows moved" is silence, not proof.
+fn timed_seam_placeholder_lies(namespace: &str, type_name: &str, method: Option<&str>) -> bool {
+    matches!(
+        (namespace, type_name, method),
+        ("System.Threading", "Monitor", Some("WaitLockTimeout" | "WaitTimedOut"))
+            | ("System.Threading", "Thread", Some("JoinThreadTimeout" | "JoinTimedOut"))
+    )
 }
 
 /// Lowers an assembly's methods to a `Vec<Function>` keyed by MethodDef row. Index 0 is a trampoline
@@ -5097,7 +6265,7 @@ fn lower_assembly_seams<'a>(
     let total = thunk_base + precise.len();
     let mut bodies = BodySlots::new(total);
     let mut maps: Vec<cil::CilSourceMap> =
-        (0..total).map(|_| cil::CilSourceMap(Vec::new())).collect();
+        (0..total).map(|_| cil::CilSourceMap::default()).collect();
     if let Some(entry_rid) = entry {
         bodies.funcs[0] = startup(
             find_native_export(assembly, "lamella_time_init"),
@@ -5175,7 +6343,18 @@ fn lower_assembly_seams<'a>(
             .iter()
             .map(|sig| mir_type(sig, assembly, None, resolver.references()))
             .collect::<Result<_, BuildError>>()?;
-        match cil::lower_method_typed(&body, &resolver, &arg_types, &local_types) {
+        let (arg_narrow, local_narrow) =
+            crate::resolver::narrowing_of(assembly, method, resolver.references());
+        match cil::lower_method_typed(
+            &body,
+            &resolver,
+            &arg_types,
+            &local_types,
+            cil::Narrowing {
+                args: &arg_narrow,
+                locals: &local_narrow,
+            },
+        ) {
             Ok((func, map)) => {
                 bodies.write(*rid, func);
                 maps[*rid as usize] = map;
@@ -6000,7 +7179,8 @@ fn array_element_shift(
     mb: &mut MirBuilder,
     array: ValueId,
     decline: usize,
-) -> (ValueId, ValueId) {
+    unstridable_to: usize,
+) -> (ValueId, ValueId, ValueId) {
     let i32t = MirType::I32;
     let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
     let base = mb.emit(
@@ -6061,7 +7241,7 @@ fn array_element_shift(
         },
     );
     let shift_block = mb.block();
-    mb.branch(unstridable, decline, shift_block);
+    mb.branch(unstridable, unstridable_to, shift_block);
 
     mb.at(shift_block);
     let table = mb.emit(i32t, c(i64::from(ELEMENT_WIDTH_SHIFTS)));
@@ -6091,7 +7271,7 @@ fn array_element_shift(
             rhs: three,
         },
     );
-    (base, shift)
+    (base, shift, kind)
 }
 
 /// The ELEMENT type's descriptor address, read out of the array descriptor's `element_desc@16` --
@@ -6145,22 +7325,98 @@ fn array_element_descriptor(mb: &mut MirBuilder, desc: ValueId, decline: usize) 
     )
 }
 
-/// The byte address of element `index` of the array whose object address is `base`, striding by
-/// `shift`: `base + 4 + (index << shift)`. The `+4` steps over the length word an ObjectRef points at.
+/// The byte address of an szarray's payload and the BYTE WIDTH of one element -- for the kinds that
+/// carry a width in `element_kind@4`, and for the ones that do not.
+///
+/// [`array_element_shift`] answers only the first half. A STRUCT element is `ELEMENT_KIND_OPAQUE`,
+/// which is the format's "I cannot stride this" -- deliberately, because a struct holding a reference
+/// field would need per-element offsets that word 1 cannot express. But "a collector must not SCAN
+/// this" and "nothing can say how wide it is" are different statements, and only the first one is
+/// true: the width is one word away, in the array descriptor's `element_desc@16`.
+///
+/// That word names the ELEMENT type's canonical descriptor, whose `payload@0` is the byte size of the
+/// element -- and the resolver that lays it says why that is the same number as the stride rather
+/// than a number that happens to match: a value type's descriptor is "sized by the very call the
+/// inline array stride uses, so the two agree by construction rather than by a rule someone keeps in
+/// step. It is what an array's `element_desc@16` answers 'how wide is one element' with". This is
+/// that word's first consumer for that purpose.
+///
+/// A NON-VECTOR still declines through `decline`: a rank-N array's payload carries dimension headers
+/// before its elements, so a width alone does not locate one. So does an OPAQUE element whose
+/// descriptor edge is absent (a `TypeSpec` the reader cannot name) or whose payload word is zero.
 #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
-fn array_element_address(
+fn array_element_width(
+    mb: &mut MirBuilder,
+    array: ValueId,
+    decline: usize,
+) -> (ValueId, ValueId) {
+    let i32t = MirType::I32;
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let opaque = mb.block();
+    let join = mb.block();
+
+    let (base, shift, _kind) = array_element_shift(mb, array, decline, opaque);
+    let one = mb.emit(i32t, c(1));
+    let width = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: one,
+            rhs: shift,
+        },
+    );
+    mb.jump(join, alloc::vec![width]);
+
+    mb.at(opaque);
+    let desc = mb.emit(i32t, Inst::LoadTypeDesc { object: array });
+    let element_desc = array_element_descriptor(mb, desc, decline);
+    let payload = mb.emit(
+        i32t,
+        Inst::Load {
+            address: element_desc,
+            width: 4,
+            signed: false,
+        },
+    );
+    let zero = mb.emit(i32t, c(0));
+    let sized = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Ne,
+            lhs: payload,
+            rhs: zero,
+        },
+    );
+    let opaque_ok = mb.block();
+    mb.branch(sized, opaque_ok, decline);
+    mb.at(opaque_ok);
+    mb.jump(join, alloc::vec![payload]);
+
+    let joined = mb.enter(join, &[i32t]);
+    (base, joined[0])
+}
+
+/// The byte address of element `index`: `base + 4 + index * width`. The `+4` steps over the length
+/// word an ObjectRef points at.
+///
+/// A BYTE WIDTH rather than a shift, and it is the only form because a shift cannot express every
+/// element: a struct of three `int`s strides by 12. Every seam that walks elements takes its width
+/// from [`array_element_width`], so one multiply serves the kinds the shift table names and the ones
+/// it does not, and there is no second address rule to keep in step with this one.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn array_element_address_by_width(
     mb: &mut MirBuilder,
     base: ValueId,
     index: ValueId,
-    shift: ValueId,
+    width: ValueId,
 ) -> ValueId {
     let i32t = MirType::I32;
     let offset = mb.emit(
         i32t,
         Inst::Binary {
-            op: BinOp::Shl,
+            op: BinOp::Mul,
             lhs: index,
-            rhs: shift,
+            rhs: width,
         },
     );
     let four = mb.emit(
@@ -6187,6 +7443,7 @@ fn array_element_address(
         },
     )
 }
+
 
 /// A synthesized MIR body for `[RuntimeProvided] System.Array.CopyCore(src, srcIndex, dst, dstIndex,
 /// length)` -- the bulk element move behind `Array.Copy`, and the reason a copy is one operation instead
@@ -6249,13 +7506,13 @@ pub fn array_copy_core_body() -> Function {
     mb.ret(zero);
 
     mb.at(accept);
-    let (base, shift) = array_element_shift(&mut mb, src, decline);
+    let (base, width) = array_element_width(&mut mb, src, decline);
     let bytes = mb.emit(
         i32t,
         Inst::Binary {
-            op: BinOp::Shl,
+            op: BinOp::Mul,
             lhs: length,
-            rhs: shift,
+            rhs: width,
         },
     );
     let nothing_to_do = mb.block();
@@ -6276,8 +7533,34 @@ pub fn array_copy_core_body() -> Function {
     mb.ret(one);
 
     mb.at(move_range);
-    let src_addr = array_element_address(&mut mb, base, src_index, shift);
-    let dst_addr = array_element_address(&mut mb, dst_base, dst_index, shift);
+    let src_addr = array_element_address_by_width(&mut mb, base, src_index, width);
+    let dst_addr = array_element_address_by_width(&mut mb, dst_base, dst_index, width);
+    emit_overlap_safe_move(&mut mb, dst_addr, src_addr, bytes);
+    let ok = mb.emit(i32t, c(1));
+    mb.ret(ok);
+
+    mb.finish(Some(i32t))
+}
+
+/// Emit an overlap-safe byte move of `bytes` from `src_addr` to `dst_addr`, leaving the builder
+/// positioned in the block both arms rejoin.
+///
+/// [`Inst::CopyBlock`] is the CLI's `cpblk` and is NOT defined on overlapping ranges, so a
+/// destination that starts INSIDE the source has to be filled from the last byte down or it reads
+/// bytes it has already overwritten.
+///
+/// EXTRACTED RATHER THAN WRITTEN TWICE. `Array.Copy` and `Buffer.BlockCopy` are two spellings of one
+/// move -- element-scaled and byte-granular -- and an overlap rule living in one of them is the shape
+/// that gains its next correction in the other and not in this one.
+fn emit_overlap_safe_move(
+    mb: &mut MirBuilder,
+    dst_addr: ValueId,
+    src_addr: ValueId,
+    bytes: ValueId,
+) {
+    let i32t = MirType::I32;
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let join = mb.block();
     let overlaps_forward = mb.emit(
         i32t,
         Inst::Compare {
@@ -6296,8 +7579,7 @@ pub fn array_copy_core_body() -> Function {
         src: src_addr,
         size: bytes,
     });
-    let ok_forward = mb.emit(i32t, c(1));
-    mb.ret(ok_forward);
+    mb.jump(join, alloc::vec![]);
 
     mb.at(backward);
     let one_b = mb.emit(i32t, c(1));
@@ -6311,7 +7593,6 @@ pub fn array_copy_core_body() -> Function {
     );
     let loop_head = mb.block();
     let latch = mb.block();
-    let done_backward = mb.block();
     mb.jump(loop_head, alloc::vec![last]);
 
     let index = mb.enter(loop_head, &[i32t])[0];
@@ -6362,14 +7643,262 @@ pub fn array_copy_core_body() -> Function {
             rhs: zero_l,
         },
     );
-    mb.branch(more, latch, done_backward);
+    mb.branch(more, latch, join);
 
     mb.at(latch);
     mb.jump(loop_head, alloc::vec![next]);
 
-    mb.at(done_backward);
-    let ok_backward = mb.emit(i32t, c(1));
-    mb.ret(ok_backward);
+    mb.at(join);
+}
+
+/// `System.Buffer.ByteLength`'s seam: the element count times the element width, or **-1** when the
+/// array's element type is not one `Buffer` measures.
+///
+/// The -1 is the sentinel corlib's wrapper turns into `ArgumentException`, and it is exactly what
+/// [`array_element_shift`]'s decline edge means -- a non-vector, or an element kind with no stride.
+/// So the two agree by construction rather than by a second list of accepted types.
+///
+/// Unsynthesized, this answered its placeholder `-1` for EVERY array, so `Buffer.ByteLength` threw on
+/// a plain `int[]` and `Buffer.BlockCopy` -- which validates through it -- could not copy anything.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn buffer_byte_length_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let array = params[0];
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let decline = mb.block();
+
+    mb.at(0);
+    let (base, shift, kind) = array_element_shift(&mut mb, array, decline, decline);
+    let reference_kind = mb.emit(
+        i32t,
+        Inst::ConstInt {
+            ty: i32t,
+            value: i64::from(crate::resolver::ELEMENT_KIND_REFERENCE),
+        },
+    );
+    let is_reference = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: kind,
+            rhs: reference_kind,
+        },
+    );
+    let measure = mb.block();
+    mb.branch(is_reference, decline, measure);
+
+    mb.at(measure);
+    let len = mb.emit(
+        i32t,
+        Inst::Load {
+            address: base,
+            width: 4,
+            signed: false,
+        },
+    );
+    let bytes = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: len,
+            rhs: shift,
+        },
+    );
+    mb.ret(bytes);
+
+    mb.at(decline);
+    let not_primitive = mb.emit(i32t, c(-1));
+    mb.ret(not_primitive);
+
+    mb.finish(Some(i32t))
+}
+
+/// `System.Buffer.BlockCopy`'s seam: `count` BYTES from `src`'s byte image at `src_offset` into
+/// `dst`'s at `dst_offset`.
+///
+/// No element width is consulted and none is needed -- the offsets and the count are already byte
+/// quantities, which is the whole difference between this and `Array.Copy`. The wrapper has range-
+/// and type-checked everything by the time this runs (it validates through
+/// [`buffer_byte_length_body`]), so the only work left is the move, and it is overlap-safe because
+/// .NET's is: `Buffer.BlockCopy` within one array is a defined operation.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn buffer_block_copy_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, i32t, objt, i32t, i32t]);
+    let (src, src_offset, dst, dst_offset, count) =
+        (params[0], params[1], params[2], params[3], params[4]);
+
+    mb.at(0);
+    let data = |mb: &mut MirBuilder, array: ValueId, offset: ValueId| {
+        let base = mb.emit(
+            i32t,
+            Inst::Convert {
+                value: array,
+                kind: ConvKind::RefToInt,
+            },
+        );
+        let four = mb.emit(
+            i32t,
+            Inst::ConstInt {
+                ty: i32t,
+                value: 4,
+            },
+        );
+        let start = mb.emit(
+            i32t,
+            Inst::Binary {
+                op: BinOp::Add,
+                lhs: base,
+                rhs: four,
+            },
+        );
+        mb.emit(
+            i32t,
+            Inst::Binary {
+                op: BinOp::Add,
+                lhs: start,
+                rhs: offset,
+            },
+        )
+    };
+    let src_addr = data(&mut mb, src, src_offset);
+    let dst_addr = data(&mut mb, dst, dst_offset);
+    emit_overlap_safe_move(&mut mb, dst_addr, src_addr, count);
+    mb.ret_void();
+
+    mb.finish(None)
+}
+
+/// A synthesized MIR body for `System.Array.get_Length` -- the TOTAL element count.
+///
+/// For a VECTOR that is the length word at `this + 0`, which is what this reader always returned.
+/// For a rank-N array it is the PRODUCT of the N dimensions, which sit in the object's own first N
+/// words -- and returning `dim0` instead meant `new int[2, 3].Length` answered 2 where .NET says 6.
+///
+/// THE RANK COMES FROM THE DESCRIPTOR, which is the only place it is written down, and this body is
+/// possible at all only because a rank-N descriptor now states it. Before that, word 0 carried no
+/// mark and the rank was unrecoverable at run time. The read itself is
+/// [`array_descriptor_rank`]'s, shared with `get_Rank`.
+///
+/// **THE UNMARKED CASE FALLS BACK RATHER THAN TRAPPING, deliberately.** A descriptor this body does
+/// not recognize -- anything whose word 0 is not `MARK | rank` -- takes the single load it always
+/// took, so a receiver reaching here through some path that predates the mark keeps today's answer
+/// instead of faulting. A vector takes the same edge by rank, with no loop at all.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn array_total_length_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let array = params[0];
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+
+    let plain = mb.block();
+    let product = mb.block();
+
+    mb.at(0);
+    let (base, rank) = array_descriptor_rank(&mut mb, array, plain);
+    let one = mb.emit(i32t, c(1));
+    let multi = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::UnsignedGt,
+            lhs: rank,
+            rhs: one,
+        },
+    );
+    mb.branch(multi, product, plain);
+
+    mb.at(plain);
+    let single = mb.emit(
+        i32t,
+        Inst::Load {
+            address: base,
+            width: 4,
+            signed: false,
+        },
+    );
+    mb.ret(single);
+
+    mb.at(product);
+    let first = mb.emit(
+        i32t,
+        Inst::Load {
+            address: base,
+            width: 4,
+            signed: false,
+        },
+    );
+    let four = mb.emit(i32t, c(4));
+    let loop_head = mb.block();
+    let latch = mb.block();
+    let done = mb.block();
+    let one_l = mb.emit(i32t, c(1));
+    mb.jump(loop_head, alloc::vec![one_l, first]);
+
+    let carried = mb.enter(loop_head, &[i32t, i32t]);
+    let (index, acc) = (carried[0], carried[1]);
+    let offset = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Mul,
+            lhs: index,
+            rhs: four,
+        },
+    );
+    let at = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: base,
+            rhs: offset,
+        },
+    );
+    let dim = mb.emit(
+        i32t,
+        Inst::Load {
+            address: at,
+            width: 4,
+            signed: false,
+        },
+    );
+    let next_acc = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Mul,
+            lhs: acc,
+            rhs: dim,
+        },
+    );
+    let step = mb.emit(i32t, c(1));
+    let next_index = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: index,
+            rhs: step,
+        },
+    );
+    let more = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::UnsignedLt,
+            lhs: next_index,
+            rhs: rank,
+        },
+    );
+    mb.branch(more, latch, done);
+
+    mb.at(latch);
+    mb.jump(loop_head, alloc::vec![next_index, next_acc]);
+
+    mb.at(done);
+    mb.ret(next_acc);
 
     mb.finish(Some(i32t))
 }
@@ -6460,17 +7989,16 @@ fn array_descriptor_rank(
     (base, rank)
 }
 
-/// A synthesized MIR body for `[RuntimeProvided] System.Array.GetValue(index)` -- the REFERENCE-element
-/// case, which is the half of it that needs no box: the element IS an `object`, so reading the slot IS
-/// the answer. The split is deliberate: a primitive or struct
-/// element has to be BOXED to be returned as `object`, and boxing against a descriptor known only at RUN
-/// TIME (the array's `element_desc@16`) needs an allocate-with-this-descriptor form the IR does not have.
+/// A synthesized MIR body for `[RuntimeProvided] System.Array.GetValue(index)` -- the untyped element
+/// READ, which splits on whether the element is already an `object`.
 ///
-/// A PRIMITIVE element is BOXED against the descriptor `element_desc@16` names -- the fifth word's first
-/// consumer, and the reason it exists: the box's type and size are both run-time facts read out of the
-/// array's own descriptor, which is what [`lamella_ir::Inst::AllocDescribed`] was added for. A STRUCT
-/// element still traps, one gate earlier: `ELEMENT_KIND_OPAQUE` carries no width, so the shared
-/// rank-and-kind gate declines it before this body ever asks about a descriptor.
+/// A REFERENCE element needs no box: reading the slot IS the answer.
+///
+/// A VALUE-TYPE element -- a primitive or a struct alike -- has to be BOXED to be returned as
+/// `object`, against the descriptor `element_desc@16` names. Both the box's type and its size are
+/// run-time facts read out of the array's own descriptor, which is what
+/// [`lamella_ir::Inst::AllocDescribed`] exists for; the element's ADDRESS is a run-time fact too,
+/// because a struct strides by a width no shift can express.
 ///
 /// Returning the raw element bits retyped as a reference would hand a caller an integer to dereference,
 /// so every case this cannot answer TRAPS instead.
@@ -6490,7 +8018,7 @@ pub fn array_get_value_body() -> Function {
 
     let trap = mb.block();
     mb.at(0);
-    let (base, shift) = array_element_shift(&mut mb, array, trap);
+    let (base, width) = array_element_width(&mut mb, array, trap);
 
     let length = mb.emit(
         i32t,
@@ -6544,7 +8072,7 @@ pub fn array_get_value_body() -> Function {
     mb.branch(is_reference, read_block, box_block);
 
     mb.at(read_block);
-    let addr = array_element_address(&mut mb, base, index, shift);
+    let addr = array_element_address_by_width(&mut mb, base, index, width);
     let slot = mb.emit(
         i32t,
         Inst::Load {
@@ -6570,15 +8098,6 @@ pub fn array_get_value_body() -> Function {
             address: element_desc,
             width: 4,
             signed: false,
-        },
-    );
-    let one = mb.emit(i32t, c(1));
-    let width = mb.emit(
-        i32t,
-        Inst::Binary {
-            op: BinOp::Shl,
-            lhs: one,
-            rhs: shift,
         },
     );
     let agree = mb.emit(
@@ -6607,7 +8126,7 @@ pub fn array_get_value_body() -> Function {
             kind: ConvKind::RefToInt,
         },
     );
-    let source = array_element_address(&mut mb, moved_base, index, shift);
+    let source = array_element_address_by_width(&mut mb, moved_base, index, width);
     let destination = mb.emit(
         i32t,
         Inst::Convert {
@@ -6629,22 +8148,23 @@ pub fn array_get_value_body() -> Function {
 }
 
 /// A synthesized MIR body for `[RuntimeProvided] System.Array.SetValue(value, index)` -- the WRITE half of
-/// the untyped element accessor, and the last live `System.Array` trap row: `Array.Reverse`, `Array.Sort`
-/// and `Array.BinarySearch` are all managed loops over this seam and [`array_get_value_body`], so they
-/// follow it rather than needing bodies of their own.
+/// the untyped element accessor. `Array.IndexOf`, `Array.Reverse`, `Array.Sort` and
+/// `Array.BinarySearch` are all managed loops over this seam and [`array_get_value_body`], so they
+/// follow it rather than needing bodies of their own, and an element shape this pair refuses is one
+/// none of them can reach.
 ///
-/// The mirror image of `GetValue` in every part. The same rank-and-kind gate
-/// ([`array_element_shift`]) and the same unsigned bounds test against the length word decide whether
+/// The mirror image of `GetValue` in every part. The same rank gate and element width
+/// ([`array_element_width`]) and the same unsigned bounds test against the length word decide whether
 /// there is an element at all; the element KIND then decides what the incoming `object` has to be:
 ///
 /// - a REFERENCE element takes the reference itself, once the value is shown ASSIGNABLE to the element
 ///   type -- a `CastClassScan` from the value's own descriptor to the one `element_desc@16` names, the
 ///   same base_ptr@12 walk `castclass`/`isinst` use. `null` is accepted without asking, since it is
 ///   assignable to every reference type and has no descriptor to ask about.
-/// - a PRIMITIVE element takes the BOX apart: the value's descriptor must be EXACTLY the element's (a
-///   box carries its type's canonical descriptor, which is how `GetValue`'s box unboxes and passes
-///   `is int`), and then the payload copies in -- the reverse of `GetValue`'s boxing path, behind the
-///   same payload/width agreement guard.
+/// - a VALUE-TYPE element, primitive or struct, takes the BOX apart: the value's descriptor must be
+///   EXACTLY the element's (a box carries its type's canonical descriptor, which is how `GetValue`'s
+///   box unboxes and passes `is int`), and then the payload copies in -- the reverse of `GetValue`'s
+///   boxing path, behind the same payload/width agreement guard.
 ///
 /// The seam is `void`, so like [`array_clear_core_body`] it has no way to hand a verdict back: the two
 /// outcomes are STORE and TRAP. **That is deliberate, and it is why no managed `throw` sits on top of a
@@ -6679,7 +8199,7 @@ pub fn array_set_value_body() -> Function {
 
     let trap = mb.block();
     mb.at(0);
-    let (base, shift) = array_element_shift(&mut mb, array, trap);
+    let (base, width) = array_element_width(&mut mb, array, trap);
 
     let length = mb.emit(
         i32t,
@@ -6729,8 +8249,8 @@ pub fn array_set_value_body() -> Function {
         },
     );
     let reference_block = mb.block();
-    let primitive_block = mb.block();
-    mb.branch(is_reference, reference_block, primitive_block);
+    let value_block = mb.block();
+    mb.branch(is_reference, reference_block, value_block);
 
     mb.at(reference_block);
     let value_bits = mb.emit(
@@ -6754,7 +8274,7 @@ pub fn array_set_value_body() -> Function {
     mb.branch(is_null, null_block, typed_block);
 
     mb.at(null_block);
-    let null_addr = array_element_address(&mut mb, base, index, shift);
+    let null_addr = array_element_address_by_width(&mut mb, base, index, width);
     mb.side(Inst::Store {
         address: null_addr,
         value: value_bits,
@@ -6775,7 +8295,7 @@ pub fn array_set_value_body() -> Function {
     mb.branch(assignable, store_block, trap);
 
     mb.at(store_block);
-    let addr = array_element_address(&mut mb, base, index, shift);
+    let addr = array_element_address_by_width(&mut mb, base, index, width);
     mb.side(Inst::Store {
         address: addr,
         value: value_bits,
@@ -6783,7 +8303,7 @@ pub fn array_set_value_body() -> Function {
     });
     mb.ret_void();
 
-    mb.at(primitive_block);
+    mb.at(value_block);
     let box_bits = mb.emit(
         i32t,
         Inst::Convert {
@@ -6826,15 +8346,6 @@ pub fn array_set_value_body() -> Function {
             signed: false,
         },
     );
-    let one = mb.emit(i32t, c(1));
-    let width = mb.emit(
-        i32t,
-        Inst::Binary {
-            op: BinOp::Shl,
-            lhs: one,
-            rhs: shift,
-        },
-    );
     let agree = mb.emit(
         i32t,
         Inst::Compare {
@@ -6847,7 +8358,7 @@ pub fn array_set_value_body() -> Function {
     mb.branch(agree, copy_block, trap);
 
     mb.at(copy_block);
-    let destination = array_element_address(&mut mb, base, index, shift);
+    let destination = array_element_address_by_width(&mut mb, base, index, width);
     mb.side(Inst::CopyBlock {
         dst: destination,
         src: box_bits,
@@ -6881,24 +8392,22 @@ pub fn array_set_value_body() -> Function {
 /// allocation rather than reused from the integer taken before it. The length and the byte count are
 /// plain integers, so they survive a move; an address does not.
 ///
-/// Declines (traps) exactly where the other untyped seams do: a rank-2+ array, and a struct element,
-/// whose `ELEMENT_KIND_OPAQUE` carries no width to compute a payload size from. .NET clones both; this
-/// one cannot size them yet, and sizing a clone wrong means allocating short and copying past the end.
+/// Declines (traps) exactly where the other untyped seams do, which is now only a rank-2+ array: its
+/// payload carries dimension headers before its elements, so a width alone does not size it. .NET
+/// clones one; this does not, and sizing a clone wrong means allocating short and copying past the
+/// end.
 ///
-/// **A VIRTUAL CALL CANNOT REACH IT, AND THE REASON IS NOT IN THIS BODY.** `Clone` is an implicit
-/// `ICloneable` implementation, so it is VIRTUAL, so a call site lowers to a `CallVirtual` that reads a
-/// slot from the receiver's descriptor -- and an ARRAY descriptor is emitted with an EMPTY vtable
-/// (`TypeDescLiteral`'s `vtable` is `[]` at both array-allocation sites). The slot read lands before the
-/// descriptor's words and dispatch jumps to whatever is there. So this is a gap in ARRAY DISPATCH rather
-/// than in this body: every virtual call on an array receiver (`Clone`, `ToString`, `GetHashCode`,
-/// `Equals`, `GetEnumerator`) has nowhere to dispatch through. `GetValue`/`SetValue` are unaffected
-/// because they are NON-virtual, so their `callvirt` devirtualizes to a direct call.
+/// A VIRTUAL CALL REACHES IT. `Clone` is an implicit `ICloneable` implementation, so it is virtual,
+/// and an array descriptor is emitted with an EMPTY vtable -- which together are why dispatch on an
+/// array receiver was expected to go nowhere. It does not: on the linked object path,
+/// `anArray.Clone()` returns the copy and `((Array)a).GetEnumerator()` walks the array to exhaustion,
+/// both agreeing with the reference implementation.
 ///
-/// The body is landed rather than held because it is complete and pinned on its own terms, and it starts
-/// working the moment either fix lands: give an array descriptor `System.Array`'s vtable (the emitter
-/// change, and the one that fixes the whole family), or devirtualize a `callvirt` to a FINAL method into
-/// a direct call (sound in general -- a final method has exactly one implementation -- and it fixes only
-/// this member). Neither is in this change; both are named in the census.
+/// The same measurement finds a different defect on the same family, and it is quiet rather than
+/// fatal: `anArray.ToString()` answers the empty string and `anArray.GetHashCode()` answers 0, where
+/// the reference implementation answers the array's type name and a nonzero hash. Those are unbacked
+/// `[RuntimeProvided]` members returning their placeholder body's value -- an answer a caller cannot
+/// tell from a real one, which is a different and worse shape than a call that fails.
 #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
 #[must_use]
 pub fn array_clone_body() -> Function {
@@ -6910,7 +8419,7 @@ pub fn array_clone_body() -> Function {
 
     let trap = mb.block();
     mb.at(0);
-    let (base, shift) = array_element_shift(&mut mb, array, trap);
+    let (base, width) = array_element_width(&mut mb, array, trap);
 
     let length = mb.emit(
         i32t,
@@ -6923,9 +8432,9 @@ pub fn array_clone_body() -> Function {
     let bytes = mb.emit(
         i32t,
         Inst::Binary {
-            op: BinOp::Shl,
+            op: BinOp::Mul,
             lhs: length,
-            rhs: shift,
+            rhs: width,
         },
     );
     let four = mb.emit(i32t, c(4));
@@ -6977,8 +8486,8 @@ pub fn array_clone_body() -> Function {
 /// zeroed byte range (`0` / `0.0` / `false` / `null` are all all-zero bits).
 ///
 /// `void`, so unlike [`array_copy_core_body`] it has no way to DECLINE: a range it cannot compute a stride
-/// for -- a rank-2+ array, or a struct element whose width word 1 does not carry -- TRAPS. That is the
-/// honest end of the only two options, since the alternative is returning as though the range were
+/// for -- a rank-2+ array, whose payload carries dimension headers before its elements -- TRAPS. That is
+/// the honest end of the only two options, since the alternative is returning as though the range were
 /// cleared.
 #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
 #[must_use]
@@ -6990,14 +8499,14 @@ pub fn array_clear_core_body() -> Function {
 
     let trap = mb.block();
     mb.at(0);
-    let (base, shift) = array_element_shift(&mut mb, array, trap);
-    let addr = array_element_address(&mut mb, base, index, shift);
+    let (base, width) = array_element_width(&mut mb, array, trap);
+    let addr = array_element_address_by_width(&mut mb, base, index, width);
     let bytes = mb.emit(
         i32t,
         Inst::Binary {
-            op: BinOp::Shl,
+            op: BinOp::Mul,
             lhs: length,
-            rhs: shift,
+            rhs: width,
         },
     );
     let zero = mb.emit(
@@ -7088,6 +8597,7 @@ fn thread_seam_import(namespace: &str, type_name: &str, method: Option<&str>) ->
         "YieldThread" => "lamella_thread_yield",
         "JoinThread" => "lamella_thread_join",
         "SleepThread" => "lamella_thread_sleep",
+        "ThreadFinished" => "lamella_thread_finished",
         _ => return None,
     })
 }
@@ -7225,7 +8735,7 @@ fn net_deferred_body(param_types: &[MirType], value: i64) -> Function {
 /// A synthesized MIR body for a `System.Net` / `System.Net.Security` `[RuntimeProvided]` seam static (the
 /// socket + TLS primitives). It MARSHALS the managed arguments to the C-ABI that the linked
 /// `lamella-runtime-support-net` exports, calls it, and returns the result. The marshalling mirrors the
-/// runtime's C-ABI (`939f993933`) exactly -- the same shape the interpreter's binding passes:
+/// runtime's C-ABI exactly -- the same shape the interpreter's binding passes:
 /// * a BUFFER SLICE (`fold_buffer`: a `byte[] buffer, int offset, int count` triple, as in Send/Receive/
 ///   Write/Read) crosses as ONE (ptr, len) pair with the offset FOLDED IN: `ptr = &buffer[offset]` (the
 ///   ObjectRef + 4 + offset) and `len = count`. The offset/count args are consumed, NOT passed separately --
@@ -7471,12 +8981,19 @@ mod tests {
         lamella_ir::verify(&clear).expect("ClearCore verifies");
         let rank = array_rank_body();
         lamella_ir::verify(&rank).expect("get_Rank verifies");
+        let length = array_total_length_body();
+        lamella_ir::verify(&length).expect("get_Length verifies");
         crate::arm32::lower_object(
-            &[copy.clone(), clear.clone(), rank],
-            &["Array_CopyCore", "Array_ClearCore", "Array_get_Rank"],
+            &[copy.clone(), clear.clone(), rank, length],
+            &[
+                "Array_CopyCore",
+                "Array_ClearCore",
+                "Array_get_Rank",
+                "Array_get_Length",
+            ],
             &[],
         )
-        .expect("all three lower on the object path");
+        .expect("all four lower on the object path");
         assert!(
             copy.blocks
                 .iter()
@@ -7825,6 +9342,397 @@ mod tests {
         );
     }
 
+    /// A `System.Decimal` as this backend types it: sixteen bytes, no reference words. The handle is
+    /// anonymous because none of the assertions below depend on the layout identity -- what they
+    /// depend on is that it is a VALUE TYPE, which is what makes an operand cross as a pointer.
+    #[cfg(feature = "arm32")]
+    const DECIMAL: MirType = MirType::ValueType {
+        handle: TypeHandle(0),
+        refs: lamella_ir::RefWords::NONE,
+        size: 16,
+    };
+
+    /// The eight seams as their managed signatures type: `(import, parameters, return)`.
+    #[cfg(feature = "arm32")]
+    fn decimal_seams() -> Vec<(&'static str, Vec<MirType>, MirType)> {
+        let binary = || vec![DECIMAL, DECIMAL];
+        vec![
+            ("lamella_decimal_add", binary(), DECIMAL),
+            ("lamella_decimal_subtract", binary(), DECIMAL),
+            ("lamella_decimal_multiply", binary(), DECIMAL),
+            ("lamella_decimal_divide", binary(), DECIMAL),
+            ("lamella_decimal_remainder", binary(), DECIMAL),
+            ("lamella_decimal_compare", binary(), MirType::I32),
+            ("lamella_decimal_from_double", vec![MirType::F64], DECIMAL),
+            ("lamella_decimal_to_double", vec![DECIMAL], MirType::F64),
+        ]
+    }
+
+    /// The blocks reachable from the entry, which counting blocks cannot say. Taken from
+    /// `a_failing_initializer_raises_the_same_wrapper_tag_at_every_later_access`, which pins the
+    /// other synthesized raise in this file and needed the same distinction for the same reason.
+    #[cfg(feature = "arm32")]
+    fn reachable_blocks(func: &Function) -> Vec<bool> {
+        let mut reached = alloc::vec![false; func.blocks.len()];
+        let mut worklist = alloc::vec![func.entry.index()];
+        while let Some(b) = worklist.pop() {
+            if core::mem::replace(&mut reached[b], true) {
+                continue;
+            }
+            match func.blocks[b].terminator.as_ref().expect("terminated") {
+                Terminator::Jump { target, .. } => worklist.push(target.index()),
+                Terminator::Branch {
+                    if_true, if_false, ..
+                } => {
+                    worklist.push(if_true.index());
+                    worklist.push(if_false.index());
+                }
+                Terminator::Return(_) | Terminator::Unreachable => {}
+            }
+        }
+        reached
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn a_bit_reinterpretation_is_the_bits_and_not_the_nearest_value() {
+        for (from, to) in [
+            (MirType::I64, MirType::F64),
+            (MirType::F64, MirType::I64),
+            (MirType::I32, MirType::F32),
+            (MirType::F32, MirType::I32),
+        ] {
+            let f = bit_reinterpret_body(from, to);
+            lamella_ir::verify(&f).unwrap_or_else(|e| panic!("{from:?}->{to:?} verify: {e:?}"));
+            crate::arm32::lower_object(&[f.clone()], &["bits"], &[])
+                .unwrap_or_else(|e| panic!("{from:?}->{to:?} arm lower: {e:?}"));
+            #[cfg(feature = "riscv32")]
+            crate::riscv32::lower_object(&[f.clone()], &["bits"], &[], &[])
+                .unwrap_or_else(|e| panic!("{from:?}->{to:?} riscv lower: {e:?}"));
+            assert!(
+                !f.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|(_, i)| matches!(i, Inst::Convert { .. })),
+                "{from:?}->{to:?} must reinterpret, never convert"
+            );
+            let cell = f.blocks[0]
+                .insts
+                .iter()
+                .find_map(|(id, i)| matches!(i, Inst::InitStruct).then_some(*id))
+                .expect("a cell is allocated");
+            assert_eq!(
+                f.value_types[cell.0 as usize],
+                MirType::ValueType {
+                    handle: TypeHandle(0),
+                    refs: lamella_ir::RefWords::NONE,
+                    size: to.stack_slot_bytes(),
+                },
+                "{from:?}->{to:?}: the cell is the operands' shared width"
+            );
+            assert_eq!(
+                from.stack_slot_bytes(),
+                to.stack_slot_bytes(),
+                "{from:?}->{to:?}: a reinterpretation is between types of ONE width"
+            );
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn the_eight_decimal_seams_are_named_and_nothing_else_is() {
+        let named: Vec<&str> = [
+            ("DecAdd", 2usize),
+            ("DecSub", 2),
+            ("DecMul", 2),
+            ("DecDiv", 2),
+            ("DecRem", 2),
+            ("Compare", 2),
+            ("FromDouble", 1),
+            ("ToDouble", 1),
+        ]
+        .into_iter()
+        .map(|(name, params)| {
+            decimal_seam_import(Some(name), params)
+                .unwrap_or_else(|| panic!("{name}/{params} is one of the eight"))
+        })
+        .collect();
+        assert_eq!(named.len(), 8);
+        assert_eq!(
+            named.iter().collect::<alloc::collections::BTreeSet<_>>().len(),
+            8,
+            "eight distinct symbols -- two seams sharing one would compute the wrong operation"
+        );
+        assert!(decimal_seam_import(Some("Compare"), 1).is_none());
+        assert!(decimal_seam_import(Some("ToString"), 0).is_none());
+        assert!(decimal_seam_import(None, 2).is_none());
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn every_decimal_seam_verifies_and_lowers() {
+        for (import, params, ret) in decimal_seams() {
+            let f = decimal_seam_body(import, params, ret)
+                .unwrap_or_else(|| panic!("{import} not synthesized"));
+            lamella_ir::verify(&f).unwrap_or_else(|e| panic!("{import} verify: {e:?}"));
+            crate::arm32::lower_object(&[f.clone()], &[import], &[])
+                .unwrap_or_else(|e| panic!("{import} arm lower: {e:?}"));
+            #[cfg(feature = "riscv32")]
+            crate::riscv32::lower_object(&[f], &[import], &[], &[])
+                .unwrap_or_else(|e| panic!("{import} riscv lower: {e:?}"));
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn a_decimal_operand_crosses_as_a_pointer_to_the_words_it_already_occupies() {
+        for (import, params, ret) in decimal_seams() {
+            let value_type_params = params.iter().filter(|t| matches!(t, MirType::ValueType { .. })).count();
+            let f = decimal_seam_body(import, params.clone(), ret).expect("synthesized");
+            let entry = &f.blocks[f.entry.index()];
+            let addresses: Vec<ValueId> = entry
+                .insts
+                .iter()
+                .filter_map(|(id, inst)| match inst {
+                    Inst::FieldAddr { base, offset: 0 } => Some((*id, *base)),
+                    _ => None,
+                })
+                .map(|(id, _)| id)
+                .collect();
+            let call_args = entry
+                .insts
+                .iter()
+                .find_map(|(_, inst)| match inst {
+                    Inst::PInvoke { import: name, args } if &**name == import => Some(args.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{import} calls its own seam exactly once"));
+            let out_cells = usize::from(import != "lamella_decimal_to_double");
+            assert_eq!(
+                addresses.len(),
+                value_type_params + out_cells,
+                "{import}: one address per value-type operand, plus the out pointer"
+            );
+            for address in &addresses {
+                assert!(
+                    call_args.contains(address),
+                    "{import}: an address was taken and not passed"
+                );
+            }
+            assert_eq!(
+                call_args.len(),
+                params.len() + out_cells,
+                "{import}: one argument per parameter, plus the out pointer"
+            );
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn a_decimal_result_is_read_only_on_the_success_edge() {
+        for (import, params, ret) in decimal_seams() {
+            if import == "lamella_decimal_to_double" {
+                continue;
+            }
+            let f = decimal_seam_body(import, params, ret).expect("synthesized");
+            let entry = &f.blocks[f.entry.index()];
+            let status = entry
+                .insts
+                .iter()
+                .find_map(|(id, inst)| matches!(inst, Inst::PInvoke { .. }).then_some(*id))
+                .expect("the call defines the status");
+            let Some(Terminator::Branch {
+                cond,
+                if_true,
+                if_false,
+                ..
+            }) = entry.terminator.as_ref()
+            else {
+                panic!("{import}: the entry must BRANCH on the status");
+            };
+            assert_eq!(*cond, status, "{import}: it branches on the status word itself");
+            let ok = &f.blocks[if_false.index()];
+            assert!(
+                matches!(ok.terminator, Some(Terminator::Return(Some(_)))),
+                "{import}: the success edge returns"
+            );
+            assert!(
+                !ok.insts
+                    .iter()
+                    .any(|(_, inst)| matches!(inst, Inst::StaticStore { offset, .. } if *offset == cil::G_EXCEPTION_TAG_OFFSET)),
+                "{import}: the success edge must not raise"
+            );
+            assert!(
+                if_true.index() != if_false.index(),
+                "{import}: the fault edge is a different block"
+            );
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn a_decimal_fault_raises_the_tag_the_matching_catch_computes() {
+        let overflow = i64::from(lamella_metadata::exception_tag_for_name(
+            "System",
+            "OverflowException",
+        ));
+        let divide_by_zero = i64::from(lamella_metadata::exception_tag_for_name(
+            "System",
+            "DivideByZeroException",
+        ));
+        assert_ne!(overflow, divide_by_zero, "two exceptions, two tags");
+
+        for (import, params, ret) in decimal_seams() {
+            let f = decimal_seam_body(import, params, ret).expect("synthesized");
+            let const_of = |value: ValueId| {
+                f.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .find_map(|(id, inst)| match inst {
+                        Inst::ConstInt { value: v, .. } if *id == value => Some(*v),
+                        _ => None,
+                    })
+            };
+            let reached = reachable_blocks(&f);
+            let raising: Vec<i64> = f
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(|(b, _)| reached[*b])
+                .filter_map(|(_, block)| {
+                    block.insts.iter().find_map(|(_, inst)| match inst {
+                        Inst::StaticStore {
+                            owner: StaticOwner::Own,
+                            offset: cil::G_EXCEPTION_TAG_OFFSET,
+                            value,
+                        } => Some(const_of(*value).expect("the raised tag is a constant")),
+                        _ => None,
+                    })
+                })
+                .collect();
+            if import == "lamella_decimal_to_double" {
+                assert!(raising.is_empty(), "to_double has no fault edge");
+                assert_eq!(f.blocks.len(), 1, "and therefore one block");
+                continue;
+            }
+            assert_eq!(
+                raising.len(),
+                2,
+                "{import}: one raise per fault status, and no more"
+            );
+            assert!(
+                raising.contains(&overflow) && raising.contains(&divide_by_zero),
+                "{import}: both statuses raise, and each raises its own exception"
+            );
+            assert!(
+                reached.iter().all(|r| *r),
+                "{import}: every block is reachable -- a raise nothing branches to is a silent 0"
+            );
+        }
+    }
+
+    /// Both `String.Substring` overloads check their bounds BEFORE the seam, and the fault edge
+    /// raises the tag a `catch (ArgumentOutOfRangeException)` computes.
+    ///
+    /// Deliberately NOT feature-gated, unlike its decimal sibling above: neither
+    /// [`synthesize_runtime_reader`] nor [`out_of_range_block`] is, and a `cfg`-gated suite runs zero
+    /// tests while reporting green.
+    ///
+    /// WHY THE COUNT MATTERS. A straight-line body with no branch and no comparison hands the seam
+    /// `Length - startIndex` unexamined. On "hello" that is 6 units for `Substring(-1)`, a read past
+    /// the end of a 5-unit blob, and a count of -1 for `Substring(6)` -- five out-of-range cases that
+    /// a differential scores as `no throw`.
+    ///
+    /// The count is asserted rather than the shape of each comparison, because the failure worth
+    /// catching is a check going MISSING -- from a refactor, or from someone reading the four-way
+    /// disjunction as three. Asserting which operands each compares would pin the spelling and not
+    /// the property.
+    #[test]
+    fn substring_checks_its_bounds_and_raises_the_tag_the_matching_catch_computes() {
+        let out_of_range = i64::from(lamella_metadata::exception_tag_for_name(
+            "System",
+            "ArgumentOutOfRangeException",
+        ));
+        for (arity, bounds) in [(1usize, 2usize), (2, 4)] {
+            let f = synthesize_runtime_reader("System", "String", Some("Substring"), arity)
+                .expect("both overloads are synthesized");
+            let reached = reachable_blocks(&f);
+            assert!(
+                reached.iter().all(|r| *r),
+                "arity {arity}: every block is reachable -- a fault edge nothing branches to raises nothing"
+            );
+            let entry = &f.blocks[f.entry.index()];
+            assert!(
+                matches!(entry.terminator, Some(Terminator::Branch { .. })),
+                "arity {arity}: the entry BRANCHES -- a straight-line body is the defect this fixes"
+            );
+            let compares = entry
+                .insts
+                .iter()
+                .filter(|(_, inst)| matches!(inst, Inst::Compare { .. }))
+                .count();
+            assert_eq!(
+                compares, bounds,
+                "arity {arity}: one comparison per bound .NET checks"
+            );
+            let const_of = |value: ValueId| {
+                f.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .find_map(|(id, inst)| match inst {
+                        Inst::ConstInt { value: v, .. } if *id == value => Some(*v),
+                        _ => None,
+                    })
+            };
+            let raised: Vec<i64> = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|(_, inst)| match inst {
+                    Inst::StaticStore {
+                        owner: StaticOwner::Own,
+                        offset: cil::G_EXCEPTION_TAG_OFFSET,
+                        value,
+                    } => Some(const_of(*value).expect("the raised tag is a constant")),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                raised,
+                alloc::vec![out_of_range],
+                "arity {arity}: exactly one raise, and it is ArgumentOutOfRangeException"
+            );
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn compare_returns_the_ordering_it_was_handed_through_a_cell() {
+        let f = decimal_seam_body("lamella_decimal_compare", vec![DECIMAL, DECIMAL], MirType::I32)
+            .expect("synthesized");
+        assert_eq!(f.ret, Some(MirType::I32));
+        let cell = f.blocks[f.entry.index()]
+            .insts
+            .iter()
+            .find_map(|(id, inst)| matches!(inst, Inst::InitStruct).then_some(*id))
+            .expect("an out cell is allocated");
+        assert_eq!(
+            f.value_types[cell.0 as usize],
+            INT_OUT_CELL,
+            "the ordering's cell is one int32 wide, not a Decimal's sixteen bytes"
+        );
+        let ok = f
+            .blocks
+            .iter()
+            .find(|b| {
+                b.insts
+                    .iter()
+                    .any(|(_, i)| matches!(i, Inst::FieldLoad { base, offset: 0 } if *base == cell))
+            })
+            .expect("the ordering is read back");
+        assert!(matches!(ok.terminator, Some(Terminator::Return(Some(_)))));
+    }
+
     #[cfg(feature = "arm32")]
     #[test]
     fn synthesized_type_seams_verify_and_lower() {
@@ -7844,6 +9752,54 @@ mod tests {
         assert!(
             synthesize_type_seam("System", "String", Some("HandleEquals"), 2).is_none(),
             "the seams are System.Type's alone"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn synthesized_math_seams_verify_and_lower() {
+        for (name, params, symbol) in [
+            ("Abs", &[SigType::R8][..], "lamella_fabs"),
+            ("Round", &[SigType::R8][..], "lamella_rint"),
+            ("Floor", &[SigType::R8][..], "lamella_math_floor"),
+            ("Ceiling", &[SigType::R8][..], "lamella_math_ceiling"),
+            ("Truncate", &[SigType::R8][..], "lamella_math_truncate"),
+            ("Max", &[SigType::R8, SigType::R8][..], "lamella_math_max"),
+            ("Min", &[SigType::R8, SigType::R8][..], "lamella_math_min"),
+        ] {
+            let f = math_seam_body(Some(name), params)
+                .unwrap_or_else(|| panic!("Math.{name} not synthesized"));
+            lamella_ir::verify(&f).unwrap_or_else(|e| panic!("Math.{name} verify: {e:?}"));
+            assert_eq!(f.params.len(), params.len(), "Math.{name} arity");
+            assert_eq!(f.ret, Some(MirType::F64), "Math.{name} returns a double");
+            let object =
+                crate::arm32::lower_object(&[f], &["m"], &[]).expect("the object path lowers it");
+            let parsed = lamella_elf::read_object(&object).expect("the object parses back");
+            assert!(
+                parsed
+                    .symbols
+                    .iter()
+                    .any(|s| s.name == symbol && !s.defined),
+                "Math.{name} must call {symbol} as an undefined extern"
+            );
+        }
+
+        assert!(
+            math_seam_body(Some("Max"), &[SigType::I4, SigType::I4]).is_none(),
+            "the integer overloads have managed bodies and must not take the double one's"
+        );
+        assert!(
+            math_seam_body(Some("Abs"), &[SigType::R4]).is_none(),
+            "the float overload widens to the double one in managed code"
+        );
+        assert!(
+            math_seam_body(Some("Sqrt"), &[SigType::R8]).is_none(),
+            "the transcendental group is not backed here"
+        );
+
+        assert!(
+            math_seam_body(Some("Sign"), &[SigType::R8]).is_none(),
+            "Sign needs a NaN throw the IR cannot express"
         );
     }
 
@@ -7997,6 +9953,122 @@ mod tests {
         assert_eq!(socket("ListenStart"), Some("lamella_net_listen_start"));
         assert_eq!(socket("LocalPort"), Some("lamella_net_local_port"));
         assert_eq!(socket("CloseSocket"), Some("lamella_net_close"));
+    }
+
+    /// The four TIMED seams fault, and the three that degrade honestly do not.
+    ///
+    /// This is the only instrument that can check it. The differential shows 555/30/103 unchanged
+    /// across the trap landing, because no corpus program reaches these members at all -- which is
+    /// exactly how `Monitor.Wait(o, ms)` came to return `true` without waiting and go unnoticed.
+    ///
+    /// `SleepThread` is the control and the line it draws is the point: with no clock registered it
+    /// degrades to one cooperative yield, a WEAKER GUARANTEE OF THE SAME OPERATION. The four above
+    /// are false reports about whether another thread has finished. A caller survives a short sleep;
+    /// it cannot survive being told it is safe to proceed over a thread that is still running.
+    #[test]
+    fn the_timed_seams_that_lie_are_trapped_and_the_one_that_degrades_is_not() {
+        let lies = |t, m| timed_seam_placeholder_lies("System.Threading", t, Some(m));
+
+        assert!(lies("Monitor", "WaitLockTimeout"), "Monitor.Wait(o, ms) waits not at all");
+        assert!(lies("Monitor", "WaitTimedOut"), "and reports it was pulsed");
+        assert!(lies("Thread", "JoinThreadTimeout"), "Thread.Join(ms) joins nothing");
+        assert!(lies("Thread", "JoinTimedOut"), "and reports the thread finished");
+
+        assert!(!lies("Thread", "SleepThread"), "Sleep degrades to a yield, deliberately");
+        assert!(!lies("Thread", "JoinThread"));
+        assert!(!lies("Thread", "ThreadFinished"));
+        assert!(!lies("Monitor", "WaitLock"));
+        assert!(!lies("Thread", "SomeFutureMember"));
+    }
+
+    /// The `Thread` seam names, pinned because a mismatch here is invisible until a device link.
+    ///
+    /// The spelling is load-bearing. In `runtime-support` the `_impl` suffix marks the ANCHORED half
+    /// of a pair: `anchor_seam_shim!("x")` emits the symbol `x`, which records the safepoint and
+    /// tail-calls `x_impl`. A seam that parks is written `..._impl` with a shim beside it; one that
+    /// does not park is named directly. `lamella_thread_finished` neither parks nor allocates, so it
+    /// has neither.
+    ///
+    /// The timed pair maps to NOTHING on purpose: unmapped is how they reach the trap.
+    /// `Buffer` refuses a REFERENCE element, and the reason it needs its own check is that the
+    /// element SHIFT cannot refuse one.
+    ///
+    /// This is the case the first implementation got wrong. `array_element_shift` accepts anything
+    /// it can stride, and an `object[]` strides perfectly well -- 4-byte pointers -- so it comes back
+    /// with a shift identical to `int[]`'s. Measuring it would have made `Buffer.ByteLength(new
+    /// object[2])` answer 8 where .NET raises, and `Buffer.BlockCopy` would then happily reinterpret
+    /// a live pointer array as bytes.
+    #[test]
+    fn buffer_refuses_a_reference_element_the_shift_alone_cannot_refuse() {
+        assert!(
+            i64::from(crate::resolver::ELEMENT_KIND_REFERENCE) <= MAX_STRIDABLE_ELEMENT_KIND,
+            "a reference element strides; if that ever stops being true this check is dead code"
+        );
+
+        let f = buffer_byte_length_body();
+        let consts: alloc::vec::Vec<i64> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|(_, inst)| match inst {
+                Inst::ConstInt { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            consts.contains(&i64::from(crate::resolver::ELEMENT_KIND_REFERENCE)),
+            "the body compares against the reference kind: {consts:?}"
+        );
+        assert!(
+            consts.contains(&-1),
+            "the decline edge answers corlib's -1 sentinel: {consts:?}"
+        );
+    }
+
+    /// The enum `ToString` symbol's shape, and the discriminator that keeps two assemblies apart.
+    ///
+    /// The SHAPE is what is pinned, and changing it has to be a deliberate act: the name is baked
+    /// into objects a previous build already emitted, so a consumer linking against one of those
+    /// resolves the old spelling and a rename breaks it silently.
+    #[test]
+    fn the_enum_tostring_symbol_is_discriminated_by_its_owner() {
+        let corlib = b"one assembly's CIL";
+        let other = b"a different assembly's CIL";
+        let token = 0x0200_0028u32;
+
+        assert_eq!(
+            enum_tostring_symbol("", token),
+            "__lamella_enum_tostring_02000028",
+            "a PROGRAM object takes no prefix, exactly as its functions are the bare f{{rid}}"
+        );
+        assert_ne!(
+            enum_tostring_symbol(&library_prefix(corlib), token),
+            enum_tostring_symbol(&library_prefix(other), token),
+            "same row, different owners, different symbols"
+        );
+        assert_eq!(library_prefix(corlib), library_prefix(corlib));
+        assert!(
+            enum_tostring_symbol(&library_prefix(corlib), token)
+                .ends_with("__lamella_enum_tostring_02000028")
+        );
+    }
+
+    #[test]
+    fn thread_seam_maps_the_scheduler_entry_points_and_leaves_the_timed_pair_unmapped() {
+        let thread = |m| thread_seam_import("System.Threading", "Thread", Some(m));
+        assert_eq!(thread("YieldThread"), Some("lamella_thread_yield"));
+        assert_eq!(thread("JoinThread"), Some("lamella_thread_join"));
+        assert_eq!(thread("SleepThread"), Some("lamella_thread_sleep"));
+        assert_eq!(thread("ThreadFinished"), Some("lamella_thread_finished"));
+
+        assert_eq!(thread("JoinThreadTimeout"), None);
+        assert_eq!(thread("JoinTimedOut"), None);
+        assert_eq!(thread("StartThread"), None);
+        assert_eq!(
+            thread_seam_import("System.Threading", "Monitor", Some("JoinThread")),
+            None,
+            "only System.Threading.Thread maps"
+        );
     }
 
     #[test]
@@ -8596,4 +10668,31 @@ mod tests {
         ));
     }
 
+
+
+    #[test]
+    fn the_clock_seam_is_a_call_to_the_archive_and_not_a_constant() {
+        let body = clock_seam_body(Some("MonotonicMilliseconds"), &[])
+            .expect("the seam is synthesized");
+        assert_eq!(body.ret, Some(MirType::I64), "the managed member returns `long`");
+        assert!(body.params.is_empty(), "and takes no arguments");
+        match &body.blocks[0].insts[..] {
+            [(_, Inst::PInvoke { import, args })] => {
+                assert_eq!(&import[..], "lamella_clock_now_ms");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected one call and nothing else, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_other_clock_member_is_synthesized() {
+        for name in ["SetTicks", "IsSet", "NowTicks", "SourceCode"] {
+            assert!(
+                clock_seam_body(Some(name), &[]).is_none(),
+                "{name} is managed, not a seam"
+            );
+        }
+        assert!(clock_seam_body(Some("MonotonicMilliseconds"), &[SigType::I8]).is_none());
+    }
 }

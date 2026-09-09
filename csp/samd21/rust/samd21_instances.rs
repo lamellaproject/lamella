@@ -35,3 +35,6 @@ pub const PM_BASE: u32 = 0x40000400;
 pub const GCLK_BASE: u32 = 0x40000C00;
 pub const PORTA_BASE: u32 = 0x41004400;
 pub const PORTB_BASE: u32 = 0x41004480;
+pub const EIC_BASE: u32 = 0x40001800;
+pub const EIC_GCLK_CORE_ID: u32 = 5;
+pub const EIC_IRQ: u32 = 4;

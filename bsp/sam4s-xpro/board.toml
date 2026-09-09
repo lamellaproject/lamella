@@ -22,3 +22,11 @@ baud = 115200               # the bridge's wire rate (BRGR CD 65 at the 120 MHz 
                             # point realizes 115385, in tolerance)
 default = true              # this board states no [[plans]] row, so the carrier names no
                             # operating point.
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "The kit carries an EDBG that programs and debugs the part over SWD. Only a PDF of its user guide is held and its debug connector section has not been read, so the exposure is unknown. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

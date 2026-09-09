@@ -11,17 +11,26 @@
 /// device has until the protocol gets a chance to speak.
 pub const VID: u16 = 0x39E9;
 
+/// The vendor id the Link enumerated under before it had one of its own: the shared open-source
+/// vendor id used by hobby and prototype devices.
+///
+/// **A device carries the identity it was FLASHED with**, so a board programmed under this pair
+/// keeps answering to it until it is next flashed. It is kept here so a host can FIND such a board
+/// and say what it is: a scan matching only the current pair would not report an older board as
+/// old, it would not report it at all, and a board that is not found is a board nobody thinks to
+/// reprogram.
 pub const LEGACY_VID: u16 = 0x1209;
 
-/// Which vendor id a board answered to
+/// Which vendor id a board answered to: the Link's own, or the one it used beforehand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkIdentity {
     /// The Link's own vendor id.
     Current,
+    /// The shared vendor id used before the Link had one, so the firmware predates the change.
     Legacy,
 }
 
-/// Whether a `(vendor_id, product_id)` pair is a Lamella Link at all
+/// Whether a `(vendor_id, product_id)` pair is a Lamella Link at all, and which era it is from.
 ///
 /// ONE definition, because two things act on it -- what a scan KEEPS and what a picker SAYS -- and a
 /// rule with two implementations gains its next case in one of them. Here that case is a whole era

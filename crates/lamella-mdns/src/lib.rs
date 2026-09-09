@@ -15,7 +15,7 @@ use wire::{CLASS_IN, Message, Question, Record, kind};
 /// A service type is `_<name>._<protocol>` (RFC 6763, section 4.1.2), and the name is limited to
 /// fifteen characters. Registered with no authority; the pairing with the port is what identifies
 /// the service, and both live in one place so they cannot drift apart.
-pub const SERVICE: [&[u8]; 2] = [b"_lamella-link", b"_tcp"];
+pub const SERVICE: [&[u8]; 2] = [b"_lamella-linker", b"_tcp"];
 
 /// The domain service discovery uses on a local link (RFC 6763, section 4.1.3).
 pub const LOCAL: &[u8] = b"local";

@@ -1,0 +1,84 @@
+# BLOCK: the STM32F76x/F77x external interrupt controller, plus the facts an ISR needs that are not
+# EXTI registers at all -- which NVIC vector a line arrives on, and how a line is bound to a port.
+#
+# A LINE IS THE PIN INDEX AND THE PORT IS A SEPARATE CHOICE. This vendor spells the relationship the
+# opposite way round from Microchip's EIC: there EXTINT is a per-pad alternate function whose number
+# does not follow the pad, and here line x is driven by pin x of whichever port SYSCFG_EXTICR selects
+# for it. So PA5, PB5, PC5 and every other port's pin 5 all drive line 5, and only SYSCFG says which
+# one is live. Neither family may be inferred from the other, and a dispatch design that assumes a
+# line is derivable from a pad works here and is unbuildable there.
+#
+# THE CONSEQUENCE IS A COLLISION THIS TABLE CANNOT RESOLVE: two pads with the same INDEX compete for
+# one line whatever ports they are on, and nothing in the chip reports the competition. It is the
+# same class of conflict as a pad serving two peripherals and belongs to whatever resolves pin
+# bindings.
+#
+# ROUTING A PIN NEEDS THE SYSCFG CLOCK AND EXTI HAS NO CLOCK OF ITS OWN. EXTI is not gated in RCC;
+# SYSCFG is, at RCC_APB2ENR bit 14. A driver that configures EXTI without enabling SYSCFG writes
+# EXTICR into a peripheral that is not clocked, the write is lost, and the line stays bound to
+# whatever port the reset value selects -- port A. That failure presents as an interrupt from the
+# wrong pin rather than as no interrupt at all.
+#
+# TWENTY-FIVE LINES AND ONLY THE FIRST SIXTEEN ARE PADS. The controller has up to 25 edge detectors;
+# lines 0 to 15 are the GPIO lines this table is about, and the rest are internal sources -- PVD, RTC
+# alarms, USB wakeup and the like -- which reach the same registers and are not selected by SYSCFG.
+#
+# SEVEN VECTORS FOR SIXTEEN LINES, WHICH DECIDES THE SHAPE OF A HANDLER. Lines 0 to 4 have a vector
+# each; lines 5 to 9 share one; lines 10 to 15 share another. So a handler for the shared vectors is
+# entered without knowing which pad fired and must read EXTI_PR to find out, and may have to service
+# several lines from one entry.
+
+[table]
+kind = "block"
+family = "stm32f769"
+block = "exti"
+sources = [
+    "STM32F76xxx/F77xxx reference manual RM0410 Rev 5 section 11.9, register descriptions, each stating its own address offset: 11.9.1 EXTI_IMR 0x00, 11.9.2 EXTI_EMR 0x04, 11.9.3 EXTI_RTSR 0x08, 11.9.4 EXTI_FTSR 0x0C, 11.9.5 EXTI_SWIER 0x10, 11.9.6 EXTI_PR 0x14.",
+    "RM0410 Rev 5 section 11.2: 'The external interrupt/event controller consists of up to 25 edge detectors for generating event/interrupt requests.'",
+    "RM0410 Rev 5 section 7.2.3 (SYSCFG_EXTICR1), which states its own offset 0x08 and its encoding in the manual's own words: 'These bits are written by software to select the source input for the EXTIx external interrupt', 0000 PA[x] through 0111 PH[x], 1000 PI[x], 1001 PJ[x], 1010 PK[x]. Sections 7.2.4 to 7.2.6 give SYSCFG_EXTICR2 0x0C, EXTICR3 0x10 and EXTICR4 0x14 -- four lines per register, four bits per line.",
+    "RM0410 Rev 5 vector table, read by matching each row's position and address cells on their x positions within a shared row y: EXTI0 position 6, EXTI1 7, EXTI2 8, EXTI3 9, EXTI4 10, EXTI9_5 23, EXTI15_10 40.",
+    "RM0410 Rev 5 memory map: EXTI at 0x40013C00-0x40013FFF and SYSCFG at 0x40013800-0x40013BFF, both on APB2.",
+    "RM0410 Rev 5 section 5.3.14, RCC_APB2ENR bit 14 SYSCFGEN, 'System configuration controller clock enable'. EXTI itself has no enable bit in any RCC register.",
+]
+notes = [
+    "THE REGISTER MAP IS IDENTICAL TO THE STM32L0x3's AND THAT WAS CHECKED RATHER THAN ASSUMED. Every offset here was read from RM0410's own per-register sections and each agrees with the value the category 5 family's book states for the same register. Two manuals, two generations, one layout -- which is worth recording precisely because it invites a shared file, and the PORT ENCODING is where such a file would break: this part selects among eleven ports up to PK and the smaller family has nothing past PH, so a shared encoding would hand a consumer port codes its silicon cannot use.",
+    "THE VECTOR POSITIONS WERE TAKEN FROM THE TABLE BY GEOMETRY AND THE LINEAR READING OF THE SAME TABLE IS WRONG. A character-stream extraction pairs EXTI9_5 with position 24 and address 0x00A0; the row actually carries position 23 and address 0x009C. Both are internally consistent under the vector-address rule 0x40 + 4n, so arithmetic alone cannot separate them -- the whole row had shifted. All seven positions here satisfy that rule against their stated addresses.",
+    "EXTI_PR IS WRITE-ONE-TO-CLEAR AND CLEARING IT IS NOT OPTIONAL: a handler that returns without writing the pending bit re-enters immediately. It is also the only way to learn WHICH line fired on the two shared vectors.",
+    "THE RESET VALUE OF SYSCFG_EXTICR IS ZERO, WHICH IS NOT A NEUTRAL STATE. Zero selects PA[x], so every line is bound to a port A pin until something writes otherwise -- a driver that forgets SYSCFG gets port A rather than nothing.",
+]
+
+[registers.IMR]
+offset = 0x00
+width = 32
+fields = { MR = [0, 25] }
+notes = "One interrupt mask bit per line. Masking here is what connects a configured line to its NVIC vector; the trigger registers alone only decide what counts as an edge."
+
+[registers.EMR]
+offset = 0x04
+width = 32
+fields = { MR = [0, 25] }
+notes = "The event mask, which routes a detection to the event system rather than to the NVIC. Independent of IMR: a line can raise an event without an interrupt and vice versa."
+
+[registers.RTSR]
+offset = 0x08
+width = 32
+fields = { TR = [0, 25] }
+notes = "Rising-edge trigger enable, one bit per line. Paired with FTSR rather than encoding a direction: BOTH edges is both bits set, which is why the pending bit cannot say which edge fired."
+
+[registers.FTSR]
+offset = 0x0C
+width = 32
+fields = { TR = [0, 25] }
+notes = "Falling-edge trigger enable. Setting this and RTSR together is how a both-edge registration is expressed, and it is the configuration on which a handler must read the pin to name a direction."
+
+[registers.SWIER]
+offset = 0x10
+width = 32
+fields = { SWIER = [0, 25] }
+notes = "Software-raised interrupt per line, which sets the corresponding pending bit without any pad activity. Useful to a driver testing its own dispatch path with no hardware to press."
+
+[registers.PR]
+offset = 0x14
+width = 32
+fields = { PR = [0, 25] }
+notes = "WRITE-ONE-TO-CLEAR. A handler that returns without clearing re-enters immediately, and on the EXTI9_5 and EXTI15_10 vectors this is the only register that says which line fired."

@@ -22,5 +22,10 @@ namespace Lamella.Generated
         public const uint GPIOJ_RCC_EN_BIT = 9;
         public const uint GPIOJ_RCC_EN_MASK = 0x200;
         public const uint RCC_BASE = 0x40023800;
+        public const uint EXTI_BASE = 0x40013C00;
+        public const uint SYSCFG_BASE = 0x40013800;
+        public const uint SYSCFG_RCC_EN_OFF = 68;
+        public const uint SYSCFG_RCC_EN_BIT = 14;
+        public const uint SYSCFG_RCC_EN_MASK = 0x4000;
     }
 }

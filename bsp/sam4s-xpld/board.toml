@@ -144,3 +144,11 @@ kind = "gpio-in"
 pin = "PA5"
 active = "low"
 source = "Schematic revision B sheet 5, User Button: BP2 between PA5 and ground. The only pull-up drawn in that block is R24 47K marked DNP, and it is on the NRST net, not this one -- so this pin needs the part's internal pull-up."
+
+[debug]
+signals = ["swd", "jtag"]
+exposure = "pads"
+fitted = "no"
+onboard = "proprietary"
+recovery = "flash-bootloader"
+source = "SAM4S Xplained board documentation, pins connections: the JTAG and UART signals are available at test points only, TP18 TDI, TP19 TMS, TP20 TCK and TP21 TDO, so no cable lands on them. The on-board debugger is a SAM3U4C running J-Link OB, whose protocol is not published, so it is not a debugger this toolchain can speak to. The part's own boot ROM carries a monitor reached by tying PB12 through jumper JP25, which is a programming route that uses no debugger."

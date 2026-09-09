@@ -1,0 +1,33 @@
+# The SAMD20 parts table. The SAM D20 is the SAM D21's PREDECESSOR rather than a variant of it,
+# and this table exists separately for the reason every family table does: the resemblance is
+# real and is not a source. The two parts share a core, a PORT layout and a SERCOM count, and
+# they disagree on the two per-instance numbers a driver cannot work without -- see
+# instances.toml, where the generic-clock ids and the NVIC lines are both different.
+#
+# WHAT THIS PART DOES NOT HAVE, stated because a reader arriving from the SAM D21 will look for
+# it: no USB, no DMAC, no TCC, no I2S. Table 11-1 rows eight TCs and no TCC at all, and function
+# columns E and F of Table 6-1 are BOTH TC where the SAM D21 spends F on TCC.
+
+[table]
+kind = "parts"
+family = "samd20"
+sources = [
+    "SAM D20 Family Data Sheet DS60001504K (2025): ch 1 (configuration summary), ch 6 (I/O multiplexing), ch 11 (peripherals configuration summary)",
+]
+notes = [
+    "THE PAD LIST BELOW IS COMPLETE FOR THE J PACKAGE AND IS CHECKED AGAINST AN INDEPENDENTLY PRINTED COUNT. Table 6-1's SAM D20J column numbers every pad, and ch 1's feature list states 'Up to 52 programmable I/O pins'. The list below counts 52. A pad list that agrees with a separately stated count is the check a partial present-list cannot make.",
+    "PA26 AND PA29 DO NOT EXIST ON THIS PART. They are absent from Table 6-1 entirely rather than merely absent from the J column, so no package brings them out and a pin-map row naming one must be refused rather than accommodated.",
+    "THE E AND G PACKAGES ARE NOT ROWED. Table 6-1 carries their pin numbers and they have smaller pad sets; no board on the roster carries one, and a row written from the J part's facts would overstate every one of them.",
+]
+
+[[parts]]
+part = "atsamd20j18a"
+package = "64-pin TQFP"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "PA00-PA25", "PA27-PA28", "PA30-PA31",
+    "PB00-PB17", "PB22-PB23", "PB30-PB31",
+]
+source = "DS60001504K Table 6-1 (PORT Function Multiplexing), whose SAM D20J column gives a package pin number for each pad above and none for PA26 or PA29. Flash 256 KB and SRAM 32 KB are ch 1's Flash and SRAM rows for the 18 density code. The list counts 52 and ch 1's feature list independently states 'Up to 52 programmable I/O pins'."
+

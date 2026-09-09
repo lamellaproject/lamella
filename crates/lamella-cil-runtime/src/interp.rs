@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use lamella_cil::{
     EhClause, EhKind, Instruction, InstructionRange, MethodBodyImage, Opcode, Operand,
 };
+use lamella_pin_events::PinEvent;
 use lamella_token::Token;
 
 /// The maximum depth of the call stack before [`Trap::CallStackOverflow`]. Bounds
@@ -35,6 +36,26 @@ pub enum PInvokeArg {
 /// with `args`, returning the raw 64-bit result slot. `Err(())` reports a resolution or
 /// call failure (missing library/symbol, unsupported arity).
 pub type PInvokeHostFn = fn(&crate::module::PInvokeTarget, &mut [PInvokeArg]) -> Result<i64, ()>;
+
+/// The embedder's pin-change event queue, as the two operations the interpreter performs on it.
+///
+/// Plain fn pointers like the wall-clock sink, so a bare-metal boot path can register one without
+/// an allocation or a trait object. The queue ITSELF is the embedder's: a serve firmware keeps it
+/// in `.bss`, and an ahead-of-time compiled image keeps it in its caller-provided RAM region,
+/// because the archive such an image links has no writable-data segment and a `static` there
+/// resolves into `.text`. Both drive the same `lamella_pin_events::PinEventQueue`, and this is
+/// where its two ends meet.
+#[derive(Debug, Clone, Copy)]
+pub struct PinEventSource {
+    /// Takes the oldest queued event, or `None` when nothing is waiting.
+    pub next: fn() -> Option<PinEvent>,
+    /// Whether the queue has DROPPED anything since the last call, clearing the flag.
+    ///
+    /// Separate from [`PinEventSource::next`] because loss is a property of the DRAIN and not of
+    /// any event that survived it: a burst that overflowed is one gap in the sequence, not one gap
+    /// per survivor.
+    pub drain_overflowed: fn() -> bool,
+}
 
 /// The runtime context an execution shares across frames and exposes to
 /// intrinsics: the managed heap and the console output.
@@ -138,6 +159,18 @@ pub struct Vm {
     /// `set_time_source`). A plain fn pointer, like the clock seam, so a bare-metal boot path can
     /// register it. `None` = no observer (the default; nothing extra happens on a set).
     wall_sink: Option<fn(i64)>,
+    /// The embedder's pin-change event queue ([`Vm::set_pin_event_source`]), drained between
+    /// scheduler quanta. `None` = no queue, and the drain is then not attempted at all -- which is
+    /// every host build and every board that arms no interrupt.
+    pin_events: Option<PinEventSource>,
+    /// Whether a pin-event drain is already in progress on this `Vm`.
+    ///
+    /// The drain invokes managed code with [`run`], which re-enters the scheduler loop the drain
+    /// itself lives in -- so without this the dispatch of event 1 drains events 2 and 3 BEFORE
+    /// event 1's body has run. That is not merely wasteful: it delivers a queue in REVERSE, because
+    /// each event nests inside the one before it and the innermost finishes first. It also costs a
+    /// call frame per event, so a full queue arrives as a stack as deep as its capacity.
+    pin_events_draining: bool,
     /// Native KEY material the managed tier references only by HANDLE (a TLS exporter output,
     /// an AEAD key): the bytes live here, runtime-side, and never appear in managed values.
     /// Append-only like the TLS handle tables; a released slot is ZEROIZED before it is
@@ -181,6 +214,14 @@ pub struct Vm {
     /// park. An id is inserted only on a timeout and REMOVED when read, so a later untimed wait
     /// cannot inherit an older wait's verdict.
     wait_timeouts: BTreeSet<u32>,
+    /// Threads the scheduler has run to completion, so a managed `Thread.IsAlive` can answer.
+    ///
+    /// The SAME shape as `wait_timeouts` above and for the same reason: the scheduler's per-thread
+    /// state lives in the run loop's slots, which a seam cannot reach, so the run loop publishes the
+    /// one fact a seam needs. Unlike a verdict, this is not consumed on read -- a thread stays
+    /// finished, and `IsAlive` may be asked any number of times.
+    ///
+    finished_threads: BTreeSet<u32>,
     /// The host clock seam for timed waits (`Thread.Sleep`, the scheduler's idle-block). `now_millis`
     /// reads a monotonic millisecond count; `sleep_millis` blocks the OS thread that many ms. The
     /// no_std core has no clock, so the embedder sets these (the host from `std::time`; a device from
@@ -576,6 +617,20 @@ impl Vm {
     /// be a second answer to that question, and the two would drift.
     pub fn take_wait_timed_out(&mut self, thread: u32) -> bool {
         self.wait_timeouts.remove(&thread)
+    }
+
+    /// Records that `thread` has run to completion, for `Thread.IsAlive` to read back.
+    ///
+    /// Called from the ONE site that sets `ThreadState::Done`, which is what keeps this a single
+    /// writer rather than a mirror of the scheduler's state.
+    pub fn mark_thread_finished(&mut self, thread: u32) {
+        self.finished_threads.insert(thread);
+    }
+
+    /// Whether `thread` has run to completion. Not consuming: a finished thread stays finished.
+    #[must_use]
+    pub fn is_thread_finished(&self, thread: u32) -> bool {
+        self.finished_threads.contains(&thread)
     }
 
     /// Requests that the scheduler wake thread `id`, blocked on a `Monitor` lock that a release
@@ -1256,9 +1311,21 @@ impl Vm {
 
     /// Sets the current wall time, as 100-nanosecond ticks since the .NET epoch
     /// (0001-01-01 00:00:00), ANCHORING it to the current monotonic reading so the clock then
-    /// advances with elapsed time. The embedder supplies this -- the host from `std::time`, a
-    /// device from its RTC, or a synced `SystemClock` (SNTP/NTS). All of these are UTC-based
-    /// (no timezone), so `Now` and `UtcNow` report the same value.
+    /// advances with elapsed time.
+    ///
+    /// # The legacy path: an embedder wants [`set_wall_clock`] instead
+    ///
+    /// The wall clock's state is MANAGED -- `Lamella.Runtime.Clock` owns the anchor, the source and
+    /// the arithmetic -- and this writes a runtime field that managed clock does not read. **A new
+    /// embedder calling this installs a time nothing will report**: `DateTime.UtcNow` goes on
+    /// answering the epoch while the caller believes it set the clock, which is a wrong answer
+    /// delivered silently.
+    ///
+    /// What still needs it is `clock_set_ticks`, the intrinsic an assembly compiled against an
+    /// older corlib binds to. Such an assembly reads back through `datetime_now_ticks` in the same
+    /// direction, so it is self-consistent on this storage -- one frozen path for images that
+    /// predate the managed clock, and it never meets the managed one because an image carries its
+    /// own corlib.
     pub fn set_now_ticks(&mut self, ticks: i64) {
         self.wall_anchor = Some((self.now_millis().unwrap_or(0), ticks));
         if let Some(sink) = self.wall_sink {
@@ -1274,11 +1341,29 @@ impl Vm {
     /// how "point the TLS time source at the clock `SystemClock` manages" is satisfied on a
     /// board whose only wall clock IS the managed one (adaptive TLS then full-validates
     /// certificate dates from the first session after a sync).
+    /// Fires the embedder's wall-clock sink with `ticks`, if one is registered. Used by
+    /// [`set_wall_clock`], which writes the managed clock and then tells the mirror.
+    pub fn notify_wall_clock_sink(&mut self, ticks: i64) {
+        if let Some(sink) = self.wall_sink {
+            sink(ticks);
+        }
+    }
+
     pub fn set_wall_clock_sink(&mut self, sink: fn(i64)) {
         self.wall_sink = Some(sink);
         if self.wall_anchor.is_some() {
             sink(self.now_ticks());
         }
+    }
+
+    /// Registers the embedder's pin-change event queue: the interpreter drains it between scheduler
+    /// quanta and calls the managed dispatcher once per event.
+    ///
+    /// Installed by whatever owns the queue's STORAGE, which is also whatever exports
+    /// `lamella_isr_notify` to the board's interrupt handler. Until this is called the drain is not
+    /// attempted, so a build with no interrupts pays one `Option` test per scheduling decision.
+    pub fn set_pin_event_source(&mut self, source: PinEventSource) {
+        self.pin_events = Some(source);
     }
 
     /// Stores native key material and returns its HANDLE -- the only form the managed tier
@@ -2104,6 +2189,108 @@ enum ThreadStatus {
 ///
 /// # Errors
 /// Propagates a [`Trap`] from any thread's execution.
+/// Installs the wall clock through the MANAGED setter -- `Lamella.Runtime.Clock::SetTicks(long)` --
+/// and notifies the embedder's wall-clock sink. `false` when the loaded module declares no such
+/// setter, which is every module that carries no corlib.
+///
+/// # Why an embedder calls this and not [`Vm::set_now_ticks`]
+///
+/// The wall clock's whole state is managed: the anchor, the source and the
+/// arithmetic live in `Lamella.Runtime.Clock`, so writing a runtime field would write something the
+/// managed clock does not read -- `DateTime.UtcNow` would go on answering the epoch while the
+/// embedder believed it had set the time. That is the silent divergence this shape exists to
+/// remove, and it is why the door INVOKES the setter rather than poking its statics: the anchoring
+/// rule stays in one place instead of gaining a second copy here.
+///
+/// # Errors
+/// None; a trap inside the setter is reported as `false` rather than propagated, because an
+/// embedder seeding a clock has nothing to unwind and the truthful outcome is that the clock is
+/// not set -- which `Clock.IsSet` will then say on its own.
+pub fn set_wall_clock(module: &Module, vm: &mut Vm, ticks: i64) -> bool {
+    let Some(setter) = module.wall_clock_setter() else {
+        return false;
+    };
+    if run(module, vm, setter, alloc::vec![Value::Int64(ticks)]).is_err() {
+        return false;
+    }
+    vm.notify_wall_clock_sink(ticks);
+    true
+}
+
+/// Drains the embedder's pin-event queue into the managed dispatcher --
+/// `Lamella.Hardware.PinEvents::Dispatch(int, bool)` -- at most
+/// [`lamella_pin_events::MAX_EVENTS_PER_DRAIN`] events, then reports a drop if there was one.
+///
+/// Does nothing when no queue is installed, when the loaded module declares no dispatcher (a
+/// program referencing no GPIO assembly, and every floor-tier build, which has none), or when the
+/// queue is empty -- the ordinary case, and it costs one fn-pointer call.
+///
+/// # Why the interpreter drains this rather than the embedder
+///
+/// An embedder's loop only runs between top-level calls, and a deployed program that never returns
+/// is exactly the program a pin-change handler is for. The drain has to happen while the program is
+/// RUNNING, which means it happens where the scheduler already decides what runs next.
+///
+/// # Errors
+/// Propagates a [`Trap`] from the dispatcher or from a handler it invokes. An exception a callback
+/// does not handle ends the program, which is what it does on .NET; swallowing it here would leave
+/// a program running with a handler that had silently stopped working.
+fn drain_pin_events(module: &Module, vm: &mut Vm) -> Result<(), Trap> {
+    let Some(source) = vm.pin_events else { return Ok(()) };
+    let Some(dispatch) = module.pin_event_dispatch() else { return Ok(()) };
+    if vm.pin_events_draining {
+        return Ok(());
+    }
+    vm.pin_events_draining = true;
+    let outcome = dispatch_queued(module, vm, source, dispatch);
+    vm.pin_events_draining = false;
+    outcome
+}
+
+/// The body of [`drain_pin_events`], split out so the re-entrancy flag has exactly one clear.
+fn dispatch_queued(
+    module: &Module,
+    vm: &mut Vm,
+    source: PinEventSource,
+    dispatch: MethodId,
+) -> Result<(), Trap> {
+    for _ in 0..lamella_pin_events::MAX_EVENTS_PER_DRAIN {
+        let Some(event) = (source.next)() else { break };
+        run(
+            module,
+            vm,
+            dispatch,
+            alloc::vec![Value::Int32(event.token as i32), Value::Int32(i32::from(event.level))],
+        )?;
+    }
+    if (source.drain_overflowed)() {
+        if let Some(report) = module.pin_event_lost() {
+            run(module, vm, report, alloc::vec![])?;
+        }
+    }
+    Ok(())
+}
+
+/// The managed wall clock's SOURCE as its underlying int -- 0 is `ClockSource.Unset`, i.e. never
+/// set. `None` when the loaded module declares no such reader.
+///
+/// The read half of [`set_wall_clock`], and it answers the SOURCE rather than a boolean on purpose:
+/// whether the clock is set and WHERE it came from are different questions, and a caller deciding
+/// how far to trust a date is asking the second. A board that read a dead coin cell's RTC and one
+/// that completed a network sync both report "set" and are not equally trustworthy.
+///
+/// # Errors
+/// None; a trap inside the reader is reported as `None`, which a caller reads the same way as a
+/// module that declares no clock at all -- in both cases there is no source to report.
+#[must_use]
+pub fn wall_clock_source(module: &Module, vm: &mut Vm) -> Option<i32> {
+    let reader = module.wall_clock_source()?;
+    match run(module, vm, reader, alloc::vec![]) {
+        Ok(Some(Value::Int32(source))) => Some(source),
+        _ => None,
+    }
+}
+
 pub fn run(
     module: &Module,
     vm: &mut Vm,
@@ -2262,6 +2449,7 @@ pub fn run_interruptible(
         {
             break;
         }
+        drain_pin_events(module, vm)?;
         let Some(index) = next_ready_thread(&threads, cursor) else {
             if !service(vm) {
                 return Ok(Ran::Interrupted);
@@ -2283,6 +2471,7 @@ pub fn run_interruptible(
                 let finished = threads[index].id;
                 threads[index].result = Some(value);
                 threads[index].state = ThreadState::Done;
+                vm.mark_thread_finished(finished);
                 live -= 1;
                 for slot in &mut threads {
                     if matches!(slot.state, ThreadState::Joining(target, _) if target == finished) {
@@ -7112,9 +7301,9 @@ fn receiver_type_id(module: &Module, vm: &Vm, this: ObjectRef) -> Option<u32> {
 /// Resolves a `callvirt` target on a `this` of `runtime_type`: an explicit interface
 /// implementation (`MethodImpl`) wins outright -- it is the only way to reach a private,
 /// interface-named body and to tell two same-signature interface methods apart -- then a
-/// class virtual via the runtime type's vtable slot, else an interface/abstract method by
-/// signature key, else the static target (a non-virtual instance method, or a string/array
-/// `this`).
+/// class virtual via the runtime type's vtable slot, then a target PROVEN non-virtual (which
+/// binds statically, III.4.2), else an interface/abstract method by signature key, else the
+/// static target (a string/array `this`, or a non-virtual target the maps could not prove).
 fn resolve_callvirt(
     module: &Module,
     static_method: Option<MethodId>,
@@ -7132,6 +7321,11 @@ fn resolve_callvirt(
                     .and_then(|type_id| module.vtable_entry(type_id, slot))
                     .unwrap_or(method),
             );
+        }
+        if let (Some(key), Some(declaring)) = (sig_key, module.method_type(method)) {
+            if module.sig_dispatch_nonvirtual(declaring, key) == Some(method) {
+                return Some(method);
+            }
         }
     }
     if let (Some(key), Some(type_id)) = (sig_key, runtime_type) {
@@ -7305,8 +7499,8 @@ fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) 
 /// compatibility follows I.8.7.1 as .NET implements it: same element type, same-width
 /// signed/unsigned INTEGER interchange (`int[]` casts to `uint[]`, but `bool`/`char`/floats
 /// match only themselves), enum/underlying interchange, and reference-element covariance.
-/// An interface target is accepted without a check -- the interpreter does not model
-/// `System.Array`'s implemented-interface surface (`(IEnumerable)array` must keep working).
+/// An interface target is tested against the interfaces `System.Array` DECLARES, so
+/// `(IEnumerable)array` succeeds and `(IComparable)array` throws, as on .NET.
 fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> bool {
     if module.is_object_type_token(asm, token) {
         return true;
@@ -7324,17 +7518,36 @@ fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> b
         }
         Some(CastElem::Prim(_) | CastElem::String | CastElem::Object) => false,
         Some(CastElem::Named(_)) | Some(CastElem::Lenient) | None => {
-            match module
-                .type_id_of(asm, token)
-                .and_then(|target_id| module.type_handle_of(target_id))
+            let target_id = module.type_id_of(asm, token);
+            match target_id
+                .and_then(|id| module.type_handle_of(id))
                 .and_then(|handle| module.reflect_type(handle))
             {
-                Some(reflect) if reflect.is_interface => true,
+                Some(reflect) if reflect.is_interface => {
+                    match (array_type_id(module), target_id) {
+                        (Some(array_id), Some(target)) => {
+                            module.implements_interface(array_id, target)
+                        }
+                        _ => true,
+                    }
+                }
                 Some(reflect) => reflect.full_name == "System.Array",
                 None => true,
             }
         }
     }
+}
+
+/// The [`TypeId`] of `System.Array`, the base of every array, or `None` when the loaded module
+/// records no such type.
+///
+/// Resolved by NAME through the same reflection-recorded table
+/// [`array_cast_matches`] already uses to recognize `System.Array` as a cast target, so it needs no
+/// tier the caller does not need already, and it survives baking with the rest of that table.
+fn array_type_id(module: &Module) -> Option<TypeId> {
+    module
+        .type_handle_by_name("System.Array")
+        .and_then(|handle| module.type_id_by_handle(handle))
 }
 
 /// The element-compatibility rule in force: array casts and `unbox.any` share the matcher
@@ -8018,6 +8231,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "exceptions")]
     fn out_of_memory_fault_names_the_out_of_memory_exception_hierarchy() {
         let (message, chain) =
             fault_exception(&Trap::OutOfMemory).expect("OutOfMemory is a catchable fault");
@@ -8035,6 +8249,7 @@ mod tests {
     /// is why that pairing matters: a `catch (ArgumentException)` written against desktop .NET
     /// fires on it without naming a type that framework's author never wrote.
     #[test]
+    #[cfg(feature = "exceptions")]
     fn the_encoder_fallback_fault_is_also_an_argument_exception() {
         let (_, chain) = fault_exception(&Trap::EncoderFallback {
             char_unknown: 0xD800,
@@ -8059,6 +8274,7 @@ mod tests {
     /// exception carries no field storage while corlib's getter reads a field. That is a separate,
     /// older defect -- a plain divide-by-zero reproduces it -- so the text is pinned here.
     #[test]
+    #[cfg(feature = "exceptions")]
     fn the_encoder_fallback_message_is_dotnets_own_text() {
         let (message, _) = fault_exception(&Trap::EncoderFallback {
             char_unknown: 0xD800,
@@ -8445,6 +8661,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "float")]
     fn float_arithmetic() {
         let result = run(vec![
             Instruction::new(Opcode::LdcR8, Operand::Float64(1.5)),
@@ -8464,6 +8681,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "float")]
     fn conv_i4_truncates_a_float_toward_zero() {
         let result = run_convert(Opcode::ConvI4, Operand::Float64(3.9), Opcode::LdcR8);
         assert_eq!(result, Ok(Some(Value::Int32(3))));
@@ -8515,6 +8733,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "float")]
     fn conv_r8_is_signed_but_conv_r_un_is_unsigned() {
         let signed = run_convert(Opcode::ConvR8, Operand::Int32(-1), Opcode::LdcI4);
         assert_eq!(signed, Ok(Some(Value::Float(-1.0))));
@@ -9032,6 +9251,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "exceptions")]
     fn array_index_out_of_range_throws() {
         let elem = Token(0x0100_0005);
         let mut module = Module::new();
@@ -9278,6 +9498,7 @@ mod tests {
     /// The underlying type gets TWO tokens bound to it, because a box's tag is not always the
     /// handle recorded as `T`: a value boxed in one assembly and tested in another carries two
     /// different tokens for one type, and a same-handle test would answer `false` for it.
+    #[cfg(feature = "generics")]
     fn nullable_program(code: Vec<Instruction>) -> (Module, MethodId) {
         let int_def = Token(0x0200_0001);
         let nullable_spec = Token(0x1B00_0001);
@@ -9303,6 +9524,7 @@ mod tests {
     /// and compute the address to the newly allocated object". `ldobj` through that pointer reads
     /// the manufactured instance.
     #[test]
+    #[cfg(feature = "generics")]
     fn unbox_of_a_nullable_manufactures_an_instance_and_points_at_it() {
         let (module, main) = nullable_program(
             vec![
@@ -9327,6 +9549,7 @@ mod tests {
     /// a NON-nullable value type". A nullable gets an instance whose `HasValue` is false instead --
     /// the type's own field defaults, the same value `initobj` writes.
     #[test]
+    #[cfg(feature = "generics")]
     fn unbox_of_a_nullable_from_null_is_an_instance_with_no_value() {
         let (module, main) = nullable_program(
             vec![
@@ -9349,6 +9572,7 @@ mod tests {
     /// and obj is not a boxed T". The control for the two tests above -- without it they would pass
     /// against an arm that accepted any box at all.
     #[test]
+    #[cfg(feature = "generics")]
     fn unbox_of_a_nullable_from_a_box_of_another_type_is_an_invalid_cast() {
         let unrelated = Token(0x0200_0009);
         let mut code = vec![
@@ -9373,6 +9597,7 @@ mod tests {
     /// castclass succeeds." Reachable only from hand-written IL -- Roslyn spells the same test with
     /// `isinst`.
     #[test]
+    #[cfg(feature = "generics")]
     fn castclass_to_a_nullable_succeeds_on_a_boxed_underlying_value() {
         let (module, main) = nullable_program(
             vec![
@@ -9395,6 +9620,7 @@ mod tests {
     /// which is what a value boxed in the corlib and tested from a program looks like. A
     /// handle-equality test alone answers `false` here.
     #[test]
+    #[cfg(feature = "generics")]
     fn a_nullable_cast_matches_a_box_tagged_through_another_token_for_the_same_type() {
         let (module, main) = nullable_program(
             vec![
@@ -9415,6 +9641,7 @@ mod tests {
     /// The negative control for both cast rules: a box of some OTHER type is not an instance of
     /// `Nullable<T>`, and `isinst` answers null rather than succeeding.
     #[test]
+    #[cfg(feature = "generics")]
     fn isinst_to_a_nullable_rejects_a_box_of_another_type() {
         let unrelated = Token(0x0200_0009);
         let (mut module, main) = nullable_program(
@@ -9436,6 +9663,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "exceptions")]
     fn castclass_to_an_unrelated_type_throws() {
         let (module, main) = cast_program(Opcode::Castclass);
         assert_eq!(
@@ -9510,6 +9738,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "exceptions")]
     fn an_unhandled_exception_traps() {
         let e_ctor = Token(0x0600_0050);
         let mut module = Module::new();
@@ -9905,5 +10134,46 @@ mod tests {
             assert_eq!(stop.returned, Some(Value::Int32(42)));
             assert_eq!(session.stopped_exception(), None);
         }
+    }
+
+    /// `Thread.IsAlive` reads TWO premises out of [`Vm::alloc_thread_id`], and until this test
+    /// neither was written down anywhere but in that function's four lines.
+    ///
+    /// An id is never 0, so the managed side's `_id == 0` means "constructed, never started" rather
+    /// than "the first thread the scheduler handed out" -- `Join()` has leaned on that since it was
+    /// written, and `IsAlive` now answers the unstarted case from it. And an id is never REUSED, so
+    /// a `finished_threads` entry cannot be inherited by a later thread and report it dead on
+    /// arrival. A thread table that recycled slots would break both silently and in opposite
+    /// directions, which is the case for asserting them rather than commenting them.
+    #[test]
+    fn thread_ids_are_never_zero_and_never_reused() {
+        let mut vm = Vm::default();
+        let mut seen = BTreeSet::new();
+        for _ in 0..1_000 {
+            let id = vm.alloc_thread_id();
+            assert_ne!(id, 0, "0 is the managed `never started` sentinel, not an id");
+            assert!(seen.insert(id), "id {id} was handed out twice");
+        }
+    }
+
+    /// The finished bit is KEYED and is NOT consumed on read -- both halves of what
+    /// [`Vm::is_thread_finished`] promises, and the second is where it parts company with the
+    /// timed-park verdict one method above it. [`Vm::take_wait_timed_out`] consumes deliberately, so
+    /// a later park cannot read a stale verdict; `IsAlive` may be asked any number of times and must
+    /// answer the same thing, so a copy of that consuming shape would have made the SECOND read of a
+    /// finished thread say it was alive again.
+    #[test]
+    fn a_finished_thread_stays_finished_and_the_bit_is_keyed_by_id() {
+        let mut vm = Vm::default();
+        let finished = vm.alloc_thread_id();
+        let other = vm.alloc_thread_id();
+
+        assert!(!vm.is_thread_finished(finished), "an unstarted id is not finished");
+        vm.mark_thread_finished(finished);
+
+        for read in 1..=3 {
+            assert!(vm.is_thread_finished(finished), "read {read} lost the finished bit");
+        }
+        assert!(!vm.is_thread_finished(other), "the bit is keyed by id, not a global flag");
     }
 }

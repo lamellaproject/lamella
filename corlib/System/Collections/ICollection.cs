@@ -5,5 +5,8 @@ namespace System.Collections
     {
         int Count { get; }
         void CopyTo(System.Array array, int index);
+
+        bool IsSynchronized { get; }
+        object SyncRoot { get; }
     }
 }

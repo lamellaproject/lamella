@@ -14,7 +14,7 @@ default = [
     "float",
     "complex",
     "bundled-stdlib",
-    "introspection",
+    "reflection",
     "asyncio-sync",
     "asyncio-streams",
     "threading",
@@ -36,7 +36,12 @@ bundled-stdlib = []
 asyncio-sync = ["bundled-stdlib"]
 asyncio-streams = ["bundled-stdlib"]
 threading = []
-introspection = []
+reflection = []
+# Unicode character NAMES for a `\N{...}` escape, forwarded to the front end. OFF by default and
+# deliberately NOT enabled by anything that a serve firmware links: the table is hundreds of
+# kilobytes of strings. A host tool that compiles arbitrary Python source turns it on; a device
+# that runs pre-compiled bytecode never needs it.
+char-names = ["lamella-py-frontend/char-names"]
 gc-collect = ["lamella-gc/gc-collect"]
 gc-none = []
 
@@ -57,8 +62,8 @@ lamella-net-core = { path = "../lamella-net-core" }
 # The shared Unicode Character Database properties: str predicates (isalpha/isspace/...)
 # classify code points exactly as CPython, from one tree-shakeable table.
 # `normalization` is on for ONE THING IN IT -- `full_case_fold`, the `C`+`F` rows of CaseFolding.txt
-# that `str.casefold()` needs. The feature name is wider than what a Python image links: measured on
-# `same54-py` (thumbv7em, flash profile), turning it on grew the loadable image 495,784 -> 506,288
+# that `str.casefold()` needs. The feature name is wider than what a Python image links: on a
+# `thumbv7em` build at the flash profile, turning it on grew the loadable image 495,784 -> 506,288
 # bytes, +10,504, which is the fold tables and 56 bytes of code. The NFC/NFD decomposition and
 # composition tables (~134 KiB) are in the same tier and the linker drops every one of them, because
 # nothing here calls `normalize`. A narrower `folding` feature would name the cost honestly, and it

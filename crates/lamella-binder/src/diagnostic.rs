@@ -130,7 +130,8 @@ impl DiagnosticKind {
     pub fn namespace(&self) -> CodeNamespace {
         match self {
             DiagnosticKind::FeatureNotInThisBuild { .. }
-            | DiagnosticKind::MemberSignatureNotSupported { .. } => CodeNamespace::Lam,
+            | DiagnosticKind::MemberSignatureNotSupported { .. }
+            | DiagnosticKind::SwitchExpressionExceptionMissing => CodeNamespace::Lam,
             _ => CodeNamespace::Cs,
         }
     }
@@ -526,6 +527,38 @@ pub enum DiagnosticKind {
         /// The operator's signature, as csc names it (`C.operator +(C, C)`).
         signature: Box<str>,
     },
+    /// `CS0550`: an explicit interface implementation declares an accessor the interface member
+    /// does not. The implementation fills the interface's slots and nothing else, so a `set` on a
+    /// getter-only member has no `set_P` to override -- and emitting one anyway writes a
+    /// `MethodImpl` against a member no interface declares, which loads as `TypeLoadException`.
+    ExplicitImplementationAddsAccessor {
+        /// The offending accessor, as csc names it (`C.I.P.set`).
+        accessor: Box<str>,
+        /// The interface member it claims to implement (`I.P`, `I.this[int]`).
+        interface_member: Box<str>,
+    },
+    /// `CS8754`: a target-typed `new()` in a position that supplies no type to take.
+    ///
+    /// The whole of what makes `new()` a construct is that the CONTEXT names the type, so a
+    /// position with no target has not written an incomplete expression -- it has written one that
+    /// cannot mean anything. csc's text names the syntax rather than a type, because there is no
+    /// type to name.
+    NoTargetTypeForNew,
+    /// `CS0551`: an explicit interface implementation OMITS an accessor the interface member
+    /// declares. The mirror of [`DiagnosticKind::ExplicitImplementationAddsAccessor`] and the same
+    /// consequence: an explicit implementation fills the interface's slots and nothing else, so an
+    /// omitted accessor leaves a slot with no `MethodImpl` and the loader refuses the type.
+    ExplicitImplementationMissingAccessor {
+        /// The implementation, as csc names it (`C.I.P`).
+        implementation: Box<str>,
+        /// The accessor it does not supply (`I.P.set`, `I.this[int].get`).
+        accessor: Box<str>,
+    },
+    /// `CS0415`: `[IndexerName]` on an EXPLICIT interface implementation. The attribute renames an
+    /// indexer's accessors, and an explicit implementation's accessors are named for the interface
+    /// member they implement -- so there is nothing for it to rename, and honoring it would emit a
+    /// `MethodImpl` naming a member no interface declares.
+    IndexerNameOnExplicitImplementation,
     /// `CS0418`: a class declared both `abstract` and `sealed` is contradictory -- an abstract type
     /// must be extended, a sealed one cannot be.
     AbstractTypeSealedOrStatic {
@@ -655,6 +688,44 @@ pub enum DiagnosticKind {
         /// The member name, as the assembly spells it.
         member: Box<str>,
     },
+    /// `CS1739`: a named argument names a parameter the chosen overload does not have.
+    ///
+    /// csc says "the BEST overload", and that wording is exact: with several overloads the name is
+    /// judged against the one the call came closest to, not against their union. A name matching
+    /// SOME overload is not this diagnostic -- it is a call that simply resolved elsewhere.
+    NoParameterNamed {
+        /// The method, as csc spells it in this message: the bare name.
+        method: Box<str>,
+        /// The name that matched no parameter.
+        name: Box<str>,
+    },
+    /// `CS1744`: a named argument names a parameter a POSITIONAL argument already filled.
+    ///
+    /// Separate from [`Self::NoParameterNamed`] because the name is perfectly good -- the fault is
+    /// that the call supplies that parameter twice, and saying "no parameter named 'a'" about a
+    /// parameter plainly called `a` would send the reader looking for a spelling mistake.
+    NamedArgumentUsedPositionally {
+        /// The name that collided.
+        name: Box<str>,
+    },
+    /// `CS8323`: a named argument out of its parameter's position, followed by an unnamed one.
+    ///
+    /// From C# 7.2 a named argument MAY be followed by positional ones -- but only when it sits in
+    /// its own parameter's position, because the arguments after it are counted from where it is.
+    /// `M(a: 1, 2)` is fine and `M(b: 1, 2)` is this: the `2` would have to be argument two and
+    /// argument one at once.
+    NamedArgumentOutOfPosition {
+        /// The name that is out of position.
+        name: Box<str>,
+    },
+    /// `CS1738`: a named argument followed by an unnamed one, below C# 7.2.
+    ///
+    /// **A BINDER GATE AND NOT A PARSER ONE, WHICH IS WHERE csc PUTS IT TOO.** Whether a named
+    /// argument is "non-trailing" is a fact about the argument LIST, and csc reports it at the
+    /// offending positional argument at every version below 7.2 -- including versions that have no
+    /// named arguments at all, where it lands alongside the version code rather than instead of it
+    /// (measured at C# 3).
+    NonTrailingNamedArgument,
     /// `CS1501`: no overload of the method takes the given number of arguments.
     NoOverloadForArgumentCount {
         /// The method name.
@@ -805,6 +876,15 @@ pub enum DiagnosticKind {
     NoEnclosingLoop,
     /// `CS0017`: the program declares more than one entry point (two or more valid `static Main`).
     MultipleEntryPoints,
+    /// `CS5001`: an EXECUTABLE target declares no usable entry point.
+    ///
+    /// **"SUITABLE" IS THE LOAD-BEARING WORD AND csc'S MESSAGE SAYS IT**: a `Main` that is
+    /// lowercase, an instance method, generic, or wrongly signed is not ABSENT -- it is present and
+    /// unusable, and csc answers this one code for all of them rather than naming what is wrong.
+    /// Measured: a two-argument `Main`, `main`, an instance `Main`, a `string`-returning `Main` and
+    /// a `Main` in a generic class are each `CS5001`, while `void`/`int` x `()`/`(string[])` are
+    /// the four that work -- in a struct or a class, public or private.
+    NoEntryPoint,
     /// `CS0428`: a method group is used where a non-delegate type is expected (it was not
     /// invoked and does not convert to the target).
     MethodGroupToNonDelegate {
@@ -1216,6 +1296,92 @@ pub enum DiagnosticKind {
         /// The dialect that permits the construct -- the one the user already selected.
         permitted_by: LanguageVersion,
     },
+    /// `CS0626` (warning): an `extern` member carries no attributes, so nothing says where its
+    /// implementation comes from.
+    ///
+    /// **THE CONDITION IS "NO ATTRIBUTES AT ALL", NOT "NO `DllImport`"**, which is what csc's own
+    /// wording says and what it does: measured, `[Obsolete] extern void M();` warns nothing. The
+    /// attribute is taken as a promise that SOMETHING supplies the body -- a `DllImport`, or a
+    /// runtime that recognizes some other marker.
+    ExternMemberHasNoAttributes {
+        /// The member, as csc renders it: `C.M()`, `C.P.get`, `C.operator +(C, C)`, `C.~C()`.
+        member: Box<str>,
+    },
+    /// `CS0824` (warning): an `extern` CONSTRUCTOR, which gets its own code and a much shorter
+    /// message than [`Self::ExternMemberHasNoAttributes`] -- csc says only that it is marked
+    /// external, with no advice about `DllImport`.
+    ExternConstructor {
+        /// The constructor, as csc renders it: `C.C()`.
+        member: Box<str>,
+    },
+    /// `CS0179`: an `extern` member declares a body. The modifier says the implementation comes
+    /// from elsewhere, so a body here is two answers to one question.
+    ExternMemberHasBody {
+        /// The member, as csc renders it.
+        member: Box<str>,
+    },
+    /// `CS8121`: a pattern's type can never be the operand's -- `int x; x is long v`.
+    ///
+    /// **THE TEST IS NOT "IS THERE A CONVERSION", IT IS "IS THERE A *RUN-TIME* ONE".** `int`
+    /// converts to `long`, implicitly and at compile time, and the pattern is still refused: a
+    /// pattern asks what an object IS, and no `int` is ever a `long` at run time. So the
+    /// conversions that qualify are identity, reference, boxing and unboxing -- the ones a type
+    /// test can actually perform -- and the numeric ones do not.
+    PatternTypeUnreachable {
+        /// The operand's type, as csc renders it.
+        from: Box<str>,
+        /// The pattern's type.
+        to: Box<str>,
+    },
+    /// `CS8117`: a pattern was matched against something with no value -- `V() switch { .. }`
+    /// where `V` returns `void`.
+    ///
+    /// Its own code rather than `CS0151` (the switch STATEMENT's governing-type error), because a
+    /// switch EXPRESSION has no governing-type list: it matches patterns, and `object` governs one
+    /// perfectly well. The only operand it refuses is one that produced nothing.
+    PatternOperandHasNoValue {
+        /// The operand's type, as csc renders it (`void`).
+        found: Box<str>,
+    },
+    /// `CS8509`: a switch expression has no arm that matches every remaining value, so it can
+    /// fall off the end and throw.
+    ///
+    /// **A WARNING, NOT AN ERROR** -- the program compiles and runs, and only an unmatched value
+    /// reaches the throw.
+    ///
+    /// **THE TEST IS "IS THERE AN UNGUARDED DISCARD ARM", NOT A COVERAGE ANALYSIS**, so this is
+    /// reported for a switch that is in fact exhaustive by enumeration --
+    /// `bool b switch { true => .., false => .. }` draws it. The program compiles and runs
+    /// correctly either way; only the warning is spurious.
+    SwitchExpressionNotExhaustive,
+    /// `CS8506`: a switch expression's arms have no type in common.
+    ///
+    /// **REPORTED WHEREVER THE ARMS HAVE NO TYPE IN COMMON, EVEN WHERE THE CONTEXT WOULD SUPPLY
+    /// ONE.** A switch expression is target-typed in the standard, so
+    /// `object M(int x) => x switch { 1 => "s", _ => 2 };` is a legal program: each arm converts
+    /// to `object` and no common type is needed. This build does not implement target typing, so
+    /// it asks for a common type in every position and refuses that program. Writing the
+    /// conversion on each arm is the repair.
+    SwitchExpressionNoBestType,
+    /// The type a non-exhaustive switch expression must throw is not in scope.
+    ///
+    /// The language says a switch expression that matches no arm throws
+    /// `System.Runtime.CompilerServices.SwitchExpressionException`. A reference set without it --
+    /// this project's own corlib today -- cannot express that, and the honest answer is to name
+    /// the missing type rather than to throw something else or to fall off the end.
+    SwitchExpressionExceptionMissing,
+    /// `CS8116`: a pattern names a NULLABLE type -- `o is int? n`.
+    ///
+    /// **A PATTERN TESTS THE UNDERLYING TYPE AND csc SAYS SO IN THE MESSAGE.** `int?` is a
+    /// `Nullable<int>`, which a boxed `int` is not an instance of, so the test could only ever be
+    /// false; the repair is to write the underlying type, and the diagnostic names it. Reported
+    /// for BOTH spellings, `int?` and `Nullable<int>` -- measured, csc renders both as `int?`.
+    NullableTypeInPattern {
+        /// The nullable type as written, rendered `T?` whichever spelling was used.
+        nullable: Box<str>,
+        /// Its underlying type -- what the message tells the reader to write instead.
+        underlying: Box<str>,
+    },
     /// `CS8703`: an interface member declares an access modifier. Every interface member is
     /// implicitly public in C# 1.0 (13.2), so the modifier is not merely redundant -- it is a
     /// later-version form, and csc gives it its own code because the repair is to delete it.
@@ -1372,6 +1538,50 @@ pub enum DiagnosticKind {
         /// The member name.
         member: Box<str>,
     },
+    /// `CS8132`: a deconstruction's target count does not match the tuple's element count.
+    ///
+    /// **BOTH NUMBERS ARE QUOTED, AND csc QUOTES THEM IN SINGLE QUOTES THOUGH THEY ARE NUMBERS**:
+    /// *Cannot deconstruct a tuple of '3' elements into '2' variables.* Measured, and copied
+    /// exactly -- the message is a search key.
+    ///
+    /// Reported at the OPENING BRACKET of the target list, which is the same position for all
+    /// three spellings: `var (a, b) = ...`, `(int a, int b) = ...` and `(a, b) = ...` (measured,
+    /// one program apiece).
+    DeconstructWrongCardinality {
+        /// How many elements the tuple has.
+        found: usize,
+        /// How many variables the target list has.
+        wanted: usize,
+    },
+    /// `CS8129`: the deconstructed value is not a tuple and its type has no usable `Deconstruct`.
+    ///
+    /// **"USABLE" IS THREE CONDITIONS AND THE MESSAGE NAMES TWO OF THEM**: an instance method,
+    /// with exactly this many `out` parameters, returning `void`. A `static` one draws `CS0176`
+    /// beside this, a non-`void` one draws this alone, and a missing one draws `CS1061` beside
+    /// it -- measured, all three, and this build reaches each of those by binding the call it
+    /// would have made rather than by predicting which one applies.
+    MissingDeconstruct {
+        /// The type that has no suitable `Deconstruct`.
+        type_name: Box<str>,
+        /// How many `out` parameters were wanted.
+        count: usize,
+    },
+    /// `CS8130`: an implicitly typed deconstruction variable whose type could not be inferred.
+    ///
+    /// The CASCADE of the two above: once the value cannot be taken apart, no element type
+    /// reaches a `var` target. csc reports one per inferred variable and none for a target that
+    /// wrote its type, so an explicit `(int a, int b)` gets the primary diagnostic alone.
+    UninferredDeconstructionVariable {
+        /// The variable that has no inferred type.
+        name: Box<str>,
+    },
+    /// `CS8185`: a declaring deconstruction was written where a value is wanted.
+    ///
+    /// `var q = (var (a, b) = t)` and `var q = ((int a, int b) = t)` are both this, while
+    /// `M((a, b) = t)` compiles and yields the tuple -- so the form with a value is exactly the
+    /// one that declares nothing. csc reports it at the `var` of a designation and at the
+    /// declaring target otherwise; both measured.
+    DeclarationNotPermitted,
     /// `CS1922`: a collection initializer targets a type that does not implement `IEnumerable`.
     ///
     /// Separate from the missing-`Add` case (`CS1061`) because the two name different repairs --
@@ -1888,6 +2098,39 @@ pub enum DiagnosticKind {
         /// The type the delegate declares.
         expected: Box<str>,
     },
+    /// `CS1673`: a lambda inside a STRUCT reads an instance member of `this`.
+    ///
+    /// **NOT A LOWERING GAP -- A LANGUAGE RULE**, and the reason is `this` in a value type: it is
+    /// a managed pointer to the caller's storage, so a delegate that outlived the call would hold
+    /// a reference to a struct that no longer exists. csc refuses it outright and says what to do
+    /// instead, so the message carries the whole remedy.
+    LambdaCapturesStructThis,
+    /// `CS1628`: a lambda captures a `ref`, `out` or `in` PARAMETER.
+    ///
+    /// **THE SAME RULE AS [`Self::LambdaCapturesStructThis`], SEEN FROM ANOTHER SIDE.** A capture
+    /// becomes a field of a display class -- heap storage with an unbounded lifetime -- and a
+    /// byref parameter is a managed pointer into the CALLER's frame. A delegate outliving the
+    /// call would hold a pointer to storage that no longer exists.
+    LambdaCapturesByRefParameter {
+        /// The parameter's name, which csc puts in the message.
+        name: Box<str>,
+    },
+    /// `CS8175`: a lambda captures a `ref` LOCAL, or a local whose type is ref-like.
+    ///
+    /// csc says "ref local" for BOTH, including a plain `Span<int> s` that is not a ref local at
+    /// all. The wording is csc's.
+    LambdaCapturesRefLocal {
+        /// The local's name.
+        name: Box<str>,
+    },
+    /// `CS9108`: a lambda captures a PARAMETER whose type is ref-like (`Span<T>` and friends).
+    ///
+    /// A DIFFERENT CODE FROM THE LOCAL CASE: a ref-like LOCAL is `CS8175` and a ref-like
+    /// PARAMETER is `CS9108`.
+    LambdaCapturesRefLikeParameter {
+        /// The parameter's name.
+        name: Box<str>,
+    },
     /// `CS8030`: a lambda converted to a `void`-returning delegate returns a value.
     LambdaReturnsValueToVoidDelegate,
     /// `CS1643`: a block-bodied lambda whose delegate returns a value has a path that does not.
@@ -1946,6 +2189,10 @@ impl DiagnosticKind {
             DiagnosticKind::RestrictedTypeArrayElement { .. } => 611,
             DiagnosticKind::RestrictedTypeByReference { .. } => 1601,
             DiagnosticKind::OperatorMustBeStaticAndPublic { .. } => 558,
+            DiagnosticKind::ExplicitImplementationAddsAccessor { .. } => 550,
+            DiagnosticKind::ExplicitImplementationMissingAccessor { .. } => 551,
+            DiagnosticKind::NoTargetTypeForNew => 8754,
+            DiagnosticKind::IndexerNameOnExplicitImplementation => 415,
             DiagnosticKind::AbstractTypeSealedOrStatic { .. } => 418,
             DiagnosticKind::StaticMemberCannotBeVirtual { .. } => 112,
             DiagnosticKind::EnumUnderlyingTypeExpected => 1008,
@@ -1966,7 +2213,12 @@ impl DiagnosticKind {
             DiagnosticKind::CannotAssignToReadonlyLocal { .. } => 1656,
             DiagnosticKind::MemberNotFound { .. } => 117,
             DiagnosticKind::MemberSignatureNotSupported { .. } => 2,
+            DiagnosticKind::SwitchExpressionExceptionMissing => 3,
             DiagnosticKind::NoOverloadForArgumentCount { .. } => 1501,
+            DiagnosticKind::NoParameterNamed { .. } => 1739,
+            DiagnosticKind::NamedArgumentUsedPositionally { .. } => 1744,
+            DiagnosticKind::NamedArgumentOutOfPosition { .. } => 8323,
+            DiagnosticKind::NonTrailingNamedArgument => 1738,
             DiagnosticKind::PredefinedTypeMissing { .. } => 518,
             DiagnosticKind::ArglistOutsideVarargMethod => 190,
             DiagnosticKind::ArglistOutsideCall => 226,
@@ -1986,6 +2238,7 @@ impl DiagnosticKind {
             DiagnosticKind::EventOutsideAddRemove { .. } => 70,
             DiagnosticKind::NoEnclosingLoop => 139,
             DiagnosticKind::MultipleEntryPoints => 17,
+            DiagnosticKind::NoEntryPoint => 5001,
             DiagnosticKind::MethodGroupToNonDelegate { .. } => 428,
             DiagnosticKind::ConstantExpected => 150,
             DiagnosticKind::ConstantOfTypeExpected { .. } => 9135,
@@ -2051,6 +2304,7 @@ impl DiagnosticKind {
             DiagnosticKind::AccessorAccessibilityNeedsBothAccessors { .. } => 276,
             DiagnosticKind::AbstractPropertyHasPrivateAccessor { .. } => 442,
             DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
+            DiagnosticKind::NullableTypeInPattern { .. } => 8116,
             DiagnosticKind::InterfaceMemberModifier { .. } => 8703,
             DiagnosticKind::AbstractMemberInNonAbstractType { .. } => 513,
             DiagnosticKind::VirtualOrAbstractMemberIsPrivate { .. } => 621,
@@ -2063,6 +2317,13 @@ impl DiagnosticKind {
             DiagnosticKind::VoidField => 670,
             DiagnosticKind::VoidLocal => 1547,
             DiagnosticKind::SwitchGoverningType => 151,
+            DiagnosticKind::ExternMemberHasNoAttributes { .. } => 626,
+            DiagnosticKind::ExternConstructor { .. } => 824,
+            DiagnosticKind::ExternMemberHasBody { .. } => 179,
+            DiagnosticKind::PatternTypeUnreachable { .. } => 8121,
+            DiagnosticKind::PatternOperandHasNoValue { .. } => 8117,
+            DiagnosticKind::SwitchExpressionNotExhaustive => 8509,
+            DiagnosticKind::SwitchExpressionNoBestType => 8506,
             DiagnosticKind::FieldInitializerReference { .. } => 236,
             DiagnosticKind::RequiredAfterOptionalParameter => 1737,
             DiagnosticKind::ByRefParameterWithDefault => 1741,
@@ -2078,6 +2339,10 @@ impl DiagnosticKind {
             DiagnosticKind::InitOnlyAssignment { .. } => 8852,
             DiagnosticKind::PropertyCannotBeAssigned { .. } => 200,
             DiagnosticKind::MemberNotFoundOnExpression { .. } => 1061,
+            DiagnosticKind::DeconstructWrongCardinality { .. } => 8132,
+            DiagnosticKind::MissingDeconstruct { .. } => 8129,
+            DiagnosticKind::UninferredDeconstructionVariable { .. } => 8130,
+            DiagnosticKind::DeclarationNotPermitted => 8185,
             DiagnosticKind::NotACollectionInitializerTarget { .. } => 1922,
             DiagnosticKind::StaticMemberInObjectInitializer { .. } => 1914,
             DiagnosticKind::RequiredMemberMustBeSettable { .. } => 9034,
@@ -2157,6 +2422,10 @@ impl DiagnosticKind {
             DiagnosticKind::LambdaParameterTypesMixed => 748,
             DiagnosticKind::LambdaParameterTypesDoNotMatch { .. } => 1661,
             DiagnosticKind::LambdaParameterTypeMismatch { .. } => 1678,
+            DiagnosticKind::LambdaCapturesStructThis => 1673,
+            DiagnosticKind::LambdaCapturesByRefParameter { .. } => 1628,
+            DiagnosticKind::LambdaCapturesRefLocal { .. } => 8175,
+            DiagnosticKind::LambdaCapturesRefLikeParameter { .. } => 9108,
             DiagnosticKind::LambdaReturnsValueToVoidDelegate => 8030,
             DiagnosticKind::LambdaNotAllPathsReturn { .. } => 1643,
             DiagnosticKind::ConstantTrueFilter => 7095,
@@ -2179,7 +2448,10 @@ impl DiagnosticKind {
             | DiagnosticKind::UnreachableCode
             | DiagnosticKind::ConstantTrueFilter
             | DiagnosticKind::ConstantFalseFilter
-            | DiagnosticKind::UnreferencedLabel => Severity::Warning,
+            | DiagnosticKind::UnreferencedLabel
+            | DiagnosticKind::SwitchExpressionNotExhaustive
+            | DiagnosticKind::ExternMemberHasNoAttributes { .. }
+            | DiagnosticKind::ExternConstructor { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -2350,6 +2622,29 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "User-defined operator '{signature}' must be declared static and public"
             ),
+            DiagnosticKind::ExplicitImplementationAddsAccessor {
+                accessor,
+                interface_member,
+            } => write!(
+                f,
+                "'{accessor}' adds an accessor not found in interface member '{interface_member}'"
+            ),
+            DiagnosticKind::NoTargetTypeForNew => {
+                write!(f, "There is no target type for 'new()'")
+            }
+            DiagnosticKind::ExplicitImplementationMissingAccessor {
+                implementation,
+                accessor,
+            } => write!(
+                f,
+                "Explicit interface implementation '{implementation}' is missing accessor \
+                 '{accessor}'"
+            ),
+            DiagnosticKind::IndexerNameOnExplicitImplementation => write!(
+                f,
+                "The 'IndexerName' attribute is valid only on an indexer that is not an explicit \
+                 interface member declaration"
+            ),
             DiagnosticKind::AbstractTypeSealedOrStatic { type_name } => write!(
                 f,
                 "'{type_name}': an abstract type cannot be sealed or static"
@@ -2438,6 +2733,22 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NoOverloadForArgumentCount { method, count } => write!(
                 f,
                 "No overload for method '{method}' takes {count} arguments"
+            ),
+            DiagnosticKind::NoParameterNamed { method, name } => write!(
+                f,
+                "The best overload for '{method}' does not have a parameter named '{name}'"
+            ),
+            DiagnosticKind::NamedArgumentUsedPositionally { name } => write!(
+                f,
+                "Named argument '{name}' specifies a parameter for which a positional argument has already been given"
+            ),
+            DiagnosticKind::NamedArgumentOutOfPosition { name } => write!(
+                f,
+                "Named argument '{name}' is used out-of-position but is followed by an unnamed argument"
+            ),
+            DiagnosticKind::NonTrailingNamedArgument => write!(
+                f,
+                "Named argument specifications must appear after all fixed arguments have been specified. Please use language version 7.2 or greater to allow non-trailing named arguments."
             ),
             DiagnosticKind::PredefinedTypeMissing { full_name } => write!(
                 f,
@@ -2529,6 +2840,10 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "Program has more than one entry point defined. Compile with /main to specify \
                  the type that contains the entry point"
+            ),
+            DiagnosticKind::NoEntryPoint => write!(
+                f,
+                "Program does not contain a static 'Main' method suitable for an entry point"
             ),
             DiagnosticKind::MethodGroupToNonDelegate { method, target } => write!(
                 f,
@@ -2787,6 +3102,13 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "'{method}' must declare a body because it is not marked abstract, extern, or partial"
             ),
+            DiagnosticKind::NullableTypeInPattern {
+                nullable,
+                underlying,
+            } => write!(
+                f,
+ "It is not legal to use nullable type '{nullable}' in a pattern; use the underlying type '{underlying}' instead."
+            ),
             DiagnosticKind::InterfaceMemberModifier { modifier } => write!(
                 f,
                 "The modifier '{modifier}' is not valid for this item in C# 1.0; \
@@ -2839,6 +3161,38 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::VoidLocal => {
                 write!(f, "Keyword 'void' cannot be used in this context")
             }
+            DiagnosticKind::ExternMemberHasNoAttributes { member } => write!(
+                f,
+                "Method, operator, or accessor '{member}' is marked external and has no \
+                 attributes on it. Consider adding a DllImport attribute to specify the external \
+                 implementation."
+            ),
+            DiagnosticKind::ExternConstructor { member } => {
+                write!(f, "Constructor '{member}' is marked external")
+            }
+            DiagnosticKind::ExternMemberHasBody { member } => {
+                write!(f, "'{member}' cannot be extern and declare a body")
+            }
+            DiagnosticKind::PatternTypeUnreachable { from, to } => write!(
+                f,
+                "An expression of type '{from}' cannot be handled by a pattern of type '{to}'."
+            ),
+            DiagnosticKind::PatternOperandHasNoValue { found } => write!(
+                f,
+                "Invalid operand for pattern match; value required, but found '{found}'."
+            ),
+            DiagnosticKind::SwitchExpressionNotExhaustive => f.write_str(
+                "The switch expression does not handle all possible values of its input type \
+                 (it is not exhaustive)."
+            ),
+            DiagnosticKind::SwitchExpressionNoBestType => {
+                f.write_str("No best type was found for the switch expression.")
+            }
+            DiagnosticKind::SwitchExpressionExceptionMissing => f.write_str(
+                "A switch expression that matches no arm throws \
+                 'System.Runtime.CompilerServices.SwitchExpressionException', which is not \
+                 defined or imported"
+            ),
             DiagnosticKind::SwitchGoverningType => write!(
                 f,
                 "A switch governing type must be sbyte, byte, short, ushort, int, uint, long, ulong, char, string, or an enum type"
@@ -2893,7 +3247,7 @@ impl fmt::Display for DiagnosticKind {
             ),
             DiagnosticKind::InitOnlyAssignment { property } => write!(
                 f,
-                "Init-only property or indexer '{property}' can only be assigned in an object                  initializer, or on 'this' or 'base' in an instance constructor or an 'init'                  accessor."
+ "Init-only property or indexer '{property}' can only be assigned in an object initializer, or on 'this' or 'base' in an instance constructor or an 'init' accessor."
             ),
             DiagnosticKind::PropertyCannotBeAssigned { property } => write!(
                 f,
@@ -2905,6 +3259,22 @@ impl fmt::Display for DiagnosticKind {
                  extension method '{member}' accepting a first argument of type '{type_name}' \
                  could be found (are you missing a using directive or an assembly reference?)"
             ),
+            DiagnosticKind::DeconstructWrongCardinality { found, wanted } => write!(
+                f,
+                "Cannot deconstruct a tuple of '{found}' elements into '{wanted}' variables."
+            ),
+            DiagnosticKind::MissingDeconstruct { type_name, count } => write!(
+                f,
+                "No suitable 'Deconstruct' instance or extension method was found for type \
+                 '{type_name}', with {count} out parameters and a void return type."
+            ),
+            DiagnosticKind::UninferredDeconstructionVariable { name } => write!(
+                f,
+                "Cannot infer the type of implicitly-typed deconstruction variable '{name}'."
+            ),
+            DiagnosticKind::DeclarationNotPermitted => {
+                write!(f, "A declaration is not allowed in this context.")
+            }
             DiagnosticKind::NotACollectionInitializerTarget { type_name } => write!(
                 f,
                 "Cannot initialize type '{type_name}' with a collection initializer because it \
@@ -3221,6 +3591,27 @@ impl fmt::Display for DiagnosticKind {
             } => write!(
                 f,
                 "Parameter {position} is declared as type '{written}' but should be '{expected}'"
+            ),
+            DiagnosticKind::LambdaCapturesStructThis => f.write_str(
+                "Anonymous methods, lambda expressions, query expressions, and local functions \
+                 inside structs cannot access instance members of 'this'. Consider copying 'this' \
+                 to a local variable outside the anonymous method, lambda expression, query \
+                 expression, or local function and using the local instead.",
+            ),
+            DiagnosticKind::LambdaCapturesByRefParameter { name } => write!(
+                f,
+                "Cannot use ref, out, or in parameter '{name}' inside an anonymous method, \
+                 lambda expression, query expression, or local function"
+            ),
+            DiagnosticKind::LambdaCapturesRefLocal { name } => write!(
+                f,
+                "Cannot use ref local '{name}' inside an anonymous method, lambda expression, \
+                 or query expression"
+            ),
+            DiagnosticKind::LambdaCapturesRefLikeParameter { name } => write!(
+                f,
+                "Cannot use parameter '{name}' that has ref-like type inside an anonymous \
+                 method, lambda expression, query expression, or local function"
             ),
             DiagnosticKind::LambdaReturnsValueToVoidDelegate => f.write_str(
                 "Anonymous function converted to a void returning delegate cannot return a value",

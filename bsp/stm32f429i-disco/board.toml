@@ -205,3 +205,11 @@ sck = { pin = "PF7" }
 miso = { pin = "PF8" }
 mosi = { pin = "PF9" }
 cs = { pin = "PC1", soft = true }
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "UM1670 documents an embedded ST-LINK that supports only SWD for this part, and a debug connector CN2 which the manual describes in the context of using the board's own ST-LINK. Whether CN2 is a way in to this part rather than an output to an external one has not been established here, so the exposure is unknown. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

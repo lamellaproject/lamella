@@ -3,7 +3,7 @@
 use lamella_assemble::{Diagnostic, LineMap, compile_source_with, compile_sources_with};
 use lamella_metadata::Assembly;
 use lamella_syntax::decode::decode_source;
-use lamella_syntax::lexer::{LexOptions, Normalization};
+use lamella_syntax::lexer::{LexOptions, Normalization, OutputKind};
 use lamella_syntax::version::{LanguageVersion, LanguageVersionError};
 use std::process::ExitCode;
 
@@ -93,6 +93,11 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             lex.unsafe_code = true;
         } else if matches!(arg.as_str(), "/unsafe-") {
             lex.unsafe_code = false;
+        } else if matches!(
+            arg.as_str(),
+            "/features:FileBasedProgram" | "--file-based" | "--features=FileBasedProgram"
+        ) {
+            lex.file_based = true;
         } else if matches!(arg.as_str(), "/typedref" | "--typedref") {
             lex.typedref = true;
         } else if matches!(arg.as_str(), "/native-interop" | "--native-interop") {
@@ -113,7 +118,22 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     return Err(format!("/langversion:{version} is not a C# language version"));
                 }
             }
-        } else if arg.starts_with("/target:") || arg == "/nologo" {
+        } else if let Some(kind) = arg.strip_prefix("/target:") {
+            lex.target = match kind {
+                "exe" | "winexe" => OutputKind::Executable,
+                "library" => OutputKind::Library,
+                "module" => {
+                    return Err(String::from(
+                        "LAM0001: /target:module is permitted by the selected dialect and this build cannot produce it: a module carries no assembly manifest",
+                    ));
+                }
+                _ => {
+                    return Err(String::from(
+                        "CS2019: Invalid target type for /target: must specify 'exe', 'winexe', 'library', or 'module'",
+                    ));
+                }
+            };
+        } else if arg == "/nologo" {
         } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
             return Err(format!("unknown option '{arg}'\n{USAGE}"));
         } else {
@@ -147,8 +167,10 @@ usage: lcsc <source.cs>... [options]
                           here and the flag itself is not accepted -- it would never do anything,
                           and a flag that never does anything claims there is a mode it turns off.
                           This is what lets a corlib compile as an ordinary compilation.
-  /target:<kind>          accepted and ignored: the output kind follows from the sources and
-                          /out. Present so a csc-shaped command line is not rejected over it.
+  /target:<kind>          exe / winexe / library. An executable target REQUIRES an entry point
+                          (CS5001 without one); a library target never emits one. Omitted, the
+                          kind follows from the sources: a static Main makes an executable.
+                          /target:module is refused -- a module carries no assembly manifest.
   /nologo                 accepted and ignored; there is no banner to suppress.
   /define:A;B             seed #if preprocessor symbols (9.5.3); ';' or ',' separated, repeatable.
   /langversion:<v>        the C# dialect to compile as: a number (1, 2, 7.2, 11), an ISO name
@@ -157,6 +179,14 @@ usage: lcsc <source.cs>... [options]
                           refused by name (LAM0001). Also --langversion=<v>, --langversion:<v>.
   /debug-                 suppress the Portable PDB (it is emitted by default).
   /normalize-identifiers  fold identifiers to NFC (ECMA-334 9.4.2; off by default, to match csc).
+  /features:FileBasedProgram
+                          compile as a FILE-BASED PROGRAM, which is what admits the `#:` directives
+                          (`#:package`, `#:sdk`, `#:property`, `#:project`, `#:include`) and a `#!`
+                          shebang. Off by default: in an ordinary compilation both are refused by
+                          name, because nothing there would act on a directive. The directives are
+                          carried out to the driver unvalidated -- which names exist, and what each
+                          argument must look like, belongs to whatever acts on them, not here. Also
+                          --file-based, --features=FileBasedProgram.
   /unsafe                 permit unsafe code (pointers, stackalloc, fixed); off by default, as
                           csc's is. Writing `unsafe` without it is CS0227. Also /unsafe+, /unsafe-.
   /typedref               enable csc's undocumented __makeref/__refvalue/__reftype (not in ECMA-334).

@@ -1766,6 +1766,7 @@ fn lower_op(
                 }
                 bc::Const::Bool(b) => i64::from(*b),
                 bc::Const::None
+                | bc::Const::Ellipsis
                 | bc::Const::Str(_)
                 | bc::Const::KwNames(_)
                 | bc::Const::ArgKinds(_)
@@ -2221,6 +2222,7 @@ fn lower_op(
         | bc::Op::CallEx { .. }
         | bc::Op::BuildClass
         | bc::Op::BuildClassKw { .. }
+        | bc::Op::BuildClassEx { .. }
         | bc::Op::SetAttr { .. }
         | bc::Op::ListAppend
         | bc::Op::SetAdd

@@ -449,6 +449,7 @@ fn walk_locals<'a>(stmt: &'a Stmt, visit: &mut dyn FnMut(&'a TypeRef, &str)) {
         StmtKind::While { body, .. }
         | StmtKind::DoWhile { body, .. }
         | StmtKind::ForEach { body, .. }
+        | StmtKind::ForEachDeconstruction { body, .. }
         | StmtKind::Lock { body, .. }
         | StmtKind::Using { body, .. }
         | StmtKind::Checked(body)

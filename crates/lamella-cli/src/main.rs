@@ -19,6 +19,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("devices") => devices::devices_command(rest),
         Some("run") => program::run_command(rest),
+        Some("board-module-run") => program::board_module_run_command(rest),
         Some("build") => program::build_command(rest),
         Some("flash") => flash::flash_command(rest),
         Some("deploy") => deploy::deploy_command(rest),
@@ -46,12 +47,15 @@ fn main() -> ExitCode {
 }
 
 /// This binary's own package version.
+///
+/// Whatever the workspace states, reported as-is. A consumer asking for a version gets the one
+/// this build carries and can pin to it; refusing to answer would tell them nothing.
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "\
 usage:
-  lamella devices [--identify]                       what is attached, and how to name it
-  lamella run <file> [--board <id> | --target <t>]   run it here, or ON a board with output here
+  lamella devices [--identify] [--all-devices]       what is attached, and how to name it
+  lamella run <file> [--target <t>]                  run it here, or ON a board with output here
   lamella build <file> [--board <id>] [--format f]   make an artifact; nothing is written
   lamella deploy <file> --target <t> | --board <id>  compile it and put it on a board
   lamella flash <image> --board <id> [--probe <s>]   write bytes that are ALREADY an image
@@ -111,6 +115,37 @@ mod tests {
                 "the usage does not mention `lamella {verb}`"
             );
         }
+    }
+
+    /// **TWO STRINGS STATE `run`'s OPTIONS AND BOTH HAVE TO AGREE.** This file's `USAGE` is the
+    /// one-line summary and `program.rs`'s `RUN_USAGE` is the verb's own help; `--board` was
+    /// removed from the verb and only the second was updated, so the summary advertised a flag the
+    /// verb refuses. A reader meets the summary FIRST.
+    #[test]
+    fn the_summary_and_the_verbs_own_help_agree_about_run() {
+        let summary = super::USAGE
+            .lines()
+            .find(|line| line.contains("lamella run <file>"))
+            .expect("the summary names `run`");
+        assert!(
+            !summary.contains("--board"),
+            "`run` has no --board; the summary must not offer one: {summary}"
+        );
+        assert!(summary.contains("--target"), "and it keeps the one it has: {summary}");
+    }
+
+    /// **ONE VERB IS DISPATCHED AND DELIBERATELY NOT DOCUMENTED**, so the test above cannot simply
+    /// walk the dispatcher -- and its absence has to be asserted rather than left to the fact that
+    /// nobody added it. `board-module-run` is what `run --board` was: the program on this machine
+    /// against a board's generated `board` module, which is a fact table and not hardware. It is
+    /// internal, it announces its own deprecation when run, and a future editor tidying the usage
+    /// into agreement with the dispatcher would undo a decision rather than fix an oversight.
+    #[test]
+    fn the_internal_verb_stays_out_of_the_usage() {
+        assert!(
+            !super::USAGE.contains("board-module-run"),
+            "`board-module-run` is undocumented on purpose; adding it to the usage publishes it"
+        );
     }
 
     /// The usage has to say the thing that stops somebody buying hardware to try Lamella.

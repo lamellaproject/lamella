@@ -18,7 +18,7 @@ lamella-probe-core = { path = "../lamella-probe-core" }
 # resolve to nothing while reporting that it had looked.
 lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
 # The per-part flash controllers these backends sequence.
-lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", features = ["microbit"] }
+lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
 lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350" }
 lamella-cmsis-dap-rp2040 = { path = "../lamella-cmsis-dap-rp2040" }
 lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32" }

@@ -51,7 +51,14 @@ namespace System.Threading
         public int ManagedThreadId { get { return _id == 0 ? 1 : _id + 1; } }
 #endif
 
-        public bool IsAlive { get { return true; } }
+        public bool IsAlive
+        {
+            get
+            {
+                if (_id == 0) return _start == null;
+                return !ThreadFinished(_id);
+            }
+        }
 
         public ThreadPriority Priority
         {
@@ -66,12 +73,29 @@ namespace System.Threading
             }
         }
 
+        public ThreadState ThreadState
+        {
+            get
+            {
+                if (_id == 0)
+                {
+                    if (_start == null) return ThreadState.Running;
+                    if (_isBackground) return ThreadState.Unstarted | ThreadState.Background;
+                    return ThreadState.Unstarted;
+                }
+                if (ThreadFinished(_id)) return ThreadState.Stopped;
+                if (_isBackground) return ThreadState.Background;
+                return ThreadState.Running;
+            }
+        }
 
         public string Name
         {
             get { return _name; }
             set { _name = value; }
         }
+
+        public static AppDomain GetDomain() { return AppDomain.CurrentDomain; }
 
         public static void Sleep(int millisecondsTimeout) { SleepThread(millisecondsTimeout); }
 
@@ -95,6 +119,7 @@ namespace System.Threading
 
         [Lamella.Runtime.RuntimeProvided] private static int StartThread(ThreadStart start, bool isBackground) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static void JoinThread(int id) { }
+        [Lamella.Runtime.RuntimeProvided] private static bool ThreadFinished(int id) { return false; }
         [Lamella.Runtime.RuntimeProvided] private static void JoinThreadTimeout(int id, int millisecondsTimeout) { }
         [Lamella.Runtime.RuntimeProvided] private static bool JoinTimedOut() { return false; }
         [Lamella.Runtime.RuntimeProvided] private static void YieldThread() { }

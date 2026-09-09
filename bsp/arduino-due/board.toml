@@ -51,3 +51,11 @@ mck_hz = 84000000           # the routed master clock this plan reaches, and the
                             # part's documented fmax, which is what PINS the crystal: the vendor's
                             # own chain multiplies MAINCK by exactly 7 to land here, and no other
                             # rate inside the measured MAINCK bound does that.
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "none"
+recovery = "unknown"
+source = "The programming port is an externally bridged UART: an ATmega16U2 bridges the part's UART on PA8 and PA9, which is a serial bridge and not a debug probe. No document for this board is held, so neither where its debug signals reach nor what survives a write to flash is established. Both are recorded as unknown and both are document requests."

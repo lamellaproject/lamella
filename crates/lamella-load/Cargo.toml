@@ -65,8 +65,8 @@ real-memory = []
 # lamella-host-tests crate, keeping their host-only dependencies out of this crate.
 # Source-level debugger names: the loader records each method's qualified name + argument names (for
 # the DAP backend / Session::this). Default ON (dev + the debugger); a constrained, non-debug profile
-# omits it -- for the full corlib that drops ~300 KB of resident Strings, with only graceful loss of
-# debugger name display. Nothing functional depends on the names.
+# omits it -- for a full-surface corlib that drops on the order of 175 KiB of resident
+# Strings, with only graceful loss of debugger name display. Nothing functional depends on the names.
 debug-names = []
 # Execute-in-place (XIP) foundation: forwards to lamella-cil-runtime/flash-image so the loader borrows
 # each method's raw CIL as a `&'static [u8]` from the flash PE (see RawCil) instead of copying it into

@@ -74,20 +74,26 @@ pub enum Fold {
 }
 
 impl Fold {
+    /// This canonicalization applied to one code point.
+    ///
+    /// **Exposed because a second question needs it and answering that one separately is how a
+    /// rule with several implementations begins.** [`Fold::same`] compares two characters, which is
+    /// what a literal and a class member need. A word-boundary assertion asks something else --
+    /// "does this character canonicalize INTO a set" -- and that cannot be phrased as one `same`
+    /// call against a set of sixty-three members without scanning all of them.
+    #[must_use]
+    pub fn canonical(self, ch: u32) -> u32 {
+        match self {
+            Fold::None => ch,
+            Fold::Ascii => fold_ascii(ch),
+            Fold::Simple => lamella_unicode::simple_case_fold(ch).unwrap_or(ch),
+        }
+    }
+
     /// Whether two code points are the same character under this canonicalization.
     #[must_use]
     pub fn same(self, left: u32, right: u32) -> bool {
-        if left == right {
-            return true;
-        }
-        match self {
-            Fold::None => false,
-            Fold::Ascii => fold_ascii(left) == fold_ascii(right),
-            Fold::Simple => {
-                let fold = |ch: u32| lamella_unicode::simple_case_fold(ch).unwrap_or(ch);
-                fold(left) == fold(right)
-            }
-        }
+        left == right || self.canonical(left) == self.canonical(right)
     }
 }
 
@@ -138,7 +144,15 @@ pub enum Instruction {
     /// Sets a contiguous run of capture slots back to "did not participate".
     ClearCaptures { from: u32, to: u32 },
 
-    Assert { assertion: Assertion, multiline: bool },
+    /// A zero-width test.
+    ///
+    /// **`fold` is here for the word-boundary assertions, and it is the fourth instruction to need
+    /// one.** A boundary is defined over a set of word characters, and that set is not fixed: the
+    /// standard builds it as the ASCII word characters plus every character that CANONICALIZES to
+    /// one, which under a Unicode fold admits the long s and the Kelvin sign. It rides on the
+    /// instruction rather than on the pattern because a scoped modifier -- `(?i:\b)` -- turns
+    /// folding on for one subexpression and the assertions outside it must not see it.
+    Assert { assertion: Assertion, multiline: bool, fold: Fold },
 
     /// Matches the text a capturing group matched.
     ///
@@ -148,7 +162,11 @@ pub enum Instruction {
     /// **This is the one comparison the front end cannot fold for**, so `fold` is not an
     /// optimization here: `/(.)\1/` contains no cased character to widen, and both sides arrive
     /// from the subject at match time.
-    Backreference { group: u32, direction: Direction, fold: Fold },
+    ///
+    /// `start` and `len` address [`Program::groups`], because a reference may name SEVERAL groups
+    /// -- see [`crate::ast::Node::Backreference`]. At most one of them can have participated, so
+    /// finding the one that did is a scan of a list that is almost always one long.
+    Backreference { start: u32, len: u32, direction: Direction, fold: Fold },
 
     /// Records the current position into a progress register, for the empty-iteration guard.
     Mark { register: u32 },
@@ -195,6 +213,12 @@ pub struct Program {
     pub instructions: Vec<Instruction>,
     /// The class ranges every [`Instruction::Class`] indexes into.
     pub classes: Vec<ClassEntry>,
+    /// The group numbers every [`Instruction::Backreference`] indexes into.
+    ///
+    /// A side table for the same reason `classes` is one: a reference names one group in almost
+    /// every pattern, and putting a list inline would make the hottest enum in the crate carry an
+    /// allocation for a case that is nearly always a single number.
+    pub groups: Vec<u32>,
     /// Capture slots, which is twice the group count plus the two for the whole match.
     pub slots: usize,
     /// Counter registers used by counted repetitions.

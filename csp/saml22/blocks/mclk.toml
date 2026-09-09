@@ -1,0 +1,47 @@
+# The SAML22 Main Clock block: the peripheral-bus gate registers. Offsets are MCLK-base-relative;
+# the base lives in ../instances.toml.
+#
+# FOUR MASK REGISTERS ON THIS FAMILY -- AHB plus APB A, B and C. The SAM L21 has five (through
+# APB-E) and the SAM C21 four with a different allocation. Which register gates an instance is
+# therefore a per-instance fact and the instance rows carry `apb_mask_offset` for it: PORT is in
+# APBBMASK here, and the SERCOMs are in APBCMASK.
+
+[table]
+kind = "block"
+family = "saml22"
+block = "mclk"
+sources = [
+    "SAM L22 Family Data Sheet DS60001465D section 16.8 (MCLK Register Description), per-register Offset headings: AHBMASK 0x10, APBAMASK 0x14, APBBMASK 0x18, APBCMASK 0x1C",
+    "DS60001465D section 16.8.8 (APBB Mask) for PORT's bit and 16.8.9 (APBC Mask) for the SERCOM bits, with the APBC positions corroborated independently by Table 12-1's APB Clock Index column",
+]
+notes = [
+    "THE SERCOM BITS ARE 1..6 AND THE ORIGIN DIFFERS ON EVERY RELATIVE. The SAM D21 line starts its SERCOMs at APBCMASK bit 2, the SAM C21 at bit 1, the SAM L21 at bit 0, and this family at bit 1. A bit carried across produces a peripheral that never clocks while every register reads back what was written.",
+    "APBCMASK COMES UP MOSTLY SET. Its reset value is 0x0007FFFF, which covers bits 0 through 18 -- so the SERCOM gates are ENABLED out of reset here, where the SAM D21 line's come up clear. A driver that enables its instance's bit is redundant rather than wrong, and a read-modify-write is still required because other peripherals share the register.",
+    "PORT IS GATED FROM APBBMASK BIT 3, at 0x41006000 behind AHB-APB Bridge B. Table 12-1 marks its APB clock 'Enabled at Reset: Y'.",
+    "THE BIT POSITIONS COME FROM TWO STATEMENTS RATHER THAN FROM THE BIT-FIELD DIAGRAM ALONE. The diagram's rows extract with Access and Reset lines interleaved between the bit numbers and the names; Table 12-1's APB Clock Index column gives the same six numbers independently, which is what makes the reading safe.",
+    "DECLARED SUBSET: AHBMASK and APBAMASK are transcribed as registers with no fields, because they are part of the offset set a reader checks an address against and nothing below names a bit in either.",
+]
+
+[registers.AHBMASK]
+offset = 0x10
+width = 32
+fields = { }
+notes = "AHB bus clock gates. Transcribed for completeness of the offset set; no instance row names a bit in it today."
+
+[registers.APBAMASK]
+offset = 0x14
+width = 32
+fields = { }
+notes = "APB-A gates -- the always-on core of the clock and reset system on this family. No instance row names a bit in it today."
+
+[registers.APBBMASK]
+offset = 0x18
+width = 32
+fields = { PORT = [3, 1] }
+notes = "APB-B gates, and on this family that includes PORT at bit 3. Table 12-1 marks PORT's APB clock enabled at reset, so a GPIO driver that assumes the reset state is correct today; the bit is stated so that a consumer which ever gates it has the register rather than a guess."
+
+[registers.APBCMASK]
+offset = 0x1C
+width = 32
+fields = { SERCOM0 = [1, 1], SERCOM1 = [2, 1], SERCOM2 = [3, 1], SERCOM3 = [4, 1], SERCOM4 = [5, 1], SERCOM5 = [6, 1] }
+notes = "APB-C gates. SERCOM0..5 are bits 1..6, and the register's reset value of 0x0007FFFF leaves all six SET. Read-modify-write in drivers, since other peripherals share the register."

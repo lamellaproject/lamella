@@ -10,6 +10,7 @@ pub mod bound;
 pub mod complete;
 pub mod conversion;
 pub mod declaration;
+pub mod deconstruct;
 pub mod diagnostic;
 pub mod flow;
 mod infer;
@@ -27,9 +28,10 @@ pub use complete::{
 };
 pub use bound::{
     Binder, BoundExpr, BoundExprKind, BoundInitializer, BoundInitializerTarget,
-    BoundMemberInitializer, BoundMemberInitializerValue, ConversionKind, DeclaredField,
+    BoundSwitchArm,
+    BoundMemberInitializer, BoundMemberInitializerValue, Capture, ConversionKind, DeclaredField,
     FieldInstantiation, FieldReference, ConvertingStep, MethodInstantiation, MethodReference,
-    SubmissionBinding, TypeInstantiation, bind_expression, constant_literal_value,
+    ScopeId, SubmissionBinding, TypeInstantiation, bind_expression, constant_literal_value,
     literal_int_value,
 };
 pub use conversion::{has_implicit_conversion, nullable_underlying};

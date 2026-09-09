@@ -6,10 +6,38 @@ pub const BOARD_VENDOR: &str = "Microchip";
 pub const CARRIER_USB_VID: u16 = 0x03EB;
 pub const CARRIER_USB_PID: u16 = 0x2175;
 
+/// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+/// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+/// peripherals of the same kind can share no register at all, so a consumer that selects a
+/// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+/// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+/// name a driver; and a uart is a different register map on every family, so the kind does
+/// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+pub const VCP_DRIVER_FAMILY: &str = "same54-sercom";
+
+pub const VCP_SERCOM_BASE: u32 = 0x43000400;
+pub const VCP_GCLK_PCHCTRL_REG: u32 = 0x40001D0C;
+pub const VCP_GCLK_PCHCTRL_VALUE: u32 = 0x40;
+pub const VCP_APB_MASK_REG: u32 = 0x40000820;
+pub const VCP_APB_MASK: u32 = 0x2;
+pub const VCP_PMUX_REG: u32 = 0x410080B8;
+pub const VCP_PMUX_PAIR: u32 = 0x22;
+pub const VCP_PMUX_TX_REG: u32 = 0x410080B8;
+pub const VCP_PMUX_TX_MASK: u32 = 0xF;
+pub const VCP_PMUX_TX_VALUE: u32 = 0x2;
+pub const VCP_PMUX_RX_REG: u32 = 0x410080B8;
+pub const VCP_PMUX_RX_MASK: u32 = 0xF0;
+pub const VCP_PMUX_RX_VALUE: u32 = 0x20;
+pub const VCP_PINCFG_TX_REG: u32 = 0x410080D0;
+pub const VCP_PINCFG_RX_REG: u32 = 0x410080D1;
+pub const VCP_TXPO: u32 = 0;
+pub const VCP_RXPO: u32 = 1;
+pub const VCP_BAUD_115200_DFLL48M_48MHZ: u32 = 0xF62C;
+
 pub const LED0_PORT_BASE: u32 = 0x41008000;
 pub const LED0_PIN: u32 = 14;
 pub const LED0_MASK: u32 = 0x4000;
-pub const LED0_ACTIVE_LOW: u32 = 1;
+pub const LED0_ACTIVE_LOW: u32 = 0;
 pub const BUTTON0_PORT_BASE: u32 = 0x41008000;
 pub const BUTTON0_PIN: u32 = 15;
 pub const BUTTON0_MASK: u32 = 0x8000;

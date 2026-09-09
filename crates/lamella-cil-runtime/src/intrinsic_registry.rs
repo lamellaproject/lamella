@@ -1,7 +1,7 @@
 //! The intrinsic registry: every intrinsic under a BUILD-STABLE id (FNV-1a of the
 //! function's own name), so a baked image records ids and a booting module rebinds
-//! them to this build's function pointers. Ids derive from names, so the registry is
-//! append-only by construction; a feature-gated intrinsic simply has no entry in a
+//! them to this build's function pointers. Ids derive from names, so ADDING a row can
+//! never disturb an existing one; a feature-gated intrinsic simply has no entry in a
 //! build without the feature, and an image needing it fails the rebind loudly.
 
 use crate::intrinsics::*;
@@ -26,6 +26,9 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(arg_iterator_get),
     #[cfg(feature = "varargs")]
     entry!(arg_iterator_remaining),
+    entry!(app_domain_friendly_name),
+    #[cfg(feature = "reflection")]
+    entry!(app_domain_assemblies),
     entry!(array_clear_range),
     entry!(array_copy_range),
     entry!(array_clone),
@@ -40,16 +43,12 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(assembly_get_type),
     #[cfg(feature = "reflection")]
     entry!(assembly_get_types),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(bitconverter_double_to_int64_bits),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(bitconverter_int32_bits_to_single),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(bitconverter_int64_bits_to_double),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(bitconverter_single_to_int32_bits),
     #[cfg(feature = "NETMFv4_4")]
@@ -75,6 +74,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     #[cfg(feature = "text")]
     entry!(char_to_upper),
     entry!(clock_is_set),
+    entry!(clock_monotonic_millis),
     entry!(clock_set_ticks),
     #[cfg(feature = "collections")]
     entry!(collection_contains),
@@ -112,7 +112,6 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(convert_to_byte_int),
     #[cfg(feature = "NETMFv4_4")]
     entry!(convert_to_char_int),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(convert_to_int32_double),
     entry!(datetime_now_ticks),
@@ -236,94 +235,70 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(marshal_write_int16),
     entry!(marshal_write_int32),
     entry!(marshal_write_int64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_abs_f64),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_abs_int32),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_abs_int64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_acos_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_asin_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_atan2_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_atan_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_ceiling_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_cos_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_cosh_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_exp_f64),
     #[cfg(feature = "float")]
     entry!(math_floor_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_ieee_remainder_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_log10_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_log_base_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_log_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_max_f64),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_max_int32),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_max_int64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_min_f64),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_min_int32),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_min_int64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_pow_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_round_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_sign_f64),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_sign_int32),
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_sign_int64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_sin_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_sinh_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_sqrt_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_tan_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_tanh_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_truncate_f64),
     entry!(md_array_address),
@@ -385,9 +360,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(queue_dequeue),
     #[cfg(feature = "collections")]
     entry!(queue_peek),
-    #[cfg(feature = "reflection")]
     entry!(reflect_handle_equals),
-    #[cfg(feature = "reflection")]
     entry!(reflect_handle_not_equals),
     #[cfg(feature = "finalizers")]
     entry!(reregister_finalize),
@@ -487,6 +460,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(string_trim),
     #[cfg(feature = "finalizers")]
     entry!(suppress_finalize),
+    entry!(thread_finished),
     entry!(thread_join),
     entry!(thread_join_timeout),
     entry!(thread_sleep),
@@ -516,14 +490,13 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(type_from_handle),
     #[cfg(feature = "reflection")]
     entry!(type_get_assembly),
-    #[cfg(feature = "reflection")]
     entry!(type_get_base_type),
     #[cfg(feature = "reflection")]
     entry!(type_get_constructor),
+    entry!(type_get_element_type),
     entry!(type_get_field),
     #[cfg(feature = "reflection")]
     entry!(type_get_fields),
-    #[cfg(feature = "reflection")]
     entry!(type_get_full_name),
     entry!(type_get_method),
     #[cfg(feature = "reflection")]
@@ -536,19 +509,16 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(type_get_property),
     #[cfg(feature = "reflection")]
     entry!(type_is_abstract),
-    #[cfg(feature = "reflection")]
     entry!(type_is_array),
-    #[cfg(feature = "reflection")]
+    entry!(type_is_assignable_from),
     entry!(type_is_class),
-    #[cfg(feature = "reflection")]
     entry!(type_is_enum),
-    #[cfg(feature = "reflection")]
     entry!(type_is_interface),
     #[cfg(feature = "reflection")]
     entry!(type_is_not_public),
+    entry!(type_is_pointer),
     #[cfg(feature = "reflection")]
     entry!(type_is_public),
-    #[cfg(feature = "reflection")]
     entry!(type_is_value_type),
     entry!(type_property_custom_attributes),
     entry!(value_type_equals),

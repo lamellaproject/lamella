@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod backends;
 pub mod bootsel;
 pub mod contracts;
+pub mod identity;
 pub mod manifest;
 
 use lamella_catalog as catalog;
@@ -596,6 +597,33 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
+        board: "arduino-zero",
+        aot_target: None,
+        programmer: Programmer::EdbgOnboard {
+            family: SamFamily::Samd21,
+            probe_id: 0x2157,
+        },
+        alternate: None,
+    },
+    Programming {
+        board: "samd21-cnano",
+        aot_target: None,
+        programmer: Programmer::EdbgOnboard {
+            family: SamFamily::Samd21,
+            probe_id: 0x2175,
+        },
+        alternate: None,
+    },
+    Programming {
+        board: "samr21-xpro",
+        aot_target: None,
+        programmer: Programmer::EdbgOnboard {
+            family: SamFamily::Samd21,
+            probe_id: 0x2111,
+        },
+        alternate: None,
+    },
+    Programming {
         board: "atsamd11-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
@@ -619,6 +647,15 @@ pub const PROGRAMMING: &[Programming] = &[
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
             probe_id: 0x2111,
+        },
+        alternate: None,
+    },
+    Programming {
+        board: "same51-cnano",
+        aot_target: None,
+        programmer: Programmer::EdbgOnboard {
+            family: SamFamily::Same54,
+            probe_id: 0x2175,
         },
         alternate: None,
     },
@@ -1207,8 +1244,11 @@ pub const UF2_BLOCK: usize = 512;
 /// **IT NAMES WHAT IS MISSING RATHER THAN REPORTING A CAPABILITY GAP.** The reader's question is
 /// "can I use my board", and the honest answer distinguishes a board nobody has taught this tool
 /// about from one that cannot work -- they are completely different waits.
+///
+/// **NO BUILD OF THIS TOOL WRITES A BOARD THAT ANOTHER BUILD REFUSES**, so the wording never
+/// implies one does. A route is a row in [`PROGRAMMING`], not a cargo feature.
 pub fn cannot_write(board: &str) -> String {
-    let mut text = format!("lamella flash: this build cannot write {board}.\n\n");
+    let mut text = format!("lamella flash: nothing states how to write {board}.\n\n");
     text.push_str("it can write:\n");
     for row in PROGRAMMING {
         text.push_str(&format!(
@@ -1239,13 +1279,15 @@ mod tests {
         for onboard in [Programmer::MicrobitV1Daplink, Programmer::MicrobitV2Daplink] {
             assert!(
                 onboard.usb_identity().is_some(),
-                "an on-board debugger resolves within its own vendor/product, so nothing else                  attached can compete with it"
+                "an on-board debugger resolves within its own vendor/product, so nothing else \
+                 attached can compete with it"
             );
         }
         assert_eq!(
             Programmer::Rp2350Probe { base: RP2_XIP_BASE }.usb_identity(),
             None,
-            "a Pico's probe is external by definition; refusing several is the same policy with              nothing to filter on"
+            "a Pico's probe is external by definition; refusing several is the same policy with \
+             nothing to filter on"
         );
     }
 

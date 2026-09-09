@@ -50,6 +50,20 @@ pub enum Trap {
     /// number. In Python that matters more than it looks: `1 / 3` is a float with no float
     /// literal in it, and `x ** n` is a float exactly when `n` is negative.
     FloatUnavailable,
+    /// A `complex` was needed and this build has none -- the `complex` capability is compiled out.
+    ///
+    /// **Its own variant for the same reason [`Trap::FloatUnavailable`] has one**, and that reason
+    /// was already written down there: `Unsupported` renders as the bare word "Unsupported" on a
+    /// device serve, which names nothing. A `1j` literal used to answer exactly that -- and worse
+    /// than the float case, it is not a Python exception at all, so a program could not catch it
+    /// and the run ended there. This one says COMPLEX IS ABSENT FROM THIS BUILD, catchably.
+    ///
+    /// Complex has no single allocation choke point of its own, unlike float, so this is reached
+    /// from the sites that name it rather than from everything that could produce a complex. One
+    /// divergence follows from that, and it is stated where it happens rather than only here: a
+    /// negative base to a fractional power yields `NaN` on a build without complex, where CPython
+    /// yields a complex number -- see `float_pow`.
+    ComplexUnavailable,
     /// An integer result overflowed the fixnum range. Python's `int` has an unlimited
     /// range (data model, Numbers); the interpreter traps the overflow rather than
     /// wrapping silently.

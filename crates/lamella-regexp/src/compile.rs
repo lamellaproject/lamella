@@ -71,6 +71,7 @@ pub fn compile(node: &Node, groups: u32, options: Options) -> Program {
     let mut builder = Builder {
         instructions: Vec::new(),
         classes: Vec::new(),
+        groups: Vec::new(),
         counters: 0,
         registers: 0,
         fold: options.fold,
@@ -85,6 +86,7 @@ pub fn compile(node: &Node, groups: u32, options: Options) -> Program {
     Program {
         instructions: builder.instructions,
         classes: builder.classes,
+        groups: builder.groups,
         slots: (groups as usize + 1) * 2,
         counters: builder.counters,
         registers: builder.registers,
@@ -94,12 +96,13 @@ pub fn compile(node: &Node, groups: u32, options: Options) -> Program {
 struct Builder {
     instructions: Vec<Instruction>,
     classes: Vec<ClassEntry>,
+    groups: Vec<u32>,
     counters: usize,
     registers: usize,
     /// The canonicalization in force at the node being lowered.
     ///
     /// **THE SINGLE SITE THAT DECIDES `fold` FOR EVERY INSTRUCTION THAT COMPARES A CHARACTER.**
-    /// Three emit sites read it and none of them decides it, which is what keeps one rule from
+    /// Four emit sites read it and none of them decides it, which is what keeps one rule from
     /// gaining a case in only one of its implementations -- without making the rule pattern-wide,
     /// which is a different thing and would foreclose a scoped inline modifier. A construct that
     /// scopes folding sets this over its subexpression and restores it after.
@@ -123,6 +126,13 @@ impl Builder {
         let start = self.classes.len() as u32;
         self.classes.extend_from_slice(entries);
         (start, entries.len() as u32)
+    }
+
+    /// Interns a backreference's group numbers into their own shared table, answering its span.
+    fn intern_groups(&mut self, groups: &[u32]) -> (u32, u32) {
+        let start = self.groups.len() as u32;
+        self.groups.extend_from_slice(groups);
+        (start, groups.len() as u32)
     }
 
     fn node(&mut self, node: &Node, direction: Direction) {
@@ -179,11 +189,23 @@ impl Builder {
                 self.emit(Instruction::Assert {
                     assertion: *assertion,
                     multiline: self.options.multiline,
+                    fold: self.fold,
                 });
             }
 
-            Node::Backreference(group) => {
-                self.emit(Instruction::Backreference { group: *group, direction, fold: self.fold });
+            Node::Backreference(groups) => {
+                let (start, len) = self.intern_groups(groups);
+                self.emit(Instruction::Backreference { start, len, direction, fold: self.fold });
+            }
+
+            Node::Modified { fold, multiline, node } => {
+                let outer_fold = self.fold;
+                let outer_multiline = self.options.multiline;
+                self.fold = *fold;
+                self.options.multiline = *multiline;
+                self.node(node, direction);
+                self.fold = outer_fold;
+                self.options.multiline = outer_multiline;
             }
 
             Node::Look { behind, negate, node } => {
@@ -321,7 +343,9 @@ fn walk_groups(node: &Node, lowest: &mut u32, highest: &mut u32) {
                 walk_groups(part, lowest, highest);
             }
         }
-        Node::Repeat { node, .. } | Node::Look { node, .. } => walk_groups(node, lowest, highest),
+        Node::Repeat { node, .. } | Node::Look { node, .. } | Node::Modified { node, .. } => {
+            walk_groups(node, lowest, highest);
+        }
         Node::Empty
         | Node::Char(_)
         | Node::Class { .. }
@@ -367,6 +391,7 @@ mod tests {
                 Instruction::Match,
             ],
             classes: Vec::new(),
+            groups: Vec::new(),
             slots: 2,
             counters: 0,
             registers: 0,

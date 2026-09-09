@@ -1789,9 +1789,10 @@ impl Interpreter {
     /// span, kind byte, declarator run. One function because they are one operation; the tags differ
     /// only in where the declaration was written.
     ///
-    /// The initializer is evaluated BEFORE the target is bound, and both are walked. The target
-    /// used to be decoded on the reasoning that a binding pattern is a small subtree; a pattern
-    /// DEFAULT is an arbitrary expression, so it was not bounded at all.
+    /// The initializer is evaluated BEFORE the target is bound, and BOTH are walked. A binding
+    /// pattern looks like a small subtree, but a pattern DEFAULT holds an arbitrary expression --
+    /// so the target's depth is not bounded by the pattern's shape and it needs the same walk the
+    /// initializer gets.
     fn declaration_node(
         &mut self,
         artifact: &Artifact<'_>,
@@ -3197,7 +3198,7 @@ impl Interpreter {
                     let Ok(body) = collect_body(&mut f) else {
                         break 'body self.host_error("unreadable function body");
                     };
-                    let body_scope = match self.pending_generator_body_scope.clone() {
+                    let body_scope = match self.pending_generator_body_scope.take() {
                         Some(existing) => existing,
                         None => body_environment(scope, simple),
                     };

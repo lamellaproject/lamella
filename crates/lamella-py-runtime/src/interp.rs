@@ -174,6 +174,13 @@ impl Frame {
         Ok(value)
     }
 
+    /// Whether local slot `idx` currently holds no value, trapping on an out-of-range slot. Used by
+    /// the deletes, which must distinguish "unbound it" from "there was nothing to unbind" -- a
+    /// question [`Self::load_local`] cannot answer, because it turns the second into a trap.
+    fn local_is_unbound(&self, idx: usize) -> Result<bool, Trap> {
+        Ok(self.locals.get(idx).ok_or(Trap::Malformed)?.is_unbound())
+    }
+
     /// Writes local slot `idx`, trapping on an out-of-range slot.
     fn store_local(&mut self, idx: usize, value: Value) -> Result<(), Trap> {
         *self.locals.get_mut(idx).ok_or(Trap::Malformed)? = value;
@@ -255,6 +262,7 @@ impl Frame {
 fn const_value(c: &Const) -> Result<Value, Trap> {
     match c {
         Const::None => Ok(Value::NONE),
+        Const::Ellipsis => Ok(Value::ELLIPSIS),
         Const::Bool(b) => Ok(Value::from_bool(*b)),
         Const::Int(n) => {
             if *n >= i64::from(FIXNUM_MIN) && *n <= i64::from(FIXNUM_MAX) {
@@ -2463,6 +2471,49 @@ pub(crate) fn set_attr(
 /// Dispatches a call of `callee` with `args` -- the unified callable protocol shared by the
 /// `Call` op, builtins that invoke dunders, and dunder dispatch. `depth` is the callee's call
 /// depth. Handles module functions, builtins, bound str/Python methods, and instantiating a class.
+/// The tail EVERY class header runs once its name, bases and namespace are in hand: create the
+/// class, stamp the module that defines it, tell every class-body value that defines `__set_name__`
+/// the name it was bound to, and deliver the header's keyword arguments to the nearest base's
+/// `__init_subclass__`.
+///
+/// The three class-header opcodes -- a plain header, one with keywords, and one whose bases or
+/// keywords are unpacked at run time -- differ ONLY in how they get their operands off the stack.
+/// Everything after that is one rule, so it is written once: three copies of it would each be a
+/// place for the next case to be added and missed.
+///
+/// An EMPTY `kwargs` is the plain header, not a degenerate keyword one: a class declared with no
+/// keywords must not raise when no base defines the hook. That case is reachable from the unpacking
+/// opcode as well as the plain one -- `class A(**{})` spreads to zero keywords -- which is why the
+/// distinction is drawn on the flattened list rather than on which opcode arrived here.
+fn finish_class_header(
+    name: Value,
+    bases: Value,
+    namespace: Value,
+    kwargs: &[(&str, Value)],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let class = model.new_class(name, bases, namespace)?;
+    model.set_class_module(class, model.current_module())?;
+    for (name_value, hook) in model.set_name_hooks(class) {
+        call_value(hook, &[class, name_value], functions, model, depth + 1)?;
+    }
+    match model.inherited_init_subclass(class) {
+        Some(hook) => {
+            call_value_kw(hook, &[class], kwargs, functions, model, depth + 1)?;
+        }
+        None if !kwargs.is_empty() => {
+            let class_name = model.class_display_name(class);
+            let message =
+                alloc::format!("{class_name}.__init_subclass__() takes no keyword arguments");
+            return Err(model.raise_named_exception("TypeError", &message));
+        }
+        None => {}
+    }
+    Ok(class)
+}
+
 pub(crate) fn call_value(
     callee: Value,
     args: &[Value],
@@ -4398,7 +4449,7 @@ fn drive_frames(
                     #[cfg(feature = "complex")]
                     Const::Imaginary(bits) => model.new_complex(0.0, f64::from_bits(*bits))?,
                     #[cfg(not(feature = "complex"))]
-                    Const::Imaginary(_) => return Err(Trap::Unsupported),
+                    Const::Imaginary(_) => return Err(Trap::ComplexUnavailable),
                     Const::BigInt(digits) => {
                         let big = crate::bigint::BigInt::from_decimal_str(digits)
                             .ok_or(Trap::Malformed)?;
@@ -5057,6 +5108,65 @@ fn drive_frames(
                 let module = frame.pop()?;
                 model.import_star(module)?;
             }
+            Op::BuildClassEx { site } => {
+                let [kinds, kwnames] =
+                    *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
+                let kinds = match code.consts.get(kinds as usize) {
+                    Some(Const::ArgKinds(k)) => k.clone(),
+                    _ => return Err(Trap::Malformed),
+                };
+                let names = match code.consts.get(kwnames as usize) {
+                    Some(Const::KwNames(n)) => n.clone(),
+                    _ => return Err(Trap::Malformed),
+                };
+                let namespace = match frame.class_namespace.pop() {
+                    Some(namespace) => namespace,
+                    None => frame.pop()?,
+                };
+                let mut slots = Vec::with_capacity(kinds.len());
+                for _ in 0..kinds.len() {
+                    slots.push(frame.pop()?);
+                }
+                slots.reverse();
+                let name = frame.pop()?;
+                let mut bases: Vec<Value> = Vec::new();
+                let mut kw_owned: Vec<(String, Value)> = Vec::new();
+                let mut names = names.into_iter();
+                for (kind, val) in kinds.iter().zip(slots) {
+                    match kind {
+                        0 => bases.push(val),
+                        1 => {
+                            let items =
+                                crate::builtins::collect_iterable(model, &[val], functions, depth)?;
+                            bases.extend(items);
+                        }
+                        2 => {
+                            let key = names.next().ok_or(Trap::Malformed)?;
+                            kw_owned.push((key, val));
+                        }
+                        3 => {
+                            let entries = model.dict_entries(val).ok_or(Trap::TypeError)?;
+                            for (key, value) in entries {
+                                let key = model.str_text(key)?.to_string();
+                                kw_owned.push((key, value));
+                            }
+                        }
+                        _ => return Err(Trap::Malformed),
+                    }
+                }
+                if kw_owned.iter().any(|(key, _)| key == "metaclass") {
+                    return Err(model.raise_named_exception(
+                        "TypeError",
+                        "metaclass= is not supported, including when spread from a mapping",
+                    ));
+                }
+                let bases = model.new_tuple(bases)?;
+                let kwargs: Vec<(&str, Value)> =
+                    kw_owned.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+                let class =
+                    finish_class_header(name, bases, namespace, &kwargs, functions, model, depth)?;
+                frame.push(class);
+            }
             Op::BuildClassKw { kwnames } => {
                 let names = match code.consts.get(kwnames as usize) {
                     Some(Const::KwNames(names)) => names.clone(),
@@ -5073,25 +5183,10 @@ fn drive_frames(
                 values.reverse();
                 let bases = frame.pop()?;
                 let name = frame.pop()?;
-                let class = model.new_class(name, bases, namespace)?;
-                model.set_class_module(class, model.current_module())?;
-                for (name_value, hook) in model.set_name_hooks(class) {
-                    call_value(hook, &[class, name_value], functions, model, depth + 1)?;
-                }
                 let kwargs: Vec<(&str, Value)> =
                     names.iter().map(alloc::string::String::as_str).zip(values).collect();
-                match model.inherited_init_subclass(class) {
-                    Some(hook) => {
-                        call_value_kw(hook, &[class], &kwargs, functions, model, depth + 1)?;
-                    }
-                    None => {
-                        let class_name = model.class_display_name(class);
-                        let message = alloc::format!(
-                            "{class_name}.__init_subclass__() takes no keyword arguments"
-                        );
-                        return Err(model.raise_named_exception("TypeError", &message));
-                    }
-                }
+                let class =
+                    finish_class_header(name, bases, namespace, &kwargs, functions, model, depth)?;
                 frame.push(class);
             }
             Op::BuildClass => {
@@ -5101,14 +5196,8 @@ fn drive_frames(
                 };
                 let bases = frame.pop()?;
                 let name = frame.pop()?;
-                let class = model.new_class(name, bases, namespace)?;
-                model.set_class_module(class, model.current_module())?;
-                for (name_value, hook) in model.set_name_hooks(class) {
-                    call_value(hook, &[class, name_value], functions, model, depth + 1)?;
-                }
-                if let Some(hook) = model.inherited_init_subclass(class) {
-                    call_value(hook, &[class], functions, model, depth + 1)?;
-                }
+                let class =
+                    finish_class_header(name, bases, namespace, &[], functions, model, depth)?;
                 frame.push(class);
             }
             Op::SetAttr { site } => {
@@ -5150,6 +5239,14 @@ fn drive_frames(
                 }
             }
             Op::DeleteFast(idx) => {
+                if frame.local_is_unbound(idx as usize)? {
+                    let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
+                    return Err(if frame.is_module {
+                        model.name_error(name)
+                    } else {
+                        model.unbound_local_error(name)
+                    });
+                }
                 frame.store_local(idx as usize, Value::UNBOUND)?;
                 if frame.is_module {
                     let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
@@ -5987,6 +6084,163 @@ mod tests {
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(6));
+    }
+
+    /// `class A(*(Base,))` -- the ONE case that proves the `*` slot is flattened into the base
+    /// tuple rather than passed through as a single operand: the class really inherits, so `A.x`
+    /// finds the base's member. Nothing in this tree emits `BuildClassEx` yet, so a hand-built code
+    /// object is the only way this arm runs at all.
+    #[test]
+    fn unpacked_bases_flatten_into_the_base_tuple() {
+        use Op::*;
+        let entry = code_w(
+            2,
+            0,
+            vec![
+                Const::Str("Base".into()),
+                Const::None,
+                Const::Int(5),
+                Const::Str("A".into()),
+                Const::ArgKinds(vec![1]),
+                Const::KwNames(Vec::new()),
+            ],
+            vec![String::from("x")],
+            2,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                SetupClassNamespace,
+                LoadConst(2),
+                StoreName(0),
+                BuildClass,
+                StoreFast(0),
+                LoadConst(3),
+                LoadFast(0),
+                BuildTuple(1),
+                SetupClassNamespace,
+                BuildClassEx { site: 0 },
+                StoreFast(1),
+                LoadFast(1),
+                LoadAttr { site: 1 },
+                Return,
+            ],
+            vec![[4, 5], [0, 0]],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(5));
+    }
+
+    /// `class A(**{'metaclass': M})` is REFUSED BY NAME, and this is the only place it can be: the
+    /// compiler refuses `metaclass=` where it is spelled out, and cannot see through a dict. The
+    /// outcome this test exists to forbid is the silent one -- a class that builds while the
+    /// metaclass it was given is dropped.
+    #[test]
+    fn a_metaclass_spread_from_a_mapping_is_refused_by_name() {
+        use Op::*;
+        let entry = code_w(
+            0,
+            0,
+            vec![
+                Const::Str("A".into()),
+                Const::Str("metaclass".into()),
+                Const::Int(1),
+                Const::ArgKinds(vec![3]),
+                Const::KwNames(Vec::new()),
+            ],
+            Vec::new(),
+            0,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                LoadConst(2),
+                BuildDict(1),
+                SetupClassNamespace,
+                BuildClassEx { site: 0 },
+                Return,
+            ],
+            vec![[3, 4]],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        assert_eq!(run(&entry, &Functions::default(), &[], &mut model), Err(Trap::Raised));
+        let raised = model.take_pending_exception().expect("an exception object");
+        assert_eq!(model.exception_type_name(raised), Some("TypeError"));
+        assert!(
+            model.display(raised).unwrap().contains("metaclass"),
+            "the refusal has to NAME the thing it refused"
+        );
+    }
+
+    /// `class A(**{})` spreads to ZERO keywords, and that is a plain class header: it must build,
+    /// and it must not raise merely because no base defines `__init_subclass__`.
+    ///
+    /// The case exists only here -- no compiler emits a keyword class header with an empty name
+    /// list -- so a keyword-form tail copied into this arm would refuse a program CPython accepts.
+    #[test]
+    fn an_empty_mapping_spread_is_a_plain_class_header() {
+        use Op::*;
+        let entry = code_w(
+            0,
+            0,
+            vec![
+                Const::Str("A".into()),
+                Const::ArgKinds(vec![3]),
+                Const::KwNames(Vec::new()),
+            ],
+            Vec::new(),
+            0,
+            vec![
+                LoadConst(0),
+                BuildDict(0),
+                SetupClassNamespace,
+                BuildClassEx { site: 0 },
+                Return,
+            ],
+            vec![[1, 2]],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
+        assert!(model.is_class(result), "an empty spread builds an ordinary class");
+    }
+
+    /// A keyword that arrives through a `**` spread is CARRIED to the same destination a spelled-out
+    /// one has -- the nearest base's `__init_subclass__` -- rather than dropped on the way. With no
+    /// base defining the hook there is nothing that could consume it, and the refusal naming the
+    /// hook is the evidence the key survived the flattening.
+    #[test]
+    fn keywords_spread_from_a_mapping_reach_the_init_subclass_check() {
+        use Op::*;
+        let entry = code_w(
+            0,
+            0,
+            vec![
+                Const::Str("A".into()),
+                Const::Str("tag".into()),
+                Const::Str("x".into()),
+                Const::ArgKinds(vec![3]),
+                Const::KwNames(Vec::new()),
+            ],
+            Vec::new(),
+            0,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                LoadConst(2),
+                BuildDict(1),
+                SetupClassNamespace,
+                BuildClassEx { site: 0 },
+                Return,
+            ],
+            vec![[3, 4]],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        assert_eq!(run(&entry, &Functions::default(), &[], &mut model), Err(Trap::Raised));
+        let raised = model.take_pending_exception().expect("an exception object");
+        assert_eq!(model.exception_type_name(raised), Some("TypeError"));
+        assert_eq!(
+            model.display(raised).unwrap(),
+            "A.__init_subclass__() takes no keyword arguments"
+        );
     }
 
     #[test]

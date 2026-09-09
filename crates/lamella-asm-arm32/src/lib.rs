@@ -11,6 +11,6 @@ pub mod register;
 pub mod target;
 
 pub use cond::Cond;
-pub use encoder::{AssembleError, Assembled, Encoder, Label, Reloc, RelocKind};
+pub use encoder::{AssembleError, Assembled, Encoder, FrameTrack, Label, Reloc, RelocKind};
 pub use register::Reg;
 pub use target::Profile;

@@ -290,11 +290,12 @@ dependencies = [
  "lamella-cil",
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
+ "lamella-dwarf",
  "lamella-elf",
  "lamella-flash-format",
  "lamella-generics",
  "lamella-ir",
- "lamella-link",
+ "lamella-linker",
  "lamella-metadata",
  "lamella-probe",
  "lamella-probe-core",
@@ -363,6 +364,7 @@ dependencies = [
  "lamella-cil",
  "lamella-decimal",
  "lamella-net-core",
+ "lamella-pin-events",
  "lamella-reactor",
  "lamella-token",
  "lamella-wtf8",
@@ -384,6 +386,7 @@ dependencies = [
  "lamella-flash-backend",
  "lamella-flash-format",
  "lamella-flash-routes",
+ "lamella-js-frontend",
  "lamella-load",
  "lamella-metadata",
  "lamella-probe",
@@ -414,9 +417,8 @@ dependencies = [
  "lamella-asm-arm32",
  "lamella-cmsis-dap",
  "lamella-elf",
- "lamella-firmware",
  "lamella-ir",
- "lamella-link",
+ "lamella-linker",
  "lamella-probe",
  "lamella-probe-core",
  "lamella-py-frontend",
@@ -493,6 +495,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-debug-agent"
+version = "0.0.0"
+dependencies = [
+ "lamella-mmio",
+ "lamella-wire",
+]
+
+[[package]]
 name = "lamella-debug-backend"
 version = "0.0.0"
 
@@ -503,18 +513,28 @@ dependencies = [
  "lamella-aot",
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-nrf",
+ "lamella-cmsis-dap-sam",
  "lamella-cmsis-dap-stm32",
  "lamella-dap",
  "lamella-debug-backend",
+ "lamella-dwarf",
+ "lamella-elf",
  "lamella-metadata",
+ "lamella-probe",
  "lamella-probe-core",
  "lamella-stlink",
- "lamella-usbhid",
 ]
 
 [[package]]
 name = "lamella-decimal"
 version = "0.0.0"
+
+[[package]]
+name = "lamella-dwarf"
+version = "0.0.0"
+dependencies = [
+ "lamella-elf",
+]
 
 [[package]]
 name = "lamella-elf"
@@ -529,16 +549,8 @@ name = "lamella-esp-serial-host"
 version = "0.0.0"
 dependencies = [
  "lamella-esp-serial",
+ "libc",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "lamella-firmware"
-version = "0.1.0"
-dependencies = [
- "lamella-aot",
- "lamella-elf",
- "lamella-link",
 ]
 
 [[package]]
@@ -601,6 +613,9 @@ dependencies = [
 [[package]]
 name = "lamella-gc"
 version = "0.0.0"
+dependencies = [
+ "lamella-aot",
+]
 
 [[package]]
 name = "lamella-generics"
@@ -635,19 +650,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "lamella-link"
-version = "0.0.0"
-dependencies = [
- "lamella-elf",
- "lamella-ir",
-]
-
-[[package]]
 name = "lamella-linkd"
 version = "0.0.0"
 dependencies = [
  "lamella-wire",
  "lamella-wire-host",
+]
+
+[[package]]
+name = "lamella-linker"
+version = "0.0.0"
+dependencies = [
+ "lamella-elf",
+ "lamella-ir",
 ]
 
 [[package]]
@@ -729,6 +744,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-pin-events"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-probe"
 version = "0.0.0"
 dependencies = [
@@ -758,7 +777,7 @@ dependencies = [
  "lamella-elf",
  "lamella-flash-format",
  "lamella-ir",
- "lamella-link",
+ "lamella-linker",
  "lamella-py-bytecode",
  "lamella-unicode",
 ]
@@ -804,10 +823,20 @@ version = "0.0.0"
 dependencies = [
  "lamella-assemble",
  "lamella-cil-runtime",
+ "lamella-debug-agent",
  "lamella-fs-fat",
  "lamella-load",
  "lamella-metadata",
  "lamella-mmio",
+ "lamella-wire",
+]
+
+[[package]]
+name = "lamella-runtime-support-debug"
+version = "0.0.0"
+dependencies = [
+ "lamella-debug-agent",
+ "lamella-fw-store",
  "lamella-wire",
 ]
 
@@ -855,6 +884,10 @@ version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
 ]
+
+[[package]]
+name = "lamella-softmath"
+version = "0.0.0"
 
 [[package]]
 name = "lamella-stlink"

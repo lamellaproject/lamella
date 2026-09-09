@@ -789,6 +789,119 @@ pub struct Connector {
     pub pins: Vec<ConnectorPin>,
 }
 
+/// The debug signals a board may bring out, in the spelling each one's own standard uses.
+///
+/// `swio` is a vendor's single-wire debug line rather than an Arm one, and it is here because a
+/// part in this roster is programmed through it and through nothing else. Recording it as `swd`
+/// would name the wrong protocol on the one board where the distinction decides which tool works.
+pub const DEBUG_SIGNALS: [&str; 3] = ["swd", "jtag", "swio"];
+
+/// How far a board's debug signals get toward a probe, as three rungs a PERSON can act on rather
+/// than three footprints.
+///
+/// The rungs are separated by two different capabilities, not by two different shapes of copper:
+/// `pads` needs a soldering iron, `connectable` needs clips or pogo pins, and `header` needs only
+/// a cable. A board at rung three can be reached by a probe with no tools at all, which is a
+/// different situation from the two below it and is why the distinction earns a field.
+///
+/// ONE BOOLEAN IS OPERATIONALLY BACKWARDS ON A WHOLE CLASS OF HOBBY BOARD. Such a board carries
+/// its SWD signals to two or three pads on the underside, with no connector on them, and says so
+/// in its own documentation. A presence flag reads true for every one of them, while an owner
+/// without a fine-pitch soldering setup can debug none of them.
+///
+/// `unknown` is a rung of its own and a deliberately usable answer. A board whose other debug
+/// facts are settled -- a recovery path read off the chip's own datasheet, say -- should not have
+/// to withhold those because nobody has found its schematic. It differs from omitting the record
+/// entirely, which says the board has not been looked at at all.
+pub const DEBUG_EXPOSURES: [&str; 5] = ["none", "pads", "connectable", "header", "unknown"];
+
+/// The protocol a board's on-board debugger speaks, which is not the same question as whether it
+/// has one.
+///
+/// A board can carry a debugger this toolchain cannot talk to, and then it is exactly as
+/// unreachable as a bare board. Recording the PRESENCE would put such a board in the reachable
+/// column; recording the PROTOCOL is what makes the fact answer the question a host actually asks.
+///
+/// `chip-usb-jtag` IS NOT A DEBUGGER ON THE BOARD AT ALL, and it is here because the alternative
+/// is worse. Some parts carry a USB-attached debug controller on the die, with the USB data lines
+/// wired to it by default, so a host reaches the debug interface over the product's own USB socket
+/// with no probe, no bridge chip and no debug pads in the path. Such a board has no on-board
+/// debugger in the bridge-chip sense, and calling it `none` would file the easiest board to debug
+/// alongside the ones a probe cannot reach.
+pub const DEBUG_ONBOARD: [&str; 6] =
+    ["none", "cmsis-dap", "st-link", "edbg", "proprietary", "chip-usb-jtag"];
+
+/// What can still reach a board after an image has been written to it.
+///
+/// `mask-rom` and `flash-bootloader` are deliberately different values rather than one "a
+/// bootloader exists" boolean, because they carry different certainties: a mask ROM is fixed when
+/// the silicon is manufactured and cannot be written by anything, while a bootloader in flash
+/// survives only as long as nothing erases the region holding it. A deploy that can brick a board
+/// is a different risk on the two.
+///
+/// `mask-rom` NAMES THE PROPERTY, NOT A VENDOR'S WORD: the recovery is resident in the part and
+/// cannot be removed by writing flash. A datasheet that says "fixed at the time the silicon is
+/// manufactured" states it outright; so does one whose boot-mode table selects a download mode by
+/// a strapping pin read before any flash contents execute. Both are the same guarantee to a
+/// deploy that is about to overwrite an application.
+pub const DEBUG_RECOVERIES: [&str; 5] =
+    ["none", "mask-rom", "flash-bootloader", "probe", "unknown"];
+
+/// Whether a connector is soldered to a debug-header position.
+///
+/// `no` is the honest answer for every rung below `header`: where there is no connector position
+/// there is nothing to fit. `unknown` belongs to a documented header position whose population the
+/// document does not state, which is the common case in kit guides.
+pub const DEBUG_FITTED: [&str; 3] = ["yes", "no", "unknown"];
+
+/// How a debugger reaches this board, and what still reaches it after a deploy.
+///
+/// ABSENCE OF A PAD IS A POSITIVE FACT ABOUT A BOARD AND CANNOT BE DERIVED FROM THE PART. The part
+/// brings SWD out of the die on every member of most families; whether the BOARD carries those
+/// signals anywhere a person can reach is a property of one product's copper, and a chip's own
+/// tables can never answer it.
+///
+/// STATING NOTHING AND STATING "none" ARE DIFFERENT CLAIMS, which is why a board holds an
+/// `Option` of this record rather than a defaulted one. A board that omits the section has not
+/// been read yet; a board that states `exposure = "none"` has been read and found to expose
+/// nothing. A verdict that read an omitted record as an explicit `none` would call a board
+/// unreachable on the strength of an unanswered question.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DebugAccess {
+    /// The signals that reach [`Self::exposure`], in table order.
+    pub signals: Vec<String>,
+    /// How far those signals get, from [`DEBUG_EXPOSURES`].
+    pub exposure: String,
+    /// Whether a connector is ON the board, as opposed to a footprint with nothing in it, from
+    /// [`DEBUG_FITTED`].
+    ///
+    /// A VENDOR'S NOUN IS NOT EVIDENCE HERE. A datasheet will call three empty through-holes a
+    /// "debug header" and, pages away, say the product is designed to be used with pin-headers the
+    /// owner solders on. Reading the noun would promote an empty footprint to a cable-ready
+    /// connector, so this field takes the answer from what is fitted rather than from what the
+    /// position is called.
+    ///
+    /// NOT A BOOLEAN, BECAUSE THE DOCUMENTS ARE UNEVEN AND A BOOLEAN FORCES A GUESS. A kit guide
+    /// will devote a numbered section and a full pin table to a debug connector while never saying
+    /// whether one is soldered to the position -- and the same guide will mark its crystals
+    /// "mounted" and "footprint (not mounted)" in its feature list, so the silence is not a
+    /// convention that can be read either way. `unknown` records that the question was asked of a
+    /// document that does not answer it, which is the state most boards are in.
+    pub fitted: String,
+    /// The pitch an owner would have to solder to, as its source spelling in millimetres (empty
+    /// when the board exposes nothing). Documentation rather than register math: it is what
+    /// separates "most owners could" from "most owners could not". The threshold that turns a
+    /// pitch into a verdict is a judgment about a person rather than a fact about a board, so it
+    /// belongs to whichever consumer applies it.
+    pub pitch_mm: String,
+    /// The protocol of any on-board debugger, from [`DEBUG_ONBOARD`].
+    pub onboard: String,
+    /// What still reaches the board after a deploy, from [`DEBUG_RECOVERIES`].
+    pub recovery: String,
+    /// Where the claim is stated. Required, as every board fact is.
+    pub source: String,
+}
+
 /// One position of a connector STANDARD: the join vocabulary two files meet in.
 ///
 /// A standard describes neither a chip nor a board, which is why it is neither. It exists
@@ -947,6 +1060,9 @@ pub struct BoardTable {
     /// The sockets a removable module plugs into, in table order. Empty means the board offers
     /// none that this file states.
     pub connectors: Vec<Connector>,
+    /// How a debugger reaches this board. `None` means the file has not stated it, which is NOT
+    /// the same as stating that nothing reaches it -- see [`DebugAccess`].
+    pub debug: Option<DebugAccess>,
 }
 
 impl BoardTable {
@@ -3180,6 +3296,8 @@ fn build_board(
         ConnectorBus(usize),
         /// A named connector's pin list (`[[connectors.<name>.pins]]`).
         ConnectorPin(usize),
+        /// The board's debug-access record (`[debug]`).
+        Debug,
     }
     let mut at = At::None;
     let mut memory_source_cited = false;
@@ -3198,6 +3316,17 @@ fn build_board(
                     .memory
                     .push(MemoryRegion { base: -1, device_size: -1, ..MemoryRegion::default() });
                 at = At::Memory;
+            }
+            Item::Section(name) if name == "debug" => {
+                if table.debug.is_some() {
+                    return Err(err(
+                        *line,
+                        "a board states [debug] once -- how a debugger reaches this board is one \
+                         fact, and a second section would be a second answer to it",
+                    ));
+                }
+                table.debug = Some(DebugAccess::default());
+                at = At::Debug;
             }
             Item::ArraySection(name) if name == "bindings" => {
                 table.bindings.push(build_binding(*line));
@@ -3329,6 +3458,34 @@ fn build_board(
                         ));
                     }
                 },
+                At::Debug => {
+                    let record = table.debug.as_mut().expect("open debug record");
+                    match (key.as_str(), value) {
+                        ("signals", RawValue::Array(items)) => {
+                            for item in items {
+                                let RawValue::Str(s) = item else {
+                                    return Err(err(*line, "a debug signal is a string"));
+                                };
+                                record.signals.push(s.clone());
+                            }
+                        }
+                        ("exposure", RawValue::Str(s)) => record.exposure = s.clone(),
+                        ("fitted", RawValue::Str(s)) => record.fitted = s.clone(),
+                        ("pitch_mm", RawValue::Float(s)) => record.pitch_mm = s.clone(),
+                        ("pitch_mm", RawValue::Int(i)) => record.pitch_mm = i.value.to_string(),
+                        ("onboard", RawValue::Str(s)) => record.onboard = s.clone(),
+                        ("recovery", RawValue::Str(s)) => record.recovery = s.clone(),
+                        ("source", RawValue::Str(s)) => record.source = s.clone(),
+                        (other, _) => {
+                            return Err(err(
+                                *line,
+                                &format!(
+                                    "unexpected debug key '{other}' -- a debug record takes signals/exposure/fitted/pitch_mm/onboard/recovery/source"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 At::MemoryDevice(index) => match (key.as_str(), value) {
                     ("part" | "source" | "notes", RawValue::Str(_)) => {}
                     (fact, RawValue::Int(i)) => {
@@ -3463,6 +3620,98 @@ fn build_board(
     }
     if !table.memory.is_empty() && !memory_source_cited {
         return Err(format!("board {}: a memory region must be SOURCE-CITED", table.board));
+    }
+    if let Some(record) = &table.debug {
+        if record.source.is_empty() {
+            return Err(format!(
+                "board {}: a [debug] record must be SOURCE-CITED -- whether a person can reach this board's debug signals is a claim about one product's copper, and an uncited one cannot be checked against anything",
+                table.board
+            ));
+        }
+        if !DEBUG_EXPOSURES.contains(&record.exposure.as_str()) {
+            return Err(format!(
+                "board {}: debug exposure '{}' is not one of {}",
+                table.board,
+                record.exposure,
+                DEBUG_EXPOSURES.join("/")
+            ));
+        }
+        if !DEBUG_ONBOARD.contains(&record.onboard.as_str()) {
+            return Err(format!(
+                "board {}: debug onboard '{}' is not one of {} -- record the PROTOCOL a host would speak, not whether a debugger is present",
+                table.board,
+                record.onboard,
+                DEBUG_ONBOARD.join("/")
+            ));
+        }
+        if !DEBUG_RECOVERIES.contains(&record.recovery.as_str()) {
+            return Err(format!(
+                "board {}: debug recovery '{}' is not one of {}",
+                table.board,
+                record.recovery,
+                DEBUG_RECOVERIES.join("/")
+            ));
+        }
+        for signal in &record.signals {
+            if !DEBUG_SIGNALS.contains(&signal.as_str()) {
+                return Err(format!(
+                    "board {}: debug signal '{}' is not one of {}",
+                    table.board,
+                    signal,
+                    DEBUG_SIGNALS.join("/")
+                ));
+            }
+            if record.signals.iter().filter(|other| *other == signal).count() > 1 {
+                return Err(format!(
+                    "board {}: debug signal '{}' is stated twice",
+                    table.board, signal
+                ));
+            }
+        }
+        if record.exposure == "none" && !record.signals.is_empty() {
+            return Err(format!(
+                "board {}: exposure is 'none' and {} signal(s) are listed -- a signal that reaches nothing is not exposed, so state no signals",
+                table.board,
+                record.signals.len()
+            ));
+        }
+        if !["none", "unknown"].contains(&record.exposure.as_str()) && record.signals.is_empty() {
+            return Err(format!(
+                "board {}: exposure is '{}' and no signal is listed -- the exposure is where something arrives, so name what arrives there",
+                table.board, record.exposure
+            ));
+        }
+        if !DEBUG_FITTED.contains(&record.fitted.as_str()) {
+            return Err(format!(
+                "board {}: debug fitted '{}' is not one of {}",
+                table.board,
+                record.fitted,
+                DEBUG_FITTED.join("/")
+            ));
+        }
+        match record.exposure.as_str() {
+            "header" => {}
+            "unknown" if record.fitted != "unknown" => {
+                return Err(format!(
+                    "board {}: fitted is '{}' and the exposure is unknown -- whether a connector sits on a position nobody has located is not a question this record can answer",
+                    table.board, record.fitted
+                ));
+            }
+            "unknown" => {}
+            _ if record.fitted != "no" => {
+                return Err(format!(
+                    "board {}: fitted is '{}' with exposure '{}' -- only a header is a position a connector can occupy, so below that rung the answer is 'no'",
+                    table.board, record.fitted, record.exposure
+                ));
+            }
+            _ => {}
+        }
+        if !record.pitch_mm.is_empty() && record.exposure == "none" {
+            return Err(format!(
+                "board {}: a pitch is stated and the board exposes nothing -- a pitch describes copper a person could solder to",
+                table.board
+            ));
+        }
     }
     for (at, region) in table.memory.iter().enumerate() {
         if region.name.is_empty() {
@@ -4389,8 +4638,23 @@ struct UartEmission {
     irq: i64,
     gclk_clkctrl_value: i64,
     apbc_mask: i64,
-    pmux_reg: i64,
-    pmux_pair: i64,
+    /// The single PMUX byte the tx/rx pair shares, and the byte value that muxes BOTH of them --
+    /// `Some` only when the two pins fall in the same PMUX element. A whole-byte store is correct
+    /// there precisely because both nibbles belong to the pair being configured.
+    ///
+    /// `None` when the pins straddle two PMUX bytes, which is a real board shape rather than a
+    /// hypothetical: the SAM HA1 Xplained Pro kits put their virtual COM port on PA27 and PA28,
+    /// and PMUX[n] covers pins 2n and 2n+1, so those land in PMUX[13] and PMUX[14]. A consumer
+    /// that needs to work on every board reads the per-pin fields below instead; this pair is
+    /// kept because four hand-written board classes already consume it and it is the cheaper
+    /// write where it applies.
+    pmux_pair: Option<(i64, i64)>,
+    /// Per-pin mux, emitted for EVERY board whether the pair is aligned or not: the PMUX byte's
+    /// address, the nibble mask within it, and the value to OR in after masking. A read-modify-
+    /// write through these is correct in both shapes, where the whole-byte `pmux_pair` store is
+    /// correct only in one -- on a straddling pair it would clobber the neighbouring pin's nibble.
+    pmux_tx: (i64, i64, i64),
+    pmux_rx: (i64, i64, i64),
     pincfg_tx_reg: i64,
     pincfg_rx_reg: i64,
     txpo: i64,
@@ -4445,9 +4709,9 @@ fn resolve_uart(
     };
     let (tx_port, tx_index) = split_pin(&tx.pin).ok_or_else(|| format!("{board}: bad pin {}", tx.pin))?;
     let (rx_port, rx_index) = split_pin(&rx.pin).ok_or_else(|| format!("{board}: bad pin {}", rx.pin))?;
-    if tx_port != rx_port || tx_index / 2 != rx_index / 2 {
+    if tx_port != rx_port {
         return Err(format!(
-            "{board}: uart binding '{}' pins {}/{} do not share a PMUX byte -- per-pin nibble emission is the named growth path; refuse until a real board needs it",
+            "{board}: uart binding '{}' pins {}/{} are in different PORT groups -- one group base cannot serve both, and no board has wanted this",
             binding.role, tx.pin, rx.pin
         ));
     }
@@ -4461,8 +4725,13 @@ fn resolve_uart(
     let func = port
         .constant(&format!("FUNC_{}", binding.function.to_ascii_uppercase()))
         .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
-    let pmux_reg = group_base + pmux0.offset.value + i64::from(tx_index / 2);
-    let pmux_pair = (func << 4) | func;
+    let pmux_of = |index: u32| -> (i64, i64, i64) {
+        let reg = group_base + pmux0.offset.value + i64::from(index / 2);
+        if index % 2 == 0 { (reg, 0x0F, func) } else { (reg, 0xF0, func << 4) }
+    };
+    let pmux_tx = pmux_of(tx_index);
+    let pmux_rx = pmux_of(rx_index);
+    let pmux_pair = (tx_index / 2 == rx_index / 2).then(|| (pmux_tx.0, (func << 4) | func));
     let pincfg_tx_reg = group_base + pincfg0.offset.value + i64::from(tx_index);
     let pincfg_rx_reg = group_base + pincfg0.offset.value + i64::from(rx_index);
 
@@ -4497,10 +4766,191 @@ fn resolve_uart(
         irq,
         gclk_clkctrl_value,
         apbc_mask: 1i64 << apbc_bit,
-        pmux_reg,
         pmux_pair,
+        pmux_tx,
+        pmux_rx,
         pincfg_tx_reg,
         pincfg_rx_reg,
+        txpo,
+        rxpo,
+        bauds,
+    })
+}
+
+/// One resolved sercom-usart emission for the PCHCTRL clock architecture -- the SAM C21, L21,
+/// L22, R30, L10/L11 and D5x/E5x shape, as opposed to the SAM D20/D21/DA1/HA1/R21 one.
+///
+/// THE PIN HALF IS IDENTICAL TO [`UartEmission`]'s AND THE CLOCK HALF IS NOT, which is the whole
+/// reason this is a separate arm rather than a flag on that one. Both architectures put the same
+/// PORT block under the same PMUX/PINCFG offsets, so muxing a pad is the same act. What differs:
+///
+///   SYSCTRL families   one indexed GCLK.CLKCTRL register; the channel id is a FIELD in the word
+///                      written, and the APB gate is always APBC.
+///   PCHCTRL families   an ARRAY, PCHCTRL[m], addressed by the channel id; the value carries only
+///                      the generator and the enable. The APB gate register is per-instance --
+///                      the instance row states WHICH mask register as an offset from MCLK.
+///
+/// So the channel id moves from the value into the address, and the APB mask register stops being
+/// a constant. Neither difference can be expressed by parameterising the other arm without making
+/// both harder to read than two functions are.
+struct PchctrlSercomUartEmission {
+    prefix: String,
+    /// The raw role id (FACTS key + role-handle value in the Python emission).
+    role: String,
+    /// The bound instance id (a FACTS descriptive key).
+    instance: String,
+    sercom_base: i64,
+    irq: i64,
+    /// The address of THIS peripheral's channel register, PCHCTRL[m], where m is the instance's
+    /// generic-clock id. The id is in the ADDRESS here, not in the value.
+    gclk_pchctrl_reg: i64,
+    /// GEN | CHEN. CHEN is what starts the clock: composing without it yields a register that
+    /// reads back the requested generator and a peripheral that never ticks.
+    gclk_pchctrl_value: i64,
+    /// The APB mask register that gates this instance, composed from the MCLK base and the
+    /// per-instance offset the instance row states -- APBA, APBB, APBC and APBD are four different
+    /// registers and which one gates a SERCOM is not derivable from the family.
+    apb_mask_reg: i64,
+    apb_mask: i64,
+    /// Per-pin mux, always -- see [`UartEmission`]'s fields for why the whole-byte form is only
+    /// offered when the pair shares a byte.
+    pmux_pair: Option<(i64, i64)>,
+    pmux_tx: (i64, i64, i64),
+    pmux_rx: (i64, i64, i64),
+    pincfg_tx_reg: i64,
+    pincfg_rx_reg: i64,
+    txpo: i64,
+    rxpo: i64,
+    /// (const name suffix, divisor), one per carrier whose wire rides this binding.
+    bauds: Vec<(String, i64)>,
+}
+
+/// Resolves a `kind = "uart"` binding on a PCHCTRL-clocked SERCOM family.
+///
+/// The pin half is [`resolve_uart`]'s exactly, down to the per-pin PMUX nibbles; the clock half is
+/// [`resolve_i2c_same54`]'s. Both halves read every number out of the strata, so a family joins
+/// this arm by having its tables read rather than by being named here.
+fn resolve_uart_pchctrl(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<PchctrlSercomUartEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let name = &binding.instance;
+    let base = instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    let irq = instances.value(name, "irq").unwrap_or(-1);
+    let gclk_id = instances
+        .value(name, "gclk_core_id")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no gclk_core_id"))?;
+    let apb_mask_offset = instances
+        .value(name, "apb_mask_offset")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no apb_mask_offset"))?;
+    let apb_bit = instances
+        .value(name, "apb_bit")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no apb_bit"))?;
+
+    if binding.gclk_gen < 0 {
+        return Err(format!(
+            "{board}: uart binding '{}' declares no gclk_gen (which generator its core clock rides under the default plan)",
+            binding.role
+        ));
+    }
+
+    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
+    let pchctrl =
+        gclk.register("PCHCTRL0").ok_or_else(|| format!("{board}: gclk has no PCHCTRL0"))?;
+    let gclk_base = instances
+        .value("gclk", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'gclk'"))?;
+    let pch_shift = |field: &str| -> Result<u32, String> {
+        pchctrl
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.lsb)
+            .ok_or_else(|| format!("{board}: PCHCTRL0 has no {field} field"))
+    };
+    let gclk_pchctrl_reg =
+        gclk_base + pchctrl.offset.value + gclk_id * i64::from(pchctrl.width / 8);
+    let gclk_pchctrl_value = binding.gclk_gen << pch_shift("GEN")? | 1i64 << pch_shift("CHEN")?;
+
+    let mclk_base = instances
+        .value("mclk", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'mclk'"))?;
+
+    let tx = binding.pins.iter().find(|(s, _)| s == "tx").map(|(_, p)| p);
+    let rx = binding.pins.iter().find(|(s, _)| s == "rx").map(|(_, p)| p);
+    let (Some(tx), Some(rx)) = (tx, rx) else {
+        return Err(format!("{board}: uart binding '{}' needs tx and rx pins", binding.role));
+    };
+    let (tx_port, tx_index) = split_pin(&tx.pin).ok_or_else(|| format!("{board}: bad pin {}", tx.pin))?;
+    let (rx_port, rx_index) = split_pin(&rx.pin).ok_or_else(|| format!("{board}: bad pin {}", rx.pin))?;
+    if tx_port != rx_port {
+        return Err(format!(
+            "{board}: uart binding '{}' pins {}/{} are in different PORT groups -- one group base cannot serve both, and no board has wanted this",
+            binding.role, tx.pin, rx.pin
+        ));
+    }
+    let group = format!("port{tx_port}");
+    let group_base = instances
+        .value(&group, "base")
+        .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+    let port = set.block("port", "").ok_or_else(|| format!("{board}: no port block table"))?;
+    let pmux0 = port.register("PMUX0").ok_or_else(|| format!("{board}: port has no PMUX0"))?;
+    let pincfg0 = port.register("PINCFG0").ok_or_else(|| format!("{board}: port has no PINCFG0"))?;
+    let func = port
+        .constant(&format!("FUNC_{}", binding.function.to_ascii_uppercase()))
+        .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
+    let pmux_of = |index: u32| -> (i64, i64, i64) {
+        let reg = group_base + pmux0.offset.value + i64::from(index / 2);
+        if index % 2 == 0 { (reg, 0x0F, func) } else { (reg, 0xF0, func << 4) }
+    };
+    let pmux_tx = pmux_of(tx_index);
+    let pmux_rx = pmux_of(rx_index);
+    let pmux_pair = (tx_index / 2 == rx_index / 2).then(|| (pmux_tx.0, (func << 4) | func));
+
+    let txpo = match tx.pad {
+        0 => 0,
+        2 => 1,
+        other => return Err(format!("{board}: TX on pad{other} has no USART TXPO encoding")),
+    };
+    let rxpo = rx.pad;
+    if !(0..=3).contains(&rxpo) {
+        return Err(format!("{board}: RX pad must be 0..3, got {rxpo}"));
+    }
+
+    let mut bauds = Vec::new();
+    for (carrier, plan) in resolved.board.carrier_points(&binding.role) {
+        let f = plan.gclk_hz(binding.gclk_gen).ok_or_else(|| {
+            format!(
+                "{board}: plan '{}' states no gclk{}_hz rate for binding '{}'",
+                plan.name, binding.gclk_gen, binding.role
+            )
+        })?;
+        let rate = carrier.baud;
+        let divisor = 65536 - (65536 * 16 * rate) / f;
+        bauds.push((format!("BAUD_{rate}_{}", upper_snake(&plan.name)), divisor));
+    }
+
+    Ok(PchctrlSercomUartEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        sercom_base: base,
+        irq,
+        gclk_pchctrl_reg,
+        gclk_pchctrl_value,
+        apb_mask_reg: mclk_base + apb_mask_offset,
+        apb_mask: 1i64 << apb_bit,
+        pmux_pair,
+        pmux_tx,
+        pmux_rx,
+        pincfg_tx_reg: group_base + pincfg0.offset.value + i64::from(tx_index),
+        pincfg_rx_reg: group_base + pincfg0.offset.value + i64::from(rx_index),
         txpo,
         rxpo,
         bauds,
@@ -6580,6 +7030,7 @@ struct BoardEmissions {
     st_i2cs: Vec<StI2cEmission>,
     sercom_spis: Vec<SpiEmission>,
     sercom_i2cs: Vec<SercomI2cEmission>,
+    pchctrl_uarts: Vec<PchctrlSercomUartEmission>,
     same54_i2cs: Vec<Same54SercomI2cEmission>,
     same54_adcs: Vec<Same54AdcEmission>,
     pl022_spis: Vec<SpiPl022Emission>,
@@ -6641,6 +7092,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         st_i2cs: Vec::new(),
         sercom_spis: Vec::new(),
         sercom_i2cs: Vec::new(),
+        pchctrl_uarts: Vec::new(),
         same54_i2cs: Vec::new(),
         same54_adcs: Vec::new(),
         pl022_spis: Vec::new(),
@@ -6654,8 +7106,11 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         let emitted_before = emissions.skipped.len();
         match binding.kind.as_str() {
             "uart" => match set.family.as_str() {
-                "samd10" | "samd11" | "samd21" | "samr21" => {
+                "samd10" | "samd11" | "samd20" | "samd21" | "samda1" | "samha1" | "samr21" => {
                     emissions.sercom_uarts.push(resolve_uart(set, resolved, binding)?)
+                }
+                "samc21" | "same54" | "saml1x" | "saml21" | "saml22" | "samr30" => {
+                    emissions.pchctrl_uarts.push(resolve_uart_pchctrl(set, resolved, binding)?)
                 }
                 "rp2040" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, false)?),
                 "rp2350" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, true)?),
@@ -6798,6 +7253,7 @@ pub fn emit_board_csharp(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
         pl022_spis,
@@ -6852,8 +7308,48 @@ pub fn emit_board_csharp(
         }
         push_const(&mut out, "uint", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", uart.gclk_clkctrl_value));
         push_const(&mut out, "uint", &format!("{p}_APBC_MASK"), &format!("0x{:X}", uart.apbc_mask));
-        push_const(&mut out, "uint", &format!("{p}_PMUX_REG"), &format!("0x{:X}", uart.pmux_reg));
-        push_const(&mut out, "uint", &format!("{p}_PMUX_PAIR"), &format!("0x{:X}", uart.pmux_pair));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            push_const(&mut out, "uint", &format!("{p}_PMUX_REG"), &format!("0x{reg:X}"));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_PAIR"), &format!("0x{pair:X}"));
+        }
+        for (sig, (reg, mask, value)) in [("TX", uart.pmux_tx), ("RX", uart.pmux_rx)] {
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{sig}_REG"), &format!("0x{reg:X}"));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{sig}_MASK"), &format!("0x{mask:X}"));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{sig}_VALUE"), &format!("0x{value:X}"));
+        }
+        push_const(&mut out, "uint", &format!("{p}_PINCFG_TX_REG"), &format!("0x{:X}", uart.pincfg_tx_reg));
+        push_const(&mut out, "uint", &format!("{p}_PINCFG_RX_REG"), &format!("0x{:X}", uart.pincfg_rx_reg));
+        push_const(&mut out, "uint", &format!("{p}_TXPO"), &uart.txpo.to_string());
+        push_const(&mut out, "uint", &format!("{p}_RXPO"), &uart.rxpo.to_string());
+        for (suffix, divisor) in &uart.bauds {
+            push_const(&mut out, "uint", &format!("{p}_{suffix}"), &format!("0x{divisor:X}"));
+        }
+    }
+
+    for uart in &pchctrl_uarts {
+        let p = &uart.prefix;
+        out.push_str(&format!("
+        // -- {p}: a sercom-usart binding descriptor on the PCHCTRL clock architecture.
+        // The peripheral channel is an ADDRESS here rather than a field -- PCHCTRL[m] --
+        // and WHICH APB mask register gates the instance is per-instance --
+"));
+        push_const(&mut out, "uint", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", uart.sercom_base));
+        if uart.irq >= 0 {
+            push_const(&mut out, "uint", &format!("{p}_IRQ"), &uart.irq.to_string());
+        }
+        push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", uart.gclk_pchctrl_reg));
+        push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", uart.gclk_pchctrl_value));
+        push_const(&mut out, "uint", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", uart.apb_mask_reg));
+        push_const(&mut out, "uint", &format!("{p}_APB_MASK"), &format!("0x{:X}", uart.apb_mask));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            push_const(&mut out, "uint", &format!("{p}_PMUX_REG"), &format!("0x{reg:X}"));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_PAIR"), &format!("0x{pair:X}"));
+        }
+        for (sig, (reg, mask, value)) in [("TX", uart.pmux_tx), ("RX", uart.pmux_rx)] {
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{sig}_REG"), &format!("0x{reg:X}"));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{sig}_MASK"), &format!("0x{mask:X}"));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{sig}_VALUE"), &format!("0x{value:X}"));
+        }
         push_const(&mut out, "uint", &format!("{p}_PINCFG_TX_REG"), &format!("0x{:X}", uart.pincfg_tx_reg));
         push_const(&mut out, "uint", &format!("{p}_PINCFG_RX_REG"), &format!("0x{:X}", uart.pincfg_rx_reg));
         push_const(&mut out, "uint", &format!("{p}_TXPO"), &uart.txpo.to_string());
@@ -8027,6 +8523,7 @@ pub fn emit_board_rust(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
         pl022_spis,
@@ -8082,8 +8579,48 @@ pub fn emit_board_rust(
         }
         push_rust_const(&mut out, "u32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", uart.gclk_clkctrl_value));
         push_rust_const(&mut out, "u32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", uart.apbc_mask));
-        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_REG"), &format!("0x{:X}", uart.pmux_reg));
-        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_PAIR"), &format!("0x{:X}", uart.pmux_pair));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_REG"), &format!("0x{reg:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_PAIR"), &format!("0x{pair:X}"));
+        }
+        for (sig, (reg, mask, value)) in [("TX", uart.pmux_tx), ("RX", uart.pmux_rx)] {
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{sig}_REG"), &format!("0x{reg:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{sig}_MASK"), &format!("0x{mask:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{sig}_VALUE"), &format!("0x{value:X}"));
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_TX_REG"), &format!("0x{:X}", uart.pincfg_tx_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_RX_REG"), &format!("0x{:X}", uart.pincfg_rx_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_TXPO"), &uart.txpo.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_RXPO"), &uart.rxpo.to_string());
+        for (suffix, divisor) in &uart.bauds {
+            push_rust_const(&mut out, "u32", &format!("{p}_{suffix}"), &format!("0x{divisor:X}"));
+        }
+    }
+
+    for uart in &pchctrl_uarts {
+        let p = &uart.prefix;
+        out.push_str(&format!("
+        // -- {p}: a sercom-usart binding descriptor on the PCHCTRL clock architecture.
+        // The peripheral channel is an ADDRESS here rather than a field -- PCHCTRL[m] --
+        // and WHICH APB mask register gates the instance is per-instance --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", uart.sercom_base));
+        if uart.irq >= 0 {
+            push_rust_const(&mut out, "u32", &format!("{p}_IRQ"), &uart.irq.to_string());
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", uart.gclk_pchctrl_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", uart.gclk_pchctrl_value));
+        push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", uart.apb_mask_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK"), &format!("0x{:X}", uart.apb_mask));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_REG"), &format!("0x{reg:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_PAIR"), &format!("0x{pair:X}"));
+        }
+        for (sig, (reg, mask, value)) in [("TX", uart.pmux_tx), ("RX", uart.pmux_rx)] {
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{sig}_REG"), &format!("0x{reg:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{sig}_MASK"), &format!("0x{mask:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{sig}_VALUE"), &format!("0x{value:X}"));
+        }
         push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_TX_REG"), &format!("0x{:X}", uart.pincfg_tx_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_RX_REG"), &format!("0x{:X}", uart.pincfg_rx_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_TXPO"), &uart.txpo.to_string());
@@ -8434,8 +8971,16 @@ const SWIFT_FAMILIES: &[&str] = &[
     "rp2350",
     "samd10",
     "samd11",
+    "samd20",
     "samd21",
+    "same54",
+    "saml21",
+    "saml22",
+    "samc21",
+    "samda1",
+    "samha1",
     "samr21",
+    "samr30",
     "stm32f7",
     "stm32l0",
     "stm32l053",
@@ -8627,6 +9172,7 @@ pub fn emit_board_swift(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
         pl022_spis,
@@ -8683,8 +9229,48 @@ pub fn emit_board_swift(
         }
         push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", uart.gclk_clkctrl_value));
         push_swift_const(&mut out, "UInt32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", uart.apbc_mask));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_REG"), &format!("0x{:X}", uart.pmux_reg));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_PAIR"), &format!("0x{:X}", uart.pmux_pair));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_REG"), &format!("0x{reg:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_PAIR"), &format!("0x{pair:X}"));
+        }
+        for (sig, (reg, mask, value)) in [("TX", uart.pmux_tx), ("RX", uart.pmux_rx)] {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{sig}_REG"), &format!("0x{reg:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{sig}_MASK"), &format!("0x{mask:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{sig}_VALUE"), &format!("0x{value:X}"));
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_TX_REG"), &format!("0x{:X}", uart.pincfg_tx_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_RX_REG"), &format!("0x{:X}", uart.pincfg_rx_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_TXPO"), &uart.txpo.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_RXPO"), &uart.rxpo.to_string());
+        for (suffix, divisor) in &uart.bauds {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{suffix}"), &format!("0x{divisor:X}"));
+        }
+    }
+
+    for uart in &pchctrl_uarts {
+        let p = &uart.prefix;
+        out.push_str(&format!("
+        // -- {p}: a sercom-usart binding descriptor on the PCHCTRL clock architecture.
+        // The peripheral channel is an ADDRESS here rather than a field -- PCHCTRL[m] --
+        // and WHICH APB mask register gates the instance is per-instance --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", uart.sercom_base));
+        if uart.irq >= 0 {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_IRQ"), &uart.irq.to_string());
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", uart.gclk_pchctrl_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", uart.gclk_pchctrl_value));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", uart.apb_mask_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK"), &format!("0x{:X}", uart.apb_mask));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_REG"), &format!("0x{reg:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_PAIR"), &format!("0x{pair:X}"));
+        }
+        for (sig, (reg, mask, value)) in [("TX", uart.pmux_tx), ("RX", uart.pmux_rx)] {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{sig}_REG"), &format!("0x{reg:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{sig}_MASK"), &format!("0x{mask:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{sig}_VALUE"), &format!("0x{value:X}"));
+        }
         push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_TX_REG"), &format!("0x{:X}", uart.pincfg_tx_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_RX_REG"), &format!("0x{:X}", uart.pincfg_rx_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_TXPO"), &uart.txpo.to_string());
@@ -9050,6 +9636,7 @@ pub fn emit_board_python(
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
+        pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
         pl022_spis,
@@ -9088,8 +9675,45 @@ pub fn emit_board_python(
         }
         rows.push(("gclk_clkctrl_value".to_string(), format!("0x{:X}", uart.gclk_clkctrl_value)));
         rows.push(("apbc_mask".to_string(), format!("0x{:X}", uart.apbc_mask)));
-        rows.push(("pmux_reg".to_string(), format!("0x{:X}", uart.pmux_reg)));
-        rows.push(("pmux_pair".to_string(), format!("0x{:X}", uart.pmux_pair)));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            rows.push(("pmux_reg".to_string(), format!("0x{reg:X}")));
+            rows.push(("pmux_pair".to_string(), format!("0x{pair:X}")));
+        }
+        for (sig, (reg, mask, value)) in [("tx", uart.pmux_tx), ("rx", uart.pmux_rx)] {
+            rows.push((format!("pmux_{sig}_reg"), format!("0x{reg:X}")));
+            rows.push((format!("pmux_{sig}_mask"), format!("0x{mask:X}")));
+            rows.push((format!("pmux_{sig}_value"), format!("0x{value:X}")));
+        }
+        rows.push(("pincfg_tx_reg".to_string(), format!("0x{:X}", uart.pincfg_tx_reg)));
+        rows.push(("pincfg_rx_reg".to_string(), format!("0x{:X}", uart.pincfg_rx_reg)));
+        rows.push(("txpo".to_string(), uart.txpo.to_string()));
+        rows.push(("rxpo".to_string(), uart.rxpo.to_string()));
+        for (suffix, divisor) in &uart.bauds {
+            rows.push((suffix.to_ascii_lowercase(), format!("0x{divisor:X}")));
+        }
+        roles.push((&uart.role, rows));
+    }
+
+    for uart in &pchctrl_uarts {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        rows.push(("instance".to_string(), uart.instance.clone()));
+        rows.push(("sercom_base".to_string(), format!("0x{:X}", uart.sercom_base)));
+        if uart.irq >= 0 {
+            rows.push(("irq".to_string(), uart.irq.to_string()));
+        }
+        rows.push(("gclk_pchctrl_reg".to_string(), format!("0x{:X}", uart.gclk_pchctrl_reg)));
+        rows.push(("gclk_pchctrl_value".to_string(), format!("0x{:X}", uart.gclk_pchctrl_value)));
+        rows.push(("apb_mask_reg".to_string(), format!("0x{:X}", uart.apb_mask_reg)));
+        rows.push(("apb_mask".to_string(), format!("0x{:X}", uart.apb_mask)));
+        if let Some((reg, pair)) = uart.pmux_pair {
+            rows.push(("pmux_reg".to_string(), format!("0x{reg:X}")));
+            rows.push(("pmux_pair".to_string(), format!("0x{pair:X}")));
+        }
+        for (sig, (reg, mask, value)) in [("tx", uart.pmux_tx), ("rx", uart.pmux_rx)] {
+            rows.push((format!("pmux_{sig}_reg"), format!("0x{reg:X}")));
+            rows.push((format!("pmux_{sig}_mask"), format!("0x{mask:X}")));
+            rows.push((format!("pmux_{sig}_value"), format!("0x{value:X}")));
+        }
         rows.push(("pincfg_tx_reg".to_string(), format!("0x{:X}", uart.pincfg_tx_reg)));
         rows.push(("pincfg_rx_reg".to_string(), format!("0x{:X}", uart.pincfg_rx_reg)));
         rows.push(("txpo".to_string(), uart.txpo.to_string()));

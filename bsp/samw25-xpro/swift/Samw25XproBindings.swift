@@ -29,6 +29,12 @@ public enum Samw25XproBindings {
     public static let VCP_APBC_MASK: UInt32 = 0x40
     public static let VCP_PMUX_REG: UInt32 = 0x410044B5
     public static let VCP_PMUX_PAIR: UInt32 = 0x33
+    public static let VCP_PMUX_TX_REG: UInt32 = 0x410044B5
+    public static let VCP_PMUX_TX_MASK: UInt32 = 0xF
+    public static let VCP_PMUX_TX_VALUE: UInt32 = 0x3
+    public static let VCP_PMUX_RX_REG: UInt32 = 0x410044B5
+    public static let VCP_PMUX_RX_MASK: UInt32 = 0xF0
+    public static let VCP_PMUX_RX_VALUE: UInt32 = 0x30
     public static let VCP_PINCFG_TX_REG: UInt32 = 0x410044CA
     public static let VCP_PINCFG_RX_REG: UInt32 = 0x410044CB
     public static let VCP_TXPO: UInt32 = 1

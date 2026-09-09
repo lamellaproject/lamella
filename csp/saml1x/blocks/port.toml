@@ -1,0 +1,124 @@
+# The SAML1X PORT block: the pin-mux and pin-config machinery. ONE PORT group on this family --
+# the porta instance row carries its base. PMUX and PINCFG are PER-PIN ARRAYS: the offsets below
+# are the n = 0 element; element addresses derive as
+#   PMUX[n]   = group_base + 0x30 + n        (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
+#   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
+# The generator owns those derivations; drivers receive resolved addresses through their bindings.
+#
+# THE REGISTER LAYOUT IS SHARED ACROSS THE WHOLE SAM LINE AND THE BASE IS THIS FAMILY'S ALONE.
+# Every offset below matches the samd20, samda1, samha1, samr21, samc21, saml21, saml22 and samr30
+# blocks value for value. What differs is where the block sits: 0x40003000, behind AHB-APB Bridge
+# A, which is a fifth distinct address on this arm -- see ../parts.toml.
+#
+# THE FUNCTION LETTERS SKIP F AND THE NIBBLE VALUES DO NOT COMPACT. THIS IS THE ONE THING ON
+# THIS FAMILY MOST LIKELY TO BE GOT WRONG, so it is stated with the register evidence rather than
+# left to the letter list. Section 4.1 says a pin "can be assigned to one of the peripheral
+# functions: A, B, C, D, E, G, H, or I" -- eight letters, no F. The obvious reading is that the
+# eight letters take the eight values 0..7, and THAT IS WRONG. The PMUX register's own value table
+# (32.8.13) reads:
+#
+#     PMUXE[3:0]   Name   Description
+#        0x4         E     Peripheral function E selected
+#        0x5         -     Reserved              <- F's slot, and it stays empty
+#        0x6         G     Peripheral function G selected
+#        0x7         H     Peripheral function H selected
+#        0x8         I     Peripheral function I selected
+#      0x9-0xF       -     Reserved
+#
+# So the encoding is POSITIONAL: G is still 0x6, exactly as on every relative that has an F. A
+# consumer that compacted the letters would write 0x5 for function G and mux NOTHING, and the
+# register would read back the value it was given. FUNC_F is therefore ABSENT from the constants
+# below rather than present-and-wrong -- and because the generator resolves a binding's letter by
+# looking up `FUNC_<letter>`, a board naming function F on this family is REFUSED at generation
+# time with that constant's name in the error, instead of silently selecting a Reserved encoding.
+#
+# PMUX15 RESETS TO 0x06 AND EVERY OTHER PMUX RESETS TO 0x00. Element 15 covers PA30 and PA31, whose
+# reset function is G -- SWCLK and SWDIO. So the debug pads arrive muxed and a driver taking them
+# for plain I/O is fighting the reset state rather than a previous configuration.
+
+[table]
+kind = "block"
+family = "saml1x"
+block = "port"
+sources = [
+    "SAM L10/L11 Family Data Sheet DS60001513J section 32.8 (PORT Register Description), each register stating its own offset: DIR 0x00, DIRCLR 0x04, DIRSET 0x08, OUT 0x10, OUTCLR 0x14, OUTSET 0x18, IN 0x20",
+    "DS60001513J 32.8.13 PMUX (Offset: 0x30 + n*0x01 [n=0..15], Reset: 0x00 except PMUX15 = 0x06) and 32.8.14 PINCFG (Offset: 0x40 + n*0x01 [n=0..31])",
+    "DS60001513J 32.8.13's PMUXE[3:0] value table for the function-letter encoding, including the Reserved 0x5 -- see the header",
+    "DS60001513J section 4.1 for the letter list: 'A, B, C, D, E, G, H, or I'",
+]
+notes = [
+    "PMUX[n] covers pins 2n (PMUXE, low nibble) and 2n+1 (PMUXO, high nibble).",
+    "EIGHT FUNCTION LETTERS, NINE ENCODINGS, AND 0x5 IS RESERVED -- see the header. FUNC_F is deliberately absent from the constants below.",
+    "PINCFG: PMUXEN hands the pin to the muxed function; INEN enables the input buffer (required for any pin the peripheral READS -- an RX line, MISO).",
+    "PORT IS A MIX-SECURE PERIPHERAL AND THAT MATTERS ONLY ON THE SAM L11. Both PMUX and PINCFG carry 'Property: PAC Write-Protection, Mix-Secure', and the L11 note reads: 'For SAM L11 Non-Secure accesses, read and write accesses are allowed only if the security attribution for the corresponding I/O pin is set as Non-Secured in the NONSEC register.' On an L11 whose PORT is PAC-Secured the registers a SECURE application must use are at base + 0x200, and the base alone is the NON-SECURE alias, where a secure access is discarded -- writes ignored, reads 0x0, and a PAC error raised. Nothing here binds the secure alias; the offset is recorded because +0x200 is FOUR PORT group strides on this line and a reader meeting it in an address will reach for a fifth group that does not exist. The SAM L10 has no TrustZone and no alias at all.",
+    "ONE PORT GROUP, so no group stride is used here. The 0x80 spacing is printed in the register descriptions and ../instances.toml enumerates the single base rather than deriving anything from it.",
+    "DRVSTR is transcribed because it is stated, not because a driver uses it: the field list is what a reader checks a write against, and a register described with a hole where a documented bit lives invites the assumption that the hole is reserved.",
+]
+
+[registers.DIR]
+offset = 0x00
+width = 32
+fields = { DIR = [0, 32] }
+notes = "The direction word, readable: 1 = output. A driver reporting a pin's CURRENT mode reads this rather than shadowing it, so a pin another driver configured is described honestly."
+
+[registers.DIRCLR]
+offset = 0x04
+width = 32
+fields = { DIRCLR = [0, 32] }
+notes = "Write 1s to make pins INPUTS."
+
+[registers.DIRSET]
+offset = 0x08
+width = 32
+fields = { DIRSET = [0, 32] }
+notes = "Write 1s to make pins outputs."
+
+[registers.OUT]
+offset = 0x10
+width = 32
+fields = { OUT = [0, 32] }
+notes = "The output drive level, readable. Load-bearing beyond writing a level: with PINCFG.PULLEN set on an INPUT pin, this bit SELECTS THE PULL DIRECTION (1 = pull-up, 0 = pull-down), so a driver offering InputPullUp/InputPullDown cannot be written without it."
+
+[registers.OUTCLR]
+offset = 0x14
+width = 32
+fields = { OUTCLR = [0, 32] }
+notes = "Write 1s to drive pins low."
+
+[registers.OUTSET]
+offset = 0x18
+width = 32
+fields = { OUTSET = [0, 32] }
+notes = "Write 1s to drive pins high."
+
+[registers.IN]
+offset = 0x20
+width = 32
+fields = { IN = [0, 32] }
+notes = "The input samples (INEN pins only)."
+
+[registers.PMUX0]
+offset = 0x30
+width = 8
+fields = { PMUXE = [0, 4], PMUXO = [4, 4] }
+notes = "Element 0 of the per-pin-pair mux array; see the block header for the element derivation. Element 15 is the one with a non-zero reset value, 0x06 -- function G on both nibbles, which is SWCLK on PA30 and SWDIO on PA31."
+
+[registers.PINCFG0]
+offset = 0x40
+width = 8
+fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
+notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
+
+# Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
+# THERE IS NO FUNC_F AND ITS ABSENCE IS LOAD-BEARING. 0x5 is Reserved on this family; see the
+# block header for the register table that says so. The values are otherwise POSITIONAL and
+# identical to every relative's, which is the whole point: G is 6 here exactly as it is there.
+[constants]
+FUNC_A = 0
+FUNC_B = 1
+FUNC_C = 2
+FUNC_D = 3
+FUNC_E = 4
+FUNC_G = 6
+FUNC_H = 7
+FUNC_I = 8

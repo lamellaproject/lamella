@@ -5,7 +5,7 @@ use core::cmp::Ordering;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Functions};
+use lamella_py_bytecode::{BinOp, CmpOp, Functions};
 
 use crate::bigint::BigInt;
 use crate::interp::{
@@ -1492,13 +1492,13 @@ pub fn call_builtin(
                 let message = "dir() with no arguments is only supported at a call site";
                 return Err(model.raise_named_exception("TypeError", message));
             };
-            #[cfg(not(feature = "introspection"))]
+            #[cfg(not(feature = "reflection"))]
             {
                 let _ = value;
-                let message = "dir() is not available in this build (introspection is off)";
+                let message = "dir() is not available in this build (reflection is off)";
                 return Err(model.raise_named_exception("NotImplementedError", message));
             }
-            #[cfg(feature = "introspection")]
+            #[cfg(feature = "reflection")]
             {
                 let names = model.dir_names(*value);
                 let mut entries = Vec::with_capacity(names.len());
@@ -1950,7 +1950,7 @@ fn print_kw(
     let Some(write) = model.find_dunder(file, "write") else {
         return Err(model.attribute_error(file, "write"));
     };
-    let mut emit = |piece: &str, model: &mut ObjectModel| -> Result<(), Trap> {
+    let emit = |piece: &str, model: &mut ObjectModel| -> Result<(), Trap> {
         let text = model.new_str(piece)?;
         call_value(write, &[text], functions, model, depth)?;
         Ok(())

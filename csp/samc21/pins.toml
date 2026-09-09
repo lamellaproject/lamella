@@ -1,0 +1,40 @@
+# The SAMC21 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table with
+# the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+#
+# BOTH ROSTER BOARDS BIND THE SAME TWO PADS AND THEY READ FROM DIFFERENT TABLES. The J's pads come
+# from Table 6-2 and the N's from Table 6-1; the two tables agree on PB10 and PB11, and that
+# agreement was checked rather than assumed, because on this family the two tables disagree
+# elsewhere -- the N carries SERCOM6 and SERCOM7 and the E/G/J does not.
+
+[table]
+kind = "pins"
+family = "samc21"
+sources = [
+    "SAM C20/C21 Family Data Sheet DS60001479M Table 6-1 (PORT Function Multiplexing for SAM C21 N) and Table 6-2 (for SAM C21 E/G/J). Both were read; the rows below hold where the two agree, and each source line says so",
+]
+notes = [
+    "COLUMN C IS SERCOM AND COLUMN D IS SERCOM-ALT. A pin carrying a pad of each has two rows here and they are told apart only by the letter, so a row without its function letter is not a fact.",
+    "THIS FAMILY'S MUX TABLE HAS NINE FUNCTION COLUMNS, A THROUGH I, WHERE THE SAM D21 LINE HAS EIGHT. Column I is CCL -- the Configurable Custom Logic -- which those families do not have. The letter-to-nibble mapping in blocks/port.toml therefore runs to FUNC_I, and a value of 8 is legal here and is not on a samd20.",
+    "NEITHER BOARD'S GUIDE NAMES A FUNCTION COLUMN. Both print 'SERCOM4 PAD[2]' and stop, and both pads carry a SERCOM only in column D, so the letter came from the datasheet and could not have come from the kit.",
+]
+
+# ---- both kits' EDBG virtual COM port ------------------------------------------------------------
+#
+# The SAM C21 Xplained Pro and the SAMC21N Xplained Pro put their virtual COM port on the same two
+# pads and the same instance, which is convenient and is not an assumption: Table 6-2's SAM C21J
+# column and Table 6-1's 100-pin column were each read for these two rows, and they agree.
+
+[[pins]]
+pin = "PB10"
+function = "D"
+instance = "sercom4"
+signal = "pad2"
+source = "DS60001479M Table 6-2: the PB10 row (SAM C21J pin 23) is empty in column C and carries SERCOM4/PAD[2] in column D, SERCOM-ALT. Table 6-1 gives the same pad the same function on the 100-pin part (pin 30). Corroborated by SAM C21 Xplained Pro user guide Atmel-42460 and SAMC21N Xplained Pro user guide 70005318A, both of which name SERCOM4 PAD[2] for the EDBG's TX line without naming a column."
+
+[[pins]]
+pin = "PB11"
+function = "D"
+instance = "sercom4"
+signal = "pad3"
+source = "DS60001479M Table 6-2: the PB11 row (SAM C21J pin 24) is empty in column C and carries SERCOM4/PAD[3] in column D, SERCOM-ALT. Table 6-1 gives the same pad the same function on the 100-pin part (pin 31). Corroborated by Atmel-42460 and 70005318A for the EDBG's RX line."

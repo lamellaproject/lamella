@@ -34,14 +34,14 @@ path = "src/lib.rs"
 default = []
 bench-counters = []
 
-# `eval` COMPILES SOURCE AT RUN TIME, so it references the PARSER -- 44,952 B on an RP2350.
+# `eval` COMPILES SOURCE AT RUN TIME, so it references the PARSER.
 #
 # It is a BUILD-time feature rather than a run-time check, and that is the whole reason it exists
 # as a feature at all: the realm installs `eval` unconditionally, so a run-time `if enabled` would
 # keep the reference to the parser in the binary, the linker would keep the parser, and every
 # parser-free image would pay for a facility it refuses. The precompiled tier exists precisely so a
-# device does not carry a parser. Measured rather than assumed: turning it on costs 44,504 B on an
-# RP2350, which is 99% of what the parser costs on its own.
+# device does not carry a parser. Turning it on therefore costs very nearly what the parser costs
+# on its own, and an image that never calls `eval` pays none of it.
 eval = []
 
 # Records which REALM objects a program ever writes, for the residency work's mutation census.

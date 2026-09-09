@@ -1291,6 +1291,110 @@ pub mod product_model {
     /// where a SAM D21 G has 38. The debugger is an EDBG and the carrier is its CDC virtual port.
     pub const SAMR21_XPLAINED_PRO: u16 = 47;
 
+    /// Microchip SAM D20 Xplained Pro (ATSAMD20-XPRO, ATSAMD20J18A, Cortex-M0+, 256 KB flash /
+    /// 32 KB SRAM). Its strata are `csp/samd20`, which is a family of its own rather than a SAM
+    /// D21 part row: the D20 is the D21's PREDECESSOR, and while the two share a core, a PORT
+    /// layout and a SERCOM count, they disagree on the generic-clock ids and the NVIC lines of
+    /// every SERCOM instance. What this part does NOT have is the more visible difference --
+    /// no USB, no DMAC, no TCC and no I2S. The debugger is an EDBG and the carrier is its CDC
+    /// virtual port.
+    pub const SAMD20_XPLAINED_PRO: u16 = 48;
+
+    /// Microchip SAMDA1 Xplained Pro (ATSAMDA1-XPRO, ATSAMDA1J16A, Cortex-M0+, 64 KB flash /
+    /// 8 KB SRAM). Its strata are `csp/samda1`. The SAM DA1 is a SAM D21 relative aimed at
+    /// automotive use, and its per-instance numbers agree with the SAM D21's value for value --
+    /// which is a RESULT of reading its own Table 14-1 rather than a reason to have derived it,
+    /// because `csp/samd20` came out of the same lineage and does NOT agree. The debugger is an
+    /// EDBG and the carrier is its CDC virtual port.
+    pub const SAMDA1_XPLAINED_PRO: u16 = 49;
+
+    /// Microchip SAM HA1G16A Xplained Pro (ATSAMHA1G16A-XPRO, ATSAMHA1G16A, Cortex-M0+, 64 KB
+    /// flash / 8 KB SRAM). Its strata are `csp/samha1`. The part is a SAM D21 relative and a LIN
+    /// System Basis Chip -- a LIN transceiver with an integrated voltage regulator -- in one
+    /// package, so a board gets five SERCOMs rather than six: on this G-series part SERCOM5 is
+    /// wired to the transceiver at pads that reach no package pin.
+    pub const SAMHA1G16A_XPLAINED_PRO: u16 = 50;
+
+    /// Microchip SAMHA1G17A Xplained Pro (order code EV47P31A, ATSAMHA1G17A, Cortex-M0+, 128 KB
+    /// flash / 16 KB SRAM). The same wiring as `SAMHA1G16A_XPLAINED_PRO` on a larger part -- same
+    /// LED pad, same button pad, same virtual COM port instance -- differing in memory and in
+    /// carrying a TCC3 its sibling does not. Its order code is an EV-code rather than the -XPRO
+    /// form the rest of this family uses, so it is not found by searching for "ATSAMHA1G17A-XPRO".
+    pub const SAMHA1G17A_XPLAINED_PRO: u16 = 51;
+
+    /// Microchip SAMHA1E16A Xplained Pro (ATSAMHA1E16A-XPRO, ATSAMHA1E16A, Cortex-M0+, 64 KB
+    /// flash / 8 KB SRAM). The 32-pin series of the same family, and NOT simply a smaller
+    /// G: it bonds no group-B pad at all, and it spends a DIFFERENT SERCOM on the LIN
+    /// transceiver -- SERCOM4, which is also the instance this kit routes to its virtual COM
+    /// port, so the two are exclusive on this board.
+    pub const SAMHA1E16A_XPLAINED_PRO: u16 = 52;
+
+    /// Microchip SAM C21 Xplained Pro (ATSAMC21-XPRO, ATSAMC21J18A, Cortex-M0+, 256 KB flash /
+    /// 32 KB SRAM). Its strata are `csp/samc21`, which is NOT a SAM D21 relative in the way
+    /// `csp/samd20` and `csp/samda1` are: the C21 carries the newer clock architecture -- MCLK
+    /// and a generic clock controller that addresses a peripheral channel as an array element --
+    /// and its PORT sits at `0x41000000`. The debugger is an EDBG and the carrier is its CDC
+    /// virtual port.
+    pub const SAMC21_XPLAINED_PRO: u16 = 53;
+
+    /// Microchip SAMC21N Xplained Pro (ATSAMC21N-XPRO, ATSAMC21N18A, Cortex-M0+, 256 KB flash /
+    /// 32 KB SRAM). The 100-pin package of the same family, and not simply a larger board: it
+    /// bonds a THIRD PORT group -- its user LED is on PC05, a pad the 64-pin part does not have --
+    /// and it carries EIGHT SERCOM instances rather than six, the extra two behind a fourth APB
+    /// bridge at `0x43000000` and sharing NVIC lines with SERCOM0 and SERCOM1.
+    pub const SAMC21N_XPLAINED_PRO: u16 = 54;
+
+    /// Microchip SAM L21 Xplained Pro (ATSAML21-XPRO-B, ATSAML21J18B, Cortex-M0+, 256 KB flash /
+    /// 32 KB System SRAM plus 8 KB of Low-power SRAM at its own address). Its strata are
+    /// `csp/saml21`. The part carries the same MCLK/PCHCTRL clock architecture as the SAM C21 and
+    /// shares none of its addresses -- PORT sits at `0x40002800` behind AHB-APB Bridge A, so it is
+    /// gated from APBAMASK rather than an APBC bit. The debugger is an EDBG and the carrier is its
+    /// CDC virtual port.
+    pub const SAML21_XPLAINED_PRO: u16 = 55;
+
+    /// Microchip SAM L22 Xplained Pro (ATSAML22-XPRO-B, ATSAML22N18A, Cortex-M0+, 256 KB flash /
+    /// 32 KB SRAM). Its strata are `csp/saml22`. Same MCLK/PCHCTRL architecture as the SAM C21 and
+    /// SAM L21 and a fourth distinct PORT base -- `0x41006000`, behind AHB-APB Bridge B. Everything
+    /// this board binds is in port group C: the LED, the button and both virtual-COM-port pads.
+    /// The part drives a segment LCD its relatives do not have, and the LED shares its pad with it.
+    pub const SAML22_XPLAINED_PRO: u16 = 56;
+
+    /// Microchip SAM R30 Xplained Pro (ATSAMR30-XPRO, ATSAMR30G18A, Cortex-M0+, 256 KB flash /
+    /// 32 KB System SRAM plus 8 KB of Low Power SRAM at its own address). Its strata are
+    /// `csp/samr30`. A SAM L21 die and an AT86RF212B sub-1 GHz transceiver in one package, and the
+    /// datasheet's own running header reads "Reference Guide - SAM L21" -- so it carries the SAM
+    /// L21's addresses and MCLK/PCHCTRL clock controller rather than the SAM R21's, and starts on
+    /// OSC16M at 4 MHz where the R21 starts at 8 MHz. The radio spends SERCOM4 and holds four pads
+    /// that cannot be outputs. Two user LEDs, which no other Xplained Pro here has. The debugger is
+    /// an EDBG and the carrier is its CDC virtual port.
+    pub const SAMR30_XPLAINED_PRO: u16 = 57;
+
+    /// Microchip SAM L10 Xplained Pro (ATSAML10-XPRO, ATSAML10E16A, Cortex-M23, 64 KB flash plus a
+    /// separate 2 KB Data Flash array / 16 KB SRAM). Its strata are `csp/saml1x`, which holds this
+    /// part and the SAM L11 together: the vendor documents them in one book whose peripheral map has
+    /// a single base-address column, and its own difference table adds no instance to either. The
+    /// MCLK/PCHCTRL clock architecture, with a PORT base -- `0x40003000` -- that matches no relative.
+    /// The debugger is an EDBG and the carrier is its CDC virtual port, on SERCOM0 pads 2 and 3
+    /// rather than 0 and 1.
+    pub const SAML10_XPLAINED_PRO: u16 = 58;
+
+    /// Microchip SAM L11 Xplained Pro (ATSAML11-XPRO, ATSAML11E16A, Cortex-M23, 64 KB flash plus a
+    /// separate 2 KB Data Flash array / 16 KB SRAM). Its strata are `csp/saml1x`, shared with the
+    /// SAM L10, and this board is wired identically to `saml10-xpro` -- the kit guide documents both
+    /// and heads its pin column "SAML10/SAML11 pin". What the fitted part adds is TrustZone for
+    /// ARMv8-M, Secure Boot, a second MPU and secure pin multiplexing, none of which moves a
+    /// peripheral: it is security behavior on the same silicon map.
+    pub const SAML11_XPLAINED_PRO: u16 = 59;
+
+    /// Microchip SAM G55 Xplained Pro (ATSAMG55-XPRO, ATSAMG55J19, Cortex-M4, 512 KB flash /
+    /// 160 KB SRAM plus up to 16 KB of cache and I/D RAM at its own address). Its strata are
+    /// `csp/samg55`, and it is the only SAM3/SAM4-architecture board on this roster's Group C set:
+    /// PIO controllers rather than a PORT block, a PMC rather than MCLK and GCLK, and FLEXCOM
+    /// serial peripherals rather than SERCOMs. GPIO only -- the board's virtual COM port is wired
+    /// to a FLEXCOM whose peripheral identifier the part's own datasheet gives two different values
+    /// for, and that identifier is the PMC gate bit.
+    pub const SAMG55_XPLAINED_PRO: u16 = 60;
+
     /// The display name for a `product_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
@@ -1346,6 +1450,19 @@ pub mod product_model {
             SAME51_CURIOSITY_NANO => "SAM E51 Curiosity Nano",
             SAMD21_CURIOSITY_NANO => "SAM D21 Curiosity Nano",
             SAMR21_XPLAINED_PRO => "SAM R21 Xplained Pro",
+            SAMD20_XPLAINED_PRO => "SAM D20 Xplained Pro",
+            SAMDA1_XPLAINED_PRO => "SAMDA1 Xplained Pro",
+            SAMHA1G16A_XPLAINED_PRO => "SAM HA1G16A Xplained Pro",
+            SAMHA1G17A_XPLAINED_PRO => "SAMHA1G17A Xplained Pro",
+            SAMHA1E16A_XPLAINED_PRO => "SAMHA1E16A Xplained Pro",
+            SAMC21_XPLAINED_PRO => "SAM C21 Xplained Pro",
+            SAMC21N_XPLAINED_PRO => "SAMC21N Xplained Pro",
+            SAML21_XPLAINED_PRO => "SAM L21 Xplained Pro",
+            SAML22_XPLAINED_PRO => "SAM L22 Xplained Pro",
+            SAMR30_XPLAINED_PRO => "SAM R30 Xplained Pro",
+            SAML10_XPLAINED_PRO => "SAM L10 Xplained Pro",
+            SAML11_XPLAINED_PRO => "SAM L11 Xplained Pro",
+            SAMG55_XPLAINED_PRO => "SAM G55 Xplained Pro",
             _ => return None,
         })
     }
@@ -1648,6 +1765,8 @@ pub struct ProfileManifest {
 impl ProfileManifest {
     /// Manifest layout version.
     ///
+    /// One is the first layout a reader can encounter; the number counts layouts, not drafts.
+    ///
     /// A decoder refuses any other value rather than reading the bytes into these fields, because a
     /// different layout describes a different identity shape and a tolerated mismatch is a wrong
     /// answer instead of a refusal.
@@ -1730,15 +1849,28 @@ pub enum TransportError {
     /// cannot be mistaken for one.
     ///
     /// Distinct from [`Closed`](Self::Closed) for the [`PayloadTooLarge`](Self::PayloadTooLarge)
-    /// reason: the carrier is fine and the target answered promptly. The remedy is to STOP asking --
-    /// this target does not implement the op -- where a closed link says reconnect. A caller that
-    /// polls a refusal to its deadline reports a timeout, which is the one reading that sends the
-    /// reader to the cable.
+    /// reason: the carrier is fine and the target answered promptly, so a caller that polls a
+    /// refusal to its deadline reports a timeout -- the one reading that sends the reader to the
+    /// cable.
+    ///
+    /// **The remedy depends on `reason`, and reading it off the variant instead is wrong for one
+    /// of them.** For [`error::UNKNOWN_MESSAGE_TYPE`] it is to STOP asking: this target does not
+    /// implement the op, and it will not start. For [`error::SESSION_HELD`] it is the opposite --
+    /// the request was well formed and the answer changes when the holding carrier lets go -- and
+    /// `holder` names that carrier's channel class so a caller can say WHO has the board rather
+    /// than reporting a fault.
     Refused {
         /// The refusal's reason byte.
         reason: u8,
         /// The message type refused, or `0` if the refusal named none.
         msg_type: u8,
+        /// The holding carrier's channel class for an [`error::SESSION_HELD`] refusal, `None` for
+        /// every other reason.
+        ///
+        /// Carried separately from `msg_type` because they occupy the SAME payload byte and mean
+        /// different things: reporting a holder as a message type renders "somebody has this board
+        /// on a cable" as a type code, and decoding it with the wrong accessor drops it entirely.
+        holder: Option<u8>,
     },
     /// A reply arrived at the expected sequence and did NOT decode.
     ///

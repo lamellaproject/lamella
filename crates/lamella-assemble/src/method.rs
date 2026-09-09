@@ -249,6 +249,11 @@ pub fn emit_method(
 /// A constructor's prologue: `ldarg.0; <arguments>; call ctor`. Models both the implicit
 /// parameterless base call (empty `arguments`) and an explicit `this(args)`/`base(args)`
 /// chain.
+///
+/// `Clone` because a constructor whose body is DEFERRED -- one holding a lambda -- has to carry
+/// its prologue to the drain that finally emits it. Without that the chain call is simply absent
+/// from the deferred body.
+#[derive(Clone, Debug)]
 pub struct ConstructorPrologue {
     /// The target `.ctor` token (a sibling, the base, or System.Object's).
     pub ctor: Token,
@@ -1779,7 +1784,7 @@ fn emit_combine(
         }
         None => push_one(operand_ty, out),
     }
-    crate::expr::emit_binary(binary, operand_ty, checked, out)?;
+    crate::expr::emit_binary(binary, operand_ty, checked, tokens, out)?;
     narrow_compound_result(operand_ty, checked, out);
     Ok(())
 }
@@ -1872,9 +1877,9 @@ mod tests {
 
     fn emit(parameter_names: &[&str], body_source: &str) -> Vec<Instruction> {
         let body = parse_statement(body_source).statement;
-        let params: Vec<(Box<str>, TypeSymbol)> = parameter_names
+        let params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> = parameter_names
             .iter()
-            .map(|name| ((*name).into(), int()))
+            .map(|name| ((*name).into(), int(), Vec::new()))
             .collect();
         let bound = Binder::new().bind_method(None, "M", int(), &params, &[], false, false, &body);
         let names: Vec<Box<str>> = parameter_names.iter().map(|name| (*name).into()).collect();

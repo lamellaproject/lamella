@@ -1,0 +1,47 @@
+# The SAMG55 parts table. THIS IS NOT A SAM D/L PART AND SHARES NO BLOCK WITH THAT LINE.
+# The classification was measured by censusing the datasheet rather than inferred from the SAM
+# name, and it is not close:
+#
+#     block census over Atmel-11289F     SERCOM 0    NVMCTRL 0    MCLK 5    GCLK 4
+#                                        PIO 721     PMC 523      USART 473  EEFC 186
+#
+# So it is the SAM3/SAM4 architecture -- PIO for I/O, PMC for clocks, EEFC for flash -- and its
+# nearest relative is `csp/sam3x`. ONE NUMBER serves
+# as both the PMC clock-enable bit and the NVIC line, which is why ../instances.toml uses the
+# sam3x record shape (`base`, `pid`) rather than the SAM D/L one.
+#
+# THE SERIAL PERIPHERAL IS A FLEXCOM AND NOT A BARE USART. Each of the eight instances is a
+# Flexible Serial Communication Controller that can be a USART, an SPI or a TWI; Table 9-1 rows
+# them as "USARTn, SPIn, TWIn" sharing one identifier. The USART register file sits at the
+# FLEXCOM base PLUS 0x200, which the register descriptions state instance by instance.
+#
+# THE SRAM IS 160 KB PLUS UP TO 16 KB THAT IS NOT THE SAME KIND OF MEMORY. Table 1-1's SRAM cell
+# reads "160 Kbytes + up to 16 Kbytes (Cache + I/D RAM)". The `ram` field below is the 160 KB
+# alone -- the span at 0x20000000 that a linker can believe -- and the 16 KB is Cache and
+# tightly-coupled I/D RAM whose availability depends on how much of it the CMCC is using. Summing
+# them would describe a region that is not there. The SAM L21 and the SAM L10 each split their
+# memory a different way again -- a low-power SRAM at its own address, and a Data Flash beside the
+# main array -- so a single `ram` or `flash` figure is a simplification on all three parts.
+
+[table]
+kind = "parts"
+family = "samg55"
+sources = [
+    "SAM G55 datasheet Atmel-11289F (27-May-16): Table 1-1 (Configuration Summary), Figure 6-1 (Product Mapping), Table 9-1 (Peripheral Identifiers), Table 9-3 and Table 9-4 (Multiplexing on PIO Controller A and B), ch 20 (SRAM), ch 29 (FLEXCOM) and ch 30 (USART) register descriptions",
+]
+notes = [
+    "THE PAD COUNT IS CONFIRMED TWICE, FROM TWO TABLES THAT DO NOT SHARE A LAYOUT. Table 9-3 carries PA0 through PA31 with no gaps and Table 9-4 carries PB0 through PB15, which is 48; Table 1-1's 'Number of PIOs' cell reads 48 for this part. The sibling SAM G55G19 in WLCSP49 is given 38 there and is not declared here.",
+    "TWO PIO CONTROLLERS, AND BOTH ARE FULLY POPULATED ON THIS PACKAGE. PIOA reaches PA31 and PIOB stops at PB15, which is the controller's own extent rather than a package limit -- Table 9-4 has no rows above PB15 for any package.",
+    "EIGHT FLEXCOM INSTANCES ON THIS PART AND SEVEN ON THE SIBLING. Table 1-1 gives the J19 eight USART/SPI/TWI and the G55G19 seven. Which one the smaller part drops is not stated there and is not needed here; no part row below is a G19.",
+    "THE 16 KB OF CACHE AND I/D RAM IS NOT IN THE `ram` FIGURE -- see the header. It is also not at the same address: ch 20 places it at 0x1FC00000 while the 160 KB runs from 0x20000000.",
+    "PIN NAMES CARRY NO LEADING ZERO ON THIS ARCHITECTURE. The datasheet writes PA0 and PB0 where the SAM D/L families write PA00; this table and the board files follow the datasheet, as csp/sam3x does. The kit user guide writes PA06 and PA02 for the same two pads, which is a third spelling of the same thing and is recorded in the board file.",
+]
+
+[[parts]]
+part = "atsamg55j19"
+package = "64-pin LQFP or QFN"
+flash = 0x80000
+ram = 0x28000
+pins = ["PA0-PA31", "PB0-PB15"]
+source = "Atmel-11289F Table 1-1, SAM G55J19 column: Flash 512 Kbytes, SRAM '160 Kbytes + up to 16 Kbytes (Cache + I/D RAM)', Package 'QFN64, LQFP64', Number of PIOs 48. The pad list is Table 9-3 (PA0..PA31, no gaps) plus Table 9-4 (PB0..PB15), which counts 48 and matches that cell. The `ram` figure is the 160 KB alone; the Cache and I/D RAM is a different memory at a different address and is deliberately not summed."
+

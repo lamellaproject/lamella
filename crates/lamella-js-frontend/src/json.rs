@@ -1,11 +1,11 @@
 //! `JSON.parse` and `JSON.stringify`.
 
-use crate::builtins::arg;
+use crate::builtins::{arg, array_length};
 use crate::interpreter::{Completion, Interpreter};
 use crate::object::{Object, PropertyKey};
 use crate::string_value::JsString;
 use crate::value::{JsValue, ObjectId};
-use crate::{abstract_ops as ops, format, String, ToString, Vec};
+use crate::{abstract_ops as ops, format, String, Vec};
 
 /// Which primitive-wrapper slot an object carries -- `[[NumberData]]`, `[[StringData]]`,
 /// `[[BooleanData]]`, `[[SymbolData]]` -- or `None` for anything else.
@@ -82,12 +82,15 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
                 transform = Some(replacer.clone());
             } else if array {
                 let mut keys: Vec<PropertyKey> = Vec::new();
-                let length = match array_length(interpreter, *id) {
+                let length = match array_length(interpreter, &JsValue::Object(*id)) {
                     Ok(length) => length,
                     Err(abrupt) => return abrupt,
                 };
-                for index in 0..length {
-                    let item = match interpreter.get_property(*id, &PropertyKey::from_str(&index.to_string())) {
+                let mut index = 0.0f64;
+                while index < length {
+                    let element = PropertyKey::from_str(&ops::number_to_string(index));
+                    index += 1.0;
+                    let item = match interpreter.get_property(*id, &element) {
                         Completion::Normal(item) => item,
                         abrupt => return abrupt,
                     };
@@ -415,6 +418,28 @@ fn hex(unit: u16) -> Option<u8> {
     }
 }
 
+/// What the reviver's answer does to the member it was called for: `undefined` removes it, anything
+/// else redefines it.
+///
+/// Both halves are `Perform ?` over an operation that is allowed to answer `false`, and 25.5.1.1
+/// says so in a note: **a refusal is not an error here.** That is why the steps read `[[Delete]]`
+/// and `CreateDataProperty` rather than the `OrThrow` forms of either -- a reviver that made this
+/// member non-configurable on an earlier call leaves the parsed value in place and the walk goes on.
+/// A throw is a different matter and still propagates, which is what the `?` is for.
+fn store_revived(
+    interpreter: &mut Interpreter,
+    id: ObjectId,
+    key: PropertyKey,
+    revived: JsValue,
+) -> Result<(), Completion> {
+    if matches!(revived, JsValue::Undefined) {
+        let _ = interpreter.delete_own_property(id, &key)?;
+    } else {
+        let _ = interpreter.create_data_property(id, key, revived)?;
+    }
+    Ok(())
+}
+
 /// `InternalizeJSONProperty`: the reviver walk, depth first, children before their parent.
 fn internalize(
     interpreter: &mut Interpreter,
@@ -428,27 +453,21 @@ fn internalize(
     };
     if let JsValue::Object(id) = value {
         if interpreter.is_array(id)? {
-            let length = match array_length(interpreter, id) {
+            let length = match array_length(interpreter, &JsValue::Object(id)) {
                 Ok(length) => length,
                 Err(abrupt) => return Err(abrupt),
             };
-            for index in 0..length {
-                let element = PropertyKey::from_str(&index.to_string());
+            let mut index = 0.0f64;
+            while index < length {
+                let element = PropertyKey::from_str(&ops::number_to_string(index));
+                index += 1.0;
                 let revived = internalize(interpreter, id, &element, reviver)?;
-                if matches!(revived, JsValue::Undefined) {
-                    interpreter.object_mut(id).delete_own(&element);
-                } else {
-                    let _ = interpreter.create_data_property(id, element, revived)?;
-                }
+                store_revived(interpreter, id, element, revived)?;
             }
         } else {
-            for own in interpreter.own_string_keys_of(id)? {
+            for own in interpreter.enumerable_keys_of(id)? {
                 let revived = internalize(interpreter, id, &own, reviver)?;
-                if matches!(revived, JsValue::Undefined) {
-                    interpreter.object_mut(id).delete_own(&own);
-                } else {
-                    let _ = interpreter.create_data_property(id, own, revived)?;
-                }
+                store_revived(interpreter, id, own, revived)?;
             }
         }
     }
@@ -611,10 +630,12 @@ impl Writer {
         stepped.extend_from(&self.gap);
         self.indent = stepped.clone();
 
-        let length = array_length(interpreter, id)?;
+        let length = array_length(interpreter, &JsValue::Object(id))?;
         let mut parts: Vec<JsString> = Vec::new();
-        for index in 0..length {
-            let key = PropertyKey::from_str(&index.to_string());
+        let mut index = 0.0f64;
+        while index < length {
+            let key = PropertyKey::from_str(&ops::number_to_string(index));
+            index += 1.0;
             let part = self.property(interpreter, id, &key)?;
             parts.push(part.unwrap_or_else(|| JsString::from("null")));
         }
@@ -693,10 +714,3 @@ fn quote(text: &JsString) -> JsString {
     out
 }
 
-fn array_length(interpreter: &mut Interpreter, id: ObjectId) -> Result<u32, Completion> {
-    match interpreter.get_property(id, &PropertyKey::from_str("length")) {
-        Completion::Normal(JsValue::Number(length)) => Ok(length as u32),
-        Completion::Normal(_) => Ok(0),
-        abrupt => Err(abrupt),
-    }
-}

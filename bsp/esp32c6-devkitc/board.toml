@@ -35,3 +35,11 @@ source = "xtal"
 xtal_hz = 40000000          # the board's crystal
 uart_sclk_hz = 40000000     # PCR sclk = XTAL / 1 (SCLK_SEL 3, dividers 0) -- the generator
                             # verifies this equality under source xtal (state-and-verify)
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "chip-usb-jtag"
+recovery = "mask-rom"
+source = "ESP32-C6 datasheet: the chip carries a USB Serial/JTAG controller, and USB_D+/USB_D- are connected to it by default, so a host reaches the debug interface over the board's own USB connector with no probe and no debug pads in the path. Where the chip's separate GPIO JTAG signals reach on this board is not established by a document held here, so the exposure is recorded as unknown rather than guessed. Table 3-3, Chip Boot Mode Control: GPIO9 low at reset selects Joint Download Boot mode, which supports USB-Serial-JTAG, UART and SDIO download. That mode is selected before any flash contents execute, so writing flash cannot remove it. An eFuse, EFUSE_DIS_USB_SERIAL_JTAG, can disable the controller; the default is enabled."

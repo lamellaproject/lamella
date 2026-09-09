@@ -127,8 +127,10 @@ impl SimCard {
         self
     }
 
-    /// A card that answers CMD6 and declines the function -- the behavior both real cards on this
-    /// bench showed over SPI.
+    /// A card that answers CMD6 and declines the function.
+    ///
+    /// This is the ordinary case over SPI rather than an edge one: the high-speed access mode
+    /// belongs to the SD bus, and a card in SPI mode answers the query and refuses the switch.
     #[must_use]
     pub fn refusing_high_speed(mut self) -> Self {
         self.grants_high_speed = false;

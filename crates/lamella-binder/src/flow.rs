@@ -6,13 +6,14 @@ use crate::bound::{
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::statement::{BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection};
+use crate::special::SpecialType;
 use crate::symbols::{Model, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
-use lamella_syntax::ast::{AssignmentOperator, Literal, UnaryOperator};
+use lamella_syntax::ast::{AssignmentOperator, BinaryOperator, Literal, UnaryOperator};
 use lamella_syntax::span::Span;
 
 /// Whether executing `stmt` always transfers control away rather than reaching its
@@ -124,6 +125,67 @@ fn is_const_false(expr: &BoundExpr) -> bool {
 
 /// The set of locals definitely assigned at a program point.
 type Assigned = BTreeSet<Box<str>>;
+
+/// The definite-assignment state a BOOLEAN expression leaves, split by the value it produced
+/// (12.3.1). `if (o is string s)` assigns `s` on the true branch and nothing on the false one, and
+/// one set cannot say that.
+///
+/// **THE PAIR IS NOT AN OPTIMIZATION, IT IS THE DIFFERENCE BETWEEN TWO ANSWERS.** Collapsing it to
+/// the union -- which this analyzer did until the declaration pattern needed better -- is never too
+/// strict and sometimes too lax: measured against csc, `if (c || (v = 1) == 1) { } return v;` is
+/// `CS0165` and the union accepts it. Collapsing it to the intersection instead would refuse
+/// `if (c && (v = 1) == 1) { return v; }`, which csc compiles. Only the pair answers both.
+///
+/// **AND A HALF CAN BE UNREACHABLE, WHICH IS NOT THE SAME AS EMPTY.** `false` never produces
+/// `true`, so its true half assigns *everything* rather than nothing -- the same rule
+/// [`merge`] applies to a branch that never completes. Modelling it as an empty set instead
+/// refuses `if (c ? (d && (v = 1) == 1) : false) { return v; }`, which csc compiles; measured.
+struct BoolState {
+    /// What is definitely assigned where the expression produced `true`, or `None` where it
+    /// cannot produce `true` at all.
+    when_true: Option<Assigned>,
+    /// The same for `false`.
+    when_false: Option<Assigned>,
+}
+
+impl BoolState {
+    /// The state for an expression whose result says nothing about what it assigned -- both
+    /// halves reachable, with the same set. Every expression that is not a `&&`, `||`, `!`,
+    /// boolean `?:` or boolean constant is one.
+    fn same(assigned: Assigned) -> Self {
+        Self {
+            when_true: Some(assigned.clone()),
+            when_false: Some(assigned),
+        }
+    }
+
+    /// What holds whichever way the expression went: the state after it, used for its VALUE.
+    fn meet(self) -> Assigned {
+        both(self.when_true, self.when_false).unwrap_or_default()
+    }
+
+    /// The state a branch taken on `true` starts from. An UNREACHABLE half falls back to the
+    /// entry state rather than to everything: the branch is dead, so what it contributes to the
+    /// merge is discarded either way, and the entry state is what makes the diagnostics inside it
+    /// the ones csc reports.
+    fn on_true(self, entry: &Assigned) -> Assigned {
+        self.when_true.unwrap_or_else(|| entry.clone())
+    }
+
+    /// [`Self::on_true`] for the `false` branch.
+    fn on_false(self, entry: &Assigned) -> Assigned {
+        self.when_false.unwrap_or_else(|| entry.clone())
+    }
+}
+
+/// Two ways of reaching one program point, combined: only what both assign survives, and a way
+/// that cannot happen constrains nothing.
+fn both(left: Option<Assigned>, right: Option<Assigned>) -> Option<Assigned> {
+    match (left, right) {
+        (None, other) | (other, None) => other,
+        (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
+    }
+}
 
 /// The flow that leaves a statement: it either reaches its endpoint with a given
 /// definitely-assigned set, or transfers control away (and the endpoint is
@@ -403,10 +465,11 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
     match &expr.kind {
         BoundExprKind::Local(name) => f(name),
         BoundExprKind::Lambda { captures, .. } => {
-            for (name, _) in captures {
-                f(name);
+            for capture in captures {
+                f(&capture.name);
             }
         }
+        BoundExprKind::CachedDelegate { .. } => {}
         BoundExprKind::Literal(_)
         | BoundExprKind::This
         | BoundExprKind::Base
@@ -489,6 +552,26 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
         | BoundExprKind::Unchecked(inner)
         | BoundExprKind::Throw(inner) => {
             visit_local_uses(inner, f);
+        }
+        BoundExprKind::SwitchExpression {
+            governing,
+            arms,
+            fallback,
+            ..
+        } => {
+            visit_local_uses(governing, f);
+            for arm in arms {
+                if let Some(test) = &arm.test {
+                    visit_local_uses(test, f);
+                }
+                if let Some(guard) = &arm.guard {
+                    visit_local_uses(guard, f);
+                }
+                visit_local_uses(&arm.value, f);
+            }
+            if let Some(fallback) = fallback {
+                visit_local_uses(fallback, f);
+            }
         }
         BoundExprKind::Conditional {
             condition,
@@ -706,7 +789,9 @@ fn collect_initializer_uses(
     match initializer {
         BoundInitializer::Collection(elements) => {
             for element in elements {
-                collect_field_uses(element, reads, writes);
+                for argument in &element.arguments {
+                    collect_field_uses(argument, reads, writes);
+                }
             }
         }
         BoundInitializer::Object(members) => {
@@ -787,6 +872,27 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
                 collect_field_accesses(block, reads, writes);
             }
         },
+        BoundExprKind::CachedDelegate { .. } => {}
+        BoundExprKind::SwitchExpression {
+            governing,
+            arms,
+            fallback,
+            ..
+        } => {
+            collect_field_uses(governing, reads, writes);
+            for arm in arms {
+                if let Some(test) = &arm.test {
+                    collect_field_uses(test, reads, writes);
+                }
+                if let Some(guard) = &arm.guard {
+                    collect_field_uses(guard, reads, writes);
+                }
+                collect_field_uses(&arm.value, reads, writes);
+            }
+            if let Some(fallback) = fallback {
+                collect_field_uses(fallback, reads, writes);
+            }
+        }
         BoundExprKind::Assignment {
             operator,
             target,
@@ -1472,12 +1578,14 @@ impl Analyzer<'_> {
                 then_branch,
                 else_branch,
             } => {
-                let mut assigned = assigned;
-                self.expression(condition, &mut assigned, span);
-                let then_flow = self.statement(then_branch, assigned.clone());
+                let entry = assigned.clone();
+                let state = self.condition(condition, assigned, span);
+                let (on_true, on_false) = (state.when_true.clone(), state.when_false.clone());
+                let then_flow = self.statement(then_branch, on_true.unwrap_or_else(|| entry.clone()));
+                let on_false = on_false.unwrap_or_else(|| entry.clone());
                 let else_flow = match else_branch {
-                    Some(branch) => self.statement(branch, assigned.clone()),
-                    None => Flow::Reaches(assigned),
+                    Some(branch) => self.statement(branch, on_false),
+                    None => Flow::Reaches(on_false),
                 };
                 if is_const_true(condition) {
                     then_flow
@@ -1488,25 +1596,27 @@ impl Analyzer<'_> {
                 }
             }
             BoundStmtKind::While { condition, body } => {
-                let mut assigned = assigned;
-                self.expression(condition, &mut assigned, span);
-                let (_, breaks) = self.statement_in_loop(body, assigned.clone());
+                let entry = assigned.clone();
+                let state = self.condition(condition, assigned, span);
+                let on_false = state.when_false.clone().unwrap_or_else(|| entry.clone());
+                let (_, breaks) = self.statement_in_loop(body, state.on_true(&entry));
                 if is_const_true(condition) {
                     Self::after_endless_loop(breaks)
                 } else {
-                    Flow::Reaches(assigned)
+                    Flow::Reaches(on_false)
                 }
             }
             BoundStmtKind::DoWhile { body, condition } => {
                 let (flow, breaks) = self.statement_in_loop(body, assigned);
                 match flow {
                     Flow::Exits => Self::after_endless_loop(breaks),
-                    Flow::Reaches(mut assigned) => {
-                        self.expression(condition, &mut assigned, span);
+                    Flow::Reaches(assigned) => {
+                        let entry = assigned.clone();
+                        let state = self.condition(condition, assigned, span);
                         if is_const_true(condition) {
                             Self::after_endless_loop(breaks)
                         } else {
-                            Flow::Reaches(assigned)
+                            Flow::Reaches(state.on_false(&entry))
                         }
                     }
                 }
@@ -1524,22 +1634,25 @@ impl Analyzer<'_> {
                         Flow::Exits => return Flow::Exits,
                     }
                 }
-                let infinite = match condition {
-                    Some(condition) => {
-                        self.expression(condition, &mut assigned, span);
-                        is_const_true(condition)
-                    }
-                    None => true,
+                let entry = assigned.clone();
+                let (infinite, state) = match condition {
+                    Some(condition) => (
+                        is_const_true(condition),
+                        self.condition(condition, assigned, span),
+                    ),
+                    None => (true, BoolState::same(assigned)),
                 };
-                let (_, breaks) = self.statement_in_loop(body, assigned.clone());
+                let on_true = state.when_true.clone().unwrap_or_else(|| entry.clone());
+                let on_false = state.when_false.clone().unwrap_or_else(|| entry.clone());
+                let (_, breaks) = self.statement_in_loop(body, on_true.clone());
                 for iterator in iterators {
-                    let mut iterator_set = assigned.clone();
+                    let mut iterator_set = on_true.clone();
                     self.expression(iterator, &mut iterator_set, span);
                 }
                 if infinite {
                     Self::after_endless_loop(breaks)
                 } else {
-                    Flow::Reaches(assigned)
+                    Flow::Reaches(on_false)
                 }
             }
             BoundStmtKind::ForEach {
@@ -1709,6 +1822,123 @@ impl Analyzer<'_> {
 
     /// Walks an expression left to right, reporting a read of an unassigned local
     /// and threading the assignments it makes.
+    /// The definite-assignment state a boolean expression leaves, split by its result (12.3.1).
+    ///
+    /// **THE SHORT-CIRCUIT OPERATORS ARE THE WHOLE REASON THIS IS NOT `expression`.** `b` in
+    /// `a && b` runs only where `a` was true, so it is analyzed from `a`'s TRUE state, and the
+    /// combined false state is what BOTH ways of arriving at false agree on. Analyzing `b` from
+    /// one shared set instead makes `a && b`'s operands look unconditional, which is how the union
+    /// accepted `if (c || (v = 1) == 1) { } return v;`.
+    fn condition(&mut self, expr: &BoundExpr, assigned: Assigned, span: Span) -> BoolState {
+        match &expr.kind {
+            BoundExprKind::Literal(Literal::Boolean(value)) => {
+                let reached = Some(assigned);
+                if *value {
+                    BoolState { when_true: reached, when_false: None }
+                } else {
+                    BoolState { when_true: None, when_false: reached }
+                }
+            }
+            BoundExprKind::Binary {
+                operator: BinaryOperator::LogicalAnd,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.condition(left, assigned, span);
+                let (right, reachable) = match left.when_true {
+                    Some(after_left) => (self.condition(right, after_left, span), true),
+                    None => (
+                        self.condition(right, left.when_false.clone().unwrap_or_default(), span),
+                        false,
+                    ),
+                };
+                BoolState {
+                    when_true: if reachable { right.when_true } else { None },
+                    when_false: both(
+                        left.when_false,
+                        if reachable { right.when_false } else { None },
+                    ),
+                }
+            }
+            BoundExprKind::Binary {
+                operator: BinaryOperator::LogicalOr,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.condition(left, assigned, span);
+                let (right, reachable) = match left.when_false {
+                    Some(after_left) => (self.condition(right, after_left, span), true),
+                    None => (
+                        self.condition(right, left.when_true.clone().unwrap_or_default(), span),
+                        false,
+                    ),
+                };
+                BoolState {
+                    when_true: both(
+                        left.when_true,
+                        if reachable { right.when_true } else { None },
+                    ),
+                    when_false: if reachable { right.when_false } else { None },
+                }
+            }
+            BoundExprKind::Unary {
+                operator: UnaryOperator::Not,
+                operand,
+            } => {
+                let inner = self.condition(operand, assigned, span);
+                BoolState {
+                    when_true: inner.when_false,
+                    when_false: inner.when_true,
+                }
+            }
+            BoundExprKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } if matches!(expr.ty, TypeSymbol::Special(SpecialType::Boolean)) => {
+                let outer = self.condition(condition, assigned, span);
+                let entry = outer.when_true.clone().or(outer.when_false.clone());
+                let entry = entry.unwrap_or_default();
+                let on_true = outer.when_true.unwrap_or_else(|| entry.clone());
+                let on_false = outer.when_false.unwrap_or(entry);
+                let if_true = self.condition(when_true, on_true, span);
+                let if_false = self.condition(when_false, on_false, span);
+                let (if_true, if_false) =
+                    match (never_completes(when_true), never_completes(when_false)) {
+                        (true, true) => return BoolState { when_true: None, when_false: None },
+                        (true, false) => (BoolState { when_true: None, when_false: None }, if_false),
+                        (false, true) => (if_true, BoolState { when_true: None, when_false: None }),
+                        (false, false) => (if_true, if_false),
+                    };
+                BoolState {
+                    when_true: both(if_true.when_true, if_false.when_true),
+                    when_false: both(if_true.when_false, if_false.when_false),
+                }
+            }
+            BoundExprKind::TypeTest {
+                operand,
+                declares: Some(name),
+                ..
+            } => {
+                let mut assigned = assigned;
+                self.expression(operand, &mut assigned, span);
+                let mut when_true = assigned.clone();
+                when_true.insert(name.clone());
+                BoolState {
+                    when_true: Some(when_true),
+                    when_false: Some(assigned),
+                }
+            }
+            _ => {
+                let mut assigned = assigned;
+                self.expression(expr, &mut assigned, span);
+                BoolState::same(assigned)
+            }
+        }
+    }
+
     fn expression(&mut self, expr: &BoundExpr, assigned: &mut Assigned, span: Span) {
         match &expr.kind {
             BoundExprKind::Local(name) => {
@@ -1725,10 +1955,12 @@ impl Analyzer<'_> {
                 body,
                 ..
             } => {
-                for (name, _) in captures {
-                    if !assigned.contains(name) {
+                for capture in captures {
+                    if !assigned.contains(&capture.name) {
                         self.diagnostics.push(Diagnostic::new(
-                            DiagnosticKind::UseOfUnassignedLocal { name: name.clone() },
+                            DiagnosticKind::UseOfUnassignedLocal {
+                                name: capture.name.clone(),
+                            },
                             span,
                         ));
                     }
@@ -1746,6 +1978,7 @@ impl Analyzer<'_> {
                     }
                 }
             }
+            BoundExprKind::CachedDelegate { .. } => {}
             BoundExprKind::Literal(_)
             | BoundExprKind::This
             | BoundExprKind::Base
@@ -1814,6 +2047,13 @@ impl Analyzer<'_> {
                     self.expression(receiver, assigned, span);
                 }
             }
+            BoundExprKind::Binary {
+                operator: BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr,
+                ..
+            } => {
+                let state = self.condition(expr, assigned.clone(), span);
+                *assigned = state.meet();
+            }
             BoundExprKind::Binary { left, right, .. } => {
                 self.expression(left, assigned, span);
                 self.expression(right, assigned, span);
@@ -1872,6 +2112,47 @@ impl Analyzer<'_> {
             BoundExprKind::ArgListLiteral(arguments) => {
                 for argument in arguments {
                     self.expression(argument, assigned, span);
+                }
+            }
+            BoundExprKind::SwitchExpression {
+                governing,
+                subject,
+                arms,
+                fallback,
+            } => {
+                self.expression(governing, assigned, span);
+                assigned.insert(subject.clone());
+                if let Some(fallback) = fallback {
+                    let mut throwing = assigned.clone();
+                    self.expression(fallback, &mut throwing, span);
+                }
+                let mut merged: Option<Assigned> = None;
+                for arm in arms {
+                    let entry = match &arm.test {
+                        Some(test) => {
+                            let state = self.condition(test, assigned.clone(), span);
+                            state.when_true.unwrap_or_else(|| assigned.clone())
+                        }
+                        None => assigned.clone(),
+                    };
+                    let mut entry = match &arm.guard {
+                        Some(guard) => {
+                            let state = self.condition(guard, entry.clone(), span);
+                            state.when_true.unwrap_or(entry)
+                        }
+                        None => entry,
+                    };
+                    self.expression(&arm.value, &mut entry, span);
+                    if never_completes(&arm.value) {
+                        continue;
+                    }
+                    merged = Some(match merged {
+                        None => entry,
+                        Some(previous) => previous.intersection(&entry).cloned().collect(),
+                    });
+                }
+                if let Some(merged) = merged {
+                    *assigned = merged;
                 }
             }
             BoundExprKind::Conditional {

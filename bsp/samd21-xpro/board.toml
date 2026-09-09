@@ -37,5 +37,24 @@ default = true
 source = "osc8m"
 gclk0_hz = 8000000
 
-# [[devices]] rows (LED0, the user button) belong here once transcribed from UG 42220 with the
-# guide open.
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB30"
+active = "low"
+source = "UG 42220 section 4.2.3 and Table 4-6: one yellow LED0 on PB30. THE POLARITY IS MEASURED AND NOT TRANSCRIBED. The guide's sentence 'The LED can be activated by driving the connected I/O line to GND' appears word for word across this vendor's kit guides and is wrong on at least one of them, so it is quoted here rather than relied on. Driven from a probe with the core halted, PB30 was held high for five seconds and low for one in a repeating cycle, sampled at both ends of every window: the diode is lit for the one-second stretch, so it lights when the pin is LOW and the guide is right on this board. The part was identified from the silicon rather than from the debugger's USB product id: CPUID 0x410cc601 is a Cortex-M0+ and the DSU DID at 0x41002018 reads 0x10010300, which decodes as processor 1, family 0, series 1, die 0, revision 3, device 0x00 -- the ATSAMD21J18A this table already names. THE PAD LEAVES THE BOARD: Table 4-3 puts PB30 on EXT3 pin 5 as GPIO1, so an extension fitted to EXT3 reaches the same wire as the LED, and a measurement of this pin must halt the core because the resident application drives it as an output."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA15"
+active = "low"
+source = "UG 42220 section 4.2.2 and Table 4-5: the generic user-configurable button, silkscreened SW0, on PA15; the other mechanical button is RESET and reaches RESETN rather than a pin. 'When a button is pressed it will drive the I/O line to GND'. BOTH HALVES ARE NOW MEASURED, AND THE HALF THE GUIDE DOES NOT COVER IS THE ONE THAT MATTERED. Read from a probe with the core halted: with the internal pull-up enabled the pad rests HIGH and a press takes it LOW, seen ten times across a fifteen-second window with holds from 107 ms to 908 ms, so the button drives its line to ground and is ACTIVE LOW as the section says. THE GUIDE IS SILENT ON A PULL-UP -- the word does not occur anywhere in its 23 pages, where the Curiosity Nano guides state outright that no pull-up is fitted -- and the measurement answers what the document cannot: NO EXTERNAL PULL-UP IS FITTED. The pad follows whichever internal pull is enabled, so a program opening this pin as a plain input must enable the internal pull-up itself. ONE DIFFERENCE FROM THE TWO CURIOSITY NANOS IS RECORDED RATHER THAN EXPLAINED: unpulled, their pads keep whichever level was applied last, and this one settles LOW after either internal pull. Both readings mean no external pull-up; why this pad does not hold its charge as theirs do is not established here. The shortest excursion seen is 107 ms, so a consumer owes this pin a debounce. The pad also leaves the board: Table 4-3 puts PA15 on EXT3 pin 6 as GPIO2."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "UG 42220 section 4.3: the kit carries an EDBG that programs and debugs the part over SWD, and Table 4-9 gives the two SWD signals between the debugger and the target. THE EXPOSURE IS STILL UNKNOWN AND THE GUIDE IS NOW HELD, WHICH IS A NARROWER STATEMENT THAN IT WAS. Its connectors section, 4.1, has exactly two subsections -- the Xplained Pro standard extension headers and the current measurement header -- and the document has no Cortex Debug Connector section anywhere, unlike the SAM D20 Xplained Pro guide beside it, which gives that connector a numbered section and a pin table. A document that describes no external debug position is not a board that has none: an unpopulated footprint is exactly the thing a guide omits, so this stays unknown until somebody looks at the board. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

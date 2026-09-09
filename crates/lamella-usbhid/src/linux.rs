@@ -6,9 +6,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-/// CMSIS-DAP report payload size (excludes the report-id byte).
-const REPORT_MAX: usize = 64;
-
 /// One `/sys/class/hidraw` entry, as much as sysfs states about it.
 struct Entry {
     /// The hidraw node name (e.g. `hidraw0`) -- the reopen key for `open_id`.
@@ -118,9 +115,8 @@ impl Device {
     }
 
     pub fn write_report(&mut self, data: &[u8]) -> Result<()> {
-        let mut report = vec![0u8; 1 + REPORT_MAX];
-        let n = data.len().min(REPORT_MAX);
-        report[1..1 + n].copy_from_slice(&data[..n]);
+        let mut report = vec![0u8; 1 + data.len().max(crate::DEFAULT_REPORT_LEN)];
+        report[1..1 + data.len()].copy_from_slice(data);
         self.file
             .write_all(&report)
             .map_err(|e| Error::Os(format!("hidraw write: {e}")))
@@ -146,13 +142,8 @@ impl Device {
         if ready == 0 {
             return Err(Error::Timeout);
         }
-        let mut report = vec![0u8; REPORT_MAX];
-        let n = self
-            .file
-            .read(&mut report)
-            .map_err(|e| Error::Os(format!("hidraw read: {e}")))?;
-        let m = n.min(buf.len());
-        buf[..m].copy_from_slice(&report[..m]);
-        Ok(m)
+        self.file
+            .read(buf)
+            .map_err(|e| Error::Os(format!("hidraw read: {e}")))
     }
 }

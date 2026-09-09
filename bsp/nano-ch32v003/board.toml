@@ -60,3 +60,11 @@ source = "nanoCH32V003 v1.0 schematic, LED block: the net PD6 reaches D1's ANODE
 # as a `[[plans]]` row because the family's RCC block does not yet carry the oscillator and
 # prescaler registers a plan is verified against, and a plan that named a rate without the
 # registers to compose it would be an unchecked number. It joins when that block lands.
+
+[debug]
+signals = ["swio"]
+exposure = "unknown"
+fitted = "unknown"
+onboard = "none"
+recovery = "unknown"
+source = "The part is programmed through its single-wire debug pin, which is a vendor protocol rather than SWD, and nothing on the board is a debugger: reaching it needs an external adapter that speaks that protocol. Where the pin is brought out on this board, and what recovers the part after a write, are not established by a document held here."

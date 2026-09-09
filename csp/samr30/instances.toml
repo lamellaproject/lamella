@@ -1,0 +1,165 @@
+# The SAMR30 instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# THE RECORD IS THE PCHCTRL FAMILIES', because on this architecture which APB mask register gates
+# an instance is per-instance rather than always APBC. On this part it is three different registers
+# for the blocks below: PORT is gated from APBAMASK, SERCOM0..4 from APBCMASK, and SERCOM5 from
+# APBDMASK. A row therefore states `apb_mask_offset` -- WHICH register, as an offset from MCLK's
+# base -- alongside its bit.
+#
+# EVERY VALUE BELOW MATCHES THE SAM L21'S, AND THAT WAS THE OUTCOME OF THE CHECK RATHER THAN ITS
+# PREMISE. The sibling families on this arm share an architecture and NOT ONE ADDRESS -- the C21,
+# the L21 and the L22 put PORT at 0x41000000, 0x40002800 and 0x41006000 -- so "it is a PCHCTRL
+# part" predicts shape and never a number. This part is the exception, and it is an exception for
+# a documented reason: it IS an L21 die, and the datasheet's own running header says so.
+#
+# STATED EXACTLY, BECAUSE A READER WILL DIFF THE TWO FILES: the emitted constants here and in
+# csp/saml21 agree on every row the L21 has, and this family adds one the L21 does not -- the
+# porta/portb/portc set is three rows where the L21's is two. The radio is why: it puts CLKM, SCLK
+# and MISO in port group C. So "matches the L21" is a claim about VALUES, not about the row set.
+#
+# READ TWICE, FROM TWO TABLES THAT DO NOT SHARE A LAYOUT. Table 13-3 (Peripherals Configuration
+# Summary, pages 74-76) gives base, IRQ, APB index and generic-clock index per peripheral; Table
+# 13-18 (PCHCTRLm Mapping, page 131) gives the generic-clock channel list independently, indexed by
+# channel rather than by peripheral. The two agree on every SERCOM id below, including the one a
+# stride would get wrong.
+
+[table]
+kind = "instances"
+family = "samr30"
+record = ["base", "gclk_core_id", "apb_mask_offset", "apb_bit", "irq"]
+sources = [
+    "SAM R30 datasheet DS70005303C Table 13-3 (Peripherals Configuration Summary) for base address, IRQ line, APB index and generic-clock index -- the table spans pages 74, 75 and 76 and SERCOM5 is on the LAST of them",
+    "DS70005303C Table 13-18 (PCHCTRLm Mapping) for the generic-clock channel ids independently, read as a channel-indexed list rather than as a column of Table 13-3",
+    "DS70005303C sections 13.6.8.9 (APBA Mask), 13.6.8.11 (APBC Mask) and 13.6.8.12 (APBD Mask) for the gate bit positions, stated one bit at a time in prose rather than read out of the register-summary table",
+    "DS70005303C section 13.6.8 for the mask register offsets: AHBMASK 0x10, APBAMASK 0x14, APBBMASK 0x18, APBCMASK 0x1C, APBDMASK 0x20, APBEMASK 0x24",
+]
+notes = [
+    "SERCOM0..4 stride 0x400 from 0x42000000 and are gated from APBCMASK bits 0..4. SERCOM5 is at 0x43000400 behind AHB-APB Bridge D and is gated from APBDMASK bit 1. Each row is still stated explicitly -- a table is data, not a formula.",
+    "SERCOM5'S GENERIC-CLOCK ID IS 24 AND A STRIDE WOULD PREDICT 23. Table 13-3 gives SERCOM0..4 the CORE ids 18..22 over a shared SLOW id of 17, and gives SERCOM5 '24: CORE' over '23: SLOW'. Table 13-18 says the same thing from the other side, listing index 23 as GCLK_SERCOM5_SLOW and index 24 as GCLK_SERCOM5_CORE. So the number a formula produces is that instance's own slow clock -- a real channel id that clocks the wrong thing. The siblings samc21 and saml21 have the same trap at their own SERCOM5 with their own numbers.",
+    "SERCOM4 IS ROWED AND MUST NOT BE BOUND BY A BOARD. It is a real placed instance with a real base, IRQ and gate bit, and it is wired inside the package to the AT86RF212B. Omitting the row would misdescribe the silicon; binding it would drive the radio's SPI from a board file. Unlike the SAM R21's, this instance DOES reach package pins -- see parts.toml, which states the refusal from the pad side and says why it is weaker here.",
+    "SERCOM5 IS ALSO IN A DIFFERENT POWER DOMAIN. Table 13-3 puts SERCOM0..4 in PD1 and SERCOM5 in PD0. Nothing here acts on that; recorded because it is a second axis on which that instance is not like the others.",
+    "PORT IS GATED FROM APBAMASK, NOT APBC. It sits at 0x40002800 behind Bridge A on this family, as it does on the SAM L21, where the SAM D21 line puts it at 0x41004400 behind Bridge B and the SAM C21 at 0x41000000, also behind B. The mask register follows the bridge.",
+    "THIS FAMILY HAS FIVE APB MASK REGISTERS, A THROUGH E. The samc21 has four. Only the three a row below names are transcribed in blocks/mclk.toml.",
+    "RFCTRL IS NOT ROWED. Table 13-3 places it at 0x42003C00 on APBC index 10 with 'Enabled at Reset: N' and gives it no IRQ line, no generic clock and no power domain. It is the transceiver's own control block; nothing in this schema binds it and a row would invite one.",
+    "THREE PORT GROUPS -- see the porta/portb/portc rows and parts.toml.",
+]
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000000
+gclk_core_id = 18
+apb_mask_offset = 0x1C
+apb_bit = 0
+irq = 8
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000400
+gclk_core_id = 19
+apb_mask_offset = 0x1C
+apb_bit = 1
+irq = 9
+
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 20
+apb_mask_offset = 0x1C
+apb_bit = 2
+irq = 10
+
+[[instances]]
+name = "sercom3"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 21
+apb_mask_offset = 0x1C
+apb_bit = 3
+irq = 11
+
+# THE RADIO'S SERCOM. Rowed because it is placed silicon, not because anything may bind it -- see
+# the note above and parts.toml, which states the same refusal from the pad side. Table 7-2 puts
+# the whole SPI on peripheral function F: MISO on PC19 PAD[0], SEL on PB31 PAD[1], MOSI on PB30
+# PAD[2] and SCLK on PC18 PAD[3]. Two of those four pads are in port group C, which no package pin
+# reaches on either part.
+[[instances]]
+name = "sercom4"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 22
+apb_mask_offset = 0x1C
+apb_bit = 4
+irq = 12
+
+# THE ODD ONE OUT, ON THREE AXES AT ONCE: a different bridge (D, at 0x43000000), a different gate
+# register (APBDMASK), a different power domain (PD0), and a core clock id that skips the number a
+# stride would give it because its own slow clock takes that number.
+[[instances]]
+name = "sercom5"
+block = "sercom"
+base = 0x43000400
+gclk_core_id = 24
+apb_mask_offset = 0x20
+apb_bit = 1
+irq = 13
+
+[[instances]]
+name = "mclk"
+block = "mclk"
+base = 0x40000400
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40001800
+gclk_core_id = -1
+apb_mask_offset = -1
+apb_bit = -1
+irq = -1
+
+# PORT SITS BEHIND BRIDGE A ON THIS FAMILY, which is why its gate is APBAMASK bit 10 and not an
+# APBC bit. Nothing consumes that gate today -- the GPIO driver assumes the reset state, where
+# Table 13-3 marks PORT's APB clock 'Enabled at Reset: Y' -- and the row states it so that a
+# consumer which ever needs to gate it has the register rather than a guess.
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x40002800
+gclk_core_id = -1
+apb_mask_offset = 0x14
+apb_bit = 10
+irq = -1
+
+[[instances]]
+name = "portb"
+block = "port"
+base = 0x40002880
+gclk_core_id = -1
+apb_mask_offset = 0x14
+apb_bit = 10
+irq = -1
+
+# GROUP 2, AND ITS EVIDENCE IS NOT THE SAM R21'S. The R21's PORT register descriptions print an
+# offset formula, 0x00+x*0x80 [x=0..2], which states both the stride and the bound. THIS document
+# prints no such formula anywhere -- searched, zero hits -- and says only "Each PORT group has its
+# own set of PORT registers with offset 0x80. The available number of PORT groups may depend on
+# the package/pin number of the device." So the stride is printed and the COUNT is evidenced
+# instead by Table 7-2, which names PC16, PC18 and PC19 as the transceiver's CLKM, SCLK and MISO.
+# A group whose pads are named exists. No package pin on either part reaches it.
+[[instances]]
+name = "portc"
+block = "port"
+base = 0x40002900
+gclk_core_id = -1
+apb_mask_offset = 0x14
+apb_bit = 10
+irq = -1

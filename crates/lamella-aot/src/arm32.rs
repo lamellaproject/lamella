@@ -68,6 +68,23 @@ pub enum LowerError {
         /// The imported seam symbol whose presence made the descriptor necessary.
         seam: alloc::string::String,
     },
+    /// A DISPATCHED call -- `callvirt`, an interface call, `calli`, a delegate invoke -- whose result
+    /// is a value type too wide to return in registers. `Call` and `CallNative` pass a hidden result
+    /// pointer (sret); these four do not, because their own first register is already spoken for by
+    /// the receiver or the target.
+    ///
+    /// **REFUSED RATHER THAN EMITTED, AND THE REASON IS THAT THE WRONG ANSWER IS SILENT.** Without
+    /// the convention the callee writes its result through whatever r0 happens to hold and reads
+    /// every argument one register off. Nothing traps; the program computes something. These calls
+    /// were unreachable while a cross-assembly value-type return was mistyped `int32` and the
+    /// verifier rejected the method for that instead -- so this refusal is what keeps a TYPING
+    /// repair from turning a loud refusal into a quiet wrong answer.
+    ///
+    /// Carries the call kind, so the message names what cannot be lowered rather than a condition.
+    BigStructResultUnsupported {
+        /// The dispatch kind, in CIL terms.
+        call: &'static str,
+    },
     /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
     /// surrogate under `string-utf8`, whose encoding has no form for one. REFUSED rather than replaced
     /// with U+FFFD, because string construction never loses data and the offending unit is known here,
@@ -261,6 +278,8 @@ fn lower_inst(
                     | ConvKind::Float64ToInt
                     | ConvKind::Float32ToLong
                     | ConvKind::Float64ToLong
+                    | ConvKind::Float32ToULong
+                    | ConvKind::Float64ToULong
                     | ConvKind::IntToFloat64
                     | ConvKind::LongToFloat64
                     | ConvKind::Float32ToFloat64
@@ -377,6 +396,8 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
         | ConvKind::Float64ToInt
         | ConvKind::Float32ToLong
         | ConvKind::Float64ToLong
+        | ConvKind::Float32ToULong
+        | ConvKind::Float64ToULong
         | ConvKind::IntToFloat64
         | ConvKind::LongToFloat64
         | ConvKind::Float32ToFloat64
@@ -622,7 +643,7 @@ fn out_args_bytes(func: &Function) -> u16 {
         .iter()
         .flat_map(|b| &b.insts)
         .filter_map(|(result, i)| match i {
-            Inst::Call { args, .. }
+            Inst::Call { args, .. } | Inst::CallNative { args, .. }
                 if matches!(
                     func.value_type(*result),
                     Some(MirType::ValueType { size, .. }) if size > 4
@@ -1685,7 +1706,7 @@ fn lower_spilled_inst(
 /// The absolute base of the FLAT path's static-field storage in RAM (`lower_module*` -- the
 /// linker-free self-contained image, where one shared region is exactly right). The OBJECT path
 /// does not use this constant: each assembly's accesses relocate against its own
-/// `__lamella_statics_<hash>` symbol and `lamella-link` places the regions -- its per-machine
+/// `__lamella_statics_<hash>` symbol and `lamella-linker` places the regions -- its per-machine
 /// default window starts at this same value, so flat and linked images share one RAM plan.
 pub const STATIC_FIELD_BASE: u32 = 0x2000_1000;
 
@@ -2335,6 +2356,260 @@ fn emit_string_equals(enc: &mut Encoder) -> Result<(), LowerError> {
 /// block's parameter values are distinct from any argument value, the parameter
 /// copies on a jump need no ordering. `func_labels` resolves calls.
 #[allow(clippy::too_many_arguments)]
+/// Where a fully-spilled function put every value, and the labels that bound each block's code --
+/// the two halves a `DW_AT_location` needs and neither of which survives assembly on its own.
+///
+/// # WHY ONLY THE FULLY-SPILLED PATH REPORTS THIS
+///
+/// On this path a value's frame slot belongs to that value ALONE for the whole function
+/// ([`spilled_slot_offsets`] hands out one slot per value and never reuses one), so a slot still
+/// holds its value at any address the function can be stopped at. The register and mixed paths give
+/// a value a home only for its LIVE INTERVAL and hand the register to the next value afterwards --
+/// so a location describing a local by its register is right while the local is live and names
+/// somebody else's value once it is dead. A dead local is exactly what a locals pane shows near the
+/// end of a method, so that would be the confidently-wrong answer rather than the missing one.
+/// Those paths report nothing, which is what this backend already did everywhere and is never wrong.
+///
+///
+/// # LABELS, NOT POSITIONS
+///
+/// [`Encoder::finish`] relaxes branches and splices far-branch veneers INTO functions, so a position
+/// captured while encoding is stale for everything after a splice -- silently, because the rows
+/// still parse and still land inside the right function. Same reason [`lamella_asm_arm32::FrameTrack`]
+/// records label ids for its stack transitions, and the same resolution after `finish`.
+struct SpilledHomes {
+    /// Byte offset from the settled stack pointer of each value's frame slot, indexed by value id.
+    slots: Vec<u16>,
+    /// The label bound at the first instruction of each MIR block, indexed by block.
+    blocks: Vec<Label>,
+    /// Per block, a label bound at each MIR instruction index a local takes a new value at -- the
+    /// indices [`crate::cil::CilSourceMap::local_changes`] named, resolved to addresses after
+    /// `finish`. An index equal to the block's instruction count sits at the terminator.
+    changes: Vec<Vec<(u32, Label)>>,
+    /// The label bound just past the last block's code, before the literal pools and string blobs.
+    /// A block's extent is `[its label, the next block's label)`; the last block needs this.
+    end: Label,
+}
+
+/// The spans of a function's code where a frame slot is reachable from r13, each paired with how
+/// far the stack pointer stands BELOW where the prologue left it -- derived from the frame
+/// transitions the assembler recorded.
+///
+/// **A LOCATION IS AN OFFSET FROM THE STACK POINTER, AND THE STACK POINTER MOVES.** It moves in the
+/// prologue that is still building the frame, in each epilogue that has already given it back, and
+/// -- the case that is easy to forget -- INSIDE THE BODY, wherever something pushes. The inline
+/// 64-bit remainder helper pushes four registers, so for its duration every offset in the method is
+/// wrong by sixteen bytes, and what a debugger reads there is another local or a saved register:
+/// well formed, of the right type, and not the programmer's variable.
+///
+/// # THE CORRECTION IS EXACT, BECAUSE THE CFA IS INVARIANT
+///
+/// A transition records the frame as `cfa` bytes above the CURRENT stack pointer, and the frame
+/// address itself does not move. So in a span recording `cfa`, `sp = CFA - cfa`, and a slot the
+/// settled frame puts at `sp_settled + off` is at `sp + off + (cfa - settled)`. That delta is what
+/// this returns, and it is arithmetic on a number the unwinder already has to be right about --
+/// not an approximation, and not a second opinion about where the frame is.
+///
+/// A span whose frame is SHALLOWER than settled is dropped rather than corrected. That is a
+/// prologue or an epilogue: the frame there has not been built or has been given back, so the
+/// slot is outside it, and the bytes that happen to still be at that address belong to nobody.
+fn frame_spans(transitions: &[(u32, u32)], settled: u32, end: u32) -> Vec<(u32, u32, u32)> {
+    let mut rows: Vec<(u32, u32)> = transitions.to_vec();
+    rows.sort_unstable();
+    let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+    for (i, &(at, cfa)) in rows.iter().enumerate() {
+        let Some(delta) = cfa.checked_sub(settled) else {
+            continue;
+        };
+        let until = rows.get(i + 1).map_or(end, |&(next, _)| next).min(end);
+        if at >= until {
+            continue;
+        }
+        match spans.last_mut() {
+            Some(last) if last.1 == at && last.2 == delta => last.1 = until,
+            _ => spans.push((at, until, delta)),
+        }
+    }
+    spans
+}
+
+/// Clips `(start, end)` to `spans`, which are sorted and disjoint, keeping each span's delta.
+fn clip_to(range: (u32, u32), spans: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32)> {
+    spans
+        .iter()
+        .filter_map(|&(low, high, delta)| {
+            let start = range.0.max(low);
+            let end = range.1.min(high);
+            (start < end).then_some((start, end, delta))
+        })
+        .collect()
+}
+
+/// Turns what the lowering recorded about a method's locals into the address ranges a
+/// `DW_AT_location` needs: for each CIL local slot, where in this function's code it lives and at
+/// which frame offset.
+///
+/// `changes` is [`crate::cil::CilSourceMap::local_changes`] for this method, `homes` is what its
+/// lowering reported, and `assembled` must still be whole -- the positions come out of the label
+/// table that goes with those bytes, and every one of them is stale before `finish` has run.
+fn resolve_local_locations(
+    func: &Function,
+    homes: &SpilledHomes,
+    changes: &[Vec<(u32, u16, Option<ValueId>)>],
+    assembled: &lamella_asm_arm32::Assembled,
+    func_start: u32,
+    transitions: &[(u32, u32)],
+    settled: u32,
+) -> Vec<crate::dwarf::LocalLocation> {
+    let Some(body_end) = assembled.label_position(homes.end) else {
+        return Vec::new();
+    };
+    let body_end = body_end.saturating_sub(func_start);
+    let spans = frame_spans(transitions, settled, body_end);
+    let mut rows: Vec<(u16, u32, u32, u16)> = Vec::new();
+    for b in 0..func.blocks.len() {
+        let Some(block_changes) = changes.get(b) else {
+            continue;
+        };
+        let Some(&start_label) = homes.blocks.get(b) else {
+            continue;
+        };
+        let Some(block_start) = assembled.label_position(start_label) else {
+            continue;
+        };
+        let block_start = block_start.saturating_sub(func_start);
+        let block_end = homes
+            .blocks
+            .get(b + 1)
+            .and_then(|&next| assembled.label_position(next))
+            .map_or(body_end, |next| next.saturating_sub(func_start))
+            .max(block_start);
+        let mut at_slot: Vec<(u16, u32, Option<ValueId>)> = Vec::new();
+        for &(index, slot, value) in block_changes {
+            let Some(&(_, label)) = homes
+                .changes
+                .get(b)
+                .and_then(|labels| labels.iter().find(|&&(at, _)| at == index))
+            else {
+                continue;
+            };
+            let Some(position) = assembled.label_position(label) else {
+                continue;
+            };
+            at_slot.push((slot, position.saturating_sub(func_start), value));
+        }
+        at_slot.sort_by_key(|&(slot, at, _)| (slot, at));
+        for i in 0..at_slot.len() {
+            let (slot, at, value) = at_slot[i];
+            let until = at_slot
+                .get(i + 1)
+                .filter(|&&(next_slot, ..)| next_slot == slot)
+                .map_or(block_end, |&(_, next_at, _)| next_at);
+            let Some(value) = value else { continue };
+            let Some(&offset) = homes.slots.get(value.index()) else {
+                continue;
+            };
+            if at >= until {
+                continue;
+            }
+            for (start, end, delta) in clip_to((at, until), &spans) {
+                let Ok(here) = u16::try_from(u32::from(offset) + delta) else {
+                    continue;
+                };
+                rows.push((slot, start, end, here));
+            }
+        }
+    }
+    rows.sort_unstable();
+    let mut located: Vec<crate::dwarf::LocalLocation> = Vec::new();
+    for (slot, start, end, offset) in rows {
+        let entry = match located.last_mut() {
+            Some(last) if last.slot == slot => last,
+            _ => {
+                located.push(crate::dwarf::LocalLocation {
+                    slot,
+                    ranges: Vec::new(),
+                });
+                located.last_mut().expect("just pushed")
+            }
+        };
+        match entry.ranges.last_mut() {
+            Some(last) if last.end == start && last.frame_offset == offset => last.end = end,
+            _ => entry.ranges.push(crate::dwarf::LocalRange {
+                start,
+                end,
+                frame_offset: offset,
+            }),
+        }
+    }
+    located
+}
+
+/// Where each ARGUMENT lives, in the same shape [`resolve_local_locations`] produces for locals.
+///
+/// Simpler than a local by exactly one thing: an argument has no change list. Its incoming value is
+/// copied into a slot of its own by the entry sequence and nothing writes that slot again, so one
+/// range covers the whole body -- and `arg_values` has already reported `None` for the arguments
+/// where that stops being true.
+///
+/// The range starts at the ENTRY BLOCK'S LABEL, which is bound after the entry sequence has run.
+/// Before that the slot holds whatever the frame held; the argument is in a register or in the
+/// caller's frame, and describing it as its slot would be reading uninitialized stack.
+fn resolve_param_locations(
+    func: &Function,
+    homes: &SpilledHomes,
+    arg_values: &[Option<ValueId>],
+    assembled: &lamella_asm_arm32::Assembled,
+    func_start: u32,
+    transitions: &[(u32, u32)],
+    settled: u32,
+) -> Vec<crate::dwarf::LocalLocation> {
+    let Some(body_end) = assembled.label_position(homes.end) else {
+        return Vec::new();
+    };
+    let body_end = body_end.saturating_sub(func_start);
+    let Some(entry) = homes
+        .blocks
+        .get(func.entry.index())
+        .and_then(|&label| assembled.label_position(label))
+    else {
+        return Vec::new();
+    };
+    let entry = entry.saturating_sub(func_start);
+    let spans = frame_spans(transitions, settled, body_end);
+    let mut located = Vec::new();
+    for (index, value) in arg_values.iter().enumerate() {
+        let (Some(value), Ok(slot)) = (value, u16::try_from(index)) else {
+            continue;
+        };
+        let Some(&offset) = homes.slots.get(value.index()) else {
+            continue;
+        };
+        let mut ranges = Vec::new();
+        for (start, end, delta) in clip_to((entry, body_end), &spans) {
+            let Ok(here) = u16::try_from(u32::from(offset) + delta) else {
+                continue;
+            };
+            match ranges.last_mut() {
+                Some(crate::dwarf::LocalRange {
+                    end: last_end,
+                    frame_offset,
+                    ..
+                }) if *last_end == start && *frame_offset == here => *last_end = end,
+                _ => ranges.push(crate::dwarf::LocalRange {
+                    start,
+                    end,
+                    frame_offset: here,
+                }),
+            }
+        }
+        if !ranges.is_empty() {
+            located.push(crate::dwarf::LocalLocation { slot, ranges });
+        }
+    }
+    located
+}
+
 /// Each value's frame-slot byte offset on the fully-spilled path, plus the total slot bytes.
 /// ONE home computation shared by the lowering ([`lower_spilled_into`]) and the per-method
 /// stack-map record builder ([`method_record_roots`]), so a record's root offsets can never
@@ -2358,8 +2633,9 @@ fn lower_spilled_into(
     func_labels: &[Label],
     alloc_addr: Option<u32>,
     py_support: PySupport,
-    source_map: &[Vec<u32>],
+    source: &crate::cil::CilSourceMap,
     line_table: &mut Vec<(u32, u32)>,
+    spilled_homes: &mut Option<SpilledHomes>,
     stack_maps: &mut Vec<StackMapEntry>,
     vtables: &[TypeMeta],
     relocate: bool,
@@ -2519,6 +2795,27 @@ fn lower_spilled_into(
     }
 
     let block_labels: Vec<Label> = (0..func.blocks.len()).map(|_| enc.new_label()).collect();
+    let change_labels: Vec<Vec<(u32, Label)>> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(b, block)| {
+            let mut at: Vec<u32> = source
+                .local_changes
+                .get(b)
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .map(|&(index, ..)| index)
+                        .filter(|&index| index as usize <= block.insts.len())
+                        .collect()
+                })
+                .unwrap_or_default();
+            at.sort_unstable();
+            at.dedup();
+            at.into_iter().map(|index| (index, enc.new_label())).collect()
+        })
+        .collect();
     match block_labels.get(func.entry.index()) {
         Some(entry) if func.entry != BlockId(0) => enc.b(*entry),
         Some(_) => {}
@@ -2528,7 +2825,12 @@ fn lower_spilled_into(
     for (index, block) in func.blocks.iter().enumerate() {
         enc.bind_label(block_labels[index]);
         for (inst_pos, (result, inst)) in block.insts.iter().enumerate() {
-            if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
+            for &(at, label) in &change_labels[index] {
+                if at as usize == inst_pos {
+                    enc.bind_label(label);
+                }
+            }
+            if let Some(&cil) = source.rows.get(index).and_then(|b| b.get(inst_pos)) {
                 line_table.push((enc.position(), cil));
             }
             if matches!(inst, Inst::InitStruct) {
@@ -2680,6 +2982,19 @@ fn lower_spilled_into(
                             .ok_or(LowerError::CallUnsupported)?;
                         enc.bl(target);
                     }
+                    record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
+                    continue;
+                }
+            }
+            if let Inst::CallNative { symbol, args } = inst {
+                if matches!(func.value_type(*result), Some(MirType::ValueType { size, .. }) if size > 4)
+                {
+                    if !relocate {
+                        return Err(LowerError::CallUnsupported);
+                    }
+                    slot_addr(enc, Reg::R0, slot(*result))?;
+                    load_call_args(enc, &func.value_types, &slot, args, 1)?;
+                    enc.bl_symbol(EXTERN_SYMBOL_FLAG | *symbol);
                     record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
                     continue;
                 }
@@ -2902,6 +3217,7 @@ fn lower_spilled_into(
                 dim0,
                 dim1,
                 element_size,
+                element_kind,
             } = inst
             {
                 let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
@@ -2909,7 +3225,10 @@ fn lower_spilled_into(
                     Some((_, label)) => *label,
                     None => {
                         let label = enc.new_label();
-                        type_descs.push((label, alloc::vec![0u32, 0u32, 0u32].into_boxed_slice()));
+                        type_descs.push((
+                            label,
+                            alloc::vec![ARRAY_DESC_MARK | 2, *element_kind, 0u32].into_boxed_slice(),
+                        ));
                         type_desc_labels.push((*handle, label));
                         label
                     }
@@ -2954,6 +3273,7 @@ fn lower_spilled_into(
                 handle,
                 dims,
                 element_size,
+                element_kind,
             } = inst
             {
                 let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
@@ -2961,7 +3281,15 @@ fn lower_spilled_into(
                     Some((_, label)) => *label,
                     None => {
                         let label = enc.new_label();
-                        type_descs.push((label, alloc::vec![0u32, 0u32, 0u32].into_boxed_slice()));
+                        type_descs.push((
+                            label,
+                            alloc::vec![
+                                ARRAY_DESC_MARK | u32::try_from(dims.len()).unwrap_or(1),
+                                *element_kind,
+                                0u32
+                            ]
+                            .into_boxed_slice(),
+                        ));
                         type_desc_labels.push((*handle, label));
                         label
                     }
@@ -3027,7 +3355,12 @@ fn lower_spilled_into(
                 slot_store(enc, Reg::R1, slot(*result) + 4, Reg::R2)?;
             }
         }
-        if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
+        for &(at, label) in &change_labels[index] {
+            if at as usize == block.insts.len() {
+                enc.bind_label(label);
+            }
+        }
+        if let Some(&cil) = source.rows.get(index).and_then(|b| b.last()) {
             line_table.push((enc.position(), cil));
         }
         match &block.terminator {
@@ -3108,6 +3441,14 @@ fn lower_spilled_into(
         }
     }
 
+    let body_end = enc.new_label();
+    enc.bind_label(body_end);
+    *spilled_homes = Some(SpilledHomes {
+        slots: offsets.clone(),
+        blocks: block_labels.clone(),
+        changes: change_labels,
+        end: body_end,
+    });
     if !pool.is_empty() {
         enc.align_to_word();
         for (entry, value) in pool {
@@ -3262,10 +3603,40 @@ enum Assignment {
     Spilled,
 }
 
+/// The first DISPATCHED call in `func` whose result is a value type too wide to return in registers,
+/// named in CIL terms -- or `None`, which is every function today.
+///
+/// `Call` and `CallNative` implement the sret convention (r0 = &result, arguments shifted to r1..);
+/// `CallVirtual`, `CallInterface`, `CallIndirect` and `InvokeDelegate` do not, because their first
+/// register already carries the receiver or the dispatch target. Emitting one anyway is a SILENT
+/// wrong answer -- see [`LowerError::BigStructResultUnsupported`] -- so it is refused here, where a
+/// program build fails loudly and a library build stubs the method into its report.
+fn big_struct_result_without_sret(func: &Function) -> Option<&'static str> {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|(result, inst)| {
+            if !matches!(func.value_type(*result), Some(MirType::ValueType { size, .. }) if size > 4)
+            {
+                return None;
+            }
+            match inst {
+                Inst::CallVirtual { .. } => Some("callvirt"),
+                Inst::CallInterface { .. } => Some("interface call"),
+                Inst::CallIndirect { .. } => Some("calli"),
+                Inst::InvokeDelegate { .. } => Some("delegate invoke"),
+                _ => None,
+            }
+        })
+}
+
 /// Verifies `func` and decides where its values live.
 fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if let Err(errors) = lamella_ir::verify(func) {
         return Err(LowerError::NotWellFormed { errors });
+    }
+    if let Some(call) = big_struct_result_without_sret(func) {
+        return Err(LowerError::BigStructResultUnsupported { call });
     }
     if func.value_types.iter().any(|ty| ty.is_float()) {
         return Ok(Assignment::Spilled);
@@ -4011,7 +4382,7 @@ impl StackMapEntry {
     ///
     /// Split out so the whole-map encoder and the per-function `.lamella_gcmap` fragment share ONE
     /// definition of an entry's shape. The fragment carries this as an opaque byte run, which is
-    /// what keeps `lamella-link` from becoming a second reader of it: the linker rebases the
+    /// what keeps `lamella-linker` from becoming a second reader of it: the linker rebases the
     /// `return_pc` word it prepends and copies these bytes through untouched.
     fn encode_tail(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.frame_size.to_le_bytes());
@@ -4041,7 +4412,7 @@ impl StackMaps {
     /// tagged fields are always present -- a C# image emits `ntagged = 0`.
     ///
     /// THIS IS THE FLAT PATH'S ENCODER ONLY. The OBJECT path does not call it: there `return_pc`
-    /// is knowable only after the linker has dead-stripped and laid out the text, so `lamella-link`
+    /// is knowable only after the linker has dead-stripped and laid out the text, so `lamella-linker`
     /// synthesizes the map from the [`lamella_elf::STACKMAP_GCMAP_SECTION`] fragments -- same bytes,
     /// same symbol, built where the addresses are true. The flat path has no linker and its offsets
     /// are final at lowering time, which is what lets this encode them directly.
@@ -4165,8 +4536,9 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
             &[],
             None,
             PySupport::default(),
-            &[],
+            &crate::cil::CilSourceMap::default(),
             &mut _lines,
+            &mut None,
             &mut Vec::new(),
             &[],
             false,
@@ -4181,12 +4553,13 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
 }
 
 /// Lowers a function and also returns a [`LineTable`] mapping native code offsets to the
-/// CIL byte offsets in `source_map` (from `cil::lower_method_debug`), so a native
+/// CIL byte offsets in `source` (from `cil::lower_method_debug`), so a native
 /// PC recovers to a CIL position.
 pub fn lower_debug(
     func: &Function,
-    source_map: &[Vec<u32>],
+    source: &crate::cil::CilSourceMap,
 ) -> Result<(Vec<u8>, LineTable), LowerError> {
+    let source_map = source.rows.as_slice();
     let mut enc = Encoder::new();
     let mut lines = Vec::new();
     match prepare(func)? {
@@ -4223,8 +4596,9 @@ pub fn lower_debug(
             &[],
             None,
             PySupport::default(),
-            source_map,
+            source,
             &mut lines,
+            &mut None,
             &mut Vec::new(),
             &[],
             false,
@@ -4323,7 +4697,7 @@ const DESC_SYMBOL_FLAG: u32 = 0x4000_0000;
 const STRING_SYMBOL_FLAG: u32 = 0x2000_0000;
 /// A backend symbol standing for a STATIC-REGION base (`__lamella_statics_<asmhash>`, see
 /// `lamella_elf::STATICS_BASE_PREFIX`) -- an object-path `ldsfld`/`stsfld` pool word references
-/// one with addend = the field's dense slot offset, and `lamella-link` places every referenced
+/// one with addend = the field's dense slot offset, and `lamella-linker` places every referenced
 /// region in RAM and defines the symbols. The low bits say WHOSE region: 0 = this assembly's own;
 /// k+1 = the region of reference ordinal k (a cross-assembly static, resolved to the OWNER's
 /// hash-qualified symbol via [`DescQualifiers::references`] -- the owner's own numbering, so both
@@ -4397,6 +4771,8 @@ fn aeabi_convert_helper(kind: ConvKind) -> Option<&'static str> {
         ConvKind::Float64ToInt => Some("__aeabi_d2iz"),
         ConvKind::Float32ToLong => Some("__aeabi_f2lz"),
         ConvKind::Float64ToLong => Some("__aeabi_d2lz"),
+        ConvKind::Float32ToULong => Some("__aeabi_f2ulz"),
+        ConvKind::Float64ToULong => Some("__aeabi_d2ulz"),
         ConvKind::IntToFloat64 => Some("__aeabi_i2d"),
         ConvKind::LongToFloat64 => Some("__aeabi_l2d"),
         ConvKind::Float32ToFloat64 => Some("__aeabi_f2d"),
@@ -4504,12 +4880,14 @@ fn rewrite_md_alloc(
     handle: lamella_ir::TypeHandle,
     dims: &[ValueId],
     element_size: u32,
+    element_kind: u32,
 ) {
     let symbol = intern_extern(externs, "lamella_gc_alloc");
     let type_tag = descriptors
         .iter()
         .find(|m| m.handle == handle)
         .map_or(0, |m| m.type_tag);
+    let rank = u32::try_from(dims.len()).unwrap_or(1);
     let fresh = |value_types: &mut Vec<MirType>| {
         let v = ValueId(value_types.len() as u32);
         value_types.push(MirType::I32);
@@ -4567,7 +4945,13 @@ fn rewrite_md_alloc(
         typedesc,
         Inst::TypeDescLiteral {
             handle: handle.0,
-            words: alloc::vec![0, 0, type_tag, 0].into_boxed_slice(),
+            words: alloc::vec![
+                crate::resolver::ARRAY_DESC_MARK | rank,
+                element_kind,
+                type_tag,
+                0
+            ]
+            .into_boxed_slice(),
             vtable: alloc::vec![].into_boxed_slice(),
             element: None,
         },
@@ -4800,6 +5184,7 @@ fn lower_runtime_calls(
                 dim0,
                 dim1,
                 element_size,
+                element_kind,
             } = &inst
             {
                 rewrite_md_alloc(
@@ -4811,6 +5196,7 @@ fn lower_runtime_calls(
                     *handle,
                     &[*dim0, *dim1],
                     *element_size,
+                    *element_kind,
                 );
                 continue;
             }
@@ -4818,6 +5204,7 @@ fn lower_runtime_calls(
                 handle,
                 dims,
                 element_size,
+                element_kind,
             } = &inst
             {
                 rewrite_md_alloc(
@@ -4829,6 +5216,7 @@ fn lower_runtime_calls(
                     *handle,
                     dims,
                     *element_size,
+                    *element_kind,
                 );
                 continue;
             }
@@ -5095,8 +5483,9 @@ fn lower_one_func(
     stack_maps: &mut Vec<StackMapEntry>,
     blob_table: Option<&[Box<[u16]>]>,
     console_symbol: Option<u32>,
-    source_map: &[Vec<u32>],
+    source: &crate::cil::CilSourceMap,
     lines: &mut Vec<(u32, u32)>,
+    spilled_homes: &mut Option<SpilledHomes>,
     string_header: Option<(u32, i32)>,
 ) -> Result<(), LowerError> {
     if let Err(errors) = lamella_ir::verify(func) {
@@ -5109,7 +5498,7 @@ fn lower_one_func(
             &regs,
             saved,
             func_labels,
-            source_map,
+            &source.rows,
             lines,
             stack_maps,
             true,
@@ -5125,7 +5514,7 @@ fn lower_one_func(
             saved,
             frame,
             func_labels,
-            source_map,
+            &source.rows,
             lines,
             stack_maps,
             true,
@@ -5136,8 +5525,9 @@ fn lower_one_func(
             func_labels,
             None,
             PySupport::default(),
-            source_map,
+            source,
             lines,
+            spilled_homes,
             stack_maps,
             &[],
             true,
@@ -5457,17 +5847,21 @@ fn emit_object_pass(
     let mut map_ranges: Vec<(usize, usize)> = Vec::with_capacity(funcs.len());
     let mut stub_report: LibraryStubReport = Vec::new();
     let mut method_lines: Vec<LineTable> = Vec::with_capacity(funcs.len());
+    let mut method_frames: Vec<lamella_asm_arm32::FrameTrack> = Vec::with_capacity(funcs.len());
+    let mut method_homes: Vec<Option<SpilledHomes>> = Vec::with_capacity(funcs.len());
     let mut func_starts: Vec<u32> = Vec::with_capacity(funcs.len());
     for (index, func) in funcs.iter().enumerate() {
         enc.align_to_word();
         enc.bind_label(func_labels[index]);
         let map_start = stack_maps.len();
         func_starts.push(enc.position());
-        let source_map = debug
+        enc.begin_function();
+        let empty_source = crate::cil::CilSourceMap::default();
+        let source = debug
             .and_then(|d| d.source_maps.get(index))
-            .map(|m| m.0.as_slice())
-            .unwrap_or(&[]);
+            .unwrap_or(&empty_source);
         let mut lines: Vec<(u32, u32)> = Vec::new();
+        let mut spilled_homes: Option<SpilledHomes> = None;
         if emit_entry && !defer_encode {
             lower_one_func(
                 func,
@@ -5476,8 +5870,9 @@ fn emit_object_pass(
                 &mut stack_maps,
                 blob_table,
                 console_symbol,
-                source_map,
+                source,
                 &mut lines,
+                &mut spilled_homes,
                 string_header,
             )?;
         } else if stubbed.contains(&index) {
@@ -5498,8 +5893,9 @@ fn emit_object_pass(
                 &mut scratch_maps,
                 blob_table,
                 console_symbol,
-                source_map,
+                source,
                 &mut Vec::new(),
+                &mut None,
                 string_header,
             ) {
                 Ok(()) => {
@@ -5510,8 +5906,9 @@ fn emit_object_pass(
                         &mut stack_maps,
                         blob_table,
                         console_symbol,
-                        source_map,
+                        source,
                         &mut lines,
+                        &mut spilled_homes,
                         string_header,
                     )
                     .expect("a method that lowered in the dry run lowers for real");
@@ -5528,6 +5925,8 @@ fn emit_object_pass(
         }
         map_ranges.push((map_start, stack_maps.len()));
         method_lines.push(LineTable(lines));
+        method_frames.push(enc.frame().clone());
+        method_homes.push(spilled_homes);
     }
     let code_end_label = enc.new_label();
     enc.bind_label(code_end_label);
@@ -5698,6 +6097,68 @@ fn emit_object_pass(
     let offsets: Vec<u32> = func_labels
         .iter()
         .map(|&l| assembled.label_position(l).unwrap_or(0))
+        .collect();
+    let method_transitions: Vec<Vec<(u32, u32)>> = method_frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let start = offsets.get(index).copied().unwrap_or(0);
+            frame
+                .transitions
+                .iter()
+                .filter_map(|&(label, cfa)| {
+                    Some((assembled.label_position_by_id(label)?.checked_sub(start)?, cfa))
+                })
+                .collect()
+        })
+        .collect();
+    let method_locations: Vec<Vec<crate::dwarf::LocalLocation>> = method_homes
+        .iter()
+        .enumerate()
+        .map(|(index, homes)| {
+            let (Some(homes), Some(func)) = (homes.as_ref(), funcs.get(index)) else {
+                return Vec::new();
+            };
+            let Some(changes) = debug
+                .and_then(|d| d.source_maps.get(index))
+                .map(|m| m.local_changes.as_slice())
+            else {
+                return Vec::new();
+            };
+            resolve_local_locations(
+                func,
+                homes,
+                changes,
+                &assembled,
+                offsets.get(index).copied().unwrap_or(0),
+                &method_transitions[index],
+                method_frames[index].cfa_offset(),
+            )
+        })
+        .collect();
+    let method_param_locations: Vec<Vec<crate::dwarf::LocalLocation>> = method_homes
+        .iter()
+        .enumerate()
+        .map(|(index, homes)| {
+            let (Some(homes), Some(func)) = (homes.as_ref(), funcs.get(index)) else {
+                return Vec::new();
+            };
+            let Some(args) = debug
+                .and_then(|d| d.source_maps.get(index))
+                .map(|m| m.arg_values.as_slice())
+            else {
+                return Vec::new();
+            };
+            resolve_param_locations(
+                func,
+                homes,
+                args,
+                &assembled,
+                offsets.get(index).copied().unwrap_or(0),
+                &method_transitions[index],
+                method_frames[index].cfa_offset(),
+            )
+        })
         .collect();
     let code_end = assembled
         .label_position(code_end_label)
@@ -6083,6 +6544,11 @@ fn emit_object_pass(
                     file: dbg.methods[*index].file,
                     rows,
                     code_size: symbols[*index].size,
+                    entry: crate::debugmap::entry_position(dbg.methods[*index].points),
+                    locals: dbg.methods[*index].locals,
+                    locations: &method_locations[*index],
+                    params: dbg.methods[*index].params,
+                    param_locations: &method_param_locations[*index],
                 })
                 .collect();
             if functions.is_empty() {
@@ -6096,10 +6562,22 @@ fn emit_object_pass(
                 let first = described[0].0;
                 let last = described[described.len() - 1].0;
                 let span = Some(offsets[last] + symbols[last].size - offsets[first]);
-                let line = crate::dwarf::line_program(&functions);
-                let (info, abbrev) =
+                let line = crate::dwarf::line_program(dbg.unit_name, &functions);
+                let (info, abbrev, loclists) =
                     crate::dwarf::compilation_unit(dbg.unit_name, dbg.producer, span, &functions);
-                let generated = [line, info, abbrev];
+                let frames: Vec<crate::dwarf::FunctionFrame> = described
+                    .iter()
+                    .map(|(index, _)| {
+                        let frame = &method_frames[*index];
+                        crate::dwarf::FunctionFrame {
+                            code_size: symbols[*index].size,
+                            transitions: method_transitions[*index].clone(),
+                            saved: frame.saved.clone(),
+                        }
+                    })
+                    .collect();
+                let frame = crate::dwarf::frame_section(&frames);
+                let generated = [line, info, abbrev, frame, loclists];
                 let first_section_symbol = symbols.len() as u32;
                 for i in 0..generated.len() {
                     symbols.push(lamella_elf::Symbol {
@@ -6122,7 +6600,7 @@ fn emit_object_pass(
                                     offset: *at,
                                     symbol: described[*function].0 as u32,
                                     kind: lamella_elf::arm::R_ARM_ABS32,
-                                    addend: 0,
+                                    addend: crate::dwarf::site_addend(section, *at),
                                 });
                         let cross =
                             section
@@ -6137,7 +6615,7 @@ fn emit_object_pass(
                                             .unwrap_or(0)
                                             as u32,
                                     kind: lamella_elf::arm::R_ARM_ABS32,
-                                    addend: 0,
+                                    addend: crate::dwarf::site_addend(section, *at),
                                 });
                         code.chain(cross).collect()
                     })
@@ -6208,10 +6686,9 @@ fn lower_module_inner(
     for (index, func) in funcs.iter().enumerate() {
         let func_offset = enc.position();
         enc.bind_label(func_labels[index]);
-        let source_map = source_maps
-            .get(index)
-            .map(|m| m.0.as_slice())
-            .unwrap_or(&[]);
+        let empty_source = crate::cil::CilSourceMap::default();
+        let source = source_maps.get(index).unwrap_or(&empty_source);
+        let source_map = source.rows.as_slice();
         let mut lines = Vec::new();
         match prepare(func)? {
             Assignment::Registers { regs, saved } => {
@@ -6252,12 +6729,13 @@ fn lower_module_inner(
                     &func_labels,
                     alloc_addr,
                     py_support,
-                    source_map,
+                    source,
                     &mut lines,
+                    &mut None,
                     &mut stack_maps,
                     vtables,
                     false,
-                    None,
+                            None,
                     None,
                     None,
                 )?;
@@ -7213,7 +7691,11 @@ mod tests {
                 terminator: Some(Terminator::Return(None)),
             }],
         };
-        let source_map = vec![vec![2u32, 4, 6]];
+        let source_map = crate::cil::CilSourceMap {
+            rows: vec![vec![2u32, 4, 6]],
+            local_changes: vec![Vec::new()],
+            arg_values: Vec::new(),
+        };
         let (bytes, table) = lower_debug(&func, &source_map).unwrap();
         assert!(!bytes.is_empty());
         assert_eq!(table.0.first().map(|&(_, cil)| cil), Some(2));
@@ -7652,6 +8134,7 @@ mod tests {
             &NoCalls,
             &[MirType::I32, MirType::I32],
             &[MirType::I32, MirType::I32],
+            crate::cil::Narrowing::default(),
         )
         .unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
@@ -9571,6 +10054,7 @@ mod tests {
                             handle: lamella_ir::TypeHandle(1),
                             dims: alloc::vec![n(0), n(1), n(2)].into_boxed_slice(),
                             element_size: 4,
+                            element_kind: 5,
                         },
                     ),
                     (n(4), i32c(1)),
@@ -10266,7 +10750,7 @@ mod tests {
         );
         assert!(
             !obj.symbols.iter().any(|s| s.name == "__lamella_gc_stackmaps"),
-            "the whole-program map is synthesized by lamella-link, not by the backend"
+            "the whole-program map is synthesized by lamella-linker, not by the backend"
         );
 
         for (function, entries) in decode_gcmap_fragments(&section.data) {
@@ -10584,6 +11068,22 @@ mod tests {
         assert!(has("__aeabi_fcmpeq"), "f32 != -> fcmpeq (inverted)");
         assert!(has("__aeabi_dcmplt"), "f64 < -> dcmplt");
         assert_eq!(code_relocations(&obj).len(), 3);
+    }
+
+    /// All FOUR float-to-long helpers, named. This is a table test rather than a lowering test for
+    /// one reason: [`aeabi_convert_helper`] ends `_ => None`, so a [`ConvKind`] that never reaches it
+    /// gets NO helper silently and the arm falls through to a caller that assumes one. The
+    /// exhaustive matches elsewhere in this file (`extend_for`) would catch a missing kind; this
+    /// table cannot, so the pairing is asserted here instead.
+    ///
+    /// The unsigned pair is not interchangeable with the signed one: `conv.u8` from a float has the
+    /// whole `2^63..2^64` range in it, which `__aeabi_d2lz` cannot represent.
+    #[test]
+    fn the_float_to_long_helpers_pair_signed_with_signed_and_unsigned_with_unsigned() {
+        assert_eq!(aeabi_convert_helper(ConvKind::Float32ToLong), Some("__aeabi_f2lz"));
+        assert_eq!(aeabi_convert_helper(ConvKind::Float64ToLong), Some("__aeabi_d2lz"));
+        assert_eq!(aeabi_convert_helper(ConvKind::Float32ToULong), Some("__aeabi_f2ulz"));
+        assert_eq!(aeabi_convert_helper(ConvKind::Float64ToULong), Some("__aeabi_d2ulz"));
     }
 
     #[test]
@@ -11682,13 +12182,13 @@ mod tests {
             roots: Vec::new(),
         };
         let maps = [
-            crate::cil::CilSourceMap(vec![vec![7]]),
-            crate::cil::CilSourceMap(vec![vec![7]]),
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
         ];
         let points = [(7u32, 11u32, 5u32)];
         let sources = [
-            crate::debugmap::MethodSource { name: "T.first", file: "t.cs", points: &points },
-            crate::debugmap::MethodSource { name: "T.second", file: "t.cs", points: &points },
+            crate::debugmap::MethodSource { name: "T.first", file: "t.cs", points: &points, locals: &[], params: &[] },
+            crate::debugmap::MethodSource { name: "T.second", file: "t.cs", points: &points, locals: &[], params: &[] },
         ];
         let debug = crate::debugmap::ObjectDebug {
             source_maps: &maps,
@@ -11715,14 +12215,32 @@ mod tests {
         assert_eq!(with_obj.text, plain_obj.text, "debug info must not move a byte of code");
         assert!(plain_obj.sections.is_empty(), "the plain build carries no debug sections");
         let names_out: Vec<&str> = with_obj.sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names_out, [".debug_line", ".debug_info", ".debug_abbrev"]);
+        assert_eq!(
+            names_out,
+            [
+                ".debug_line",
+                ".debug_info",
+                ".debug_abbrev",
+                ".debug_frame",
+                ".debug_loclists"
+            ]
+        );
         assert!(
             with_obj
                 .sections
                 .iter()
-                .any(|s| s.name == ".debug_line" && !s.relocations.is_empty()),
-            "the line program's addresses come from relocations"
+                .any(|s| s.name == ".debug_loclists" && s.data.is_empty()),
+            "a unit with no locals must carry an empty location-list section"
         );
+        for section in [".debug_line", ".debug_frame"] {
+            assert!(
+                with_obj
+                    .sections
+                    .iter()
+                    .any(|s| s.name == section && !s.relocations.is_empty()),
+                "{section} names code by relocation, because only the linker knows the address"
+            );
+        }
 
         assert_eq!(lines.len(), 2);
         let obj = &with_obj;

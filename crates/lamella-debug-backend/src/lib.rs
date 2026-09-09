@@ -80,7 +80,29 @@ pub trait DebugBackend {
     /// Replaces the breakpoints, each an opaque code address (see the module docs).
     /// Interpreter: `(method, instruction)` pairs. Device: native code addresses, set
     /// as hardware BPU comparators.
-    fn set_breakpoints(&mut self, addresses: &[u64]);
+    ///
+    /// `Ok` is a promise: every address the adapter believes is armed is armed. `Err(reason)`
+    /// withdraws that promise, and the adapter reports the breakpoints unverified with `reason`
+    /// shown on them -- because the alternative is an editor showing armed breakpoints at which
+    /// the target will never stop, which reads to the user as their code not being reached.
+    ///
+    /// Truncation at [`DebugBackend::max_breakpoints`] is `Ok`, deliberately: that limit is the
+    /// seam that already tells the adapter which breakpoints do not fit, so they were reported
+    /// unverified before this call and are not a broken promise. `Err` is for what the adapter
+    /// could not predict -- a bus or transport failure, a unit that refused the write, an address
+    /// outside the target's address space.
+    ///
+    /// The reason is a whole-set fact. A backend that armed part of the set still returns `Err`,
+    /// and the adapter cannot say which ones failed, so it greys them all. That is coarse in the
+    /// safe direction: a greyed breakpoint that would have worked costs a question, and a green
+    /// one that never fires costs a debugging session.
+    ///
+    /// A backend with no target under control yet returns `Ok` and arms the set when it gets one
+    /// -- the adapter sends breakpoints before `configurationDone`, so a not-yet-launched target
+    /// is the ordinary sequence rather than a failure. Calling it one would grey every breakpoint
+    /// in the editor before a session had a chance to start, and [`DebugBackend::launch`] reports
+    /// the arm that follows.
+    fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String>;
 
     /// The most breakpoints the target can arm at once, or `None` for no limit. The
     /// device has a fixed number of hardware comparators (the Cortex-M0 BPU has four);

@@ -1,0 +1,59 @@
+# The SAMR30 Main Clock block: the peripheral-bus gate registers. Offsets are MCLK-base-relative;
+# the base lives in ../instances.toml.
+#
+# FIVE APB MASK REGISTERS ON THIS FAMILY, A THROUGH E, as on the SAM L21 die this part is built
+# from. The sibling samc21 has four and the SAM D21 line has one that matters. Which register gates
+# an instance is therefore a per-instance fact and the instance rows carry `apb_mask_offset` for it
+# -- on this part PORT is in APBA, SERCOM0..4 are in APBC, and SERCOM5 is in APBD.
+
+[table]
+kind = "block"
+family = "samr30"
+block = "mclk"
+sources = [
+    "SAM R30 datasheet DS70005303C section 13.6.8 (MCLK Register Description), per-register Offset headings: AHBMASK 0x10, APBAMASK 0x14, APBBMASK 0x18, APBCMASK 0x1C, APBDMASK 0x20, APBEMASK 0x24",
+    "DS70005303C sections 13.6.8.9 (APBA Mask), 13.6.8.11 (APBC Mask) and 13.6.8.12 (APBD Mask) per-bit prose, one numbered paragraph per bit naming the peripheral it gates",
+]
+notes = [
+    "PORT IS GATED FROM APBAMASK BIT 10 ON THIS FAMILY, not from an APBC bit. It sits behind AHB-APB Bridge A at 0x40002800, where the SAM D21 line and the SAM C21 both put it behind Bridge B. The mask register follows the bridge, which is exactly why it cannot be a family constant.",
+    "SERCOM0..4 ARE APBCMASK BITS 0..4 AND SERCOM5 IS APBDMASK BIT 1. The numbering starts at 0 here where the SAM D21 line starts its SERCOMs at APBCMASK bit 2 and the SAM C21 starts at bit 1. A bit carried across produces a peripheral that never clocks while every register reads back what was written.",
+    "SERCOM4'S BIT IS TRANSCRIBED AND IS NOT A BOARD'S TO SET. The instance is the AT86RF212B's; the field exists here because the register does, and because a reader checking a write against this table needs the bit that is NOT theirs to be visible rather than absent.",
+    "THE BIT POSITIONS WERE TAKEN FROM THE PER-BIT PROSE, NOT FROM THE BIT-FIELD DIAGRAM. The diagram's rows extract with Access and Reset lines interleaved between the bit numbers and the names, which is how a name comes to sit under the wrong number; the numbered paragraphs each name one bit and one peripheral and cannot desynchronize.",
+    "DECLARED SUBSET: APBBMASK and APBEMASK are transcribed as registers with no fields, because they are part of the offset set a reader checks an address against and nothing below names a bit in either. AHBMASK likewise.",
+]
+
+[registers.AHBMASK]
+offset = 0x10
+width = 32
+fields = { }
+notes = "AHB bus clock gates. Transcribed for completeness of the offset set; no instance row names a bit in it today."
+
+[registers.APBAMASK]
+offset = 0x14
+width = 32
+fields = { PORT = [10, 1] }
+notes = "APB-A gates, and on this family that includes PORT at bit 10. Table 13-3 marks PORT's APB clock 'Enabled at Reset: Y', so a GPIO driver that assumes the reset state is correct today; the bit is stated so that a consumer which ever gates it has the register rather than a guess."
+
+[registers.APBBMASK]
+offset = 0x18
+width = 32
+fields = { }
+notes = "APB-B gates -- USB, DSU, NVMCTRL and the memory-side blocks on this family. No instance row names a bit in it today."
+
+[registers.APBCMASK]
+offset = 0x1C
+width = 32
+fields = { SERCOM0 = [0, 1], SERCOM1 = [1, 1], SERCOM2 = [2, 1], SERCOM3 = [3, 1], SERCOM4 = [4, 1] }
+notes = "APB-C gates. SERCOM0..4 are bits 0..4 -- the numbering starts at zero on this family. SERCOM4's gate belongs to the transceiver, not to a board. SERCOM5 is NOT here; it is behind Bridge D. Read-modify-write in drivers, since other peripherals share the register."
+
+[registers.APBDMASK]
+offset = 0x20
+width = 32
+fields = { SERCOM5 = [1, 1] }
+notes = "APB-D gates, reached over AHB-APB Bridge D at 0x43000000. SERCOM5 is the only instance this family's bindings reach through it, and it is in a different power domain from its five siblings."
+
+[registers.APBEMASK]
+offset = 0x24
+width = 32
+fields = { }
+notes = "APB-E gates. Transcribed because the register exists and a reader checking an offset needs the set to be complete; the sibling samc21 has no APB-E at all."

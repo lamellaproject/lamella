@@ -110,3 +110,11 @@ kind = "gpio-in"
 pin = "PC13"
 active = "high"
 source = "Arduino GIGA R1 WiFi full pinout page 1 labels PC13/BOOT0 as BOOT0_BUTTON and states that it can be used as USER button. The schematics sheet TOP.SchDoc gives push-button PB2 one terminal on +3V3 and the other on the net carrying BOOT0 and PC13, and sheet STM32H747.SchDoc holds that net to ground through R4, 100 kohm. So the pin reads low while the button is open and high while it is pressed, and the idle level is defined by a fitted resistor rather than left floating."
+
+[debug]
+signals = ["jtag"]
+exposure = "header"
+fitted = "unknown"
+onboard = "none"
+recovery = "flash-bootloader"
+source = "The board offers a six-pin JTAG header with no probe fitted, and carries neither an on-board debugger nor a USB-serial bridge. The board document names the header and does not state that a connector is populated on it, so it is recorded as a header position with nothing fitted."

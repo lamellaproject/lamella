@@ -338,7 +338,7 @@ data_lines = 1
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
-source = "100 of 100 cold bring-ups at a 16 MHz interface clock, where the part answered 6. Measured again on 2026-07-29 by the same firmware at the same clock, walking every count in the range rather than every second one, it answered 8 -- its datasheet's own figure -- and read back 100 of 100 at that. Both counts are observations of this part; the count is not a constant of it."
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, where the part answered 6. Measured again by the same firmware at the same clock, walking every count in the range rather than every second one, it answered 8 -- its datasheet's own figure -- and read back 100 of 100 at that. Both counts are observations of this part; the count is not a constant of it."
 
 [[memory.qspi.reads]]
 name = "quad_output_read"
@@ -349,7 +349,7 @@ data_lines = 4
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
-source = "100 of 100 cold bring-ups at a 16 MHz interface clock, data on four lines and the address still on one, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 8 and read back 100 of 100 at that."
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, data on four lines and the address still on one, where the part answered 6. Measured again at the same clock it answered 8 and read back 100 of 100 at that."
 
 [[memory.qspi.reads]]
 name = "quad_io_read"
@@ -360,7 +360,7 @@ data_lines = 4
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
-source = "100 of 100 cold bring-ups at a 16 MHz interface clock, address and data both on four lines, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 10 -- the figure associated with this part's full-rate quad I/O -- and read back 100 of 100 at that. The largest gap of the four, on the fastest configuration."
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, address and data both on four lines, where the part answered 6. Measured again at the same clock it answered 10 -- the figure associated with this part's full-rate quad I/O -- and read back 100 of 100 at that. The largest gap of the four, on the fastest configuration."
 
 [memory.sdram.device]
 part = "MT48LC4M32B2B5-6A"  # the fitted device, named by the board schematic. What it IS -- a
@@ -462,3 +462,11 @@ pclk_hz = 16000000          # the APB clock feeding this board's bound USART. US
                             # APB2, so this is PCLK2 -- which is exactly why the key is not
                             # named for a bus number. Under reset prescalers it equals HSI,
                             # which the generator verifies rather than takes.
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "st-link"
+recovery = "probe"
+source = "UM1907 documents SWD debugging support and an embedded ST-LINK/V2-1 reaching the part over SWD, with PA13 carrying SYS_JTMS-SWDIO. The manual does not place those signals on a connector for an external probe in anything read here, so the exposure is unknown. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

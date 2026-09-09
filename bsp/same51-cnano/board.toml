@@ -7,9 +7,13 @@
 # 51 pads, port A complete as the larger part has it, port B cut to PB00-PB17 plus four, and no
 # port C or D at all.
 #
-# BOTH CONTROL LINES ARE ACTIVE LOW AND THE GUIDE STATES BOTH IN WORDS, exactly as the Xplained Pro
-# board's do. The LED lights when its line is driven to ground; the switch drives its line to ground
-# when pressed. AND THE SWITCH HAS NO EXTERNAL PULL-UP -- the guide says so outright and says what
+# THE TWO CONTROL LINES DO NOT SHARE A POLARITY, AND ONE OF THEM CONTRADICTS THE GUIDE. The switch
+# drives its line to ground when pressed, as the guide says. THE LED DOES NOT: it lights when PA14
+# is driven HIGH, measured on the fitted board, while the guide states the opposite in words and
+# draws it in a schematic. Both of those describe an earlier revision -- they are one source, not
+# two, because prose and a drawing in one document share an author and a revision baseline and go
+# stale together. The device row below carries the measurement and what it overturned.
+# AND THE SWITCH HAS NO EXTERNAL PULL-UP -- the guide says so outright and says what
 # to do about it, so a program opening that pin as a plain input reads a floating pad.
 #
 # THE DEBUGGER IS AN nEDBG RATHER THAN AN EDBG, and the difference that matters to a host is the USB
@@ -42,7 +46,12 @@ usb_vid = 0x03EB            # which is this: an nEDBG answers 0x2175 where an Xp
 usb_pid = 0x2175            # answers 0x2111. Read off this kit rather than inherited, and it
                             # narrows to a KIT rather than to a board -- the probe's serial is
                             # what separates two of the same kit.
+role = "vcp"                # NAMED NOW THAT SOMETHING DRIVES IT. A role ties this carrier to the
+                            # binding below; until that binding existed the row deliberately had
+                            # none, because a role with nothing behind it claims a driver that does
+                            # not exist and the generator refuses it.
 baud = 115200
+plan = "dfll48m-48mhz"      # the reset plan below, which is what the baud divisor is derived from
 default = true
 
 # --- the clock plan -------------------------------------------------------------------------------
@@ -60,16 +69,45 @@ gclk0_hz = 48000000
 
 # --- control lines ------------------------------------------------------------------------------
 
+# --- the debugger's UART ---------------------------------------------------------------------
+#
+# THE nEDBG'S CDC PORT, ON SERCOM5 IOSET 1. DS70005432B's debugger section names both pads and both
+# roles outright -- "PB16 SERCOM5 PAD0 TX" and "PB17 SERCOM5 PAD1 RX" -- and its connection table
+# says the same thing from the DEBUGGER's side, which is the direction worth reading carefully:
+# it lists PB16 as "CDC RX / UART RX (SAME51J20A TX line)". The debugger RECEIVES what the part
+# TRANSMITS, so PB16 is the part's TX and PB17 its RX, which is what the pad roles already said.
+#
+# THE GUIDE MISSPELLS THE INSTANCE IN TWO PLACES AND IT DOES NOT MATTER HERE. It prints "SEMCOM5"
+# on two rows and "SERCOM5" on others; the pads and the pad numbers agree across all of them, and
+# DS60001507F Table 6-1 gives both pins to SERCOM5 in column C independently.
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom5"
+function = "C"              # the SERCOM column. This instance is ALSO in csp/same54/pins.toml on
+gclk_gen = 0                # PA22/PA23 in column D -- IOSET 2 of the same SERCOM -- so the letter
+tx = { pin = "PB16", pad = 0 }   # and the pad pair have to move together, and these two are IOSET 1.
+rx = { pin = "PB17", pad = 1 }
+
 [[devices]]
 name = "led0"
 kind = "gpio-out"
 pin = "PA14"
-active = "low"
-source = "DS70005432B section 4.2.2 and Table 4-1: one yellow LED0 on PA14 with no shared functionality. 'The LED can be activated by driving the connected I/O line to GND', which is the polarity stated in words rather than inferred from a schematic."
+active = "high"
+source = "DS70005432B section 4.2.1 and Table 4-1: one yellow LED0 on PA14 with no shared functionality. THE POLARITY IS MEASURED AND THE GUIDE DISAGREES WITH IT. Driven from a probe with the core halted, PA14 was held high for five seconds and low for one in a repeating cycle, with IN tracking OUT on every cycle so the pad is known to follow: the diode is lit for the five-second stretch, so it lights when the pin is HIGH. The kit is identifier 02-01259 revision 05. The guide states the opposite twice: section 4.2.1 says 'The LED can be activated by driving the connected I/O line to GND', and its schematic sheets, marked R3, draw VCC_TARGET to the D200 anode, cathode to R202 110R, and R202 to PA14 -- a circuit that lights when the pin is low. Both statements describe a revision earlier than the one measured; the guide's Hardware Revision History chapter documents no revisions, so it cannot say what changed."
 
 [[devices]]
 name = "button0"
 kind = "gpio-in"
 pin = "PA15"
 active = "low"
-source = "DS70005432B section 4.2.2 and Table 4-2: the generic user-configurable switch SW0 on PA15, no shared functionality. 'When the switch is pressed, it will drive the I/O line to ground (GND)'. THERE IS NO EXTERNAL PULL-UP: the section's Tip says no pull-up resistor is connected to this switch and that the internal pull-up in the part must be enabled to use it, so a program opening this pin as a plain input reads a floating pad."
+source = "DS70005432B section 4.2.2 and Table 4-2: the generic user-configurable switch SW0 on PA15, no shared functionality. 'When the switch is pressed, it will drive the I/O line to ground (GND)'. BOTH HALVES ARE MEASURED AND THE GUIDE IS RIGHT ON BOTH -- worth stating on this board in particular, because its LED0 row records the same guide being wrong twice about the diode. Read from a probe with the core halted: with the internal pull-up enabled the pad rests HIGH and a press takes it LOW, seen seventeen times across a fifteen-second window with holds from 87 ms to 619 ms, so the switch is ACTIVE LOW. THERE IS NO EXTERNAL PULL-UP, as the section's Tip says: parked as an input the pad follows whichever internal pull is enabled, and with no pull at all it keeps whichever level was applied last -- a pad holding its own gate charge, which is only possible with nothing outside the chip driving it. So a program opening this pin as a plain input reads a floating pad and must enable the internal pull-up itself. The shortest excursion seen is 87 ms, so a consumer owes this pin a debounce."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "The on-board debugger is an nEDBG, which presents the same virtual COM port as an EDBG and reaches the part's SWD lines on PA31 and PA30. The kit's user guide does not place those signals on a connector for an external probe, so the exposure is unknown. The edge connector shares lines with the debugger and is not a debug header. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

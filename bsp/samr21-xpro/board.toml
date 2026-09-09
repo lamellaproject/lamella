@@ -70,3 +70,11 @@ kind = "gpio-in"
 pin = "PA28"
 active = "low"
 source = "Atmel-42243D section 4.2.2 and Table 4-7: the generic user-configurable button SW0 on PA28, silkscreened SW0. 'When a button is pressed it will drive the I/O line to GND'. The guide says nothing about an external pull-up on this line, in either direction."
+
+[debug]
+signals = []
+exposure = "unknown"
+fitted = "unknown"
+onboard = "edbg"
+recovery = "probe"
+source = "Atmel-42243D section 4.4.1 and Table 4-11, SWD Connections, give SWD clock on PA30 and SWD data on PA31, reached by the on-board EDBG. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

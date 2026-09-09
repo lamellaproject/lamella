@@ -84,6 +84,14 @@ fn format_radix(mut n: u128, radix: u128, upper: bool) -> String {
 /// Zero-pads the digit portion of a rendered int (the `%`-format int precision = minimum digits) to
 /// at least `precision` digits, keeping a leading sign and any `0x`/`0o`/`0b` prefix in front.
 fn zero_pad_int(rendered: &str, precision: usize) -> String {
+    let (sign, prefix, digits) = split_sign_and_prefix(rendered);
+    let pad = "0".repeat(precision.saturating_sub(digits.chars().count()));
+    alloc::format!("{sign}{prefix}{pad}{digits}")
+}
+
+/// Splits a rendered integer into its sign, its radix prefix and its digits -- the three parts a
+/// zero-fill has to keep in that order.
+fn split_sign_and_prefix(rendered: &str) -> (&str, &str, &str) {
     let (sign, rest) = match rendered.strip_prefix(['-', '+', ' ']) {
         Some(rest) => (&rendered[..1], rest),
         None => ("", rendered),
@@ -92,7 +100,18 @@ fn zero_pad_int(rendered: &str, precision: usize) -> String {
         Some(p @ ("0x" | "0X" | "0o" | "0O" | "0b" | "0B")) => (p, &rest[2..]),
         _ => ("", rest),
     };
-    let pad = "0".repeat(precision.saturating_sub(digits.chars().count()));
+    (sign, prefix, digits)
+}
+
+/// Widens a rendered integer to `width` by inserting zeros AFTER the sign and any radix prefix --
+/// the `0` flag's rule.
+///
+/// **[`pad_field`] cannot express it**: it prepends the fill, so a zero fill would land in front of
+/// the sign and print `"0-042"` where CPython prints `"-0042"`.
+fn zero_fill_to_width(rendered: &str, width: usize) -> String {
+    let (sign, prefix, digits) = split_sign_and_prefix(rendered);
+    let head = sign.chars().count() + prefix.chars().count() + digits.chars().count();
+    let pad = "0".repeat(width.saturating_sub(head));
     alloc::format!("{sign}{prefix}{pad}{digits}")
 }
 
@@ -1052,20 +1071,7 @@ fn str_predicate(method_id: u32, s: &str) -> bool {
             }
             cased
         }
-        STR_ISPRINTABLE => s.chars().all(|c| {
-            c == ' '
-                || !matches!(
-                    general_category(c as u32),
-                    GeneralCategory::SpaceSeparator
-                        | GeneralCategory::LineSeparator
-                        | GeneralCategory::ParagraphSeparator
-                        | GeneralCategory::Control
-                        | GeneralCategory::Format
-                        | GeneralCategory::Surrogate
-                        | GeneralCategory::PrivateUse
-                        | GeneralCategory::NotAssigned
-                )
-        }),
+        STR_ISPRINTABLE => s.chars().all(|c| is_printable_code_point(c as u32)),
         _ => false,
     }
 }
@@ -1239,9 +1245,43 @@ fn adjust_slice(start_v: Value, stop_v: Value, step: i64, len: i64) -> Result<(i
     Ok((start, stop))
 }
 
+/// Whether `cp` is PRINTABLE in Python's sense: not in an "Other" (C*) or "Separator" (Z*)
+/// general category, except that ASCII space (U+0020) is printable.
+///
+/// **One predicate, two callers, and they must not drift**: `str.isprintable` reports it and
+/// [`str_repr`] escapes what it denies. CPython derives both from the same `Py_UNICODE_ISPRINTABLE`,
+/// so a string is round-trippable exactly when `isprintable` says the escapes were unnecessary.
+fn is_printable_code_point(cp: u32) -> bool {
+    use lamella_unicode::{general_category, GeneralCategory};
+    cp == 0x20
+        || !matches!(
+            general_category(cp),
+            GeneralCategory::SpaceSeparator
+                | GeneralCategory::LineSeparator
+                | GeneralCategory::ParagraphSeparator
+                | GeneralCategory::Control
+                | GeneralCategory::Format
+                | GeneralCategory::Surrogate
+                | GeneralCategory::PrivateUse
+                | GeneralCategory::NotAssigned
+        )
+}
+
+/// A non-printable code point in `repr`'s escape spelling, chosen by WIDTH as CPython chooses it:
+/// `\xNN` below U+0100, `\uNNNN` below U+10000, `\UNNNNNNNN` above -- lower-case hex throughout.
+///
+fn escape_code_point(cp: u32) -> String {
+    if cp < 0x100 {
+        alloc::format!("\\x{cp:02x}")
+    } else if cp < 0x1_0000 {
+        alloc::format!("\\u{cp:04x}")
+    } else {
+        alloc::format!("\\U{cp:08x}")
+    }
+}
+
 /// The Python `repr()` of a string: single quotes, switching to double quotes if the string
-/// contains a `'` but no `"`; backslash, the quote, and the common control chars are escaped.
-/// (Escaping of exotic non-printables is an ASCII-faithful refinement.)
+/// contains a `'` but no `"`; backslash, the quote, and every NON-PRINTABLE code point are escaped.
 fn str_repr(s: &[u8]) -> String {
     let quote = if s.contains(&b'\'') && !s.contains(&b'"') {
         '"'
@@ -1260,10 +1300,7 @@ fn str_repr(s: &[u8]) -> String {
                 out.push('\\');
                 out.push(quote);
             }
-            c if c < 0x20 || c == 0x7f => {
-                out.push_str(&alloc::format!("\\x{c:02x}"));
-            }
-            0xD800..=0xDFFF => out.push_str(&alloc::format!("\\u{code:04x}")),
+            c if !is_printable_code_point(c) => out.push_str(&escape_code_point(c)),
             c => out.push(char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER)),
         }
     }
@@ -3533,7 +3570,7 @@ impl ObjectModel {
     /// surrogate-bearing string would then be silently treated as NOT A STRING: a wrong answer rather
     /// than a refusal, and the wrong answer would surface somewhere else entirely.
     ///
-    /// **This lane has met that exact shape before**: `find_dunder` answered `None` to "absent" and
+    /// **That exact shape has arisen before**: `find_dunder` answered `None` to "absent" and
     /// to "present but not a function" alike, and the fix was to ask the two questions separately.
     /// [`Self::str_text`] is the other question.
     #[must_use]
@@ -3563,7 +3600,7 @@ impl ObjectModel {
         core::str::from_utf8(bytes).map_err(|_| Trap::Unsupported)
     }
 
-    /// A `str`'s text for an INTROSPECTION NAME LIST -- **the one accessor here that deliberately
+    /// A `str`'s text for a REFLECTION NAME LIST -- **the one accessor here that deliberately
     /// answers `None` to two different questions**, and the only place that is admissible.
     ///
     /// `None` means both "not a `str`" and "a `str` with no UTF-8 form". Every other accessor on this
@@ -3971,6 +4008,11 @@ impl ObjectModel {
                     let align = if flags.contains('-') { '<' } else { '>' };
                     out.push_str(&pad_field(&body, width_n, ' ', align));
                 }
+                'c' => {
+                    let body = self.format_value_spec(arg, "c")?;
+                    let align = if flags.contains('-') { '<' } else { '>' };
+                    out.push_str(&pad_field(&body, width_n, ' ', align));
+                }
                 _ => {
                     let mut spec = String::new();
                     if flags.contains('-') {
@@ -4000,8 +4042,12 @@ impl ObjectModel {
                         }
                         digit_spec.push(if ty == 'i' || ty == 'u' { 'd' } else { ty });
                         let body = zero_pad_int(&self.format_value_spec(arg, &digit_spec)?, precision);
-                        let align = if flags.contains('-') { '<' } else { '>' };
-                        out.push_str(&pad_field(&body, width_n, ' ', align));
+                        if flags.contains('0') && !flags.contains('-') {
+                            out.push_str(&zero_fill_to_width(&body, width_n));
+                        } else {
+                            let align = if flags.contains('-') { '<' } else { '>' };
+                            out.push_str(&pad_field(&body, width_n, ' ', align));
+                        }
                     } else {
                         spec.push_str(&width);
                         if has_precision && float_ty {
@@ -4229,7 +4275,7 @@ impl ObjectModel {
     /// store-subscript are separate operations; `str` is immutable.) Containers join this
     /// dispatch later -- the one-source-of-truth path the interpreter and the AOT
     /// `py_getitem` intrinsic both consume.
-    pub fn py_getitem(&mut self, container: Value, index: Value) -> Result<Value, Trap> {
+    pub(crate) fn py_getitem(&mut self, container: Value, index: Value) -> Result<Value, Trap> {
         if self.is_deque(container) {
             if self.is_slice(index) {
                 let message = "sequence index must be integer, not 'slice'";
@@ -5531,7 +5577,7 @@ impl ObjectModel {
     /// `container[index] = value` (`Op::Setitem`): a `list` stores at an int index (negative
     /// from the end, `IndexError` out of range); a `dict` inserts or updates `index` as the
     /// key. A `tuple`/`str`/other is not assignable (`TypeError`).
-    pub fn py_setitem(&mut self, container: Value, index: Value, value: Value) -> Result<(), Trap> {
+    pub(crate) fn py_setitem(&mut self, container: Value, index: Value, value: Value) -> Result<(), Trap> {
         if let Some(slot) = self.deque_slot(container) {
             let len = self.seqs[slot].len() as i64;
             let i = index.as_int().ok_or(Trap::TypeError)?;
@@ -5707,7 +5753,7 @@ impl ObjectModel {
     /// from the end, `IndexError` out of range) or the elements a slice selects (the list shrinks);
     /// a `dict` removes `index` as a key (`KeyError` if absent). A `tuple`/`str`/other is a
     /// `TypeError`. An instance's `__delitem__` is dispatched by the interpreter before this.
-    pub fn py_delitem(&mut self, container: Value, index: Value) -> Result<(), Trap> {
+    pub(crate) fn py_delitem(&mut self, container: Value, index: Value) -> Result<(), Trap> {
         if let Some(slot) = self.deque_slot(container) {
             let len = self.seqs[slot].len() as i64;
             let i = index.as_int().ok_or(Trap::TypeError)?;
@@ -5831,7 +5877,7 @@ impl ObjectModel {
 
     /// `element in container` (`Op::Contains`): substring for `str`, membership for a
     /// `list`/`tuple` (any element equals), key membership for a `dict`.
-    pub fn py_contains(&self, container: Value, element: Value) -> Result<bool, Trap> {
+    pub(crate) fn py_contains(&self, container: Value, element: Value) -> Result<bool, Trap> {
         if let Some(s) = self.str_bytes(container) {
             let sub = self.str_bytes(element).ok_or(Trap::TypeError)?;
             return Ok(sub.is_empty() || s.windows(sub.len()).any(|window| window == sub));
@@ -6204,7 +6250,7 @@ impl ObjectModel {
     /// `str(value)` (the Python builtin): a `str` is returned unchanged; an int/bool/None
     /// render as `print()` shows them; a container uses its `repr`. Allocates a new `str`
     /// (except when `value` is already one).
-    pub fn py_str(&mut self, value: Value) -> Result<Value, Trap> {
+    pub(crate) fn py_str(&mut self, value: Value) -> Result<Value, Trap> {
         if self.is_str(value) {
             return Ok(value);
         }
@@ -7387,7 +7433,7 @@ impl ObjectModel {
     /// Advances an iterator (`Op::ForIter`): `Some(value)` on the next element, `None` at
     /// exhaustion. The iterator stores its container + position; this reads the position-th
     /// element (a sequence element / a dict key / a 1-char `str`) and advances the position.
-    pub fn py_next(&mut self, iterator: Value) -> Result<Option<Value>, Trap> {
+    pub(crate) fn py_next(&mut self, iterator: Value) -> Result<Option<Value>, Trap> {
         let reference = iterator.as_ref().ok_or(Trap::TypeError)?;
         if self.heap.type_id_of(reference) != self.iter_type_id {
             return Err(Trap::TypeError);
@@ -7645,7 +7691,7 @@ impl ObjectModel {
     /// For an instance, a class or a module the answer is EXHAUSTIVE, because their names live in
     /// dictionaries this can read. For a built-in value it is the method surface of its type plus the
     /// dunders that type exposes -- maintained as a list, and a test asserts every entry resolves.
-    #[cfg(feature = "introspection")]
+    #[cfg(feature = "reflection")]
     pub fn dir_names(&mut self, value: Value) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         if self.is_instance(value) {
@@ -7733,7 +7779,7 @@ impl ObjectModel {
     }
 
     /// The names a class and its bases provide -- the MRO's namespaces, in order.
-    #[cfg(feature = "introspection")]
+    #[cfg(feature = "reflection")]
     fn class_dir_names(&mut self, class: Value) -> Vec<String> {
         let mut names = Vec::new();
         for ancestor in self.class_mro_vec(class) {
@@ -7864,7 +7910,7 @@ impl ObjectModel {
     /// The captured cells of a `PyFunction` (the closure's freevar cells as a `Vec`, or empty for a
     /// plain function -- `cells` is `None`).
     #[must_use]
-    pub fn py_function_cells(&self, func: Value) -> Vec<Value> {
+    pub(crate) fn py_function_cells(&self, func: Value) -> Vec<Value> {
         let Some(reference) = func.as_ref() else {
             return Vec::new();
         };
@@ -7882,14 +7928,14 @@ impl ObjectModel {
 
     /// The module-function index a `PyFunction` refers to.
     #[must_use]
-    pub fn py_function_index(&self, func: Value) -> u32 {
+    pub(crate) fn py_function_index(&self, func: Value) -> u32 {
         let reference = func.as_ref().expect("a PyFunction");
         self.heap.read_u32(reference.0)
     }
 
     /// The HOME module id a `PyFunction` carries (0 = entry).
     #[must_use]
-    pub fn py_function_home(&self, func: Value) -> u16 {
+    pub(crate) fn py_function_home(&self, func: Value) -> u16 {
         func.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + 16) as u16)
     }
 
@@ -7910,7 +7956,7 @@ impl ObjectModel {
     /// The positional DEFAULTS of a `PyFunction` as a vector (the defaults tuple's elements, or
     /// empty if it has none). They align to the trailing positional parameters at bind time.
     #[must_use]
-    pub fn py_function_defaults(&self, func: Value) -> Vec<Value> {
+    pub(crate) fn py_function_defaults(&self, func: Value) -> Vec<Value> {
         let reference = func.as_ref().expect("a PyFunction");
         let defaults = Value::from_bits(self.heap.read_u32(reference.0 + 4));
         self.seq_value(defaults).cloned().unwrap_or_default()
@@ -7920,7 +7966,7 @@ impl ObjectModel {
     /// `None` if it has none. Bound by name to the keyword-only parameters at bind time (via
     /// [`ObjectModel::dict_get_str`]).
     #[must_use]
-    pub fn py_function_kwdefaults(&self, func: Value) -> Value {
+    pub(crate) fn py_function_kwdefaults(&self, func: Value) -> Value {
         match func.as_ref() {
             Some(reference) => Value::from_bits(self.heap.read_u32(reference.0 + 8)),
             None => Value::NONE,
@@ -8213,7 +8259,7 @@ impl ObjectModel {
     /// `super().name`: resolve `name` from the base of the super's class (the MRO after it),
     /// bound to the super's `self` -- a function there binds (single inheritance), a non-function
     /// is returned as-is; otherwise `AttributeError`.
-    pub fn py_getattr_super(&mut self, super_obj: Value, name: &str) -> Result<Value, Trap> {
+    pub(crate) fn py_getattr_super(&mut self, super_obj: Value, name: &str) -> Result<Value, Trap> {
         let class = self.read_slot(super_obj, 0);
         let receiver = self.read_slot(super_obj, 1);
         let instance_type = if self.is_instance(receiver) {
@@ -8287,7 +8333,7 @@ impl ObjectModel {
     /// (returned as-is), then the class + base chain -- a function there binds to the
     /// instance (a [`Self::new_py_bound`]), a non-function is a class attribute; otherwise
     /// `AttributeError`.
-    pub fn py_getattr_instance(&mut self, instance: Value, name: &str) -> Result<Value, Trap> {
+    pub(crate) fn py_getattr_instance(&mut self, instance: Value, name: &str) -> Result<Value, Trap> {
         let dict = self.read_slot(instance, 1);
         if name == "__dict__" {
             if self.instance_slots(instance).is_some() {
@@ -8378,7 +8424,7 @@ impl ObjectModel {
     }
 
     /// `instance.name = value` (`Op::SetAttr`): stores into the instance `__dict__`.
-    pub fn py_setattr_instance(&mut self, instance: Value, name: &str, value: Value) -> Result<(), Trap> {
+    pub(crate) fn py_setattr_instance(&mut self, instance: Value, name: &str, value: Value) -> Result<(), Trap> {
         if let Some(slots) = self.instance_slots(instance) {
             if !slots.iter().any(|s| s == name) {
                 let class_name = String::from(self.instance_class_name(instance).unwrap_or(""));
@@ -8419,7 +8465,7 @@ impl ObjectModel {
     /// (`cls.tagged = True`), a class-level rebinding (`C.count = 0`) works, and instances then read
     /// the new value through the class. The base chain is the READ path ([`ObjectModel::find_in_class`]);
     /// a write always targets this class, matching CPython.
-    pub fn py_setattr_class(&mut self, class: Value, name: &str, value: Value) -> Result<(), Trap> {
+    pub(crate) fn py_setattr_class(&mut self, class: Value, name: &str, value: Value) -> Result<(), Trap> {
         let key = self.new_str(name)?;
         let namespace = self.read_slot(class, 2);
         self.py_setitem(namespace, key, value)
@@ -8428,7 +8474,7 @@ impl ObjectModel {
     /// `f.name = value` (`Op::SetAttr` on a function object): a function has no `__dict__` slot, so its
     /// user attributes live in the `function_dicts` side-table, keyed by the function's identity. The
     /// dict is created on first write. Reads go through [`ObjectModel::function_attr`].
-    pub fn py_setattr_function(&mut self, func: Value, name: &str, value: Value) -> Result<(), Trap> {
+    pub(crate) fn py_setattr_function(&mut self, func: Value, name: &str, value: Value) -> Result<(), Trap> {
         let dict = self.function_dict_or_create(func);
         let key = self.new_str(name)?;
         self.py_setitem(dict, key, value)
@@ -8522,7 +8568,7 @@ impl ObjectModel {
     /// **NOT covered, deliberately: a built-in type.** CPython refuses `del int.x` with a `TypeError`
     /// about built-in types rather than an `AttributeError`, which is a REFUSAL rather than a failed
     /// deletion; it wants its own message and is not this function's shape.
-    pub fn py_delattr(&mut self, target: Value, name: &str) -> Result<(), Trap> {
+    pub(crate) fn py_delattr(&mut self, target: Value, name: &str) -> Result<(), Trap> {
         if self.is_class(target) {
             self.py_delattr_class(target, name)
         } else if self.is_module_object(target) {
@@ -8537,10 +8583,10 @@ impl ObjectModel {
     /// `del m.name` on a module object: removes the entry from the namespace the module wraps. Native
     /// and Python-authored modules are one representation here, so both behave alike -- as they do in
     /// CPython, where a module's `__dict__` is an ordinary dict whoever built it.
-    pub fn py_delattr_module(&mut self, module: Value, name: &str) -> Result<(), Trap> {
+    pub(crate) fn py_delattr_module(&mut self, module: Value, name: &str) -> Result<(), Trap> {
         let namespace = self.module_namespace(module);
         if !self.delete_dict_str_key(namespace, name) {
-            return Err(self.attribute_error(module, name));
+            return Err(self.attribute_error_by_type(module, name));
         }
         Ok(())
     }
@@ -8549,7 +8595,7 @@ impl ObjectModel {
     /// function has no `__dict__` slot, so its user attributes live in the `function_dicts` side
     /// table; a function that was never written to has no entry there, which is a miss rather than
     /// something to create.
-    pub fn py_delattr_function(&mut self, func: Value, name: &str) -> Result<(), Trap> {
+    pub(crate) fn py_delattr_function(&mut self, func: Value, name: &str) -> Result<(), Trap> {
         let key = func.bits();
         let dict = self.function_dicts.iter().find(|(k, _)| *k == key).map(|(_, d)| *d);
         if !dict.is_some_and(|dict| self.delete_dict_str_key(dict, name)) {
@@ -8566,7 +8612,7 @@ impl ObjectModel {
     /// `AttributeError` and B keeps its `m` -- deleting through a subclass must not reach into a base
     /// that other classes share. The write path already targets this class only
     /// ([`ObjectModel::py_setattr_class`]); this is its mirror.
-    pub fn py_delattr_class(&mut self, class: Value, name: &str) -> Result<(), Trap> {
+    pub(crate) fn py_delattr_class(&mut self, class: Value, name: &str) -> Result<(), Trap> {
         let namespace = self.read_slot(class, 2);
         if !self.delete_dict_str_key(namespace, name) {
             let class_name = self.class_display_name(class);
@@ -8580,7 +8626,7 @@ impl ObjectModel {
 
     /// Deletes the named attribute from `instance`'s `__dict__` (`delattr(obj, name)` / `del
     /// obj.name`). An `AttributeError` if the value is not an instance or has no such attribute.
-    pub fn py_delattr_instance(&mut self, instance: Value, name: &str) -> Result<(), Trap> {
+    pub(crate) fn py_delattr_instance(&mut self, instance: Value, name: &str) -> Result<(), Trap> {
         if !self.is_instance(instance) {
             return Err(Trap::AttributeError);
         }
@@ -8817,6 +8863,7 @@ impl ObjectModel {
             Trap::RecursionError => "RecursionError",
             Trap::Overflow => "OverflowError",
             Trap::FloatUnavailable => "NotImplementedError",
+            Trap::ComplexUnavailable => "NotImplementedError",
             Trap::OutOfMemory => "MemoryError",
             Trap::Raised
             | Trap::StackUnderflow
@@ -8845,6 +8892,7 @@ impl ObjectModel {
             Trap::ZeroDivisionError => "division by zero",
             Trap::RecursionError => "maximum recursion depth exceeded",
             Trap::FloatUnavailable => "float is not available in this build (the no-float tier)",
+            Trap::ComplexUnavailable => "complex is not available in this build (the complex knob is off)",
             _ => return None,
         };
         self.new_str(message).ok()
@@ -9313,11 +9361,60 @@ impl ObjectModel {
         self.raise_named_exception("TypeError", &alloc::format!("bad operand type for unary {sym}: '{name}'"))
     }
 
-    /// The `AttributeError` for `value.name` where `name` is not an attribute of `value` -- CPython
-    /// 3.14's `'X' object has no attribute 'NAME'`. Raised at the attribute-access site on a bare
-    /// `Trap::AttributeError` (an attribute miss), so it does not disturb `getattr`'s own contract
-    /// (`hasattr` / `getattr(o, n, default)` still catch the bare trap and never see this message).
+    /// The `AttributeError` for `value.name` where `name` is not an attribute of `value`. Raised at
+    /// the attribute-access site on a bare `Trap::AttributeError` (an attribute miss), so it does not
+    /// disturb `getattr`'s own contract (`hasattr` / `getattr(o, n, default)` still catch the bare
+    /// trap and never see this message).
+    ///
+    /// **Three shapes, because CPython 3.14 words them differently on purpose** -- the subject a
+    /// reader needs is the object itself for a class or a module, and its TYPE for everything else:
+    ///
+    /// ```text
+    /// C.nope      type object 'C' has no attribute 'nope'
+    /// sys.nope    module 'sys' has no attribute 'nope'
+    /// c.nope      'C' object has no attribute 'nope'
+    /// ```
+    ///
+    /// A class and a module each name THEMSELVES, and describing one by its type instead drops the
+    /// half that identifies it: every miss on any class reads `'type' object`, which is true of all
+    /// of them and tells the reader nothing about theirs. The delete path already worded the class
+    /// case this way ([`ObjectModel::py_delattr_class`]); this is the READ path agreeing with it.
     pub(crate) fn attribute_error(&mut self, value: Value, name: &str) -> Trap {
+        let is_a_type = self.is_class(value)
+            || value
+                .as_builtin_id()
+                .and_then(crate::builtins::Builtin::from_id)
+                .is_some_and(crate::builtins::Builtin::is_type);
+        if is_a_type {
+            let class_name = self.class_display_name(value);
+            return self.raise_named_exception(
+                "AttributeError",
+                &alloc::format!("type object '{class_name}' has no attribute '{name}'"),
+            );
+        }
+        if let Some(module_name) = self.module_name_of(value) {
+            return self.raise_named_exception(
+                "AttributeError",
+                &alloc::format!("module '{module_name}' has no attribute '{name}'"),
+            );
+        }
+        self.attribute_error_by_type(value, name)
+    }
+
+    /// The type-described `AttributeError` alone -- `'X' object has no attribute 'NAME'` -- for the
+    /// callers that must NOT get the class/module wording above.
+    ///
+    /// **`del m.x` is the one that needs it, and that is CPython's own asymmetry rather than ours:**
+    /// a module READ is answered by `module_getattro`, which names the module, while a module DELETE
+    /// falls to the generic object path, which names its type. Measured against CPython 3.14.6:
+    ///
+    /// ```text
+    /// sys.nope        module 'sys' has no attribute 'nope'
+    /// del sys.nope    'module' object has no attribute 'nope'
+    /// ```
+    ///
+    /// A class is consistent both ways, so only the module delete comes here.
+    pub(crate) fn attribute_error_by_type(&mut self, value: Value, name: &str) -> Trap {
         let type_name = self.tp_name_of(value);
         self.raise_named_exception(
             "AttributeError",
@@ -10239,7 +10336,7 @@ impl ObjectModel {
                         frame.trace(visit);
                     }
                 }
-                Some(_) | None => {}
+                Some(ArenaKind::Strings | ArenaKind::Bigints | ArenaKind::ByteBuffers) | None => {}
             }
         };
         let newly_due = heap.collect_with_finalization(|visit| {
@@ -14783,6 +14880,9 @@ impl ObjectModel {
     /// the int presentation types (d/x/X/o/b/c), str (s), and the float types (f/F/e/E/g/G/%), plus
     /// alignment/width/fill/sign/zero-pad, str precision (truncation), and digit grouping (`,` / `_`).
     pub(crate) fn format_value_spec(&mut self, value: Value, spec: &str) -> Result<String, Trap> {
+        if spec.is_empty() {
+            return self.display(value);
+        }
         let chars: Vec<char> = spec.chars().collect();
         let mut i = 0;
         let (mut fill, mut align) = (' ', '\0');
@@ -14842,6 +14942,10 @@ impl ObjectModel {
         let float_type = matches!(type_char, Some('f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%'));
         if self.is_integer_value(value) && !float_type {
             let int_code = type_char.unwrap_or('d');
+            if precision.is_some() {
+                let message = "Precision not allowed in integer format specifier";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
             if int_code == 'c' {
                 let Some(n) = self.as_i128(value).filter(|n| i32::try_from(*n).is_ok()) else {
                     let message = "Python int too large to convert to C long";
@@ -14851,7 +14955,7 @@ impl ObjectModel {
                     return Err(self.with_message(Trap::Overflow, "%c arg not in range(0x110000)"));
                 };
                 let mut buf = [0u8; 4];
-                let align = if align == '\0' { '<' } else { align };
+                let align = if align == '\0' { '>' } else { align };
                 return Ok(pad_field(ch.encode_utf8(&mut buf), width, fill, align));
             }
             let (radix, upper, prefix) = match int_code {
@@ -14892,6 +14996,10 @@ impl ObjectModel {
             if let Some(code) = type_char.filter(|c| *c != 's') {
                 return Err(self.unknown_format_code(code, value));
             }
+            if let Some(separator) = grouping {
+                let message = alloc::format!("Cannot specify '{separator}' with 's'.");
+                return Err(self.with_message(Trap::ValueError, &message));
+            }
             let body = match precision {
                 Some(p) => cp_slice(&s, 0, p as i64).to_vec(),
                 None => s,
@@ -14918,7 +15026,7 @@ impl ObjectModel {
                 match type_char {
                     Some('f' | 'F') => alloc::format!("{magnitude:.*}", precision.unwrap_or(6)),
                     Some('e' | 'E') => float_format_scientific(magnitude, precision.unwrap_or(6), upper),
-                    Some('g' | 'G') => {
+                    Some('g' | 'G' | 'n') => {
                         float_format_general(magnitude, precision.unwrap_or(6), upper, alternate, false)
                     }
                     Some('%') => alloc::format!("{:.*}%", precision.unwrap_or(6), magnitude * 100.0),
@@ -14929,6 +15037,12 @@ impl ObjectModel {
                     Some(code) => return Err(self.unknown_format_code(code, value)),
                 }
             };
+            if alternate && magnitude.is_finite() && !body.contains('.') {
+                match body.find(['e', 'E', '%']) {
+                    Some(at) => body.insert(at, '.'),
+                    None => body.push('.'),
+                }
+            }
             if let Some(separator) = grouping {
                 if magnitude.is_finite() {
                     body = group_integer_digits(&body, separator);
@@ -14953,8 +15067,6 @@ impl ObjectModel {
             }
             Ok(pad_field(&alloc::format!("{sign_str}{body}"), width, fill, align))
             }
-        } else if spec.is_empty() {
-            self.display(value)
         } else {
             Err(self.unsupported_format_string(value))
         }
@@ -15697,7 +15809,7 @@ impl ObjectModel {
                 }
                 let text = String::from(self.str_text(receiver)?);
                 let mut folded = String::with_capacity(text.len());
-                let mut push = |cp: u32, original: char, out: &mut String| {
+                let push = |cp: u32, original: char, out: &mut String| {
                     out.push(char::from_u32(cp).unwrap_or(original));
                 };
                 for c in text.chars() {
@@ -18021,52 +18133,52 @@ impl ObjectModel {
 /// this file rather than typed out, and a test asserts every entry still resolves through the table it
 /// came from -- so a list cannot drift into naming a method that is not there, which is the one thing
 /// `dir()` must never do.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const STR_METHOD_NAMES: &[&str] = &["capitalize", "casefold", "center", "count", "encode", "endswith", "expandtabs", "find", "format", "format_map", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit", "isidentifier", "islower", "isnumeric", "isprintable", "isspace", "istitle", "isupper", "join", "ljust", "lower", "lstrip", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "translate", "upper", "zfill"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const LIST_METHOD_NAMES: &[&str] = &["append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove", "reverse", "sort"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const DICT_METHOD_NAMES: &[&str] = &["clear", "copy", "get", "items", "keys", "pop", "popitem", "setdefault", "update", "values"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const SET_METHOD_NAMES: &[&str] = &["copy", "difference", "intersection", "isdisjoint", "issubset", "issuperset", "symmetric_difference", "union"];
 
 /// The six a `set` has and a `frozenset` does not, because they mutate. Split for the same reason the
 /// bytearray-only names are: one method table serves both types, and one of them refuses these.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const SET_ONLY_METHOD_NAMES: &[&str] = &["add", "clear", "discard", "pop", "remove", "update"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const TUPLE_METHOD_NAMES: &[&str] = &["count", "index"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const INT_METHOD_NAMES: &[&str] = &["__index__", "as_integer_ratio", "bit_count", "bit_length", "conjugate", "denominator", "from_bytes", "imag", "is_integer", "numerator", "real", "to_bytes"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const FLOAT_METHOD_NAMES: &[&str] = &["as_integer_ratio", "conjugate", "hex", "imag", "is_integer", "real"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const BYTES_METHOD_NAMES: &[&str] = &["capitalize", "center", "count", "decode", "endswith", "expandtabs", "find", "hex", "index", "isalnum", "isalpha", "isdigit", "islower", "isspace", "istitle", "isupper", "join", "ljust", "lower", "lstrip", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "upper", "zfill"];
 
 /// The three a BYTEARRAY has and `bytes` does not, because they mutate. Listing them for `bytes`
 /// would name attributes it refuses -- the one thing this list must never do.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const BYTEARRAY_ONLY_METHOD_NAMES: &[&str] = &["append", "copy", "extend"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const DEQUE_METHOD_NAMES: &[&str] = &["append", "appendleft", "clear", "copy", "count", "extend", "extendleft", "pop", "popleft", "remove", "rotate"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const COUNTER_METHOD_NAMES: &[&str] = &["elements", "most_common", "subtract", "total", "update"];
 
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const ODICT_METHOD_NAMES: &[&str] = &["move_to_end", "popitem"];
 
 /// The method names of `value`'s built-in type. A dict SUBTYPE reports its own methods AND the dict
 /// surface it inherits, which is what makes `dir(Counter())` include both `most_common` and `keys`.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 fn builtin_type_method_names(model: &ObjectModel, value: Value) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
     if model.is_str(value) {
@@ -18122,32 +18234,32 @@ pub type ExtraRoots<'a> = dyn FnMut(&mut dyn FnMut(&mut lamella_gc::Ref)) + 'a;
 /// `__subclasshook__` (no abstract base classes), and `__doc__`/`__firstlineno__`/
 /// `__static_attributes__` (compile-time metadata the code object does not carry) are absent from
 /// this list because they are absent from the runtime.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const INSTANCE_DUNDERS: &[&str] = &["__class__", "__getstate__", "__init__", "__new__"];
 
 /// What a user function answers: its identity from the code object, plus anything set on it.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const FUNCTION_ATTRIBUTES: &[&str] = &["__doc__", "__name__", "__qualname__"];
 
 /// What a method bound to an instance answers -- the function's identity, and the two halves it was
 /// made of.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const BOUND_METHOD_ATTRIBUTES: &[&str] =
     &["__doc__", "__func__", "__name__", "__qualname__", "__self__"];
 
 /// What every class answers, beyond its own namespace and its bases'.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const CLASS_ATTRIBUTES: &[&str] = &[
     "__class__", "__dict__", "__init__", "__init_subclass__", "__module__", "__name__", "__new__",
     "__qualname__",
 ];
 
 /// What an exception instance answers beyond an ordinary one.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 const EXCEPTION_ATTRIBUTES: &[&str] = &["__cause__", "__context__", "__suppress_context__", "args"];
 
 /// Sorts and de-duplicates the collected names, which is the order `dir()` reports.
-#[cfg(feature = "introspection")]
+#[cfg(feature = "reflection")]
 fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
     names.sort();
     names.dedup();
@@ -18492,6 +18604,133 @@ mod tests {
             let v = model.new_float(value).unwrap();
             assert_eq!(model.format_value_spec(v, spec).unwrap(), expected, "format({value:e}, {spec:?})");
         }
+    }
+
+    /// The `%` surface's integer rules, which the CPython corpus cannot guard on a tier that has no
+    /// CPython to compare against -- and every row here is integer-only, so the no-float tier runs
+    /// it too.
+    #[test]
+    fn percent_zero_flag_survives_an_integer_precision() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let cases: &[(&str, i32, &str)] = &[
+            ("%05.3d", 42, "00042"),
+            ("%05.3d", -42, "-0042"),
+            ("%08.3d", 42, "00000042"),
+            ("%+05.3d", 42, "+0042"),
+            ("% 05.3d", 42, " 0042"),
+            ("%05.3x", 42, "0002a"),
+            ("%05.3o", 42, "00052"),
+            ("%#08.3x", 42, "0x00002a"),
+            ("%#08.3x", -42, "-0x0002a"),
+            ("%-05.3d", 42, "042  "),
+            ("%5.3d", 42, "  042"),
+        ];
+        for &(template, arg, expected) in cases {
+            let rendered = model.percent_format(template, &[n(arg)]).unwrap();
+            assert_eq!(rendered, expected, "{template:?} % {arg}");
+        }
+    }
+
+    /// `%c` takes an int and is still not a numeric conversion: the `%` surface ignores a precision
+    /// and pads with SPACES, where the spec surface refuses the precision and honors a zero fill.
+    /// The two disagree in CPython, so a shared implementation is the defect this pins.
+    #[test]
+    fn percent_c_is_not_a_numeric_conversion() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let a = model.new_str("A").unwrap();
+        let point = Value::fixnum(65).unwrap();
+        for arg in [a, point] {
+            assert_eq!(model.percent_format("%c", &[arg]).unwrap(), "A");
+            assert_eq!(model.percent_format("%5c", &[arg]).unwrap(), "    A");
+            assert_eq!(model.percent_format("%-5c", &[arg]).unwrap(), "A    ");
+            assert_eq!(model.percent_format("%05c", &[arg]).unwrap(), "    A");
+            assert_eq!(model.percent_format("%.3c", &[arg]).unwrap(), "A");
+            assert_eq!(model.percent_format("%5.3c", &[arg]).unwrap(), "    A");
+        }
+        assert_eq!(model.format_value_spec(point, "5c").unwrap(), "    A");
+        assert_eq!(model.format_value_spec(point, "<5c").unwrap(), "A    ");
+        assert_eq!(model.format_value_spec(point, "05c").unwrap(), "0000A");
+    }
+
+    /// A precision counts fractional digits, so an integer presentation type has no use for one and
+    /// CPython refuses rather than ignoring it. Accepting it is the failure that prints a plausible
+    /// answer to a question the language declines to answer.
+    #[test]
+    fn an_integer_format_spec_refuses_a_precision() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let n = Value::fixnum(65).unwrap();
+        for spec in [".3d", ".3x", ".3c", ".0d", ".3"] {
+            let refused = model.format_value_spec(n, spec);
+            assert_eq!(refused, Err(Trap::ValueError), "format(65, {spec:?}) must refuse");
+        }
+        assert_eq!(model.percent_format("%.3d", &[n]).unwrap(), "065");
+    }
+
+    /// The empty spec is `str(value)` for every type, which is visible only on a bool: a `bool`
+    /// reaches the integer renderer under any non-empty spec and prints `1`.
+    #[test]
+    fn an_empty_format_spec_is_str_even_for_a_bool() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        assert_eq!(model.format_value_spec(Value::TRUE, "").unwrap(), "True");
+        assert_eq!(model.format_value_spec(Value::FALSE, "").unwrap(), "False");
+        assert_eq!(model.format_value_spec(Value::TRUE, "d").unwrap(), "1");
+        assert_eq!(model.format_value_spec(Value::TRUE, "5").unwrap(), "    1");
+        assert_eq!(model.format_value_spec(Value::fixnum(42).unwrap(), "").unwrap(), "42");
+    }
+
+    /// `repr` escapes exactly what `str.isprintable` denies -- asserted as the PAIRING, because the
+    /// defect is the two drifting apart, and either alone can look right.
+    #[test]
+    fn repr_escapes_exactly_what_isprintable_denies() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let escaped: &[(u32, &str)] = &[
+            (0x07, "'\\x07'"),
+            (0x7F, "'\\x7f'"),
+            (0x81, "'\\x81'"),
+            (0xAD, "'\\xad'"),
+            (0x200B, "'\\u200b'"),
+            (0x2028, "'\\u2028'"),
+            (0x3000, "'\\u3000'"),
+            (0xE000, "'\\ue000'"),
+            (0x0378, "'\\u0378'"),
+        ];
+        for &(cp, expected) in escaped {
+            assert!(!is_printable_code_point(cp), "U+{cp:04X} must not be printable");
+            let s = model.new_str(&alloc::string::String::from(char::from_u32(cp).unwrap())).unwrap();
+            assert_eq!(model.repr(s), expected, "repr of U+{cp:04X}");
+        }
+        for cp in [0x20u32, 0x41, 0xE9, 0x4E2D, 0x1F600] {
+            assert!(is_printable_code_point(cp), "U+{cp:04X} must be printable");
+            let text = alloc::string::String::from(char::from_u32(cp).unwrap());
+            let s = model.new_str(&text).unwrap();
+            assert_eq!(model.repr(s), alloc::format!("'{text}'"), "repr of U+{cp:04X}");
+        }
+    }
+
+    /// `#` guarantees a decimal point on a float even where no fractional digit is shown, and it
+    /// goes before the exponent or the percent sign rather than at the end.
+    #[cfg(feature = "float")]
+    #[test]
+    fn alternate_form_keeps_the_decimal_point() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let cases: &[(&str, f64, &str)] = &[
+            ("#.0f", 1.0, "1."),
+            ("#.0f", 42.5, "42."),
+            ("#.0e", 42.5, "4.e+01"),
+            ("#.0g", 100.0, "1.e+02"),
+            ("#.0%", 0.5, "50.%"),
+            ("#08.0f", 1.0, "0000001."),
+            ("#.2f", 1.0, "1.00"),
+            ("#.0f", f64::NAN, "nan"),
+            ("#.0f", f64::INFINITY, "inf"),
+        ];
+        for &(spec, value, expected) in cases {
+            let v = model.new_float(value).unwrap();
+            assert_eq!(model.format_value_spec(v, spec).unwrap(), expected, "format({value}, {spec:?})");
+        }
+        let v = model.new_float(3.75).unwrap();
+        assert_eq!(model.format_value_spec(v, "n").unwrap(), "3.75");
     }
 
     #[test]

@@ -88,16 +88,32 @@ pub enum ConvKind {
     /// Truncate a 64-bit float toward zero to a signed `int32` (`conv.i4` from an `R8`). wasm has a
     /// native truncate; a no-FPU ARM target needs the aeabi soft helper (unsupported).
     Float64ToInt,
-    /// Truncate a 32-bit float toward zero to a signed `int64` (`conv.i8`/`conv.u8` from an `R4`).
+    /// Truncate a 32-bit float toward zero to a signed `int64` (`conv.i8` from an `R4`).
     /// ARM `__aeabi_f2lz`; wasm `i64.trunc_f32_s`.
     Float32ToLong,
-    /// Truncate a 64-bit float toward zero to a signed `int64` (`conv.i8`/`conv.u8` from an `R8`).
+    /// Truncate a 32-bit float toward zero to an UNSIGNED `int64` (`conv.u8` from an `R4`).
+    /// ARM `__aeabi_f2ulz`; wasm `i64.trunc_f32_u`. See [`ConvKind::Float64ToULong`] for why the
+    /// unsigned form cannot be the signed one reinterpreted.
+    Float32ToULong,
+    /// Truncate a 64-bit float toward zero to a signed `int64` (`conv.i8` from an `R8`).
     /// ARM `__aeabi_d2lz`; wasm `i64.trunc_f64_s`.
     ///
     /// This is also the FIRST step of every sub-word narrowing from a float (`conv.i1` and friends):
     /// the CLI converts the float to an integer and THEN narrows, so without it the narrow reads the
     /// operand's IEEE encoding rather than its value.
     Float64ToLong,
+    /// Truncate a 64-bit float toward zero to an UNSIGNED `int64` (`conv.u8` from an `R8`).
+    /// ARM `__aeabi_d2ulz`; wasm `i64.trunc_f64_u`.
+    ///
+    /// A DISTINCT CONVERSION FROM [`ConvKind::Float64ToLong`], not that one's result reinterpreted.
+    /// ECMA-335 III.3.27 defines `conv.u8` as a conversion to *unsigned* int64 truncating toward
+    /// zero, so the target's range reaches `2^64` and every answer below it is specified --
+    /// including the whole half above `2^63`, which a signed conversion cannot represent at all.
+    ///
+    /// NaN and the infinities are the exception the same clause names: the result is unspecified
+    /// when the value does not fit the target or is a NaN. Those answers are not a contract, and a
+    /// saturating soft helper is free to differ from an interpreter that biases instead.
+    Float64ToULong,
     /// Convert a signed `int32` to a 64-bit float (`conv.r8` from an int32 -- e.g. `double d = intVar`).
     /// The no-FPU ARM form is the `__aeabi_i2d` soft helper; wasm has `f64.convert_i32_s`.
     IntToFloat64,
@@ -153,7 +169,10 @@ impl ConvKind {
             | ConvKind::Float32ToFloat64
             | ConvKind::UIntToFloat64
             | ConvKind::ULongToFloat64 => MirType::F64,
-            ConvKind::Float32ToLong | ConvKind::Float64ToLong => MirType::I64,
+            ConvKind::Float32ToLong
+            | ConvKind::Float64ToLong
+            | ConvKind::Float32ToULong
+            | ConvKind::Float64ToULong => MirType::I64,
             ConvKind::IntToRef => MirType::ObjectRef,
             ConvKind::ToNativeInt => MirType::NativeInt,
             ConvKind::SignExtend8
@@ -867,6 +886,15 @@ pub enum Inst {
         dim1: ValueId,
         /// The size in bytes of one element.
         element_size: u32,
+        /// What one element IS, as the array descriptor's word-1 code (see
+        /// `ELEMENT_KIND_REFERENCE`). Carried for the same reason the vector's `AllocArray` carries
+        /// it: `element_size` is a compile-time stride baked at each access site, while this is the
+        /// run-time fact a tracing collector needs to know whether an element is a reference.
+        ///
+        /// It must be written into the descriptor in the SAME EDIT that marks word 0 with the rank:
+        /// the kind's absent value is 0, which is itself a meaningful code (a reference element), so
+        /// neither word can be published without the other.
+        element_kind: u32,
     },
     /// Loads element `(index0, index1)` of a 2-D `array` -- the CLI's `int[,]::Get`. The element sits
     /// at `array + 8 + (index0*dim1 + index1)*element_size` (row-major; `dim1` is read from
@@ -927,6 +955,15 @@ pub enum Inst {
         dims: alloc::boxed::Box<[ValueId]>,
         /// The size in bytes of one element.
         element_size: u32,
+        /// What one element IS, as the array descriptor's word-1 code (see
+        /// `ELEMENT_KIND_REFERENCE`). Carried for the same reason the vector's `AllocArray` carries
+        /// it: `element_size` is a compile-time stride baked at each access site, while this is the
+        /// run-time fact a tracing collector needs to know whether an element is a reference.
+        ///
+        /// It must be written into the descriptor in the SAME EDIT that marks word 0 with the rank:
+        /// the kind's absent value is 0, which is itself a meaningful code (a reference element), so
+        /// neither word can be published without the other.
+        element_kind: u32,
     },
     /// Loads element `(indices[0], ..., indices[N-1])` of a rank-N `array` -- the CLI's `int[,,...]::Get`.
     /// Row-major: the element sits at `array + 4*N + flat*element_size` where the flat index is the Horner
