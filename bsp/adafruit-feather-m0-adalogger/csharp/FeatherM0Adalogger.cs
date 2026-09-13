@@ -8,22 +8,22 @@ namespace Lamella.Boards.Adafruit
     public sealed class FeatherM0Adalogger
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
-        public static readonly int BoardModel = FeatherM0AdaloggerBindings.BOARD_MODEL;
+        public static readonly int BoardModel = AdafruitFeatherM0AdaloggerBindings.BOARD_MODEL;
 
         /// <summary>The red LED beside the USB jack (Arduino D13) -- the board's blink target.</summary>
         public static readonly int LedPin =
-            LogicalPin(FeatherM0AdaloggerBindings.LED_PORT_BASE, FeatherM0AdaloggerBindings.LED_PIN);
+            LogicalPin(AdafruitFeatherM0AdaloggerBindings.LED_PORT_BASE, AdafruitFeatherM0AdaloggerBindings.LED_PIN);
 
         /// <summary>The green LED beside the microSD socket. A pin a program drives, not a signal
         /// the socket raises: nothing lights it unless the program does.</summary>
         public static readonly int SdLedPin =
-            LogicalPin(FeatherM0AdaloggerBindings.LED_SD_PORT_BASE, FeatherM0AdaloggerBindings.LED_SD_PIN);
+            LogicalPin(AdafruitFeatherM0AdaloggerBindings.LED_SD_PORT_BASE, AdafruitFeatherM0AdaloggerBindings.LED_SD_PIN);
 
         /// <summary>The microSD socket's card-detect line, ACTIVE LOW: a card present reads
         /// <see cref="PinValue.Low"/>, so the pin wants <see cref="PinMode.InputPullUp"/>.</summary>
         public static readonly int SdCardDetectPin = LogicalPin(
-            FeatherM0AdaloggerBindings.SD_CARD_DETECT_PORT_BASE,
-            FeatherM0AdaloggerBindings.SD_CARD_DETECT_PIN);
+            AdafruitFeatherM0AdaloggerBindings.SD_CARD_DETECT_PORT_BASE,
+            AdafruitFeatherM0AdaloggerBindings.SD_CARD_DETECT_PIN);
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching

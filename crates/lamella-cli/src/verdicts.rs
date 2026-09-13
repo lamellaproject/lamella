@@ -292,15 +292,22 @@ fn budget_line(budget: &Budget) -> String {
 mod tests {
     use super::*;
 
-    /// The rendered verdict names the id the user typed even when the board file states another.
+    /// The rendered verdict names the id the user typed, and discloses the file's own id when
+    /// the two differ. They agree on every board in the tree, so the second half is exercised
+    /// with a selection the file does not state rather than with a board that drifts.
     #[test]
     fn the_rendering_leads_with_the_id_the_user_selected() {
         let (board, part) = catalog::resolve("rpi-pico").expect("the pico board and its part");
-        let text = render("rpi-pico", &fit(&board, &part, 100_000));
+        let verdict = fit(&board, &part, 100_000);
+        let text = render("rpi-pico", &verdict);
         assert!(text.starts_with("board rpi-pico"), "got {text:?}");
-        assert!(text.contains("\"pico\""), "and discloses the file's own id: {text:?}");
+        assert!(!text.contains("board id"), "the two ids agree, so only one is printed: {text:?}");
         assert!(text.contains("FITS"));
         assert!(text.contains("does NOT answer"), "the limits are printed, not logged");
+
+        let other = render("a-name-the-file-does-not-state", &verdict);
+        assert!(other.starts_with("board a-name-the-file-does-not-state"), "got {other:?}");
+        assert!(other.contains("\"rpi-pico\""), "and discloses the file's own id: {other:?}");
     }
 
     /// An image over the budget is a failure exit; one whose budget is unknown is not.

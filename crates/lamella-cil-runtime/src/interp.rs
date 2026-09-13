@@ -61,9 +61,14 @@ pub struct PinEventSource {
 /// intrinsics: the managed heap and the console output.
 ///
 /// This is the `Vm` an [`crate::module::IntrinsicFn`] receives. It deliberately
-/// does *not* hold the call frames or the program, so an intrinsic can borrow it
+/// does *not* hold the RUNNING call frames or the program, so an intrinsic can borrow it
 /// mutably while the interpreter holds the frame stack. The console is an
 /// in-memory buffer for now; a device console transport replaces it later.
+///
+/// The one exception proves the rule rather than bending it: an activation SUSPENDED beneath a
+/// nested run parks its frames here ([`ParkedFrames`]) because nothing else can reach them to mark
+/// them. They are moved in and back out, so no borrow is held and the property above survives --
+/// the frames the interpreter is currently executing are still not here.
 #[derive(Debug, Default)]
 pub struct Vm {
     heap: Heap,
@@ -135,6 +140,11 @@ pub struct Vm {
     /// [`Vm::suspend_collection`] / [`Vm::resume_collection`].
     #[cfg(feature = "gc")]
     collect_suspend: u32,
+    /// Frames of activations suspended on the Rust stack across a nested run ([`ParkedFrames`]).
+    /// Suspension is the wrong instrument for those: it stops the collection rather than teaching
+    /// it what is live, so a nested run that allocates heavily has nowhere to give memory back.
+    #[cfg(feature = "gc")]
+    parked: ParkedFrames,
     /// The exception currently propagating without (yet) a handler: set the moment a
     /// `throw`/`rethrow` begins its search and cleared the instant a `catch`/`filter`
     /// accepts it, so if the search exhausts the call stack this still holds the culprit.
@@ -342,6 +352,23 @@ impl Vm {
     #[must_use]
     pub fn collection_suspended(&self) -> bool {
         self.collect_suspend != 0
+    }
+
+    /// Parks a caller's `frames` for the duration of a nested run, so a collection inside that run
+    /// marks and REMAPS them instead of leaving them stale ([`ParkedFrames`]).
+    ///
+    /// Must be balanced by [`Vm::unpark_frames`] on every path out, the error path included: the
+    /// caller's frame vector is left empty until it is taken back, and a session with no frames
+    /// reports itself finished.
+    #[cfg(feature = "gc")]
+    fn park_frames(&mut self, frames: Vec<Frame>) {
+        self.parked.activations.push(frames);
+    }
+
+    /// Takes back the frames from the matching [`Vm::park_frames`], relocated if a collection ran.
+    #[cfg(feature = "gc")]
+    fn unpark_frames(&mut self) -> Vec<Frame> {
+        self.parked.activations.pop().unwrap_or_default()
     }
 
     /// The managed heap.
@@ -1661,6 +1688,36 @@ impl core::fmt::Debug for FramePool {
         f.debug_struct("FramePool")
             .field("shells", &self.shells.len())
             .field("values", &self.values.len())
+            .finish()
+    }
+}
+
+/// Activation frames PARKED on the [`Vm`] for the duration of a nested interpreter run.
+///
+/// A [`Session`]'s root walk reaches that session's own frames and no others, so a collection
+/// triggered inside a NESTED session -- a reflective `Invoke`, an intrinsic's lazy cctor -- marks
+/// and remaps the nested frames while the caller's frames are left pointing at the objects' old
+/// addresses. The caller's frames sit on the Rust stack for the duration and no walk can reach
+/// them there, so the dispatch site hands them here first and takes them back after: parked frames
+/// are roots like any other, marked and remapped by the same pass.
+///
+/// A STACK, because nesting nests: an intrinsic's cctor may call an intrinsic of its own.
+///
+/// The frames are MOVED in and back out rather than borrowed, which is what lets an intrinsic keep
+/// its `&mut Vm` -- the property the `Vm` doc calls out. The pool's shells are still not roots
+/// (they are cleared on retirement); these are live frames temporarily housed elsewhere.
+#[cfg(feature = "gc")]
+#[derive(Default)]
+struct ParkedFrames {
+    /// One entry per suspended activation, innermost last.
+    activations: Vec<Vec<Frame>>,
+}
+
+#[cfg(feature = "gc")]
+impl core::fmt::Debug for ParkedFrames {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ParkedFrames")
+            .field("activations", &self.activations.len())
             .finish()
     }
 }
@@ -3259,12 +3316,25 @@ impl Session {
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(func)) => {
-                    run_pending_cctor_nested(module, vm, method)?;
+                    #[cfg(feature = "gc")]
+                    vm.park_frames(core::mem::take(frames));
+                    let cctor = run_pending_cctor_nested(module, vm, method);
+                    #[cfg(feature = "gc")]
+                    {
+                        *frames = vm.unpark_frames();
+                    }
+                    cctor?;
                     let mut args = args;
                     if !is_compare_exchange(module, method) {
                         deref_byref_args_in_place(frames, vm, &mut args);
                     }
+                    #[cfg(feature = "gc")]
+                    vm.park_frames(core::mem::take(frames));
                     let outcome = func(vm, module, &args);
+                    #[cfg(feature = "gc")]
+                    {
+                        *frames = vm.unpark_frames();
+                    }
                     vm.frame_pool.give_values(args);
                     match outcome {
                         Ok(result) => {
@@ -3331,7 +3401,13 @@ impl Session {
                     full_args.push(Value::Object(object));
                     full_args.append(&mut args);
                     vm.frame_pool.give_values(args);
+                    #[cfg(feature = "gc")]
+                    vm.park_frames(core::mem::take(frames));
                     let outcome = func(vm, module, &full_args);
+                    #[cfg(feature = "gc")]
+                    {
+                        *frames = vm.unpark_frames();
+                    }
                     vm.frame_pool.give_values(full_args);
                     outcome?;
                     frames
@@ -7771,39 +7847,7 @@ impl Session {
     /// the scheduler's all-threads collection ([`collect_all_threads`]).
     #[cfg(feature = "gc")]
     fn visit_roots(&mut self, visit: &mut dyn FnMut(&mut Value)) {
-        for frame in self.frames.iter_mut() {
-            for value in frame.stack.iter_mut() {
-                visit(value);
-            }
-            for value in frame.locals.iter_mut() {
-                visit(value);
-            }
-            for value in frame.args.iter_mut() {
-                visit(value);
-            }
-            visit_optional_ref(&mut frame.new_object, visit);
-            visit_optional_location(&mut frame.new_value, visit);
-            visit_optional_ref(&mut frame.current_exception, visit);
-            if let Some(pending) = &mut frame.pending {
-                match &mut pending.then {
-                    AfterFinally::Catch { exception, .. } | AfterFinally::Unwind(exception) => {
-                        visit_ref(exception, visit);
-                    }
-                    AfterFinally::Goto(_) => {}
-                }
-            }
-            if let Some(filter) = &mut frame.pending_filter {
-                visit_ref(&mut filter.exception, visit);
-            }
-            if let Some((invocations, params)) = &mut frame.multicast {
-                for (target, _) in invocations.iter_mut() {
-                    visit(target);
-                }
-                for value in params.iter_mut() {
-                    visit(value);
-                }
-            }
-        }
+        visit_frames(&mut self.frames, visit);
         if let Some(Some(value)) = self.result.as_mut() {
             visit(value);
         }
@@ -7811,6 +7855,50 @@ impl Session {
 
     fn collect_garbage(&mut self, module: &Module, vm: &mut Vm) {
         run_collection(vm, module, |visit| self.visit_roots(visit));
+    }
+}
+
+/// Visits every heap reference held by `frames` -- each frame's eval stack, locals and arguments,
+/// plus its in-flight new-object / new-value / exception / multicast continuation state.
+///
+/// Shared by [`Session::visit_roots`] and by the parked-activation walk in [`run_collection`], and
+/// that sharing is the point: a frame is a frame whether the session holding it is the one running
+/// or one suspended on the Rust stack beneath a nested run, and a root the two walks disagreed
+/// about would be marked on one path and missed on the other.
+#[cfg(feature = "gc")]
+fn visit_frames(frames: &mut [Frame], visit: &mut dyn FnMut(&mut Value)) {
+    for frame in frames.iter_mut() {
+        for value in frame.stack.iter_mut() {
+            visit(value);
+        }
+        for value in frame.locals.iter_mut() {
+            visit(value);
+        }
+        for value in frame.args.iter_mut() {
+            visit(value);
+        }
+        visit_optional_ref(&mut frame.new_object, visit);
+        visit_optional_location(&mut frame.new_value, visit);
+        visit_optional_ref(&mut frame.current_exception, visit);
+        if let Some(pending) = &mut frame.pending {
+            match &mut pending.then {
+                AfterFinally::Catch { exception, .. } | AfterFinally::Unwind(exception) => {
+                    visit_ref(exception, visit);
+                }
+                AfterFinally::Goto(_) => {}
+            }
+        }
+        if let Some(filter) = &mut frame.pending_filter {
+            visit_ref(&mut filter.exception, visit);
+        }
+        if let Some((invocations, params)) = &mut frame.multicast {
+            for (target, _) in invocations.iter_mut() {
+                visit(target);
+            }
+            for value in params.iter_mut() {
+                visit(value);
+            }
+        }
     }
 }
 
@@ -7865,9 +7953,12 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
         lock_states.push(state);
     }
 
-    let Vm { heap, statics, .. } = vm;
+    let Vm { heap, statics, parked, .. } = vm;
     let finalizable = heap.collect(|visit| {
         roots(&mut *visit);
+        for frames in parked.activations.iter_mut() {
+            visit_frames(frames, visit);
+        }
         for value in statics.iter_mut() {
             visit(value);
         }

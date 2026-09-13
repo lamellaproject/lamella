@@ -3,7 +3,7 @@
 
 [table]
 kind = "board"
-board = "pico"
+board = "rpi-pico"
 vendor = "raspberry-pi"
 family = "rp2040"
 part = "rp2040"

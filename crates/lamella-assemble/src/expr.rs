@@ -310,11 +310,34 @@ pub fn emit_expression(
             constructor,
             initializer,
         } => {
-            emit_new(constructor.as_ref(), arguments, frame, tokens, out)?;
-            match initializer {
-                Some(initializer) => emit_initializer(initializer, &expr.ty, frame, tokens, out),
-                None => Ok(()),
+            let Some(initializer) = initializer else {
+                return emit_new(constructor.as_ref(), arguments, frame, tokens, out);
+            };
+            if is_value_type(&expr.ty, tokens) {
+                let slot = frame.reserve_local(&expr.ty);
+                if arguments.is_empty() {
+                    let type_token = tokens.instruction_type_token(&expr.ty).ok_or(
+                        EmitError::Unsupported("a value type with no metadata token for initobj"),
+                    )?;
+                    out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+                    out.push(Instruction::new(Opcode::Initobj, Operand::Token(type_token)));
+                } else {
+                    let Some(constructor) = constructor.as_ref() else {
+                        return Err(EmitError::Unsupported(
+                            "an object creation that did not resolve",
+                        ));
+                    };
+                    out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+                    let token =
+                        emit_constructor_arguments(constructor, arguments, frame, tokens, out)?;
+                    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+                }
+                emit_initializer(initializer, &InitTarget::address(slot), frame, tokens, out)?;
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+                return Ok(());
             }
+            emit_new(constructor.as_ref(), arguments, frame, tokens, out)?;
+            emit_initializer(initializer, &InitTarget::stack(), frame, tokens, out)
         }
         BoundExprKind::DelegateCreation {
             delegate_type,
@@ -1143,6 +1166,25 @@ fn emit_new(
         out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
         return Ok(());
     }
+    let token = emit_constructor_arguments(constructor, arguments, frame, tokens, out)?;
+    out.push(Instruction::new(Opcode::Newobj, Operand::Token(token)));
+    Ok(())
+}
+
+/// Pushes a constructor's arguments and answers the token that names it.
+///
+/// **SHARED BY THE TWO WAYS A CONSTRUCTOR IS RUN**, which is why it is a function rather than a
+/// passage inside one of them: a reference type is constructed with `newobj`, and a value type
+/// being built in place is constructed by CALLING the constructor on its address. The arguments
+/// and the member lookup are identical in both, and vararg handling in particular is the kind of
+/// detail a second copy acquires late or not at all.
+fn emit_constructor_arguments(
+    constructor: &lamella_binder::MethodReference,
+    arguments: &[BoundExpr],
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<lamella_token::Token, EmitError> {
     let (fixed_args, extras) = split_vararg_arguments(arguments);
     for argument in fixed_args {
         emit_argument(argument, frame, tokens, out)?;
@@ -1156,11 +1198,9 @@ fn emit_new(
         Some(extras) => vararg_lookup_params(&constructor.parameters, extras),
         None => constructor.parameters.clone(),
     };
-    let token = tokens
+    tokens
         .method(&constructor.declaring_type, &constructor.name, &lookup_params)
-        .ok_or(EmitError::Unsupported("constructor outside this module"))?;
-    out.push(Instruction::new(Opcode::Newobj, Operand::Token(token)));
-    Ok(())
+        .ok_or(EmitError::Unsupported("constructor outside this module"))
 }
 
 /// Pushes one call/creation argument: a `ref`/`out` argument pushes the variable's
@@ -1670,28 +1710,105 @@ pub(crate) fn emit_indexer_store(
 }
 
 /// The `get_`/`set_` accessor method name for a property.
-/// Lowers an object or collection initializer, with the object it initializes ALREADY ON THE STACK,
-/// and leaves it there.
+/// How an initializer's members reach the object they store into.
 ///
-/// **Every member `dup`s the object rather than storing it to a local**, which is what csc emits and
-/// what makes the whole initializer one expression: the value of `new C { F = 1 }` is the
-/// initialized `C`, so it can be returned, passed or assigned without a temp.
+/// **THE PATH IS RE-EMITTED FOR EVERY MEMBER RATHER THAN PUSHED ONCE, AND THAT IS WHAT MAKES THE
+/// VALUE-TYPE CASE EXPRESSIBLE AT ALL.** A reference could sit on the stack across a whole member
+/// list, but a value type's members store through a managed pointer, and that pointer has to be
+/// taken again for each store. Re-pushing serves both kinds, so one rule covers them and the
+/// nested cases fall out of it. It is also why no member list ends in a `pop`: each member's push
+/// is consumed exactly by its own store.
+#[derive(Clone)]
+struct InitTarget {
+    /// Where the path starts.
+    root: InitRoot,
+    /// The steps from the root down to the object being initialized -- a field load, a field
+    /// ADDRESS load, or a property read -- in order.
+    steps: Vec<Instruction>,
+    /// Whether the path leaves a managed POINTER rather than an object reference, which is what
+    /// chooses how an accessor on it is called.
+    addressed: bool,
+}
+
+/// Where an initializer's target path begins.
+#[derive(Clone, Copy)]
+enum InitRoot {
+    /// A reference type's newly constructed object, left on the stack beneath the initializer.
+    Stack,
+    /// A value type being built in a local, addressed with `ldloca`.
+    Address(u16),
+}
+
+impl InitTarget {
+    /// The object a `newobj` left on the stack.
+    fn stack() -> InitTarget {
+        InitTarget {
+            root: InitRoot::Stack,
+            steps: Vec::new(),
+            addressed: false,
+        }
+    }
+
+    /// A value type being built in local `slot`.
+    fn address(slot: u16) -> InitTarget {
+        InitTarget {
+            root: InitRoot::Address(slot),
+            steps: Vec::new(),
+            addressed: true,
+        }
+    }
+
+    /// This path with one more step -- the member an inner initializer targets. `addressed` says
+    /// whether that step leaves a pointer or a reference.
+    fn stepped(&self, step: Instruction, addressed: bool) -> InitTarget {
+        let mut steps = self.steps.clone();
+        steps.push(step);
+        InitTarget {
+            root: self.root,
+            steps,
+            addressed,
+        }
+    }
+
+    /// Pushes the object this path names, ready for one member's store.
+    fn push(&self, out: &mut Vec<Instruction>) {
+        match self.root {
+            InitRoot::Stack => out.push(Instruction::simple(Opcode::Dup)),
+            InitRoot::Address(slot) => {
+                out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+            }
+        }
+        out.extend(self.steps.iter().cloned());
+    }
+
+    /// The opcode that calls an accessor on the object this path names. A value type's accessor
+    /// is called directly on its address; there is no receiver to dispatch on.
+    fn accessor_call(&self) -> Opcode {
+        if self.addressed {
+            Opcode::Call
+        } else {
+            Opcode::Callvirt
+        }
+    }
+}
+
+/// Lowers an object or collection initializer against `target`, the path to the object its
+/// members store into. Leaves the stack as it found it.
 ///
 /// ```text
-/// newobj C::.ctor
-/// dup ; <value> ; stfld C::F              a field
-/// dup ; <value> ; callvirt C::set_P       a property
-/// dup ; <value> ; callvirt C::Add         a collection element
-/// dup ; ldfld C::F ; <nested...> ; pop    a NESTED initializer
+/// <target> ; <value> ; stfld C::F           a field
+/// <target> ; <value> ; callvirt C::set_P    a property
+/// <target> ; <value> ; callvirt C::Add      a collection element
+/// <target> ; ldfld C::F ; <members...>      a NESTED initializer on a reference member
+/// <target> ; ldflda C::F ; <members...>     a NESTED initializer on a value-type member
 /// ```
 ///
-/// **The nested form loads the member and assigns INTO it -- it constructs nothing.** `ldfld` then
-/// the nested members then `pop`: the `pop` discards the member value the nested stores were made
-/// against, leaving the outer object. Emitting a `newobj` there instead would be the natural
-/// misreading and would silently replace whatever `F` already referred to.
+/// **A NESTED INITIALIZER LOADS THE MEMBER AND ASSIGNS INTO IT -- IT CONSTRUCTS NOTHING.**
+/// Emitting a `newobj` there would be the natural misreading, and it would silently replace
+/// whatever the member already referred to.
 fn emit_initializer(
     initializer: &BoundInitializer,
-    target_ty: &TypeSymbol,
+    target: &InitTarget,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1706,26 +1823,27 @@ fn emit_initializer(
                 let token = tokens
                     .method(&add.declaring_type, &add.name, &add.parameters)
                     .ok_or(EmitError::Unsupported("collection Add outside this module"))?;
-                out.push(Instruction::simple(Opcode::Dup));
+                target.push(out);
                 for argument in &element.arguments {
                     emit_expression(argument, frame, tokens, out)?;
                 }
-                out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
+                out.push(Instruction::new(target.accessor_call(), Operand::Token(token)));
             }
             Ok(())
         }
         BoundInitializer::Object(members) => {
             for member in members {
-                emit_member_initializer(member, frame, tokens, out)?;
+                emit_member_initializer(member, target, frame, tokens, out)?;
             }
             Ok(())
         }
     }
 }
 
-/// Lowers one `name = value`, with the object on the stack, leaving it there.
+/// Lowers one `name = value` against `target`, leaving the stack as it found it.
 fn emit_member_initializer(
     member: &BoundMemberInitializer,
+    target: &InitTarget,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1735,7 +1853,7 @@ fn emit_member_initializer(
             let token = tokens
                 .field(&field.declaring_type, &field.name)
                 .ok_or(EmitError::Unsupported("initializer field outside this module"))?;
-            out.push(Instruction::simple(Opcode::Dup));
+            target.push(out);
             emit_expression(value, frame, tokens, out)?;
             if field.is_volatile {
                 out.push(Instruction::simple(Opcode::Volatile));
@@ -1759,20 +1877,25 @@ fn emit_member_initializer(
                 .ok_or(EmitError::Unsupported(
                     "initializer property setter outside this module",
                 ))?;
-            out.push(Instruction::simple(Opcode::Dup));
+            target.push(out);
             emit_expression(value, frame, tokens, out)?;
-            out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
+            out.push(Instruction::new(target.accessor_call(), Operand::Token(token)));
             Ok(())
         }
         (BoundInitializerTarget::Field(field), BoundMemberInitializerValue::Nested(nested)) => {
             let token = tokens
                 .field(&field.declaring_type, &field.name)
                 .ok_or(EmitError::Unsupported("initializer field outside this module"))?;
-            out.push(Instruction::simple(Opcode::Dup));
-            out.push(Instruction::new(Opcode::Ldfld, Operand::Token(token)));
-            emit_initializer(nested, &field.ty, frame, tokens, out)?;
-            out.push(Instruction::simple(Opcode::Pop));
-            Ok(())
+            let addressed = is_value_type(&field.ty, tokens);
+            let step = Instruction::new(
+                if addressed {
+                    Opcode::Ldflda
+                } else {
+                    Opcode::Ldfld
+                },
+                Operand::Token(token),
+            );
+            emit_initializer(nested, &target.stepped(step, addressed), frame, tokens, out)
         }
         (
             BoundInitializerTarget::Property {
@@ -1781,16 +1904,18 @@ fn emit_member_initializer(
             },
             BoundMemberInitializerValue::Nested(nested),
         ) => {
+            if is_value_type(ty, tokens) {
+                return Err(EmitError::Unsupported(
+                    "a nested initializer on a value-typed property",
+                ));
+            }
             let token = tokens
                 .method(setter_declaring_type, &accessor_name("get_", &member.name), &[])
                 .ok_or(EmitError::Unsupported(
                     "initializer property getter outside this module",
                 ))?;
-            out.push(Instruction::simple(Opcode::Dup));
-            out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
-            emit_initializer(nested, ty, frame, tokens, out)?;
-            out.push(Instruction::simple(Opcode::Pop));
-            Ok(())
+            let step = Instruction::new(target.accessor_call(), Operand::Token(token));
+            emit_initializer(nested, &target.stepped(step, false), frame, tokens, out)
         }
         (BoundInitializerTarget::Unresolved, _) => Err(EmitError::Unsupported(
             "an initializer member that did not resolve",

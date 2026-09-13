@@ -6,7 +6,7 @@
 
 [table]
 kind = "board"
-board = "mkr1000"
+board = "arduino-mkr1000"
 vendor = "arduino"
 module = "samw25"
 product_model = 9

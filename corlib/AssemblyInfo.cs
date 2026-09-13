@@ -78,3 +78,6 @@
 #if LAMELLA_SURFACE_VARARGS
 [assembly: Lamella.Runtime.SurfaceSymbol("LAMELLA_SURFACE_VARARGS")]
 #endif
+#if LAMELLA_SURFACE_TUPLES
+[assembly: Lamella.Runtime.SurfaceSymbol("LAMELLA_SURFACE_TUPLES")]
+#endif

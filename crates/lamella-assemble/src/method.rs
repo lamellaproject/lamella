@@ -605,7 +605,11 @@ fn emit_statement(
                 if let Some(initializer) = &declarator.initializer {
                     let value_type_new = matches!(
                         &initializer.kind,
-                        BoundExprKind::ObjectCreation { arguments, .. } if arguments.is_empty()
+                        BoundExprKind::ObjectCreation {
+                            arguments,
+                            initializer: None,
+                            ..
+                        } if arguments.is_empty()
                     ) && tokens.is_struct(&initializer.ty);
                     if value_type_new {
                         let token =

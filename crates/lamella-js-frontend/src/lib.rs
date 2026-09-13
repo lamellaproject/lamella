@@ -1,6 +1,25 @@
 //! **An ECMAScript engine for constrained devices.** It parses source, compiles it to a
 //! pointer-free artifact, and executes that artifact -- on a host, or straight out of flash on a
 //! microcontroller with no parser present.
+//!
+//! ```
+//! use lamella_js_frontend::Interpreter;
+//!
+//! let mut interpreter = Interpreter::new();
+//! let value = interpreter.eval_source("var xs = [1, 2, 3]; xs.length").unwrap();
+//! assert_eq!(interpreter.describe(&value), "3");
+//! ```
+//!
+//! # Unsupported features
+//!
+//! A feature the engine does not support is refused with a diagnostic that names it; it is never
+//! approximated. The complete set of refusals is [`absence::Absence`].
+//!
+//! # Entry points
+//!
+//! [`Interpreter::run_source`] parses, compiles and runs source in one call.
+//! [`Interpreter::run_artifact`] runs an artifact compiled elsewhere, so a device that only runs
+//! artifacts needs no parser.
 
 #![cfg_attr(not(test), no_std)]
 

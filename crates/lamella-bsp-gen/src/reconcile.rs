@@ -449,7 +449,7 @@ mod tests {
     /// A board with an 8 MB region and whatever discriminators a case needs.
     fn board(discriminators: Vec<Discriminator>) -> BoardTable {
         BoardTable {
-            board: String::from("stm32f746g-disco"),
+            board: String::from("st-stm32f746g-disco"),
             memory: vec![region("sdram", 0x0080_0000, 0x0100_0000)],
             discriminators,
             ..BoardTable::default()

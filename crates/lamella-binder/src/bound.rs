@@ -11287,6 +11287,18 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 BoundMemberInitializerValue::Expression(bound)
             }
             MemberInitializerValue::Nested(nested) => {
+                if let MemberResolution::Property { ty, .. } = &resolution {
+                    if self.is_value_type(ty) {
+                        let type_name = format!("{ty}");
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::ValueTypePropertyInitializer {
+                                member: qualified.clone().into(),
+                                type_name: type_name.into(),
+                            },
+                            member.span,
+                        ));
+                    }
+                }
                 let nested_ty = expected.unwrap_or_else(|| target_ty.clone());
                 BoundMemberInitializerValue::Nested(self.bind_initializer(
                     &nested_ty,

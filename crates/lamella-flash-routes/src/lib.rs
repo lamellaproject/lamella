@@ -495,13 +495,13 @@ pub const RP2_XIP_BASE: u32 = 0x1000_0000;
 /// Every board this build can write, and how.
 pub const PROGRAMMING: &[Programming] = &[
     Programming {
-        board: "micro-bit-v1",
+        board: "bbc-micro-bit-v1",
         aot_target: Some("microbit"),
         programmer: Programmer::MicrobitV1Daplink,
         alternate: None,
     },
     Programming {
-        board: "micro-bit-v2",
+        board: "bbc-micro-bit-v2",
         aot_target: Some("nrf52833"),
         programmer: Programmer::MicrobitV2Daplink,
         alternate: None,
@@ -543,7 +543,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: Some(Programmer::Rp2040Probe { base: RP2_XIP_BASE }),
     },
     Programming {
-        board: "nucleo-l053r8",
+        board: "st-nucleo-l053r8",
         aot_target: None,
         programmer: Programmer::StlinkOnboard {
             family: StFamily::L0,
@@ -552,7 +552,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "nucleo-l011k4",
+        board: "st-nucleo-l011k4",
         aot_target: None,
         programmer: Programmer::StlinkOnboard {
             family: StFamily::L0,
@@ -561,7 +561,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "nucleo-h755zi-q",
+        board: "st-nucleo-h755zi-q",
         aot_target: None,
         programmer: Programmer::StlinkOnboard {
             family: StFamily::H7,
@@ -570,7 +570,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "nucleo-u5a5zj-q",
+        board: "st-nucleo-u5a5zj-q",
         aot_target: None,
         programmer: Programmer::StlinkOnboard {
             family: StFamily::U5,
@@ -579,7 +579,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "nucleo-l476rg",
+        board: "st-nucleo-l476rg",
         aot_target: None,
         programmer: Programmer::StlinkOnboard {
             family: StFamily::L4,
@@ -588,7 +588,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "samd21-xpro",
+        board: "microchip-samd21-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -606,7 +606,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "samd21-cnano",
+        board: "microchip-samd21-cnano",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -615,7 +615,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "samr21-xpro",
+        board: "microchip-samr21-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -624,7 +624,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "atsamd11-xpro",
+        board: "microchip-atsamd11-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -633,7 +633,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "atsamd10-xmini",
+        board: "microchip-atsamd10-xmini",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -642,7 +642,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "samw25-xpro",
+        board: "microchip-samw25-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -651,7 +651,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "same51-cnano",
+        board: "microchip-same51-cnano",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Same54,
@@ -660,7 +660,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "same54-xpro",
+        board: "microchip-same54-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Same54,
@@ -669,7 +669,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "sam4e-xpro",
+        board: "microchip-sam4e-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4Eefc,
@@ -678,7 +678,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "sam4n-xpro",
+        board: "microchip-sam4n-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4Eefc,
@@ -687,7 +687,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "sam4l8-xpro",
+        board: "microchip-sam4l8-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4l,
@@ -704,7 +704,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "sam4s-xpro",
+        board: "microchip-sam4s-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4sDual,
@@ -1331,7 +1331,7 @@ mod tests {
         let pico = PROGRAMMING
             .iter()
             .find(|r| r.board == "rpi-pico2")
-            .expect("pico2 is listed");
+            .expect("rpi-pico2 is listed");
         assert!(
             matches!(route_for(pico, None), Ok(Programmer::Uf2Volume { .. })),
             "no --via means the route needing no probe"
@@ -1588,7 +1588,7 @@ mod tests {
             "the two generations must not share a family, or each would accept the other's image"
         );
         assert_eq!(
-            uf2_family_for_board("micro-bit-v2"),
+            uf2_family_for_board("bbc-micro-bit-v2"),
             None,
             "written over a probe, not a volume"
         );

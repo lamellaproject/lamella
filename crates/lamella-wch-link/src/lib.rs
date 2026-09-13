@@ -1,4 +1,28 @@
 //! WCH-Link (RV mode) debug-probe host.
+//!
+//! A WCH-LinkE in RISC-V mode (USB `1a86:8010`, bulk endpoints OUT `0x01` / IN `0x81`) speaks a small
+//! vendor command protocol whose key primitive, `dmi_op`, reads and writes RISC-V Debug Module registers
+//! over the wire. This crate is layered like `lamella_cmsis_dap` -- a byte-packet
+//! [`Transport`] seam, a transport-free [`proto`] command layer, and a [`WchLink`] probe over them --
+//! and drives a RISC-V External Debug ([`Dm`]) core through that `dmi_op`.
+//!
+//! The protocol + DM logic here are host-testable with a mock [`Transport`]; a concrete WinUSB bulk
+//! transport (binding interface 0's driverless vendor pipe) plugs in on the host to reach a real probe.
+//!
+//! ```no_run
+//! # use lamella_wch_link::{WchLink, Transport, Dm};
+//! # fn go<T: Transport>(transport: T) -> Result<(), Box<dyn std::error::Error>> {
+//! let mut probe = WchLink::new(transport);
+//! let (major, minor) = probe.firmware_version()?;
+//! probe.attach()?;
+//! let mut dm = probe.dm();
+//! dm.enable()?;
+//! dm.halt()?;
+//! let pc = dm.read_csr(0x7b1)?; // dpc
+//! # let _ = (major, minor, pc);
+//! # Ok(())
+//! # }
+//! ```
 
 mod dm;
 mod flash;

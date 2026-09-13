@@ -8,16 +8,16 @@ namespace Lamella.Boards.RaspberryPi
     public sealed class Pico2W
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
-        public static readonly int BoardModel = Pico2WBindings.BOARD_MODEL;
+        public static readonly int BoardModel = RpiPico2WBindings.BOARD_MODEL;
 
         /// <summary>The pins the CYW43439 owns, as a mask over bank 0 -- WL_REG_ON, the shared
         /// data/IRQ line, the chip select and the clock. Composed from the generated per-line masks
         /// rather than written out, so a line moved in board.toml moves here.</summary>
         public static readonly uint RadioPins =
-            Pico2WBindings.CYW43439_WL_REG_ON_MASK
-            | Pico2WBindings.CYW43439_DATA_MASK
-            | Pico2WBindings.CYW43439_CS_MASK
-            | Pico2WBindings.CYW43439_CLK_MASK;
+            RpiPico2WBindings.CYW43439_WL_REG_ON_MASK
+            | RpiPico2WBindings.CYW43439_DATA_MASK
+            | RpiPico2WBindings.CYW43439_CS_MASK
+            | RpiPico2WBindings.CYW43439_CLK_MASK;
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
@@ -59,14 +59,14 @@ namespace Lamella.Boards.RaspberryPi
         public Rp2350UartBinding CreateUartBinding()
         {
             return new Rp2350UartBinding(
-                Pico2WBindings.UART0_BASE,
-                Pico2WBindings.UART0_RESET_MASK,
-                Pico2WBindings.UART0_IO_TX_CTRL,
-                Pico2WBindings.UART0_IO_RX_CTRL,
-                Pico2WBindings.UART0_PADS_TX,
-                Pico2WBindings.UART0_PADS_RX,
-                Pico2WBindings.UART0_FUNCSEL,
-                Pico2WBindings.UART0_CLK_PERI_HZ);
+                RpiPico2WBindings.UART0_BASE,
+                RpiPico2WBindings.UART0_RESET_MASK,
+                RpiPico2WBindings.UART0_IO_TX_CTRL,
+                RpiPico2WBindings.UART0_IO_RX_CTRL,
+                RpiPico2WBindings.UART0_PADS_TX,
+                RpiPico2WBindings.UART0_PADS_RX,
+                RpiPico2WBindings.UART0_FUNCSEL,
+                RpiPico2WBindings.UART0_CLK_PERI_HZ);
         }
 
         /// <summary>UART0 on GP0 (TX, header pin 1) / GP1 (RX, pin 2), ready for

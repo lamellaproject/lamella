@@ -12,7 +12,7 @@
 //
 // The vocabulary this is written in -- `PartBus`, `RegisterTransform`, `PartRegister`,
 // `IdentitySet`, `BusProfile`, `RegisterBus` -- lives in `parts/common/swift/PartKit.swift`, once
-// for the whole tree. It used to live in this file, which made a second driver a second copy of it.
+// for the whole tree, so a second driver shares the vocabulary rather than declaring its own copy.
 
 /// The BME280's own facts, in Swift's terms.
 public enum Bme280 {

@@ -1072,19 +1072,19 @@ fn an_edbg_route_narrows_to_the_kit_and_not_to_the_vendor() {
 fn the_routed_microchip_kits_carry_their_own_product_ids() {
     use crate::{PROGRAMMING, Programmer};
     let expected = [
-        ("samd21-xpro", 0x2169u16),
-        ("atsamd11-xpro", 0x2111),
-        ("atsamd10-xmini", 0x2145),
-        ("samw25-xpro", 0x2111),
-        ("same51-cnano", 0x2175),
-        ("same54-xpro", 0x2111),
-        ("sam4e-xpro", 0x2111),
-        ("sam4n-xpro", 0x2111),
-        ("sam4l8-xpro", 0x2111),
-        ("sam4s-xpro", 0x2111),
+        ("microchip-samd21-xpro", 0x2169u16),
+        ("microchip-atsamd11-xpro", 0x2111),
+        ("microchip-atsamd10-xmini", 0x2145),
+        ("microchip-samw25-xpro", 0x2111),
+        ("microchip-same51-cnano", 0x2175),
+        ("microchip-same54-xpro", 0x2111),
+        ("microchip-sam4e-xpro", 0x2111),
+        ("microchip-sam4n-xpro", 0x2111),
+        ("microchip-sam4l8-xpro", 0x2111),
+        ("microchip-sam4s-xpro", 0x2111),
         ("arduino-zero", 0x2157),
-        ("samd21-cnano", 0x2175),
-        ("samr21-xpro", 0x2111),
+        ("microchip-samd21-cnano", 0x2175),
+        ("microchip-samr21-xpro", 0x2111),
     ];
     for (board, id) in expected {
         let row = PROGRAMMING
@@ -1112,7 +1112,7 @@ fn the_routed_microchip_kits_carry_their_own_product_ids() {
 /// which controller fronts which window is decided by a `GPNVM` swap bit that no address reveals,
 /// and filling one plane's write latch while commanding the other reports success.
 ///
-/// So `sam4s-xpro` must NOT carry this family: it is the dual-plane part, and it is routed on
+/// So `microchip-sam4s-xpro` must NOT carry this family: it is the dual-plane part, and it is routed on
 /// [`crate::SamFamily::Sam4sDual`] instead. The erase arm refuses at run time on the descriptor's
 /// own plane count, and this refuses at the table.
 #[test]
@@ -1131,11 +1131,11 @@ fn the_eefc_family_routes_no_dual_plane_board() {
 
     assert!(!eefc.is_empty(), "no board carries this family, so the check proves nothing");
     assert!(
-        !eefc.contains(&"sam4s-xpro"),
+        !eefc.contains(&"microchip-sam4s-xpro"),
         "the SAM4S Xplained Pro carries an ATSAM4SD32C -- two planes, two controllers, chosen by a \
          GPNVM bit rather than by the address: {eefc:?}"
     );
-    assert!(eefc.contains(&"sam4e-xpro") && eefc.contains(&"sam4n-xpro"), "{eefc:?}");
+    assert!(eefc.contains(&"microchip-sam4e-xpro") && eefc.contains(&"microchip-sam4n-xpro"), "{eefc:?}");
 
     let dual: Vec<&str> = PROGRAMMING
         .iter()
@@ -1147,7 +1147,7 @@ fn the_eefc_family_routes_no_dual_plane_board() {
         })
         .map(|row| row.board)
         .collect();
-    assert_eq!(dual, vec!["sam4s-xpro"], "{dual:?}");
+    assert_eq!(dual, vec!["microchip-sam4s-xpro"], "{dual:?}");
 }
 
 /// A route's declared units count the family's own granule, so the same image does not read as

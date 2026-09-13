@@ -14,7 +14,7 @@
 
 [table]
 kind = "board"
-board = "pico-w"
+board = "rpi-pico-w"
 vendor = "raspberry-pi"
 family = "rp2040"
 part = "rp2040"

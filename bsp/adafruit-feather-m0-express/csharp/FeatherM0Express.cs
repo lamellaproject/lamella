@@ -8,7 +8,7 @@ namespace Lamella.Boards.Adafruit
     public sealed class FeatherM0Express
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
-        public static readonly int BoardModel = FeatherM0ExpressBindings.BOARD_MODEL;
+        public static readonly int BoardModel = AdafruitFeatherM0ExpressBindings.BOARD_MODEL;
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
@@ -31,13 +31,13 @@ namespace Lamella.Boards.Adafruit
         /// <summary>The red LED beside the USB jack (Arduino D13) -- the board's blink target, and
         /// the only indicator visible without driving a protocol.</summary>
         public static readonly int LedPin =
-            LogicalPin(FeatherM0ExpressBindings.LED_PORT_BASE, FeatherM0ExpressBindings.LED_PIN);
+            LogicalPin(AdafruitFeatherM0ExpressBindings.LED_PORT_BASE, AdafruitFeatherM0ExpressBindings.LED_PIN);
 
         /// <summary>The on-board addressable RGB LED (Arduino D8). ONE pin carries a timed serial
         /// protocol rather than a level, so a driver owns the waveform -- this is only the pin that
         /// reaches it.</summary>
         public static readonly int NeoPixelPin =
-            LogicalPin(FeatherM0ExpressBindings.NEOPIXEL_PORT_BASE, FeatherM0ExpressBindings.NEOPIXEL_PIN);
+            LogicalPin(AdafruitFeatherM0ExpressBindings.NEOPIXEL_PORT_BASE, AdafruitFeatherM0ExpressBindings.NEOPIXEL_PIN);
 
         /// <summary>The family's PORT driver, over every pin on the part.</summary>
         /// <remarks>THE SAME INSTANCE <see cref="GpioController"/> drives, resolved through the

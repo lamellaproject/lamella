@@ -4673,7 +4673,7 @@ fn apply_init_only_modifier(
 /// `System.Runtime.InteropServices.InAttribute`** (II.23.2.7), applied OUTSIDE the byref so the blob
 /// reads modifier-then-type -- the same order `mint_instantiated_member_ref` writes when it
 /// REPRODUCES one from an imported signature, which is the encoding that made `ReadOnlySpan<T>`'s
-/// indexer resolve where a bare `!0&` matched nothing. One encoding, proven against real .NET
+/// indexer resolve where a bare `!0&` matched nothing. One encoding, proven against full .NET
 /// metadata from the consuming side, now used from the declaring side too.
 ///
 /// The modifier NAMES a type, so the type has to exist: a reference set that does not declare

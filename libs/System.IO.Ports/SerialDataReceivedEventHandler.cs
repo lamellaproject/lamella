@@ -1,4 +1,4 @@
-// System.IO.Ports (libs/, real .NET's own assembly name) -- System.IO.Ports.SerialDataReceivedEventHandler
+// System.IO.Ports (libs/, full .NET's own assembly name) -- System.IO.Ports.SerialDataReceivedEventHandler
 #if LAMELLA_SURFACE_SERIAL && LAMELLA_SURFACE_NETFX_2_0 && LAMELLA_SURFACE_THREADS
 namespace System.IO.Ports
 {

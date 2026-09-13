@@ -8,24 +8,24 @@ namespace Lamella.Boards.Adafruit
     public sealed class FeatherRp2040Adalogger
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
-        public static readonly int BoardModel = FeatherRp2040AdaloggerBindings.BOARD_MODEL;
+        public static readonly int BoardModel = AdafruitFeatherRp2040AdaloggerBindings.BOARD_MODEL;
 
         /// <summary>The red user LED (Arduino D13) -- the board's blink target.</summary>
-        public static readonly int LedPin = (int)FeatherRp2040AdaloggerBindings.LED_PIN;
+        public static readonly int LedPin = (int)AdafruitFeatherRp2040AdaloggerBindings.LED_PIN;
 
         /// <summary>The on-board addressable RGB LED. ONE pin carries a timed serial protocol
         /// rather than a level, so a driver owns the waveform -- this is only the pin that reaches
         /// it.</summary>
-        public static readonly int NeoPixelPin = (int)FeatherRp2040AdaloggerBindings.NEOPIXEL_PIN;
+        public static readonly int NeoPixelPin = (int)AdafruitFeatherRp2040AdaloggerBindings.NEOPIXEL_PIN;
 
         /// <summary>The BOOT button, which the board wires ACTIVE LOW -- so a pressed button reads
         /// <see cref="PinValue.Low"/>, and the pin wants <see cref="PinMode.InputPullUp"/>.</summary>
-        public static readonly int ButtonPin = (int)FeatherRp2040AdaloggerBindings.BUTTON_PIN;
+        public static readonly int ButtonPin = (int)AdafruitFeatherRp2040AdaloggerBindings.BUTTON_PIN;
 
         /// <summary>The microSD socket's card-detect line, ACTIVE LOW: a card present reads
         /// <see cref="PinValue.Low"/>.</summary>
         public static readonly int SdCardDetectPin =
-            (int)FeatherRp2040AdaloggerBindings.SD_CARD_DETECT_PIN;
+            (int)AdafruitFeatherRp2040AdaloggerBindings.SD_CARD_DETECT_PIN;
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
@@ -69,12 +69,12 @@ namespace Lamella.Boards.Adafruit
         public Rp2040Uart CreateUart()
         {
             return new Rp2040Uart(new Rp2040UartBinding(
-                FeatherRp2040AdaloggerBindings.UART0_BASE,
-                FeatherRp2040AdaloggerBindings.UART0_RESET_MASK,
-                FeatherRp2040AdaloggerBindings.UART0_IO_TX_CTRL,
-                FeatherRp2040AdaloggerBindings.UART0_IO_RX_CTRL,
-                FeatherRp2040AdaloggerBindings.UART0_FUNCSEL,
-                FeatherRp2040AdaloggerBindings.UART0_CLK_PERI_HZ));
+                AdafruitFeatherRp2040AdaloggerBindings.UART0_BASE,
+                AdafruitFeatherRp2040AdaloggerBindings.UART0_RESET_MASK,
+                AdafruitFeatherRp2040AdaloggerBindings.UART0_IO_TX_CTRL,
+                AdafruitFeatherRp2040AdaloggerBindings.UART0_IO_RX_CTRL,
+                AdafruitFeatherRp2040AdaloggerBindings.UART0_FUNCSEL,
+                AdafruitFeatherRp2040AdaloggerBindings.UART0_CLK_PERI_HZ));
         }
     }
 }

@@ -30,7 +30,7 @@ notes = "MODE 1 = USART with internal clock. TXPO/RXPO select the TX/RX pads (bi
 [registers.CTRLB]
 offset = 0x4
 width = 32
-fields = { CHSIZE = [0, 3], SBMODE = [6, 1], SFDE = [8, 1], PMODE = [13, 1], TXEN = [16, 1], RXEN = [17, 1] }
+fields = { CHSIZE = [0, 3], SBMODE = [6, 1], COLDEN = [8, 1], SFDE = [9, 1], ENC = [10, 1], PMODE = [13, 1], TXEN = [16, 1], RXEN = [17, 1] }
 notes = "CHSIZE 0 = 8-bit. SBMODE 0 = 1 stop bit. PMODE unused (no parity). TXEN | RXEN enable the transmitter/receiver."
 
 [registers.BAUD]

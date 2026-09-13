@@ -49,12 +49,11 @@ pub const STRING_COMPARISON: u64 = 1 << 16;
 pub const TYPED_REFERENCES: u64 = 1 << 17;
 /// Variable-argument methods.
 pub const VARARGS: u64 = 1 << 18;
-/// `System.Span<T>` and `System.ReadOnlySpan<T>`.
-///
-/// A capability of its own rather than a member of an era: no NETMF or nanoFramework generation
-/// declares a span, and it reaches this surface through the device-API clause instead. It requires
-/// GENERICS, which `build-corlib.ps1` enforces as a refusal.
+/// `System.Span<T>` and `System.ReadOnlySpan<T>`. Requires [`GENERICS`].
 pub const SPAN: u64 = 1 << 19;
+/// `System.ValueTuple<...>`, the eight generic structs that C# tuple types compile to. Requires
+/// [`GENERICS`].
+pub const TUPLES: u64 = 1 << 20;
 
 /// The era bits together, so "which generation was this built against" is one mask rather than four
 /// tests.
@@ -91,6 +90,7 @@ pub const NAMED: &[(u64, &str)] = &[
     (TYPED_REFERENCES, "LAMELLA_SURFACE_TYPED_REFERENCES"),
     (VARARGS, "LAMELLA_SURFACE_VARARGS"),
     (SPAN, "LAMELLA_SURFACE_SPAN"),
+    (TUPLES, "LAMELLA_SURFACE_TUPLES"),
 ];
 
 /// The bit a compilation symbol stands for, or `None` when this build does not name it.

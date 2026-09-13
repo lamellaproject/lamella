@@ -6,7 +6,7 @@
 # CHIP truth -- which pad carries which peripheral signal on which function letter -- and for the
 # SAM G55 Xplained Pro's virtual COM port that is fully settled by Table 9-4. What is NOT settled
 # is FLEXCOM6's peripheral identifier, which is a field of ../instances.toml rather than of this
-# table, and which is why bsp/samg55-xpro binds no UART. Keeping the pad rows here means the
+# table, and which is why bsp/microchip-samg55-xpro binds no UART. Keeping the pad rows here means the
 # binding is one field away rather than one investigation away when somebody reads that id off
 # silicon.
 #
@@ -25,7 +25,7 @@ sources = [
 notes = [
     "PERIPHERAL A AND PERIPHERAL B ARE THE ONLY POPULATED FUNCTIONS ON THIS PART. The ABCDSR pair encodes four, and Table 9-3 and Table 9-4 print two; see blocks/pio.toml.",
     "A FLEXCOM SIGNAL IS NAMED FOR THE MODE IT IS IN. The same pad is TXD6, SPI6_MOSI or TWD6 depending on what FLEXCOM6's mode register selects, and Table 9-4 prints all three in one cell. The `signal` field below names the USART reading because that is what a virtual COM port uses; an SPI or TWI binding on the same pad would be a different row with a different signal and the same function letter.",
-    "THE KIT GUIDE DISAGREES WITH THE DATASHEET ABOUT ONE OF THESE TWO PADS AND THE DATASHEET WINS. Atmel-42389 names PB0 as 'USART0 TXD' while naming PB1 'USART6 RXD' -- two instances for one link. Table 9-4 gives both pads to instance 6. Same class as the SAM R21 Xplained Pro guide's SERCOM0/SERCOM1 split; bsp/samg55-xpro's header states it against that board.",
+    "THE KIT GUIDE DISAGREES WITH THE DATASHEET ABOUT ONE OF THESE TWO PADS AND THE DATASHEET WINS. Atmel-42389 names PB0 as 'USART0 TXD' while naming PB1 'USART6 RXD' -- two instances for one link. Table 9-4 gives both pads to instance 6. Same class as the SAM R21 Xplained Pro guide's SERCOM0/SERCOM1 split; bsp/microchip-samg55-xpro's header states it against that board.",
 ]
 
 [[pins]]

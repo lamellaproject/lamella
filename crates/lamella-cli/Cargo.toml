@@ -59,7 +59,7 @@ lamella-syntax = { path = "../lamella-syntax" }
 # EVERY INSTRUCTION SET THE CATALOG LISTS A BOARD FOR, selected through this crate's OWN features
 # below rather than named here. The features decide what the SHIPPED TOOL can compile, and a person
 # holding a board reads a missing generator as a missing capability of the project. The catalog has
-# RISC-V boards (`nano-ch32v003`, `esp32c6-devkitc`), so a build carrying Thumb alone answers them
+# RISC-V boards (`muselab-nano-ch32v003`, `esp-esp32c6-devkitc`), so a build carrying Thumb alone answers them
 # with "unsupported target" while the generator it needed sat in the tree unlinked.
 lamella-aot = { path = "../lamella-aot", default-features = false }
 # Flattening a linked ELF into the bytes a flasher writes -- the same computation as
@@ -124,7 +124,7 @@ lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 default = ["aot-arm32", "aot-riscv32"]
 # Thumb code generation -- every Cortex-M board in the catalog.
 aot-arm32 = ["lamella-aot/arm32"]
-# RV32 code generation -- `nano-ch32v003` (RV32EC) and `esp32c6-devkitc` in the catalog.
+# RV32 code generation -- `muselab-nano-ch32v003` (RV32EC) and `esp-esp32c6-devkitc` in the catalog.
 aot-riscv32 = ["lamella-aot/riscv32"]
 # The flash image and the deploy path: compile -> bake (`Module::write_baked`, which needs
 # `code-in-place`) -> `.lmli`, and the chunked deploy over Lamella Link. Default-OFF for the

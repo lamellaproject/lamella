@@ -1380,7 +1380,7 @@ pub mod product_model {
 
     /// Microchip SAM L11 Xplained Pro (ATSAML11-XPRO, ATSAML11E16A, Cortex-M23, 64 KB flash plus a
     /// separate 2 KB Data Flash array / 16 KB SRAM). Its strata are `csp/saml1x`, shared with the
-    /// SAM L10, and this board is wired identically to `saml10-xpro` -- the kit guide documents both
+    /// SAM L10, and this board is wired identically to `microchip-saml10-xpro` -- the kit guide documents both
     /// and heads its pin column "SAML10/SAML11 pin". What the fitted part adds is TrustZone for
     /// ARMv8-M, Secure Boot, a second MPU and secure pin multiplexing, none of which moves a
     /// peripheral: it is security behavior on the same silicon map.

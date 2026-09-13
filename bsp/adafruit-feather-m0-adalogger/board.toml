@@ -8,7 +8,7 @@
 
 [table]
 kind = "board"
-board = "feather-m0-adalogger"
+board = "adafruit-feather-m0-adalogger"
 vendor = "adafruit"
 family = "samd21"
 part = "atsamd21g18a"

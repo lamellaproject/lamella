@@ -8,16 +8,16 @@ namespace Lamella.Boards.RaspberryPi
     public sealed class PicoW
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
-        public static readonly int BoardModel = PicoWBindings.BOARD_MODEL;
+        public static readonly int BoardModel = RpiPicoWBindings.BOARD_MODEL;
 
         /// <summary>The pins the CYW43439 owns, as a mask over the user bank -- WL_REG_ON, the
         /// shared data/IRQ line, the chip select and the clock. Composed from the generated
         /// per-line masks rather than written out, so a line moved in board.toml moves here.</summary>
         public static readonly uint RadioPins =
-            PicoWBindings.CYW43439_WL_REG_ON_MASK
-            | PicoWBindings.CYW43439_DATA_MASK
-            | PicoWBindings.CYW43439_CS_MASK
-            | PicoWBindings.CYW43439_CLK_MASK;
+            RpiPicoWBindings.CYW43439_WL_REG_ON_MASK
+            | RpiPicoWBindings.CYW43439_DATA_MASK
+            | RpiPicoWBindings.CYW43439_CS_MASK
+            | RpiPicoWBindings.CYW43439_CLK_MASK;
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
@@ -63,12 +63,12 @@ namespace Lamella.Boards.RaspberryPi
         public Rp2040Uart CreateUart()
         {
             return new Rp2040Uart(new Rp2040UartBinding(
-                PicoWBindings.UART0_BASE,
-                PicoWBindings.UART0_RESET_MASK,
-                PicoWBindings.UART0_IO_TX_CTRL,
-                PicoWBindings.UART0_IO_RX_CTRL,
-                PicoWBindings.UART0_FUNCSEL,
-                PicoWBindings.UART0_CLK_PERI_HZ));
+                RpiPicoWBindings.UART0_BASE,
+                RpiPicoWBindings.UART0_RESET_MASK,
+                RpiPicoWBindings.UART0_IO_TX_CTRL,
+                RpiPicoWBindings.UART0_IO_RX_CTRL,
+                RpiPicoWBindings.UART0_FUNCSEL,
+                RpiPicoWBindings.UART0_CLK_PERI_HZ));
         }
     }
 }

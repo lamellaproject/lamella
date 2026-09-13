@@ -60,7 +60,11 @@ $DefaultSurface = @(
     # are Microsoft's signatures for those members. The symbol brings `corlib/System/Span.cs` into
     # the compile; without it those facades name a type that does not exist and the assembly listed
     # below cannot be built at all.
-    'LAMELLA_SURFACE_SPAN'
+    'LAMELLA_SURFACE_SPAN',
+    # Tuple syntax names `System.ValueTuple<...>` and nothing else, so the symbol that brings
+    # `corlib/System/ValueTuple.cs` into the compile is what makes `(int, string)` compilable at all.
+    # Without it a tuple type resolves to no type and the use site reports a refused object creation.
+    'LAMELLA_SURFACE_TUPLES'
 )
 if ($PrintSurface) { $DefaultSurface | ForEach-Object { Write-Output $_ }; exit 0 }
 if (-not $Define) { $Define = $DefaultSurface }
@@ -74,6 +78,7 @@ $SurfaceRequires = [ordered]@{
     'LAMELLA_SURFACE_NETFX_2_0' = @('LAMELLA_SURFACE_GENERICS')
     'LAMELLA_SURFACE_SERIAL'    = @('LAMELLA_SURFACE_NETFX_2_0')
     'LAMELLA_SURFACE_SPAN'      = @('LAMELLA_SURFACE_GENERICS')
+    'LAMELLA_SURFACE_TUPLES'    = @('LAMELLA_SURFACE_GENERICS')
 }
 foreach ($symbol in $SurfaceRequires.Keys) {
     if ($Define -notcontains $symbol) { continue }
@@ -93,8 +98,13 @@ $Assemblies = @(
     # only the assembly is.
     @{ name = 'System.Device.Gpio';                    references = @(); extraSources = @('System.Device.Pwm') },
     @{ name = 'System.Device.Model';                   references = @() },
+    # Its own assembly, and the contrast with the fold above is the whole reason. Upstream's
+    # `System.Device.Gpio` holds Gpio, I2c, Pwm and Spi and no Analog, so folding `System.Device.Pwm`
+    # converges on that shape and folding Analog would be a deviation dressed as convergence.
+    # References only corlib: these sources name `System.IDisposable` and nothing else.
+    @{ name = 'System.Device.Analog';                  references = @() },
     @{ name = 'System.Net.NetworkInformation';         references = @() },
-    # Real .NET's own assembly name, bare and unprefixed, because these are real .NET's types in real
+    # Full .NET's own assembly name, bare and unprefixed, because these are full .NET's types in full
     # .NET's namespace: it ships System.IO.Ports out-of-band (dotnet/dotnet) rather than in its
     # corlib, NETMF v4.4 has no SerialPort in mscorlib at all, and nanoFramework has it as a separate
     # assembly of this same name. All three agree it does not belong in a core library, which is why
@@ -172,6 +182,14 @@ $defineArg = @("/define:$($Define -join ';')")
 # move together. The property the paragraph above is about survives: WITHOUT the symbol you stay on
 # the lower rung, so a surface that does not offer spans still refuses a 7.2 construct anywhere in
 # these sources.
+#
+# LAMELLA_SURFACE_TUPLES DELIBERATELY HAS NO RUNG HERE, and the absence is the point of this note.
+# This ladder exists because a capability's own SOURCES need language constructs -- Span<T> is a
+# `readonly ref struct` with byref-returning members and cannot be compiled below 7.2. The eight
+# ValueTuple structs are plain generics that compile at 2, so giving tuples a 7.0 step would raise
+# the version every OTHER source in this tree is compiled at and buy nothing. What gates the type is
+# the SYMBOL: a profile that does not name it has no ValueTuple, whatever its language version. The
+# 7.0 rung belongs to tuple SYNTAX, which is a property of the program being compiled, not of these.
 $langArg = @('/langversion:1')
 if ($Define -contains 'LAMELLA_SURFACE_NETFX_2_0' -or $Define -contains 'LAMELLA_SURFACE_GENERICS') {
     $langArg = @('/langversion:2')

@@ -72,7 +72,7 @@
           },
           "target": {
             "type": "string",
-            "description": "Optional board/profile name (e.g. 'pico2'); default is the generic profile."
+            "description": "Optional board/profile name (e.g. 'rpi-pico2'); default is the generic profile."
           }
         },
         "required": [

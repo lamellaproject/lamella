@@ -45,7 +45,7 @@ source = "DS20005841E Table 7-1: the PA28 row (48-pin pin 41) carries SERCOM1/PA
 # INSTANCE. On the E series the SBC is wired to SERCOM4 at PA13 and PB11; this kit routes SERCOM4
 # to the EDBG at PA14 and PA15 instead. One instance cannot serve both, so a program that opens
 # the virtual COM port on this board has spent the LIN transceiver's UART. That is a real
-# exclusion rather than a caution, and bsp/samha1e16a-xpro/board.toml states it again from the
+# exclusion rather than a caution, and bsp/microchip-samha1e16a-xpro/board.toml states it again from the
 # board side.
 #
 # The function letter matters here and the guide does not give it: PA14 and PA15 carry SERCOM2 in

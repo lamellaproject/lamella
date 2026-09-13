@@ -1,4 +1,22 @@
-//! A host-PC C# REPL on the lamella interpreter, compiled in-process with the project's own compiler (lcsc).
+//! A host-PC C# REPL on the Lamella interpreter, compiled in-process with the project's own compiler (lcsc).
+//!
+//! Two entry points, sharing one compile + load + interpret pipeline:
+//!
+//! - [`eval`] runs one C# *expression* statelessly: it wraps the line in a small program,
+//!   compiles it, runs it on a fresh [`Vm`](lamella_cil_runtime::Vm), and returns the captured
+//!   console output. Nothing carries between calls.
+//! - [`ReplSession`] runs a stateful stream of submissions: declarations persist, so
+//!   `int x = 5;` then `x * 2` prints `10`. It re-emits a synthetic `__Repl` class in full
+//!   each turn (growing by one field per declaration), with the prior instance's field values
+//!   migrated into the newly loaded type by stable slot order.
+//!
+//! ```no_run
+//! assert_eq!(lamella_repl::eval("1 + 2 * 3").unwrap(), "7\n");
+//!
+//! let mut s = lamella_repl::ReplSession::new().unwrap();
+//! assert_eq!(s.submit("int x = 5;").unwrap(), "");
+//! assert_eq!(s.submit("x * 2").unwrap(), "10\n");
+//! ```
 
 use lamella_load::{
     DeltaContext, load, load_bootstrap, load_bootstrap_lazy_corlib, load_bootstrap_with_corlib,

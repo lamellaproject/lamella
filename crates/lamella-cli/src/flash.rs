@@ -870,7 +870,7 @@ class Program
 
     #[test]
     fn the_cannot_build_message_renders_without_stray_columns() {
-        let message = cannot_build_for("nucleo-l053r8");
+        let message = cannot_build_for("st-nucleo-l053r8");
         for line in message.lines() {
             assert!(line == line.trim_end(), "a line ends in whitespace:
 {message}");
@@ -884,7 +884,7 @@ class Program
 {message}");
             }
         }
-        assert!(message.contains("nucleo-l053r8"), "{message}");
+        assert!(message.contains("st-nucleo-l053r8"), "{message}");
         assert!(message.contains("lamella flash"), "it names the verb that works:
 {message}");
     }
@@ -918,7 +918,7 @@ class Program
     #[test]
     fn the_refusal_names_the_missing_fact_and_what_still_works() {
         let text = cannot_write("rpi-pico2");
-        assert!(text.contains("micro-bit-v1"), "it lists what CAN be written: {text}");
+        assert!(text.contains("bbc-micro-bit-v1"), "it lists what CAN be written: {text}");
         assert!(text.contains("not yet stated in any board file"), "and why the list is short");
         assert!(text.contains("lamella build"), "and what still works for that board");
         assert!(text.contains("rpi-pico2"), "and names the board asked for");
@@ -930,9 +930,9 @@ class Program
 
     #[test]
     fn the_coverage_column_agrees_with_the_table() {
-        assert!(can_flash("micro-bit-v1"));
+        assert!(can_flash("bbc-micro-bit-v1"));
         assert!(can_flash("rpi-pico2"));
-        assert!(!can_flash("nucleo-f429zi"), "no mechanism is stated for the ST boards yet");
+        assert!(!can_flash("st-nucleo-f429zi"), "no mechanism is stated for the ST boards yet");
         assert!(!can_flash("no-such-board"));
     }
 

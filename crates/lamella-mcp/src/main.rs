@@ -1419,7 +1419,7 @@ mod tests {
             "a board scope narrows the REQUEST and says nothing about which part may be erased"
         );
         assert!(scope.permits_request("rpi-pico2", None));
-        assert!(!scope.permits_request("micro-bit-v2", None), "another board is outside it");
+        assert!(!scope.permits_request("bbc-micro-bit-v2", None), "another board is outside it");
     }
 
     /// A probe scope requires a probe to be named -- otherwise "only through this cable" would be

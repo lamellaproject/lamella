@@ -17,7 +17,7 @@
 
 [table]
 kind = "board"
-board = "feather-m0-wifi"
+board = "adafruit-feather-m0-wifi"
 vendor = "adafruit"
 family = "samd21"
 part = "atsamd21g18a"

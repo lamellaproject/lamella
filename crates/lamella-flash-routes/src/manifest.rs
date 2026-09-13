@@ -269,7 +269,7 @@ mod tests {
     /// A record for `bytes`, correct in every field, so a test can spoil exactly one.
     fn record_for(bytes: &[u8], format: &str, base: &str) -> String {
         format!(
-            "{{\"schema\":1,\"kind\":\"flash-image\",\"board\":\"micro-bit-v2\",\
+            "{{\"schema\":1,\"kind\":\"flash-image\",\"board\":\"bbc-micro-bit-v2\",\
              \"format\":\"{format}\",\"base\":{base},\"sha256\":\"{}\",\"bytes\":{},\
              \"producer\":\"lamella-aot\"}}",
             hex(lamella_pe::sha256::sha256(bytes)),
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn an_elf_record_reads() {
         let manifest = parse(&record_for(b"image", "elf", "null")).expect("a valid elf record");
-        assert_eq!(manifest.board, "micro-bit-v2");
+        assert_eq!(manifest.board, "bbc-micro-bit-v2");
         assert_eq!(manifest.format, "elf");
         assert_eq!(manifest.base, None);
         assert_eq!(manifest.bytes, 5);
@@ -439,9 +439,9 @@ mod tests {
     #[test]
     fn the_wrong_board_is_refused_and_both_are_named() {
         let manifest = parse(&record_for(b"image", "elf", "null")).unwrap();
-        assert!(check_board(&manifest, "micro-bit-v2").is_ok());
-        let why = check_board(&manifest, "pico2").unwrap_err();
-        assert!(why.contains("micro-bit-v2") && why.contains("pico2"), "{why}");
+        assert!(check_board(&manifest, "bbc-micro-bit-v2").is_ok());
+        let why = check_board(&manifest, "rpi-pico2").unwrap_err();
+        assert!(why.contains("bbc-micro-bit-v2") && why.contains("rpi-pico2"), "{why}");
         assert!(why.contains("Nothing was written"), "{why}");
     }
 
@@ -463,7 +463,7 @@ mod tests {
 
         std::fs::write(&sidecar, record_for(b"image", "bin", "\"0x0\"")).expect("write a record");
         let manifest = read(&image).expect("a valid sidecar").expect("present");
-        assert_eq!(manifest.board, "micro-bit-v2");
+        assert_eq!(manifest.board, "bbc-micro-bit-v2");
         let _ = std::fs::remove_file(&sidecar);
         let _ = std::fs::remove_file(&image);
     }
@@ -474,7 +474,7 @@ mod tests {
         let manifest = parse(&record_for(b"image", "elf", "null")).unwrap();
         let rendered = [
             attestation(&manifest),
-            check_board(&manifest, "pico2").unwrap_err(),
+            check_board(&manifest, "rpi-pico2").unwrap_err(),
             check_identity(&manifest, b"image", Some("bin")).unwrap_err(),
             check_identity(&manifest, b"imagf", Some("elf")).unwrap_err(),
             check_identity(&manifest, b"imag", Some("elf")).unwrap_err(),
@@ -500,7 +500,7 @@ mod tests {
     fn the_attestation_names_the_board_and_the_build() {
         let manifest = parse(&record_for(b"image", "elf", "null")).unwrap();
         let line = attestation(&manifest);
-        assert!(line.contains("micro-bit-v2"), "{line}");
+        assert!(line.contains("bbc-micro-bit-v2"), "{line}");
         assert!(line.contains("lamella-aot"), "{line}");
         assert!(line.contains("5 B"), "{line}");
 

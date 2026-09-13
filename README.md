@@ -1,4 +1,4 @@
-# Lamella
+# Lamella&trade;
 
 ![Status](https://img.shields.io/badge/status-in_development-orange)
 
@@ -49,3 +49,5 @@ Dual licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
 at your option.
+
+<sub>Lamella is a trademark of Lamella LLC.</sub>

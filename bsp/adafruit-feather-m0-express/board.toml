@@ -9,7 +9,7 @@
 
 [table]
 kind = "board"
-board = "feather-m0-express"
+board = "adafruit-feather-m0-express"
 vendor = "adafruit"
 family = "samd21"
 part = "atsamd21g18a"

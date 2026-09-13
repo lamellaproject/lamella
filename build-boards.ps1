@@ -158,16 +158,24 @@ function Resolve-Family($boardDir) {
     throw "$($boardDir)/board.toml states neither family nor module"
 }
 
-# The assembly's board name, taken from the GENERATED bindings file rather than re-derived from the
-# directory name. The generator already decided how `feather-m0-adalogger` becomes
-# `FeatherM0Adalogger`; re-implementing that rule here is a second source that can disagree with the
-# first, and the class the board file declares is the one that has to match.
+# The assembly's board name: the GENERATED bindings name, less the maker it begins with. A board id is
+# `<maker>-<product>`, and the assembly's vendor segment already says who made the board, so keeping
+# the maker in the board part would say it twice -- `Lamella.Boards.RaspberryPi.RpiPico2` rather than
+# `Lamella.Boards.RaspberryPi.Pico2`. The name comes from the generated file rather than from the
+# directory, because the generator already decided how `adafruit-feather-m0-adalogger` becomes
+# `AdafruitFeatherM0Adalogger`, and a second copy of that casing rule here could disagree with the
+# first. Removing the maker takes only its LENGTH from the directory name, so no casing is re-applied.
 function Resolve-BoardName($csharpDir, $dirName) {
     $bindings = @(Get-ChildItem $csharpDir -Filter '*Bindings.g.cs')
     if ($bindings.Count -ne 1) {
         throw "bsp/$dirName/csharp: expected exactly one *Bindings.g.cs to name the board, found $($bindings.Count). Regenerate the family."
     }
-    $bindings[0].Name -replace 'Bindings\.g\.cs$', ''
+    $name = $bindings[0].Name -replace 'Bindings\.g\.cs$', ''
+    $maker = ($dirName -split '-', 2)[0]
+    if ($name.Length -le $maker.Length -or -not $name.StartsWith($maker, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "bsp/$dirName/csharp/$($bindings[0].Name): the generated name does not begin with the maker '$maker' its directory names. Regenerate the family."
+    }
+    $name.Substring($maker.Length)
 }
 
 # The assembly's VENDOR segment, read from the same generated file for the same reason: the

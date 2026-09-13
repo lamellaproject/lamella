@@ -8,12 +8,12 @@ namespace Lamella.Boards.RaspberryPi
     public sealed class Pico
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
-        public static readonly int BoardModel = PicoBindings.BOARD_MODEL;
+        public static readonly int BoardModel = RpiPicoBindings.BOARD_MODEL;
 
         /// <summary>The green user LED on GP25 -- the board's blink target, and the only indicator
         /// it has. Lifted from the generated pin rather than written out, so a pin moved in
         /// board.toml moves here.</summary>
-        public static readonly int LedPin = (int)PicoBindings.LED_PIN;
+        public static readonly int LedPin = (int)RpiPicoBindings.LED_PIN;
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
@@ -57,12 +57,12 @@ namespace Lamella.Boards.RaspberryPi
         public Rp2040Uart CreateUart()
         {
             return new Rp2040Uart(new Rp2040UartBinding(
-                PicoBindings.UART0_BASE,
-                PicoBindings.UART0_RESET_MASK,
-                PicoBindings.UART0_IO_TX_CTRL,
-                PicoBindings.UART0_IO_RX_CTRL,
-                PicoBindings.UART0_FUNCSEL,
-                PicoBindings.UART0_CLK_PERI_HZ));
+                RpiPicoBindings.UART0_BASE,
+                RpiPicoBindings.UART0_RESET_MASK,
+                RpiPicoBindings.UART0_IO_TX_CTRL,
+                RpiPicoBindings.UART0_IO_RX_CTRL,
+                RpiPicoBindings.UART0_FUNCSEL,
+                RpiPicoBindings.UART0_CLK_PERI_HZ));
         }
     }
 }

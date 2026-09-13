@@ -1010,7 +1010,7 @@ mod tests {
         );
         let (_, text) = BOARD_PYTHON
             .iter()
-            .find(|(id, _)| *id == "micro-bit-v2")
+            .find(|(id, _)| *id == "bbc-micro-bit-v2")
             .expect("the micro:bit v2 board module");
         assert!(!text.is_empty(), "an embedded module with no text serves nothing");
     }
@@ -1022,7 +1022,7 @@ mod tests {
     fn a_board_module_resolves_without_a_checkout_underneath() {
         let source = "import board\nprint(1)\n";
         let path = Path::new("nowhere/main.py");
-        let bundle = compile_python(path, source, Some("micro-bit-v2"))
+        let bundle = compile_python(path, source, Some("bbc-micro-bit-v2"))
             .expect("a board module comes from the binary, not from bsp/ on disk");
         assert!(
             bundle.modules.iter().any(|module| module.name == "board"),

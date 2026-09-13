@@ -4,7 +4,7 @@
 
 [table]
 kind = "board"
-board = "pico2"
+board = "rpi-pico2"
 vendor = "raspberry-pi"
 family = "rp2350"
 part = "rp2350a"

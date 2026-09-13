@@ -1600,6 +1600,19 @@ pub enum DiagnosticKind {
         /// The member, qualified as csc renders it (`C.F`).
         member: Box<str>,
     },
+    /// `CS1918`: a NESTED initializer on a property whose type is a value type.
+    ///
+    /// **A PROPERTY IS NOT STORAGE, AND THAT IS THE WHOLE RULE.** A nested initializer assigns
+    /// into the member's existing value, which needs somewhere to assign INTO; a property answers
+    /// through its getter, so a value type comes back as a copy and every member would be stored
+    /// into a temporary that is discarded when the initializer ends. A value-typed FIELD carries
+    /// the same syntax and is legal, because a field can be addressed.
+    ValueTypePropertyInitializer {
+        /// The property, qualified as csc renders it (`C.P`).
+        member: Box<str>,
+        /// The property's type, as csc renders it.
+        type_name: Box<str>,
+    },
     /// `CS9034`: a `required` member cannot be assigned -- a `readonly` field, or a property with
     /// no `set` accessor.
     ///
@@ -2345,6 +2358,7 @@ impl DiagnosticKind {
             DiagnosticKind::DeclarationNotPermitted => 8185,
             DiagnosticKind::NotACollectionInitializerTarget { .. } => 1922,
             DiagnosticKind::StaticMemberInObjectInitializer { .. } => 1914,
+            DiagnosticKind::ValueTypePropertyInitializer { .. } => 1918,
             DiagnosticKind::RequiredMemberMustBeSettable { .. } => 9034,
             DiagnosticKind::RequiredMemberLessVisible { .. } => 9032,
             DiagnosticKind::RequiredMemberMustBeSet { .. } => 9035,
@@ -3283,6 +3297,11 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::StaticMemberInObjectInitializer { member } => write!(
                 f,
                 "Static field or property '{member}' cannot be assigned in an object initializer"
+            ),
+            DiagnosticKind::ValueTypePropertyInitializer { member, type_name } => write!(
+                f,
+                "Members of property '{member}' of type '{type_name}' cannot be assigned with an \
+                 object initializer because it is of a value type"
             ),
             DiagnosticKind::RequiredMemberMustBeSettable { member } => {
                 write!(f, "Required member '{member}' must be settable.")

@@ -8,7 +8,7 @@ namespace Lamella.Boards.Arduino
     public sealed class Mkr1000
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
-        public static readonly int BoardModel = Mkr1000Bindings.BOARD_MODEL;
+        public static readonly int BoardModel = ArduinoMkr1000Bindings.BOARD_MODEL;
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching

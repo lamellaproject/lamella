@@ -1,4 +1,24 @@
 //! Emit the firmware file formats a bootloader accepts by drag-and-drop.
+//!
+//! Both formats exist for the same reason: the board exposes a USB mass-storage volume, and
+//! copying one file onto it flashes the device. That is the entire deployment step -- no probe, no
+//! vendor tool, no driver install. DAPLink boards such as the micro:bit take [Intel HEX](hex);
+//! an RP2040 or RP2350 held in BOOTSEL takes [UF2](uf2).
+//!
+//! ```no_run
+//! # fn main() -> Result<(), lamella_flash_format::EmitError> {
+//! let image = std::fs::read("firmware.bin").unwrap();
+//! std::fs::write("firmware.hex", lamella_flash_format::hex::to_intel_hex(&image, 0)?).unwrap();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Why the emitters return errors
+//!
+//! An emitter refuses an empty image. A link that produces no loadable sections does not fail, and
+//! the Intel HEX for it is a lone end-of-file record: a 13-byte file that copies onto the volume
+//! without complaint and leaves the board running whatever was flashed before. Each emitter
+//! therefore checks that its output contains data rather than trusting the build that produced it.
 
 #![forbid(unsafe_code)]
 

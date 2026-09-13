@@ -8,27 +8,27 @@ namespace Lamella.Boards.Adafruit
     public sealed class FeatherM0Wifi
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
-        public static readonly int BoardModel = FeatherM0WifiBindings.BOARD_MODEL;
+        public static readonly int BoardModel = AdafruitFeatherM0WifiBindings.BOARD_MODEL;
 
         /// <summary>The red LED beside the USB jack (Arduino D13) -- the board's blink target, and
         /// the only indicator visible without driving a protocol.</summary>
         public static readonly int LedPin =
-            LogicalPin(FeatherM0WifiBindings.LED_PORT_BASE, FeatherM0WifiBindings.LED_PIN);
+            LogicalPin(AdafruitFeatherM0WifiBindings.LED_PORT_BASE, AdafruitFeatherM0WifiBindings.LED_PIN);
 
         /// <summary>The radio's chip-select line on the SPI bus it shares.</summary>
         public static readonly int WincChipSelectPin =
-            LogicalPin(FeatherM0WifiBindings.WINC_SPI_CS_PORT_BASE, FeatherM0WifiBindings.WINC_SPI_CS_PIN);
+            LogicalPin(AdafruitFeatherM0WifiBindings.WINC_SPI_CS_PORT_BASE, AdafruitFeatherM0WifiBindings.WINC_SPI_CS_PIN);
 
         /// <summary>The radio's reset line, ACTIVE LOW: driving it <see cref="PinValue.Low"/> holds
         /// the WINC in reset.</summary>
         public static readonly int WincResetPin =
-            LogicalPin(FeatherM0WifiBindings.WINC_RESET_N_PORT_BASE, FeatherM0WifiBindings.WINC_RESET_N_PIN);
+            LogicalPin(AdafruitFeatherM0WifiBindings.WINC_RESET_N_PORT_BASE, AdafruitFeatherM0WifiBindings.WINC_RESET_N_PIN);
 
         /// <summary>The radio's enable line, ACTIVE HIGH: driving it <see cref="PinValue.High"/>
         /// powers the WINC on. The opposite polarity from <see cref="WincResetPin"/>, which is a
         /// board fact rather than a convention and is why both are stated.</summary>
         public static readonly int WincChipEnablePin =
-            LogicalPin(FeatherM0WifiBindings.WINC_CHIP_EN_PORT_BASE, FeatherM0WifiBindings.WINC_CHIP_EN_PIN);
+            LogicalPin(AdafruitFeatherM0WifiBindings.WINC_CHIP_EN_PORT_BASE, AdafruitFeatherM0WifiBindings.WINC_CHIP_EN_PIN);
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching

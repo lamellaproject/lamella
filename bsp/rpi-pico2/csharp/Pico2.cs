@@ -12,7 +12,7 @@ namespace Lamella.Boards.RaspberryPi
     public sealed class Pico2
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
-        public static readonly int BoardModel = Pico2Bindings.BOARD_MODEL;
+        public static readonly int BoardModel = RpiPico2Bindings.BOARD_MODEL;
 
         /// <summary>Constructs the board and ensures its clock tree is up (idempotent) -- so
         /// `new Pico2()` "just works" on both tiers: under an interpreter the resident firmware
@@ -96,7 +96,7 @@ namespace Lamella.Boards.RaspberryPi
                 Rp2350Instances.PLL_SYS_BASE + Rp2350PllLayout.PRIM_OFF,
                 Rp2350Instances.PLL_SYS_BASE + Rp2350PllLayout.PWR_CLR_OFF,
                 Rp2350Instances.PLL_SYS_RESET_MASK,
-                Pico2Bindings.PLL_SYS_FBDIV_PLL_150_48, Pico2Bindings.PLL_SYS_PRIM_PLL_150_48);
+                RpiPico2Bindings.PLL_SYS_FBDIV_PLL_150_48, RpiPico2Bindings.PLL_SYS_PRIM_PLL_150_48);
             Mmio.Write32(clkSysCtrl, 0);
             Mmio.Write32(clkSysCtrl, Rp2350ClocksLayout.CLK_SYS_SRC_AUX);
             for (int spin = 0; spin < 100000; spin++)
@@ -109,7 +109,7 @@ namespace Lamella.Boards.RaspberryPi
                 Rp2350Instances.PLL_USB_BASE + Rp2350PllLayout.PRIM_OFF,
                 Rp2350Instances.PLL_USB_BASE + Rp2350PllLayout.PWR_CLR_OFF,
                 Rp2350Instances.PLL_USB_RESET_MASK,
-                Pico2Bindings.PLL_USB_FBDIV_PLL_150_48, Pico2Bindings.PLL_USB_PRIM_PLL_150_48);
+                RpiPico2Bindings.PLL_USB_FBDIV_PLL_150_48, RpiPico2Bindings.PLL_USB_PRIM_PLL_150_48);
             Mmio.Write32(clkUsbCtrl, 0);
             Mmio.Write32(clkUsbCtrl, Rp2350ClocksLayout.CLK_USB_CTRL_ENABLE);
         }
@@ -150,7 +150,7 @@ namespace Lamella.Boards.RaspberryPi
         public static readonly int AdcChannelGp27 = Rp2350AdcLayout.Channel_GPIO27;
         public static readonly int AdcChannelGp28 = Rp2350AdcLayout.Channel_GPIO28;
         public static readonly int AdcChannelGp29 = Rp2350AdcLayout.Channel_GPIO29;
-        public static readonly int AdcReferenceMicrovolts = (int)Pico2Bindings.ADC_REFERENCE_UV;
+        public static readonly int AdcReferenceMicrovolts = (int)RpiPico2Bindings.ADC_REFERENCE_UV;
 
         /// <summary>The `adc` binding descriptor, lifted from the generated consts.</summary>
         public Rp2350AdcBinding CreateAdcBinding() { return AdcBinding(); }
@@ -158,9 +158,9 @@ namespace Lamella.Boards.RaspberryPi
         private static Rp2350AdcBinding AdcBinding()
         {
             return new Rp2350AdcBinding(
-                Pico2Bindings.ADC_BASE,
-                Pico2Bindings.ADC_RESET_MASK,
-                Pico2Bindings.ADC_REFERENCE_UV);
+                RpiPico2Bindings.ADC_BASE,
+                RpiPico2Bindings.ADC_RESET_MASK,
+                RpiPico2Bindings.ADC_REFERENCE_UV);
         }
 
         /// <summary>An ADC controller over the RP2350 SAR converter (the on-chip temperature
@@ -174,14 +174,14 @@ namespace Lamella.Boards.RaspberryPi
         public Rp2350UartBinding CreateUartBinding()
         {
             return new Rp2350UartBinding(
-                Pico2Bindings.UART0_BASE,
-                Pico2Bindings.UART0_RESET_MASK,
-                Pico2Bindings.UART0_IO_TX_CTRL,
-                Pico2Bindings.UART0_IO_RX_CTRL,
-                Pico2Bindings.UART0_PADS_TX,
-                Pico2Bindings.UART0_PADS_RX,
-                Pico2Bindings.UART0_FUNCSEL,
-                Pico2Bindings.UART0_CLK_PERI_HZ);
+                RpiPico2Bindings.UART0_BASE,
+                RpiPico2Bindings.UART0_RESET_MASK,
+                RpiPico2Bindings.UART0_IO_TX_CTRL,
+                RpiPico2Bindings.UART0_IO_RX_CTRL,
+                RpiPico2Bindings.UART0_PADS_TX,
+                RpiPico2Bindings.UART0_PADS_RX,
+                RpiPico2Bindings.UART0_FUNCSEL,
+                RpiPico2Bindings.UART0_CLK_PERI_HZ);
         }
 
         /// <summary>UART0 on GP0 (TX, header pin 1) / GP1 (RX, pin 2), ready for
@@ -203,18 +203,18 @@ namespace Lamella.Boards.RaspberryPi
                 throw new ArgumentException("pico2 has no such spi bus: bus 0 = SPI0 on GP16..GP19");
             }
             return new Rp2350SpiBinding(
-                Pico2Bindings.SPI0_BASE,
-                Pico2Bindings.SPI0_RESET_MASK,
-                Pico2Bindings.SPI0_IO_MISO_CTRL,
-                Pico2Bindings.SPI0_PADS_MISO,
-                Pico2Bindings.SPI0_IO_CS_CTRL,
-                Pico2Bindings.SPI0_PADS_CS,
-                Pico2Bindings.SPI0_IO_SCK_CTRL,
-                Pico2Bindings.SPI0_PADS_SCK,
-                Pico2Bindings.SPI0_IO_MOSI_CTRL,
-                Pico2Bindings.SPI0_PADS_MOSI,
-                Pico2Bindings.SPI0_FUNCSEL,
-                Pico2Bindings.SPI0_SSPCLK_HZ);
+                RpiPico2Bindings.SPI0_BASE,
+                RpiPico2Bindings.SPI0_RESET_MASK,
+                RpiPico2Bindings.SPI0_IO_MISO_CTRL,
+                RpiPico2Bindings.SPI0_PADS_MISO,
+                RpiPico2Bindings.SPI0_IO_CS_CTRL,
+                RpiPico2Bindings.SPI0_PADS_CS,
+                RpiPico2Bindings.SPI0_IO_SCK_CTRL,
+                RpiPico2Bindings.SPI0_PADS_SCK,
+                RpiPico2Bindings.SPI0_IO_MOSI_CTRL,
+                RpiPico2Bindings.SPI0_PADS_MOSI,
+                RpiPico2Bindings.SPI0_FUNCSEL,
+                RpiPico2Bindings.SPI0_SSPCLK_HZ);
         }
 
         /// <summary>A SPI device per <paramref name="settings"/>: the settings' BusId picks
@@ -243,14 +243,14 @@ namespace Lamella.Boards.RaspberryPi
                 throw new ArgumentException("pico2 has no such i2c bus: bus 0 = I2C0 on GP4/GP5");
             }
             return new Rp2350I2cBinding(
-                Pico2Bindings.I2C0_BASE,
-                Pico2Bindings.I2C0_RESET_MASK,
-                Pico2Bindings.I2C0_IO_SDA_CTRL,
-                Pico2Bindings.I2C0_PADS_SDA,
-                Pico2Bindings.I2C0_IO_SCL_CTRL,
-                Pico2Bindings.I2C0_PADS_SCL,
-                Pico2Bindings.I2C0_FUNCSEL,
-                Pico2Bindings.I2C0_IC_CLK_HZ);
+                RpiPico2Bindings.I2C0_BASE,
+                RpiPico2Bindings.I2C0_RESET_MASK,
+                RpiPico2Bindings.I2C0_IO_SDA_CTRL,
+                RpiPico2Bindings.I2C0_PADS_SDA,
+                RpiPico2Bindings.I2C0_IO_SCL_CTRL,
+                RpiPico2Bindings.I2C0_PADS_SCL,
+                RpiPico2Bindings.I2C0_FUNCSEL,
+                RpiPico2Bindings.I2C0_IC_CLK_HZ);
         }
 
         /// <summary>An I2C device per <paramref name="settings"/>: the settings' BusId picks
@@ -290,7 +290,7 @@ namespace Lamella.Boards.RaspberryPi
         /// sum as <paramref name="raw"/> and counts * samples as the scale.</summary>
         public static long MicrovoltsFromRaw(long raw, long fullScaleCounts)
         {
-            return raw * Pico2Bindings.ADC_REFERENCE_UV / fullScaleCounts;
+            return raw * RpiPico2Bindings.ADC_REFERENCE_UV / fullScaleCounts;
         }
     }
 }

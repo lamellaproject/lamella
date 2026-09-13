@@ -88,7 +88,7 @@ fn run_family(mode: &str, repo_root: &str, family: &str) -> ExitCode {
 ///
 /// A GENERATOR THAT FORKS IS WORSE THAN ONE THAT FAILS, and this defect arrived reported from
 /// outside rather than from any gate here. A board named with an internal word boundary can be
-/// spelled two ways -- `MicrobitV1Bindings` against `MicroBitV1Bindings` -- and what happens next
+/// spelled two ways -- `MicrobitV1Bindings` against `BbcMicroBitV1Bindings` -- and what happens next
 /// depends on the filesystem, with three different bad endings:
 ///
 ///   case-sensitive     two files. The build keeps compiling the committed one, which is now

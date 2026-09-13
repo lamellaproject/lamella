@@ -486,6 +486,9 @@ pub struct ControlPin {
     pub role: String,
     /// The bus device's address (-1 for pin-wired rows).
     pub address: i64,
+    /// The pull a pin-wired row's pad needs, one of [`PULL_STATES`]. Empty where the board file
+    /// states none, which is NOT the same as stating `none`.
+    pub pull: String,
 }
 
 impl Default for ControlPin {
@@ -497,6 +500,7 @@ impl Default for ControlPin {
             active: String::new(),
             role: String::new(),
             address: -1,
+            pull: String::new(),
         }
     }
 }
@@ -527,6 +531,36 @@ pub fn asserts_low(control: &ControlPin) -> Option<bool> {
     match control.active.as_str() {
         "low" => Some(true),
         "high" => Some(false),
+        _ => None,
+    }
+}
+
+/// The pulls a pin-wired control line may declare. The set is closed, like [`ACTIVE_LEVELS`], and
+/// any other value is refused where it is written.
+///
+/// `none` means a document states that the pad needs no pull; `unknown` means nobody has
+/// established it. An absent key reads as `unknown`, never as checked.
+pub const PULL_STATES: &[&str] = &["up", "down", "none", "unknown"];
+
+/// A pin-wired line's pull as (up, down), or `None` where no pull has been established.
+///
+/// `none` EMITS HERE, WHERE A POLARITY'S `none` DOES NOT, and the asymmetry is deliberate rather
+/// than an oversight: "no asserted level" is something a line does not HAVE -- a clock has no
+/// polarity and there is nothing to tell a driver -- while "no pull" is something a driver DOES.
+/// A pad that a document says needs neither resistor is an instruction, so it is emitted as one
+/// (both flags zero) and a consumer can tell it apart from a pad nobody read.
+///
+/// TWO FLAGS RATHER THAN ONE ENCODED VALUE, and the reason is the failure this lane keeps paying
+/// for. Any small integer chosen here would coincide with some family's register field -- 0/1/2
+/// happens to be the STM32 `PUPDR` encoding and is NOT nRF's `PIN_CNF.PULL` -- and a value that
+/// looks like a register field invites being written into one, which is right on one family and
+/// silently wrong on the next. Two booleans cannot be written to any register directly, so the
+/// translation a family needs stays where it belongs.
+pub fn pull_flags(control: &ControlPin) -> Option<(bool, bool)> {
+    match control.pull.as_str() {
+        "up" => Some((true, false)),
+        "down" => Some((false, true)),
+        "none" => Some((false, false)),
         _ => None,
     }
 }
@@ -1022,7 +1056,7 @@ impl ExtensionTable {
 /// A board BSP: the bindings, carrier, plans, and identity of one product.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoardTable {
-    /// The board id (`samd21-xpro`).
+    /// The board id (`microchip-samd21-xpro`).
     pub board: String,
     /// Who MADE the board (`raspberry-pi`), kebab-cased like every other id here. Board truth:
     /// the same chip ships on boards from a dozen vendors, and a product name is unambiguous only
@@ -2846,6 +2880,19 @@ fn control_pin_key(
             }
             pin.active = s.clone();
         }
+        ("pull", RawValue::Str(s)) => {
+            if !PULL_STATES.contains(&s.as_str()) {
+                return Err(err(
+                    line,
+                    &format!(
+                        "control line '{}': pull = '{s}' is not one of {} -- and leaving the key                          out is not the same as writing 'none', which is why the word exists",
+                        pin.name,
+                        PULL_STATES.join(", ")
+                    ),
+                ));
+            }
+            pin.pull = s.clone();
+        }
         ("kind", RawValue::Str(s)) => pin.kind = s.clone(),
         ("role", RawValue::Str(s)) => pin.role = s.clone(),
         ("address", RawValue::Int(i)) => pin.address = i.value,
@@ -4480,7 +4527,7 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
     let class = layout_class(block);
     let mut out = String::new();
     let what = format!(
-        "The {} {}{} BLOCK layout: offsets are instance-base-relative (`base + *_OFF`);\n// instance bases live in {}Instances. Widths are access widths.",
+        "The {} {}{} block layout: offsets are instance-base-relative (`base + *_OFF`);\n// instance bases live in {}Instances. Widths are access widths.",
         block.family,
         block.block,
         if block.mode.is_empty() { String::new() } else { format!(" ({} mode)", block.mode) },
@@ -4592,7 +4639,7 @@ pub fn emit_instances_csharp(
     let class = instances_class(&instances.family);
     let mut out = String::new();
     let what = format!(
-        "The {} INSTANCE map: where each block copy sits and its per-instance ids.\n// Layout offsets live in the *Layout classes; wiring lives in the per-board *Bindings.",
+        "The {} instance map: where each block copy sits and its per-instance ids.\n// Layout offsets live in the *Layout classes; wiring lives in the per-board *Bindings.",
         instances.family
     );
     emit_header(&mut out, &class, &what, &[source.to_string()], regen);
@@ -4620,7 +4667,7 @@ pub fn emit_instances_csharp(
     Ok(out)
 }
 
-/// The generated bindings class name for a board: `Samd21XproBindings`.
+/// The generated bindings class name for a board: `MicrochipSamd21XproBindings`.
 #[must_use]
 pub fn bindings_class(board: &str) -> String {
     format!("{}Bindings", pascal(board))
@@ -7266,12 +7313,12 @@ pub fn emit_board_csharp(
 
     let mut out = String::new();
     let mut what = format!(
-        "The {} board BINDINGS (resolved against the {} chip strata): every value below is a\n// generation-time literal derived from the strata -- role descriptors, module control\n// lines, and the carrier identity. Board truth lives in board.toml, never here.",
+        "The {} board bindings (resolved against the {} chip strata): every value below is a\n// generation-time literal derived from the strata -- role descriptors, module control\n// lines, and the carrier identity. The board's facts are stated in board.toml.",
         resolved.board.board, set.family
     );
     if !skipped.is_empty() {
         what.push_str(&format!(
-            "\n// NOT YET EMITTED (no emitter for these binding kinds): {}.",
+            "\n// Not emitted (no emitter exists for these binding kinds): {}.",
             skipped.join(", ")
         ));
     }
@@ -7655,6 +7702,8 @@ pub fn emit_board_csharp(
         ("module control lines", &resolved.module_pins),
         ("on-board devices", &resolved.board.devices),
     ];
+    let device_count = resolved.module_pins.len() + resolved.board.devices.len();
+    push_const(&mut out, "uint", "DEVICE_COUNT", &device_count.to_string());
     for (label, pins) in controls {
         if pins.is_empty() {
             continue;
@@ -7673,6 +7722,10 @@ pub fn emit_board_csharp(
             push_const(&mut out, "uint", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
             if let Some(low) = asserts_low(control) {
                 push_const(&mut out, "uint", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
+            }
+            if let Some((up, down)) = pull_flags(control) {
+                push_const(&mut out, "uint", &format!("{p}_PULL_UP"), if up { "1" } else { "0" });
+                push_const(&mut out, "uint", &format!("{p}_PULL_DOWN"), if down { "1" } else { "0" });
             }
         }
     }
@@ -8346,7 +8399,7 @@ pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result
         .map(|(name, _)| name.as_str())
         .collect();
     let what = format!(
-        "The {} {}{} BLOCK layout as Rust consts, name/value-identical to {}.g.cs:\n// offsets are instance-base-relative (`base + *_OFF`) and the instance bases live in\n// {}_instances.rs. Widths are access widths.",
+        "The {} {}{} block layout as Rust consts, name/value-identical to {}.g.cs:\n// offsets are instance-base-relative (`base + *_OFF`) and the instance bases live in\n// {}_instances.rs. Widths are access widths.",
         block.family,
         block.block,
         if block.mode.is_empty() { String::new() } else { format!(" ({} mode)", block.mode) },
@@ -8472,7 +8525,7 @@ pub fn emit_instances_rust(
 ) -> Result<String, String> {
     let mut out = String::new();
     let what = format!(
-        "The {} INSTANCE map as Rust consts, name/value-identical to {}.g.cs.\n// WHERE each block copy sits; WHAT is inside one is the per-block layout module\n// beside this file. A driver includes both and composes from neither's literals.",
+        "The {} instance map as Rust consts, name/value-identical to {}.g.cs:\n// where each block copy sits and its per-instance ids. Each block's layout is in its own\n// layout module beside this file.",
         instances.family,
         instances_class(&instances.family),
     );
@@ -8536,13 +8589,13 @@ pub fn emit_board_rust(
 
     let mut out = String::new();
     let mut what = format!(
-        "The {} board BINDINGS as Rust consts, name/value-identical to {}.g.cs:\n// every value below is a generation-time literal derived from the strata.\n// Board truth lives in board.toml, never here.",
+        "The {} board bindings as Rust consts, name/value-identical to {}.g.cs:\n// every value below is a generation-time literal derived from the strata.\n// The board's facts are stated in board.toml.",
         resolved.board.board,
         bindings_class(&resolved.board.board),
     );
     if !skipped.is_empty() {
         what.push_str(&format!(
-            "\n// NOT YET EMITTED (no emitter for these binding kinds): {}.",
+            "\n// Not emitted (no emitter exists for these binding kinds): {}.",
             skipped.join(", ")
         ));
     }
@@ -8922,6 +8975,8 @@ pub fn emit_board_rust(
         ("module control lines", &resolved.module_pins),
         ("on-board devices", &resolved.board.devices),
     ];
+    let device_count = resolved.module_pins.len() + resolved.board.devices.len();
+    push_rust_const(&mut out, "u32", "DEVICE_COUNT", &device_count.to_string());
     for (label, pins) in controls {
         if pins.is_empty() {
             continue;
@@ -8940,6 +8995,10 @@ pub fn emit_board_rust(
             push_rust_const(&mut out, "u32", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
             if let Some(low) = asserts_low(control) {
                 push_rust_const(&mut out, "u32", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
+            }
+            if let Some((up, down)) = pull_flags(control) {
+                push_rust_const(&mut out, "u32", &format!("{p}_PULL_UP"), if up { "1" } else { "0" });
+                push_rust_const(&mut out, "u32", &format!("{p}_PULL_DOWN"), if down { "1" } else { "0" });
             }
         }
     }
@@ -9022,7 +9081,7 @@ pub fn emit_layout_swift(block: &BlockTable, source: &str, regen: &str) -> Resul
     let mut out = String::new();
     let class = layout_class(block);
     let what = format!(
-        "The {} {}{} BLOCK layout: offsets are instance-base-relative (`base + *_OFF`);\n// instance bases live in {}Instances. Widths are access widths.",
+        "The {} {}{} block layout: offsets are instance-base-relative (`base + *_OFF`);\n// instance bases live in {}Instances. Widths are access widths.",
         block.family,
         block.block,
         if block.mode.is_empty() { String::new() } else { format!("-{}", block.mode) },
@@ -9186,12 +9245,12 @@ pub fn emit_board_swift(
     let mut out = String::new();
     let class = bindings_class(&resolved.board.board);
     let mut what = format!(
-        "The {} board bindings as Swift constants, name/value-identical to {class}.g.cs:\n// every value below is a generation-time literal derived from the strata. Board truth\n// lives in board.toml, never here.",
+        "The {} board bindings as Swift constants, name/value-identical to {class}.g.cs:\n// every value below is a generation-time literal derived from the strata. The board's\n// facts are stated in board.toml.",
         resolved.board.board,
     );
     if !skipped.is_empty() {
         what.push_str(&format!(
-            "\n// NOT YET EMITTED (no Swift emitter for these binding kinds yet): {}.",
+            "\n// Not emitted (no Swift emitter exists for these binding kinds): {}.",
             skipped.join(", ")
         ));
     }
@@ -9250,9 +9309,9 @@ pub fn emit_board_swift(
     for uart in &pchctrl_uarts {
         let p = &uart.prefix;
         out.push_str(&format!("
-        // -- {p}: a sercom-usart binding descriptor on the PCHCTRL clock architecture.
-        // The peripheral channel is an ADDRESS here rather than a field -- PCHCTRL[m] --
-        // and WHICH APB mask register gates the instance is per-instance --
+    // -- {p}: a sercom-usart binding descriptor on the PCHCTRL clock architecture.
+    // The peripheral channel is an ADDRESS here rather than a field -- PCHCTRL[m] --
+    // and WHICH APB mask register gates the instance is per-instance --
 "));
         push_swift_const(&mut out, "UInt32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", uart.sercom_base));
         if uart.irq >= 0 {
@@ -9395,8 +9454,8 @@ pub fn emit_board_swift(
     for i2c in &sercom_i2cs {
         let p = &i2c.prefix;
         out.push_str(&format!("
-        // -- {p}: a sercom-i2c binding descriptor (the CORE-CLOCK RATE, not a
-        // divisor: an I2C bus speed is a runtime Configure choice) --
+    // -- {p}: a sercom-i2c binding descriptor (the CORE-CLOCK RATE, not a
+    // divisor: an I2C bus speed is a runtime Configure choice) --
 "));
         push_swift_const(&mut out, "UInt32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", i2c.sercom_base));
         if i2c.irq >= 0 {
@@ -9413,7 +9472,7 @@ pub fn emit_board_swift(
     for adc in &same54_adcs {
         let p = &adc.prefix;
         out.push_str(&format!("
-        // -- {p}: a same54 adc binding descriptor. A CALIBRATION ADDRESS and a PMUX MASK --
+    // -- {p}: a same54 adc binding descriptor. A CALIBRATION ADDRESS and a PMUX MASK --
 "));
         push_swift_const(&mut out, "UInt32", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
         push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
@@ -9433,8 +9492,8 @@ pub fn emit_board_swift(
     for i2c in &same54_i2cs {
         let p = &i2c.prefix;
         out.push_str(&format!("
-        // -- {p}: a same54 sercom-i2c binding descriptor. A CHANNEL REGISTER and a
-        // MASK REGISTER, not a composed word and a bare mask --
+    // -- {p}: a same54 sercom-i2c binding descriptor. A CHANNEL REGISTER and a
+    // MASK REGISTER, not a composed word and a bare mask --
 "));
         push_swift_const(&mut out, "UInt32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", i2c.sercom_base));
         if i2c.irq >= 0 {
@@ -9571,6 +9630,8 @@ pub fn emit_board_swift(
         ("module control lines", &resolved.module_pins),
         ("on-board devices", &resolved.board.devices),
     ];
+    let device_count = resolved.module_pins.len() + resolved.board.devices.len();
+    push_swift_const(&mut out, "UInt32", "DEVICE_COUNT", &device_count.to_string());
     for (label, pins) in controls {
         if pins.is_empty() {
             continue;
@@ -9589,6 +9650,10 @@ pub fn emit_board_swift(
             push_swift_const(&mut out, "UInt32", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
             if let Some(low) = asserts_low(control) {
                 push_swift_const(&mut out, "UInt32", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
+            }
+            if let Some((up, down)) = pull_flags(control) {
+                push_swift_const(&mut out, "UInt32", &format!("{p}_PULL_UP"), if up { "1" } else { "0" });
+                push_swift_const(&mut out, "UInt32", &format!("{p}_PULL_DOWN"), if down { "1" } else { "0" });
             }
         }
     }
@@ -9654,7 +9719,7 @@ pub fn emit_board_python(
     ));
     if !skipped.is_empty() {
         out.push_str(&format!(
-            "# NOT YET EMITTED (no emitter for these binding kinds): {}.\n",
+            "# Not emitted (no emitter exists for these binding kinds): {}.\n",
             skipped.join(", ")
         ));
     }
@@ -10125,8 +10190,16 @@ pub fn emit_board_python(
             Some(false) => ", \"active_low\": False".to_string(),
             None => String::new(),
         };
+        let pull = match pull_flags(control) {
+            Some((up, down)) => format!(
+                ", \"pull_up\": {}, \"pull_down\": {}",
+                if up { "True" } else { "False" },
+                if down { "True" } else { "False" }
+            ),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "    \"{}\": {{{kind}\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"mask\": 0x{:X}{polarity}}},\n",
+            "    \"{}\": {{{kind}\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"mask\": 0x{:X}{polarity}{pull}}},\n",
             control.name,
             1u64 << index,
         ));
@@ -10849,12 +10922,9 @@ fn common_rows(parts: &[DeviceTable]) -> Result<Vec<Row>, String> {
 fn common_what(family: &str, parts: &[DeviceTable]) -> String {
     let members: Vec<&str> = parts.iter().map(|p| p.part.as_str()).collect();
     format!(
-        "The facts every {family} member emits IDENTICALLY -- the family's INVARIANT subset,\n\
-         // computed across {}. A part family's driver base is shared code in every language, and\n\
-         // this is what it may rely on. A fact is here only while EVERY member agrees on it, so the\n\
-         // day one member states its own value the fact LEAVES this class and the shared code that\n\
-         // used it stops compiling. Nothing here is inherited: each member's own table spells all\n\
-         // of it too, flattened.",
+        "The facts every {family} member states identically, computed across {}. Code shared\n\
+         // across the family's parts may rely on them. Each member's own table also spells out\n\
+         // every one of these facts.",
         members.join(", "),
     )
 }
@@ -10863,11 +10933,10 @@ fn common_what(family: &str, parts: &[DeviceTable]) -> String {
 /// marker; the Python emitter rewrites the continuations to its own.
 fn device_what(part: &DeviceTable) -> String {
     format!(
-        "The {} part table, FLATTENED: every value it inherited is spelled out here, because a\n\
-         // value that is only ever inherited is pinned in no emitted artifact and so cannot be\n\
-         // checked for drift between languages. A part is something we talk TO rather than a chip\n\
-         // we run on -- a board states which buses exist, this table states the part's identity,\n\
-         // and a probe joins the two at run time.",
+        "The {} part table, flattened: every value it inherits from its family is spelled out here.\n\
+         // A part is a device reached over a bus, not the chip the program runs on: a board states\n\
+         // which buses exist, this table states the part's identity, and a probe joins the two at\n\
+         // run time.",
         part.part,
     )
 }
@@ -11261,10 +11330,9 @@ pub fn generate_extension(
             format!("ext/standards/{}.toml", table.standard),
         ];
     let what = format!(
-        "The {} EXTENSION board, resolved against the {} connector standard: what it needs a host\n\
-         // socket to bring out, and what a host reaches through it. NO HOST PAD APPEARS HERE and none\n\
-         // can -- an extension does not know which board it is plugged into, which is exactly what\n\
-         // lets one of these bind to every host that offers a socket of this standard.",
+        "The {} extension board, resolved against the {} connector standard: what it needs a host\n\
+         // socket to bring out, and what a host reaches through it. No host pad appears here: an\n\
+         // extension binds to any host that offers a socket of this standard.",
         table.extension, table.standard
     );
     let class = extension_class(extension);
@@ -12191,7 +12259,7 @@ source = \"a datasheet\"
 
     #[test]
     fn snake_maps_board_ids_to_module_file_stems() {
-        assert_eq!(snake("samd21-xpro"), "samd21_xpro");
+        assert_eq!(snake("microchip-samd21-xpro"), "microchip_samd21_xpro");
         assert_eq!(snake("arduino-zero"), "arduino_zero");
         assert_eq!(snake("samd21"), "samd21");
     }

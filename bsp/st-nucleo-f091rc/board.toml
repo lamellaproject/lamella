@@ -1,0 +1,47 @@
+# BOARD binding: the ST NUCLEO-F091RC. Board truth ONLY: role
+# bindings, the carrier, and the clock plan. Chip truth lives in csp/stm32f091/.
+#
+# The USART2/PA2/PA3/AF1 wiring is the NUCLEO-F091RC ST-LINK VCP mapping, transcribed from
+# the board documentation cited under [table].
+
+[table]
+kind = "board"
+board = "st-nucleo-f091rc"
+vendor = "st"
+family = "stm32f091"
+part = "stm32f091rc"
+product_model = 7           # lamella_wire::product_model::STM32F091
+sources = ["NUCLEO-F091RC ST-LINK VCP mapping (USART2 on PA2/PA3, AF1)"]
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge (a vendor carrier kind);
+role = "vcp"                # its fixed USB identity joins evidence-cited when the host
+baud = 115200               # tooling pins the ids when it lands them.
+plan = "hsi-8mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart2"
+function = "AF1"
+tx = { pin = "PA2" }
+rx = { pin = "PA3" }
+
+[[plans]]
+name = "hsi-8mhz"
+default = true
+source = "hsi"
+hsi_hz = 8000000            # the F0 reset clock (HSI at 8 MHz, all prescalers 1)
+pclk_hz = 8000000           # the APB clock feeding this board's bound USART; under reset
+                            # prescalers it equals HSI, which the generator verifies rather
+                            # than takes (state-and-verify)
+
+[debug]
+signals = ["swd"]
+exposure = "connectable"
+fitted = "no"
+pitch_mm = 2.54
+onboard = "st-link"
+recovery = "probe"
+source = "UM1724 section 7.3: the target part's SWD signals are available on the ST morpho connector, SWCLK on CN7 pin 15 and SWDIO on CN7 pin 13. Section 6.6 states the ST morpho connector consists of male pin headers, and the feature list names the ST morpho extension pin headers as a board feature, so those pins are fitted and a clip or jumper reaches them with no soldering. The board's own debug connector CN4 is not this: UM1724 section 7.4 describes it as the way to program an MCU in an EXTERNAL application board using the on-board ST-LINK, so it is an output rather than a way in to this part. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

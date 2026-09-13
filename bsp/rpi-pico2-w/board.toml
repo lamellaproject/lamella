@@ -1,13 +1,13 @@
 # BOARD binding: the Raspberry Pi Pico 2 W. The same RP2350A +
 # header wiring as the plain Pico 2, plus the board-soldered CYW43439 wireless chip -- named
-# here the way samw25-xpro names the WINC, as device records: the CYW is board-soldered,
+# here the way microchip-samw25-xpro names the WINC, as device records: the CYW is board-soldered,
 # not an orderable module, so its wiring stays in this board file. Its gSPI is a
 # BIT-BANGED shared-line wire through the SIO block (no hardware spi instance to bind), so
 # the record is the four control lines; the C# driver story joins with its first consumer.
 
 [table]
 kind = "board"
-board = "pico2-w"
+board = "rpi-pico2-w"
 vendor = "raspberry-pi"
 family = "rp2350"
 part = "rp2350a"

@@ -8,7 +8,7 @@
 
 [table]
 kind = "board"
-board = "due"
+board = "arduino-due"
 vendor = "arduino"
 family = "sam3x"
 part = "atsam3x8e"

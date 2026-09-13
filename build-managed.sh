@@ -22,11 +22,15 @@ lcsc=""
 # match the cargo features the runtime is built with, because a method whose intrinsic was compiled
 # out keeps its placeholder body and silently returns zero rather than failing to load.
 #
+# LAMELLA_SURFACE_TUPLES is what brings `corlib/System/ValueTuple.cs` into the compile, and tuple
+# syntax names those types and nothing else -- without the symbol `(int, string)` resolves to no
+# type at all. It takes no langversion rung below: the eight structs are plain generics, so see
+# build-managed.ps1's note beside the ladder for why a 7.0 step would be the wrong lever.
 # LAMELLA_SURFACE_SPAN is what brings `corlib/System/Span.cs` into the compile. `System.Device.Gpio`'s
 # I2C and SPI facades take `Span<byte>` and `ReadOnlySpan<byte>` -- Microsoft's signatures for those
 # members -- so without it those facades name a type that does not exist and that assembly cannot be
 # built at all. It also selects the language version below.
-define="LAMELLA_SURFACE_FLOAT;LAMELLA_SURFACE_MATH_TRANSCENDENTAL;LAMELLA_SURFACE_GC;LAMELLA_SURFACE_VARARGS;LAMELLA_SURFACE_TYPED_REFERENCES;LAMELLA_SURFACE_DECIMAL;LAMELLA_SURFACE_THREADS;LAMELLA_SURFACE_WAIT_HANDLES;LAMELLA_SURFACE_NET;LAMELLA_SURFACE_NET_TLS;LAMELLA_NET_2_0;LAMELLA_SURFACE_GENERICS;LAMELLA_SURFACE_NETFX_1_1;LAMELLA_SURFACE_NETFX_2_0;LAMELLA_SURFACE_NETFX_4_0;LAMELLA_SURFACE_NETFX_4_5;LAMELLA_SURFACE_FILE_IO;LAMELLA_SURFACE_SERIAL;LAMELLA_SURFACE_STRING_COMPARISON;LAMELLA_SURFACE_REFLECTION;LAMELLA_SURFACE_SPAN"
+define="LAMELLA_SURFACE_FLOAT;LAMELLA_SURFACE_MATH_TRANSCENDENTAL;LAMELLA_SURFACE_GC;LAMELLA_SURFACE_VARARGS;LAMELLA_SURFACE_TYPED_REFERENCES;LAMELLA_SURFACE_DECIMAL;LAMELLA_SURFACE_THREADS;LAMELLA_SURFACE_WAIT_HANDLES;LAMELLA_SURFACE_NET;LAMELLA_SURFACE_NET_TLS;LAMELLA_NET_2_0;LAMELLA_SURFACE_GENERICS;LAMELLA_SURFACE_NETFX_1_1;LAMELLA_SURFACE_NETFX_2_0;LAMELLA_SURFACE_NETFX_4_0;LAMELLA_SURFACE_NETFX_4_5;LAMELLA_SURFACE_FILE_IO;LAMELLA_SURFACE_SERIAL;LAMELLA_SURFACE_STRING_COMPARISON;LAMELLA_SURFACE_REFLECTION;LAMELLA_SURFACE_SPAN;LAMELLA_SURFACE_TUPLES"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -53,8 +57,11 @@ assemblies=(
     "Lamella.Hardware|"
     "System.Device.Gpio||System.Device.Pwm"
     "System.Device.Model|"
+    # Its own assembly rather than folded, unlike System.Device.Pwm above. See build-managed.ps1's
+    # entry for the upstream measurement the distinction rests on. References only corlib.
+    "System.Device.Analog|"
     "System.Net.NetworkInformation|"
-    # Bare, unprefixed: real .NET's own assembly name for real .NET's types. See build-managed.ps1's
+    # Bare, unprefixed: full .NET's own assembly name for full .NET's types. See build-managed.ps1's
     # entry for the three-way argument. References only corlib.
     "System.IO.Ports|"
     "Lamella.Net.Time|"
