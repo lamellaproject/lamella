@@ -3,12 +3,13 @@
 //! but over a vendor-specific interface's bulk IN/OUT pipes instead of HID reports, so there is no
 //! report id or padding. Implemented directly against each OS's native USB API -- WinUSB + SetupAPI on
 //! Windows, IOKit IOUSBLib on macOS, sysfs + usbfs on Linux -- with no external USB crates. Enumeration,
-//! open-by-VID/PID, serial/product strings, and bulk I/O are supported on all three.
+//! open-by-VID/PID, serial/product strings, bulk I/O, and a bounded control transfer to an interface of
+//! any class are supported on all three.
 #![allow(unsafe_code)]
 
 use std::time::Duration;
 
-/// An error enumerating, opening, or exchanging packets with a bulk USB device.
+/// An error enumerating, opening, or exchanging data with a USB device.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -16,19 +17,22 @@ pub enum Error {
     NotFound,
     /// The operating system's USB layer failed; carries a description.
     Os(String),
-    /// A read returned no packet within the timeout.
+    /// A read returned no packet, or a control transfer did not complete, within its timeout.
     Timeout,
     /// This operating system's backend is not implemented yet.
     Unsupported,
+    /// The request cannot be sent as asked, and nothing was sent; carries why.
+    InvalidRequest(String),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::NotFound => write!(f, "no matching USB bulk device"),
+            Error::NotFound => write!(f, "no matching USB device"),
             Error::Os(msg) => write!(f, "USB error: {msg}"),
-            Error::Timeout => write!(f, "USB bulk transfer timed out"),
-            Error::Unsupported => write!(f, "USB bulk backend not implemented on this platform"),
+            Error::Timeout => write!(f, "USB transfer timed out"),
+            Error::Unsupported => write!(f, "USB backend not implemented on this platform"),
+            Error::InvalidRequest(why) => write!(f, "USB request not sent: {why}"),
         }
     }
 }
@@ -87,6 +91,30 @@ pub(crate) fn select_requested<T>(
         .ok_or(Error::NotFound)
 }
 
+/// Whether a device's reported serial is `wanted` whole, without regard to case -- the rule a
+/// [`ControlInterface`] is opened by.
+///
+/// It differs from [`candidate_satisfies`] in one thing: a device whose serial only CONTAINS the one
+/// asked for is not the device asked for. `wanted` NONE is a YES for everything, and `reported` NONE
+/// with a serial requested is a NO, as there.
+///
+pub(crate) fn serial_is(wanted: Option<&str>, reported: Option<&str>) -> bool {
+    match wanted {
+        None => true,
+        Some(wanted) => reported.is_some_and(|actual| actual.eq_ignore_ascii_case(wanted)),
+    }
+}
+
+/// Picks the first candidate whose serial is `wanted` whole ([`serial_is`]), or REFUSES.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn select_by_whole_serial<T>(
+    candidates: impl IntoIterator<Item = T>,
+    wanted: Option<&str>,
+    serial_of: impl Fn(&T) -> Option<&str>,
+) -> Result<T> {
+    candidates.into_iter().find(|c| serial_is(wanted, serial_of(c))).ok_or(Error::NotFound)
+}
+
 /// A bulk USB device discovered by [`enumerate`].
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -113,10 +141,13 @@ pub struct DeviceInfo {
     pub interface_name: Option<String>,
 }
 
-/// Lists every connected vendor-bulk device -- a CMSIS-DAP v2 probe OR e.g. a Lamella Link board (both
-/// expose a vendor-specific class-0xFF interface with bulk IN/OUT) -- with its ids and, where the OS reports
+/// Lists every connected device exposing a vendor-specific class-0xFF interface -- a CMSIS-DAP v2 probe OR
+/// e.g. a Lamella Link board -- with its ids and, where the OS reports
 /// them, serial/product strings. No VID filter: a caller keeps the vendor id(s) it wants (a probe consumer
 /// filters to probe vendors; the Lamella Link picker keeps its own VID). Cross-platform (Windows/macOS/Linux).
+///
+/// **The interface class is the whole test.** A listed device is not checked for a bulk IN/OUT pair, so carrying
+/// one is an expectation of the vendor-bulk convention rather than something this function establishes.
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     imp::enumerate()
 }
@@ -187,16 +218,23 @@ impl Device {
         imp::Device::open_guid(interface_guid, vendor_id, product_id, serial).map(Device)
     }
 
-    /// The bulk endpoint addresses negotiated at open time, as `(in, out)`.
+    /// The bulk pipe identifiers negotiated at open time, as `(in, out)`.
     ///
     /// Exposed because probing endpoints blindly is not a viable diagnostic: reading an endpoint a
     /// device does not have can block rather than fail, so a tool that needs to know which pipes
     /// exist must ask instead of sweep.
+    ///
+    /// **These are USB endpoint addresses on Linux and Windows, and IOKit pipe reference numbers on
+    /// macOS**, where the framework addresses a pipe by index rather than by address. Treat them as
+    /// opaque identifiers for diagnostics, not as addresses that mean the same thing everywhere.
     pub fn endpoints(&self) -> (u8, u8) {
         self.0.endpoints()
     }
 
     /// Clears any stall on both pipes, so one failed transfer does not contaminate the next.
+    ///
+    /// **Windows only today** -- the Linux and macOS backends do nothing here, so a diagnostic that
+    /// resets between attempts gets a reset on Windows alone.
     pub fn reset_pipes(&mut self) {
         self.0.reset_pipes();
     }
@@ -231,8 +269,10 @@ impl Device {
         self.0.write_packet(data)
     }
 
-    /// Reads one bulk IN packet into `buf` from the primary IN endpoint, returning its length (or
-    /// [`Error::Timeout`]).
+    /// Reads one bulk IN packet into `buf` from the primary IN endpoint, returning its length.
+    ///
+    /// **A timeout arrives as [`Error::Timeout`] on Windows only.** Linux and macOS report every
+    /// failed bulk transfer, a timeout included, as [`Error::Os`].
     pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         self.0.read_packet(buf, timeout)
     }
@@ -245,10 +285,255 @@ impl Device {
         self.0.write_endpoint(endpoint, data)
     }
 
-    /// Reads one bulk IN packet from a specific endpoint address into `buf`, returning its length (or
-    /// [`Error::Timeout`]) -- the companion to [`write_endpoint`](Self::write_endpoint).
+    /// Reads one bulk IN packet from a specific endpoint address into `buf`, returning its length --
+    /// the companion to [`write_endpoint`](Self::write_endpoint). A timeout is reported as it is by
+    /// [`read_packet`](Self::read_packet).
     pub fn read_endpoint(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         self.0.read_endpoint(endpoint, buf, timeout)
+    }
+}
+
+/// The type of a control request: bits 6 and 5 of `bmRequestType` (USB 2.0, Table 9-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    /// A request the USB specification defines for every device.
+    Standard,
+    /// A request a device class defines.
+    Class,
+    /// A request the device's vendor defines.
+    Vendor,
+}
+
+/// Who a control request is addressed to: bits 4 to 0 of `bmRequestType` (USB 2.0, Table 9-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recipient {
+    /// The device.
+    Device,
+    /// An interface, whose number is the low byte of `wIndex` (USB 2.0, Figure 9-3).
+    Interface,
+    /// An endpoint, whose direction and number are the low byte of `wIndex` (USB 2.0, Figure 9-2).
+    Endpoint,
+    /// Another recipient.
+    Other,
+}
+
+/// A control request's setup stage, less its direction and its length (USB 2.0, 9.3).
+///
+/// The direction is set by whichever of [`ControlInterface::control_in`] and
+/// [`ControlInterface::control_out`] sends the request, and `wLength` is the length of the buffer
+/// that call is given, so neither can disagree with the transfer that carries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlRequest {
+    /// The request's type.
+    pub kind: RequestKind,
+    /// The request's recipient.
+    pub recipient: Recipient,
+    /// `bRequest`: which request this is.
+    pub request: u8,
+    /// `wValue`: a parameter whose meaning depends on the request.
+    pub value: u16,
+    /// `wIndex`: a parameter whose meaning depends on the request; for a request addressed to an
+    /// interface or an endpoint, the one it is addressed to.
+    pub index: u16,
+}
+
+impl ControlRequest {
+    /// The setup stage this request is sent with, its data stage `length` bytes long and running from
+    /// device to host when `device_to_host` (USB 2.0, Table 9-2).
+    ///
+    /// # Errors
+    /// [`Error::InvalidRequest`] for a data stage longer than `wLength`'s sixteen bits can state.
+    pub(crate) fn setup(&self, device_to_host: bool, length: usize) -> Result<Setup> {
+        let length = u16::try_from(length).map_err(|_| {
+            Error::InvalidRequest(format!(
+                "a control transfer's data stage is at most 65,535 bytes, since wLength is sixteen \
+                 bits, and this one is {length}"
+            ))
+        })?;
+        let direction = if device_to_host { 0x80 } else { 0x00 };
+        let kind = match self.kind {
+            RequestKind::Standard => 0x00,
+            RequestKind::Class => 0x20,
+            RequestKind::Vendor => 0x40,
+        };
+        let recipient = match self.recipient {
+            Recipient::Device => 0,
+            Recipient::Interface => 1,
+            Recipient::Endpoint => 2,
+            Recipient::Other => 3,
+        };
+        Ok(Setup {
+            request_type: direction | kind | recipient,
+            request: self.request,
+            value: self.value,
+            index: self.index,
+            length,
+        })
+    }
+}
+
+/// A setup stage as a backend sends it: the five fields of USB 2.0, Table 9-2, its length already
+/// checked against the buffer that goes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Setup {
+    pub(crate) request_type: u8,
+    pub(crate) request: u8,
+    pub(crate) value: u16,
+    pub(crate) index: u16,
+    pub(crate) length: u16,
+}
+
+/// A request the device stalled, worded once so that every backend reports a stall the same way.
+///
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) fn stalled(setup: Setup) -> Error {
+    Error::Os(format!(
+        "the device stalled request {:#04x} (bmRequestType {:#04x}, wValue {:#06x}, wIndex {:#06x})",
+        setup.request, setup.request_type, setup.value, setup.index
+    ))
+}
+
+/// A control transfer's timeout in whole milliseconds, never zero.
+///
+pub(crate) fn bounded_milliseconds(timeout: Duration) -> u32 {
+    u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX).max(1)
+}
+
+/// An interface's class, subclass and protocol, as its interface descriptor states them (USB 2.0,
+/// Table 9-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterfaceClass {
+    /// `bInterfaceClass`.
+    pub class: u8,
+    /// `bInterfaceSubClass`.
+    pub subclass: u8,
+    /// `bInterfaceProtocol`.
+    pub protocol: u8,
+}
+
+/// An interface of an attached device, found by [`enumerate_class`].
+#[derive(Debug, Clone)]
+pub struct InterfaceInfo {
+    /// USB vendor id.
+    pub vendor_id: u16,
+    /// USB product id.
+    pub product_id: u16,
+    /// Serial number string, if the OS reported one.
+    pub serial_number: Option<String>,
+    /// Product string, if the OS reported one.
+    pub product: Option<String>,
+    /// The interface's `bInterfaceNumber`.
+    pub interface_number: u8,
+    /// The interface's own name (`iInterface`), where the OS publishes it.
+    pub interface_name: Option<String>,
+}
+
+/// Lists every attached device that has an interface of `class`, with that interface's number and
+/// name -- the first such interface, where a device has several. Listing opens nothing.
+pub fn enumerate_class(class: InterfaceClass) -> Result<Vec<InterfaceInfo>> {
+    imp::enumerate_class(class)
+}
+
+/// Splits a configuration's descriptors -- what GET_DESCRIPTOR returns for a configuration -- into
+/// one slice per descriptor, in the order the device sent them: the configuration descriptor, each
+/// interface descriptor with the endpoint descriptors after it, and each class- or vendor-specific
+/// descriptor after the standard descriptor it extends (USB 2.0, 9.4.3).
+///
+/// Each slice is `bLength` bytes, with `bDescriptorType` at index 1. The walk ends at the end of
+/// `set`, or early at a descriptor whose `bLength` is below two or runs past the end, so a malformed
+/// set is cut short rather than read past.
+pub fn descriptors(set: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = set;
+    std::iter::from_fn(move || {
+        let length = usize::from(*rest.first()?);
+        if length < 2 || length > rest.len() {
+            return None;
+        }
+        let (descriptor, tail) = rest.split_at(length);
+        rest = tail;
+        Some(descriptor)
+    })
+}
+
+/// The first interface descriptor among a configuration's descriptors whose class is `class`, as its
+/// `bInterfaceNumber` and `iInterface` (USB 2.0, Tables 9-5 and 9-12).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn interface_of_class(set: &[u8], class: InterfaceClass) -> Option<(u8, u8)> {
+    const INTERFACE: u8 = 4;
+    let wanted = (class.class, class.subclass, class.protocol);
+    descriptors(set).find_map(|descriptor| match *descriptor {
+        [_, INTERFACE, number, _, _, c, s, p, name, ..] if (c, s, p) == wanted => Some((number, name)),
+        _ => None,
+    })
+}
+
+/// An interface opened to be driven through its device's default control pipe -- all a DFU
+/// interface has, since it uses no endpoint of its own (DFU 1.1, Table 4.4).
+pub struct ControlInterface(imp::ControlInterface);
+
+impl ControlInterface {
+    /// Opens the first attached device with `vendor_id` and `product_id` -- and `serial`, when one is
+    /// named -- that has an interface of `class`: on Linux by claiming that interface, on macOS by
+    /// opening the whole device, and on Windows through the device interface WinUSB registered for it.
+    ///
+    /// A named serial is matched whole, without regard to case, as [`enumerate_class`] reports it: a
+    /// device whose serial only contains it is another device, and a serial that no attached device
+    /// reports is [`Error::NotFound`], never another device of the same vendor and product.
+    pub fn open(
+        vendor_id: u16,
+        product_id: u16,
+        serial: Option<&str>,
+        class: InterfaceClass,
+    ) -> Result<Self> {
+        imp::ControlInterface::open(vendor_id, product_id, serial, class).map(ControlInterface)
+    }
+
+    /// The claimed interface's `bInterfaceNumber`, which a request addressed to it carries in
+    /// `wIndex`.
+    pub fn interface_number(&self) -> u8 {
+        self.0.interface_number()
+    }
+
+    /// Sends `request` with a data stage from device to host into `buffer`, and answers how many
+    /// bytes the device returned; `wLength` is the length of `buffer`, and a device may return fewer.
+    ///
+    /// `timeout` bounds the transfer. One shorter than a millisecond is a millisecond, so no transfer
+    /// waits without a bound, and a transfer that reaches it is cancelled before this returns.
+    ///
+    /// # Errors
+    /// [`Error::InvalidRequest`], before anything is sent, for a buffer longer than a data stage can be
+    /// here: 65,535 bytes, all that `wLength` can state, and on Windows 4 KB, the most
+    /// `WinUsb_ControlTransfer` takes. Linux usbfs takes at most one page (`PAGE_SIZE`) and refuses a
+    /// longer data stage itself, which comes back as [`Error::Os`]. [`Error::Timeout`] for a transfer
+    /// that did not complete in time. [`Error::Os`] for any other failure, a request the device stalled
+    /// among them: its text names the stalled request on Linux and macOS, and carries WinUSB's error
+    /// code on Windows.
+    pub fn control_in(
+        &mut self,
+        request: ControlRequest,
+        buffer: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
+        let setup = request.setup(true, buffer.len())?;
+        self.0.control_in(setup, buffer, bounded_milliseconds(timeout))
+    }
+
+    /// Sends `request` with `data` as its data stage from host to device, or with no data stage when
+    /// `data` is empty.
+    ///
+    /// `timeout` bounds the transfer as it does for [`control_in`](Self::control_in).
+    ///
+    /// # Errors
+    /// Those of [`control_in`](Self::control_in), and [`Error::Os`] when the device took fewer bytes
+    /// than were sent.
+    pub fn control_out(&mut self, request: ControlRequest, data: &[u8], timeout: Duration) -> Result<()> {
+        let setup = request.setup(false, data.len())?;
+        let taken = self.0.control_out(setup, data, bounded_milliseconds(timeout))?;
+        if taken == data.len() {
+            Ok(())
+        } else {
+            Err(Error::Os(format!("the device took {taken} of the {} bytes sent", data.len())))
+        }
     }
 }
 
@@ -266,7 +551,10 @@ compile_error!("lamella-usbbulk supports macOS, Linux, and Windows");
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Result, candidate_satisfies, select_requested, serial_matches};
+    use super::{
+        Error, Result, candidate_satisfies, select_by_whole_serial, select_requested, serial_is,
+        serial_matches,
+    };
 
 
     /// Candidates are (serial, tag); the tag stands for whatever the platform hands back.
@@ -332,6 +620,24 @@ mod tests {
     }
 
     #[test]
+    /// An interface opened to be driven is chosen by its whole serial: a board whose serial contains the
+    /// one named, or is contained in it, is another board, whichever is listed first.
+    fn the_whole_serial_rule_takes_only_the_board_named() {
+        assert!(serial_is(Some("ABC"), Some("ABC")));
+        assert!(serial_is(Some("abc"), Some("ABC")), "without regard to case");
+        assert!(!serial_is(Some("ABC"), Some("ABC1")), "a longer serial that contains it");
+        assert!(!serial_is(Some("ABC1"), Some("ABC")), "a shorter one it contains");
+        assert!(!serial_is(Some("ABC"), None), "a device that reports none");
+        assert!(serial_is(None, None) && serial_is(None, Some("ABC")), "nothing named takes any");
+        let nested = [(Some("ABC1"), "listed-first"), (Some("ABC"), "named")];
+        let pick = |wanted: Option<&str>| {
+            select_by_whole_serial(nested.iter().copied(), wanted, |(serial, _)| *serial).map(|(_, tag)| tag)
+        };
+        assert_eq!(pick(Some("ABC")).unwrap(), "named");
+        assert!(matches!(pick(Some("BC")), Err(Error::NotFound)), "a part of a serial names no board");
+    }
+
+    #[test]
     /// Many boards sharing one vendor and product id, with the requested one enumerating last. A
     /// first-match search answers `board-a` for every one of these.
     fn the_requested_board_is_found_however_late_it_enumerates() {
@@ -342,5 +648,124 @@ mod tests {
             })
             .collect();
         assert_eq!(pick(&bench, Some("9999AAAA8888BBBB")).unwrap(), "the-one-asked-for");
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::{
+        ControlRequest, Error, InterfaceClass, Recipient, RequestKind, bounded_milliseconds,
+        descriptors, interface_of_class,
+    };
+    use std::time::Duration;
+
+    fn request(kind: RequestKind, recipient: Recipient) -> ControlRequest {
+        ControlRequest { kind, recipient, request: 0, value: 0, index: 0 }
+    }
+
+    #[test]
+    /// DFU 1.1, section 3: every DFU request is a class request to an interface, `00100001b` from
+    /// host to device and `10100001b` from device to host.
+    fn a_class_request_to_an_interface_is_0x21_out_and_0xa1_in() {
+        let dfu = request(RequestKind::Class, Recipient::Interface);
+        assert_eq!(dfu.setup(false, 0).unwrap().request_type, 0x21);
+        assert_eq!(dfu.setup(true, 6).unwrap().request_type, 0xA1);
+    }
+
+    #[test]
+    /// USB 2.0, Table 9-3: GET_DESCRIPTOR is `10000000B`, and SET_INTERFACE is `00000001B`.
+    fn the_standard_requests_carry_the_request_types_the_specification_lists() {
+        let get_descriptor = ControlRequest {
+            request: 6,
+            value: 0x0200,
+            ..request(RequestKind::Standard, Recipient::Device)
+        };
+        let setup = get_descriptor.setup(true, 255).unwrap();
+        assert_eq!(setup.request_type, 0b1000_0000);
+        assert_eq!((setup.request, setup.value, setup.index, setup.length), (6, 0x0200, 0, 255));
+        let set_interface = request(RequestKind::Standard, Recipient::Interface);
+        assert_eq!(set_interface.setup(false, 0).unwrap().request_type, 0b0000_0001);
+    }
+
+    #[test]
+    /// USB 2.0, Table 9-2: the type is bits 6 and 5 and the recipient bits 4 to 0, whichever way
+    /// the data stage runs.
+    fn every_type_and_recipient_takes_its_own_bits() {
+        let out = |kind, recipient| request(kind, recipient).setup(false, 0).unwrap().request_type;
+        assert_eq!(out(RequestKind::Vendor, Recipient::Device), 0b0100_0000);
+        assert_eq!(out(RequestKind::Class, Recipient::Endpoint), 0b0010_0010);
+        assert_eq!(out(RequestKind::Standard, Recipient::Other), 0b0000_0011);
+        let vendor_in = request(RequestKind::Vendor, Recipient::Other).setup(true, 1).unwrap();
+        assert_eq!(vendor_in.request_type, 0b1100_0011);
+    }
+
+    #[test]
+    /// `wLength` is two bytes (USB 2.0, Table 9-2), so a longer data stage has no setup stage that
+    /// can describe it, and it is refused before anything is sent.
+    fn a_data_stage_longer_than_wlength_can_state_is_refused() {
+        let vendor = request(RequestKind::Vendor, Recipient::Device);
+        assert_eq!(vendor.setup(false, 65_535).unwrap().length, 65_535);
+        assert!(matches!(vendor.setup(false, 65_536), Err(Error::InvalidRequest(_))));
+        assert!(matches!(vendor.setup(true, usize::MAX), Err(Error::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn a_timeout_is_whole_milliseconds_and_never_zero() {
+        assert_eq!(bounded_milliseconds(Duration::ZERO), 1);
+        assert_eq!(bounded_milliseconds(Duration::from_micros(999)), 1);
+        assert_eq!(bounded_milliseconds(Duration::from_millis(1_500)), 1_500);
+        assert_eq!(bounded_milliseconds(Duration::MAX), u32::MAX);
+    }
+
+    /// A DFU-mode configuration laid out as DFU 1.1 section 4.2 describes it: the configuration
+    /// descriptor (USB 2.0, Table 9-10), an interface descriptor for each of two alternate settings
+    /// (DFU 1.1, Table 4.4), and the functional descriptor (DFU 1.1, Table 4.2).
+    const DFU_CONFIGURATION: [u8; 36] = [
+        0x09, 0x02, 0x24, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32,
+        0x09, 0x04, 0x00, 0x00, 0x00, 0xFE, 0x01, 0x02, 0x04,
+        0x09, 0x04, 0x00, 0x01, 0x00, 0xFE, 0x01, 0x02, 0x05,
+        0x09, 0x21, 0x0B, 0xFF, 0x00, 0x00, 0x08, 0x1A, 0x01,
+    ];
+
+    #[test]
+    /// The walk yields each descriptor whole, by its `bLength`, in the order the set holds them.
+    fn a_configuration_splits_into_its_descriptors_in_order() {
+        let types: Vec<u8> = descriptors(&DFU_CONFIGURATION).map(|descriptor| descriptor[1]).collect();
+        assert_eq!(types, [0x02, 0x04, 0x04, 0x21]);
+        assert!(descriptors(&DFU_CONFIGURATION).all(|descriptor| descriptor.len() == 9));
+    }
+
+    #[test]
+    /// A descriptor whose `bLength` is below two, or longer than what is left, ends the walk
+    /// instead of being read past.
+    fn a_malformed_descriptor_ends_the_walk() {
+        let mut zero_length = DFU_CONFIGURATION;
+        zero_length[9] = 0;
+        assert_eq!(descriptors(&zero_length).count(), 1);
+        let truncated = &DFU_CONFIGURATION[..DFU_CONFIGURATION.len() - 1];
+        assert_eq!(descriptors(truncated).count(), 3);
+        assert_eq!(descriptors(&[]).count(), 0);
+        assert_eq!(descriptors(&[0x01]).count(), 0);
+    }
+
+    #[test]
+    /// An interface is found by its class, subclass and protocol together, and answered as its
+    /// number and its first alternate setting's string index.
+    fn an_interface_is_found_by_its_class_subclass_and_protocol() {
+        let dfu_mode = InterfaceClass { class: 0xFE, subclass: 0x01, protocol: 0x02 };
+        assert_eq!(interface_of_class(&DFU_CONFIGURATION, dfu_mode), Some((0, 4)));
+        let run_time = InterfaceClass { protocol: 0x01, ..dfu_mode };
+        assert_eq!(interface_of_class(&DFU_CONFIGURATION, run_time), None);
+        let vendor = InterfaceClass { class: 0xFF, subclass: 0x00, protocol: 0x00 };
+        assert_eq!(interface_of_class(&DFU_CONFIGURATION, vendor), None);
+    }
+
+    #[test]
+    /// Only a descriptor whose type is INTERFACE is read as one, whatever bytes sit where an
+    /// interface descriptor keeps its class.
+    fn only_an_interface_descriptor_is_read_as_an_interface() {
+        let functional_with_class_bytes = [0x09, 0x21, 0x00, 0x00, 0x00, 0xFE, 0x01, 0x02, 0x00];
+        let dfu_mode = InterfaceClass { class: 0xFE, subclass: 0x01, protocol: 0x02 };
+        assert_eq!(interface_of_class(&functional_with_class_bytes, dfu_mode), None);
     }
 }

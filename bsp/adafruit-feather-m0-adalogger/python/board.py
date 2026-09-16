@@ -78,7 +78,7 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "sd-card-detect": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 21, "mask": 0x200000, "active_low": True},
-    "led": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 17, "mask": 0x20000, "active_low": False},
-    "led-sd": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 6, "mask": 0x40, "active_low": False},
+    "sd-card-detect": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 21, "bank": 0, "mask": 0x200000, "active_low": True},
+    "led": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 17, "bank": 0, "mask": 0x20000, "active_low": False},
+    "led-sd": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 6, "bank": 0, "mask": 0x40, "active_low": False},
 }

@@ -276,7 +276,17 @@ impl Binder {
         let kind = match &stmt.kind {
             StmtKind::Block(statements) => {
                 self.enter_scope_at(stmt.span);
-                let bound = statements.iter().map(|s| self.bind_statement(s)).collect();
+                let contexts = self.take_body_statement_contexts();
+                let bound = statements
+                    .iter()
+                    .enumerate()
+                    .map(|(index, s)| {
+                        match contexts.iter().find(|context| context.statements.contains(&index)) {
+                            Some(context) => self.bind_statement_in_file_context(context, s),
+                            None => self.bind_statement(s),
+                        }
+                    })
+                    .collect();
                 self.exit_scope();
                 BoundStmtKind::Block(bound)
             }

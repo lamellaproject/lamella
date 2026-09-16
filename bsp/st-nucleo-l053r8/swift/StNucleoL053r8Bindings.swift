@@ -21,7 +21,8 @@ public enum StNucleoL053r8Bindings {
     public static let BUTTON_DRIVER_FAMILY: String = "stm32l053-exti"
 
     // -- BUTTON: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from
-    // the ISR to the managed side and never decodes it. Clear EXTI_PR before returning. --
+    // the ISR to the managed side and never decodes it. Clear EXTI_PR, then read the pad's
+    // level from PORT_IDR_REG. --
     public static let BUTTON_TOKEN: UInt32 = 0
     public static let BUTTON_EXTI_LINE: UInt32 = 13
     public static let BUTTON_EXTI_LINE_MASK: UInt32 = 0x2000
@@ -31,6 +32,8 @@ public enum StNucleoL053r8Bindings {
     public static let BUTTON_EXTI_IMR_REG: UInt32 = 0x40010400
     public static let BUTTON_EXTI_RTSR_REG: UInt32 = 0x40010408
     public static let BUTTON_EXTI_FTSR_REG: UInt32 = 0x4001040C
+    public static let BUTTON_PORT_IDR_REG: UInt32 = 0x50000810
+    public static let BUTTON_PIN_MASK: UInt32 = 0x2000
     public static let BUTTON_PORT_RCC_EN_REG: UInt32 = 0x4002102C
     public static let BUTTON_PORT_RCC_EN_MASK: UInt32 = 0x4
     public static let BUTTON_SYSCFG_RCC_EN_REG: UInt32 = 0x40021034

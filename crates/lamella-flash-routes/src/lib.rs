@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod backends;
 pub mod bootsel;
 pub mod contracts;
+pub mod dfu;
 pub mod identity;
 pub mod manifest;
 
@@ -140,6 +141,35 @@ pub enum Programmer {
     SamExternalProbe {
         /// Which controller to drive. A key into routines, not a mechanism.
         family: SamFamily,
+    },
+    /// An external SWD probe, driving an STM32 part's own flash controller.
+    ///
+    /// The route for an STM32 board with no debugger soldered to it -- an Arduino GIGA R1 WiFi or a
+    /// Portenta H7 -- reached through its debug header with a probe the owner supplies: a CMSIS-DAP
+    /// probe, or an ST-LINK. It drives the same family plan as [`Programmer::StlinkOnboard`], so the
+    /// flash sequence is the same and only the probe differs. A named serial selects the probe, and
+    /// the USB identity of the device carrying it decides which kind it is -- see
+    /// [`external_probe_for`]. With no serial named, every attached CMSIS-DAP probe is a candidate
+    /// and several are refused rather than guessed between, which is why it answers `None` for
+    /// [`Programmer::usb_identity`], as [`Programmer::SamExternalProbe`] does.
+    StExternalProbe {
+        /// Which family's flash plan to drive.
+        family: StFamily,
+    },
+    /// An STM32 board's own system bootloader, over USB DFU, with no probe attached.
+    ///
+    /// **THE BOARD's OWN MECHANISM, SO A DEFAULT AND NOT AN ALTERNATE.** The bootloader is in the
+    /// part's ROM, so reaching it takes no probe: a USB connection to the part's DFU pins and a reset
+    /// with its boot pin set. `--via probe` still means an external probe, and on such a board that
+    /// is the alternate.
+    ///
+    /// It answers `None` for [`Programmer::usb_identity`], as the volume route does: no probe is
+    /// involved, and the bootloader is chosen among the attached ones by
+    /// [`crate::dfu::choose_device`].
+    StDfu {
+        /// Which family's plan the addresses come from. Its parts' bootloader is
+        /// [`StFamily::system_bootloader`].
+        family: StFamily,
     },
 }
 
@@ -345,6 +375,10 @@ pub enum StFamily {
     ///
     /// Driven on a NUCLEO-U5A5ZJ-Q: 4 MB restored and hash-verified against the backup taken first.
     U5,
+    /// STM32F7 (RM0385: F74x/F75x; RM0410: F76x/F77x). Sectors of 32, 128 and 256 KB in one array, a
+    /// 32-bit word, one lock. The sector map is read from the part, and an F76x in dual-bank mode is
+    /// refused.
+    F7,
 }
 
 impl StFamily {
@@ -356,6 +390,7 @@ impl StFamily {
             StFamily::L4 => "STM32L4",
             StFamily::H7 => "STM32H7",
             StFamily::U5 => "STM32U5",
+            StFamily::F7 => "STM32F7",
         }
     }
 }
@@ -376,9 +411,10 @@ impl Programmer {
             Programmer::EdbgOnboard { .. } => {
                 "the EDBG on the board, by the part's own flash controller"
             }
-            Programmer::SamExternalProbe { .. } => {
+            Programmer::SamExternalProbe { .. } | Programmer::StExternalProbe { .. } => {
                 "an external SWD probe, by the part's own flash controller"
             }
+            Programmer::StDfu { .. } => "the part's system bootloader, over USB DFU",
         }
     }
 
@@ -392,13 +428,36 @@ impl Programmer {
     pub fn writes_over_a_probe(self) -> bool {
         match self {
             Programmer::Uf2Volume { .. } => false,
+            Programmer::StDfu { .. } => false,
             Programmer::MicrobitV1Daplink
             | Programmer::MicrobitV2Daplink
             | Programmer::Rp2350Probe { .. }
             | Programmer::Rp2040Probe { .. }
             | Programmer::StlinkOnboard { .. }
             | Programmer::EdbgOnboard { .. }
-            | Programmer::SamExternalProbe { .. } => true,
+            | Programmer::SamExternalProbe { .. }
+            | Programmer::StExternalProbe { .. } => true,
+        }
+    }
+
+    /// Whether a board reached this way can also be written by copying the image onto a bootloader
+    /// volume -- the drive a part's boot ROM presents over USB.
+    ///
+    /// True of the RP2040 and the RP2350, whose boot ROM presents one, and of that volume route
+    /// itself. False everywhere else: a board may carry a debugger whose firmware presents a drive,
+    /// but that drive belongs to the debugger, and this verb does not write it.
+    fn has_bootloader_volume_route(self) -> bool {
+        match self {
+            Programmer::Uf2Volume { .. }
+            | Programmer::Rp2350Probe { .. }
+            | Programmer::Rp2040Probe { .. } => true,
+            Programmer::MicrobitV1Daplink
+            | Programmer::MicrobitV2Daplink
+            | Programmer::StlinkOnboard { .. }
+            | Programmer::EdbgOnboard { .. }
+            | Programmer::SamExternalProbe { .. }
+            | Programmer::StExternalProbe { .. }
+            | Programmer::StDfu { .. } => false,
         }
     }
 
@@ -413,7 +472,9 @@ impl Programmer {
             Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => 0,
             Programmer::Uf2Volume { base, .. } => base,
             Programmer::Rp2350Probe { base } | Programmer::Rp2040Probe { base } => base,
-            Programmer::StlinkOnboard { family, .. } => family.plan().flash_base,
+            Programmer::StlinkOnboard { family, .. }
+            | Programmer::StExternalProbe { family }
+            | Programmer::StDfu { family } => family.plan().flash_base,
             Programmer::EdbgOnboard { family, .. } => family.flash_base(),
             Programmer::SamExternalProbe { family } => family.flash_base(),
         }
@@ -426,7 +487,8 @@ impl Programmer {
             Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => None,
             Programmer::Uf2Volume { family, .. } => Some(crate::artifact::Format::Uf2 { family }),
             Programmer::Rp2350Probe { .. } | Programmer::Rp2040Probe { .. } => None,
-            Programmer::StlinkOnboard { .. } => None,
+            Programmer::StlinkOnboard { .. } | Programmer::StExternalProbe { .. } => None,
+            Programmer::StDfu { .. } => None,
             Programmer::EdbgOnboard { .. } | Programmer::SamExternalProbe { .. } => None,
         }
     }
@@ -442,7 +504,9 @@ impl Programmer {
             Programmer::Rp2350Probe { .. } | Programmer::Rp2040Probe { .. } => {
                 format!("{} words", bytes.div_ceil(4))
             }
-            Programmer::StlinkOnboard { family, .. } => {
+            Programmer::StlinkOnboard { family, .. }
+            | Programmer::StExternalProbe { family }
+            | Programmer::StDfu { family } => {
                 let plan = family.plan();
                 format!(
                     "{} {}",
@@ -472,7 +536,7 @@ impl Programmer {
             Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => {
                 Some(lamella_cmsis_dap_nrf::MICROBIT_DAPLINK)
             }
-            Programmer::Uf2Volume { .. } => None,
+            Programmer::Uf2Volume { .. } | Programmer::StDfu { .. } => None,
             Programmer::Rp2350Probe { .. } | Programmer::Rp2040Probe { .. } => None,
             Programmer::StlinkOnboard { probe_id, .. } => {
                 Some((lamella_stlink::ST_VENDOR_ID, probe_id))
@@ -480,7 +544,7 @@ impl Programmer {
             Programmer::EdbgOnboard { probe_id, .. } => {
                 Some((lamella_cmsis_dap_sam::EDBG_VENDOR_ID, probe_id))
             }
-            Programmer::SamExternalProbe { .. } => None,
+            Programmer::SamExternalProbe { .. } | Programmer::StExternalProbe { .. } => None,
         }
     }
 }
@@ -583,6 +647,24 @@ pub const PROGRAMMING: &[Programming] = &[
         aot_target: None,
         programmer: Programmer::StlinkOnboard {
             family: StFamily::L4,
+            probe_id: lamella_stlink::product_id::V2_1,
+        },
+        alternate: None,
+    },
+    Programming {
+        board: "st-stm32f746g-disco",
+        aot_target: None,
+        programmer: Programmer::StlinkOnboard {
+            family: StFamily::F7,
+            probe_id: lamella_stlink::product_id::V2_1,
+        },
+        alternate: None,
+    },
+    Programming {
+        board: "st-stm32f769i-disco",
+        aot_target: None,
+        programmer: Programmer::StlinkOnboard {
+            family: StFamily::F7,
             probe_id: lamella_stlink::product_id::V2_1,
         },
         alternate: None,
@@ -704,6 +786,22 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
+        board: "arduino-giga-r1-wifi",
+        aot_target: None,
+        programmer: Programmer::StExternalProbe {
+            family: StFamily::H7,
+        },
+        alternate: None,
+    },
+    Programming {
+        board: "arduino-portenta-h7",
+        aot_target: None,
+        programmer: Programmer::StExternalProbe {
+            family: StFamily::H7,
+        },
+        alternate: None,
+    },
+    Programming {
         board: "microchip-sam4s-xpro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
@@ -760,34 +858,68 @@ pub fn check_rp2350_stamp(bytes: &[u8], aot_target: Option<&str>) -> Result<(), 
 }
 /// Which INSTANCE of the chosen route to write to, from the option that names it.
 ///
-/// **A DRIVE AND A PROBE ARE TWO DIFFERENT QUESTIONS AND MUST NOT SHARE ONE WORD.** One `--probe`
-/// naming a serial on a probe route and a drive letter on a volume route reasons that both answer
-/// "which of several identical things". They are not identical things: they live in
+/// **A DRIVE, A PROBE AND A BOOTLOADER ARE DIFFERENT QUESTIONS AND MUST NOT SHARE ONE WORD.** One
+/// `--probe` naming a serial on a probe route and a drive letter on a volume route reasons that both
+/// answer "which of several identical things". They are not identical things: they live in
 /// different namespaces, they are discovered by different mechanisms, and a reader who typed the
 /// one the route did not want got no complaint -- the value was simply passed to something that
-/// interpreted it differently.
+/// interpreted it differently. A system bootloader over USB DFU is the third: `--device` names it,
+/// and since it is not a probe, `LAMELLA_PROBE_SERIAL` does not name it either.
 ///
 /// # Errors
-/// Naming the selector the chosen route does not use. Refused rather than ignored: a `--probe`
+/// Naming a selector the chosen route does not use. Refused rather than ignored: a `--probe`
 /// silently dropped on a volume route reads as "I told it which board" while nothing was told.
 pub fn selector_for(
     programmer: Programmer,
     probe: Option<&str>,
     volume: Option<&str>,
+    device: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let wants_volume = matches!(programmer, Programmer::Uf2Volume { .. });
-    match (wants_volume, probe, volume) {
-        (true, Some(_), _) => Err(
-            "--probe names a debug probe, and this write goes to a bootloader DRIVE.\n\n\
+    match programmer {
+        Programmer::Uf2Volume { .. } => match (probe, device) {
+            (Some(_), _) => Err(
+                "--probe names a debug probe, and this write goes to a bootloader DRIVE.\n\n\
 Name the drive with --volume <name>, or ask for the probe route with --via probe."
-                .to_owned(),
-        ),
-        (false, _, Some(_)) => Err(
-            "--volume names a bootloader drive, and this write goes over a PROBE.\n\n\
+                    .to_owned(),
+            ),
+            (None, Some(_)) => Err(
+                "--device names a system bootloader over USB DFU, and this write goes to a bootloader \
+DRIVE.\n\n\
+Name the drive with --volume <name>."
+                    .to_owned(),
+            ),
+            (None, None) => Ok(volume.map(str::to_owned)),
+        },
+        Programmer::StDfu { .. } => match (probe, volume) {
+            (Some(_), _) => Err(
+                "--probe names a debug probe, and this write goes to the part's system bootloader \
+over USB DFU.\n\n\
+Name the bootloader with --device <serial> when several are attached, or ask for the probe route \
+with --via probe."
+                    .to_owned(),
+            ),
+            (None, Some(_)) => Err(
+                "--volume names a bootloader drive, and this write goes to the part's system bootloader \
+over USB DFU, which presents none.\n\n\
+Name the bootloader with --device <serial> when several are attached, or ask for the probe route \
+with --via probe."
+                    .to_owned(),
+            ),
+            (None, None) => Ok(device.map(str::to_owned)),
+        },
+        _ => match (volume, device) {
+            (Some(_), _) => Err(
+                "--volume names a bootloader drive, and this write goes over a PROBE.\n\n\
 Name the probe with --probe <serial>, or ask for the drive with --via volume."
-                .to_owned(),
-        ),
-        (true, None, chosen) | (false, chosen, None) => Ok(chosen.map(str::to_owned)),
+                    .to_owned(),
+            ),
+            (None, Some(_)) => Err(
+                "--device names a system bootloader over USB DFU, and this write goes over a PROBE.\n\n\
+Name the probe with --probe <serial>."
+                    .to_owned(),
+            ),
+            (None, None) => Ok(probe.map(str::to_owned)),
+        },
     }
 }
 /// Which route to write by: the board's default, or the one `--via` asks for.
@@ -902,6 +1034,117 @@ pub fn check_base(
 would put the right bytes in the wrong place, which a board reports as nothing at all."
     ))
 }
+
+/// An image file, read into the bytes its route takes.
+#[derive(Debug)]
+pub struct Prepared {
+    /// What the route's backend is handed: a UF2 for a bootloader volume, flat bytes for a probe.
+    pub bytes: Vec<u8>,
+    /// What the file held, for the line that reports the read: `998096 B of ELF`.
+    pub read: String,
+    /// The line that reports a wrap into a UF2, when the route needed one.
+    pub wrapped: Option<String>,
+}
+
+/// Read the image file at `path` into the bytes a write through `route` puts on the board `row`
+/// describes. Nothing is opened: no probe, and no drive.
+///
+/// A bootloader volume is handed a `.uf2` exactly as the file holds it. Every other image, on
+/// every route, is read to flat bytes at an address -- a `.bin`, Intel HEX, S-records, or a linked
+/// ELF flattened by physical address -- and for a bootloader volume those bytes are then wrapped
+/// into a UF2 by [`wrap_for_route`].
+///
+/// # Errors
+/// A file that cannot be read or parsed; an image that states an address this route does not
+/// write from ([`check_base`]); an RP2350 image with no boot block ([`check_rp2350_stamp`]); or a
+/// flat image larger than the flash the board's facts state. Each is worded for a reader.
+///
+pub fn prepare_image(
+    path: &std::path::Path,
+    row: &Programming,
+    route: Programmer,
+) -> Result<Prepared, String> {
+    let extension = crate::artifact::classify_format(path);
+    if let Some(required) = route.required_format() {
+        if extension.as_deref() == Some(required.extension()) {
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+            let read = format!("{} B of {}", bytes.len(), required.description());
+            return Ok(Prepared { bytes, read, wrapped: None });
+        }
+    }
+    let artifact = crate::artifact::read(path)?;
+    check_base(&artifact, route)?;
+    check_rp2350_stamp(&artifact.bytes, row.aot_target)?;
+    refuse_unless_it_fits(
+        row.board,
+        &artifact,
+        route.flash_base(),
+        extension.as_deref() == Some("elf"),
+    )?;
+    let read = format!("{} B of {}", artifact.bytes.len(), artifact.format);
+    Ok(match wrap_for_route(route, &artifact.bytes) {
+        Some((bytes, line)) => Prepared { bytes, read, wrapped: Some(line) },
+        None => Prepared { bytes: artifact.bytes, read, wrapped: None },
+    })
+}
+
+/// `image` wrapped into a UF2 for `route`, with the line that reports the wrap -- or `None` when
+/// the route takes the bytes as they stand.
+///
+/// A bootloader volume takes a UF2, so a flat image is wrapped at the route's flash base with the
+/// family id its bootloader checks. An image that is already a UF2 is not wrapped again, and every
+/// other route takes flat bytes.
+///
+#[must_use]
+pub fn wrap_for_route(route: Programmer, image: &[u8]) -> Option<(Vec<u8>, String)> {
+    let Some(crate::artifact::Format::Uf2 { family }) = route.required_format() else {
+        return None;
+    };
+    if is_uf2(image) {
+        return None;
+    }
+    let base = route.flash_base();
+    let wrapped = crate::artifact::Format::Uf2 { family }.render(image, base);
+    let line = format!("wrapped {} B as UF2 at {base:#010x} (family {family:#010x})", image.len());
+    Some((wrapped, line))
+}
+
+/// Refuse a flat image larger than the flash `board`'s facts state. A board that states no flash
+/// size is not refused, because there is nothing to compare against.
+///
+fn refuse_unless_it_fits(
+    board: &str,
+    artifact: &crate::artifact::Artifact,
+    base: u32,
+    from_elf: bool,
+) -> Result<(), String> {
+    let (table, part) = catalog::resolve(board)?;
+    let length = i64::try_from(artifact.bytes.len()).unwrap_or(i64::MAX);
+    let verdict = lamella_bsp_gen::fit::fit(&table, &part, length);
+    let lamella_bsp_gen::fit::Fit::Exceeds { over } = verdict.flash_fit else {
+        return Ok(());
+    };
+    let source = match &verdict.flash.source {
+        lamella_bsp_gen::fit::BudgetSource::Board { region } => format!("board region '{region}'"),
+        lamella_bsp_gen::fit::BudgetSource::Part => format!("part {}", verdict.part),
+    };
+    let end = u64::from(base).saturating_add(u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX));
+    let mut message = format!(
+        "this image is {} B, from {base:#010x} to {end:#010x}, and {board} has {} B of flash \
+         ({source}) -- {over} B too many.",
+        artifact.bytes.len(),
+        verdict.flash.bytes
+    );
+    if from_elf {
+        message.push_str(
+            "\nA linked ELF is written from its lowest loadable address to its highest, so a segment \
+             placed outside\nflash -- initialized data given a load address in RAM, most often -- \
+             stretches the image across the gap.",
+        );
+    }
+    Err(message)
+}
 /// Write `image` to the board through `programmer`.
 /// Write `image` through `programmer`, with no restriction on which part.
 ///
@@ -936,6 +1179,11 @@ pub fn write_scoped(
     write_with(programmer, image, selector, allow)
 }
 
+/// What a refusal to find a system bootloader tells its reader.
+const ENTER_THE_SYSTEM_BOOTLOADER: &str = "An STM32 answers over USB DFU only while its system \
+bootloader runs, which it does after a reset with the part's boot pin held high; AN2606 gives the \
+pattern each series follows.";
+
 fn write_with(
     programmer: Programmer,
     image: &[u8],
@@ -962,8 +1210,8 @@ fn write_with(
         }
         Programmer::Rp2350Probe { base } => {
             let selector = lamella_probe::Selector::named_or_environment(probe);
-            let session =
-                lamella_probe::open(&selector).map_err(|why| describe_probe_choice(&why))?;
+            let session = lamella_probe::open(&selector)
+                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
             let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
             let idcode = lamella_cmsis_dap_rp2350::connect(&mut dap)
                 .map_err(|why| format!("connecting to the RP2350: {why:?}"))?;
@@ -1009,14 +1257,9 @@ fn write_with(
         Programmer::SamExternalProbe { family } => {
             use lamella_probe_core::TargetAccess as _;
 
-            let selector = match probe {
-                Some(serial) if !serial.trim().is_empty() => {
-                    lamella_probe::Selector::by_serial(serial.trim().to_owned())
-                }
-                _ => lamella_probe::Selector::from_environment(),
-            };
-            let session =
-                lamella_probe::open(&selector).map_err(|why| describe_probe_choice(&why))?;
+            let selector = lamella_probe::Selector::named_or_environment(probe);
+            let session = lamella_probe::open(&selector)
+                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
             let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
             dap.connect()
                 .map_err(|why| format!("entering SWD through the attached probe: {why}"))?;
@@ -1032,10 +1275,89 @@ fn write_with(
             )
             .map_err(|why| why.to_string());
         }
+        Programmer::StExternalProbe { family } => {
+            use lamella_probe_core::TargetAccess as _;
+
+            let selector = lamella_probe::Selector::named_or_environment(probe);
+            if let Some(serial) = selector.serial.as_deref() {
+                if let ExternalProbe::StLink { product_id } =
+                    external_probe_for(serial, &attached_usb_devices())?
+                {
+                    let stlink = lamella_stlink::StLink::open(product_id, Some(serial))
+                        .map_err(describe_stlink_choice)?;
+                    return write_through_stlink(
+                        stlink,
+                        family,
+                        &image,
+                        allow,
+                        "the attached ST-LINK",
+                    );
+                }
+            }
+            let session = lamella_probe::open(&selector)
+                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
+            let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
+            if family.plan().attach_under_reset {
+                attach_under_reset(&mut dap, family.plan().low_power_debug).map_err(|why| {
+                    format!("attaching to the board under reset through the attached probe: {why}")
+                })?;
+            } else {
+                dap.connect()
+                    .map_err(|why| format!("entering SWD through the attached probe: {why}"))?;
+            }
+            dap.init_mem()
+                .map_err(|why| format!("opening memory access through the attached probe: {why}"))?;
+            let mut backend = crate::backends::StProbe::new(dap, family.plan());
+            return lamella_flash_backend::flash(
+                &mut backend,
+                &image,
+                lamella_flash_backend::VerifyPolicy::ReadBack,
+                allow,
+            )
+            .map_err(|why| why.to_string());
+        }
+        Programmer::StDfu { family } => {
+            let bootloader = family.system_bootloader().ok_or_else(|| {
+                format!("{} has no system bootloader this build writes through", family.name())
+            })?;
+            let attached = lamella_usbbulk::enumerate_class(crate::dfu::DFU_MODE)
+                .map_err(|why| format!("listing the attached USB DFU interfaces: {why}"))?;
+            let device = crate::dfu::choose_device(&attached, lamella_stlink::ST_VENDOR_ID, probe)
+                .map_err(|why| format!("{why}\n\n{ENTER_THE_SYSTEM_BOOTLOADER}"))?;
+            let interface = lamella_usbbulk::ControlInterface::open(
+                device.vendor_id,
+                device.product_id,
+                device.serial_number.as_deref(),
+                crate::dfu::DFU_MODE,
+            )
+            .map_err(|why| format!("opening the bootloader's DFU interface: {why}"))?;
+            let mut pipe = crate::dfu::UsbPipe::new(interface);
+            let configuration = pipe
+                .configuration()
+                .map_err(|why| format!("reading the bootloader's configuration: {why}"))?;
+            let functional = crate::dfu::FunctionalDescriptor::find(&configuration)
+                .map_err(|why| why.to_string())?;
+            if !functional.can_download || !functional.can_upload {
+                return Err(format!(
+                    "the bootloader's functional descriptor states download {} and upload {}, and a \
+                     write here needs both",
+                    functional.can_download, functional.can_upload
+                ));
+            }
+            let dfu = crate::dfu::DfuSe::new(pipe, functional.transfer_size);
+            let mut backend = crate::backends::StDfu::new(dfu, family.plan(), bootloader);
+            return lamella_flash_backend::flash(
+                &mut backend,
+                &image,
+                lamella_flash_backend::VerifyPolicy::ReadBack,
+                allow,
+            )
+            .map_err(|why| why.to_string());
+        }
         Programmer::Rp2040Probe { base } => {
             let selector = lamella_probe::Selector::named_or_environment(probe);
-            let session =
-                lamella_probe::open(&selector).map_err(|why| describe_probe_choice(&why))?;
+            let session = lamella_probe::open(&selector)
+                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
             let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
             let idcode = lamella_cmsis_dap_rp2040::connect(&mut dap)
                 .map_err(|why| format!("connecting to the RP2040: {why}"))?;
@@ -1052,30 +1374,9 @@ fn write_with(
             .map_err(|why| why.to_string());
         }
         Programmer::StlinkOnboard { family, probe_id } => {
-            use lamella_probe_core::TargetAccess as _;
-
-            let mut stlink =
+            let stlink =
                 lamella_stlink::StLink::open(probe_id, probe).map_err(describe_stlink_choice)?;
-            if family.plan().attach_under_reset {
-                stlink.attach_under_reset().map_err(|why| {
-                    format!("attaching to the board under reset through its ST-LINK: {why}")
-                })?;
-            } else {
-                stlink
-                    .connect()
-                    .map_err(|why| format!("entering SWD through the board's ST-LINK: {why}"))?;
-            }
-            stlink.init_mem().map_err(|why| {
-                format!("opening memory access through the board's ST-LINK: {why}")
-            })?;
-            let mut backend = crate::backends::StProbe::new(stlink, family.plan());
-            return lamella_flash_backend::flash(
-                &mut backend,
-                &image,
-                lamella_flash_backend::VerifyPolicy::ReadBack,
-                allow,
-            )
-            .map_err(|why| why.to_string());
+            return write_through_stlink(stlink, family, &image, allow, "the board's ST-LINK");
         }
     };
 
@@ -1095,6 +1396,190 @@ fn write_with(
         allow,
     )
     .map_err(|why| why.to_string())
+}
+/// Attach to a target held in reset and leave its core halted at the reset vector, through any probe
+/// that speaks [`TargetAccess`](lamella_probe_core::TargetAccess): hold reset, bring up SWD and memory
+/// access, then [`lamella_stlink::attach_held_in_reset`] -- the known answer, `low_power_debug`'s
+/// bits, the reset vector catch, the release and the halt.
+///
+/// # Errors
+/// Any step the probe or the target refuses. A failure while SWD or memory access is brought up
+/// leaves the core held in reset; a later failure before the release releases it.
+pub fn attach_under_reset<T>(
+    target: &mut T,
+    low_power_debug: Option<lamella_stlink::LowPowerDebug>,
+) -> Result<(), lamella_probe_core::ProbeError>
+where
+    T: lamella_probe_core::TargetAccess + lamella_probe_core::CoreMemory,
+{
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+    lamella_probe_core::TargetAccess::set_reset(target, true)?;
+    std::thread::sleep(SETTLE);
+    lamella_probe_core::TargetAccess::connect(target)?;
+    lamella_probe_core::TargetAccess::init_mem(target)?;
+    lamella_stlink::attach_held_in_reset(target, low_power_debug)
+}
+
+/// Writes `image` through an opened ST-LINK on `family`'s plan: the family's attach, memory access,
+/// then the plan's erase, program and read-back. `through` names the probe in a refusal.
+fn write_through_stlink(
+    mut stlink: lamella_stlink::StLink,
+    family: StFamily,
+    image: &lamella_flash_backend::Image<'_>,
+    allow: &lamella_flash_backend::Allow,
+    through: &str,
+) -> Result<lamella_flash_backend::Report, String> {
+    use lamella_probe_core::TargetAccess as _;
+
+    if family.plan().attach_under_reset {
+        stlink
+            .attach_under_reset(family.plan().low_power_debug)
+            .map_err(|why| {
+                format!("attaching to the board under reset through {through}: {why}")
+            })?;
+    } else {
+        stlink
+            .connect()
+            .map_err(|why| format!("entering SWD through {through}: {why}"))?;
+    }
+    stlink
+        .init_mem()
+        .map_err(|why| format!("opening memory access through {through}: {why}"))?;
+    let mut backend = crate::backends::StProbe::new(stlink, family.plan());
+    lamella_flash_backend::flash(
+        &mut backend,
+        image,
+        lamella_flash_backend::VerifyPolicy::ReadBack,
+        allow,
+    )
+    .map_err(|why| why.to_string())
+}
+
+/// A USB device as an external-probe route sees it when a serial names the probe: its identity, and
+/// whether it presents a CMSIS-DAP interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsbDevice {
+    /// USB vendor id.
+    pub vendor_id: u16,
+    /// USB product id.
+    pub product_id: u16,
+    /// Serial number, if the operating system reported one.
+    pub serial: Option<String>,
+    /// Product string, if the operating system reported one.
+    pub product: Option<String>,
+    /// Whether the device presents a CMSIS-DAP interface.
+    pub speaks_cmsis_dap: bool,
+}
+
+/// The kind of probe that carries the serial an external-probe route was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalProbe {
+    /// An ST-LINK, opened through its own protocol under this USB product id.
+    StLink {
+        /// The ST-LINK's USB product id.
+        product_id: u16,
+    },
+    /// A CMSIS-DAP probe.
+    CmsisDap,
+    /// No attached device reports the serial.
+    NotAttached,
+}
+
+/// Every attached USB device that could carry a probe serial: the CMSIS-DAP probes and the
+/// vendor-class devices that are not, as `lamella devices --all-devices` lists them. Listing opens
+/// nothing.
+pub fn attached_usb_devices() -> Vec<UsbDevice> {
+    let mut others = Vec::new();
+    let probes = lamella_probe::list_reporting(&mut others);
+    let listed = probes.iter().map(|probe| UsbDevice {
+        vendor_id: probe.vendor_id,
+        product_id: probe.product_id,
+        serial: probe.serial.clone(),
+        product: probe.product.clone(),
+        speaks_cmsis_dap: true,
+    });
+    let passed_over = others.iter().map(|other| UsbDevice {
+        vendor_id: other.vendor_id,
+        product_id: other.product_id,
+        serial: other.serial.clone(),
+        product: other.product.clone(),
+        speaks_cmsis_dap: false,
+    });
+    listed.chain(passed_over).collect()
+}
+
+/// Which kind of probe carries `serial`, decided by the USB identity of the device that reports it
+/// and never by the serial's text.
+///
+/// An ST-LINK is recognized by ST's vendor id and an ST-LINK product id; any other device must
+/// present a CMSIS-DAP interface. The serial matches whole and without regard to case, as the probe
+/// ladder matches it, and a device listed through several interfaces counts once.
+///
+/// # Errors
+/// When more than one device reports the serial, or the one that does is neither kind -- naming
+/// every device it found.
+pub fn external_probe_for(serial: &str, devices: &[UsbDevice]) -> Result<ExternalProbe, String> {
+    let serial = serial.trim();
+    let mut carrying: Vec<UsbDevice> = Vec::new();
+    for device in devices {
+        let reports_it = device
+            .serial
+            .as_deref()
+            .is_some_and(|reported| reported.eq_ignore_ascii_case(serial));
+        if !reports_it {
+            continue;
+        }
+        match carrying
+            .iter_mut()
+            .find(|held| held.vendor_id == device.vendor_id && held.product_id == device.product_id)
+        {
+            Some(held) => held.speaks_cmsis_dap |= device.speaks_cmsis_dap,
+            None => carrying.push(device.clone()),
+        }
+    }
+    match carrying.as_slice() {
+        [] => Ok(ExternalProbe::NotAttached),
+        [device] if is_st_link(device.vendor_id, device.product_id) => {
+            Ok(ExternalProbe::StLink { product_id: device.product_id })
+        }
+        [device] if device.speaks_cmsis_dap => Ok(ExternalProbe::CmsisDap),
+        [device] => {
+            let mut message = format!("the device reporting the serial `{serial}` is ");
+            message.push_str(&describe_usb_device(device));
+            message.push_str(", which is neither an ST-LINK nor a CMSIS-DAP probe, so this route ");
+            message.push_str("cannot drive it.");
+            Err(message)
+        }
+        several => {
+            let mut message = format!(
+                "the serial `{serial}` is reported by {} devices, so it names none of them:\n",
+                several.len()
+            );
+            for device in several {
+                message.push_str(&format!("  {}\n", describe_usb_device(device)));
+            }
+            message.push_str("Unplug the ones you do not mean, then name the probe again.");
+            Err(message)
+        }
+    }
+}
+
+/// Whether a USB identity is an ST-LINK's: ST's vendor id and a product id of either ST-LINK
+/// generation.
+fn is_st_link(vendor_id: u16, product_id: u16) -> bool {
+    use lamella_stlink::product_id::{V2, V2_1, V2EC, V3_FAMILY};
+    vendor_id == lamella_stlink::ST_VENDOR_ID
+        && ([V2, V2_1, V2EC].contains(&product_id) || V3_FAMILY.contains(&product_id))
+}
+
+/// A device in the words a refusal names it by: its vendor and product id, then its product string.
+fn describe_usb_device(device: &UsbDevice) -> String {
+    format!(
+        "{:04x}:{:04x} {}",
+        device.vendor_id,
+        device.product_id,
+        device.product.as_deref().unwrap_or("(no product string)")
+    )
 }
 /// What an nRF51's debug-port id settles, and what it does not.
 ///
@@ -1174,8 +1659,18 @@ Name one with --probe <serial>, or set LAMELLA_PROBE_SERIAL.
 /// which is wired to the board that was named, and it stops. So the message lists every candidate
 /// and says how to name one, because the remedy is to pick and the reader should not have to go
 /// and look them up.
+///
+/// `selector` is what the route asked for and `named` is the `--probe` value, if one was given, so a
+/// serial that matched nothing is refused by that serial and by where it came from. `programmer`
+/// decides whether a bootloader volume is offered as the way round: only a board that has one is
+/// sent to look for it.
 #[must_use]
-pub fn describe_probe_choice(error: &lamella_probe::ProbeError) -> String {
+pub fn describe_probe_choice(
+    error: &lamella_probe::ProbeError,
+    selector: &lamella_probe::Selector,
+    named: Option<&str>,
+    programmer: Programmer,
+) -> String {
     match error {
         lamella_probe::ProbeError::Ambiguous(names) => {
             let mut message = String::from(
@@ -1207,22 +1702,38 @@ Name one with --probe <serial>, or set LAMELLA_PROBE_SERIAL.
             message
         }
         lamella_probe::ProbeError::NotFound => {
-            let mut message = String::from("no probe is attached, or the one that is reports no ");
-            message.push_str(
-                "serial number and so cannot
-be named. `lamella devices` lists what ",
-            );
-            message.push_str(
-                "is attached.
+            let mut message = match selector.serial.as_deref() {
+                Some(serial) if named.is_some_and(|given| given.trim() == serial) => {
+                    format!("no attached probe has the serial `{serial}`, which --probe named.
+")
+                }
+                Some(serial) => {
+                    let mut message = format!("no attached probe has the serial `{serial}`, which ");
+                    message.push_str(lamella_probe::PROBE_SERIAL_ENV);
+                    message.push_str(" names.
+Correct or unset it, or name the probe with --probe.
+");
+                    message
+                }
+                None => {
+                    let mut message = String::from("no probe is attached, or the one that is reports ");
+                    message.push_str("no serial number and so cannot be named.
+");
+                    message
+                }
+            };
+            message.push_str("`lamella devices` lists every attached probe with its serial.");
+            let st_route = matches!(programmer, Programmer::StExternalProbe { .. });
+            if st_route && selector.serial.is_none() {
+                message.push_str("\nAn ST-LINK is used only when its serial is named.");
+            }
+            if programmer.has_bootloader_volume_route() {
+                message.push_str("
 
-",
-            );
-            message.push_str("To flash this board without a probe, drop the image on its ");
-            message.push_str(
-                "bootloader volume instead --
-that is what this verb does by ",
-            );
-            message.push_str("default.");
+To flash this board without a probe, drop the image on its ");
+                message.push_str("bootloader volume instead --
+that is what this verb does by default.");
+            }
             message
         }
         other => format!("{other:?}"),
@@ -1274,6 +1785,356 @@ pub fn cannot_write(board: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A linked ELF32 executable with one loadable segment per `(physical address, bytes)`.
+    fn linked_elf(segments: &[(u32, &[u8])]) -> Vec<u8> {
+        const HEADER: usize = 52;
+        const PROGRAM_HEADER: usize = 32;
+        let word = |value: usize| u32::try_from(value).expect("a 32-bit field");
+        let half = |value: usize| u16::try_from(value).expect("a 16-bit field");
+        let mut elf = vec![0u8; HEADER + PROGRAM_HEADER * segments.len()];
+        // ELFCLASS32, ELFDATA2LSB, EV_CURRENT; then ET_EXEC for EM_ARM.
+        elf[..7].copy_from_slice(&[0x7F, b'E', b'L', b'F', 1, 1, 1]);
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&40u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[28..32].copy_from_slice(&word(HEADER).to_le_bytes());
+        elf[40..42].copy_from_slice(&half(HEADER).to_le_bytes());
+        elf[42..44].copy_from_slice(&half(PROGRAM_HEADER).to_le_bytes());
+        elf[44..46].copy_from_slice(&half(segments.len()).to_le_bytes());
+        for (index, (address, bytes)) in segments.iter().enumerate() {
+            let at = HEADER + PROGRAM_HEADER * index;
+            let (offset, length) = (word(elf.len()), word(bytes.len()));
+            // PT_LOAD, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz.
+            for (field, value) in
+                [(0, 1), (4, offset), (8, *address), (12, *address), (16, length), (20, length)]
+            {
+                elf[at + field..at + field + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            elf.extend_from_slice(bytes);
+        }
+        elf
+    }
+
+    /// `bytes` in a file named `name`, in a scratch directory of the calling test's own.
+    fn image_file(test: &str, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let directory = std::env::temp_dir()
+            .join(format!("lamella-flash-routes-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).expect("the image file");
+        path
+    }
+
+    /// A body that carries the RP2350 boot block, so an image made of it is not refused as
+    /// unstamped.
+    fn stamped(length: usize) -> Vec<u8> {
+        let mut body = vec![0u8; length];
+        body[0x40..0x44].copy_from_slice(&PICOBIN_BLOCK_START.to_le_bytes());
+        body
+    }
+
+    fn pico2() -> &'static Programming {
+        programmer_for("rpi-pico2").expect("rpi-pico2 is routed")
+    }
+
+    /// A serial named with `--probe` that no attached probe carries is refused by that serial, and a
+    /// board with no bootloader volume is not sent looking for one.
+    #[test]
+    fn a_named_probe_nothing_carries_is_refused_by_its_serial_and_offers_no_volume_it_lacks() {
+        let serial = "NOSUCHPROBE0000";
+        let selector = lamella_probe::Selector::by_serial(serial);
+        for programmer in [
+            Programmer::StExternalProbe { family: StFamily::H7 },
+            Programmer::SamExternalProbe { family: SamFamily::Samd21 },
+        ] {
+            let text = describe_probe_choice(
+                &lamella_probe::ProbeError::NotFound,
+                &selector,
+                Some(serial),
+                programmer,
+            );
+            let route = programmer.description();
+            assert!(text.contains(serial), "{route}: names the serial nothing carries: {text}");
+            assert!(text.contains("--probe"), "{route}: says where that serial came from: {text}");
+            assert!(!text.contains("no probe is attached"), "{route}: probes may be attached: {text}");
+            assert!(!text.contains("volume"), "{route}: has no bootloader volume: {text}");
+        }
+    }
+
+    /// A serial that came from the environment is reported as the environment's, so a stale export is
+    /// what the reader goes to correct.
+    #[test]
+    fn a_serial_from_the_environment_is_refused_as_the_environments() {
+        let selector = lamella_probe::Selector::by_serial("STALEEXPORT0000");
+        let text = describe_probe_choice(
+            &lamella_probe::ProbeError::NotFound,
+            &selector,
+            None,
+            Programmer::StExternalProbe { family: StFamily::H7 },
+        );
+        assert!(text.contains("STALEEXPORT0000"), "names the serial: {text}");
+        assert!(text.contains("LAMELLA_PROBE_SERIAL"), "names where it came from: {text}");
+    }
+
+    /// A Pico's probe route that found nothing still points at the bootloader volume, which a Pico
+    /// has and which this verb writes by default.
+    #[test]
+    fn a_pico_probe_route_that_found_nothing_still_offers_its_volume() {
+        let text = describe_probe_choice(
+            &lamella_probe::ProbeError::NotFound,
+            &lamella_probe::Selector::any(),
+            None,
+            Programmer::Rp2350Probe { base: RP2_XIP_BASE },
+        );
+        assert!(text.contains("bootloader volume"), "a Pico has one: {text}");
+    }
+
+    /// A device as the probe listing reports it.
+    fn usb(vendor_id: u16, product_id: u16, serial: &str, speaks_cmsis_dap: bool) -> UsbDevice {
+        UsbDevice {
+            vendor_id,
+            product_id,
+            serial: Some(serial.to_owned()),
+            product: Some(format!("device {vendor_id:04x}:{product_id:04x}")),
+            speaks_cmsis_dap,
+        }
+    }
+
+    /// The probe kind comes from the USB identity of the device carrying the serial, never from the
+    /// serial's text: an ST-LINK whose serial is short is an ST-LINK, a CMSIS-DAP probe whose serial
+    /// has an ST-LINK's length is a CMSIS-DAP probe, and the serial matches whole, without regard
+    /// to case.
+    #[test]
+    fn a_named_serial_chooses_the_probe_kind_by_the_identity_of_the_device_carrying_it() {
+        let v3s = lamella_stlink::product_id::V3S;
+        let devices = [
+            usb(lamella_stlink::ST_VENDOR_ID, v3s, "PROBE00000001", false),
+            usb(0x1fc9, 0x0143, "0123456789ABCDEF01234567", true),
+        ];
+        let st_link = Ok(ExternalProbe::StLink { product_id: v3s });
+        assert_eq!(external_probe_for("PROBE00000001", &devices), st_link);
+        assert_eq!(external_probe_for("probe00000001", &devices), st_link);
+        assert_eq!(
+            external_probe_for("0123456789ABCDEF01234567", &devices),
+            Ok(ExternalProbe::CmsisDap)
+        );
+        assert_eq!(external_probe_for("PROBE0000000", &devices), Ok(ExternalProbe::NotAttached));
+    }
+
+    /// Every ST-LINK generation's product id is an ST-LINK, and a device under ST's vendor id that is
+    /// not one -- its USB DFU bootloader, `0xdf11` -- is refused by name rather than driven.
+    #[test]
+    fn every_st_link_product_id_is_an_st_link_and_no_other_st_device_is() {
+        use lamella_stlink::product_id::{V2, V2_1, V2EC, V3_FAMILY};
+        for product_id in [V2, V2_1, V2EC].into_iter().chain(V3_FAMILY) {
+            let devices = [usb(lamella_stlink::ST_VENDOR_ID, product_id, "SERIAL1", false)];
+            assert_eq!(
+                external_probe_for("SERIAL1", &devices),
+                Ok(ExternalProbe::StLink { product_id })
+            );
+        }
+        let dfu = [usb(lamella_stlink::ST_VENDOR_ID, 0xdf11, "SERIAL1", false)];
+        let refusal = external_probe_for("SERIAL1", &dfu).expect_err("a DFU bootloader is no probe");
+        assert!(refusal.contains("0483:df11"), "names what it found: {refusal}");
+    }
+
+    /// A probe listed through its CMSIS-DAP interface and a sibling vendor interface is one device,
+    /// so its serial is not refused as ambiguous.
+    #[test]
+    fn one_probe_listed_through_two_interfaces_is_one_device() {
+        let devices = [usb(0x1fc9, 0x0143, "SERIAL2", true), usb(0x1fc9, 0x0143, "SERIAL2", false)];
+        assert_eq!(external_probe_for("SERIAL2", &devices), Ok(ExternalProbe::CmsisDap));
+    }
+
+    /// A serial that two different devices report names neither, and the refusal names both.
+    #[test]
+    fn a_serial_two_devices_report_is_refused_naming_both() {
+        let devices = [
+            usb(lamella_stlink::ST_VENDOR_ID, lamella_stlink::product_id::V2, "000000000001", false),
+            usb(0x2e8a, 0x000c, "000000000001", true),
+        ];
+        let refusal =
+            external_probe_for("000000000001", &devices).expect_err("two devices, one serial");
+        assert!(refusal.contains("0483:3748"), "names the first: {refusal}");
+        assert!(refusal.contains("2e8a:000c"), "names the second: {refusal}");
+    }
+
+    /// A device carrying the serial that is neither an ST-LINK nor a CMSIS-DAP probe is refused by
+    /// name rather than driven.
+    #[test]
+    fn a_serial_on_a_device_that_is_no_probe_is_refused_naming_it() {
+        let devices = [usb(0x0403, 0x6001, "SERIAL3", false)];
+        let refusal =
+            external_probe_for("SERIAL3", &devices).expect_err("a serial bridge is no probe");
+        assert!(refusal.contains("0403:6001"), "names what it found: {refusal}");
+    }
+
+    /// An STM32 external-probe route with nothing named says that an ST-LINK is taken only by its
+    /// serial, since the candidates it counted were CMSIS-DAP probes.
+    #[test]
+    fn an_st_external_route_with_nothing_named_says_an_st_link_needs_its_serial() {
+        let text = describe_probe_choice(
+            &lamella_probe::ProbeError::NotFound,
+            &lamella_probe::Selector::any(),
+            None,
+            Programmer::StExternalProbe { family: StFamily::H7 },
+        );
+        assert!(text.contains("ST-LINK"), "says how an ST-LINK is chosen: {text}");
+    }
+
+    /// An external-probe STM32 route is a probe route that takes the family plan's facts and filters
+    /// no USB identity, because no debugger is soldered to its board.
+    #[test]
+    fn an_external_probe_st_route_takes_the_plans_facts_and_no_usb_filter() {
+        let route = Programmer::StExternalProbe { family: StFamily::H7 };
+        let onboard = Programmer::StlinkOnboard { family: StFamily::H7, probe_id: 0x374e };
+        assert!(route.writes_over_a_probe(), "a probe route, so --via probe is already answered");
+        assert_eq!(route.usb_identity(), None, "nothing is soldered on, so there is nothing to filter");
+        assert_eq!(route.flash_base(), StFamily::H7.plan().flash_base);
+        assert_eq!(route.required_format(), None, "a probe takes raw bytes");
+        assert_eq!(route.units(64), onboard.units(64), "the same plan counts the same granule");
+        assert!(route.description().contains("external"), "{}", route.description());
+    }
+
+    /// **EVERY FLAT FORMAT REACHES A BOOTLOADER VOLUME AS THE SAME UF2.** A `.bin`, Intel HEX,
+    /// S-records and a linked ELF holding one image are wrapped once, at the flash base, with the
+    /// family the bootloader checks.
+    #[test]
+    fn every_flat_format_reaches_a_bootloader_volume_as_the_same_uf2() {
+        let code = stamped(700);
+        let row = pico2();
+        let volume = route_for(row, None).expect("the default route");
+        let expected = crate::artifact::Format::Uf2 { family: RP2350_UF2_FAMILY }
+            .render(&code, RP2_XIP_BASE);
+        assert_eq!(expected.len(), 3 * UF2_BLOCK, "700 B is three blocks");
+        let mut payload = Vec::new();
+        for (index, block) in expected.chunks(UF2_BLOCK).enumerate() {
+            let field =
+                |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().expect("a word"));
+            let number = u32::try_from(index).expect("a small index");
+            assert_eq!(
+                [field(0), field(4), field(8), field(12), field(16)],
+                [0x0A32_4655, 0x9E5D_5157, 0x2000, RP2_XIP_BASE + 256 * number, 256],
+                "block {index}: magic, family flag, its address, and a FULL 256 B payload"
+            );
+            assert_eq!(
+                [field(20), field(24), field(28), field(508)],
+                [number, 3, RP2350_UF2_FAMILY, 0x0AB1_6F30],
+                "block {index}: its index, the count, the family, the end magic"
+            );
+            payload.extend_from_slice(&block[32..32 + 256]);
+        }
+        assert_eq!(&payload[..code.len()], &code[..], "the payload is the image");
+        assert!(payload[code.len()..].iter().all(|&byte| byte == 0), "then zero-filled to the page");
+        let files = [
+            ("image.bin", code.clone()),
+            ("image.hex", crate::artifact::Format::IntelHex.render(&code, RP2_XIP_BASE)),
+            ("image.s19", crate::artifact::Format::SRecord.render(&code, RP2_XIP_BASE)),
+            ("image.elf", linked_elf(&[(RP2_XIP_BASE, &code)])),
+        ];
+        for (name, contents) in files {
+            let path = image_file("flat-formats", name, &contents);
+            let prepared =
+                prepare_image(&path, row, volume).unwrap_or_else(|why| panic!("{name}: {why}"));
+            assert_eq!(prepared.bytes, expected, "{name} becomes the UF2 of its flat image");
+            assert!(prepared.read.starts_with("700 B of "), "{name}: {}", prepared.read);
+            assert!(prepared.wrapped.is_some(), "{name}: the wrap is reported");
+            assert!(
+                wrap_for_route(volume, &prepared.bytes).is_none(),
+                "{name}: and a UF2 is never wrapped a second time"
+            );
+        }
+    }
+
+    /// Over the probe route an ELF is its flat image, because a probe takes raw bytes.
+    #[test]
+    fn over_a_probe_an_elf_is_its_flat_image() {
+        let code = stamped(700);
+        let path = image_file("elf-probe", "image.elf", &linked_elf(&[(RP2_XIP_BASE, &code)]));
+        let row = pico2();
+        let probe = route_for(row, Some("probe")).expect("the probe route");
+        let prepared = prepare_image(&path, row, probe).expect("an ELF is taken");
+        assert_eq!(prepared.bytes, code);
+        assert_eq!(prepared.wrapped, None);
+    }
+
+    /// An ELF linked for another part's address is refused, and the refusal names both addresses.
+    #[test]
+    fn an_elf_linked_for_another_address_is_refused_naming_both() {
+        let elf = linked_elf(&[(0x0800_0000, &stamped(700))]);
+        let path = image_file("elf-base", "image.elf", &elf);
+        let row = pico2();
+        let volume = route_for(row, None).expect("the default route");
+        let error = prepare_image(&path, row, volume).expect_err("not this part's address");
+        assert!(error.contains("0x08000000") && error.contains("0x10000000"), "{error}");
+    }
+
+    /// An RP2350 ELF with no boot block is refused on the volume route exactly as on the probe
+    /// route.
+    #[test]
+    fn an_unstamped_elf_is_refused_on_both_routes() {
+        let elf = linked_elf(&[(RP2_XIP_BASE, &[0u8; 700])]);
+        let path = image_file("elf-stamp", "image.elf", &elf);
+        let row = pico2();
+        for via in [None, Some("probe")] {
+            let route = route_for(row, via).expect("a route");
+            let error = prepare_image(&path, row, route).expect_err("no boot block");
+            assert!(error.contains("PICOBIN"), "{via:?}: {error}");
+        }
+    }
+
+    /// **ONE SEGMENT PAST THE FLASH STRETCHES AN ELF ACROSS THE GAP**, so the image is refused by
+    /// the board's flash size on both routes, naming where it ends and what the board holds.
+    #[test]
+    fn an_elf_with_a_segment_past_the_flash_is_refused_by_the_boards_flash_size() {
+        let code = stamped(700);
+        let data = [0xAA_u8; 16];
+        let elf = linked_elf(&[(RP2_XIP_BASE, &code), (RP2_XIP_BASE + 0x40_0000, &data)]);
+        let path = image_file("elf-fit", "image.elf", &elf);
+        let row = pico2();
+        for via in [None, Some("probe")] {
+            let route = route_for(row, via).expect("a route");
+            let error = prepare_image(&path, row, route).expect_err("larger than the flash");
+            assert!(error.contains("0x10400010"), "{via:?}: where it ends: {error}");
+            assert!(error.contains("4194304 B of flash"), "{via:?}: what the board holds: {error}");
+            assert!(error.contains("load address in RAM"), "{via:?}: the likely cause: {error}");
+        }
+    }
+
+    /// A `.uf2` is copied to a volume byte for byte, and refused over a probe.
+    #[test]
+    fn a_uf2_is_copied_to_a_volume_as_it_stands_and_refused_over_a_probe() {
+        let uf2 = crate::artifact::Format::Uf2 { family: RP2350_UF2_FAMILY }
+            .render(&stamped(300), RP2_XIP_BASE);
+        let path = image_file("uf2", "image.uf2", &uf2);
+        let row = pico2();
+        let volume = route_for(row, None).expect("the default route");
+        let prepared = prepare_image(&path, row, volume).expect("what a volume takes");
+        assert_eq!(prepared.bytes, uf2);
+        assert_eq!(prepared.wrapped, None);
+        let probe = route_for(row, Some("probe")).expect("the probe route");
+        let error = prepare_image(&path, row, probe).expect_err("a probe takes raw bytes");
+        assert!(error.contains("bootloader volume"), "{error}");
+    }
+
+    /// **THE SIZE REFUSAL BINDS ONLY WHERE A BOARD STATES ITS FLASH**, so every routed board must.
+    #[test]
+    fn every_routed_board_states_the_flash_an_image_must_fit() {
+        let unstated: Vec<&str> = PROGRAMMING
+            .iter()
+            .filter(|row| {
+                let (table, part) =
+                    catalog::resolve(row.board).expect("every routed board resolves");
+                matches!(
+                    lamella_bsp_gen::fit::fit(&table, &part, 1).flash_fit,
+                    lamella_bsp_gen::fit::Fit::Unknown { .. }
+                )
+            })
+            .map(|row| row.board)
+            .collect();
+        assert!(unstated.is_empty(), "these routed boards state no flash size: {unstated:?}");
+    }
+
     #[test]
     fn a_boards_own_debugger_is_found_without_asking_and_an_external_probe_is_not_a_rival() {
         for onboard in [Programmer::MicrobitV1Daplink, Programmer::MicrobitV2Daplink] {
@@ -1300,30 +2161,65 @@ mod tests {
         let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE };
 
         let error =
-            selector_for(volume, Some("SERIAL00"), None).expect_err("a drive is not a probe");
+            selector_for(volume, Some("SERIAL00"), None, None).expect_err("a drive is not a probe");
         assert!(
             error.contains("--volume"),
             "and it names the option that IS right: {error}"
         );
 
-        let error = selector_for(probe, None, Some("D:")).expect_err("a probe is not a drive");
+        let error = selector_for(probe, None, Some("D:"), None).expect_err("a probe is not a drive");
         assert!(
             error.contains("--probe"),
             "and it names the option that IS right: {error}"
         );
 
         assert_eq!(
-            selector_for(volume, None, Some("D:")).expect("a drive on a volume route"),
+            selector_for(volume, None, Some("D:"), None).expect("a drive on a volume route"),
             Some("D:".to_owned())
         );
         assert_eq!(
-            selector_for(probe, Some("SERIAL00"), None).expect("a serial on a probe route"),
+            selector_for(probe, Some("SERIAL00"), None, None).expect("a serial on a probe route"),
             Some("SERIAL00".to_owned())
         );
         assert_eq!(
-            selector_for(volume, None, None).expect("neither is fine"),
+            selector_for(volume, None, None, None).expect("neither is fine"),
             None
         );
+    }
+
+    /// A system bootloader over DFU is neither a probe nor a drive, so neither of their options can
+    /// name one, and each refusal names the option that can; `--device` names it, and names nothing
+    /// on any other route.
+    #[test]
+    fn a_dfu_bootloader_is_named_by_its_own_option_and_by_no_other() {
+        let dfu = Programmer::StDfu { family: StFamily::H7 };
+
+        let error =
+            selector_for(dfu, Some("SERIAL00"), None, None).expect_err("a bootloader is not a probe");
+        assert!(error.contains("--device <serial>"), "and it names the option that IS right: {error}");
+
+        let error = selector_for(dfu, None, Some("D:"), None).expect_err("a bootloader is not a drive");
+        assert!(error.contains("--device <serial>"), "and it names the option that IS right: {error}");
+        assert!(!error.contains("--probe"), "a probe's option names no bootloader: {error}");
+
+        assert_eq!(
+            selector_for(dfu, None, None, Some("SERIAL00")).expect("a serial on the DFU route"),
+            Some("SERIAL00".to_owned())
+        );
+        assert_eq!(selector_for(dfu, None, None, None).expect("none named is fine"), None);
+
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE };
+        let error =
+            selector_for(probe, None, None, Some("SERIAL00")).expect_err("a probe is not a bootloader");
+        assert!(error.contains("--probe <serial>"), "and it names the option that IS right: {error}");
+
+        let volume = Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        };
+        let error =
+            selector_for(volume, None, None, Some("SERIAL00")).expect_err("a drive is not a bootloader");
+        assert!(error.contains("--volume <name>"), "and it names the option that IS right: {error}");
     }
 
     #[test]
@@ -1576,6 +2472,36 @@ mod tests {
             !PROGRAMMING.is_empty(),
             "an empty table would pass every assertion above"
         );
+    }
+
+    #[test]
+    fn every_route_agrees_with_the_debugger_its_board_carries() {
+        let mut checked = 0;
+        for row in PROGRAMMING {
+            let board = catalog::load_board(row.board)
+                .expect("the census above already requires every board to resolve");
+            let onboard = board.debug.as_ref().map(|debug| debug.onboard.as_str());
+            let wants = match row.programmer {
+                Programmer::StlinkOnboard { .. } => "st-link",
+                Programmer::EdbgOnboard { .. } => "edbg",
+                Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => "cmsis-dap",
+                Programmer::Rp2350Probe { .. }
+                | Programmer::Rp2040Probe { .. }
+                | Programmer::SamExternalProbe { .. }
+                | Programmer::StExternalProbe { .. } => "none",
+                Programmer::StDfu { .. } => "none",
+                Programmer::Uf2Volume { .. } => continue,
+            };
+            assert_eq!(
+                onboard,
+                Some(wants),
+                "{}: its default route needs an on-board debugger of kind {wants:?}, and the board's \
+                 `[debug] onboard` is {onboard:?}",
+                row.board
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no row was checked, so this proved nothing");
     }
 
     #[test]

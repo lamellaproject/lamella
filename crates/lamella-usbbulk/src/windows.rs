@@ -11,28 +11,34 @@ use std::time::Duration;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Child, CM_Get_DevNode_PropertyW, CM_Get_DevNode_Registry_PropertyW, CM_Get_Device_IDW,
-    CM_Get_Parent, CM_Get_Sibling, CR_SUCCESS,
+    CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW, CM_Get_Parent, CM_Get_Sibling,
+    CM_Open_DevNode_Key, CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_REGISTRY_HARDWARE, CR_BUFFER_SMALL,
+    CR_SUCCESS, RegDisposition_OpenExisting,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
 };
-use windows_sys::Win32::Devices::Properties::{DEVPROPKEY, DEVPROPTYPE};
+use windows_sys::Win32::Devices::Properties::{DEVPKEY_Device_Service, DEVPROPKEY, DEVPROPTYPE};
 use windows_sys::Win32::Devices::Usb::{
-    UsbdPipeTypeBulk, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetOverlappedResult,
+    UsbdPipeTypeBulk, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
+    WinUsb_GetOverlappedResult,
     WinUsb_AbortPipe, WinUsb_Initialize, WinUsb_ResetPipe, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe,
     WinUsb_SetPipePolicy, WinUsb_WritePipe, USB_DEVICE_DESCRIPTOR_TYPE, USB_INTERFACE_DESCRIPTOR,
     USB_STRING_DESCRIPTOR_TYPE, WINUSB_INTERFACE_HANDLE, WINUSB_PIPE_INFORMATION,
     WINUSB_SETUP_PACKET,
 };
 use windows_sys::Win32::Foundation::{WAIT_OBJECT_0,
-    CloseHandle, GetLastError, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegQueryValueExW, HKEY, KEY_READ, REG_MULTI_SZ, REG_SZ, REG_VALUE_TYPE,
+};
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 const DAP_V2_GUID: GUID = GUID {
@@ -164,7 +170,13 @@ struct PnpIdentity {
 /// the driver bound to the device node ITSELF and no interface children at all. Looking only at
 /// children would find every probe and miss every single-interface board, including ours.
 unsafe fn vendor_class_interface(devinst: u32) -> Option<u32> {
-    if compatible_ids(devinst).iter().any(|id| id.to_ascii_uppercase().contains("CLASS_FF")) {
+    interface_node(devinst, |ids| ids.iter().any(|id| id.to_ascii_uppercase().contains("CLASS_FF")))
+}
+
+/// The devnode whose compatible ids satisfy `wanted`: the device's own node, or one of its children --
+/// both shapes, for the reason [`vendor_class_interface`] gives.
+unsafe fn interface_node(devinst: u32, wanted: impl Fn(&[String]) -> bool) -> Option<u32> {
+    if wanted(&compatible_ids(devinst)) {
         return Some(devinst);
     }
     let mut child: u32 = 0;
@@ -172,7 +184,7 @@ unsafe fn vendor_class_interface(devinst: u32) -> Option<u32> {
         return None;
     }
     loop {
-        if compatible_ids(child).iter().any(|id| id.to_ascii_uppercase().contains("CLASS_FF")) {
+        if wanted(&compatible_ids(child)) {
             return Some(child);
         }
         let mut next: u32 = 0;
@@ -181,6 +193,46 @@ unsafe fn vendor_class_interface(devinst: u32) -> Option<u32> {
         }
         child = next;
     }
+}
+
+/// Whether `ids` hold the compatible id Windows gives an interface of `class`,
+/// `USB\CLASS_c(2)&SUBCLASS_s(2)&PROT_p(2)` (Standard USB Identifiers) -- whole, and without regard to
+/// case. A shorter id, `USB\CLASS_c(2)&SUBCLASS_s(2)`, names every protocol of that subclass, so it
+/// does not count.
+fn names_class(ids: &[String], class: crate::InterfaceClass) -> bool {
+    let wanted = format!(
+        "USB\\CLASS_{:02X}&SUBCLASS_{:02X}&PROT_{:02X}",
+        class.class, class.subclass, class.protocol
+    );
+    ids.iter().any(|id| id.eq_ignore_ascii_case(&wanted))
+}
+
+/// The `bInterfaceNumber` of the interface on `node`, a devnode of the device whose own node is
+/// `device`.
+///
+/// An interface node of a composite device carries it as the `MI_z(2)` field of its device id
+/// (Standard USB Identifiers). A device with a single interface has the one numbered 0: an interface's
+/// number is its zero-based index among the configuration's concurrent interfaces (USB 2.0, Table
+/// 9-12).
+unsafe fn interface_number_of(node: u32, device: u32) -> Option<u8> {
+    if node == device {
+        return Some(0);
+    }
+    device_instance_id(node).as_deref().and_then(interface_number_from_instance_id)
+}
+
+/// The `MI_z(2)` field of the device id at the front of an instance id
+/// (`USB\VID_v(4)&PID_d(4)&MI_z(2)\...`), in hexadecimal. The instance id after the device id is never
+/// read, whatever it contains.
+fn interface_number_from_instance_id(id: &str) -> Option<u8> {
+    let device_id = id.split('\\').nth(1)?;
+    device_id.split('&').find_map(|field| {
+        let (key, value) = (field.get(..3)?, field.get(3..)?);
+        if !key.eq_ignore_ascii_case("MI_") || value.len() != 2 {
+            return None;
+        }
+        u8::from_str_radix(value, 16).ok()
+    })
 }
 
 /// A devnode's compatible ids -- a `REG_MULTI_SZ`, so a run of NUL-terminated strings.
@@ -252,19 +304,39 @@ unsafe fn bus_reported_name(devinst: u32) -> Option<String> {
         },
         pid: 4,
     };
+    string_property(devinst, &KEY)
+}
+
+/// `DEVPKEY_Device_Service`: the name of the service installed for a devnode, readable without a
+/// handle.
+unsafe fn service_name(devinst: u32) -> Option<String> {
+    string_property(devinst, &DEVPKEY_Device_Service)
+}
+
+/// A string property of a devnode, read with no handle; `None` when it is absent or empty.
+unsafe fn string_property(devinst: u32, key: &DEVPROPKEY) -> Option<String> {
     let mut ty: DEVPROPTYPE = 0;
     let mut len: u32 = 0;
-    CM_Get_DevNode_PropertyW(devinst, &KEY, &mut ty, null_mut(), &mut len, 0);
+    CM_Get_DevNode_PropertyW(devinst, key, &mut ty, null_mut(), &mut len, 0);
     if len == 0 {
         return None;
     }
-    let mut buf = vec![0u8; len as usize + 2];
-    if CM_Get_DevNode_PropertyW(devinst, &KEY, &mut ty, buf.as_mut_ptr(), &mut len, 0) != CR_SUCCESS
-    {
+    let mut buf = vec![0u8; len as usize];
+    if CM_Get_DevNode_PropertyW(devinst, key, &mut ty, buf.as_mut_ptr(), &mut len, 0) != CR_SUCCESS {
         return None;
     }
-    let s = wide_string(buf.as_ptr().cast::<u16>());
+    let s = utf16_until_nul(&buf[..(len as usize).min(buf.len())]);
     (!s.is_empty()).then_some(s)
+}
+
+/// UTF-16LE `bytes` up to the first NUL, or to the end when there is none.
+fn utf16_until_nul(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// A NUL-terminated wide string as a `String`.
@@ -332,8 +404,8 @@ enum PathVerdict {
 ///
 /// The three-way answer is the point. Collapsing it to a boolean makes a settled NO indistinguishable
 /// from a DO NOT KNOW, and the two want opposite handling: a settled no should skip the device, and
-/// only a do-not-know justifies opening one to ask its descriptor. Treating both as "open it" is
-/// what made a bench pay a descriptor fetch per non-matching board.
+/// only a do-not-know justifies opening one to ask its descriptor. Treating both as "open it" costs
+/// a descriptor fetch on every non-matching board.
 fn judge_path(serial: Option<&str>, path: &[u16]) -> PathVerdict {
     let Some(wanted) = serial else { return PathVerdict::Match };
     match instance_id_from_path(path) {
@@ -347,8 +419,8 @@ fn judge_path(serial: Option<&str>, path: &[u16]) -> PathVerdict {
 /// How long a descriptor fetch may take before it is abandoned.
 ///
 /// A healthy device answers its own descriptors in microseconds. This bound is not for slowness --
-/// it is for a device that never answers at all, which is a thing that ships: one Lamella Link
-/// RP2350 returns its descriptors in 0 ms and another takes over ten seconds for the same request.
+/// it is for a device that never answers at all, which is a thing that ships: two boards of the
+/// same model can answer the same request microseconds apart or seconds apart.
 /// Enumeration reads up to three descriptors per device, so an unbounded fetch multiplies that
 /// across every board on the bus.
 const DESCRIPTOR_TIMEOUT: Duration = Duration::from_millis(250);
@@ -467,13 +539,13 @@ fn guid_from_str(s: &str) -> Option<GUID> {
     Some(GUID { data1, data2, data3, data4 })
 }
 
-/// Lists the CMSIS-DAP v2 devices -- the same body [`enumerate_guid`] runs, and it must be.
+/// Lists the CMSIS-DAP v2 devices -- the vendor-class population, not a driver-bound one.
 ///
 /// **THE DESCRIPTOR READ IS NOT OPTIONAL: SKIP IT AND EVERY COMPOSITE PROBE LISTS UNDER A SYNTHESIZED
 /// ID INSTEAD OF ITS SERIAL.** Both an RPi Debug Probe and a micro:bit DAPLink are composite, and
 /// Windows names an interface of a composite device with a port-derived id (`6&526bcf1&0&0000`) --
-/// so `list()` reported two probes whose "serials" changed with the USB port and matched nothing a
-/// user could read off the hardware. `open` never had the bug: it already falls back to the
+/// so without it `list()` reports probes whose "serials" change with the USB port and match nothing
+/// a user can read off the hardware. `open` does not have that problem: it falls back to the
 /// descriptor for exactly this reason (see `open_with`). **Listing and opening disagreeing about
 /// what a device is CALLED is worse than either being wrong alone** -- a tool selects by the name
 /// the list gave it and finds nothing.
@@ -493,7 +565,7 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
 /// **BEING LISTED IS NOT BEING OPENABLE, and keeping those apart is the point.** Opening still goes
 /// through the WinUSB interface GUID, because that is what Windows can actually drive; a device
 /// listed here with no WinUSB binding fails at `open` with [`crate::diagnose`]'s `PresentUnbound`,
-/// which names the remedy. Hiding it instead reported "not attached" for a device sitting on the
+/// which names the remedy. Hiding it instead would report "not attached" for a device sitting on the
 /// bus one driver install away from working.
 unsafe fn enumerate_vendor_class() -> Vec<DeviceInfo> {
     let mut out = Vec::new();
@@ -560,6 +632,373 @@ pub fn diagnose(interface_guid: &str, vendor_id: u16, product_id: u16) -> Result
         return Ok(Binding::PresentUnbound);
     }
     Ok(Binding::Absent)
+}
+
+/// See [`crate::enumerate_class`]. Reads the PnP tree, so nothing is opened.
+///
+/// An interface is recognized by the compatible id Windows gives it, on the device's own node or on
+/// one of its interface nodes, and its device is named as [`enumerate`] names one.
+pub fn enumerate_class(class: crate::InterfaceClass) -> Result<Vec<crate::InterfaceInfo>> {
+    let mut out = Vec::new();
+    unsafe {
+        for (path, devinst) in iface_paths(&USB_DEVICE_GUID) {
+            let Some((vendor_id, product_id)) = vid_pid_from_path(&path) else { continue };
+            let Some(node) = interface_node(devinst, |ids| names_class(ids, class)) else { continue };
+            let Some(interface_number) = interface_number_of(node, devinst) else { continue };
+            let identity = pnp_identity(devinst, vendor_id, product_id);
+            out.push(crate::InterfaceInfo {
+                vendor_id,
+                product_id,
+                serial_number: identity.serial.or_else(|| instance_id_from_path(&path)),
+                product: identity.product,
+                interface_number,
+                interface_name: if node == devinst { None } else { bus_reported_name(node) },
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The longest data stage `WinUsb_ControlTransfer` takes: "The length of this buffer must not exceed
+/// 4KB."
+const LONGEST_CONTROL_DATA_STAGE: u16 = 4 * 1024;
+
+/// Refuses a data stage longer than WinUSB takes, before anything is sent.
+fn winusb_takes_length(length: u16) -> Result<()> {
+    if length <= LONGEST_CONTROL_DATA_STAGE {
+        return Ok(());
+    }
+    Err(Error::InvalidRequest(format!(
+        "WinUSB takes a control transfer's data stage of at most 4 KB ({LONGEST_CONTROL_DATA_STAGE} \
+         bytes), and this one is {length}"
+    )))
+}
+
+/// Whether a request is addressed to an interface or to an endpoint -- recipient 1 or 2 in the low
+/// bits of `bmRequestType` (USB 2.0, Table 9-2) -- which WinUSB sends through the handle of the
+/// interface concerned; a request to the device, or to another recipient, goes through the handle
+/// `WinUsb_Initialize` returned (WinUsb_ControlTransfer).
+fn addressed_through_interface(request_type: u8) -> bool {
+    matches!(request_type & 0x1F, 1 | 2)
+}
+
+/// `timeout_ms` as `WaitForSingleObject` takes it. `INFINITE` is `u32::MAX` and waits without end, so
+/// the longest bound is one millisecond short of it.
+fn wait_milliseconds(timeout_ms: u32) -> u32 {
+    timeout_ms.min(INFINITE - 1)
+}
+
+/// A control transfer WinUSB completed with the error `code`.
+///
+/// `ERROR_SEM_TIMEOUT` is what WinUSB reports for a transfer its timeout policy cancelled
+/// (WinUsb_ReadPipe), and the default control pipe carries a five-second policy of its own (WinUSB
+/// Functions for Pipe Policy Modification), so here that code is a timeout too.
+fn transfer_failed(code: u32) -> Error {
+    if code == ERROR_SEM_TIMEOUT {
+        return Error::Timeout;
+    }
+    Error::Os(format!("WinUsb_ControlTransfer failed (error {code})"))
+}
+
+/// Why a device that is attached, and has an interface of the class asked for, cannot be opened:
+/// WinUSB registered no device interface for it, and `service` is the driver Windows installed for
+/// it instead, if any.
+fn no_winusb_interface(vendor_id: u16, product_id: u16, service: Option<&str>) -> String {
+    let device = format!("{vendor_id:04x}:{product_id:04x}");
+    match service {
+        Some(name) if name.eq_ignore_ascii_case("WinUSB") => format!(
+            "{device} is attached with WinUSB as its driver, and no device interface class is named \
+             under its hardware key, so WinUSB registered no interface to open it through"
+        ),
+        Some(name) => format!(
+            "{device} is attached, and Windows has installed the `{name}` driver for it; it can be \
+             opened only with WinUSB as its driver"
+        ),
+        None => format!(
+            "{device} is attached, and Windows has installed no driver for it; it can be opened only \
+             with WinUSB as its driver"
+        ),
+    }
+}
+
+/// Every GUID in a registry string, or string list, held as UTF-16LE bytes; a string that is not a
+/// GUID is skipped, and a list whose terminating NULs are missing is read to its end.
+fn guids_from_wide_list(bytes: &[u8]) -> Vec<GUID> {
+    let units: Vec<u16> =
+        bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    units
+        .split(|&unit| unit == 0)
+        .filter(|string| !string.is_empty())
+        .filter_map(|string| guid_from_str(&String::from_utf16_lossy(string)))
+        .collect()
+}
+
+/// The device interface classes WinUSB registers a devnode under: the `DeviceInterfaceGUIDs` or
+/// `DeviceInterfaceGUID` value under its hardware key, where an INF's `[.HW]` section and the device's
+/// own Microsoft OS descriptor both put it (WinUSB Installation; WinUSB Device).
+unsafe fn winusb_interface_classes(devinst: u32) -> Vec<GUID> {
+    let mut key: HKEY = null_mut();
+    if CM_Open_DevNode_Key(devinst, KEY_READ, 0, RegDisposition_OpenExisting, &mut key, CM_REGISTRY_HARDWARE)
+        != CR_SUCCESS
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for name in ["DeviceInterfaceGUIDs", "DeviceInterfaceGUID"] {
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let mut kind: REG_VALUE_TYPE = 0;
+        let mut len: u32 = 0;
+        if RegQueryValueExW(key, name.as_ptr(), null(), &mut kind, null_mut(), &mut len) != ERROR_SUCCESS
+            || len == 0
+        {
+            continue;
+        }
+        let mut buf = vec![0u8; len as usize];
+        if RegQueryValueExW(key, name.as_ptr(), null(), &mut kind, buf.as_mut_ptr(), &mut len)
+            != ERROR_SUCCESS
+        {
+            continue;
+        }
+        if kind == REG_MULTI_SZ || kind == REG_SZ {
+            out.extend(guids_from_wide_list(&buf[..(len as usize).min(buf.len())]));
+        }
+    }
+    RegCloseKey(key);
+    out
+}
+
+/// The present device interfaces of class `guid` that the devnode `devinst` registered, as
+/// NUL-terminated paths.
+unsafe fn interfaces_of_device(guid: &GUID, devinst: u32) -> Vec<Vec<u16>> {
+    let Some(id) = device_instance_id(devinst) else { return Vec::new() };
+    let id: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+    for _ in 0..4 {
+        let mut len: u32 = 0;
+        if CM_Get_Device_Interface_List_SizeW(&mut len, guid, id.as_ptr(), CM_GET_DEVICE_INTERFACE_LIST_PRESENT)
+            != CR_SUCCESS
+            || len <= 1
+        {
+            return Vec::new();
+        }
+        let mut buf = vec![0u16; len as usize];
+        match CM_Get_Device_Interface_ListW(guid, id.as_ptr(), buf.as_mut_ptr(), len, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) {
+            CR_SUCCESS => {
+                return buf
+                    .split(|&unit| unit == 0)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| path.iter().copied().chain(Some(0)).collect())
+                    .collect();
+            }
+            CR_BUFFER_SMALL => continue,
+            _ => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+/// The `bInterfaceNumber` of the interface WinUSB's handle `handle` reaches, when its class is `class`.
+/// Its first alternate setting is the one read, since an interface's default setting is setting zero.
+unsafe fn interface_number_if_class(handle: WINUSB_INTERFACE_HANDLE, class: crate::InterfaceClass) -> Option<u8> {
+    let mut descriptor: USB_INTERFACE_DESCRIPTOR = std::mem::zeroed();
+    if WinUsb_QueryInterfaceSettings(handle, 0, &mut descriptor) == 0 {
+        return None;
+    }
+    let stated = (descriptor.bInterfaceClass, descriptor.bInterfaceSubClass, descriptor.bInterfaceProtocol);
+    (stated == (class.class, class.subclass, class.protocol)).then_some(descriptor.bInterfaceNumber)
+}
+
+/// The first interface of `class` among those `first` -- the handle `WinUsb_Initialize` returned --
+/// reaches, as its `bInterfaceNumber` and its handle: `None` when it is the first interface itself, and
+/// otherwise an associated interface's handle, which the caller frees (WinUsb_GetAssociatedInterface).
+unsafe fn winusb_interface_of_class(
+    first: WINUSB_INTERFACE_HANDLE,
+    class: crate::InterfaceClass,
+) -> Option<(Option<WINUSB_INTERFACE_HANDLE>, u8)> {
+    if let Some(number) = interface_number_if_class(first, class) {
+        return Some((None, number));
+    }
+    for index in 0..=u8::MAX {
+        let mut associated: WINUSB_INTERFACE_HANDLE = null_mut();
+        if WinUsb_GetAssociatedInterface(first, index, &mut associated) == 0 {
+            return None;
+        }
+        if let Some(number) = interface_number_if_class(associated, class) {
+            return Some((Some(associated), number));
+        }
+        WinUsb_Free(associated);
+    }
+    None
+}
+
+/// An interface opened through WinUSB and driven by `WinUsb_ControlTransfer`.
+pub struct ControlInterface {
+    file: HANDLE,
+    /// The handle `WinUsb_Initialize` returned, for the device's first interface.
+    first: WINUSB_INTERFACE_HANDLE,
+    /// The opened interface's own handle, when it is not the first interface.
+    associated: Option<WINUSB_INTERFACE_HANDLE>,
+    event: HANDLE,
+    interface: u8,
+}
+
+impl ControlInterface {
+    /// See [`crate::ControlInterface::open`].
+    ///
+    /// The device is chosen from the PnP tree as [`enumerate_class`] lists it, and opened through the
+    /// device interface WinUSB registered for it. A device WinUSB is not driving is refused, with the
+    /// driver Windows installed for it instead named.
+    pub fn open(
+        vendor_id: u16,
+        product_id: u16,
+        serial: Option<&str>,
+        class: crate::InterfaceClass,
+    ) -> Result<Self> {
+        unsafe {
+            for (path, devinst) in iface_paths(&USB_DEVICE_GUID) {
+                if vid_pid_from_path(&path) != Some((vendor_id, product_id)) {
+                    continue;
+                }
+                let Some(node) = interface_node(devinst, |ids| names_class(ids, class)) else { continue };
+                let reported =
+                    pnp_identity(devinst, vendor_id, product_id).serial.or_else(|| instance_id_from_path(&path));
+                if !crate::serial_is(serial, reported.as_deref()) {
+                    continue;
+                }
+                return Self::open_node(node, vendor_id, product_id, class);
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    /// Opens the interface of `class` on the devnode `node` through WinUSB.
+    unsafe fn open_node(node: u32, vendor_id: u16, product_id: u16, class: crate::InterfaceClass) -> Result<Self> {
+        let Some(path) = winusb_interface_classes(node)
+            .iter()
+            .find_map(|guid| interfaces_of_device(guid, node).into_iter().next())
+        else {
+            return Err(Error::Os(no_winusb_interface(vendor_id, product_id, service_name(node).as_deref())));
+        };
+        let mut opened = ControlInterface {
+            file: INVALID_HANDLE_VALUE,
+            first: null_mut(),
+            associated: None,
+            event: null_mut(),
+            interface: 0,
+        };
+        opened.file = CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            null_mut(),
+        );
+        if opened.file == INVALID_HANDLE_VALUE {
+            return Err(Error::Os(format!(
+                "opening {vendor_id:04x}:{product_id:04x} through WinUSB failed (error {})",
+                GetLastError()
+            )));
+        }
+        let mut first: WINUSB_INTERFACE_HANDLE = null_mut();
+        if WinUsb_Initialize(opened.file, &mut first) == 0 {
+            return Err(Error::Os(format!("WinUsb_Initialize failed (error {})", GetLastError())));
+        }
+        opened.first = first;
+        let Some((associated, interface)) = winusb_interface_of_class(opened.first, class) else {
+            return Err(Error::Os(format!(
+                "{vendor_id:04x}:{product_id:04x} opened through WinUSB, and no interface it reaches is \
+                 of class {:02x}, subclass {:02x}, protocol {:02x}",
+                class.class, class.subclass, class.protocol
+            )));
+        };
+        opened.associated = associated;
+        opened.interface = interface;
+        opened.event = CreateEventW(null(), 1, 0, null());
+        if opened.event.is_null() {
+            return Err(Error::Os(format!("CreateEventW failed (error {})", GetLastError())));
+        }
+        Ok(opened)
+    }
+
+    /// See [`crate::ControlInterface::interface_number`].
+    pub fn interface_number(&self) -> u8 {
+        self.interface
+    }
+
+    /// See [`crate::ControlInterface::control_in`].
+    pub fn control_in(&mut self, setup: crate::Setup, buffer: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        unsafe { self.control(setup, buffer.as_mut_ptr(), timeout_ms) }
+    }
+
+    /// See [`crate::ControlInterface::control_out`].
+    pub fn control_out(&mut self, setup: crate::Setup, data: &[u8], timeout_ms: u32) -> Result<usize> {
+        unsafe { self.control(setup, data.as_ptr().cast_mut(), timeout_ms) }
+    }
+
+    /// One overlapped `WinUsb_ControlTransfer`, bounded by `timeout_ms`: a transfer still pending at
+    /// the bound is aborted on the default pipe and reaped before this returns.
+    unsafe fn control(&mut self, setup: crate::Setup, buffer: *mut u8, timeout_ms: u32) -> Result<usize> {
+        winusb_takes_length(setup.length)?;
+        let handle = if addressed_through_interface(setup.request_type) {
+            self.associated.unwrap_or(self.first)
+        } else {
+            self.first
+        };
+        let packet = WINUSB_SETUP_PACKET {
+            RequestType: setup.request_type,
+            Request: setup.request,
+            Value: setup.value,
+            Index: setup.index,
+            Length: setup.length,
+        };
+        ResetEvent(self.event);
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        overlapped.hEvent = self.event;
+        let mut transferred = 0u32;
+        if WinUsb_ControlTransfer(handle, packet, buffer, u32::from(setup.length), &mut transferred, &overlapped) != 0 {
+            return Ok(transferred as usize);
+        }
+        let code = GetLastError();
+        if code != ERROR_IO_PENDING {
+            return Err(transfer_failed(code));
+        }
+        let waited = WaitForSingleObject(self.event, wait_milliseconds(timeout_ms));
+        if waited == WAIT_OBJECT_0 {
+            if WinUsb_GetOverlappedResult(self.first, &overlapped, &mut transferred, 0) != 0 {
+                return Ok(transferred as usize);
+            }
+            return Err(transfer_failed(GetLastError()));
+        }
+        let wait_failure = (waited != WAIT_TIMEOUT).then(|| GetLastError());
+        WinUsb_AbortPipe(handle, 0);
+        if WinUsb_GetOverlappedResult(self.first, &overlapped, &mut transferred, 1) != 0 {
+            return Ok(transferred as usize);
+        }
+        Err(match wait_failure {
+            None => Error::Timeout,
+            Some(code) => Error::Os(format!("waiting for the control transfer failed (error {code})")),
+        })
+    }
+}
+
+impl Drop for ControlInterface {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.event.is_null() {
+                CloseHandle(self.event);
+            }
+            if let Some(associated) = self.associated {
+                WinUsb_Free(associated);
+            }
+            if !self.first.is_null() {
+                WinUsb_Free(self.first);
+            }
+            if self.file != INVALID_HANDLE_VALUE {
+                CloseHandle(self.file);
+            }
+        }
+    }
 }
 
 pub struct Device {
@@ -808,6 +1247,12 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                                 if std::time::Instant::now() >= deadline {
                                     WinUsb_AbortPipe(self.wu, endpoint);
                                     let _ = WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 1);
+                                    // The transfer can finish between the last check and the abort.
+                                    // What it delivered is in `buf` and counted in `got`, so it is
+                                    // returned; only a read that delivered nothing is a timeout.
+                                    if got > 0 {
+                                        return Ok(got as usize);
+                                    }
                                     return Err(Error::Timeout);
                                 }
                                 std::thread::sleep(Duration::from_millis(1));
@@ -847,7 +1292,13 @@ impl Drop for Device {
 
 #[cfg(test)]
 mod tests {
-    use super::{instance_id_is_for, judge_path, serial_from_instance_id, PathVerdict};
+    use super::{
+        addressed_through_interface, guids_from_wide_list, instance_id_is_for,
+        interface_number_from_instance_id, judge_path, names_class, no_winusb_interface,
+        serial_from_instance_id, transfer_failed, utf16_until_nul, wait_milliseconds,
+        winusb_takes_length, Error, PathVerdict, ERROR_SEM_TIMEOUT, INFINITE,
+    };
+    use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
 
     /// A device-interface path as Windows spells it, wide and null-terminated.
     fn path(text: &str) -> Vec<u16> {
@@ -916,5 +1367,117 @@ mod tests {
     fn a_path_with_no_id_segment_is_not_a_refusal() {
         let truncated = path(r"\\?\usb#vid_0001&pid_0002");
         assert!(matches!(judge_path(Some("ANY"), &truncated), PathVerdict::Unknown));
+    }
+
+    /// Compatible ids as Windows lists them for one interface node.
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_class_is_named_by_its_whole_compatible_id_in_either_case() {
+        let dfu_mode = crate::InterfaceClass { class: 0xFE, subclass: 0x01, protocol: 0x02 };
+        assert!(names_class(
+            &ids(&[r"USB\Class_FE&SubClass_01&Prot_02", r"USB\Class_FE&SubClass_01", r"USB\Class_FE"]),
+            dfu_mode
+        ));
+        assert!(names_class(&ids(&[r"USB\CLASS_FE&SUBCLASS_01&PROT_02"]), dfu_mode), "in either case");
+        assert!(
+            !names_class(&ids(&[r"USB\Class_FE&SubClass_01", r"USB\Class_FE"]), dfu_mode),
+            "a shorter id names every protocol of the subclass"
+        );
+        assert!(!names_class(&ids(&[r"USB\Class_FE&SubClass_01&Prot_01"]), dfu_mode), "another protocol");
+        assert!(!names_class(&ids(&[r"USB\Class_FE&SubClass_01&Prot_021"]), dfu_mode), "a longer id");
+        assert!(!names_class(&[], dfu_mode), "no ids at all");
+    }
+
+    #[test]
+    fn an_interface_number_is_read_from_the_device_id_alone() {
+        assert_eq!(interface_number_from_instance_id(r"USB\VID_0483&PID_374B&MI_02\6&1a2b3c4d&0&0002"), Some(2));
+        assert_eq!(
+            interface_number_from_instance_id(r"usb\vid_0483&pid_374b&mi_0a\6&1a2b3c4d&0&000a"),
+            Some(10),
+            "hexadecimal, in either case"
+        );
+        assert_eq!(interface_number_from_instance_id(r"USB\VID_0483&PID_DF11\SERIAL0001"), None, "no MI field");
+        assert_eq!(
+            interface_number_from_instance_id(r"USB\VID_0001&PID_0002\A&MI_05"),
+            None,
+            "the instance id after the device id is not read"
+        );
+        assert_eq!(interface_number_from_instance_id(r"USB\VID_0001&PID_0002&MI_\X"), None, "an empty field");
+        assert_eq!(interface_number_from_instance_id(r"USB\VID_0001&PID_0002&MI_ZZ\X"), None, "not hexadecimal");
+        assert_eq!(interface_number_from_instance_id("no separators"), None);
+    }
+
+    #[test]
+    fn a_request_to_an_interface_or_an_endpoint_goes_through_that_interfaces_handle() {
+        assert!(addressed_through_interface(0x21), "a DFU class request, host to device");
+        assert!(addressed_through_interface(0xA1), "and device to host");
+        assert!(addressed_through_interface(0x02), "a standard request to an endpoint");
+        assert!(!addressed_through_interface(0x80), "GET_DESCRIPTOR to the device");
+        assert!(!addressed_through_interface(0xC3), "a vendor request to another recipient");
+    }
+
+    #[test]
+    fn a_data_stage_longer_than_winusb_takes_is_refused_before_anything_is_sent() {
+        assert!(winusb_takes_length(0).is_ok());
+        assert!(winusb_takes_length(4096).is_ok());
+        assert!(matches!(winusb_takes_length(4097), Err(Error::InvalidRequest(_))));
+        assert!(matches!(winusb_takes_length(u16::MAX), Err(Error::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn no_timeout_becomes_a_wait_without_end() {
+        assert_eq!(wait_milliseconds(1), 1);
+        assert_eq!(wait_milliseconds(5_000), 5_000);
+        assert_eq!(wait_milliseconds(u32::MAX), u32::MAX - 1);
+        assert_ne!(wait_milliseconds(u32::MAX), INFINITE);
+    }
+
+    #[test]
+    fn a_policy_timeout_is_a_timeout_and_any_other_code_is_carried() {
+        assert!(matches!(transfer_failed(ERROR_SEM_TIMEOUT), Error::Timeout));
+        match transfer_failed(ERROR_GEN_FAILURE) {
+            Error::Os(text) => assert!(text.contains("error 31"), "carries the code: {text}"),
+            other => panic!("expected an OS error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_guid_in_a_registry_string_or_string_list_is_read() {
+        let wide = |text: &str| text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let list = wide("{9f543223-cede-4fa3-b376-a25ce9a30e74}\0{D696BFEB-1734-417d-8A04-86D01071C512}\0\0");
+        let guids = guids_from_wide_list(&list);
+        assert_eq!(guids.len(), 2);
+        assert_eq!((guids[0].data1, guids[0].data2, guids[0].data3), (0x9F54_3223, 0xCEDE, 0x4FA3));
+        assert_eq!(guids[0].data4, [0xB3, 0x76, 0xA2, 0x5C, 0xE9, 0xA3, 0x0E, 0x74]);
+        assert_eq!((guids[1].data1, guids[1].data4[7]), (0xD696_BFEB, 0x12));
+        assert_eq!(
+            guids_from_wide_list(&wide("{9f543223-cede-4fa3-b376-a25ce9a30e74}")).len(),
+            1,
+            "a string stored without its terminating NUL"
+        );
+        assert!(guids_from_wide_list(&wide("not a guid\0\0")).is_empty());
+        assert!(guids_from_wide_list(&[0x7B]).is_empty(), "an odd byte is not a character");
+    }
+
+    #[test]
+    fn a_device_not_driven_by_winusb_is_refused_with_the_driver_it_has() {
+        let none = no_winusb_interface(0x0483, 0xDF11, None);
+        assert!(none.contains("0483:df11") && none.contains("no driver"), "{none}");
+        let other = no_winusb_interface(0x0483, 0xDF11, Some("exampledriver"));
+        assert!(other.contains("`exampledriver`"), "names the driver Windows installed: {other}");
+        let winusb = no_winusb_interface(0x0483, 0xDF11, Some("WinUSB"));
+        assert!(winusb.contains("no device interface class"), "{winusb}");
+        assert!(none.contains("WinUSB") && other.contains("WinUSB"), "and what it is opened through");
+    }
+
+    #[test]
+    fn a_utf16_property_ends_at_its_first_nul() {
+        let wide = |text: &str| text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        assert_eq!(utf16_until_nul(&wide("WinUSB\0trailing")), "WinUSB");
+        assert_eq!(utf16_until_nul(&wide("unterminated")), "unterminated");
+        assert_eq!(utf16_until_nul(&[]), "");
     }
 }

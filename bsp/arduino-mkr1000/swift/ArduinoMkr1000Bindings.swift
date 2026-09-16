@@ -45,14 +45,17 @@ public enum ArduinoMkr1000Bindings {
     // -- module control lines: PORT group base + pin index + mask --
     public static let WINC_RESET_N_PORT_BASE: UInt32 = 0x41004400
     public static let WINC_RESET_N_PIN: UInt32 = 27
+    public static let WINC_RESET_N_BANK: UInt32 = 0
     public static let WINC_RESET_N_MASK: UInt32 = 0x8000000
     public static let WINC_RESET_N_ACTIVE_LOW: UInt32 = 1
     public static let WINC_CHIP_EN_PORT_BASE: UInt32 = 0x41004400
     public static let WINC_CHIP_EN_PIN: UInt32 = 28
+    public static let WINC_CHIP_EN_BANK: UInt32 = 0
     public static let WINC_CHIP_EN_MASK: UInt32 = 0x10000000
     public static let WINC_CHIP_EN_ACTIVE_LOW: UInt32 = 0
     public static let WINC_IRQN_PORT_BASE: UInt32 = 0x41004480
     public static let WINC_IRQN_PIN: UInt32 = 9
+    public static let WINC_IRQN_BANK: UInt32 = 0
     public static let WINC_IRQN_MASK: UInt32 = 0x200
     public static let WINC_IRQN_ACTIVE_LOW: UInt32 = 1
 }

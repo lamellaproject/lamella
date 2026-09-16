@@ -247,20 +247,65 @@ fn lower_module_inner(
     Ok(module.finish())
 }
 
-/// The embedding ABI's `alloc(size) -> ptr`: round `size` up to 8 bytes, bump the heap-pointer global
-/// by it, and return the old top. JS reserves a buffer with this, writes `[len][bytes]`, and passes
-/// the pointer into an exported method.
+/// The embedding ABI's `alloc(size) -> ptr`: reserve `size` bytes, rounded up to 8, for the host to
+/// write into, and return where they start. JS reserves a buffer with this, writes `[len][bytes]`,
+/// and passes the pointer into an exported method.
+///
+/// Every range it returns is fresh and inside linear memory. Memory grows when a request needs it,
+/// and a request that cannot be served traps (`unreachable`) with the heap pointer untouched: a size
+/// whose rounding would wrap, an end that would wrap the address space, or a grow the engine
+/// refuses. A pointer out of range, or one overlapping an earlier buffer, would let two buffers alias
+/// inside the one linear memory, where memory isolation cannot see it. A host that keeps a view of
+/// `memory.buffer` must take it again after this returns, because a grow replaces that buffer.
 fn build_alloc() -> Func {
     let mut f = Func::new(1);
+    let top = f.add_local(ValType::I32);
+    let end = f.add_local(ValType::I32);
+    let grow = f.add_local(ValType::I32);
+    f.local_get(0);
+    f.i32_const(-8);
+    f.i32_gt_u();
+    f.if_(BlockType::Empty);
+    f.unreachable();
+    f.end();
     f.global_get(HEAP_POINTER);
-    f.global_get(HEAP_POINTER);
+    f.local_tee(top);
     f.local_get(0);
     f.i32_const(7);
     f.i32_add();
     f.i32_const(!7);
     f.i32_and();
     f.i32_add();
+    f.local_tee(end);
+    f.local_get(top);
+    f.i32_lt_u();
+    f.if_(BlockType::Empty);
+    f.unreachable();
+    f.end();
+    f.local_get(end);
+    f.i32_const(1);
+    f.i32_sub();
+    f.i32_const(16);
+    f.i32_shr_u();
+    f.i32_const(1);
+    f.i32_add();
+    f.memory_size();
+    f.i32_sub();
+    f.local_tee(grow);
+    f.i32_const(0);
+    f.i32_gt_s();
+    f.if_(BlockType::Empty);
+    f.local_get(grow);
+    f.memory_grow();
+    f.i32_const(-1);
+    f.i32_eq();
+    f.if_(BlockType::Empty);
+    f.unreachable();
+    f.end();
+    f.end();
+    f.local_get(end);
     f.global_set(HEAP_POINTER);
+    f.local_get(top);
     f.end();
     f
 }

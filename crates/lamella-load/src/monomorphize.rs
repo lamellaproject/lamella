@@ -1018,7 +1018,7 @@ pub(crate) fn monomorphize<'pe>(
             };
             if method.is_virtual {
                 let overridden = (!method.newslot)
-                    .then(|| vtable.iter().position(|(slot, _)| *slot == key))
+                    .then(|| lamella_metadata::overridden_slot(&vtable, |(slot, _)| *slot == key))
                     .flatten();
                 if overridden.is_none() && own_keys.contains(&key) {
                     lowering.refusals.push(Refusal::SubstitutedKeyCollision {
@@ -1563,9 +1563,18 @@ struct VirtualSite {
     declaration_key: String,
     /// The key the call site and the lowered bodies share -- the declaration plus THIS site's type
     /// arguments, so `Tag<int>` and `Tag<string>` do not overwrite each other.
+    ///
+    /// When the named declaration's slot was introduced by a `new virtual` hiding an inherited
+    /// method of the same signature, the key also names the type that introduced the slot. A call
+    /// naming the hidden method and a call naming the hiding one are then two keys, because a type
+    /// below both answers them with different bodies.
     key: String,
     /// `callvirt` is always on an instance: the parameters plus `this`.
     arg_count: u16,
+    /// Whether the declaration is an interface method. An interface method's bodies are found
+    /// through each type's interface mapping, and a class method's through each type's base class
+    /// chain.
+    on_interface: bool,
 }
 
 /// The program's `MethodDef` row declaring `pair`, or `None` when the program does not declare it.
@@ -1736,6 +1745,21 @@ fn expand_virtual_rows<'pe>(
             });
             continue;
         }
+        let on_interface = walk.is_interface(&declaring).unwrap_or(false);
+        let mut key = super::sig_encode(
+            assembly,
+            &name,
+            &signature.parameters,
+            signature.generic_param_count,
+            arguments,
+        );
+        if !on_interface
+            && let Some(slot) = walk.virtual_slot(&seed)
+            && slot.hides_inherited
+        {
+            key.push('@');
+            key.push_str(&slot.introduced_by);
+        }
         virtual_sites.push(VirtualSite {
             token: *token,
             declaration_key: super::sig_encode(
@@ -1745,16 +1769,11 @@ fn expand_virtual_rows<'pe>(
                 signature.generic_param_count,
                 &[],
             ),
-            key: super::sig_encode(
-                assembly,
-                &name,
-                &signature.parameters,
-                signature.generic_param_count,
-                arguments,
-            ),
+            key,
             arg_count: arg_count(&method),
             method: name,
             bodies,
+            on_interface,
         });
     }
 }
@@ -1814,12 +1833,28 @@ fn dispatch_virtual_sites(
         let mut targets: Vec<(TypeId, MethodId)> = Vec::new();
         let mut reached: BTreeSet<MethodId> = BTreeSet::new();
         let count = module.type_count() as TypeId;
+        let declared_on: BTreeMap<TypeId, MethodId> = if site.on_interface {
+            BTreeMap::new()
+        } else {
+            lowered
+                .iter()
+                .filter_map(|(&declaration, &body)| Some((module.method_type(declaration)?, body)))
+                .collect()
+        };
         for type_id in 0..count {
-            let Some(declared) = module.sig_dispatch(type_id, declaration_key) else {
-                continue;
-            };
-            let Some(&body) = lowered.get(&declared) else {
-                continue;
+            let body = if site.on_interface {
+                let Some(declared) = module.sig_dispatch(type_id, declaration_key) else {
+                    continue;
+                };
+                let Some(&body) = lowered.get(&declared) else {
+                    continue;
+                };
+                body
+            } else {
+                let Some(body) = nearest_declared(module, type_id, &declared_on) else {
+                    continue;
+                };
+                body
             };
             targets.push((type_id, body));
             reached.insert(body);
@@ -1837,6 +1872,24 @@ fn dispatch_virtual_sites(
         module.bind_call_target(asm, site.token, site.key.clone(), site.arg_count);
         module.clear_unlowered_generic(asm, site.token);
     }
+}
+
+/// The body of the declaration nearest `type_id` in its base class chain, `type_id` itself first,
+/// among `declared_on` -- which maps each declaring type to its body.
+#[cfg(feature = "generics")]
+fn nearest_declared(
+    module: &Module,
+    type_id: TypeId,
+    declared_on: &BTreeMap<TypeId, MethodId>,
+) -> Option<MethodId> {
+    let mut at = type_id;
+    for _ in 0..module.type_count() {
+        if let Some(&body) = declared_on.get(&at) {
+            return Some(body);
+        }
+        at = module.type_base(at)?;
+    }
+    None
 }
 
 /// A definition's methods, in declaration order.

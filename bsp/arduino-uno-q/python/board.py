@@ -46,10 +46,10 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led1_red": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 10, "mask": 0x400, "active_low": True},
-    "led1_green": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 11, "mask": 0x800, "active_low": True},
-    "led1_blue": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 12, "mask": 0x1000, "active_low": True},
-    "led2_red": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 13, "mask": 0x2000, "active_low": True},
-    "led2_green": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 14, "mask": 0x4000, "active_low": True},
-    "led2_blue": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 15, "mask": 0x8000, "active_low": True},
+    "led1_red": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 10, "bank": 0, "mask": 0x400, "active_low": True},
+    "led1_green": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 11, "bank": 0, "mask": 0x800, "active_low": True},
+    "led1_blue": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 12, "bank": 0, "mask": 0x1000, "active_low": True},
+    "led2_red": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": True},
+    "led2_green": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 14, "bank": 0, "mask": 0x4000, "active_low": True},
+    "led2_blue": {"kind": "gpio-out", "port_base": 0x42021C00, "pin": 15, "bank": 0, "mask": 0x8000, "active_low": True},
 }

@@ -94,7 +94,7 @@ name = "irq_n"
 kind = "gpio-in"
 signal = "irq"
 active = "unknown"
-source = "DS50002616A Table 4-1 pin 9 and Table 4-5 module pin 13 both name this line IRQ_N and describe it as an interrupt output from the wireless module to the host. NEITHER STATES AN ACTIVE LEVEL, and no other document on this bench does either, so none is claimed here."
+source = "DS50002616A Table 4-1 pin 9 and Table 4-5 module pin 13 both name this line IRQ_N and describe it as an interrupt output from the wireless module to the host. NEITHER STATES AN ACTIVE LEVEL, and no other document consulted states one, so none is claimed here."
 
 # --- what is on the board, reached over a bus ---------------------------------------------------
 

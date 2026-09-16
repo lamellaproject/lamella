@@ -82,3 +82,12 @@ pub const CONFIG_SENSE7: u32 = 0x70000000;
 pub const CONFIG_SENSE7_LSB: u32 = 28;
 pub const CONFIG_FILTEN7: u32 = 0x80000000;
 pub const CONFIG_FILTEN7_LSB: u32 = 31;
+
+/// -- block constants --
+pub const LINE_COUNT: u32 = 16;
+pub const SENSE_NONE: u32 = 0;
+pub const SENSE_RISE: u32 = 1;
+pub const SENSE_FALL: u32 = 2;
+pub const SENSE_BOTH: u32 = 3;
+pub const SENSE_HIGH: u32 = 4;
+pub const SENSE_LOW: u32 = 5;

@@ -7,7 +7,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 authors = ["The Lamella project"]
 description = "A from-scratch C# toolchain: compiler, runtime, and base class library."

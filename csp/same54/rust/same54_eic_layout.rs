@@ -142,3 +142,12 @@ pub const DPRESCALER_TICKON: u32 = 0x10000;
 pub const DPRESCALER_TICKON_LSB: u32 = 16;
 pub const PINSTATE_PINSTATE: u32 = 0xFFFF;
 pub const PINSTATE_PINSTATE_LSB: u32 = 0;
+
+/// -- block constants --
+pub const LINE_COUNT: u32 = 16;
+pub const SENSE_NONE: u32 = 0;
+pub const SENSE_RISE: u32 = 1;
+pub const SENSE_FALL: u32 = 2;
+pub const SENSE_BOTH: u32 = 3;
+pub const SENSE_HIGH: u32 = 4;
+pub const SENSE_LOW: u32 = 5;

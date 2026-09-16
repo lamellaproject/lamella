@@ -6247,7 +6247,7 @@ fn relink_one(module: &mut Module, heir: &GenericBaseHeir<'_>, base: TypeId) {
                 &[],
             );
             let overridden = (!method.newslot)
-                .then(|| table.iter().position(|(slot, _)| *slot == key))
+                .then(|| lamella_metadata::overridden_slot(&table, |(slot, _)| *slot == key))
                 .flatten();
             let slot = match overridden {
                 Some(slot) => {
@@ -7218,7 +7218,7 @@ fn compute_vtable(
     for method in &virtuals[type_id] {
         let key = sig_encode(assembly, &method.name, &method.params, method.generic_arity, &[]);
         let overridden = (!method.newslot)
-            .then(|| table.iter().position(|slot| slot.key == key))
+            .then(|| lamella_metadata::overridden_slot(&table, |slot| slot.key == key))
             .flatten();
         let slot = match overridden {
             Some(slot) => {

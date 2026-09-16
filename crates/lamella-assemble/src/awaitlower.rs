@@ -279,6 +279,7 @@ fn int_expr(value: i64) -> BoundExpr {
             kind: BoundExprKind::Unary {
                 operator: UnaryOperator::Minus,
                 operand: Box::new(magnitude),
+                checked: false,
             },
             ty: TypeSymbol::Special(SpecialType::Int32),
         }
@@ -969,6 +970,7 @@ impl Rewriter {
                                 kind: BoundExprKind::Unary {
                                     operator: UnaryOperator::Not,
                                     operand: Box::new(condition),
+                                    checked: false,
                                 },
                                 ty: TypeSymbol::Special(SpecialType::Boolean),
                             },
@@ -1551,12 +1553,17 @@ impl Rewriter {
                     ty,
                 }
             }
-            BoundExprKind::Unary { operator, operand } => {
+            BoundExprKind::Unary {
+                operator,
+                operand,
+                checked,
+            } => {
                 let operand = self.expression(operand, pre, routes)?;
                 BoundExpr {
                     kind: BoundExprKind::Unary {
                         operator: *operator,
                         operand: Box::new(operand),
+                        checked: *checked,
                     },
                     ty,
                 }
@@ -1799,6 +1806,7 @@ impl Rewriter {
                     kind: BoundExprKind::Unary {
                         operator: UnaryOperator::Not,
                         operand: Box::new(is_completed_read),
+                        checked: false,
                     },
                     ty: TypeSymbol::Special(SpecialType::Boolean),
                 },
@@ -1876,18 +1884,25 @@ pub(crate) fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> 
             out: *out,
             operand: Box::new(map_expr(operand, replace)),
         },
-        BoundExprKind::Unary { operator, operand } => BoundExprKind::Unary {
+        BoundExprKind::Unary {
+            operator,
+            operand,
+            checked,
+        } => BoundExprKind::Unary {
             operator: *operator,
             operand: Box::new(map_expr(operand, replace)),
+            checked: *checked,
         },
         BoundExprKind::Postfix {
             operator,
             operand,
             step,
+            checked,
         } => BoundExprKind::Postfix {
             operator: *operator,
             operand: Box::new(map_expr(operand, replace)),
             step: step.clone(),
+            checked: *checked,
         },
         BoundExprKind::Cast { operand, checked } => BoundExprKind::Cast {
             operand: Box::new(map_expr(operand, replace)),

@@ -12,14 +12,17 @@ use lamella_cmsis_dap_sam::{
 };
 use lamella_cmsis_dap_stm32::{
     STM32C0_DBGMCU_IDCODE, STM32C0_DOUBLE_WORD, STM32C0_ERASED_VALUE, STM32C0_FLASH_BASE,
-    STM32C0_FLASH_SIZE_REG, STM32C0_PAGE, STM32C0_PARTS, STM32H7_BANK2_BASE, STM32H7_DBGMCU_IDC,
+    STM32C0_FLASH_SIZE_REG, STM32C0_PAGE, STM32C0_PARTS, STM32F7_DBG_IWDG_STOP,
+    STM32F7_DBG_WWDG_STOP, STM32F7_DBGMCU_APB1_FZ, STM32F7_DBGMCU_CR,
+    STM32F7_DBGMCU_CR_LOW_POWER_DEBUG, STM32F7_DBGMCU_IDCODE, STM32F7_FLASH_BASE,
+    STM32F7_FLASH_SIZE_REG, STM32F7_PARTS, STM32H7_BANK2_BASE, STM32H7_DBGMCU_IDC,
     STM32H7_FLASH_BASE, STM32H7_FLASH_SIZE_REG, STM32H7_FLASH_WORD, STM32H7_PARTS, STM32H7_SECTOR,
     STM32L0_DBGMCU_IDCODE, STM32L0_ERASED_WORD, STM32L0_FLASH_BASE, STM32L0_FLASH_SIZE_REG,
     STM32L0_PAGE, STM32L0_PARTS, STM32L4_DBGMCU_IDCODE, STM32L4_DOUBLE_WORD, STM32L4_ERASED_WORD,
     STM32L4_FLASH_BASE, STM32L4_FLASH_SIZE_REG, STM32L4_PAGE, STM32L4_PARTS, STM32U5_DBGMCU_IDCODE,
     STM32U5_FLASH_BASE, STM32U5_FLASH_SIZE_REG, STM32U5_PAGE, STM32U5_PARTS, STM32U5_QUAD_WORD,
-    Stm32C0Flash, Stm32H7Flash, Stm32L0Flash, Stm32L4Flash, Stm32U5Flash, stm32_dev_id,
-    stm32_flash_size_bytes,
+    Stm32C0Flash, Stm32F4Flash, Stm32H7Flash, Stm32L0Flash, Stm32L4Flash, Stm32U5Flash,
+    stm32_dev_id, stm32_flash_size_bytes, stm32f7_read_sector_sizes,
 };
 use lamella_flash_backend::{FlashBackend, FlashError, Image, PartIdentity};
 use lamella_probe_core::{TargetAccess, TargetAccessExt};
@@ -436,11 +439,10 @@ with BOOTSEL held), and it will appear as a drive."
                         several.iter().map(|found| found.volume.as_str()).collect();
                     return Err(FlashError::Refused(format!(
                         "{} boards are in their bootloader and nothing on a volume tells them \
-                         apart: {}
-
-Name one with --probe <volume>. Their labels and their                          INFO_UF2.TXT files are identical, so
-this will not guess -- the wrong \
-                         choice puts your program on somebody else's board.",
+                         apart: {}\n\n\
+                         Name one with --volume <name>. Their labels and their INFO_UF2.TXT files \
+                         are identical, so this will not guess -- the wrong choice writes your \
+                         program to the wrong board.",
                         several.len(),
                         list.join(", ")
                     )));
@@ -549,6 +551,38 @@ fn write_through(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// How a family's flash divides into the units one erase operation takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EraseMap {
+    /// Every unit is this many bytes and the controller finds the one holding an address: a page on
+    /// the L0, C0, L4 and U5, a sector on the H7.
+    Stride(u32),
+    /// Sectors of unequal size, numbered in address order from the base of the array, whose sizes the
+    /// part itself decides. The walk reads the map from the part when it erases, and commands each
+    /// sector by its number.
+    PartSectors,
+}
+
+/// One erase unit a walk reaches: where it starts, how many bytes it spans, and its number in the map.
+///
+/// A stride family's controller is handed `start` and finds its own unit; a
+/// [`EraseMap::PartSectors`] controller is handed `index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Granule {
+    start: u32,
+    size: u32,
+    index: u32,
+}
+
+/// The register that stops a family's watchdogs while its core is halted, and the bits that do it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchdogFreeze {
+    /// The debug freeze register.
+    pub register: u32,
+    /// The bits that stop the watchdogs, set on top of whatever the register already holds.
+    pub bits: u32,
+}
+
 /// Everything an STM32 family's flash write needs EXCEPT the sequence.
 ///
 /// **THE SEQUENCE IS THE PART WORTH SHARING AND THE NUMBERS ARE THE PART WORTH SEPARATING.** Ask the
@@ -572,8 +606,8 @@ pub struct StPlan {
     pub id_register: u32,
     /// The `DEV_ID` values this family's manual lists, with what each names.
     pub parts: &'static [(u32, &'static str)],
-    /// One erase operation's span: a page on the L0 and the U5, a sector on the H7.
-    pub erase_granule: u32,
+    /// How the array divides into the units one erase takes.
+    pub erase: EraseMap,
     /// What an erased cell reads as.
     ///
     /// **The L0 is the only part here that erases to ZERO**, which is why this is a field and not an
@@ -598,9 +632,27 @@ pub struct StPlan {
     /// flash read comes back 2 MB of `0xFF` with every chunk failed. A backend that trusted the
     /// idcode would report an erased part rather than a refused one.
     ///
-    /// False everywhere else here, because the plain path is what those families were driven with
-    /// and an attach is not the place to change a proven route's behavior speculatively.
+    /// **AN STM32F7 WHOSE FIRMWARE SLEEPS FAILS IN THE SILENT DIRECTION: EVERY READ SUCCEEDS.** With
+    /// `DBG_SLEEP` clear the part turns off a clock its debugger connection needs whenever the core
+    /// waits for an interrupt, and a probe can then answer every memory read with one word and
+    /// report each read as a success. A part held in reset is not asleep, so the F7 plan attaches
+    /// this way too and sets [`low_power_debug`](Self::low_power_debug) while the core is held.
+    ///
+    /// False for the other families here, because the plain path is what those families were
+    /// driven with and an attach is not the place to change a proven route's behavior
+    /// speculatively.
     pub attach_under_reset: bool,
+    /// The register and bits an attach under reset sets while the core is held, so a debugger
+    /// connection keeps its clocks when the part's firmware puts the core to sleep. `None` sets
+    /// nothing.
+    ///
+    /// Only an attach under reset writes them: a part whose core sleeps is reached while it is
+    /// held in reset, and a plain attach does not hold it.
+    pub low_power_debug: Option<lamella_stlink::LowPowerDebug>,
+    /// The watchdogs to stop for the length of a write: set before the core is halted, and put back
+    /// as found before the part is released. `None` means this plan does not stop them, not that the
+    /// part has no watchdog.
+    pub watchdog_freeze: Option<WatchdogFreeze>,
     /// What one [`program_align`](Self::program_align) chunk of this route is CALLED, for a person
     /// watching the write count them.
     pub unit: &'static str,
@@ -623,11 +675,13 @@ const L0_PLAN: StPlan = StPlan {
     size_register: STM32L0_FLASH_SIZE_REG,
     id_register: STM32L0_DBGMCU_IDCODE,
     parts: STM32L0_PARTS,
-    erase_granule: STM32L0_PAGE,
+    erase: EraseMap::Stride(STM32L0_PAGE),
     erased_word: STM32L0_ERASED_WORD,
     program_align: 4,
     banks: &[STM32L0_FLASH_BASE],
     attach_under_reset: false,
+    low_power_debug: None,
+    watchdog_freeze: None,
     unit: "words",
     manual: "RM0377 27.4.1",
 };
@@ -644,11 +698,13 @@ const C0_PLAN: StPlan = StPlan {
     size_register: STM32C0_FLASH_SIZE_REG,
     id_register: STM32C0_DBGMCU_IDCODE,
     parts: STM32C0_PARTS,
-    erase_granule: STM32C0_PAGE,
+    erase: EraseMap::Stride(STM32C0_PAGE),
     erased_word: STM32C0_ERASED_VALUE,
     program_align: STM32C0_DOUBLE_WORD as u32,
     banks: &[STM32C0_FLASH_BASE],
     attach_under_reset: false,
+    low_power_debug: None,
+    watchdog_freeze: None,
     unit: "double words",
     manual: "RM0490 Table 178",
 };
@@ -663,11 +719,13 @@ const L4_PLAN: StPlan = StPlan {
     size_register: STM32L4_FLASH_SIZE_REG,
     id_register: STM32L4_DBGMCU_IDCODE,
     parts: STM32L4_PARTS,
-    erase_granule: STM32L4_PAGE,
+    erase: EraseMap::Stride(STM32L4_PAGE),
     erased_word: STM32L4_ERASED_WORD,
     program_align: STM32L4_DOUBLE_WORD as u32,
     banks: &[STM32L4_FLASH_BASE],
     attach_under_reset: false,
+    low_power_debug: None,
+    watchdog_freeze: None,
     unit: "double words",
     manual: "RM0351",
 };
@@ -680,11 +738,13 @@ const H7_PLAN: StPlan = StPlan {
     size_register: STM32H7_FLASH_SIZE_REG,
     id_register: STM32H7_DBGMCU_IDC,
     parts: STM32H7_PARTS,
-    erase_granule: STM32H7_SECTOR,
+    erase: EraseMap::Stride(STM32H7_SECTOR),
     erased_word: 0xffff_ffff,
     program_align: STM32H7_FLASH_WORD as u32,
     banks: &[STM32H7_FLASH_BASE, STM32H7_BANK2_BASE],
     attach_under_reset: true,
+    low_power_debug: None,
+    watchdog_freeze: None,
     unit: "flash words",
     manual: "RM0399",
 };
@@ -699,13 +759,41 @@ const U5_PLAN: StPlan = StPlan {
     size_register: STM32U5_FLASH_SIZE_REG,
     id_register: STM32U5_DBGMCU_IDCODE,
     parts: STM32U5_PARTS,
-    erase_granule: STM32U5_PAGE,
+    erase: EraseMap::Stride(STM32U5_PAGE),
     erased_word: 0xffff_ffff,
     program_align: STM32U5_QUAD_WORD as u32,
     banks: &[STM32U5_FLASH_BASE],
     attach_under_reset: false,
+    low_power_debug: None,
+    watchdog_freeze: None,
     unit: "quad-words",
     manual: "RM0456 75.12.4",
+};
+
+/// The STM32F7: sectors of 32, 128 and 256 KB in one array behind one lock, programmed a 32-bit word
+/// at a time through the F4 controller primitives, whose register block, keys and `FLASH_CR` bit
+/// positions RM0385 gives the F7 unchanged.
+const F7_PLAN: StPlan = StPlan {
+    family: crate::StFamily::F7,
+    flash_base: STM32F7_FLASH_BASE,
+    size_register: STM32F7_FLASH_SIZE_REG,
+    id_register: STM32F7_DBGMCU_IDCODE,
+    parts: STM32F7_PARTS,
+    erase: EraseMap::PartSectors,
+    erased_word: 0xffff_ffff,
+    program_align: 4,
+    banks: &[STM32F7_FLASH_BASE],
+    attach_under_reset: true,
+    low_power_debug: Some(lamella_stlink::LowPowerDebug {
+        register: STM32F7_DBGMCU_CR,
+        bits: STM32F7_DBGMCU_CR_LOW_POWER_DEBUG,
+    }),
+    watchdog_freeze: Some(WatchdogFreeze {
+        register: STM32F7_DBGMCU_APB1_FZ,
+        bits: STM32F7_DBG_IWDG_STOP | STM32F7_DBG_WWDG_STOP,
+    }),
+    unit: "words",
+    manual: "RM0385/RM0410",
 };
 
 impl crate::StFamily {
@@ -713,7 +801,7 @@ impl crate::StFamily {
     ///
     /// **A `match` WITH NO DEFAULT ARM, DELIBERATELY.** Adding a variant to [`crate::StFamily`]
     /// without a plan is then a compile error rather than a route that resolves at run time to
-    /// somebody else's register addresses.
+    /// another family's register addresses.
     pub fn plan(self) -> &'static StPlan {
         match self {
             crate::StFamily::L0 => &L0_PLAN,
@@ -721,6 +809,7 @@ impl crate::StFamily {
             crate::StFamily::L4 => &L4_PLAN,
             crate::StFamily::H7 => &H7_PLAN,
             crate::StFamily::U5 => &U5_PLAN,
+            crate::StFamily::F7 => &F7_PLAN,
         }
     }
 }
@@ -751,17 +840,29 @@ impl crate::StFamily {
 pub struct StProbe<A: TargetAccess> {
     target: A,
     plan: &'static StPlan,
+    /// The watchdog freeze register as the write found it, put back before the part is released.
+    watchdogs_found: Option<u32>,
 }
 
 impl<A: TargetAccess> StProbe<A> {
     /// A backend for the family `plan` describes, reached through `target`.
     pub fn new(target: A, plan: &'static StPlan) -> Self {
-        StProbe { target, plan }
+        StProbe {
+            target,
+            plan,
+            watchdogs_found: None,
+        }
     }
 
-    /// Takes the lock covering `at`. Idempotent on all three families, and it has to be: every one
-    /// of them locks its control register until the next system reset if the key sequence is
-    /// performed a SECOND time, so each primitive reads the lock bit before writing a key.
+    /// The probe this backend was built over, handed back once a write is done, for a caller that
+    /// goes on to use the part.
+    pub fn into_target(self) -> A {
+        self.target
+    }
+
+    /// Takes the lock covering `at`. Idempotent on every family here, and it has to be: each of them
+    /// locks its control register until the next system reset on a wrong key sequence, so each
+    /// primitive reads the lock bit before writing a key.
     fn unlock(&mut self, at: u32) -> Result<(), FlashError> {
         match self.plan.family {
             crate::StFamily::L0 => self.target.l0_unlock_flash()?,
@@ -769,6 +870,7 @@ impl<A: TargetAccess> StProbe<A> {
             crate::StFamily::L4 => self.target.l4_unlock_flash()?,
             crate::StFamily::H7 => self.target.h7_unlock_flash(at)?,
             crate::StFamily::U5 => self.target.u5_unlock_flash()?,
+            crate::StFamily::F7 => Stm32F4Flash::unlock_flash(&mut self.target)?,
         }
         Ok(())
     }
@@ -781,18 +883,21 @@ impl<A: TargetAccess> StProbe<A> {
             crate::StFamily::L4 => self.target.l4_lock_flash()?,
             crate::StFamily::H7 => self.target.h7_lock_flash(at)?,
             crate::StFamily::U5 => self.target.u5_lock_flash()?,
+            crate::StFamily::F7 => Stm32F4Flash::lock_flash(&mut self.target)?,
         }
         Ok(())
     }
 
-    /// Erases the one granule containing `at`.
-    fn erase_granule(&mut self, at: u32) -> Result<(), FlashError> {
+    /// Erases one granule the walk reached.
+    fn erase_granule(&mut self, granule: Granule) -> Result<(), FlashError> {
+        let at = granule.start;
         match self.plan.family {
             crate::StFamily::L0 => self.target.l0_erase_page(at)?,
             crate::StFamily::C0 => self.target.c0_erase_page(at)?,
             crate::StFamily::L4 => self.target.l4_erase_page(at)?,
             crate::StFamily::H7 => self.target.h7_erase_sector(at)?,
             crate::StFamily::U5 => self.target.u5_erase_page(at)?,
+            crate::StFamily::F7 => Stm32F4Flash::erase_sector(&mut self.target, granule.index)?,
         }
         Ok(())
     }
@@ -805,8 +910,87 @@ impl<A: TargetAccess> StProbe<A> {
             crate::StFamily::L4 => self.target.l4_program(at, data)?,
             crate::StFamily::H7 => self.target.h7_program(at, data)?,
             crate::StFamily::U5 => self.target.u5_program(at, data)?,
+            crate::StFamily::F7 => {
+                if data.len() % 4 != 0 {
+                    return Err(FlashError::Refused(format!(
+                        "{} bytes is not a whole number of the 32-bit words this controller programs",
+                        data.len()
+                    )));
+                }
+                let words: Vec<u32> = data
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect();
+                Stm32F4Flash::program_words(&mut self.target, at, &words)?
+            }
         }
         Ok(())
+    }
+
+    /// Stops the plan's watchdogs while the core is halted, keeping the register's value as found.
+    fn freeze_watchdogs(&mut self) -> Result<(), FlashError> {
+        let Some(freeze) = self.plan.watchdog_freeze else {
+            return Ok(());
+        };
+        let found = self.target.read_word(freeze.register)?;
+        self.watchdogs_found.get_or_insert(found);
+        self.target.write_word(freeze.register, found | freeze.bits)?;
+        Ok(())
+    }
+
+    /// The erase units an image at `base` of `len` bytes reaches, in address order: for a stride
+    /// family, units of one size from `base` with the last rounded up; for a mapped family, every
+    /// sector of the part's map the image overlaps, the one it starts inside included.
+    fn granules_covering(&mut self, base: u32, len: u32) -> Result<Vec<Granule>, FlashError> {
+        match self.plan.erase {
+            EraseMap::Stride(size) => Ok(stride_granules(base, len, size)),
+            EraseMap::PartSectors => {
+                let sizes = self.sector_sizes()?;
+                if base < self.plan.flash_base {
+                    return Err(FlashError::Refused(format!(
+                        "this image is based at {base:#010x}, below the {:#010x} where this part's \
+                         sectors begin",
+                        self.plan.flash_base
+                    )));
+                }
+                let end = base.saturating_add(len);
+                let mut start = self.plan.flash_base;
+                let mut reached = Vec::new();
+                for (index, size) in sizes.iter().enumerate() {
+                    let size = u32::try_from(*size).unwrap_or(u32::MAX);
+                    let next = start.saturating_add(size);
+                    if len > 0 && start < end && base < next {
+                        reached.push(Granule {
+                            start,
+                            size,
+                            index: u32::try_from(index).unwrap_or(u32::MAX),
+                        });
+                    }
+                    start = next;
+                }
+                if len > 0 && start < end {
+                    return Err(FlashError::Refused(format!(
+                        "this part's sector map ends at {start:#010x} and the image runs to {end:#010x}"
+                    )));
+                }
+                Ok(reached)
+            }
+        }
+    }
+
+    /// The sector map a [`EraseMap::PartSectors`] family's part is using, read from the part.
+    fn sector_sizes(&mut self) -> Result<&'static [usize], FlashError> {
+        match self.plan.family {
+            crate::StFamily::F7 => Ok(stm32f7_read_sector_sizes(&mut self.target)?),
+            crate::StFamily::L0
+            | crate::StFamily::C0
+            | crate::StFamily::L4
+            | crate::StFamily::H7
+            | crate::StFamily::U5 => Err(FlashError::Refused(format!(
+                "{} erases by a stride and has no sector map to read",
+                self.plan.family.name()
+            ))),
+        }
     }
 
     /// Which of the family's locked banks an image at `base` of `len` bytes reaches.
@@ -828,16 +1012,6 @@ impl<A: TargetAccess> StProbe<A> {
             }
         }
         taken
-    }
-
-    /// The byte a short tail is padded with: whatever an erased cell of this family already holds.
-    ///
-    /// **SO PADDING IS NEVER A WRITE.** On the L0 that means a zero tail is skipped by the
-    /// programmer and those cells stay erased; on a ones-erasing part the same rule pads with `0xFF`
-    /// and writes the flash word once. The same line would be a defect on either part with the other
-    /// one's value hard-coded, which is why it is derived from the plan.
-    fn erased_byte(&self) -> u8 {
-        (self.plan.erased_word & 0xff) as u8
     }
 
     /// Read back exactly the bytes `image` covers. The core is already halted by
@@ -926,26 +1100,16 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
     fn erase(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
         let fitted = stm32_flash_size_bytes(&mut self.target, self.plan.size_register)?;
         let wanted = u32::try_from(image.bytes.len()).unwrap_or(u32::MAX);
-        let granules = wanted.div_ceil(self.plan.erase_granule);
-        let walk_end = image
-            .base
-            .saturating_add(granules.saturating_mul(self.plan.erase_granule));
-        let array_end = self.plan.flash_base.saturating_add(fitted);
-        if walk_end > array_end {
-            return Err(FlashError::Refused(format!(
-                "erasing {wanted} bytes from {:#010x} walks to {walk_end:#010x}, past the {} KB \
-                 this part reports fitted, whose array ends at {array_end:#010x}",
-                image.base,
-                fitted / 1024
-            )));
-        }
+        let granules = self.granules_covering(image.base, wanted)?;
+        let walk_end = walk_within_fitted_flash(image, &granules, self.plan, fitted)?;
+        self.freeze_watchdogs()?;
         self.target.halt()?;
         let banks = self.banks_covering(image.base, walk_end.saturating_sub(image.base));
         for bank in &banks {
             self.unlock(*bank)?;
         }
-        for granule in 0..granules {
-            self.erase_granule(image.base + granule * self.plan.erase_granule)?;
+        for granule in granules {
+            self.erase_granule(granule)?;
         }
         for bank in &banks {
             self.lock(*bank)?;
@@ -959,18 +1123,14 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
     /// that had to happen: on the L0 that byte is zero and the programmer skips a zero word because
     /// the cell already holds one, leaving the tail erased; on a ones-erasing part the same rule
     /// pads with `0xFF` and the granule is written once. Either value hard-coded would be a defect
-    /// on the other family -- see [`erased_byte`](StProbe::erased_byte).
+    /// on the other family -- see [`padded_to_program_granule`].
     fn program(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
         let wanted = u32::try_from(image.bytes.len()).unwrap_or(u32::MAX);
         let banks = self.banks_covering(image.base, wanted);
         for bank in &banks {
             self.unlock(*bank)?;
         }
-        let mut padded = image.bytes.to_vec();
-        let filler = self.erased_byte();
-        while padded.len() % self.plan.program_align as usize != 0 {
-            padded.push(filler);
-        }
+        let padded = padded_to_program_granule(image.bytes, self.plan);
         let programmed = self.program_from(image.base, &padded);
         let mut locked = Ok(());
         for bank in &banks {
@@ -992,8 +1152,222 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
     }
 
     fn finish(&mut self) -> Result<(), FlashError> {
+        if let (Some(freeze), Some(found)) = (self.plan.watchdog_freeze, self.watchdogs_found.take()) {
+            self.target.write_word(freeze.register, found)?;
+        }
         self.target.reset_and_run()?;
         Ok(())
+    }
+}
+
+/// The erase units a stride of `size` bytes gives an image at `base` of `len` bytes, in address order,
+/// the last one rounded up to a whole unit.
+fn stride_granules(base: u32, len: u32, size: u32) -> Vec<Granule> {
+    (0..len.div_ceil(size))
+        .map(|index| Granule {
+            start: base.saturating_add(index.saturating_mul(size)),
+            size,
+            index,
+        })
+        .collect()
+}
+
+/// Where the erase walk `granules` ends, or the refusal when that is past the flash the part reports
+/// fitted -- `fitted` bytes from the plan's base.
+///
+/// **THE BOUND IS ON WHERE THE WALK REACHES, NOT ON THE IMAGE's LENGTH.** A walk starts at the image's
+/// base and rounds its last unit up, so a bound on the image's length covers the walk only while the
+/// image starts at the flash base -- an equality `lamella_flash_backend::flash` enforces from another
+/// crate, which a backend does not get to depend on.
+fn walk_within_fitted_flash(
+    image: &Image<'_>,
+    granules: &[Granule],
+    plan: &StPlan,
+    fitted: u32,
+) -> Result<u32, FlashError> {
+    let wanted = u32::try_from(image.bytes.len()).unwrap_or(u32::MAX);
+    let walk_end = granules
+        .last()
+        .map_or(image.base, |last| last.start.saturating_add(last.size));
+    let array_end = plan.flash_base.saturating_add(fitted);
+    if walk_end > array_end {
+        return Err(FlashError::Refused(format!(
+            "erasing {wanted} bytes from {:#010x} walks to {walk_end:#010x}, past the {} KB \
+             this part reports fitted, whose array ends at {array_end:#010x}",
+            image.base,
+            fitted / 1024
+        )));
+    }
+    Ok(walk_end)
+}
+
+/// `bytes` padded to a whole number of `plan`'s program granules with the byte an erased cell of that
+/// family already holds.
+///
+/// **SO PADDING IS NEVER A WRITE.** On the L0 that means a zero tail is skipped by the programmer and
+/// those cells stay erased; on a ones-erasing part the same rule pads with `0xFF` and writes the flash
+/// word once. The same line would be a defect on either part with the other one's value hard-coded,
+/// which is why it is derived from the plan.
+fn padded_to_program_granule(bytes: &[u8], plan: &StPlan) -> Vec<u8> {
+    let filler = (plan.erased_word & 0xff) as u8;
+    let mut padded = bytes.to_vec();
+    while padded.len() % plan.program_align as usize != 0 {
+        padded.push(filler);
+    }
+    padded
+}
+
+/// An STM32 written through its system bootloader's USB DFU interface, by the DfuSe commands of
+/// AN3156, with no probe attached.
+///
+/// **THE BOOTLOADER PROGRAMS THE FLASH, SO THE PLAN SUPPLIES ADDRESSES AND NOTHING ELSE.** Unlocking a
+/// bank, the flash word and the controller's error flags are the bootloader's to handle. What the
+/// host still owns is where the array starts, the units it erases in, where the second bank begins,
+/// and what a padded tail holds -- read from the same plan [`StProbe`] drives.
+///
+/// The pipe is opened, and the interface's transfer size read from its functional descriptor, by the
+/// caller. The first thing this does is bring the bootloader to idle and read its ID, which touches no
+/// flash.
+pub struct StDfu<P: crate::dfu::ControlPipe> {
+    dfu: crate::dfu::DfuSe<P>,
+    plan: &'static StPlan,
+    bootloader: &'static crate::dfu::SystemBootloader,
+    /// The bootloader ID [`identify`](FlashBackend::identify) read, which decides whether an erase in
+    /// the second bank needs the wait AN2606 prescribes for it.
+    version: Option<u8>,
+}
+
+impl<P: crate::dfu::ControlPipe> StDfu<P> {
+    /// A backend for the family `plan` describes, whose system bootloader `bootloader` describes,
+    /// reached through `dfu`.
+    pub fn new(
+        dfu: crate::dfu::DfuSe<P>,
+        plan: &'static StPlan,
+        bootloader: &'static crate::dfu::SystemBootloader,
+    ) -> Self {
+        StDfu { dfu, plan, bootloader, version: None }
+    }
+
+    /// Gives the protocol back, with its pipe.
+    pub fn into_dfu(self) -> crate::dfu::DfuSe<P> {
+        self.dfu
+    }
+
+    /// `length` bytes from `address`, through the bootloader's Read memory command.
+    fn read(&mut self, address: u32, length: usize) -> Result<Vec<u8>, FlashError> {
+        self.dfu.read(address, length).map_err(dfu_refusal)
+    }
+}
+
+/// A DFU exchange that stopped, as a flash backend reports it: in the protocol's own words.
+fn dfu_refusal(why: crate::dfu::DfuError) -> FlashError {
+    FlashError::Refused(why.to_string())
+}
+
+impl<P: crate::dfu::ControlPipe> FlashBackend for StDfu<P> {
+    fn mechanism(&self) -> &'static str {
+        "the part's system bootloader, over USB DFU"
+    }
+
+    fn flash_base(&self) -> u32 {
+        self.plan.flash_base
+    }
+
+    /// The bootloader's ID byte, read from where AN2606 Rev 70 keeps it for the series (4.2 and
+    /// Table 3), refused unless the series' version table lists it.
+    ///
+    /// **IT NAMES A BOOTLOADER VERSION, AND THROUGH IT A SERIES -- NEVER A BOARD.** Every part of the
+    /// series carrying that version answers the same byte. What it rules out is a bootloader AN2606
+    /// lists for no part of the series.
+    fn identify(&mut self) -> Result<PartIdentity, FlashError> {
+        self.dfu.to_idle().map_err(dfu_refusal)?;
+        let id = self.read(self.bootloader.id_address, 2)?[0];
+        if !self.bootloader.versions.iter().any(|(listed, _)| *listed == id) {
+            let listed: Vec<String> = self
+                .bootloader
+                .versions
+                .iter()
+                .map(|(listed, name)| format!("{listed:#04x} ({name})"))
+                .collect();
+            return Err(FlashError::Refused(format!(
+                "the bootloader ID at {:#010x} reads {id:#04x}, which AN2606 Rev 70 lists for no {} \
+                 system bootloader; it lists {}.",
+                self.bootloader.id_address,
+                self.bootloader.series,
+                listed.join(", ")
+            )));
+        }
+        self.version = Some(id);
+        Ok(PartIdentity {
+            value: u64::from(id),
+            what: self.bootloader.settles,
+        })
+    }
+
+    /// Ask the part how much flash is fitted, then erase the units the image covers, one DfuSe erase
+    /// command each.
+    ///
+    /// **THE SIZE COMES FROM THE PART**, read through the bootloader from the plan's flash-size
+    /// register, and it bounds where the walk reaches exactly as it does for [`StProbe`]. After each
+    /// erase in the second bank, a bootloader version that AN2606 lists as answering before that
+    /// erase has finished is given the wait the series' facts state before the next command.
+    fn erase(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
+        let EraseMap::Stride(size) = self.plan.erase else {
+            return Err(FlashError::Refused(format!(
+                "{} erases by a sector map read from the part, and this route reads none",
+                self.plan.family.name()
+            )));
+        };
+        let register = self.read(self.plan.size_register, 2)?;
+        let kb = u32::from(u16::from_le_bytes([register[0], register[1]]));
+        if kb == 0 || kb == 0xffff {
+            return Err(FlashError::Refused(format!(
+                "the flash-size register at {:#010x} reads blank through the bootloader",
+                self.plan.size_register
+            )));
+        }
+        let wanted = u32::try_from(image.bytes.len()).unwrap_or(u32::MAX);
+        let granules = stride_granules(image.base, wanted, size);
+        walk_within_fitted_flash(image, &granules, self.plan, kb * 1024)?;
+        let second_bank = self.plan.banks.get(1).copied();
+        for granule in granules {
+            self.dfu.erase_page(granule.start).map_err(dfu_refusal)?;
+            if let (Some((version, milliseconds)), Some(bank)) =
+                (self.bootloader.early_bank2_erase, second_bank)
+                && self.version == Some(version)
+                && granule.start >= bank
+            {
+                self.dfu.wait(milliseconds);
+            }
+        }
+        Ok(())
+    }
+
+    /// Program the image through the bootloader, its tail padded as [`padded_to_program_granule`]
+    /// pads it.
+    fn program(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
+        let padded = padded_to_program_granule(image.bytes, self.plan);
+        self.dfu.write(image.base, &padded).map_err(dfu_refusal)
+    }
+
+    /// Every byte, read back through the bootloader's Read memory command.
+    ///
+    /// A bootloader that answers an upload has a read-back, so this must use it.
+    fn read_back(&mut self, image: &Image<'_>) -> Option<Result<Vec<u8>, FlashError>> {
+        let programmed = image.bytes.len().next_multiple_of(self.plan.program_align as usize);
+        Some(self.read(image.base, programmed).map(|mut bytes| {
+            bytes.truncate(image.bytes.len());
+            bytes
+        }))
+    }
+
+    /// Leave DFU mode and start the image from the flash base.
+    ///
+    /// **A BOOTLOADER THAT MANIFESTS HAS NOT NECESSARILY STARTED THE IMAGE** -- see
+    /// [`DfuSe::leave`](crate::dfu::DfuSe::leave) -- so a board that does nothing afterwards is reset
+    /// by hand.
+    fn finish(&mut self) -> Result<(), FlashError> {
+        self.dfu.leave(self.plan.flash_base).map_err(dfu_refusal)
     }
 }
 
@@ -1001,7 +1375,7 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
 ///
 /// # Why this is NOT the ST backend with different constants
 ///
-/// [`StProbe`] shares one SEQUENCE across five families because they genuinely have one: ask the
+/// [`StProbe`] shares one SEQUENCE across six families because they genuinely have one: ask the
 /// size, halt, unlock, walk the granules, lock, program, read back, reset. **The SAM controllers do
 /// not.** A SAM3X has no page erase at all -- only erase-all -- so it has no granule walk to share;
 /// a SAM4L must invalidate its flash cache after a write or a correct write reads back as all ones
@@ -1331,7 +1705,7 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
                 return Err(FlashError::Refused(format!(
                     "CHIPID reports CIDR {cidr:#010x}, which is no SAM3X or SAM3A this tree knows \
                      -- refused rather than driven, because a flash routine pointed at an unknown \
-                     die is the one case where guessing costs somebody else's board."
+                     die would erase and program a part it cannot identify."
                 )));
             };
             return Ok(PartIdentity { value: u64::from(cidr), what: part });
@@ -1357,8 +1731,8 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
                 return Err(FlashError::Refused(format!(
                     "CHIPID reports CIDR {cidr:#010x} / EXID {exid:#010x}, which is not the {} \
                      this route drives -- refused rather than driven, because a flash routine \
-                     pointed at the wrong controller is the one case where guessing costs \
-                     somebody else's board.",
+                     pointed at the wrong controller would write flash registers that are not \
+                     there on this part.",
                     self.family.controller()
                 )));
             }

@@ -197,6 +197,16 @@ pub trait FsBackend: core::fmt::Debug {
     /// does not sort; .NET's order is unspecified too).
     fn list_dir(&mut self, path: &str) -> FsResult<Vec<DirEntry>>;
 
+    /// Whether this backend is given paths exactly as the program wrote them when it is mounted at
+    /// the root. A backend over the host's own file system answers `true`: a relative path stays
+    /// relative to the working directory, a drive-qualified path keeps its drive, and `..` may climb
+    /// above the starting directory. A backend that is a volume of its own answers `false` (the
+    /// default) and receives normalized paths rooted at `/`. Under any other mount prefix, every
+    /// backend receives the rooted remainder of the path.
+    fn takes_host_paths(&self) -> bool {
+        false
+    }
+
     /// The volume's total capacity in bytes -- the managed `DriveInfo.TotalSize`. A backend that
     /// cannot report it returns [`FsError::Unsupported`] (the managed layer then shows `0`). Default:
     /// unsupported.

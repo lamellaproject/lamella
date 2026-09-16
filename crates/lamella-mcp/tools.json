@@ -316,6 +316,10 @@
           "volume": {
             "type": "string",
             "description": "Bootloader drive, on a volume route. Required when more than one board is in its bootloader."
+          },
+          "device": {
+            "type": "string",
+            "description": "System bootloader serial, on a USB DFU route. Required when more than one bootloader is attached."
           }
         },
         "required": [

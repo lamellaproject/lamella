@@ -105,7 +105,7 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "winc-reset_n": {"port_base": 0x41004400, "pin": 27, "mask": 0x8000000, "active_low": True},
-    "winc-chip_en": {"port_base": 0x41004400, "pin": 28, "mask": 0x10000000, "active_low": False},
-    "winc-irqn": {"port_base": 0x41004480, "pin": 9, "mask": 0x200, "active_low": True},
+    "winc-reset_n": {"port_base": 0x41004400, "pin": 27, "bank": 0, "mask": 0x8000000, "active_low": True},
+    "winc-chip_en": {"port_base": 0x41004400, "pin": 28, "bank": 0, "mask": 0x10000000, "active_low": False},
+    "winc-irqn": {"port_base": 0x41004480, "pin": 9, "bank": 0, "mask": 0x200, "active_low": True},
 }

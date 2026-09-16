@@ -54,10 +54,10 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led": {"kind": "gpio-out", "port_base": 0x41004480, "pin": 8, "mask": 0x100, "active_low": False},
-    "run-switch": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 28, "mask": 0x10000000, "active_low": True},
-    "base-enable": {"kind": "gpio-out", "port_base": 0x41004480, "pin": 9, "mask": 0x200, "active_low": False},
-    "base-cs": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 4, "mask": 0x10, "active_low": True},
-    "base-ready": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 5, "mask": 0x20, "active_low": False},
-    "sd-cs": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 14, "mask": 0x4000},
+    "led": {"kind": "gpio-out", "port_base": 0x41004480, "pin": 8, "bank": 0, "mask": 0x100, "active_low": False},
+    "run-switch": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 28, "bank": 0, "mask": 0x10000000, "active_low": True},
+    "base-enable": {"kind": "gpio-out", "port_base": 0x41004480, "pin": 9, "bank": 0, "mask": 0x200, "active_low": False},
+    "base-cs": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 4, "bank": 0, "mask": 0x10, "active_low": True},
+    "base-ready": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 5, "bank": 0, "mask": 0x20, "active_low": False},
+    "sd-cs": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 14, "bank": 0, "mask": 0x4000},
 }

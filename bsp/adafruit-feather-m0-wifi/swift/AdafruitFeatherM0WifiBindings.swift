@@ -45,18 +45,22 @@ public enum AdafruitFeatherM0WifiBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let WINC_RESET_N_PORT_BASE: UInt32 = 0x41004400
     public static let WINC_RESET_N_PIN: UInt32 = 8
+    public static let WINC_RESET_N_BANK: UInt32 = 0
     public static let WINC_RESET_N_MASK: UInt32 = 0x100
     public static let WINC_RESET_N_ACTIVE_LOW: UInt32 = 1
     public static let WINC_CHIP_EN_PORT_BASE: UInt32 = 0x41004400
     public static let WINC_CHIP_EN_PIN: UInt32 = 14
+    public static let WINC_CHIP_EN_BANK: UInt32 = 0
     public static let WINC_CHIP_EN_MASK: UInt32 = 0x4000
     public static let WINC_CHIP_EN_ACTIVE_LOW: UInt32 = 0
     public static let WINC_IRQN_PORT_BASE: UInt32 = 0x41004400
     public static let WINC_IRQN_PIN: UInt32 = 21
+    public static let WINC_IRQN_BANK: UInt32 = 0
     public static let WINC_IRQN_MASK: UInt32 = 0x200000
     public static let WINC_IRQN_ACTIVE_LOW: UInt32 = 1
     public static let LED_PORT_BASE: UInt32 = 0x41004400
     public static let LED_PIN: UInt32 = 17
+    public static let LED_BANK: UInt32 = 0
     public static let LED_MASK: UInt32 = 0x20000
     public static let LED_ACTIVE_LOW: UInt32 = 0
 }

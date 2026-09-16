@@ -37,6 +37,8 @@ FACTS = {
         "exti_imr_reg": 0x40010400,
         "exti_rtsr_reg": 0x40010408,
         "exti_ftsr_reg": 0x4001040C,
+        "port_idr_reg": 0x50000810,
+        "pin_mask": 0x2000,
         "port_rcc_en_reg": 0x4002102C,
         "port_rcc_en_mask": 0x4,
         "syscfg_rcc_en_reg": 0x40021034,

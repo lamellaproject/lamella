@@ -142,4 +142,13 @@ public enum Same54EicLayout {
     public static let DPRESCALER_TICKON_LSB: UInt32 = 16
     public static let PINSTATE_PINSTATE: UInt32 = 0xFFFF
     public static let PINSTATE_PINSTATE_LSB: UInt32 = 0
+
+    // -- block constants --
+    public static let LINE_COUNT: UInt32 = 16
+    public static let SENSE_NONE: UInt32 = 0
+    public static let SENSE_RISE: UInt32 = 1
+    public static let SENSE_FALL: UInt32 = 2
+    public static let SENSE_BOTH: UInt32 = 3
+    public static let SENSE_HIGH: UInt32 = 4
+    public static let SENSE_LOW: UInt32 = 5
 }

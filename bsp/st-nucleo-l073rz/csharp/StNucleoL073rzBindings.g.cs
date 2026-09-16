@@ -25,8 +25,8 @@ namespace Lamella.Generated
         public const string BUTTON_DRIVER_FAMILY = "stm32l073-exti";
 
         // -- BUTTON: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it
-        // from the ISR to the managed side and never decodes it. Clear EXTI_PR before returning
-        // or the interrupt re-enters. --
+        // from the ISR to the managed side and never decodes it. Clear EXTI_PR, then read the
+        // pad's level from PORT_IDR_REG; without the clear the interrupt re-enters. --
         public const uint BUTTON_TOKEN = 0;
         public const uint BUTTON_EXTI_LINE = 13;
         public const uint BUTTON_EXTI_LINE_MASK = 0x2000;
@@ -36,6 +36,8 @@ namespace Lamella.Generated
         public const uint BUTTON_EXTI_IMR_REG = 0x40010400;
         public const uint BUTTON_EXTI_RTSR_REG = 0x40010408;
         public const uint BUTTON_EXTI_FTSR_REG = 0x4001040C;
+        public const uint BUTTON_PORT_IDR_REG = 0x50000810;
+        public const uint BUTTON_PIN_MASK = 0x2000;
         public const uint BUTTON_PORT_RCC_EN_REG = 0x4002102C;
         public const uint BUTTON_PORT_RCC_EN_MASK = 0x4;
         public const uint BUTTON_SYSCFG_RCC_EN_REG = 0x40021034;
@@ -71,6 +73,7 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint LED_PORT_BASE = 0x50000000;
         public const uint LED_PIN = 5;
+        public const uint LED_BANK = 0;
         public const uint LED_MASK = 0x20;
         public const uint LED_ACTIVE_LOW = 0;
     }

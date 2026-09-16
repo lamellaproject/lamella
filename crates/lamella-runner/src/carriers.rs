@@ -83,18 +83,21 @@ fn writes_flash(frame: &lamella_wire::Frame) -> bool {
 pub struct Carrier<'t> {
     transport: &'t mut dyn Transport,
     class: ChannelClass,
+    /// Whether this carrier took the previous frame of a report nobody asked for, which is evidence
+    /// that a host is reading it.
+    took_last_report: bool,
 }
 
 impl<'t> Carrier<'t> {
     /// A carrier reached over a network -- a socket, directly or through a relay.
     pub fn network(transport: &'t mut dyn Transport) -> Self {
-        Self { transport, class: ChannelClass::Network }
+        Self { transport, class: ChannelClass::Network, took_last_report: false }
     }
 
     /// A carrier somebody had to physically attach: a USB cable, a serial line, a debug probe's
     /// virtual port.
     pub fn physical(transport: &'t mut dyn Transport) -> Self {
-        Self { transport, class: ChannelClass::Physical }
+        Self { transport, class: ChannelClass::Physical, took_last_report: false }
     }
 }
 
@@ -314,6 +317,9 @@ impl<'a, 't> CarrierSet<'a, 't> {
 
     /// Give up on a carrier: it loses the session if it held it, and stops being a claim in flight.
     fn release(&mut self, index: usize) {
+        if let Some(carrier) = self.carriers.get_mut(index) {
+            carrier.took_last_report = false;
+        }
         if self.reply_to == Some(index) {
             self.reply_to = None;
         }
@@ -467,6 +473,9 @@ impl<'a, 't> CarrierSet<'a, 't> {
 
     /// Decide what happens to a frame that arrived on `index`, and hand it up if it may be served.
     fn admit(&mut self, index: usize, frame: Frame) -> Result<Option<Frame>, TransportError> {
+        for carrier in self.carriers.iter_mut() {
+            carrier.took_last_report = false;
+        }
         if self.probing() && self.arbiter.owner() == Some(index as ChannelId) {
             if let Some((waiting, decision)) = self.arbiter.owner_answered() {
                 let seq = self.take_held_seq(waiting as usize);
@@ -516,7 +525,8 @@ impl Transport for CarrierSet<'_, '_> {
     /// Answer on the carrier whose request is being served, or on the session's owner when the
     /// frame answers nothing.
     ///
-    /// A frame with NEITHER goes to every carrier -- see below, it is the boot path and it matters.
+    /// A frame with NEITHER goes to every carrier -- see below, it is the boot path and it matters. It
+    /// waits for a carrier that took that report's previous frame, and is only offered to the rest.
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
         if let Some(index) = self.reply_to.or_else(|| self.arbiter.owner().map(usize::from)) {
             return self.send_on(index, msg_type, seq, payload);
@@ -524,7 +534,16 @@ impl Transport for CarrierSet<'_, '_> {
         let mut delivered = false;
         let mut failure = None;
         for index in 0..self.carriers.len() {
-            match self.try_send_on(index, msg_type, seq, payload) {
+            let reading = self.carriers.get(index).is_some_and(|carrier| carrier.took_last_report);
+            let outcome = if reading {
+                self.send_on(index, msg_type, seq, payload).map(|()| true)
+            } else {
+                self.try_send_on(index, msg_type, seq, payload)
+            };
+            if let Some(carrier) = self.carriers.get_mut(index) {
+                carrier.took_last_report = matches!(outcome, Ok(true));
+            }
+            match outcome {
                 Ok(true) => delivered = true,
                 Ok(false) => {}
                 Err(error) => failure = Some(error),
@@ -611,6 +630,14 @@ mod tests {
         /// Attached and healthy, but nothing is draining it -- a native-USB carrier whose host has
         /// closed its handle while the device stays configured.
         unread: bool,
+        /// The line keeps the last packet of each frame it takes until its host's next read, as a
+        /// native-USB endpoint does, so a frame offered right behind it is refused by the non-blocking
+        /// send while the host is reading.
+        holds_last_packet: bool,
+        /// A frame's last packet is still waiting for the host's next read.
+        last_packet_pending: bool,
+        /// How many times the blocking `send` was used on this line.
+        blocking_sends: usize,
     }
 
     /// One carrier, as a handle the test keeps a clone of. The set holds one clone and the test the
@@ -645,14 +672,25 @@ mod tests {
         fn stop_reading(&self) {
             self.0.borrow_mut().unread = true;
         }
+
+        /// The line keeps each frame's last packet until its host's next read.
+        fn hold_last_packet(&self) {
+            self.0.borrow_mut().holds_last_packet = true;
+        }
+
+        fn blocking_sends(&self) -> usize {
+            self.0.borrow().blocking_sends
+        }
     }
 
     impl Transport for Line {
         fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
             let mut state = self.0.borrow_mut();
+            state.blocking_sends += 1;
             if state.failing {
                 return Err(TransportError::Closed);
             }
+            state.last_packet_pending = state.holds_last_packet;
             state.out.push(Frame { msg_type, seq, payload: payload.to_vec() });
             Ok(())
         }
@@ -675,9 +713,10 @@ mod tests {
             if state.failing {
                 return Err(TransportError::Closed);
             }
-            if state.unread {
+            if state.unread || state.last_packet_pending {
                 return Ok(false);
             }
+            state.last_packet_pending = state.holds_last_packet;
             state.out.push(Frame { msg_type, seq, payload: payload.to_vec() });
             Ok(true)
         }
@@ -1040,6 +1079,62 @@ mod tests {
             assert_eq!(sent[0].msg_type, crate::debug::EVT_STOPPED);
             assert_eq!(sent[0].payload, vec![7]);
         }
+    }
+
+    #[test]
+    fn a_boot_report_waits_for_a_carrier_that_took_its_last_frame_and_only_offers_to_the_rest() {
+        set_now(0);
+        let uart = Line::default();
+        let usb = Line::default();
+        let unread = Line::default();
+        usb.hold_last_packet();
+        unread.stop_reading();
+        let (mut uart_t, mut usb_t, mut unread_t) = (uart.clone(), usb.clone(), unread.clone());
+        let mut carriers = [
+            Carrier::physical(&mut uart_t),
+            Carrier::physical(&mut usb_t),
+            Carrier::physical(&mut unread_t),
+        ];
+        let mut set = CarrierSet::new(&mut carriers, now_ms, windows()).expect("three carriers");
+
+        let output = [crate::debug::output::STDOUT, 0, b'o', b'k'];
+        set.send(crate::debug::EVT_OUTPUT, 0, &output).unwrap();
+        set.send(crate::debug::EVT_STOPPED, 0, &[7]).unwrap();
+
+        let both = vec![crate::debug::EVT_OUTPUT, crate::debug::EVT_STOPPED];
+        assert_eq!(usb.sent_types(), both, "the host reading the USB carrier gets the stop");
+        assert_eq!(uart.sent_types(), both);
+        assert!(unread.target_sent().is_empty(), "a carrier nobody reads is told nothing");
+        assert_eq!(
+            unread.blocking_sends(),
+            0,
+            "and is never given the blocking send, which would stall every other carrier"
+        );
+    }
+
+    #[test]
+    fn a_request_ends_what_a_boot_report_learned_about_who_reads_which_carrier() {
+        set_now(0);
+        let uart = Line::default();
+        let usb = Line::default();
+        let (mut uart_t, mut usb_t) = (uart.clone(), usb.clone());
+        let mut carriers = [Carrier::physical(&mut uart_t), Carrier::physical(&mut usb_t)];
+        let mut set = CarrierSet::new(&mut carriers, now_ms, windows()).expect("two carriers");
+
+        let output = [crate::debug::output::STDOUT, 0, b'o', b'k'];
+        set.send(crate::debug::EVT_OUTPUT, 0, &output).unwrap();
+        assert_eq!(usb.sent_types(), vec![crate::debug::EVT_OUTPUT], "the USB host took the report");
+
+        uart.host_sends(msg::HELLO, 1, &[]);
+        assert!(set.poll().unwrap().is_some(), "the request is served");
+        uart.break_line();
+        assert!(set.send(msg::HELLO_ACK, 1, &[]).is_err(), "the reply's carrier is gone");
+        assert_eq!(set.owner(), None);
+        usb.stop_reading();
+
+        let _ = set.send(crate::debug::EVT_STOPPED, 0, &[7]);
+        assert_eq!(usb.blocking_sends(), 0, "the USB carrier is offered the frame, not made to take it");
+        assert!(usb.target_sent().is_empty());
     }
 
     #[test]

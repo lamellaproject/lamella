@@ -82,8 +82,8 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led0": {"kind": "gpio-out", "port_base": 0x42020800, "pin": 7, "mask": 0x80, "active_low": False},
-    "led1": {"kind": "gpio-out", "port_base": 0x42020400, "pin": 7, "mask": 0x80, "active_low": False},
-    "led2": {"kind": "gpio-out", "port_base": 0x42021800, "pin": 2, "mask": 0x4, "active_low": False},
-    "button0": {"kind": "gpio-in", "port_base": 0x42020800, "pin": 13, "mask": 0x2000, "active_low": False, "pull_up": False, "pull_down": True},
+    "led0": {"kind": "gpio-out", "port_base": 0x42020800, "pin": 7, "bank": 0, "mask": 0x80, "active_low": False},
+    "led1": {"kind": "gpio-out", "port_base": 0x42020400, "pin": 7, "bank": 0, "mask": 0x80, "active_low": False},
+    "led2": {"kind": "gpio-out", "port_base": 0x42021800, "pin": 2, "bank": 0, "mask": 0x4, "active_low": False},
+    "button0": {"kind": "gpio-in", "port_base": 0x42020800, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": False, "pull_up": False, "pull_down": True},
 }

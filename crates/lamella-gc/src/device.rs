@@ -1,8 +1,7 @@
-//! The device GC link: the process/device-global C-ABI surface the AOT backend
-//! (`lamella_aot::arm32`) links its emitted `newobj` / `box` / array-alloc and
-//! safepoint-collect calls against. The mark-compact engine itself is [`crate::heap`];
-//! this module owns only the *global heap* and the *entry points*, reusing
-//! [`Heap::alloc`] / [`Heap::collect`] / [`Heap::collect_stack`] unchanged.
+//! The device GC link: a process/device-global heap and the C-ABI allocation and collection
+//! entry points over it. The mark-compact engine itself is [`crate::heap`]; this module owns
+//! only the *global heap* and the *entry points*, reusing [`Heap::alloc`] /
+//! [`Heap::collect`] / [`Heap::collect_stack`] unchanged.
 
 extern crate alloc;
 
@@ -14,9 +13,8 @@ use crate::heap::{Heap, Ref, StackMapTable, TypeDesc};
 
 
 /// The signature of the out-of-memory roots hook: given the live heap, report every
-/// root slot to `visit` so the subsequent compaction relocates them. This is the seam
-/// the device build fills with "decode the AOT frames at the captured SP/return_pc";
-/// see [`set_oom_roots_hook`].
+/// root slot to `visit` so the subsequent compaction relocates them. See
+/// [`set_oom_roots_hook`].
 pub type OomRootsHook = fn(&mut Heap, visit: &mut dyn FnMut(&mut Ref));
 
 /// The process/device-global garbage-collected heap and its OOM roots hook, behind a
@@ -29,8 +27,8 @@ pub type OomRootsHook = fn(&mut Heap, visit: &mut dyn FnMut(&mut Ref));
 struct GcCell {
     /// The global heap; `None` until [`lamella_gc_init`] installs one.
     heap: UnsafeCell<Option<Heap>>,
-    /// The roots reported on an OOM collection; `None` means "collect with no roots"
-    /// (the conservative default until backend installs the SP/PC frame walk).
+    /// The roots reported on an OOM collection. `None` means the collection runs with no
+    /// roots, which reclaims every object -- live ones included.
     oom_roots: UnsafeCell<Option<OomRootsHook>>,
 }
 
@@ -46,9 +44,9 @@ static GC: GcCell = GcCell {
 /// given TypeDesc table (an object's header word indexes it). Replaces any previously
 /// installed heap, so it doubles as the per-test reset.
 ///
-/// On device this hands the GC its fixed raw heap region instead of a `Vec`-backed
-/// [`Heap`]; see the module header. The TypeDesc table is moved in once and lives for
-/// the program's lifetime.
+/// This installs the `Vec`-backed [`Heap`]. The device's fixed raw region is a separate
+/// entry point, [`lamella_gc_init_region`], and a device build uses that one. The TypeDesc
+/// table is moved in once and lives for the program's lifetime.
 pub fn lamella_gc_init(capacity: usize, type_descs: Vec<TypeDesc>) {
     let heap = Heap::new(capacity, type_descs);
     critical_section(|| unsafe {
@@ -68,9 +66,8 @@ pub fn lamella_gc_teardown() {
 }
 
 /// Installs the hook that reports the live roots on an out-of-memory collection (see
-/// [`lamella_gc_alloc`]). This is the backend seam: on device it is set to "walk the AOT
-/// frames at the safepoint-captured SP/return_pc"; until then it is unset and OOM
-/// collects with no roots. Exposed for that wiring and for the host tests that prove the
+/// [`lamella_gc_alloc`]). Unset, an out-of-memory collection runs with no roots and reclaims
+/// every object, live ones included. Exposed for the host tests that prove the
 /// retry-after-collect path.
 pub fn set_oom_roots_hook(hook: OomRootsHook) {
     critical_section(|| unsafe {
@@ -176,9 +173,12 @@ pub fn lamella_gc_collect(
 struct DeviceGcCell {
     /// The global device heap; `None` until [`lamella_gc_init_region`] installs one.
     heap: UnsafeCell<Option<DeviceHeap>>,
-    /// The decoded stack maps for the lowered program, installed once at startup so the
-    /// OOM-triggered [`DeviceHeap::collect_stack`] can resolve each safepoint's roots
-    /// from the SP/return_pc the alloc shim captured. `None` until installed.
+    /// The decoded stack maps for the lowered program, installed once at startup. They are what
+    /// [`DeviceHeap::collect_stack`] would resolve a safepoint's roots against; the allocator's
+    /// own OOM path does not walk them today, and collects with whatever roots
+    /// [`set_oom_roots_hook`] supplies -- with none installed, that is no roots at all, so an
+    /// embedder installs the hook before a program holds a reference across an allocation.
+    /// `None` until installed.
     stack_maps: UnsafeCell<Option<StackMapTable>>,
 }
 
@@ -222,32 +222,26 @@ fn with_device_heap<R>(body: impl FnOnce(&mut DeviceHeap) -> R) -> R {
 /// The device allocator body, the impl half of the `lamella_gc_alloc` C-ABI entry (the
 /// naked SP/PC shim, below, is the entry on ARM and tail-calls this). Bump-allocates a
 /// zeroed `[header][payload]` block for the backend's `newobj` / `box` / array-alloc and
-/// returns the real *payload* pointer (`region_base + offset`); on out-of-memory it drives
-/// one stack-walking collection from the captured `(sp, return_pc)` and retries, returning
-/// null (`0`) only if the object still does not fit.
+/// returns the real *payload* pointer (`region_base + offset`). On out-of-memory with
+/// `gc-collect` it runs one collection and retries, returning null (`0`) if the object still
+/// does not fit; without `gc-collect` an out-of-memory allocation returns null.
 ///
 /// The object header holds the `type_desc` *pointer* (so the collector reads the
 /// `payload_size` and `ref_offsets` by dereferencing it -- the device representation),
 /// where the host [`lamella_gc_alloc`] entry uses a table index. `sp` and `return_pc` are
 /// the mutator's SP-at-the-call and the safepoint return address, captured for free by the
-/// shim from `r2`/`r3`; the fast path ignores them, the OOM path walks the stack from them.
+/// shim from `r2`/`r3`. Both are accepted and ignored.
 ///
 /// # Safety
 /// `type_desc` must be a valid [`DeviceTypeDesc`] address the backend emitted (its
-/// `payload_size`/`nrefs`/`ref_offsets` are read on alloc and on every trace). `sp` and
-/// `return_pc`, on the OOM path, must be the real mutator SP-at-the-call and safepoint
-/// return address so the frame walk reads live roots and not arbitrary memory.
+/// `payload_size`/`nrefs`/`ref_offsets` are read on alloc and on every trace).
 ///
-/// # The on-device stack slice (a documented seam to backend's harness)
+/// # The out-of-memory collection has no roots
 ///
-/// The OOM collection walks the live AOT call stack via [`DeviceHeap::collect_stack`],
-/// which needs that stack as a `&mut [u8]` whose index `sp` is SP-at-the-call. Forming the
-/// real on-device stack slice from the captured `sp` (its extent down to the bottom frame)
-/// is backend's harness side; until that lands, the OOM path here collects with **no
-/// roots** (conservative: it never spuriously keeps an object, and on a host call -- where
-/// `sp`/`return_pc` are not a real stack -- it must not interpret arbitrary memory as
-/// frames). The structure ("capture SP/PC at the safepoint, then `collect_stack`") is the
-/// exact shape the real stack slice drops into.
+/// The collection marks nothing, so it reclaims every object -- including objects the caller
+/// still holds -- and the retry can hand back memory a live object occupies. That is correct
+/// only for a program that holds no reference across an allocation. A program that does must
+/// not use this entry with `gc-collect` enabled.
 #[cfg_attr(target_arch = "arm", unsafe(no_mangle))]
 pub unsafe extern "C" fn lamella_gc_alloc_impl(
     payload_size: u32,

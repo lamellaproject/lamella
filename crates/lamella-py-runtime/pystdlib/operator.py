@@ -297,7 +297,7 @@ class methodcaller:
         )
 
 
-# In-place forms (iconcat omitted; see the header)
+# In-place forms
 def iadd(a, b):
     a += b
     return a

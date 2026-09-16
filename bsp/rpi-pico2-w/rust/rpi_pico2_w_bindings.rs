@@ -83,17 +83,21 @@ pub const DEVICE_COUNT: u32 = 4;
 // -- on-board devices: PORT group base + pin index + mask --
 pub const CYW43439_WL_REG_ON_PORT_BASE: u32 = 0xD0000000;
 pub const CYW43439_WL_REG_ON_PIN: u32 = 23;
+pub const CYW43439_WL_REG_ON_BANK: u32 = 0;
 pub const CYW43439_WL_REG_ON_MASK: u32 = 0x800000;
 pub const CYW43439_WL_REG_ON_ACTIVE_LOW: u32 = 0;
 pub const CYW43439_DATA_PORT_BASE: u32 = 0xD0000000;
 pub const CYW43439_DATA_PIN: u32 = 24;
+pub const CYW43439_DATA_BANK: u32 = 0;
 pub const CYW43439_DATA_MASK: u32 = 0x1000000;
 pub const CYW43439_CS_PORT_BASE: u32 = 0xD0000000;
 pub const CYW43439_CS_PIN: u32 = 25;
+pub const CYW43439_CS_BANK: u32 = 0;
 pub const CYW43439_CS_MASK: u32 = 0x2000000;
 pub const CYW43439_CS_ACTIVE_LOW: u32 = 1;
 pub const CYW43439_CLK_PORT_BASE: u32 = 0xD0000000;
 pub const CYW43439_CLK_PIN: u32 = 29;
+pub const CYW43439_CLK_BANK: u32 = 0;
 pub const CYW43439_CLK_MASK: u32 = 0x20000000;
 
 /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own

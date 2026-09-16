@@ -44,10 +44,14 @@ sources = [
     "DS40001882D Figure 9-1 (SAM D21 Product Mapping): AHB-APB Bridge A places EIC at 0x40001800, between RTC at 0x40001400 and the bridge's reserved region at 0x40001C00.",
     "DS40001882D section 16.8.8 (APBA Mask), which states its own name APBAMASK and offset 0x18 within PM, gives bit 6 as 'EIC APB Clock Enable', and a reset value of 0x0000007F.",
     "DS40001882D GCLK clock source table: peripheral channel 0x05 is GCLK_EIC, feeding the EIC.",
+    "DS40001882D section 21.6.2.1 (Initialization), as printed on page 368: '2. If edge detection or filtering is required, GCLK_EIC must be enabled', before the configuration registers are written and the EIC is enabled. Section 21.6.3 says it twice more on page 369 -- 'If filtering or edge detection is enabled, the EIC automatically requests the GCLK_EIC to operate' -- and Table 21-2 gives an edge without the filter a worst-case latency of 'Four GCLK_EIC periods + Three CLK_EIC_APB periods'.",
+    "DS40001882D section 21.8.10 (Configuration n), as printed on page 382: the SENSEx table reads 0x0 NONE, 0x1 RISE, 0x2 FALL, 0x3 BOTH, 0x4 HIGH, 0x5 LOW and 0x6-0x7 reserved, and the property line reads Write-Protected alone.",
 ]
 notes = [
     "THE CONFIG BOUND IS DERIVED AND THE DERIVATION IS STATED BECAUSE THE DOCUMENT DOES NOT. Each line occupies four bits of CONFIG -- FILTENx plus SENSEx[2:0] -- so one 32-bit register configures eight lines and sixteen lines need two. That arithmetic alone would be a guess dressed as a fact, so it is anchored against the same IP in the SAM D5x/E5x family, whose section 23.8.10 spells the array out in the notation this book omits: 'Offset: 0x1C + n*0x04 [n=0..1]'. TWO REGISTERS, EIGHT LINES EACH, ON BOTH. The BASE OFFSET DIFFERS between the two families -- 0x18 here against 0x1C there -- so the sibling confirms the SHAPE and not the address, and carrying its offset across would place CONFIG one register too high.",
-    "THE APB CLOCK IS ON OUT OF RESET. APBAMASK's reset value is 0x0000007F, setting bits 0 through 6, and EIC is bit 6, so a driver configures a line without touching PM. THE GCLK PERIPHERAL CHANNEL IS A SEPARATE GATE AND THAT RESET VALUE SAYS NOTHING ABOUT IT: filtering and synchronous sensing need GCLK_EIC running, asynchronous edge detection does not.",
+    "THE APB CLOCK IS ON OUT OF RESET. APBAMASK's reset value is 0x0000007F, setting bits 0 through 6, and EIC is bit 6, so a driver configures a line without touching PM. THE GCLK PERIPHERAL CHANNEL IS A SEPARATE GATE AND THAT RESET VALUE SAYS NOTHING ABOUT IT.",
+    "EDGE DETECTION NEEDS GCLK_EIC RUNNING, AND ONLY LEVEL DETECTION WITHOUT THE FILTER IS ASYNCHRONOUS. The initialization order, both statements in section 21.6.3 on page 369 and the latency table all say so. One sentence disagrees: the last line of page 368 reads 'When an external interrupt is configured for level detection, or if filtering is disabled, detection is made asynchronously, and GCLK_EIC is not required', where the same statement on the next page reads 'level detection and when filtering is disabled'. Four statements stand against that one, and the latency table counts GCLK_EIC periods for an edge with no filter, so a line armed for any edge needs GCLK_EIC routed and enabled first.",
+    "CONFIG IS NOT ENABLE-PROTECTED ON THIS FAMILY: its property line reads Write-Protected alone, so the register description permits a write with the EIC enabled, while the initialization order writes it before ENABLE. The same page prints every CONFIG bit's access as R, which cannot describe a register that order writes, so that row is not the one to rely on.",
     "THE PAC WRITE-PROTECT REGISTER HAS THE IDENTICAL BIT ORDER AND IS A DIFFERENT REGISTER. PAC0's write-protect word also lays out PM 1, SYSCTRL 2, GCLK 3, WDT 4, RTC 5, EIC 6, two pages from APBAMASK in the same book, and its bit 6 means 'write-protection for the EIC' rather than 'clock for the EIC'. THE BIT LAYOUT CANNOT SEPARATE THEM AND THE PROSE UNDER IT CAN.",
     "NMI IS A SEPARATE PIN, A SEPARATE FLAG AND A SEPARATE VECTOR. NMICTRL and NMIFLAG are 8-bit registers of their own, NMI is not in INTFLAG, and it reaches the core's NMI request rather than an NVIC line -- so it cannot be masked and cannot be serviced by the same handler this block's other lines use.",
     "THE FIRST FOUR REGISTERS ARE BYTE-WIDE AND THE REST ARE WORDS. CTRL, STATUS, NMICTRL and NMIFLAG occupy 0x00 through 0x03 as four separate 8-bit registers rather than one word, which is why EVCTRL starts at 0x04 rather than 0x08.",
@@ -111,4 +115,18 @@ notes = "One wake enable per line, for sleep modes where the interrupt clock is 
 offset = 0x18
 width = 32
 fields = { SENSE0 = [0, 3], FILTEN0 = [3, 1], SENSE1 = [4, 3], FILTEN1 = [7, 1], SENSE2 = [8, 3], FILTEN2 = [11, 1], SENSE3 = [12, 3], FILTEN3 = [15, 1], SENSE4 = [16, 3], FILTEN4 = [19, 1], SENSE5 = [20, 3], FILTEN5 = [23, 1], SENSE6 = [24, 3], FILTEN6 = [27, 1], SENSE7 = [28, 3], FILTEN7 = [31, 1] }
-notes = "AN ARRAY OF TWO AT 0x18 AND 0x1C, eight lines each, four bits per line. The suffixes here are the position WITHIN one register and not the line number: CONFIG[1]'s SENSE0 configures EXTINT[8]. SENSE selects none, rising, falling, both, high or low; FILTEN adds a majority filter that needs GCLK_EIC running, which asynchronous edge detection does not."
+notes = "AN ARRAY OF TWO AT 0x18 AND 0x1C, eight lines each, four bits per line. The suffixes here are the position WITHIN one register and not the line number: CONFIG[1]'s SENSE0 configures EXTINT[8]. SENSE selects none, rising, falling, both, high or low -- the SENSE_ constants below; FILTEN adds a majority filter. The filter and every edge sense need GCLK_EIC running."
+
+# The number of external interrupt lines, from the feature list and the signal table. The interrupt,
+# wake-up and event-output registers above carry bits 0 through 17, so a count taken from their width
+# is two lines too many.
+[constants]
+LINE_COUNT = 16
+
+# The SENSEx values, one per detection a line can be configured for.
+SENSE_NONE = 0
+SENSE_RISE = 1
+SENSE_FALL = 2
+SENSE_BOTH = 3
+SENSE_HIGH = 4
+SENSE_LOW = 5

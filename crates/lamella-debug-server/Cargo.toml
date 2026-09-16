@@ -1,0 +1,60 @@
+[package]
+name = "lamella-debug-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "device-dap-server: debugs a program running on a Cortex-M board from a Debug Adapter Protocol client such as VS Code, through the board's debug probe."
+publish = false
+
+[[bin]]
+name = "device-dap-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+lamella-debug-device = { path = "../lamella-debug-device" }
+lamella-probe-core = { path = "../lamella-probe-core" }
+# The server links the adapter + wire protocol WITHOUT the interpreter, and lowers the deployed
+# program (lamella-aot) + reads its Portable PDB (lamella-metadata) to compose the native ->
+# source-line mapping at launch.
+lamella-dap = { path = "../lamella-dap", default-features = false }
+lamella-aot = { path = "../lamella-aot" }
+lamella-metadata = { path = "../lamella-metadata" }
+# PROBE ENUMERATION AND SELECTION, not one vendor id. `usbbulk` is NOT optional: without it this
+# sees CMSIS-DAP v1 (HID) probes only, and an MCU-Link or a Debug Probe is v2 over USB bulk -- so a
+# setup full of them would resolve to nothing while reporting that it had looked.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
+# The server flashes the built image on launch (F5 = deploy + debug).
+lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
+lamella-stlink = { path = "../lamella-stlink", optional = true }
+lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32", optional = true }
+# An STM32F7 or H7 deploy writes through the route `lamella flash` takes: the part identified, the write
+# bounded by the flash the part reports, and every byte read back.
+lamella-flash-routes = { path = "../lamella-flash-routes", optional = true }
+lamella-flash-backend = { path = "../lamella-flash-backend", optional = true }
+lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam", optional = true }
+
+# EVERY PROBE AND PART THE SERVER KNOWS IS ON BY DEFAULT. A server is installed to debug the board in
+# front of someone, and one built without that board's probe is not the server they asked for. The
+# features exist so a build can leave a family out; a build without one refuses an argument that
+# needs it, and names the command that installs a server with every feature on.
+[features]
+default = ["st", "sam"]
+## Lets `device-dap-server` drive an ST-Link and program STM32 flash, so an ST board with an
+## on-board debugger can be deployed to and natively debugged over its one USB cable.
+st = [
+    "dep:lamella-stlink",
+    "dep:lamella-cmsis-dap-stm32",
+    "dep:lamella-flash-routes",
+    "dep:lamella-flash-backend",
+]
+## Lets `device-dap-server` stop a SAM D21 with the sequence that part needs. The generic
+## reset-and-halt arms the vector catch under nRESET, which requires the debug port to stay
+## reachable while the part is held; a SAM D21 does not offer that, so `Samd21Debug::samd21_park`
+## drives the DSU's cold-plugging reset extension instead. It is written against `TargetAccess`
+## rather than against a CMSIS-DAP probe, so an ST-Link reaches it too.
+sam = ["dep:lamella-cmsis-dap-sam"]

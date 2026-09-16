@@ -1,15 +1,20 @@
 # BOARD binding: the 32F769IDISCOVERY (STM32F769I-DISCO), an STM32F769NI carrier.
 #
-# THIS BOARD'S LEDS SINK AND THE OTHER ST BOARDS HERE DRIVE, WHICH IS THE FACT IT CONTRIBUTES.
-# UM2033 states it in words -- "to light a LED, a zero low-logic state must be written in the
-# corresponding GPIO register" -- and that is the opposite of the two Nucleo-144 boards and the
-# F429 Discovery, where the pin sources current into the anode. Same vendor, same year, opposite
-# habit. Polarity is a per-BOARD reading and this board is the counter-example that proves it.
+# BOTH USER LEDS DRIVE, AND UM2033 SAYS THE OPPOSITE IN WORDS. The manual's section 5.16 reads "to
+# light a LED, a zero low-logic state must be written in the corresponding GPIO register", and that
+# sentence is wrong for this board. The MB1225 schematic settles it: LD_USER1 leaves the pin,
+# passes through R62 and LD1, and the LED's cathode goes to GROUND -- and LD_USER2 through R63 and
+# LD2 to the same ground node. A pin that reaches an anode through a resistor sources the current,
+# so a ONE lights these LEDs.
 #
-# THE USER BUTTON GOES THE OTHER WAY AND AGREES WITH THEM: "when the button is depressed the logic
-# state is 1, otherwise, the logic state is 0". So on this one board the LEDs are active low and
-# the button is active high, which is exactly the combination a reader who learned one rule gets
-# wrong twice.
+# THE MANUAL IS RIGHT IN ITS TABLES AND WRONG IN ITS PROSE, TWICE IN THE SAME SECTION. Table 4's
+# port assignment (PJ13, PJ5) is confirmed by the schematic ball-for-ball, and so are Table 4's LED
+# colors -- while the prose beside both gets the colors wrong and the polarity wrong. A later
+# reader of UM2033 5.16 should take its tables and verify its sentences.
+#
+# THE USER BUTTON READS THE SAME WAY AND THE MANUAL IS RIGHT ABOUT IT: "when the button is
+# depressed the logic state is 1, otherwise, the logic state is 0". So every control line on this
+# board is active high.
 #
 # NOT MODELLED, AND NAMED SO THE OMISSION IS DELIBERATE: a 128-Mbit SDRAM on the FMC (used as
 # 4M x 32) and a 512-Mbit Quad-SPI NOR flash. Both are the external-memory stratum, which needs
@@ -25,11 +30,12 @@ part = "stm32f769ni"
 product_model = 30          # lamella_wire::product_model::STM32F769I_DISCO
 sources = [
     "UM2033 Rev 5 (Discovery kit with STM32F769NI MCU) section 5.15: the serial interface USART1 is directly available as a virtual COM port of the PC, connected to the ST-LINK/V2-1 USB connector, configured with 115200 b/s, 8 bits data, no parity, one stop bit and no flow control.",
-    "UM2033 Rev 5 section 5.16 and Table 4 (control port assignment): LD1 USER1 on PJ13 and LD2 USER2 on PJ5; the blue button B1 is the user button and the black button B2 is the reset. To light a LED a zero low-logic state must be written to the port; when B1 is depressed the logic state is 1.",
+    "UM2033 Rev 5 section 5.16 and Table 4 (control port assignment): LD1 USER1 on PJ13 and LD2 USER2 on PJ5; the blue button B1 is the user button and the black button B2 is the reset. When B1 is depressed the logic state is 1. The same section says a zero lights a LED, which the board schematic contradicts -- see the MB1225 source below and the led0/led1 rows.",
+    "MB1225 schematic rev B03 (32F769IDISCOVERY), sheet 13 of 13, the LEDs sheet: LD_USER1 -> R62 (1K 1% 0603) -> LD1 (red) -> GND, and LD_USER2 -> R63 (330R 1% 0603) -> LD2 (green) -> the same ground node. Sheet 4 gives the MCU side: ball B9 = PJ13 = LD_USER1, ball M14 = PJ5 = LD_USER2. Both LEDs are driven from the pin through their resistor into the anode, so a ONE lights them.",
     "UM2033 Rev 5 pin table: PA9 carries USART1_TX against the label VCP_TX, PA10 carries USART1_RX against VCP_RX, and PA0/WKUP carries the label B_USER.",
 ]
 notes = [
-    "UM2033 CONTRADICTS ITSELF ABOUT THE LED COLORS INSIDE ONE SECTION. Its prose says the four LEDs are 'LD1, LD2, LD3, and LD4 with respectively green, orange, red, and blue colors'; Table 4, eight lines below, gives LD1 RED, LD2 GREEN, LD3 GREEN and LD4 RED, and names no orange or blue LED at all. The assignment table is taken, because it is the table that also carries the port assignments this file depends on and because the same manual family has been wrong in its prose and right in its table before. No color reaches an artifact -- what the disagreement changes is which document a later reader should trust for the pins.",
+    "UM2033 CONTRADICTS ITSELF ABOUT THE LED COLORS INSIDE ONE SECTION. Its prose says the four LEDs are 'LD1, LD2, LD3, and LD4 with respectively green, orange, red, and blue colors'; Table 4, eight lines below, gives LD1 RED, LD2 GREEN, LD3 GREEN and LD4 RED, and names no orange or blue LED at all. The assignment table is taken, because it is the table that also carries the port assignments this file depends on and because the same manual family has been wrong in its prose and right in its table before. The MB1225 schematic settles it and agrees with the table: LD1 is red and LD2 is green. No color reaches an artifact -- what the disagreement changes is which document a later reader should trust, and the answer measured twice now is the tables and the schematic, never the prose.",
     "LD3 and LD4 are deliberately not device rows. LD3 is the ARDUINO signal LED on PA12 rather than a user LED, and LD4 on PD4 indicates an OTG overcurrent condition -- neither is a general-purpose indicator a program should be told it owns.",
     "The user button is on PA0, which is also the part's wake-up pin. UM2033 describes B1 as usable 'as a digital input or as a wake-up alternate function' -- this row states the digital-input reading, which is the one a program polls; the wake-up path is a power-management fact nothing here models.",
 ]
@@ -103,23 +109,25 @@ pclk1_hz = 54000000         # APB1 = sysclk / 4.
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# BOTH USER LEDS ARE ACTIVE LOW and the manual says so outright rather than leaving it to a
-# schematic: a zero written to the port lights the LED. Read backwards, a board's LEDs are ON from
-# reset until a program touches them, so a blink driver's opening write looks like it worked.
+# BOTH USER LEDS ARE ACTIVE HIGH, read off the MB1225 schematic rather than off UM2033's sentence,
+# which says the opposite and is wrong. Confirmed on the board as well as on the schematic: PJ13
+# driven low leaves LD1 dark and driven high lights it. Read backwards, this board's LEDs are dark
+# from reset until a program drives them. A manual sentence about polarity is a claim; the net is
+# the fact.
 
 [[devices]]
 name = "led0"
 kind = "gpio-out"
 pin = "PJ13"
-active = "low"
-source = "UM2033 Rev 5 Table 4: LD1, named USER1, is assigned to PJ13. Section 5.16: to light a LED, a zero low-logic state must be written in the corresponding GPIO register."
+active = "high"
+source = "MB1225 schematic rev B03 sheet 13: LD_USER1 reaches LD1's anode through R62 (1K) and LD1's cathode goes to GND, so the pin sources the current and a ONE lights it. Sheet 4: ball B9 is PJ13 and carries LD_USER1, which is the same assignment UM2033 Rev 5 Table 4 gives for LD1/USER1. UM2033 section 5.16 says a zero lights a LED; that sentence is wrong for this board, and it is the reason this row is sourced from the schematic rather than from the manual that names the pin."
 
 [[devices]]
 name = "led1"
 kind = "gpio-out"
 pin = "PJ5"
-active = "low"
-source = "UM2033 Rev 5 Table 4: LD2, named USER2, is assigned to PJ5. Section 5.16: to light a LED, a zero low-logic state must be written in the corresponding GPIO register."
+active = "high"
+source = "MB1225 schematic rev B03 sheet 13: LD_USER2 reaches LD2's anode through R63 (330R) and LD2's cathode joins LD1's at the same ground node, so the pin sources the current and a ONE lights it. Sheet 4: ball M14 is PJ5 and carries LD_USER2, which is the same assignment UM2033 Rev 5 Table 4 gives for LD2/USER2. This row is read from the schematic only -- LD1 is the one that has also been watched on the board -- and the two LEDs are the same net shape."
 
 [[devices]]
 name = "button0"

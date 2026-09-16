@@ -1,0 +1,177 @@
+# BOARD binding: the Pimoroni Pico Plus 2, an RP2350B carrier. Board truth ONLY: role bindings and
+# the wiring. Chip truth lives in csp/rp2350/.
+#
+# AN RP2350B BOARD, AND THE PACKAGE DECIDES WHICH PADS IT CAN WIRE. The RP2350A's 30 GPIO stop at
+# GP29; this board carries the RP2350B and wires pads the A does not bond at all: the PSRAM chip
+# select on GP47, an SP/CE expansion connector on GP32-GP36, and the analogue channels its header
+# borrows.
+#
+# THE HEADER SAYS 26/A0 AND MEANS TWO PINS. On the QFN-80 the ADC reads GPIO40-47 and does NOT read
+# GPIO26-29, so a board that keeps the Pico's 26/27/28 header positions cannot make them analogue by
+# naming them. This one bridges each to an ADC pad through a 1k resistor -- GP26 to GP40 (ADC0),
+# GP27 to GP41 (ADC1), GP28 to GP42 (ADC2) -- so one header position lands on TWO MCU pins, and a
+# program reads it digitally through the low number and analogue through the high one. Nothing in
+# the pin name says so, which is why this file states it here.
+#
+# THE BOOT BUTTON IS ALSO THE USER BUTTON, and the schematic says so in its own title: "Combined USB
+# boot & user switch". It reaches GP45 through two 10k resistors from the node the BOOTSEL switch
+# pulls to ground, so a program polls the same button the ROM watches at reset.
+#
+# EVERY PIN THIS BOARD WIRES ABOVE GP31 IS A BANK-1 ROW, and its mask is named for that bank.
+# A device row's mask is only meaningful against the register set a consumer writes, and on the
+# RP2350B one SIO block serves all 48 pins through two of them -- so the boot/user button on
+# GP45, the PSRAM chip select on GP47 and the three analogue pads on GP40-GP42 publish
+# `<NAME>_BANK = 1` and `<NAME>_BANK1_MASK` rather than `<NAME>_MASK`. A shim written for the
+# ordinary case cannot read one by accident; it fails to compile instead.
+#
+# ALSO NOT MODELLED, FOR A DIFFERENT REASON: the SP/CE connector's five signals on GP32-GP36. It is an expansion port whose meaning depends on the module fitted,
+# and the schematic names each pad two ways -- UART_TX/DC on GP32, UART_RX/CS on GP33, NETLIGHT/SCK
+# on GP34, RESET/MOSI on GP35 and PWRKEY/BL on GP36 -- because the port carries either a serial or
+# an SPI peripheral. Naming one of the two in a row would pick a module this board does not have.
+
+[table]
+kind = "board"
+board = "pimoroni-pico-plus-2"
+vendor = "pimoroni"
+family = "rp2350"
+part = "rp2350b"
+product_model = 61          # lamella_wire::product_model::PICO_PLUS_2
+sources = [
+    "Pimoroni Pico Plus 2 schematic (Pimoroni_Pico_Plus_2_Schematic.pdf, 3 sheets): sheet 1 is the RP2350B and its nets, sheet 2 the flash, PSRAM, USB-C, crystal, user LED and the combined boot/user switch, sheet 3 the 40-pin header.",
+    "Pimoroni Pico Plus 2 pinout diagram (ppico_plus_2_pinout_diagram.pdf): 51x21mm, RP2350B with 16MB Flash, 8MB PSRAM, USB-C, Mono LED, Reset and User/Boot Button, 40 pins, QW/ST, SP/CE and Debug connectors, input 3V-5.5V.",
+    "RP2350 datasheet Table 1 and chapter 1's two NOTEs, for what the QFN-80 package bonds and where its analogue inputs are.",
+    "RP2350 datasheet section 5.2.8.1 (BOOTSEL clock requirements) and section 13.10 (the BOOT_FLAGS0, BOOTSEL_PLL_CFG and BOOTSEL_XOSC_CFG rows of OTP), for what a USB boot says about the crystal.",
+]
+notes = [
+    "THE 26/27/28 HEADER POSITIONS REACH TWO MCU PINS EACH AND THE SECOND ONE IS WHERE THE ADC IS. Schematic sheet 1: the net GP26 lands on GPIO26 (ball 27) and on GPIO40/ADC0 (ball 49) through RN2-1, 1k; GP27 on GPIO27 (ball 28) and GPIO41/ADC1 (ball 52) through RN2-2; GP28 on GPIO28 (ball 36) and GPIO42/ADC2 (ball 53) through RN2-3. The pinout diagram labels them 26 / A0, 27 / A1 and 28 / A2 and annotates the bridge as 1kOhms Internal.",
+    "THE USER LED IS ON THE HOST MCU HERE AND ON THE RADIO ON THE W. This board drives it from GP25; bsp/pimoroni-pico-plus-2-w has no GP25 LED at all and drives its LED from the RM2 module's own GPIO0, so the two boards' LED rows are not one fact with a different pin.",
+    "X1 IS A 12 MHz CRYSTAL, AND THE FIGURE IS MEASURED BECAUSE NO DOCUMENT FOR THIS BOARD STATES IT. Schematic sheet 2 draws X1 with its designator, its pads and its load capacitors, and no frequency. RP2350 datasheet section 5.2.8.1: BOOTSEL mode needs a crystal across XIN and XOUT or a clock driven into XIN; the bootrom assumes a 12 MHz XOSC and derives a fixed 48 MHz for USB from it, which 'must be a precise frequency'; and a board with any other crystal that wants USB boot programs BOOTSEL_PLL_CFG and BOOTSEL_XOSC_CFG in OTP and sets BOOT_FLAGS0.ENABLE_BOOTSEL_NON_DEFAULT_PLL_XOSC_CFG. Measured on one unit of this board: it enumerates as the RP2350's USB boot device, and its OTP, read over SWD, has that bit clear in BOOT_FLAGS0 and in both of its redundant copies (rows 0x048 to 0x04a, section 13.10) and neither configuration row programmed. So its bootrom brought USB up on the 12 MHz it assumes.",
+]
+
+[memory]                    # the RP2350 has NO internal flash (chip flash = 0, gate-pinned) --
+flash = 0x1000000           # the 16 MB QSPI chip it XIPs from is BOARD truth.
+source = "Schematic sheet 2: U2 is a 16MB W25Q128JVPIQ on the QSPI lines. The pinout diagram states 16MB Flash in its summary. 16 MB = 0x1000000."
+
+# --- the wires, and the peripherals the header names. The pinout diagram labels GP0 and GP1 UART 0
+#     TX and RX; GP16, GP17, GP18 and GP19 SPI 0 RX, CSn, SCK and TX; and GP4 and GP5 I2C 0 SDA and
+#     SCL, the pair it also wires to the QW/ST connector. Each row below takes those labels. ---
+
+[[carriers]]
+kind = "native-usb"         # the RP2350B's own USB device controller on the USB-C socket -- no
+                            # bridge, and so no board-fixed bridge identity to state.
+plan = "pll-150-48"
+default = true
+
+[[carriers]]
+kind = "uart"               # the second wire: uart0 on GP0/GP1 through an EXTERNAL bridge (a debug
+role = "uart0"              # probe's UART cable, any USB-UART dongle), at the same operating point
+baud = 115200               # as the usb wire.
+plan = "pll-150-48"
+
+[[bindings]]
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+[[bindings]]
+role = "spi0"
+kind = "spi"
+instance = "spi0"
+function = "F1"
+mosi = { pin = "GP19" }
+sck = { pin = "GP18" }
+miso = { pin = "GP16" }
+cs = { pin = "GP17" }
+
+[[bindings]]
+role = "i2c0"
+kind = "i2c"
+instance = "i2c0"
+function = "F3"
+sda = { pin = "GP4" }
+scl = { pin = "GP5" }
+
+[[bindings]]
+role = "adc"
+kind = "adc"
+instance = "adc"
+reference_uv = 3300000
+source = "Schematic sheet 1: the 3V3 rail reaches the RP2350B's ADC supply pin (labelled ADC_IOVDD, pin 59) through R3 (220R), with C9 (2.2uF) to ground -- the net ADC_VREF, which the pinout diagram brings out at the header's ADC VREF position. The part symbol's own note reads USB&ADC: 3.3V."
+
+# --- control lines -----------------------------------------------------------------------------
+#
+# THE USER LED IS ACTIVE HIGH, read off the schematic rather than from the family's habit: GP25
+# reaches the LED's anode through R6, 470R, and the cathode is at ground, so the pin sources the
+# current and a ONE lights it.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "GP25"
+active = "high"
+source = "Schematic sheet 2, the User LED block: the net LED_GP25 leaves GPIO25 (ball 26), passes through R6 (470R) into the anode of LED_USER, a GREEN LED whose cathode is at ground. A one on the pin lights it. The pinout diagram's summary calls the board's indicator a Mono LED and its pin table gives LED on GP25."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "GP45"
+active = "low"
+source = "Schematic sheet 2, the block titled 'Combined USB boot & user switch': RN1-3 (10k) holds a node at 3V3, SW_BOOT shorts that node to ground, and the node reaches GPIO45 (ball 56) through RN1-2 and RN1-1 (10k each). So the pin rests HIGH and reads LOW while the button is held. The same node reaches the flash chip select through D1 and R4 (1k), which is what makes one button serve both the boot ROM and a program. The pinout diagram labels this position BOOT / USER on GP45 and annotates it Active Low."
+
+[[devices]]
+name = "psram-cs"
+kind = "gpio-out"
+pin = "GP47"
+active = "low"
+source = "Schematic sheet 1: the net PSRAM_CS lands on GPIO47/ADC7 (ball 58); sheet 2 carries it to the chip select of an 8MB APS6404L-3SQR-ZR and notes that PSRAM_CS can be GP0, GP8, GP19 or GP47, of which this board fits GP47. The level is the chip's own: the APMemory APS6404L-3SQR datasheet (APM_PSRAM_E3_QSPI v2.7), section 6, Table 2 'Signals Table', gives CE# as an input, 'Chip select, active low. When CE#=1, chip is in standby state'."
+
+[[devices]]
+name = "adc0-header-26"
+kind = "gpio-in"
+pin = "GP40"
+active = "none"
+source = "Schematic sheet 1: the header net GP26 reaches GPIO40/ADC0 (ball 49) through RN2-1, 1k, as well as GPIO26 (ball 27) directly. This row names the ANALOGUE half of a header position that also lands on a low-numbered GPIO, so it is a sampled input rather than a logic line and asserts no level: `none` here states that, where `unknown` would say nobody had looked."
+
+[[devices]]
+name = "adc1-header-27"
+kind = "gpio-in"
+pin = "GP41"
+active = "none"
+source = "Schematic sheet 1: the header net GP27 reaches GPIO41/ADC1 (ball 52) through RN2-2, 1k, as well as GPIO27 (ball 28) directly. This row names the ANALOGUE half of a header position that also lands on a low-numbered GPIO, so it is a sampled input rather than a logic line and asserts no level: `none` here states that, where `unknown` would say nobody had looked."
+
+[[devices]]
+name = "adc2-header-28"
+kind = "gpio-in"
+pin = "GP42"
+active = "none"
+source = "Schematic sheet 1: the header net GP28 reaches GPIO42/ADC2 (ball 53) through RN2-3, 1k, as well as GPIO28 (ball 36) directly. This row names the ANALOGUE half of a header position that also lands on a low-numbered GPIO, so it is a sampled input rather than a logic line and asserts no level: `none` here states that, where `unknown` would say nobody had looked."
+
+# --- the clock plan. X1 is a 12 MHz crystal: no document for this board states its frequency, so
+#     the figure is a measurement, and this file's notes say how it was taken. ---
+
+[[plans]]
+name = "pll-150-48"         # the operating point: clk_sys 150 MHz off
+default = true              # PLL_SYS, clk_usb/clk_adc 48 MHz off PLL_USB, clk_peri left
+source = "xosc"             # crystal-exact (state-and-verify: generation checks
+xosc_hz = 12000000          # hz == xosc * fbdiv / (postdiv1 * postdiv2) per PLL).
+clk_peri_hz = 12000000
+clk_sys_hz = 150000000
+clk_usb_hz = 48000000
+clk_adc_hz = 48000000
+pll_sys_fbdiv = 125
+pll_sys_postdiv1 = 5
+pll_sys_postdiv2 = 2
+pll_usb_fbdiv = 100
+pll_usb_postdiv1 = 5
+pll_usb_postdiv2 = 5
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "yes"
+onboard = "none"
+recovery = "mask-rom"
+source = "The pinout diagram lists a Debug connector among the board's connectors and gives its three positions as SWCLK, GND and SWDIO, so a probe cable lands on it with no tools; the schematic carries SWCLK and SWDIO from the MCU to it. There is no on-board debug probe. RP2350 datasheet section 4.1: the mask ROM is a physically immutable memory resource, so the recovery path is in silicon and no image written to flash can remove it."

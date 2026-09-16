@@ -31,18 +31,22 @@ public enum AdafruitFeatherRp2040AdaloggerBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LED_PORT_BASE: UInt32 = 0xD0000000
     public static let LED_PIN: UInt32 = 13
+    public static let LED_BANK: UInt32 = 0
     public static let LED_MASK: UInt32 = 0x2000
     public static let LED_ACTIVE_LOW: UInt32 = 0
     public static let NEOPIXEL_PORT_BASE: UInt32 = 0xD0000000
     public static let NEOPIXEL_PIN: UInt32 = 17
+    public static let NEOPIXEL_BANK: UInt32 = 0
     public static let NEOPIXEL_MASK: UInt32 = 0x20000
     public static let NEOPIXEL_ACTIVE_LOW: UInt32 = 0
     public static let BUTTON_PORT_BASE: UInt32 = 0xD0000000
     public static let BUTTON_PIN: UInt32 = 7
+    public static let BUTTON_BANK: UInt32 = 0
     public static let BUTTON_MASK: UInt32 = 0x80
     public static let BUTTON_ACTIVE_LOW: UInt32 = 1
     public static let SD_CARD_DETECT_PORT_BASE: UInt32 = 0xD0000000
     public static let SD_CARD_DETECT_PIN: UInt32 = 16
+    public static let SD_CARD_DETECT_BANK: UInt32 = 0
     public static let SD_CARD_DETECT_MASK: UInt32 = 0x10000
     public static let SD_CARD_DETECT_ACTIVE_LOW: UInt32 = 1
 
@@ -65,8 +69,10 @@ public enum AdafruitFeatherRp2040AdaloggerBindings {
     public static let CONNECTOR_QT_STANDARD: StaticString = "stemma-qt"
     public static let CONNECTOR_QT_SDA_PORT_BASE: UInt32 = 0xD0000000
     public static let CONNECTOR_QT_SDA_PIN: UInt32 = 2
+    public static let CONNECTOR_QT_SDA_BANK: UInt32 = 0
     public static let CONNECTOR_QT_SDA_MASK: UInt32 = 0x4
     public static let CONNECTOR_QT_SCL_PORT_BASE: UInt32 = 0xD0000000
     public static let CONNECTOR_QT_SCL_PIN: UInt32 = 3
+    public static let CONNECTOR_QT_SCL_BANK: UInt32 = 0
     public static let CONNECTOR_QT_SCL_MASK: UInt32 = 0x8
 }

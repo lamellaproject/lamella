@@ -46,6 +46,7 @@ public enum RpiPicoBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LED_PORT_BASE: UInt32 = 0xD0000000
     public static let LED_PIN: UInt32 = 25
+    public static let LED_BANK: UInt32 = 0
     public static let LED_MASK: UInt32 = 0x2000000
     public static let LED_ACTIVE_LOW: UInt32 = 0
 

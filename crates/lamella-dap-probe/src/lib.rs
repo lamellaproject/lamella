@@ -162,25 +162,30 @@ impl<T: TargetAccess> ProbeBackend<T> {
 }
 
 impl<T: TargetAccess> DebugBackend for ProbeBackend<T> {
-    fn launch(&mut self) -> bool {
+    fn launch(&mut self) -> Result<(), String> {
         {
             let mut target = self.target.borrow_mut();
-            if target.connect().is_err() || target.init_mem().is_err() {
-                return false;
-            }
-            let started = match self.start {
-                Start::Reset => target.reset_and_halt(),
-                Start::Attach => target.halt().and_then(|()| target.wait_halted()),
-            };
-            if started.is_err() {
-                return false;
+            target
+                .connect()
+                .map_err(|error| format!("could not connect to the target: {error}"))?;
+            target
+                .init_mem()
+                .map_err(|error| format!("could not reach the target's memory: {error}"))?;
+            match self.start {
+                Start::Reset => target
+                    .reset_and_halt()
+                    .map_err(|error| format!("could not reset and halt the target: {error}"))?,
+                Start::Attach => target
+                    .halt()
+                    .and_then(|()| target.wait_halted())
+                    .map_err(|error| format!("could not halt the target to attach: {error}"))?,
             }
         }
         self.comparators = self.read_comparators();
         self.sync_pc();
         self.running = false;
         self.launched = true;
-        self.arm().is_ok()
+        self.arm().map_err(|error| format!("could not arm the breakpoints: {error}"))
     }
 
     fn resume(&mut self) -> Stop {
@@ -236,6 +241,15 @@ impl<T: TargetAccess> DebugBackend for ProbeBackend<T> {
         self.running = false;
         self.sync_pc();
         true
+    }
+
+    /// Removes every breakpoint, resumes a halted core and turns halting debug off, so the program
+    /// runs on as it would with no debugger attached. See [`lamella_probe_core::hand_back`].
+    fn release(&mut self) -> Result<(), String> {
+        self.breakpoints.clear();
+        self.launched = false;
+        self.running = false;
+        lamella_probe_core::hand_back(self.target.get_mut()).map_err(|error| error.to_string())
     }
 
     /// One, always: recovering a caller needs an unwinder, and this backend has no debug info to
@@ -346,6 +360,11 @@ mod tests {
     use lamella_probe_core::CallFrame;
     use std::collections::BTreeMap;
 
+    /// The Debug Halting Control and Status Register, and the key a write to it carries in bits
+    /// [31:16] (Armv8-M ARM, D1.2.39).
+    const DHCSR: u32 = 0xE000_EDF0;
+    const DBGKEY: u32 = 0xA05F_0000;
+
     /// A target that answers from a memory map and a register file, so the backend's logic is
     /// exercised without a probe or a board.
     #[derive(Default)]
@@ -363,6 +382,9 @@ mod tests {
         fail_connect: bool,
         /// A unit that refuses the write, so the test can distinguish "armed" from "asked to arm".
         fail_breakpoints: bool,
+        /// The operations a release is made of, in the order they reached the target: `breakpoints`
+        /// for a breakpoint write it took, `resume`, and `dhcsr` for a write to that register.
+        order: Vec<&'static str>,
     }
 
     impl FakeTarget {
@@ -392,6 +414,9 @@ mod tests {
             Ok(self.memory.get(&address).copied().unwrap_or(0))
         }
         fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+            if address == DHCSR {
+                self.order.push("dhcsr");
+            }
             self.memory.insert(address, value);
             Ok(())
         }
@@ -427,6 +452,7 @@ mod tests {
             Ok(())
         }
         fn resume(&mut self) -> Result<(), ProbeError> {
+            self.order.push("resume");
             self.halted = false;
             Ok(())
         }
@@ -487,6 +513,7 @@ mod tests {
             if self.fail_breakpoints {
                 return Err(ProbeError::Device("the unit refused the write"));
             }
+            self.order.push("breakpoints");
             self.armed = addresses.to_vec();
             Ok(())
         }
@@ -503,7 +530,7 @@ mod tests {
     #[test]
     fn launch_halts_the_target_and_reports_where_it_stopped() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x0800_0100), Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert_eq!(backend.pc(), 0x0800_0100);
         let stack = backend.stack();
         assert_eq!(stack.len(), 1, "no unwinder: exactly one frame");
@@ -515,14 +542,17 @@ mod tests {
         let mut target = FakeTarget::with_pc(0);
         target.fail_connect = true;
         let mut backend = ProbeBackend::new(target, Start::Reset);
-        assert!(!backend.launch(), "a probe that cannot connect must not report a launched session");
+        assert!(
+            backend.launch().is_err(),
+            "a probe that cannot connect must not report a launched session"
+        );
     }
 
     #[test]
     fn the_breakpoint_limit_comes_from_the_target_not_a_constant() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x1000), Start::Reset);
         assert_eq!(backend.max_breakpoints(), None, "nothing is claimed before the target is read");
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert_eq!(
             backend.max_breakpoints(),
             Some(4),
@@ -535,7 +565,7 @@ mod tests {
         let mut target = FakeTarget::with_pc(0x1000);
         target.memory.insert(FP_CTRL, 0x0000_0003);
         let mut backend = ProbeBackend::new(target, Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert_eq!(
             backend.max_breakpoints(),
             Some(0),
@@ -549,7 +579,7 @@ mod tests {
         let mut target = FakeTarget::with_pc(0x1000);
         target.memory.insert(FP_CTRL, 0x0000_0003);
         let mut backend = ProbeBackend::new(target, Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         backend.breakpoints = vec![0x2100];
         let refused = backend.arm();
         assert!(
@@ -569,7 +599,7 @@ mod tests {
             backend.set_breakpoints(&[0x2100, 0x2200]).is_ok(),
             "before launch there is no target to program, so this is not a failure to report"
         );
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         let armed = backend.into_target().armed;
         assert_eq!(
             armed,
@@ -581,7 +611,7 @@ mod tests {
     #[test]
     fn breakpoints_past_the_comparator_count_are_not_sent_to_the_unit() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x2000), Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert!(
             backend.set_breakpoints(&[1, 2, 3, 4, 5, 6]).is_ok(),
             "truncation at max_breakpoints is the PREDICTED case, already greyed by the adapter"
@@ -597,7 +627,7 @@ mod tests {
         let mut target = FakeTarget::with_pc(0x2000);
         target.memory.insert(FP_CTRL, 0x0000_0083);
         let mut backend = ProbeBackend::new(target, Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert_eq!(backend.max_breakpoints(), Some(8));
         assert!(backend.set_breakpoints(&[1, 2, 3, 4, 5, 6]).is_ok());
         assert_eq!(
@@ -610,7 +640,7 @@ mod tests {
     #[test]
     fn a_unit_that_refuses_the_write_is_reported_rather_than_swallowed() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x2000), Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         backend.target.borrow_mut().fail_breakpoints = true;
         let Err(reason) = backend.set_breakpoints(&[0x2100]) else {
             panic!("a unit that refused the write must say so, not report an armed breakpoint");
@@ -624,7 +654,7 @@ mod tests {
     #[test]
     fn an_address_too_wide_for_the_target_is_dropped_not_truncated() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x2000), Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         let outcome = backend.set_breakpoints(&[0x1_0000_2100, 0x2200]);
         let armed = backend.into_target().armed;
         assert_eq!(
@@ -647,7 +677,7 @@ mod tests {
         target.run_for = 2;
         target.lands_at = 0x3400;
         let mut backend = ProbeBackend::new(target, Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert!(backend.set_breakpoints(&[0x3400]).is_ok());
 
         assert!(matches!(backend.resume(), Stop::Running), "a probe target is free-running");
@@ -665,7 +695,7 @@ mod tests {
         let mut target = FakeTarget::with_pc(0x3000);
         target.lands_at = 0x3fff;
         let mut backend = ProbeBackend::new(target, Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert!(backend.set_breakpoints(&[0x3400]).is_ok());
         assert!(matches!(backend.resume(), Stop::Running));
         assert!(
@@ -677,7 +707,7 @@ mod tests {
     #[test]
     fn step_advances_the_program_counter() {
         let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x4000), Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert!(matches!(backend.step(), Stop::Step));
         assert_eq!(backend.pc(), 0x4002);
     }
@@ -687,7 +717,7 @@ mod tests {
         let mut target = FakeTarget::with_pc(0x5000);
         target.run_for = 100;
         let mut backend = ProbeBackend::new(target, Start::Reset);
-        assert!(backend.launch());
+        assert_eq!(backend.launch(), Ok(()));
         assert!(matches!(backend.resume(), Stop::Running));
         assert!(backend.pause());
         assert!(matches!(backend.poll(), Stop::Step), "after a pause the target is not running");
@@ -744,5 +774,89 @@ mod tests {
         assert!(backend.source_location(0x6000).is_none());
         assert!(backend.disassemble(0x6000, 0, 4).is_empty());
         assert!(backend.take_output().is_none(), "a probe carries no program output");
+    }
+
+    #[test]
+    fn release_hands_a_halted_target_back_running_with_no_breakpoint_and_halting_debug_off() {
+        let mut target = FakeTarget::with_pc(0x1000);
+        target.run_for = u32::MAX;
+        let mut backend = ProbeBackend::new(target, Start::Reset);
+        assert!(backend.set_breakpoints(&[0x1004]).is_ok());
+        assert_eq!(backend.launch(), Ok(()));
+        backend.target.get_mut().order.clear();
+
+        assert_eq!(backend.release(), Ok(()));
+        let target = backend.into_target();
+        assert!(
+            target.armed.is_empty(),
+            "a breakpoint left armed stops the program with nobody attached"
+        );
+        assert!(
+            !target.halted,
+            "the core stopped at entry must be running once the session ends"
+        );
+        assert_eq!(
+            target.memory.get(&DHCSR),
+            Some(&DBGKEY),
+            "halting debug must be off: C_DEBUGEN and C_HALT both 0, written with the key"
+        );
+        assert_eq!(
+            target.order,
+            ["breakpoints", "resume", "dhcsr"],
+            "breakpoints off first, then out of Debug state with C_DEBUGEN still set, then C_DEBUGEN cleared"
+        );
+    }
+
+    #[test]
+    fn release_does_not_resume_a_target_that_is_already_running() {
+        let mut target = FakeTarget::with_pc(0x1000);
+        target.run_for = u32::MAX;
+        let mut backend = ProbeBackend::new(target, Start::Reset);
+        assert_eq!(backend.launch(), Ok(()));
+        assert!(matches!(backend.resume(), Stop::Running));
+        backend.target.get_mut().order.clear();
+
+        assert_eq!(backend.release(), Ok(()));
+        let target = backend.into_target();
+        assert_eq!(
+            target.order,
+            ["breakpoints", "dhcsr"],
+            "a running core is not resumed a second time"
+        );
+        assert_eq!(target.memory.get(&DHCSR), Some(&DBGKEY));
+    }
+
+    #[test]
+    fn a_core_that_halts_before_halting_debug_is_off_is_reported_rather_than_released() {
+        let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x1000), Start::Reset);
+        assert_eq!(backend.launch(), Ok(()));
+        let released = backend.release();
+        assert!(
+            matches!(&released, Err(reason) if reason.contains("stopped again")),
+            "a core still halted is not a released one: {released:?}"
+        );
+    }
+
+    #[test]
+    fn a_release_that_cannot_remove_the_breakpoints_leaves_the_core_stopped_and_says_so() {
+        let mut backend = ProbeBackend::new(FakeTarget::with_pc(0x1000), Start::Reset);
+        assert!(backend.set_breakpoints(&[0x1004]).is_ok());
+        assert_eq!(backend.launch(), Ok(()));
+        let target = backend.target.get_mut();
+        target.fail_breakpoints = true;
+        target.order.clear();
+
+        let released = backend.release();
+        assert!(
+            matches!(&released, Err(reason) if reason.contains("could not remove the breakpoints")),
+            "{released:?}"
+        );
+        let target = backend.into_target();
+        assert!(target.halted, "the core stays where the session left it");
+        assert!(
+            target.order.is_empty(),
+            "nothing after the failed write: {:?}",
+            target.order
+        );
     }
 }

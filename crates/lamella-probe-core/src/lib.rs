@@ -302,7 +302,7 @@ pub trait TargetAccess {
     fn write_byte(&mut self, address: u32, value: u8) -> Result<(), ProbeError>;
     /// Reads a halfword.
     fn read_halfword(&mut self, address: u32) -> Result<u16, ProbeError>;
-    /// Writes a halfword. NOT guaranteed to be a single 16-bit bus cycle -- see the note above.
+    /// Writes a halfword. NOT guaranteed to be a single 16-bit bus cycle.
     fn write_halfword(&mut self, address: u32, value: u16) -> Result<(), ProbeError>;
 
     /// Halts the processor core.
@@ -386,6 +386,68 @@ pub trait TargetAccessExt: TargetAccess {
 }
 
 impl<T: TargetAccess + ?Sized> TargetAccessExt for T {}
+
+/// Where [`hand_back`] stopped, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandBackError {
+    /// The breakpoints could not be removed, so the core was left where it was.
+    Breakpoints(ProbeError),
+    /// Whether the core is halted could not be read.
+    HaltState(ProbeError),
+    /// The halted core could not be resumed.
+    Resume(ProbeError),
+    /// Halting debug could not be turned off.
+    DebugOff(ProbeError),
+    /// The core was halted again after halting debug was turned off.
+    HaltedAgain,
+}
+
+impl fmt::Display for HandBackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HandBackError::Breakpoints(error) => write!(f, "could not remove the breakpoints: {error}"),
+            HandBackError::HaltState(error) => {
+                write!(f, "could not read whether the core is halted: {error}")
+            }
+            HandBackError::Resume(error) => write!(f, "could not resume the core: {error}"),
+            HandBackError::DebugOff(error) => write!(f, "could not turn halting debug off: {error}"),
+            HandBackError::HaltedAgain => {
+                f.write_str("the core stopped again before halting debug was turned off")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HandBackError {}
+
+/// Hands a Cortex-M target back as a debug session ends, so its program runs as it would with no
+/// debugger attached: every hardware breakpoint is removed, a halted core is resumed, and halting
+/// debug is turned off.
+///
+/// The steps run in that order, and the first one that fails ends the sequence and is returned. A
+/// core this cannot release is left where it was, not half released.
+///
+/// Halting debug is turned off in two writes to the Debug Halting Control and Status Register. The
+/// table that defines leaving Debug state -- the Armv7-M Architecture Reference Manual, section C1.5,
+/// Table C1-9 -- covers writes made while `C_DEBUGEN` is set. So a halted core is resumed first, with
+/// `C_DEBUGEN` still 1, and a second write clears `C_DEBUGEN`. With `C_DEBUGEN` 0 the core behaves
+/// as if `C_MASKINTS`, `C_STEP` and `C_HALT` were all 0 (the Armv8-M Architecture Reference Manual,
+/// section D1.2.39), so it does not halt again with nobody attached to resume it.
+///
+/// # Errors
+/// A [`HandBackError`] that names the step that failed.
+pub fn hand_back<T: TargetAccess + ?Sized>(target: &mut T) -> Result<(), HandBackError> {
+    target.set_breakpoints(&[]).map_err(HandBackError::Breakpoints)?;
+    if target.is_halted().map_err(HandBackError::HaltState)? {
+        target.resume().map_err(HandBackError::Resume)?;
+    }
+    target.write_word(DHCSR, DBGKEY).map_err(HandBackError::DebugOff)?;
+    if target.is_halted().map_err(HandBackError::HaltState)? {
+        return Err(HandBackError::HaltedAgain);
+    }
+    Ok(())
+}
 
 /// The primitives Cortex-M run control is built out of.
 ///
@@ -566,7 +628,7 @@ pub mod cortex_m {
         core.write_word(DEMCR, 0)
     }
 
-    /// Which revision of the breakpoint unit a part implements, from `FP_CTRL.REV` (bits [31:28]).
+    /// Which revision of the breakpoint unit a part implements, from `FP_CTRL.REV` (bits `[31:28]`).
     ///
     /// **THE TWO REVISIONS SHARE NO COMPARATOR LAYOUT, so a comparator word cannot be built without
     /// knowing which one is present**, and the register that says so is the same one the enable is
@@ -574,11 +636,11 @@ pub mod cortex_m {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum FpbRevision {
         /// `FP_CTRL.REV == 0` -- Armv6-M and Armv7-M. A comparator carries `BP_MATCH` in bits
-        /// [31:30] selecting which halfword to break on, and `COMP` in bits [28:2], so the unit
+        /// `[31:30]` selecting which halfword to break on, and `COMP` in bits `[28:2]`, so the unit
         /// reaches only the low 512 MB and needs the halfword picked for it.
         V1,
         /// `FP_CTRL.REV == 1` -- Armv8-M (Cortex-M23, Cortex-M33 and later). A comparator carries
-        /// `BPADDR` in bits [31:1] and there is NO match field: the whole address space, and the
+        /// `BPADDR` in bits `[31:1]` and there is NO match field: the whole address space, and the
         /// halfword falls out of the address itself. Literal remapping does not exist on Armv8-M.
         ///
         /// Armv8-M ARM (DDI 0553B.y), D1.2 -- `FP_COMP{0..125}` and `FP_CTRL`.
@@ -606,7 +668,7 @@ pub mod cortex_m {
 
     /// How many code comparators the unit implements, from the `FP_CTRL` word already read.
     ///
-    /// `NUM_CODE` is split across two fields: bits [14:12] carry its high three bits and bits [7:4]
+    /// `NUM_CODE` is split across two fields: bits `[14:12]` carry its high three bits and bits `[7:4]`
     /// its low four. Both are needed -- the low field alone saturates at 15, and an Armv8-M unit
     /// may implement up to 126.
     pub fn fpb_num_code(fp_ctrl: u32) -> u32 {
@@ -615,10 +677,10 @@ pub mod cortex_m {
 
     /// The FPB comparator word breaking at `address`, in the layout `revision` implements.
     ///
-    /// V1: `BP_MATCH` (bits [31:30]) picks the halfword -- 01 lower, 10 upper -- `COMP` carries
-    /// address[28:2], and bit 0 enables.
+    /// V1: `BP_MATCH` (bits `[31:30]`) picks the halfword -- 01 lower, 10 upper -- `COMP` carries
+    /// address `[28:2]`, and bit 0 enables.
     ///
-    /// V2: `BPADDR` (bits [31:1]) carries address[31:1] and `BE` (bit 0) enables. There is no match
+    /// V2: `BPADDR` (bits `[31:1]`) carries address `[31:1]` and `BE` (bit 0) enables. There is no match
     /// field and no truncation of the address.
     pub fn comparator(revision: FpbRevision, address: u32) -> u32 {
         match revision {
@@ -784,6 +846,129 @@ const FP_CTRL_KEY: u32 = 1 << 1;
 /// `FP_CTRL.ENABLE` -- the breakpoint unit's global enable.
 const FP_CTRL_ENABLE: u32 = 1 << 0;
 const FP_COMP0: u32 = 0xe000_2008;
+
+/// A debug port's identification register, `DPIDR`, decoded field by field.
+///
+/// `VERSION` is bits 15:12 in both debug interface architectures, ADIv5.2 (IHI 0031G) B2.2.5 and
+/// ADIv6.0 (IHI 0074E) B2.2.6, and the two differ in which values exist: ADIv5.2 permits DPv1 and
+/// DPv2, and ADIv6.0 adds DPv3 -- a debug port whose access ports are selected by address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DpIdr(pub u32);
+
+impl DpIdr {
+    /// `REVISION`, bits 31:28.
+    pub fn revision(self) -> u32 {
+        self.0 >> 28
+    }
+
+    /// `PARTNO`, bits 27:20.
+    pub fn partno(self) -> u32 {
+        (self.0 >> 20) & 0xff
+    }
+
+    /// `MIN`, bit 16: set when the port implements the minimal debug port.
+    pub fn min(self) -> bool {
+        self.0 & (1 << 16) != 0
+    }
+
+    /// `VERSION`, bits 15:12: the debug port architecture version.
+    pub fn version(self) -> u32 {
+        (self.0 >> 12) & 0xf
+    }
+
+    /// `DESIGNER`, bits 11:1, as the raw 11-bit field: the JEP106 continuation count in its top four
+    /// bits and the identity code in its low seven.
+    pub fn designer(self) -> u32 {
+        (self.0 >> 1) & 0x7ff
+    }
+
+    /// Whether this is a DPv3 port, which ADIv6.0 defines and ADIv5.2 does not. Its access ports are
+    /// selected by address, so [`TargetAccess::init_mem`]'s ADIv5 selection of AP 0 does not reach a
+    /// MEM-AP on it; select one with [`ArmDap::init_mem_select`].
+    pub fn is_dpv3(self) -> bool {
+        self.version() == 3
+    }
+}
+
+/// The word every 32-bit little-endian word of `image` holds, or `None` when any word differs, or
+/// when `image` is empty or not a whole number of words.
+///
+/// A memory dump that is one repeated word is not a backup, whichever way it came about. A read
+/// through the wrong access port returns one -- an RP2350's debug port gave `0x00007003` for all
+/// 4 MB of its flash -- and a region that is entirely erased holds one, and holds nothing to
+/// restore.
+pub fn repeated_word(image: &[u8]) -> Option<u32> {
+    let mut words = image.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+    if image.len() % 4 != 0 {
+        return None;
+    }
+    let first = words.next()?;
+    words.all(|word| word == first).then_some(first)
+}
+
+#[cfg(test)]
+mod dpidr_and_dump_tests {
+    extern crate std;
+    use super::{DpIdr, repeated_word};
+    use std::vec::Vec;
+
+    /// An RP2350's SW-DP: Arm-designed, and DPv3.
+    const RP2350_SW_DP: u32 = 0x4c01_3477;
+    /// An RP2040's rescue debug port: Raspberry-Pi-designed, and DPv2.
+    const RP2040_RESCUE_DP: u32 = 0x1021_2927;
+
+    fn words(word: u32, count: usize) -> Vec<u8> {
+        core::iter::repeat(word.to_le_bytes()).take(count).flatten().collect()
+    }
+
+    /// The field decode, against one Arm-designed DPv3 port and one Raspberry-Pi-designed DPv2 one.
+    /// `DESIGNER` is bits 11:1 and the low bit reads as one, which is the detail a hand-written mask
+    /// gets wrong.
+    #[test]
+    fn dpidr_fields_decode_against_both_designers() {
+        let arm = DpIdr(RP2350_SW_DP);
+        assert_eq!(arm.designer(), 0x23b);
+        assert_eq!(arm.version(), 3);
+        assert_eq!(arm.partno(), 0xc0);
+        assert_eq!(arm.revision(), 4);
+        assert!(arm.min());
+
+        let pi = DpIdr(RP2040_RESCUE_DP);
+        assert_eq!(pi.designer(), 0x493);
+        assert_eq!(pi.version(), 2);
+        assert_eq!(pi.partno(), 0x02);
+        assert_eq!(pi.revision(), 1);
+        assert!(pi.min());
+
+        assert_eq!(DpIdr(0xf100_2927).designer(), 0x493);
+        assert_eq!(DpIdr(0x0100_2927).designer(), 0x493);
+    }
+
+    #[test]
+    fn only_a_dpv3_port_selects_its_access_ports_by_address() {
+        assert!(DpIdr(RP2350_SW_DP).is_dpv3());
+        for other in [0x0bc1_2477, RP2040_RESCUE_DP, 0x2ba0_1477, 0x6ba0_2477] {
+            assert!(!DpIdr(other).is_dpv3(), "{other:#010x} is not DPv3");
+        }
+    }
+
+    /// The dump that looked like a backup: the RP2350's 4 MB, every word `0x00007003`.
+    #[test]
+    fn a_dump_of_one_repeated_word_is_recognized_whatever_the_word() {
+        assert_eq!(repeated_word(&words(0x0000_7003, 1 << 20)), Some(0x0000_7003));
+        assert_eq!(repeated_word(&words(0xffff_ffff, 1024)), Some(0xffff_ffff));
+        assert_eq!(repeated_word(&words(0, 1)), Some(0));
+    }
+
+    #[test]
+    fn a_dump_in_which_any_word_differs_is_not_one_repeated_word() {
+        let mut image = words(0x0000_7003, 1 << 20);
+        image[4 * 700_000] ^= 1;
+        assert_eq!(repeated_word(&image), None, "one differing word anywhere");
+        assert_eq!(repeated_word(&[]), None, "an empty dump");
+        assert_eq!(repeated_word(&[0x03, 0x70, 0x00]), None, "not a whole number of words");
+    }
+}
 
 /// The ARM bridge: turns raw [`DapAccess`] (DP/AP registers) into [`TargetAccess`] (memory and run
 /// control) by implementing the ADIv5 MEM-AP and the Cortex-M debug unit on top of it.

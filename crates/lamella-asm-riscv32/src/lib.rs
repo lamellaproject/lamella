@@ -149,6 +149,9 @@ enum Fixup {
 #[derive(Debug, Clone, Default)]
 pub struct Encoder {
     bytes: Vec<u8>,
+    /// The last `sw rs2, imm(sp)` emitted, as (register, offset, the position just past it); cleared
+    /// when a label is bound. See [`Encoder::holds_sp_slot`].
+    sp_store: Option<(Reg, i32, u32)>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, Fixup, u32)>,
     /// `emit_word_diff` sites: `(word offset, base label, target label)` patched to `target - base`.
@@ -164,19 +167,20 @@ pub struct Encoder {
 }
 
 /// Re-points a byte offset recorded BEFORE relaxation to where it sits AFTER, given the insertions
-/// [`Assembled::shifts`] reports. An offset moves by the total inserted at or before it.
+/// [`Assembled::shifts`] reports.
+///
+/// The insertions are replayed in the order they were made. Each one's position was taken in the
+/// layout as it stood at that moment, which already counts every earlier insertion, so the offset is
+/// carried forward one insertion at a time and compared against each in that same layout.
 ///
 /// A site exactly AT an insertion point moves too: the relaxation splices the unconditional jump
 /// AFTER the branch it widens, so anything recorded at that address belonged to the following
 /// instruction and has to travel with it.
 #[must_use]
 pub fn shift_position(shifts: &[(u32, u32)], position: u32) -> u32 {
-    shifts
-        .iter()
-        .filter(|(at, _)| *at <= position)
-        .map(|(_, grow)| *grow)
-        .sum::<u32>()
-        + position
+    shifts.iter().fold(position, |moved, &(at, grow)| {
+        if moved >= at { moved + grow } else { moved }
+    })
 }
 
 impl Encoder {
@@ -201,6 +205,7 @@ impl Encoder {
 
     /// Binds `label` to the current position.
     pub fn bind_label(&mut self, label: Label) {
+        self.sp_store = None;
         let here = self.position();
         if let Some(slot) = self.labels.get_mut(label.0 as usize) {
             *slot = Some(here);
@@ -415,6 +420,17 @@ impl Encoder {
     /// `sw rs2, imm(rs1)` -- store a word.
     pub fn sw(&mut self, rs2: Reg, rs1: Reg, imm: i32) {
         self.s_type(imm, rs2, rs1, 2);
+        if rs1 == Reg::SP {
+            self.sp_store = Some((rs2, imm, self.position()));
+        }
+    }
+
+    /// Whether `rd` still holds the word at `imm(sp)`: the last instruction emitted is
+    /// `sw rd, imm(sp)` and no label has been bound since, so execution reaches the current position
+    /// only by falling through from that store. A load of that word here can be omitted.
+    #[must_use]
+    pub fn holds_sp_slot(&self, rd: Reg, imm: i32) -> bool {
+        self.sp_store == Some((rd, imm, self.position()))
     }
 
     /// `jalr rd, rs1, imm` -- jump to `rs1 + imm`, link into rd.
@@ -519,7 +535,6 @@ impl Encoder {
             }
         }
         self.shifts.push((at, grow));
-        self.shifts.sort_unstable();
     }
 
     /// Widens ONE conditional branch that cannot reach its target, and reports whether it did.
@@ -661,6 +676,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stack_store_is_held_until_a_label_or_another_instruction() {
+        let mut enc = Encoder::new();
+        enc.sw(Reg::A0, Reg::SP, 8);
+        assert!(enc.holds_sp_slot(Reg::A0, 8));
+        assert!(!enc.holds_sp_slot(Reg::A1, 8), "another register");
+        assert!(!enc.holds_sp_slot(Reg::A0, 12), "another slot");
+        let label = enc.new_label();
+        enc.bind_label(label);
+        assert!(!enc.holds_sp_slot(Reg::A0, 8), "a label bound after the store");
+        enc.sw(Reg::A0, Reg::SP, 8);
+        enc.addi(Reg::A1, Reg::ZERO, 0);
+        assert!(!enc.holds_sp_slot(Reg::A0, 8), "an instruction emitted after the store");
+        let mut other_base = Encoder::new();
+        other_base.sw(Reg::A0, Reg::T0, 8);
+        assert!(!other_base.holds_sp_slot(Reg::A0, 8), "a store through another base");
+    }
+
+    #[test]
     fn a_far_conditional_branch_widens_into_an_inverted_branch_over_a_jump() {
         let mut enc = Encoder::new();
         let far = enc.new_label();
@@ -692,6 +725,45 @@ mod tests {
             out.shifts.as_slice(),
             &[(4u32, 4u32)][..],
             "one 4-byte insertion, reported to the caller"
+        );
+    }
+
+    #[test]
+    fn a_caller_offset_past_the_second_widening_lands_on_its_own_instruction() {
+        let mut enc = Encoder::new();
+        let far = enc.new_label();
+        enc.branch(BranchCond::Eq, Reg::T0, Reg::T1, far);
+        for _ in 0..2000 {
+            enc.addi(Reg::ZERO, Reg::ZERO, 0);
+        }
+        enc.branch(BranchCond::Ne, Reg::T0, Reg::T1, far);
+        let marker_at = enc.position();
+        enc.addi(Reg::T2, Reg::ZERO, 123);
+        for _ in 0..2000 {
+            enc.addi(Reg::ZERO, Reg::ZERO, 0);
+        }
+        enc.bind_label(far);
+        enc.ret();
+        let out = enc.finish().expect("both far branches widen");
+        assert_eq!(
+            out.shifts.as_slice(),
+            &[(4u32, 4u32), (8012, 4)][..],
+            "two insertions, in the order made, each in the layout of its moment"
+        );
+        let moved = shift_position(&out.shifts, marker_at);
+        assert_eq!(moved, marker_at + 8, "the offset travels past BOTH insertions");
+        let mut expected = Encoder::new();
+        expected.addi(Reg::T2, Reg::ZERO, 123);
+        let expected = expected.finish().unwrap().bytes;
+        assert_eq!(
+            &out.bytes[moved as usize..moved as usize + 4],
+            &expected[..],
+            "the re-pointed offset holds the instruction it was recorded against"
+        );
+        assert_eq!(
+            shift_position(&out.shifts, 8004),
+            8008,
+            "the second branch itself sits before its own insertion, so only the first moves it"
         );
     }
 

@@ -1,5 +1,9 @@
 ﻿//! ANSI/CJK code-page tables, GENERATED from the official
 //! Unicode mappings (unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS). Do not edit by hand.
+//!
+//! The mapping data comes from unicode.org's Public directory, whose data files Unicode, Inc.
+//! licenses under the Unicode License v3; the license's notice is in `LICENSE-UNICODE` at this
+//! crate's root.
 
 /// Windows-1250, bytes 0x80..=0xFF.
 pub(crate) const CP1250_HIGH: [char; 128] = [

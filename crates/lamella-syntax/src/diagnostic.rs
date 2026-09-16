@@ -33,6 +33,17 @@ pub enum DiagnosticKind {
     },
     /// An integer literal is larger than `ulong` can represent.
     IntegerLiteralTooLarge,
+    /// `CS0594`: a real literal whose value is too large for its type, such as `1e400`, `1e40f` or
+    /// `1e29m`.
+    ///
+    /// The value is the literal rounded as its type rounds, so a literal just below the point where
+    /// a `float` or `double` would round to an infinity is that type's largest value, and a
+    /// non-zero literal that rounds to zero is not an error either. A real literal never produces
+    /// an infinity.
+    RealLiteralOutOfRange {
+        /// The literal's type as C# spells it: `float`, `double` or `decimal`.
+        type_name: &'static str,
+    },
     /// A numeric literal is malformed, for example `0x` with no hex digits or an
     /// exponent with no digits. (Code to be confirmed against csc.)
     MalformedNumericLiteral,
@@ -416,6 +427,7 @@ impl DiagnosticKind {
             DiagnosticKind::UnterminatedDelimitedComment => 1035,
             DiagnosticKind::UnexpectedCharacter { .. } => 1056,
             DiagnosticKind::IntegerLiteralTooLarge => 1021,
+            DiagnosticKind::RealLiteralOutOfRange { .. } => 594,
             DiagnosticKind::MalformedNumericLiteral => 1013,
             DiagnosticKind::UnrecognizedEscapeSequence => 1009,
             DiagnosticKind::NewlineInConstant => 1010,
@@ -506,6 +518,10 @@ impl fmt::Display for DiagnosticKind {
                 write!(f, "Unexpected character '{character}'")
             }
             DiagnosticKind::IntegerLiteralTooLarge => f.write_str("Integer constant is too large"),
+            DiagnosticKind::RealLiteralOutOfRange { type_name } => write!(
+                f,
+                "Floating-point constant is outside the range of type '{type_name}'"
+            ),
             DiagnosticKind::MalformedNumericLiteral => f.write_str("Invalid number"),
             DiagnosticKind::UnrecognizedEscapeSequence => f.write_str("Unrecognized escape sequence"),
             DiagnosticKind::NewlineInConstant => f.write_str("Newline in constant"),
@@ -729,6 +745,10 @@ mod tests {
             DiagnosticKind::UnexpectedCharacter { character: '#' }.code(),
             1056
         );
+        assert_eq!(
+            DiagnosticKind::RealLiteralOutOfRange { type_name: "float" }.code(),
+            594
+        );
     }
 
     #[test]
@@ -737,12 +757,23 @@ mod tests {
             DiagnosticKind::UnterminatedDelimitedComment.severity(),
             Severity::Error
         );
+        assert_eq!(
+            DiagnosticKind::RealLiteralOutOfRange { type_name: "float" }.severity(),
+            Severity::Error
+        );
     }
 
     #[test]
     fn messages_render_their_detail() {
         let unexpected = DiagnosticKind::UnexpectedCharacter { character: '#' };
         assert_eq!(format!("{unexpected}"), "Unexpected character '#'");
+        let out_of_range = DiagnosticKind::RealLiteralOutOfRange {
+            type_name: "decimal",
+        };
+        assert_eq!(
+            format!("{out_of_range}"),
+            "Floating-point constant is outside the range of type 'decimal'"
+        );
         assert_eq!(
             format!("{}", DiagnosticKind::UnterminatedDelimitedComment),
             "End-of-comment expected"

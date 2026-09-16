@@ -239,14 +239,15 @@ namespace System.Net.Security
         public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
         public override void SetLength(long value) { throw new NotSupportedException(); }
 
-        public override void Close()
+        protected override void Dispose(bool disposing)
         {
             if (_tls >= 0)
             {
                 TlsNative.CloseTls(_tls);
                 _tls = -1;
             }
-            if (!_leaveInnerStreamOpen) _inner.Close();
+            if (disposing && !_leaveInnerStreamOpen) _inner.Close();
+            base.Dispose(disposing);
         }
     }
 }

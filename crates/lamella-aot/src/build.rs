@@ -80,6 +80,33 @@ pub enum BuildError {
         /// How many such edges the build found; the named pair is the first.
         total: usize,
     },
+    /// A LIBRARY METHOD COULD NOT BE EMITTED: its body failed verification, the target could not
+    /// lower it, or the object could not encode with it in. A bare return in its place would answer
+    /// the method's first argument at every call while the build reported success, and a program
+    /// build refuses the same method -- so a library build refuses it too, for the reason
+    /// [`Self::SilentSeamCallEdge`] is refused: the failure mode is a confident wrong answer. A core
+    /// library -- the assembly that defines `System.Object` -- reports such methods instead.
+    StubbedLibraryMethod {
+        /// The first such method's readable name (`Namespace.Type::Method`).
+        method: alloc::string::String,
+        /// Why it could not be emitted: the lowering error, as text.
+        reason: alloc::string::String,
+        /// How many methods the build could not emit; the named one is the first.
+        total: usize,
+    },
+    /// A LIBRARY METHOD'S BODY NEVER BECAME MIR, so the method kept the assembly's placeholder body,
+    /// which answers a constant at every call. A program build refuses the same method
+    /// ([`Self::LowerCil`]), so a library build refuses it too, as it refuses a method it could not
+    /// emit ([`Self::StubbedLibraryMethod`]). A core library -- the assembly that defines
+    /// `System.Object` -- reports such methods instead.
+    PlaceholderLibraryMethod {
+        /// The first such method's readable name (`Namespace.Type::Method`).
+        method: alloc::string::String,
+        /// Why its body did not lower: the CIL-lowering error, as text.
+        reason: alloc::string::String,
+        /// How many methods kept a placeholder; the named one is the first.
+        total: usize,
+    },
     /// TWO BODIES WERE WRITTEN FOR ONE MethodDef ROW. A program is a `Vec<Function>` indexed by rid
     /// and every emitted symbol is `f<rid>`, so a second body does not collide -- it REPLACES the
     /// first, and the image is built around whichever won with no diagnostic anywhere. Refused
@@ -630,8 +657,9 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     /// real silicon (the statics window's word 0 is the EH tag; garbage there HardFaults startup).
     const ZERO_START: u32 = 0x2000_0100;
     const ZERO_END: u32 = HEAP_BASE + 0x1_0000;
-    /// One past the last byte the bump allocator may hand out -- the archive returns NULL rather than
-    /// bumping past it, and a zero here means "no heap", so seeding it is not optional.
+    /// One past the last byte the bump allocator may hand out -- the archive stops the program with
+    /// `HEAPFULL` rather than bumping past it, and a zero here means "no heap", so seeding it is not
+    /// optional.
     ///
     /// The ceiling is [`ZERO_END`], i.e. the heap is exactly the band this stub PREPARED. That is the
     /// honest bound rather than the larger one the 512 KB SRAM would allow: an object's reference
@@ -1252,36 +1280,9 @@ fn build_object_core(
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let display_names = method_display_names(&assembly, funcs.len());
     let mut silent_edges = silent_seam_call_edges(&assembly, &funcs, &seams, &display_names);
-    let imports = pinvoke_imports(&funcs);
-    let import_names: Vec<&str> = imports.iter().map(|(name, _)| name.as_str()).collect();
-    for (ordinal, reference) in references.iter().enumerate() {
-        for (rid, seam, symbol) in
-            imported_silent_seams(reference, &references[..ordinal], &import_names)
-        {
-            let caller_rid = imports
-                .iter()
-                .find(|(name, _)| *name == symbol)
-                .map_or(0, |(_, caller)| *caller);
-            silent_edges.push(SeamCallEdge {
-                caller_rid,
-                caller: display_names
-                    .get(caller_rid as usize)
-                    .cloned()
-                    .flatten()
-                    .unwrap_or_else(|| alloc::format!("f{caller_rid}")),
-                seam_rid: rid,
-                seam,
-            });
-        }
-    }
+    silent_edges.extend(imported_silent_seam_edges(&funcs, &references, &display_names));
     if !defer {
-        if let Some(edge) = silent_edges.first() {
-            return Err(BuildError::SilentSeamCallEdge {
-                caller: edge.caller.clone(),
-                seam: edge.seam.clone(),
-                total: silent_edges.len(),
-            });
-        }
+        refuse_silent_seam_edges(&silent_edges)?;
     }
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     {
@@ -2204,27 +2205,9 @@ fn build_object_riscv_inner(
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     point_referenced_enums_at_their_owner(&resolver, reference_cils, &mut descriptors);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let imports = pinvoke_imports(&funcs);
-    let import_names: Vec<&str> = imports.iter().map(|(name, _)| name.as_str()).collect();
-    let mut silent_edges: Vec<(alloc::string::String, alloc::string::String)> = Vec::new();
-    for (ordinal, reference) in reference_assemblies.iter().enumerate() {
-        for (_, seam, symbol) in
-            imported_silent_seams(reference, &references[..ordinal], &import_names)
-        {
-            let caller_rid = imports
-                .iter()
-                .find(|(name, _)| *name == symbol)
-                .map_or(0, |(_, caller)| *caller);
-            silent_edges.push((alloc::format!("f{caller_rid}"), seam));
-        }
-    }
-    if let Some((caller, seam)) = silent_edges.first() {
-        return Err(BuildError::SilentSeamCallEdge {
-            caller: caller.clone(),
-            seam: seam.clone(),
-            total: silent_edges.len(),
-        });
-    }
+    let display_names = method_display_names(&assembly, funcs.len());
+    let imported_edges = imported_silent_seam_edges(&funcs, &references, &display_names);
+    refuse_silent_seam_edges(&imported_edges)?;
     let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized(), resolver.references());
     let reference_regions: Vec<alloc::string::String> = reference_cils
         .iter()
@@ -3006,6 +2989,9 @@ fn build_library_object_riscv_inner(
         &prefix,
     ));
     replace_exception_message(&assembly, &mut funcs);
+    let display_names = method_display_names(&assembly, funcs.len());
+    let imported_edges = imported_silent_seam_edges(&funcs, &references, &display_names);
+    refuse_silent_seam_edges(&imported_edges)?;
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     point_referenced_enums_at_their_owner(&resolver, reference_cils, &mut descriptors);
@@ -3040,7 +3026,6 @@ fn build_library_object_riscv_inner(
         &qualifiers,
     )
     .map_err(BuildError::LowerRiscv)?;
-    let display_names = method_display_names(&assembly, funcs.len());
     let name_of = |rid: usize| {
         display_names
             .get(rid)
@@ -3066,6 +3051,7 @@ fn build_library_object_riscv_inner(
         ),
         silent_seam_edges: silent_seam_call_edges(&assembly, &funcs, &seams, &display_names),
     };
+    refuse_demoted_library_methods(&assembly, &report)?;
     Ok((bytes, report))
 }
 
@@ -3090,8 +3076,10 @@ pub fn build_library_object_riscv_report_with_references(
 
 /// AOT-lowers a whole assembly as a LINKABLE LIBRARY object (a corlib, a helper library): every public
 /// static method becomes a global symbol (named by `extern_method_symbol`) a program's extern call
-/// resolves against, and a method that does not lower yet becomes a STUB so the rest of the library
-/// still builds -- gaps are fixed iteratively. No entry/startup ([`arm32::lower_object_library`]).
+/// resolves against. A method whose body never became MIR refuses the build
+/// ([`BuildError::PlaceholderLibraryMethod`]), and so does one that cannot be emitted
+/// ([`BuildError::StubbedLibraryMethod`]), unless the assembly is a core library, which reports both.
+/// No entry/startup ([`arm32::lower_object_library`]).
 #[cfg(feature = "arm32")]
 pub fn build_library_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     build_library_object_inner(cil, &[], false).map(|(bytes, _)| bytes)
@@ -3205,17 +3193,21 @@ pub struct UnsynthesizedSeam {
     pub in_vtable_slot: bool,
 }
 
-/// What [`build_library_object_report`] observed while building: the THREE distinct silent-demotion
-/// layers a library method can fall through, none of which a plain build surfaces.
+/// What [`build_library_object_report`] observed while building: the three distinct demotion layers a
+/// library method can fall through. A build refuses the first two -- a body that never became MIR and
+/// a method it could not emit -- unless the library is a core library, and reports the third.
 #[derive(Debug, Default)]
 pub struct LibraryBuildReport {
     /// Methods whose CIL BODY failed to lower to MIR -- they kept the placeholder body, so calling
-    /// one returns a constant. `(rid, name, CilError)`.
+    /// one returns a constant. `(rid, name, CilError)`. Empty in any report a build returns unless the
+    /// library is a core library, the assembly that defines `System.Object`: any other build with one
+    /// refuses ([`BuildError::PlaceholderLibraryMethod`]).
     pub cil_fails: Vec<LibraryReportEntry>,
-    /// Methods whose MIR failed the OBJECT-EMIT stage -- emitted as a bare `bx lr`, which silently
-    /// returns its first argument (the WaitOne-style truthy no-op). `(rid, name, LowerError)`;
-    /// `CodeTooLarge` marks a fixpoint stub (the body lowers alone, the whole object could not
-    /// encode with it in).
+    /// Methods whose MIR failed the OBJECT-EMIT stage, which a bare return in their place would answer
+    /// with its first argument. `(rid, name, LowerError)`; `CodeTooLarge` marks a method whose body
+    /// lowers alone while the whole object could not encode with it in. Empty in any report a build
+    /// returns unless the library is a core library: any other build with one refuses
+    /// ([`BuildError::StubbedLibraryMethod`]).
     pub emit_stubs: Vec<LibraryReportEntry>,
     /// `[RuntimeProvided]` seams the build did not synthesize. Unlike the two above this is not a
     /// FAILURE -- the body was never in the assembly to lower -- which is exactly why it stayed
@@ -3299,6 +3291,9 @@ fn build_library_object_inner(
         &prefix,
     ));
     replace_exception_message(&assembly, &mut funcs);
+    let display_names = method_display_names(&assembly, funcs.len());
+    let imported_edges = imported_silent_seam_edges(&funcs, &reference_list, &display_names);
+    refuse_silent_seam_edges(&imported_edges)?;
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     point_referenced_enums_at_their_owner(&resolver, references, &mut descriptors);
@@ -3313,7 +3308,6 @@ fn build_library_object_inner(
         wide,
     )
     .map_err(BuildError::LowerArm)?;
-    let display_names = method_display_names(&assembly, funcs.len());
     let name_of = |rid: usize| {
         display_names
             .get(rid)
@@ -3339,6 +3333,7 @@ fn build_library_object_inner(
         ),
         silent_seam_edges: silent_seam_call_edges(&assembly, &funcs, &seams, &display_names),
     };
+    refuse_demoted_library_methods(&assembly, &report)?;
     Ok((bytes, report))
 }
 
@@ -3547,6 +3542,96 @@ fn imported_silent_seams<'a>(
     found
 }
 
+/// Every call edge from `funcs` into a SILENT seam that a REFERENCE owns -- the cross-assembly half of
+/// the caller audit, over the whole reference list. Each reference is read against the ones before
+/// it, the order its own compile saw them in, so its seam bodies resolve the way its own library
+/// build resolves them. The caller is the function that imports the seam's symbol, looked up rather
+/// than guessed, so a refusal names both ends of the edge.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn imported_silent_seam_edges<'a>(
+    funcs: &[Function],
+    references: &[&'a Assembly<'a>],
+    display_names: &[Option<alloc::string::String>],
+) -> Vec<SeamCallEdge> {
+    let imports = pinvoke_imports(funcs);
+    let import_names: Vec<&str> = imports.iter().map(|(name, _)| name.as_str()).collect();
+    let mut edges: Vec<SeamCallEdge> = Vec::new();
+    for (ordinal, reference) in references.iter().enumerate() {
+        for (seam_rid, seam, symbol) in
+            imported_silent_seams(reference, &references[..ordinal], &import_names)
+        {
+            let caller_rid = imports
+                .iter()
+                .find(|(name, _)| *name == symbol)
+                .map_or(0, |(_, caller)| *caller);
+            edges.push(SeamCallEdge {
+                caller_rid,
+                caller: display_names
+                    .get(caller_rid as usize)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| alloc::format!("f{caller_rid}")),
+                seam_rid,
+                seam,
+            });
+        }
+    }
+    edges
+}
+
+/// Refuses a build that has any silent-seam call edge, naming the first edge and counting them all.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn refuse_silent_seam_edges(edges: &[SeamCallEdge]) -> Result<(), BuildError> {
+    match edges.first() {
+        Some(edge) => Err(BuildError::SilentSeamCallEdge {
+            caller: edge.caller.clone(),
+            seam: edge.seam.clone(),
+            total: edges.len(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a library build that demoted one of its methods -- a body that never became MIR, kept as a
+/// placeholder that answers a constant, or a method it could not emit, laid as a bare return that
+/// answers its first argument -- naming the first of that list and counting it, placeholders first, as
+/// a program build meets them. A core library refuses neither: it reports both lists by name.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn refuse_demoted_library_methods(
+    assembly: &Assembly,
+    report: &LibraryBuildReport,
+) -> Result<(), BuildError> {
+    if is_core_library(assembly) {
+        return Ok(());
+    }
+    if let Some((_, method, reason)) = report.cil_fails.first() {
+        return Err(BuildError::PlaceholderLibraryMethod {
+            method: method.clone(),
+            reason: reason.clone(),
+            total: report.cil_fails.len(),
+        });
+    }
+    match report.emit_stubs.first() {
+        Some((_, method, reason)) => Err(BuildError::StubbedLibraryMethod {
+            method: method.clone(),
+            reason: reason.clone(),
+            total: report.emit_stubs.len(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Whether `assembly` is a core library: it defines `System.Object`, the one class with no base type.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn is_core_library(assembly: &Assembly) -> bool {
+    assembly.type_defs().any(|type_def| {
+        type_def.extends().row() == 0
+            && type_def
+                .name()
+                .is_some_and(|name| (name.namespace, name.name) == ("System", "Object"))
+    })
+}
+
 /// Every extern managed symbol `funcs` calls -- the [`Inst::PInvoke`] imports, deduplicated. The
 /// input side of [`imported_silent_seams`].
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
@@ -3751,6 +3836,30 @@ fn find_main(assembly: &Assembly) -> Option<u32> {
         }
     }
     None
+}
+
+/// Whether the assembly's entry point returns `void` -- the entry point being the method a build runs,
+/// which is the one the CLI header's entry-point token names. A harness that reads a program's result
+/// from the return register asks this, because a `void` entry leaves that register holding whatever ran
+/// last, and .NET exits 0 for one that returns normally. `false` for an assembly with no entry point.
+///
+/// A harness asks here rather than choosing a `Main` of its own. The first static method named `Main`
+/// can be an overload that is not the entry point: with `static void Main(int)` declared ahead of
+/// `static int Main()`, its signature says `void`, and a program that returns 42 is scored as 0.
+pub fn entry_returns_void(assembly: &Assembly) -> bool {
+    let Some(rid) = find_main(assembly) else {
+        return false;
+    };
+    for type_def in assembly.type_defs() {
+        for method in type_def.methods() {
+            if method.rid() == rid {
+                return method
+                    .signature()
+                    .is_none_or(|sig| matches!(sig.return_type, SigType::Void));
+            }
+        }
+    }
+    false
 }
 
 /// Every type initializer (`.cctor`) in the assembly, by `MethodDef` rid, in metadata order. The
@@ -4365,105 +4474,21 @@ fn synthesize_runtime_reader(
         (Some("get_Length"), 0) => Some(Function {
             params: vec![MirType::ObjectRef],
             ret: Some(MirType::I32),
-            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            value_types: vec![MirType::ObjectRef, MirType::I32],
             entry: BlockId(0),
             blocks: vec![BasicBlock {
                 params: vec![ValueId(0)],
-                insts: vec![
-                    (
-                        ValueId(1),
-                        Inst::Convert {
-                            value: ValueId(0),
-                            kind: ConvKind::RefToInt,
-                        },
-                    ),
-                    (
-                        ValueId(2),
-                        Inst::Load {
-                            address: ValueId(1),
-                            width: 4,
-                            signed: false,
-                        },
-                    ),
-                ],
-                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+                insts: vec![(
+                    ValueId(1),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
             }],
         }),
-        (Some("get_Chars"), 1) if type_name == "String" => Some(Function {
-            params: vec![MirType::ObjectRef, MirType::I32],
-            ret: Some(MirType::I32),
-            value_types: vec![
-                MirType::ObjectRef,
-                MirType::I32,
-                MirType::I32,
-                MirType::I32,
-                MirType::I32,
-                MirType::I32,
-                MirType::I32,
-                MirType::I32,
-                MirType::I32,
-            ],
-            entry: BlockId(0),
-            blocks: vec![BasicBlock {
-                params: vec![ValueId(0), ValueId(1)],
-                insts: vec![
-                    (
-                        ValueId(2),
-                        Inst::Convert {
-                            value: ValueId(0),
-                            kind: ConvKind::RefToInt,
-                        },
-                    ),
-                    (
-                        ValueId(3),
-                        Inst::ConstInt {
-                            ty: MirType::I32,
-                            value: 2,
-                        },
-                    ),
-                    (
-                        ValueId(4),
-                        Inst::Binary {
-                            op: BinOp::Mul,
-                            lhs: ValueId(1),
-                            rhs: ValueId(3),
-                        },
-                    ),
-                    (
-                        ValueId(5),
-                        Inst::ConstInt {
-                            ty: MirType::I32,
-                            value: 4,
-                        },
-                    ),
-                    (
-                        ValueId(6),
-                        Inst::Binary {
-                            op: BinOp::Add,
-                            lhs: ValueId(2),
-                            rhs: ValueId(5),
-                        },
-                    ),
-                    (
-                        ValueId(7),
-                        Inst::Binary {
-                            op: BinOp::Add,
-                            lhs: ValueId(6),
-                            rhs: ValueId(4),
-                        },
-                    ),
-                    (
-                        ValueId(8),
-                        Inst::Load {
-                            address: ValueId(7),
-                            width: 2,
-                            signed: false,
-                        },
-                    ),
-                ],
-                terminator: Some(Terminator::Return(Some(ValueId(8)))),
-            }],
-        }),
+        (Some("get_Chars"), 1) if type_name == "String" => Some(string_char_at_body()),
         (Some("Substring"), 1) => Some(Function {
             params: vec![MirType::ObjectRef, MirType::I32],
             ret: Some(MirType::ObjectRef),
@@ -7774,6 +7799,108 @@ pub fn buffer_block_copy_body() -> Function {
     mb.finish(None)
 }
 
+/// Emits the null test a synthesized reader makes before it reads through its receiver: a null one stores
+/// `NullReferenceException`'s tag in the in-flight word and returns zero, which is what a throw with no
+/// handler leaves -- so the caller's post-call test sees the tag and routes it, in its own `catch` or a
+/// caller's. These readers reach their data through a COMPUTED address (`Convert` + `Load`, or the type
+/// descriptor), and only a `FieldLoad` through the reference carries the backends' own null test.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn emit_receiver_null_test(mb: &mut MirBuilder, receiver: ValueId) {
+    let i32t = MirType::I32;
+    let raise = mb.block();
+    let ok = mb.block();
+    let null = mb.emit(
+        MirType::ObjectRef,
+        Inst::ConstInt {
+            ty: MirType::ObjectRef,
+            value: 0,
+        },
+    );
+    let is_null = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: receiver,
+            rhs: null,
+        },
+    );
+    mb.branch(is_null, raise, ok);
+    mb.at(raise);
+    let tag = mb.emit(
+        i32t,
+        Inst::ConstInt {
+            ty: i32t,
+            value: i64::from(cil::InlineCheck::NullReference.tag()),
+        },
+    );
+    mb.side(Inst::StaticStore {
+        owner: StaticOwner::Own,
+        offset: cil::G_EXCEPTION_TAG_OFFSET,
+        value: tag,
+    });
+    let zero = mb.emit(i32t, Inst::ConstInt { ty: i32t, value: 0 });
+    mb.ret(zero);
+    mb.at(ok);
+}
+
+/// A synthesized MIR body for `System.String.get_Chars(int)`: the `u16` at `this + 4 + 2*i`, zero-extended.
+///
+/// A null receiver raises NullReferenceException ahead of that load rather than reading at `4 + 2*i`, which
+/// on ARM answers whatever sits in low memory and on RISC-V faults.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+fn string_char_at_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, i32t]);
+    let (text, index) = (params[0], params[1]);
+    mb.at(0);
+    emit_receiver_null_test(&mut mb, text);
+    let base = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: text,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let two = mb.emit(i32t, Inst::ConstInt { ty: i32t, value: 2 });
+    let offset = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Mul,
+            lhs: index,
+            rhs: two,
+        },
+    );
+    let header = mb.emit(i32t, Inst::ConstInt { ty: i32t, value: 4 });
+    let start = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: base,
+            rhs: header,
+        },
+    );
+    let at = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: start,
+            rhs: offset,
+        },
+    );
+    let unit = mb.emit(
+        i32t,
+        Inst::Load {
+            address: at,
+            width: 2,
+            signed: false,
+        },
+    );
+    mb.ret(unit);
+    mb.finish(Some(i32t))
+}
+
 /// A synthesized MIR body for `System.Array.get_Length` -- the TOTAL element count.
 ///
 /// For a VECTOR that is the length word at `this + 0`, which is what this reader always returned.
@@ -7802,6 +7929,13 @@ pub fn array_total_length_body() -> Function {
     let product = mb.block();
 
     mb.at(0);
+    let word0 = mb.emit(
+        i32t,
+        Inst::FieldLoad {
+            base: array,
+            offset: 0,
+        },
+    );
     let (base, rank) = array_descriptor_rank(&mut mb, array, plain);
     let one = mb.emit(i32t, c(1));
     let multi = mb.emit(
@@ -7815,25 +7949,10 @@ pub fn array_total_length_body() -> Function {
     mb.branch(multi, product, plain);
 
     mb.at(plain);
-    let single = mb.emit(
-        i32t,
-        Inst::Load {
-            address: base,
-            width: 4,
-            signed: false,
-        },
-    );
-    mb.ret(single);
+    mb.ret(word0);
 
     mb.at(product);
-    let first = mb.emit(
-        i32t,
-        Inst::Load {
-            address: base,
-            width: 4,
-            signed: false,
-        },
-    );
+    let first = word0;
     let four = mb.emit(i32t, c(4));
     let loop_head = mb.block();
     let latch = mb.block();
@@ -7917,6 +8036,7 @@ pub fn array_rank_body() -> Function {
     let array = params[0];
     let trap = mb.block();
     mb.at(0);
+    emit_receiver_null_test(&mut mb, array);
     let (_, rank) = array_descriptor_rank(&mut mb, array, trap);
     mb.ret(rank);
     mb.at(trap);

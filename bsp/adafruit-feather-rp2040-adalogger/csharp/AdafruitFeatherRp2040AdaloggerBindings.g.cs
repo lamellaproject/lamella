@@ -35,18 +35,22 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint LED_PORT_BASE = 0xD0000000;
         public const uint LED_PIN = 13;
+        public const uint LED_BANK = 0;
         public const uint LED_MASK = 0x2000;
         public const uint LED_ACTIVE_LOW = 0;
         public const uint NEOPIXEL_PORT_BASE = 0xD0000000;
         public const uint NEOPIXEL_PIN = 17;
+        public const uint NEOPIXEL_BANK = 0;
         public const uint NEOPIXEL_MASK = 0x20000;
         public const uint NEOPIXEL_ACTIVE_LOW = 0;
         public const uint BUTTON_PORT_BASE = 0xD0000000;
         public const uint BUTTON_PIN = 7;
+        public const uint BUTTON_BANK = 0;
         public const uint BUTTON_MASK = 0x80;
         public const uint BUTTON_ACTIVE_LOW = 1;
         public const uint SD_CARD_DETECT_PORT_BASE = 0xD0000000;
         public const uint SD_CARD_DETECT_PIN = 16;
+        public const uint SD_CARD_DETECT_BANK = 0;
         public const uint SD_CARD_DETECT_MASK = 0x10000;
         public const uint SD_CARD_DETECT_ACTIVE_LOW = 1;
 
@@ -69,9 +73,11 @@ namespace Lamella.Generated
         public const string CONNECTOR_QT_STANDARD = "stemma-qt";
         public const uint CONNECTOR_QT_SDA_PORT_BASE = 0xD0000000;
         public const uint CONNECTOR_QT_SDA_PIN = 2;
+        public const uint CONNECTOR_QT_SDA_BANK = 0;
         public const uint CONNECTOR_QT_SDA_MASK = 0x4;
         public const uint CONNECTOR_QT_SCL_PORT_BASE = 0xD0000000;
         public const uint CONNECTOR_QT_SCL_PIN = 3;
+        public const uint CONNECTOR_QT_SCL_BANK = 0;
         public const uint CONNECTOR_QT_SCL_MASK = 0x8;
     }
 }

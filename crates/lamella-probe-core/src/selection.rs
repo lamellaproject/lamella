@@ -141,7 +141,7 @@ impl Selector {
     /// **A CASE-SENSITIVE FILTER HERE REFUSES A BOARD THAT IS SITTING THERE ON ITS OWN**, and it
     /// refuses it in a way the operator cannot fix: they named the probe correctly, in the case one
     /// backend reports, and the ladder answers `NotFound`. A refusal that names no remedy reads as
-    /// broken hardware, which is worse than the ambiguity [`distinct`] guards against.
+    /// broken hardware, which is worse than the ambiguity that de-duplicating the matches guards against.
     #[must_use]
     pub fn matches(&self, candidate: &Candidate) -> bool {
         self.vendor_id.is_none_or(|v| v == candidate.vendor_id)

@@ -38,7 +38,7 @@ namespace System.IO
 
         public void Dispose()
         {
-            Dispose(true);
+            Close();
         }
 
         protected virtual void Dispose(bool disposing)

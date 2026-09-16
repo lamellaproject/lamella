@@ -1,13 +1,14 @@
 //! The HOST side of the Lamella Link debug + REPL channel:
 
 pub use lamella_runner::{
-    ArtifactLoad, RunCollector, RunResult, baked_image_checksum, debug, deploy, exec, load, repl,
-    run_program, send_image, send_program, serve_one, stop_exit,
+    ArtifactLoad, OutputChunk, RunCollector, RunResult, baked_image_checksum, debug, deploy, exec,
+    load, repl, run_program, send_image, send_program, serve_one, stop_exit,
 };
 
 pub mod engine;
 pub mod firmware;
 pub mod identity;
+pub mod terminal;
 
 #[cfg(feature = "debug-backend")]
 pub mod debug_backend;
@@ -226,6 +227,10 @@ impl Transport for SerialTransport {
             Err(_) => return Err(TransportError::Carrier),
         }
         Ok(self.reader.next_frame())
+    }
+
+    fn discarded_bytes(&self) -> Option<u64> {
+        Some(self.reader.discarded_bytes())
     }
 }
 
@@ -462,6 +467,10 @@ impl Transport for UsbTransport {
         }
         Ok(self.reader.next_frame())
     }
+
+    fn discarded_bytes(&self) -> Option<u64> {
+        Some(self.reader.discarded_bytes())
+    }
 }
 
 /// A [`Transport`] over TCP -- the carrier for a board that is reached across a network rather
@@ -682,6 +691,10 @@ impl Transport for TcpTransport {
             (None, None) => Ok(None),
         }
     }
+
+    fn discarded_bytes(&self) -> Option<u64> {
+        Some(self.reader.discarded_bytes())
+    }
 }
 
 /// Whichever carrier a target string named.
@@ -725,6 +738,17 @@ impl Transport for AnyTransport {
             Self::Usb(carrier) => carrier.poll(),
             #[cfg(feature = "tcp")]
             Self::Tcp(carrier) => carrier.poll(),
+        }
+    }
+
+    fn discarded_bytes(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "serial")]
+            Self::Serial(carrier) => carrier.discarded_bytes(),
+            #[cfg(feature = "usb")]
+            Self::Usb(carrier) => carrier.discarded_bytes(),
+            #[cfg(feature = "tcp")]
+            Self::Tcp(carrier) => carrier.discarded_bytes(),
         }
     }
 }
@@ -933,12 +957,7 @@ pub fn hello_blocking(
                     });
                 }
                 msg::ERROR if frame.seq == seq => {
-                    return Err(TransportError::Refused {
-                        reason: frame.payload.first().copied().unwrap_or(0),
-                        msg_type: lamella_wire::error::refused_message_type(&frame.payload)
-                            .unwrap_or(0),
-                        holder: lamella_wire::error::session_holder(&frame.payload),
-                    });
+                    return Err(lamella_wire::error::refusal(&frame.payload));
                 }
                 _ => {}
             }
@@ -998,12 +1017,23 @@ pub fn eval_image_blocking(
 /// answer at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferAck {
-    /// The target took every chunk it was offered.
+    /// The target took every chunk it was offered, and every acknowledgement that was compared matched.
     Accepted,
     /// The target refused a chunk. `chunk` is that chunk's index in the plan, counting from zero.
     Rejected {
         /// The index of the refused chunk in the plan that produced it.
         chunk: usize,
+    },
+    /// The target took a chunk, but its CRC over the prefix it holds is not the CRC of the prefix that
+    /// was sent: the flash does not hold the artifact. Reported only when the session has
+    /// [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`].
+    Mismatched {
+        /// The index of the chunk whose acknowledgement disagreed.
+        chunk: usize,
+        /// The CRC of the prefix the host sent.
+        sent: u32,
+        /// The CRC the target reported over the prefix it read back.
+        reported: u32,
     },
 }
 
@@ -1035,10 +1065,38 @@ pub enum RunOutcome {
 /// ONE definition, because several drivers ask it. The status carries more than an acceptance --
 /// a CRC over the memory as assembled or the flash as read back -- and a caller that wants that
 /// reads the reply itself.
-#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 fn transfer_accepted(payload: &[u8]) -> bool {
     use lamella_wire::msg::xfer;
     matches!(payload.first().copied(), Some(xfer::MATCHED) | Some(xfer::WRITTEN_NOT_READ_BACK))
+}
+
+/// What one deploy chunk's acknowledgement says, by the rule on [`lamella_wire::msg::XFER_RESULT`]:
+/// the chunk was refused, or accepted -- and when `expected` is the CRC of the prefix that was sent,
+/// a `MATCHED` acknowledgement whose CRC differs is [`TransferAck::Mismatched`].
+///
+/// Every deploy path, blocking or not, decides here, so which acknowledgements are compared cannot
+/// differ between them. Pass `expected` only for a session with
+/// [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`].
+///
+/// # Errors
+/// [`TransportError::MalformedReply`] when a compared acknowledgement carries no CRC.
+fn deploy_chunk_outcome(
+    reply: &[u8],
+    chunk: usize,
+    expected: Option<u32>,
+) -> Result<TransferAck, TransportError> {
+    use lamella_wire::msg::xfer;
+    if !transfer_accepted(reply) {
+        return Ok(TransferAck::Rejected { chunk });
+    }
+    let (Some(sent), Some(&xfer::MATCHED)) = (expected, reply.first()) else {
+        return Ok(TransferAck::Accepted);
+    };
+    let Some(crc) = reply.get(1..5) else {
+        return Err(TransportError::MalformedReply { msg_type: deploy::XFER_RESULT });
+    };
+    let reported = u32::from_le_bytes([crc[0], crc[1], crc[2], crc[3]]);
+    Ok(if reported == sent { TransferAck::Accepted } else { TransferAck::Mismatched { chunk, sent, reported } })
 }
 
 /// Host driver, blocking: persist `image` to the target's flash (it boots on reset), or
@@ -1135,10 +1193,42 @@ pub fn deploy_chunked_blocking(
     chunk_len: usize,
     timeout: Duration,
 ) -> Result<bool, TransportError> {
-    use lamella_wire::Frame;
+    deploy_image_blocking(transport, seq, image, chunk_len, timeout, lamella_wire::Capabilities(0))
+        .map(|ack| ack == TransferAck::Accepted)
+}
+
+/// Host driver, blocking: deploy a baked image in chunks as [`deploy_chunked_blocking`] does, and say
+/// what the acknowledgements said.
+///
+/// When `session_caps` has [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`], the CRC in each
+/// [`lamella_wire::msg::xfer::MATCHED`] acknowledgement is compared with the CRC of the image up to the
+/// end of that chunk, so a flash that does not hold what was sent is reported at the first chunk
+/// where it differs rather than discovered at boot. Without it nothing is compared, because the
+/// target's CRC covers something else. Pass [`lamella_wire::Negotiated::caps`], so that both ends
+/// have agreed to the rule.
+///
+/// The chunking rules -- the upper bound this enforces, and the alignment it cannot -- are
+/// [`deploy_chunked_blocking`]'s.
+///
+/// # Errors
+/// [`TransportError::MalformedReply`] when a compared acknowledgement carries no CRC, and
+/// [`TransportError::Closed`] if a chunk goes unacknowledged past `timeout`; otherwise a carrier
+/// [`TransportError`].
+pub fn deploy_image_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    image: &[u8],
+    chunk_len: usize,
+    timeout: Duration,
+    session_caps: lamella_wire::Capabilities,
+) -> Result<TransferAck, TransportError> {
+    use lamella_wire::{Frame, crc32};
     let chunk_len = chunk_len.clamp(1, CHUNK_DATA_CAP);
+    let compare = session_caps.has(lamella_wire::Capabilities::DEPLOY_PREFIX_CRC);
     let total = image.len() as u32;
     let mut offset = 0usize;
+    let mut chunk = 0usize;
+    let mut sent = 0u32;
     while offset < image.len() {
         let end = (offset + chunk_len).min(image.len());
         let mut payload = Vec::with_capacity(8 + (end - offset));
@@ -1146,26 +1236,30 @@ pub fn deploy_chunked_blocking(
         payload.extend_from_slice(&total.to_le_bytes());
         payload.extend_from_slice(&image[offset..end]);
         transport.send(deploy::DEPLOY_IMAGE, seq, &payload)?;
+        sent = crc32::update(sent, &image[offset..end]);
 
         let deadline = Instant::now() + timeout;
-        let mut acked = None;
+        let mut reply = None;
         'wait: while Instant::now() < deadline {
             while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
                 if msg_type == deploy::XFER_RESULT && reply_seq == seq {
-                    acked = Some(transfer_accepted(&payload));
+                    reply = Some(payload);
                     break 'wait;
                 }
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        match acked {
-            Some(true) => {}
-            Some(false) => return Ok(false),
-            None => return Err(TransportError::Closed),
+        let Some(reply) = reply else {
+            return Err(TransportError::Closed);
+        };
+        let outcome = deploy_chunk_outcome(&reply, chunk, compare.then_some(sent))?;
+        if outcome != TransferAck::Accepted {
+            return Ok(outcome);
         }
         offset = end;
+        chunk += 1;
     }
-    Ok(true)
+    Ok(TransferAck::Accepted)
 }
 
 /// The largest bundle slice one frame can carry: the frame's `u16` LEN cap, less the 8-byte
@@ -1263,7 +1357,7 @@ pub fn run_bundle_blocking(
     let mut index = 0usize;
     while let Some(chunk) = chunks.next() {
         send_run_bundle(transport, seq, &chunk)?;
-        if let TransferAck::Rejected { chunk } = await_transfer_ack(transport, seq, index, timeout)? {
+        if let TransferAck::Rejected { chunk } = await_transfer_ack(transport, seq, index, None, timeout)? {
             return Ok(RunOutcome::Rejected { chunk });
         }
         index += 1;
@@ -1278,11 +1372,12 @@ fn await_transfer_ack(
     transport: &mut impl Transport,
     seq: u16,
     chunk: usize,
+    expected: Option<u32>,
     timeout: Duration,
 ) -> Result<TransferAck, TransportError> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(ack) = try_recv_bundle_ack(transport, seq, chunk)? {
+        if let Some(ack) = try_recv_deploy_ack(transport, seq, chunk, expected)? {
             return Ok(ack);
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -1312,6 +1407,8 @@ pub struct BundleChunks<'a> {
     chunk_len: usize,
     offset: usize,
     done: bool,
+    /// The CRC of every byte planned so far. See [`BundleChunks::prefix_crc`].
+    crc: u32,
 }
 
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
@@ -1330,6 +1427,7 @@ impl<'a> BundleChunks<'a> {
             chunk_len: (chunk_len.min(BUNDLE_CHUNK_DATA_CAP) / 4 * 4).max(4),
             offset: 0,
             done: false,
+            crc: 0,
         }
     }
 
@@ -1351,9 +1449,18 @@ impl<'a> BundleChunks<'a> {
         payload.extend_from_slice(&(self.offset as u32).to_le_bytes());
         payload.extend_from_slice(&total.to_le_bytes());
         payload.extend_from_slice(&self.bundle[self.offset..end]);
+        self.crc = lamella_wire::crc32::update(self.crc, &self.bundle[self.offset..end]);
         self.offset = end;
         self.done = self.offset >= self.bundle.len();
         Some(payload)
+    }
+
+    /// The CRC of the bundle up to the end of the last planned frame: what a target with
+    /// [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`] reports when it deploys that frame. Pass it to
+    /// [`try_recv_deploy_ack`].
+    #[must_use]
+    pub fn prefix_crc(&self) -> u32 {
+        self.crc
     }
 }
 
@@ -1371,6 +1478,7 @@ pub fn send_bundle_chunk(
 }
 
 /// Host driver: poll for one chunk's `XFER_RESULT` (non-blocking; `Ok(None)` if it is not in yet).
+/// It compares no CRC; [`try_recv_deploy_ack`] does, for a deploy under the prefix rule.
 ///
 /// `chunk` is the index of the chunk this poll is FOR, and it is an argument because only the
 /// caller knows it: the reply carries the request's sequence number, not a position in a plan.
@@ -1390,24 +1498,34 @@ pub fn try_recv_bundle_ack(
     seq: u16,
     chunk: usize,
 ) -> Result<Option<TransferAck>, TransportError> {
+    try_recv_deploy_ack(transport, seq, chunk, None)
+}
+
+/// Host driver: [`try_recv_bundle_ack`], comparing a `MATCHED` acknowledgement's CRC with `expected`
+/// -- the [`BundleChunks::prefix_crc`] of the chunk this poll is for -- by the rule on
+/// [`lamella_wire::msg::XFER_RESULT`]. Pass `None` for a session without
+/// [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`], and nothing is compared.
+///
+/// # Errors
+/// As [`try_recv_bundle_ack`], and [`TransportError::MalformedReply`] when a compared acknowledgement
+/// carries no CRC.
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn try_recv_deploy_ack(
+    transport: &mut impl Transport,
+    seq: u16,
+    chunk: usize,
+    expected: Option<u32>,
+) -> Result<Option<TransferAck>, TransportError> {
     use lamella_wire::{Frame, msg};
     while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
         if reply_seq != seq {
             continue;
         }
         if msg_type == deploy::XFER_RESULT {
-            return Ok(Some(if transfer_accepted(&payload) {
-                TransferAck::Accepted
-            } else {
-                TransferAck::Rejected { chunk }
-            }));
+            return deploy_chunk_outcome(&payload, chunk, expected).map(Some);
         }
         if msg_type == msg::ERROR {
-            return Err(TransportError::Refused {
-                reason: payload.first().copied().unwrap_or(0),
-                msg_type: lamella_wire::error::refused_message_type(&payload).unwrap_or(0),
-                holder: lamella_wire::error::session_holder(&payload),
-            });
+            return Err(lamella_wire::error::refusal(&payload));
         }
     }
     Ok(None)
@@ -1426,6 +1544,10 @@ pub fn try_recv_bundle_ack(
 ///
 /// A target REJECTING a chunk is not among them: it is [`TransferAck::Rejected`], and it carries
 /// which chunk.
+///
+/// When `session_caps` has [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`], each acknowledgement is
+/// compared as [`deploy_image_blocking`] compares one, and the first that differs is
+/// [`TransferAck::Mismatched`]. Pass [`lamella_wire::Negotiated::caps`].
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn deploy_bundle_blocking(
     transport: &mut impl Transport,
@@ -1433,15 +1555,17 @@ pub fn deploy_bundle_blocking(
     bundle: &[u8],
     chunk_len: usize,
     timeout: Duration,
+    session_caps: lamella_wire::Capabilities,
 ) -> Result<TransferAck, TransportError> {
+    let compare = session_caps.has(lamella_wire::Capabilities::DEPLOY_PREFIX_CRC);
     let mut chunks = BundleChunks::new(bundle, chunk_len);
     let mut index = 0usize;
     while let Some(chunk) = chunks.next() {
         send_bundle_chunk(transport, seq, &chunk)?;
-        if let rejected @ TransferAck::Rejected { .. } =
-            await_transfer_ack(transport, seq, index, timeout)?
-        {
-            return Ok(rejected);
+        let expected = compare.then(|| chunks.prefix_crc());
+        let outcome = await_transfer_ack(transport, seq, index, expected, timeout)?;
+        if outcome != TransferAck::Accepted {
+            return Ok(outcome);
         }
         index += 1;
     }
@@ -1543,6 +1667,106 @@ pub fn profile_manifest_blocking(
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn send_deploy_run(transport: &mut impl Transport, seq: u16) -> Result<(), TransportError> {
     transport.send(exec::EXEC, seq, &[exec::exec_source::DEPLOYED, 0])
+}
+
+/// Why [`start_execution`] did not start anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartFailure {
+    /// The target answered with an [`exec::EXEC_ACK`] that is not a start: the code it gave (see
+    /// [`exec::ack`]), or `None` when the acknowledgement carried no code.
+    ///
+    /// Nothing is executing, so no stop follows.
+    Refused(Option<u8>),
+    /// No acknowledgement arrived before the wait ran out.
+    ///
+    /// The target may still have started: an acknowledgement lost on the way looks the same from
+    /// here.
+    NoAnswer,
+    /// The carrier failed, or the target refused the command itself by answering
+    /// [`lamella_wire::msg::ERROR`] ([`TransportError::Refused`]).
+    Transport(TransportError),
+}
+
+impl core::fmt::Display for StartFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Refused(code) => f.write_str(&describe_start_refusal(*code)),
+            Self::NoAnswer => f.write_str("the target did not acknowledge the start"),
+            Self::Transport(refused @ TransportError::Refused { .. }) => {
+                write!(f, "the target refused the start command: {refused:?}")
+            }
+            Self::Transport(error) => write!(f, "the carrier failed before the start was acknowledged: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for StartFailure {}
+
+/// Host driver, blocking: send an [`exec::EXEC`] for `source` with `flags`, and wait for the target to
+/// acknowledge it.
+///
+/// It returns when the answer arrives, so a refused start is reported as soon as the target gives its
+/// reason rather than after a wait for a stop that never comes. `Ok` means the execution began --
+/// [`exec::ack::STARTED`], or [`exec::ack::RUNNING`] -- and how it ends arrives later as
+/// [`debug::EVT_STOPPED`] at the same `seq`.
+///
+/// Frames answering other requests are skipped. Polling stops at the acknowledgement, so whatever the
+/// execution sends after it is left for the caller to read.
+///
+/// # Errors
+/// [`StartFailure::Refused`] with the code the target gave; [`StartFailure::NoAnswer`] when no
+/// acknowledgement arrives within `timeout`; [`StartFailure::Transport`] for a carrier error, or with
+/// [`TransportError::Refused`] when the target answers `ERROR`.
+pub fn start_execution(
+    transport: &mut impl Transport,
+    seq: u16,
+    source: u8,
+    flags: u8,
+    timeout: Duration,
+) -> Result<(), StartFailure> {
+    transport.send(exec::EXEC, seq, &[source, flags]).map_err(StartFailure::Transport)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        while let Some(frame) = transport.poll().map_err(StartFailure::Transport)? {
+            if frame.seq != seq {
+                continue;
+            }
+            if frame.msg_type == exec::EXEC_ACK {
+                return match frame.payload.first().copied() {
+                    Some(exec::ack::STARTED | exec::ack::RUNNING) => Ok(()),
+                    code => Err(StartFailure::Refused(code)),
+                };
+            }
+            if frame.msg_type == lamella_wire::msg::ERROR {
+                return Err(StartFailure::Transport(lamella_wire::error::refusal(&frame.payload)));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(StartFailure::NoAnswer);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The sentence saying why the target did not start a run, from the code its [`exec::EXEC_ACK`]
+/// gave, or `None` when the acknowledgement carried no code.
+pub(crate) fn describe_start_refusal(code: Option<u8>) -> String {
+    let why = match code {
+        Some(exec::ack::NOTHING_TO_RUN) => {
+            "there is nothing at the requested source to start (NOTHING_TO_RUN)".to_string()
+        }
+        Some(exec::ack::HALTED_UNSUPPORTED) => {
+            "starting halted needs a debug capability this target does not offer (HALTED_UNSUPPORTED)"
+                .to_string()
+        }
+        Some(exec::ack::NO_SUCH_SOURCE) => {
+            "this target does not run artifacts from the requested source (NO_SUCH_SOURCE)".to_string()
+        }
+        Some(exec::ack::IDLE) => "it answered that nothing is executing (IDLE)".to_string(),
+        Some(other) => format!("it answered with acknowledgement code {other}"),
+        None => "its acknowledgement carried no code".to_string(),
+    };
+    format!("the target did not start the run: {why}")
 }
 
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
@@ -1887,7 +2111,8 @@ mod tests {
             transport.feed(&xfer_ack(7));
         }
 
-        let ack = deploy_bundle_blocking(&mut transport, 7, &bundle, 1023, Duration::from_secs(5))
+        let none = lamella_wire::Capabilities(0);
+        let ack = deploy_bundle_blocking(&mut transport, 7, &bundle, 1023, Duration::from_secs(5), none)
             .expect("the in-memory carrier never errors");
         assert_eq!(ack, TransferAck::Accepted, "every chunk acked");
 
@@ -1926,7 +2151,8 @@ mod tests {
         let mut transport = MemTransport::new();
         transport.feed(&xfer_ack(9));
 
-        let ack = deploy_bundle_blocking(&mut transport, 9, &[], 4096, Duration::from_secs(5))
+        let none = lamella_wire::Capabilities(0);
+        let ack = deploy_bundle_blocking(&mut transport, 9, &[], 4096, Duration::from_secs(5), none)
             .expect("the in-memory carrier never errors");
         assert_eq!(ack, TransferAck::Accepted, "the clear was acked");
 
@@ -1947,11 +2173,54 @@ mod tests {
         let mut transport = MemTransport::new();
         transport.feed(&encode_frame(lamella_wire::msg::ERROR, 5, &[]).expect("an ERROR frames"));
 
-        let error = deploy_bundle_blocking(&mut transport, 5, &[1, 2, 3, 4], 4096, Duration::from_secs(5))
+        let none = lamella_wire::Capabilities(0);
+        let error = deploy_bundle_blocking(&mut transport, 5, &[1, 2, 3, 4], 4096, Duration::from_secs(5), none)
             .expect_err("a refusal is an error, not an Ok(false)");
         assert!(
             matches!(error, TransportError::Refused { .. }),
             "expected Refused, got {error:?} -- a refusal reported as a timeout is the defect"
+        );
+    }
+
+    /// A bundle deploy compares each acknowledgement with the prefix CRC of what was planned, as an
+    /// image deploy does, and names the first chunk that differs -- blocking, and through the
+    /// event-loop poll alike.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn a_bundle_deploy_names_the_first_chunk_whose_prefix_crc_differs() {
+        use lamella_wire::{Capabilities, crc32, msg::xfer};
+        let bundle: Vec<u8> = (0..12u8).collect();
+        let prefix = |end: usize| crc32::of(&bundle[..end]);
+        let ack = |crc: u32| {
+            let mut payload = vec![xfer::MATCHED];
+            payload.extend_from_slice(&crc.to_le_bytes());
+            encode_frame(deploy::XFER_RESULT, 3, &payload).expect("a 5-byte ack frames")
+        };
+        let caps = Capabilities(Capabilities::DEPLOY_PREFIX_CRC);
+        let timeout = Duration::from_secs(5);
+
+        let mut transport = MemTransport::new();
+        for end in [4, 8, 12] {
+            transport.feed(&ack(prefix(end)));
+        }
+        assert_eq!(deploy_bundle_blocking(&mut transport, 3, &bundle, 4, timeout, caps), Ok(TransferAck::Accepted));
+
+        let mut transport = MemTransport::new();
+        transport.feed(&ack(prefix(4)));
+        transport.feed(&ack(0xDEAD_BEEF));
+        assert_eq!(
+            deploy_bundle_blocking(&mut transport, 3, &bundle, 4, timeout, caps),
+            Ok(TransferAck::Mismatched { chunk: 1, sent: prefix(8), reported: 0xDEAD_BEEF })
+        );
+
+        let mut chunks = BundleChunks::new(&bundle, 4);
+        let first = chunks.next().expect("a first chunk");
+        let mut transport = MemTransport::new();
+        send_bundle_chunk(&mut transport, 3, &first).expect("the in-memory carrier never errors");
+        transport.feed(&ack(0x0BAD_F00D));
+        assert_eq!(
+            try_recv_deploy_ack(&mut transport, 3, 0, Some(chunks.prefix_crc())),
+            Ok(Some(TransferAck::Mismatched { chunk: 0, sent: prefix(4), reported: 0x0BAD_F00D }))
         );
     }
 

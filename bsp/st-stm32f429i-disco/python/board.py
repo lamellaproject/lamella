@@ -130,9 +130,9 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led-green": {"kind": "gpio-out", "port_base": 0x40021800, "pin": 13, "mask": 0x2000, "active_low": False},
-    "led-red": {"kind": "gpio-out", "port_base": 0x40021800, "pin": 14, "mask": 0x4000, "active_low": False},
-    "button": {"kind": "gpio-in", "port_base": 0x40020000, "pin": 0, "mask": 0x1, "active_low": False},
+    "led-green": {"kind": "gpio-out", "port_base": 0x40021800, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": False},
+    "led-red": {"kind": "gpio-out", "port_base": 0x40021800, "pin": 14, "bank": 0, "mask": 0x4000, "active_low": False},
+    "button": {"kind": "gpio-in", "port_base": 0x40020000, "pin": 0, "bank": 0, "mask": 0x1, "active_low": False},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until

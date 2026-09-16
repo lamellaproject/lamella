@@ -66,30 +66,29 @@ const HEAP_PTR: *mut u32 = 0x2000_0100 as *mut u32;
 /// board, exactly like the console sink. So the image supplies the number and the archive enforces
 /// it, which is the same split the `console_sink` knob makes for the UART.
 ///
-/// **A zero end is not "unbounded", it is "no heap": every allocation fails.** That direction is
-/// deliberate. The opposite reading -- treat 0 as no limit -- would make an un-seeded stub silently
-/// keep an unbounded heap -- the invisible-default shape, where the safe-looking reading of a
-/// missing value is the dangerous one. A stub that forgets to seed this instead fails at its FIRST allocation,
-/// loudly and immediately, where the cause is unmistakable.
+/// **A zero end is not "unbounded", it is "no heap": the first allocation stops the program.** That
+/// direction is deliberate. The opposite reading -- treat 0 as no limit -- would make an un-seeded
+/// stub silently keep an unbounded heap -- the invisible-default shape, where the safe-looking
+/// reading of a missing value is the dangerous one. A stub that forgets to seed this instead stops
+/// at its first allocation, printing `HEAPFULL`, where the cause is unmistakable.
 const HEAP_END: *mut u32 = 0x2000_0104 as *mut u32;
 
 /// The device GC-alloc entry the AOT emits `newobj`/`box`/array-alloc calls against:
 /// `lamella_gc_alloc(payload_size [r0], &TypeDesc [r1]) -> payload* [r0]`. Bumps the fixed-RAM heap,
 /// writes the descriptor at the object header (base+0), and returns the payload (base+4).
 ///
-/// **Returns NULL when the request does not fit below [`HEAP_END`], and nothing above this seam
-/// looks at the result.** The AOT emits no test after an allocation call, so exhaustion reaches the
-/// program as a null reference it never compares: a field store through it is discarded, and a
-/// field read answers whatever occupies low memory -- which on a Cortex-M part is the vector table,
-/// so the value comes back looking like an ordinary number. **An exhausted heap therefore produces
-/// a plausible wrong answer rather than a stop**, and a program that cannot afford one must bound
-/// its own allocation or test the reference itself.
+/// **It never returns on an exhausted heap.** A request that does not fit below [`HEAP_END`] ends
+/// the program through [`lamella_heap_exhausted`], so every pointer this returns is a fresh block and
+/// no caller -- emitted code or a seam in this archive -- has a null to test. Emitted code tests none:
+/// a null handed back from here would reach the program as a reference nothing compares, a store
+/// through it would be discarded, and a read would answer low memory, which on a Cortex-M part is the
+/// vector table. That is a plausible wrong answer, and a stop is the better failure by exactly that
+/// difference.
 ///
-/// Refusing is still the right behavior here, because the alternative is worse and is not
-/// observable at all. Without the bound the cursor runs past the end of the heap and overwrites
-/// whatever sits above it: a program that keeps running on corrupted memory, presenting as whatever
-/// happens to occupy that address -- a statics window looks like a backend fault, a stack looks
-/// like a codegen defect.
+/// Refusing to bump past the end is the half that protects everything else. Without the bound the
+/// cursor runs past the end of the heap and overwrites whatever sits above it: a program that keeps
+/// running on corrupted memory, presenting as whatever happens to occupy that address -- a statics
+/// window looks like a backend fault, a stack looks like a codegen defect.
 ///
 /// Every arithmetic step is checked. `payload_size` reaches this seam from a managed `newarr`
 /// count, so a hostile or merely wrong length must not wrap the rounding (or the sum) into a
@@ -100,18 +99,34 @@ extern "C" fn lamella_gc_alloc_impl(payload_size: u32, type_desc: *const u32) ->
         let base = core::ptr::read_volatile(HEAP_PTR);
         let end = core::ptr::read_volatile(HEAP_END);
         let Some(rounded) = payload_size.checked_add(7).map(|n| n & !7) else {
-            return core::ptr::null_mut();
+            lamella_heap_exhausted();
         };
         let Some(next) = base.checked_add(4).and_then(|b| b.checked_add(rounded)) else {
-            return core::ptr::null_mut();
+            lamella_heap_exhausted();
         };
         if next > end {
-            return core::ptr::null_mut();
+            lamella_heap_exhausted();
         }
         core::ptr::write(base as *mut u32, type_desc as u32);
         core::ptr::write_volatile(HEAP_PTR, next);
         (base + 4) as *mut u8
     }
+}
+
+/// Ends the program because the heap cannot serve an allocation: prints `HEAPFULL` on the console
+/// sink and halts.
+///
+/// A native seam cannot raise a managed exception, so this ends the way `DEADLOCK`, `LOCKFULL`,
+/// `MONITOR` and `NULLLOCK` do: a word on the console, visibly wrong next to a harness's one-byte
+/// verdict, and a loop that never resumes. It is exported so an allocator other than
+/// [`lamella_gc_alloc_impl`] can end an exhausted heap the same way, and so a debugger halted in it
+/// names the cause.
+#[no_mangle]
+pub extern "C" fn lamella_heap_exhausted() -> ! {
+    for b in *b"HEAPFULL" {
+        console_put(b);
+    }
+    loop {}
 }
 
 /// The magnitude of a double: clears the IEEE-754 sign bit. Branch-free and correct for the
@@ -512,19 +527,18 @@ unsafe extern "C" {
 /// an image degrades to empty text rather than hanging. That path is unreachable once the emitter
 /// refuses such a build on the host, and it is kept because a degradation that is dead is still
 /// cheaper than a hang that is not.
+///
+/// An exhausted heap never returns here: [`lamella_gc_alloc_impl`] stops the program, and so does a
+/// length whose byte count overflows, since no heap could serve it.
 fn alloc_string(units: u32) -> *mut u32 {
     let type_desc = unsafe { core::ptr::read_volatile(&raw const __lamella_string_typedesc) };
     if type_desc == 0 {
         return core::ptr::null_mut();
     }
-    let payload = match units.checked_mul(2).and_then(|n| n.checked_add(4)) {
-        Some(n) => n,
-        None => return core::ptr::null_mut(),
+    let Some(payload) = units.checked_mul(2).and_then(|n| n.checked_add(4)) else {
+        lamella_heap_exhausted();
     };
     let obj = lamella_gc_alloc_impl(payload, type_desc as *const u32) as *mut u32;
-    if obj.is_null() {
-        return obj;
-    }
     unsafe { core::ptr::write(obj, units) };
     obj
 }

@@ -32,6 +32,9 @@ pub struct DebugProgram {
     pub frames: Vec<u8>,
     /// The sections a variables pane is read from. **Empty is ordinary** for the same reason.
     pub locals: LocalSections,
+    /// The Arm exception-handling tables, from which a call stack is computed where `.debug_frame`
+    /// has no row. **Empty is ordinary** for the same reason.
+    pub unwind: UnwindTables,
 }
 
 /// The debug sections local variables are read from, owned.
@@ -85,6 +88,113 @@ impl LocalSections {
     }
 }
 
+/// The Arm exception-handling tables a program carries, owned: its index tables, and the loaded
+/// sections their table entries are in.
+///
+/// **HELD AS BYTES AND SEARCHED PER STOP**, for the reason [`crate::DeviceBackend`] gives about
+/// `.debug_frame`: the reader borrows what it reads, and a stop is a human-scale event.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnwindTables {
+    /// Every index table that can be searched, as `(address, bytes)`.
+    pub indexes: Vec<(u32, Vec<u8>)>,
+    /// Each loaded section holding a table entry an index points at, as `(address, bytes)`.
+    pub entries: Vec<(u32, Vec<u8>)>,
+    /// The image's executable address ranges, `[start, end)`.
+    ///
+    /// An index records where each function starts and not where the last one ends, so outside
+    /// these ranges no address is taken to be described. Empty when the file named none, and then
+    /// nothing is excluded.
+    pub code: Vec<(u64, u64)>,
+}
+
+/// What the index tables say about the function containing an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Described {
+    /// The function's index entry.
+    pub(crate) entry: lamella_elf::ehabi::IndexEntry,
+    /// What its table entry says.
+    pub(crate) description: lamella_elf::ehabi::Description,
+}
+
+impl UnwindTables {
+    /// The tables of a linked ELF; see [`Self::from_tables`].
+    #[must_use]
+    pub fn from_elf(bytes: &[u8]) -> Self {
+        Self::from_tables(&lamella_elf::ehabi::tables(bytes), lamella_elf::executable_ranges(bytes))
+    }
+
+    /// Keeps every index table in `tables` that can be searched, and each loaded section holding a
+    /// table entry one of them points at, with the image's executable ranges `code`.
+    ///
+    /// An index table that cannot be searched -- out of order, or not whole entries -- is left out: a
+    /// lookup in one answers the wrong function for some address, and nothing about that answer says
+    /// so.
+    #[must_use]
+    pub fn from_tables(tables: &lamella_elf::ehabi::Tables<'_>, code: Vec<(u64, u64)>) -> Self {
+        let mut kept = UnwindTables { code, ..Self::default() };
+        for region in &tables.indexes {
+            let Ok(index) = lamella_elf::ehabi::IndexTable::new(*region) else {
+                continue;
+            };
+            kept.indexes.push((region.address, region.bytes.to_vec()));
+            for entry in index.entries() {
+                let lamella_elf::ehabi::Content::Table(address) = entry.content else {
+                    continue;
+                };
+                let Some(section) = tables.loaded.iter().find(|section| section.word(address).is_some())
+                else {
+                    continue;
+                };
+                if !kept.entries.iter().any(|(start, _)| *start == section.address) {
+                    kept.entries.push((section.address, section.bytes.to_vec()));
+                }
+            }
+        }
+        kept
+    }
+
+    /// Whether the program carries no index table.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
+    }
+
+    /// What the index tables say about the function containing `address`, where one does.
+    ///
+    /// `None` below every function, and outside the image's code where the image names its code.
+    pub(crate) fn describe(&self, address: u32) -> Option<Described> {
+        let in_code = self.code.is_empty()
+            || self
+                .code
+                .iter()
+                .any(|&(start, end)| u64::from(address) >= start && u64::from(address) < end);
+        if !in_code {
+            return None;
+        }
+        let loaded: Vec<lamella_elf::ehabi::Region<'_>> = self
+            .entries
+            .iter()
+            .map(|(start, bytes)| lamella_elf::ehabi::Region { address: *start, bytes })
+            .collect();
+        let mut best: Option<lamella_elf::ehabi::IndexEntry> = None;
+        for (start, bytes) in &self.indexes {
+            let region = lamella_elf::ehabi::Region { address: *start, bytes };
+            let Ok(index) = lamella_elf::ehabi::IndexTable::new(region) else {
+                continue;
+            };
+            let Some(entry) = index.lookup(address) else {
+                continue;
+            };
+            if best.is_none_or(|chosen| entry.function > chosen.function) {
+                best = Some(entry);
+            }
+        }
+        let entry = best?;
+        let description = lamella_elf::ehabi::describe(&entry, &loaded).ok()?;
+        Some(Described { entry, description })
+    }
+}
+
 /// Why a program could not be prepared for debugging.
 #[derive(Debug)]
 pub enum ProgramError {
@@ -124,6 +234,67 @@ impl core::fmt::Display for ProgramError {
             ),
         }
     }
+}
+
+/// The entry of `names` that holds `offset`, where the table is ordered as [`add_symbol_names`] leaves
+/// it: the containing entry that starts nearest below `offset`, and among entries starting together,
+/// the one last in the table.
+///
+/// **NOT THE NEAREST PRECEDING NAME.** Most of an image can have no subprogram entry, and the
+/// nearest-preceding rule labels every such stretch with whatever function ended before it.
+pub(crate) fn name_containing(names: &[(u32, u32, String)], offset: u32) -> Option<&(u32, u32, String)> {
+    names
+        .iter()
+        .rev()
+        .find(|&&(start, end, _)| start <= offset && offset < end)
+}
+
+/// Adds a name for code no subprogram describes from the image's function `symbols`, and orders the
+/// table for [`name_containing`].
+///
+/// A symbol names code only where it overlaps no subprogram, so the debug information names every
+/// function it describes and a symbol names only what it leaves unnamed. A symbol below the image,
+/// or outside its code, is left out as a subprogram there would be. Where several symbols hold one
+/// address, the name found for it is the symbol that starts nearest below the address, then the
+/// shortest, then a global symbol before a weak one before a local one, then the one the table lists
+/// first. A name is the table's own spelling, mangled or not.
+fn add_symbol_names(
+    names: &mut Vec<(u32, u32, String)>,
+    symbols: &[lamella_elf::symbols::Function<'_>],
+    base: u64,
+    is_code: impl Fn(u64) -> bool,
+) {
+    let described = names.len();
+    let mut named: Vec<(u32, u32, u8, usize, &str)> = Vec::new();
+    for (position, symbol) in symbols.iter().enumerate() {
+        let address = u64::from(symbol.address);
+        if address < base || !is_code(address) {
+            continue;
+        }
+        let Ok(start) = u32::try_from(address - base) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(symbol.size) else {
+            continue;
+        };
+        if names[..described].iter().any(|&(from, to, _)| start < to && from < end) {
+            continue;
+        }
+        let rank = match symbol.binding {
+            lamella_elf::Binding::Global => 0,
+            lamella_elf::Binding::Weak => 1,
+            lamella_elf::Binding::Local => 2,
+        };
+        named.push((start, end, rank, position, symbol.name));
+    }
+    named.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then((b.1 - b.0).cmp(&(a.1 - a.0)))
+            .then(b.2.cmp(&a.2))
+            .then(b.3.cmp(&a.3))
+    });
+    names.extend(named.into_iter().map(|(start, end, _, _, name)| (start, end, String::from(name))));
+    names.sort_by_key(|&(offset, _, _)| offset);
 }
 
 /// Prepares a linked ELF -- one a Swift, RHU or C toolchain produced -- for a device debug session.
@@ -263,7 +434,7 @@ pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
             names.push((offset, end, String::from_utf8_lossy(function.name).into_owned()));
         }
     }
-    names.sort_by_key(|&(offset, _, _)| offset);
+    add_symbol_names(&mut names, &lamella_elf::symbols::functions(bytes), base, is_code);
 
     let entry_address = bytes
         .get(24..28)
@@ -278,10 +449,12 @@ pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
                 && f.low_pc <= u64::from(entry_address)
                 && u64::from(entry_address) < f.high_pc
         })
-        .map_or_else(
-            || String::from("?"),
-            |f| String::from_utf8_lossy(f.name).into_owned(),
-        );
+        .map(|f| String::from_utf8_lossy(f.name).into_owned())
+        .or_else(|| {
+            let offset = u32::try_from(u64::from(entry_address).checked_sub(base)?).ok()?;
+            name_containing(&names, offset).map(|(_, _, name)| name.clone())
+        })
+        .unwrap_or_else(|| String::from("?"));
 
     Ok(DebugProgram {
         image: flat.bytes,
@@ -292,6 +465,7 @@ pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
         entry,
         frames,
         locals,
+        unwind: UnwindTables::from_elf(bytes),
     })
 }
 

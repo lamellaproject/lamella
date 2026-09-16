@@ -320,13 +320,7 @@ mod tests {
         assert_eq!(format!("{:?}", exit_for(&fits)), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(format!("{:?}", exit_for(&exceeds)), format!("{:?}", ExitCode::FAILURE));
     }
-    /// **A VERB WITH NO USAGE TEXT ANSWERS `--help` BY PRINTING NOTHING AND EXITING 0**, which
-    /// reads to a person as "this tool has no help" and to a script as success. Five verbs did
-    /// exactly that until they were given one.
-    ///
-    /// Asserting the FIRST LINE rather than the presence of a string also catches the likelier
-    /// drift: a usage block copied from a neighbouring verb and not renamed.
-    #[test]
+
     /// EVERY board in the listing resolves to a part, including the ones that name a MODULE.
     ///
     /// A board names either a bare chip (`family` + `part`) or a module, and the two are exclusive.
@@ -359,6 +353,12 @@ mod tests {
         assert!(modules > 0, "no board names a module, so this proves nothing about that hop");
     }
 
+    /// **A VERB WITH NO USAGE TEXT ANSWERS `--help` BY PRINTING NOTHING AND EXITING 0**, which
+    /// reads to a person as "this tool has no help" and to a script as success. Five verbs did
+    /// exactly that until they were given one.
+    ///
+    /// Asserting the FIRST LINE rather than the presence of a string also catches the likelier
+    /// drift: a usage block copied from a neighboring verb and not renamed.
     #[test]
     fn the_usage_opens_with_the_verb_it_belongs_to() {
         assert!(

@@ -56,12 +56,13 @@ pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if !backend.launch() {
+    if let Err(reason) = backend.launch() {
         eprintln!(
-            "lamella run: {target} would not take the program.\n\n\
-             An attached run needs firmware that offers the debug capabilities -- stepping and \
-             breakpoints --\nbecause the output stream rides that channel. A board running a \
-             serve build without them can\nstill take `lamella deploy`, which needs none of it."
+            "lamella run: {target} would not take the program: {reason}.\n\n\
+             `run --target` starts the program halted under the debugger and streams its output \
+             over that\nchannel, so the board's firmware has to offer the debug capabilities -- \
+             stepping and breakpoints.\nA board whose firmware does not can still take `lamella \
+             deploy`, which needs neither."
         );
         return ExitCode::FAILURE;
     }
@@ -72,12 +73,11 @@ pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
 
 /// `run --target`'s wording for a source it cannot compile.
 ///
-/// **IT IS NOT `deploy`'s SENTENCE AND MUST NOT BECOME IT.** Sharing the finished message across
-/// the two verbs put `deploy`'s wording under `lamella run:`, where it said *"`--board` builds one
-/// ahead of time"* -- **false here.** `run --board` executes on THIS machine against a board's
-/// generated `board` module, which is a fact table rather than hardware, and it is the one mode a
-/// Python program DOES have. So the verb that shares the predicate points its reader somewhere the
-/// other verb cannot: at itself, without `--target`.
+/// **IT IS NOT `deploy`'s SENTENCE AND MUST NOT BECOME IT.** `deploy` says `--board` builds an
+/// image ahead of time, which is false for this verb: `run --board` executes on THIS machine
+/// against a board's generated `board` module, a fact table rather than hardware, and that is the
+/// one mode a Python program DOES have. A shared sentence would point the reader at something
+/// this verb cannot do.
 fn cannot_run_on_a_target(path: &Path, what: &crate::deploy::Uncompilable) -> String {
     match what {
         crate::deploy::Uncompilable::Python => format!(

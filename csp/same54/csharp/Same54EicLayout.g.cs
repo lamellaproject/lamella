@@ -146,5 +146,14 @@ namespace Lamella.Generated
         public const uint DPRESCALER_TICKON_LSB = 16;
         public const uint PINSTATE_PINSTATE = 0xFFFF;
         public const uint PINSTATE_PINSTATE_LSB = 0;
+
+        // -- block constants --
+        public const uint LINE_COUNT = 16;
+        public const uint SENSE_NONE = 0;
+        public const uint SENSE_RISE = 1;
+        public const uint SENSE_FALL = 2;
+        public const uint SENSE_BOTH = 3;
+        public const uint SENSE_HIGH = 4;
+        public const uint SENSE_LOW = 5;
     }
 }

@@ -204,6 +204,22 @@ pub const LOAD_JS: u8 = 0x33;
 ///
 /// The CRC's MEANING is keyed on the REQUEST, not on this reply: over the RAM as assembled for a
 /// load, over the flash as read back for a deploy.
+///
+/// # The deploy CRC under [`crate::Capabilities::DEPLOY_PREFIX_CRC`]
+///
+/// It covers the artifact's committed PREFIX: bytes `[0, offset + len)` of the chunk it answers, as
+/// read back from flash. The range alone defines it, whatever order the chunks arrived in. A target
+/// keeps it cheaply as a running CRC while each chunk begins where the last one ended, and
+/// recomputes it from the start of the artifact otherwise. The algorithm is [`crate::crc32`] at both
+/// ends.
+///
+/// A host that sent the artifact in order keeps one running CRC over what it sent and compares it
+/// with every acknowledgement, so the last acknowledgement covers the whole artifact. Only an
+/// [`xfer::MATCHED`] acknowledgement is compared: [`xfer::WRITTEN_NOT_READ_BACK`] says the end of the
+/// prefix is not in flash yet, so the next `MATCHED` acknowledgement covers it, and a failed or
+/// rejected chunk has no prefix to cover.
+///
+/// Without the capability the deploy CRC covers something else, and a host compares nothing.
 pub const XFER_RESULT: u8 = 0x38;
 /// Host -> target: discard the loaded artifact -- partial or complete -- and reclaim the arena.
 /// Empty payload. Answered by [`XFER_RESULT`] with `crc32 = 0`.
@@ -678,7 +694,7 @@ pub mod exec_flags {
 ///
 /// It answers TWO ops -- an [`EXEC`] that started something, and an [`EXEC_STATUS`] asking what is
 /// executing -- because both questions have the same answer space: what is running, or why nothing
-/// is. A second reply type would have been a second spelling of these five values.
+/// is. A second reply type would have been a second spelling of these six values.
 ///
 /// **An acknowledgement is not a result.** [`STARTED`][exec_ack::STARTED] means the execution began; how it ENDED
 /// arrives later as [`EVT_STOPPED`], and a host that read this as completion would report success

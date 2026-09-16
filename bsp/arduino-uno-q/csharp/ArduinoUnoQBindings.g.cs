@@ -18,26 +18,32 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint LED1_RED_PORT_BASE = 0x42021C00;
         public const uint LED1_RED_PIN = 10;
+        public const uint LED1_RED_BANK = 0;
         public const uint LED1_RED_MASK = 0x400;
         public const uint LED1_RED_ACTIVE_LOW = 1;
         public const uint LED1_GREEN_PORT_BASE = 0x42021C00;
         public const uint LED1_GREEN_PIN = 11;
+        public const uint LED1_GREEN_BANK = 0;
         public const uint LED1_GREEN_MASK = 0x800;
         public const uint LED1_GREEN_ACTIVE_LOW = 1;
         public const uint LED1_BLUE_PORT_BASE = 0x42021C00;
         public const uint LED1_BLUE_PIN = 12;
+        public const uint LED1_BLUE_BANK = 0;
         public const uint LED1_BLUE_MASK = 0x1000;
         public const uint LED1_BLUE_ACTIVE_LOW = 1;
         public const uint LED2_RED_PORT_BASE = 0x42021C00;
         public const uint LED2_RED_PIN = 13;
+        public const uint LED2_RED_BANK = 0;
         public const uint LED2_RED_MASK = 0x2000;
         public const uint LED2_RED_ACTIVE_LOW = 1;
         public const uint LED2_GREEN_PORT_BASE = 0x42021C00;
         public const uint LED2_GREEN_PIN = 14;
+        public const uint LED2_GREEN_BANK = 0;
         public const uint LED2_GREEN_MASK = 0x4000;
         public const uint LED2_GREEN_ACTIVE_LOW = 1;
         public const uint LED2_BLUE_PORT_BASE = 0x42021C00;
         public const uint LED2_BLUE_PIN = 15;
+        public const uint LED2_BLUE_BANK = 0;
         public const uint LED2_BLUE_MASK = 0x8000;
         public const uint LED2_BLUE_ACTIVE_LOW = 1;
     }

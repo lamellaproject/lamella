@@ -14,25 +14,31 @@ public enum AutomationdirectP1am100Bindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LED_PORT_BASE: UInt32 = 0x41004480
     public static let LED_PIN: UInt32 = 8
+    public static let LED_BANK: UInt32 = 0
     public static let LED_MASK: UInt32 = 0x100
     public static let LED_ACTIVE_LOW: UInt32 = 0
     public static let RUN_SWITCH_PORT_BASE: UInt32 = 0x41004400
     public static let RUN_SWITCH_PIN: UInt32 = 28
+    public static let RUN_SWITCH_BANK: UInt32 = 0
     public static let RUN_SWITCH_MASK: UInt32 = 0x10000000
     public static let RUN_SWITCH_ACTIVE_LOW: UInt32 = 1
     public static let BASE_ENABLE_PORT_BASE: UInt32 = 0x41004480
     public static let BASE_ENABLE_PIN: UInt32 = 9
+    public static let BASE_ENABLE_BANK: UInt32 = 0
     public static let BASE_ENABLE_MASK: UInt32 = 0x200
     public static let BASE_ENABLE_ACTIVE_LOW: UInt32 = 0
     public static let BASE_CS_PORT_BASE: UInt32 = 0x41004400
     public static let BASE_CS_PIN: UInt32 = 4
+    public static let BASE_CS_BANK: UInt32 = 0
     public static let BASE_CS_MASK: UInt32 = 0x10
     public static let BASE_CS_ACTIVE_LOW: UInt32 = 1
     public static let BASE_READY_PORT_BASE: UInt32 = 0x41004400
     public static let BASE_READY_PIN: UInt32 = 5
+    public static let BASE_READY_BANK: UInt32 = 0
     public static let BASE_READY_MASK: UInt32 = 0x20
     public static let BASE_READY_ACTIVE_LOW: UInt32 = 0
     public static let SD_CS_PORT_BASE: UInt32 = 0x41004400
     public static let SD_CS_PIN: UInt32 = 14
+    public static let SD_CS_BANK: UInt32 = 0
     public static let SD_CS_MASK: UInt32 = 0x4000
 }

@@ -135,9 +135,9 @@ impl InterpreterBackend {
     ///
     /// Through the module's own accessor rather than `method_body`, because which of the two body
     /// representations exists is decided by a feature `lamella-cil-runtime` declares -- so a `cfg`
-    /// here could not express it, and naming `method_body` outright stopped compiling the moment
-    /// anything in the build forwarded `code-in-place` (`lamella-wasm`'s `bake` does, which is why
-    /// `verify-wasm-builds`'s all-features row was red). Borrowed on the ordinary build; owned only
+    /// here could not express it: naming `method_body` outright fails to compile whenever anything
+    /// in the build forwards `code-in-place`, which `lamella-wasm`'s `bake` does. Borrowed on the
+    /// ordinary build; owned only
     /// where the module holds bytes rather than a decoded body.
     fn method_code(&self, method: u32) -> Option<Cow<'_, [Instruction]>> {
         self.module.method_instructions(method)
@@ -188,18 +188,27 @@ impl InterpreterBackend {
         }
         Some(names)
     }
+
+    /// The session's index for frame `frame`, counted as [`DebugBackend::stack`] lists the frames:
+    /// `frame` 0 is the innermost, while the session counts from the entry frame.
+    fn session_frame(&self, frame: usize) -> Option<usize> {
+        self.session
+            .as_ref()?
+            .depth()
+            .checked_sub(frame.checked_add(1)?)
+    }
 }
 
 impl DebugBackend for InterpreterBackend {
-    fn launch(&mut self) -> bool {
+    fn launch(&mut self) -> Result<(), String> {
         match Session::new(&self.module, self.entry, Vec::new()) {
             Ok(session) => {
                 self.session = Some(session);
                 self.at_reported_breakpoint = false;
                 self.apply_breakpoints();
-                true
+                Ok(())
             }
-            Err(_) => false,
+            Err(trap) => Err(format!("the program could not be started: {trap}")),
         }
     }
 
@@ -291,6 +300,7 @@ impl DebugBackend for InterpreterBackend {
             return Vec::new();
         };
         (0..session.depth())
+            .rev()
             .filter_map(|index| {
                 session.frame(index).map(|frame| Frame {
                     address: encode_address(frame.method, frame.ip),
@@ -367,7 +377,10 @@ impl DebugBackend for InterpreterBackend {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
         };
-        let Some(frame) = session.frame(frame_index) else {
+        let Some(frame) = self
+            .session_frame(frame_index)
+            .and_then(|at| session.frame(at))
+        else {
             return Vec::new();
         };
         let method = frame.method;
@@ -418,7 +431,8 @@ impl DebugBackend for InterpreterBackend {
             .variables(frame_index, scope)
             .iter()
             .position(|variable| variable.name == name)?;
-        let frame = self.session.as_ref()?.frame(frame_index)?;
+        let at = self.session_frame(frame_index)?;
+        let frame = self.session.as_ref()?.frame(at)?;
         let current = match scope {
             Scope::Arguments => frame.args.get(slot),
             Scope::Locals => frame.locals.get(slot),
@@ -434,8 +448,8 @@ impl DebugBackend for InterpreterBackend {
         };
         let session = self.session.as_mut()?;
         let written = match scope {
-            Scope::Arguments => session.set_arg(frame_index, slot, new_value.clone()),
-            Scope::Locals => session.set_local(frame_index, slot, new_value.clone()),
+            Scope::Arguments => session.set_arg(at, slot, new_value.clone()),
+            Scope::Locals => session.set_local(at, slot, new_value.clone()),
             Scope::Stack => false,
         };
         if !written {

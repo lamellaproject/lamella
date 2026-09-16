@@ -20,6 +20,64 @@ use lamella_ir::{
 /// corlib throw and a program catch would use different words and cross-assembly EH would break.
 pub(crate) const G_EXCEPTION_TAG_OFFSET: u32 = 0;
 
+/// An exception a backend's inline check raises when no hoisted check has routed it: the check branches
+/// to its function's stub entry for the kind, which stores the kind's tag and returns as a throw with no
+/// handler does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineCheck {
+    /// A field access through a null object reference.
+    NullReference,
+    /// An array index outside its dimension.
+    IndexOutOfRange,
+    /// An integer divide or remainder by zero.
+    DivideByZero,
+}
+
+impl InlineCheck {
+    /// Every kind, in the order a backend lays their stub entries.
+    const ALL: [Self; 3] = [Self::NullReference, Self::IndexOutOfRange, Self::DivideByZero];
+
+    /// The tag the kind's stub entry stores: the builtin exception's, the tag the hoisted check asks its
+    /// resolver for ([`CallResolver::builtin_exception_tag`]), so one `catch` matches both.
+    pub(crate) fn tag(self) -> u32 {
+        let name = match self {
+            Self::NullReference => "NullReferenceException",
+            Self::IndexOutOfRange => "IndexOutOfRangeException",
+            Self::DivideByZero => "DivideByZeroException",
+        };
+        lamella_metadata::exception_tag_for_name("System", name)
+    }
+}
+
+/// One function's stub entries, at most one per [`InlineCheck`] kind, each made by the first check that
+/// needs it and laid by the backend after the function's last block.
+pub(crate) struct CheckStubs<L>([Option<L>; 3]);
+
+impl<L: Copy> Default for CheckStubs<L> {
+    fn default() -> Self {
+        Self([None; 3])
+    }
+}
+
+impl<L: Copy> CheckStubs<L> {
+    /// The entry for `kind`, made by `new_label` on first use.
+    pub(crate) fn entry(&mut self, kind: InlineCheck, new_label: impl FnOnce() -> L) -> L {
+        *self.0[kind as usize].get_or_insert_with(new_label)
+    }
+
+    /// Whether no check has made an entry, so there is nothing to lay.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+
+    /// The entries made, each with its kind, in [`InlineCheck::ALL`]'s order.
+    pub(crate) fn made(&self) -> impl Iterator<Item = (InlineCheck, L)> + '_ {
+        InlineCheck::ALL
+            .into_iter()
+            .filter_map(|kind| self.0[kind as usize].map(|label| (kind, label)))
+    }
+}
+
 /// A delegate's field offsets within its heap object: `object _target` (a GC ref) first, then
 /// `IntPtr _methodPtr` (the `ldftn` code address), then `Delegate[] _invocationList` (a GC ref, null for
 /// single-cast; the multicast chain otherwise). The object pointer is the payload start, so these are
@@ -721,6 +779,8 @@ pub enum Array2DOp {
     Set {
         /// The size in bytes of one element.
         element_size: u32,
+        /// The MIR type of the stored element, which a check hoisted ahead of the store receives it as.
+        element_type: MirType,
     },
     /// `call int[,]::Address(i, j)` -- the element's ADDRESS. The fourth pseudo-method a
     /// multidimensional array type declares, and the one `fixed (int* p = m)` pins through.
@@ -762,6 +822,8 @@ pub enum ArrayMDOp {
     Set {
         /// The size in bytes of one element.
         element_size: u32,
+        /// The MIR type of the stored element, which a check hoisted ahead of the store receives it as.
+        element_type: MirType,
         /// The array's rank -- the number of index arguments (before the value).
         rank: usize,
     },
@@ -811,9 +873,13 @@ fn lower_with_source(
         };
         running = running.wrapping_add(opcode + operand);
     }
-    let blocks = control_flow::discover_blocks(code, &body.handlers, &|op| {
-        resolver.field_on_reference_type(op)
-    });
+    let blocks = control_flow::discover_blocks(
+        code,
+        &body.handlers,
+        &|op| resolver.field_on_reference_type(op),
+        &|op| rectangular_access(resolver, op).is_some(),
+        &widths,
+    );
     let preds = control_flow::predecessors(code, &blocks);
     let (used_args, local_count) = scan_slots(code);
     let arg_count = used_args.max(arg_types.len());
@@ -1090,8 +1156,9 @@ fn lower_with_source(
         .iter()
         .enumerate()
         .map(|(b, &(start, _))| {
-            let kind = trap_kind_at(&code[start], resolver);
+            let kind = trap_kind_at(&code[start], widths[start], resolver);
             if throw_clauses[b].is_empty()
+                && finally_protect[b].is_none()
                 && !matches!(
                     kind,
                     Some(TrapKind::Cast(_))
@@ -1529,8 +1596,7 @@ fn lower_with_source(
                 }
             }
 
-            let guarded = (!throw_clauses[b].is_empty() || finally_protect[b].is_some())
-                && !runs_with_tag_in_flight[b];
+            let guarded = !runs_with_tag_in_flight[b];
             let leave_covers_it = i + 2 == end
                 && matches!(code[end - 1].opcode, Opcode::Leave | Opcode::LeaveS)
                 && leave_exits[b].is_none()
@@ -2992,6 +3058,15 @@ fn apply_value_op(
         Opcode::ConvI8 | Opcode::ConvOvfI8 => widen(value_types, stack, insts, true)?,
         Opcode::ConvU8 | Opcode::ConvOvfU8 => widen(value_types, stack, insts, false)?,
         Opcode::ConvOvfI8Un | Opcode::ConvOvfU8Un => widen(value_types, stack, insts, false)?,
+        Opcode::ConvU4 | Opcode::ConvOvfU4 | Opcode::ConvOvfU4Un | Opcode::ConvOvfUUn
+            if stack
+                .last()
+                .and_then(|top| value_types.get(top.index()))
+                .is_some_and(|ty| ty.is_float()) =>
+        {
+            float_to_long_first(value_types, stack, insts, true)?;
+            narrow_to_i32(value_types, stack, insts)?;
+        }
         Opcode::ConvI4
         | Opcode::ConvU4
         | Opcode::ConvOvfI4
@@ -3285,7 +3360,7 @@ fn apply_value_op(
                     stack.push(result);
                     return Ok(());
                 }
-                Some(Array2DOp::Set { element_size }) => {
+                Some(Array2DOp::Set { element_size, .. }) => {
                     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let index1 = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let index0 = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -3350,7 +3425,9 @@ fn apply_value_op(
                     stack.push(result);
                     return Ok(());
                 }
-                Some(ArrayMDOp::Set { element_size, rank }) => {
+                Some(ArrayMDOp::Set {
+                    element_size, rank, ..
+                }) => {
                     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let mut indices = Vec::with_capacity(rank);
                     for _ in 0..rank {
@@ -4728,7 +4805,10 @@ fn synthesize_dispatch(
     propagate_fixups: &mut Vec<usize>,
 ) -> usize {
     let base = block_count + split_blocks.len();
-    let no_match_block = base + 2 * catches.len();
+    let no_match_block = match (unwind, propagate_fixups.first()) {
+        (None, Some(&shared)) => shared,
+        _ => base + 2 * catches.len(),
+    };
 
     for (i, (match_kind, handler_block)) in catches.iter().enumerate() {
         let clear = base + 2 * i + 1;
@@ -5321,7 +5401,14 @@ enum TrapKind {
     /// array's own descriptor (`element_desc@16`) and the stored value's type is walked up its
     /// base-pointer chain against it -- the same scan `castclass` uses.
     BoundsThenArrayStore,
-    /// A field load on an object from the stack: `base == 0` -> `NullReferenceException`.
+    /// A rectangular array's `Get`, `Set` or `Address`: any index at or past its own dimension (unsigned)
+    /// -> `IndexOutOfRangeException`.
+    RectangularBounds {
+        /// The number of indices, each checked against the dimension word at `[array + 4k]`.
+        rank: usize,
+    },
+    /// A field load, or an array's length, on an object from the stack: `base == 0` ->
+    /// `NullReferenceException`.
     NullRef,
     /// `unbox T` / `unbox.any T`: the boxed value's TypeDesc must be one of the ACCEPTED descriptors
     /// -> `InvalidCastException`.
@@ -5349,9 +5436,11 @@ enum TrapKind {
     /// A checked `add.ovf`/`sub.ovf` (and `.un`) whose result overflows -> `OverflowException`.
     Overflow(OverflowKind),
     /// A checked `conv.ovf.*` whose value lies outside the target type's range -> `OverflowException`.
-    /// `lo` is the inclusive lower bound; `hi` the inclusive upper, or `None` for a `u64` target (no
-    /// upper). Bounds + the value's compares run at the value's own width (i64 when narrowing a `long`);
-    /// a `u32`/`u64` upper bound past i32::MAX is unreachable from an i32 source, so that compare is skipped.
+    /// `lo` is the inclusive lower bound; `hi` the inclusive upper, or `None` for a `u64` target, whose
+    /// maximum does not fit an `i64` -- no integer source exceeds it, and a float source is tested
+    /// against 2^64. Bounds + the value's compares run at the value's own width (i64 when narrowing a
+    /// `long`); a bound the source cannot reach -- a `u32`/`u64` upper bound past i32::MAX, or
+    /// `i64::MIN`, from an i32 source -- has its compare skipped.
     /// `unsigned_source` is the `.un` family: the source reads UNSIGNED, so there is no lower bound (it is
     /// never negative) and the upper compare is UNSIGNED -- e.g. `conv.ovf.i4.un` on `0xFFFFFFFF`
     /// (4294967295) overflows, where `conv.ovf.i4` on the same bits (-1) does not.
@@ -5378,11 +5467,34 @@ enum OverflowKind {
 /// base stays on compares -- cheaper than the runtime walk, and needs no emitted base-pointer chain.
 const CAST_CHAIN_THRESHOLD: usize = 4;
 
+/// The rank of the rectangular array whose `Get`, `Set` or `Address` a call names, with the element type a
+/// `Set` stores, or `None` for any other operand -- a constructor too, which indexes nothing.
+fn rectangular_access(resolver: &dyn CallResolver, operand: &Operand) -> Option<(usize, Option<MirType>)> {
+    match resolver.array_2d_op(operand) {
+        Some(Array2DOp::Get { .. } | Array2DOp::Address { .. }) => Some((2, None)),
+        Some(Array2DOp::Set { element_type, .. }) => Some((2, Some(element_type))),
+        Some(Array2DOp::New { .. }) => None,
+        None => match resolver.array_md_op(operand)? {
+            ArrayMDOp::Get { rank, .. } | ArrayMDOp::Address { rank, .. } => Some((rank, None)),
+            ArrayMDOp::Set {
+                element_type, rank, ..
+            } => Some((rank, Some(element_type))),
+            ArrayMDOp::New { .. } => None,
+        },
+    }
+}
+
 /// The trap a block's FIRST instruction needs, or `None` if it is not a trap-leader: a bounds check
 /// for an array access, or a null check for a field access (`ldfld`/`stfld`) whose field is declared
 /// on a REFERENCE type (so its object can be null). The reference-type gate is the same one
-/// `discover_blocks` applies when it makes the leader, so the two agree.
-fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapKind> {
+/// `discover_blocks` applies when it makes the leader, so the two agree. `top_of_stack` is the type on
+/// top of the evaluation stack as the instruction runs: a divide is a trap only when that divisor is an
+/// integer, which `discover_blocks` decides by the same predicate.
+fn trap_kind_at(
+    inst: &Instruction,
+    top_of_stack: MirType,
+    resolver: &dyn CallResolver,
+) -> Option<TrapKind> {
     let opcode = inst.opcode;
     if control_flow::is_may_trap_access(opcode) {
         if opcode == Opcode::StelemRef {
@@ -5390,8 +5502,14 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
         }
         return Some(TrapKind::Bounds);
     }
-    if matches!(opcode, Opcode::Ldfld | Opcode::Stfld)
-        && resolver.field_on_reference_type(&inst.operand)
+    if matches!(opcode, Opcode::Call | Opcode::Callvirt) {
+        if let Some((rank, _)) = rectangular_access(resolver, &inst.operand) {
+            return Some(TrapKind::RectangularBounds { rank });
+        }
+    }
+    if (matches!(opcode, Opcode::Ldfld | Opcode::Stfld)
+        && resolver.field_on_reference_type(&inst.operand))
+        || opcode == Opcode::Ldlen
     {
         return Some(TrapKind::NullRef);
     }
@@ -5420,10 +5538,7 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
             return Some(TrapKind::CastClass(handles));
         }
     }
-    if matches!(
-        opcode,
-        Opcode::Div | Opcode::DivUn | Opcode::Rem | Opcode::RemUn
-    ) {
+    if control_flow::is_integer_divide(opcode, top_of_stack) {
         return Some(TrapKind::DivByZero);
     }
     let overflow = match opcode {
@@ -5438,24 +5553,7 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
     if let Some(kind) = overflow {
         return Some(TrapKind::Overflow(kind));
     }
-    let conv_range: Option<(i64, Option<i64>, bool)> = match opcode {
-        Opcode::ConvOvfI1 => Some((-128, Some(127), false)),
-        Opcode::ConvOvfU1 => Some((0, Some(255), false)),
-        Opcode::ConvOvfI2 => Some((-32768, Some(32767), false)),
-        Opcode::ConvOvfU2 => Some((0, Some(65535), false)),
-        Opcode::ConvOvfI4 => Some((i64::from(i32::MIN), Some(i64::from(i32::MAX)), false)),
-        Opcode::ConvOvfU4 => Some((0, Some(i64::from(u32::MAX)), false)),
-        Opcode::ConvOvfU8 => Some((0, None, false)),
-        Opcode::ConvOvfI1Un => Some((0, Some(127), true)),
-        Opcode::ConvOvfU1Un => Some((0, Some(255), true)),
-        Opcode::ConvOvfI2Un => Some((0, Some(32767), true)),
-        Opcode::ConvOvfU2Un => Some((0, Some(65535), true)),
-        Opcode::ConvOvfI4Un | Opcode::ConvOvfIUn => Some((0, Some(i64::from(i32::MAX)), true)),
-        Opcode::ConvOvfU4Un | Opcode::ConvOvfUUn => Some((0, Some(i64::from(u32::MAX)), true)),
-        Opcode::ConvOvfI8Un => Some((0, Some(i64::MAX), true)),
-        _ => None,
-    };
-    if let Some((lo, hi, unsigned_source)) = conv_range {
+    if let Some((lo, hi, unsigned_source)) = control_flow::conv_overflow_range(opcode) {
         return Some(TrapKind::ConvOverflow {
             lo,
             hi,
@@ -5543,6 +5641,34 @@ fn eval_stack_widths(
                 stack.pop();
                 stack.push(slot(resolver.field_type(&inst.operand)));
             }
+            Opcode::LdindI8 => {
+                stack.pop();
+                stack.push(MirType::I64);
+            }
+            Opcode::LdindR4 => {
+                stack.pop();
+                stack.push(MirType::F32);
+            }
+            Opcode::LdindR8 => {
+                stack.pop();
+                stack.push(MirType::F64);
+            }
+            Opcode::LdindI1
+            | Opcode::LdindU1
+            | Opcode::LdindI2
+            | Opcode::LdindU2
+            | Opcode::LdindI4
+            | Opcode::LdindU4
+            | Opcode::LdindI
+            | Opcode::LdindRef => {
+                stack.pop();
+                stack.push(MirType::I32);
+            }
+            Opcode::UnboxAny => {
+                stack.pop();
+                stack.push(slot(resolver.type_operand_mir(&inst.operand)));
+            }
+            Opcode::Ckfinite => {}
             Opcode::LdelemI8 => {
                 stack.pop();
                 stack.pop();
@@ -5693,7 +5819,7 @@ fn trap_operand_types(inst: &Instruction, slot: MirType, resolver: &dyn CallReso
     let opcode = inst.opcode;
     if matches!(
         opcode,
-        Opcode::Ldfld | Opcode::Unbox | Opcode::UnboxAny | Opcode::Castclass
+        Opcode::Ldfld | Opcode::Ldlen | Opcode::Unbox | Opcode::UnboxAny | Opcode::Castclass
     ) {
         return vec![MirType::ObjectRef];
     }
@@ -5704,25 +5830,15 @@ fn trap_operand_types(inst: &Instruction, slot: MirType, resolver: &dyn CallReso
     if control_flow::is_may_trap_load(opcode) {
         return vec![MirType::ObjectRef, MirType::I32];
     }
-    if matches!(
-        opcode,
-        Opcode::ConvOvfI1
-            | Opcode::ConvOvfU1
-            | Opcode::ConvOvfI2
-            | Opcode::ConvOvfU2
-            | Opcode::ConvOvfI4
-            | Opcode::ConvOvfU4
-            | Opcode::ConvOvfU8
-            | Opcode::ConvOvfI1Un
-            | Opcode::ConvOvfU1Un
-            | Opcode::ConvOvfI2Un
-            | Opcode::ConvOvfU2Un
-            | Opcode::ConvOvfI4Un
-            | Opcode::ConvOvfU4Un
-            | Opcode::ConvOvfI8Un
-            | Opcode::ConvOvfIUn
-            | Opcode::ConvOvfUUn
-    ) {
+    if matches!(opcode, Opcode::Call | Opcode::Callvirt) {
+        if let Some((rank, stored)) = rectangular_access(resolver, &inst.operand) {
+            let mut types = vec![MirType::ObjectRef];
+            types.extend(core::iter::repeat_n(MirType::I32, rank));
+            types.extend(stored);
+            return types;
+        }
+    }
+    if control_flow::conv_overflow_range(opcode).is_some() {
         return vec![slot];
     }
     if matches!(
@@ -5905,15 +6021,19 @@ fn emit_overflow_check(
     })
 }
 
-/// The overflow test for a checked conversion FROM A FLOAT: `NOT (lo <= value <= hi)`, which is true
-/// for NaN because both ordered comparisons are false for it. Returns the condition and the exception
-/// it raises, matching the integer arm's shape.
+/// The overflow test for a checked conversion FROM A FLOAT. ECMA-335 truncates the value toward zero
+/// BEFORE it tests the range, so the conversion fits exactly when `lo - 1 < value < hi + 1`:
+/// `checked((int)2147483647.5)` is 2147483647. The test asks the NEGATION of that, which is also true
+/// for NaN, because both ordered comparisons are false for it. A `hi` of `None` is the `u64` target,
+/// whose `hi + 1` is 2^64. Returns the condition and the exception it raises, matching the integer
+/// arm's shape.
 ///
-/// Refuses when a bound does not ROUND-TRIP through the source float type. `conv.ovf.i4` from an
-/// `f32` is the case: `i32::MAX` is 2147483647 and the nearest `f32` is 2147483648, so a `value <= hi`
-/// written in `f32` would ACCEPT 2147483648.0 -- a value that does not fit the target. A bound that
-/// cannot be spelled exactly is refused rather than rounded, because rounding it outward admits
-/// exactly the values the check exists to reject.
+/// Each bound is laid in the source float type. Where `lo - 1` (or `hi + 1`) is exactly representable
+/// there, the compare excludes it. Where it is not, the float spacing at that magnitude is wider than
+/// 1, so no float lies between it and `lo` (or `hi`), and the compare includes `lo` (or `hi`) instead
+/// -- which is how a `long` from a `double` becomes `-2^63 <= value < 2^63`. A bound neither form can
+/// spell exactly is refused rather than rounded, because rounding it outward admits exactly the values
+/// the check exists to reject.
 fn emit_float_conv_overflow(
     ty: MirType,
     value: ValueId,
@@ -5922,41 +6042,41 @@ fn emit_float_conv_overflow(
     value_types: &mut Vec<MirType>,
     insts: &mut Vec<(ValueId, Inst)>,
 ) -> Result<(ValueId, &'static str), CilError> {
-    let exact_bits = |bound: i64| -> Option<i64> {
+    let exact_bits = |bound: i128| -> Option<i64> {
         if ty == MirType::F32 {
             let f = bound as f32;
-            (f as i64 == bound).then(|| i64::from(f.to_bits()))
+            (f as i128 == bound).then(|| i64::from(f.to_bits()))
         } else {
             let f = bound as f64;
-            (f as i64 == bound).then(|| f.to_bits() as i64)
+            (f as i128 == bound).then(|| f.to_bits() as i64)
         }
     };
-    let mut constant = |bits: i64, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
-        let v = new_value(vts, ty);
-        is.push((v, Inst::ConstInt { ty, value: bits }));
-        v
+    let side = |outside: i128, end: i128, excluding: CmpOp, including: CmpOp| {
+        exact_bits(outside)
+            .map(|bits| (excluding, bits))
+            .or_else(|| exact_bits(end).map(|bits| (including, bits)))
+            .ok_or(CilError::Unsupported(Opcode::ConvOvfI4))
     };
-    let lo_bits = exact_bits(lo).ok_or(CilError::Unsupported(Opcode::ConvOvfI4))?;
-    let lo_c = constant(lo_bits, value_types, insts);
-    let in_range = cmp_value(CmpOp::SignedGe, value, lo_c, value_types, insts);
-    let in_range = match hi {
-        Some(hi) => {
-            let hi_bits = exact_bits(hi).ok_or(CilError::Unsupported(Opcode::ConvOvfI4))?;
-            let hi_c = constant(hi_bits, value_types, insts);
-            let below = cmp_value(CmpOp::SignedLe, value, hi_c, value_types, insts);
-            let both = new_value(value_types, MirType::I32);
-            insts.push((
-                both,
-                Inst::Binary {
-                    op: BinOp::And,
-                    lhs: in_range,
-                    rhs: below,
-                },
-            ));
-            both
-        }
-        None => in_range,
+    let lo = i128::from(lo);
+    let hi = hi.map_or(i128::from(u64::MAX), i128::from);
+    let (lower_op, lower_bits) = side(lo - 1, lo, CmpOp::SignedGt, CmpOp::SignedGe)?;
+    let (upper_op, upper_bits) = side(hi + 1, hi, CmpOp::SignedLt, CmpOp::SignedLe)?;
+    let compare = |op: CmpOp, bits: i64, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
+        let bound = new_value(vts, ty);
+        is.push((bound, Inst::ConstInt { ty, value: bits }));
+        cmp_value(op, value, bound, vts, is)
     };
+    let above_lower = compare(lower_op, lower_bits, value_types, insts);
+    let below_upper = compare(upper_op, upper_bits, value_types, insts);
+    let in_range = new_value(value_types, MirType::I32);
+    insts.push((
+        in_range,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: above_lower,
+            rhs: below_upper,
+        },
+    ));
     let zero = new_value(value_types, MirType::I32);
     insts.push((
         zero,
@@ -6398,6 +6518,62 @@ fn build_builtin_throw_block(
     Ok(trap)
 }
 
+/// Pushes `index >=u [array + offset]` onto `insts` and returns it: nonzero when `index` lies outside the
+/// dimension whose length is the word at `offset`. Unsigned, so a negative index is outside too.
+fn dimension_out_of_range(
+    array: ValueId,
+    offset: u32,
+    index: ValueId,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let length = new_value(value_types, MirType::I32);
+    insts.push((
+        length,
+        Inst::FieldLoad {
+            base: array,
+            offset,
+        },
+    ));
+    let out_of_range = new_value(value_types, MirType::I32);
+    insts.push((
+        out_of_range,
+        Inst::Compare {
+            op: CmpOp::UnsignedGe,
+            lhs: index,
+            rhs: length,
+        },
+    ));
+    out_of_range
+}
+
+/// Pushes `object == null` onto `insts` and returns it. The null is an ObjectRef zero (as `ldnull` lowers),
+/// so the reference comparison's operands share a type.
+fn object_is_null(
+    object: ValueId,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let null = new_value(value_types, MirType::ObjectRef);
+    insts.push((
+        null,
+        Inst::ConstInt {
+            ty: MirType::ObjectRef,
+            value: 0,
+        },
+    ));
+    let is_null = new_value(value_types, MirType::I32);
+    insts.push((
+        is_null,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: object,
+            rhs: null,
+        },
+    ));
+    is_null
+}
+
 fn build_trap_access_check(
     access_block: usize,
     kind: TrapKind,
@@ -6419,50 +6595,52 @@ fn build_trap_access_check(
     propagate_fixups: &mut Vec<usize>,
 ) -> Result<Terminator, CilError> {
     let covariant_store = matches!(kind, TrapKind::BoundsThenArrayStore);
+    let null_array = matches!(
+        kind,
+        TrapKind::Bounds | TrapKind::BoundsThenArrayStore | TrapKind::RectangularBounds { .. }
+    )
+    .then(|| object_is_null(operands[0], value_types, insts));
+    let mut bounds_insts: Vec<(ValueId, Inst)> = Vec::new();
     let (failed, exception_name) = match kind {
         TrapKind::Bounds | TrapKind::BoundsThenArrayStore => {
-            let array = operands[0];
-            let index = operands[1];
-            let length = new_value(value_types, MirType::I32);
-            insts.push((
-                length,
-                Inst::FieldLoad {
-                    base: array,
-                    offset: 0,
-                },
-            ));
-            let oob = new_value(value_types, MirType::I32);
-            insts.push((
-                oob,
-                Inst::Compare {
-                    op: CmpOp::UnsignedGe,
-                    lhs: index,
-                    rhs: length,
-                },
-            ));
+            let oob = dimension_out_of_range(
+                operands[0],
+                0,
+                operands[1],
+                value_types,
+                &mut bounds_insts,
+            );
             (oob, "IndexOutOfRangeException")
         }
-        TrapKind::NullRef => {
-            let object = operands[0];
-            let null = new_value(value_types, MirType::ObjectRef);
-            insts.push((
-                null,
-                Inst::ConstInt {
-                    ty: MirType::ObjectRef,
-                    value: 0,
-                },
-            ));
-            let is_null = new_value(value_types, MirType::I32);
-            insts.push((
-                is_null,
-                Inst::Compare {
-                    op: CmpOp::Eq,
-                    lhs: object,
-                    rhs: null,
-                },
-            ));
-            (is_null, "NullReferenceException")
+        TrapKind::RectangularBounds { rank } => {
+            let array = operands[0];
+            let mut failed =
+                dimension_out_of_range(array, 0, operands[1], value_types, &mut bounds_insts);
+            for k in 1..rank {
+                let oob = dimension_out_of_range(
+                    array,
+                    (4 * k) as u32,
+                    operands[1 + k],
+                    value_types,
+                    &mut bounds_insts,
+                );
+                let either = new_value(value_types, MirType::I32);
+                bounds_insts.push((
+                    either,
+                    Inst::Binary {
+                        op: BinOp::Or,
+                        lhs: failed,
+                        rhs: oob,
+                    },
+                ));
+                failed = either;
+            }
+            (failed, "IndexOutOfRangeException")
         }
+        TrapKind::NullRef => (
+            object_is_null(operands[0], value_types, insts),
+            "NullReferenceException",
+        ),
         TrapKind::Cast(handles) => {
             let object = operands[0];
             let box_desc = new_value(value_types, MirType::I32);
@@ -6721,32 +6899,48 @@ fn build_trap_access_check(
                     }
                 }
             } else {
-                let lo_c = new_value(value_types, ty);
-                insts.push((lo_c, Inst::ConstInt { ty, value: lo }));
-                let below = cmp_value(CmpOp::SignedLt, value, lo_c, value_types, insts);
-                let source_max = if ty == MirType::I64 {
-                    i64::MAX
+                let (source_min, source_max) = if ty == MirType::I64 {
+                    (i64::MIN, i64::MAX)
                 } else {
-                    i64::from(i32::MAX)
+                    (i64::from(i32::MIN), i64::from(i32::MAX))
                 };
-                match hi {
-                    Some(hi) if hi <= source_max => {
-                        let hi_c = new_value(value_types, ty);
-                        insts.push((hi_c, Inst::ConstInt { ty, value: hi }));
-                        let above = cmp_value(CmpOp::SignedGt, value, hi_c, value_types, insts);
-                        let ovf = new_value(value_types, MirType::I32);
+                let below = (lo >= source_min).then(|| {
+                    let lo_c = new_value(value_types, ty);
+                    insts.push((lo_c, Inst::ConstInt { ty, value: lo }));
+                    cmp_value(CmpOp::SignedLt, value, lo_c, value_types, insts)
+                });
+                let above = hi.filter(|&hi| hi <= source_max).map(|hi| {
+                    let hi_c = new_value(value_types, ty);
+                    insts.push((hi_c, Inst::ConstInt { ty, value: hi }));
+                    cmp_value(CmpOp::SignedGt, value, hi_c, value_types, insts)
+                });
+                let ovf = match (below, above) {
+                    (Some(below), Some(above)) => {
+                        let either = new_value(value_types, MirType::I32);
                         insts.push((
-                            ovf,
+                            either,
                             Inst::Binary {
                                 op: BinOp::Or,
                                 lhs: below,
                                 rhs: above,
                             },
                         ));
-                        (ovf, "OverflowException")
+                        either
                     }
-                    _ => (below, "OverflowException"),
-                }
+                    (Some(only), None) | (None, Some(only)) => only,
+                    (None, None) => {
+                        let never = new_value(value_types, MirType::I32);
+                        insts.push((
+                            never,
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: 0,
+                            },
+                        ));
+                        never
+                    }
+                };
+                (ovf, "OverflowException")
             }
         }
     };
@@ -6926,6 +7120,45 @@ fn build_trap_access_check(
         landing
     };
 
+    if let Some(null_array) = null_array {
+        let null_trap = build_builtin_throw_block(
+            "NullReferenceException",
+            throw_clauses,
+            catch_clauses,
+            handler_block_of_clause,
+            finally_protect,
+            finally_is_innermost,
+            finally_handler_block,
+            resolver,
+            locals,
+            local_count,
+            local_types,
+            value_types,
+            split_blocks,
+            block_count,
+            propagate_fixups,
+        )?;
+        let bounds = block_count + split_blocks.len();
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: bounds_insts,
+            terminator: Some(Terminator::Branch {
+                cond: failed,
+                if_true: BlockId(trap as u32),
+                true_args: Vec::new(),
+                if_false: BlockId(in_range as u32),
+                false_args: Vec::new(),
+            }),
+        });
+        return Ok(Terminator::Branch {
+            cond: null_array,
+            if_true: BlockId(null_trap as u32),
+            true_args: Vec::new(),
+            if_false: BlockId(bounds as u32),
+            false_args: Vec::new(),
+        });
+    }
+
     Ok(Terminator::Branch {
         cond: failed,
         if_true: BlockId(trap as u32),
@@ -7047,14 +7280,17 @@ fn build_eh_endfinally(
     })
 }
 
-/// Pushes a propagation block -- an exit that returns, leaving `g_exception_tag` set -- and
-/// records it for return-value fill-in once the function's return type is known. Returns its
-/// block index.
+/// The function's propagation block -- an exit that returns, leaving `g_exception_tag` set --
+/// pushed and recorded for return-value fill-in the first time it is asked for, and returned as
+/// is after that. Returns its block index.
 fn push_propagate(
     split_blocks: &mut Vec<BasicBlock>,
     block_count: usize,
     propagate_fixups: &mut Vec<usize>,
 ) -> usize {
+    if let Some(&index) = propagate_fixups.first() {
+        return index;
+    }
     let index = block_count + split_blocks.len();
     split_blocks.push(BasicBlock {
         params: Vec::new(),
@@ -7755,6 +7991,7 @@ mod control_flow {
 
     use alloc::collections::BTreeSet;
     use lamella_cil::{EhClause, EhKind, Instruction, Opcode, Operand};
+    use lamella_ir::MirType;
 
     #[test]
     fn lowers_unsigned_less_than() {
@@ -7995,9 +8232,39 @@ mod control_flow {
         )
     }
 
+    /// The range a checked conversion (`conv.ovf.*`) tests, or `None` for an opcode that cannot
+    /// overflow: `(lo, hi, unsigned_source)`. `lo` is the target's inclusive minimum and `hi` its
+    /// inclusive maximum, or `None` for `u64`, whose maximum does not fit an `i64`. `unsigned_source`
+    /// marks the `.un` family, which reads its source unsigned, so it has no lower bound and compares its
+    /// upper one unsigned. The native `.un` forms target a 32-bit native int here, so they share the
+    /// `i4`/`u4` ranges; `conv.ovf.u8.un` holds any unsigned source, so it has none.
+    ///
+    /// Block discovery makes every opcode with a range a leader, and the trap lowering takes its bounds
+    /// from the same answer, so an opcode cannot be one without the other.
+    pub fn conv_overflow_range(op: Opcode) -> Option<(i64, Option<i64>, bool)> {
+        Some(match op {
+            Opcode::ConvOvfI1 => (-128, Some(127), false),
+            Opcode::ConvOvfU1 => (0, Some(255), false),
+            Opcode::ConvOvfI2 => (-32768, Some(32767), false),
+            Opcode::ConvOvfU2 => (0, Some(65535), false),
+            Opcode::ConvOvfI4 => (i64::from(i32::MIN), Some(i64::from(i32::MAX)), false),
+            Opcode::ConvOvfU4 => (0, Some(i64::from(u32::MAX)), false),
+            Opcode::ConvOvfI8 => (i64::MIN, Some(i64::MAX), false),
+            Opcode::ConvOvfU8 => (0, None, false),
+            Opcode::ConvOvfI1Un => (0, Some(127), true),
+            Opcode::ConvOvfU1Un => (0, Some(255), true),
+            Opcode::ConvOvfI2Un => (0, Some(32767), true),
+            Opcode::ConvOvfU2Un => (0, Some(65535), true),
+            Opcode::ConvOvfI4Un | Opcode::ConvOvfIUn => (0, Some(i64::from(i32::MAX)), true),
+            Opcode::ConvOvfU4Un | Opcode::ConvOvfUUn => (0, Some(i64::from(u32::MAX)), true),
+            Opcode::ConvOvfI8Un => (0, Some(i64::MAX), true),
+            _ => return None,
+        })
+    }
+
     /// Whether an opcode is a bounds-checked array element LOAD -- one that raises
     /// `IndexOutOfRangeException` on an out-of-range index. The lowering hoists a bounds check ahead
-    /// of these (inside a catch-protected try) so the trap can route to a handler.
+    /// of these (inside a protected try) so the trap can route to a handler.
     pub fn is_may_trap_load(op: Opcode) -> bool {
         matches!(
             op,
@@ -8041,6 +8308,14 @@ mod control_flow {
         is_may_trap_load(op) || is_may_trap_store(op)
     }
 
+    /// Whether an opcode is a divide or a remainder that raises `DivideByZeroException` -- an integer
+    /// one. `divisor` is the type on top of the evaluation stack as the instruction runs, which for
+    /// these opcodes is the divisor's. A float divide answers an infinity or a NaN and raises nothing.
+    pub fn is_integer_divide(op: Opcode, divisor: MirType) -> bool {
+        matches!(op, Opcode::Div | Opcode::DivUn | Opcode::Rem | Opcode::RemUn)
+            && !matches!(divisor, MirType::F32 | MirType::F64)
+    }
+
     /// The instruction indices control can reach from the terminator at `index`.
     pub fn successors(inst: &Instruction, index: usize) -> Vec<usize> {
         let mut out = Vec::new();
@@ -8076,10 +8351,15 @@ mod control_flow {
     /// Leaders are instruction 0, every branch target, the instruction after a branch or a
     /// return, and every exception-region boundary (a try/handler/filter start or end), so a
     /// protected region and its handler are clean block boundaries the EH lowering can map.
+    /// `top_of_stack` is the type on top of the evaluation stack as each instruction runs -- one past
+    /// its end reads as `I32` -- and it is what tells an integer divide, a trap leader inside a catch
+    /// try, from a float one, which raises nothing.
     pub fn discover_blocks(
         code: &[Instruction],
         handlers: &[EhClause],
         is_reference_field: &dyn Fn(&Operand) -> bool,
+        is_rectangular_accessor: &dyn Fn(&Operand) -> bool,
+        top_of_stack: &[MirType],
     ) -> Vec<(usize, usize)> {
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
         leaders.insert(0);
@@ -8112,13 +8392,16 @@ mod control_flow {
         for (i, inst) in code.iter().enumerate() {
             let is_field_null_deref = matches!(inst.opcode, Opcode::Ldfld | Opcode::Stfld)
                 && is_reference_field(&inst.operand);
+            let is_length_null_deref = inst.opcode == Opcode::Ldlen;
+            let is_rectangular = matches!(inst.opcode, Opcode::Call | Opcode::Callvirt)
+                && is_rectangular_accessor(&inst.operand);
             let is_cast = matches!(
                 inst.opcode,
                 Opcode::Unbox | Opcode::UnboxAny | Opcode::Castclass
             );
-            let is_div_rem = matches!(
+            let is_div_rem = is_integer_divide(
                 inst.opcode,
-                Opcode::Div | Opcode::DivUn | Opcode::Rem | Opcode::RemUn
+                top_of_stack.get(i).copied().unwrap_or(MirType::I32),
             );
             let is_overflow = matches!(
                 inst.opcode,
@@ -8129,31 +8412,17 @@ mod control_flow {
                     | Opcode::MulOvf
                     | Opcode::MulOvfUn
             );
-            let is_conv_ovf = matches!(
-                inst.opcode,
-                Opcode::ConvOvfI1
-                    | Opcode::ConvOvfU1
-                    | Opcode::ConvOvfI2
-                    | Opcode::ConvOvfU2
-                    | Opcode::ConvOvfI4
-                    | Opcode::ConvOvfU4
-                    | Opcode::ConvOvfU8
-                    | Opcode::ConvOvfI1Un
-                    | Opcode::ConvOvfU1Un
-                    | Opcode::ConvOvfI2Un
-                    | Opcode::ConvOvfU2Un
-                    | Opcode::ConvOvfI4Un
-                    | Opcode::ConvOvfU4Un
-                    | Opcode::ConvOvfI8Un
-                    | Opcode::ConvOvfIUn
-                    | Opcode::ConvOvfUUn
-            );
-            let in_catch_try = handlers.iter().any(|clause| {
-                matches!(clause.kind, EhKind::Catch(_))
+            let is_conv_ovf = conv_overflow_range(inst.opcode).is_some();
+            let in_protected_try = handlers.iter().any(|clause| {
+                matches!(clause.kind, EhKind::Catch(_) | EhKind::Finally)
                     && (clause.try_range.start as usize..clause.try_range.end as usize).contains(&i)
             });
-            if ((is_may_trap_access(inst.opcode) || is_field_null_deref || is_div_rem)
-                && in_catch_try)
+            if ((is_may_trap_access(inst.opcode)
+                || is_field_null_deref
+                || is_length_null_deref
+                || is_div_rem
+                || is_rectangular)
+                && in_protected_try)
                 || is_cast
                 || is_conv_ovf
                 || is_overflow
@@ -8268,7 +8537,7 @@ mod tests {
 
     #[test]
     fn conv_ovf_un_trap_reads_the_source_unsigned() {
-        let range = |op: Opcode| match trap_kind_at(&Instruction::simple(op), &NoCalls) {
+        let range = |op: Opcode| match trap_kind_at(&Instruction::simple(op), MirType::I32, &NoCalls) {
             Some(TrapKind::ConvOverflow {
                 lo,
                 hi,
@@ -8288,6 +8557,41 @@ mod tests {
         assert_eq!(range(Opcode::ConvOvfU8Un), None);
         assert_eq!(range(Opcode::ConvOvfI1), Some((-128, Some(127), false)));
         assert_eq!(range(Opcode::ConvOvfU4), Some((0, Some(4_294_967_295), false)));
+        assert_eq!(range(Opcode::ConvOvfI8), Some((i64::MIN, Some(i64::MAX), false)));
+        assert_eq!(range(Opcode::ConvOvfU8), Some((0, None, false)));
+    }
+
+    #[test]
+    fn only_an_integer_divide_is_a_divide_by_zero_trap() {
+        let trap = |op: Opcode, divisor: MirType| {
+            matches!(
+                trap_kind_at(&Instruction::simple(op), divisor, &NoCalls),
+                Some(TrapKind::DivByZero)
+            )
+        };
+        for op in [Opcode::Div, Opcode::DivUn, Opcode::Rem, Opcode::RemUn] {
+            for divisor in [MirType::I32, MirType::I64] {
+                assert!(control_flow::is_integer_divide(op, divisor), "{op:?} over {divisor:?} can raise");
+                assert!(trap(op, divisor), "{op:?} over {divisor:?} is a DivideByZero trap");
+            }
+            for divisor in [MirType::F32, MirType::F64] {
+                assert!(!control_flow::is_integer_divide(op, divisor), "{op:?} over {divisor:?} cannot raise");
+                assert!(!trap(op, divisor), "{op:?} over {divisor:?} is no trap");
+            }
+        }
+    }
+
+    #[test]
+    fn the_width_model_sees_a_double_loaded_through_a_reference() {
+        let code = [
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdindR8),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::simple(Opcode::LdindR8),
+            Instruction::simple(Opcode::Div),
+        ];
+        let widths = eval_stack_widths(&code, &[MirType::ManagedPtr, MirType::ManagedPtr], &[], &NoCalls);
+        assert_eq!(widths[4], MirType::F64, "the divide sees a double divisor");
     }
 
     #[test]
@@ -9689,6 +9993,144 @@ mod tests {
         }
     }
 
+    /// One conversion of the method's only argument, lowered with every exception tagged -- the shape
+    /// the conversion tests below read.
+    fn lower_one_conversion(op: Opcode, source: MirType) -> lamella_ir::Function {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(op),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &TagsEveryException, &[source], &[], Narrowing::default())
+            .unwrap_or_else(|e| panic!("{op:?} from {source:?} lowers: {e:?}"));
+        assert!(lamella_ir::verify(&func).is_ok(), "{op:?} from {source:?} verifies");
+        func
+    }
+
+    /// AN UNSIGNED 32-BIT TARGET FROM A FLOAT CONVERTS THROUGH THE 64-BIT ROUTINE. The 32-bit routine is
+    /// signed and stops at int's maximum, so `(uint)3000000000.0` answered 2147483647; the int64 route
+    /// holds every value a uint can. A signed target keeps the 32-bit routine, which is the control.
+    #[test]
+    fn an_unsigned_int_from_a_float_converts_through_the_long_routine() {
+        let kinds = |op: Opcode, source: MirType| -> Vec<ConvKind> {
+            lower_one_conversion(op, source)
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|(_, i)| match i {
+                    Inst::Convert { kind, .. } => Some(*kind),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (op, source, route) in [
+            (Opcode::ConvU4, MirType::F64, ConvKind::Float64ToLong),
+            (Opcode::ConvU4, MirType::F32, ConvKind::Float32ToLong),
+            (Opcode::ConvOvfU4, MirType::F64, ConvKind::Float64ToLong),
+        ] {
+            assert_eq!(kinds(op, source), [route], "{op:?} from {source:?}");
+        }
+        assert_eq!(
+            kinds(Opcode::ConvI4, MirType::F64),
+            [ConvKind::Float64ToInt],
+            "a signed target keeps the 32-bit routine"
+        );
+    }
+
+    /// A CHECKED CONVERSION FROM A FLOAT TRUNCATES BEFORE IT TESTS THE RANGE (ECMA-335 III.3.19), so its
+    /// bounds are the integers just OUTSIDE the target's range, excluded: `checked((int)2147483647.5)` is
+    /// 2147483647 on .NET. Where that integer is not exactly representable in the source float, the
+    /// spacing there is wider than 1 and the range's own end is included instead -- which is how a `long`
+    /// from a `double` becomes `-2^63 <= value < 2^63`, and how an `int` from a `float` builds at all.
+    #[test]
+    fn a_checked_conversion_from_a_float_truncates_before_it_tests_the_range() {
+        let f32_bits = |x: f32| i64::from(x.to_bits());
+        let f64_bits = |x: f64| x.to_bits() as i64;
+        let two_63 = 9_223_372_036_854_775_808.0_f64;
+        let cases = [
+            (
+                Opcode::ConvOvfI4,
+                MirType::F64,
+                (CmpOp::SignedGt, f64_bits(-2_147_483_649.0)),
+                (CmpOp::SignedLt, f64_bits(2_147_483_648.0)),
+            ),
+            (
+                Opcode::ConvOvfI4,
+                MirType::F32,
+                (CmpOp::SignedGe, f32_bits(-2_147_483_648.0)),
+                (CmpOp::SignedLt, f32_bits(2_147_483_648.0)),
+            ),
+            (
+                Opcode::ConvOvfU4,
+                MirType::F32,
+                (CmpOp::SignedGt, f32_bits(-1.0)),
+                (CmpOp::SignedLt, f32_bits(4_294_967_296.0)),
+            ),
+            (
+                Opcode::ConvOvfI8,
+                MirType::F64,
+                (CmpOp::SignedGe, f64_bits(-two_63)),
+                (CmpOp::SignedLt, f64_bits(two_63)),
+            ),
+            (
+                Opcode::ConvOvfU8,
+                MirType::F64,
+                (CmpOp::SignedGt, f64_bits(-1.0)),
+                (CmpOp::SignedLt, f64_bits(2.0 * two_63)),
+            ),
+        ];
+        for (op, source, lower, upper) in cases {
+            let func = lower_one_conversion(op, source);
+            let insts: Vec<&Inst> = func.blocks.iter().flat_map(|b| &b.insts).map(|(_, i)| i).collect();
+            for (side, (compare, bits)) in [("lower", lower), ("upper", upper)] {
+                assert!(
+                    insts
+                        .iter()
+                        .any(|i| matches!(i, Inst::ConstInt { ty, value } if *ty == source && *value == bits)),
+                    "{op:?} from {source:?}: the {side} bound's bits"
+                );
+                assert!(
+                    insts
+                        .iter()
+                        .any(|i| matches!(i, Inst::Compare { op: found, .. } if *found == compare)),
+                    "{op:?} from {source:?}: the {side} bound's {compare:?}"
+                );
+            }
+        }
+    }
+
+    /// NO INTEGER BOUND IS LAID AT A WIDTH THAT CANNOT HOLD IT. The integer arm lays each bound as a
+    /// constant at the SOURCE's width, so a bound beyond the source's range would not be a check but a
+    /// different number: `conv.ovf.i8`'s `i64::MIN` as an `int32` constant is 0, and every negative `int`
+    /// would raise. A bound the source cannot reach is skipped instead.
+    #[test]
+    fn a_checked_conversion_lays_no_bound_its_source_width_cannot_hold() {
+        for (op, source) in [
+            (Opcode::ConvOvfI8, MirType::I32),
+            (Opcode::ConvOvfI8, MirType::I64),
+            (Opcode::ConvOvfU8, MirType::I32),
+            (Opcode::ConvOvfI4, MirType::I32),
+            (Opcode::ConvOvfU4, MirType::I32),
+        ] {
+            let func = lower_one_conversion(op, source);
+            for (_, inst) in func.blocks.iter().flat_map(|b| &b.insts) {
+                if let Inst::ConstInt { ty: MirType::I32, value } = inst {
+                    assert!(
+                        (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(value),
+                        "{op:?} from {source:?} lays {value} as an int32"
+                    );
+                }
+            }
+        }
+    }
+
     /// A CHECKED CONVERSION FROM A FLOAT ASKS THE NEGATION OF AN IN-RANGE TEST, WHICH IS WHAT MAKES
     /// NaN OVERFLOW. The out-of-range form asks `value < lo OR value > hi`, and for NaN both are
     /// false under the ordered comparisons a float lowers to -- so that form reports "in range" and
@@ -9723,7 +10165,7 @@ mod tests {
             .flat_map(|b| &b.insts)
             .map(|(_, i)| i)
             .collect();
-        for bound in [f64::from(i32::MIN), f64::from(i32::MAX)] {
+        for bound in [f64::from(i32::MIN) - 1.0, f64::from(i32::MAX) + 1.0] {
             assert!(
                 insts.iter().any(|i| matches!(
                     i,
@@ -9735,20 +10177,20 @@ mod tests {
         assert!(
             insts
                 .iter()
-                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedGe, .. })),
-            "the lower bound is an inclusive ordered compare"
+                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedGt, .. })),
+            "the lower bound is an exclusive ordered compare"
         );
         assert!(
             insts
                 .iter()
-                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedLe, .. })),
-            "the upper bound is an inclusive ordered compare"
+                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedLt, .. })),
+            "the upper bound is an exclusive ordered compare"
         );
         assert!(
             !insts
                 .iter()
-                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedLt, .. })),
-            "and NOT the out-of-range form, which answers FALSE for NaN in both directions"
+                .any(|i| matches!(i, Inst::Binary { op: BinOp::Or, .. })),
+            "and NOT the out-of-range form, whose OR answers FALSE for NaN in both directions"
         );
         let (int_func, _) = lower_method_typed(&body, &TagsEveryException, &[MirType::I64], &[], Narrowing::default())
             .expect("a checked narrowing from a long lowers");
@@ -9758,7 +10200,7 @@ mod tests {
                 .blocks
                 .iter()
                 .flat_map(|b| &b.insts)
-                .any(|(_, i)| matches!(i, Inst::Compare { op: CmpOp::SignedLt, .. })),
+                .any(|(_, i)| matches!(i, Inst::Binary { op: BinOp::Or, .. })),
             "a long source is still checked with the out-of-range form"
         );
     }
@@ -10712,7 +11154,7 @@ mod tests {
             Instruction::simple(Opcode::LdcI41),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[], &|_| false);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &[]);
         assert_eq!(blocks, vec![(0, 3), (3, 5), (5, 7)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -10904,7 +11346,7 @@ mod tests {
             Instruction::new(Opcode::LdcI4S, Operand::Int8(30)),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[], &|_| false);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &[]);
         assert_eq!(blocks, vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());

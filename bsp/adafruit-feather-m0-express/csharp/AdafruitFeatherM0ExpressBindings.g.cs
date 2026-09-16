@@ -18,10 +18,12 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint LED_PORT_BASE = 0x41004400;
         public const uint LED_PIN = 17;
+        public const uint LED_BANK = 0;
         public const uint LED_MASK = 0x20000;
         public const uint LED_ACTIVE_LOW = 0;
         public const uint NEOPIXEL_PORT_BASE = 0x41004400;
         public const uint NEOPIXEL_PIN = 6;
+        public const uint NEOPIXEL_BANK = 0;
         public const uint NEOPIXEL_MASK = 0x40;
         public const uint NEOPIXEL_ACTIVE_LOW = 0;
     }

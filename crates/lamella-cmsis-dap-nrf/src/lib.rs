@@ -251,8 +251,8 @@ pub const MICROBIT_DAPLINK: (u16, u16) = (0x0d28, 0x0204);
 /// **THIS WRITES FLASH, SO IT MUST NOT CHOOSE ITS TARGET BY USB ENUMERATION ORDER.** Opening
 /// `0d28:0204` with no serial, so on a bench holding more than one micro:bit it reached whichever
 /// the OS handed over first -- an order that changes with plug order and across reboots. **That
-/// failure does not announce itself:** the flash succeeds, on someone else's board, and its owner
-/// finds it running a program nobody sent it with nothing in any log to say why.
+/// failure does not announce itself:** the flash succeeds, on whichever board was opened, which is
+/// then running a program nobody sent it with nothing in any log to say why.
 ///
 /// So the target is resolved through [`lamella_probe::resolve_serial`] -- an explicit `serial`,
 /// then `LAMELLA_PROBE_SERIAL`, then the sole attached micro:bit, then a REFUSAL naming every

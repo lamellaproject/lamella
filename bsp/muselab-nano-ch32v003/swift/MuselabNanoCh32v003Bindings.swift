@@ -14,6 +14,7 @@ public enum MuselabNanoCh32v003Bindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LED_PORT_BASE: UInt32 = 0x40011400
     public static let LED_PIN: UInt32 = 6
+    public static let LED_BANK: UInt32 = 0
     public static let LED_MASK: UInt32 = 0x40
     public static let LED_ACTIVE_LOW: UInt32 = 0
 }

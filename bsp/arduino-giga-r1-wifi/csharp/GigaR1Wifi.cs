@@ -1,11 +1,12 @@
-// Lamella.Boards.Arduino.ArduinoGigaR1Wifi -- the Arduino GIGA R1 WiFi (STM32H747XI). Board truth
+// Lamella.Boards.Arduino.GigaR1Wifi -- the Arduino GIGA R1 WiFi (STM32H747XI): the generated
+// board literals lifted into the shapes a consumer uses.
 using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
 namespace Lamella.Boards.Arduino
 {
-    public sealed class ArduinoGigaR1Wifi
+    public sealed class GigaR1Wifi
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = ArduinoGigaR1WifiBindings.BOARD_MODEL;
@@ -28,7 +29,7 @@ namespace Lamella.Boards.Arduino
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
-        /// <see cref="ArduinoGigaR1Wifi"/> at all is what arms it, which is why a program constructs the board
+        /// <see cref="GigaR1Wifi"/> at all is what arms it, which is why a program constructs the board
         /// first.</summary>
         /// <remarks>A TYPE INITIALIZER rather than the instance constructor, for the reason
         /// <see cref="Lamella.Hardware.Buses.BindGpio"/> documents: the table refuses a second bind
@@ -37,7 +38,7 @@ namespace Lamella.Boards.Arduino
         /// idempotence costs nothing and the table keeps its throw as a genuine-error detector.
         /// The bound value is a FACTORY, not a driver, so a program that never touches GPIO never
         /// constructs one.</remarks>
-        static ArduinoGigaR1Wifi()
+        static GigaR1Wifi()
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
         }

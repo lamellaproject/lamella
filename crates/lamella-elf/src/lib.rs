@@ -7,6 +7,9 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub mod ehabi;
+pub mod symbols;
+
 /// RISC-V ELF relocation type numbers (the `r_info` low byte), from the RISC-V ELF psABI.
 pub mod riscv {
     /// `R_RISCV_32` -- a 32-bit absolute reference, `S + A`.
@@ -47,7 +50,7 @@ pub mod arm {
     /// Thumb code generator becomes one of these.
     pub const R_ARM_THM_CALL: u32 = 10;
     /// `R_ARM_CALL` -- an A32 (ARM-state) `BL`/`BLX` call: `((S + A) | T) - P`, a 24-bit signed
-    /// word-scaled offset in bits[23:0].
+    /// word-scaled offset in bits `[23:0]`.
     pub const R_ARM_CALL: u32 = 28;
     /// `R_ARM_THM_JUMP24` -- a Thumb `B.W` (T4) unconditional branch: `(S + A) - P`, the SAME 24-bit
     /// halfword-scaled offset swizzle as `R_ARM_THM_CALL`; the instruction differs only in the second
@@ -89,14 +92,14 @@ impl Machine {
 
     /// `e_flags` -- the target's ABI, which is NOT decoration on ARM.
     ///
-    /// # A ZERO HERE MADE gdb READ EVERY `double` BACKWARDS
+    /// # A ZERO HERE IS READ AS THE OLD ARM ABI
     ///
     /// On ARM, `e_flags` is where a file says it is EABI. With no version declared, a consumer is
     /// entitled to read the file as the OLD ARM ABI -- and the old ABI stores a double as two words
-    /// in the opposite order to the modern one. Measured: with `e_flags` zero, a frame slot holding
-    /// the correct bytes for 2.25 was printed as `5.3056370591364978e-315`, from the right address,
-    /// with the right type. The memory was right, the ABI declaration was missing, and what came out
-    /// was a plausible number that looked exactly like a code-generation bug.
+    /// in the opposite order to the modern one. A frame slot holding the correct bytes for 2.25
+    /// then prints as `5.3056370591364978e-315`, from the right address, with the right type: the
+    /// memory is right, the ABI declaration is missing, and what comes out is a plausible number
+    /// that looks exactly like a code-generation bug.
     ///
     ///
     /// `EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT`: version 5 is what every current ARM toolchain
@@ -209,7 +212,7 @@ pub const TEXT_BASE_SYMBOL: &str = "__lamella_text_base";
 
 /// Whether a PROGBITS, non-`SHF_ALLOC` section is one the linker CARRIES through the link as itself
 /// -- the DWARF [`DEBUG_SECTION_PREFIX`] family, plus [`STACKMAP_GCMAP_SECTION`]. Anything else
-/// non-allocated is dropped, as it was before carrying existed.
+/// non-allocated is dropped.
 #[must_use]
 pub fn is_carried_section(name: &str) -> bool {
     name.starts_with(DEBUG_SECTION_PREFIX) || name == STACKMAP_GCMAP_SECTION
@@ -748,7 +751,7 @@ pub fn write_executable_arm_thumb_with_heap(
 /// This is the outlet for the linker's DWARF passthrough: `lamella_linker::LinkedImage` comes back
 /// with the debug sections concatenated and relocated, and until they are written into a container
 /// with section headers, nothing can read them. The loaded image is UNAFFECTED -- the `PT_LOAD`
-/// segment still covers only the headers plus `.text`, so the debug bytes ride along in the file
+/// segment still covers only `.text`, so the debug bytes ride along in the file
 /// and cost the target nothing. Flash the same `.text`; hand a debugger this.
 ///
 /// `text_addr` IS THE ADDRESS `.text` GETS, not a file base: pass the address the code was LINKED
@@ -1210,9 +1213,9 @@ pub struct Object {
     pub symbols: Vec<ParsedSymbol>,
     /// The `.text` relocations.
     pub relocations: Vec<ParsedRelocation>,
-    /// Sections carried through the link rather than merged into [`Self::text`] -- today the DWARF
-    /// `.debug_*` family (see [`Section`]). Empty for an object with no debug info, so the code path
-    /// costs nothing when it is not in use.
+    /// Sections carried through the link rather than merged into [`Self::text`] -- the DWARF
+    /// `.debug_*` family and the GC map (see [`is_carried_section`]). Empty for an object carrying
+    /// neither, so the code path costs nothing when it is not in use.
     pub sections: Vec<ParsedSection>,
 }
 
@@ -1539,99 +1542,14 @@ fn resolve_ar_name(raw: &[u8], long_names: &[u8]) -> Result<String, ElfError> {
 /// Returns the sections in the order the file lists them, as `(name, bytes)`.
 #[must_use]
 pub fn debug_sections(bytes: &[u8]) -> Vec<(&str, &[u8])> {
-    let mut out = Vec::new();
-    if bytes.len() < 64 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] || bytes[5] != 1 {
-        return out;
-    }
-    let elf64 = match bytes[4] {
-        1 => false,
-        2 => true,
-        _ => return out,
-    };
-
-    let rd32 = |o: usize| -> Option<u32> {
-        bytes
-            .get(o..o + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    };
-    let rd64 = |o: usize| -> Option<u64> {
-        bytes.get(o..o + 8).map(|b| {
-            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    section_headers(bytes)
+        .into_iter()
+        .filter(|section| section.kind != SHT_NOBITS)
+        .filter_map(|section| {
+            let name = section.name.filter(|name| name.starts_with(".debug_"))?;
+            Some((name, section.data?))
         })
-    };
-    let rd16 = |o: usize| -> Option<u16> { bytes.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])) };
-
-    let (shoff, shentsize, shnum, shstrndx) = if elf64 {
-        (
-            rd64(40).map(|v| v as usize),
-            rd16(58).map(usize::from),
-            rd16(60).map(usize::from),
-            rd16(62).map(usize::from),
-        )
-    } else {
-        (
-            rd32(32).map(|v| v as usize),
-            rd16(46).map(usize::from),
-            rd16(48).map(usize::from),
-            rd16(50).map(usize::from),
-        )
-    };
-    let (Some(shoff), Some(shentsize), Some(shnum), Some(shstrndx)) =
-        (shoff, shentsize, shnum, shstrndx)
-    else {
-        return out;
-    };
-    if shentsize == 0 || shnum == 0 || shstrndx >= shnum {
-        return out;
-    }
-
-    let (off_offset, off_size, off_type) = if elf64 { (24, 32, 4) } else { (16, 20, 4) };
-    let header = |i: usize| -> Option<(u32, u32, usize, usize)> {
-        let base = shoff.checked_add(i.checked_mul(shentsize)?)?;
-        let name = rd32(base)?;
-        let kind = rd32(base + off_type)?;
-        let (offset, size) = if elf64 {
-            (rd64(base + off_offset)? as usize, rd64(base + off_size)? as usize)
-        } else {
-            (rd32(base + off_offset)? as usize, rd32(base + off_size)? as usize)
-        };
-        Some((name, kind, offset, size))
-    };
-
-    let Some((_, _, strtab_offset, strtab_size)) = header(shstrndx) else {
-        return out;
-    };
-    let Some(strtab) = strtab_offset
-        .checked_add(strtab_size)
-        .and_then(|end| bytes.get(strtab_offset..end))
-    else {
-        return out;
-    };
-
-    for i in 0..shnum {
-        let Some((name_offset, kind, offset, size)) = header(i) else {
-            continue;
-        };
-        const SHT_NOBITS: u32 = 8;
-        if kind == SHT_NOBITS {
-            continue;
-        }
-        let Some(rest) = strtab.get(name_offset as usize..) else {
-            continue;
-        };
-        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-        let Ok(name) = core::str::from_utf8(&rest[..end]) else {
-            continue;
-        };
-        if !name.starts_with(".debug_") {
-            continue;
-        }
-        let Some(data) = offset.checked_add(size).and_then(|e| bytes.get(offset..e)) else {
-            continue;
-        };
-        out.push((name, data));
-    }
-    out
+        .collect()
 }
 
 /// The address ranges of a linked ELF's executable sections, as `[start, end)` pairs.
@@ -1659,11 +1577,49 @@ pub fn debug_sections(bytes: &[u8]) -> Vec<(&str, &[u8])> {
 pub fn executable_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
     /// `SHF_EXECINSTR` -- the section holds instructions.
     const SHF_EXECINSTR: u64 = 0x4;
-    /// `SHF_ALLOC` -- the section occupies memory when the program runs. A debug section carries
-    /// neither flag, and an `.ARM.attributes` carries neither; requiring both keeps this to
-    /// sections that are actually part of the running image.
-    const SHF_ALLOC: u64 = 0x2;
 
+    section_headers(bytes)
+        .into_iter()
+        .filter(|section| {
+            section.flags & SHF_EXECINSTR != 0
+                && section.flags & u64::from(SHF_ALLOC) != 0
+                && section.size != 0
+        })
+        .map(|section| (section.address, section.address.saturating_add(section.size)))
+        .collect()
+}
+
+/// `SHT_NOBITS` -- a section that occupies no bytes in the file.
+const SHT_NOBITS: u32 = 8;
+
+/// One entry of an ELF's section-header table, as the file states it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SectionHeader<'a> {
+    /// The section's name, where the name table can be read and the name is UTF-8.
+    pub(crate) name: Option<&'a str>,
+    /// `sh_type`.
+    pub(crate) kind: u32,
+    /// `sh_flags`.
+    pub(crate) flags: u64,
+    /// `sh_addr`.
+    pub(crate) address: u64,
+    /// `sh_size`.
+    pub(crate) size: u64,
+    /// `sh_link`. For a symbol table, the index of the string table that holds its names.
+    pub(crate) link: u32,
+    /// The `sh_size` bytes at `sh_offset`, where the file holds all of them. **For a `SHT_NOBITS`
+    /// section these are whatever the file put at that offset, not the section's.**
+    pub(crate) data: Option<&'a [u8]>,
+}
+
+/// Every header a little-endian ELF's section-header table lists, in the file's order, for either
+/// class.
+///
+/// ONE READER OF THE TABLE, SO A CASE LEARNED BY ONE CALLER IS LEARNED BY ALL. A header that runs
+/// past the end of the file is left out. A table whose name section cannot be read still lists its
+/// sections, without names, so a caller that needs no names is not refused for want of them. A file
+/// that is not an ELF, or whose table cannot be located, lists none.
+pub(crate) fn section_headers(bytes: &[u8]) -> Vec<SectionHeader<'_>> {
     let mut out = Vec::new();
     if bytes.len() < 64 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] || bytes[5] != 1 {
         return out;
@@ -1684,38 +1640,86 @@ pub fn executable_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
         })
     };
 
-    let (shoff, shentsize, shnum) = if elf64 {
-        (rd64(40).map(|v| v as usize), rd16(58).map(usize::from), rd16(60).map(usize::from))
+    let (shoff, shentsize, shnum, shstrndx) = if elf64 {
+        (
+            rd64(40).and_then(|v| usize::try_from(v).ok()),
+            rd16(58).map(usize::from),
+            rd16(60).map(usize::from),
+            rd16(62).map(usize::from),
+        )
     } else {
-        (rd32(32).map(|v| v as usize), rd16(46).map(usize::from), rd16(48).map(usize::from))
+        (
+            rd32(32).and_then(|v| usize::try_from(v).ok()),
+            rd16(46).map(usize::from),
+            rd16(48).map(usize::from),
+            rd16(50).map(usize::from),
+        )
     };
-    let (Some(shoff), Some(shentsize), Some(shnum)) = (shoff, shentsize, shnum) else {
+    let (Some(shoff), Some(shentsize), Some(shnum), Some(shstrndx)) =
+        (shoff, shentsize, shnum, shstrndx)
+    else {
         return out;
     };
     if shentsize == 0 {
         return out;
     }
 
-    for i in 0..shnum {
-        let Some(base) = i.checked_mul(shentsize).and_then(|o| shoff.checked_add(o)) else {
-            continue;
-        };
-        let (flags, addr, size) = if elf64 {
-            (rd64(base + 8), rd64(base + 16), rd64(base + 32))
+    let header = |i: usize| -> Option<(u32, u32, u64, u64, u64, u64, u32)> {
+        let base = shoff.checked_add(i.checked_mul(shentsize)?)?;
+        let name = rd32(base)?;
+        let kind = rd32(base + 4)?;
+        if elf64 {
+            Some((
+                name,
+                kind,
+                rd64(base + 8)?,
+                rd64(base + 16)?,
+                rd64(base + 24)?,
+                rd64(base + 32)?,
+                rd32(base + 40)?,
+            ))
         } else {
-            (
-                rd32(base + 8).map(u64::from),
-                rd32(base + 12).map(u64::from),
-                rd32(base + 20).map(u64::from),
-            )
-        };
-        let (Some(flags), Some(addr), Some(size)) = (flags, addr, size) else {
-            continue;
-        };
-        if flags & SHF_EXECINSTR == 0 || flags & SHF_ALLOC == 0 || size == 0 {
-            continue;
+            Some((
+                name,
+                kind,
+                u64::from(rd32(base + 8)?),
+                u64::from(rd32(base + 12)?),
+                u64::from(rd32(base + 16)?),
+                u64::from(rd32(base + 20)?),
+                rd32(base + 24)?,
+            ))
         }
-        out.push((addr, addr.saturating_add(size)));
+    };
+    let slice = |offset: u64, size: u64| -> Option<&[u8]> {
+        let offset = usize::try_from(offset).ok()?;
+        let size = usize::try_from(size).ok()?;
+        bytes.get(offset..offset.checked_add(size)?)
+    };
+
+    let strtab = if shstrndx < shnum {
+        header(shstrndx).and_then(|(_, _, _, _, offset, size, _)| slice(offset, size))
+    } else {
+        None
+    };
+
+    for i in 0..shnum {
+        let Some((name_offset, kind, flags, address, offset, size, link)) = header(i) else {
+            continue;
+        };
+        let name = strtab.and_then(|table| {
+            let rest = table.get(name_offset as usize..)?;
+            let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+            core::str::from_utf8(&rest[..end]).ok()
+        });
+        out.push(SectionHeader {
+            name,
+            kind,
+            flags,
+            address,
+            size,
+            link,
+            data: slice(offset, size),
+        });
     }
     out
 }

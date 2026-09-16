@@ -2,7 +2,7 @@
 //! discovery, `/dev/bus/usb/BBB/DDD` for I/O via the `USBDEVFS_*` ioctls. libc only -- no external
 //! USB crate. The v2 sibling of lamella-usbhid's hidraw backend.
 
-use crate::{Binding, DeviceInfo, Error, Result};
+use crate::{Binding, DeviceInfo, Error, InterfaceClass, InterfaceInfo, Result, Setup};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -11,12 +11,38 @@ use std::time::Duration;
 const USBDEVFS_CLAIMINTERFACE: libc::c_ulong = 0x8004_550f;
 const USBDEVFS_RELEASEINTERFACE: libc::c_ulong = 0x8004_5510;
 const USBDEVFS_BULK: libc::c_ulong = 0xc018_5502;
+const USBDEVFS_CONTROL: libc::c_ulong =
+    ioctl_read_write(b'U', 0, std::mem::size_of::<UsbdevfsCtrltransfer>());
+
+/// `_IOWR(type, nr, size)` in the asm-generic encoding of `include/uapi/asm-generic/ioctl.h`: the two
+/// direction bits on top, then fourteen bits of size, eight of type and eight of number.
+const fn ioctl_read_write(kind: u8, number: u8, size: usize) -> libc::c_ulong {
+    const IOC_WRITE: libc::c_ulong = 1;
+    const IOC_READ: libc::c_ulong = 2;
+    ((IOC_READ | IOC_WRITE) << 30)
+        | ((size as libc::c_ulong) << 16)
+        | ((kind as libc::c_ulong) << 8)
+        | number as libc::c_ulong
+}
 
 #[repr(C)]
 struct UsbdevfsBulktransfer {
     ep: libc::c_uint,
     len: libc::c_uint,
     timeout: libc::c_uint,
+    data: *mut libc::c_void,
+}
+
+/// `struct usbdevfs_ctrltransfer`: the eight bytes of a setup stage in host byte order, then the
+/// timeout and the buffer the data stage reads from or writes into.
+#[repr(C)]
+struct UsbdevfsCtrltransfer {
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+    timeout: u32,
     data: *mut libc::c_void,
 }
 
@@ -88,10 +114,29 @@ fn bulk_endpoints(iface_dir: &Path) -> (u8, u8) {
     (ep_in, ep_out)
 }
 
+/// Where sysfs lists every USB device and interface.
+const SYSFS_USB_DEVICES: &str = "/sys/bus/usb/devices";
+
 /// Scan for USB devices exposing a vendor (class 0xFF) interface with bulk IN + OUT -- the v2 shape.
 fn scan() -> Vec<Found> {
+    scan_where(Path::new(SYSFS_USB_DEVICES), |iface| {
+        read_hex8(&iface.join("bInterfaceClass")) == Some(0xFF)
+    })
+}
+
+/// Whether the interface whose sysfs directory is `iface` is of `class`, by its `bInterfaceClass`,
+/// `bInterfaceSubClass` and `bInterfaceProtocol` attributes (`drivers/usb/core/sysfs.c`).
+fn has_class(iface: &Path, class: InterfaceClass) -> bool {
+    read_hex8(&iface.join("bInterfaceClass")) == Some(class.class)
+        && read_hex8(&iface.join("bInterfaceSubClass")) == Some(class.subclass)
+        && read_hex8(&iface.join("bInterfaceProtocol")) == Some(class.protocol)
+}
+
+/// Every USB device listed under `root` with an interface that `wanted` accepts, given that
+/// interface's directory -- one entry per device, for the first such interface.
+fn scan_where(root: &Path, wanted: impl Fn(&Path) -> bool) -> Vec<Found> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") else {
+    let Ok(entries) = fs::read_dir(root) else {
         return out;
     };
     for entry in entries.flatten() {
@@ -121,7 +166,7 @@ fn scan() -> Vec<Found> {
             if !iname.starts_with(&format!("{name}:")) {
                 continue;
             }
-            if read_hex8(&iface.path().join("bInterfaceClass")) != Some(0xFF) {
+            if !wanted(&iface.path()) {
                 continue;
             }
             let (ep_in, ep_out) = bulk_endpoints(&iface.path());
@@ -159,6 +204,27 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
 
 pub fn enumerate_guid(_interface_guid: &str) -> Result<Vec<DeviceInfo>> {
     Err(Error::Unsupported)
+}
+
+/// See [`crate::enumerate_class`]. Reads sysfs, so nothing is opened.
+pub fn enumerate_class(class: InterfaceClass) -> Result<Vec<InterfaceInfo>> {
+    Ok(interfaces_of_class(Path::new(SYSFS_USB_DEVICES), class))
+}
+
+/// Every device listed under the sysfs directory `root` with an interface of `class`, as
+/// [`crate::enumerate_class`] lists them.
+fn interfaces_of_class(root: &Path, class: InterfaceClass) -> Vec<InterfaceInfo> {
+    scan_where(root, |iface| has_class(iface, class))
+        .into_iter()
+        .map(|f| InterfaceInfo {
+            vendor_id: f.vid,
+            product_id: f.pid,
+            serial_number: f.serial,
+            product: f.product,
+            interface_number: f.interface,
+            interface_name: f.interface_name,
+        })
+        .collect()
 }
 
 pub struct Device {
@@ -208,19 +274,7 @@ impl Device {
                 f.vid, f.pid
             )));
         }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&f.node)
-            .map_err(|e| Error::Os(format!("open {}: {e}", f.node)))?;
-        let iface = f.interface as libc::c_uint;
-        let rc = unsafe { libc::ioctl(file.as_raw_fd(), USBDEVFS_CLAIMINTERFACE, &iface) };
-        if rc < 0 {
-            return Err(Error::Os(format!(
-                "USBDEVFS_CLAIMINTERFACE: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+        let file = open_claimed(&f.node, f.interface)?;
         Ok(Device {
             file,
             interface: f.interface,
@@ -277,10 +331,117 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        let iface = self.interface as libc::c_uint;
-        unsafe {
-            libc::ioctl(self.file.as_raw_fd(), USBDEVFS_RELEASEINTERFACE, &iface);
+        release(&self.file, self.interface);
+    }
+}
+
+/// Opens the usbfs node `node` for I/O and claims interface `interface` on it.
+fn open_claimed(node: &str, interface: u8) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .map_err(|e| Error::Os(format!("open {node}: {e}")))?;
+    let iface = libc::c_uint::from(interface);
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), USBDEVFS_CLAIMINTERFACE, &iface) };
+    if rc < 0 {
+        return Err(Error::Os(format!(
+            "USBDEVFS_CLAIMINTERFACE: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(file)
+}
+
+/// Releases the claim [`open_claimed`] made on `interface`.
+fn release(file: &fs::File, interface: u8) {
+    let iface = libc::c_uint::from(interface);
+    unsafe {
+        libc::ioctl(file.as_raw_fd(), USBDEVFS_RELEASEINTERFACE, &iface);
+    }
+}
+
+/// The device [`ControlInterface::open`] opens among the devices `found`: the first with `vendor_id`
+/// and `product_id` whose serial is `serial`, when one is named.
+fn control_candidate(
+    found: Vec<Found>,
+    vendor_id: u16,
+    product_id: u16,
+    serial: Option<&str>,
+) -> Result<Found> {
+    crate::select_by_whole_serial(
+        found.into_iter().filter(|f| f.vid == vendor_id && f.pid == product_id),
+        serial,
+        |f| f.serial.as_deref(),
+    )
+}
+
+/// An interface claimed on a usbfs node and driven by `USBDEVFS_CONTROL`.
+pub struct ControlInterface {
+    file: fs::File,
+    interface: u8,
+}
+
+impl ControlInterface {
+    /// See [`crate::ControlInterface::open`].
+    pub fn open(
+        vendor_id: u16,
+        product_id: u16,
+        serial: Option<&str>,
+        class: InterfaceClass,
+    ) -> Result<Self> {
+        let f = control_candidate(
+            scan_where(Path::new(SYSFS_USB_DEVICES), |iface| has_class(iface, class)),
+            vendor_id,
+            product_id,
+            serial,
+        )?;
+        let file = open_claimed(&f.node, f.interface)?;
+        Ok(ControlInterface { file, interface: f.interface })
+    }
+
+    /// See [`crate::ControlInterface::interface_number`].
+    pub fn interface_number(&self) -> u8 {
+        self.interface
+    }
+
+    /// See [`crate::ControlInterface::control_in`].
+    pub fn control_in(&mut self, setup: Setup, buffer: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        self.control(setup, buffer.as_mut_ptr().cast(), timeout_ms)
+    }
+
+    /// See [`crate::ControlInterface::control_out`].
+    pub fn control_out(&mut self, setup: Setup, data: &[u8], timeout_ms: u32) -> Result<usize> {
+        self.control(setup, data.as_ptr().cast_mut().cast(), timeout_ms)
+    }
+
+    /// One `USBDEVFS_CONTROL`, which answers the number of bytes transferred (`do_proc_control`).
+    fn control(&self, setup: Setup, data: *mut libc::c_void, timeout_ms: u32) -> Result<usize> {
+        let mut transfer = UsbdevfsCtrltransfer {
+            request_type: setup.request_type,
+            request: setup.request,
+            value: setup.value,
+            index: setup.index,
+            length: setup.length,
+            timeout: timeout_ms,
+            data,
+        };
+        let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), USBDEVFS_CONTROL, &mut transfer) };
+        if rc >= 0 {
+            return Ok(rc as usize);
         }
+        let error = std::io::Error::last_os_error();
+        Err(match error.raw_os_error() {
+            Some(libc::ETIMEDOUT) => Error::Timeout,
+            Some(libc::EPIPE) => crate::stalled(setup),
+            _ => Error::Os(format!("USBDEVFS_CONTROL: {error}")),
+        })
+    }
+}
+
+impl Drop for ControlInterface {
+    fn drop(&mut self) {
+        release(&self.file, self.interface);
     }
 }
 
@@ -297,6 +458,119 @@ pub fn diagnose(_interface_guid: &str, vendor_id: u16, product_id: u16) -> Resul
 #[cfg(test)]
 mod tests {
     use super::Found;
+    use crate::InterfaceClass;
+    use std::path::{Path, PathBuf};
+
+    /// A sysfs tree in a fresh directory, each attribute written as `drivers/usb/core/sysfs.c`
+    /// formats it.
+    struct FakeSysfs {
+        root: PathBuf,
+    }
+
+    impl FakeSysfs {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("lamella-usbbulk-sysfs-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            FakeSysfs { root }
+        }
+
+        fn write(dir: &Path, name: &str, value: &str) {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), value).unwrap();
+        }
+
+        /// A device directory with its ids, its bus position and its serial.
+        fn device(&self, name: &str, vid: u16, pid: u16, serial: &str) -> PathBuf {
+            let dir = self.root.join(name);
+            Self::write(&dir, "idVendor", &format!("{vid:04x}\n"));
+            Self::write(&dir, "idProduct", &format!("{pid:04x}\n"));
+            Self::write(&dir, "busnum", "1\n");
+            Self::write(&dir, "devnum", "7\n");
+            Self::write(&dir, "serial", &format!("{serial}\n"));
+            dir
+        }
+
+        /// An interface directory inside `device`: its number, its class, subclass and protocol, and
+        /// its name.
+        fn interface(device: &Path, number: u8, class: (u8, u8, u8), name: &str) {
+            let device_name = device.file_name().unwrap().to_string_lossy().into_owned();
+            let dir = device.join(format!("{device_name}:1.{number}"));
+            Self::write(&dir, "bInterfaceNumber", &format!("{number:02x}\n"));
+            Self::write(&dir, "bInterfaceClass", &format!("{:02x}\n", class.0));
+            Self::write(&dir, "bInterfaceSubClass", &format!("{:02x}\n", class.1));
+            Self::write(&dir, "bInterfaceProtocol", &format!("{:02x}\n", class.2));
+            Self::write(&dir, "interface", &format!("{name}\n"));
+        }
+    }
+
+    impl Drop for FakeSysfs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// DFU mode's class, subclass and protocol (DFU 1.1, Table 4.4).
+    const DFU_MODE: InterfaceClass = InterfaceClass { class: 0xFE, subclass: 0x01, protocol: 0x02 };
+
+    #[test]
+    /// A DFU interface is listed with its device's ids and serial and its own number and name, and a
+    /// device whose only interface is of another class is not listed.
+    fn a_dfu_interface_is_listed_by_its_class_and_a_probe_beside_it_is_not() {
+        let sysfs = FakeSysfs::new("class");
+        let bootloader = sysfs.device("1-2", 0x0483, 0xdf11, "AAAA1111");
+        FakeSysfs::interface(&bootloader, 0, (0xFE, 0x01, 0x02), "@Internal Flash");
+        let probe = sysfs.device("1-3", 0x2e8a, 0x000c, "BBBB2222");
+        FakeSysfs::interface(&probe, 0, (0xFF, 0x00, 0x00), "CMSIS-DAP v2 Interface");
+
+        let listed = super::interfaces_of_class(&sysfs.root, DFU_MODE);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let dfu = &listed[0];
+        assert_eq!((dfu.vendor_id, dfu.product_id), (0x0483, 0xdf11));
+        assert_eq!(dfu.serial_number.as_deref(), Some("AAAA1111"));
+        assert_eq!(dfu.interface_number, 0);
+        assert_eq!(dfu.interface_name.as_deref(), Some("@Internal Flash"));
+    }
+
+    #[test]
+    /// Class, subclass and protocol must all agree: an interface in DFU's run-time protocol (DFU 1.1,
+    /// section 4.1) is not one in DFU mode.
+    fn every_part_of_the_class_must_agree() {
+        let sysfs = FakeSysfs::new("protocol");
+        let application = sysfs.device("1-4", 0x0483, 0x5740, "CCCC3333");
+        FakeSysfs::interface(&application, 2, (0xFE, 0x01, 0x01), "DFU run-time");
+        assert!(super::interfaces_of_class(&sysfs.root, DFU_MODE).is_empty());
+        let run_time = InterfaceClass { protocol: 0x01, ..DFU_MODE };
+        assert_eq!(super::interfaces_of_class(&sysfs.root, run_time)[0].interface_number, 2);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_control_request_number_is_encoded_as_the_bulk_one_is() {
+        use std::mem::size_of;
+        assert_eq!(
+            super::ioctl_read_write(b'U', 2, size_of::<super::UsbdevfsBulktransfer>()),
+            super::USBDEVFS_BULK
+        );
+        assert_eq!(size_of::<super::UsbdevfsCtrltransfer>(), 24);
+        assert_eq!(super::USBDEVFS_CONTROL, 0xc018_5500);
+    }
+
+    #[test]
+    /// The control structure is laid out as `include/uapi/linux/usbdevice_fs.h` declares it: the
+    /// eight bytes of the setup stage, the timeout, then the data pointer at its own alignment.
+    fn the_control_structure_puts_the_setup_stage_first() {
+        use std::mem::{align_of, offset_of};
+        type Transfer = super::UsbdevfsCtrltransfer;
+        assert_eq!(offset_of!(Transfer, request_type), 0);
+        assert_eq!(offset_of!(Transfer, request), 1);
+        assert_eq!(offset_of!(Transfer, value), 2);
+        assert_eq!(offset_of!(Transfer, index), 4);
+        assert_eq!(offset_of!(Transfer, length), 6);
+        assert_eq!(offset_of!(Transfer, timeout), 8);
+        assert_eq!(offset_of!(Transfer, data), 12usize.next_multiple_of(align_of::<*mut libc::c_void>()));
+    }
 
     const VID: u16 = 0x39e9;
     const PID: u16 = 0x0001;
@@ -336,5 +610,18 @@ mod tests {
     fn the_ids_still_select_when_a_serial_agrees() {
         assert!(!board(Some("AAAA")).selected_by(VID, PID + 1, Some("AAAA")));
         assert!(!board(Some("AAAA")).selected_by(VID + 1, PID, Some("AAAA")));
+    }
+
+    #[test]
+    /// Two attached bootloaders of one model whose serials nest, the longer one listed first: the
+    /// interface opened for a serial is the device that reports that serial whole, never one whose
+    /// serial only contains it.
+    fn of_two_boards_whose_serials_nest_the_one_named_whole_is_opened() {
+        let listed = || vec![board(Some("ABC1")), board(Some("ABC"))];
+        let opened = |serial| super::control_candidate(listed(), VID, PID, Some(serial)).map(|f| f.serial);
+        assert_eq!(opened("ABC").unwrap().as_deref(), Some("ABC"), "the one named, not the one listed first");
+        assert_eq!(opened("abc").unwrap().as_deref(), Some("ABC"), "without regard to case");
+        assert_eq!(opened("ABC1").unwrap().as_deref(), Some("ABC1"));
+        assert!(matches!(opened("BC"), Err(crate::Error::NotFound)), "a part of a serial names no board");
     }
 }

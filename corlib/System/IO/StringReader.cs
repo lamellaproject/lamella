@@ -54,7 +54,13 @@ namespace System.IO
 
         public override void Close()
         {
+            Dispose(true);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
             _text = null;
+            base.Dispose(disposing);
         }
 
         private void EnsureOpen()

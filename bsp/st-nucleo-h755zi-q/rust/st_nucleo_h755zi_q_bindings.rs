@@ -45,13 +45,16 @@ pub const DEVICE_COUNT: u32 = 3;
 // -- on-board devices: PORT group base + pin index + mask --
 pub const LED0_PORT_BASE: u32 = 0x58020400;
 pub const LED0_PIN: u32 = 0;
+pub const LED0_BANK: u32 = 0;
 pub const LED0_MASK: u32 = 0x1;
 pub const LED0_ACTIVE_LOW: u32 = 0;
 pub const LED1_PORT_BASE: u32 = 0x58021000;
 pub const LED1_PIN: u32 = 1;
+pub const LED1_BANK: u32 = 0;
 pub const LED1_MASK: u32 = 0x2;
 pub const LED1_ACTIVE_LOW: u32 = 0;
 pub const LED2_PORT_BASE: u32 = 0x58020400;
 pub const LED2_PIN: u32 = 14;
+pub const LED2_BANK: u32 = 0;
 pub const LED2_MASK: u32 = 0x4000;
 pub const LED2_ACTIVE_LOW: u32 = 0;

@@ -132,6 +132,11 @@ const FLASH_CR: u32 = 0x4002_3C10;
 const KEY1: u32 = 0x4567_0123;
 const KEY2: u32 = 0xCDEF_89AB;
 const SR_BSY: u32 = 1 << 16;
+const SR_EOP: u32 = 1 << 0;
+/// Every error flag `FLASH_SR` latches for a program or an erase, at the positions all three manuals
+/// give them: `OPERR` 1, `WRPERR` 4, `PGAERR` 5, `PGPERR` 6, and bit 7 -- `PGSERR` in RM0090 and
+/// `ERSERR` in RM0385 and RM0410, one condition under two names. `RDERR` (bit 8) is not included.
+pub(crate) const F4_SR_ERRORS: u32 = (1 << 1) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
 const CR_PG: u32 = 1 << 0;
 const CR_SER: u32 = 1 << 1;
 const CR_SNB_SHIFT: u32 = 3;
@@ -164,8 +169,9 @@ const CR_LOCK: u32 = 1 << 31;
 /// not there. **A name that under-claims fails in the direction where nobody files a bug**, because
 /// the reader assumes the limit is real and works around it.
 pub trait Stm32F4Flash {
-    /// Unlocks `FLASH_CR` for erase/program (writes the two `FLASH_KEYR` keys). Idempotent: the
-    /// keys have no effect if the controller is already unlocked.
+    /// Unlocks `FLASH_CR` for erase/program. Idempotent, and checked: the two `FLASH_KEYR` keys are
+    /// written only to a register whose `LOCK` bit is set, and a register still locked afterwards is
+    /// an error.
     fn unlock_flash(&mut self) -> Result<(), ProbeError>;
     /// Re-locks `FLASH_CR`.
     fn lock_flash(&mut self) -> Result<(), ProbeError>;
@@ -179,8 +185,17 @@ pub trait Stm32F4Flash {
 
 impl<A: TargetAccess> Stm32F4Flash for A {
     fn unlock_flash(&mut self) -> Result<(), ProbeError> {
+        if self.read_word(FLASH_CR)? & CR_LOCK == 0 {
+            return Ok(());
+        }
         self.write_word(FLASH_KEYR, KEY1)?;
-        self.write_word(FLASH_KEYR, KEY2)
+        self.write_word(FLASH_KEYR, KEY2)?;
+        if self.read_word(FLASH_CR)? & CR_LOCK != 0 {
+            return Err(ProbeError::Device(
+                "STM32F4/F7 flash stayed locked after the key sequence, and FLASH_CR now stays locked until the next reset",
+            ));
+        }
+        Ok(())
     }
 
     fn lock_flash(&mut self) -> Result<(), ProbeError> {
@@ -194,25 +209,35 @@ impl<A: TargetAccess> Stm32F4Flash for A {
                 "STM32 sector index does not fit the FLASH_CR SNB field -- refusing rather than erasing a different sector",
             ));
         }
-        wait_not_busy(self)?;
+        f4_wait_idle(self, FlashWait::BeforeOperation)?;
         let base = CR_PSIZE_X32 | CR_SER | (sector << CR_SNB_SHIFT);
         self.write_word(FLASH_CR, base)?;
         self.write_word(FLASH_CR, base | CR_STRT)?;
-        wait_not_busy(self)?;
-        self.write_word(FLASH_CR, CR_PSIZE_X32)
+        let erased = f4_wait_idle(self, FlashWait::AfterOperation);
+        let cleared = self.write_word(FLASH_CR, CR_PSIZE_X32);
+        erased?;
+        cleared
     }
 
     fn program_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
-        wait_not_busy(self)?;
+        f4_wait_idle(self, FlashWait::BeforeOperation)?;
         self.write_word(FLASH_CR, CR_PSIZE_X32 | CR_PG)?;
 
+        let mut written = Ok(());
         for (index, chunk) in words.chunks(F4_WORDS_PER_POLL).enumerate() {
             let at = address + (index * F4_WORDS_PER_POLL * 4) as u32;
-            self.write_words(at, chunk)?;
-            wait_not_busy(self)?;
+            written = self.write_words(at, chunk);
+            if written.is_ok() {
+                written = f4_wait_idle(self, FlashWait::AfterOperation);
+            }
+            if written.is_err() {
+                break;
+            }
         }
 
-        self.write_word(FLASH_CR, CR_PSIZE_X32)
+        let cleared = self.write_word(FLASH_CR, CR_PSIZE_X32);
+        written?;
+        cleared
     }
 }
 
@@ -294,6 +319,115 @@ pub const STM32F76X_SECTOR_SIZES_SINGLE_BANK: [usize; 12] = [
 pub const STM32F7_OPTCR: u32 = 0x4002_3C14;
 /// `FLASH_OPTCR.nDBANK`: SET means single bank, CLEAR means dual.
 pub const STM32F7_OPTCR_NDBANK: u32 = 1 << 29;
+
+/// Where an STM32F7 maps its main flash for a probe to write it: sector 0 begins at `0x0800 0000` on
+/// the AXIM interface in both RM0385 Table 3 and RM0410 Table 3.
+///
+/// The same array also appears at `0x0020 0000` through ITCM. That is an execution alias, not the
+/// address an image is written from.
+pub const STM32F7_FLASH_BASE: u32 = 0x0800_0000;
+
+/// `DBGMCU_IDCODE` on an STM32F7, which RM0385 40.6.1 and RM0410 44.6.1 each place "in the external
+/// PPB memory map at address 0xE0042000". The STM32L4 answers at the same address; the two families
+/// are told apart by the `DEV_ID` read there.
+pub const STM32F7_DBGMCU_IDCODE: u32 = 0xE004_2000;
+
+/// The `DEV_ID` values the two STM32F7 manuals give, with what each names: `0x449` for the F74x and
+/// F75x (RM0385), `0x451` for the F76x and F77x (RM0410). An F7 answering anything else has no sector
+/// map here.
+pub const STM32F7_PARTS: &[(u32, &str)] = &[
+    (
+        0x449,
+        "an STM32F74x or F75x -- the DEV_ID, which every part in that group answers, not this board",
+    ),
+    (
+        0x451,
+        "an STM32F76x or F77x -- the DEV_ID, which every part in that group answers, not this board",
+    ),
+];
+
+/// Which sector map an STM32F7 is using, from the `DEV_ID` it answers and its `FLASH_OPTCR`.
+///
+/// An F74x or F75x answers [`STM32F7_SECTOR_SIZES`]. An F76x or F77x with `nDBANK` set answers
+/// [`STM32F76X_SECTOR_SIZES_SINGLE_BANK`]: one bank of 4x32 KB, 1x128 KB and 7x256 KB sectors,
+/// numbered 0 to 11 (RM0410 3.3.1, Table 3). A walk over either map is bounded by the flash size the
+/// part reports, not by the map's length.
+///
+/// # Errors
+/// For a `DEV_ID` neither manual gives, and for an F76x or F77x in dual-bank mode (`nDBANK` clear),
+/// whose sector numbering neither map describes.
+pub fn stm32f7_sector_sizes(dev_id: u32, optcr: u32) -> Result<&'static [usize], &'static str> {
+    match dev_id {
+        0x449 => Ok(&STM32F7_SECTOR_SIZES[..]),
+        0x451 if optcr & STM32F7_OPTCR_NDBANK != 0 => Ok(&STM32F76X_SECTOR_SIZES_SINGLE_BANK[..]),
+        0x451 => Err(
+            "this STM32F76x/F77x has nDBANK clear in FLASH_OPTCR, so its flash is two banks whose sectors are numbered from 12 in bank 2 -- a map this driver does not carry, so it refuses rather than erase by the single-bank numbering",
+        ),
+        _ => Err("this part answers no DEV_ID the STM32F7 manuals give, so its sector map is not known"),
+    }
+}
+
+/// Reads [`STM32F7_DBGMCU_IDCODE`] and [`STM32F7_OPTCR`] from the part and answers its sector map.
+/// See [`stm32f7_sector_sizes`] for how the answer is chosen.
+///
+/// # Errors
+/// When either register cannot be read, and for the refusals [`stm32f7_sector_sizes`] makes.
+pub fn stm32f7_read_sector_sizes<A: TargetAccess>(
+    target: &mut A,
+) -> Result<&'static [usize], ProbeError> {
+    let (dev_id, _) = stm32_dev_id(target, STM32F7_DBGMCU_IDCODE)?;
+    let optcr = target.read_word(STM32F7_OPTCR)?;
+    stm32f7_sector_sizes(dev_id, optcr).map_err(ProbeError::Device)
+}
+
+/// `DBGMCU_APB1_FZ` on an STM32F7, the register that says which peripherals stop while the core is
+/// halted. RM0385 40.16.5 and RM0410 44.16.5 both give "Address: 0xE004 2008".
+pub const STM32F7_DBGMCU_APB1_FZ: u32 = 0xE004_2008;
+
+/// `DBG_IWDG_STOP`, bit 12 of [`STM32F7_DBGMCU_APB1_FZ`] in both manuals. While it is clear, "the
+/// independent watchdog counter clock continues even if the core is halted".
+pub const STM32F7_DBG_IWDG_STOP: u32 = 1 << 12;
+
+/// `DBG_WWDG_STOP`, bit 11 of [`STM32F7_DBGMCU_APB1_FZ`] in both manuals: the same, for the window
+/// watchdog.
+pub const STM32F7_DBG_WWDG_STOP: u32 = 1 << 11;
+
+/// `DBGMCU_CR` on an STM32F7, whose low three bits keep a debugger connection working while the
+/// part is in a low-power mode. RM0385 40.16.4 and RM0410 44.16.4 both give "Address: 0xE004 2004"
+/// and "Only 32-bit access supported".
+///
+/// A power-on reset clears it and a system reset does not: both manuals say it "is asynchronously
+/// reset by the PORESET (and not the system reset). It can be written by the debugger under system
+/// reset." (RM0385 40.16.3, RM0410 44.16.3). Bits set here stay set through every system reset
+/// until the part next loses power.
+pub const STM32F7_DBGMCU_CR: u32 = 0xE004_2004;
+
+/// `DBG_SLEEP`, bit 0 of [`STM32F7_DBGMCU_CR`]. While it is clear, in Sleep mode "HCLK is
+/// disabled"; while it is set, "HCLK is fed by the same clock that is provided to FCLK" (RM0410
+/// 44.16.4).
+pub const STM32F7_DBG_SLEEP: u32 = 1 << 0;
+
+/// `DBG_STOP`, bit 1 of [`STM32F7_DBGMCU_CR`]. While it is set, "FCLK and HCLK are provided by the
+/// internal RC oscillator which remains active in STOP mode" (RM0410 44.16.4).
+pub const STM32F7_DBG_STOP: u32 = 1 << 1;
+
+/// `DBG_STANDBY`, bit 2 of [`STM32F7_DBGMCU_CR`]. While it is set, "the digital part is not
+/// unpowered and FCLK and HCLK are provided by the internal RC oscillator which remains active"
+/// (RM0410 44.16.4).
+pub const STM32F7_DBG_STANDBY: u32 = 1 << 2;
+
+/// The three low-power debug bits of [`STM32F7_DBGMCU_CR`]: what an attach sets so a debugger
+/// connection keeps its clocks through Sleep, Stop and Standby mode.
+///
+/// RM0410 44.16.1: "The core does not allow FCLK or HCLK to be turned off during a debug session.
+/// As these are required for the debugger connection, during a debug, they must remain active."
+/// For Sleep mode it adds that `DBG_SLEEP` "must be previously set by the debugger", and for Stop
+/// mode that `DBG_STOP` must be.
+///
+/// Setting them keeps clocks running in modes that otherwise stop them, and keeps the digital part
+/// powered in Standby, until the next power-on reset clears the register.
+pub const STM32F7_DBGMCU_CR_LOW_POWER_DEBUG: u32 =
+    STM32F7_DBG_SLEEP | STM32F7_DBG_STOP | STM32F7_DBG_STANDBY;
 
 /// How many sectors from 0 an image of `len` bytes spans, given a family's sector `sizes`.
 ///
@@ -971,14 +1105,57 @@ fn l0_program_words<A: TargetAccess>(
     Ok(())
 }
 
-/// Polls `FLASH_SR` until the controller reports not busy.
-fn wait_not_busy<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
+/// Names the error flag a failed F4 or F7 operation left in `FLASH_SR`.
+///
+/// Bit 7 has two names for one condition -- `PGSERR` in RM0090 and `ERSERR` in RM0385 and RM0410,
+/// both defined as a write to flash while `FLASH_CR` was not set up for it -- so the sentence gives
+/// both rather than guessing which family the caller holds.
+fn f4_error_text(sr: u32) -> Option<&'static str> {
+    if sr & (1 << 4) != 0 {
+        return Some("STM32F4/F7 flash write protection error (WRPERR) -- the sector is write protected by its nWRP option bit");
+    }
+    if sr & (1 << 7) != 0 {
+        return Some("STM32F4/F7 flash sequence error (ERSERR, called PGSERR on an F4) -- flash was written while FLASH_CR was not set up for it");
+    }
+    if sr & (1 << 5) != 0 {
+        return Some("STM32F4/F7 flash programming alignment error (PGAERR) -- the data did not fit one flash memory row");
+    }
+    if sr & (1 << 6) != 0 {
+        return Some("STM32F4/F7 flash programming parallelism error (PGPERR) -- an access was not the width PSIZE selects");
+    }
+    if sr & (1 << 1) != 0 {
+        return Some("STM32F4/F7 flash operation error (OPERR)");
+    }
+    None
+}
+
+/// Waits for `FLASH_SR.BSY` to clear, then reports the flag an operation latched -- or, before an
+/// operation, clears whatever an earlier session left latched.
+///
+/// See [`FlashWait`] for why the same flag means an error in one phase and not in the other. RM0385
+/// and RM0410 mark every one of these flags write-one-to-clear.
+pub(crate) fn f4_wait_idle<A: TargetAccess>(target: &mut A, phase: FlashWait) -> Result<(), ProbeError> {
     for _ in 0..100_000 {
-        if target.read_word(FLASH_SR)? & SR_BSY == 0 {
+        let sr = target.read_word(FLASH_SR)?;
+        if sr & SR_BSY != 0 {
+            continue;
+        }
+        if phase == FlashWait::BeforeOperation {
+            if sr & (F4_SR_ERRORS | SR_EOP) != 0 {
+                target.write_word(FLASH_SR, F4_SR_ERRORS | SR_EOP)?;
+            }
             return Ok(());
         }
+        if let Some(text) = f4_error_text(sr) {
+            target.write_word(FLASH_SR, F4_SR_ERRORS | SR_EOP)?;
+            return Err(ProbeError::Device(text));
+        }
+        if sr & SR_EOP != 0 {
+            target.write_word(FLASH_SR, SR_EOP)?;
+        }
+        return Ok(());
     }
-    Err(ProbeError::Timeout("STM32 flash busy"))
+    Err(ProbeError::Timeout("STM32F4/F7 flash controller busy"))
 }
 
 #[cfg(test)]
@@ -1086,6 +1263,39 @@ mod geometry_tests {
             "the F76x has four more sectors than the F74x, not a different shape"
         );
         assert_eq!(STM32F7_OPTCR_NDBANK, 1 << 29);
+    }
+
+    /// THE MAP COMES FROM THE PART, AND ON AN F76x THE OPTION BIT IS WHAT CHOOSES IT.
+    ///
+    /// `0xFFFFAAFD` is the reset value RM0410 3.7.6 gives `FLASH_OPTCR`, with `nDBANK` set: the
+    /// single-bank map. The same value with that one bit cleared is the dual-bank part, and it is
+    /// refused rather than walked by the single-bank numbering.
+    #[test]
+    fn an_f7_sector_map_is_chosen_by_device_id_and_bank_mode() {
+        let reset = 0xFFFF_AAFD;
+        let dual = reset & !STM32F7_OPTCR_NDBANK;
+        assert_eq!(stm32f7_sector_sizes(0x449, reset), Ok(&STM32F7_SECTOR_SIZES[..]));
+        assert_eq!(
+            stm32f7_sector_sizes(0x451, reset),
+            Ok(&STM32F76X_SECTOR_SIZES_SINGLE_BANK[..])
+        );
+        assert!(stm32f7_sector_sizes(0x451, dual).is_err(), "a dual-bank F76x is refused");
+        assert_eq!(stm32f7_sector_sizes(0x449, dual), Ok(&STM32F7_SECTOR_SIZES[..]));
+        for foreign in [0x450, 0x452] {
+            assert!(stm32f7_sector_sizes(foreign, reset).is_err(), "{foreign:#x} has no map");
+        }
+        for (id, _) in STM32F7_PARTS {
+            assert!(stm32f7_sector_sizes(*id, reset).is_ok(), "{id:#x} is listed and has no map");
+        }
+    }
+
+    /// The watchdog freeze register and its two bits, pinned to both manuals as literals.
+    #[test]
+    fn the_f7_watchdog_freeze_bits_are_where_both_manuals_put_them() {
+        assert_eq!(STM32F7_DBGMCU_APB1_FZ, 0xE004_2008, "RM0385 40.16.5, RM0410 44.16.5");
+        assert_eq!(STM32F7_DBG_IWDG_STOP, 0x1000, "bit 12");
+        assert_eq!(STM32F7_DBG_WWDG_STOP, 0x0800, "bit 11");
+        assert_eq!(STM32F7_DBGMCU_APB1_FZ - STM32F7_DBGMCU_IDCODE, 8);
     }
 
     /// AN OUT-OF-RANGE SECTOR INDEX MUST BE REFUSED, AND MASKING WOULD BE WORSE THAN NOTHING.
@@ -1389,8 +1599,9 @@ mod flash_wait_phase_tests {
     #[test]
     fn a_stale_error_blocks_no_operation_but_a_fresh_one_fails_its_own() {
         type Poll = fn(&mut ArmDap<Dap<Mock>>, FlashWait) -> Result<(), ProbeError>;
-        let families: [(&str, u32, Poll); 5] = [
+        let families: [(&str, u32, Poll); 6] = [
             ("F0", F0_SR_PGERR | F0_SR_WRPRTERR, f0_wait_idle),
+            ("F4/F7", F4_SR_ERRORS, f4_wait_idle),
             ("L0", L0_SR_ERRORS, l0_wait_idle),
             ("C0", c0::C0_SR_ERRORS, c0::c0_wait_idle),
             ("U5", u5::U5_SR_ERRORS, u5::u5_wait_idle),
@@ -1415,6 +1626,19 @@ mod flash_wait_phase_tests {
                 );
             }
         }
+    }
+
+    /// Every flag the F4/F7 poll treats as an error has a sentence, at the position the manuals give
+    /// it, and a status of only `BSY` or `EOP` has none.
+    #[test]
+    fn every_f4_and_f7_error_flag_is_named_where_the_manuals_put_it() {
+        assert_eq!(F4_SR_ERRORS, 0b1111_0010);
+        for bit in bits_of(F4_SR_ERRORS) {
+            assert!(f4_error_text(bit).is_some(), "FLASH_SR bit {bit:#x} must be named");
+        }
+        assert!(f4_error_text(0).is_none());
+        assert!(f4_error_text(SR_BSY | SR_EOP).is_none(), "busy and done are not errors");
+        assert!(f4_error_text(1 << 8).is_none());
     }
 
     /// The measured case, kept as its own row because it is the one that actually happened.

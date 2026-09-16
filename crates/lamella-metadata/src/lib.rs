@@ -43,3 +43,15 @@ pub use signature::{
     parse_method_spec, parse_type,
 };
 pub use tables::{TableError, TablesHeader};
+
+/// The inherited vtable slot that a virtual method declared without `newslot` overrides, as an index
+/// into `inherited`: the most-derived slot whose signature matches, or `None` when none matches and
+/// the method takes a slot of its own.
+///
+/// A vtable laid out base-first appends each type's new slots after its base's, so a later matching
+/// slot belongs to a more-derived declaration. When one type hides a virtual method with `newslot`
+/// and a type below it overrides that method, the override replaces the hiding method's slot; the
+/// hidden method's slot keeps its own body, and a call made through the older base still reaches it.
+pub fn overridden_slot<S>(inherited: &[S], same_signature: impl FnMut(&S) -> bool) -> Option<usize> {
+    inherited.iter().rposition(same_signature)
+}

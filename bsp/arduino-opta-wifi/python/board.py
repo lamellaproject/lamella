@@ -54,10 +54,10 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "relay_1": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 6, "mask": 0x40, "active_low": False},
-    "relay_2": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 5, "mask": 0x20, "active_low": False},
-    "relay_3": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 7, "mask": 0x80, "active_low": False},
-    "relay_4": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 4, "mask": 0x10, "active_low": False},
-    "user_button": {"kind": "gpio-in", "port_base": 0x58021000, "pin": 4, "mask": 0x10, "active_low": True},
-    "user_led": {"kind": "gpio-out", "port_base": 0x58021000, "pin": 5, "mask": 0x20},
+    "relay_1": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 6, "bank": 0, "mask": 0x40, "active_low": False},
+    "relay_2": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 5, "bank": 0, "mask": 0x20, "active_low": False},
+    "relay_3": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 7, "bank": 0, "mask": 0x80, "active_low": False},
+    "relay_4": {"kind": "gpio-out", "port_base": 0x58022000, "pin": 4, "bank": 0, "mask": 0x10, "active_low": False},
+    "user_button": {"kind": "gpio-in", "port_base": 0x58021000, "pin": 4, "bank": 0, "mask": 0x10, "active_low": True},
+    "user_led": {"kind": "gpio-out", "port_base": 0x58021000, "pin": 5, "bank": 0, "mask": 0x20},
 }

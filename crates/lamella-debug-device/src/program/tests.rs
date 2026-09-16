@@ -408,6 +408,131 @@ fn the_entry_is_the_function_containing_it_and_not_the_nearest_one_before() {
     );
 }
 
+/// A symbol table and its string table: the null entry, then one `Elf32_Sym` per
+/// `(name, value, size, st_info)`, each defined in section 1.
+fn symbol_table(entries: &[(&str, u32, u32, u8)]) -> (Vec<u8>, Vec<u8>) {
+    let mut strings = vec![0u8];
+    let mut table = vec![0u8; 16];
+    for &(name, value, size, info) in entries {
+        let name_at = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        table.extend_from_slice(&name_at.to_le_bytes());
+        table.extend_from_slice(&value.to_le_bytes());
+        table.extend_from_slice(&size.to_le_bytes());
+        table.push(info);
+        table.push(0);
+        table.extend_from_slice(&1u16.to_le_bytes());
+    }
+    (table, strings)
+}
+
+/// The same file, with the `.symtab` and `.strtab` sections the writer carried as plain data typed as
+/// a symbol table and the string table it links, the way a linker writes them.
+fn typed_as_a_symbol_table(mut elf: Vec<u8>) -> Vec<u8> {
+    let word = |elf: &[u8], at: usize| u32::from_le_bytes([elf[at], elf[at + 1], elf[at + 2], elf[at + 3]]);
+    let half = |elf: &[u8], at: usize| u16::from_le_bytes([elf[at], elf[at + 1]]);
+    let headers = word(&elf, 32) as usize;
+    let count = usize::from(half(&elf, 48));
+    let header = |index: usize| headers + index * 40;
+    let section_names = word(&elf, header(usize::from(half(&elf, 50))) + 16) as usize;
+    let named = |elf: &[u8], wanted: &str| {
+        (0..count)
+            .find(|&index| {
+                let at = section_names + word(elf, header(index)) as usize;
+                elf[at..].split(|&byte| byte == 0).next() == Some(wanted.as_bytes())
+            })
+            .expect(wanted)
+    };
+    let (symtab, strtab) = (named(&elf, ".symtab"), named(&elf, ".strtab"));
+    elf[header(symtab) + 4..header(symtab) + 8].copy_from_slice(&2u32.to_le_bytes());
+    elf[header(symtab) + 24..header(symtab) + 28].copy_from_slice(&(strtab as u32).to_le_bytes());
+    elf[header(strtab) + 4..header(strtab) + 8].copy_from_slice(&3u32.to_le_bytes());
+    elf
+}
+
+#[test]
+fn an_entry_no_subprogram_holds_is_named_by_the_function_symbol_that_holds_it() {
+    const TEXT: u32 = 0x0800_0100;
+    let (abbrev, info) = info_sections(&[("described", TEXT, 8)]);
+    let line = line_section("Blink.swift", TEXT);
+    let (symtab, strtab) = symbol_table(&[("startup_code", TEXT + 16 + 1, 8, 0x02)]);
+    let build = |entry_offset: u32| {
+        typed_as_a_symbol_table(lamella_elf::write_debuggable_executable(
+            lamella_elf::Machine::Arm,
+            &[0x00u8, 0xBF].repeat(16),
+            entry_offset,
+            TEXT,
+            true,
+            &[
+                (".debug_line", &line),
+                (".debug_abbrev", &abbrev),
+                (".debug_info", &info),
+                (".symtab", &symtab),
+                (".strtab", &strtab),
+            ],
+        ))
+    };
+
+    let inside = from_elf(&build(18)).expect("parses");
+    assert_eq!(inside.entry, "startup_code", "no subprogram holds the entry, and a symbol does");
+    assert!(
+        inside.names.contains(&(16, 24, String::from("startup_code"))),
+        "and the symbol names its code for every frame, not only the entry: {:?}",
+        inside.names
+    );
+
+    let between = from_elf(&build(12)).expect("parses");
+    assert_eq!(between.entry, "?", "neither a subprogram nor a symbol holds this address");
+}
+
+#[test]
+fn a_symbol_names_code_only_where_no_subprogram_does() {
+    use lamella_elf::{Binding, symbols::Function};
+    const BASE: u64 = 0x0800_0000;
+    let mut names = vec![(0x10, 0x20, String::from("described"))];
+    let symbols = [
+        Function { address: 0x0800_0010, size: 0x10, binding: Binding::Global, name: "described_again" },
+        Function { address: 0x0800_0018, size: 0x20, binding: Binding::Global, name: "overlaps_its_end" },
+        Function { address: 0x0800_0040, size: 0x10, binding: Binding::Local, name: "undescribed" },
+        Function { address: 0x07FF_FFF0, size: 0x10, binding: Binding::Global, name: "below_the_image" },
+        Function { address: 0x0800_0080, size: 0x10, binding: Binding::Global, name: "not_code" },
+    ];
+    add_symbol_names(&mut names, &symbols, BASE, |address| address < 0x0800_0080);
+    assert_eq!(
+        names,
+        vec![(0x10, 0x20, String::from("described")), (0x40, 0x50, String::from("undescribed"))],
+        "a symbol over described code is left out even where it runs past that code; one below the \
+         image or outside its code is left out too"
+    );
+}
+
+#[test]
+fn where_several_symbols_hold_one_address_one_rule_names_it() {
+    use lamella_elf::{Binding, symbols::Function};
+    const BASE: u64 = 0x0800_0000;
+    let function = |name, address, size, binding| Function { address, size, binding, name };
+    let symbols = [
+        function("local_alias", 0x0800_0100, 0x20, Binding::Local),
+        function("global_alias", 0x0800_0100, 0x20, Binding::Global),
+        function("weak_alias", 0x0800_0100, 0x20, Binding::Weak),
+        function("second_global_alias", 0x0800_0100, 0x20, Binding::Global),
+        function("outer", 0x0800_00F0, 0x110, Binding::Local),
+        function("short", 0x0800_0100, 0x08, Binding::Global),
+    ];
+    let mut names = Vec::new();
+    add_symbol_names(&mut names, &symbols, BASE, |_| true);
+    let at = |offset| name_containing(&names, offset).map(|(_, _, name)| name.as_str());
+    assert_eq!(at(0x104), Some("short"), "the symbols starting nearest below, and of those the shortest");
+    assert_eq!(
+        at(0x110),
+        Some("global_alias"),
+        "a global symbol before a weak one before a local one, then the one the table lists first"
+    );
+    assert_eq!(at(0x1F0), Some("outer"), "only the outer symbol holds this address");
+    assert_eq!(at(0x0E0), None, "and no symbol holds this one");
+}
+
 /// A subprogram for code the linker discarded is dropped, the same way a row is.
 ///
 /// **THE RULE HAS TWO CALL SITES AND THIS IS THE SECOND ONE.** The row half is covered above; the
@@ -473,4 +598,112 @@ fn debug_information_from_another_image_is_refused() {
             other.map(|program| program.image_base)
         ),
     }
+}
+
+
+/// A prel31 offset from `place` to `target`, as an index table stores one.
+fn prel31(target: u32, place: u32) -> u32 {
+    target.wrapping_sub(place) & 0x7FFF_FFFF
+}
+
+/// Little-endian words, as a table section holds them.
+fn words(values: &[u32]) -> Vec<u8> {
+    values.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+const INDEX: u32 = 0x0800_1000;
+const EXTAB: u32 = 0x0800_2000;
+
+/// An index table describing `0x08000100` (cannot unwind) and `0x08000200` (a table entry at
+/// `EXTAB + 4`).
+fn index_with_one_table_entry() -> Vec<u8> {
+    words(&[
+        prel31(0x0800_0100, INDEX),
+        lamella_elf::ehabi::EXIDX_CANTUNWIND,
+        prel31(0x0800_0200, INDEX + 8),
+        prel31(EXTAB + 4, INDEX + 12),
+    ])
+}
+
+#[test]
+fn a_program_keeps_its_index_tables_and_only_the_sections_their_entries_point_into() {
+    use lamella_elf::ehabi::{Region, Tables};
+    let index = index_with_one_table_entry();
+    let extab = words(&[0, 0x8084_80B0]);
+    let text = vec![0u8; 0x400];
+    let rodata = vec![0xAAu8; 8];
+    let tables = Tables {
+        indexes: vec![Region { address: INDEX, bytes: &index }],
+        loaded: vec![
+            Region { address: 0x0800_0000, bytes: &text },
+            Region { address: INDEX, bytes: &index },
+            Region { address: EXTAB, bytes: &extab },
+            Region { address: 0x0800_3000, bytes: &rodata },
+        ],
+    };
+    let kept = UnwindTables::from_tables(&tables, vec![(0x0800_0000, 0x0800_0400)]);
+    assert_eq!(kept.indexes, vec![(INDEX, index.clone())]);
+    assert_eq!(
+        kept.entries,
+        vec![(EXTAB, extab.clone())],
+        "the code, the index itself and a section no entry points into are not copied"
+    );
+    assert_eq!(kept.code, vec![(0x0800_0000, 0x0800_0400)]);
+    assert!(!kept.is_empty());
+}
+
+#[test]
+fn an_index_table_that_cannot_be_searched_is_not_kept() {
+    use lamella_elf::ehabi::{Region, Tables, EXIDX_CANTUNWIND};
+    let index = words(&[
+        prel31(0x0800_0200, INDEX),
+        EXIDX_CANTUNWIND,
+        prel31(0x0800_0100, INDEX + 8),
+        EXIDX_CANTUNWIND,
+    ]);
+    let tables = Tables {
+        indexes: vec![Region { address: INDEX, bytes: &index }],
+        loaded: vec![Region { address: INDEX, bytes: &index }],
+    };
+    let kept = UnwindTables::from_tables(&tables, Vec::new());
+    assert!(kept.is_empty(), "an index out of order answers the wrong function for some address");
+}
+
+#[test]
+fn an_address_is_described_by_the_function_containing_it_and_only_inside_the_code() {
+    use lamella_elf::ehabi::Description;
+    let kept = UnwindTables {
+        indexes: vec![(
+            INDEX,
+            words(&[
+                prel31(0x0800_0100, INDEX),
+                0x80A8_B0B0,
+                prel31(0x0800_0200, INDEX + 8),
+                lamella_elf::ehabi::EXIDX_CANTUNWIND,
+            ]),
+        )],
+        entries: Vec::new(),
+        code: vec![(0x0800_0000, 0x0800_0300)],
+    };
+
+    let described = kept.describe(0x0800_0150).expect("inside the first function");
+    assert_eq!(described.entry.function, 0x0800_0100);
+    assert_eq!(
+        described.description,
+        Description::Compact { personality: 0, table: None, instructions: vec![0xA8, 0xB0, 0xB0] }
+    );
+    assert_eq!(kept.describe(0x0800_0250).map(|d| d.description), Some(Description::CantUnwind));
+    assert_eq!(kept.describe(0x0800_00F0), None, "below the first function");
+    assert_eq!(
+        kept.describe(0x0800_0350),
+        None,
+        "past the code: the index does not say where its last function ends"
+    );
+
+    let unbounded = UnwindTables { code: Vec::new(), ..kept };
+    assert_eq!(
+        unbounded.describe(0x0800_0350).map(|d| d.description),
+        Some(Description::CantUnwind),
+        "a file that named no code cannot bound the last function, and is not refused for it"
+    );
 }

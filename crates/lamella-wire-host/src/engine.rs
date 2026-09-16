@@ -23,7 +23,7 @@ pub enum CompileFailure {
 
 /// Compiles a C# submission to a program assembly's bytes. This is the engine's COMPILE seam, the
 /// symmetric counterpart to [`ReplLink`]: a host supplies an in-process compiler (the project's own,
-/// over `lamella-assemble`); a browser host (Lamella Studio) supplies one over `lamella-wasm`. Because
+/// over `lamella-assemble`); a browser host (Lamella Code) supplies one over `lamella-wasm`. Because
 /// the engine is written against this trait (not a concrete compiler), the SAME [`Repl`] -- transcript
 /// model, classification, suffix logic -- drives both, so the browser REPL is a faithful preview of the
 /// CLI one.

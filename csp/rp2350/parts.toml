@@ -35,3 +35,22 @@ pins = ["GP0-GP1", "GP4-GP5", "GP16-GP19", "GP23-GP29"]
 cores = { core0 = ["cortex-m33", "hazard3"], core1 = ["cortex-m33", "hazard3"] }
 cores_share_memory = true
 source = "RP2350 datasheet 4.2 (520 kB SRAM = 8 x 64 kB striped to 0x2007ffff + 2 x 4 kB; this row states the contiguous 512 KB window) + ch 1 (QFN-60/RP2350A, external QSPI flash) -- PARTIAL pin list: GP0/1 uart, GP4/5 i2c, GP16-19 spi, GP23-25 + GP29 the wireless-module control lines a board may wire, GP26-29 the ADC channel pads (adc block channel map). The pin list is PARTIAL rather than the package's full set"
+
+[[parts]]
+part = "rp2350b"
+package = "QFN-80"
+flash = 0
+ram = 0x80000
+pins = ["GP0-GP47"]
+# THE SAME TWO SOCKETS AS THE A ROW, and for the same reason: the package changes how many pads are
+# bonded out, not what is behind them.
+cores = { core0 = ["cortex-m33", "hazard3"], core1 = ["cortex-m33", "hazard3"] }
+cores_share_memory = true
+# THE PIN LIST IS COMPLETE HERE RATHER THAN PARTIAL, which is the one place this row differs in kind
+# from the A above: the datasheet states the whole range in one sentence, so there is nothing to add
+# to it later.
+#
+# ANALOGUE INPUT MOVES WITH THE PACKAGE AND IS THE TRAP IN THIS PART. On the QFN-60 the ADC reads
+# GPIO26-29; on the QFN-80 it reads GPIO40-47 and NOT GPIO26-29, so a GPIO number that is analogue on
+# one package is digital-only on the other, and an ADC channel number is not derivable from it.
+source = "RP2350 datasheet Table 1: RP2350B is the QFN-80 (10 x 10 mm) member, no internal flash, 48 GPIO, 8 analogue inputs. Chapter 1 NOTE: GPIOs 0 through 29 are available in all package variants, GPIOs 30 through 47 only in QFN-80 (RP2350B) -- so GP0-GP47 is the whole bonded set. Second NOTE, same chapter: analogue input is on GPIOs 26 through 29 in QFN-60 for four inputs, and on GPIOs 40 through 47 in QFN-80 for eight. Section 4.2 gives the SRAM, unchanged across the family: 520 kB as 8 x 64 kB striped to 0x2007ffff plus 2 x 4 kB above the watermark, and this row states the contiguous 512 KB window the A row states."

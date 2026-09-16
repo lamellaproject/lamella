@@ -13,11 +13,14 @@ use alloc::vec::Vec;
 /// `Box<dyn DebugBackend>` chosen at launch (interpreter, or device over CMSIS-DAP).
 pub trait DebugBackend {
     /// Begins (or restarts) execution, leaving the target stopped at its first
-    /// location, ready for breakpoints and `configurationDone`. Returns `false` if
-    /// the target could not be started. Interpreter: create the `Session` at the
-    /// entry point. Device: reset-and-halt at the entry (a fresh `launch`), or attach
-    /// to a running target and halt it (`attach`).
-    fn launch(&mut self) -> bool;
+    /// location, ready for breakpoints and `configurationDone`. Interpreter: create the
+    /// `Session` at the entry point. Device: reset-and-halt at the entry (a fresh `launch`), or
+    /// attach to a running target and halt it (`attach`).
+    ///
+    /// `Err(reason)` says the target could not be started, in words the adapter shows the user. A
+    /// target that refused, one that never answered and one that could not be reached need
+    /// different remedies, and only the backend knows which it was.
+    fn launch(&mut self) -> Result<(), String>;
 
     /// Resumes until a breakpoint, completion, or fault. Interpreter: run the
     /// `Session`. Device: clear the halt and run until a BPU match / the program ends.
@@ -43,6 +46,20 @@ pub trait DebugBackend {
     /// Returns `false` if the halt failed.
     fn pause(&mut self) -> bool {
         true
+    }
+
+    /// Hands the target back as the session ends -- on a `disconnect` request, or when the client
+    /// goes away without sending one -- so the program goes on as it would with no debugger attached.
+    ///
+    /// The default suits a synchronous backend, whose program lives inside the adapter's process and
+    /// ends with it. A backend whose target outlives the adapter overrides this, because whatever the
+    /// session leaves behind stays behind: a core left halted stays halted, and a breakpoint left
+    /// armed stops the program again later with nothing attached to resume it.
+    ///
+    /// `Err(reason)` says the target could not be handed back and may still be stopped, so the
+    /// adapter can tell the user instead of ending the session as though it had been.
+    fn release(&mut self) -> Result<(), String> {
+        Ok(())
     }
 
     /// The program's exit code once it has run to completion ([`Stop::Done`]): the entry method's
@@ -172,13 +189,15 @@ pub trait DebugBackend {
         4_096
     }
 
-    /// The variables in one scope of frame `index`. Interpreter: the frame's
-    /// arguments / locals / evaluation-stack slots. Device: locals/arguments recovered
-    /// from the AOT debug-info (register or stack-slot homes), read via memory/regs.
+    /// The variables in one scope of frame `frame`, counted as [`DebugBackend::stack`] lists the
+    /// frames, so 0 is the innermost. Interpreter: the frame's arguments / locals /
+    /// evaluation-stack slots. Device: locals/arguments recovered from the AOT debug-info
+    /// (register or stack-slot homes), read via memory/regs.
     fn variables(&self, frame: usize, scope: Scope) -> Vec<Variable>;
 
-    /// Writes a new value into the variable named `name` in one scope of frame `index`,
-    /// for DAP's `setVariable`. `value` is the new value as the user typed it; the backend
+    /// Writes a new value into the variable named `name` in one scope of frame `frame`, counted
+    /// as [`DebugBackend::stack`] lists the frames, for DAP's `setVariable`. `value` is the new
+    /// value as the user typed it; the backend
     /// parses it as the slot's existing kind (the inverse of how [`DebugBackend::variables`]
     /// rendered it). Returns the re-rendered value string on success (so the adapter can echo
     /// it back, matching the `variables` rendering), or `None` if the variable is unknown, the

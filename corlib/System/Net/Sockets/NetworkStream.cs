@@ -33,7 +33,11 @@ namespace System.Net.Sockets
         public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
         public override void SetLength(long value) { throw new NotSupportedException(); }
         public override void Flush() { }
-        public override void Close() { _socket.Close(); }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _socket.Close();
+            base.Dispose(disposing);
+        }
     }
 }
 #endif

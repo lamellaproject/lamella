@@ -98,16 +98,34 @@ namespace System
             return copy;
         }
 
-        /// <summary>Copies this span into <paramref name="destination"/>.</summary>
+        /// <summary>Copies this span into <paramref name="destination"/>. When the two overlap in
+        /// the same array, every element arrives as it was before the copy began.</summary>
         public void CopyTo(Span<T> destination)
         {
             if (destination.Length < _length)
             {
                 throw new ArgumentException();
             }
-            for (int i = 0; i < _length; i++)
+            destination.CopyFrom(_items, _start, _length);
+        }
+
+        /// <summary>Writes <paramref name="length"/> elements of <paramref name="source"/>, starting
+        /// at <paramref name="sourceStart"/>, into the start of this span. When the source is this
+        /// span's own array and begins before this span does, the elements are copied last to first,
+        /// so none is overwritten before it has been read.</summary>
+        internal void CopyFrom(T[] source, int sourceStart, int length)
+        {
+            if ((object)source == (object)_items && sourceStart < _start)
             {
-                destination[i] = _items[_start + i];
+                for (int i = length - 1; i >= 0; i--)
+                {
+                    _items[_start + i] = source[sourceStart + i];
+                }
+                return;
+            }
+            for (int i = 0; i < length; i++)
+            {
+                _items[_start + i] = source[sourceStart + i];
             }
         }
 
@@ -228,17 +246,15 @@ namespace System
             return copy;
         }
 
-        /// <summary>Copies this span into <paramref name="destination"/>.</summary>
+        /// <summary>Copies this span into <paramref name="destination"/>. When the two overlap in
+        /// the same array, every element arrives as it was before the copy began.</summary>
         public void CopyTo(Span<T> destination)
         {
             if (destination.Length < _length)
             {
                 throw new ArgumentException();
             }
-            for (int i = 0; i < _length; i++)
-            {
-                destination[i] = _items[_start + i];
-            }
+            destination.CopyFrom(_items, _start, _length);
         }
     }
 }

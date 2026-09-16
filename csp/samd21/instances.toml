@@ -104,8 +104,8 @@ irq = -1
 name = "eic"
 block = "eic"
 base = 0x40001800          # DS40001882D Figure 9-1, AHB-APB Bridge A
-gclk_core_id = 0x05        # GCLK_EIC. Needed only for filtering and synchronous sensing; asynchronous
-                           # edge detection runs without it.
+gclk_core_id = 0x05        # GCLK_EIC. Needed for the filter and for every edge sense; only level
+                           # sensing without the filter runs without it.
 apbc_bit = -1              # NOT ABSENT: PM.APBAMASK bit 6, which this record cannot express
 irq = 4                    # DS40001882D Table 11-3. ONE line for all sixteen EXTINTs; NMI is separate
                            # and is not an NVIC line at all.

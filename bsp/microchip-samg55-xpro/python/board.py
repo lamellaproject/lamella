@@ -54,6 +54,6 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led0": {"kind": "gpio-out", "port_base": 0x400E0E00, "pin": 6, "mask": 0x40, "active_low": True},
-    "button0": {"kind": "gpio-in", "port_base": 0x400E0E00, "pin": 2, "mask": 0x4, "active_low": True},
+    "led0": {"kind": "gpio-out", "port_base": 0x400E0E00, "pin": 6, "bank": 0, "mask": 0x40, "active_low": True},
+    "button0": {"kind": "gpio-in", "port_base": 0x400E0E00, "pin": 2, "bank": 0, "mask": 0x4, "active_low": True},
 }

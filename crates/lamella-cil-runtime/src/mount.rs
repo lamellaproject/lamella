@@ -137,8 +137,9 @@ pub struct MountTable {
 
 impl MountTable {
     /// Splits a path (or a mount prefix) into normalized segments: both separators accepted, empty
-    /// and `.` segments dropped, `..` popped. The root (`/`, `D:`, or empty) is the empty segment
-    /// list. A path that escapes the root is [`FsError::InvalidPath`].
+    /// and `.` segments dropped, `..` popped. `/` and the empty path give the empty segment list;
+    /// a drive prefix such as `D:` stays an ordinary segment, which is how a drive mount matches.
+    /// A path that escapes the root is [`FsError::InvalidPath`].
     fn segments(path: &str) -> FsResult<Vec<String>> {
         let mut segments: Vec<String> = Vec::new();
         for segment in path.split(['/', '\\']) {
@@ -251,9 +252,19 @@ impl MountTable {
 
     /// Resolves `path` to the longest-matching mount index and the sub-path within it (a rooted path
     /// of the remaining segments). The root mount matches everything; a deeper mount wins by matching
-    /// more leading segments. [`FsError::Io`] if no mount covers the path (not even a root).
+    /// more leading segments. A root mount whose backend answers `true` from `takes_host_paths`
+    /// receives `path` exactly as written instead, including a path that climbs above its starting
+    /// directory. [`FsError::Io`] if no mount covers the path (not even a root).
     fn resolve(&self, path: &str) -> FsResult<(usize, String)> {
-        let segments = Self::segments(path)?;
+        let segments = match Self::segments(path) {
+            Ok(segments) => segments,
+            Err(error) => {
+                return self
+                    .host_root()
+                    .map(|index| (index, String::from(path)))
+                    .ok_or(error);
+            }
+        };
         let mut best: Option<(usize, usize)> = None;
         for (index, slot) in self.mounts.iter().enumerate() {
             let Some(mount) = slot else { continue };
@@ -266,9 +277,20 @@ impl MountTable {
             }
         }
         let (index, plen) = best.ok_or(FsError::Io)?;
+        if plen == 0 && self.host_root() == Some(index) {
+            return Ok((index, String::from(path)));
+        }
         let mut sub = String::from("/");
         sub.push_str(&segments[plen..].join("/"));
         Ok((index, sub))
+    }
+
+    /// The index of the root mount, when its backend takes host paths.
+    fn host_root(&self) -> Option<usize> {
+        self.mounts.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|mount| mount.segments.is_empty() && mount.backend.takes_host_paths())
+        })
     }
 
     /// The backend at `mount`, or [`FsError::Io`] if that slot was unmounted (a stale handle).
@@ -422,10 +444,14 @@ mod tests {
         tag: u8,
         total: u64,
         can_format: bool,
+        host_paths: bool,
         last_path: alloc::rc::Rc<core::cell::RefCell<String>>,
     }
 
     impl FsBackend for RecordingFs {
+        fn takes_host_paths(&self) -> bool {
+            self.host_paths
+        }
         fn open(&mut self, path: &str, _m: FileMode, _a: FileAccess) -> FsResult<FileHandle> {
             *self.last_path.borrow_mut() = String::from(path);
             Ok(u32::from(self.tag))
@@ -546,6 +572,40 @@ mod tests {
         table.mount("/", Box::new(recorder(1).0)).unwrap();
         assert!(!table.is_empty());
         assert!(table.file_exists("/anything/at/all.txt"));
+    }
+
+    #[test]
+    fn a_root_backend_that_takes_host_paths_sees_each_path_as_written() {
+        let mut table = MountTable::default();
+        let host_path = alloc::rc::Rc::new(core::cell::RefCell::new(String::new()));
+        let host = RecordingFs {
+            tag: 1,
+            host_paths: true,
+            last_path: host_path.clone(),
+            ..Default::default()
+        };
+        let (sd, sd_path) = recorder(2);
+        table.mount("/", Box::new(host)).unwrap();
+        table.mount("/sd", Box::new(sd)).unwrap();
+        for path in [
+            "notes.txt",
+            "logs/../notes.txt",
+            "../up.txt",
+            "F:/data/log.txt",
+            "C:\\data\\log.txt",
+            "/var/log.txt",
+        ] {
+            assert!(table.file_exists(path), "{path}");
+            assert_eq!(*host_path.borrow(), path);
+        }
+        assert!(table.file_exists("/sd/log.txt"));
+        assert_eq!(*sd_path.borrow(), "/log.txt");
+
+        let mut volume = MountTable::default();
+        let (root, root_path) = recorder(3);
+        volume.mount("/", Box::new(root)).unwrap();
+        assert!(volume.file_exists("logs/../notes.txt"));
+        assert_eq!(*root_path.borrow(), "/notes.txt");
     }
 
     #[test]

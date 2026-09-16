@@ -112,10 +112,10 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "cyw43439-wl-reg-on": {"port_base": 0xD0000000, "pin": 23, "mask": 0x800000, "active_low": False},
-    "cyw43439-data": {"port_base": 0xD0000000, "pin": 24, "mask": 0x1000000},
-    "cyw43439-cs": {"port_base": 0xD0000000, "pin": 25, "mask": 0x2000000, "active_low": True},
-    "cyw43439-clk": {"port_base": 0xD0000000, "pin": 29, "mask": 0x20000000},
+    "cyw43439-wl-reg-on": {"port_base": 0xD0000000, "pin": 23, "bank": 0, "mask": 0x800000, "active_low": False},
+    "cyw43439-data": {"port_base": 0xD0000000, "pin": 24, "bank": 0, "mask": 0x1000000},
+    "cyw43439-cs": {"port_base": 0xD0000000, "pin": 25, "bank": 0, "mask": 0x2000000, "active_low": True},
+    "cyw43439-clk": {"port_base": 0xD0000000, "pin": 29, "bank": 0, "mask": 0x20000000},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until

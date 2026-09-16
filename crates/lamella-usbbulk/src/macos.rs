@@ -93,7 +93,29 @@ struct IOUSBDeviceInterface500 {
     DeviceRequest: *const c_void,
     DeviceRequestAsync: *const c_void,
     CreateInterfaceIterator: extern "C" fn(*mut c_void, *const IOUSBFindInterfaceRequest, *mut io_iterator_t) -> IOReturn,
+    USBDeviceOpenSeize: *const c_void,
+    DeviceRequestTO: extern "C" fn(*mut c_void, *mut IOUSBDevRequestTO) -> IOReturn,
 }
+
+/// `IOUSBDevRequestTO` from IOUSBFamily's `USB.h`: a control request with its two timeouts, in
+/// milliseconds. The header declares it outside its `#pragma pack(1)` regions, so each field sits
+/// at its natural alignment.
+#[repr(C)]
+struct IOUSBDevRequestTO {
+    bmRequestType: u8,
+    bRequest: u8,
+    wValue: u16,
+    wIndex: u16,
+    wLength: u16,
+    pData: *mut c_void,
+    wLenDone: u32,
+    noDataTimeout: u32,
+    completionTimeout: u32,
+}
+
+const kIOReturnTimeout: IOReturn = 0xe000_02d6_u32 as IOReturn;
+const kIOUSBTransactionTimeout: IOReturn = 0xe000_4051_u32 as IOReturn;
+const kIOUSBPipeStalled: IOReturn = 0xe000_404f_u32 as IOReturn;
 
 #[repr(C)]
 struct IOUSBInterfaceInterface500 {
@@ -164,8 +186,6 @@ unsafe extern "C" {
     fn IORegistryEntryGetChildIterator(entry: io_object_t, plane: *const c_char, iterator: *mut io_iterator_t) -> kern_return_t;
 }
 
-/// Read a string property (`"USB Serial Number"`, `"USB Product Name"`) from a device's IORegistry entry,
-/// without opening the device. `None` if absent, empty, or not a string.
 /// One NUMERIC IORegistry property of a device entry -- `idVendor`, `idProduct`, `bInterfaceClass`.
 ///
 /// The kernel publishes these when the device enumerates, so reading them costs no user client and
@@ -224,6 +244,8 @@ unsafe fn has_vendor_iface_registry(svc: io_object_t) -> Option<(bool, Option<St
     saw_any.then_some((vendor, name))
 }
 
+/// Read a string property (`"USB Serial Number"`, `"USB Product Name"`) from a device's IORegistry entry,
+/// without opening the device. `None` if absent, empty, or not a string.
 unsafe fn registry_string(entry: io_object_t, key: &str) -> Option<String> {
     let key_c = std::ffi::CString::new(key).ok()?;
     let cf_key = CFStringCreateWithCString(null(), key_c.as_ptr(), kCFStringEncodingUTF8);
@@ -268,11 +290,11 @@ impl Device {
         format!("endpoints in {:#04x} out {:#04x}", self.ep_in, self.ep_out)
     }
 
-    /// The bulk endpoint addresses negotiated at open time, as `(in, out)`.
+    /// The bulk pipe reference numbers negotiated at open time, as `(in, out)`.
     ///
-    /// Exposed because probing endpoints blindly is not a viable diagnostic: reading an endpoint a
-    /// device does not have can block rather than fail, so a tool that needs to know which pipes
-    /// exist must ask instead of sweep.
+    /// **These are indices, not endpoint addresses.** IOUSBLib addresses a pipe by a 1-based
+    /// reference number, so an interface whose IN endpoint is `0x81` and OUT endpoint is `0x01`
+    /// reports `(1, 2)`. See [`crate::Device::endpoints`] for what a caller may assume.
     pub fn endpoints(&self) -> (u8, u8) {
         (self.ep_in, self.ep_out)
     }
@@ -506,11 +528,7 @@ unsafe fn try_device(
         ((**dev).Release)(dev as *mut c_void);
         return None;
     }
-    let mut current: u8 = 0;
-    let known = ((**dev).GetConfiguration)(dev as *mut c_void, &mut current) == kIOReturnSuccess;
-    if !known || current != 1 {
-        ((**dev).SetConfiguration)(dev as *mut c_void, 1);
-    }
+    configure_once(dev);
 
     match open_vendor_interface(dev, plugin_id, intf_user, intf_iid) {
         Some((intf, ep_in, ep_out, pipes)) => Some(Device { dev, intf, ep_in, ep_out, pipes }),
@@ -644,4 +662,290 @@ pub fn diagnose(_interface_guid: &str, vendor_id: u16, product_id: u16) -> Resul
         .into_iter()
         .any(|device| device.vendor_id == vendor_id && device.product_id == product_id);
     Ok(if present { Binding::Bound } else { Binding::Absent })
+}
+
+/// The device user client for the device behind `svc`, or `None` where one cannot be created.
+/// Creating it opens nothing.
+unsafe fn device_interface(
+    svc: io_service_t,
+    plugin_id: CFUUIDRef,
+    dev_user: CFUUIDRef,
+    dev_iid: CFUUIDBytes,
+) -> Option<*mut *mut IOUSBDeviceInterface500> {
+    let mut plugin: *mut *mut IOCFPlugInInterface = null_mut();
+    let mut score = 0i32;
+    if IOCreatePlugInInterfaceForService(svc, dev_user, plugin_id, &mut plugin, &mut score) != kIOReturnSuccess || plugin.is_null() {
+        return None;
+    }
+    let mut raw: *mut c_void = null_mut();
+    ((**plugin).QueryInterface)(plugin as *mut c_void, dev_iid, &mut raw);
+    IODestroyPlugInInterface(plugin);
+    let dev = raw as *mut *mut IOUSBDeviceInterface500;
+    (!dev.is_null()).then_some(dev)
+}
+
+/// Selects configuration 1 unless the device already has it.
+///
+unsafe fn configure_once(dev: *mut *mut IOUSBDeviceInterface500) {
+    let mut current: u8 = 0;
+    let known = ((**dev).GetConfiguration)(dev as *mut c_void, &mut current) == kIOReturnSuccess;
+    if !known || current != 1 {
+        ((**dev).SetConfiguration)(dev as *mut c_void, 1);
+    }
+}
+
+/// The first interface of `class` in the device's first configuration descriptor, as its number and
+/// string index.
+unsafe fn configuration_interface(
+    dev: *mut *mut IOUSBDeviceInterface500,
+    class: crate::InterfaceClass,
+) -> Option<(u8, u8)> {
+    let mut desc: *const u8 = null();
+    if ((**dev).GetConfigurationDescriptorPtr)(dev as *mut c_void, 0, &mut desc) != kIOReturnSuccess || desc.is_null() {
+        return None;
+    }
+    let total = usize::from(u16::from_le_bytes([*desc.add(2), *desc.add(3)]));
+    crate::interface_of_class(std::slice::from_raw_parts(desc, total), class)
+}
+
+/// The first interface entry of the device behind `svc` in the IORegistry whose class is `class`, as
+/// its number and name. `None` when no interface entry published a class at all: the registry did
+/// not say, which is not a no.
+unsafe fn registry_interface(
+    svc: io_object_t,
+    class: crate::InterfaceClass,
+) -> Option<Option<(u8, Option<String>)>> {
+    let plane = std::ffi::CString::new("IOService").ok()?;
+    let mut iter: io_iterator_t = 0;
+    if IORegistryEntryGetChildIterator(svc, plane.as_ptr(), &mut iter) != kIOReturnSuccess {
+        return None;
+    }
+    let mut saw_any = false;
+    let mut found = None;
+    loop {
+        let child = IOIteratorNext(iter);
+        if child == 0 {
+            break;
+        }
+        if let Some(interface_class) = registry_u16(child, "bInterfaceClass") {
+            saw_any = true;
+            if found.is_none()
+                && interface_class == u16::from(class.class)
+                && registry_u16(child, "bInterfaceSubClass") == Some(u16::from(class.subclass))
+                && registry_u16(child, "bInterfaceProtocol") == Some(u16::from(class.protocol))
+            {
+                found = registry_u16(child, "bInterfaceNumber")
+                    .and_then(|number| u8::try_from(number).ok())
+                    .map(|number| (number, registry_string(child, "kUSBString")));
+            }
+        }
+        IOObjectRelease(child);
+    }
+    IOObjectRelease(iter);
+    saw_any.then_some(found)
+}
+
+/// What [`crate::enumerate_class`] lists for the device behind `svc`, or `None` when it has no
+/// interface of `class`.
+unsafe fn class_interface_info(
+    svc: io_service_t,
+    class: crate::InterfaceClass,
+    plugin_id: CFUUIDRef,
+    dev_user: CFUUIDRef,
+    dev_iid: CFUUIDBytes,
+) -> Option<crate::InterfaceInfo> {
+    let published = (
+        registry_u16(svc, "idVendor"),
+        registry_u16(svc, "idProduct"),
+        registry_interface(svc, class),
+    );
+    let (vendor_id, product_id, interface_number, interface_name) = match published {
+        (Some(vendor_id), Some(product_id), Some(found)) => {
+            let (number, name) = found?;
+            (vendor_id, product_id, number, name)
+        }
+        _ => {
+            let dev = device_interface(svc, plugin_id, dev_user, dev_iid)?;
+            let mut vendor_id: u16 = 0;
+            ((**dev).GetDeviceVendor)(dev as *mut c_void, &mut vendor_id);
+            let mut product_id: u16 = 0;
+            ((**dev).GetDeviceProduct)(dev as *mut c_void, &mut product_id);
+            let found = configuration_interface(dev, class);
+            ((**dev).Release)(dev as *mut c_void);
+            (vendor_id, product_id, found?.0, None)
+        }
+    };
+    Some(crate::InterfaceInfo {
+        vendor_id,
+        product_id,
+        serial_number: registry_string(svc, "USB Serial Number"),
+        product: registry_string(svc, "USB Product Name"),
+        interface_number,
+        interface_name,
+    })
+}
+
+/// See [`crate::enumerate_class`].
+pub fn enumerate_class(class: crate::InterfaceClass) -> Result<Vec<crate::InterfaceInfo>> {
+    let mut out = Vec::new();
+    unsafe {
+        let plugin_id = cfuuid(&ID_CFPLUGIN);
+        let dev_user = cfuuid(&ID_DEV_USERCLIENT);
+        let dev_iid = CFUUIDBytes { b: ID_DEV_IFACE500 };
+        for service_class in ["IOUSBHostDevice\0", "IOUSBDevice\0"] {
+            let matching = IOServiceMatching(service_class.as_ptr() as *const c_char);
+            if matching.is_null() {
+                continue;
+            }
+            let mut iter: io_iterator_t = 0;
+            if IOServiceGetMatchingServices(0, matching, &mut iter) != kIOReturnSuccess {
+                continue;
+            }
+            loop {
+                let svc = IOIteratorNext(iter);
+                if svc == 0 {
+                    break;
+                }
+                if let Some(info) = class_interface_info(svc, class, plugin_id, dev_user, dev_iid) {
+                    out.push(info);
+                }
+                IOObjectRelease(svc);
+            }
+            IOObjectRelease(iter);
+            if !out.is_empty() {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// An opened device, one of whose interfaces is driven through the default control pipe by
+/// `DeviceRequestTO`.
+pub struct ControlInterface {
+    dev: *mut *mut IOUSBDeviceInterface500,
+    interface: u8,
+}
+
+impl ControlInterface {
+    /// See [`crate::ControlInterface::open`].
+    pub fn open(
+        vendor_id: u16,
+        product_id: u16,
+        serial: Option<&str>,
+        class: crate::InterfaceClass,
+    ) -> Result<Self> {
+        unsafe {
+            let plugin_id = cfuuid(&ID_CFPLUGIN);
+            let dev_user = cfuuid(&ID_DEV_USERCLIENT);
+            let dev_iid = CFUUIDBytes { b: ID_DEV_IFACE500 };
+            for service_class in ["IOUSBHostDevice\0", "IOUSBDevice\0"] {
+                let matching = IOServiceMatching(service_class.as_ptr() as *const c_char);
+                if matching.is_null() {
+                    continue;
+                }
+                let mut iter: io_iterator_t = 0;
+                if IOServiceGetMatchingServices(0, matching, &mut iter) != kIOReturnSuccess {
+                    continue;
+                }
+                loop {
+                    let svc = IOIteratorNext(iter);
+                    if svc == 0 {
+                        break;
+                    }
+                    let reported = registry_string(svc, "USB Serial Number");
+                    let opened = if crate::serial_is(serial, reported.as_deref()) {
+                        open_control_interface(svc, plugin_id, dev_user, dev_iid, vendor_id, product_id, class)
+                    } else {
+                        None
+                    };
+                    IOObjectRelease(svc);
+                    if let Some(opened) = opened {
+                        IOObjectRelease(iter);
+                        return Ok(opened);
+                    }
+                }
+                IOObjectRelease(iter);
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    /// See [`crate::ControlInterface::interface_number`].
+    pub fn interface_number(&self) -> u8 {
+        self.interface
+    }
+
+    /// See [`crate::ControlInterface::control_in`].
+    pub fn control_in(&mut self, setup: crate::Setup, buffer: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        self.request(setup, buffer.as_mut_ptr().cast(), timeout_ms)
+    }
+
+    /// See [`crate::ControlInterface::control_out`].
+    pub fn control_out(&mut self, setup: crate::Setup, data: &[u8], timeout_ms: u32) -> Result<usize> {
+        self.request(setup, data.as_ptr().cast_mut().cast(), timeout_ms)
+    }
+
+    /// One `DeviceRequestTO`, whose `wLenDone` is the number of bytes transferred (`USB.h`).
+    fn request(&mut self, setup: crate::Setup, data: *mut c_void, timeout_ms: u32) -> Result<usize> {
+        let mut request = IOUSBDevRequestTO {
+            bmRequestType: setup.request_type,
+            bRequest: setup.request,
+            wValue: setup.value,
+            wIndex: setup.index,
+            wLength: setup.length,
+            pData: data,
+            wLenDone: 0,
+            noDataTimeout: timeout_ms,
+            completionTimeout: timeout_ms,
+        };
+        let status = unsafe { ((**self.dev).DeviceRequestTO)(self.dev as *mut c_void, &mut request) };
+        if status == kIOReturnSuccess {
+            Ok(request.wLenDone as usize)
+        } else if status == kIOReturnTimeout || status == kIOUSBTransactionTimeout {
+            Err(Error::Timeout)
+        } else if status == kIOUSBPipeStalled {
+            Err(crate::stalled(setup))
+        } else {
+            Err(Error::Os(format!("DeviceRequestTO returned {:#010x}", status as u32)))
+        }
+    }
+}
+
+impl Drop for ControlInterface {
+    fn drop(&mut self) {
+        unsafe {
+            ((**self.dev).USBDeviceClose)(self.dev as *mut c_void);
+            ((**self.dev).Release)(self.dev as *mut c_void);
+        }
+    }
+}
+
+/// Opens the device behind `svc` for `DeviceRequestTO`, configured, if it is `vendor_id` and
+/// `product_id` and has an interface of `class`.
+unsafe fn open_control_interface(
+    svc: io_service_t,
+    plugin_id: CFUUIDRef,
+    dev_user: CFUUIDRef,
+    dev_iid: CFUUIDBytes,
+    vendor_id: u16,
+    product_id: u16,
+    class: crate::InterfaceClass,
+) -> Option<ControlInterface> {
+    let dev = device_interface(svc, plugin_id, dev_user, dev_iid)?;
+    let mut vid: u16 = 0;
+    ((**dev).GetDeviceVendor)(dev as *mut c_void, &mut vid);
+    let mut pid: u16 = 0;
+    ((**dev).GetDeviceProduct)(dev as *mut c_void, &mut pid);
+    let found = if vid == vendor_id && pid == product_id { configuration_interface(dev, class) } else { None };
+    let Some((interface, _)) = found else {
+        ((**dev).Release)(dev as *mut c_void);
+        return None;
+    };
+    if ((**dev).USBDeviceOpen)(dev as *mut c_void) != kIOReturnSuccess {
+        ((**dev).Release)(dev as *mut c_void);
+        return None;
+    }
+    configure_once(dev);
+    Some(ControlInterface { dev, interface })
 }

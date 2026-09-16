@@ -3,7 +3,9 @@
 //! Code -- can debug AOT-compiled code running on real hardware, the same protocol layer
 //! that drives the interpreter.
 
+mod innermost;
 pub mod program;
+mod thumb;
 
 /// Whether a client's document names the file a row recorded.
 ///
@@ -57,14 +59,11 @@ pub struct LineRow {
 /// take `&self` (suited to the interpreter's in-memory state), so the probe sits behind a
 /// `RefCell` for the I/O those methods must perform.
 ///
-/// **GENERIC OVER [`TargetAccess`], NOT OVER ONE PROBE'S PACKET TRANSPORT.** Holding a
-/// concrete `Dap<T>`, which pinned native debugging to CMSIS-DAP even though a probe-neutral
-/// abstraction already existed and `lamella_stlink::StLink` already implemented it. The whole
-/// surface used here is SEVEN methods -- `connect`, `read_word`, `read_core_reg`, `step`,
-/// `set_breakpoints`, `is_halted`, `halt` -- and every one is on `TargetAccess`, so the narrower
-/// bound bought nothing and cost every non-CMSIS-DAP probe. (`connect` is the one an earlier
-/// count of this list missed; `launch` calls it, so a reader checking the surface against the
-/// code would have found six where seven are reached.)
+/// **GENERIC OVER [`TargetAccess`], NOT OVER ONE PROBE'S PACKET TRANSPORT.** The surface it uses is
+/// twelve methods -- `connect`, `init_mem`, `read_idcode`, `read_word`, `write_word`,
+/// `read_core_reg`, `write_core_reg`, `step`, `resume`, `halt`, `is_halted` and
+/// `set_breakpoints` -- and every one is on `TargetAccess`. Any probe implementing that trait
+/// drives this backend: CMSIS-DAP and `lamella_stlink::StLink` alike.
 pub struct DeviceBackend<A: TargetAccess> {
     probe: RefCell<A>,
     /// The source map for the loaded program, ascending by offset.
@@ -80,6 +79,9 @@ pub struct DeviceBackend<A: TargetAccess> {
     /// The user's hardware breakpoints (the code addresses last set), kept so a step-over can
     /// re-arm them around its temporary return-address breakpoint.
     breakpoints: Vec<u32>,
+    /// How many instruction address comparators the target's breakpoint unit reports, read from
+    /// `FP_CTRL` at launch. `None` before launch, and when that read fails.
+    comparators: Option<usize>,
     /// The entry method's `Type.Method` name. Stepping out of it means "continue" -- the entry
     /// has no caller within the program (its return is the startup trampoline), so there is no
     /// frame to return to.
@@ -95,6 +97,10 @@ pub struct DeviceBackend<A: TargetAccess> {
     /// [`Self::with_locals`] is called, and then a session reports no variables -- which is what it
     /// did before there was a reader for them.
     locals: crate::program::LocalSections,
+    /// The image's Arm exception-handling tables, consulted for a frame `.debug_frame` has no row
+    /// for. Empty until [`Self::with_unwind_tables`] is called, and then such a frame ends the walk
+    /// -- which is what it did before there was a reader for them.
+    unwind: crate::program::UnwindTables,
 }
 
 impl<A: TargetAccess> DeviceBackend<A> {
@@ -118,9 +124,11 @@ impl<A: TargetAccess> DeviceBackend<A> {
             files,
             output: String::new(),
             breakpoints: Vec::new(),
+            comparators: None,
             entry,
             frame_section,
             locals: crate::program::LocalSections::default(),
+            unwind: crate::program::UnwindTables::default(),
         }
     }
 
@@ -131,20 +139,18 @@ impl<A: TargetAccess> DeviceBackend<A> {
     /// which is the caller's stack pointer by definition. Computing it here rather than twice is
     /// what stops a variables pane and a call stack disagreeing about where a frame is.
     fn walk_frames(&self) -> Vec<(Frame, u32)> {
-        let (pc, sp, lr) = {
-            let mut probe = self.probe.borrow_mut();
-            (
-                probe.read_core_reg(15).unwrap_or(0),
-                probe.read_core_reg(13).unwrap_or(0),
-                probe.read_core_reg(14).unwrap_or(0),
-            )
-        };
+        let live = self.live_registers();
         let mut sections = lamella_dwarf::Sections::default();
         sections.set(".debug_frame", &self.frame_section);
         let frames = lamella_dwarf::FrameTable::parse(&sections).ok();
 
         let mut out = Vec::new();
-        let (mut pc, mut sp, mut lr) = (pc, sp, lr);
+        let (mut pc, mut sp, mut lr) = (
+            live[15].unwrap_or(0),
+            live[13].unwrap_or(0),
+            live[14].unwrap_or(0),
+        );
+        let mut registers = live;
         for depth in 0..32u32 {
             let lookup = if depth == 0 { pc } else { pc.saturating_sub(1) };
             let offset = lookup.saturating_sub(self.base);
@@ -157,81 +163,17 @@ impl<A: TargetAccess> DeviceBackend<A> {
                 sp,
             ));
 
-            let Some(table) = frames.as_ref() else {
-                break;
-            };
-            let Ok(Some(rules)) = table.unwind(u64::from(lookup)) else {
-                break;
-            };
-            if rules.truncated_at.is_some() {
-                break;
-            }
-            if !rules.describes_a_possible_frame(SP_DWARF_REGISTER) {
-                break;
-            }
-            let lamella_dwarf::CfaRule::RegisterOffset { register, offset } = rules.cfa else {
-                break;
-            };
-            let cfa_base = match register {
-                13 => sp,
-                14 => lr,
-                15 => pc,
-                other => {
-                    let Ok(other) = u8::try_from(other) else {
-                        break;
-                    };
-                    match self.probe.borrow_mut().read_core_reg(other) {
-                        Ok(value) if depth == 0 => value,
-                        _ => break,
-                    }
+            let row = frames.as_ref().map(|table| table.unwind(u64::from(lookup)));
+            let caller = match row {
+                Some(Ok(Some(rules))) => {
+                    registers = [None; 16];
+                    self.caller_from_frame_table(&rules, depth, pc, sp, lr)
                 }
+                Some(Err(_)) => None,
+                Some(Ok(None)) | None => self.caller_from_index_table(depth, lookup, &mut registers),
             };
-            let Ok(offset) = i32::try_from(offset) else {
+            let Some((return_address, cfa)) = caller else {
                 break;
-            };
-            let Some(cfa) = cfa_base.checked_add_signed(offset) else {
-                break;
-            };
-
-            let return_address = match rules.return_address() {
-                lamella_dwarf::RegisterRule::Undefined if depth > 0 => break,
-                lamella_dwarf::RegisterRule::Undefined
-                | lamella_dwarf::RegisterRule::SameValue => {
-                    let (start, end) = rules.function;
-                    let candidate = u64::from(lr & !1);
-                    if candidate >= start && candidate < end {
-                        break;
-                    }
-                    if !self.follows_a_call(lr & !1) {
-                        break;
-                    }
-                    lr
-                }
-                lamella_dwarf::RegisterRule::Offset(at) => {
-                    let Ok(at) = i32::try_from(at) else {
-                        break;
-                    };
-                    let Some(address) = cfa.checked_add_signed(at) else {
-                        break;
-                    };
-                    let bytes = self.read_memory(u64::from(address), 4);
-                    if bytes.len() < 4 {
-                        break;
-                    }
-                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                }
-                lamella_dwarf::RegisterRule::Register(number) => {
-                    let Ok(number) = u8::try_from(number) else {
-                        break;
-                    };
-                    match self.probe.borrow_mut().read_core_reg(number) {
-                        Ok(value) if depth == 0 => value,
-                        _ => break,
-                    }
-                }
-                lamella_dwarf::RegisterRule::ValOffset(_)
-                | lamella_dwarf::RegisterRule::Expression(_)
-                | lamella_dwarf::RegisterRule::ValExpression(_) => break,
             };
 
             let next = return_address & !1;
@@ -241,8 +183,168 @@ impl<A: TargetAccess> DeviceBackend<A> {
             lr = return_address;
             pc = next;
             sp = cfa;
+            registers[13] = Some(cfa);
+            registers[14] = Some(return_address);
+            registers[15] = Some(next);
         }
         out
+    }
+
+    /// The caller of the frame at `pc` from its `.debug_frame` row: the return address, and the
+    /// caller's stack pointer, which is the row's canonical frame address.
+    fn caller_from_frame_table(
+        &self,
+        rules: &lamella_dwarf::UnwindRow<'_>,
+        depth: u32,
+        pc: u32,
+        sp: u32,
+        lr: u32,
+    ) -> Option<(u32, u32)> {
+        if rules.truncated_at.is_some() {
+            return None;
+        }
+        if !rules.describes_a_possible_frame(SP_DWARF_REGISTER) {
+            return None;
+        }
+        let lamella_dwarf::CfaRule::RegisterOffset { register, offset } = rules.cfa else {
+            return None;
+        };
+        let cfa_base = match register {
+            13 => sp,
+            14 => lr,
+            15 => pc,
+            other => {
+                let other = u8::try_from(other).ok()?;
+                match self.probe.borrow_mut().read_core_reg(other) {
+                    Ok(value) if depth == 0 => value,
+                    _ => return None,
+                }
+            }
+        };
+        let cfa = cfa_base.checked_add_signed(i32::try_from(offset).ok()?)?;
+
+        let return_address = match rules.return_address() {
+            lamella_dwarf::RegisterRule::Undefined if depth > 0 => return None,
+            lamella_dwarf::RegisterRule::Undefined | lamella_dwarf::RegisterRule::SameValue => {
+                let (start, end) = rules.function;
+                let candidate = u64::from(lr & !1);
+                if candidate >= start && candidate < end {
+                    return None;
+                }
+                if !self.follows_a_call(lr & !1) {
+                    return None;
+                }
+                lr
+            }
+            lamella_dwarf::RegisterRule::Offset(at) => {
+                let address = cfa.checked_add_signed(i32::try_from(at).ok()?)?;
+                let bytes = self.read_memory(u64::from(address), 4);
+                if bytes.len() < 4 {
+                    return None;
+                }
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
+            lamella_dwarf::RegisterRule::Register(number) => {
+                let number = u8::try_from(number).ok()?;
+                match self.probe.borrow_mut().read_core_reg(number) {
+                    Ok(value) if depth == 0 => value,
+                    _ => return None,
+                }
+            }
+            lamella_dwarf::RegisterRule::ValOffset(_)
+            | lamella_dwarf::RegisterRule::Expression(_)
+            | lamella_dwarf::RegisterRule::ValExpression(_) => return None,
+        };
+        Some((return_address, cfa))
+    }
+
+    /// The caller of the frame at `lookup` from the image's index tables, where `.debug_frame` has no
+    /// row for its function: the return address, and the caller's stack pointer.
+    ///
+    /// `registers` are that frame's registers as far as the walk knows them; on success they become
+    /// the caller's.
+    fn caller_from_index_table(
+        &self,
+        depth: u32,
+        lookup: u32,
+        registers: &mut lamella_elf::ehabi::Registers,
+    ) -> Option<(u32, u32)> {
+        let described = self.unwind.describe(lookup)?;
+        let mut caller = *registers;
+        if depth == 0 {
+            let xpsr = self.probe.borrow_mut().read_core_reg(16).ok()?;
+            let placement = crate::innermost::place(
+                described.entry.function,
+                registers,
+                xpsr,
+                &described.description,
+                |address| self.halfword(address),
+                |address| self.probe.borrow_mut().read_word(address).ok(),
+            );
+            match placement {
+                crate::innermost::Placement::Caller(placed) => caller = placed,
+                crate::innermost::Placement::Body => {
+                    self.unwind_through(&described.description, &mut caller)?;
+                }
+                crate::innermost::Placement::Undecided => return None,
+            }
+        } else {
+            self.unwind_through(&described.description, &mut caller)?;
+        }
+        let return_address = caller[15]?;
+        let caller_stack_pointer = caller[13]?;
+        if !self.follows_a_call(return_address & !1) {
+            return None;
+        }
+        *registers = caller;
+        Some((return_address, caller_stack_pointer))
+    }
+
+    /// Runs an index entry's `description` over `registers`, reading the stack through the probe.
+    ///
+    /// A register a called function need not preserve is unknown afterwards unless the frame restored
+    /// it: the value left in it belongs to the callee.
+    fn unwind_through(
+        &self,
+        description: &lamella_elf::ehabi::Description,
+        registers: &mut lamella_elf::ehabi::Registers,
+    ) -> Option<()> {
+        let restored = lamella_elf::ehabi::unwind(description, registers, |address| {
+            self.probe.borrow_mut().read_word(address).ok()
+        })
+        .ok()?;
+        for register in crate::innermost::NOT_PRESERVED {
+            if restored & (1 << register) == 0 {
+                registers[register] = None;
+            }
+        }
+        Some(())
+    }
+
+    /// The halted core's registers, r0 to r15, each `None` where the probe could not read it.
+    ///
+    /// For an image with no index tables only the stack pointer, the link register and the program
+    /// counter are read, because nothing else is used and each read is a round trip to the probe.
+    fn live_registers(&self) -> lamella_elf::ehabi::Registers {
+        let mut registers = [None; 16];
+        let mut probe = self.probe.borrow_mut();
+        for (number, register) in (0u8..).zip(registers.iter_mut()) {
+            if number < 13 && self.unwind.is_empty() {
+                continue;
+            }
+            *register = probe.read_core_reg(number).ok();
+        }
+        registers
+    }
+
+    /// The Thumb halfword at `address`, read through the whole word that contains it.
+    ///
+    /// **A WORD IS ONLY EVER ASKED FOR AT A MULTIPLE OF FOUR.** A Thumb instruction starts at any
+    /// even address, and reading a word at one that is not aligned would make the answer depend on
+    /// what each probe does with an address between two words.
+    fn halfword(&self, address: u32) -> Option<u16> {
+        let word = self.probe.borrow_mut().read_word(address & !3).ok()?;
+        Some(if address & 2 != 0 { (word >> 16) as u16 } else { word as u16 })
     }
 
     /// The stack pointer frame `index` had, which is what its locals' frame offsets count from.
@@ -347,6 +449,14 @@ impl<A: TargetAccess> DeviceBackend<A> {
         self
     }
 
+    /// Gives the walk the image's Arm exception-handling tables, for the frames `.debug_frame` does
+    /// not describe.
+    #[must_use]
+    pub fn with_unwind_tables(mut self, unwind: crate::program::UnwindTables) -> Self {
+        self.unwind = unwind;
+        self
+    }
+
     /// The 1-based source line whose native code contains `offset` (the last entry at or
     /// before it), or 0 if unknown.
     fn source_line_at(&self, offset: u32) -> u32 {
@@ -366,10 +476,7 @@ impl<A: TargetAccess> DeviceBackend<A> {
     /// end before it. Measured on a Swift image: 15 names over 1,524 bytes of code, so a stop in
     /// the SERCOM driver reported itself in `appMain`.
     fn method_name_at(&self, offset: u32) -> String {
-        self.names
-            .iter()
-            .rev()
-            .find(|&&(start, end, _)| start <= offset && offset < end)
+        program::name_containing(&self.names, offset)
             .map_or_else(|| String::from("?"), |(_, _, name)| name.clone())
     }
 
@@ -386,15 +493,10 @@ impl<A: TargetAccess> DeviceBackend<A> {
     /// A read that fails answers false: an address whose memory the probe cannot reach is not one
     /// to build a frame on.
     fn follows_a_call(&self, address: u32) -> bool {
-        let Some(base) = address.checked_sub(4) else {
+        let halfword = |back: u32| address.checked_sub(back).and_then(|at| self.halfword(at));
+        let (Some(first), Some(second)) = (halfword(4), halfword(2)) else {
             return false;
         };
-        let bytes = self.read_memory(u64::from(base), 4);
-        if bytes.len() < 4 {
-            return false;
-        }
-        let first = u16::from_le_bytes([bytes[0], bytes[1]]);
-        let second = u16::from_le_bytes([bytes[2], bytes[3]]);
         let bl = (first & 0xF800) == 0xF000 && (second & 0xD000) == 0xD000;
         let blx = (second & 0xFF80) == 0x4780;
         bl || blx
@@ -454,29 +556,30 @@ impl<A: TargetAccess> DeviceBackend<A> {
     /// the duration misses nothing; else single-step with a bound (never hanging), stopping on any
     /// user breakpoint (never missing).
     fn run_to_address(&mut self, target: u32) -> Stop {
-        let armed: Option<Vec<u32>> =
-            if self.breakpoints.len() < 4 || self.breakpoints.contains(&target) {
-                let mut a = self.breakpoints.clone();
-                if !a.contains(&target) {
-                    a.push(target);
-                }
-                Some(a)
-            } else {
-                let call_line =
-                    self.source_line_at(target.saturating_sub(self.base).saturating_sub(4));
-                let borrow = (call_line != 0)
-                    .then(|| {
-                        self.breakpoints.iter().position(|&bp| {
-                            self.source_line_at(bp.saturating_sub(self.base)) == call_line
-                        })
+        let free = self
+            .comparators
+            .is_some_and(|count| self.breakpoints.len() < count);
+        let armed: Option<Vec<u32>> = if free || self.breakpoints.contains(&target) {
+            let mut a = self.breakpoints.clone();
+            if !a.contains(&target) {
+                a.push(target);
+            }
+            Some(a)
+        } else {
+            let call_line = self.source_line_at(target.saturating_sub(self.base).saturating_sub(4));
+            let borrow = (call_line != 0)
+                .then(|| {
+                    self.breakpoints.iter().position(|&bp| {
+                        self.source_line_at(bp.saturating_sub(self.base)) == call_line
                     })
-                    .flatten();
-                borrow.map(|index| {
-                    let mut a = self.breakpoints.clone();
-                    a[index] = target;
-                    a
                 })
-            };
+                .flatten();
+            borrow.map(|index| {
+                let mut a = self.breakpoints.clone();
+                a[index] = target;
+                a
+            })
+        };
 
         if let Some(armed) = armed {
             let probe = self.probe.get_mut();
@@ -540,12 +643,7 @@ impl<A: TargetAccess> DeviceBackend<A> {
     /// prologue is not that shape (e.g. a leaf that never saved LR), so the caller can fall back.
     fn frame_return_address(&mut self, pc: u32) -> Option<u32> {
         let off = pc.saturating_sub(self.base);
-        let method_off = self
-            .names
-            .iter()
-            .rev()
-            .find(|&&(start, end, _)| start <= off && off < end)
-            .map(|&(start, _, _)| start)?;
+        let method_off = program::name_containing(&self.names, off).map(|&(start, _, _)| start)?;
         let method_start = self.base + method_off;
         let probe = self.probe.get_mut();
         let w0 = probe.read_word(method_start & !3).ok()?;
@@ -576,13 +674,37 @@ impl<A: TargetAccess> DeviceBackend<A> {
     }
 }
 
+/// The Debug Halting Control and Status Register: Armv7-M ARM (DDI 0403E.d) C1.6.2, and Armv8-M ARM
+/// (DDI 0553B.y) D1.2.39.
+const DHCSR: u32 = 0xE000_EDF0;
+/// `DHCSR.DBGKEY`, bits 31:16: a write to the register's lower half takes effect only with this key.
+const DBGKEY: u32 = 0xA05F_0000;
+
+/// The breakpoint unit's control register, at one address on every Cortex-M: `BP_CTRL` in Armv6-M ARM
+/// (DDI 0419E) C1.8.2, and `FP_CTRL` in Armv7-M ARM (DDI 0403E.d) C1.11.3 and Armv8-M ARM (DDI
+/// 0553B.y) D1.2.109. Its NUM_CODE field counts the unit's instruction address comparators.
+const FP_CTRL: u32 = 0xE000_2000;
+
 impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
-    fn launch(&mut self) -> bool {
+    fn launch(&mut self) -> Result<(), String> {
         let probe = self.probe.get_mut();
-        probe.connect().is_ok()
-            && probe.read_idcode().is_ok()
-            && probe.init_mem().is_ok()
-            && probe.halt().is_ok()
+        probe
+            .connect()
+            .map_err(|error| format!("could not connect to the target: {error}"))?;
+        probe
+            .read_idcode()
+            .map_err(|error| format!("could not read the debug port's IDCODE: {error}"))?;
+        probe
+            .init_mem()
+            .map_err(|error| format!("could not reach the target's memory: {error}"))?;
+        probe
+            .halt()
+            .map_err(|error| format!("could not halt the core: {error}"))?;
+        self.comparators = probe
+            .read_word(FP_CTRL)
+            .ok()
+            .map(|word| lamella_probe_core::cortex_m::fpb_num_code(word) as usize);
+        Ok(())
     }
 
     fn resume(&mut self) -> Stop {
@@ -602,6 +724,46 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
 
     fn pause(&mut self) -> bool {
         self.probe.get_mut().halt().is_ok()
+    }
+
+    /// Removes every breakpoint, lets a halted core run on, and turns halting debug off, so the part
+    /// behaves as it would with no debugger attached: a debug event that would have halted it -- a
+    /// breakpoint instruction, a vector catch -- does what it does on a board nobody is debugging.
+    fn release(&mut self) -> Result<(), String> {
+        self.breakpoints.clear();
+        let probe = self.probe.get_mut();
+        probe
+            .set_breakpoints(&[])
+            .map_err(|error| format!("could not remove the breakpoints: {error}"))?;
+        let halted = probe
+            .is_halted()
+            .map_err(|error| format!("could not read whether the core is halted: {error}"))?;
+        if halted {
+            match self.service_semihosting() {
+                Some(true) => {}
+                Some(false) => self
+                    .probe
+                    .get_mut()
+                    .resume()
+                    .map_err(|error| format!("could not resume the core: {error}"))?,
+                None => {
+                    return Err("could not read the instruction the core is stopped at".to_owned());
+                }
+            }
+        }
+        let probe = self.probe.get_mut();
+        probe
+            .write_word(DHCSR, DBGKEY)
+            .map_err(|error| format!("could not turn halting debug off: {error}"))?;
+        match probe.is_halted() {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                Err("the core stopped again before halting debug was turned off".to_owned())
+            }
+            Err(error) => Err(format!(
+                "could not read whether the core is halted: {error}"
+            )),
+        }
     }
 
     fn run_to_return(&mut self) -> Stop {
@@ -666,7 +828,10 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
             .collect();
         let dropped = addresses.len() - fitting.len();
 
-        let words: Vec<u32> = fitting.into_iter().take(4).collect();
+        let words: Vec<u32> = fitting
+            .into_iter()
+            .take(self.comparators.unwrap_or(usize::MAX))
+            .collect();
         self.breakpoints = words.clone();
 
         self.probe
@@ -684,7 +849,7 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     }
 
     fn max_breakpoints(&self) -> Option<usize> {
-        Some(4)
+        self.comparators
     }
 
     fn stack(&self) -> Vec<Frame> {

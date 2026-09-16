@@ -46,17 +46,21 @@ public enum RpiPicoWBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let CYW43439_WL_REG_ON_PORT_BASE: UInt32 = 0xD0000000
     public static let CYW43439_WL_REG_ON_PIN: UInt32 = 23
+    public static let CYW43439_WL_REG_ON_BANK: UInt32 = 0
     public static let CYW43439_WL_REG_ON_MASK: UInt32 = 0x800000
     public static let CYW43439_WL_REG_ON_ACTIVE_LOW: UInt32 = 0
     public static let CYW43439_DATA_PORT_BASE: UInt32 = 0xD0000000
     public static let CYW43439_DATA_PIN: UInt32 = 24
+    public static let CYW43439_DATA_BANK: UInt32 = 0
     public static let CYW43439_DATA_MASK: UInt32 = 0x1000000
     public static let CYW43439_CS_PORT_BASE: UInt32 = 0xD0000000
     public static let CYW43439_CS_PIN: UInt32 = 25
+    public static let CYW43439_CS_BANK: UInt32 = 0
     public static let CYW43439_CS_MASK: UInt32 = 0x2000000
     public static let CYW43439_CS_ACTIVE_LOW: UInt32 = 1
     public static let CYW43439_CLK_PORT_BASE: UInt32 = 0xD0000000
     public static let CYW43439_CLK_PIN: UInt32 = 29
+    public static let CYW43439_CLK_BANK: UInt32 = 0
     public static let CYW43439_CLK_MASK: UInt32 = 0x20000000
 
     // -- memory regions the board fits: SIZE is what a program may reach, which a device's own

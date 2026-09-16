@@ -363,27 +363,11 @@ impl StLink {
         }
         .with_vid_pid(ST_VENDOR_ID, product_id);
 
-        let candidates: Vec<selection::Candidate> =
-            lamella_usbbulk::enumerate_interface(ST_DEBUG_INTERFACE_GUID)
-                .map_err(|_| ProbeError::Device("could not enumerate the ST-Link debug interfaces"))?
-                .into_iter()
-                .map(|found| selection::Candidate {
-                    vendor_id: found.vendor_id,
-                    product_id: found.product_id,
-                    serial: found.serial_number,
-                })
-                .collect();
-
-        let chosen = match selection::choose(&candidates, &selector) {
-            selection::Selection::Unique(found) => found,
-            selection::Selection::NotFound => {
-                return Err(ProbeError::Device(
-                    "no ST-Link matched -- check the serial, or the product id for this probe \
-                     generation (a V3 is a FAMILY of ids, not one)",
-                ));
-            }
-            selection::Selection::Ambiguous(names) => return Err(ProbeError::Ambiguous(names)),
-        };
+        let chosen = choose_debug_interface(
+            lamella_usbbulk::enumerate_interface(ST_DEBUG_INTERFACE_GUID),
+            lamella_usbbulk::enumerate,
+            &selector,
+        )?;
 
         let device =
             Device::open_interface(ST_DEBUG_INTERFACE_GUID, ST_VENDOR_ID, product_id, chosen.as_deref())
@@ -760,17 +744,23 @@ impl StLink {
         Ok(())
     }
 
-    /// Attaches to a target that refuses the plain path and leaves the core HALTED at its reset
-    /// vector -- the state a flash routine needs before it erases the code the core is running.
+    /// Attaches with the core held in reset and leaves it HALTED at its reset vector -- the state a
+    /// flash routine needs before it erases the code the core is running.
     ///
-    /// The vector catch is armed while the core is still held, so nothing races the arm: the target
-    /// cannot execute an instruction between the arm and the release.
-    pub fn attach_under_reset(&mut self) -> Result<(), ProbeError> {
+    /// For a target the plain path does not reach: one whose running firmware leaves its access
+    /// port unreachable, and one whose firmware sleeps. SWD is entered with reset asserted
+    /// ([`enter_swd_under_reset`](Self::enter_swd_under_reset)), and [`attach_held_in_reset`] does
+    /// the rest, `low_power_debug`'s bits included.
+    ///
+    /// # Errors
+    /// Those of [`enter_swd_under_reset`](Self::enter_swd_under_reset) and
+    /// [`attach_held_in_reset`].
+    pub fn attach_under_reset(
+        &mut self,
+        low_power_debug: Option<LowPowerDebug>,
+    ) -> Result<(), ProbeError> {
         self.enter_swd_under_reset()?;
-        cortex_m::arm_reset_catch(self)?;
-        self.release_reset()?;
-        cortex_m::wait_halted(self)?;
-        cortex_m::disarm_reset_catch(self)
+        attach_held_in_reset(self, low_power_debug)
     }
 
     /// The highest application voltage ANY ST-Link in TN1235 states support for, in volts.
@@ -838,6 +828,130 @@ impl StLink {
     }
 }
 
+/// The CPUID Base Register: the one word of target memory whose shape every Cortex-M architecture
+/// fixes (Armv6-M ARM, Table B3-5; Armv7-M ARM, B3.2.3; Armv8-M ARM, D1.2).
+const CPUID: u32 = 0xE000_ED00;
+
+/// Reads CPUID and refuses unless the word read has the shape every Cortex-M architecture fixes for
+/// it, so a probe whose memory reads are not reaching the target is refused instead of trusted.
+///
+/// A transfer the probe reports as successful is not, on its own, a read that happened: a probe can
+/// answer every memory read with one constant word and report each read as successful. A register
+/// whose answer is known tells a real read from that.
+///
+/// The known answer is the two fields the architecture manuals fix: IMPLEMENTER, `0x41` for a
+/// processor implemented by Arm, and ARCHITECTURE, `0xC` (Armv6-M, and Armv8-M without the Main
+/// Extension) or `0xF` (Armv7-M, and Armv8-M with the Main Extension). The other fields are
+/// implementation defined and are not judged.
+///
+/// Returns the word read, for a caller that wants the part number too.
+///
+/// # Errors
+/// The read's own error when the read fails, and [`ProbeError::Protocol`] naming the word when the
+/// read succeeds with a word no Cortex-M holds.
+pub fn check_known_answer<M: CoreMemory + ?Sized>(core: &mut M) -> Result<u32, ProbeError> {
+    let word = core.read_word(CPUID)?;
+    if is_cortex_m_cpuid(word) {
+        return Ok(word);
+    }
+    Err(ProbeError::Protocol(format!(
+        "the probe reported a successful read of CPUID ({CPUID:#010x}) that returned {word:#010x}, a \
+         word no Cortex-M holds, so its memory reads are not reaching the target; attaching with the \
+         core held in reset may reach it"
+    )))
+}
+
+/// Whether `word` has the IMPLEMENTER and ARCHITECTURE fields a Cortex-M's CPUID holds.
+fn is_cortex_m_cpuid(word: u32) -> bool {
+    const ARM: u32 = 0x41;
+    let implementer = word >> 24;
+    let architecture = (word >> 16) & 0xF;
+    implementer == ARM && matches!(architecture, 0xC | 0xF)
+}
+
+/// A register whose bits keep a debugger connection working while the target's core is in a
+/// low-power mode, and the bits to set in it: on an STM32, `DBGMCU_CR` and its low-power debug
+/// bits.
+///
+/// With those bits clear, a part can stop a clock its debugger connection needs whenever the core
+/// sleeps, and memory access through the probe then stops reaching the target while the firmware
+/// waits for an interrupt. A part held in reset is not asleep, which is why
+/// [`attach_held_in_reset`] sets the bits before it releases the core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LowPowerDebug {
+    /// The register's address. It is written with a 32-bit access.
+    pub register: u32,
+    /// The bits to set, on top of whatever the register already holds.
+    pub bits: u32,
+}
+
+/// Finishes an attach that began with the core held in reset, and leaves the core HALTED at its
+/// reset vector: reads the known answer, sets `low_power_debug`'s bits, arms the reset vector
+/// catch, releases reset, waits for the halt and disarms the catch.
+///
+/// Everything before the release runs while the core is held. A part held in reset is not asleep,
+/// so its memory answers even when its firmware idles in a low-power mode, and the vector catch is
+/// armed before the core can execute an instruction.
+///
+/// The known answer ([`check_known_answer`]) is read first because the low-power write is
+/// composed from the word its register reads back, and a word that never came from the target
+/// must not be written into it. The bits are set on top of what the register holds and then read
+/// back, so a write the probe reports as successful and the part does not keep is refused rather
+/// than trusted.
+///
+/// A step that fails before the release releases reset before returning, so a refused attach does
+/// not leave the part held in reset. Bits set in a register that a system reset does not clear
+/// stay set after the attach, through later resets.
+///
+/// # Errors
+/// [`check_known_answer`]'s refusal, [`ProbeError::Protocol`] naming the register when the bits
+/// do not read back as set, and any read, write or change of the reset line the probe refuses.
+pub fn attach_held_in_reset<M: CoreMemory>(
+    core: &mut M,
+    low_power_debug: Option<LowPowerDebug>,
+) -> Result<(), ProbeError> {
+    if let Err(refused) = prepare_held_core(core, low_power_debug) {
+        let _ = core.set_reset(false);
+        return Err(refused);
+    }
+    core.set_reset(false)?;
+    std::thread::sleep(RESET_SETTLE);
+    cortex_m::wait_halted(core)?;
+    cortex_m::disarm_reset_catch(core)
+}
+
+/// The steps of [`attach_held_in_reset`] that run while the core is held: the known answer, the
+/// low-power bits and the reset vector catch.
+fn prepare_held_core<M: CoreMemory>(
+    core: &mut M,
+    low_power_debug: Option<LowPowerDebug>,
+) -> Result<(), ProbeError> {
+    check_known_answer(core)?;
+    if let Some(debug) = low_power_debug {
+        set_low_power_debug(core, debug)?;
+    }
+    cortex_m::arm_reset_catch(core)
+}
+
+/// Sets `debug`'s bits on top of what its register holds, and refuses unless they read back set.
+fn set_low_power_debug<M: CoreMemory>(
+    core: &mut M,
+    debug: LowPowerDebug,
+) -> Result<(), ProbeError> {
+    let written = core.read_word(debug.register)? | debug.bits;
+    core.write_word(debug.register, written)?;
+    let kept = core.read_word(debug.register)?;
+    if kept & debug.bits == debug.bits {
+        return Ok(());
+    }
+    Err(ProbeError::Protocol(format!(
+        "the part did not keep the low-power debug bits {bits:#010x}: {register:#010x} was written \
+         with {written:#010x} and reads back {kept:#010x}",
+        bits = debug.bits,
+        register = debug.register,
+    )))
+}
+
 /// Memory is all the shared Cortex-M run control needs; everything else it derives.
 impl CoreMemory for StLink {
     fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
@@ -865,7 +979,8 @@ impl CoreMemory for StLink {
 /// SHARED [`cortex_m`] logic rather than reimplementing it.
 impl TargetAccess for StLink {
     fn connect(&mut self) -> Result<(), ProbeError> {
-        self.enter_swd()
+        self.enter_swd()?;
+        check_known_answer(self).map(|_| ())
     }
 
     fn read_idcode(&mut self) -> Result<u32, ProbeError> {
@@ -1002,6 +1117,160 @@ pub fn diagnose(product_id: u16) -> Result<Binding, ProbeError> {
         .map_err(|_| ProbeError::Device("could not classify the ST-Link's driver binding"))
 }
 
+/// The devices a USB listing reports, or why it could not list them.
+type Listing = lamella_usbbulk::Result<Vec<lamella_usbbulk::DeviceInfo>>;
+
+/// Which attached ST-Link `selector` names: its serial, or `None` for a sole match that reports no
+/// serial and is opened by vendor and product id alone.
+///
+/// `registered` is the listing of interfaces under [`ST_DEBUG_INTERFACE_GUID`]. A platform with no
+/// registry of interface GUIDs answers it with [`lamella_usbbulk::Error::Unsupported`], and there
+/// `every_vendor_bulk_device` supplies the candidates instead: every attached device with a
+/// vendor-class interface, which the vendor and product id in `selector` narrow to ST-Links of the
+/// requested generation. Both listings reach the same [`selection::choose`], so an explicit serial,
+/// [`selection::PROBE_SERIAL_ENV`] and the refusal of several matches mean the same thing on every
+/// platform.
+///
+/// # Errors
+///
+/// [`ProbeError::Device`] when a listing fails or nothing matches; [`ProbeError::Ambiguous`],
+/// naming every match, when more than one probe matches.
+fn choose_debug_interface(
+    registered: Listing,
+    every_vendor_bulk_device: impl FnOnce() -> Listing,
+    selector: &selection::Selector,
+) -> Result<Option<String>, ProbeError> {
+    let listed = match registered {
+        Err(lamella_usbbulk::Error::Unsupported) => every_vendor_bulk_device(),
+        registered => registered,
+    }
+    .map_err(|_| ProbeError::Device("could not enumerate the ST-Link debug interfaces"))?;
+
+    let candidates: Vec<selection::Candidate> = listed
+        .into_iter()
+        .map(|found| selection::Candidate {
+            vendor_id: found.vendor_id,
+            product_id: found.product_id,
+            serial: found.serial_number,
+        })
+        .collect();
+
+    match selection::choose(&candidates, selector) {
+        selection::Selection::Unique(found) => Ok(found),
+        selection::Selection::NotFound => Err(ProbeError::Device(
+            "no ST-Link matched -- check the serial, or the product id for this probe \
+             generation (a V3 is a FAMILY of ids, not one)",
+        )),
+        selection::Selection::Ambiguous(names) => Err(ProbeError::Ambiguous(names)),
+    }
+}
+
+#[cfg(test)]
+mod debug_interface_listing_tests {
+    use super::{Listing, ProbeError, ST_VENDOR_ID, choose_debug_interface, product_id, selection};
+    use lamella_usbbulk::{DeviceInfo, Error};
+
+    const FIRST: &str = "AAAA1111AAAA1111AAAA1111";
+    const SECOND: &str = "BBBB2222BBBB2222BBBB2222";
+    const NEITHER: &str = "CCCC3333CCCC3333CCCC3333";
+
+    fn attached(vendor_id: u16, product_id: u16, serial: Option<&str>) -> DeviceInfo {
+        DeviceInfo {
+            vendor_id,
+            product_id,
+            serial_number: serial.map(String::from),
+            product: None,
+            interface_name: None,
+        }
+    }
+
+    /// Two ST-Link/V2-1s: one model, so only the serial tells them apart.
+    fn two_alike() -> Vec<DeviceInfo> {
+        vec![
+            attached(ST_VENDOR_ID, product_id::V2_1, Some(FIRST)),
+            attached(ST_VENDOR_ID, product_id::V2_1, Some(SECOND)),
+        ]
+    }
+
+    /// The selector `StLink::open` builds for a V2-1, with the environment's answer supplied as a
+    /// value so that no test depends on the shell running it.
+    fn selector(serial: Option<&str>) -> selection::Selector {
+        selection::Selector::named_or(serial, selection::Selector::any())
+            .with_vid_pid(ST_VENDOR_ID, product_id::V2_1)
+    }
+
+    /// The GUID listing as a platform with no registry of interface GUIDs answers it.
+    fn no_registry() -> Listing {
+        Err(Error::Unsupported)
+    }
+
+    #[test]
+    fn without_a_registry_a_serial_picks_the_second_of_two_alike() {
+        assert_eq!(
+            choose_debug_interface(no_registry(), || Ok(two_alike()), &selector(Some(SECOND))),
+            Ok(Some(String::from(SECOND)))
+        );
+        assert!(matches!(
+            choose_debug_interface(no_registry(), || Ok(two_alike()), &selector(Some(NEITHER))),
+            Err(ProbeError::Device(why)) if why.starts_with("no ST-Link matched")
+        ));
+    }
+
+    #[test]
+    fn without_a_registry_two_alike_and_no_serial_are_refused() {
+        let chosen = choose_debug_interface(no_registry(), || Ok(two_alike()), &selector(None));
+        let Err(ProbeError::Ambiguous(names)) = &chosen else {
+            panic!("two ST-Links and no serial must be refused, not resolved to one: {chosen:?}");
+        };
+        assert_eq!(*names, [FIRST, SECOND], "the refusal names both");
+    }
+
+    /// Without a registry the listing holds every vendor-class device on the bus -- here a
+    /// CMSIS-DAP probe and an ST-Link of another generation beside the one asked for -- and the
+    /// vendor and product id leave only that one, so it needs no serial.
+    #[test]
+    fn without_a_registry_the_ids_leave_only_the_st_link_asked_for() {
+        let every_vendor_bulk_device = vec![
+            attached(0x2e8a, 0x000c, Some("DDDD4444DDDD4444")),
+            attached(ST_VENDOR_ID, product_id::V3E, Some(NEITHER)),
+            attached(ST_VENDOR_ID, product_id::V2_1, Some(FIRST)),
+        ];
+        assert_eq!(
+            choose_debug_interface(no_registry(), || Ok(every_vendor_bulk_device), &selector(None)),
+            Ok(Some(String::from(FIRST)))
+        );
+    }
+
+    #[test]
+    fn a_registry_that_answers_is_the_only_listing_consulted() {
+        assert_eq!(
+            choose_debug_interface(
+                Ok(vec![attached(ST_VENDOR_ID, product_id::V2_1, Some(FIRST))]),
+                || panic!("the vendor-class listing is for a platform with no registry"),
+                &selector(None),
+            ),
+            Ok(Some(String::from(FIRST)))
+        );
+    }
+
+    #[test]
+    fn a_listing_that_fails_is_refused() {
+        let refused = |chosen: Result<Option<String>, ProbeError>| {
+            matches!(chosen, Err(ProbeError::Device(why)) if why.starts_with("could not enumerate"))
+        };
+        assert!(refused(choose_debug_interface(
+            Err(Error::Os(String::from("the registry could not be read"))),
+            || panic!("a registry that failed is refused, not replaced by another listing"),
+            &selector(None),
+        )));
+        assert!(refused(choose_debug_interface(
+            no_registry(),
+            || Err(Error::Os(String::from("the bus could not be read"))),
+            &selector(None),
+        )));
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1036,6 +1305,288 @@ mod tests {
         assert!(!FlashVerdict::Failed { wrong: 1 }.image_is_on_the_part());
     }
     use super::*;
+
+    /// Target memory that answers every read with one word and reports each read as successful --
+    /// what a probe whose reads do not reach the target hands back -- recording where it was read.
+    struct ConstantMemory {
+        word: u32,
+        read_at: Vec<u32>,
+    }
+
+    impl CoreMemory for ConstantMemory {
+        fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+            self.read_at.push(address);
+            Ok(self.word)
+        }
+        fn write_word(&mut self, _address: u32, _value: u32) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+            Ok(0)
+        }
+    }
+
+    const STALE_ANSWER: u32 = 0x0000_001a;
+
+    #[test]
+    fn a_read_answered_by_a_constant_with_success_is_refused_and_names_the_word() {
+        let mut memory = ConstantMemory {
+            word: STALE_ANSWER,
+            read_at: Vec::new(),
+        };
+        let refused = check_known_answer(&mut memory);
+        assert_eq!(
+            memory.read_at,
+            [CPUID],
+            "the known answer is read from CPUID"
+        );
+        match refused {
+            Err(ProbeError::Protocol(text)) => {
+                assert!(text.contains("0x0000001a"), "names the word read: {text}");
+                assert!(text.contains("CPUID"), "names the register: {text}");
+            }
+            other => panic!("a constant answered with success must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_word_with_the_fields_every_cortex_m_architecture_fixes_is_accepted() {
+        for word in [0x410C_1234_u32, 0x412F_ABC5, 0x41FC_0000, 0x410F_FFFF] {
+            let mut memory = ConstantMemory {
+                word,
+                read_at: Vec::new(),
+            };
+            assert_eq!(check_known_answer(&mut memory), Ok(word), "{word:#010x}");
+        }
+    }
+
+    #[test]
+    fn a_word_no_cortex_m_holds_is_refused() {
+        for word in [
+            0x4107_1230_u32,
+            0x550F_1230,
+            0xFFFF_FFFF,
+            0x0000_0000,
+            STALE_ANSWER,
+        ] {
+            let mut memory = ConstantMemory {
+                word,
+                read_at: Vec::new(),
+            };
+            assert!(
+                matches!(
+                    check_known_answer(&mut memory),
+                    Err(ProbeError::Protocol(_))
+                ),
+                "{word:#010x} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_that_fails_is_reported_as_it_failed() {
+        struct Failing;
+        impl CoreMemory for Failing {
+            fn read_word(&mut self, _address: u32) -> Result<u32, ProbeError> {
+                Err(ProbeError::Device("the transfer failed"))
+            }
+            fn write_word(&mut self, _address: u32, _value: u32) -> Result<(), ProbeError> {
+                Ok(())
+            }
+            fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+                Ok(0)
+            }
+        }
+        assert_eq!(
+            check_known_answer(&mut Failing),
+            Err(ProbeError::Device("the transfer failed"))
+        );
+    }
+
+    /// One access an attach made, in the order it made them.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Access {
+        Read(u32),
+        Write(u32, u32),
+        Reset(bool),
+    }
+
+    const DHCSR: u32 = 0xE000_EDF0;
+    const DEMCR: u32 = 0xE000_EDFC;
+    const S_HALT: u32 = 1 << 17;
+    const VC_CORERESET: u32 = 1 << 0;
+
+    const CORTEX_M_CPUID: u32 = 0x412F_ABC5;
+
+    const TRACE_CLKINEN: u32 = 1 << 5;
+
+    const F7_LOW_POWER_DEBUG: LowPowerDebug = LowPowerDebug {
+        register: lamella_cmsis_dap_stm32::STM32F7_DBGMCU_CR,
+        bits: lamella_cmsis_dap_stm32::STM32F7_DBGMCU_CR_LOW_POWER_DEBUG,
+    };
+
+    /// A part as an attach under reset hands it on: reset asserted, CPUID holding `cpuid`, a
+    /// low-power register at [`F7_LOW_POWER_DEBUG`]'s address that keeps only the bits in `keeps`,
+    /// and a core that halts when reset is released with the reset vector catch armed.
+    struct HeldPart {
+        cpuid: u32,
+        low_power: u32,
+        keeps: u32,
+        answers_every_read_with: Option<u32>,
+        catch_armed: bool,
+        in_reset: bool,
+        halted: bool,
+        accesses: Vec<Access>,
+    }
+
+    impl HeldPart {
+        fn new() -> Self {
+            Self {
+                cpuid: CORTEX_M_CPUID,
+                low_power: TRACE_CLKINEN,
+                keeps: u32::MAX,
+                answers_every_read_with: None,
+                catch_armed: false,
+                in_reset: true,
+                halted: false,
+                accesses: Vec::new(),
+            }
+        }
+
+        fn position(&self, access: Access) -> usize {
+            self.accesses
+                .iter()
+                .position(|made| *made == access)
+                .unwrap_or_else(|| panic!("{access:?} was never made: {:?}", self.accesses))
+        }
+
+        fn wrote(&self) -> bool {
+            self.accesses
+                .iter()
+                .any(|made| matches!(made, Access::Write(..)))
+        }
+    }
+
+    impl CoreMemory for HeldPart {
+        fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+            self.accesses.push(Access::Read(address));
+            if let Some(word) = self.answers_every_read_with {
+                return Ok(word);
+            }
+            Ok(match address {
+                CPUID => self.cpuid,
+                DHCSR if self.halted => S_HALT,
+                address if address == F7_LOW_POWER_DEBUG.register => self.low_power,
+                _ => 0,
+            })
+        }
+
+        fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+            self.accesses.push(Access::Write(address, value));
+            if address == F7_LOW_POWER_DEBUG.register {
+                self.low_power = (self.low_power & !self.keeps) | (value & self.keeps);
+            } else if address == DEMCR {
+                self.catch_armed = value & VC_CORERESET != 0;
+            }
+            Ok(())
+        }
+
+        fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
+            self.accesses.push(Access::Reset(assert));
+            if !assert && self.in_reset && self.catch_armed {
+                self.halted = true;
+            }
+            self.in_reset = assert;
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn the_low_power_bits_are_set_on_what_the_register_holds_before_the_core_is_released() {
+        let mut part = HeldPart::new();
+        assert_eq!(
+            attach_held_in_reset(&mut part, Some(F7_LOW_POWER_DEBUG)),
+            Ok(())
+        );
+        let composed = TRACE_CLKINEN | F7_LOW_POWER_DEBUG.bits;
+        let known_answer = part.position(Access::Read(CPUID));
+        let register_read = part.position(Access::Read(F7_LOW_POWER_DEBUG.register));
+        let written = part.position(Access::Write(F7_LOW_POWER_DEBUG.register, composed));
+        let armed = part.position(Access::Write(DEMCR, VC_CORERESET));
+        let released = part.position(Access::Reset(false));
+        assert!(
+            known_answer < register_read,
+            "the register is read only after the known answer: {:?}",
+            part.accesses
+        );
+        assert!(
+            register_read < written && written < armed && armed < released,
+            "the bits are set and the catch armed while the core is held: {:?}",
+            part.accesses
+        );
+        assert_eq!(
+            part.low_power, composed,
+            "a bit the attach does not own is kept"
+        );
+        assert!(part.halted, "the core is left halted at its reset vector");
+        assert_eq!(
+            part.accesses.last(),
+            Some(&Access::Write(DEMCR, 0)),
+            "the catch is disarmed last"
+        );
+    }
+
+    #[test]
+    fn a_part_answering_every_read_with_one_word_is_refused_before_any_write_and_released() {
+        let mut part = HeldPart::new();
+        part.answers_every_read_with = Some(STALE_ANSWER);
+        let refused = attach_held_in_reset(&mut part, Some(F7_LOW_POWER_DEBUG));
+        assert!(
+            matches!(refused, Err(ProbeError::Protocol(_))),
+            "a constant answered with success must be refused, got {refused:?}"
+        );
+        assert!(!part.wrote(), "nothing is written: {:?}", part.accesses);
+        assert_eq!(
+            part.accesses.last(),
+            Some(&Access::Reset(false)),
+            "a refused attach does not leave the part held in reset"
+        );
+    }
+
+    #[test]
+    fn low_power_bits_the_part_does_not_keep_are_refused_naming_the_register() {
+        let mut part = HeldPart::new();
+        part.keeps = 0;
+        match attach_held_in_reset(&mut part, Some(F7_LOW_POWER_DEBUG)) {
+            Err(ProbeError::Protocol(text)) => {
+                assert!(text.contains("0xe0042004"), "names the register: {text}");
+            }
+            other => panic!("bits that do not read back must be refused, got {other:?}"),
+        }
+        assert!(
+            !part.accesses.contains(&Access::Write(DEMCR, VC_CORERESET)),
+            "the catch is not armed: {:?}",
+            part.accesses
+        );
+        assert_eq!(part.accesses.last(), Some(&Access::Reset(false)));
+    }
+
+    #[test]
+    fn with_no_low_power_register_the_known_answer_is_read_and_only_debug_registers_are_written() {
+        let mut part = HeldPart::new();
+        assert_eq!(attach_held_in_reset(&mut part, None), Ok(()));
+        assert!(
+            part.accesses.contains(&Access::Read(CPUID)),
+            "the known answer is read: {:?}",
+            part.accesses
+        );
+        for access in &part.accesses {
+            if let Access::Write(address, _) = access {
+                assert!(matches!(*address, DHCSR | DEMCR), "{access:?}");
+            }
+        }
+        assert!(part.halted);
+    }
 
     #[test]
     fn version_word_unpacks_big_endian_fields() {

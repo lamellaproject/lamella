@@ -206,12 +206,12 @@ impl Format {
     }
 }
 
-/// One UF2 block. Fixed by the format: 512 bytes on the wire, 256 of them payload.
-const UF2_BLOCK: usize = 512;
-/// The payload each UF2 block carries.
-const UF2_PAYLOAD: usize = 256;
-
-/// Render `image` as UF2, to be COPIED to a bootloader volume.
+/// Render `image` as UF2, to be COPIED to a bootloader volume, for the chip family `family`.
+///
+/// Every block is 512 bytes and carries a full 256 B page, the last one included: the RP2350
+/// (datasheet 5.5.2) and the RP2040 (datasheet 2.8.4.2) accept only blocks whose `payload_size` is
+/// 256, so an image that is not a whole number of pages is zero-filled to the next one. An empty
+/// image renders as no blocks.
 ///
 /// **EVERY BLOCK CARRIES THE WHOLE FILE'S SHAPE, AND THAT IS THE FORMAT'S POINT.** A mass-storage
 /// write arrives out of order and in pieces, so each block states its own address, its index, and
@@ -221,34 +221,19 @@ const UF2_PAYLOAD: usize = 256;
 ///
 /// The family id rides every block too, and a bootloader checks it: an image built for another
 /// chip is REFUSED rather than run, which is the whole reason this carries one.
+///
+/// # Panics
+/// When the image runs past the end of the 32-bit address space from `base`.
+///
 #[must_use]
 pub fn write_uf2(image: &[u8], base: u32, family: u32) -> Vec<u8> {
-    const MAGIC_START0: u32 = 0x0A32_4655;
-    const MAGIC_START1: u32 = 0x9E5D_5157;
-    const MAGIC_END: u32 = 0x0AB1_6F30;
-    const FLAG_FAMILY_ID: u32 = 0x0000_2000;
-
-    let blocks = image.len().div_ceil(UF2_PAYLOAD);
-    let mut out = Vec::with_capacity(blocks * UF2_BLOCK);
-    for (index, chunk) in image.chunks(UF2_PAYLOAD).enumerate() {
-        let header = [
-            MAGIC_START0,
-            MAGIC_START1,
-            FLAG_FAMILY_ID,
-            base + (index * UF2_PAYLOAD) as u32,
-            u32::try_from(chunk.len()).unwrap_or(0),
-            u32::try_from(index).unwrap_or(0),
-            u32::try_from(blocks).unwrap_or(0),
-            family,
-        ];
-        for value in header {
-            out.extend_from_slice(&value.to_le_bytes());
+    match lamella_flash_format::uf2::to_uf2(image, base, family) {
+        Ok(uf2) => uf2,
+        Err(lamella_flash_format::EmitError::EmptyImage) => Vec::new(),
+        Err(overflow @ lamella_flash_format::EmitError::AddressOverflow { .. }) => {
+            panic!("{overflow}")
         }
-        out.extend_from_slice(chunk);
-        out.resize(out.len() + (476 - chunk.len()), 0);
-        out.extend_from_slice(&MAGIC_END.to_le_bytes());
     }
-    out
 }
 
 /// The data bytes per record. 16 is what every toolchain emits and what every reader has been fed
@@ -762,11 +747,13 @@ mod tests {
         }
     }
 
-    /// **THE BLOCK LAYOUT IS FIXED AND A BOOTLOADER SEEKS BY MULTIPLYING**, so a short final chunk
-    /// must pad rather than shorten its block. Checked on an image that is deliberately NOT a
-    /// multiple of the payload size, which is the only case that can get this wrong.
+    /// **EVERY BLOCK CARRIES A FULL 256 B PAGE, THE LAST ONE INCLUDED.** The RP2350 (datasheet
+    /// 5.5.2) and the RP2040 (datasheet 2.8.4.2) accept only blocks whose `payload_size` is 256, so
+    /// an image that is not a whole number of pages is zero-filled to the next one. Checked on an
+    /// image that is deliberately NOT a multiple of the payload size, which is the only case that
+    /// can get this wrong.
     #[test]
-    fn every_uf2_block_is_512_bytes_even_when_the_last_is_short() {
+    fn every_uf2_block_carries_a_full_page_even_when_the_image_does_not() {
         let image: Vec<u8> = (0..300u32).map(|byte| byte as u8).collect();
         let uf2 = write_uf2(&image, 0x1000_0000, 0xe48b_ff59);
         assert_eq!(uf2.len(), 2 * 512, "two blocks, both full width");
@@ -779,8 +766,10 @@ mod tests {
         assert_eq!(&uf2[508..512], &0x0AB1_6F30u32.to_le_bytes(), "and ends with the end magic");
 
         assert_eq!(&uf2[512 + 12..512 + 16], &0x1000_0100u32.to_le_bytes());
-        assert_eq!(&uf2[512 + 16..512 + 20], &44u32.to_le_bytes(), "the short tail");
+        assert_eq!(&uf2[512 + 16..512 + 20], &256u32.to_le_bytes(), "a full page, not the 44 B tail");
         assert_eq!(&uf2[512 + 20..512 + 24], &1u32.to_le_bytes(), "block index 1");
+        assert_eq!(&uf2[512 + 32..512 + 76], &image[256..], "the 44 bytes that remain");
+        assert!(uf2[512 + 76..512 + 288].iter().all(|&byte| byte == 0), "then zeros to the page");
         assert_eq!(&uf2[1020..1024], &0x0AB1_6F30u32.to_le_bytes(), "still a full 512-byte block");
     }
 

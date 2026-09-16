@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
 lamella-net-smoltcp = { path = "../lamella-net-smoltcp" }
-smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "alloc"] }
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "alloc"] }
 lamella-tls-mbedtls = { path = "../lamella-tls-mbedtls", optional = true }
 
 [features]

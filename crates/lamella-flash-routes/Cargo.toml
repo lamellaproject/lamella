@@ -29,6 +29,9 @@ lamella-flash-format = { path = "../lamella-flash-format" }
 lamella-elf = { path = "../lamella-elf" }
 # Board resolution, so a board id means the same thing here as in every verdict verb.
 lamella-catalog = { path = "../lamella-catalog" }
+# The flash budget a board states, through the same `fit` every verdict verb reports, so an image
+# that cannot fit is refused before a probe or a drive is opened.
+lamella-bsp-gen = { path = "../lamella-bsp-gen" }
 # The Lamella Link protocol version, for `contracts` to REPORT rather than restate. Nothing here
 # speaks the wire; this crate depends on it so that the number a build states about itself comes
 # from the crate that defines it, and both front ends already link it, so it costs no code.
@@ -38,6 +41,8 @@ lamella-wire = { path = "../lamella-wire" }
 # rather than two, because two implementations of a digest disagreeing is silent and total.
 lamella-pe = { path = "../lamella-pe" }
 serde_json = "1"
+# The USB control transfer a DFU bootloader is driven through, and the listing that finds one.
+lamella-usbbulk = { path = "../lamella-usbbulk" }
 # The ST-LINK soldered to a NUCLEO or Discovery board, which is how those parts are reached.
 # A backend stays generic over `TargetAccess` so that CHOOSING a probe belongs to its caller; this
 # crate is that caller, and it depends on `lamella-probe` for the same reason. A route that cannot

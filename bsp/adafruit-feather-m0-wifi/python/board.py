@@ -78,8 +78,8 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "winc-reset_n": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 8, "mask": 0x100, "active_low": True},
-    "winc-chip_en": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 14, "mask": 0x4000, "active_low": False},
-    "winc-irqn": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 21, "mask": 0x200000, "active_low": True},
-    "led": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 17, "mask": 0x20000, "active_low": False},
+    "winc-reset_n": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 8, "bank": 0, "mask": 0x100, "active_low": True},
+    "winc-chip_en": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 14, "bank": 0, "mask": 0x4000, "active_low": False},
+    "winc-irqn": {"kind": "gpio-in", "port_base": 0x41004400, "pin": 21, "bank": 0, "mask": 0x200000, "active_low": True},
+    "led": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 17, "bank": 0, "mask": 0x20000, "active_low": False},
 }

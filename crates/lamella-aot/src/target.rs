@@ -3,7 +3,17 @@
 
 use alloc::vec::Vec;
 
-use lamella_ir::Function;
+use lamella_ir::{BlockId, Function};
+
+/// Whether control leaving block `from` for block `to` reaches it without a jump.
+///
+/// A lowering that emits a function's blocks in index order, binding each block's label before
+/// anything else in it, starts the block with the next index at the very next instruction. A jump
+/// or branch edge to that block can be omitted: execution arrives there anyway.
+#[must_use]
+pub(crate) fn falls_through(from: usize, to: BlockId) -> bool {
+    to.index() == from + 1
+}
 
 /// A target code generator: lowers a verified MIR [`Function`] to machine code
 /// for one target, or reports why it could not.

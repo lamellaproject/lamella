@@ -18,26 +18,32 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint RELAY_1_PORT_BASE = 0x58022000;
         public const uint RELAY_1_PIN = 6;
+        public const uint RELAY_1_BANK = 0;
         public const uint RELAY_1_MASK = 0x40;
         public const uint RELAY_1_ACTIVE_LOW = 0;
         public const uint RELAY_2_PORT_BASE = 0x58022000;
         public const uint RELAY_2_PIN = 5;
+        public const uint RELAY_2_BANK = 0;
         public const uint RELAY_2_MASK = 0x20;
         public const uint RELAY_2_ACTIVE_LOW = 0;
         public const uint RELAY_3_PORT_BASE = 0x58022000;
         public const uint RELAY_3_PIN = 7;
+        public const uint RELAY_3_BANK = 0;
         public const uint RELAY_3_MASK = 0x80;
         public const uint RELAY_3_ACTIVE_LOW = 0;
         public const uint RELAY_4_PORT_BASE = 0x58022000;
         public const uint RELAY_4_PIN = 4;
+        public const uint RELAY_4_BANK = 0;
         public const uint RELAY_4_MASK = 0x10;
         public const uint RELAY_4_ACTIVE_LOW = 0;
         public const uint USER_BUTTON_PORT_BASE = 0x58021000;
         public const uint USER_BUTTON_PIN = 4;
+        public const uint USER_BUTTON_BANK = 0;
         public const uint USER_BUTTON_MASK = 0x10;
         public const uint USER_BUTTON_ACTIVE_LOW = 1;
         public const uint USER_LED_PORT_BASE = 0x58021000;
         public const uint USER_LED_PIN = 5;
+        public const uint USER_LED_BANK = 0;
         public const uint USER_LED_MASK = 0x20;
     }
 }

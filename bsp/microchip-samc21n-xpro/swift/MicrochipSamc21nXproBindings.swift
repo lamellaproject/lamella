@@ -47,10 +47,12 @@ public enum MicrochipSamc21nXproBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LED0_PORT_BASE: UInt32 = 0x41000100
     public static let LED0_PIN: UInt32 = 5
+    public static let LED0_BANK: UInt32 = 0
     public static let LED0_MASK: UInt32 = 0x20
     public static let LED0_ACTIVE_LOW: UInt32 = 1
     public static let BUTTON0_PORT_BASE: UInt32 = 0x41000080
     public static let BUTTON0_PIN: UInt32 = 19
+    public static let BUTTON0_BANK: UInt32 = 0
     public static let BUTTON0_MASK: UInt32 = 0x80000
     public static let BUTTON0_ACTIVE_LOW: UInt32 = 1
 }

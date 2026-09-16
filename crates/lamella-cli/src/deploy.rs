@@ -2,7 +2,7 @@
 
 use crate::args::{self, Spec};
 use lamella_wire::Capabilities;
-use lamella_wire_host::{deploy_chunked_blocking, hello_blocking, open_target, send_deploy_run};
+use lamella_wire_host::{deploy_chunked_blocking, hello_blocking, open_target};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -64,7 +64,7 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
     let spec = Spec {
         verb: "deploy",
         usage: Some(USAGE),
-        values: &["--target", "--board", "--probe", "--via"],
+        values: &["--target", "--board", "--probe", "--volume", "--device", "--via"],
         flags: &["--no-run", "--unsafe"],
     };
     let parsed = match args::parse_or_halt(args, &spec) {
@@ -115,6 +115,8 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
             &path,
             board_id,
             parsed.value("--probe"),
+            parsed.value("--volume"),
+            parsed.value("--device"),
             parsed.value("--via"),
             parsed.flag("--unsafe"),
         ),
@@ -156,7 +158,7 @@ mod source_refusal_tests {
     fn the_deploy_refusal_speaks_for_deploys_own_routes_only() {
         let python = deploy_refusal(Path::new("app.py"), &Uncompilable::Python);
         assert!(python.starts_with("lamella deploy: "), "its own verb: {python}");
-        assert!(python.contains("BUNDLE") && python.contains("wire-py"), "and the real route");
+        assert!(python.contains("BUNDLE") && python.contains("lamella build"), "and the real route");
         assert!(
             !python.contains("deploy path is separate"),
             "it must not point at a route that also refuses Python: {python}"
@@ -168,7 +170,8 @@ mod source_refusal_tests {
 
 const USAGE: &str = "\
 usage: lamella deploy <file.cs> --target <t> [--no-run]   into firmware already on the board
-       lamella deploy <file.cs> --board <id> [--via probe|volume] [--probe <s>]  onto the bare chip
+       lamella deploy <file.cs> --board <id> [--via probe|volume]                onto the bare chip
+                               [--probe <serial>] [--volume <name>] [--device <serial>]
 
 --target is a live connection (what `lamella devices` prints); --board is a board model (what
 `lamella boards` lists). The first keeps the board's firmware and takes about a second; the second
@@ -178,6 +181,9 @@ replaces everything on the chip and needs nothing there first.
 bootloader drive and needs no probe; `probe` writes over an attached SWD probe and reads every
 byte back to check it. The default is whatever the board takes without extra hardware. With more
 than one probe attached, `--via probe` refuses until you name one with --probe <serial>.
+
+--probe, --volume and --device name which probe, which drive and which USB DFU bootloader when
+several are attached, each on its own route, as `lamella flash` takes them.
 ";
 
 /// Send a payload that is ALREADY built to firmware running at `target`.
@@ -190,10 +196,7 @@ fn send_payload(path: &Path, target: &str, no_run: bool) -> ExitCode {
     if path.extension().and_then(|extension| extension.to_str()) == Some("lpyc") {
         eprintln!(
             "lamella deploy: {} is a Python bundle, which travels by a different wire message \
-             (DEPLOY_BUNDLE)\nthan a baked C# image. The host side of that message is not a \
-             library call yet, so this verb\ncannot send one -- and sending it down the image path \
-             would deploy successfully and leave the\nboard unable to boot what it holds.\n\n\
-             `cargo run -p lamella-wire-host --example wire-py` drives it today.",
+             (DEPLOY_BUNDLE)\nthan a baked C# image. This verb does not send bundles.",
             path.display()
         );
         return ExitCode::FAILURE;
@@ -244,9 +247,7 @@ pub fn deploy_refusal(path: &Path, what: &Uncompilable) -> String {
             "lamella deploy: {} is a Python program, and this verb compiles C#.\n\n\
              Neither route of this verb takes one: `--target` sends a baked C# image and \
              `--board`\nbuilds one ahead of time. A Python program reaches a board as a BUNDLE, \
-             which `lamella build`\nproduces, and whose host-side send is not a library call this \
-             tool can make yet -- `cargo run -p\nlamella-wire-host --example wire-py` drives it \
-             today.",
+             which `lamella build`\nproduces; this verb does not send bundles.",
             path.display()
         ),
         Uncompilable::Other => format!(
@@ -341,17 +342,41 @@ fn send_image(image: &[u8], target: &str, no_run: bool) -> ExitCode {
         println!("not started (--no-run). It runs at the board's next reset.");
         return ExitCode::SUCCESS;
     }
-    match send_deploy_run(&mut transport, 2) {
-        Ok(()) => {
-            println!("started it.");
+    match start_deployed(&mut transport, START_ACK_PATIENCE) {
+        Ok(line) => {
+            println!("{line}");
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            eprintln!(
-                "lamella deploy: the image is on the board and the start command failed \
-                 ({error:?}). Resetting the board runs it."
-            );
+        Err(why) => {
+            eprintln!("lamella deploy: {why}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// How long to wait for the board to acknowledge a start. It answers before the reset the start
+/// implies, so the answer is prompt.
+const START_ACK_PATIENCE: Duration = Duration::from_secs(2);
+
+/// Asks the board to start the image just deployed over `transport`, answering the line to print when
+/// it started, and why it did not when it did not.
+///
+/// **THE BOARD's ACKNOWLEDGEMENT IS READ, AND ONLY IT SAYS "STARTED".** A board answers a start with
+/// its reason when it will not make one, so a start sent and never read reported a refusal as a start.
+fn start_deployed(transport: &mut impl lamella_wire::Transport, patience: Duration) -> Result<&'static str, String> {
+    use lamella_wire_host::{StartFailure, exec};
+    match lamella_wire_host::start_execution(transport, 2, exec::exec_source::DEPLOYED, 0, patience) {
+        Ok(()) => Ok("started it."),
+        Err(StartFailure::NoAnswer) => Err(
+            "the image is on the board, and the board did not acknowledge the start, so whether it is \
+             running is not known. Resetting the board runs it."
+                .to_owned(),
+        ),
+        Err(failure @ (StartFailure::Refused(_) | StartFailure::Transport(lamella_wire::TransportError::Refused { .. }))) => {
+            Err(format!("the image is on the board, and {failure}."))
+        }
+        Err(failure @ StartFailure::Transport(_)) => {
+            Err(format!("the image is on the board, and {failure}. Resetting the board runs it."))
         }
     }
 }
@@ -418,5 +443,58 @@ mod tests {
         assert!(USAGE.contains("--board"), "got {USAGE}");
         assert!(USAGE.contains("live connection"), "it says what a target IS");
         assert!(USAGE.contains("board model"), "and what a board IS");
+    }
+
+    /// A target that answers the first frame it is sent with the frames `answer` builds.
+    struct Answering {
+        wire: lamella_wire::MemTransport,
+        answer: Option<Vec<u8>>,
+    }
+
+    impl Answering {
+        fn with(answer: impl FnOnce(&mut lamella_wire::MemTransport)) -> Self {
+            let mut peer = lamella_wire::MemTransport::new();
+            answer(&mut peer);
+            Answering { wire: lamella_wire::MemTransport::new(), answer: Some(peer.take_sent()) }
+        }
+    }
+
+    impl lamella_wire::Transport for Answering {
+        fn send(&mut self, _msg_type: u8, _seq: u16, _payload: &[u8]) -> Result<(), lamella_wire::TransportError> {
+            if let Some(answer) = self.answer.take() {
+                self.wire.feed(&answer);
+            }
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, lamella_wire::TransportError> {
+            lamella_wire::Transport::poll(&mut self.wire)
+        }
+    }
+
+    /// A board answering a start with the acknowledgement `code`.
+    fn acknowledging(code: u8) -> Answering {
+        Answering::with(|peer| {
+            lamella_wire::Transport::send(peer, lamella_wire_host::exec::EXEC_ACK, 2, &[code]).unwrap();
+        })
+    }
+
+    /// A start is reported as made only when the board acknowledges it. A start the board refuses is
+    /// reported with the board's reason, a board that does not answer has not been shown to start, and
+    /// either way the deploy itself is said to have succeeded.
+    #[test]
+    fn a_start_is_reported_as_made_only_when_the_board_acknowledges_it() {
+        let quick = Duration::from_millis(50);
+        let started = start_deployed(&mut acknowledging(lamella_wire_host::exec::ack::STARTED), quick);
+        assert_eq!(started, Ok("started it."));
+
+        let refused = start_deployed(&mut acknowledging(lamella_wire_host::exec::ack::NOTHING_TO_RUN), quick)
+            .expect_err("a refused start did not start");
+        assert!(refused.contains("NOTHING_TO_RUN"), "names the board's reason: {refused}");
+        assert!(refused.contains("the image is on the board"), "and that the deploy succeeded: {refused}");
+
+        let silent = start_deployed(&mut Answering::with(|_| {}), quick).expect_err("silence is not a start");
+        assert!(silent.contains("did not acknowledge"), "{silent}");
+        assert!(silent.contains("the image is on the board"), "{silent}");
     }
 }

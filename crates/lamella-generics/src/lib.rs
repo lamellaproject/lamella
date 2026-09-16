@@ -1182,6 +1182,11 @@ impl Program<'_> {
         let mut seen: BTreeSet<(Box<str>, Box<str>, u32)> = BTreeSet::new();
         for pair in named {
             let declaring_is_interface = self.is_interface(&pair.declaring).unwrap_or(false);
+            let seed_slot = if declaring_is_interface {
+                None
+            } else {
+                self.virtual_slot(pair)
+            };
             for (candidate, &(index, row)) in &self.definitions {
                 if candidate.as_ref() == pair.declaring.as_ref() {
                     continue;
@@ -1213,6 +1218,13 @@ impl Program<'_> {
                     };
                     if signature.generic_param_count != pair.arity
                         || signature.parameters != pair.parameters
+                    {
+                        continue;
+                    }
+                    if let Some(seed_slot) = &seed_slot
+                        && self
+                            .virtual_slot_at(candidate, pair)
+                            .is_some_and(|slot| slot.introduced_by != seed_slot.introduced_by)
                     {
                         continue;
                     }
@@ -1293,36 +1305,117 @@ impl Program<'_> {
     /// cycle in one is malformed metadata, so the honest response is to stop walking rather than to
     /// tidy it into an answer.
     fn derives_from(&self, candidate: &str, ancestor: &str) -> bool {
-        let mut at = candidate;
-        let mut owned;
+        let Some(mut at) = self.base_of(candidate) else {
+            return false;
+        };
         for _ in 0..PATH_BACKSTOP {
-            let Some(&(index, row)) = self.definitions.get(at) else {
-                return false;
-            };
-            let assembly = &self.assemblies[index];
-            let Some(type_def) = assembly.type_def(row) else {
-                return false;
-            };
-            let extends = type_def.extends();
-            if extends.0 == 0 {
-                return false;
-            }
-            let name = if extends.table() == table::TYPE_SPEC {
-                instantiation_of(assembly, extends).map(|(name, _)| name)
-            } else {
-                type_def_full_name(assembly, extends)
-            };
-            let Some(name) = name else {
-                return false;
-            };
-            if name == ancestor {
+            if at == ancestor {
                 return true;
             }
-            owned = name;
-            at = &owned;
+            let Some(next) = self.base_of(&at) else {
+                return false;
+            };
+            at = next;
         }
         false
     }
+
+    /// The name of `definition`'s base type, or `None` when it has none or `definition` is not one of
+    /// ours to see.
+    ///
+    /// A constructed generic base answers its DEFINITION's name: `class C<T> : Base<T>` derives from
+    /// `Base` whatever `T` is, because the override relation is between declarations. The type
+    /// arguments matter to the tier that emits the bodies, not to whether the edge exists.
+    fn base_of(&self, definition: &str) -> Option<String> {
+        let &(index, row) = self.definitions.get(definition)?;
+        let assembly = &self.assemblies[index];
+        let extends = assembly.type_def(row)?.extends();
+        if extends.0 == 0 {
+            return None;
+        }
+        if extends.table() == table::TYPE_SPEC {
+            instantiation_of(assembly, extends).map(|(name, _)| name)
+        } else {
+            type_def_full_name(assembly, extends)
+        }
+    }
+
+    /// The vtable slot `pair`'s declaration occupies when its declaring type is a class: the type
+    /// whose declaration introduced the slot, and whether that declaration hides an inherited virtual
+    /// method of the same signature. `None` when the declaring type declares no virtual method with
+    /// `pair`'s name, arity and parameters, or cannot be walked.
+    ///
+    /// A virtual method declared `newslot` introduces a slot of its own (ECMA-335 II.15.4.2.2),
+    /// hiding any inherited virtual method with the same signature. One declared without `newslot`
+    /// overrides the nearest inherited virtual method with that signature and occupies its slot. Two
+    /// declarations share a slot exactly when this answers the same introducing type for both, and
+    /// only then does a call naming one reach the other's body on a receiver that declares it.
+    #[must_use]
+    pub fn virtual_slot(&self, pair: &MethodPair) -> Option<VirtualSlot> {
+        self.virtual_slot_at(&pair.declaring, pair)
+    }
+
+    /// [`Program::virtual_slot`] for the method with `pair`'s name, arity and parameters that
+    /// `declaring` declares.
+    fn virtual_slot_at(&self, declaring: &str, pair: &MethodPair) -> Option<VirtualSlot> {
+        let mut owner: String = declaring.into();
+        let mut newslot = self.declared_virtual(&owner, pair)?;
+        for _ in 0..PATH_BACKSTOP {
+            let inherited = self.inherited_virtual(&owner, pair);
+            match inherited {
+                Some((ancestor, ancestor_newslot)) if !newslot => {
+                    owner = ancestor;
+                    newslot = ancestor_newslot;
+                }
+                _ => {
+                    return Some(VirtualSlot {
+                        introduced_by: owner.into_boxed_str(),
+                        hides_inherited: inherited.is_some(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether `definition` itself declares a virtual method with `pair`'s name, arity and
+    /// parameters: `Some(true)` when that declaration is `newslot`, `Some(false)` when it overrides.
+    fn declared_virtual(&self, definition: &str, pair: &MethodPair) -> Option<bool> {
+        let &(index, row) = self.definitions.get(definition)?;
+        let type_def = self.assemblies[index].type_def(row)?;
+        type_def.methods().find_map(|method| {
+            let signature = method.signature()?;
+            let same = method.is_virtual()
+                && method.name() == Some(pair.method.as_ref())
+                && signature.generic_param_count == pair.arity
+                && signature.parameters == pair.parameters;
+            same.then(|| method.flags() & METHOD_NEWSLOT != 0)
+        })
+    }
+
+    /// The nearest proper ancestor of `definition` declaring a virtual method with `pair`'s name,
+    /// arity and parameters, with whether that declaration is `newslot`.
+    fn inherited_virtual(&self, definition: &str, pair: &MethodPair) -> Option<(String, bool)> {
+        let mut at = self.base_of(definition)?;
+        for _ in 0..PATH_BACKSTOP {
+            if let Some(newslot) = self.declared_virtual(&at, pair) {
+                return Some((at, newslot));
+            }
+            at = self.base_of(&at)?;
+        }
+        None
+    }
+}
+
+/// The vtable slot a class's virtual method occupies, as [`Program::virtual_slot`] answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualSlot {
+    /// The type whose declaration introduced the slot: a `newslot` declaration, or the root of an
+    /// override chain with no inherited declaration in view.
+    pub introduced_by: Box<str>,
+    /// Whether the introducing declaration hides an inherited virtual method of the same signature,
+    /// so that the hierarchy holds two slots answering to one name and signature.
+    pub hides_inherited: bool,
 }
 
 /// `mdNewSlot` (II.23.1.10) -- the method starts a new vtable slot rather than overriding one.

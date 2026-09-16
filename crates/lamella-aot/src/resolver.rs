@@ -988,10 +988,13 @@ impl<'a> MetadataResolver<'a> {
             self.mono
                 .virtual_method_body(&declaring, name, &arguments)?;
         }
-        self.vtable_methods(type_def)
-            .iter()
-            .position(|slot| slot.name == Some(name) && slot.key == key)
-            .map(GenericDispatch::Slot)
+        call_site_slot(
+            &self.vtable_methods(type_def),
+            name,
+            &key,
+            Some(method.is_virtual()),
+        )
+        .map(GenericDispatch::Slot)
     }
 
     /// Whether any type in this module implements the interface method at `declaration` EXPLICITLY
@@ -1315,11 +1318,10 @@ impl<'a> MetadataResolver<'a> {
                 for (key, impl_) in self.slots_for(declaring.as_deref(), &method, rid, key) {
                     let impl_ = self.instantiated_slot_impl(link.through.as_deref(), &method, impl_);
                     if !newslot {
-                        if let Some(entry) = slots
-                            .iter_mut()
-                            .find(|slot| slot.name == name && slot.key == key)
-                        {
-                            entry.impl_ = impl_;
+                        if let Some(index) = lamella_metadata::overridden_slot(&slots, |slot| {
+                            slot.name == name && slot.key == key
+                        }) {
+                            slots[index].impl_ = impl_;
                             continue;
                         }
                     }
@@ -1328,6 +1330,32 @@ impl<'a> MetadataResolver<'a> {
             }
         }
         slots
+    }
+
+    /// Whether the method a call names on `type_def` is virtual: its most-derived declaration with
+    /// `name` and the parameter `key`, searched from `type_def` up its base class chain, or `None`
+    /// when no class in that chain declares one.
+    ///
+    /// The chain, and the base it continues into in another assembly, are the ones
+    /// [`Self::vtable_methods`] lays `type_def`'s slots over, so every slot that table holds has its
+    /// declaration within reach of this search.
+    fn declared_virtual(&self, type_def: TypeDef<'a>, name: &str, key: &str) -> Option<bool> {
+        let chain = assembly_base_chain(self.assembly, type_def);
+        if let Some(declared) = declared_virtual_in(self.assembly, &chain, name, key) {
+            return Some(declared);
+        }
+        let base = chain.last()?.type_def.extends();
+        if base.row() == 0 || base.table() == table::TYPE_DEF {
+            return None;
+        }
+        let definition = if base.table() == table::TYPE_SPEC {
+            generic_base_definition(self.assembly, base)?
+        } else {
+            base
+        };
+        let (base_ns, base_name) = self.assembly.type_token_full_name(definition)?;
+        let (_, reference, ref_td) = self.find_reference_type(&base_ns, &base_name)?;
+        reference_declared_virtual(&self.references, reference, ref_td, name, key, 0)
     }
 
     /// An inherited slot's implementation, REBOUND to the monomorphized body when the link that
@@ -1491,6 +1519,24 @@ impl<'a> MetadataResolver<'a> {
         result
     }
 
+    /// The index of a REFERENCE-owned type's nullary virtual `name`, in the SAME numbering
+    /// [`Self::reference_type_meta`] fills its vtable with.
+    ///
+    /// [`Self::nullary_vtable_slot`] cannot answer this: it walks `self.assembly`'s slots, and a
+    /// referenced type's are numbered inside its OWNER (that is the whole reason
+    /// `reference_vtable_slots` exists). Asking the wrong one returns either `None` or an index into
+    /// a different vtable, and the second is the dangerous answer.
+    #[must_use]
+    pub fn reference_nullary_vtable_slot(&self, handle: TypeHandle, name: &str) -> Option<usize> {
+        let (ordinal, token) = reference_handle_parts(handle)?;
+        let reference = *self.references.get(ordinal)?;
+        let type_def = reference.type_def(token & 0x00ff_ffff)?;
+        let key = param_key(reference, 0, &[]);
+        reference_vtable_slots(&self.references, reference, type_def)
+            .iter()
+            .position(|slot| slot.name == Some(name) && slot.key == key)
+    }
+
     /// The slot index at which `type_def`'s vtable carries the PARAMETERLESS virtual method `name` --
     /// the index a `callvirt` of it dispatches through on a receiver of this type.
     ///
@@ -1514,23 +1560,6 @@ impl<'a> MetadataResolver<'a> {
     /// required parameter enumerates the CALLERS of `param_key` and cannot reach a site that does
     /// not call it. **A format has one implementation or it has none.**
     #[must_use]
-    /// The index of a REFERENCE-owned type's nullary virtual `name`, in the SAME numbering
-    /// [`Self::reference_type_meta`] fills its vtable with.
-    ///
-    /// [`Self::nullary_vtable_slot`] cannot answer this: it walks `self.assembly`'s slots, and a
-    /// referenced type's are numbered inside its OWNER (that is the whole reason
-    /// `reference_vtable_slots` exists). Asking the wrong one returns either `None` or an index into
-    /// a different vtable, and the second is the dangerous answer.
-    pub fn reference_nullary_vtable_slot(&self, handle: TypeHandle, name: &str) -> Option<usize> {
-        let (ordinal, token) = reference_handle_parts(handle)?;
-        let reference = *self.references.get(ordinal)?;
-        let type_def = reference.type_def(token & 0x00ff_ffff)?;
-        let key = param_key(reference, 0, &[]);
-        reference_vtable_slots(&self.references, reference, type_def)
-            .iter()
-            .position(|slot| slot.name == Some(name) && slot.key == key)
-    }
-
     pub fn nullary_vtable_slot(&self, type_def: TypeDef<'a>, name: &str) -> Option<usize> {
         let key = param_key(self.assembly, 0, &[]);
         self.vtable_methods(type_def)
@@ -2032,7 +2061,7 @@ impl<'a> MetadataResolver<'a> {
     /// keep those library methods alive through gc). `base` carries the owner's OWN base as a
     /// reference-owned handle (resolved across the attached references when the owner extends a
     /// type from one of ITS references), so a `castclass`/`isinst` chain scan crosses the
-    /// assembly boundary; interface dispatch on such a type is not yet threaded (empty itable).
+    /// assembly boundary, and its itable is the owner's own, built from the owner's `InterfaceImpl` rows.
     /// `None` without a reference, or if the handle is not a reference TypeDef.
     pub fn reference_type_meta(&self, handle: TypeHandle) -> Option<TypeMeta> {
         let (ordinal, token) = reference_handle_parts(handle)?;
@@ -2170,25 +2199,7 @@ impl<'a> MetadataResolver<'a> {
             .collect();
         self.fold_explicit_itable_entries(
             &links,
-            &|link, link_type, body| {
-                let MethodKind::Definition(rid) = link.resolve_method(body)?.kind else {
-                    return None;
-                };
-                let method = link_type.methods().find(|method| method.rid() == rid)?;
-                if !method.is_virtual() {
-                    return None;
-                }
-                let owner = link.type_token_name(link_type.token());
-                let owner_namespace: String =
-                    owner.as_ref().map(|n| n.namespace.into()).unwrap_or_default();
-                let owner_name: String = owner.as_ref().map(|n| n.name.into()).unwrap_or_default();
-                Some(VtableEntry::Extern(reference_method_symbol(
-                    link,
-                    &owner_namespace,
-                    &owner_name,
-                    &method,
-                )))
-            },
+            &|link, link_type, body| reference_explicit_entry(link, link_type, body),
             &mut entries,
         );
         entries
@@ -2690,20 +2701,65 @@ impl<'a> MetadataResolver<'a> {
                         let Some(slot) = found else {
                             continue;
                         };
-                        if let Some(func_index) = module_slot_index(slot, resolve) {
-                            entries.push((tag, VtableEntry::Func(func_index)));
+                        if let Some(entry) = slot_entry(slot, resolve) {
+                            entries.push((tag, entry));
                         }
                     }
                 }
             }
-            let chain: Vec<(&'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> =
+            for link in self.cross_class_chain(assembly, type_def, arguments) {
+                if core::ptr::eq(link.assembly, assembly) {
+                    continue;
+                }
+                for iface_token in link.type_def.interfaces() {
+                    let Some((iface_assembly, iface, identity)) =
+                        self.interface_link(link.assembly, iface_token, &link.arguments)
+                    else {
+                        continue;
+                    };
+                    let iface_name = identity.type_name();
+                    for method in iface.methods() {
+                        let Some(name) = method.name() else { continue };
+                        let Some(signature) = decodable_signature(&method) else {
+                            continue;
+                        };
+                        for (tag, key) in
+                            self.interface_method_keys(iface_assembly, &iface_name, name, &signature)
+                        {
+                            if entries.iter().any(|(t, _)| *t == tag) {
+                                continue;
+                            }
+                            let Some(slot) = impls
+                                .iter()
+                                .find(|slot| slot.name == Some(name) && slot.key == key)
+                            else {
+                                continue;
+                            };
+                            if let Some(entry) = slot_entry(slot, resolve) {
+                                entries.push((tag, entry));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut chain: Vec<(&'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> =
                 assembly_base_chain_under(assembly, type_def, arguments)
                     .into_iter()
                     .map(|link| (assembly, link.type_def, link.in_force))
                     .collect();
+            chain.extend(
+                self.cross_class_chain(assembly, type_def, arguments)
+                    .into_iter()
+                    .rev()
+                    .filter(|link| !core::ptr::eq(link.assembly, assembly))
+                    .map(|link| (link.assembly, link.type_def, link.arguments)),
+            );
             self.fold_explicit_itable_entries(
                 &chain,
-                &|link, _, body| {
+                &|link, link_type, body| {
+                    if !core::ptr::eq(link, assembly) {
+                        return reference_explicit_entry(link, link_type, body);
+                    }
                     let MethodKind::Definition(rid) = link.resolve_method(body)?.kind else {
                         return None;
                     };
@@ -2796,21 +2852,6 @@ fn slot_entries(
     slots.iter().map(|slot| slot_entry(slot, resolve)).collect()
 }
 
-/// The function index a slot names WHEN THE IMPLEMENTATION IS THIS MODULE'S, or `None` for one that
-/// lives in a reference.
-///
-/// An itable entry carries a function INDEX, and a slot whose implementation is a referenced
-/// assembly's has only that assembly's extern SYMBOL -- there is no index here to write down. So
-/// this is the itable's half of [`slot_entry`], with the same job of giving a new [`SlotImpl`]
-/// variant its case in ONE place.
-fn module_slot_index(slot: &VSlot<'_>, resolve: &dyn Fn(u32) -> Option<u32>) -> Option<u32> {
-    match &slot.impl_ {
-        SlotImpl::Rid(rid) => resolve(*rid),
-        SlotImpl::Mono(index) => Some(*index),
-        SlotImpl::Extern(_) => None,
-    }
-}
-
 /// ONE slot as the entry a descriptor carries.
 ///
 /// **EVERY SITE THAT TURNS A [`VSlot`] INTO A [`VtableEntry`] GOES THROUGH HERE**, because the
@@ -2823,6 +2864,35 @@ fn slot_entry(slot: &VSlot<'_>, resolve: &dyn Fn(u32) -> Option<u32>) -> Option<
         SlotImpl::Extern(symbol) => Some(VtableEntry::Extern(symbol.clone())),
         SlotImpl::Mono(index) => Some(VtableEntry::Func(*index)),
     }
+}
+
+/// The itable entry a referenced link's explicit interface implementation contributes: the extern symbol
+/// of the method its `MethodImpl` row names, so the entry links against the owning assembly's object.
+///
+/// The method is named from the row itself rather than found by name among the type's slots: an explicit
+/// implementation is emitted `newslot`, so a base and a type that re-implements the same interface
+/// contribute two slots that are identical under name and parameter key.
+fn reference_explicit_entry<'x>(
+    link: &'x Assembly<'x>,
+    link_type: TypeDef<'x>,
+    body: Token,
+) -> Option<VtableEntry> {
+    let MethodKind::Definition(rid) = link.resolve_method(body)?.kind else {
+        return None;
+    };
+    let method = link_type.methods().find(|method| method.rid() == rid)?;
+    if !method.is_virtual() {
+        return None;
+    }
+    let owner = link.type_token_name(link_type.token());
+    let owner_namespace: String = owner.as_ref().map(|n| n.namespace.into()).unwrap_or_default();
+    let owner_name: String = owner.as_ref().map(|n| n.name.into()).unwrap_or_default();
+    Some(VtableEntry::Extern(reference_method_symbol(
+        link,
+        &owner_namespace,
+        &owner_name,
+        &method,
+    )))
 }
 
 /// One vtable slot during numbering: the method name, its assembly-independent parameter identity
@@ -3315,11 +3385,10 @@ fn reference_vtable_slots_seeded<'x>(
                 reference_method_symbol(assembly, &owner_namespace, &owner_name, &method);
             let newslot = method.flags() & 0x0100 != 0;
             if !newslot {
-                if let Some(entry) = slots
-                    .iter_mut()
-                    .find(|slot| slot.name == name && slot.key == key)
-                {
-                    entry.impl_ = SlotImpl::Extern(symbol);
+                if let Some(index) = lamella_metadata::overridden_slot(&slots, |slot| {
+                    slot.name == name && slot.key == key
+                }) {
+                    slots[index].impl_ = SlotImpl::Extern(symbol);
                     continue;
                 }
             }
@@ -3331,6 +3400,82 @@ fn reference_vtable_slots_seeded<'x>(
         }
     }
     slots
+}
+
+/// The vtable slot a `callvirt` dispatches through, for a call naming `name` with the parameter
+/// `key` on a type whose laid-out slots are `slots`: the slot of the declaration the call names.
+///
+/// That declaration is the most-derived one at or above the named type (ECMA-335 III.4.2), and
+/// `declared_virtual` says whether it is virtual. A non-virtual declaration hides every inherited
+/// virtual method with its signature, so the call is direct and has no slot. A virtual one owns the
+/// LAST slot with its name and key: a `newslot` declaration appends its slot after every inherited
+/// one, an override takes the most-derived inherited slot with its signature
+/// ([`lamella_metadata::overridden_slot`]), and no type between the declaration and the named type
+/// declares the member again. The FIRST matching slot belongs to a hidden method whenever a class in
+/// the chain re-declares the member with `new virtual`.
+///
+/// `None` for `declared_virtual` means no class in the chain declares the member; the slots are laid
+/// over the same chain, so none of them matches either.
+fn call_site_slot(
+    slots: &[VSlot<'_>],
+    name: &str,
+    key: &str,
+    declared_virtual: Option<bool>,
+) -> Option<usize> {
+    if declared_virtual == Some(false) {
+        return None;
+    }
+    slots
+        .iter()
+        .rposition(|slot| slot.name == Some(name) && slot.key == key)
+}
+
+/// Whether the most-derived declaration of `name` with the parameter `key` along `chain` is virtual,
+/// or `None` when no link declares that member. `chain` is derived-first and within `assembly`.
+fn declared_virtual_in(
+    assembly: &Assembly<'_>,
+    chain: &[BaseLink<'_>],
+    name: &str,
+    key: &str,
+) -> Option<bool> {
+    chain.iter().find_map(|link| {
+        link.type_def
+            .methods()
+            .find(|method| {
+                method.name() == Some(name) && slot_key(assembly, method, method.rid()) == key
+            })
+            .map(|method| method.is_virtual())
+    })
+}
+
+/// [`MetadataResolver::declared_virtual`] for a type a referenced assembly declares, over the chain
+/// and the cross-assembly base that [`reference_vtable_slots_seeded`] numbers the type's slots with.
+fn reference_declared_virtual<'x>(
+    references: &[&'x Assembly<'x>],
+    assembly: &'x Assembly<'x>,
+    type_def: TypeDef<'x>,
+    name: &str,
+    key: &str,
+    depth: u32,
+) -> Option<bool> {
+    let chain = assembly_base_chain(assembly, type_def);
+    if let Some(declared) = declared_virtual_in(assembly, &chain, name, key) {
+        return Some(declared);
+    }
+    if depth >= 64 {
+        return None;
+    }
+    let base = chain.last()?.type_def.extends();
+    if base.row() == 0 || base.table() == table::TYPE_DEF {
+        return None;
+    }
+    let base_name = assembly.type_token_name(base)?;
+    let (owner, base_td) = references.iter().find_map(|reference| {
+        reference
+            .find_type(base_name.namespace, base_name.name)
+            .map(|td| (*reference, td))
+    })?;
+    reference_declared_virtual(references, owner, base_td, name, key, depth + 1)
 }
 
 /// Where a dispatched method's implementation lives -- a vtable slot's or an itable entry's emitted
@@ -5080,7 +5225,10 @@ impl CallResolver for MetadataResolver<'_> {
                 signed,
                 element_type: self.slot_type(&element).unwrap_or(MirType::I32),
             }),
-            "Set" => Some(Array2DOp::Set { element_size }),
+            "Set" => Some(Array2DOp::Set {
+                element_size,
+                element_type: self.slot_type(&element).unwrap_or(MirType::I32),
+            }),
             "Address" => Some(Array2DOp::Address { element_size }),
             _ => None,
         }
@@ -5116,7 +5264,11 @@ impl CallResolver for MetadataResolver<'_> {
                 element_type: self.slot_type(&element).unwrap_or(MirType::I32),
                 rank,
             }),
-            "Set" => Some(ArrayMDOp::Set { element_size, rank }),
+            "Set" => Some(ArrayMDOp::Set {
+                element_size,
+                element_type: self.slot_type(&element).unwrap_or(MirType::I32),
+                rank,
+            }),
             "Address" => Some(ArrayMDOp::Address { element_size, rank }),
             _ => None,
         }
@@ -5731,14 +5883,26 @@ impl CallResolver for MetadataResolver<'_> {
                     if type_def.is_interface() {
                         return None;
                     }
-                    let slots = if core::ptr::eq(owner, self.assembly) {
-                        self.vtable_methods(type_def)
+                    let name = method.name?;
+                    let (slots, declared_virtual) = if core::ptr::eq(owner, self.assembly) {
+                        (
+                            self.vtable_methods(type_def),
+                            self.declared_virtual(type_def, name, &key),
+                        )
                     } else {
-                        reference_vtable_slots(&self.references, owner, type_def)
+                        (
+                            reference_vtable_slots(&self.references, owner, type_def),
+                            reference_declared_virtual(
+                                &self.references,
+                                owner,
+                                type_def,
+                                name,
+                                &key,
+                                0,
+                            ),
+                        )
                     };
-                    return slots
-                        .iter()
-                        .position(|slot| slot.name == method.name && slot.key == key);
+                    return call_site_slot(&slots, name, &key, declared_virtual);
                 }
                 let declaring = method.declaring_type.as_ref()?;
                 let (_, reference, ref_td) =
@@ -5746,9 +5910,13 @@ impl CallResolver for MetadataResolver<'_> {
                 if ref_td.is_interface() {
                     return None;
                 }
-                reference_vtable_slots(&self.references, reference, ref_td)
-                    .iter()
-                    .position(|slot| slot.name == method.name && slot.key == key)
+                let name = method.name?;
+                call_site_slot(
+                    &reference_vtable_slots(&self.references, reference, ref_td),
+                    name,
+                    &key,
+                    reference_declared_virtual(&self.references, reference, ref_td, name, &key, 0),
+                )
             }
             table::METHOD_SPEC => match self.virtual_generic_dispatch(*token)? {
                 GenericDispatch::Slot(slot) => Some(slot),

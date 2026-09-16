@@ -4667,6 +4667,299 @@ pub fn emit_instances_csharp(
     Ok(out)
 }
 
+
+/// What one pad's EIC cell reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtIntTarget {
+    /// External interrupt line `n`.
+    Line(u32),
+    /// The non-maskable interrupt, which is not one of the lines.
+    Nmi,
+}
+
+/// A family's pad-to-EXTINT map, checked complete by [`extint_map`].
+struct ExtIntMap {
+    family: String,
+    /// The strata files the map was read from, for the generated header.
+    sources: Vec<String>,
+    /// (PORT group, pad index, what the pad raises), sorted by group and then by index.
+    pads: Vec<(u32, u32, ExtIntTarget)>,
+    /// The PMUX value selecting the EIC function, which every pad in the map shares.
+    function: i64,
+    /// The eic block's layout class (C#, Swift) and module (Rust), where `LINE_COUNT` is published.
+    eic_layout_class: String,
+    eic_layout_module: String,
+}
+
+/// The generated pad-to-EXTINT lookup class name for a family: `Samd21Pins`.
+#[must_use]
+pub fn pins_class(family: &str) -> String {
+    format!("{}Pins", pascal(family))
+}
+
+/// Reads the pad-to-EXTINT map a family's pin table states, or `None` when the table has no EIC
+/// rows.
+///
+/// The emitted lookup answers "no external interrupt" for every pad it has no row for, so an
+/// incomplete map would describe a pad that raises a line as a pad that raises nothing. Every refusal
+/// here protects that answer: the map is emitted only when each pad a part of the family lists has
+/// exactly one EIC row, each row names a line the controller has or the non-maskable interrupt, every
+/// line has a pad, and every row selects the same function.
+fn extint_map(set: &FamilySet) -> Result<Option<ExtIntMap>, String> {
+    let family = &set.family;
+    let rows: Vec<&PinRow> = set.pins.rows.iter().filter(|row| row.instance == "eic").collect();
+    let Some(first) = rows.first() else { return Ok(None) };
+
+    let eic = set
+        .block("eic", "")
+        .ok_or_else(|| format!("pins.toml states EIC rows but there is no eic block table"))?;
+    let line_count = eic
+        .constant("LINE_COUNT")
+        .and_then(|count| u32::try_from(count).ok())
+        .filter(|count| *count > 0)
+        .ok_or_else(|| {
+            format!(
+                "the eic block states no LINE_COUNT -- the lookup's lines are checked against \
+                 it, and a count read off a register width can be larger than the controller"
+            )
+        })?;
+    let port = set
+        .block("port", "")
+        .ok_or_else(|| format!("pins.toml states EIC rows but there is no port block table"))?;
+    let function = port
+        .constant(&format!("FUNC_{}", first.function.to_ascii_uppercase()))
+        .ok_or_else(|| format!("the port block states no FUNC_{} constant", first.function))?;
+
+    let mut pads: Vec<(u32, u32, ExtIntTarget)> = Vec::new();
+    for row in &rows {
+        let (letter, index) = split_pin(&row.pin)
+            .filter(|(letter, _)| letter.is_ascii_lowercase())
+            .ok_or_else(|| format!("EIC row '{}' does not name a pad as P<group><index>", row.pin))?;
+        let group = u32::from(letter) - u32::from('a');
+        if row.function != first.function {
+            return Err(format!(
+                "EIC rows select function {} on {} and {} on {} -- the lookup publishes one \
+                 function value for every pad it answers",
+                first.function, first.pin, row.function, row.pin
+            ));
+        }
+        let target = if row.signal == "nmi" {
+            ExtIntTarget::Nmi
+        } else {
+            let line = row
+                .signal
+                .strip_prefix("extint")
+                .and_then(|n| n.parse::<u32>().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "EIC row '{}' states signal '{}' -- an EIC row states `extint<n>` or \
+                         `nmi`, and the lookup has no other answer to give",
+                        row.pin, row.signal
+                    )
+                })?;
+            if line >= line_count {
+                return Err(format!(
+                    "'{}' states EXTINT {line}, but the eic block states {line_count} lines",
+                    row.pin
+                ));
+            }
+            ExtIntTarget::Line(line)
+        };
+        if pads.iter().any(|(g, i, _)| *g == group && *i == index) {
+            return Err(format!("'{}' has two EIC rows -- a pad raises one line", row.pin));
+        }
+        pads.push((group, index, target));
+    }
+    pads.sort_by_key(|(group, index, _)| (*group, *index));
+
+    let unraised: Vec<String> = (0..line_count)
+        .filter(|line| !pads.iter().any(|(_, _, target)| *target == ExtIntTarget::Line(*line)))
+        .map(|line| line.to_string())
+        .collect();
+    if !unraised.is_empty() {
+        return Err(format!(
+            "no EIC row raises line {} of the {line_count} the eic block states -- a complete \
+             map gives every line a pad",
+            unraised.join(", ")
+        ));
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    for part in &set.parts.rows {
+        for entry in &part.pins {
+            let (lo, hi) = entry.split_once('-').unwrap_or((entry.as_str(), entry.as_str()));
+            let (Some((letter, first_index)), Some((last_letter, last_index))) = (split_pin(lo), split_pin(hi))
+            else {
+                continue;
+            };
+            if letter != last_letter || !letter.is_ascii_lowercase() {
+                continue;
+            }
+            let group = u32::from(letter) - u32::from('a');
+            for index in first_index..=last_index {
+                let name = format!("P{}{index:02}", letter.to_ascii_uppercase());
+                if !pads.iter().any(|(g, i, _)| *g == group && *i == index) && !missing.contains(&name) {
+                    missing.push(name);
+                }
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} {} in a part's present-list with no EIC row, so the lookup would answer that \
+             {} no external interrupt -- transcribe the EIC column for every pad the parts list",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are" },
+            if missing.len() == 1 { "it raises" } else { "they raise" },
+        ));
+    }
+
+    Ok(Some(ExtIntMap {
+        family: family.clone(),
+        sources: vec![
+            format!("csp/{family}/pins.toml"),
+            format!("csp/{family}/blocks/port.toml"),
+            format!("csp/{family}/blocks/eic.toml"),
+        ],
+        pads,
+        function,
+        eic_layout_class: layout_class(eic),
+        eic_layout_module: layout_module(eic),
+    }))
+}
+
+/// The PORT groups a map covers, ascending.
+fn extint_groups(map: &ExtIntMap) -> Vec<u32> {
+    let mut groups: Vec<u32> = map.pads.iter().map(|(group, _, _)| *group).collect();
+    groups.dedup();
+    groups
+}
+
+/// `0 for PA, 1 for PB`: what each group number means, spelled from the groups the map covers.
+fn extint_group_phrase(map: &ExtIntMap) -> String {
+    extint_groups(map)
+        .iter()
+        .map(|group| format!("{group} for P{}", char::from_u32(u32::from('A') + group).unwrap_or('?')))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One pad's answer as every emitted language spells it: the line number, or the NMI constant.
+fn extint_answer(target: ExtIntTarget) -> String {
+    match target {
+        ExtIntTarget::Line(line) => line.to_string(),
+        ExtIntTarget::Nmi => "EXTINT_NMI".to_string(),
+    }
+}
+
+/// Emits a family's pad-to-EXTINT lookup as a C# class: the two answers that are not a line, the
+/// PMUX value selecting the EIC, and `ExtIntLine(group, index)`.
+fn emit_pins_csharp(map: &ExtIntMap, regen: &str) -> Result<String, String> {
+    let class = pins_class(&map.family);
+    let mut out = String::new();
+    let what = format!(
+        "The {} external interrupt line each pad raises, looked up by PORT group and pad index.\n// A pad raises its line only while its multiplexer selects the EIC function.",
+        map.family
+    );
+    emit_header(&mut out, &class, &what, &map.sources, regen);
+
+    out.push_str("\n        /// <summary>Returned by ExtIntLine for a pad that raises no external interrupt.</summary>\n");
+    push_const(&mut out, "int", "EXTINT_NONE", "-1");
+    out.push_str(
+        "        /// <summary>Returned by ExtIntLine for the pad whose EIC function is the non-maskable\n        /// interrupt, which is not one of the external interrupt lines.</summary>\n",
+    );
+    push_const(&mut out, "int", "EXTINT_NMI", "-2");
+    out.push_str(
+        "        /// <summary>The PMUX function value that selects the EIC on every pad ExtIntLine\n        /// answers for.</summary>\n",
+    );
+    push_const(&mut out, "uint", "EXTINT_FUNCTION", &map.function.to_string());
+
+    out.push_str(&format!(
+        "\n        /// <summary>The external interrupt line a pad raises while its PMUX selects\n        /// EXTINT_FUNCTION: a line below {layout}.LINE_COUNT, EXTINT_NMI, or EXTINT_NONE.</summary>\n        /// <param name=\"group\">The PORT group: {groups}.</param>\n        /// <param name=\"index\">The pad's index within its group.</param>\n        public static int ExtIntLine(int group, int index)\n        {{\n",
+        layout = map.eic_layout_class,
+        groups = extint_group_phrase(map),
+    ));
+    for group in extint_groups(map) {
+        out.push_str(&format!(
+            "            if (group == {group})\n            {{\n                switch (index)\n                {{\n"
+        ));
+        for (_, index, target) in map.pads.iter().filter(|(g, _, _)| *g == group) {
+            out.push_str(&format!("                    case {index}: return {};\n", extint_answer(*target)));
+        }
+        out.push_str("                }\n                return EXTINT_NONE;\n            }\n");
+    }
+    out.push_str("            return EXTINT_NONE;\n        }\n");
+    finish_class(&mut out)?;
+    Ok(out)
+}
+
+/// Emits a family's pad-to-EXTINT lookup as a Rust module: the same constants as
+/// [`emit_pins_csharp`], and the lookup as a `const fn` spelled `extint_line`.
+fn emit_pins_rust(map: &ExtIntMap, regen: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let what = format!(
+        "The {} external interrupt line each pad raises, with the same constants as {}.g.cs and the\n// lookup spelled `extint_line`. A pad raises its line only while its multiplexer selects the EIC\n// function.",
+        map.family,
+        pins_class(&map.family),
+    );
+    emit_rust_header(&mut out, &what, &map.sources, regen);
+
+    out.push_str("\n/// Returned by [`extint_line`] for a pad that raises no external interrupt.\n");
+    push_rust_const(&mut out, "i32", "EXTINT_NONE", "-1");
+    out.push_str(
+        "/// Returned by [`extint_line`] for the pad whose EIC function is the non-maskable interrupt, which\n/// is not one of the external interrupt lines.\n",
+    );
+    push_rust_const(&mut out, "i32", "EXTINT_NMI", "-2");
+    out.push_str("/// The PMUX function value that selects the EIC on every pad [`extint_line`] answers for.\n");
+    push_rust_const(&mut out, "u32", "EXTINT_FUNCTION", &map.function.to_string());
+
+    out.push_str(&format!(
+        "\n/// The external interrupt line a pad raises while its PMUX selects [`EXTINT_FUNCTION`]: a line\n/// below `LINE_COUNT` in `{module}`, [`EXTINT_NMI`], or [`EXTINT_NONE`]. `group` is the PORT group,\n/// {groups}; `index` is the pad's index within its group.\n#[must_use]\npub const fn extint_line(group: u32, index: u32) -> i32 {{\n    match (group, index) {{\n",
+        module = map.eic_layout_module,
+        groups = extint_group_phrase(map),
+    ));
+    for (group, index, target) in &map.pads {
+        out.push_str(&format!("        ({group}, {index}) => {},\n", extint_answer(*target)));
+    }
+    out.push_str("        _ => EXTINT_NONE,\n    }\n}\n");
+    finish_rust(&out)?;
+    Ok(out)
+}
+
+/// Emits a family's pad-to-EXTINT lookup as a Swift caseless enum: the same constants as
+/// [`emit_pins_csharp`], and the lookup spelled `extIntLine`.
+fn emit_pins_swift(map: &ExtIntMap, regen: &str) -> Result<String, String> {
+    let class = pins_class(&map.family);
+    let mut out = String::new();
+    let what = format!(
+        "The {} external interrupt line each pad raises, with the same constants as {class}.g.cs and\n// the lookup spelled `extIntLine`. A pad raises its line only while its multiplexer selects the\n// EIC function.",
+        map.family,
+    );
+    emit_swift_header(&mut out, &what, &map.sources, regen);
+
+    out.push_str(&format!("\npublic enum {class} {{\n"));
+    out.push_str("    /// Returned by `extIntLine` for a pad that raises no external interrupt.\n");
+    push_swift_const(&mut out, "Int32", "EXTINT_NONE", "-1");
+    out.push_str(
+        "    /// Returned by `extIntLine` for the pad whose EIC function is the non-maskable interrupt,\n    /// which is not one of the external interrupt lines.\n",
+    );
+    push_swift_const(&mut out, "Int32", "EXTINT_NMI", "-2");
+    out.push_str("    /// The PMUX function value that selects the EIC on every pad `extIntLine` answers for.\n");
+    push_swift_const(&mut out, "UInt32", "EXTINT_FUNCTION", &map.function.to_string());
+
+    out.push_str(&format!(
+        "\n    /// The external interrupt line a pad raises while its PMUX selects `EXTINT_FUNCTION`: a line\n    /// below `{layout}.LINE_COUNT`, `EXTINT_NMI`, or `EXTINT_NONE`. `group` is the PORT group,\n    /// {groups}; `index` is the pad's index within its group.\n    public static func extIntLine(group: UInt32, index: UInt32) -> Int32 {{\n        switch (group, index) {{\n",
+        layout = map.eic_layout_class,
+        groups = extint_group_phrase(map),
+    ));
+    for (group, index, target) in &map.pads {
+        out.push_str(&format!("        case ({group}, {index}): return {}\n", extint_answer(*target)));
+    }
+    out.push_str("        default: return EXTINT_NONE\n        }\n    }\n}\n");
+    finish_swift(&out)?;
+    Ok(out)
+}
+
 /// The generated bindings class name for a board: `MicrochipSamd21XproBindings`.
 #[must_use]
 pub fn bindings_class(board: &str) -> String {
@@ -6283,6 +6576,10 @@ struct StInterruptEmission {
     /// The falling-edge trigger register, absolute. Setting BOTH this and RTSR for a line is how
     /// a both-edges pin change is asked for, which is what the `ValueChanged` surface means.
     ftsr_reg: i64,
+    /// The pad's port input register, absolute, and the pad's bit in it: where the handler reads the
+    /// level it passes on, after it clears the pending bit.
+    port_idr_reg: i64,
+    pin_mask: i64,
     port_rcc_en_reg: i64,
     port_rcc_en_mask: i64,
     syscfg_rcc_en_reg: i64,
@@ -6422,10 +6719,17 @@ fn resolve_interrupt_stm32(
         Ok((rcc_base + off, 1i64 << bit))
     };
 
-    let (port, _) = split_pin(&pin.pin)
+    let (port, index) = split_pin(&pin.pin)
         .ok_or_else(|| format!("{board}: cannot read a port letter from pin '{}'", pin.pin))?;
     let (port_rcc_en_reg, port_rcc_en_mask) = rcc_enable(&format!("gpio{}", port.to_ascii_lowercase()))?;
     let (syscfg_rcc_en_reg, syscfg_rcc_en_mask) = rcc_enable("syscfg")?;
+    let port_group = format!("gpio{}", port.to_ascii_lowercase());
+    let port_base = instances
+        .value(&port_group, "base")
+        .ok_or_else(|| format!("{board}: no instance row for port group '{port_group}'"))?;
+    let gpio = set.block("gpio", "").ok_or_else(|| format!("{board}: no gpio block table"))?;
+    let port_idr_reg = port_base
+        + gpio.register("IDR").ok_or_else(|| format!("{board}: gpio block states no `IDR` register"))?.offset.value;
 
     let syscfg_base = instances
         .value("syscfg", "base")
@@ -6467,6 +6771,8 @@ fn resolve_interrupt_stm32(
         imr_reg: reg("IMR")?,
         rtsr_reg: reg("RTSR")?,
         ftsr_reg: reg("FTSR")?,
+        port_idr_reg,
+        pin_mask: 1i64 << index,
         port_rcc_en_reg,
         port_rcc_en_mask,
         syscfg_rcc_en_reg,
@@ -7456,7 +7762,7 @@ pub fn emit_board_csharp(
 
     for irq in &st_interrupts {
         let p = &irq.prefix;
-        out.push_str(&format!("\n        // -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it\n        // from the ISR to the managed side and never decodes it. Clear EXTI_PR before returning\n        // or the interrupt re-enters. --\n"));
+        out.push_str(&format!("\n        // -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it\n        // from the ISR to the managed side and never decodes it. Clear EXTI_PR, then read the\n        // pad's level from PORT_IDR_REG; without the clear the interrupt re-enters. --\n"));
         push_const(&mut out, "uint", &format!("{p}_TOKEN"), &irq.token.to_string());
         push_const(&mut out, "uint", &format!("{p}_EXTI_LINE"), &irq.line.to_string());
         push_const(&mut out, "uint", &format!("{p}_EXTI_LINE_MASK"), &format!("0x{:X}", irq.line_mask));
@@ -7466,6 +7772,8 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_EXTI_IMR_REG"), &format!("0x{:X}", irq.imr_reg));
         push_const(&mut out, "uint", &format!("{p}_EXTI_RTSR_REG"), &format!("0x{:X}", irq.rtsr_reg));
         push_const(&mut out, "uint", &format!("{p}_EXTI_FTSR_REG"), &format!("0x{:X}", irq.ftsr_reg));
+        push_const(&mut out, "uint", &format!("{p}_PORT_IDR_REG"), &format!("0x{:X}", irq.port_idr_reg));
+        push_const(&mut out, "uint", &format!("{p}_PIN_MASK"), &format!("0x{:X}", irq.pin_mask));
         push_const(&mut out, "uint", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", irq.port_rcc_en_reg));
         push_const(&mut out, "uint", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", irq.port_rcc_en_mask));
         push_const(&mut out, "uint", &format!("{p}_SYSCFG_RCC_EN_REG"), &format!("0x{:X}", irq.syscfg_rcc_en_reg));
@@ -7719,7 +8027,9 @@ pub fn emit_board_csharp(
             let p = upper_snake(&control.name);
             push_const(&mut out, "uint", &format!("{p}_PORT_BASE"), &format!("0x{group_base:X}"));
             push_const(&mut out, "uint", &format!("{p}_PIN"), &index.to_string());
-            push_const(&mut out, "uint", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
+            let (bank, bit) = pin_bank(index);
+            push_const(&mut out, "uint", &format!("{p}_BANK"), &bank.to_string());
+            push_const(&mut out, "uint", &mask_const_name(&p, bank), &format!("0x{:X}", 1u32 << bit));
             if let Some(low) = asserts_low(control) {
                 push_const(&mut out, "uint", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
             }
@@ -7759,6 +8069,34 @@ pub fn emit_board_csharp(
 /// NEITHER FIELD PREDICTS THE OTHER, so a row cannot be found from its block alone: Nordic's ports
 /// place a block called `gpio` and are named `port0` and `port1`. A family that spells a group a
 /// third way is a row here, and the error below names both spellings it looked for.
+/// A GPIO row's BANK and the bit within it, from the pin index its group base is paired with.
+///
+/// A MASK IS ONLY MEANINGFUL AGAINST THE REGISTER SET A CONSUMER WRITES, and a part whose pins
+/// outrun one 32-bit register has more than one such set. On such a part `1 << 45` is not a mask at
+/// all: it is a number no register has a bit for. So the index splits, and the bank is emitted
+/// beside the mask so a consumer can tell which set the bits belong to.
+///
+/// WHAT A BANK MEANS IS THE CHIP FAMILY'S TO SAY, and two families can answer differently. Where a
+/// port's base address already separates the banks -- one address for port A, another for port B --
+/// every row is bank 0 and the field carries no information. Where one peripheral block serves
+/// every pin and reaches the upper ones through a second set of registers, the bank is what selects
+/// that set. Acting on the field needs the family's register map, which is what `csp/` carries.
+pub(crate) fn pin_bank(index: u32) -> (u32, u32) {
+    (index / 32, index % 32)
+}
+
+/// The name a row's mask constant takes: `<NAME>_MASK` in bank 0, and `<NAME>_BANK<n>_MASK` in any
+/// other bank.
+///
+/// THE ASYMMETRY IS DELIBERATE AND IS THE POINT. A consumer written for the ordinary case does
+/// `write(PORT_BASE + OUTSET, MASK)`. If a row in a second bank also published `<NAME>_MASK`, that
+/// code would compile, run, and write the wrong register with a plausible-looking value. Under this
+/// rule it fails to COMPILE against such a row instead, which is the loud direction. The bank
+/// appears in the name as well as in its own constant, so the two cannot drift apart.
+pub(crate) fn mask_const_name(prefix: &str, bank: u32) -> String {
+    if bank == 0 { format!("{prefix}_MASK") } else { format!("{prefix}_BANK{bank}_MASK") }
+}
+
 fn control_pin_group_base(set: &FamilySet, board: &str, pin: &str) -> Result<(i64, u32), String> {
     let Some((port, index)) = split_pin(pin) else {
         return Err(format!("{board}: bad control pin {pin}"));
@@ -7850,7 +8188,9 @@ fn connector_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>,
             let at = format!("{prefix}_{}", upper_snake(&line.signal));
             uint(&mut rows, format!("{at}_PORT_BASE"), format!("0x{group_base:X}"));
             uint(&mut rows, format!("{at}_PIN"), index.to_string());
-            uint(&mut rows, format!("{at}_MASK"), format!("0x{:X}", 1u64 << index));
+            let (bank, bit) = pin_bank(index);
+            uint(&mut rows, format!("{at}_BANK"), bank.to_string());
+            uint(&mut rows, mask_const_name(&at, bank), format!("0x{:X}", 1u32 << bit));
         }
     }
     Ok(rows)
@@ -8312,24 +8652,25 @@ fn push_rust_isr_bodies(out: &mut String, interrupts: &[StInterruptEmission]) {
         let roles = bound.iter().map(|irq| irq.role.as_str()).collect::<Vec<_>>().join(", ");
 
         out.push_str(&format!(
-            "\n/// Takes one pending interrupt line this board has bound on NVIC position {vector}: clears it\n\
-             /// and answers its TOKEN, or `None` when no line of this board's is pending there.\n\
+            "\n/// Takes one pending interrupt line this board has bound on NVIC position {vector}: clears the\n\
+             /// line, reads the pad's level, and answers `(token, level)`, or `None` when no line of this\n\
+             /// board's is pending there.\n\
              ///\n\
-             /// THE CLEAR HAPPENS BEFORE THE ANSWER, and that ordering is why this is a function rather\n\
-             /// than another constant. The pending register is write-one-to-clear, so a handler that\n\
-             /// returns without writing its line's bit is re-entered immediately and the board makes no\n\
-             /// progress. Clearing FIRST also settles the fate of an edge that arrives mid-handler: it\n\
-             /// re-pends and the vector is entered again, where answering first and clearing afterwards\n\
-             /// would write the new edge away together with the old one.\n\
+             /// The line is cleared before the pad is read, which is the order `lamella_isr_notify` asks of\n\
+             /// its caller: an edge that lands during the read pends the line again and enters the vector\n\
+             /// once more, so the last level reported always matches the pad, at the cost of an occasional\n\
+             /// duplicate. Reading first would let the clear erase that edge. The pending register is\n\
+             /// write-one-to-clear, so a handler that returns without writing its line's bit is re-entered\n\
+             /// immediately.\n\
              ///\n\
-             /// CALL IT IN A LOOP, from the vector for NVIC position {vector}. One entry can find several\n\
-             /// bound lines pending and each carries its own token:\n\
+             /// Call it in a loop, from the vector for NVIC position {vector}. One entry can find several bound\n\
+             /// lines pending, and each carries its own token:\n\
              ///\n\
              /// ```text\n\
              /// #[unsafe(no_mangle)]\n\
              /// pub extern \"C\" fn exti_isr() {{\n\
-             ///     while let Some(token) = unsafe {{ board::isr_vector_{vector}_take() }} {{\n\
-             ///         unsafe {{ lamella_isr_notify(token) }};\n\
+             ///     while let Some((token, level)) = unsafe {{ board::isr_vector_{vector}_take() }} {{\n\
+             ///         unsafe {{ lamella_isr_notify(token, level) }};\n\
              ///     }}\n\
              /// }}\n\
              /// ```\n\
@@ -8338,15 +8679,15 @@ fn push_rust_isr_bodies(out: &mut String, interrupts: &[StInterruptEmission]) {
              /// managed side and hands it back to the driver, which is the only place that knows it means\n\
              /// a pin. That is what keeps the pad-to-line-to-vector mapping here and out of the runtime.\n\
              ///\n\
-             /// IT ANSWERS ONLY THE LINES THIS BOARD BOUND -- here, {roles}. A line the firmware enabled\n\
-             /// for its own use can share this vector and is neither reported nor cleared, because\n\
-             /// clearing a line this board did not bind would swallow that firmware's interrupt in\n\
-             /// silence. Such a firmware clears its own line in the same handler.\n\
+             /// It answers only the lines this board bound -- here, {roles}. A line the firmware enabled for\n\
+             /// its own use can share this vector and is neither reported nor cleared, because clearing a\n\
+             /// line this board did not bind would swallow that firmware's interrupt in silence. Such a\n\
+             /// firmware clears its own line in the same handler.\n\
              ///\n\
              /// # Safety\n\
-             /// Reads and writes the pending register through raw MMIO. Call it only from the interrupt\n\
-             /// vector for NVIC position {vector}.\n\
-             pub unsafe fn isr_vector_{vector}_take() -> Option<u32> {{\n"
+             /// Reads the pad's input register, and reads and writes the pending register, through raw\n\
+             /// MMIO. Call it only from the interrupt vector for NVIC position {vector}.\n\
+             pub unsafe fn isr_vector_{vector}_take() -> Option<(u32, u8)> {{\n"
         ));
 
         for irq in &bound {
@@ -8355,7 +8696,9 @@ fn push_rust_isr_bodies(out: &mut String, interrupts: &[StInterruptEmission]) {
                 "    let pending = unsafe {{ core::ptr::read_volatile({p}_EXTI_PR_REG as *const u32) }};\n\
                  \x20   if pending & {p}_EXTI_LINE_MASK != 0 {{\n\
                  \x20       unsafe {{ core::ptr::write_volatile({p}_EXTI_PR_REG as *mut u32, {p}_EXTI_LINE_MASK) }};\n\
-                 \x20       return Some({p}_TOKEN);\n\
+                 \x20       let pad = unsafe {{ core::ptr::read_volatile({p}_PORT_IDR_REG as *const u32) }};\n\
+                 \x20       let level = u8::from(pad & {p}_PIN_MASK != 0);\n\
+                 \x20       return Some(({p}_TOKEN, level));\n\
                  \x20   }}\n"
             ));
         }
@@ -8733,7 +9076,7 @@ pub fn emit_board_rust(
 
     for irq in &st_interrupts {
         let p = &irq.prefix;
-        out.push_str(&format!("\n// -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from the\n// ISR to the managed side and never decodes it. Clear EXTI_PR before returning or the\n// interrupt re-enters. --\n"));
+        out.push_str(&format!("\n// -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from the\n// ISR to the managed side and never decodes it. Clear EXTI_PR, then read the pad's level from\n// PORT_IDR_REG; without the clear the interrupt re-enters. --\n"));
         push_rust_const(&mut out, "u32", &format!("{p}_TOKEN"), &irq.token.to_string());
         push_rust_const(&mut out, "u32", &format!("{p}_EXTI_LINE"), &irq.line.to_string());
         push_rust_const(&mut out, "u32", &format!("{p}_EXTI_LINE_MASK"), &format!("0x{:X}", irq.line_mask));
@@ -8743,6 +9086,8 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_EXTI_IMR_REG"), &format!("0x{:X}", irq.imr_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_EXTI_RTSR_REG"), &format!("0x{:X}", irq.rtsr_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_EXTI_FTSR_REG"), &format!("0x{:X}", irq.ftsr_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PORT_IDR_REG"), &format!("0x{:X}", irq.port_idr_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PIN_MASK"), &format!("0x{:X}", irq.pin_mask));
         push_rust_const(&mut out, "u32", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", irq.port_rcc_en_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", irq.port_rcc_en_mask));
         push_rust_const(&mut out, "u32", &format!("{p}_SYSCFG_RCC_EN_REG"), &format!("0x{:X}", irq.syscfg_rcc_en_reg));
@@ -8992,7 +9337,9 @@ pub fn emit_board_rust(
             let p = upper_snake(&control.name);
             push_rust_const(&mut out, "u32", &format!("{p}_PORT_BASE"), &format!("0x{group_base:X}"));
             push_rust_const(&mut out, "u32", &format!("{p}_PIN"), &index.to_string());
-            push_rust_const(&mut out, "u32", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
+            let (bank, bit) = pin_bank(index);
+            push_rust_const(&mut out, "u32", &format!("{p}_BANK"), &bank.to_string());
+            push_rust_const(&mut out, "u32", &mask_const_name(&p, bank), &format!("0x{:X}", 1u32 << bit));
             if let Some(low) = asserts_low(control) {
                 push_rust_const(&mut out, "u32", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
             }
@@ -9389,7 +9736,7 @@ pub fn emit_board_swift(
 
     for irq in &st_interrupts {
         let p = &irq.prefix;
-        out.push_str(&format!("\n    // -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from\n    // the ISR to the managed side and never decodes it. Clear EXTI_PR before returning. --\n"));
+        out.push_str(&format!("\n    // -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from\n    // the ISR to the managed side and never decodes it. Clear EXTI_PR, then read the pad's\n    // level from PORT_IDR_REG. --\n"));
         push_swift_const(&mut out, "UInt32", &format!("{p}_TOKEN"), &irq.token.to_string());
         push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_LINE"), &irq.line.to_string());
         push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_LINE_MASK"), &format!("0x{:X}", irq.line_mask));
@@ -9399,6 +9746,8 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_IMR_REG"), &format!("0x{:X}", irq.imr_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_RTSR_REG"), &format!("0x{:X}", irq.rtsr_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_FTSR_REG"), &format!("0x{:X}", irq.ftsr_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_IDR_REG"), &format!("0x{:X}", irq.port_idr_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_MASK"), &format!("0x{:X}", irq.pin_mask));
         push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", irq.port_rcc_en_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", irq.port_rcc_en_mask));
         push_swift_const(&mut out, "UInt32", &format!("{p}_SYSCFG_RCC_EN_REG"), &format!("0x{:X}", irq.syscfg_rcc_en_reg));
@@ -9647,7 +9996,9 @@ pub fn emit_board_swift(
             let p = upper_snake(&control.name);
             push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_BASE"), &format!("0x{group_base:X}"));
             push_swift_const(&mut out, "UInt32", &format!("{p}_PIN"), &index.to_string());
-            push_swift_const(&mut out, "UInt32", &format!("{p}_MASK"), &format!("0x{:X}", 1u64 << index));
+            let (bank, bit) = pin_bank(index);
+            push_swift_const(&mut out, "UInt32", &format!("{p}_BANK"), &bank.to_string());
+            push_swift_const(&mut out, "UInt32", &mask_const_name(&p, bank), &format!("0x{:X}", 1u32 << bit));
             if let Some(low) = asserts_low(control) {
                 push_swift_const(&mut out, "UInt32", &format!("{p}_ACTIVE_LOW"), if low { "1" } else { "0" });
             }
@@ -9883,6 +10234,8 @@ pub fn emit_board_python(
             ("exti_imr_reg".to_string(), format!("0x{:X}", irq.imr_reg)),
             ("exti_rtsr_reg".to_string(), format!("0x{:X}", irq.rtsr_reg)),
             ("exti_ftsr_reg".to_string(), format!("0x{:X}", irq.ftsr_reg)),
+            ("port_idr_reg".to_string(), format!("0x{:X}", irq.port_idr_reg)),
+            ("pin_mask".to_string(), format!("0x{:X}", irq.pin_mask)),
             ("port_rcc_en_reg".to_string(), format!("0x{:X}", irq.port_rcc_en_reg)),
             ("port_rcc_en_mask".to_string(), format!("0x{:X}", irq.port_rcc_en_mask)),
             ("syscfg_rcc_en_reg".to_string(), format!("0x{:X}", irq.syscfg_rcc_en_reg)),
@@ -10198,10 +10551,12 @@ pub fn emit_board_python(
             ),
             None => String::new(),
         };
+        let (bank, bit) = pin_bank(index);
+        let mask_key = if bank == 0 { "mask".to_string() } else { format!("bank{bank}_mask") };
         out.push_str(&format!(
-            "    \"{}\": {{{kind}\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"mask\": 0x{:X}{polarity}{pull}}},\n",
+            "    \"{}\": {{{kind}\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"bank\": {bank}, \"{mask_key}\": 0x{:X}{polarity}{pull}}},\n",
             control.name,
-            1u64 << index,
+            1u32 << bit,
         ));
     }
     out.push_str("}\n");
@@ -10277,10 +10632,12 @@ pub fn emit_board_python(
             for line in &connector.pins {
                 let (group_base, index) =
                     control_pin_group_base(set, &resolved.board.board, &line.pin)?;
+                let (bank, bit) = pin_bank(index);
+                let mask_key = if bank == 0 { "mask".to_string() } else { format!("bank{bank}_mask") };
                 pins.push(format!(
-                    "\"{}\": {{\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"mask\": 0x{:X}}}",
+                    "\"{}\": {{\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"bank\": {bank}, \"{mask_key}\": 0x{:X}}}",
                     line.signal,
-                    1u64 << index
+                    1u32 << bit
                 ));
             }
             out.push_str(&format!(
@@ -11359,9 +11716,10 @@ pub struct Generated {
 }
 
 /// Generates every artifact of a family: the C# layout classes, the instances class (C# and
-/// its 1:1 Rust twin), and per board under `bsp/*/board.toml` whose family (or module's
-/// family) matches, a bindings class (C#) plus its 1:1 Rust twin -- one strata load, every
-/// projection, so gate A freshness and the gate B anchors cover all of them together.
+/// its 1:1 Rust twin), the pad-to-EXTINT lookup when the pin table states the die's EIC map, and
+/// per board under `bsp/*/board.toml` whose family (or module's family) matches, a bindings class
+/// (C#) plus its 1:1 Rust twin -- one strata load, every projection, so gate A freshness and the
+/// gate B anchors cover all of them together.
 pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<Generated>, String> {
     let regen = format!("cargo run -p lamella-bsp-gen -- gen-family . {family}");
     let set = load_family(repo_root, family)?;
@@ -11399,6 +11757,23 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
             path: format!("csp/{family}/swift/{}.swift", instances_class(family)),
             contents: emit_instances_swift(&set.instances, &format!("csp/{family}/instances.toml"), &regen)?,
         });
+    }
+
+    if let Some(map) = extint_map(&set)? {
+        out.push(Generated {
+            path: format!("csp/{family}/csharp/{}.g.cs", pins_class(family)),
+            contents: emit_pins_csharp(&map, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("csp/{family}/rust/{}_pins.rs", snake(family)),
+            contents: emit_pins_rust(&map, &regen)?,
+        });
+        if swift {
+            out.push(Generated {
+                path: format!("csp/{family}/swift/{}.swift", pins_class(family)),
+                contents: emit_pins_swift(&map, &regen)?,
+            });
+        }
     }
 
     let bsp_root = repo_root.join("bsp");
@@ -12257,6 +12632,150 @@ source = \"a datasheet\"
         assert!(swift.trim_end().ends_with('}'), "the namespace closes");
     }
 
+    /// A small family whose EIC section is complete: two lines, the non-maskable interrupt, and a
+    /// pad in a second group sharing line 1 at an index the modulo rule would not give it.
+    fn extint_family() -> FamilySet {
+        let constants = |pairs: &[(&str, i64)]| -> Vec<(String, crate::Int)> {
+            pairs.iter().map(|(name, value)| ((*name).to_string(), crate::Int { value: *value, hex: false })).collect()
+        };
+        let row = |pin: &str, signal: &str| PinRow {
+            pin: pin.into(),
+            function: "A".into(),
+            instance: "eic".into(),
+            signal: signal.into(),
+            source: "a datasheet".into(),
+        };
+        FamilySet {
+            family: "fam".into(),
+            blocks: vec![
+                BlockTable {
+                    family: "fam".into(),
+                    block: "eic".into(),
+                    constants: constants(&[("LINE_COUNT", 2)]),
+                    ..Default::default()
+                },
+                BlockTable {
+                    family: "fam".into(),
+                    block: "port".into(),
+                    constants: constants(&[("FUNC_A", 0), ("FUNC_B", 1)]),
+                    ..Default::default()
+                },
+            ],
+            pins: PinsTable {
+                family: "fam".into(),
+                rows: vec![row("PA00", "extint0"), row("PA01", "extint1"), row("PA08", "nmi"), row("PB03", "extint1")],
+            },
+            parts: PartsTable {
+                family: "fam".into(),
+                rows: vec![PartRow {
+                    part: "p".into(),
+                    pins: vec!["PA00-PA01".into(), "PA08".into(), "PB03".into()],
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_extint_lookup_answers_each_row_in_all_three_languages() {
+        let map = extint_map(&extint_family()).expect("a complete section").expect("a section is stated");
+        let csharp = emit_pins_csharp(&map, "regen").expect("C# emits");
+        let rust = emit_pins_rust(&map, "regen").expect("Rust emits");
+        let swift = emit_pins_swift(&map, "regen").expect("Swift emits");
+
+        for line in [
+            "    public sealed class FamPins",
+            "        public const int EXTINT_NONE = -1;",
+            "        public const int EXTINT_NMI = -2;",
+            "        public const uint EXTINT_FUNCTION = 0;",
+            "        public static int ExtIntLine(int group, int index)",
+            "            if (group == 0)",
+            "                    case 0: return 0;",
+            "                    case 1: return 1;",
+            "                    case 8: return EXTINT_NMI;",
+            "            if (group == 1)",
+            "                    case 3: return 1;",
+            "        /// <param name=\"group\">The PORT group: 0 for PA, 1 for PB.</param>",
+        ] {
+            assert!(csharp.contains(line), "C# is missing: {line}\n{csharp}");
+        }
+        assert!(csharp.contains("a line below FamEicLayout.LINE_COUNT"), "{csharp}");
+
+        for line in [
+            "pub const EXTINT_NONE: i32 = -1;",
+            "pub const EXTINT_NMI: i32 = -2;",
+            "pub const EXTINT_FUNCTION: u32 = 0;",
+            "pub const fn extint_line(group: u32, index: u32) -> i32 {",
+            "        (0, 0) => 0,",
+            "        (0, 1) => 1,",
+            "        (0, 8) => EXTINT_NMI,",
+            "        (1, 3) => 1,",
+            "        _ => EXTINT_NONE,",
+            "/// 0 for PA, 1 for PB; `index` is the pad's index within its group.",
+        ] {
+            assert!(rust.contains(line), "Rust is missing: {line}\n{rust}");
+        }
+        assert!(rust.contains("below `LINE_COUNT` in `fam_eic_layout`"), "{rust}");
+
+        for line in [
+            "public enum FamPins {",
+            "    public static let EXTINT_NONE: Int32 = -1",
+            "    public static let EXTINT_NMI: Int32 = -2",
+            "    public static let EXTINT_FUNCTION: UInt32 = 0",
+            "    public static func extIntLine(group: UInt32, index: UInt32) -> Int32 {",
+            "        case (0, 0): return 0",
+            "        case (0, 1): return 1",
+            "        case (0, 8): return EXTINT_NMI",
+            "        case (1, 3): return 1",
+            "        default: return EXTINT_NONE",
+        ] {
+            assert!(swift.contains(line), "Swift is missing: {line}\n{swift}");
+        }
+
+        assert!(!csharp.contains("case 2:") && !rust.contains("(0, 2)") && !swift.contains("case (0, 2)"));
+
+        let mut plain = extint_family();
+        plain.pins.rows.retain(|row| row.instance != "eic");
+        assert!(extint_map(&plain).expect("a table with no EIC rows is not an error").is_none());
+    }
+
+    /// Every way an EIC section can fail to state the lookup whole is REFUSED, each with a message
+    /// naming what is missing. The baseline is asserted complete first, and each case breaks exactly
+    /// one thing about it.
+    #[test]
+    fn an_extint_section_the_lookup_cannot_state_whole_is_refused() {
+        assert!(
+            extint_map(&extint_family()).is_ok(),
+            "the baseline is complete -- without this every refusal below proves nothing"
+        );
+
+        fn refused(edit: impl Fn(&mut FamilySet), expect: &str) {
+            let mut set = extint_family();
+            edit(&mut set);
+            match extint_map(&set) {
+                Err(error) => assert!(error.contains(expect), "expected '{expect}' in: {error}"),
+                Ok(_) => panic!("accepted a section that should be refused: {expect}"),
+            }
+        }
+
+        refused(|set| set.parts.rows[0].pins.push("PB04".into()), "PB04 is in a part's present-list with no EIC row");
+        refused(|set| set.blocks[0].constants[0].1.value = 3, "no EIC row raises line 2 of the 3");
+        refused(|set| set.pins.rows[1].signal = "extint2".into(), "'PA01' states EXTINT 2, but the eic block states 2 lines");
+        refused(|set| set.pins.rows[0].signal = "pad0".into(), "states signal 'pad0'");
+        refused(
+            |set| {
+                let duplicate = set.pins.rows[0].clone();
+                set.pins.rows.push(duplicate);
+            },
+            "'PA00' has two EIC rows",
+        );
+        refused(|set| set.pins.rows[3].function = "B".into(), "select function A on PA00 and B on PB03");
+        refused(|set| set.blocks[0].constants.clear(), "states no LINE_COUNT");
+        refused(|set| set.blocks[1].constants.clear(), "no FUNC_A constant");
+        refused(|set| set.blocks.retain(|block| block.block != "eic"), "no eic block table");
+    }
+
     #[test]
     fn snake_maps_board_ids_to_module_file_stems() {
         assert_eq!(snake("microchip-samd21-xpro"), "microchip_samd21_xpro");
@@ -12878,6 +13397,8 @@ resolution_bits = "16..20, depending only on the oversampling setting"
             imr_reg: 0x4001_0400,
             rtsr_reg: 0x4001_0408,
             ftsr_reg: 0x4001_040C,
+            port_idr_reg: 0,
+            pin_mask: 0,
             port_rcc_en_reg: 0x4002_102C,
             port_rcc_en_mask: 0x4,
             syscfg_rcc_en_reg: 0x4002_1034,

@@ -48,14 +48,14 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led0": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 8, "mask": 0x100, "active_low": True},
-    "led1": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 9, "mask": 0x200, "active_low": True},
-    "led2": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 10, "mask": 0x400, "active_low": True},
-    "led3": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 11, "mask": 0x800, "active_low": True},
-    "button0": {"kind": "gpio-in", "port_base": 0x48000800, "pin": 13, "mask": 0x2000, "active_low": True},
-    "joystick-select": {"kind": "gpio-in", "port_base": 0x48000000, "pin": 0, "mask": 0x1, "active_low": False},
-    "joystick-up": {"kind": "gpio-in", "port_base": 0x48001400, "pin": 9, "mask": 0x200, "active_low": False},
-    "joystick-down": {"kind": "gpio-in", "port_base": 0x48001400, "pin": 10, "mask": 0x400, "active_low": False},
-    "joystick-left": {"kind": "gpio-in", "port_base": 0x48001000, "pin": 2, "mask": 0x4, "active_low": False},
-    "joystick-right": {"kind": "gpio-in", "port_base": 0x48001000, "pin": 3, "mask": 0x8, "active_low": False},
+    "led0": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 8, "bank": 0, "mask": 0x100, "active_low": True},
+    "led1": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 9, "bank": 0, "mask": 0x200, "active_low": True},
+    "led2": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 10, "bank": 0, "mask": 0x400, "active_low": True},
+    "led3": {"kind": "gpio-out", "port_base": 0x48000C00, "pin": 11, "bank": 0, "mask": 0x800, "active_low": True},
+    "button0": {"kind": "gpio-in", "port_base": 0x48000800, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": True},
+    "joystick-select": {"kind": "gpio-in", "port_base": 0x48000000, "pin": 0, "bank": 0, "mask": 0x1, "active_low": False},
+    "joystick-up": {"kind": "gpio-in", "port_base": 0x48001400, "pin": 9, "bank": 0, "mask": 0x200, "active_low": False},
+    "joystick-down": {"kind": "gpio-in", "port_base": 0x48001400, "pin": 10, "bank": 0, "mask": 0x400, "active_low": False},
+    "joystick-left": {"kind": "gpio-in", "port_base": 0x48001000, "pin": 2, "bank": 0, "mask": 0x4, "active_low": False},
+    "joystick-right": {"kind": "gpio-in", "port_base": 0x48001000, "pin": 3, "bank": 0, "mask": 0x8, "active_low": False},
 }

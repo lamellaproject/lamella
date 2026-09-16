@@ -210,15 +210,17 @@ pub fn emit_expression(
         BoundExprKind::Unary {
             operator: operator @ (UnaryOperator::PreIncrement | UnaryOperator::PreDecrement),
             operand,
+            checked,
         } => emit_step_expression(
             operand,
             false,
             *operator == UnaryOperator::PreIncrement,
+            *checked,
             frame,
             tokens,
             out,
         ),
-        BoundExprKind::Unary { operator, operand } => {
+        BoundExprKind::Unary { operator, operand, .. } => {
             emit_expression(operand, frame, tokens, out)?;
             emit_unary(*operator, out)?;
             if *operator == UnaryOperator::Complement {
@@ -232,6 +234,7 @@ pub fn emit_expression(
             operator,
             operand,
             step,
+            checked,
         } => {
             let increment = *operator == PostfixOperator::Increment;
             if let Some(step) = step {
@@ -243,14 +246,14 @@ pub fn emit_expression(
                     None,
                     user_step,
                     result_conversion,
-                    false,
+                    *checked,
                     frame,
                     tokens,
                     out,
                     crate::method::Leave::Old,
                 )
             } else {
-                emit_step_expression(operand, true, increment, frame, tokens, out)
+                emit_step_expression(operand, true, increment, *checked, frame, tokens, out)
             }
         }
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
@@ -2220,20 +2223,24 @@ pub(crate) fn numeric_conversion(target: &TypeSymbol) -> Result<Opcode, EmitErro
 /// so an operation defined in the narrower type wraps correctly (e.g. a `byte`-backed enum at
 /// 256). A no-op for int/uint/long/ulong (already the right width) and any non-sub-int type.
 fn narrow_subint(ty: &TypeSymbol, out: &mut Vec<Instruction>) {
-    if matches!(
-        ty,
-        TypeSymbol::Special(
-            SpecialType::SByte
-                | SpecialType::Byte
-                | SpecialType::Int16
-                | SpecialType::UInt16
-                | SpecialType::Char
-        )
-    ) {
+    if matches!(ty, TypeSymbol::Special(special) if is_subint(*special)) {
         if let Ok(op) = numeric_conversion(ty) {
             out.push(Instruction::simple(op));
         }
     }
+}
+
+/// Whether `special` is narrower than `int` -- `sbyte`, `byte`, `short`, `ushort` or `char` -- so its
+/// arithmetic runs on the 32-bit stack and a result narrows back to its width.
+pub(crate) fn is_subint(special: SpecialType) -> bool {
+    matches!(
+        special,
+        SpecialType::SByte
+            | SpecialType::Byte
+            | SpecialType::Int16
+            | SpecialType::UInt16
+            | SpecialType::Char
+    )
 }
 
 /// Emits the address of a local or parameter (`ldloca`/`ldarga`), for accessing a
@@ -2403,6 +2410,7 @@ fn emit_step_expression(
     operand: &BoundExpr,
     postfix: bool,
     increment: bool,
+    checked: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -2420,7 +2428,7 @@ fn emit_step_expression(
             None,
             user_step,
             None,
-            false,
+            checked,
             frame,
             tokens,
             out,
@@ -2453,34 +2461,67 @@ fn emit_step_expression(
     if postfix {
         out.push(Instruction::simple(Opcode::Dup));
     }
-    if let TypeSymbol::Pointer(element) = &operand.ty {
-        emit_sizeof(element, tokens, out)?;
-    } else {
-        out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
-    }
-    let enum_underlying = tokens.enum_underlying(&operand.ty);
-    let step_ty = match enum_underlying {
-        Some(special) => TypeSymbol::Special(special),
-        None => operand.ty.clone(),
-    };
-    if matches!(
-        step_ty,
-        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
-    ) {
-        out.push(Instruction::simple(Opcode::ConvI8));
-    }
-    out.push(Instruction::simple(if increment {
-        Opcode::Add
-    } else {
-        Opcode::Sub
-    }));
-    if enum_underlying.is_some() {
-        narrow_subint(&step_ty, out);
-    }
+    emit_step(&operand.ty, increment, checked, tokens, out)?;
     if !postfix {
         out.push(Instruction::simple(Opcode::Dup));
     }
     out.push(store);
+    Ok(())
+}
+
+/// Steps the value on the stack for a numeric, enum or pointer `++`/`--`: pushes a step of the
+/// operand's own type, adds or subtracts it, and narrows a result narrower than `int` back to its
+/// width, so the value a prefix step leaves is already narrowed. In a `checked` context the
+/// arithmetic and the narrowing check for overflow in the operand's own signedness; a floating
+/// step never checks (ECMA-334 12.8.19). Every position a step can take lowers through this.
+pub(crate) fn emit_step(
+    operand_ty: &TypeSymbol,
+    increment: bool,
+    checked: bool,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let step_ty = tokens
+        .enum_underlying(operand_ty)
+        .map_or_else(|| operand_ty.clone(), TypeSymbol::Special);
+    match &step_ty {
+        TypeSymbol::Pointer(element) => emit_sizeof(element, tokens, out)?,
+        TypeSymbol::Special(SpecialType::Single) => {
+            out.push(Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)));
+        }
+        TypeSymbol::Special(SpecialType::Double) => {
+            out.push(Instruction::new(Opcode::LdcR8, Operand::Float64(1.0)));
+        }
+        _ => {
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
+            if matches!(step_ty, TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)) {
+                out.push(Instruction::simple(Opcode::ConvI8));
+            }
+        }
+    }
+    let overflow = match &step_ty {
+        TypeSymbol::Special(SpecialType::Single | SpecialType::Double) => Overflow::Never,
+        TypeSymbol::Special(special) if special.is_unsigned() => Overflow::Unsigned,
+        TypeSymbol::Pointer(_) => Overflow::Unsigned,
+        _ => Overflow::Signed,
+    };
+    out.push(Instruction::simple(if increment {
+        checked_or(checked, overflow, Opcode::AddOvfUn, Opcode::AddOvf, Opcode::Add)
+    } else {
+        checked_or(checked, overflow, Opcode::SubOvfUn, Opcode::SubOvf, Opcode::Sub)
+    }));
+    if let TypeSymbol::Special(special) = step_ty {
+        if is_subint(special) {
+            let narrow = if checked {
+                checked_overflow_conversion(special, overflow == Overflow::Unsigned)
+            } else {
+                numeric_conversion(&step_ty).ok()
+            };
+            if let Some(opcode) = narrow {
+                out.push(Instruction::simple(opcode));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2976,10 +3017,21 @@ pub(crate) fn emit_binary(
         .map_or_else(|| operand_ty.clone(), TypeSymbol::Special);
     let unsigned = matches!(&effective, TypeSymbol::Special(special) if special.is_unsigned())
         || matches!(&effective, TypeSymbol::Pointer(_));
+    let floating = matches!(
+        &effective,
+        TypeSymbol::Special(SpecialType::Single | SpecialType::Double)
+    );
+    let overflow = if floating {
+        Overflow::Never
+    } else if unsigned && !matches!(&effective, TypeSymbol::Special(special) if is_subint(*special)) {
+        Overflow::Unsigned
+    } else {
+        Overflow::Signed
+    };
     let opcode = match operator {
-        Op::Add => checked_or(checked, unsigned, Opcode::AddOvfUn, Opcode::AddOvf, Opcode::Add),
-        Op::Subtract => checked_or(checked, unsigned, Opcode::SubOvfUn, Opcode::SubOvf, Opcode::Sub),
-        Op::Multiply => checked_or(checked, unsigned, Opcode::MulOvfUn, Opcode::MulOvf, Opcode::Mul),
+        Op::Add => checked_or(checked, overflow, Opcode::AddOvfUn, Opcode::AddOvf, Opcode::Add),
+        Op::Subtract => checked_or(checked, overflow, Opcode::SubOvfUn, Opcode::SubOvf, Opcode::Sub),
+        Op::Multiply => checked_or(checked, overflow, Opcode::MulOvfUn, Opcode::MulOvf, Opcode::Mul),
         Op::Divide => unsigned_or(unsigned, Opcode::DivUn, Opcode::Div),
         Op::Modulo => unsigned_or(unsigned, Opcode::RemUn, Opcode::Rem),
         Op::BitwiseAnd => Opcode::And,
@@ -2992,10 +3044,12 @@ pub(crate) fn emit_binary(
         Op::LessThan => unsigned_or(unsigned, Opcode::CltUn, Opcode::Clt),
         Op::NotEqual => return emit_negated(Opcode::Ceq, out),
         Op::LessThanOrEqual => {
-            return emit_negated(unsigned_or(unsigned, Opcode::CgtUn, Opcode::Cgt), out);
+            let greater = if unsigned || floating { Opcode::CgtUn } else { Opcode::Cgt };
+            return emit_negated(greater, out);
         }
         Op::GreaterThanOrEqual => {
-            return emit_negated(unsigned_or(unsigned, Opcode::CltUn, Opcode::Clt), out);
+            let less = if unsigned || floating { Opcode::CltUn } else { Opcode::Clt };
+            return emit_negated(less, out);
         }
         Op::LogicalAnd | Op::LogicalOr => {
             return Err(EmitError::Unsupported(
@@ -3018,7 +3072,13 @@ pub(crate) fn emit_binary(
             | Op::RightShift
     ) {
         if let Some(underlying) = tokens.enum_underlying(operand_ty) {
-            narrow_subint(&TypeSymbol::Special(underlying), out);
+            let arithmetic = matches!(operator, Op::Add | Op::Subtract | Op::Multiply);
+            match checked_overflow_conversion(underlying, false) {
+                Some(opcode) if checked && arithmetic && is_subint(underlying) => {
+                    out.push(Instruction::simple(opcode));
+                }
+                _ => narrow_subint(&TypeSymbol::Special(underlying), out),
+            }
         }
     }
     Ok(())
@@ -3029,13 +3089,24 @@ fn unsigned_or(unsigned: bool, when_unsigned: Opcode, when_signed: Opcode) -> Op
     if unsigned { when_unsigned } else { when_signed }
 }
 
-/// Picks the overflow-throwing opcode in a `checked` context (its `.un` variant for
-/// unsigned operands), else the plain form.
-fn checked_or(checked: bool, unsigned: bool, ovf_un: Opcode, ovf: Opcode, plain: Opcode) -> Opcode {
-    if checked {
-        if unsigned { ovf_un } else { ovf }
-    } else {
-        plain
+/// Which overflow check an arithmetic operation takes in a `checked` context.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Overflow {
+    /// None: a floating operation, which has no overflow-checking form.
+    Never,
+    /// The signed `.ovf` forms.
+    Signed,
+    /// The unsigned `.ovf.un` forms.
+    Unsigned,
+}
+
+/// Picks the overflow-throwing opcode in a `checked` context -- its `.un` variant for an unsigned
+/// check -- else the plain form, which is also the only form for floating point.
+fn checked_or(checked: bool, overflow: Overflow, ovf_un: Opcode, ovf: Opcode, plain: Opcode) -> Opcode {
+    match (checked, overflow) {
+        (true, Overflow::Signed) => ovf,
+        (true, Overflow::Unsigned) => ovf_un,
+        _ => plain,
     }
 }
 
@@ -3126,6 +3197,34 @@ mod tests {
     }
 
     #[test]
+    fn checked_context_leaves_floating_arithmetic_alone() {
+        let r8 = |value| Instruction::new(Opcode::LdcR8, Operand::Float64(value));
+        let r4 = |value| Instruction::new(Opcode::LdcR4, Operand::Float32(value));
+        assert_eq!(emit("checked(1.5 + 2.5)"), [r8(1.5), r8(2.5), op(Opcode::Add)]);
+        assert_eq!(emit("checked(1.5 * 2.5)"), [r8(1.5), r8(2.5), op(Opcode::Mul)]);
+        assert_eq!(emit("checked(1.5f - 2.5f)"), [r4(1.5), r4(2.5), op(Opcode::Sub)]);
+    }
+
+    #[test]
+    fn a_step_has_its_operands_type_and_checks_in_its_own_signedness() {
+        let step = |ty: TypeSymbol, increment: bool, checked: bool| {
+            let mut out = Vec::new();
+            emit_step(&ty, increment, checked, &Tokens::new(), &mut out).expect("should lower");
+            out
+        };
+        let special = TypeSymbol::Special;
+        assert_eq!(step(special(SpecialType::Byte), true, true), [i4(1), op(Opcode::AddOvfUn), op(Opcode::ConvOvfU1Un)]);
+        assert_eq!(step(special(SpecialType::SByte), false, true), [i4(1), op(Opcode::SubOvf), op(Opcode::ConvOvfI1)]);
+        assert_eq!(step(special(SpecialType::Byte), true, false), [i4(1), op(Opcode::Add), op(Opcode::ConvU1)]);
+        assert_eq!(step(special(SpecialType::Int32), true, false), [i4(1), op(Opcode::Add)]);
+        assert_eq!(step(special(SpecialType::Int64), true, true), [i4(1), op(Opcode::ConvI8), op(Opcode::AddOvf)]);
+        assert_eq!(step(special(SpecialType::Double), true, true), [Instruction::new(Opcode::LdcR8, Operand::Float64(1.0)), op(Opcode::Add)]);
+        assert_eq!(step(special(SpecialType::Single), false, true), [Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)), op(Opcode::Sub)]);
+        let pointer = TypeSymbol::Pointer(Box::new(special(SpecialType::Int32)));
+        assert_eq!(step(pointer, true, true), [i4(4), op(Opcode::AddOvfUn)]);
+    }
+
+    #[test]
     fn integer_arithmetic_lowers_left_right_operator() {
         assert_eq!(emit("7"), [i4(7)]);
         assert_eq!(emit("1 + 2"), [i4(1), i4(2), op(Opcode::Add)]);
@@ -3150,6 +3249,30 @@ mod tests {
         assert_eq!(
             emit("1 <= 2"),
             [i4(1), i4(2), op(Opcode::Cgt), i4(0), op(Opcode::Ceq)]
+        );
+    }
+
+    #[test]
+    fn floating_less_or_equal_negates_the_unordered_comparison() {
+        let r8 = |value| Instruction::new(Opcode::LdcR8, Operand::Float64(value));
+        let r4 = |value| Instruction::new(Opcode::LdcR4, Operand::Float32(value));
+        assert_eq!(
+            emit("1.0 <= 2.0"),
+            [r8(1.0), r8(2.0), op(Opcode::CgtUn), i4(0), op(Opcode::Ceq)]
+        );
+        assert_eq!(
+            emit("1.0 >= 2.0"),
+            [r8(1.0), r8(2.0), op(Opcode::CltUn), i4(0), op(Opcode::Ceq)]
+        );
+        assert_eq!(
+            emit("1.0f >= 2.0f"),
+            [r4(1.0), r4(2.0), op(Opcode::CltUn), i4(0), op(Opcode::Ceq)]
+        );
+        assert_eq!(emit("1.0 < 2.0"), [r8(1.0), r8(2.0), op(Opcode::Clt)]);
+        assert_eq!(emit("1.0 > 2.0"), [r8(1.0), r8(2.0), op(Opcode::Cgt)]);
+        assert_eq!(
+            emit("1 >= 2"),
+            [i4(1), i4(2), op(Opcode::Clt), i4(0), op(Opcode::Ceq)]
         );
     }
 

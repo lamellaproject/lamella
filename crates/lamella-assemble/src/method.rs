@@ -1382,18 +1382,19 @@ fn emit_statement_expression(
                 return emit_compound(target, binary, Some(value), None, None, *checked, frame, tokens, out, Leave::Discard);
             }
         }
-        BoundExprKind::Postfix { operator, operand, step } => {
+        BoundExprKind::Postfix { operator, operand, step, checked } => {
             let increment = *operator == PostfixOperator::Increment;
             let (user_step, result_conversion) = step_tokens(step.as_deref(), operand, increment, tokens);
-            return emit_compound(operand, step_operator(increment), None, user_step, result_conversion, false, frame, tokens, out, Leave::Discard);
+            return emit_compound(operand, step_operator(increment), None, user_step, result_conversion, *checked, frame, tokens, out, Leave::Discard);
         }
         BoundExprKind::Unary {
             operator: operator @ (UnaryOperator::PreIncrement | UnaryOperator::PreDecrement),
             operand,
+            checked,
         } => {
             let increment = *operator == UnaryOperator::PreIncrement;
             let user_step = user_step_method(operand, increment, tokens);
-            return emit_compound(operand, step_operator(increment), None, user_step, None, false, frame, tokens, out, Leave::Discard);
+            return emit_compound(operand, step_operator(increment), None, user_step, None, *checked, frame, tokens, out, Leave::Discard);
         }
         _ => {}
     }
@@ -1707,9 +1708,9 @@ pub(crate) fn emit_compound(
 
 /// Applies the modification of a read-modify-write to the value already on the stack: a
 /// user `op_Increment`/`op_Decrement` (`user_step`, for a `++`/`--` on a user type) is a
-/// static call that consumes the value and pushes the stepped one; otherwise the numeric
-/// `++`/`--` or `op=` combine pushes the right-hand value (or the implicit `1`) and applies
-/// `binary`.
+/// static call that consumes the value and pushes the stepped one; otherwise a numeric, enum or
+/// pointer `++`/`--` steps the value ([`crate::expr::emit_step`]) and an `op=` combines it with the
+/// right-hand value through `binary`.
 fn emit_modify(
     user_step: Option<Token>,
     result_conversion: Option<Token>,
@@ -1733,8 +1734,9 @@ fn emit_modify(
     }
 }
 
-/// Pushes the right-hand value (the `op=` value, or the implicit `1` of `++`/`--` in the
-/// target's type) and applies `binary` -- string `+` is `String.Concat`, not `add`.
+/// Combines the value on the stack with an `op=`'s right-hand value through `binary` -- string `+`
+/// is `String.Concat`, not `add` -- or, with no right-hand value, steps it for a `++`/`--`
+/// ([`crate::expr::emit_step`]).
 fn emit_combine(
     binary: BinaryOperator,
     operand_ty: &TypeSymbol,
@@ -1786,7 +1788,9 @@ fn emit_combine(
                 out.push(Instruction::simple(crate::expr::numeric_conversion(operand_ty)?));
             }
         }
-        None => push_one(operand_ty, out),
+        None => {
+            return crate::expr::emit_step(operand_ty, binary == BinaryOperator::Add, checked, tokens, out);
+        }
     }
     crate::expr::emit_binary(binary, operand_ty, checked, tokens, out)?;
     narrow_compound_result(operand_ty, checked, out);
@@ -1800,14 +1804,7 @@ fn narrow_compound_result(operand_ty: &TypeSymbol, checked: bool, out: &mut Vec<
     let TypeSymbol::Special(special) = operand_ty else {
         return;
     };
-    if !matches!(
-        special,
-        SpecialType::SByte
-            | SpecialType::Byte
-            | SpecialType::Int16
-            | SpecialType::UInt16
-            | SpecialType::Char
-    ) {
+    if !crate::expr::is_subint(*special) {
         return;
     }
     let op = if checked {
@@ -1817,18 +1814,6 @@ fn narrow_compound_result(operand_ty: &TypeSymbol, checked: bool, out: &mut Vec<
     };
     if let Some(op) = op {
         out.push(Instruction::simple(op));
-    }
-}
-
-/// Pushes the constant `1` in `ty` (the step of `++`/`--`): `ldc.i4.1`, widened for a
-/// 64-bit target.
-fn push_one(ty: &TypeSymbol, out: &mut Vec<Instruction>) {
-    out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
-    if matches!(
-        ty,
-        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
-    ) {
-        out.push(Instruction::simple(Opcode::ConvI8));
     }
 }
 

@@ -120,13 +120,14 @@ namespace System.IO
             if (code < 0) NativeFs.Throw(code, _path);
         }
 
-        public override void Close()
+        protected override void Dispose(bool disposing)
         {
             if (_handle >= 0)
             {
                 NativeFs.Close(_handle);
                 _handle = -1;
             }
+            base.Dispose(disposing);
         }
 
         private void EnsureOpen()

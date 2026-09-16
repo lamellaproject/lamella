@@ -112,7 +112,7 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led": {"kind": "gpio-out", "port_base": 0xD0000000, "pin": 25, "mask": 0x2000000, "active_low": False},
+    "led": {"kind": "gpio-out", "port_base": 0xD0000000, "pin": 25, "bank": 0, "mask": 0x2000000, "active_low": False},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until

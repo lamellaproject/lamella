@@ -206,6 +206,9 @@ impl FrameTrack {
 #[derive(Debug, Clone, Default)]
 pub struct Encoder {
     bytes: Vec<u8>,
+    /// The last `STR Rt, [SP, #imm]` emitted, as (register, offset, the position just past it);
+    /// cleared when a label is bound. See [`Encoder::holds_sp_slot`].
+    sp_store: Option<(Reg, u16, u32)>,
     /// What the current function's prologue has put on the stack -- see [`FrameTrack`].
     frame: FrameTrack,
     /// Set while a stack-moving instruction is being encoded, so the emit primitive it goes through
@@ -380,6 +383,7 @@ impl Encoder {
     /// its latest position; a label from another encoder is ignored rather than
     /// allowed to panic.
     pub fn bind_label(&mut self, label: Label) {
+        self.sp_store = None;
         let here = self.position();
         if let Some(slot) = self.labels.get_mut(label.0 as usize) {
             *slot = Some(here);
@@ -659,7 +663,16 @@ impl Encoder {
             return Err(AssembleError::UnencodableOperand);
         }
         self.emit_u16(0x9000 | (u16::from(rt.number()) << 8) | (imm / 4));
+        self.sp_store = Some((rt, imm, self.position()));
         Ok(())
+    }
+
+    /// Whether `rt` still holds the word at `[SP, #imm]`: the last instruction emitted is
+    /// `STR rt, [SP, #imm]` and no label has been bound since, so execution reaches the current
+    /// position only by falling through from that store. A load of that word here can be omitted.
+    #[must_use]
+    pub fn holds_sp_slot(&self, rt: Reg, imm: u16) -> bool {
+        self.sp_store == Some((rt, imm, self.position()))
     }
 
     /// The 16-bit register-offset load/store form, `0101 opB Rm Rn Rt` (Armv6-M
@@ -1897,6 +1910,21 @@ mod tests {
         let mut enc = Encoder::new();
         emit(&mut enc);
         enc.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn a_stack_store_is_held_until_a_label_or_another_instruction() {
+        let mut enc = Encoder::new();
+        enc.str_sp(Reg::R0, 8).unwrap();
+        assert!(enc.holds_sp_slot(Reg::R0, 8));
+        assert!(!enc.holds_sp_slot(Reg::R1, 8), "another register");
+        assert!(!enc.holds_sp_slot(Reg::R0, 12), "another slot");
+        let label = enc.new_label();
+        enc.bind_label(label);
+        assert!(!enc.holds_sp_slot(Reg::R0, 8), "a label bound after the store");
+        enc.str_sp(Reg::R0, 8).unwrap();
+        enc.movs_imm(Reg::R1, 0).unwrap();
+        assert!(!enc.holds_sp_slot(Reg::R0, 8), "an instruction emitted after the store");
     }
 
     #[test]

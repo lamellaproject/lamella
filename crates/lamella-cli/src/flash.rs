@@ -3,8 +3,7 @@
 use crate::args::{self, Spec};
 pub use lamella_flash_routes::{can_flash, uf2_family_for_board};
 use lamella_flash_routes::{
-    Programmer, check_base, check_rp2350_stamp, is_uf2, programmer_for, route_for,
-    selector_for, write,
+    Programmer, prepare_image, programmer_for, route_for, selector_for, wrap_for_route, write,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -108,7 +107,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
     let spec = Spec {
         verb: "flash",
         usage: Some(USAGE),
-        values: &["--board", "--probe", "--volume", "--via"],
+        values: &["--board", "--probe", "--volume", "--device", "--via"],
         flags: &[],
     };
     let parsed = match args::parse_or_halt(args, &spec) {
@@ -210,71 +209,30 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let (bytes, described) = match chosen.required_format() {
-        Some(required) => {
-            let named = lamella_flash_routes::artifact::classify_format(&path);
-            let raw = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    eprintln!("lamella flash: read {}: {error}", path.display());
-                    return ExitCode::FAILURE;
-                }
-            };
-            match named.as_deref() {
-                Some(extension) if extension == required.extension() => {
-                    let count = raw.len();
-                    (raw, format!("{count} B of {}", required.description()))
-                }
-                Some("bin") => {
-                    if let Err(why) = check_rp2350_stamp(&raw, row.aot_target) {
-                        eprintln!("lamella flash: {why}");
-                        return ExitCode::FAILURE;
-                    }
-                    let count = raw.len();
-                    (raw, format!("{count} B of raw binary"))
-                }
-                _ => {
-                    eprintln!(
-                        "lamella flash: {board_id} takes an image COPIED to its bootloader volume, \
-                         as a {} (or a\n.bin, which is wrapped into one). {} is neither. \
-                         `lamella build <file> --board {board_id} --format {}`\nproduces it.",
-                        required.extension(),
-                        path.display(),
-                        required.extension()
-                    );
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        None => {
-            let artifact = match lamella_flash_routes::artifact::read(&path) {
-                Ok(artifact) => artifact,
-                Err(error) => {
-                    eprintln!("lamella flash: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            if let Err(error) = check_base(&artifact, chosen) {
-                eprintln!("lamella flash: {error}");
-                return ExitCode::FAILURE;
-            }
-            if let Err(why) = check_rp2350_stamp(&artifact.bytes, row.aot_target) {
-                eprintln!("lamella flash: {why}");
-                return ExitCode::FAILURE;
-            }
-            let described = format!("{} B of {}", artifact.bytes.len(), artifact.format);
-            (artifact.bytes, described)
+    let prepared = match prepare_image(&path, row, chosen) {
+        Ok(prepared) => prepared,
+        Err(why) => {
+            eprintln!("lamella flash: {why}");
+            return ExitCode::FAILURE;
         }
     };
-    println!("read {described} from {}", path.display());
-    let selector = match selector_for(chosen, parsed.value("--probe"), parsed.value("--volume")) {
+    println!("read {} from {}", prepared.read, path.display());
+    if let Some(wrapped) = &prepared.wrapped {
+        println!("{wrapped}");
+    }
+    let selector = match selector_for(
+        chosen,
+        parsed.value("--probe"),
+        parsed.value("--volume"),
+        parsed.value("--device"),
+    ) {
         Ok(selector) => selector,
         Err(error) => {
             eprintln!("lamella flash: {error}");
             return ExitCode::FAILURE;
         }
     };
-    write_image(chosen, row.aot_target, &bytes, selector.as_deref())
+    write_image(chosen, row.aot_target, &prepared.bytes, selector.as_deref())
 }
 
 
@@ -289,13 +247,26 @@ pub fn flash_command(args: &[String]) -> ExitCode {
 /// be wrong more often than right -- and wrong in the direction that reassures, since a reader
 /// checking whether their image landed would be told a check had passed that never ran.
 ///
+/// **A WRITE THROUGH A SYSTEM BOOTLOADER'S DFU INTERFACE DOES NOT SEE ITS IMAGE START.** The
+/// bootloader reads every byte back, so that write is verified, but leaving DFU mode ends with the
+/// bootloader gone and nothing reporting whether its jump to the image ran. That route says the
+/// start was asked for, and what to do when the board does not run the image.
+///
 /// A pure function so the wording is testable without a board.
 fn completion_line(programmer: Programmer, report: &lamella_flash_backend::Report) -> String {
     let units = programmer.units(report.bytes);
     match report.verification {
-        lamella_flash_backend::Verification::ReadBack => {
-            format!("wrote and verified {} B ({units}); the board is running it.", report.bytes)
-        }
+        lamella_flash_backend::Verification::ReadBack => match programmer {
+            Programmer::StDfu { .. } => format!(
+                "wrote and verified {} B ({units}); the bootloader was told to start it and does not \
+                 report whether it did -- reset the board if it does not run it.",
+                report.bytes
+            ),
+            _ => format!(
+                "wrote and verified {} B ({units}); the board is running it.",
+                report.bytes
+            ),
+        },
         lamella_flash_backend::Verification::NotPossible(_) => {
             let mut line =
                 format!("wrote {} B ({units}); the board is running it.
@@ -340,19 +311,13 @@ fn write_image(
             return ExitCode::FAILURE;
         }
     };
-    let wrapped;
-    let image = match programmer.required_format() {
-        Some(lamella_flash_routes::artifact::Format::Uf2 { family }) if !is_uf2(image) => {
-            wrapped = lamella_flash_routes::artifact::Format::Uf2 { family }
-                .render(image, programmer.flash_base());
-            println!(
-                "wrapped {} B as UF2 at {:#010x} (family {family:#010x})",
-                image.len(),
-                programmer.flash_base()
-            );
-            &wrapped[..]
+    let wrapped = wrap_for_route(programmer, image);
+    let image = match &wrapped {
+        Some((bytes, line)) => {
+            println!("{line}");
+            &bytes[..]
         }
-        _ => image,
+        None => image,
     };
     println!("writing over {}...", programmer.description());
     match write(programmer, image, probe.as_deref()) {
@@ -381,6 +346,8 @@ pub fn deploy_to_chip(
     path: &Path,
     board_id: &str,
     probe: Option<&str>,
+    volume: Option<&str>,
+    device: Option<&str>,
     via: Option<&str>,
     unsafe_code: bool,
 ) -> ExitCode {
@@ -425,7 +392,14 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
-    write_image(chosen, row.aot_target, &image, probe)
+    let selector = match selector_for(chosen, probe, volume, device) {
+        Ok(selector) => selector,
+        Err(error) => {
+            eprintln!("lamella deploy: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    write_image(chosen, row.aot_target, &image, selector.as_deref())
 }
 
 /// The bare-metal image for `board_id`, and the address it belongs at -- what `build --format`
@@ -561,8 +535,9 @@ fn has_static_main(assembly: &[u8]) -> bool {
 
 const USAGE: &str = "\
 usage: lamella flash <image> [--board <id>] [--via probe|volume]
-                          [--probe <serial>]  which probe, on a probe route
-                          [--volume <name>]   which drive, on a volume route
+                          [--probe <serial>]   which probe, on a probe route
+                          [--volume <name>]    which drive, on a volume route
+                          [--device <serial>]  which bootloader, on a USB DFU route
 
 Writes an image that ALREADY EXISTS to the board's chip, over its debug probe. It does not compile
 anything -- `lamella build <file> --board <id> --format <f>` produces what this takes, and
@@ -570,15 +545,17 @@ anything -- `lamella build <file> --board <id> --format <f>` produces what this 
 
 The image is read by extension: .hex, .bin, .s19, .elf, or the .uf2 a bootloader-volume board
 takes. A linked .elf is flattened the way `objcopy -O binary` would, by physical address, so an
-image another toolchain produced needs no conversion step. A .bin for a bootloader-volume board is
-wrapped into a .uf2 here, because the address and the family id that requires are facts about the
-board and are already known.
+image another toolchain produced needs no conversion step. For a bootloader-volume board, any of
+them but a .uf2 is wrapped into one here, because the address and the family id a .uf2 carries are
+facts about the board and are already known. An image larger than the board's flash is refused
+before anything is opened.
 
---probe names WHICH probe when more than one is attached; --volume names which drive. They are
-different questions and each belongs to one route, so naming the wrong one is refused rather than
-ignored. Without either, LAMELLA_PROBE_SERIAL is used, then the sole candidate, and otherwise the
-write is REFUSED with every candidate named. A write to the wrong board succeeds and reports
-nothing, so it is never guessed at.
+--probe names WHICH probe when more than one is attached; --volume names which drive; --device
+names which system bootloader, over USB DFU. They are different questions and each belongs to one
+route, so naming the wrong one is refused rather than ignored. Without one, a probe route takes
+LAMELLA_PROBE_SERIAL and then the sole attached probe, the other routes take the sole candidate,
+and otherwise the write is REFUSED with every candidate named. A write to the wrong board succeeds
+and reports nothing, so it is never guessed at.
 
 WITHOUT --via, the board is written by ITS OWN mechanism: a debugger soldered to it if it has one,
 otherwise its bootloader drive. That needs no hardware you do not already own, and it is never a
@@ -764,7 +741,7 @@ class Program
     /// **WITH NO TERMINAL THERE IS NOBODY TO ASK, AND THE ANSWER MUST STILL BE A REFUSAL.** A test
     /// process has no terminal, which is what makes this assertable here -- and it is the case
     /// that matters, because a script, a build, or an agent driving this tool is the situation in
-    /// which a silent fallback would write somebody else's board.
+    /// which a silent fallback would write the wrong board.
     /// The numbered list a person reads has to be the list the answer indexes into.
     /// **AN EXPLICIT SERIAL MUST NOT REACH THE PROMPT.** The interactive rung sits below the
     /// refusal, which is below every rung that names a board -- so a named board is written
@@ -800,6 +777,31 @@ class Program
         assert!(
             line.contains("bootloader admitted"),
             "while crediting the check that DID run: {line}"
+        );
+    }
+
+    /// A write through a system bootloader's DFU interface is read back, and its start is only asked
+    /// for: leaving DFU mode ends with the bootloader gone and nothing reporting the jump.
+    #[test]
+    fn a_dfu_write_says_the_start_was_asked_for_and_not_seen() {
+        let dfu = Programmer::StDfu {
+            family: lamella_flash_routes::StFamily::H7,
+        };
+        let line = completion_line(
+            dfu,
+            &report(2048, lamella_flash_backend::Verification::ReadBack),
+        );
+        assert!(
+            line.contains("verified"),
+            "the bootloader read every byte back: {line}"
+        );
+        assert!(
+            !line.contains("is running it"),
+            "a leave does not show a start: {line}"
+        );
+        assert!(
+            line.contains("reset the board"),
+            "and says what to do when nothing runs: {line}"
         );
     }
 

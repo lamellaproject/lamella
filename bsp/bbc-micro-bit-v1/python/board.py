@@ -58,16 +58,16 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "display-row1": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 13, "mask": 0x2000, "active_low": False},
-    "display-row2": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 14, "mask": 0x4000, "active_low": False},
-    "display-row3": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 15, "mask": 0x8000, "active_low": False},
-    "display-col1": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 4, "mask": 0x10, "active_low": True},
-    "display-col2": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 5, "mask": 0x20, "active_low": True},
-    "display-col3": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 6, "mask": 0x40, "active_low": True},
-    "display-col4": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 7, "mask": 0x80, "active_low": True},
-    "display-col5": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 8, "mask": 0x100, "active_low": True},
-    "display-col6": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 9, "mask": 0x200, "active_low": True},
-    "display-col7": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 10, "mask": 0x400, "active_low": True},
-    "display-col8": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 11, "mask": 0x800, "active_low": True},
-    "display-col9": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 12, "mask": 0x1000, "active_low": True},
+    "display-row1": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": False},
+    "display-row2": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 14, "bank": 0, "mask": 0x4000, "active_low": False},
+    "display-row3": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 15, "bank": 0, "mask": 0x8000, "active_low": False},
+    "display-col1": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 4, "bank": 0, "mask": 0x10, "active_low": True},
+    "display-col2": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 5, "bank": 0, "mask": 0x20, "active_low": True},
+    "display-col3": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 6, "bank": 0, "mask": 0x40, "active_low": True},
+    "display-col4": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 7, "bank": 0, "mask": 0x80, "active_low": True},
+    "display-col5": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 8, "bank": 0, "mask": 0x100, "active_low": True},
+    "display-col6": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 9, "bank": 0, "mask": 0x200, "active_low": True},
+    "display-col7": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 10, "bank": 0, "mask": 0x400, "active_low": True},
+    "display-col8": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 11, "bank": 0, "mask": 0x800, "active_low": True},
+    "display-col9": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 12, "bank": 0, "mask": 0x1000, "active_low": True},
 }

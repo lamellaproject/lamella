@@ -39,6 +39,9 @@ sources = [
     "DS60001507F product mapping: EIC at 0x42001800, between RTC at 0x42001400 and FREQM at 0x42001C00.",
     "DS60001507F section 15.8.7 (APBA Mask), which states its own name APBAMASK, offset 0x14 within MCLK, and reset value 0x000007FF; bit 10 is 'EIC APBA Clock Enable'.",
     "DS60001507F generic clock table: peripheral channel 7 is GCLK_EIC.",
+    "DS60001507F page 1 feature list, under External Interrupt Controller (EIC): '16 external interrupts'. The signal descriptions list names the inputs EXTINT[15:0].",
+    "DS60001507F section 23.8.10 (External Interrupt Sense Configuration n), as printed on page 428: property 'PAC Write-Protection, Enable-Protected'; the SENSEx table reads 0x0 NONE, 0x1 RISE, 0x2 FALL, 0x3 BOTH, 0x4 HIGH, 0x5 LOW and 0x6-0x7 reserved; and under FILTENx, 'The filter must be disabled if the asynchronous detection is enabled.'",
+    "DS60001507F section 23.6.4.2 (Asynchronous Edge Detection Mode (No Debouncing)), as printed on page 414: with ASYNCH.ASYNCH[x] at its reset value of 0 the edge detection is synchronous and 'the EIC clock is required'; written to 1, the pins 'set the External Interrupt flag ... directly' and 'the EIC clock is not requested'. Section 23.6.4.3 on the same page: 'The debouncer uses the EIC clock as defined by the bit CTRLA.CKSEL'.",
 ]
 notes = [
     "THE APB CLOCK IS ON OUT OF RESET. APBAMASK's reset value is 0x000007FF, setting bits 0 through 10, and EIC is bit 10. GCLK_EIC is a separate gate that reset value says nothing about: the block's own description notes some functions need either a generic clock or the ultra-low-power 32 kHz clock, and that both are asynchronous to the APB interface clock.",
@@ -100,13 +103,13 @@ notes = "WRITE-ONE-TO-CLEAR, and clearing it is not optional: a handler returnin
 offset = 0x18
 width = 32
 fields = { ASYNCH = [0, 16] }
-notes = "Per-line asynchronous detection, which lets a line be detected with no clock running at all. Absent on the SAM D21, where asynchronous edge detection is a property of the sense configuration rather than a separate enable."
+notes = "Per-line asynchronous edge detection. With a line's bit set and its debouncer off, an edge sets INTFLAG directly and the EIC clock is not requested; with the bit clear, the reset value, edge detection samples on the EIC clock and needs it running. A line using it must have its filter disabled, and the register is enable-protected. Absent on the SAM D21, where no register enables it: there only a level sense without the filter is detected asynchronously, and every edge sense needs GCLK_EIC running."
 
 [registers.CONFIG0]
 offset = 0x1C
 width = 32
 fields = { SENSE0 = [0, 3], FILTEN0 = [3, 1], SENSE1 = [4, 3], FILTEN1 = [7, 1], SENSE2 = [8, 3], FILTEN2 = [11, 1], SENSE3 = [12, 3], FILTEN3 = [15, 1], SENSE4 = [16, 3], FILTEN4 = [19, 1], SENSE5 = [20, 3], FILTEN5 = [23, 1], SENSE6 = [24, 3], FILTEN6 = [27, 1], SENSE7 = [28, 3], FILTEN7 = [31, 1] }
-notes = "Lines 0 through 7. The suffix is the position within the register rather than the line number, which matters only for CONFIG1. SENSE selects none, rising, falling, both, high or low; FILTEN adds a majority filter that needs a clock."
+notes = "Lines 0 through 7. The suffix is the position within the register rather than the line number, which matters only for CONFIG1. SENSE selects none, rising, falling, both, high or low -- the SENSE_ constants below; FILTEN adds a majority filter that needs a clock. Enable-protected: written only while CTRLA.ENABLE is clear."
 
 [registers.CONFIG1]
 offset = 0x20
@@ -131,3 +134,17 @@ offset = 0x38
 width = 32
 fields = { PINSTATE = [0, 16] }
 notes = "READ-ONLY, and the register that lets a handler answer which way a pin moved without touching PORT. Its own description is precise about what it returns: the valid pin state of the DEBOUNCED external interrupt pin, so a consumer not using the debouncer should establish that is the reading it wants."
+
+# The number of external interrupt lines, from the feature list and the signal table. It matches the
+# width of the per-line fields above on this family, and that agreement is not a rule to read the
+# count from: the SAM D21's equivalent fields are wider than its line count.
+[constants]
+LINE_COUNT = 16
+
+# The SENSEx values, one per detection a line can be configured for.
+SENSE_NONE = 0
+SENSE_RISE = 1
+SENSE_FALL = 2
+SENSE_BOTH = 3
+SENSE_HIGH = 4
+SENSE_LOW = 5

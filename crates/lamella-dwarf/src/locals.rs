@@ -15,8 +15,8 @@ const DW_AT_NAME: u64 = 0x03;
 const DW_AT_LOW_PC: u64 = 0x11;
 const DW_AT_HIGH_PC: u64 = 0x12;
 const DW_AT_FRAME_BASE: u64 = 0x40;
-const DW_AT_ABSTRACT_ORIGIN: u64 = 0x31;
-const DW_AT_SPECIFICATION: u64 = 0x47;
+pub(crate) const DW_AT_ABSTRACT_ORIGIN: u64 = 0x31;
+pub(crate) const DW_AT_SPECIFICATION: u64 = 0x47;
 const DW_AT_TYPE: u64 = 0x49;
 const DW_AT_STR_OFFSETS_BASE: u64 = 0x72;
 const DW_AT_ADDR_BASE: u64 = 0x73;
@@ -61,8 +61,8 @@ pub enum Place<'a> {
         /// A signed byte displacement from its value.
         offset: i64,
     },
-    /// At a fixed address in the image -- `DW_OP_addr` or `DW_OP_addrx`. A static, or a local the
-    /// compiler promoted to one.
+    /// At a fixed address in the image -- `DW_OP_addr`. A static, or a local the compiler
+    /// promoted to one. `DW_OP_addrx` is not resolved here and arrives as [`Self::Expression`].
     Address(u64),
     /// An expression this crate does not classify, carried whole.
     ///
@@ -234,10 +234,10 @@ impl<'a> Locals<'a> {
     /// `--gc-sections` resolves a relocation against a discarded symbol to zero, so a removed
     /// function's entry survives with `low_pc` 0 and its real length. On a Cortex-M image, whose
     /// code begins at zero, those ranges land ON TOP of live functions -- and a discarded body is
-    /// usually SHORTER than the live function it covers, so [`Self::at`] picks it. Measured on
-    /// `samples/hello`: asking for the locals at `appMain`'s first instruction answers with a
-    /// discarded subprogram spanning `0x0..0x5c`, whose parameters are real entries describing
-    /// registers that hold something else entirely.
+    /// usually SHORTER than the live function it covers, so [`Self::at`] picks it. Asking for the
+    /// locals at a live function's first instruction then answers with a discarded subprogram
+    /// covering that address, whose parameters are real entries describing registers that hold
+    /// something else entirely.
     ///
     /// **This is not an address-is-zero check and must not become one.** Zero is a legitimate
     /// image offset on these parts -- the vector table lives there. The discriminator is whether an
@@ -281,7 +281,7 @@ impl<'a> Locals<'a> {
         &self.subprograms
     }
 
-    /// How many subprograms carried locals.
+    /// How many subprograms were read, whether or not they carry locals.
     #[must_use]
     pub fn len(&self) -> usize {
         self.subprograms.len()
@@ -347,12 +347,12 @@ pub(crate) fn classify_frame_base(expression: &[u8]) -> FrameBase<'_> {
 }
 
 /// What one entry contributed, kept while its unit is walked so references can be resolved.
-struct Entry<'a> {
+pub(crate) struct Entry<'a> {
     /// The entry's offset from the start of its unit, which is what a `DW_FORM_ref4` names.
-    unit_relative: usize,
-    name: Option<&'a [u8]>,
+    pub(crate) unit_relative: usize,
+    pub(crate) name: Option<&'a [u8]>,
     /// The unit-relative offset of the entry this one takes its name from, when it named one.
-    origin: Option<usize>,
+    pub(crate) origin: Option<usize>,
 }
 
 /// Walks one compilation unit for its subprograms and their locals.
@@ -529,7 +529,7 @@ fn unit_locals<'a>(
 /// specification -- so this follows it, with a bound. **The bound is not defensiveness about depth:
 /// a damaged or hostile file can point an entry at itself**, and a reader that trusts the chain
 /// then does not return.
-fn resolve_name<'a>(entries: &[Entry<'a>], offset: usize, depth: u8) -> Option<&'a [u8]> {
+pub(crate) fn resolve_name<'a>(entries: &[Entry<'a>], offset: usize, depth: u8) -> Option<&'a [u8]> {
     if depth > 8 {
         return None;
     }
@@ -542,7 +542,7 @@ fn resolve_name<'a>(entries: &[Entry<'a>], offset: usize, depth: u8) -> Option<&
 
 /// A reference expressed as an offset from the start of its unit, which is what the `DW_FORM_ref*`
 /// family means -- `DW_FORM_ref_addr` counts from the section instead and is not resolved here.
-fn unit_relative_reference(form: u64, value: Value<'_>) -> Option<usize> {
+pub(crate) fn unit_relative_reference(form: u64, value: Value<'_>) -> Option<usize> {
     match form {
         DW_FORM_REF1 | DW_FORM_REF2 | DW_FORM_REF4 | DW_FORM_REF8 | DW_FORM_REF_UDATA => {
             usize::try_from(value.as_u64()?).ok()

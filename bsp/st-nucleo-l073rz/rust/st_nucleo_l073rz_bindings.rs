@@ -20,8 +20,8 @@ pub const VCP_DRIVER_FAMILY: &str = "stm32l073-usart";
 pub const BUTTON_DRIVER_FAMILY: &str = "stm32l073-exti";
 
 // -- BUTTON: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from the
-// ISR to the managed side and never decodes it. Clear EXTI_PR before returning or the
-// interrupt re-enters. --
+// ISR to the managed side and never decodes it. Clear EXTI_PR, then read the pad's level from
+// PORT_IDR_REG; without the clear the interrupt re-enters. --
 pub const BUTTON_TOKEN: u32 = 0;
 pub const BUTTON_EXTI_LINE: u32 = 13;
 pub const BUTTON_EXTI_LINE_MASK: u32 = 0x2000;
@@ -31,6 +31,8 @@ pub const BUTTON_EXTI_PR_REG: u32 = 0x40010414;
 pub const BUTTON_EXTI_IMR_REG: u32 = 0x40010400;
 pub const BUTTON_EXTI_RTSR_REG: u32 = 0x40010408;
 pub const BUTTON_EXTI_FTSR_REG: u32 = 0x4001040C;
+pub const BUTTON_PORT_IDR_REG: u32 = 0x50000810;
+pub const BUTTON_PIN_MASK: u32 = 0x2000;
 pub const BUTTON_PORT_RCC_EN_REG: u32 = 0x4002102C;
 pub const BUTTON_PORT_RCC_EN_MASK: u32 = 0x4;
 pub const BUTTON_SYSCFG_RCC_EN_REG: u32 = 0x40021034;
@@ -39,24 +41,25 @@ pub const BUTTON_EXTICR_REG: u32 = 0x40010014;
 pub const BUTTON_EXTICR_MASK: u32 = 0xF0;
 pub const BUTTON_EXTICR_VALUE: u32 = 0x20;
 
-/// Takes one pending interrupt line this board has bound on NVIC position 7: clears it
-/// and answers its TOKEN, or `None` when no line of this board's is pending there.
+/// Takes one pending interrupt line this board has bound on NVIC position 7: clears the
+/// line, reads the pad's level, and answers `(token, level)`, or `None` when no line of this
+/// board's is pending there.
 ///
-/// THE CLEAR HAPPENS BEFORE THE ANSWER, and that ordering is why this is a function rather
-/// than another constant. The pending register is write-one-to-clear, so a handler that
-/// returns without writing its line's bit is re-entered immediately and the board makes no
-/// progress. Clearing FIRST also settles the fate of an edge that arrives mid-handler: it
-/// re-pends and the vector is entered again, where answering first and clearing afterwards
-/// would write the new edge away together with the old one.
+/// The line is cleared before the pad is read, which is the order `lamella_isr_notify` asks of
+/// its caller: an edge that lands during the read pends the line again and enters the vector
+/// once more, so the last level reported always matches the pad, at the cost of an occasional
+/// duplicate. Reading first would let the clear erase that edge. The pending register is
+/// write-one-to-clear, so a handler that returns without writing its line's bit is re-entered
+/// immediately.
 ///
-/// CALL IT IN A LOOP, from the vector for NVIC position 7. One entry can find several
-/// bound lines pending and each carries its own token:
+/// Call it in a loop, from the vector for NVIC position 7. One entry can find several bound
+/// lines pending, and each carries its own token:
 ///
 /// ```text
 /// #[unsafe(no_mangle)]
 /// pub extern "C" fn exti_isr() {
-///     while let Some(token) = unsafe { board::isr_vector_7_take() } {
-///         unsafe { lamella_isr_notify(token) };
+///     while let Some((token, level)) = unsafe { board::isr_vector_7_take() } {
+///         unsafe { lamella_isr_notify(token, level) };
 ///     }
 /// }
 /// ```
@@ -65,19 +68,21 @@ pub const BUTTON_EXTICR_VALUE: u32 = 0x20;
 /// managed side and hands it back to the driver, which is the only place that knows it means
 /// a pin. That is what keeps the pad-to-line-to-vector mapping here and out of the runtime.
 ///
-/// IT ANSWERS ONLY THE LINES THIS BOARD BOUND -- here, button. A line the firmware enabled
-/// for its own use can share this vector and is neither reported nor cleared, because
-/// clearing a line this board did not bind would swallow that firmware's interrupt in
-/// silence. Such a firmware clears its own line in the same handler.
+/// It answers only the lines this board bound -- here, button. A line the firmware enabled for
+/// its own use can share this vector and is neither reported nor cleared, because clearing a
+/// line this board did not bind would swallow that firmware's interrupt in silence. Such a
+/// firmware clears its own line in the same handler.
 ///
 /// # Safety
-/// Reads and writes the pending register through raw MMIO. Call it only from the interrupt
-/// vector for NVIC position 7.
-pub unsafe fn isr_vector_7_take() -> Option<u32> {
+/// Reads the pad's input register, and reads and writes the pending register, through raw
+/// MMIO. Call it only from the interrupt vector for NVIC position 7.
+pub unsafe fn isr_vector_7_take() -> Option<(u32, u8)> {
     let pending = unsafe { core::ptr::read_volatile(BUTTON_EXTI_PR_REG as *const u32) };
     if pending & BUTTON_EXTI_LINE_MASK != 0 {
         unsafe { core::ptr::write_volatile(BUTTON_EXTI_PR_REG as *mut u32, BUTTON_EXTI_LINE_MASK) };
-        return Some(BUTTON_TOKEN);
+        let pad = unsafe { core::ptr::read_volatile(BUTTON_PORT_IDR_REG as *const u32) };
+        let level = u8::from(pad & BUTTON_PIN_MASK != 0);
+        return Some((BUTTON_TOKEN, level));
     }
     None
 }
@@ -109,5 +114,6 @@ pub const DEVICE_COUNT: u32 = 1;
 // -- on-board devices: PORT group base + pin index + mask --
 pub const LED_PORT_BASE: u32 = 0x50000000;
 pub const LED_PIN: u32 = 5;
+pub const LED_BANK: u32 = 0;
 pub const LED_MASK: u32 = 0x20;
 pub const LED_ACTIVE_LOW: u32 = 0;

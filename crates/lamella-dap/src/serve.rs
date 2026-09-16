@@ -12,6 +12,10 @@ use std::time::Duration;
 /// resulting responses and events to `writer`, until a `disconnect` request or
 /// the end of the stream.
 ///
+/// However the session ends, the target is released: a `disconnect` request releases it, and any
+/// other end -- the stream closing, or a frame that cannot be read or written -- releases it here,
+/// through [`Debugger::release_target`], so a client that goes away does not leave it stopped.
+///
 /// # Errors
 /// Returns an [`io::Error`] if reading a frame, parsing it, or writing a reply
 /// fails.
@@ -20,6 +24,15 @@ pub fn serve<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
 ) -> io::Result<()> {
+    let ended = serve_requests(debugger, reader, writer);
+    release_unless_disconnected(debugger, ended)
+}
+
+fn serve_requests<R: BufRead, W: Write>(
+    debugger: &mut Debugger,
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<Ended> {
     while let Some(message) = read_message(reader)? {
         let Message::Request(request) = message else {
             continue;
@@ -38,10 +51,10 @@ pub fn serve<R: BufRead, W: Write>(
             }
         }
         if disconnecting {
-            break;
+            return Ok(Ended::DisconnectRequest);
         }
     }
-    Ok(())
+    Ok(Ended::StreamClosed)
 }
 
 /// Like [`serve`], but polls a free-running ("resume-now") backend concurrently with reading
@@ -55,6 +68,8 @@ pub fn serve<R: BufRead, W: Write>(
 /// [`serve`] suffices for the synchronous interpreter (which never leaves the target
 /// running); this is for the device backend.
 ///
+/// The target is released however the session ends, as for [`serve`].
+///
 /// # Errors
 /// Returns an [`io::Error`] if writing a reply fails.
 pub fn serve_polled<R: BufRead + Send + 'static, W: Write>(
@@ -62,6 +77,15 @@ pub fn serve_polled<R: BufRead + Send + 'static, W: Write>(
     reader: R,
     writer: &mut W,
 ) -> io::Result<()> {
+    let ended = serve_requests_polled(debugger, reader, writer);
+    release_unless_disconnected(debugger, ended)
+}
+
+fn serve_requests_polled<R: BufRead + Send + 'static, W: Write>(
+    debugger: &mut Debugger,
+    reader: R,
+    writer: &mut W,
+) -> io::Result<Ended> {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut reader = reader;
@@ -85,12 +109,12 @@ pub fn serve_polled<R: BufRead + Send + 'static, W: Write>(
                     }
                     continue;
                 }
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => return Ok(Ended::StreamClosed),
             }
         } else {
             match rx.recv() {
                 Ok(message) => message,
-                Err(_) => break,
+                Err(_) => return Ok(Ended::StreamClosed),
             }
         };
 
@@ -102,10 +126,34 @@ pub fn serve_polled<R: BufRead + Send + 'static, W: Write>(
             write_message(writer, &reply)?;
         }
         if disconnecting {
-            break;
+            return Ok(Ended::DisconnectRequest);
         }
     }
-    Ok(())
+}
+
+/// How a session's request loop ended.
+enum Ended {
+    /// The client sent `disconnect`, whose handler released the target.
+    DisconnectRequest,
+    /// The client's stream closed without one.
+    StreamClosed,
+}
+
+/// Releases the target unless a `disconnect` request already did, and passes the loop's own outcome
+/// on. Nobody is left to tell when this release fails -- the client is gone -- so the reason goes to
+/// standard error.
+fn release_unless_disconnected(
+    debugger: &mut Debugger,
+    ended: io::Result<Ended>,
+) -> io::Result<()> {
+    if !matches!(ended, Ok(Ended::DisconnectRequest)) {
+        if let Err(reason) = debugger.release_target() {
+            eprintln!(
+                "the session ended without a disconnect, and the target could not be released: {reason}"
+            );
+        }
+    }
+    ended.map(|_| ())
 }
 
 #[cfg(all(test, feature = "interpreter"))]
@@ -207,5 +255,187 @@ mod tests {
         let mut output = Vec::new();
         serve(&mut debugger, &mut reader, &mut output).unwrap();
         assert!(!read_all(output).is_empty());
+    }
+
+    #[test]
+    fn a_session_that_cannot_start_shows_the_user_why_when_it_is_launched() {
+        let reason = "--probe stlink needs the `st` feature {and this server was built without it}";
+        let mut debugger = Debugger::refusing(reason);
+        let input = request_frames(&["initialize", "launch", "disconnect"]);
+        let mut output = Vec::new();
+        serve(&mut debugger, &mut Cursor::new(input), &mut output).unwrap();
+
+        let messages = read_all(output);
+        let response = |command: &str| {
+            messages
+                .iter()
+                .find_map(|m| match m {
+                    Message::Response(r) if r.command == command => Some(r),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {command} response"))
+        };
+        assert!(response("initialize").success);
+        let launch = response("launch");
+        assert!(!launch.success);
+        let error = &launch.body.as_ref().expect("a structured error")["error"];
+        assert_eq!(error["showUser"], serde_json::json!(true));
+        assert_eq!(error["format"], serde_json::json!("{reason}"));
+        assert_eq!(error["variables"]["reason"], serde_json::json!(reason));
+        assert!(response("disconnect").success);
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, Message::Event(e) if e.event == "initialized"))
+        );
+    }
+
+    /// A backend that counts the times it is released, answers every release with `outcome`, and
+    /// answers every launch with `launch`. Everything else is inert.
+    struct Releasing {
+        releases: std::rc::Rc<std::cell::Cell<u32>>,
+        outcome: Result<(), String>,
+        launch: Result<(), String>,
+    }
+
+    impl lamella_debug_backend::DebugBackend for Releasing {
+        fn launch(&mut self) -> Result<(), String> {
+            self.launch.clone()
+        }
+        fn resume(&mut self) -> lamella_debug_backend::Stop {
+            lamella_debug_backend::Stop::Done
+        }
+        fn step(&mut self) -> lamella_debug_backend::Stop {
+            lamella_debug_backend::Stop::Step
+        }
+        fn release(&mut self) -> Result<(), String> {
+            self.releases.set(self.releases.get() + 1);
+            self.outcome.clone()
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<lamella_debug_backend::Frame> {
+            Vec::new()
+        }
+        fn variables(
+            &self,
+            _frame: usize,
+            _scope: lamella_debug_backend::Scope,
+        ) -> Vec<lamella_debug_backend::Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<lamella_debug_backend::Register> {
+            Vec::new()
+        }
+        fn disassemble(
+            &self,
+            _address: u64,
+            _offset: i64,
+            _count: usize,
+        ) -> Vec<lamella_debug_backend::Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    fn releasing(outcome: Result<(), String>) -> (Debugger, std::rc::Rc<std::cell::Cell<u32>>) {
+        let releases = std::rc::Rc::new(std::cell::Cell::new(0));
+        let backend = Releasing {
+            releases: std::rc::Rc::clone(&releases),
+            outcome,
+            launch: Ok(()),
+        };
+        (Debugger::with_backend(Box::new(backend)), releases)
+    }
+
+    #[test]
+    fn a_launch_the_backend_cannot_start_shows_the_user_its_reason() {
+        let reason = "the target did not start the run: {NOTHING_TO_RUN}";
+        let backend = Releasing {
+            releases: std::rc::Rc::new(std::cell::Cell::new(0)),
+            outcome: Ok(()),
+            launch: Err(reason.to_owned()),
+        };
+        let mut debugger = Debugger::with_backend(Box::new(backend));
+        let input = request_frames(&["initialize", "launch", "disconnect"]);
+        let mut output = Vec::new();
+        serve(&mut debugger, &mut Cursor::new(input), &mut output).unwrap();
+
+        let messages = read_all(output);
+        let launch = messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Response(r) if r.command == "launch" => Some(r),
+                _ => None,
+            })
+            .expect("a launch response");
+        assert!(!launch.success);
+        let error = &launch.body.as_ref().expect("a structured error")["error"];
+        assert_eq!(error["showUser"], serde_json::json!(true));
+        assert_eq!(error["format"], serde_json::json!("{reason}"));
+        let shown = error["variables"]["reason"].as_str().expect("the reason travels as a variable");
+        assert!(shown.contains(reason), "the backend's own words reach the user: {shown}");
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, Message::Event(e) if e.event == "initialized"))
+        );
+    }
+
+    #[test]
+    fn a_disconnect_releases_the_target_once() {
+        let (mut debugger, releases) = releasing(Ok(()));
+        let input = request_frames(&["initialize", "launch", "disconnect"]);
+        let mut output = Vec::new();
+        serve(&mut debugger, &mut Cursor::new(input), &mut output).unwrap();
+        assert_eq!(releases.get(), 1);
+        assert!(
+            read_all(output).iter().any(
+                |m| matches!(m, Message::Response(r) if r.command == "disconnect" && r.success)
+            )
+        );
+    }
+
+    #[test]
+    fn a_client_that_goes_away_without_a_disconnect_still_releases_the_target() {
+        let (mut debugger, releases) = releasing(Ok(()));
+        let input = request_frames(&["initialize", "launch"]);
+        serve(&mut debugger, &mut Cursor::new(input), &mut Vec::new()).unwrap();
+        assert_eq!(releases.get(), 1, "serve");
+
+        let (mut debugger, releases) = releasing(Ok(()));
+        let input = request_frames(&["initialize", "launch"]);
+        serve_polled(&mut debugger, Cursor::new(input), &mut Vec::new()).unwrap();
+        assert_eq!(releases.get(), 1, "serve_polled");
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_released_is_reported_to_the_user() {
+        let (mut debugger, _) = releasing(Err("the probe stopped answering".to_owned()));
+        let input = request_frames(&["initialize", "launch", "disconnect"]);
+        let mut output = Vec::new();
+        serve(&mut debugger, &mut Cursor::new(input), &mut output).unwrap();
+        let messages = read_all(output);
+        let disconnect = messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Response(r) if r.command == "disconnect" => Some(r),
+                _ => None,
+            })
+            .expect("a disconnect response");
+        assert!(!disconnect.success);
+        let error = &disconnect.body.as_ref().expect("a structured error")["error"];
+        assert_eq!(error["showUser"], serde_json::json!(true));
+        let reason = error["variables"]["reason"].as_str().expect("the reason");
+        assert!(reason.contains("the probe stopped answering"), "{reason}");
     }
 }

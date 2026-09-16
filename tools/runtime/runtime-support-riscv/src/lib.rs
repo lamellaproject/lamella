@@ -483,7 +483,8 @@ fn sched_any_parked(s: &Scheduler) -> bool {
 /// `virt` SiFive test-finisher FAIL with exit code 2 (the finisher exits with the HIGH sixteen bits,
 /// so a bare 0x3333 would exit 0, indistinguishable from PASS; real silicon has no finisher and halts
 /// in the loop) rather than silently spinning forever. The ARM twin prints `DEADLOCK`; the trap codes
-/// here are DEADLOCK = 2, LOCKFULL = 3, MONITOR = 4, NULLLOCK = 5 (harness wrong-result FAILs use 1).
+/// here are DEADLOCK = 2, LOCKFULL = 3, MONITOR = 4, NULLLOCK = 5 and HEAPFULL = 7 (harness
+/// wrong-result FAILs use 1, and the harness trap handler uses 6).
 fn sched_deadlock_trap() -> ! {
     const FINISHER: *mut u32 = 0x0010_0000 as *mut u32;
     unsafe { core::ptr::write_volatile(FINISHER, 0x0002_3333) };
@@ -1350,12 +1351,43 @@ extern "C" fn lamella_gc_count_roots_impl() -> u32 {
 const HEAP_PTR: *mut u32 = 0x8010_0000 as *mut u32;
 
 /// Bump-allocate `bytes` (rounded to 8, the provider's rounding), returning the block base.
+///
+/// There is no heap end to compare against here. The cursor word is shared with whichever
+/// `lamella_gc_alloc` provider the image links, and only that provider knows where its heap stops.
+/// A request whose rounding or sum overflows cannot fit by construction and ends the program through
+/// [`lamella_heap_exhausted`]; a request that runs past the provider's end without overflowing is
+/// not caught here.
 fn bump_alloc(bytes: u32) -> *mut u32 {
     unsafe {
         let base = core::ptr::read_volatile(HEAP_PTR);
-        core::ptr::write_volatile(HEAP_PTR, base + ((bytes + 7) & !7));
+        let Some(next) = bytes
+            .checked_add(7)
+            .map(|n| n & !7)
+            .and_then(|n| base.checked_add(n))
+        else {
+            lamella_heap_exhausted();
+        };
+        core::ptr::write_volatile(HEAP_PTR, next);
         base as *mut u32
     }
+}
+
+/// Ends the program because the heap cannot serve an allocation: `HEAPFULL` on the console, then the
+/// QEMU `virt` test-finisher FAIL with exit code 7, then a halt -- real silicon has no finisher and
+/// stops in the loop. The ARM twin prints the same word; the exit codes are listed at
+/// [`sched_deadlock_trap`].
+///
+/// Exported, because on this instruction set the image supplies `lamella_gc_alloc`: a provider with
+/// a heap end calls this when a request does not fit, so an exhausted heap reads the same whichever
+/// allocator ran out.
+#[no_mangle]
+pub extern "C" fn lamella_heap_exhausted() -> ! {
+    for b in *b"HEAPFULL" {
+        console_put(b);
+    }
+    const FINISHER: *mut u32 = 0x0010_0000 as *mut u32;
+    unsafe { core::ptr::write_volatile(FINISHER, 0x0007_3333) };
+    loop {}
 }
 
 unsafe extern "C" {
@@ -1398,7 +1430,7 @@ fn alloc_string(units: u32) -> *mut u32 {
         .checked_mul(2)
         .and_then(|n| n.checked_add(8))
     else {
-        return core::ptr::null_mut();
+        lamella_heap_exhausted();
     };
     let block = bump_alloc(bytes);
     unsafe {

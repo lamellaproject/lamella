@@ -37,6 +37,8 @@ FACTS = {
         "exti_imr_reg": 0x40010400,
         "exti_rtsr_reg": 0x40010408,
         "exti_ftsr_reg": 0x4001040C,
+        "port_idr_reg": 0x50000810,
+        "pin_mask": 0x2000,
         "port_rcc_en_reg": 0x4002102C,
         "port_rcc_en_mask": 0x4,
         "syscfg_rcc_en_reg": 0x40021034,
@@ -103,5 +105,5 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 5, "mask": 0x20, "active_low": False},
+    "led": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 5, "bank": 0, "mask": 0x20, "active_low": False},
 }

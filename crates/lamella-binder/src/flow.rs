@@ -1014,7 +1014,7 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
             mark_field_write(operand, writes);
             collect_field_uses(operand, reads, writes);
         }
-        BoundExprKind::Unary { operator, operand } => {
+        BoundExprKind::Unary { operator, operand, .. } => {
             if matches!(
                 operator,
                 UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
@@ -1886,6 +1886,7 @@ impl Analyzer<'_> {
             BoundExprKind::Unary {
                 operator: UnaryOperator::Not,
                 operand,
+                ..
             } => {
                 let inner = self.condition(operand, assigned, span);
                 BoolState {
@@ -2058,7 +2059,7 @@ impl Analyzer<'_> {
                 self.expression(left, assigned, span);
                 self.expression(right, assigned, span);
             }
-            BoundExprKind::Unary { operator, operand } => {
+            BoundExprKind::Unary { operator, operand, .. } => {
                 self.expression(operand, assigned, span);
                 if matches!(
                     operator,

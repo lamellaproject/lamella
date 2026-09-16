@@ -170,9 +170,9 @@ pub enum Designer {
     /// The 16-bit extended form: a 9-bit continuation code and a 7-bit identity code, both in
     /// `PIDR4.DES_3`. Reached only when a designer's bank is past the compressed form's 16.
     Extended {
-        /// The 9-bit continuation code, `DES_3` bits[15:7].
+        /// The 9-bit continuation code, `DES_3` bits `[15:7]`.
         continuation: u16,
-        /// The 7-bit identity code, `DES_3` bits[6:0].
+        /// The 7-bit identity code, `DES_3` bits `[6:0]`.
         identity: u8,
     },
     /// The designer is deliberately not identified: identity `0x7F` with continuation `0xF`.
@@ -244,9 +244,9 @@ impl fmt::Display for Designer {
 
 /// A component's part number, in BOTH readings, because the registers do not say which is meant.
 ///
-/// CoreSight v3.0 (IHI 0029G), B2.2.2.1: a 12-bit part number puts bits[11:8] in `PIDR1.PART_1` and
-/// bits[7:0] in `PIDR0.PART_0`, leaving `PIDR2.REVISION` as a revision; a 16-bit part number shifts
-/// everything up a nibble and takes `PIDR2.REVISION` as part number bits[3:0].
+/// CoreSight v3.0 (IHI 0029G), B2.2.2.1: a 12-bit part number puts bits `[11:8]` in `PIDR1.PART_1` and
+/// bits `[7:0]` in `PIDR0.PART_0`, leaving `PIDR2.REVISION` as a revision; a 16-bit part number shifts
+/// everything up a nibble and takes `PIDR2.REVISION` as part number bits `[3:0]`.
 ///
 /// **The choice is "specific to the designer of the component", in the specification's words, and
 /// no bit records it.** So a walk cannot decide, and picking one silently is how a part number gets
@@ -267,12 +267,12 @@ pub struct PartNumber {
 /// architect may differ from the designer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceArchitecture {
-    /// `ARCHITECT`, bits[31:21] -- the 11-bit compressed JEP106 code of the ARCHITECT, which
+    /// `ARCHITECT`, bits `[31:21]` -- the 11-bit compressed JEP106 code of the ARCHITECT, which
     /// IHI 0029G notes is `0x23B` where Arm is the architect.
     pub architect: u16,
-    /// `REVISION`, bits[19:16] -- the revision of the architecture `archid` names.
+    /// `REVISION`, bits `[19:16]` -- the revision of the architecture `archid` names.
     pub revision: u8,
-    /// `ARCHID`, bits[15:0].
+    /// `ARCHID`, bits `[15:0]`.
     pub archid: u16,
 }
 
@@ -395,7 +395,7 @@ pub struct Component {
     pub designer: Designer,
     /// Its part number, in both readings. See [`PartNumber`].
     pub part: PartNumber,
-    /// `PIDR2.REVISION`, which is ALSO part number bits[3:0] under a 16-bit part numbering
+    /// `PIDR2.REVISION`, which is ALSO part number bits `[3:0]` under a 16-bit part numbering
     /// scheme -- see [`PartNumber`] for why nothing here can tell which.
     pub revision: u8,
     /// `PIDR3.REVAND` -- a minor revision, a modification marker, or the revision itself, depending
@@ -483,7 +483,7 @@ pub enum Cause {
     /// A Class `0x9` ROM table's `DEVID.FORMAT` is not `0x0`, so its entries are not 32-bit words.
     ///
     /// ADIv6.0 (IHI 0074E), D3.5.10: `0x1` is the 64-bit format and `0x2`-`0xF` are reserved. The
-    /// 64-bit form is refused rather than half-read -- its `OFFSET` is bits[63:12], so a component
+    /// 64-bit form is refused rather than half-read -- its `OFFSET` is bits `[63:12]`, so a component
     /// address does not fit the `u32` this walk carries, and ADIv5.2 (IHI 0031G), D1.2 requires
     /// `FORMAT` to be `0` on an ADIv5 implementation, which is every part this drives. Carries the
     /// `DEVID` word so a target that does it anyway is reported rather than guessed at.
@@ -493,7 +493,7 @@ pub enum Cause {
     /// ADIv6.0 (IHI 0074E), D1 prohibits circular references. A target that has one would otherwise
     /// walk forever.
     CircularReference(u32),
-    /// The hierarchy is deeper than [`MAX_DEPTH`], or names more than [`MAX_COMPONENTS`] components.
+    /// The hierarchy is deeper than this reader's depth cap, or names more than its component cap.
     TooLarge,
 }
 
@@ -663,11 +663,11 @@ pub enum DebugBase {
 
 /// Decodes a `BASE` register word.
 ///
-/// ADIv5.2 (IHI 0031G), C2.6.1: `BASEADDR` bits[31:12], bits[11:2] RES0, `Format` bit[1], `P`
-/// bit[0], plus a legacy format that predates the `Format` bit.
+/// ADIv5.2 (IHI 0031G), C2.6.1: `BASEADDR` bits `[31:12]`, bits `[11:2]` RES0, `Format` bit `[1]`, `P`
+/// bit `[0]`, plus a legacy format that predates the `Format` bit.
 ///
 /// WARNING: **`P` IS ONLY A PRESENCE BIT IN THE ADIv5 FORMAT.** In the legacy format (`Format`
-/// clear) the specification makes bit[0] "Reserved, RAZ" -- so a decoder that tests `P`
+/// clear) the specification makes bit `[0]` "Reserved, RAZ" -- so a decoder that tests `P`
 /// unconditionally reports "no debug components" for a legacy DAP, out of the very word that holds
 /// their address.
 pub fn decode_base(word: u32) -> DebugBase {
@@ -711,8 +711,8 @@ pub enum DebugBasePointer {
     Absent,
     /// The system address of the first component reachable from this DP.
     At {
-        /// The address, 4KB aligned. `BASEPTR1[31:0]` supplies bits[63:32], and `BASEPTR0`
-        /// bits[31:12] supply bits[31:12]; bits[11:0] are always zero.
+        /// The address, 4KB aligned. `BASEPTR1[31:0]` supplies bits `[63:32]`, and `BASEPTR0`
+        /// bits `[31:12]` supply bits `[31:12]`; bits `[11:0]` are always zero.
         address: u64,
         /// The address width `DPIDR1.ASIZE` declares, in bits, so a report can say whether the
         /// upper word was meaningful. IHI 0074E, B2.2.7 permits 12, 20, 32, 40, 48 and 52.
@@ -745,7 +745,7 @@ pub fn decode_base_pointer(dpidr: u32, dpidr1: u32, low: u32, high: u32) -> Debu
 
 /// One ROM table entry, decoded against the format its table declared.
 ///
-/// `OFFSET` bits[31:12], `POWERID` bits[8:4] and `POWERIDVALID` bit[2] are the same in both formats
+/// `OFFSET` bits `[31:12]`, `POWERID` bits `[8:4]` and `POWERIDVALID` bit `[2]` are the same in both formats
 /// (ADIv6.0 IHI 0074E, D2.4.4 and D3.5.17). **The low two bits are not**, which is the whole reason
 /// [`decode`](Self::decode) takes a [`TableFormat`] rather than reading a word on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,7 +759,7 @@ pub struct RomEntry {
     /// The entry is in an encoding this reads. Clear for a Class `0x1` entry with `FORMAT == 0`
     /// (the legacy 8-bit table) or a Class `0x9` entry with the reserved `PRESENT` value `0b01`.
     pub understood: bool,
-    /// `POWERID` bits[8:4], when `POWERIDVALID` bit[2] is set.
+    /// `POWERID` bits `[8:4]`, when `POWERIDVALID` bit `[2]` is set.
     pub power_id: Option<u8>,
 }
 
@@ -796,7 +796,7 @@ impl RomEntry {
 
     /// The address of the component this entry names, given the table's own base address.
     ///
-    /// Shared by both formats: `OFFSET` is bits[31:12] of the 32-bit word either way.
+    /// Shared by both formats: `OFFSET` is bits `[31:12]` of the 32-bit word either way.
     ///
     /// ADIv6.0 (IHI 0074E), D1.4: `Component_n_Address = ROM_Base_Address + (OFFSET << 12)`, with
     /// `OFFSET` a two's-complement signed value -- the Armv6-M ARM (DDI 0419E), Table C1-3 calls it

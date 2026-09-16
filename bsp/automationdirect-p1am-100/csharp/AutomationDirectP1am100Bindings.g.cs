@@ -18,26 +18,32 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint LED_PORT_BASE = 0x41004480;
         public const uint LED_PIN = 8;
+        public const uint LED_BANK = 0;
         public const uint LED_MASK = 0x100;
         public const uint LED_ACTIVE_LOW = 0;
         public const uint RUN_SWITCH_PORT_BASE = 0x41004400;
         public const uint RUN_SWITCH_PIN = 28;
+        public const uint RUN_SWITCH_BANK = 0;
         public const uint RUN_SWITCH_MASK = 0x10000000;
         public const uint RUN_SWITCH_ACTIVE_LOW = 1;
         public const uint BASE_ENABLE_PORT_BASE = 0x41004480;
         public const uint BASE_ENABLE_PIN = 9;
+        public const uint BASE_ENABLE_BANK = 0;
         public const uint BASE_ENABLE_MASK = 0x200;
         public const uint BASE_ENABLE_ACTIVE_LOW = 0;
         public const uint BASE_CS_PORT_BASE = 0x41004400;
         public const uint BASE_CS_PIN = 4;
+        public const uint BASE_CS_BANK = 0;
         public const uint BASE_CS_MASK = 0x10;
         public const uint BASE_CS_ACTIVE_LOW = 1;
         public const uint BASE_READY_PORT_BASE = 0x41004400;
         public const uint BASE_READY_PIN = 5;
+        public const uint BASE_READY_BANK = 0;
         public const uint BASE_READY_MASK = 0x20;
         public const uint BASE_READY_ACTIVE_LOW = 0;
         public const uint SD_CS_PORT_BASE = 0x41004400;
         public const uint SD_CS_PIN = 14;
+        public const uint SD_CS_BANK = 0;
         public const uint SD_CS_MASK = 0x4000;
     }
 }

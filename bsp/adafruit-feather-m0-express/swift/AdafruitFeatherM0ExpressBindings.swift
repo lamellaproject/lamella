@@ -14,10 +14,12 @@ public enum AdafruitFeatherM0ExpressBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LED_PORT_BASE: UInt32 = 0x41004400
     public static let LED_PIN: UInt32 = 17
+    public static let LED_BANK: UInt32 = 0
     public static let LED_MASK: UInt32 = 0x20000
     public static let LED_ACTIVE_LOW: UInt32 = 0
     public static let NEOPIXEL_PORT_BASE: UInt32 = 0x41004400
     public static let NEOPIXEL_PIN: UInt32 = 6
+    public static let NEOPIXEL_BANK: UInt32 = 0
     public static let NEOPIXEL_MASK: UInt32 = 0x40
     public static let NEOPIXEL_ACTIVE_LOW: UInt32 = 0
 }

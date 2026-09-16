@@ -48,7 +48,7 @@ absent = "SCPS207H describes no identity register: the part has one 8-bit contro
 [address]
 bus = "i2c"
 base = 0x70
-notes = "SCPS207H target address figure: the top four bits are fixed at 1110 and the low three are the A2/A1/A0 pins, giving 0x70 through 0x77 as its Table 7-1 enumerates. A unit on this bench answered 0x70, the all-low strapping."
+notes = "SCPS207H target address figure: the top four bits are fixed at 1110 and the low three are the A2/A1/A0 pins, giving 0x70 through 0x77 as its Table 7-1 enumerates. A device with A2/A1/A0 all low answers 0x70."
 
 [[address.straps]]
 pin = "A0"

@@ -1689,10 +1689,21 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Parses a real-literal's numeric text (without its suffix) to an `f64`,
-    /// returning its bit pattern. A value the `f64` parser rejects is `MalformedNumericLiteral`.
-    fn parse_real_value(&mut self, text: &str, start: usize) -> u64 {
-        match text.parse::<f64>() {
+    /// Converts a `float` or `double` literal's text (without its suffix or separators) to the
+    /// value's bits, as `f64` bits for either type: a `float` widens to `f64` exactly. A value too
+    /// large for the literal's type is `RealLiteralOutOfRange`, and text the parser rejects is
+    /// `MalformedNumericLiteral`.
+    fn parse_real_value(&mut self, text: &str, suffix: RealSuffix, start: usize) -> u64 {
+        let (parsed, type_name) = if suffix == RealSuffix::Float {
+            (text.parse::<f32>().map(f64::from), "float")
+        } else {
+            (text.parse::<f64>(), "double")
+        };
+        match parsed {
+            Ok(value) if value.is_infinite() => {
+                self.report(DiagnosticKind::RealLiteralOutOfRange { type_name }, start);
+                0
+            }
             Ok(value) => value.to_bits(),
             Err(_) => {
                 self.report(DiagnosticKind::MalformedNumericLiteral, start);
@@ -1702,7 +1713,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Builds the token for a real-literal text (without its suffix). A `decimal` (`m`) literal
-    /// keeps its EXACT 96-bit mantissa and scale; `float`/`double` narrow to `f64` bits.
+    /// keeps its EXACT 96-bit mantissa and scale; a `float` or `double` is kept as `f64` bits.
     fn numeric_real_token(&mut self, text: &str, suffix: RealSuffix, start: usize) -> TokenKind {
         let stripped;
         let text = if text.contains('_') {
@@ -1715,7 +1726,12 @@ impl<'a> Lexer<'a> {
             if let Some((lo, mid, hi, scale)) = parse_decimal_literal(text) {
                 return TokenKind::DecimalLiteral { lo, mid, hi, scale };
             }
-            self.report(DiagnosticKind::MalformedNumericLiteral, start);
+            self.report(
+                DiagnosticKind::RealLiteralOutOfRange {
+                    type_name: "decimal",
+                },
+                start,
+            );
             return TokenKind::DecimalLiteral {
                 lo: 0,
                 mid: 0,
@@ -1723,7 +1739,7 @@ impl<'a> Lexer<'a> {
                 scale: 0,
             };
         }
-        let bits = self.parse_real_value(text, start);
+        let bits = self.parse_real_value(text, suffix, start);
         TokenKind::RealLiteral { bits, suffix }
     }
 
@@ -1974,11 +1990,23 @@ struct ScannedFormat {
 /// separate unary minus, folded later, not part of the literal.)
 fn parse_decimal_literal(text: &str) -> Option<(u32, u32, u32, u8)> {
     let (mantissa_text, exponent) = match text.split_once(['e', 'E']) {
-        Some((mantissa, exp)) => (mantissa, exp.parse::<i32>().ok()?),
+        Some((mantissa, exp)) => {
+            let (negative, digits) = match exp.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, exp.strip_prefix('+').unwrap_or(exp)),
+            };
+            let magnitude = digits
+                .bytes()
+                .filter(u8::is_ascii_digit)
+                .fold(0i64, |value, digit| {
+                    (value * 10 + i64::from(digit - b'0')).min(1 << 40)
+                });
+            (mantissa, if negative { -magnitude } else { magnitude })
+        }
         None => (text, 0),
     };
     let mut mantissa: u128 = 0;
-    let mut fractional_digits: i32 = 0;
+    let mut scale: i64 = -exponent;
     let mut after_point = false;
     let mut sticky = false;
     for ch in mantissa_text.chars() {
@@ -1990,15 +2018,18 @@ fn parse_decimal_literal(text: &str) -> Option<(u32, u32, u32, u8)> {
         if mantissa <= (u128::MAX - u128::from(digit)) / 10 {
             mantissa = mantissa * 10 + u128::from(digit);
             if after_point {
-                fractional_digits += 1;
+                scale += 1;
             }
-        } else if after_point {
-            sticky |= digit != 0;
         } else {
-            return None;
+            sticky |= digit != 0;
+            if !after_point {
+                scale -= 1;
+            }
         }
     }
-    let mut scale = fractional_digits - exponent;
+    if mantissa == 0 {
+        return Some((0, 0, 0, scale.clamp(0, 28) as u8));
+    }
     while scale < 0 {
         mantissa = mantissa.checked_mul(10)?;
         scale += 1;
@@ -2738,6 +2769,98 @@ class C { }
         );
         assert_eq!(parse_decimal_literal("79228162514264337593543950335.6"), None);
         assert_eq!(parse_decimal_literal("1e29"), None);
+    }
+
+    #[test]
+    fn a_decimal_literal_is_decided_by_its_value_however_long_its_digits_or_exponent() {
+        assert_eq!(parse_decimal_literal("0e2147483648"), parts(0, 0));
+        assert_eq!(parse_decimal_literal("1e-2147483649"), parts(0, 28));
+        assert_eq!(parse_decimal_literal("1e-2147483648"), parts(0, 28));
+        assert_eq!(parse_decimal_literal("0.0e-2147483648"), parts(0, 28));
+        assert_eq!(parse_decimal_literal("0e2147483647"), parts(0, 0));
+        let ones = "1".repeat(50) + "e-49";
+        assert_eq!(
+            parse_decimal_literal(&ones),
+            parts(11_111_111_111_111_111_111_111_111_111, 28)
+        );
+        let ones = "1".repeat(45) + "e-30";
+        assert_eq!(
+            parse_decimal_literal(&ones),
+            parts(11_111_111_111_111_111_111_111_111_111, 14)
+        );
+        assert_eq!(parse_decimal_literal("1e2147483648"), None);
+        assert_eq!(parse_decimal_literal("1e99999999999999999999"), None);
+    }
+
+    #[test]
+    fn a_real_literal_too_large_for_its_type_is_cs0594_naming_the_type() {
+        for (source, type_name) in [
+            ("1e400", "double"),
+            ("1e400D", "double"),
+            ("1.7976931348623159e308", "double"),
+            ("1e99999999999999999999", "double"),
+            ("1e40f", "float"),
+            ("3.4028236e38F", "float"),
+            ("340282356779733661637539395458142568448f", "float"),
+            ("1e29m", "decimal"),
+            ("79228162514264337593543950335.5M", "decimal"),
+            ("1e2147483648m", "decimal"),
+        ] {
+            let lexed = tokenize(source);
+            assert_eq!(lexed.diagnostics.len(), 1, "{source}");
+            let diagnostic = &lexed.diagnostics[0];
+            assert_eq!(
+                diagnostic.kind,
+                DiagnosticKind::RealLiteralOutOfRange { type_name },
+                "{source}"
+            );
+            assert_eq!(diagnostic.code(), 594, "{source}");
+            assert_eq!(
+                diagnostic.span,
+                Span::new(0, source.len() as u32),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_literal_rounded_to_its_largest_value_or_to_zero_is_not_an_error() {
+        for source in [
+            "1.7976931348623158e308",
+            "340282356779733661637539395458142568447f",
+            "3.4028235e38f",
+            "1e-400",
+            "1e-46f",
+            "0e2147483648",
+            "1e-2147483649f",
+            "79228162514264337593543950335.4m",
+            "1e-2147483648m",
+        ] {
+            assert!(tokenize(source).diagnostics.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_float_literal_is_rounded_once_from_its_digits() {
+        let float = |value: f32| {
+            vec![
+                real(f64::from(value), RealSuffix::Float),
+                TokenKind::EndOfFile,
+            ]
+        };
+        assert_eq!(
+            kinds("340282356779733661637539395458142568447f"),
+            float(f32::MAX)
+        );
+        assert_eq!(
+            kinds("1.000000059604644775390625000000001f"),
+            float(1.0 + f32::EPSILON)
+        );
+        assert_eq!(
+            kinds("1.000000178813934326171874999999999f"),
+            float(1.0 + f32::EPSILON)
+        );
+        assert_eq!(kinds("16777217.000000000000001f"), float(16_777_218.0));
     }
 
     #[test]

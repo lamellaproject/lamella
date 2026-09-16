@@ -10,7 +10,7 @@ use lamella_wire_host::engine::{CompileFailure, LcscCompiler, LoopbackLink, Outc
 use lamella_wire_host::engine::BakedSerialLink;
 use lamella_wire_host::{deployed_status_blocking, hello_blocking, list_serial, SerialTransport, UsbTransport};
 #[cfg(feature = "bake")]
-use lamella_wire_host::{deploy_chunked_blocking, send_deploy_run};
+use lamella_wire_host::deploy_chunked_blocking;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -564,6 +564,7 @@ impl Server {
         let via = args.get("via").and_then(Value::as_str);
         let probe = args.get("probe").and_then(Value::as_str);
         let volume = args.get("volume").and_then(Value::as_str);
+        let device = args.get("device").and_then(Value::as_str);
 
         if image.is_empty() || board.is_empty() {
             return text_result(
@@ -624,29 +625,19 @@ That is set when the server starts.",
             Ok(programmer) => programmer,
             Err(error) => return text_result(error, true),
         };
-        let selector = match lamella_flash_routes::selector_for(chosen, probe, volume) {
+        let selector = match lamella_flash_routes::selector_for(chosen, probe, volume, device) {
             Ok(selector) => selector,
             Err(error) => return text_result(error, true),
         };
 
-        let bytes = match lamella_flash_routes::artifact::read(path) {
-            Ok(artifact) => {
-                if let Err(error) = lamella_flash_routes::check_base(&artifact, chosen) {
-                    return text_result(error, true);
-                }
-                if let Err(error) =
-                    lamella_flash_routes::check_rp2350_stamp(&artifact.bytes, row.aot_target)
-                {
-                    return text_result(error, true);
-                }
-                artifact.bytes
-            }
+        let prepared = match lamella_flash_routes::prepare_image(path, row, chosen) {
+            Ok(prepared) => prepared,
             Err(error) => return text_result(error, true),
         };
 
         match lamella_flash_routes::write_scoped(
             chosen,
-            &bytes,
+            &prepared.bytes,
             selector.as_deref(),
             &self.scope.identities(),
         ) {
@@ -748,13 +739,13 @@ Verification: {}.",
         match deploy_chunked_blocking(&mut t, 1, &image, 8 * 1024, timeout) {
             Ok(true) => {
                 let mut msg = format!("deployed {} bytes to {target}.", image.len());
+                let mut failed = false;
                 if run {
-                    match send_deploy_run(&mut t, 2) {
-                        Ok(()) => msg.push_str(" Booted it (DEPLOY_RUN)."),
-                        Err(e) => msg.push_str(&format!(" (deploy ok, DEPLOY_RUN failed: {e:?})")),
-                    }
+                    let (said, is_error) = start_deployed(&mut t, START_ACK_PATIENCE);
+                    msg.push_str(&said);
+                    failed = is_error;
                 }
-                text_result(msg, false)
+                text_result(msg, failed)
             }
             Ok(false) => text_result(format!("deploy to {target} was not fully acked (a chunk failed to verify)."), true),
             Err(e) => text_result(format!("deploy to {target} failed: {e:?}"), true),
@@ -762,6 +753,32 @@ Verification: {}.",
     }
 }
 
+
+/// How long `lamella_deploy` waits for the board to acknowledge a start. It answers before the reset
+/// the start implies, so the answer is prompt.
+#[cfg(feature = "bake")]
+const START_ACK_PATIENCE: Duration = Duration::from_secs(2);
+
+/// What `lamella_deploy` adds to its answer after asking the board to start the image it deployed, and
+/// whether that answer is an error.
+///
+/// **ONLY THE BOARD's ACKNOWLEDGEMENT MAKES IT A START.** A start the board refuses, or never answers,
+/// makes the answer an error that still says the image is on the board, so a caller that cannot see the
+/// board is not told a program is running when none is.
+#[cfg_attr(not(feature = "bake"), allow(dead_code))]
+fn start_deployed(transport: &mut impl lamella_wire::Transport, patience: Duration) -> (String, bool) {
+    use lamella_wire_host::{StartFailure, exec};
+    match lamella_wire_host::start_execution(transport, 2, exec::exec_source::DEPLOYED, 0, patience) {
+        Ok(()) => (" Started it: the board acknowledged the start.".to_owned(), false),
+        Err(StartFailure::NoAnswer) => (
+            " The board did not acknowledge the start, so whether it is running is not known; resetting \
+             the board runs it."
+                .to_owned(),
+            true,
+        ),
+        Err(failure) => (format!(" But {failure}."), true),
+    }
+}
 
 /// Add the caching hints the specification requires on a `resultType: "complete"` result.
 ///
@@ -1198,6 +1215,63 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    mod a_deploy_start {
+        use super::super::start_deployed;
+        use std::time::Duration;
+
+        /// A target that answers the first frame it is sent with the frames `answer` builds.
+        struct Answering {
+            wire: lamella_wire::MemTransport,
+            answer: Option<Vec<u8>>,
+        }
+
+        impl Answering {
+            fn with(answer: impl FnOnce(&mut lamella_wire::MemTransport)) -> Self {
+                let mut peer = lamella_wire::MemTransport::new();
+                answer(&mut peer);
+                Answering { wire: lamella_wire::MemTransport::new(), answer: Some(peer.take_sent()) }
+            }
+        }
+
+        impl lamella_wire::Transport for Answering {
+            fn send(&mut self, _msg_type: u8, _seq: u16, _payload: &[u8]) -> Result<(), lamella_wire::TransportError> {
+                if let Some(answer) = self.answer.take() {
+                    self.wire.feed(&answer);
+                }
+                Ok(())
+            }
+
+            fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, lamella_wire::TransportError> {
+                lamella_wire::Transport::poll(&mut self.wire)
+            }
+        }
+
+        /// A board answering a start with the acknowledgement `code`.
+        fn acknowledging(code: u8) -> Answering {
+            Answering::with(|peer| {
+                lamella_wire::Transport::send(peer, lamella_wire_host::exec::EXEC_ACK, 2, &[code]).unwrap();
+            })
+        }
+
+        /// A deploy's answer calls its start made only when the board acknowledges it; a start the
+        /// board refuses, or does not answer, makes the answer an error, with the board's reason.
+        #[test]
+        fn a_start_is_reported_as_made_only_when_the_board_acknowledges_it() {
+            let quick = Duration::from_millis(50);
+            let (said, is_error) = start_deployed(&mut acknowledging(lamella_wire_host::exec::ack::STARTED), quick);
+            assert!(!is_error, "{said}");
+
+            let (said, is_error) =
+                start_deployed(&mut acknowledging(lamella_wire_host::exec::ack::NOTHING_TO_RUN), quick);
+            assert!(is_error, "a refused start is an error: {said}");
+            assert!(said.contains("NOTHING_TO_RUN"), "and says the board's reason: {said}");
+
+            let (said, is_error) = start_deployed(&mut Answering::with(|_| {}), quick);
+            assert!(is_error, "a start nobody acknowledged is not reported as made: {said}");
+            assert!(!said.contains("Booted"), "{said}");
+        }
+    }
+
     use super::*;
 
     /// The boards resource must be COMPUTED from the wire's board table, not stored beside it.

@@ -49,18 +49,22 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint WINC_RESET_N_PORT_BASE = 0x41004400;
         public const uint WINC_RESET_N_PIN = 8;
+        public const uint WINC_RESET_N_BANK = 0;
         public const uint WINC_RESET_N_MASK = 0x100;
         public const uint WINC_RESET_N_ACTIVE_LOW = 1;
         public const uint WINC_CHIP_EN_PORT_BASE = 0x41004400;
         public const uint WINC_CHIP_EN_PIN = 14;
+        public const uint WINC_CHIP_EN_BANK = 0;
         public const uint WINC_CHIP_EN_MASK = 0x4000;
         public const uint WINC_CHIP_EN_ACTIVE_LOW = 0;
         public const uint WINC_IRQN_PORT_BASE = 0x41004400;
         public const uint WINC_IRQN_PIN = 21;
+        public const uint WINC_IRQN_BANK = 0;
         public const uint WINC_IRQN_MASK = 0x200000;
         public const uint WINC_IRQN_ACTIVE_LOW = 1;
         public const uint LED_PORT_BASE = 0x41004400;
         public const uint LED_PIN = 17;
+        public const uint LED_BANK = 0;
         public const uint LED_MASK = 0x20000;
         public const uint LED_ACTIVE_LOW = 0;
     }

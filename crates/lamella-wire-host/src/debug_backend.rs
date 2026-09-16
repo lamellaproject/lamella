@@ -2,7 +2,7 @@
 //! the Lamella Link debug channel -- VS Code (via lamella-dap) debugs code running ON A DEVICE
 //! with zero adapter changes.
 
-use crate::{SerialTransport, deploy_chunked_blocking, hello_blocking};
+use crate::{SerialTransport, TransferAck, deploy_image_blocking, hello_blocking, start_execution};
 #[cfg(feature = "usb")]
 use crate::{UsbTransport, parse_usb_target};
 use lamella_debug_backend::{
@@ -713,12 +713,12 @@ pub fn children_total(payload: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
-/// Closing the host closes the session it opened.
+/// Closing the host ends a session nothing handed back.
 ///
-/// **A DAP `disconnect` reaches no backend: it answers success and sends nothing.** The serve loop
-/// breaks, the `Debugger` owning this backend is dropped, and this is where the target hears about
-/// it -- so an editor that disconnects does not leave a session live on the device until some later
-/// host launches into it.
+/// When the debug adapter ends a session -- a `disconnect`, or a client that goes away -- it releases
+/// the target first ([`DebugBackend::release`]): the breakpoints come off, the program runs on, and no
+/// session is left for this to end. A host dropped without a release is where this matters, so that
+/// its session does not stay live on the device until some later host launches into it.
 ///
 /// This covers a host whose session ends with the host, which is every host that runs one session
 /// per process. A host holding one backend across several sessions wants an explicit detach on the
@@ -730,34 +730,59 @@ impl Drop for WireHostBackend {
 }
 
 impl DebugBackend for WireHostBackend {
-    fn launch(&mut self) -> bool {
+    fn launch(&mut self) -> Result<(), String> {
         self.detach_if_live();
         self.running = false;
         self.exit_code = 0;
         let seq = self.next_seq();
-        if !matches!(
-            deploy_chunked_blocking(&mut self.transport, seq, &self.image, 8 * 1024, self.timeout),
-            Ok(true)
-        ) {
-            return false;
+        let deployed = deploy_image_blocking(
+            &mut self.transport,
+            seq,
+            &self.image,
+            8 * 1024,
+            self.timeout,
+            Capabilities(0),
+        );
+        match deployed {
+            Ok(TransferAck::Accepted) => {}
+            Ok(TransferAck::Rejected { chunk }) => {
+                return Err(format!("the target refused chunk {chunk} of the image"));
+            }
+            Ok(TransferAck::Mismatched { chunk, .. }) => {
+                return Err(format!(
+                    "the target's flash does not hold the image that was sent, from chunk {chunk} on"
+                ));
+            }
+            Err(TransportError::Closed) => {
+                return Err("the target did not acknowledge the image as it was sent".to_string());
+            }
+            Err(error) => {
+                return Err(format!("the carrier failed while the image was sent: {error:?}"));
+            }
         }
         let seq = self.next_seq();
-        let start = [exec::exec_source::DEPLOYED, exec::exec_flags::START_HALTED];
-        if self.transport.send(exec::EXEC, seq, &start).is_err() {
-            return false;
-        }
+        start_execution(
+            &mut self.transport,
+            seq,
+            exec::exec_source::DEPLOYED,
+            exec::exec_flags::START_HALTED,
+            self.timeout,
+        )
+        .map_err(|failure| failure.to_string())?;
         let Some(stop) = self.await_type(debug::EVT_STOPPED) else {
-            return false;
+            return Err(
+                "the target started the program and reported no stop at its entry point".to_string(),
+            );
         };
         self.session_live = true;
-        if matches!(self.on_stopped(&stop), Stop::Fault(_)) {
-            return false;
+        if let Stop::Fault(reason) = self.on_stopped(&stop) {
+            return Err(format!("the program did not reach its entry point: {reason}"));
         }
         if self.user_bps.is_empty() {
-            return true;
+            return Ok(());
         }
         let pending = self.user_bps.clone();
-        self.send_breakpoints(&pending).is_ok()
+        self.send_breakpoints(&pending)
     }
 
     fn resume(&mut self) -> Stop {
@@ -804,6 +829,27 @@ impl DebugBackend for WireHostBackend {
             }
         }
         true
+    }
+
+    /// Takes every breakpoint off and lets a stopped program run on, so it goes on as it would with
+    /// no debugger attached. It sends no detach: on this wire a detach ends the execution, and the
+    /// target goes back to waiting for its next command.
+    fn release(&mut self) -> Result<(), String> {
+        if !self.session_live {
+            return Ok(());
+        }
+        self.set_breakpoints(&[])
+            .map_err(|reason| format!("could not remove the breakpoints: {reason}"))?;
+        if !self.running {
+            let seq = self.next_seq();
+            self.transport
+                .send(debug::DBG_RESUME, seq, &[])
+                .map_err(|_| "could not resume the program: the wire dropped".to_string())?;
+        }
+        self.session_live = false;
+        self.running = false;
+        self.frames.clear();
+        Ok(())
     }
 
     fn step(&mut self) -> Stop {
@@ -974,11 +1020,11 @@ impl DebugBackend for WireHostBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{SrcMap, WireHostBackend, WireTransport, debug, pack};
+    use super::{SrcMap, WireHostBackend, WireTransport, debug, exec, pack, reason};
     use lamella_debug_backend::DebugBackend;
     use lamella_wire::{MemTransport, Transport};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// A backend wired to an in-memory board, with a live session and one `DBG_ACK` already
     /// waiting -- so a detach completes instead of sitting out its timeout.
@@ -1018,17 +1064,50 @@ mod tests {
         (backend, shared)
     }
 
-    /// The message types the host sent, decoded through the wire's own framing rather than by
-    /// looking for a byte -- a raw scan would pass on a payload that happens to contain one.
-    fn sent_types(shared: &Arc<Mutex<MemTransport>>) -> Vec<u8> {
+    /// The frames the host sent, as `(type, payload)`, decoded through the wire's own framing rather
+    /// than by looking for a byte -- a raw scan would pass on a payload that happens to contain one.
+    fn sent_frames(shared: &Arc<Mutex<MemTransport>>) -> Vec<(u8, Vec<u8>)> {
         let bytes = shared.lock().expect("the test transport").take_sent();
         let mut reader = MemTransport::new();
         reader.feed(&bytes);
-        let mut types = Vec::new();
+        let mut frames = Vec::new();
         while let Ok(Some(frame)) = reader.poll() {
-            types.push(frame.msg_type);
+            frames.push((frame.msg_type, frame.payload.to_vec()));
         }
-        types
+        frames
+    }
+
+    /// The message types of [`sent_frames`].
+    fn sent_types(shared: &Arc<Mutex<MemTransport>>) -> Vec<u8> {
+        sent_frames(shared).into_iter().map(|(msg_type, _)| msg_type).collect()
+    }
+
+    /// The sequence number a fresh backend's launch starts its execution with: the deploy takes the
+    /// first whether or not it sends anything, and a board's answer to the start has to carry the
+    /// start's own number to be read as its answer.
+    const START_SEQ: u16 = 2;
+
+    /// A host with no session open, launching an empty image -- which deploys nothing, so the launch
+    /// goes straight to its start -- into a board whose answers are already queued, in order.
+    fn launching_into(
+        answers: &[(u8, u16, &[u8])],
+        timeout: Duration,
+    ) -> (WireHostBackend, Arc<Mutex<MemTransport>>) {
+        let (mut backend, shared) = live_session(0);
+        backend.session_live = false;
+        backend.timeout = timeout;
+        queue_board_answers(&shared, answers);
+        (backend, shared)
+    }
+
+    /// Queues `answers` -- `(type, seq, payload)`, in order -- as frames the board has already sent.
+    fn queue_board_answers(shared: &Arc<Mutex<MemTransport>>, answers: &[(u8, u16, &[u8])]) {
+        let mut board = MemTransport::new();
+        for &(msg_type, seq, payload) in answers {
+            board.send(msg_type, seq, payload).expect("queue the board's answer");
+        }
+        let queued = board.take_sent();
+        shared.lock().expect("the test transport").feed(&queued);
     }
 
     #[test]
@@ -1081,6 +1160,129 @@ mod tests {
         drop(backend);
 
         assert!(sent_types(&shared).is_empty(), "silence, because there is nothing to close");
+    }
+
+    #[test]
+    fn a_start_the_target_refuses_fails_the_launch_at_once_with_its_reason() {
+        let refused: &[u8] = &[exec::ack::NOTHING_TO_RUN];
+        let (mut backend, _shared) =
+            launching_into(&[(exec::EXEC_ACK, START_SEQ, refused)], Duration::from_secs(2));
+        let began = Instant::now();
+        let Err(reason) = backend.launch() else {
+            panic!("a refused start must not be reported as a launched session");
+        };
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "the refusal is the answer, so nothing waits for a stop after it: {:?}",
+            began.elapsed()
+        );
+        assert!(reason.contains("NOTHING_TO_RUN"), "and the user is told what the target said: {reason}");
+    }
+
+    #[test]
+    fn a_target_that_refuses_the_start_command_fails_the_launch_with_its_reason() {
+        let held = lamella_wire::error::session_held(2);
+        let (mut backend, _shared) =
+            launching_into(&[(lamella_wire::msg::ERROR, START_SEQ, &held)], Duration::from_secs(2));
+        let began = Instant::now();
+        let Err(reason) = backend.launch() else {
+            panic!("a target that refused the command must not be reported as launched");
+        };
+        assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
+        assert!(reason.contains("refused"), "the reason says the target refused: {reason}");
+    }
+
+    #[test]
+    fn a_start_nothing_acknowledges_fails_the_launch_saying_so() {
+        let (mut backend, _shared) = launching_into(&[], Duration::from_millis(50));
+        let Err(reason) = backend.launch() else {
+            panic!("a silent target must not be reported as launched");
+        };
+        assert!(reason.contains("acknowledge"), "silence is named as silence: {reason}");
+    }
+
+    #[test]
+    fn an_acknowledged_start_launches_into_the_entry_stop() {
+        let started: &[u8] = &[exec::ack::STARTED];
+        let entry: &[u8] = &[reason::ENTRY, 0, 0, 0, 0, 0, 0, 0, 0];
+        let no_frames: &[u8] = &[0, 0];
+        let (mut backend, shared) = launching_into(
+            &[
+                (exec::EXEC_ACK, START_SEQ, started),
+                (debug::EVT_STOPPED, START_SEQ, entry),
+                (debug::DBG_FRAMES, START_SEQ + 1, no_frames),
+            ],
+            Duration::from_secs(2),
+        );
+        assert_eq!(backend.launch(), Ok(()));
+        assert_eq!(sent_types(&shared), vec![exec::EXEC, debug::DBG_STACK]);
+    }
+
+    #[test]
+    fn releasing_a_stopped_session_clears_the_breakpoints_and_resumes_the_program() {
+        let (mut backend, shared) = live_session(1);
+        backend.user_bps = vec![pack(1, 0)];
+
+        assert_eq!(backend.release(), Ok(()));
+
+        let sent = sent_frames(&shared);
+        let types: Vec<u8> = sent.iter().map(|(msg_type, _)| *msg_type).collect();
+        assert_eq!(types, vec![debug::DBG_BREAK, debug::DBG_RESUME]);
+        assert_eq!(sent[0].1, vec![0, 0], "the breakpoint set it sends is empty");
+        drop(backend);
+        assert!(sent_types(&shared).is_empty(), "a released session is not detached afterwards");
+    }
+
+    #[test]
+    fn releasing_a_running_session_clears_the_breakpoints_and_leaves_it_running() {
+        let (mut backend, shared) = live_session(0);
+        backend.user_bps = vec![pack(1, 0)];
+        backend.running = true;
+        let paused: &[u8] = &[reason::PAUSED, 0, 0, 0, 0, 0, 0, 0, 0];
+        let no_frames: &[u8] = &[0, 0];
+        let acknowledged: &[u8] = &[];
+        queue_board_answers(
+            &shared,
+            &[
+                (debug::EVT_STOPPED, 1, paused),
+                (debug::DBG_FRAMES, 2, no_frames),
+                (debug::DBG_ACK, 3, acknowledged),
+            ],
+        );
+
+        assert_eq!(backend.release(), Ok(()));
+
+        assert_eq!(
+            sent_types(&shared),
+            vec![debug::DBG_PAUSE, debug::DBG_STACK, debug::DBG_BREAK, debug::DBG_RESUME],
+            "paused for the change, and resumed exactly once"
+        );
+        drop(backend);
+        assert!(sent_types(&shared).is_empty(), "and it is not detached");
+    }
+
+    #[test]
+    fn a_release_the_target_does_not_acknowledge_is_reported() {
+        let (mut backend, shared) = live_session(0);
+        backend.user_bps = vec![pack(1, 0)];
+
+        let Err(reason) = backend.release() else {
+            panic!("breakpoints nobody acknowledged removing may still be armed");
+        };
+        assert!(reason.contains("acknowledge"), "{reason}");
+        assert_eq!(sent_types(&shared), vec![debug::DBG_BREAK], "nothing resumes past a failed removal");
+        drop(backend);
+        assert_eq!(sent_types(&shared), vec![debug::DBG_DETACH]);
+    }
+
+    #[test]
+    fn releasing_a_host_with_no_live_session_sends_nothing() {
+        let (mut backend, shared) = live_session(0);
+        backend.session_live = false;
+
+        assert_eq!(backend.release(), Ok(()));
+
+        assert!(sent_types(&shared).is_empty());
     }
 
     #[test]

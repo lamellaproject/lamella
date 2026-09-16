@@ -58,8 +58,11 @@ notes = [
 # ALL FOUR LEDS ARE ACTIVE LOW, and the schematic shows why in one direction: the LED's anode sits
 # at +3V3 and its cathode returns through a series resistor to the MCU pin, so the pin SINKS the
 # current. Read backwards, a board's LEDs are lit from reset until a program drives them high.
-# That is the opposite of the two Nucleo-144 boards and the F429 Discovery and the same as the
-# F769 Discovery -- four ST boards, two habits, so polarity stays a per-board reading.
+# That is the opposite of the two Nucleo-144 boards, the F429 Discovery and the F769 Discovery,
+# which all drive their LEDs -- so polarity is a per-board reading and this board is the one that
+# reads the other way. It is read off Figure 26 rather than off a sentence, which is the safer of
+# the two: where an ST manual's prose and its own schematic have disagreed about a LED, the
+# schematic held.
 #
 # THE TAMPER KEY IS ACTIVE LOW TOO, and for once that is the arrangement a reader expects: R195, a
 # 4K7, holds the pin up to VDD and the switch shorts it to ground.

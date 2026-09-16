@@ -12,7 +12,8 @@ mbedTLS, for boards whose firmware runs TLS on the main MCU (the `managed` arm o
 
 - source: `https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.6.7.tar.gz`
 - archive SHA-256: `7312b70b067b6a271961c8d36c3b8f9ba3e86fe6b26f18af13cd70430ee52ed1`
-- license: Apache-2.0 (see `vendor/mbedtls/LICENSE`)
+- license: used under Apache-2.0, one of the two licenses Mbed TLS offers
+  (`Apache-2.0 OR GPL-2.0-or-later`; see `vendor/mbedtls/LICENSE`)
 
 The build profile lives in `csrc/lamella_mbedtls_config.h` (TLS 1.2 client, ECDHE/RSA +
 AES-GCM + SHA-2, P-256/P-384, no filesystem, no wall clock -- certificate validity

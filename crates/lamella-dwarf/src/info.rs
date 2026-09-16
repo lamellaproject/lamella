@@ -28,7 +28,8 @@ const DW_FORM_IMPLICIT_CONST: u64 = 0x21;
 /// One subprogram: a name and the addresses it occupies.
 #[derive(Debug, Clone, Copy)]
 pub struct Function<'a> {
-    /// The name as the producer spelled it in `DW_AT_name`.
+    /// The name as the producer spelled it in `DW_AT_name`: the subprogram's own or, for a definition
+    /// that carries none, the one its `DW_AT_specification` or `DW_AT_abstract_origin` leads to.
     pub name: &'a [u8],
     /// The name a linker would see, from `DW_AT_linkage_name`, when the producer emitted one.
     pub linkage_name: Option<&'a [u8]>,
@@ -157,10 +158,16 @@ fn unit_functions<'a>(
         }
     }
 
-    let mut out = Vec::new();
+    let header_length_size = match format {
+        Format::Dwarf32 => 4,
+        Format::Dwarf64 => 12,
+    };
+    let mut entries: Vec<crate::locals::Entry<'a>> = Vec::new();
+    let mut defined: Vec<(Function<'a>, bool, Option<usize>)> = Vec::new();
     let mut comp_dir = None;
     let mut stmt_list = None;
     while !unit.is_empty() {
+        let entry_offset = unit.offset();
         let code = unit.uleb128()?;
         if code == 0 {
             continue;
@@ -171,6 +178,7 @@ fn unit_functions<'a>(
         let _ = abbrev.has_children;
 
         let mut name = None;
+        let mut origin = None;
         let mut linkage_name = None;
         let mut low_pc = None;
         let mut high_pc = None;
@@ -186,6 +194,9 @@ fn unit_functions<'a>(
             match attribute {
                 DW_AT_NAME => name = value.as_bytes(),
                 DW_AT_LINKAGE_NAME => linkage_name = value.as_bytes(),
+                crate::locals::DW_AT_ABSTRACT_ORIGIN | crate::locals::DW_AT_SPECIFICATION => {
+                    origin = crate::locals::unit_relative_reference(form, value);
+                }
                 DW_AT_LOW_PC => low_pc = value.as_u64(),
                 DW_AT_HIGH_PC => {
                     high_pc = value.as_u64();
@@ -199,10 +210,16 @@ fn unit_functions<'a>(
             }
         }
 
+        entries.push(crate::locals::Entry {
+            unit_relative: entry_offset + header_length_size,
+            name,
+            origin,
+        });
+
         if abbrev.tag != DW_TAG_SUBPROGRAM {
             continue;
         }
-        let (Some(name), Some(low_pc), Some(high_pc)) = (name, low_pc, high_pc) else {
+        let (Some(low_pc), Some(high_pc)) = (low_pc, high_pc) else {
             continue;
         };
         let high_pc = if high_pc_is_address {
@@ -210,17 +227,34 @@ fn unit_functions<'a>(
         } else {
             low_pc.saturating_add(high_pc)
         };
-        out.push(Function {
-            name,
-            linkage_name,
-            low_pc,
-            high_pc,
-            decl_file,
-            decl_line,
-            unit_offset,
-            stmt_list,
-            comp_dir,
-        });
+        defined.push((
+            Function {
+                name: name.unwrap_or_default(),
+                linkage_name,
+                low_pc,
+                high_pc,
+                decl_file,
+                decl_line,
+                unit_offset,
+                stmt_list,
+                comp_dir,
+            },
+            name.is_some(),
+            origin,
+        ));
+    }
+
+    let mut out = Vec::with_capacity(defined.len());
+    for (mut function, named, origin) in defined {
+        if !named {
+            let Some(name) =
+                origin.and_then(|origin| crate::locals::resolve_name(&entries, origin, 0))
+            else {
+                continue;
+            };
+            function.name = name;
+        }
+        out.push(function);
     }
     Ok(out)
 }

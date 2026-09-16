@@ -102,6 +102,10 @@ impl Session {
     /// submission's new session variables are committed (visible to later submissions);
     /// on any error the session is left unchanged so a retry is not skewed.
     pub fn compile_submission(&mut self, source: &str) -> SubmissionResult {
+        crate::compile::on_compile_stack(move || self.compile_submission_on_this_stack(source))
+    }
+
+    fn compile_submission_on_this_stack(&mut self, source: &str) -> SubmissionResult {
         let parsed = parse_submission(source);
         let parse_diagnostics: Vec<Diagnostic> = parsed
             .diagnostics

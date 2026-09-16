@@ -22,6 +22,10 @@ pub struct Debugger {
     launched: bool,
     /// Whether `launch` asked to stop at the entry point instead of running.
     stop_on_entry: bool,
+    /// Why this session cannot start, when the server that built it found out before it had a
+    /// target to debug. `launch` answers with it instead of starting anything; see
+    /// [`Debugger::refusing`].
+    refusal: Option<String>,
     /// Whether a resume-now backend left the target running, so the serve loop polls for
     /// the async stop. Always false for the synchronous interpreter backend.
     running: bool,
@@ -125,6 +129,7 @@ impl Debugger {
             output: String::new(),
             launched: false,
             stop_on_entry: false,
+            refusal: None,
             running: false,
             source_breakpoints: Vec::new(),
             instruction_breakpoints: Vec::new(),
@@ -134,6 +139,20 @@ impl Debugger {
             #[cfg(feature = "interpreter")]
             repl: None,
         }
+    }
+
+    /// Creates a debugger that cannot start, and tells the client why.
+    ///
+    /// `initialize` is answered as usual, `launch` fails with `reason` marked for the client to show
+    /// the user, and `disconnect` ends the session. This is for a server that found a problem before
+    /// it had a target to debug -- a probe its build does not include, an argument it cannot honor --
+    /// and must still answer the client that started it: a server that exits instead leaves the client
+    /// nothing to report except that it exited.
+    #[must_use]
+    pub fn refusing(reason: impl Into<String>) -> Debugger {
+        let mut debugger = Debugger::with_backend(Box::new(Unstartable));
+        debugger.refusal = Some(reason.into());
+        debugger
     }
 
     /// All console output the program has produced and the adapter has forwarded.
@@ -172,16 +191,41 @@ impl Debugger {
             .collect()
     }
 
+    /// Hands the target back as the session ends, so the program goes on without a debugger. A
+    /// `disconnect` request does this itself; the serve loops call it when a session ends any other
+    /// way -- the client's stream closing, or a frame that cannot be read or written. See
+    /// [`DebugBackend::release`].
+    ///
+    /// # Errors
+    /// The backend's reason, when the target could not be released and may still be stopped.
+    pub fn release_target(&mut self) -> Result<(), String> {
+        self.running = false;
+        self.backend.release()
+    }
+
     /// Handles one DAP request, returning the response followed by any events.
     pub fn handle(&mut self, request: &Request) -> Vec<Message> {
         let mut events: Vec<(&str, Option<Json>)> = Vec::new();
         let (success, body) = match request.command.as_str() {
             "initialize" => (true, Some(capabilities())),
             "launch" => {
+                if let Some(reason) = self.refusal.clone() {
+                    return self.fail_for_user(request, ERROR_SESSION_REFUSED, &reason);
+                }
                 let launched = self.launch(request);
                 self.flush_output(&mut events);
+                if let Err(reason) = launched {
+                    let mut out: Vec<Message> =
+                        events.into_iter().map(|(event, body)| self.event(event, body)).collect();
+                    out.extend(self.fail_for_user(
+                        request,
+                        ERROR_LAUNCH_FAILED,
+                        &format!("The session could not start: {reason}"),
+                    ));
+                    return out;
+                }
                 events.push(("initialized", None));
-                (launched, None)
+                (true, None)
             }
             "configurationDone" => {
                 if self.stop_on_entry {
@@ -251,7 +295,19 @@ impl Debugger {
                     arg_str(request, "context"),
                 )),
             ),
-            "disconnect" => (true, None),
+            "disconnect" => match self.release_target() {
+                Ok(()) => (true, None),
+                Err(reason) => {
+                    return self.fail_for_user(
+                        request,
+                        ERROR_TARGET_NOT_RELEASED,
+                        &format!(
+                            "The session has ended, but the target could not be released and may \
+                             still be stopped: {reason}"
+                        ),
+                    );
+                }
+            },
             _ => (false, None),
         };
 
@@ -263,15 +319,16 @@ impl Debugger {
         out
     }
 
-    fn launch(&mut self, request: &Request) -> bool {
+    fn launch(&mut self, request: &Request) -> Result<(), String> {
         self.stop_on_entry = request
             .arguments
             .as_ref()
             .and_then(|arguments| arguments.get("stopOnEntry"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
-        self.launched = self.backend.launch();
-        self.launched
+        let launched = self.backend.launch();
+        self.launched = launched.is_ok();
+        launched
     }
 
     /// Programs the backend with the union of source and instruction breakpoints. They share
@@ -642,7 +699,7 @@ impl Debugger {
     fn stack_trace(&self) -> Json {
         let frames = self.backend.stack();
         let mut out = Vec::with_capacity(frames.len());
-        for (index, frame) in frames.iter().enumerate().rev() {
+        for (index, frame) in frames.iter().enumerate() {
             let source = self.backend.source_location(frame.address);
             let mut entry = json!({
                 "id": index,
@@ -773,6 +830,31 @@ impl Debugger {
         })]
     }
 
+    /// A standalone unsuccessful response whose reason the client shows the user: the body is DAP's
+    /// `ErrorResponse`, a structured `error` message with `showUser` set. The `message` that
+    /// [`Self::fail`] sends is the protocol's raw short form, which DAP says is not shown in the UI.
+    ///
+    /// The reason travels as a variable of the format string rather than as the format string itself,
+    /// so a reason containing braces is shown as written instead of being read as placeholders.
+    fn fail_for_user(&mut self, request: &Request, id: u32, reason: &str) -> Vec<Message> {
+        self.out_seq += 1;
+        vec![Message::Response(Response {
+            seq: self.out_seq,
+            request_seq: request.seq,
+            success: false,
+            command: request.command.clone(),
+            message: Some(reason.to_owned()),
+            body: Some(json!({
+                "error": {
+                    "id": id,
+                    "format": "{reason}",
+                    "variables": { "reason": reason },
+                    "showUser": true,
+                }
+            })),
+        })]
+    }
+
     fn event(&mut self, event: &str, body: Option<Json>) -> Message {
         self.out_seq += 1;
         Message::Event(Event {
@@ -822,6 +904,64 @@ enum Action {
 
 fn stopped(reason: &str) -> Json {
     json!({ "reason": reason, "threadId": 1, "allThreadsStopped": true })
+}
+
+/// The identifier of the error a session that cannot start shows the user ([`Debugger::refusing`]).
+/// DAP asks that each message a user can see carry an identifier unique within the adapter, so a
+/// report can name which one it was.
+const ERROR_SESSION_REFUSED: u32 = 1;
+
+/// The identifier of the error shown when a session ends with its target still in the debugger's
+/// hands ([`Debugger::release_target`]).
+const ERROR_TARGET_NOT_RELEASED: u32 = 2;
+
+/// The identifier of the error shown when the backend could not start the target
+/// ([`DebugBackend::launch`]).
+const ERROR_LAUNCH_FAILED: u32 = 3;
+
+/// The backend behind [`Debugger::refusing`]. There is no target: nothing starts, and every question
+/// about a program has an empty answer.
+struct Unstartable;
+
+impl DebugBackend for Unstartable {
+    fn launch(&mut self) -> Result<(), String> {
+        Err(String::from("there is no target to start"))
+    }
+    fn resume(&mut self) -> Stop {
+        Stop::Done
+    }
+    fn step(&mut self) -> Stop {
+        Stop::Done
+    }
+    fn depth(&self) -> usize {
+        1
+    }
+    fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+        Ok(())
+    }
+    fn stack(&self) -> Vec<lamella_debug_backend::Frame> {
+        Vec::new()
+    }
+    fn variables(&self, _frame: usize, _scope: Scope) -> Vec<lamella_debug_backend::Variable> {
+        Vec::new()
+    }
+    fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+        Vec::new()
+    }
+    fn read_registers(&self) -> Vec<lamella_debug_backend::Register> {
+        Vec::new()
+    }
+    fn disassemble(
+        &self,
+        _address: u64,
+        _offset: i64,
+        _count: usize,
+    ) -> Vec<lamella_debug_backend::Disassembled> {
+        Vec::new()
+    }
+    fn take_output(&mut self) -> Option<String> {
+        None
+    }
 }
 
 fn capabilities() -> Json {
@@ -964,8 +1104,8 @@ mod tests {
     }
 
     impl DebugBackend for CapBackend {
-        fn launch(&mut self) -> bool {
-            true
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
         }
         fn resume(&mut self) -> Stop {
             Stop::Done
@@ -1025,8 +1165,8 @@ mod tests {
     }
 
     impl DebugBackend for BannerBackend {
-        fn launch(&mut self) -> bool {
-            true
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
         }
         fn resume(&mut self) -> Stop {
             Stop::Done
@@ -1067,8 +1207,8 @@ mod tests {
     struct FaultingBackend;
 
     impl DebugBackend for FaultingBackend {
-        fn launch(&mut self) -> bool {
-            true
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
         }
         fn resume(&mut self) -> Stop {
             Stop::Fault("call token 0x0A000003 resolved to no method".to_string())
@@ -1187,8 +1327,8 @@ mod tests {
     }
 
     impl DebugBackend for LoopBackend {
-        fn launch(&mut self) -> bool {
-            true
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
         }
         fn resume(&mut self) -> Stop {
             if self.seen < self.total_hits {
@@ -1250,8 +1390,8 @@ mod tests {
     }
 
     impl DebugBackend for NoEndBackend {
-        fn launch(&mut self) -> bool {
-            true
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
         }
         fn resume(&mut self) -> Stop {
             Stop::Done
@@ -1597,7 +1737,8 @@ mod tests {
         dbg.handle(&request(4, "stepIn", None));
         assert_eq!(frame_count(&mut dbg), 2);
 
-        let scopes = dbg.handle(&request(5, "scopes", Some(json!({ "frameId": 1 }))));
+        let frame = innermost_frame_id(&mut dbg);
+        let scopes = dbg.handle(&request(5, "scopes", Some(json!({ "frameId": frame }))));
         let args_ref = find_scope(&scopes[0].response_body(), "Arguments");
 
         let before = dbg.handle(&request(
@@ -1642,7 +1783,8 @@ mod tests {
         dbg.handle(&request(2, "stepIn", None));
         dbg.handle(&request(3, "stepIn", None));
         dbg.handle(&request(4, "stepIn", None));
-        let scopes = dbg.handle(&request(5, "scopes", Some(json!({ "frameId": 1 }))));
+        let frame = innermost_frame_id(&mut dbg);
+        let scopes = dbg.handle(&request(5, "scopes", Some(json!({ "frameId": frame }))));
         let args_ref = find_scope(&scopes[0].response_body(), "Arguments");
         let before = dbg.handle(&request(
             6,
@@ -1800,6 +1942,104 @@ mod tests {
     fn frame_count(dbg: &mut Debugger) -> u64 {
         let trace = dbg.handle(&request(99, "stackTrace", None));
         trace[0].response_body()["totalFrames"].as_u64().unwrap()
+    }
+
+    /// The id the adapter gives the innermost frame: the first `stackTrace` entry, which is the frame an
+    /// editor selects at a stop.
+    fn innermost_frame_id(dbg: &mut Debugger) -> u64 {
+        let trace = dbg.handle(&request(98, "stackTrace", None));
+        trace[0].response_body()["stackFrames"][0]["id"]
+            .as_u64()
+            .unwrap()
+    }
+
+    /// A backend stopped two calls deep that lists its stack innermost first, as
+    /// [`DebugBackend::stack`] documents and the device and Link backends do. Each scope's one
+    /// variable names the frame index it was read for.
+    struct TwoFramesDeep;
+
+    impl DebugBackend for TwoFramesDeep {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            2
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<Frame> {
+            vec![
+                Frame {
+                    address: 0x0807_76bc,
+                    name: String::from("Sleep"),
+                    line: 373,
+                },
+                Frame {
+                    address: 0x0809_8a42,
+                    name: String::from("Main"),
+                    line: 18,
+                },
+            ]
+        }
+        fn variables(&self, frame: usize, _scope: Scope) -> Vec<Variable> {
+            vec![Variable {
+                name: String::from("frame"),
+                value: frame.to_string(),
+                kind: String::from("index"),
+            }]
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// The editor's frame 0 is where the target stopped, and the id that frame carries reads that
+    /// frame's variables, for a backend that lists its stack innermost first.
+    #[test]
+    fn a_stack_listed_innermost_first_reaches_the_editor_innermost_first() {
+        let mut dbg = Debugger::with_backend(Box::new(TwoFramesDeep));
+        dbg.handle(&request(1, "launch", None));
+        let trace = dbg.handle(&request(2, "stackTrace", None));
+        let frames = trace[0].response_body()["stackFrames"].clone();
+        assert_eq!(
+            frames[0]["name"],
+            json!("Sleep"),
+            "frame 0 is the stop: {frames}"
+        );
+        assert_eq!(frames[1]["name"], json!("Main"), "{frames}");
+
+        let scopes = dbg.handle(&request(
+            3,
+            "scopes",
+            Some(json!({ "frameId": frames[0]["id"].clone() })),
+        ));
+        let arguments = find_scope(&scopes[0].response_body(), "Arguments");
+        let read = dbg.handle(&request(
+            4,
+            "variables",
+            Some(json!({ "variablesReference": arguments })),
+        ));
+        assert_eq!(
+            read[0].response_body()["variables"][0]["value"],
+            json!("0"),
+            "the id of frame 0 reads frame 0's variables"
+        );
     }
 
     #[test]

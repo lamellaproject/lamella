@@ -86,5 +86,14 @@ namespace Lamella.Generated
         public const uint CONFIG_SENSE7_LSB = 28;
         public const uint CONFIG_FILTEN7 = 0x80000000;
         public const uint CONFIG_FILTEN7_LSB = 31;
+
+        // -- block constants --
+        public const uint LINE_COUNT = 16;
+        public const uint SENSE_NONE = 0;
+        public const uint SENSE_RISE = 1;
+        public const uint SENSE_FALL = 2;
+        public const uint SENSE_BOTH = 3;
+        public const uint SENSE_HIGH = 4;
+        public const uint SENSE_LOW = 5;
     }
 }

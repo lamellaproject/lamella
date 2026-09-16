@@ -278,10 +278,59 @@ pub fn compile_source(
     )
 }
 
+/// Runs `work` on a thread whose stack is deep enough for the front end to follow deeply nested
+/// source, and returns its result; a panic in `work` resumes on the calling thread.
+///
+/// Parsing, binding and emission each recurse once per nesting level of the source -- parentheses,
+/// a long `a + b + c` chain, nested blocks -- so a program nested a few hundred levels deep
+/// overflows the 1 MiB stack a Windows main thread starts with. Every compile entry point runs its
+/// work here, so a host that calls one from an ordinary thread cannot overflow.
+#[cfg(any(unix, windows))]
+pub(crate) fn on_compile_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    const COMPILE_STACK_BYTES: usize = 64 * 1024 * 1024;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(alloc::string::String::from("lamella-compile"))
+            .stack_size(COMPILE_STACK_BYTES)
+            .spawn_scoped(scope, work)
+            .expect("spawn the compile thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Runs `work` where it is: a target without threads compiles on the stack it has.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn on_compile_stack<T>(work: impl FnOnce() -> T) -> T {
+    work()
+}
+
 /// Like [`compile_source`], but scans `source` under `options` (9.4.2): how identifiers are
 /// folded (`Normalization`) and whether the csc typed-reference operators (`__makeref`/
 /// `__refvalue`/`__reftype`) are recognized. The defaults match csc and strict ISO-1.
 pub fn compile_source_with(
+    source: &str,
+    source_path: &str,
+    module_name: &str,
+    assembly_name: &str,
+    references: &[Assembly],
+    emit_debug: bool,
+    options: LexOptions,
+) -> Compilation {
+    on_compile_stack(move || {
+        compile_source_on_this_stack(
+            source,
+            source_path,
+            module_name,
+            assembly_name,
+            references,
+            emit_debug,
+            options,
+        )
+    })
+}
+
+fn compile_source_on_this_stack(
     source: &str,
     source_path: &str,
     module_name: &str,
@@ -494,6 +543,26 @@ pub fn compile_sources_with(
     emit_debug: bool,
     options: LexOptions,
 ) -> MultiCompilation {
+    on_compile_stack(move || {
+        compile_sources_on_this_stack(
+            sources,
+            module_name,
+            assembly_name,
+            references,
+            emit_debug,
+            options,
+        )
+    })
+}
+
+fn compile_sources_on_this_stack(
+    sources: &[(&str, &str)],
+    module_name: &str,
+    assembly_name: &str,
+    references: &[Assembly],
+    emit_debug: bool,
+    options: LexOptions,
+) -> MultiCompilation {
     let mut diagnostics: Vec<Vec<Diagnostic>> = Vec::with_capacity(sources.len());
     let mut units: Vec<CompilationUnit> = Vec::with_capacity(sources.len());
     let mut syntax_error = false;
@@ -683,6 +752,7 @@ fn build_image(
     let object =
         declared_system_type(&tokens, "Object").unwrap_or_else(|| image.object_type());
     let mut entry_point = None;
+    binder.set_file_context_base();
     for (index, unit) in units.iter().enumerate() {
         binder.set_defined_symbols(unit.defined_symbols.clone());
         emit_namespace(
@@ -1655,14 +1725,7 @@ fn emit_namespace(
     for using in usings {
         binder.import_using(&using.kind);
     }
-    let mut prefix = String::new();
-    for part in namespace.split('.').filter(|part| !part.is_empty()) {
-        if !prefix.is_empty() {
-            prefix.push('.');
-        }
-        prefix.push_str(part);
-        binder.import_namespace(&prefix);
-    }
+    import_enclosing_namespaces(binder, namespace);
     for member in members {
         match member {
             NamespaceMember::Type(declaration) => {
@@ -1780,32 +1843,65 @@ fn emit_nested_types(
     Ok(())
 }
 
-/// Brings one partial part's FILE CONTEXT into the binder for the length of its emission: its
-/// `using` directives and aliases, and its `#define` set. Returns the import scope to restore.
+/// Replaces the binder's file context with one partial part's for the length of its emission: the
+/// `using` directives and aliases in force where the part is written, and its file's `#define` set.
+/// Returns what it displaced, for [`leave_part`].
 ///
-/// **A PART IN ANOTHER FILE WAS BOUND UNDER THAT FILE'S SCOPE, AND EMISSION RE-RESOLVES.** A member
-/// whose body names `Console` under its own file's `using System;` has to find it here too, and a
-/// name its file did NOT import must not resolve just because the first part's file did.
 fn enter_part(binder: &mut Binder, part: &PartialPart<'_>) -> PartScope {
-    let imports = binder.import_scope();
+    let imports = binder.take_file_imports();
     let defined = binder.replace_defined_symbols(part.defined_symbols.clone());
-    for using in part.usings {
-        binder.import_using(&using.kind);
-    }
+    import_part_context(binder, part);
     PartScope { imports, defined }
 }
 
 /// What [`enter_part`] displaced, to be handed to [`leave_part`].
 struct PartScope {
-    imports: lamella_binder::bound::ImportScope,
+    imports: lamella_binder::bound::FileImports,
     defined: alloc::collections::BTreeSet<Box<str>>,
 }
 
 /// Puts back the file context [`enter_part`] displaced. The walk that reached the part is still
 /// inside ANOTHER file's unit, and every type after it there is entitled to that file's scope.
 fn leave_part(binder: &mut Binder, scope: PartScope) {
-    binder.restore_import_scope(scope.imports);
+    binder.put_file_imports(scope.imports);
     binder.set_defined_symbols(scope.defined);
+}
+
+/// Imports a partial part's `using` directives and enclosing namespaces, in the order the unit walk
+/// that reaches the part imports them.
+fn import_part_context(binder: &mut Binder, part: &PartialPart<'_>) {
+    for step in &part.imports {
+        for using in step.usings {
+            binder.import_using(&using.kind);
+        }
+        import_enclosing_namespaces(binder, &step.namespace);
+    }
+}
+
+/// Imports `namespace` and every namespace enclosing it: a name in a namespace body resolves against
+/// each of them with no `using` directive (10.8).
+fn import_enclosing_namespaces(binder: &mut Binder, namespace: &str) {
+    let mut prefix = String::new();
+    for part in namespace.split('.').filter(|part| !part.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(part);
+        binder.import_namespace(&prefix);
+    }
+}
+
+/// One partial part's file imports as a value, for statements written in that part and bound inside
+/// a body that another part's emission is assembling.
+fn part_file_imports(
+    binder: &mut Binder,
+    part: &PartialPart<'_>,
+) -> lamella_binder::bound::FileImports {
+    let outer = binder.take_file_imports();
+    import_part_context(binder, part);
+    let imports = binder.take_file_imports();
+    binder.put_file_imports(outer);
+    imports
 }
 
 /// Emits one declaration's `GenericParam` rows (II.22.20) WITH their constraint flag word, plus a
@@ -2987,6 +3083,7 @@ fn emit_type_inner(
             }
         }
     }
+    let type_parts = every_part(partials, namespace, declaration);
     if !is_struct
         && continuation.is_none()
         && !any_part_declares_instance_constructor(declaration, later)
@@ -3021,17 +3118,39 @@ fn emit_type_inner(
             base_ctor,
             None,
             debug,
+            type_parts,
         )?;
         if binder.has_required_members_in_chain(&enclosing) {
             emit_required_members_constructor_guard(image, tokens, token);
         }
     }
-    if needs_static_constructor(declaration) {
-        let mut statements = static_field_initializer_statements(declaration);
-        if let Some(static_body) = static_constructor_body(declaration) {
-            statements.push(static_body.clone());
+    if emits_static_constructor(declaration, type_parts) {
+        let (mut statements, mut contexts) = initializers_of_every_part(
+            binder,
+            declaration,
+            type_parts,
+            debug,
+            static_field_initializer_statements,
+        );
+        match type_parts {
+            Some(parts) => {
+                for part in parts {
+                    if let Some(static_body) = static_constructor_body(part.declaration) {
+                        let group = alloc::vec![static_body.clone()];
+                        append_part_statements(binder, &mut statements, &mut contexts, declaration, debug, part, group);
+                    }
+                }
+            }
+            None => {
+                if let Some(static_body) = static_constructor_body(declaration) {
+                    statements.push(static_body.clone());
+                }
+            }
         }
         let body = Stmt::new(StmtKind::Block(statements), declaration.span);
+        if !contexts.is_empty() {
+            binder.set_next_method_statement_contexts(contexts);
+        }
         emit_method_body(
             image,
             binder,
@@ -3228,6 +3347,7 @@ fn emit_type_inner(
                     base_ctor,
                     Some(*header_span),
                     debug,
+                    type_parts,
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
                 if !sets_required_members(attributes)
@@ -4380,6 +4500,7 @@ fn emit_constructor(
     base_ctor: Option<Token>,
     header_span: Option<Span>,
     debug: Option<&DebugContext>,
+    parts: Option<&[PartialPart<'_>]>,
 ) -> Result<Token, crate::EmitError> {
     let params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> = parameters
         .iter()
@@ -4484,15 +4605,25 @@ fn emit_constructor(
         initializer.map(|init| &init.kind),
         Some(ConstructorInitializerKind::This)
     );
-    let body = if chains_to_this {
-        body.clone()
+    let (initializers, contexts) = if chains_to_this {
+        (Vec::new(), Vec::new())
     } else {
-        body_with_field_initializers(declaration, body)
+        initializers_of_every_part(binder, declaration, parts, debug, field_initializer_statements)
     };
     if let Some(prologue) = prologue.as_mut() {
         if !chains_to_this {
-            prologue.leading_body = field_initializer_statements(declaration).len();
+            prologue.leading_body = initializers.len();
         }
+    }
+    let body = if initializers.is_empty() {
+        body.clone()
+    } else {
+        let mut statements = initializers;
+        statements.push(body.clone());
+        Stmt::new(StmtKind::Block(statements), body.span)
+    };
+    if !contexts.is_empty() {
+        binder.set_next_method_statement_contexts(contexts);
     }
     let ctor = emit_method_body(
         image,
@@ -9119,15 +9250,58 @@ fn field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
     statements
 }
 
-/// `body` with the type's field initializers prepended (as a block), so they run
-/// before the rest of a constructor. Returns `body` unchanged when there are none.
-fn body_with_field_initializers(declaration: &TypeDecl, body: &Stmt) -> Stmt {
-    let mut statements = field_initializer_statements(declaration);
-    if statements.is_empty() {
-        return body.clone();
+/// The initializers of every part of a type, in part order, for a body that `declaration`'s emission
+/// is assembling, with the file context each run from another part binds under. `of_one_part`
+/// collects one part's, instance or static. A type that is not partial has only its own.
+fn initializers_of_every_part(
+    binder: &mut Binder,
+    declaration: &TypeDecl,
+    parts: Option<&[PartialPart<'_>]>,
+    debug: Option<&DebugContext>,
+    of_one_part: fn(&TypeDecl) -> Vec<Stmt>,
+) -> (Vec<Stmt>, Vec<lamella_binder::bound::StatementContext>) {
+    let Some(parts) = parts else {
+        return (of_one_part(declaration), Vec::new());
+    };
+    let mut statements = Vec::new();
+    let mut contexts = Vec::new();
+    for part in parts {
+        let group = of_one_part(part.declaration);
+        append_part_statements(binder, &mut statements, &mut contexts, declaration, debug, part, group);
     }
-    statements.push(body.clone());
-    Stmt::new(StmtKind::Block(statements), body.span)
+    (statements, contexts)
+}
+
+/// Appends `group`, statements written in `part`, to a body that `declaration`'s emission is
+/// assembling. Statements from another part bind under that part's file context, and when that part
+/// is in another source file they get hidden sequence points.
+///
+fn append_part_statements(
+    binder: &mut Binder,
+    statements: &mut Vec<Stmt>,
+    contexts: &mut Vec<lamella_binder::bound::StatementContext>,
+    declaration: &TypeDecl,
+    debug: Option<&DebugContext>,
+    part: &PartialPart<'_>,
+    mut group: Vec<Stmt>,
+) {
+    if group.is_empty() {
+        return;
+    }
+    if !core::ptr::eq(part.declaration, declaration) {
+        if debug.map(|context| context.document) != part.debug.map(|context| context.document) {
+            for statement in &mut group {
+                statement.span = Span::HIDDEN;
+            }
+        }
+        let start = statements.len();
+        contexts.push(lamella_binder::bound::StatementContext {
+            statements: start..start + group.len(),
+            imports: part_file_imports(binder, part),
+            defined: part.defined_symbols.clone(),
+        });
+    }
+    statements.append(&mut group);
 }
 
 /// Whether `modifiers` mark a `static` constructor.
@@ -9300,6 +9474,33 @@ fn needs_static_constructor(declaration: &TypeDecl) -> bool {
         || static_initializers(declaration)
             .iter()
             .any(|entry| !is_default_valued_static_init(&entry.field_ty, entry.init))
+}
+
+/// Every part of `declaration`'s type, the first included, when the type is partial.
+fn every_part<'b, 'a>(
+    partials: &'b PartialIndex<'a>,
+    scope: &str,
+    declaration: &TypeDecl,
+) -> Option<&'b [PartialPart<'a>]> {
+    partials
+        .get(&(String::from(scope), partial_key_name(declaration)))
+        .map(Vec::as_slice)
+}
+
+/// Whether `declaration` writes its type's one `.cctor`: some part needs it, and this is the part
+/// that declares the static constructor or, when none does, the first part.
+fn emits_static_constructor(declaration: &TypeDecl, parts: Option<&[PartialPart<'_>]>) -> bool {
+    let Some(parts) = parts else {
+        return needs_static_constructor(declaration);
+    };
+    if !parts.iter().any(|part| needs_static_constructor(part.declaration)) {
+        return false;
+    }
+    parts
+        .iter()
+        .find(|part| static_constructor_body(part.declaration).is_some())
+        .or(parts.first())
+        .is_some_and(|owner| core::ptr::eq(owner.declaration, declaration))
 }
 
 /// Whether the type declares an INSTANCE constructor (a static constructor does not
@@ -9629,9 +9830,19 @@ fn mentions_type_parameter(ty: &TypeSymbol, type_parameters: &[Box<str>]) -> boo
 /// not under the file that happens to hold the first part.
 struct PartialPart<'a> {
     declaration: &'a TypeDecl,
-    usings: &'a [UsingDirective],
+    /// The `using` directives in force where the part is written, in the order the unit walk
+    /// imports them: the file's own, then each enclosing namespace block's.
+    imports: Vec<ImportStep<'a>>,
     defined_symbols: &'a alloc::collections::BTreeSet<Box<str>>,
     debug: Option<&'a DebugContext<'a>>,
+}
+
+/// One level of a partial part's file context: the `using` directives of a compilation unit or of a
+/// namespace block, and the namespace that block declares (empty for the compilation unit).
+#[derive(Clone)]
+struct ImportStep<'a> {
+    usings: &'a [UsingDirective],
+    namespace: String,
 }
 
 /// Every declaration of each PARTIAL type in the compilation, in source order, keyed by the
@@ -9658,7 +9869,8 @@ fn index_partial_types<'a>(
 ) -> PartialIndex<'a> {
     let mut index = PartialIndex::new();
     for (position, unit) in units.iter().enumerate() {
-        index_partial_members(&mut index, &unit.members, "", unit, contexts.get(position));
+        let file = [ImportStep { usings: &unit.usings, namespace: String::new() }];
+        index_partial_members(&mut index, &unit.members, "", unit, contexts.get(position), &file);
     }
     index
 }
@@ -9669,12 +9881,15 @@ fn index_partial_members<'a>(
     scope: &str,
     unit: &'a CompilationUnit,
     debug: Option<&'a DebugContext<'a>>,
+    imports: &[ImportStep<'a>],
 ) {
     for member in members {
         match member {
             NamespaceMember::Namespace(declaration) => {
                 let inner = join_namespace(scope, &declaration.name);
-                index_partial_members(index, &declaration.members, &inner, unit, debug);
+                let mut inner_imports = imports.to_vec();
+                inner_imports.push(ImportStep { usings: &declaration.usings, namespace: inner.clone() });
+                index_partial_members(index, &declaration.members, &inner, unit, debug, &inner_imports);
             }
             NamespaceMember::Type(declaration) => {
                 if declaration.modifiers.contains(&Modifier::Partial) {
@@ -9683,7 +9898,7 @@ fn index_partial_members<'a>(
                         .or_default()
                         .push(PartialPart {
                             declaration,
-                            usings: &unit.usings,
+                            imports: imports.to_vec(),
                             defined_symbols: &unit.defined_symbols,
                             debug,
                         });
@@ -9697,6 +9912,7 @@ fn index_partial_members<'a>(
                             &enclosing,
                             unit,
                             debug,
+                            imports,
                         );
                     }
                 }
@@ -9747,6 +9963,7 @@ fn assign_tokens(
     let mut next_type = 1u32;
     let mut next_field = 0u32;
     let mut next_method = 0u32;
+    binder.set_file_context_base();
     for unit in units {
         collect_tokens(
             &mut tokens,
@@ -9871,7 +10088,7 @@ fn collect_type_tokens(
             Token::new(METHOD_DEF, *next_method),
         );
     }
-    if needs_static_constructor(declaration) {
+    if emits_static_constructor(declaration, every_part(partials, namespace, declaration)) {
         *next_method += 1;
         tokens.insert_method(
             &declaring,
@@ -10266,14 +10483,7 @@ fn collect_tokens(
     for using in usings {
         binder.import_using(&using.kind);
     }
-    let mut prefix = String::new();
-    for part in namespace.split('.').filter(|part| !part.is_empty()) {
-        if !prefix.is_empty() {
-            prefix.push('.');
-        }
-        prefix.push_str(part);
-        binder.import_namespace(&prefix);
-    }
+    import_enclosing_namespaces(binder, namespace);
     for member in members {
         match member {
             NamespaceMember::Type(declaration) => {
@@ -15436,6 +15646,92 @@ mod tests {
         let mut methods: Vec<&str> = widget.methods().filter_map(|method| method.name()).collect();
         methods.sort_unstable();
         assert_eq!(methods, [".ctor", "A", "SetA", "SetB", "Sum"]);
+    }
+
+    /// A partial type's field initializers reach its constructors whichever file holds them, and a
+    /// type with static initializers in two parts has one static constructor.
+    #[test]
+    fn a_partial_types_initializers_reach_its_constructors_in_either_file_order() {
+        let a = "public partial class P { public int n = 40; public static int s = 1; }";
+        let b = "public partial class P { public int m = 2; public static int t = 2; \
+                 public int Value() { return n + m + s + t; } }";
+        let compile = |sources: &[(&str, &str)]| {
+            let options = LexOptions {
+                version: LanguageVersion::CSharp2,
+                ..LexOptions::default()
+            };
+            let result = compile_sources_with(sources, "p.dll", "p", &[], false, options);
+            assert!(
+                result.diagnostics.iter().all(|per_file| per_file.is_empty()),
+                "{:?}",
+                result.diagnostics
+            );
+            assert!(result.emit_error.is_none(), "{:?}", result.emit_error);
+            result.image.expect("an image")
+        };
+        let forward = compile(&[(a, "a.cs"), (b, "b.cs")]);
+        let backward = compile(&[(b, "b.cs"), (a, "a.cs")]);
+        let bare = compile(&[("public partial class P { public int Value() { return 0; } }", "c.cs")]);
+        assert_eq!(body_of(&forward, ".ctor"), body_of(&backward, ".ctor"));
+        assert!(body_of(&forward, ".ctor") > body_of(&bare, ".ctor"));
+        for image in [&forward, &backward] {
+            let assembly = Assembly::read(image).expect("the reader parses the image");
+            let p = assembly.find_type("", "P").expect("the P type");
+            let static_constructors =
+                p.methods().filter(|method| method.name() == Some(".cctor")).count();
+            assert_eq!(static_constructors, 1);
+        }
+    }
+
+    /// A later part's members are emitted under that part's own file's `using` directives: a
+    /// namespace another file imports does not make its names ambiguous, and an alias another file
+    /// declares does not capture them.
+    #[test]
+    fn a_later_partial_part_is_emitted_under_its_own_files_usings() {
+        let ambiguous = (
+            "using N1; public partial class P { } \
+             namespace N1 { public class T { public static int V = 1; } }",
+            "using N2; public partial class P { public int M() { return T.V; } } \
+             namespace N2 { public class T { public static int V = 42; } }",
+        );
+        let aliased = (
+            "using T = N1.X; public partial class P { } \
+             namespace N1 { public class X { public static int V = 1; } }",
+            "using N2; public partial class P { public int M() { return T.V; } } \
+             namespace N2 { public class T { public static int V = 42; } }",
+        );
+        for (a, b) in [ambiguous, aliased] {
+            for sources in [[(a, "a.cs"), (b, "b.cs")], [(b, "b.cs"), (a, "a.cs")]] {
+                let options = LexOptions {
+                    version: LanguageVersion::CSharp2,
+                    ..LexOptions::default()
+                };
+                let result = compile_sources_with(&sources, "p.dll", "p", &[], false, options);
+                assert!(
+                    result.diagnostics.iter().all(|per_file| per_file.is_empty()),
+                    "{:?}",
+                    result.diagnostics
+                );
+                assert!(result.emit_error.is_none(), "{:?}", result.emit_error);
+                assert!(result.image.is_some());
+            }
+        }
+    }
+
+    /// Initializers spliced into a constructor from another file keep a debug build emitting.
+    #[test]
+    fn a_partial_types_initializers_from_another_file_emit_with_debug_info() {
+        let a = "public partial class P { int n = 40; }";
+        let b = "public partial class P { public P() { } public int Value() { return n + 2; } }";
+        for sources in [[(a, "a.cs"), (b, "b.cs")], [(b, "b.cs"), (a, "a.cs")]] {
+            let options = LexOptions {
+                version: LanguageVersion::CSharp2,
+                ..LexOptions::default()
+            };
+            let result = compile_sources_with(&sources, "p.dll", "p", &[], true, options);
+            assert!(result.emit_error.is_none(), "{:?}", result.emit_error);
+            assert!(result.image.is_some() && result.pdb.is_some());
+        }
     }
 
     /// A part that names something only ANOTHER part's file imported does not resolve, and the

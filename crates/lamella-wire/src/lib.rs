@@ -173,6 +173,20 @@ pub mod error {
             _ => None,
         }
     }
+
+    /// The [`super::TransportError::Refused`] an [`crate::msg::ERROR`] payload carries.
+    ///
+    /// A host decodes every refusal here, so the reason byte and the two readings of the byte after
+    /// it -- a refused message type, or the class of the carrier holding the session -- have one
+    /// decoder rather than one per caller.
+    #[must_use]
+    pub fn refusal(payload: &[u8]) -> super::TransportError {
+        super::TransportError::Refused {
+            reason: payload.first().copied().unwrap_or(0),
+            msg_type: refused_message_type(payload).unwrap_or(0),
+            holder: session_holder(payload),
+        }
+    }
 }
 
 /// A decoded protocol frame: its message type, sequence number, and payload bytes.
@@ -184,6 +198,46 @@ pub struct Frame {
     pub seq: u16,
     /// The message payload.
     pub payload: Vec<u8>,
+}
+
+/// CRC-32/ISO-HDLC: the checksum an [`msg::XFER_RESULT`] carries, defined once for both ends.
+///
+/// "CRC-32" names several algorithms that disagree on every input, so this one is pinned by its
+/// parameters and its check value rather than by the name:
+///
+/// ```text
+/// polynomial  0x04C11DB7, reflected as 0xEDB88320
+/// init        0xFFFFFFFF      reflect in/out  yes
+/// xorout      0xFFFFFFFF      check("123456789") = 0xCBF43926
+/// ```
+///
+/// It is the value `zlib.crc32` produces. It is computed a byte at a time with no table: a table is
+/// 1 KiB of flash on the smallest targets, and the bytes it covers arrive at transfer speed.
+pub mod crc32 {
+    /// CRC-32/ISO-HDLC's polynomial, 0x04C11DB7, bit-reflected for a right-shifting loop.
+    const REFLECTED_POLYNOMIAL: u32 = 0xEDB8_8320;
+
+    /// Extends `seed` -- the CRC of the bytes before `data`, or 0 when there are none -- over `data`.
+    ///
+    /// Folding a sequence in pieces gives what one pass over it gives, which is what lets both ends
+    /// of a transfer keep a running value.
+    #[must_use]
+    pub fn update(seed: u32, data: &[u8]) -> u32 {
+        let mut crc = !seed;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ REFLECTED_POLYNOMIAL } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    /// The CRC of `data` alone.
+    #[must_use]
+    pub fn of(data: &[u8]) -> u32 {
+        update(0, data)
+    }
 }
 
 /// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over the framed bytes, for frame integrity.
@@ -245,6 +299,8 @@ pub struct FrameReader {
     /// The largest payload a header may claim before it is treated as garbage. See
     /// [`FrameReader::with_max_payload`].
     max_payload: usize,
+    /// How many received bytes have been discarded. See [`FrameReader::discarded_bytes`].
+    discarded: u64,
 }
 
 impl Default for FrameReader {
@@ -258,7 +314,7 @@ impl FrameReader {
     /// A new, empty reader that will wait for any length the protocol allows.
     #[must_use]
     pub fn new() -> Self {
-        Self { buf: Vec::new(), max_payload: MAX_PAYLOAD }
+        Self { buf: Vec::new(), max_payload: MAX_PAYLOAD, discarded: 0 }
     }
 
     /// A reader that treats a header claiming more than `max_payload` bytes as garbage and
@@ -288,7 +344,7 @@ impl FrameReader {
     /// is given.
     #[must_use]
     pub fn with_max_payload(max_payload: usize) -> Self {
-        Self { buf: Vec::new(), max_payload }
+        Self { buf: Vec::new(), max_payload, discarded: 0 }
     }
 
     /// Append received carrier bytes. Growth is RESERVE-EXACT to the frame length the
@@ -302,6 +358,23 @@ impl FrameReader {
             self.buf.reserve_exact(target - self.buf.len());
         }
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// How many received bytes this reader has discarded: bytes between frames that belong to none,
+    /// and the bytes of a frame that failed its CRC or declared a type or length no frame can have.
+    ///
+    /// A byte that never reached [`FrameReader::push`] is not counted. So when a frame goes missing
+    /// and this count has not moved, its bytes never reached the reader; when the count has moved by
+    /// at least the frame's length, they may have arrived damaged.
+    #[must_use]
+    pub fn discarded_bytes(&self) -> u64 {
+        self.discarded
+    }
+
+    /// Drops the first `count` buffered bytes as belonging to no frame, and counts them.
+    fn discard(&mut self, count: usize) {
+        self.buf.drain(0..count);
+        self.discarded = self.discarded.saturating_add(count as u64);
     }
 
     /// Whether a header's declared length is one this reader could ever complete.
@@ -335,7 +408,8 @@ impl FrameReader {
     }
 
     /// Pull the next complete, CRC-valid frame, or `None` if more bytes are needed. Leading garbage and
-    /// a CRC-failed frame are discarded (resync on the next SYNC).
+    /// a CRC-failed frame are discarded (resync on the next SYNC), and counted in
+    /// [`FrameReader::discarded_bytes`].
     ///
     /// A header whose TYPE byte is one of the two that can never be a message type
     /// ([`msg::is_valid_type`]) is discarded as soon as the header is readable, rather than after
@@ -346,13 +420,11 @@ impl FrameReader {
         loop {
             match find_sync(&self.buf) {
                 Some(0) => {}
-                Some(pos) => {
-                    self.buf.drain(0..pos);
-                }
+                Some(pos) => self.discard(pos),
                 None => {
                     let keep = usize::from(self.buf.last() == Some(&SYNC[0]));
                     let drop = self.buf.len() - keep;
-                    self.buf.drain(0..drop);
+                    self.discard(drop);
                     return None;
                 }
             }
@@ -360,12 +432,12 @@ impl FrameReader {
                 return None;
             }
             if !msg::is_valid_type(self.buf[4]) {
-                self.buf.drain(0..1);
+                self.discard(1);
                 continue;
             }
             let len = u16::from_le_bytes([self.buf[2], self.buf[3]]) as usize;
             if !self.believable_length(len) {
-                self.buf.drain(0..1);
+                self.discard(1);
                 continue;
             }
             let frame_len = HEADER_LEN + len + CRC_LEN;
@@ -375,7 +447,7 @@ impl FrameReader {
             let computed = crc16(&self.buf[2..HEADER_LEN + len]);
             let stored = u16::from_le_bytes([self.buf[HEADER_LEN + len], self.buf[HEADER_LEN + len + 1]]);
             if computed != stored {
-                self.buf.drain(0..1);
+                self.discard(1);
                 continue;
             }
             let frame = Frame {
@@ -529,6 +601,13 @@ impl Capabilities {
     /// [`Capabilities::ATTACH_INTERPRETED`] and [`Capabilities::ATTACH_NATIVE`], which are different bits because they are a
     /// different thing.
     pub const DEBUG_BOOT_DEPLOYED: u64 = 1 << 30;
+    /// The CRC in each `XFER_RESULT` answering a DEPLOY chunk covers the artifact's committed PREFIX
+    /// -- its bytes `[0, offset + len)` as read back -- so a host keeping a CRC over what it sent can
+    /// compare every acknowledgement, and the last one covers the whole artifact.
+    ///
+    /// A target without it reports a CRC over something else, which a host must not compare. The
+    /// rules are on [`msg::XFER_RESULT`].
+    pub const DEPLOY_PREFIX_CRC: u64 = 1 << 31;
 
 
     /// On-device telemetry: the host subscribes to device signals and the target streams samples
@@ -627,6 +706,7 @@ impl Capabilities {
         (Self::REPL_SOURCE, "REPL_SOURCE"),
         (Self::RESIDENT_CORLIB, "RESIDENT_CORLIB"),
         (Self::DEBUG_BOOT_DEPLOYED, "DEBUG_BOOT_DEPLOYED"),
+        (Self::DEPLOY_PREFIX_CRC, "DEPLOY_PREFIX_CRC"),
         (Self::TELEMETRY, "TELEMETRY"),
         (Self::LIVE_MEMORY, "LIVE_MEMORY"),
         (Self::HW_BOOTLOADER, "HW_BOOTLOADER"),
@@ -1395,6 +1475,17 @@ pub mod product_model {
     /// for, and that identifier is the PMC gate bit.
     pub const SAMG55_XPLAINED_PRO: u16 = 60;
 
+    /// Pimoroni Pico Plus 2 (RP2350B in the QFN-80 package, 16 MB flash, 8 MB PSRAM). Distinct from
+    /// the Raspberry Pi Pico 2 in the part as well as the board: the QFN-80 carries 48 GPIO against
+    /// the QFN-60's 30, and this board wires the extra ones -- the PSRAM chip select, an SP/CE
+    /// expansion connector, and the analogue channels its 26/27/28 header positions borrow.
+    pub const PICO_PLUS_2: u16 = 61;
+    /// Pimoroni Pico Plus 2 W (the Plus 2 plus a Raspberry Pi RM2 radio module). A separate model
+    /// rather than a variant flag: the radio takes the SP/CE connector's place, and the user LED
+    /// moves off the host MCU entirely onto the radio's own GPIO0, so a program cannot reach it
+    /// through any RP2350 pin.
+    pub const PICO_PLUS_2_W: u16 = 62;
+
     /// The display name for a `product_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
@@ -1463,6 +1554,8 @@ pub mod product_model {
             SAML10_XPLAINED_PRO => "SAM L10 Xplained Pro",
             SAML11_XPLAINED_PRO => "SAM L11 Xplained Pro",
             SAMG55_XPLAINED_PRO => "SAM G55 Xplained Pro",
+            PICO_PLUS_2 => "Pimoroni Pico Plus 2",
+            PICO_PLUS_2_W => "Pimoroni Pico Plus 2 W",
             _ => return None,
         })
     }
@@ -1972,6 +2065,16 @@ pub trait Transport {
     fn try_send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<bool, TransportError> {
         self.send(msg_type, seq, payload).map(|()| true)
     }
+
+    /// How many received bytes this carrier's [`FrameReader`] has discarded since the carrier opened
+    /// (see [`FrameReader::discarded_bytes`]), or `None` -- the default -- for a carrier that does not
+    /// count them.
+    ///
+    /// It separates a frame that arrived damaged from one that never arrived, which look the same from
+    /// [`Transport::poll`]: neither is returned.
+    fn discarded_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// An in-memory [`Transport`] for tests / a host-side loopback: `send` encodes into `sent` (which a test
@@ -2011,12 +2114,59 @@ impl Transport for MemTransport {
     fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
         Ok(self.reader.next_frame())
     }
+
+    fn discarded_bytes(&self) -> Option<u64> {
+        Some(self.reader.discarded_bytes())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// An ERROR payload decodes to one refusal, with the byte after the reason read the way that
+    /// reason defines it.
+    #[test]
+    fn an_error_payload_decodes_to_a_refusal_that_reads_its_second_byte_by_its_reason() {
+        assert_eq!(
+            error::refusal(&error::unknown_message_type(msg::EXEC)),
+            TransportError::Refused { reason: error::UNKNOWN_MESSAGE_TYPE, msg_type: msg::EXEC, holder: None }
+        );
+        assert_eq!(
+            error::refusal(&error::session_held(2)),
+            TransportError::Refused { reason: error::SESSION_HELD, msg_type: 0, holder: Some(2) }
+        );
+        assert_eq!(error::refusal(&[]), TransportError::Refused { reason: 0, msg_type: 0, holder: None });
+    }
+
+    /// The value that proves this is CRC-32/ISO-HDLC, and not one of the other checksums called CRC-32.
+    #[test]
+    fn crc32_is_iso_hdlc_by_its_check_value() {
+        let check = crc32::of(b"123456789");
+        assert_eq!(check, 0xCBF4_3926);
+        for (other, name) in [
+            (0xFC89_1918, "BZIP2"),
+            (0x0376_E6E7, "MPEG-2"),
+            (0x340B_C6D9, "JAMCRC"),
+            (0x765E_7680, "POSIX"),
+            (0xBD0B_E338, "XFER"),
+        ] {
+            assert_ne!(check, other, "that is CRC-32/{name}");
+        }
+    }
+
+    /// Folding in pieces gives one pass's value, and an empty piece moves nothing -- the two properties
+    /// a running CRC kept a chunk at a time depends on.
+    #[test]
+    fn crc32_folded_in_pieces_equals_one_pass() {
+        let whole = b"the committed prefix";
+        for split in 0..=whole.len() {
+            let folded = crc32::update(crc32::of(&whole[..split]), &whole[split..]);
+            assert_eq!(folded, crc32::of(whole), "split at {split} disagreed with one pass");
+        }
+        assert_eq!(crc32::update(0xDEAD_BEEF, &[]), 0xDEAD_BEEF);
+    }
 
     /// A capability set renders as names, and -- the half that matters -- a bit nobody named is
     /// REPORTED rather than dropped.
@@ -2157,6 +2307,36 @@ mod tests {
         assert_eq!(frame.msg_type, msg::PING);
         assert_eq!(frame.seq, 1);
         assert_eq!(frame.payload, vec![0xAB]);
+    }
+
+    /// Every byte the reader drops is counted, and no byte of a frame it delivers is.
+    #[test]
+    fn a_reader_counts_every_byte_it_discards_and_none_it_delivers() {
+        let good = encode_frame(msg::PING, 1, &[0xAB]).expect("a 1-byte payload frames");
+        let mut corrupt = encode_frame(msg::PING, 2, &[0xCD]).expect("a 1-byte payload frames");
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+
+        let mut reader = FrameReader::new();
+        reader.push(&good);
+        assert!(reader.next_frame().is_some(), "a whole frame is delivered");
+        assert_eq!(reader.discarded_bytes(), 0, "a delivered frame is not a discard");
+
+        let noise = [0x00, 0xFF, 0x4C, 0x11];
+        reader.push(&noise);
+        reader.push(&corrupt);
+        reader.push(&good);
+        assert!(reader.next_frame().is_some(), "the good frame survives the noise and the corruption");
+        assert_eq!(
+            reader.discarded_bytes(),
+            (noise.len() + corrupt.len()) as u64,
+            "every byte before the good frame: the noise, and the whole corrupt frame"
+        );
+
+        let mut transport = MemTransport::new();
+        transport.feed(&noise);
+        assert_eq!(transport.poll(), Ok(None));
+        assert_eq!(transport.discarded_bytes(), Some(noise.len() as u64), "a carrier reports its reader's count");
     }
 
     /// A fixture identity with something in every field, so a decoder that drops one is caught by

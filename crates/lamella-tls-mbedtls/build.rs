@@ -1,15 +1,11 @@
 //! Compiles the vendored mbedTLS (vendor/mbedtls, pinned -- see README.md) plus the C shim
 //! against csrc/lamella_mbedtls_config.h. On a bare-metal target the compiler is an ARM
-//! cross GCC: `LAMELLA_ARM_GCC` if set, else `arm-none-eabi-gcc` on PATH, else the MSYS2
-//! default install location. Host builds use the platform C compiler (the same one the
+//! cross GCC: `LAMELLA_ARM_GCC` if set, else `arm-none-eabi-gcc` on PATH. Host builds use the
+//! platform C compiler (the same one the
 //! workspace's other native deps already require).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// The MSYS2 package location this machine class installs the ARM toolchain to; a plain
-/// fallback after `LAMELLA_ARM_GCC` and PATH.
-const MSYS2_ARM_GCC: &str = r"C:\msys64\ucrt64\bin\arm-none-eabi-gcc.exe";
 
 fn arm_gcc() -> PathBuf {
     if let Ok(explicit) = std::env::var("LAMELLA_ARM_GCC") {
@@ -18,9 +14,6 @@ fn arm_gcc() -> PathBuf {
     let on_path = Command::new("arm-none-eabi-gcc").arg("--version").output();
     if on_path.map(|out| out.status.success()).unwrap_or(false) {
         return PathBuf::from("arm-none-eabi-gcc");
-    }
-    if Path::new(MSYS2_ARM_GCC).exists() {
-        return PathBuf::from(MSYS2_ARM_GCC);
     }
     panic!(
         "no ARM cross C compiler found for a bare-metal target: set LAMELLA_ARM_GCC, or put \

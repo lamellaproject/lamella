@@ -797,10 +797,13 @@ fn the_read_back_is_used_and_a_bad_one_fails_the_flash() {
 
 
 use lamella_cmsis_dap_stm32::{
-    STM32H7_BANK2_BASE, STM32H7_DBGMCU_IDC, STM32H7_FLASH_BASE, STM32H7_FLASH_SIZE_REG,
-    STM32H7_FLASH_WORD, STM32H7_SECTOR, STM32L0_DBGMCU_IDCODE, STM32L0_ERASED_WORD,
-    STM32L0_FLASH_BASE, STM32L0_FLASH_SIZE_REG, STM32L0_PAGE, STM32U5_DBGMCU_IDCODE,
-    STM32U5_FLASH_BASE, STM32U5_FLASH_SIZE_REG, STM32U5_PAGE, STM32U5_QUAD_WORD,
+    STM32F7_DBG_IWDG_STOP, STM32F7_DBG_WWDG_STOP, STM32F7_DBGMCU_APB1_FZ, STM32F7_DBGMCU_CR,
+    STM32F7_DBGMCU_CR_LOW_POWER_DEBUG, STM32F7_DBGMCU_IDCODE, STM32F7_FLASH_BASE,
+    STM32F7_FLASH_SIZE_REG, STM32F7_OPTCR_NDBANK, STM32F7_PARTS, STM32H7_BANK2_BASE,
+    STM32H7_DBGMCU_IDC, STM32H7_FLASH_BASE, STM32H7_FLASH_SIZE_REG, STM32H7_FLASH_WORD,
+    STM32H7_SECTOR, STM32L0_DBGMCU_IDCODE, STM32L0_ERASED_WORD, STM32L0_FLASH_BASE,
+    STM32L0_FLASH_SIZE_REG, STM32L0_PAGE, STM32U5_DBGMCU_IDCODE, STM32U5_FLASH_BASE,
+    STM32U5_FLASH_SIZE_REG, STM32U5_PAGE, STM32U5_QUAD_WORD,
 };
 
 /// Every number in every plan is the part crate's, checked field by field.
@@ -815,14 +818,14 @@ fn every_plan_takes_its_numbers_from_the_part_crate() {
     assert_eq!(l0.flash_base, STM32L0_FLASH_BASE);
     assert_eq!(l0.size_register, STM32L0_FLASH_SIZE_REG);
     assert_eq!(l0.id_register, STM32L0_DBGMCU_IDCODE);
-    assert_eq!(l0.erase_granule, STM32L0_PAGE);
+    assert_eq!(l0.erase, EraseMap::Stride(STM32L0_PAGE));
     assert_eq!(l0.erased_word, STM32L0_ERASED_WORD);
 
     let h7 = crate::StFamily::H7.plan();
     assert_eq!(h7.flash_base, STM32H7_FLASH_BASE);
     assert_eq!(h7.size_register, STM32H7_FLASH_SIZE_REG);
     assert_eq!(h7.id_register, STM32H7_DBGMCU_IDC);
-    assert_eq!(h7.erase_granule, STM32H7_SECTOR);
+    assert_eq!(h7.erase, EraseMap::Stride(STM32H7_SECTOR));
     assert_eq!(h7.program_align, STM32H7_FLASH_WORD as u32);
     assert_eq!(h7.banks, &[STM32H7_FLASH_BASE, STM32H7_BANK2_BASE]);
 
@@ -830,14 +833,38 @@ fn every_plan_takes_its_numbers_from_the_part_crate() {
     assert_eq!(u5.flash_base, STM32U5_FLASH_BASE);
     assert_eq!(u5.size_register, STM32U5_FLASH_SIZE_REG);
     assert_eq!(u5.id_register, STM32U5_DBGMCU_IDCODE);
-    assert_eq!(u5.erase_granule, STM32U5_PAGE);
+    assert_eq!(u5.erase, EraseMap::Stride(STM32U5_PAGE));
     assert_eq!(u5.program_align, STM32U5_QUAD_WORD as u32);
+
+    let f7 = crate::StFamily::F7.plan();
+    assert_eq!(f7.flash_base, STM32F7_FLASH_BASE);
+    assert_eq!(f7.size_register, STM32F7_FLASH_SIZE_REG);
+    assert_eq!(f7.id_register, STM32F7_DBGMCU_IDCODE);
+    assert_eq!(f7.parts, STM32F7_PARTS);
+    assert_eq!(f7.erase, EraseMap::PartSectors);
+    assert_eq!(f7.banks, &[STM32F7_FLASH_BASE]);
+    assert_eq!(
+        f7.watchdog_freeze,
+        Some(WatchdogFreeze {
+            register: STM32F7_DBGMCU_APB1_FZ,
+            bits: STM32F7_DBG_IWDG_STOP | STM32F7_DBG_WWDG_STOP,
+        })
+    );
+    assert_eq!(
+        f7.low_power_debug,
+        Some(lamella_stlink::LowPowerDebug {
+            register: STM32F7_DBGMCU_CR,
+            bits: STM32F7_DBGMCU_CR_LOW_POWER_DEBUG,
+        })
+    );
 
     for family in [
         crate::StFamily::L0,
         crate::StFamily::C0,
+        crate::StFamily::L4,
         crate::StFamily::H7,
         crate::StFamily::U5,
+        crate::StFamily::F7,
     ] {
         let plan = family.plan();
         assert!(
@@ -852,7 +879,7 @@ fn every_plan_takes_its_numbers_from_the_part_crate() {
             family.name()
         );
         assert!(
-            plan.erase_granule > 0,
+            plan.erase != EraseMap::Stride(0),
             "{} would erase forever",
             family.name()
         );
@@ -867,6 +894,10 @@ fn every_plan_takes_its_numbers_from_the_part_crate() {
         crate::StFamily::H7.plan().attach_under_reset,
         "a running H755 refuses memory access"
     );
+    assert!(
+        crate::StFamily::F7.plan().attach_under_reset,
+        "a sleeping F7 answers every plain read with one word"
+    );
     for family in [
         crate::StFamily::L0,
         crate::StFamily::C0,
@@ -878,16 +909,35 @@ fn every_plan_takes_its_numbers_from_the_part_crate() {
             family.name()
         );
     }
+    for family in [
+        crate::StFamily::L0,
+        crate::StFamily::C0,
+        crate::StFamily::L4,
+        crate::StFamily::H7,
+        crate::StFamily::U5,
+        crate::StFamily::F7,
+    ] {
+        let plan = family.plan();
+        assert!(
+            plan.low_power_debug.is_none() || plan.attach_under_reset,
+            "{} names low-power debug bits but attaches plainly",
+            family.name()
+        );
+    }
 }
 
-/// The three identity registers are three DIFFERENT addresses, and that is the whole reason
-/// [`lamella_cmsis_dap_stm32::stm32_dev_id`] takes one rather than knowing one.
+/// The identity registers are DIFFERENT addresses wherever the manuals put them apart, and that is
+/// the whole reason [`lamella_cmsis_dap_stm32::stm32_dev_id`] takes one rather than knowing one.
 ///
 /// A plan that inherited a sibling's `id_register` would read a peripheral that is something else
 /// on this part, decode whatever it found as a `DEV_ID`, and refuse a perfectly good board -- or,
 /// worse, match one. This is the cheapest possible guard against the copy that produces that.
+///
+/// **THE L4 AND THE F7 BOTH ANSWER AT `0xE0042000`, AND THAT IS THEIR MANUALS RATHER THAN A COPY.**
+/// What keeps a route from mistaking one for the other there is the `DEV_ID` list, so for that pair
+/// the check is that the two lists name no id in common.
 #[test]
-fn no_two_families_read_the_same_identity_register() {
+fn an_identity_register_is_shared_only_where_the_device_ids_are_disjoint() {
     let registers = [
         crate::StFamily::L0.plan().id_register,
         crate::StFamily::H7.plan().id_register,
@@ -899,6 +949,17 @@ fn no_two_families_read_the_same_identity_register() {
         }
     }
     assert!(!registers.contains(&0xE004_2000));
+
+    let l4 = crate::StFamily::L4.plan();
+    let f7 = crate::StFamily::F7.plan();
+    assert_eq!(l4.id_register, 0xE004_2000, "RM0351");
+    assert_eq!(f7.id_register, 0xE004_2000, "RM0385 and RM0410");
+    for (id, _) in l4.parts {
+        assert!(
+            !f7.parts.iter().any(|(other, _)| other == id),
+            "{id:#x} names a part in both families that share this register"
+        );
+    }
 }
 
 /// A single-bank family answers its one lock for ANY address, including one outside its own map.
@@ -976,7 +1037,7 @@ fn an_h7_image_takes_exactly_the_banks_it_reaches() {
 /// than on a board.
 #[test]
 fn neither_rounding_can_reach_a_bank_the_lock_walk_did_not_take() {
-    let h7 = StProbe::new(FakeL0::new(), crate::StFamily::H7.plan());
+    let mut h7 = StProbe::new(FakeL0::new(), crate::StFamily::H7.plan());
     let plan = crate::StFamily::H7.plan();
     let one_bank = STM32H7_BANK2_BASE - STM32H7_FLASH_BASE;
 
@@ -985,15 +1046,22 @@ fn neither_rounding_can_reach_a_bank_the_lock_walk_did_not_take() {
         0,
         "padding could cross a bank boundary"
     );
+    let EraseMap::Stride(granule) = plan.erase else {
+        panic!("the H7 erases by a stride")
+    };
     assert_eq!(
-        one_bank % plan.erase_granule,
+        one_bank % granule,
         0,
         "a granule could straddle a bank boundary"
     );
 
     let over = one_bank + 1;
-    let granules = over.div_ceil(plan.erase_granule);
-    let last_erase = STM32H7_FLASH_BASE + (granules - 1) * plan.erase_granule;
+    let last_erase = h7
+        .granules_covering(STM32H7_FLASH_BASE, over)
+        .expect("a stride walk reads nothing from the part")
+        .last()
+        .expect("a non-empty image reaches a granule")
+        .start;
     assert!(
         last_erase >= STM32H7_BANK2_BASE,
         "this case is meant to reach bank 2"
@@ -1004,8 +1072,12 @@ fn neither_rounding_can_reach_a_bank_the_lock_walk_did_not_take() {
         "the erase reaches bank 2 and the lock walk did not take it"
     );
 
-    let granules = one_bank.div_ceil(plan.erase_granule);
-    let last_erase = STM32H7_FLASH_BASE + (granules - 1) * plan.erase_granule;
+    let last_erase = h7
+        .granules_covering(STM32H7_FLASH_BASE, one_bank)
+        .expect("a stride walk reads nothing from the part")
+        .last()
+        .expect("a non-empty image reaches a granule")
+        .start;
     assert!(last_erase < STM32H7_BANK2_BASE);
     assert_eq!(
         h7.banks_covering(STM32H7_FLASH_BASE, one_bank),
@@ -1021,20 +1093,24 @@ fn neither_rounding_can_reach_a_bank_the_lock_walk_did_not_take() {
 /// a test that only checked each value against itself would pass with one hard-coded byte.
 #[test]
 fn the_padding_byte_is_the_erased_one_and_the_l0_is_the_odd_family() {
-    let l0 = StProbe::new(FakeL0::new(), crate::StFamily::L0.plan());
-    let h7 = StProbe::new(FakeL0::new(), crate::StFamily::H7.plan());
-    let u5 = StProbe::new(FakeL0::new(), crate::StFamily::U5.plan());
+    let tail = |family: crate::StFamily| {
+        let plan = family.plan();
+        let padded = padded_to_program_granule(&[0xA5], plan);
+        assert_eq!(padded[0], 0xA5, "{}: the image's own byte is kept", family.name());
+        assert_eq!(padded.len(), plan.program_align as usize, "{}: one whole granule", family.name());
+        *padded.last().expect("padded")
+    };
 
     assert_eq!(
-        l0.erased_byte(),
+        tail(crate::StFamily::L0),
         0x00,
         "the L0 erases to zero -- RM0377 3.3.4"
     );
-    assert_eq!(h7.erased_byte(), 0xff);
-    assert_eq!(u5.erased_byte(), 0xff);
+    assert_eq!(tail(crate::StFamily::H7), 0xff);
+    assert_eq!(tail(crate::StFamily::U5), 0xff);
     assert_ne!(
-        l0.erased_byte(),
-        h7.erased_byte(),
+        tail(crate::StFamily::L0),
+        tail(crate::StFamily::H7),
         "the difference between the families is the whole reason the field exists"
     );
 }
@@ -3237,4 +3313,657 @@ fn asking_for_a_probe_on_a_board_that_is_already_one_says_which() {
             .writes_over_a_probe(),
         "a bootloader volume is the one mechanism here that needs no probe"
     );
+}
+
+const F7_KEYR: u32 = 0x4002_3C04;
+const F7_SR: u32 = 0x4002_3C0C;
+const F7_CR: u32 = 0x4002_3C10;
+const F7_OPTCR: u32 = 0x4002_3C14;
+/// The aligned word holding the F7's flash-size halfword, which sits at `0x1FF0_F442`.
+const F7_FSIZE_WORD: u32 = 0x1FF0_F440;
+/// `FLASH_OPTCR`'s reset value in RM0410 3.7.6, with `nDBANK` set: one bank.
+const F7_OPTCR_RESET: u32 = 0xFFFF_AAFD;
+const F7_CR_LOCK: u32 = 1 << 31;
+const F7_CR_PG: u32 = 1 << 0;
+const F7_CR_SER: u32 = 1 << 1;
+const F7_CR_STRT: u32 = 1 << 16;
+const F7_SR_WRPERR: u32 = 1 << 4;
+const F7_SR_ERSERR: u32 = 1 << 7;
+
+/// An STM32F7 modelled as its controller and its array, with the two behaviors that decide whether
+/// a backend is correct rather than lucky.
+///
+/// **A SECTOR NUMBER MEANS AN ADDRESS ONLY UNDER THE MAP THE PART IS USING**, so this fake keeps its
+/// OWN maps, written out from RM0385 Table 3 and RM0410 Tables 3 and 4 rather than borrowed from the
+/// part crate: a fake that asked the driver which bytes sector 5 covers would agree with the driver
+/// by construction. **AND A KEY SEQUENCE WRITTEN TO A REGISTER THAT IS NOT LOCKED IS THE MANUAL'S
+/// WRONG SEQUENCE**, which locks the controller until reset.
+struct FakeF7 {
+    log: Vec<String>,
+    dev_id: u32,
+    flash_kb: u32,
+    optcr: u32,
+    flash: Vec<u8>,
+    locked: bool,
+    /// Set by a wrong key sequence. Nothing unlocks the controller after that.
+    wedged: bool,
+    keys: Vec<u32>,
+    cr: u32,
+    sr: u32,
+    /// Sector numbers erased, in the order they were commanded.
+    erased: Vec<u32>,
+    /// A sector whose erase latches `WRPERR`, as a write-protected one does.
+    protected: Option<u32>,
+    /// `DBGMCU_APB1_FZ`, whose bit 12 is what stops the independent watchdog while halted.
+    apb1_fz: u32,
+    halted: bool,
+    /// Whether the firmware the part was running had started its independent watchdog.
+    iwdg_started: bool,
+}
+
+impl FakeF7 {
+    /// A 2 MB STM32F769 in single-bank mode, erased and locked, as it comes out of reset.
+    fn f769() -> Self {
+        FakeF7 {
+            log: Vec::new(),
+            dev_id: 0x451,
+            flash_kb: 2048,
+            optcr: F7_OPTCR_RESET,
+            flash: vec![0xFF; 2048 * 1024],
+            locked: true,
+            wedged: false,
+            keys: Vec::new(),
+            cr: 0,
+            sr: 0,
+            erased: Vec::new(),
+            protected: None,
+            apb1_fz: 0,
+            halted: false,
+            iwdg_started: false,
+        }
+    }
+
+    /// Whether a watchdog the firmware started has reset the part: it counts through a halt unless
+    /// `DBG_IWDG_STOP` is set.
+    fn watchdog_fired(&mut self) -> bool {
+        let fired = self.iwdg_started && self.halted && self.apb1_fz & (1 << 12) == 0;
+        if fired {
+            self.log.push("watchdog reset".to_owned());
+        }
+        fired
+    }
+
+    /// A 1 MB STM32F746, whose family has no dual-bank mode.
+    fn f746() -> Self {
+        FakeF7 {
+            dev_id: 0x449,
+            flash_kb: 1024,
+            flash: vec![0xFF; 1024 * 1024],
+            ..FakeF7::f769()
+        }
+    }
+
+    /// Where sector `number` starts and how long it is, under the map this part is in.
+    fn sector(&self, number: u32) -> Option<(u32, u32)> {
+        const K: u32 = 1024;
+        let single_bank = self.optcr & (1 << 29) != 0;
+        let (sizes, numbered_per_bank): (&[u32], bool) = match (self.dev_id, single_bank) {
+            (0x449, _) => (&[32 * K, 32 * K, 32 * K, 32 * K, 128 * K, 256 * K, 256 * K, 256 * K][..], false),
+            (0x451, true) => (
+                &[
+                    32 * K, 32 * K, 32 * K, 32 * K, 128 * K, 256 * K, 256 * K, 256 * K, 256 * K,
+                    256 * K, 256 * K, 256 * K,
+                ][..],
+                false,
+            ),
+            (0x451, false) => (
+                &[
+                    16 * K, 16 * K, 16 * K, 16 * K, 64 * K, 128 * K, 128 * K, 128 * K, 128 * K,
+                    128 * K, 128 * K, 128 * K,
+                ][..],
+                true,
+            ),
+            _ => return None,
+        };
+        let (index, bank_base) = if numbered_per_bank && number >= 12 {
+            (number - 12, 0x0810_0000)
+        } else {
+            (number, STM32F7_FLASH_BASE)
+        };
+        let index = usize::try_from(index).ok()?;
+        let size = *sizes.get(index)?;
+        Some((bank_base + sizes[..index].iter().sum::<u32>(), size))
+    }
+
+    fn array_end(&self) -> u32 {
+        STM32F7_FLASH_BASE + u32::try_from(self.flash.len()).expect("the fake's array fits")
+    }
+}
+
+impl TargetAccess for FakeF7 {
+    fn connect(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+        Ok(0x5ba0_2477)
+    }
+    fn init_mem(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+
+    fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+        match address {
+            STM32F7_DBGMCU_IDCODE => Ok((0x1001 << 16) | self.dev_id),
+            F7_FSIZE_WORD => Ok(self.flash_kb << 16),
+            F7_OPTCR => Ok(self.optcr),
+            STM32F7_DBGMCU_APB1_FZ => Ok(self.apb1_fz),
+            F7_CR => Ok(if self.locked { self.cr | F7_CR_LOCK } else { self.cr }),
+            F7_SR => Ok(self.sr),
+            _ if (STM32F7_FLASH_BASE..self.array_end()).contains(&address) => {
+                let at = (address - STM32F7_FLASH_BASE) as usize;
+                let cell = self
+                    .flash
+                    .get(at..at + 4)
+                    .ok_or(ProbeError::Device("read past the array"))?;
+                Ok(u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]))
+            }
+            _ => Err(ProbeError::Device(
+                "read of an address this fake does not model",
+            )),
+        }
+    }
+
+    fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        match address {
+            STM32F7_DBGMCU_APB1_FZ => {
+                self.apb1_fz = value;
+                self.log.push(format!("apb1_fz {value:#06x}"));
+                Ok(())
+            }
+            F7_KEYR => {
+                if !self.locked || self.wedged {
+                    self.locked = true;
+                    self.wedged = true;
+                    self.log.push("wedged".to_owned());
+                    return Err(ProbeError::Device("bus error on FLASH_KEYR"));
+                }
+                self.keys.push(value);
+                if self.keys.len() == 2 {
+                    if (self.keys[0], self.keys[1]) == (0x4567_0123, 0xCDEF_89AB) {
+                        self.locked = false;
+                        self.log.push("unlock".to_owned());
+                    } else {
+                        self.wedged = true;
+                    }
+                    self.keys.clear();
+                }
+                Ok(())
+            }
+            F7_CR => {
+                if self.locked {
+                    return Ok(());
+                }
+                if value & F7_CR_LOCK != 0 {
+                    self.locked = true;
+                    self.log.push("lock".to_owned());
+                }
+                self.cr = value & !(F7_CR_LOCK | F7_CR_STRT);
+                if value & F7_CR_STRT != 0 && value & F7_CR_SER != 0 {
+                    if self.watchdog_fired() {
+                        return Err(ProbeError::Device("the independent watchdog reset the part"));
+                    }
+                    let number = (value >> 3) & 0x1f;
+                    if self.protected == Some(number) {
+                        self.sr |= F7_SR_WRPERR;
+                        return Ok(());
+                    }
+                    let (start, size) = self
+                        .sector(number)
+                        .ok_or(ProbeError::Device("a sector number this part does not have"))?;
+                    let from = (start - STM32F7_FLASH_BASE) as usize;
+                    let to = from + size as usize;
+                    self.flash
+                        .get_mut(from..to)
+                        .ok_or(ProbeError::Device("a sector past the fake's array"))?
+                        .iter_mut()
+                        .for_each(|byte| *byte = 0xFF);
+                    self.erased.push(number);
+                    self.log.push(format!("erase_sector {number}"));
+                }
+                Ok(())
+            }
+            F7_SR => {
+                self.sr &= !value;
+                Ok(())
+            }
+            _ if (STM32F7_FLASH_BASE..self.array_end()).contains(&address) => {
+                if self.watchdog_fired() {
+                    return Err(ProbeError::Device("the independent watchdog reset the part"));
+                }
+                if self.locked || self.cr & F7_CR_PG == 0 {
+                    self.sr |= F7_SR_ERSERR;
+                    self.log.push("erserr".to_owned());
+                    return Ok(());
+                }
+                let at = (address - STM32F7_FLASH_BASE) as usize;
+                let cell = self
+                    .flash
+                    .get_mut(at..at + 4)
+                    .ok_or(ProbeError::Device("write past the array"))?;
+                let current = u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]);
+                cell.copy_from_slice(&(current & value).to_le_bytes());
+                Ok(())
+            }
+            _ => Err(ProbeError::Device(
+                "write to an address this fake does not model",
+            )),
+        }
+    }
+
+    fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = self.read_word(address + (index * 4) as u32)?;
+        }
+        Ok(())
+    }
+
+    fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
+        if self.log.last().map(String::as_str) != Some("program") {
+            self.log.push("program".to_owned());
+        }
+        for (index, word) in words.iter().enumerate() {
+            self.write_word(address + (index * 4) as u32, *word)?;
+        }
+        Ok(())
+    }
+
+    fn halt(&mut self) -> Result<(), ProbeError> {
+        self.halted = true;
+        self.log.push("halt".to_owned());
+        Ok(())
+    }
+    fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.halted = false;
+        self.log.push("reset_and_run".to_owned());
+        Ok(())
+    }
+
+    fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
+        unreachable!("byte access is not part of the flashing path")
+    }
+    fn write_byte(&mut self, _address: u32, _value: u8) -> Result<(), ProbeError> {
+        unreachable!("byte access is not part of the flashing path")
+    }
+    fn read_halfword(&mut self, _address: u32) -> Result<u16, ProbeError> {
+        unreachable!("halfword access is not part of the flashing path")
+    }
+    fn write_halfword(&mut self, _address: u32, _value: u16) -> Result<(), ProbeError> {
+        unreachable!("halfword access is not part of the flashing path")
+    }
+    fn resume(&mut self) -> Result<(), ProbeError> {
+        unreachable!("a flashing backend leaves the part through reset_and_run, not resume")
+    }
+    fn step(&mut self) -> Result<(), ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn is_halted(&mut self) -> Result<bool, ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn wait_halted(&mut self) -> Result<(), ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+        unreachable!("a flashing backend does not drive the reset line directly")
+    }
+    fn read_core_reg(&mut self, _selector: u8) -> Result<u32, ProbeError> {
+        unreachable!("core registers are not the flashing path")
+    }
+    fn write_core_reg(&mut self, _selector: u8, _value: u32) -> Result<(), ProbeError> {
+        unreachable!("core registers are not the flashing path")
+    }
+    fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        unreachable!("reset catch is not the flashing path")
+    }
+    fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        unreachable!("reset catch is not the flashing path")
+    }
+    fn set_breakpoint(&mut self, _address: u32) -> Result<(), ProbeError> {
+        unreachable!("breakpoints are not the flashing path")
+    }
+    fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+        unreachable!("breakpoints are not the flashing path")
+    }
+    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
+        unreachable!("breakpoints are not the flashing path")
+    }
+    fn call_target(
+        &mut self,
+        _address: u32,
+        _args: &[u32],
+        _frame: &lamella_probe_core::CallFrame,
+    ) -> Result<u32, ProbeError> {
+        unreachable!("a flashing backend does not run code on the target")
+    }
+}
+
+/// Bytes whose top bit is always clear, so no word in them can pass for an erased one.
+fn f7_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 127) as u8).collect()
+}
+
+fn f7_flash(backend: &mut StProbe<FakeF7>, bytes: &[u8]) -> Result<lamella_flash_backend::Report, FlashError> {
+    flash(
+        backend,
+        &Image {
+            bytes,
+            base: STM32F7_FLASH_BASE,
+        },
+        VerifyPolicy::ReadBack,
+        &Allow::Any,
+    )
+}
+
+/// **THE WALK TAKES SECTORS BY NUMBER, AND ONLY THE ONES THE IMAGE OVERLAPS.** One byte past the
+/// first 32 KB sector needs the second and nothing beyond it, and the steps run in the contract's
+/// order.
+#[test]
+fn an_f7_image_erases_exactly_the_sectors_it_overlaps() {
+    let bytes = f7_pattern(32 * 1024 + 1);
+    let mut backend = StProbe::new(FakeF7::f769(), crate::StFamily::F7.plan());
+    let report = f7_flash(&mut backend, &bytes).expect("the F7 sequence");
+
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert_eq!(backend.target.erased, vec![0, 1]);
+    assert!(!backend.target.wedged, "{:?}", backend.target.log);
+
+    let log = &backend.target.log;
+    let step = |name: &str| {
+        log.iter()
+            .position(|entry| entry.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} in {log:?}"))
+    };
+    assert!(step("halt") < step("erase_sector"), "{log:?}");
+    assert!(step("erase_sector") < step("program"), "{log:?}");
+    assert!(step("program") < step("reset_and_run"), "{log:?}");
+    assert!(
+        backend.target.flash[64 * 1024..].iter().all(|byte| *byte == 0xFF),
+        "nothing past sector 1 was touched"
+    );
+}
+
+/// Four 32 KB sectors and the 128 KB one cover 256 KB, so a 300 KB image's last 44 KB need the first
+/// 256 KB sector -- on an F746, whose map is the F74x one.
+#[test]
+fn an_f746_image_past_its_128_kb_sector_takes_the_first_256_kb_one() {
+    let bytes = f7_pattern(300 * 1024);
+    let mut backend = StProbe::new(FakeF7::f746(), crate::StFamily::F7.plan());
+    f7_flash(&mut backend, &bytes).expect("the F746 sequence");
+    assert_eq!(backend.target.erased, vec![0, 1, 2, 3, 4, 5]);
+}
+
+/// The whole part: every sector once, in order, and every byte read back.
+#[test]
+fn a_whole_f769_image_erases_every_sector_once_in_order() {
+    let bytes = f7_pattern(2048 * 1024);
+    let mut backend = StProbe::new(FakeF7::f769(), crate::StFamily::F7.plan());
+    let report = f7_flash(&mut backend, &bytes).expect("a whole 2 MB write");
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert_eq!(backend.target.erased, (0..12).collect::<Vec<u32>>());
+}
+
+/// **A DUAL-BANK F76x IS REFUSED BEFORE THE CORE IS HALTED.** Its sector numbers name other
+/// addresses: sector 5 is 256 KB at `0x08040000` in single-bank mode and 128 KB at `0x08020000` in
+/// dual-bank mode, so erasing by the wrong map erases flash the image does not cover.
+#[test]
+fn a_dual_bank_f769_is_refused_before_anything_is_halted_or_erased() {
+    let mut part = FakeF7::f769();
+    part.optcr &= !STM32F7_OPTCR_NDBANK;
+    assert_eq!(part.sector(5), Some((0x0802_0000, 128 * 1024)), "the fake's own dual-bank map");
+    let original = part.flash.clone();
+    let bytes = f7_pattern(64 * 1024);
+    let mut backend = StProbe::new(part, crate::StFamily::F7.plan());
+
+    let error = f7_flash(&mut backend, &bytes).expect_err("a dual-bank part is refused");
+    assert!(error.to_string().contains("nDBANK"), "{error}");
+    assert!(backend.target.erased.is_empty());
+    assert!(!backend.target.log.iter().any(|entry| entry == "halt"), "{:?}", backend.target.log);
+    assert!(backend.target.flash == original, "not one byte changed");
+}
+
+/// **A CONTROLLER ITS FIRMWARE LEFT UNLOCKED IS USED AS FOUND, NOT KEYED AGAIN.** The manual's wrong
+/// sequence locks `FLASH_CR` until reset, so a backend that re-keyed it would fail every erase after.
+#[test]
+fn an_f7_left_unlocked_by_its_firmware_is_written_without_being_keyed_again() {
+    let mut part = FakeF7::f769();
+    part.locked = false;
+    let bytes = f7_pattern(1024);
+    let mut backend = StProbe::new(part, crate::StFamily::F7.plan());
+    f7_flash(&mut backend, &bytes).expect("an unlocked controller is used as it was found");
+    assert!(!backend.target.wedged, "{:?}", backend.target.log);
+    assert_eq!(backend.target.erased, vec![0]);
+
+    let mut control = FakeF7::f769();
+    control.locked = false;
+    assert!(control.write_word(F7_KEYR, 0x4567_0123).is_err());
+    assert!(control.wedged);
+}
+
+/// A flag a finished session left latched does not fail this session's erase. A write-protected
+/// sector's flag, raised by this erase, fails it and names the rule.
+#[test]
+fn a_stale_f7_flag_is_cleared_but_a_protected_sector_fails_its_own_erase() {
+    let mut stale = FakeF7::f769();
+    stale.sr = F7_SR_ERSERR;
+    let bytes = f7_pattern(1024);
+    let mut backend = StProbe::new(stale, crate::StFamily::F7.plan());
+    f7_flash(&mut backend, &bytes).expect("a stale flag is not this operation's failure");
+
+    let mut protected = FakeF7::f769();
+    protected.protected = Some(1);
+    let bytes = f7_pattern(40 * 1024);
+    let mut backend = StProbe::new(protected, crate::StFamily::F7.plan());
+    let error = f7_flash(&mut backend, &bytes).expect_err("sector 1 is write protected");
+    assert!(error.to_string().contains("WRPERR"), "{error}");
+}
+
+/// The bound is the flash the PART reports, whatever the map could describe: a 1 MB F76x is refused
+/// an image one byte over 1 MB before anything is halted.
+#[test]
+fn an_f7_image_past_the_fitted_flash_is_refused_before_anything_is_erased() {
+    let mut part = FakeF7::f769();
+    part.flash_kb = 1024;
+    let bytes = f7_pattern(1024 * 1024 + 1);
+    let mut backend = StProbe::new(part, crate::StFamily::F7.plan());
+    f7_flash(&mut backend, &bytes).expect_err("past the fitted flash");
+    assert!(backend.target.erased.is_empty());
+    assert!(!backend.target.log.iter().any(|entry| entry == "halt"), "{:?}", backend.target.log);
+}
+
+/// An F7 answering a `DEV_ID` neither manual gives is refused at identify, naming the ones they do.
+#[test]
+fn an_f7_route_refuses_a_device_id_its_manuals_do_not_give() {
+    let mut part = FakeF7::f769();
+    part.dev_id = 0x452;
+    let bytes = f7_pattern(1024);
+    let mut backend = StProbe::new(part, crate::StFamily::F7.plan());
+    let error = f7_flash(&mut backend, &bytes).expect_err("an F72x is not covered");
+    let text = error.to_string();
+    assert!(text.contains("0x452") && text.contains("0x449") && text.contains("0x451"), "{text}");
+    assert!(backend.target.erased.is_empty());
+}
+
+/// **A WATCHDOG THE FIRMWARE STARTED DOES NOT RESET THE PART MIDWAY**, because both watchdogs are
+/// stopped before the core is -- and the register is put back as found before the part is released.
+#[test]
+fn an_f7_write_stops_the_watchdogs_before_it_halts_and_puts_the_register_back() {
+    let mut part = FakeF7::f769();
+    part.iwdg_started = true;
+    part.apb1_fz = 0x0000_0001;
+    let bytes = f7_pattern(40 * 1024);
+    let mut backend = StProbe::new(part, crate::StFamily::F7.plan());
+    f7_flash(&mut backend, &bytes).expect("a write the watchdog does not interrupt");
+
+    let log = &backend.target.log;
+    assert!(!log.iter().any(|entry| entry == "watchdog reset"), "{log:?}");
+    let position = |wanted: &str| {
+        log.iter()
+            .position(|entry| entry == wanted)
+            .unwrap_or_else(|| panic!("no {wanted} in {log:?}"))
+    };
+    assert!(position("apb1_fz 0x1801") < position("halt"), "{log:?}");
+    assert!(position("apb1_fz 0x0001") < position("reset_and_run"), "{log:?}");
+    assert_eq!(backend.target.apb1_fz, 0x0000_0001, "put back as found");
+
+    let mut control = FakeF7::f769();
+    control.iwdg_started = true;
+    control.halted = true;
+    control.locked = false;
+    assert!(control.write_word(F7_CR, F7_CR_SER | F7_CR_STRT).is_err());
+    assert!(control.log.iter().any(|entry| entry == "watchdog reset"));
+}
+
+/// The two replies a DfuSe download receives when the device takes it: dfuDNBUSY with no wait asked,
+/// then dfuDNLOAD-IDLE -- states 4 and 5 (DFU 1.1, 6.1.2; AN3156 Rev 18, 5.1 and 5.2).
+fn taken() -> Vec<Vec<u8>> {
+    vec![crate::dfu::scripted::status(0x00, 0, 4), crate::dfu::scripted::status(0x00, 0, 5)]
+}
+
+/// The replies one DfuSe read of `block` receives: its address pointer's download taken, then the block.
+fn uploaded(block: &[u8]) -> Vec<Vec<u8>> {
+    let mut replies = taken();
+    replies.push(block.to_vec());
+    replies
+}
+
+/// The reply that finds a bootloader already in dfuIDLE, state 2.
+fn found_idle() -> Vec<u8> {
+    crate::dfu::scripted::status(0x00, 0, 2)
+}
+
+/// An H7 backend over a pipe answering `replies`, at a transfer size of 1,024 bytes.
+fn h7_over_dfu(replies: Vec<Vec<u8>>) -> StDfu<crate::dfu::scripted::Scripted> {
+    StDfu::new(
+        crate::dfu::DfuSe::new(crate::dfu::scripted::Scripted::answering(replies), 1024),
+        crate::StFamily::H7.plan(),
+        crate::StFamily::H7.system_bootloader().expect("the H7 plan names its bootloader"),
+    )
+}
+
+/// Whether `sent` is a DfuSe Erase command: a download of block 0 whose first byte is 0x41 (AN3156
+/// Rev 18, 5.3).
+fn is_erase(sent: &crate::dfu::scripted::Sent) -> bool {
+    matches!(sent, crate::dfu::scripted::Sent::Out { request: 1, value: 0, data } if data.first() == Some(&0x41))
+}
+
+/// A DFU write runs in the contract's order -- identify, erase, program, read back, leave -- and reports
+/// a verified write, its tail padded with the erased byte to a whole 32-byte flash word.
+#[test]
+fn a_dfu_write_identifies_erases_programs_reads_back_and_leaves() {
+    use crate::dfu::scripted::Sent;
+    let image_bytes: Vec<u8> = (0..40).collect();
+    let mut programmed = image_bytes.clone();
+    programmed.resize(64, 0xFF);
+
+    let mut replies = vec![found_idle()];
+    replies.extend(uploaded(&[0x92, 0xFF]));
+    replies.extend(uploaded(&[0x00, 0x08]));
+    replies.extend(taken());
+    replies.extend(taken());
+    replies.extend(taken());
+    replies.extend(uploaded(&programmed));
+    replies.extend(taken());
+    replies.push(crate::dfu::scripted::status(0x00, 0, 7));
+
+    let mut backend = h7_over_dfu(replies);
+    let image = Image { bytes: &image_bytes, base: 0x0800_0000 };
+    let report = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any).expect("the write");
+    assert_eq!(report.identity.value, 0x92);
+    assert_eq!(report.verification, Verification::ReadBack);
+
+    let sent = backend.into_dfu().into_pipe().sent;
+    assert_eq!(sent.iter().filter(|sent| is_erase(sent)).count(), 1, "one sector erased");
+    let erase = sent.iter().position(is_erase).expect("an erase");
+    let program = sent
+        .iter()
+        .position(|sent| matches!(sent, Sent::Out { request: 1, value: 2, data } if *data == programmed))
+        .expect("the padded image downloaded as block 2");
+    let read_back = sent
+        .iter()
+        .position(|sent| matches!(sent, Sent::In { request: 2, value: 2, length: 64 }))
+        .expect("64 bytes uploaded");
+    assert!(erase < program && program < read_back, "{sent:?}");
+}
+
+/// A bootloader ID that AN2606 lists for no STM32H74xxx/75xxx bootloader is refused, naming what it read
+/// and what the table lists, before anything is erased.
+#[test]
+fn a_bootloader_id_the_series_does_not_list_is_refused_before_any_erase() {
+    let mut replies = vec![found_idle()];
+    replies.extend(uploaded(&[0x31, 0xFF]));
+    let mut backend = h7_over_dfu(replies);
+    let image_bytes = [0u8; 32];
+    let image = Image { bytes: &image_bytes, base: 0x0800_0000 };
+    let text = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
+        .expect_err("an unlisted bootloader")
+        .to_string();
+    assert!(text.contains("reads 0x31"), "names what it read: {text}");
+    assert!(text.contains("0x92 (V9.2)"), "and what the table lists: {text}");
+    assert!(!backend.into_dfu().into_pipe().sent.iter().any(is_erase), "nothing erased");
+}
+
+/// An image whose erase walk would reach past the flash the part reports fitted is refused before the
+/// first erase.
+#[test]
+fn a_dfu_erase_that_would_walk_past_the_fitted_flash_erases_nothing() {
+    let mut replies = vec![found_idle()];
+    replies.extend(uploaded(&[0x92, 0xFF]));
+    replies.extend(uploaded(&[0x00, 0x04]));
+    let mut backend = h7_over_dfu(replies);
+    let image_bytes = vec![0u8; 0x10_0001];
+    let image = Image { bytes: &image_bytes, base: 0x0800_0000 };
+    backend.identify().expect("identified");
+    let text = backend.erase(&image).expect_err("one byte past 1,024 KB").to_string();
+    assert!(text.contains("1024 KB"), "{text}");
+    assert!(!backend.into_dfu().into_pipe().sent.iter().any(is_erase), "nothing erased");
+}
+
+/// Only bootloader V9.1 waits after an erase, and only after an erase in the second bank: AN2606 Rev 70,
+/// Table 136 lists its bank-2 erase as answering early, with the datasheet's worst case as the wait.
+#[test]
+fn only_the_bootloader_that_answers_early_waits_after_a_second_bank_erase() {
+    use crate::dfu::scripted::Sent;
+    for (version, expected) in [(0x91u8, vec![4_000u32]), (0x90, vec![]), (0x92, vec![])] {
+        let mut replies = vec![found_idle()];
+        replies.extend(uploaded(&[version, 0xFF]));
+        replies.extend(uploaded(&[0x00, 0x08]));
+        for _ in 0..9 {
+            replies.extend(taken());
+        }
+        let mut backend = h7_over_dfu(replies);
+        let image_bytes = vec![0u8; 9 * 128 * 1024];
+        let image = Image { bytes: &image_bytes, base: 0x0800_0000 };
+        backend.identify().expect("identified");
+        backend.erase(&image).expect("erased");
+        let sent = backend.into_dfu().into_pipe().sent;
+        assert_eq!(sent.iter().filter(|sent| is_erase(sent)).count(), 9, "version {version:#04x}");
+        let waited: Vec<u32> = sent
+            .iter()
+            .filter_map(|sent| match sent {
+                Sent::Pause(milliseconds) if *milliseconds > 0 => Some(*milliseconds),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waited, expected, "version {version:#04x}");
+        let last_erase = sent.iter().rposition(is_erase).expect("the bank-2 erase");
+        if !expected.is_empty() {
+            assert!(
+                sent[last_erase..].contains(&Sent::Pause(4_000)),
+                "the wait follows the bank-2 erase: {:?}",
+                &sent[last_erase..]
+            );
+        }
+    }
 }

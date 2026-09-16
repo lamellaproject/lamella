@@ -44,13 +44,16 @@ pub const DEVICE_COUNT: u32 = 3;
 // -- on-board devices: PORT group base + pin index + mask --
 pub const SD_CARD_DETECT_PORT_BASE: u32 = 0x41004400;
 pub const SD_CARD_DETECT_PIN: u32 = 21;
+pub const SD_CARD_DETECT_BANK: u32 = 0;
 pub const SD_CARD_DETECT_MASK: u32 = 0x200000;
 pub const SD_CARD_DETECT_ACTIVE_LOW: u32 = 1;
 pub const LED_PORT_BASE: u32 = 0x41004400;
 pub const LED_PIN: u32 = 17;
+pub const LED_BANK: u32 = 0;
 pub const LED_MASK: u32 = 0x20000;
 pub const LED_ACTIVE_LOW: u32 = 0;
 pub const LED_SD_PORT_BASE: u32 = 0x41004400;
 pub const LED_SD_PIN: u32 = 6;
+pub const LED_SD_BANK: u32 = 0;
 pub const LED_SD_MASK: u32 = 0x40;
 pub const LED_SD_ACTIVE_LOW: u32 = 0;

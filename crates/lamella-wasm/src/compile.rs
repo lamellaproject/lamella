@@ -1,5 +1,5 @@
 //! In-page compilation (feature `compile`): a wasm ABI over `compile_source`, so the
-//! browser IDE (Studio) compiles the user's own C# client-side -- no server, the
+//! browser IDE (Lamella Code) compiles the user's own C# client-side -- no server, the
 //! "all compilation in the browser" pillar.
 
 #![allow(unsafe_code)]

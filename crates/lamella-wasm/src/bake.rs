@@ -1,7 +1,7 @@
 //! In-page BAKING (feature `bake`): a wasm ABI over the loader's `write_baked`, so the browser IDE
-//! (Studio) turns a compiled app plus its assemblies into a self-contained `.lmli` flash image
-//! client-side -- the deploy half of the browser hardware story (compile in-page -> bake in-page ->
-//! deploy over WebSerial). It mirrors the host library-image bake: load (unfrozen) ->
+//! (Lamella Code) turns a compiled app plus its assemblies into a self-contained `.lmli` flash image
+//! client-side, between compiling in the page and deploying from it (compile in-page -> bake in-page
+//! -> deploy over WebUSB or Web Serial). It mirrors the host library-image bake: load (unfrozen) ->
 //! optionally trim to the reachable set -> validate the capability profile -> `write_baked`.
 
 #![allow(unsafe_code)]
@@ -26,8 +26,9 @@ fn error_payload(message: &str) -> Vec<u8> {
     payload
 }
 
-/// Loads corlib (+ optional library) + app, trims + validates, and bakes -- returning the payload
-/// described in the module doc. `code-in-place` pins the loader to `Assembly<'static>`, so the
+/// Loads corlib (+ optional library) + app, trims + validates, and bakes -- returning a
+/// `[u32 json_len][JSON][u32 image_len][image bytes]` payload, the image 0-length on a violation or
+/// an error. `code-in-place` pins the loader to `Assembly<'static>`, so the
 /// inputs are staged via [`crate::abi::with_static`] (leaked, then reclaimed once the OWNED image is
 /// produced) -- a repeated in-page bake does not leak.
 fn bake(corlib: &[u8], library: &[u8], app: &[u8], trim: bool) -> Vec<u8> {

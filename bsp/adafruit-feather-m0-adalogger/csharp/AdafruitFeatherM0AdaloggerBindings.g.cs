@@ -49,14 +49,17 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint SD_CARD_DETECT_PORT_BASE = 0x41004400;
         public const uint SD_CARD_DETECT_PIN = 21;
+        public const uint SD_CARD_DETECT_BANK = 0;
         public const uint SD_CARD_DETECT_MASK = 0x200000;
         public const uint SD_CARD_DETECT_ACTIVE_LOW = 1;
         public const uint LED_PORT_BASE = 0x41004400;
         public const uint LED_PIN = 17;
+        public const uint LED_BANK = 0;
         public const uint LED_MASK = 0x20000;
         public const uint LED_ACTIVE_LOW = 0;
         public const uint LED_SD_PORT_BASE = 0x41004400;
         public const uint LED_SD_PIN = 6;
+        public const uint LED_SD_BANK = 0;
         public const uint LED_SD_MASK = 0x40;
         public const uint LED_SD_ACTIVE_LOW = 0;
     }

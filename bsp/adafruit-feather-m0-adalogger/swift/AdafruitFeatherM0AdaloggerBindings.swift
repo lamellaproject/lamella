@@ -45,14 +45,17 @@ public enum AdafruitFeatherM0AdaloggerBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let SD_CARD_DETECT_PORT_BASE: UInt32 = 0x41004400
     public static let SD_CARD_DETECT_PIN: UInt32 = 21
+    public static let SD_CARD_DETECT_BANK: UInt32 = 0
     public static let SD_CARD_DETECT_MASK: UInt32 = 0x200000
     public static let SD_CARD_DETECT_ACTIVE_LOW: UInt32 = 1
     public static let LED_PORT_BASE: UInt32 = 0x41004400
     public static let LED_PIN: UInt32 = 17
+    public static let LED_BANK: UInt32 = 0
     public static let LED_MASK: UInt32 = 0x20000
     public static let LED_ACTIVE_LOW: UInt32 = 0
     public static let LED_SD_PORT_BASE: UInt32 = 0x41004400
     public static let LED_SD_PIN: UInt32 = 6
+    public static let LED_SD_BANK: UInt32 = 0
     public static let LED_SD_MASK: UInt32 = 0x40
     public static let LED_SD_ACTIVE_LOW: UInt32 = 0
 }

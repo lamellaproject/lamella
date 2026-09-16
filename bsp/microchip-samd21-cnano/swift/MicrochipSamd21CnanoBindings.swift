@@ -14,10 +14,12 @@ public enum MicrochipSamd21CnanoBindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LED0_PORT_BASE: UInt32 = 0x41004480
     public static let LED0_PIN: UInt32 = 10
+    public static let LED0_BANK: UInt32 = 0
     public static let LED0_MASK: UInt32 = 0x400
     public static let LED0_ACTIVE_LOW: UInt32 = 1
     public static let BUTTON0_PORT_BASE: UInt32 = 0x41004480
     public static let BUTTON0_PIN: UInt32 = 11
+    public static let BUTTON0_BANK: UInt32 = 0
     public static let BUTTON0_MASK: UInt32 = 0x800
     public static let BUTTON0_ACTIVE_LOW: UInt32 = 1
 }

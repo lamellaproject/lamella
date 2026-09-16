@@ -88,17 +88,21 @@ namespace Lamella.Generated
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint CYW43439_WL_REG_ON_PORT_BASE = 0xD0000000;
         public const uint CYW43439_WL_REG_ON_PIN = 23;
+        public const uint CYW43439_WL_REG_ON_BANK = 0;
         public const uint CYW43439_WL_REG_ON_MASK = 0x800000;
         public const uint CYW43439_WL_REG_ON_ACTIVE_LOW = 0;
         public const uint CYW43439_DATA_PORT_BASE = 0xD0000000;
         public const uint CYW43439_DATA_PIN = 24;
+        public const uint CYW43439_DATA_BANK = 0;
         public const uint CYW43439_DATA_MASK = 0x1000000;
         public const uint CYW43439_CS_PORT_BASE = 0xD0000000;
         public const uint CYW43439_CS_PIN = 25;
+        public const uint CYW43439_CS_BANK = 0;
         public const uint CYW43439_CS_MASK = 0x2000000;
         public const uint CYW43439_CS_ACTIVE_LOW = 1;
         public const uint CYW43439_CLK_PORT_BASE = 0xD0000000;
         public const uint CYW43439_CLK_PIN = 29;
+        public const uint CYW43439_CLK_BANK = 0;
         public const uint CYW43439_CLK_MASK = 0x20000000;
 
         /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own

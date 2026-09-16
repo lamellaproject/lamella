@@ -64,10 +64,10 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
-    "led": {"kind": "gpio-out", "port_base": 0xD0000000, "pin": 13, "mask": 0x2000, "active_low": False},
-    "neopixel": {"kind": "gpio-out", "port_base": 0xD0000000, "pin": 17, "mask": 0x20000, "active_low": False},
-    "button": {"kind": "gpio-in", "port_base": 0xD0000000, "pin": 7, "mask": 0x80, "active_low": True},
-    "sd-card-detect": {"kind": "gpio-in", "port_base": 0xD0000000, "pin": 16, "mask": 0x10000, "active_low": True},
+    "led": {"kind": "gpio-out", "port_base": 0xD0000000, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": False},
+    "neopixel": {"kind": "gpio-out", "port_base": 0xD0000000, "pin": 17, "bank": 0, "mask": 0x20000, "active_low": False},
+    "button": {"kind": "gpio-in", "port_base": 0xD0000000, "pin": 7, "bank": 0, "mask": 0x80, "active_low": True},
+    "sd-card-detect": {"kind": "gpio-in", "port_base": 0xD0000000, "pin": 16, "bank": 0, "mask": 0x10000, "active_low": True},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until
@@ -83,5 +83,5 @@ MEMORY = {
 # attached module speaks is a property of the module, so a board that offers several states all
 # of them and chooses none.
 CONNECTORS = {
-    "qt": {"standard": "stemma-qt", "buses": {}, "pins": {"sda": {"port_base": 0xD0000000, "pin": 2, "mask": 0x4}, "scl": {"port_base": 0xD0000000, "pin": 3, "mask": 0x8}}},
+    "qt": {"standard": "stemma-qt", "buses": {}, "pins": {"sda": {"port_base": 0xD0000000, "pin": 2, "bank": 0, "mask": 0x4}, "scl": {"port_base": 0xD0000000, "pin": 3, "bank": 0, "mask": 0x8}}},
 }

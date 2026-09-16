@@ -130,7 +130,7 @@ function Resolve-ExtensionSources($root, $standards) {
         $standard = ''
         # The header runs to the first ARRAY section, which is the strata reader's own rule: an
         # extension states its standard inside `[table]`, so stopping at the first `[` would stop
-        # at `[table]` itself and find nothing. That was this function's first bug.
+        # at `[table]` itself and find nothing.
         foreach ($line in [System.IO.File]::ReadLines($toml)) {
             $trimmed = $line.Trim()
             if ($trimmed.StartsWith('[[')) { break }

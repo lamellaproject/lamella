@@ -765,8 +765,9 @@ pub enum BoundExprKind {
         left: Box<BoundExpr>,
         /// The right operand.
         right: Box<BoundExpr>,
-        /// Whether the operation is in a `checked` context, so emission uses the
-        /// overflow-checking `add.ovf`/`sub.ovf`/`mul.ovf` (14.5.12).
+        /// Whether the operation is in a `checked` context, so an integral `+`, `-` or `*` uses the
+        /// overflow-checking `add.ovf`/`sub.ovf`/`mul.ovf` (14.5.12). A floating one never does:
+        /// those forms take integer operands only.
         checked: bool,
     },
     /// A prefix unary operation (14.6).
@@ -775,6 +776,10 @@ pub enum BoundExprKind {
         operator: UnaryOperator,
         /// The operand.
         operand: Box<BoundExpr>,
+        /// Whether the operation is in a `checked` context. It matters to `++` and `--`, whose
+        /// integral, enum or pointer step then checks for overflow (ECMA-334 12.8.19); a checked
+        /// integer `-x` is bound as `0 - x` instead of reaching this node.
+        checked: bool,
     },
     /// An `await` expression, bound to the 12.8.8.2 awaiter pattern (ECMA-334 5th ed). The four
     /// references are the compile-time protocol of 12.8.8.4, resolved here so the lowering emits
@@ -805,6 +810,9 @@ pub enum BoundExprKind {
         /// operand's (14.14.2): the operator to call and any conversion of its result back to the
         /// operand type. `None` for a numeric/enum/pointer step or an exact same-type user operator.
         step: Option<Box<ConvertingStep>>,
+        /// Whether the step is in a `checked` context, so an integral, enum or pointer step checks
+        /// for overflow (ECMA-334 12.8.19).
+        checked: bool,
     },
     /// A cast to the expression's type (14.6.6).
     Cast {
@@ -1163,6 +1171,14 @@ pub struct Binder {
     /// [`Binder::next_method_vararg`] beside it and for the same reason: self-clearing, so a
     /// member whose caller forgot to set it cannot inherit the previous member's list.
     next_method_ref_parameters: Vec<Box<str>>,
+    /// The statement contexts of the NEXT [`Binder::bind_method`] body. Pre-set by the caller and
+    /// consumed by `bind_method`, the same self-clearing shape as the two fields above.
+    next_method_statement_contexts: Vec<StatementContext>,
+    /// The statement contexts of the body being bound, which the body block takes.
+    body_statement_contexts: Vec<StatementContext>,
+    /// The imports every file context sits on: those in force when the caller began walking the
+    /// compilation's files -- a session's own, or none. See [`Binder::set_file_context_base`].
+    file_context_base: ImportScope,
     imported_namespaces: Vec<Box<str>>,
     /// `using X = N.T;` aliases in scope, each the alias name and its target type, so an
     /// unqualified `X` resolves to the target (16.4.1). Scoped per namespace block alongside
@@ -1426,11 +1442,38 @@ fn fold_builtins_deep(ty: TypeSymbol) -> TypeSymbol {
 /// **OPAQUE, AND THAT IS THE POINT.** Three lengths of the same type are a shape in which two can
 /// be swapped silently, so they are named fields rather than a tuple, and there is no public
 /// constructor: the only way to hold one is to have taken a snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ImportScope {
     namespaces: usize,
     aliases: usize,
     static_types: usize,
+}
+
+/// The imports a file context adds above the base every file sits on, held by value, so a caller can
+/// set one file's context aside, bind under another's, and put the first back exactly.
+#[derive(Debug, Clone, Default)]
+pub struct FileImports {
+    namespaces: Vec<Box<str>>,
+    aliases: Vec<(Box<str>, TypeSymbol)>,
+    static_types: Vec<TypeSymbol>,
+}
+
+/// A run of a method body's top-level statements that binds under another file's context: the field
+/// initializers one part of a partial type contributes to a body that another part's emission
+/// assembles.
+#[derive(Debug, Clone)]
+pub struct StatementContext {
+    /// The positions, within the body block, of the statements this context covers.
+    pub statements: core::ops::Range<usize>,
+    /// The file's imports, taken by value with [`Binder::take_file_imports`].
+    pub imports: FileImports,
+    /// The file's `#define` set.
+    pub defined: alloc::collections::BTreeSet<Box<str>>,
+}
+
+/// The entries of `stack` above `base`, removed from it.
+fn split_above<T>(stack: &mut Vec<T>, base: usize) -> Vec<T> {
+    stack.split_off(base.min(stack.len()))
 }
 
 impl Binder {
@@ -3834,6 +3877,51 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.imported_static_types.truncate(scope.static_types);
     }
 
+    /// Records the imports in force now as the base every file context sits on. Call it before
+    /// walking a compilation's files, after any import meant to apply to all of them.
+    pub fn set_file_context_base(&mut self) {
+        self.file_context_base = self.import_scope();
+    }
+
+    /// Takes the imports above the file-context base out of the binder, by value, leaving the base.
+    #[must_use = "the taken imports must be put back, or a file's context is lost"]
+    pub fn take_file_imports(&mut self) -> FileImports {
+        let base = self.file_context_base;
+        FileImports {
+            namespaces: split_above(&mut self.imported_namespaces, base.namespaces),
+            aliases: split_above(&mut self.aliases, base.aliases),
+            static_types: split_above(&mut self.imported_static_types, base.static_types),
+        }
+    }
+
+    /// Replaces the imports above the file-context base with `imports`.
+    pub fn put_file_imports(&mut self, imports: FileImports) {
+        self.restore_import_scope(self.file_context_base);
+        self.imported_namespaces.extend(imports.namespaces);
+        self.aliases.extend(imports.aliases);
+        self.imported_static_types.extend(imports.static_types);
+    }
+
+    /// The statement contexts of the body being bound, taken so that only the body block sees them.
+    pub(crate) fn take_body_statement_contexts(&mut self) -> Vec<StatementContext> {
+        core::mem::take(&mut self.body_statement_contexts)
+    }
+
+    /// Binds `stmt` under `context`'s imports and `#define` set, then puts the current ones back.
+    pub(crate) fn bind_statement_in_file_context(
+        &mut self,
+        context: &StatementContext,
+        stmt: &lamella_syntax::ast::Stmt,
+    ) -> crate::statement::BoundStmt {
+        let imports = self.take_file_imports();
+        self.put_file_imports(context.imports.clone());
+        let defined = self.replace_defined_symbols(context.defined.clone());
+        let bound = self.bind_statement(stmt);
+        self.put_file_imports(imports);
+        self.set_defined_symbols(defined);
+        bound
+    }
+
     /// The current type's namespace, if any, for unqualified type resolution.
     fn current_namespace(&self) -> Option<Box<str>> {
         match &self.current_type {
@@ -4036,6 +4124,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.next_method_ref_parameters = names;
     }
 
+    /// Names the runs of the NEXT [`Binder::bind_method`] body's top-level statements that bind
+    /// under another file's context. `bind_method` consumes them.
+    pub fn set_next_method_statement_contexts(&mut self, contexts: Vec<StatementContext>) {
+        self.next_method_statement_contexts = contexts;
+    }
+
     /// Binds a method body end to end: the enclosing type is in scope for `this`
     /// and unqualified names, the parameters are declared as locals, and `return`
     /// statements are checked against `return_type` (15.9.4). Returns the bound
@@ -4092,7 +4186,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             matches!(body.kind, lamella_syntax::ast::StmtKind::Block(_))
                 .then_some(ScopeId(self.next_scope_id)),
         ];
+        self.body_statement_contexts = core::mem::take(&mut self.next_method_statement_contexts);
         let bound = self.bind_statement(body);
+        self.body_statement_contexts.clear();
         self.exit_scope();
         if returns_value && !crate::flow::method_body_always_exits(&bound) {
             self.diagnostics.push(Diagnostic::new(
@@ -6479,32 +6575,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             self.report_unary(unary_operator_symbol(operator), &operand.ty, span);
             TypeSymbol::Error
         };
-        if operator == UnaryOperator::Minus
-            && self.checked_context
-            && matches!(ty, TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64))
-            && constant_literal_value(&operand).is_none()
-        {
-            let zero = BoundExpr {
-                kind: BoundExprKind::Literal(Literal::Integer {
-                    value: 0,
-                    suffix: if matches!(ty, TypeSymbol::Special(SpecialType::Int64)) {
-                        IntegerSuffix::Long
-                    } else {
-                        IntegerSuffix::None
-                    },
-                }),
-                ty: ty.clone(),
-            };
-            let operand = self.convert(operand, &ty);
-            return BoundExpr {
-                kind: BoundExprKind::Binary {
-                    operator: BinaryOperator::Subtract,
-                    left: Box::new(zero),
-                    right: Box::new(operand),
-                    checked: true,
-                },
-                ty,
-            };
+        if self.lowers_to_checked_negation(operator, &operand, &ty) {
+            return self.checked_negation(operand, ty);
         }
         if operator == UnaryOperator::Minus {
             if let Some(value) =
@@ -6513,10 +6585,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 self.report_constant_overflow(-i128::from(value), &ty, span);
             }
         }
+        let operand = self.promoted_negation_operand(operator, operand, &ty);
         BoundExpr {
             kind: BoundExprKind::Unary {
                 operator,
                 operand: Box::new(operand),
+                checked: self.checked_context,
             },
             ty,
         }
@@ -6642,6 +6716,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 operator,
                 operand: Box::new(operand),
                 step: converting,
+                checked: self.checked_context,
             },
             ty,
         }
@@ -7229,6 +7304,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 kind: BoundExprKind::Unary {
                     operator: UnaryOperator::Not,
                     operand: Box::new(has_value),
+                    checked: false,
                 },
                 ty: TypeSymbol::Special(SpecialType::Boolean),
             },
@@ -7671,6 +7747,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     kind: BoundExprKind::Unary {
                         operator: UnaryOperator::Not,
                         operand: Box::new(equal),
+                        checked: false,
                     },
                     ty: boolean.clone(),
                 }
@@ -7690,6 +7767,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     kind: BoundExprKind::Unary {
                         operator: UnaryOperator::Not,
                         operand: Box::new(equal),
+                        checked: false,
                     },
                     ty: boolean.clone(),
                 }
@@ -7739,6 +7817,65 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// One operand, so one presence term and no comparison shapes: `a.HasValue ? new S?(op a.V) :
     /// null`. `++`/`--` are lifted too but are not here -- they READ, operate and WRITE BACK, so
     /// they belong to the compound-assignment lowering rather than to this value path.
+    /// Whether a unary `operator` over `operand`, whose result is `ty`, is a checked integer `-x`
+    /// that [`Self::checked_negation`] lowers. A constant operand is not: its overflow is a
+    /// compile-time error rather than a run-time throw.
+    fn lowers_to_checked_negation(
+        &self,
+        operator: UnaryOperator,
+        operand: &BoundExpr,
+        ty: &TypeSymbol,
+    ) -> bool {
+        operator == UnaryOperator::Minus
+            && self.checked_context
+            && matches!(ty, TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64))
+            && constant_literal_value(operand).is_none()
+    }
+
+    /// The operand of a unary minus, converted to its promoted type when the promotion widens it: a
+    /// `uint` negates as a `long` (14.6.2). Anything else, and any constant, is returned unchanged.
+    fn promoted_negation_operand(
+        &mut self,
+        operator: UnaryOperator,
+        operand: BoundExpr,
+        ty: &TypeSymbol,
+    ) -> BoundExpr {
+        if operator == UnaryOperator::Minus
+            && matches!(operand.ty, TypeSymbol::Special(SpecialType::UInt32))
+            && matches!(ty, TypeSymbol::Special(SpecialType::Int64))
+            && constant_literal_value(&operand).is_none()
+        {
+            self.convert(operand, ty)
+        } else {
+            operand
+        }
+    }
+
+    /// A checked integer `-x` as `0 - x`, whose `sub.ovf` throws where `neg` wraps.
+    fn checked_negation(&mut self, operand: BoundExpr, ty: TypeSymbol) -> BoundExpr {
+        let zero = BoundExpr {
+            kind: BoundExprKind::Literal(Literal::Integer {
+                value: 0,
+                suffix: if matches!(ty, TypeSymbol::Special(SpecialType::Int64)) {
+                    IntegerSuffix::Long
+                } else {
+                    IntegerSuffix::None
+                },
+            }),
+            ty: ty.clone(),
+        };
+        let operand = self.convert(operand, &ty);
+        BoundExpr {
+            kind: BoundExprKind::Binary {
+                operator: BinaryOperator::Subtract,
+                left: Box::new(zero),
+                right: Box::new(operand),
+                checked: true,
+            },
+            ty,
+        }
+    }
+
     fn bind_lifted_unary(
         &mut self,
         operator: UnaryOperator,
@@ -7777,12 +7914,18 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let value = self.nullable_value(spilled, span)?;
         let result_ty = self.nullable_of(&underlying_result);
-        let inner = BoundExpr {
-            kind: BoundExprKind::Unary {
-                operator,
-                operand: Box::new(value),
-            },
-            ty: underlying_result,
+        let inner = if self.lowers_to_checked_negation(operator, &value, &underlying_result) {
+            self.checked_negation(value, underlying_result)
+        } else {
+            let value = self.promoted_negation_operand(operator, value, &underlying_result);
+            BoundExpr {
+                kind: BoundExprKind::Unary {
+                    operator,
+                    operand: Box::new(value),
+                    checked: self.checked_context,
+                },
+                ty: underlying_result,
+            }
         };
         let wrapped = self.convert(inner, &result_ty);
         let value = BoundExpr {
@@ -15945,7 +16088,7 @@ pub(crate) fn constant_int_value(expr: &BoundExpr) -> Option<i64> {
         BoundExprKind::FieldAccess {
             field: Some(field), ..
         } => field.constant.as_ref().and_then(literal_int_value),
-        BoundExprKind::Unary { operator, operand } => match operator {
+        BoundExprKind::Unary { operator, operand, .. } => match operator {
             UnaryOperator::Plus => constant_int_value(operand),
             UnaryOperator::Minus => constant_int_value(operand)?.checked_neg(),
             _ => None,
@@ -16035,7 +16178,7 @@ pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
                 _ => Some(inner),
             }
         }
-        BoundExprKind::Unary { operator, operand } => {
+        BoundExprKind::Unary { operator, operand, .. } => {
             fold_const_unary(*operator, &constant_literal_value(operand)?)
         }
         BoundExprKind::Binary {

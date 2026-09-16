@@ -1,7 +1,7 @@
 //! The Lamella Link debug + REPL **runner core**: the piece that runs a host-compiled program on the
 //! interpreter and answers over the wire. ONE implementation serves three hosts:
 //! - the **host reference runner** (in-process, for the `lamella-repl` CLI loopback + tests),
-//! - the **browser runner** (compiled into `lamella-wasm` for the Studio REPL),
+//! - the **browser runner** (compiled into `lamella-wasm` for Lamella Code's REPL),
 //! - the **on-device firmware** (flashed onto a microcontroller behind the wire).
 
 #![cfg_attr(not(test), no_std)]
@@ -910,7 +910,9 @@ fn deploy_caps_with(
     live_window_len: u32,
 ) -> lamella_wire::Capabilities {
     let live = if live_window_len == 0 { 0 } else { lamella_wire::Capabilities::LIVE_MEMORY };
-    lamella_wire::Capabilities(base.0 | lamella_wire::Capabilities::DEBUG_BOOT_DEPLOYED | live)
+    let deploy = lamella_wire::Capabilities::DEBUG_BOOT_DEPLOYED
+        | lamella_wire::Capabilities::DEPLOY_PREFIX_CRC;
+    lamella_wire::Capabilities(base.0 | deploy | live)
 }
 
 /// The rustc target triple this crate was compiled for, from the build script -- the only statement
@@ -1681,8 +1683,9 @@ fn wait_until(
 }
 
 /// One pass of the mid-run wire contract, shared by the burst loop and the sleep wait so the two
-/// cannot drift: a `DBG_PAUSE` stops, a `HELLO` reclaims, a `DBG_DETACH` acks and ends, breakpoints
-/// may be edited without pausing first, and anything else is dropped. `None` = keep running.
+/// cannot drift: a `DBG_PAUSE` stops, an `ABORT` ends the run, a `HELLO` is answered while the
+/// program keeps running, a `DBG_DETACH` acks and ends, breakpoints may be edited without pausing
+/// first, and anything else is dropped. `None` = keep running.
 #[cfg(feature = "baked-image")]
 fn service_wire(
     transport: &mut impl Transport,
@@ -2167,6 +2170,11 @@ pub struct ArtifactLoad {
     /// for as long as it needs.
     #[cfg(feature = "baked-image")]
     ready: Option<&'static [u8]>,
+    /// The deploy half's committed prefix: where the last acknowledged chunk ended, and the CRC of the
+    /// flash read back over `[0, end)`. `None` until a chunk is acknowledged, and again after the region
+    /// changes some other way.
+    #[cfg(feature = "baked-image")]
+    deployed: Option<(usize, u32)>,
 }
 
 impl ArtifactLoad {
@@ -2271,26 +2279,39 @@ impl ArtifactLoad {
     fn crc32(&self) -> u32 {
         #[cfg(feature = "baked-image")]
         if let Some(placed) = self.ready {
-            return crc32(placed);
+            return lamella_wire::crc32::of(placed);
         }
-        crc32(&self.bytes)
+        lamella_wire::crc32::of(&self.bytes)
     }
-}
 
-/// CRC-32 (IEEE, reflected, `0xEDB88320`) over `bytes` -- what a transfer reply reports so a host
-/// can check what the target assembled against what it sent.
-///
-/// Computed rather than tabled: a 1 KiB table is real flash on the parts this serves, and a
-/// transfer is already bounded by how fast the bytes arrive.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
-        }
+    /// The CRC a deploy chunk's acknowledgement carries under
+    /// [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`]: `flash`, the region as read back, over
+    /// `[0, offset + len)`.
+    ///
+    /// It is kept as a running CRC while each chunk begins where the last one ended, and recomputed
+    /// from the start of the artifact otherwise -- after a gap, a retried chunk or one sent out of
+    /// order. Reading the whole prefix again for every chunk would make a deploy's cost grow with the
+    /// square of the image. A region too short to hold the prefix answers 0 and keeps nothing.
+    #[cfg(feature = "baked-image")]
+    fn deployed_prefix_crc(&mut self, flash: &[u8], offset: usize, len: usize) -> u32 {
+        let Some(read_back) = offset.checked_add(len).and_then(|end| flash.get(..end)) else {
+            self.deployed = None;
+            return 0;
+        };
+        let crc = match self.deployed {
+            Some((end, crc)) if end == offset => lamella_wire::crc32::update(crc, &read_back[offset..]),
+            _ => lamella_wire::crc32::of(read_back),
+        };
+        self.deployed = Some((read_back.len(), crc));
+        crc
     }
-    !crc
+
+    /// Forgets the deploy half's committed prefix, because the region changed in a way no chunk
+    /// acknowledged: an erase, or a write that failed.
+    #[cfg(feature = "baked-image")]
+    fn forget_deployed_prefix(&mut self) {
+        self.deployed = None;
+    }
 }
 
 /// One [`load::XFER_RESULT`]: `status(u8)`, `crc32(u32 LE)`.
@@ -2600,25 +2621,28 @@ fn serve_deploy_frame(
     match frame.msg_type {
         deploy::DEPLOY_PE | deploy::DEPLOY_IMAGE | deploy::DEPLOY_BUNDLE => {
             let payload = &frame.payload;
-            let status = match payload.get(..CHUNK_HEADER_LEN) {
+            let (status, crc) = match payload.get(..CHUNK_HEADER_LEN) {
                 Some(header) => {
                     let offset =
                         u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
                     let total =
                         u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-                    if flash.program_chunk(offset, &payload[CHUNK_HEADER_LEN..], total) {
-                        xfer::MATCHED
+                    let chunk = &payload[CHUNK_HEADER_LEN..];
+                    if flash.program_chunk(offset, chunk, total) {
+                        let read_back = flash.image_slice();
+                        (xfer::MATCHED, load.deployed_prefix_crc(read_back, offset, chunk.len()))
                     } else {
-                        xfer::WRITE_FAILED
+                        load.forget_deployed_prefix();
+                        (xfer::WRITE_FAILED, 0)
                     }
                 }
-                None => xfer::RANGE_REJECTED,
+                None => (xfer::RANGE_REJECTED, 0),
             };
-            let crc = crc32(flash.image_slice());
             send_xfer_result(transport, frame.seq, status, crc)?;
         }
         deploy::DEPLOY_CLEAR => {
             flash.erase();
+            load.forget_deployed_prefix();
             send_xfer_result(transport, frame.seq, xfer::MATCHED, 0)?;
         }
         deploy::DEPLOY_STATUS => {
@@ -3627,6 +3651,9 @@ pub fn send_repl_reset(transport: &mut impl Transport, seq: u16) -> Result<(), T
 pub struct RunCollector {
     /// The sequence number of the execution this collector is following.
     seq: u16,
+    /// Whether this collector follows a run that no request of its driver started, and so owns the
+    /// first terminal stop at any sequence number ([`RunCollector::unprompted`]).
+    unprompted: bool,
     /// What the program wrote to standard output.
     pub stdout: String,
     /// What the program, or the runner reporting on it, wrote to standard error.
@@ -3636,8 +3663,45 @@ pub struct RunCollector {
     pub debug: String,
     /// The exit code from the terminal stop, once it has arrived.
     exit: Option<i32>,
+    /// The reason the stop that ended the execution gave.
+    reason: Option<u8>,
+    /// The acknowledgement code of a start the target refused, if it refused one.
+    refused_start: Option<u8>,
+    /// The method id and IL offset the ending stop named, once it has arrived.
+    location: Option<(u32, u32)>,
     /// Whether the execution ended -- with or without an exit code, since an ABORT carries none.
     ended: bool,
+}
+
+/// One chunk of a run's streamed output, as [`RunCollector::poll_streaming`] folds it.
+///
+/// The header travels with the text because showing two streams in one terminal needs it: a host
+/// has to know whether the previous chunk left a line open, and only the target knows where its
+/// lines end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputChunk<'a> {
+    /// The stream the target wrote to: [`debug::output::STDOUT`], [`debug::output::STDERR`],
+    /// [`debug::output::DEBUG`], or a stream a board family defines for itself.
+    pub stream: u8,
+    /// The header flags: [`debug::output::ENDS_ON_LINE_BOUNDARY`] and
+    /// [`debug::output::OUTPUT_DROPPED`].
+    pub flags: u8,
+    /// The chunk's text, with any bytes that are not UTF-8 replaced.
+    pub text: &'a str,
+}
+
+impl OutputChunk<'_> {
+    /// Whether this chunk ends a line: the target says so, or the text ends with a newline.
+    #[must_use]
+    pub fn ends_a_line(&self) -> bool {
+        self.flags & debug::output::ENDS_ON_LINE_BOUNDARY != 0 || self.text.ends_with('\n')
+    }
+
+    /// Whether the target dropped output immediately before this chunk.
+    #[must_use]
+    pub fn follows_dropped_output(&self) -> bool {
+        self.flags & debug::output::OUTPUT_DROPPED != 0
+    }
 }
 
 impl RunCollector {
@@ -3645,6 +3709,18 @@ impl RunCollector {
     #[must_use]
     pub fn new(seq: u16) -> Self {
         Self { seq, ..Self::default() }
+    }
+
+    /// A collector following a run that no request of its driver started: a deployed program booted
+    /// by a reset, whose events answer no sequence number the driver sent.
+    ///
+    /// It ends at the first stop that ends a program -- [`debug::reason::DONE`],
+    /// [`debug::reason::TRAP`] or [`debug::reason::ABORTED`] -- whatever sequence number that stop
+    /// carries. A refusal or an [`exec::EXEC_ACK`] is never taken as this run's: with no request of
+    /// its own, there is nothing either could be answering.
+    #[must_use]
+    pub fn unprompted() -> Self {
+        Self { unprompted: true, ..Self::default() }
     }
 
     /// Fold every pending frame into this collector, and report whether the execution has ENDED.
@@ -3657,25 +3733,47 @@ impl RunCollector {
     /// Propagates a [`TransportError`] from the carrier; [`TransportError::Refused`] when the target
     /// answered [`lamella_wire::msg::ERROR`] for this sequence.
     pub fn poll(&mut self, transport: &mut impl Transport) -> Result<bool, TransportError> {
+        self.poll_streaming(transport, &mut |_chunk| {})
+    }
+
+    /// [`RunCollector::poll`], handing each output chunk to `show` as it is folded.
+    ///
+    /// A driver that shows output only once a run has ended makes a program that prints and then
+    /// waits look hung, and shows nothing at all for a run that never ends. `show` sees every chunk
+    /// in arrival order, before the next frame is read, so whatever a caller renders from it is
+    /// visible while the target is still running. Each chunk is folded as well, so
+    /// [`RunCollector::finish`] still has the whole transcript.
+    ///
+    /// # Errors
+    /// As [`RunCollector::poll`].
+    pub fn poll_streaming(
+        &mut self,
+        transport: &mut impl Transport,
+        show: &mut dyn FnMut(OutputChunk<'_>),
+    ) -> Result<bool, TransportError> {
         while let Some(frame) = transport.poll()? {
             match frame.msg_type {
-                debug::EVT_OUTPUT => self.take_output(&frame.payload),
-                debug::EVT_STOPPED if frame.seq == self.seq => {
+                debug::EVT_OUTPUT => self.take_output(&frame.payload, show),
+                debug::EVT_STOPPED if self.ends_at(frame.seq, &frame.payload) => {
                     self.ended = true;
+                    self.reason = frame.payload.first().copied();
                     self.exit = stop_exit(&frame.payload).map(|(exit, _flags)| exit);
-                }
-                lamella_wire::msg::ERROR if frame.seq == self.seq => {
-                    return Err(TransportError::Refused {
-                        reason: frame.payload.first().copied().unwrap_or(0),
-                        msg_type: lamella_wire::error::refused_message_type(&frame.payload)
-                            .unwrap_or(0),
-                        holder: lamella_wire::error::session_holder(&frame.payload),
+                    self.location = frame.payload.get(1..9).map(|site| {
+                        let method = u32::from_le_bytes([site[0], site[1], site[2], site[3]]);
+                        let offset = u32::from_le_bytes([site[4], site[5], site[6], site[7]]);
+                        (method, offset)
                     });
                 }
-                exec::EXEC_ACK if frame.seq == self.seq => {
+                lamella_wire::msg::ERROR if self.answers(frame.seq) => {
+                    return Err(lamella_wire::error::refusal(&frame.payload));
+                }
+                exec::EXEC_ACK if self.answers(frame.seq) => {
                     match frame.payload.first().copied() {
                         Some(exec::ack::STARTED | exec::ack::RUNNING) => {}
-                        _ => self.ended = true,
+                        refusal => {
+                            self.ended = true;
+                            self.refused_start = refusal;
+                        }
                     }
                 }
                 _ => {}
@@ -3684,12 +3782,61 @@ impl RunCollector {
         Ok(self.ended)
     }
 
-    /// One [`debug::EVT_OUTPUT`] payload -- `stream(u8)`, `flags(u8)`, bytes -- into the stream it
-    /// names.
-    fn take_output(&mut self, payload: &[u8]) {
+    /// Whether a stop tagged `seq` ends this collector's execution. A collector with a request of its
+    /// own owns every stop for that request; an unprompted one owns the first stop that ends a
+    /// program.
+    fn ends_at(&self, seq: u16, payload: &[u8]) -> bool {
+        if self.unprompted {
+            matches!(
+                payload.first().copied(),
+                Some(debug::reason::DONE | debug::reason::TRAP | debug::reason::ABORTED)
+            )
+        } else {
+            seq == self.seq
+        }
+    }
+
+    /// Whether a reply tagged `seq` answers this collector's request. An unprompted collector made no
+    /// request, so nothing answers it.
+    fn answers(&self, seq: u16) -> bool {
+        !self.unprompted && seq == self.seq
+    }
+
+    /// The reason carried by the stop that ended the execution, or `None` while it has not stopped
+    /// and when it ended because its start was refused.
+    #[must_use]
+    pub fn stop_reason(&self) -> Option<u8> {
+        self.reason
+    }
+
+    /// The exit value the ending stop carried. `None` until the execution ends, and for an ending that
+    /// carries none: an abort, or a refused start.
+    #[must_use]
+    pub fn exit_value(&self) -> Option<i32> {
+        self.exit
+    }
+
+    /// The acknowledgement code the target gave when it refused to start this execution, if it did.
+    #[must_use]
+    pub fn start_refusal(&self) -> Option<u8> {
+        self.refused_start
+    }
+
+    /// The method id and IL offset the ending stop named: `None` while the execution has not stopped,
+    /// when its start was refused, and when the stop was too short to name a site. A stop with no
+    /// site -- a program that returned -- names zeros.
+    #[must_use]
+    pub fn stop_location(&self) -> Option<(u32, u32)> {
+        self.location
+    }
+
+    /// One [`debug::EVT_OUTPUT`] payload -- `stream(u8)`, `flags(u8)`, bytes -- shown, then folded into
+    /// the stream it names.
+    fn take_output(&mut self, payload: &[u8], show: &mut dyn FnMut(OutputChunk<'_>)) {
         let Some((&stream, rest)) = payload.split_first() else { return };
-        let Some((_flags, bytes)) = rest.split_first() else { return };
+        let Some((&flags, bytes)) = rest.split_first() else { return };
         let text = String::from_utf8_lossy(bytes);
+        show(OutputChunk { stream, flags, text: &text });
         match stream {
             debug::output::STDERR => self.stderr.push_str(&text),
             debug::output::DEBUG => self.debug.push_str(&text),
@@ -3780,6 +3927,13 @@ mod tests {
             assert!(!deploy_caps_with(base, 0).has(Capabilities::LIVE_MEMORY));
             assert!(deploy_caps_with(base, 1024).has(Capabilities::LIVE_MEMORY));
             assert!(deploy_caps_with(base, 0).has(Capabilities::DEBUG_BOOT_DEPLOYED));
+        }
+
+        #[test]
+        fn a_deploy_serve_promises_the_prefix_crc_its_deploy_arm_answers() {
+            let base = Capabilities(Capabilities::BAKED_IMAGE);
+            assert!(deploy_caps_with(base, 0).has(Capabilities::DEPLOY_PREFIX_CRC));
+            assert!(deploy_caps_with(base, 1024).has(Capabilities::DEPLOY_PREFIX_CRC));
         }
     }
 
@@ -3997,6 +4151,106 @@ mod tests {
         target.send(msg::ERROR, 5, &error::unknown_message_type(exec::EXEC)).unwrap();
         driver.feed(&target.take_sent());
         assert!(!RunCollector::new(4).poll(&mut driver).unwrap());
+    }
+
+    /// A streaming poll hands out every chunk as it folds it, in arrival order and with the header the
+    /// target sent, and the collector still ends up holding what a plain poll would.
+    #[test]
+    fn a_streaming_poll_shows_each_chunk_in_arrival_order_as_it_folds_it() {
+        use lamella_wire::MemTransport;
+
+        let mut target = MemTransport::new();
+        let mut driver = MemTransport::new();
+        send_output(&mut target, debug::output::STDOUT, "work").unwrap();
+        send_output(&mut target, debug::output::DEBUG, "trace\n").unwrap();
+        send_output(&mut target, debug::output::STDOUT, "ing\n").unwrap();
+        driver.feed(&target.take_sent());
+
+        let mut shown = Vec::new();
+        let mut run = RunCollector::new(9);
+        let ended = run
+            .poll_streaming(&mut driver, &mut |chunk| {
+                shown.push((chunk.stream, chunk.ends_a_line(), chunk.text.to_string()));
+            })
+            .unwrap();
+        assert!(!ended, "output alone does not end an execution");
+        assert_eq!(
+            shown,
+            vec![
+                (debug::output::STDOUT, false, "work".to_string()),
+                (debug::output::DEBUG, true, "trace\n".to_string()),
+                (debug::output::STDOUT, true, "ing\n".to_string()),
+            ]
+        );
+        assert_eq!(run.stdout, "working\n");
+        assert_eq!(run.debug, "trace\n");
+    }
+
+    /// A run no request started ends at the first stop that ends a program, whatever its sequence
+    /// number, and takes no other request's refusal, start acknowledgement or pause as its own.
+    #[test]
+    fn an_unprompted_collector_ends_at_a_program_ending_stop_and_owns_no_reply() {
+        use lamella_wire::{MemTransport, error, msg};
+
+        let mut target = MemTransport::new();
+        let mut driver = MemTransport::new();
+        target.send(msg::ERROR, 4, &error::unknown_message_type(exec::EXEC)).unwrap();
+        target.send(exec::EXEC_ACK, 4, &[exec::ack::NOTHING_TO_RUN]).unwrap();
+        send_stopped_result(&mut target, 4, debug::reason::PAUSED, 0).unwrap();
+        driver.feed(&target.take_sent());
+        let mut run = RunCollector::unprompted();
+        assert_eq!(run.poll(&mut driver), Ok(false), "none of those three is this run's");
+        assert_eq!(run.start_refusal(), None);
+
+        send_stopped_result(&mut target, 0, debug::reason::TRAP, 70).unwrap();
+        driver.feed(&target.take_sent());
+        assert_eq!(run.poll(&mut driver), Ok(true), "a trap ends it, at any sequence number");
+        assert_eq!(run.stop_reason(), Some(debug::reason::TRAP));
+        assert_eq!(run.exit_value(), Some(70));
+
+        let mut aborted = MemTransport::new();
+        let mut abort = vec![debug::reason::ABORTED];
+        abort.extend_from_slice(&[0; 8]);
+        target.send(debug::EVT_STOPPED, 3, &abort).unwrap();
+        aborted.feed(&target.take_sent());
+        let mut run = RunCollector::unprompted();
+        assert_eq!(run.poll(&mut aborted), Ok(true), "an abort ends it too");
+        assert_eq!(run.exit_value(), None);
+        assert_eq!(run.finish().expect("an ended run").exit, -2);
+    }
+
+    /// A refused start ends the run, and the collector keeps the code the target gave.
+    #[test]
+    fn a_refused_start_keeps_the_code_the_target_gave() {
+        use lamella_wire::MemTransport;
+
+        let mut target = MemTransport::new();
+        let mut driver = MemTransport::new();
+        target.send(exec::EXEC_ACK, 4, &[exec::ack::NOTHING_TO_RUN]).unwrap();
+        driver.feed(&target.take_sent());
+        let mut run = RunCollector::new(4);
+        assert!(run.poll(&mut driver).unwrap(), "a refused start ends the run");
+        assert_eq!(run.start_refusal(), Some(exec::ack::NOTHING_TO_RUN));
+        assert_eq!(run.stop_reason(), None);
+    }
+
+    /// The stop that ends a collector's wait names where execution stopped.
+    #[test]
+    fn a_stop_names_the_method_and_offset_it_stopped_at() {
+        use lamella_wire::MemTransport;
+
+        let mut target = MemTransport::new();
+        let mut driver = MemTransport::new();
+        let mut step = vec![debug::reason::STEP];
+        step.extend_from_slice(&5u32.to_le_bytes());
+        step.extend_from_slice(&0x12u32.to_le_bytes());
+        target.send(debug::EVT_STOPPED, 4, &step).unwrap();
+        driver.feed(&target.take_sent());
+        let mut run = RunCollector::new(4);
+        assert_eq!(run.stop_location(), None, "nothing has stopped yet");
+        assert!(run.poll(&mut driver).unwrap(), "the stop at the request's sequence ends the wait");
+        assert_eq!(run.stop_location(), Some((5, 0x12)));
+        assert_eq!(run.exit_value(), None, "a step carries no result tail");
     }
 
     #[cfg(feature = "baked-image")]
@@ -5001,6 +5255,96 @@ mod tests {
             seq += 1;
         }
         assert_eq!(sink.data, image, "the reassembled image matches the original");
+    }
+
+    #[cfg(feature = "baked-image")]
+    struct ReadsBack(&'static [u8]);
+
+    #[cfg(feature = "baked-image")]
+    impl FlashSink for ReadsBack {
+        fn image_slice(&self) -> &'static [u8] {
+            self.0
+        }
+        fn erase(&mut self) {}
+        fn program(&mut self, _image: &[u8]) -> bool {
+            false
+        }
+        fn program_chunk(&mut self, offset: usize, chunk: &[u8], _total: usize) -> bool {
+            offset + chunk.len() <= self.0.len()
+        }
+    }
+
+    /// Deploys `chunks` -- `(offset, bytes)`, in the order given, each declaring `total` -- through one
+    /// arena, as a firmware's serve loop does, and answers each acknowledgement's status and CRC.
+    #[cfg(feature = "baked-image")]
+    fn deploy_chunks(flash: &mut impl FlashSink, total: usize, chunks: &[(usize, &[u8])]) -> Vec<(u8, u32)> {
+        use lamella_wire::MemTransport;
+
+        let mut arena = ArtifactLoad::new();
+        let mut acks = Vec::new();
+        for (seq, &(offset, bytes)) in chunks.iter().enumerate() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(offset as u32).to_le_bytes());
+            payload.extend_from_slice(&(total as u32).to_le_bytes());
+            payload.extend_from_slice(bytes);
+            let mut driver = MemTransport::new();
+            let mut runner = MemTransport::new();
+            driver.send(deploy::DEPLOY_IMAGE, seq as u16, &payload).unwrap();
+            runner.feed(&driver.take_sent());
+            assert_eq!(serve_one_deploy(&mut runner, flash, &mut arena).unwrap(), Served::Handled);
+            driver.feed(&runner.take_sent());
+            let ack = driver.poll().unwrap().expect("a chunk acknowledgement");
+            assert_eq!(ack.msg_type, deploy::XFER_RESULT);
+            let crc = u32::from_le_bytes([ack.payload[1], ack.payload[2], ack.payload[3], ack.payload[4]]);
+            acks.push((ack.payload[0], crc));
+        }
+        acks
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_deploy_acknowledges_each_chunk_with_the_crc_of_the_prefix_read_back() {
+        let image: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut region = image.clone();
+        region.resize(131_072, 0xFF);
+        let mut flash = ReadsBack(Box::leak(region.into_boxed_slice()));
+        let chunks: Vec<(usize, &[u8])> =
+            image.chunks(32_768).enumerate().map(|(index, chunk)| (index * 32_768, chunk)).collect();
+        let acks = deploy_chunks(&mut flash, image.len(), &chunks);
+        assert_eq!(acks.len(), 4);
+        for (index, &(status, crc)) in acks.iter().enumerate() {
+            let end = ((index + 1) * 32_768).min(image.len());
+            assert_eq!(status, deploy::xfer::MATCHED, "chunk {index}");
+            assert_eq!(crc, lamella_wire::crc32::of(&image[..end]), "chunk {index} covers [0, {end})");
+        }
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_chunk_that_does_not_continue_the_last_one_is_answered_from_the_start_of_the_artifact() {
+        let image: Vec<u8> = (0..96_000u32).map(|i| (i % 241) as u8).collect();
+        let mut flash = ReadsBack(Box::leak(image.clone().into_boxed_slice()));
+        let part = |index: usize| (index * 32_000, &image[index * 32_000..(index + 1) * 32_000]);
+        let acks = deploy_chunks(&mut flash, image.len(), &[part(0), part(2), part(1), part(1)]);
+        let expected =
+            [32_000, 96_000, 64_000, 64_000].map(|end| (deploy::xfer::MATCHED, lamella_wire::crc32::of(&image[..end])));
+        assert_eq!(acks, expected);
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn flash_that_does_not_hold_what_was_sent_shows_in_every_crc_from_that_chunk_on() {
+        let image: Vec<u8> = (0..96_000u32).map(|i| (i % 239) as u8).collect();
+        let mut held = image.clone();
+        held[40_000] ^= 0x01;
+        let mut flash = ReadsBack(Box::leak(held.into_boxed_slice()));
+        let chunks: Vec<(usize, &[u8])> =
+            image.chunks(32_000).enumerate().map(|(index, chunk)| (index * 32_000, chunk)).collect();
+        let acks = deploy_chunks(&mut flash, image.len(), &chunks);
+        let sent = |end: usize| lamella_wire::crc32::of(&image[..end]);
+        assert_eq!(acks[0], (deploy::xfer::MATCHED, sent(32_000)), "the first chunk is held as sent");
+        assert_ne!(acks[1].1, sent(64_000), "the second holds the changed byte");
+        assert_ne!(acks[2].1, sent(96_000), "and every prefix after it holds it too");
     }
 
     #[cfg(feature = "baked-image")]

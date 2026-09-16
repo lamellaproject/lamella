@@ -2,8 +2,25 @@
 #![forbid(unsafe_code)]
 
 //! CIL emission for C# 1.0 (ECMA-335 1st edition, Partition III).
+//!
+//! The back of the front end: it lowers the binder's typed bound tree
+//! ([`lamella_binder`]) to CIL -- the stack-based instruction stream
+//! ([`lamella_cil`]) that the runtime executes and the backend lowers to native.
+//! Emission walks each [`BoundExpr`](lamella_binder::BoundExpr) and
+//! [`BoundStmt`](lamella_binder::BoundStmt), pushing values onto the evaluation
+//! stack the way the bound tree's shape dictates.
+//!
+//! The crate is `no_std` + `alloc`, so the same emitter runs on a host and, for the
+//! on-device REPL, on a microcontroller.
+//!
+//! **One thing differs by target.** On a host, every compile entry point runs its work on a thread
+//! with a 64 MiB stack, so deeply nested source cannot overflow the ~1 MiB a main thread starts
+//! with. A target without threads -- WebAssembly, or a microcontroller -- compiles on the stack it
+//! has, and how deeply source may nest there depends on that stack.
 
 extern crate alloc;
+#[cfg(all(not(test), any(unix, windows)))]
+extern crate std;
 
 pub mod awaitlower;
 pub mod compile;

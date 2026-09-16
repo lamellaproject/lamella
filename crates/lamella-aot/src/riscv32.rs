@@ -8,11 +8,13 @@ use lamella_ir::{
     VerifyError,
 };
 
+use crate::cil::{CheckStubs, InlineCheck};
 use crate::resolver::{
     ARRAY_DESC_MARK, STRING_ALLOCATING_SEAMS, STRING_TYPEDESC_SYMBOL, TypeMeta, VtableEntry,
     descriptor_symbol,
 };
 use crate::stringgen::CONSOLE_WRITE_BYTES;
+use crate::target::falls_through;
 pub use crate::resolver::DescQualifiers;
 pub use crate::stackmaps::AssemblyStatics;
 use crate::stackmaps::{
@@ -188,10 +190,13 @@ const FRAME_IMM_MAX: i32 = 2047;
 /// `lw rd, off(sp)`, extended past [`FRAME_IMM_MAX`]. The address is assembled in the DESTINATION
 /// register, so a far load needs no scratch at all -- the same trick arm32's `slot_load` uses.
 /// Byte-identical to a bare `lw` for an in-range offset, so converting every site is behaviour-free
-/// for every frame that already fit.
+/// for every frame that already fit. A near load of the word `rd` already holds -- the instruction
+/// just emitted stored it ([`Encoder::holds_sp_slot`]) -- emits nothing.
 fn slot_load(enc: &mut Encoder, rd: Reg, off: i32) {
     if (-2048..=FRAME_IMM_MAX).contains(&off) {
-        enc.lw(rd, Reg::SP, off);
+        if !enc.holds_sp_slot(rd, off) {
+            enc.lw(rd, Reg::SP, off);
+        }
         return;
     }
     enc.li(rd, off);
@@ -210,6 +215,28 @@ fn slot_store(enc: &mut Encoder, rs: Reg, off: i32) {
     enc.li(far, off);
     enc.add(far, far, Reg::SP);
     enc.sw(rs, far, 0);
+}
+
+/// Ends a block on `value`: control goes to `if_true` when it is nonzero and to `if_false`
+/// otherwise. An edge to the block emitted next falls through ([`falls_through`]); for the true
+/// edge that means branching on the inverse condition.
+fn branch_on_nonzero(
+    enc: &mut Encoder,
+    value: Reg,
+    from: usize,
+    if_true: lamella_ir::BlockId,
+    true_label: Label,
+    if_false: lamella_ir::BlockId,
+    false_label: Label,
+) {
+    if falls_through(from, if_false) {
+        enc.branch(BranchCond::Ne, value, Reg::ZERO, true_label);
+    } else if falls_through(from, if_true) {
+        enc.branch(BranchCond::Eq, value, Reg::ZERO, false_label);
+    } else {
+        enc.branch(BranchCond::Ne, value, Reg::ZERO, true_label);
+        enc.j(false_label);
+    }
 }
 
 /// The prologue's `addi sp, sp, -frame`, extended past [`FRAME_IMM_MAX`] via [`far_scratch`]. x30 is
@@ -334,6 +361,37 @@ fn int64_soft_routine(op: BinOp) -> Option<&'static str> {
         BinOp::RemUnsigned => Some("__umoddi3"),
         _ => None,
     }
+}
+
+/// Whether `op` is an integer divide or remainder: the operations that raise DivideByZeroException on a
+/// zero divisor.
+fn is_divide_op(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::DivSigned | BinOp::DivUnsigned | BinOp::RemSigned | BinOp::RemUnsigned
+    )
+}
+
+/// Emits the test an integer `div` or `rem` makes before it divides: a zero `divisor` branches to the
+/// function's `DivideByZeroException` stub entry. RV32M's divide instructions do not trap -- a zero
+/// divisor gives a quotient with every bit set and a remainder equal to the dividend -- and the soft
+/// routines do not either, so without this a division by zero answers a number where the CLI raises
+/// DivideByZeroException.
+fn emit_divisor_zero_test(enc: &mut Encoder, divisor: Reg, stubs: &mut CheckStubs<Label>) {
+    let zero = stubs.entry(InlineCheck::DivideByZero, || enc.new_label());
+    enc.branch(BranchCond::Eq, divisor, Reg::ZERO, zero);
+}
+
+/// [`emit_divisor_zero_test`] for a 64-bit divisor held in `low` and `high`; `scratch` takes their OR.
+fn emit_divisor_zero_test64(
+    enc: &mut Encoder,
+    low: Reg,
+    high: Reg,
+    scratch: Reg,
+    stubs: &mut CheckStubs<Label>,
+) {
+    enc.or(scratch, low, high);
+    emit_divisor_zero_test(enc, scratch, stubs);
 }
 
 /// Whether `value` is a float (`f32`/`f64`). The RV32IM/RV32E cores have no FPU, so every float op lowers
@@ -1930,6 +1988,7 @@ fn lower_function(
         }
     }
 
+    let mut stubs = CheckStubs::default();
     let block_labels: Vec<Label> = (0..func.blocks.len()).map(|_| enc.new_label()).collect();
     if func.entry != lamella_ir::BlockId(0) {
         enc.j(block_labels[func.entry.index()]);
@@ -1951,6 +2010,7 @@ fn lower_function(
                 inst,
                 relocs,
                 relocate,
+                &mut stubs,
             )?;
         }
 
@@ -1989,7 +2049,9 @@ fn lower_function(
                         enc.mv(reg(*p), reg(*a));
                     }
                 }
-                enc.j(block_labels[target.index()]);
+                if !falls_through(index, *target) {
+                    enc.j(block_labels[target.index()]);
+                }
             }
             Some(Terminator::Branch {
                 cond,
@@ -2003,11 +2065,34 @@ fn lower_function(
                 }
                 let true_label = block_labels[if_true.index()];
                 let false_label = block_labels[if_false.index()];
-                enc.branch(BranchCond::Ne, reg(*cond), Reg::ZERO, true_label);
-                enc.j(false_label);
+                branch_on_nonzero(enc, reg(*cond), index, *if_true, true_label, *if_false, false_label);
             }
             Some(Terminator::Unreachable) => enc.ebreak(),
             None => return Err(LowerError::ControlFlowUnsupported),
+        }
+    }
+    if !stubs.is_empty() {
+        let mut statics_ptr_pool: Vec<((u32, i32), Label)> = Vec::new();
+        let two_words = matches!(func.ret, Some(MirType::I64 | MirType::F64));
+        emit_check_stubs(enc, &stubs, two_words, &mut statics_ptr_pool, relocate, |enc| {
+            let mut offset = 0i32;
+            if has_calls {
+                slot_load(enc, Reg::RA, offset);
+                offset += 4;
+            }
+            for &r in used {
+                slot_load(enc, r, offset);
+                offset += 4;
+            }
+            if frame > 0 {
+                frame_free(enc, frame);
+            }
+            enc.ret();
+        })?;
+        for ((target, addend), label) in &statics_ptr_pool {
+            enc.bind_label(*label);
+            desc_relocs.push((enc.position(), *target, *addend));
+            enc.emit_word(0);
         }
     }
     Ok(has_calls.then(|| MethodRecordInfo {
@@ -2051,6 +2136,7 @@ fn lower_inst(
     inst: &Inst,
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
+    stubs: &mut CheckStubs<Label>,
 ) -> Result<(), LowerError> {
     match inst {
         Inst::ConstInt { value, .. } => enc.li(reg(result), *value as i32),
@@ -2090,6 +2176,7 @@ fn lower_inst(
             if !is_pointer(value_types, *base) {
                 return Err(LowerError::Unsupported);
             }
+            emit_null_test(enc, value_types, *base, reg(*base), stubs);
             enc.lw(reg(result), reg(*base), field_offset(*offset)?);
         }
         Inst::FieldStore {
@@ -2100,6 +2187,7 @@ fn lower_inst(
             if !is_pointer(value_types, *base) {
                 return Err(LowerError::Unsupported);
             }
+            emit_null_test(enc, value_types, *base, reg(*base), stubs);
             enc.sw(reg(*value), reg(*base), field_offset(*offset)?);
         }
         Inst::FieldLoadNarrow {
@@ -2111,6 +2199,7 @@ fn lower_inst(
             if !is_pointer(value_types, *base) {
                 return Err(LowerError::Unsupported);
             }
+            emit_null_test(enc, value_types, *base, reg(*base), stubs);
             let off = field_offset(*offset)?;
             match (*size, *signed) {
                 (1, false) => enc.lbu(reg(result), reg(*base), off),
@@ -2129,6 +2218,7 @@ fn lower_inst(
             if !is_pointer(value_types, *base) {
                 return Err(LowerError::Unsupported);
             }
+            emit_null_test(enc, value_types, *base, reg(*base), stubs);
             let off = field_offset(*offset)?;
             match *size {
                 1 => enc.sb(reg(*value), reg(*base), off),
@@ -2157,6 +2247,7 @@ fn lower_inst(
                 reg(*index),
                 *element_size,
                 RiscvProfile::Rv32im,
+                stubs,
             );
             match (*element_size, *signed) {
                 (1, true) => enc.lb(reg(result), scratch(), 4),
@@ -2181,6 +2272,7 @@ fn lower_inst(
                 reg(*index),
                 *element_size,
                 RiscvProfile::Rv32im,
+                stubs,
             );
             match *element_size {
                 1 => enc.sb(reg(*value), scratch(), 4),
@@ -2199,11 +2291,15 @@ fn lower_inst(
                 reg(*index),
                 *element_size,
                 RiscvProfile::Rv32im,
+                stubs,
             );
             enc.addi(reg(result), scratch(), 4);
         }
         Inst::Binary { op, lhs, rhs } => {
             let (d, a, b) = (reg(result), reg(*lhs), reg(*rhs));
+            if is_divide_op(*op) {
+                emit_divisor_zero_test(enc, b, stubs);
+            }
             match op {
                 BinOp::Add => enc.add(d, a, b),
                 BinOp::Sub => enc.sub(d, a, b),
@@ -2279,6 +2375,7 @@ fn lower_inst(
                 Reg::T0,
                 Reg::T1,
                 RiscvProfile::Rv32im,
+                stubs,
             );
             match (*element_size, *signed) {
                 (1, true) => enc.lb(reg(result), scratch(), 0),
@@ -2307,6 +2404,7 @@ fn lower_inst(
                 Reg::T0,
                 Reg::T1,
                 RiscvProfile::Rv32im,
+                stubs,
             );
             match *element_size {
                 1 => enc.sb(reg(*value), scratch(), 0),
@@ -2433,12 +2531,16 @@ fn lower_function_spilled(
         .blocks
         .iter()
         .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::InvokeDelegate { .. })));
+    let delegate_result_wide = func.blocks.iter().flat_map(|b| &b.insts).any(|(result, i)| {
+        matches!(i, Inst::InvokeDelegate { .. }) && value_words(&func.value_types, *result) >= 2
+    });
     let mc_off = sret_off + returns_sret as i32 * 4;
     let frame = ((used
         + has_calls as i32 * 4
         + saves_scratch as i32 * 4
         + returns_sret as i32 * 4
-        + invokes_delegate as i32 * 8) as usize)
+        + invokes_delegate as i32 * 8
+        + delegate_result_wide as i32 * 4) as usize)
         .div_ceil(16)
         * 16;
     let frame_ceiling = match profile {
@@ -2466,6 +2568,7 @@ fn lower_function_spilled(
     let mut desc_ptr_pool: Vec<(TypeHandle, Label)> = Vec::new();
     let mut func_ptr_pool: Vec<(u32, Label)> = Vec::new();
     let mut statics_ptr_pool: Vec<((u32, i32), Label)> = Vec::new();
+    let mut stubs = CheckStubs::default();
 
     if frame > 0 {
         frame_alloc(enc, frame);
@@ -2559,6 +2662,7 @@ fn lower_function_spilled(
                 relocs,
                 relocate,
                 mc_off,
+                &mut stubs,
             )?;
         }
         if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
@@ -2607,7 +2711,9 @@ fn lower_function_spilled(
                         slot_store(enc, Reg::T0, slot(*p) + w * 4);
                     }
                 }
-                enc.j(block_labels[target.index()]);
+                if !falls_through(index, *target) {
+                    enc.j(block_labels[target.index()]);
+                }
             }
             Some(Terminator::Branch {
                 cond,
@@ -2622,12 +2728,27 @@ fn lower_function_spilled(
                 let true_label = block_labels[if_true.index()];
                 let false_label = block_labels[if_false.index()];
                 slot_load(enc, Reg::T0, slot(*cond));
-                enc.branch(BranchCond::Ne, Reg::T0, Reg::ZERO, true_label);
-                enc.j(false_label);
+                branch_on_nonzero(enc, Reg::T0, index, *if_true, true_label, *if_false, false_label);
             }
             Some(Terminator::Unreachable) => enc.ebreak(),
             None => return Err(LowerError::ControlFlowUnsupported),
         }
+    }
+    if !stubs.is_empty() {
+        let two_words = matches!(func.ret, Some(MirType::I64 | MirType::F64));
+        let scratch = spilled_scratch(profile);
+        emit_check_stubs(enc, &stubs, two_words, &mut statics_ptr_pool, relocate, |enc| {
+            if has_calls {
+                slot_load(enc, Reg::RA, ra_off);
+            }
+            if saves_scratch {
+                slot_load(enc, scratch, scratch_off);
+            }
+            if frame > 0 {
+                frame_free(enc, frame);
+            }
+            enc.ret();
+        })?;
     }
     let mut ancestor = 0;
     while ancestor < type_desc_labels.len() {
@@ -2727,6 +2848,7 @@ fn lower_inst_spilled(
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
     mc_off: i32,
+    stubs: &mut CheckStubs<Label>,
 ) -> Result<(), LowerError> {
     let (t0, t1, t2) = (Reg::T0, Reg::T1, Reg::T2);
     let scratch = spilled_scratch(profile);
@@ -2771,6 +2893,9 @@ fn lower_inst_spilled(
                     slot_load(enc, Reg::A1, slot(*lhs) + 4);
                     slot_load(enc, a2, slot(*rhs));
                     slot_load(enc, a3, slot(*rhs) + 4);
+                    if is_divide_op(*op) {
+                        emit_divisor_zero_test64(enc, a2, a3, t0, stubs);
+                    }
                     let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
                     emit_call(enc, func_labels, relocs, relocate, target)?;
                     slot_store(enc, Reg::A0, slot(result));
@@ -2808,12 +2933,18 @@ fn lower_inst_spilled(
             } else if matches!(profile, RiscvProfile::Rv32ec) && is_soft_int_binop(*op) {
                 slot_load(enc, Reg::A0, slot(*lhs));
                 slot_load(enc, Reg::A1, slot(*rhs));
+                if is_divide_op(*op) {
+                    emit_divisor_zero_test(enc, Reg::A1, stubs);
+                }
                 let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, soft_int_routine(*op));
                 emit_call(enc, func_labels, relocs, relocate, target)?;
                 slot_store(enc, Reg::A0, slot(result));
             } else {
                 slot_load(enc, t0, slot(*lhs));
                 slot_load(enc, t1, slot(*rhs));
+                if is_divide_op(*op) {
+                    emit_divisor_zero_test(enc, t1, stubs);
+                }
                 match op {
                     BinOp::Add => enc.add(t0, t0, t1),
                     BinOp::Sub => enc.sub(t0, t0, t1),
@@ -3024,7 +3155,17 @@ fn lower_inst_spilled(
             slot_load(enc, t0, slot(*array));
             slot_load(enc, t1, slot(*index0));
             slot_load(enc, t2, slot(*index1));
-            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
+            emit_2d_element_address(
+                enc,
+                t0,
+                t1,
+                t2,
+                *element_size,
+                Reg::A0,
+                Reg::A1,
+                profile,
+                stubs,
+            );
             match (*element_size, *signed) {
                 (1, true) => enc.lb(t0, scratch, 0),
                 (1, false) => enc.lbu(t0, scratch, 0),
@@ -3054,7 +3195,17 @@ fn lower_inst_spilled(
             slot_load(enc, t0, slot(*array));
             slot_load(enc, t1, slot(*index0));
             slot_load(enc, t2, slot(*index1));
-            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
+            emit_2d_element_address(
+                enc,
+                t0,
+                t1,
+                t2,
+                *element_size,
+                Reg::A0,
+                Reg::A1,
+                profile,
+                stubs,
+            );
             slot_load(enc, t0, slot(*value));
             match *element_size {
                 1 => enc.sb(t0, scratch, 0),
@@ -3134,7 +3285,17 @@ fn lower_inst_spilled(
             slot_load(enc, t0, slot(*array));
             slot_load(enc, t1, slot(*index0));
             slot_load(enc, t2, slot(*index1));
-            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
+            emit_2d_element_address(
+                enc,
+                t0,
+                t1,
+                t2,
+                *element_size,
+                Reg::A0,
+                Reg::A1,
+                profile,
+                stubs,
+            );
             slot_store(enc, scratch, slot(result));
         }
         Inst::ArrayMDElemAddr {
@@ -3146,7 +3307,7 @@ fn lower_inst_spilled(
                 return Err(LowerError::Unsupported);
             }
             slot_load(enc, t0, slot(*array));
-            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
+            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size, stubs);
             slot_store(enc, t1, slot(result));
         }
         Inst::ArrayMDLoad {
@@ -3159,7 +3320,7 @@ fn lower_inst_spilled(
                 return Err(LowerError::Unsupported);
             }
             slot_load(enc, t0, slot(*array));
-            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
+            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size, stubs);
             match (*element_size, *signed) {
                 (1, true) => enc.lb(t0, t1, 0),
                 (1, false) => enc.lbu(t0, t1, 0),
@@ -3186,7 +3347,7 @@ fn lower_inst_spilled(
                 return Err(LowerError::Unsupported);
             }
             slot_load(enc, t0, slot(*array));
-            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
+            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size, stubs);
             slot_load(enc, t0, slot(*value));
             match *element_size {
                 1 => enc.sb(t0, t1, 0),
@@ -3240,6 +3401,7 @@ fn lower_inst_spilled(
             if let Some((full_words, rem)) = value_type_copy_extent(value_types, result) {
                 if ptr {
                     slot_load(enc, t0, slot(*base));
+                    emit_null_test(enc, value_types, *base, t0, stubs);
                 }
                 for w in 0..full_words {
                     let foff = *offset + w * 4;
@@ -3261,6 +3423,7 @@ fn lower_inst_spilled(
                 }
             } else if ptr {
                 slot_load(enc, t0, slot(*base));
+                emit_null_test(enc, value_types, *base, t0, stubs);
                 enc.lw(t1, t0, field_offset(*offset)?);
                 slot_store(enc, t1, slot(result));
             } else {
@@ -3277,6 +3440,7 @@ fn lower_inst_spilled(
             if let Some((full_words, rem)) = value_type_copy_extent(value_types, *value) {
                 if ptr {
                     slot_load(enc, t0, slot(*base));
+                    emit_null_test(enc, value_types, *base, t0, stubs);
                 }
                 for w in 0..full_words {
                     let foff = *offset + w * 4;
@@ -3298,6 +3462,7 @@ fn lower_inst_spilled(
                 }
             } else if ptr {
                 slot_load(enc, t0, slot(*base));
+                emit_null_test(enc, value_types, *base, t0, stubs);
                 slot_load(enc, t1, slot(*value));
                 enc.sw(t1, t0, field_offset(*offset)?);
             } else {
@@ -3313,6 +3478,7 @@ fn lower_inst_spilled(
         } => {
             if is_pointer(value_types, *base) {
                 slot_load(enc, t0, slot(*base));
+                emit_null_test(enc, value_types, *base, t0, stubs);
             } else {
                 slot_addr(enc, t0, slot(*base));
             }
@@ -3334,6 +3500,7 @@ fn lower_inst_spilled(
         } => {
             if is_pointer(value_types, *base) {
                 slot_load(enc, t0, slot(*base));
+                emit_null_test(enc, value_types, *base, t0, stubs);
             } else {
                 slot_addr(enc, t0, slot(*base));
             }
@@ -3380,7 +3547,7 @@ fn lower_inst_spilled(
             }
             slot_load(enc, t0, slot(*array));
             slot_load(enc, t1, slot(*index));
-            emit_element_address(enc, t0, t1, *element_size, profile);
+            emit_element_address(enc, t0, t1, *element_size, profile, stubs);
             match (*element_size, *signed) {
                 (1, true) => enc.lb(t2, scratch, 4),
                 (1, false) => enc.lbu(t2, scratch, 4),
@@ -3408,7 +3575,7 @@ fn lower_inst_spilled(
             }
             slot_load(enc, t0, slot(*array));
             slot_load(enc, t1, slot(*index));
-            emit_element_address(enc, t0, t1, *element_size, profile);
+            emit_element_address(enc, t0, t1, *element_size, profile, stubs);
             if *element_size == 8 {
                 slot_load(enc, t2, slot(*value));
                 enc.sw(t2, scratch, 4);
@@ -3430,7 +3597,7 @@ fn lower_inst_spilled(
         } => {
             slot_load(enc, t0, slot(*array));
             slot_load(enc, t1, slot(*index));
-            emit_element_address(enc, t0, t1, *element_size, profile);
+            emit_element_address(enc, t0, t1, *element_size, profile, stubs);
             enc.addi(t2, scratch, 4);
             slot_store(enc, t2, slot(result));
         }
@@ -3616,7 +3783,7 @@ fn lower_inst_spilled(
             slot_load(enc, scratch, slot(*target));
             marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.jalr(Reg::RA, scratch, 0);
-            slot_store(enc, Reg::A0, slot(result));
+            store_call_result(enc, slot, value_types, result);
         }
         Inst::InvokeDelegate { delegate, args, .. } => {
             let mloop = enc.new_label();
@@ -3651,14 +3818,21 @@ fn lower_inst_spilled(
             marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.bind_label(do_call);
             enc.jalr(Reg::RA, scratch, 0);
+            let wide = value_words(value_types, result) >= 2;
             slot_store(enc, Reg::A0, mc_off + 4);
+            if wide {
+                slot_store(enc, Reg::A1, mc_off + 8);
+            }
             slot_load(enc, t0, mc_off);
             enc.addi(t0, t0, 1);
             slot_store(enc, t0, mc_off);
             enc.j(mloop);
             enc.bind_label(mdone);
             slot_load(enc, Reg::A0, mc_off + 4);
-            slot_store(enc, Reg::A0, slot(result));
+            if wide {
+                slot_load(enc, Reg::A1, mc_off + 8);
+            }
+            store_call_result(enc, slot, value_types, result);
         }
         Inst::CallVirtual {
             slot: vslot, args, ..
@@ -3675,7 +3849,7 @@ fn lower_inst_spilled(
             enc.add(scratch, t0, t1);
             marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.jalr(Reg::RA, scratch, 0);
-            slot_store(enc, Reg::A0, slot(result));
+            store_call_result(enc, slot, value_types, result);
         }
         Inst::CallInterface { tag, args, .. } => {
             let receiver = *args.first().ok_or(LowerError::ControlFlowUnsupported)?;
@@ -3715,7 +3889,7 @@ fn lower_inst_spilled(
             enc.add(scratch, t0, scratch);
             marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.jalr(Reg::RA, scratch, 0);
-            slot_store(enc, Reg::A0, slot(result));
+            store_call_result(enc, slot, value_types, result);
         }
         Inst::VirtualFuncAddr {
             object,
@@ -4205,6 +4379,69 @@ fn is_pointer(value_types: &[MirType], value: ValueId) -> bool {
         value_types.get(value.index()),
         Some(MirType::ObjectRef | MirType::ManagedPtr | MirType::NativeInt)
     )
+}
+
+/// Tests the object reference in `reg` for null ahead of an access through it, branching to the
+/// function's `NullReferenceException` stub entry (made on first use), which raises it as a throw with
+/// no handler does. A managed or native pointer is not tested; the ARM backend's twin says why.
+fn emit_null_test(
+    enc: &mut Encoder,
+    value_types: &[MirType],
+    base: ValueId,
+    reg: Reg,
+    stubs: &mut CheckStubs<Label>,
+) {
+    if matches!(value_types.get(base.index()), Some(MirType::ObjectRef)) {
+        emit_reference_null_test(enc, reg, stubs);
+    }
+}
+
+/// Branches to the function's `NullReferenceException` stub entry when the object reference in `reg` is
+/// null: the test ahead of a load through a reference -- a field's object, or an array ahead of its
+/// length.
+fn emit_reference_null_test(enc: &mut Encoder, reg: Reg, stubs: &mut CheckStubs<Label>) {
+    let stub = stubs.entry(InlineCheck::NullReference, || enc.new_label());
+    enc.branch(BranchCond::Eq, reg, Reg::ZERO, stub);
+}
+
+/// Lays a function's exception stubs after its last block: each entry loads its kind's tag, and the
+/// shared tail stores it, then returns a zero through `epilogue`, as a throw with no handler leaves --
+/// so the caller's post-call test sees the tag and routes it. None is a MIR block, so no block is split
+/// and no value moves off its register. The last entry falls into the tail.
+fn emit_check_stubs(
+    enc: &mut Encoder,
+    stubs: &CheckStubs<Label>,
+    two_word_return: bool,
+    statics_ptr_pool: &mut Vec<((u32, i32), Label)>,
+    relocate: bool,
+    epilogue: impl FnOnce(&mut Encoder),
+) -> Result<(), LowerError> {
+    let entries: Vec<(InlineCheck, Label)> = stubs.made().collect();
+    let tail = enc.new_label();
+    for (position, &(kind, entry)) in entries.iter().enumerate() {
+        enc.bind_label(entry);
+        enc.li(Reg::A0, kind.tag() as i32);
+        if position + 1 < entries.len() {
+            enc.j(tail);
+        }
+    }
+    enc.bind_label(tail);
+    emit_static_addr(
+        enc,
+        Reg::T0,
+        Reg::T1,
+        &StaticOwner::Own,
+        crate::cil::G_EXCEPTION_TAG_OFFSET,
+        statics_ptr_pool,
+        relocate,
+    )?;
+    enc.sw(Reg::A0, Reg::T0, 0);
+    enc.li(Reg::A0, 0);
+    if two_word_return {
+        enc.li(Reg::A1, 0);
+    }
+    epilogue(enc);
+    Ok(())
 }
 
 /// The vtable of the type `handle`, as one entry per slot: a module function index (`Some`) or
@@ -4729,9 +4966,10 @@ fn field_offset(offset: u32) -> Result<i32, LowerError> {
     }
 }
 
-/// Emits the bounds check and element-address computation for array access: traps (`ebreak`) unless
-/// `index < length` (the length at `[array+0]`, compared UNSIGNED so a negative index -- a huge
-/// unsigned value -- traps too, matching IndexOutOfRangeException's effect), then leaves
+/// Emits the null and bounds checks and element-address computation for array access: branches to the
+/// function's `NullReferenceException` stub entry when `array` is null, and to its
+/// `IndexOutOfRangeException` entry unless `index < length` (the length at `[array+0]`, compared
+/// UNSIGNED so a negative index -- a huge unsigned value -- raises too), then leaves
 /// `array + index*element_size` in [`scratch`] so the caller's access at offset 4 hits the element
 /// past the length word. The `[u32 length]` prefix is one word regardless of element size, so the +4
 /// is element-size-independent. A power-of-two size scales with a shift; any other with a multiply.
@@ -4741,13 +4979,13 @@ fn emit_element_address(
     index: Reg,
     element_size: u32,
     profile: RiscvProfile,
+    stubs: &mut CheckStubs<Label>,
 ) {
     let s = spilled_scratch(profile);
+    emit_reference_null_test(enc, array, stubs);
     enc.lw(s, array, 0);
-    let ok = enc.new_label();
-    enc.branch(BranchCond::LtU, index, s, ok);
-    enc.ebreak();
-    enc.bind_label(ok);
+    let out_of_range = stubs.entry(InlineCheck::IndexOutOfRange, || enc.new_label());
+    enc.branch(BranchCond::GeU, index, s, out_of_range);
     if element_size.is_power_of_two() {
         enc.slli(s, index, element_size.trailing_zeros());
     } else {
@@ -4758,8 +4996,9 @@ fn emit_element_address(
 }
 
 /// Emits the two per-dimension bounds checks and element-address computation for a 2-D rectangular
-/// array `[u32 dim0][u32 dim1][elements...]`: traps unless `index0 < dim0` (`[array+0]`) and
-/// `index1 < dim1` (`[array+4]`), both UNSIGNED (a negative index traps too), then leaves
+/// array `[u32 dim0][u32 dim1][elements...]`: branches to the function's `IndexOutOfRangeException` stub
+/// entry unless `index0 < dim0` (`[array+0]`) and `index1 < dim1` (`[array+4]`), both UNSIGNED (a
+/// negative index fails too), then leaves
 /// `array + 8 + (index0*dim1 + index1)*element_size` in [`scratch`] so the caller accesses the
 /// element at offset 0. `array`/`index0`/`index1` are read-only; `ta`/`tb` are caller-supplied temps
 /// distinct from those and from `t6` (the register path passes t0/t1, the spilled path a0/a1).
@@ -4773,18 +5012,15 @@ fn emit_2d_element_address(
     ta: Reg,
     tb: Reg,
     profile: RiscvProfile,
+    stubs: &mut CheckStubs<Label>,
 ) {
     let s = spilled_scratch(profile);
+    let out_of_range = stubs.entry(InlineCheck::IndexOutOfRange, || enc.new_label());
+    emit_reference_null_test(enc, array, stubs);
     enc.lw(ta, array, 0);
-    let ok0 = enc.new_label();
-    enc.branch(BranchCond::LtU, index0, ta, ok0);
-    enc.ebreak();
-    enc.bind_label(ok0);
+    enc.branch(BranchCond::GeU, index0, ta, out_of_range);
     enc.lw(tb, array, 4);
-    let ok1 = enc.new_label();
-    enc.branch(BranchCond::LtU, index1, tb, ok1);
-    enc.ebreak();
-    enc.bind_label(ok1);
+    enc.branch(BranchCond::GeU, index1, tb, out_of_range);
     emit_soft_mul32(enc, s, index0, tb, ta, profile);
     enc.add(s, s, index1);
     if element_size.is_power_of_two() {
@@ -4798,7 +5034,8 @@ fn emit_2d_element_address(
 }
 
 /// Emits the rank-N (row-major) element address into `out`, with a per-dimension bounds check (each
-/// `indices[k] < dim_k`, `dim_k` read from `[base + 4*k]`; an out-of-range index traps). The flat index is
+/// `indices[k] < dim_k`, `dim_k` read from `[base + 4*k]`; an index out of range branches to the
+/// function's `IndexOutOfRangeException` stub entry). The flat index is
 /// the Horner fold `((...(i0*dim1 + i1)*dim2 + i2)...) + i(N-1)`, then `* element_size`, then `+ base +
 /// 4*N` (past the N dimension words). `base` is preserved; `tmp`/`tmp2` are scratch. RV32IM only (uses
 /// `mul`); `base`/`out`/`tmp`/`tmp2` must be four distinct registers.
@@ -4812,22 +5049,19 @@ fn emit_md_element_address(
     slot: &impl Fn(ValueId) -> i32,
     indices: &[ValueId],
     element_size: u32,
+    stubs: &mut CheckStubs<Label>,
 ) {
     let n = indices.len();
+    let out_of_range = stubs.entry(InlineCheck::IndexOutOfRange, || enc.new_label());
+    emit_reference_null_test(enc, base, stubs);
     slot_load(enc, out, slot(indices[0]));
     enc.lw(tmp, base, 0);
-    let ok = enc.new_label();
-    enc.branch(BranchCond::LtU, out, tmp, ok);
-    enc.ebreak();
-    enc.bind_label(ok);
+    enc.branch(BranchCond::GeU, out, tmp, out_of_range);
     for (k, &idx) in indices.iter().enumerate().skip(1) {
         enc.lw(tmp, base, 4 * k as i32);
         enc.mul(out, out, tmp);
         slot_load(enc, tmp2, slot(idx));
-        let okk = enc.new_label();
-        enc.branch(BranchCond::LtU, tmp2, tmp, okk);
-        enc.ebreak();
-        enc.bind_label(okk);
+        enc.branch(BranchCond::GeU, tmp2, tmp, out_of_range);
         enc.add(out, out, tmp2);
     }
     if element_size.is_power_of_two() {
@@ -5296,6 +5530,57 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_just_stored_is_not_reloaded_into_the_same_register() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: TypeHandle(0),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let obj = lamella_elf::read_object(
+            &lower_object(&[main, record_leaf()], &["main", "g"], &[], &[]).unwrap(),
+        )
+        .unwrap();
+        let words: Vec<u32> = obj
+            .text
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let sp_store = |w: u32| {
+            ((w & 0x000F_F07F) == 0x0001_2023)
+                .then(|| ((w >> 20) & 31, (((w >> 25) << 5) | ((w >> 7) & 31)) & 0xFFF))
+        };
+        let sp_load =
+            |w: u32| ((w & 0x000F_F07F) == 0x0001_2003).then(|| ((w >> 7) & 31, (w >> 20) & 0xFFF));
+        let reloads = words
+            .windows(2)
+            .filter(|p| matches!((sp_store(p[0]), sp_load(p[1])), (Some(s), Some(l)) if s == l))
+            .count();
+        assert_eq!(reloads, 0, "a spill-slot load straight after its own store");
+    }
+
+    #[test]
     fn lower_object_emits_method_records_with_function_relocations() {
         let main = Function {
             params: Vec::new(),
@@ -5730,6 +6015,88 @@ mod tests {
         }
     }
 
+    fn branch_to_the_next_block(true_edge_next: bool) -> Function {
+        let i32t = MirType::I32;
+        let (if_true, if_false) = if true_edge_next {
+            (BlockId(1), BlockId(2))
+        } else {
+            (BlockId(2), BlockId(1))
+        };
+        Function {
+            params: vec![i32t],
+            ret: Some(i32t),
+            value_types: vec![i32t, i32t, i32t, i32t, i32t],
+            entry: BlockId(0),
+            blocks: vec![
+                BasicBlock {
+                    params: vec![ValueId(0)],
+                    insts: vec![
+                        (ValueId(1), Inst::ConstInt { ty: i32t, value: 0 }),
+                        (
+                            ValueId(2),
+                            Inst::Compare {
+                                op: CmpOp::Eq,
+                                lhs: ValueId(0),
+                                rhs: ValueId(1),
+                            },
+                        ),
+                    ],
+                    terminator: Some(Terminator::Branch {
+                        cond: ValueId(2),
+                        if_true,
+                        true_args: Vec::new(),
+                        if_false,
+                        false_args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![(ValueId(3), Inst::ConstInt { ty: i32t, value: 1 })],
+                    terminator: Some(Terminator::Return(Some(ValueId(3)))),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![(ValueId(4), Inst::ConstInt { ty: i32t, value: 0 })],
+                    terminator: Some(Terminator::Return(Some(ValueId(4)))),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn an_edge_to_the_next_block_falls_through() {
+        let is_branch = |w: u32| (w & 0x7F) == 0x63;
+        let offset_is = |w: u32, imm4_1: u32| (w & 0xFE00_0F80) == (imm4_1 << 8);
+        let is_jump = |w: u32| (w & 0xFFF) == 0x06F;
+        let shapes: Vec<(usize, usize, usize)> = [false, true]
+            .into_iter()
+            .map(|true_edge_next| {
+                let func = branch_to_the_next_block(true_edge_next);
+                assert!(lamella_ir::verify(&func).is_ok());
+                let words: Vec<u32> = lower(&func)
+                    .expect("a two-way branch lowers")
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let to_next = words
+                    .iter()
+                    .filter(|&&w| w == 0x0040_006F || (is_branch(w) && offset_is(w, 2)))
+                    .count();
+                let over_a_jump = words
+                    .windows(2)
+                    .filter(|p| is_branch(p[0]) && offset_is(p[0], 4) && is_jump(p[1]))
+                    .count();
+                let branches = words.iter().filter(|&&w| is_branch(w)).count();
+                (to_next, over_a_jump, branches)
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            [(0, 0, 1), (0, 0, 1)],
+            "(jumps that go nowhere, branches over one, conditional branches) per layout"
+        );
+    }
+
     #[test]
     fn a_compare_reused_by_a_later_block_branch_materializes() {
         let i32t = MirType::I32;
@@ -5795,13 +6162,13 @@ mod tests {
                 .any(|w| w & 0x0000_707F == 0x0000_3013 && (w >> 20) == 1),
             "the Eq compare materializes its 0/1 via SLTIU ..., 1"
         );
-        let bne_on_value = words
+        let branch_on_value = words
             .iter()
-            .filter(|w| *w & 0x0000_707F == 0x0000_1063 && ((*w >> 20) & 31) == 0)
+            .filter(|w| *w & 0x0000_607F == 0x0000_0063 && ((*w >> 20) & 31) == 0)
             .count();
         assert!(
-            bne_on_value >= 2,
-            "both branch sites test the materialized compare against zero (found {bne_on_value})"
+            branch_on_value >= 2,
+            "both branch sites test the materialized compare against zero (found {branch_on_value})"
         );
     }
 

@@ -258,10 +258,8 @@ foreach ($assembly in $Assemblies) {
 }
 
 # An assembly this script STOPPED producing is the one file in $out nothing overwrites, so it sits
-# there at its old date presenting a surface no source in the tree still describes. The Pwm fold
-# left exactly that: a 6-day-old System.Device.Pwm.dll beside the System.Device.Gpio.dll that now
-# carries PwmChannel, so the type resolved from two assemblies at once and the fold looked half
-# done to anything reading the directory. Only names this script OWNS are removed -- $out also
+# there at its old date presenting a surface no source in the tree still describes, so a type
+# that has moved to another assembly resolves from two at once. Only names this script OWNS are removed -- $out also
 # holds board assemblies written by build-boards.ps1, so a blanket clean would delete another
 # script's output.
 $folded = @($Assemblies | ForEach-Object { $_.extraSources } | Where-Object { $_ })

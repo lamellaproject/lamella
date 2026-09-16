@@ -551,7 +551,7 @@ fn a_single_file_program_answers_with_its_one_file() {
     assert_eq!(
         info.device_lines(0x1000).single_file(),
         Some("dir/main.c"),
-        "the shape an AOT program of one source file has, which is the case that hid the defect"
+        "the shape an AOT program of one source file has"
     );
 }
 
@@ -1312,6 +1312,8 @@ const ABBREV: &[u8] = &[
     6, 0x05, 0, 0x31, 0x13, 0x02, 0x18, 0, 0,
     7, 0x2e, 1, 0x03, 0x08, 0, 0,
     8, 0x34, 0, 0x03, 0x08, 0x02, 0x17, 0, 0,
+    9, 0x2e, 1, 0x47, 0x13, 0x11, 0x01, 0x12, 0x06, 0, 0,
+    10, 0x2e, 1, 0x31, 0x13, 0x11, 0x01, 0x12, 0x06, 0, 0,
     0,
 ];
 
@@ -1347,6 +1349,17 @@ impl UnitBuilder {
         self.entries.extend_from_slice(&len.to_le_bytes());
         self.entries.push(frame_base.len() as u8);
         self.entries.extend_from_slice(frame_base);
+        self
+    }
+
+    /// A subprogram definition with no name of its own, occupying `[low, low + len)` and naming
+    /// itself through `reference`: its specification under abbreviation 9, its abstract origin
+    /// under 10.
+    fn referring_subprogram(&mut self, abbrev: u8, reference: u32, low: u32, len: u32) -> &mut Self {
+        self.entries.push(abbrev);
+        self.entries.extend_from_slice(&reference.to_le_bytes());
+        self.entries.extend_from_slice(&low.to_le_bytes());
+        self.entries.extend_from_slice(&len.to_le_bytes());
         self
     }
 
@@ -1472,10 +1485,68 @@ fn a_frame_base_is_a_register_or_the_call_frame_address_and_nothing_else() {
 ///
 /// # THE REFERENCE COUNTS FROM THE UNIT HEADER AND THE CURSOR STARTS AT THE UNIT BODY
 ///
-/// This is the arithmetic that was wrong first: a unit is read through a cursor over its own bytes,
-/// whose offset restarts past the initial length field, while a `DW_FORM_ref4` counts from the
-/// header. Without the shift every reference resolved to whichever entry was recorded first -- real
-/// names against the wrong variables, which is not a shape anybody would file a bug about.
+/// A unit is read through a cursor over its own bytes, whose offset restarts past the initial
+/// length field, while a `DW_FORM_ref4` counts from the header. The shift between the two is what
+/// this checks: without it a reference resolves to whichever entry was recorded first, which puts
+/// real names against the wrong variables rather than failing.
+/// A definition with no name of its own takes its declaration's, through `DW_AT_specification`.
+/// That is how a method defined outside its class is described, and a reader that does not follow
+/// the reference leaves every such body nameless in the function table.
+#[test]
+fn a_definition_named_only_by_its_specification_takes_the_declarations_name() {
+    let mut builder = UnitBuilder::new();
+    let declaration = builder.next_offset();
+    builder.declaration("Blink");
+    builder.close();
+    builder.referring_subprogram(9, declaration, 0x200, 0x20);
+    builder.close();
+    let info = builder.finish();
+
+    let functions = crate::info::functions(&locals_of(&info)).expect("parses");
+    assert_eq!(
+        functions.len(),
+        1,
+        "the declaration occupies no addresses, so it is not a function"
+    );
+    assert_eq!(functions[0].name, &b"Blink"[..]);
+    assert_eq!((functions[0].low_pc, functions[0].high_pc), (0x200, 0x220));
+}
+
+/// A concrete instance takes its name through `DW_AT_abstract_origin`, and a reference to an entry
+/// LATER in the unit resolves as well as one to an earlier, because names are resolved once the unit
+/// has been read.
+#[test]
+fn an_instance_named_by_an_abstract_origin_later_in_the_unit_takes_that_name() {
+    let mut builder = UnitBuilder::new();
+    let declaration = builder.next_offset() + 14;
+    builder.referring_subprogram(10, declaration, 0x300, 0x10);
+    builder.close();
+    builder.declaration("inlined");
+    builder.close();
+    let info = builder.finish();
+
+    let functions = crate::info::functions(&locals_of(&info)).expect("parses");
+    assert_eq!(functions.len(), 1);
+    assert_eq!(functions[0].name, &b"inlined"[..]);
+}
+
+/// A reference that leads to no name -- here, back to the entry itself -- leaves the definition out
+/// as a nameless one always was, and the walk returns rather than following the circle.
+#[test]
+fn a_definition_whose_reference_leads_back_to_itself_is_left_out_and_the_walk_returns() {
+    let mut builder = UnitBuilder::new();
+    let itself = builder.next_offset();
+    builder.referring_subprogram(9, itself, 0x400, 0x10);
+    builder.close();
+    builder.subprogram("named", 0x500, 0x10, &[0x5d]);
+    builder.close();
+    let info = builder.finish();
+
+    let functions = crate::info::functions(&locals_of(&info)).expect("parses");
+    let names: Vec<&[u8]> = functions.iter().map(|function| function.name).collect();
+    assert_eq!(names, vec![&b"named"[..]]);
+}
+
 #[test]
 fn a_parameter_with_no_name_takes_the_one_its_abstract_origin_carries() {
     let mut builder = UnitBuilder::new();

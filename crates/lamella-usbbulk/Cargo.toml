@@ -20,6 +20,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Devices_Usb",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # CM_Open_DevNode_Key and RegQueryValueExW, for the DeviceInterfaceGUIDs value under a device's
+    # hardware key: the device interface class WinUSB registers the device under.
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
 
