@@ -26,6 +26,7 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
+            if (!(obj is int)) throw new ArgumentException("Object must be of type Int32.");
             return CompareTo((int)obj);
         }
 

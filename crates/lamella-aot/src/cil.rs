@@ -13,12 +13,47 @@ use lamella_ir::{
 /// The reserved static-region offset of `g_exception_tag`: the no-GC exception model's
 /// in-flight tag word. A `throw` stores the thrown type's tag here; a catch dispatch loads it
 /// and compares; zero means no exception is propagating. User statics start past it (the
-/// resolver's dense layout numbers slots from 1), so a throw/dispatch and an `ldsfld`/`stsfld`
-/// never alias -- which is what lets the arm32 OBJECT lowering split offset 0 out to the ONE
+/// resolver's dense layout numbers slots past [`RESERVED_STATIC_SLOTS`]), so a throw/dispatch and
+/// an `ldsfld`/`stsfld` never alias -- which is what lets the arm32 OBJECT lowering split offset 0 out to the ONE
 /// VES-global `__lamella_eh_tag` symbol shared by every assembly, while any other offset
 /// addresses the assembly's OWN region symbol. If this stopped being the discriminator, a
 /// corlib throw and a program catch would use different words and cross-assembly EH would break.
 pub(crate) const G_EXCEPTION_TAG_OFFSET: u32 = 0;
+
+/// The reserved static-region offset of `g_exception_message`: the in-flight exception's MESSAGE,
+/// the second half of the no-GC exception model's propagating state. A `throw` stores the string
+/// the constructor was handed (or, for a real object, the `_message` it already holds) here, and a
+/// catch that materializes a binding stores it INTO that binding's `_message`.
+///
+/// **WHY A SECOND WORD RATHER THAN THE OBJECT.** Carrying the exception itself would answer every
+/// question a handler can ask, and it costs AN ALLOCATION ON EVERY THROW from a heap whose
+/// collector does not run on this tier -- a `throw` in a retry loop then exhausts the heap, which
+/// turns a reported wrong answer into an unreported hang. One static word is 4 bytes and no
+/// allocation.
+///
+/// **WHAT IT THEREFORE DOES NOT CARRY:** a DERIVED exception's own fields. `throw new
+/// CodedException(7)` still binds a zeroed `Code`, because no constructor ran -- that is the price
+/// of the word, not a gap in it, and `tools/probes/aot-eh-ctor-payload` stays red BY DESIGN.
+pub(crate) const G_EXCEPTION_MESSAGE_OFFSET: u32 = 4;
+
+/// How many words at the base of EVERY assembly's static region belong to the exception model
+/// rather than to a field: [`G_EXCEPTION_TAG_OFFSET`] and [`G_EXCEPTION_MESSAGE_OFFSET`].
+///
+/// **STATED ONCE BECAUSE FOUR BANDS NUMBER SLOTS AND THEY MUST ALL START PAST IT.** The dense
+/// field band, the `.cctor` precise-init flags, the monomorphized band and the region SIZE each
+/// carried their own literal `1`; a reservation grown in three of the four would have laid a user
+/// static on top of the message word, which reads as a throw corrupting an unrelated variable.
+pub(crate) const RESERVED_STATIC_SLOTS: u32 = 2;
+
+/// The byte offset of the FNV identity tag within a type descriptor, whose ratified layout is
+/// `[payload@0][nrefs@4][tag@8][base_ptr@12][ref_offsets@16..]` (an array descriptor's
+/// `[MARK|rank@0][element_kind@4][tag@8][base_ptr@12]` puts its tag in the same word).
+///
+/// It is read at run time by exactly one site -- a `throw` whose operand is a real exception OBJECT
+/// rather than a tag -- so that such a throw puts the SAME `exception_tag_for_name` word in flight
+/// that an adjacent `newobj` would have pushed as a constant, rather than a heap address no `catch`
+/// can match.
+pub(crate) const TYPE_DESC_TAG_OFFSET: i64 = 8;
 
 /// An exception a backend's inline check raises when no hoisted check has routed it: the check branches
 /// to its function's stub entry for the kind, which stores the kind's tag and returns as a throw with no
@@ -460,6 +495,36 @@ pub trait CallResolver {
     /// type is named -- throw site, catch, and runtime -- so the tiers never diverge. Defaults to
     /// `None`.
     fn exception_tag(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
+    /// Where the MESSAGE argument of a `newobj` of an exception type sits on the evaluation stack,
+    /// counted from the top (`1` = the topmost operand), for the throw that is about to consume it.
+    /// `None` when there is no message to put in flight.
+    ///
+    /// **IT IS A DEPTH RATHER THAN A VALUE BECAUSE THE ARGUMENTS ARE STILL ON THE STACK.** The tag
+    /// path pushes a constant and pops nothing -- a `throw` is a terminator, so the leftovers are
+    /// never read -- and the constructor's first argument is therefore the DEEPEST of them:
+    /// `new E(message)` puts it at depth 1, `new E(message, inner)` at depth 2.
+    ///
+    /// **AN IMPLEMENTATION MUST ANSWER ONLY FOR A CONSTRUCTOR THAT WOULD HAVE STORED THAT ARGUMENT
+    /// AS THE MESSAGE**, because on this path no constructor runs: nothing downstream can discover
+    /// that `class E : Exception { E(string code) : base("fixed") {} }` meant something else by it,
+    /// and answering `code` there would be a wrong message that reads exactly like a right one.
+    /// Defaults to `None`.
+    fn exception_message_argument(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
+    /// The payload byte offset of `System.Exception::_message` in this world, or `None` when the
+    /// corlib in force declares no such field.
+    ///
+    /// **IT TAKES NO TYPE BECAUSE IT IS NOT A PROPERTY OF ONE.** Every exception layout is walked
+    /// base-first and `System.Exception` is the base-most block that declares a field, so
+    /// `_message` sits at one offset in `Exception`, in `InvalidOperationException`, and in a
+    /// program's `class E<T> : Exception` alike -- the one number the catch binding stores into
+    /// and a thrown object is read from. Defaults to `None`.
+    fn exception_message_offset(&self) -> Option<u32> {
         None
     }
 
@@ -965,6 +1030,23 @@ fn lower_with_source(
     cell_types.extend_from_slice(&promoted_types);
     mem_elem.resize(local_count + promoted_types.len(), None);
     let local_count = local_count + promoted_types.len();
+
+    let finally_clauses: Vec<&EhClause> = body
+        .handlers
+        .iter()
+        .filter(|clause| matches!(clause.kind, EhKind::Finally))
+        .collect();
+    let (finally_protect, leave_exits, finally_continuations) =
+        finally_exit_analysis(code, &blocks, &finally_clauses)?;
+    let continuation_selector = finally_continuations
+        .iter()
+        .any(|targets| targets.len() > 1)
+        .then(|| {
+            cell_types.push(MirType::I32);
+            mem_elem.push(None);
+            cell_types.len() - 1
+        });
+    let local_count = local_count + usize::from(continuation_selector.is_some());
     let local_types: &[MirType] = &cell_types;
 
     let mut mem_arg: Vec<Option<MirType>> = alloc::vec![None; arg_count];
@@ -1026,11 +1108,7 @@ fn lower_with_source(
         })
         .collect();
 
-    let finally_clauses: Vec<&EhClause> = body
-        .handlers
-        .iter()
-        .filter(|clause| matches!(clause.kind, EhKind::Finally))
-        .collect();
+
     let finally_handler_block: Vec<usize> = finally_clauses
         .iter()
         .map(|clause| {
@@ -1043,21 +1121,6 @@ fn lower_with_source(
     let in_range = |idx: usize, range: lamella_cil::InstructionRange| {
         (range.start as usize) <= idx && idx < (range.end as usize)
     };
-    let finally_continuation_block: Vec<Option<usize>> = finally_clauses
-        .iter()
-        .map(|clause| {
-            (clause.try_range.start as usize..clause.try_range.end as usize).find_map(|i| {
-                match (code[i].opcode, &code[i].operand) {
-                    (Opcode::Leave | Opcode::LeaveS, Operand::Target(t))
-                        if !in_range(*t as usize, clause.try_range) =>
-                    {
-                        block_of(*t as usize)
-                    }
-                    _ => None,
-                }
-            })
-        })
-        .collect();
     let finally_handler: Vec<Option<usize>> = blocks
         .iter()
         .map(|&(start, _)| {
@@ -1067,36 +1130,7 @@ fn lower_with_source(
         })
         .collect();
     let finally_continuation: Vec<bool> = (0..blocks.len())
-        .map(|b| finally_continuation_block.contains(&Some(b)))
-        .collect();
-    let finally_protect: Vec<Option<usize>> = blocks
-        .iter()
-        .map(|&(start, end)| {
-            finally_clauses
-                .iter()
-                .enumerate()
-                .filter(|(_, clause)| {
-                    clause.try_range.start as usize <= start && end <= clause.try_range.end as usize
-                })
-                .min_by_key(|(_, clause)| clause.try_range.end - clause.try_range.start)
-                .map(|(index, _)| index)
-        })
-        .collect();
-    let leave_exits: Vec<Option<usize>> = blocks
-        .iter()
-        .map(|&(_, end)| {
-            let last = end.checked_sub(1)?;
-            let inst = code.get(last)?;
-            if !matches!(inst.opcode, Opcode::Leave | Opcode::LeaveS) {
-                return None;
-            }
-            let Operand::Target(target) = &inst.operand else {
-                return None;
-            };
-            let block = block_of(last)?;
-            let clause = finally_protect[block]?;
-            (!in_range(*target as usize, finally_clauses[clause].try_range)).then_some(clause)
-        })
+        .map(|b| finally_continuations.iter().any(|t| t.contains(&b)))
         .collect();
     let clause_span = |range: lamella_cil::InstructionRange| range.end - range.start;
     let resume_catches: Vec<Vec<usize>> = finally_clauses
@@ -1406,7 +1440,12 @@ fn lower_with_source(
         }
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
         if let Some(layout) = &catch_binding_layout {
-            let object = materialize_catch_binding(layout, &mut value_types, &mut insts);
+            let object = materialize_catch_binding(
+                layout,
+                resolver.exception_message_offset(),
+                &mut value_types,
+                &mut insts,
+            );
             if let Some(slot) = stack.first_mut() {
                 *slot = object;
             }
@@ -1467,6 +1506,7 @@ fn lower_with_source(
                     &finally_handler_block,
                     resolver,
                     &mut stack,
+                    current_exception,
                     &locals,
                     local_count,
                     local_types,
@@ -1490,7 +1530,8 @@ fn lower_with_source(
                     (None, _) => false,
                 };
                 terminator = Some(build_eh_endfinally(
-                    finally_continuation_block[clause],
+                    &finally_continuations[clause],
+                    continuation_selector,
                     &resume_catches[clause],
                     resume_finally[clause],
                     resume_innermost,
@@ -1512,8 +1553,22 @@ fn lower_with_source(
                 && leave_exits[b].is_some()
             {
                 let clause = leave_exits[b].expect("checked is_some above");
+                let Operand::Target(target_instr) = &inst.operand else {
+                    return Err(CilError::BadOperand);
+                };
+                let leave_target = block_of(*target_instr as usize).ok_or(
+                    CilError::UnsupportedControlFlow(ControlFlowGap::TargetNotBlockStart),
+                )?;
+                let continuation_index = finally_continuations[clause]
+                    .iter()
+                    .position(|&target| target == leave_target)
+                    .ok_or(CilError::UnsupportedControlFlow(
+                        ControlFlowGap::TargetNotBlockStart,
+                    ))?;
                 terminator = Some(build_eh_finally_leave(
                     finally_handler_block[clause],
+                    continuation_selector,
+                    continuation_index,
                     &locals,
                     local_count,
                     local_types,
@@ -1583,6 +1638,7 @@ fn lower_with_source(
             } else {
                 apply_value_op(
                     inst,
+                    i + 1 < end && code[i + 1].opcode == Opcode::Throw,
                     &mut value_types,
                     &mut stack,
                     &mut locals,
@@ -2679,6 +2735,7 @@ fn box_constrained_receiver(
 #[allow(clippy::too_many_arguments)]
 fn apply_value_op(
     inst: &Instruction,
+    next_is_throw: bool,
     value_types: &mut Vec<MirType>,
     stack: &mut Vec<ValueId>,
     locals: &mut [Option<ValueId>],
@@ -4326,7 +4383,36 @@ fn apply_value_op(
                 value_types,
                 insts,
             );
-            if let Some(tag) = resolver.exception_tag(&inst.operand) {
+            if next_is_throw
+                && let Some(tag) = resolver.exception_tag(&inst.operand)
+            {
+                let message = match resolver
+                    .exception_message_argument(&inst.operand)
+                    .and_then(|depth| {
+                        stack.get(stack.len().wrapping_sub(depth as usize)).copied()
+                    }) {
+                    Some(message) => message,
+                    None => {
+                        let none = new_value(value_types, MirType::ObjectRef);
+                        insts.push((
+                            none,
+                            Inst::ConstInt {
+                                ty: MirType::ObjectRef,
+                                value: 0,
+                            },
+                        ));
+                        none
+                    }
+                };
+                let stored = new_value(value_types, MirType::I32);
+                insts.push((
+                    stored,
+                    Inst::StaticStore {
+                        owner: StaticOwner::Own,
+                        offset: G_EXCEPTION_MESSAGE_OFFSET,
+                        value: message,
+                    },
+                ));
                 push_const(value_types, stack, insts, i64::from(tag));
                 return Ok(());
             }
@@ -5135,6 +5221,7 @@ fn classify_catch_binding(
 ///    from outliving the frame that owns it.
 fn materialize_catch_binding(
     layout: &ReferenceLayout,
+    message_offset: Option<u32>,
     value_types: &mut Vec<MirType>,
     insts: &mut Vec<(ValueId, Inst)>,
 ) -> ValueId {
@@ -5165,6 +5252,25 @@ fn materialize_catch_binding(
             width: 4,
         },
     ));
+    if let Some(offset) = message_offset {
+        let message = new_value(value_types, MirType::ObjectRef);
+        insts.push((
+            message,
+            Inst::StaticLoad {
+                owner: StaticOwner::Own,
+                offset: G_EXCEPTION_MESSAGE_OFFSET,
+            },
+        ));
+        let stored = new_value(value_types, MirType::I32);
+        insts.push((
+            stored,
+            Inst::FieldStore {
+                base: cell,
+                offset: 4 + offset,
+                value: message,
+            },
+        ));
+    }
     let object = new_value(value_types, MirType::ObjectRef);
     insts.push((object, Inst::FieldAddr { base: cell, offset: 4 }));
     object
@@ -5188,6 +5294,7 @@ fn build_eh_throw(
     finally_handler_block: &[usize],
     resolver: &dyn CallResolver,
     stack: &mut Vec<ValueId>,
+    current_exception: Option<ValueId>,
     locals: &[Option<ValueId>],
     local_count: usize,
     local_types: &[MirType],
@@ -5197,7 +5304,61 @@ fn build_eh_throw(
     block_count: usize,
     propagate_fixups: &mut Vec<usize>,
 ) -> Result<Terminator, CilError> {
-    let tag = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let thrown = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let tag = if Some(thrown) != current_exception
+        && matches!(value_types.get(thrown.index()), Some(MirType::ObjectRef))
+    {
+        let descriptor = new_value(value_types, MirType::I32);
+        insts.push((descriptor, Inst::LoadTypeDesc { object: thrown }));
+        let offset = new_value(value_types, MirType::I32);
+        insts.push((
+            offset,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: TYPE_DESC_TAG_OFFSET,
+            },
+        ));
+        let address = new_value(value_types, MirType::I32);
+        insts.push((
+            address,
+            Inst::Binary {
+                op: BinOp::Add,
+                lhs: descriptor,
+                rhs: offset,
+            },
+        ));
+        let tag = new_value(value_types, MirType::I32);
+        insts.push((
+            tag,
+            Inst::Load {
+                address,
+                width: 4,
+                signed: false,
+            },
+        ));
+        if let Some(message_offset) = resolver.exception_message_offset() {
+            let message = new_value(value_types, MirType::ObjectRef);
+            insts.push((
+                message,
+                Inst::FieldLoad {
+                    base: thrown,
+                    offset: message_offset,
+                },
+            ));
+            let carried = new_value(value_types, MirType::I32);
+            insts.push((
+                carried,
+                Inst::StaticStore {
+                    owner: StaticOwner::Own,
+                    offset: G_EXCEPTION_MESSAGE_OFFSET,
+                    value: message,
+                },
+            ));
+        }
+        tag
+    } else {
+        thrown
+    };
     let stored = new_value(value_types, MirType::I32);
     insts.push((
         stored,
@@ -6593,6 +6754,7 @@ fn build_builtin_throw_block(
         finally_handler_block,
         resolver,
         &mut trap_stack,
+        None,
         locals,
         local_count,
         local_types,
@@ -7261,22 +7423,210 @@ fn build_trap_access_check(
     })
 }
 
-/// Builds the terminator for a `leave` that exits a try with a `finally`: a plain jump to the
-/// finally handler carrying the locals. The finally runs, then its `endfinally` epilogue resumes at
-/// the leave target -- there is no tag check here (the `endfinally` decides resume vs propagate).
+/// Builds the terminator for a `leave` that exits a try with a `finally`: a jump to the finally
+/// handler carrying the locals, and WHICH exit this is. The finally runs, then its `endfinally`
+/// epilogue resumes at this leave's own target -- there is no tag check here (the `endfinally`
+/// decides resume vs propagate).
+#[allow(clippy::too_many_arguments)]
 fn build_eh_finally_leave(
     finally_handler: usize,
+    continuation_selector: Option<usize>,
+    continuation_index: usize,
     locals: &[Option<ValueId>],
     local_count: usize,
     local_types: &[MirType],
     value_types: &mut Vec<MirType>,
     insts: &mut Vec<(ValueId, Inst)>,
 ) -> Terminator {
-    let args = merge_args(true, local_count, locals, local_types, value_types, insts);
+    let mut args = merge_args(true, local_count, locals, local_types, value_types, insts);
+    if let Some(slot) = continuation_selector {
+        let index = new_value(value_types, MirType::I32);
+        insts.push((
+            index,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: continuation_index as i64,
+            },
+        ));
+        args[slot] = index;
+    }
     Terminator::Jump {
         target: BlockId(finally_handler as u32),
         args,
     }
+}
+
+/// The normal-resume path of an `endfinally`: one landing block per continuation, each jumping there
+/// with the finally's locals (a continuation takes them as parameters, and a `Branch` edge carries no
+/// arguments). Returns the block the `endfinally` takes when no exception is in flight.
+///
+/// With more than one continuation, a cascade of equality tests on the selector slot picks the
+/// landing. The LAST continuation is the cascade's fall-through, so n of them cost n-1 tests -- and
+/// the single-exit finally, which is nearly every one, costs no test and no selector at all.
+#[allow(clippy::too_many_arguments)]
+fn build_finally_resume(
+    continuations: &[usize],
+    continuation_selector: Option<usize>,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+) -> usize {
+    let landings: Vec<usize> = continuations
+        .iter()
+        .map(|&target| {
+            let landing = block_count + split_blocks.len();
+            let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
+            let args = merge_args(
+                true,
+                local_count,
+                locals,
+                local_types,
+                value_types,
+                &mut landing_insts,
+            );
+            split_blocks.push(BasicBlock {
+                params: Vec::new(),
+                insts: landing_insts,
+                terminator: Some(Terminator::Jump {
+                    target: BlockId(target as u32),
+                    args,
+                }),
+            });
+            landing
+        })
+        .collect();
+    let Some(slot) = continuation_selector.filter(|_| landings.len() > 1) else {
+        return landings[0];
+    };
+    let base = block_count + split_blocks.len();
+    let mut pending: Vec<(ValueId, Inst)> = Vec::new();
+    let selector = match locals.get(slot).copied().flatten() {
+        Some(value) => value,
+        None => {
+            let zero = new_value(value_types, MirType::I32);
+            pending.push((zero, zero_inst(MirType::I32)));
+            zero
+        }
+    };
+    for (index, &landing) in landings.iter().enumerate().take(landings.len() - 1) {
+        let next = if index + 2 < landings.len() {
+            base + index + 1
+        } else {
+            landings[landings.len() - 1]
+        };
+        let mut test_insts = core::mem::take(&mut pending);
+        let expected = new_value(value_types, MirType::I32);
+        test_insts.push((
+            expected,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: index as i64,
+            },
+        ));
+        let matched = new_value(value_types, MirType::I32);
+        test_insts.push((
+            matched,
+            Inst::Compare {
+                op: CmpOp::Eq,
+                lhs: selector,
+                rhs: expected,
+            },
+        ));
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: test_insts,
+            terminator: Some(Terminator::Branch {
+                cond: matched,
+                if_true: BlockId(landing as u32),
+                true_args: Vec::new(),
+                if_false: BlockId(next as u32),
+                false_args: Vec::new(),
+            }),
+        });
+    }
+    base
+}
+
+/// What [`finally_exit_analysis`] answers, in its order: per block, the finally whose try encloses
+/// it and the finally its `leave` exits; per finally clause, that clause's normal-exit continuations.
+type FinallyExits = (Vec<Option<usize>>, Vec<Option<usize>>, Vec<Vec<usize>>);
+
+/// The finally-exit analysis over a whole method: which `finally` each `leave` exits, and where each
+/// finally's normal exits continue. Returns `(finally_protect, leave_exits, finally_continuations)`.
+///
+/// * `finally_protect[b]` -- the innermost finally clause whose try region encloses block `b`, so a
+///   `leave` that block ends in runs that finally first.
+/// * `leave_exits[b]` -- the finally clause a block-ending `leave` EXITS, its target lying outside
+///   that finally's try. Only such a leave runs the finally; a `leave` that stays within the try (a
+///   catch's leave to the finally-exiting leave) does not, and is `None` here.
+/// * `finally_continuations[clause]` -- the distinct blocks those leaves target, in instruction
+///   order. Empty when the try always throws, so the handler has no normal exit to resume at.
+///
+/// ONE ENTRY PER DISTINCT TARGET, WHICH IS WHY THE LAST IS A LIST. A `break`, a `return` and the
+/// try's own fall-through each leave the same try to a DIFFERENT place. Taking one continuation per
+/// clause sent all of them wherever the FIRST `leave` in instruction order went, with no diagnostic:
+/// a loop whose try held a `break` stopped after one iteration, and a method whose try held an
+/// untaken `return` returned its zero-initialized return temporary. The `endfinally` picks among
+/// these by the selector slot the caller reserves when a clause has more than one.
+///
+/// Derived from the block list alone, so a caller can size that slot before laying out the locals
+/// and then lower from the same answer -- one derivation rather than two that could disagree.
+fn finally_exit_analysis(
+    code: &[Instruction],
+    blocks: &[(usize, usize)],
+    finally_clauses: &[&EhClause],
+) -> Result<FinallyExits, CilError> {
+    let block_of = |instr: usize| blocks.iter().position(|&(s, e)| instr >= s && instr < e);
+    let in_range = |idx: usize, range: lamella_cil::InstructionRange| {
+        (range.start as usize) <= idx && idx < (range.end as usize)
+    };
+    let finally_protect: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(start, end)| {
+            finally_clauses
+                .iter()
+                .enumerate()
+                .filter(|(_, clause)| {
+                    clause.try_range.start as usize <= start && end <= clause.try_range.end as usize
+                })
+                .min_by_key(|(_, clause)| clause.try_range.end - clause.try_range.start)
+                .map(|(index, _)| index)
+        })
+        .collect();
+    let leave_exits: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(_, end)| {
+            let last = end.checked_sub(1)?;
+            let inst = code.get(last)?;
+            if !matches!(inst.opcode, Opcode::Leave | Opcode::LeaveS) {
+                return None;
+            }
+            let Operand::Target(target) = &inst.operand else {
+                return None;
+            };
+            let block = block_of(last)?;
+            let clause = finally_protect[block]?;
+            (!in_range(*target as usize, finally_clauses[clause].try_range)).then_some(clause)
+        })
+        .collect();
+    let mut finally_continuations: Vec<Vec<usize>> = alloc::vec![Vec::new(); finally_clauses.len()];
+    for (b, exits) in leave_exits.iter().enumerate() {
+        let Some(clause) = *exits else { continue };
+        let last = blocks[b].1.checked_sub(1).ok_or(CilError::BadOperand)?;
+        let Some(Operand::Target(target)) = code.get(last).map(|inst| &inst.operand) else {
+            return Err(CilError::BadOperand);
+        };
+        let target_block = block_of(*target as usize).ok_or(
+            CilError::UnsupportedControlFlow(ControlFlowGap::TargetNotBlockStart),
+        )?;
+        if !finally_continuations[clause].contains(&target_block) {
+            finally_continuations[clause].push(target_block);
+        }
+    }
+    Ok((finally_protect, leave_exits, finally_continuations))
 }
 
 /// Builds the terminator for a finally handler's `endfinally`: load the in-flight tag and branch on
@@ -7287,13 +7637,21 @@ fn build_eh_finally_leave(
 /// outer region. When the try always throws there is no normal continuation and only that edge
 /// exists.
 ///
-/// The tag is what distinguishes the two entries, which is why no per-entry continuation selector is
-/// needed: the same word that says "an exception is in flight" says "you were entered by one".
-/// Propagating on a set tag -- the previous answer -- made every intervening `finally` CONSUME the
-/// exception, so a handler in the same frame never saw it.
+/// The tag is what distinguishes the two ENTRIES: the same word that says "an exception is in
+/// flight" says "you were entered by one". Those are not the same question. Propagating whenever
+/// the tag is set answers the second with the first, which makes every intervening `finally`
+/// CONSUME the exception, so a handler in the same frame never sees it. The entry test is what the
+/// tag is read for here.
+///
+/// WHICH NORMAL EXIT this is, the tag does NOT say, and it cannot: a try can be left by a `break`,
+/// a `return` and its own fall-through, each to a different place, while the tag carries one bit of
+/// state for the whole clause. So the normal edge picks among `continuations` by the selector slot
+/// ([`build_finally_resume`]). A single continuation per clause cannot express that choice -- it
+/// has one target to offer, so every exit takes it.
 #[allow(clippy::too_many_arguments)]
 fn build_eh_endfinally(
-    continuation: Option<usize>,
+    continuations: &[usize],
+    continuation_selector: Option<usize>,
     resume_catches: &[usize],
     resume_finally: Option<usize>,
     resume_finally_is_innermost: bool,
@@ -7330,13 +7688,13 @@ fn build_eh_endfinally(
             propagate_fixups,
         )
     };
-    let Some(continuation) = continuation else {
+    if continuations.is_empty() {
         let landing = in_flight_target(value_types, split_blocks, propagate_fixups)?;
         return Ok(Terminator::Jump {
             target: BlockId(landing as u32),
             args: Vec::new(),
         });
-    };
+    }
     let in_flight = new_value(value_types, MirType::I32);
     insts.push((
         in_flight,
@@ -7345,24 +7703,16 @@ fn build_eh_endfinally(
             offset: G_EXCEPTION_TAG_OFFSET,
         },
     ));
-    let landing = block_count + split_blocks.len();
-    let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
-    let cont_args = merge_args(
-        true,
-        local_count,
+    let landing = build_finally_resume(
+        continuations,
+        continuation_selector,
         locals,
+        local_count,
         local_types,
         value_types,
-        &mut landing_insts,
+        split_blocks,
+        block_count,
     );
-    split_blocks.push(BasicBlock {
-        params: Vec::new(),
-        insts: landing_insts,
-        terminator: Some(Terminator::Jump {
-            target: BlockId(continuation as u32),
-            args: cont_args,
-        }),
-    });
     let unwind = in_flight_target(value_types, split_blocks, propagate_fixups)?;
     Ok(Terminator::Branch {
         cond: in_flight,

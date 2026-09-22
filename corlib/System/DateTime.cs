@@ -68,6 +68,10 @@ namespace System
 
         public DateTime(int year, int month, int day, int hour, int minute, int second, int millisecond)
         {
+            if (millisecond < 0 || millisecond > 999)
+            {
+                throw new ArgumentOutOfRangeException("millisecond");
+            }
             _dateData = CheckedTicks(DateToTicks(year, month, day)
                 + TimeToTicks(hour, minute, second)
                 + (long)millisecond * TicksPerMillisecond);
@@ -84,13 +88,34 @@ namespace System
         }
 #endif
 
+        private static void RejectOutsideCalendar(int year, int month)
+        {
+            if (year < 1 || year > 9999)
+            {
+                throw new ArgumentOutOfRangeException("year");
+            }
+            if (month < 1 || month > 12)
+            {
+                throw new ArgumentOutOfRangeException("month");
+            }
+        }
+
         public static bool IsLeapYear(int year)
         {
+            if (year < 1 || year > 9999)
+            {
+                throw new ArgumentOutOfRangeException("year");
+            }
             return (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
         }
 
         private static long DateToTicks(int year, int month, int day)
         {
+            RejectOutsideCalendar(year, month);
+            if (day < 1 || day > DaysInMonth(year, month))
+            {
+                throw new ArgumentOutOfRangeException("day");
+            }
             int[] days = IsLeapYear(year) ? DaysToMonth366 : DaysToMonth365;
             int y = year - 1;
             int n = y * 365 + y / 4 - y / 100 + y / 400 + days[month - 1] + day - 1;
@@ -99,6 +124,18 @@ namespace System
 
         private static long TimeToTicks(int hour, int minute, int second)
         {
+            if (hour < 0 || hour > 23)
+            {
+                throw new ArgumentOutOfRangeException("hour");
+            }
+            if (minute < 0 || minute > 59)
+            {
+                throw new ArgumentOutOfRangeException("minute");
+            }
+            if (second < 0 || second > 59)
+            {
+                throw new ArgumentOutOfRangeException("second");
+            }
             long totalSeconds = (long)hour * 3600 + (long)minute * 60 + (long)second;
             return totalSeconds * TicksPerSecond;
         }
@@ -180,6 +217,10 @@ namespace System
 
         public DateTime AddMonths(int months)
         {
+            if (months < -120000 || months > 120000)
+            {
+                throw new ArgumentOutOfRangeException("months");
+            }
             int y = GetDatePart(0);
             int m = GetDatePart(1);
             int d = GetDatePart(2);
@@ -201,11 +242,16 @@ namespace System
 
         public DateTime AddYears(int value)
         {
+            if (value < -10000 || value > 10000)
+            {
+                throw new ArgumentOutOfRangeException("value");
+            }
             return AddMonths(value * 12);
         }
 
         public static int DaysInMonth(int year, int month)
         {
+            RejectOutsideCalendar(year, month);
             int[] days = IsLeapYear(year) ? DaysToMonth366 : DaysToMonth365;
             return days[month] - days[month - 1];
         }
@@ -220,6 +266,7 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
+            if (!(obj is DateTime)) throw new ArgumentException("Object must be of type DateTime.");
             return CompareTo((DateTime)obj);
         }
 
@@ -227,7 +274,7 @@ namespace System
 
         public override bool Equals(object obj)
         {
-            if (obj == null) return false;
+            if (!(obj is DateTime)) return false;
             return InternalTicks == ((DateTime)obj).InternalTicks;
         }
 

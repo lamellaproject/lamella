@@ -48,6 +48,7 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
+            if (!(obj is ulong)) throw new ArgumentException("Object must be of type UInt64.");
             return CompareTo((ulong)obj);
         }
 

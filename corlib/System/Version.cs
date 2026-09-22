@@ -8,18 +8,29 @@ namespace System
         private int _build;
         private int _revision;
 
+        private static void Reject(int negative)
+        {
+            if (negative < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+        }
+
         public Version(int major, int minor)
         {
+            Reject(major); Reject(minor);
             _major = major; _minor = minor; _build = -1; _revision = -1;
         }
 
         public Version(int major, int minor, int build)
         {
+            Reject(major); Reject(minor); Reject(build);
             _major = major; _minor = minor; _build = build; _revision = -1;
         }
 
         public Version(int major, int minor, int build, int revision)
         {
+            Reject(major); Reject(minor); Reject(build); Reject(revision);
             _major = major; _minor = minor; _build = build; _revision = revision;
         }
 

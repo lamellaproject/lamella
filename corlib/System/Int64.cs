@@ -30,6 +30,7 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
+            if (!(obj is long)) throw new ArgumentException("Object must be of type Int64.");
             return CompareTo((long)obj);
         }
 

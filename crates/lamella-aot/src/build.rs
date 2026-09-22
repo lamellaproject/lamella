@@ -224,8 +224,8 @@ pub enum BuildError {
 
 /// Why an AOT build failed, as a sentence naming WHAT could not be built and WHERE.
 ///
-/// **A refusal names the thing, not the variant.** A build failure is rendered with `{error:?}`
-/// wherever a caller has no better renderer, so an arm that adds nothing leaves someone compiling a
+/// **A refusal names the thing, not the variant.** This text is what reaches a caller -- the CLI
+/// renders a build failure with `{error}` -- so an arm that adds nothing leaves someone compiling a
 /// program holding two enum names -- no method, no assembly, no remedy. Every arm below spends the
 /// payload its variant already carries, as [`BuildError::UnresolvedAssemblyReference`] spends the
 /// library list rather than naming the method that tripped over the gap.
@@ -2288,15 +2288,17 @@ fn append_enum_to_string(
     names
 }
 
-/// Replaces `System.Exception::get_Message`'s BODY with the one `exception_strings = type-name`
-/// specifies: the receiver's own type name.
+/// Replaces `System.Exception::get_Message`'s BODY with the stored message when the receiver has
+/// one, and otherwise the receiver's own type name -- which is what `exception_strings = type-name`
+/// specifies for the case that has no message to give.
 ///
-/// WHY THERE IS ANYTHING TO REPLACE. The in-flight exception is a TAG, so a caught exception is
-/// materialized with a ZEROED payload -- no constructor ran, and under this knob none can, because
-/// `throw` keeps costing one word. Corlib's own `Message` therefore reads a null `_message` and hands
-/// back null, and `"caught " + e.Message` then faults inside [`Inst::StringConcat`] on the null
-/// operand. That is the fault the object model would otherwise MOVE rather than fix: the binding stops
-/// hard-faulting on dispatch and starts hard-faulting one instruction later.
+/// WHY THERE IS ANYTHING TO REPLACE. A THROWN exception is in flight as a TAG, so the exception a
+/// handler binds is materialized with a ZEROED payload -- no constructor ran, and on that path none
+/// can, because `throw` keeps costing one word. Corlib's own `Message` therefore reads a null
+/// `_message` and hands back null, and `"caught " + e.Message` then faults inside
+/// [`Inst::StringConcat`] on the null operand. That is the fault the object model would otherwise
+/// MOVE rather than fix: the binding stops hard-faulting on dispatch and starts hard-faulting one
+/// instruction later.
 ///
 /// WHY IT REPLACES A BODY INSTEAD OF APPENDING ONE AND REPOINTING SLOTS. A consumer of a REFERENCED
 /// exception type builds its own copy of that type's descriptor, and the copy's vtable slots are
@@ -2306,24 +2308,34 @@ fn append_enum_to_string(
 /// referenced enum. Replacing the body makes the extern symbol itself resolve to the new behavior, so
 /// one edit serves corlib and every assembly that links it, with no new symbol to collide.
 ///
-/// ONE BODY SERVES EVERY EXCEPTION TYPE. It is `LoadTypeDesc(this)` then [`Inst::TypeName`] -- the same
-/// pair the synthesized `Object::ToString` uses -- so it answers the RECEIVER's descriptor name rather
-/// than a baked literal. Corlib declares 43 exception types and NONE of them overrides `Message`, so
-/// all 43 inherit this one slot and each still reports its own name.
+/// ONE BODY SERVES EVERY EXCEPTION TYPE, and nothing in it is per-type. It reads `_message` and, when
+/// that is null, falls to `LoadTypeDesc(this)` then [`Inst::TypeName`] -- the same pair the synthesized
+/// `Object::ToString` uses -- so the fallback answers the RECEIVER's descriptor name rather than a baked
+/// literal. Corlib declares 43 exception types and NONE of them overrides `Message`, so all 43 inherit
+/// this one slot, and each reports its own message or, lacking one, its own name.
 ///
 /// SCOPE, stated because each limit is a printed answer rather than an error:
 /// - **The message text of `throw new E("boom")` is not retained on this tier.** This returns `E`'s name, which
 ///   is what `exception_strings = type-name` means and is closer to .NET than the null it replaces
 ///   (.NET's own message-less default is "Exception of type 'E' was thrown.").
-/// - **`_message` is not consulted, because on this tier it can never be set.** No constructor runs at
-///   a throw, and a `newobj E` that is NOT thrown is still lowered to a tag rather than an object. When
-///   that second case becomes a real allocation, this body wants a `_message != null` arm ahead of the
-///   type name -- corlib's field is at payload offset 0, since `System.Exception` is the base-most block
-///   of every exception layout.
+/// - **`_message` IS consulted now, and it is the first thing this body asks.** That arm was written
+///   the day `newobj` stopped lowering a NOT-THROWN exception to a tag and started allocating it
+///   (see the adjacency note on `Opcode::Newobj` in [`crate::cil`]): from then on `new E("boom")`
+///   runs its constructor and the field really holds the message, so the body that ignored it was
+///   answering the type name over a message it had. A THROWN exception is still a tag and its catch
+///   binding is still a zeroed cell, so the field reads null there and the type name below is still
+///   the answer -- one body, both cases, decided by the field rather than by the caller.
 /// - A program that OVERRIDES `Message` keeps its own body: this only rewrites the declaring type's.
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
 fn replace_exception_message(assembly: &Assembly, funcs: &mut [Function]) {
     let Some(type_def) = assembly.find_type("System", "Exception") else {
+        return;
+    };
+    let Some(message_offset) = type_def
+        .fields()
+        .find(|field| !field.is_static() && field.name() == Some("_message"))
+        .and_then(|field| assembly.field_offset(field.token(), &TargetLayout::ilp32()))
+    else {
         return;
     };
     for method in type_def.methods() {
@@ -2332,22 +2344,42 @@ fn replace_exception_message(assembly: &Assembly, funcs: &mut [Function]) {
         }
         let rid = method.token().row() as usize;
         if let Some(slot) = funcs.get_mut(rid) {
-            *slot = exception_message_body();
+            *slot = exception_message_body(message_offset);
         }
     }
 }
 
-/// The MIR for the shared exception `Message` getter: the receiver's own type name.
+/// The MIR for the shared exception `Message` getter: the stored message when there is one, and
+/// otherwise the receiver's own type name.
 ///
-/// Three instructions, and none of them touches a field -- which is what lets one function serve every
-/// exception type. [`Inst::TypeName`] answers null for a null descriptor rather than dereferencing, so
-/// the body is total even on a receiver whose header was never written.
+/// ONE BODY SERVES BOTH KINDS OF EXCEPTION because the FIELD is what decides, not the caller. A
+/// constructed exception is a real allocation whose constructor ran, so `_message` holds the text and
+/// the first arm answers it. A thrown one is a tag, and its catch binding is a zeroed cell, so the
+/// same read yields null and the second arm answers the type name exactly as this body always did.
+///
+/// Both arms are total on a receiver whose header was never written: the bump allocator hands out a
+/// ZEROED payload (`lamella_gc::device_heap`, which its own test asserts), so the field read is a
+/// definite null rather than heap residue, and [`Inst::TypeName`] answers null for a null descriptor
+/// rather than dereferencing it.
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
-fn exception_message_body() -> Function {
+fn exception_message_body(message_offset: u32) -> Function {
     let objt = MirType::ObjectRef;
     let (mut mb, params) = MirBuilder::new(&[objt]);
     let object = params[0];
+    let from_field = mb.block();
+    let from_type_name = mb.block();
     mb.at(0);
+    let stored = mb.emit(
+        objt,
+        Inst::FieldLoad {
+            base: object,
+            offset: message_offset,
+        },
+    );
+    mb.branch(stored, from_field, from_type_name);
+    mb.at(from_field);
+    mb.ret(stored);
+    mb.at(from_type_name);
     let descriptor = mb.emit(MirType::I32, Inst::LoadTypeDesc { object });
     let text = mb.emit(objt, Inst::TypeName { descriptor });
     mb.ret(text);
@@ -2698,11 +2730,14 @@ fn narrow(value: i64, underlying: MirType) -> i64 {
 /// -- every ref-typed static field's dense slot (the resolver's [`static_field_slots`] layout; the
 /// record and the `ldsfld`/`stsfld` lowering share that one source, or the collector would walk
 /// the wrong words). `include_eh_row` adds word 0 for the PROGRAM assembly only: the linker
-/// aliases the shared `__lamella_eh_tag` word to the ENTRY object's reserved word 0, and that word
+/// aliases the shared `__lamella_eh_tag` word to the ENTRY object's reserved word 0 (the message
+/// rides at that symbol + 4, in the same region's word 1), and that word
 /// holds a type TAG today (an integer; the no-GC exception model), so it is emitted `ManagedPtr`
 /// -- the collector range-checks a maybe-heap word and skips a non-heap value, and when an
 /// object-carrying exception model lands the same entry covers the in-flight exception reference.
-/// A library's word 0 is dead (never aliased, never written), so its record claims no root there.
+/// Word 1 -- the in-flight MESSAGE -- takes the same row for the same reason, and the two are
+/// emitted together because they are one piece of propagating state. A library's reserved words
+/// are dead (never aliased, never written), so its record claims no root on either.
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
 fn assembly_statics<'x>(
     cil: &[u8],
@@ -2715,6 +2750,7 @@ fn assembly_statics<'x>(
     let mut roots = Vec::new();
     if include_eh_row {
         roots.push(crate::stackmaps::STACKMAP_KIND_MANAGED_PTR << 14);
+        roots.push(1 | (crate::stackmaps::STACKMAP_KIND_MANAGED_PTR << 14));
     }
     let mut ref_rows: alloc::collections::BTreeSet<u32> = alloc::collections::BTreeSet::new();
     for type_def in assembly.type_defs() {
@@ -3144,6 +3180,7 @@ fn rebase_identities(
                     let in_own_band = own_band_base != 0 && *offset >= own_band_base;
                     if matches!(owner, StaticOwner::Own)
                         && *offset != cil::G_EXCEPTION_TAG_OFFSET
+                        && *offset != cil::G_EXCEPTION_MESSAGE_OFFSET
                         && !in_own_band
                     {
                         return Err(MonoGap::CrossAssemblyStatic { offset: *offset });

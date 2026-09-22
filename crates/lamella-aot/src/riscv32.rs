@@ -4523,6 +4523,7 @@ fn emit_check_stubs(
         relocate,
     )?;
     enc.sw(Reg::A0, Reg::T0, 0);
+    enc.sw(Reg::ZERO, Reg::T0, crate::cil::G_EXCEPTION_MESSAGE_OFFSET as i32);
     enc.li(Reg::A0, 0);
     if two_word_return {
         enc.li(Reg::A1, 0);
@@ -4740,7 +4741,8 @@ fn emit_descriptors(
 /// pre-region form). Object path (`relocate`): an indirection pool word -- `region - word` as an
 /// exact-target `R_LAMELLA_REL_DESC` against the assembly's OWN `__lamella_statics_<hash>`
 /// region symbol (the field's byte offset rides as the reloc addend), or the shared
-/// `__lamella_eh_tag` for the reserved word 0 -- reconstituted `la dst, word; lw tmp; add`, so
+/// `__lamella_eh_tag` for the reserved PAIR, word 0 at addend 0 and the in-flight message at
+/// addend 4 -- reconstituted `la dst, word; lw tmp; add`, so
 /// the linker's RAM-window placement and any `--gc-sections` re-layout stay authoritative.
 /// A REFERENCE-owned static (`StaticOwner::Reference`) addresses the OWNER's region -- the same
 /// `__lamella_statics_<ownerhash>` symbol the owner's own object defines, at the owner's dense
@@ -4766,8 +4768,11 @@ fn emit_static_addr(
         };
     }
     let key = match owner {
-        StaticOwner::Own if offset == crate::cil::G_EXCEPTION_TAG_OFFSET => {
-            (EH_TAG_SYMBOL_FLAG, 0i32)
+        StaticOwner::Own
+            if offset == crate::cil::G_EXCEPTION_TAG_OFFSET
+                || offset == crate::cil::G_EXCEPTION_MESSAGE_OFFSET =>
+        {
+            (EH_TAG_SYMBOL_FLAG, offset as i32)
         }
         StaticOwner::Own => (STATICS_BASE_SYMBOL_FLAG, offset as i32),
         StaticOwner::Reference(ordinal) => {
@@ -5485,7 +5490,7 @@ mod tests {
                         ValueId(1),
                         Inst::StaticStore {
                             owner: StaticOwner::Own,
-                            offset: 4,
+                            offset: 8,
                             value: ValueId(0),
                         },
                     ),
@@ -5496,7 +5501,7 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         let statics = AssemblyStatics {
             suffix: "deadbeef".into(),
-            region_bytes: 8,
+            region_bytes: 12,
             roots: Vec::new(),
         };
         let obj = lower_object_profile_statics(
@@ -5516,12 +5521,12 @@ mod tests {
             .find(|(_, s)| s.name == "__lamella_statics_deadbeef")
             .expect("the region symbol is referenced");
         assert!(!region.defined, "the region is UNDEFINED -- the linker places it");
-        assert_eq!(region.size, 8, "the sized reference carries region_bytes");
+        assert_eq!(region.size, 12, "the sized reference carries region_bytes");
         assert!(
             parsed
                 .relocations
                 .iter()
-                .any(|r| r.symbol == index as u32 && r.addend == 4),
+                .any(|r| r.symbol == index as u32 && r.addend == 8),
             "a pool-word relocation addresses the region at the field's byte offset"
         );
     }

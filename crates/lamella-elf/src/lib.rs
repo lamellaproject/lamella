@@ -231,9 +231,10 @@ pub const STACKMAP_STATICS_PREFIX: &str = "__lamella_smstat_";
 /// every `ldsfld`/`stsfld` pool word (addend = the field's dense slot offset) and from the mode-2
 /// statics record's base word, carrying the region's byte size in the reference's `st_size`;
 /// `lamella-linker` lays each referenced region out in a RAM window, defines the symbol, and brackets
-/// the span with [`STATICS_START_SYMBOL`]/[`STATICS_END_SYMBOL`]. Word 0 of every region is
-/// RESERVED (dense slots start at 1): offset 0 is the MIR-level EH-tag marker, split out to
-/// [`EH_TAG_SYMBOL`].
+/// the span with [`STATICS_START_SYMBOL`]/[`STATICS_END_SYMBOL`]. Words 0 AND 1 of every region are
+/// RESERVED (dense field slots start past them): offset 0 is the MIR-level EH-tag marker, split out
+/// to [`EH_TAG_SYMBOL`], and offset 4 is the in-flight exception MESSAGE, reached as that same
+/// symbol plus 4 rather than through a second symbol that could come to disagree with it.
 pub const STATICS_BASE_PREFIX: &str = "__lamella_statics_";
 
 /// The ONE VES-global in-flight exception word, shared by EVERY assembly's throw/catch lowering
@@ -241,7 +242,9 @@ pub const STATICS_BASE_PREFIX: &str = "__lamella_statics_";
 /// working across assemblies: a corlib `throw` and a program `catch` must read the SAME word, so
 /// it cannot be "row 0 of the thrower's region". `lamella-linker` defines it as the ENTRY object's
 /// region word 0 (reserved by the dense layout, and covered by that record's row-0 ManagedPtr
-/// root), falling back to the first laid region / a standalone word.
+/// root), falling back to the first laid region / a standalone word. **The in-flight MESSAGE is
+/// the word AFTER it**, addressed as this symbol + 4 -- one reserved pair, one symbol, so the two
+/// halves of the propagating state cannot be placed apart.
 pub const EH_TAG_SYMBOL: &str = "__lamella_eh_tag";
 
 /// The symbol at the start of the linker-laid statics RAM span (every region plus the EH word).

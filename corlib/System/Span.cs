@@ -2,6 +2,17 @@
 #if LAMELLA_SURFACE_SPAN
 namespace System
 {
+    internal sealed class SpanWindow
+    {
+        internal static void Check(int start, int length, int extent)
+        {
+            if (start < 0 || length < 0 || start > extent - length)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+        }
+    }
+
     public readonly ref struct Span<T>
     {
         private readonly T[] _items;
@@ -38,10 +49,7 @@ namespace System
                 _length = 0;
                 return;
             }
-            if (start < 0 || length < 0 || start + length > array.Length)
-            {
-                throw new ArgumentOutOfRangeException();
-            }
+            SpanWindow.Check(start, length, array.Length);
             _items = array;
             _start = start;
             _length = length;
@@ -80,10 +88,7 @@ namespace System
         /// <paramref name="start"/>.</summary>
         public Span<T> Slice(int start, int length)
         {
-            if (start < 0 || length < 0 || start + length > _length)
-            {
-                throw new ArgumentOutOfRangeException();
-            }
+            SpanWindow.Check(start, length, _length);
             return new Span<T>(_items, _start + start, length);
         }
 
@@ -186,10 +191,7 @@ namespace System
                 _length = 0;
                 return;
             }
-            if (start < 0 || length < 0 || start + length > array.Length)
-            {
-                throw new ArgumentOutOfRangeException();
-            }
+            SpanWindow.Check(start, length, array.Length);
             _items = array;
             _start = start;
             _length = length;
@@ -228,10 +230,7 @@ namespace System
         /// <paramref name="start"/>.</summary>
         public ReadOnlySpan<T> Slice(int start, int length)
         {
-            if (start < 0 || length < 0 || start + length > _length)
-            {
-                throw new ArgumentOutOfRangeException();
-            }
+            SpanWindow.Check(start, length, _length);
             return new ReadOnlySpan<T>(_items, _start + start, length);
         }
 

@@ -102,10 +102,9 @@ pub enum LowerError {
 /// Why a function could not be lowered, as a sentence a caller can act on rather than as a variant
 /// name.
 ///
-/// A build failure is rendered with `{error:?}`, so without this a refusal reads as
-/// `LowerArm(CallUnsupported)` -- naming no function, no construct and no remedy, and sounding like
-/// an internal assertion rather than something the caller did or can change. **Each arm spends the
-/// payload the variant already carries.**
+/// Without this a refusal reads as `LowerArm(CallUnsupported)` -- naming no function, no construct
+/// and no remedy, and sounding like an internal assertion rather than something the caller did or
+/// can change. **Each arm spends the payload the variant already carries.**
 impl core::fmt::Display for LowerError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -523,8 +522,11 @@ fn static_slot_addr(
     }
     let label = enc.new_label();
     match owner {
-        StaticOwner::Own if offset == crate::cil::G_EXCEPTION_TAG_OFFSET => {
-            sym_pool.push((label, EH_TAG_SYMBOL_FLAG, 0));
+        StaticOwner::Own
+            if offset == crate::cil::G_EXCEPTION_TAG_OFFSET
+                || offset == crate::cil::G_EXCEPTION_MESSAGE_OFFSET =>
+        {
+            sym_pool.push((label, EH_TAG_SYMBOL_FLAG, offset as i32));
         }
         StaticOwner::Own => sym_pool.push((label, STATICS_BASE_SYMBOL_FLAG, offset as i32)),
         StaticOwner::Reference(ordinal) => {
@@ -3686,6 +3688,10 @@ fn lower_spilled_into(
             crate::cil::G_EXCEPTION_TAG_OFFSET,
         )?;
         enc.str_imm(Reg::R1, Reg::R0, 0)
+            .map_err(|_| LowerError::TooManyValues)?;
+        enc.movs_imm(Reg::R1, 0)
+            .map_err(|_| LowerError::TooManyValues)?;
+        enc.str_imm(Reg::R1, Reg::R0, crate::cil::G_EXCEPTION_MESSAGE_OFFSET as u16)
             .map_err(|_| LowerError::TooManyValues)?;
         enc.movs_imm(Reg::R0, 0)
             .map_err(|_| LowerError::TooManyValues)?;
@@ -12370,14 +12376,14 @@ mod tests {
                         ValueId(0),
                         Inst::StaticLoad {
                             owner: StaticOwner::Reference(0),
-                            offset: 4,
+                            offset: 8,
                         },
                     ),
                     (
                         ValueId(1),
                         Inst::StaticStore {
                             owner: StaticOwner::Reference(1),
-                            offset: 8,
+                            offset: 12,
                             value: ValueId(0),
                         },
                     ),
@@ -12385,7 +12391,7 @@ mod tests {
                         ValueId(2),
                         Inst::StaticLoad {
                             owner: StaticOwner::Own,
-                            offset: 4,
+                            offset: 8,
                         },
                     ),
                 ],
@@ -12394,7 +12400,7 @@ mod tests {
         };
         let statics = AssemblyStatics {
             suffix: alloc::string::String::from("11223344"),
-            region_bytes: 8,
+            region_bytes: 12,
             roots: Vec::new(),
         };
         let qualifiers = DescQualifiers {
@@ -12418,15 +12424,15 @@ mod tests {
             })
         };
         assert!(
-            lands("__lamella_statics_aaaa0001", 4),
+            lands("__lamella_statics_aaaa0001", 8),
             "the reference-0 load lands on ITS owner's region + slot addend"
         );
         assert!(
-            lands("__lamella_statics_bbbb0002", 8),
+            lands("__lamella_statics_bbbb0002", 12),
             "the reference-1 store lands on ITS owner's region + slot addend"
         );
         assert!(
-            lands("__lamella_statics_11223344", 4),
+            lands("__lamella_statics_11223344", 8),
             "an own access still lands on this assembly's region"
         );
         for name in ["__lamella_statics_aaaa0001", "__lamella_statics_bbbb0002"] {

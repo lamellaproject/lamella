@@ -34,6 +34,7 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
+            if (!(obj is float)) throw new ArgumentException("Object must be of type Single.");
             return CompareTo((float)obj);
         }
 

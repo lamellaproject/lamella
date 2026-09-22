@@ -179,9 +179,10 @@ pub struct AssemblyStatics {
     /// (fnv1a32 of the assembly's CIL bytes -- the same hash that prefixes a library object's
     /// internal `L<hash>.f<rid>` symbols). The linker's region matcher REQUIRES the 8-hex shape.
     pub suffix: alloc::string::String,
-    /// The region's size in bytes: `(1 + static field count) * 4` -- word 0 is the reserved
-    /// EH-marker slot (dense slots start at 1), present in EVERY region so the entry assembly's
-    /// word 0 can serve as the shared `__lamella_eh_tag` home.
+    /// The region's size in bytes: `(2 + static field count) * 4` -- words 0 and 1 are the
+    /// reserved EH slots, the in-flight TAG and the in-flight MESSAGE (dense field slots start
+    /// past them), present in EVERY region so the entry assembly's word 0 can serve as the shared
+    /// `__lamella_eh_tag` home and its word 1 as the message the next byte over.
     pub region_bytes: u32,
     /// Root entries, encoded exactly like a method record's: word offset | kind << 14.
     pub roots: Vec<u16>,

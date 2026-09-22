@@ -785,8 +785,10 @@ fn class_library_image(
     let (archive_path, archive) = crate::tiers::runtime_archive(aot_target)
         .map_err(|reason| format!("lamella {verb}: {reason}"))?;
     linked_build(assembly, corlib, libraries, &archive, aot_target).map_err(|error| {
+        let head =
+            wrapped(&format!("lamella {verb}: the class-library build failed: {error}"));
         format!(
-            "lamella {verb}: the class-library build failed: {error}
+            "{head}
 
              The program and the class library were linked against {}.
 Nothing was written.",
@@ -826,7 +828,39 @@ fn linked_build(
         archive,
         aot_target,
     )
-    .map_err(|error| format!("{error:?}"))
+    .map_err(|error| format!("{error}"))
+}
+
+/// A refusal's first sentence, wrapped so a terminal does not choose the break for it.
+///
+/// **THE BACKEND'S OWN PROSE ARRIVES AS ONE LINE.** A `BuildError` renders as a sentence naming
+/// what could not be built and where -- which is what a reader wants, and is routinely longer
+/// than a terminal is wide. These messages list boards underneath that sentence, so a line the
+/// terminal soft-wraps pushes the list out of alignment and the refusal reads as ragged output
+/// rather than as an answer. Wrapping is the caller's job: only the caller knows its message is
+/// a block rather than a line.
+fn wrapped(text: &str) -> String {
+    const WIDTH: usize = 96;
+    let mut out = String::with_capacity(text.len() + text.len() / WIDTH + 1);
+    for (index, paragraph) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let mut column = 0;
+        for word in paragraph.split(' ') {
+            let width = word.chars().count();
+            if column > 0 && column + 1 + width > WIDTH {
+                out.push('\n');
+                column = 0;
+            } else if column > 0 {
+                out.push(' ');
+                column += 1;
+            }
+            out.push_str(word);
+            column += width;
+        }
+    }
+    out
 }
 
 /// Unreachable in a build without the tier -- [`linked_tier_compiled_in`] refuses above it -- and
@@ -864,8 +898,11 @@ const fn linked_tier_compiled_in() -> bool {
 /// plan for. A flag suggested to somebody it would then refuse costs them a build to find out, and
 /// teaches them the suggestion is not worth reading next time.
 fn flat_refusal(verb: &str, aot_target: &str, error: &lamella_aot::build::BuildError) -> String {
+    let head = wrapped(&format!(
+        "lamella {verb}: the ahead-of-time build failed: {error}"
+    ));
     let limits = format!(
-        "lamella {verb}: the ahead-of-time build failed: {error:?}\n\n\
+        "{head}\n\n\
          This is the flat tier: it is linker-free and resolves no call outside the program, so \
          floating\npoint, allocation, and anything reaching the class library are unavailable in \
          it. A program that\nwrites device registers and loops is the shape it covers."

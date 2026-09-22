@@ -3761,6 +3761,85 @@ impl<'a> MetadataResolver<'a> {
     /// portion alone allocated OVERLAPPING objects -- the first write through an inherited
     /// field then rewrote the NEXT object's header. Each block computes from its OWNING
     /// assembly's metadata, so both sides of a boundary agree on every offset.
+    /// Whether `ctor` (of `arity` parameters, resolved in `world`) hands its FIRST argument on,
+    /// unchanged and in position, until it reaches `System.Exception`'s own constructor -- which is
+    /// the one that stores it into `_message`.
+    ///
+    /// **THE WALK IS THE ONLY THING THAT KNOWS WHAT THE ARGUMENT MEANT**, because the tag path
+    /// runs no constructor. `class E : Exception { E(string code) : base("fixed") {} }` is a
+    /// perfectly ordinary type whose `Message` is `fixed`; putting `code` in flight for it yields
+    /// a WRONG MESSAGE THAT READS EXACTLY LIKE A RIGHT ONE, and there is nothing in the output for
+    /// a reader to catch it by. Declining leaves such a throw answering the TYPE NAME: a DEGRADED
+    /// answer a reader CAN recognize, which is strictly better than a plausible one they cannot.
+    /// It is also exactly what the throw answered before the message word existed, so declining
+    /// costs nothing that was working.
+    ///
+    /// **POSITIONAL, NOT MERELY PRESENT.** The body must be `ldarg.0; ldarg.1; ..; ldarg.N; call
+    /// base..ctor; ret`: every argument forwarded in its own place. A body that reorders them, or
+    /// passes a literal, or does anything else at all, is declined rather than guessed at -- and so
+    /// is a constructor whose declaring type this build cannot open, because "cannot read it" and
+    /// "read it and it forwards" are not the same fact.
+    ///
+    /// The depth bound is the chain `ArgumentNullException -> ArgumentException -> SystemException
+    /// -> Exception` with room over it; a chain longer than that declines rather than walks, since
+    /// nothing here can prove a cycle absent.
+    fn ctor_forwards_message(
+        &self,
+        world: &'a Assembly<'a>,
+        ctor: Token,
+        arity: usize,
+    ) -> bool {
+        let mut world = world;
+        let mut current = ctor;
+        for _ in 0..8 {
+            let Some(method) = world.resolve_method(current) else {
+                return false;
+            };
+            let Some(declaring) = method.declaring_type else {
+                return false;
+            };
+            if declaring.namespace == "System" && declaring.name == "Exception" {
+                return true;
+            }
+            let Some((owner, type_def)) = self.type_def_named(world, declaring) else {
+                return false;
+            };
+            let Some(body) = type_def
+                .methods()
+                .filter(|method| method.name() == Some(".ctor"))
+                .find(|method| {
+                    method
+                        .signature()
+                        .is_some_and(|signature| signature.parameters.len() == arity)
+                })
+                .and_then(|method| method.body())
+            else {
+                return false;
+            };
+            let Some(next) = positional_base_forward(&body.code, arity) else {
+                return false;
+            };
+            world = owner;
+            current = next;
+        }
+        false
+    }
+
+    /// The `TypeDef` a name refers to, with the assembly that declares it: `world`'s own table
+    /// first, then the reference list. `None` for a name this build cannot open.
+    fn type_def_named(
+        &self,
+        world: &'a Assembly<'a>,
+        name: lamella_metadata::TypeName<'_>,
+    ) -> Option<(&'a Assembly<'a>, TypeDef<'a>)> {
+        if let Some(type_def) = world.find_type(name.namespace, name.name) {
+            return Some((world, type_def));
+        }
+        let (ordinal, type_def) =
+            Assembly::find_in_references(&self.references, name.namespace, name.name)?;
+        Some((*self.references.get(ordinal)?, type_def))
+    }
+
     fn reference_layout_of(
         &self,
         owner: &'a Assembly<'a>,
@@ -5527,6 +5606,38 @@ impl CallResolver for MetadataResolver<'_> {
         tags
     }
 
+    fn exception_message_offset(&self) -> Option<u32> {
+        let (owner, type_def) = self.type_def_named(
+            self.assembly,
+            lamella_metadata::TypeName {
+                namespace: "System",
+                name: "Exception",
+            },
+        )?;
+        let field = type_def
+            .fields()
+            .find(|field| !field.is_static() && field.name() == Some("_message"))?;
+        owner.field_offset(field.token(), &TargetLayout::ilp32())
+    }
+
+    fn exception_message_argument(&self, operand: &Operand) -> Option<u32> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let method = self.assembly.resolve_method(*token)?;
+        if method.name != Some(".ctor") {
+            return None;
+        }
+        let parameters = method.signature?.parameters;
+        if !matches!(parameters.first(), Some(SigType::String)) {
+            return None;
+        }
+        if !self.ctor_forwards_message(self.assembly, *token, parameters.len()) {
+            return None;
+        }
+        u32::try_from(parameters.len()).ok()
+    }
+
     fn catch_binding_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
         let Operand::Token(token) = operand else {
             return None;
@@ -6100,9 +6211,10 @@ fn mir_type_across<'x>(
 }
 
 /// The DENSE static-field layout of one assembly: every static, non-literal Field row paired with
-/// its region slot, in metadata order, slots numbered from 1 -- slot 0 (region offset 0) is
-/// RESERVED, because offset 0 is the MIR-level EH-tag marker (`cil::G_EXCEPTION_TAG_OFFSET`) and a
-/// field slot there would alias every throw/catch. Literal (`const`) fields have no runtime
+/// its region slot, in metadata order, slots numbered from [`crate::cil::RESERVED_STATIC_SLOTS`]
+/// -- slots 0 and 1 (region offsets 0 and 4) are RESERVED for the exception model's in-flight TAG
+/// (`cil::G_EXCEPTION_TAG_OFFSET`) and in-flight MESSAGE (`cil::G_EXCEPTION_MESSAGE_OFFSET`), and a
+/// field slot on either would alias every throw/catch. Literal (`const`) fields have no runtime
 /// storage (ECMA-335 II.16.1.2) and are skipped -- a compiler inlines their values, and an
 /// `ldsfld` naming one fails the offset lookup LOUD rather than reading a phantom slot. This is
 /// the ONE source for both the `ldsfld`/`stsfld` lowering ([`CallResolver::static_field_offset`])
@@ -6159,7 +6271,7 @@ pub(crate) fn static_field_slots<'x>(
     references: &[&'x Assembly<'x>],
 ) -> Vec<(u32, u32, u32)> {
     let mut slots = Vec::new();
-    let mut next = 1u32;
+    let mut next = crate::cil::RESERVED_STATIC_SLOTS;
     for type_def in assembly.type_defs() {
         for field in type_def.fields() {
             if field.is_static() && !field.is_literal() {
@@ -6196,7 +6308,7 @@ pub(crate) fn type_init_types<'x>(
         .iter()
         .map(|(_, slot, words)| slot + words)
         .max()
-        .unwrap_or(1);
+        .unwrap_or(crate::cil::RESERVED_STATIC_SLOTS);
     let mut types = Vec::new();
     for type_def in assembly.type_defs() {
         let Some(cctor) = type_init_cctor(&type_def) else {
@@ -6298,7 +6410,7 @@ pub(crate) fn type_init_thunk_symbol(assembly: &Assembly, type_row: u32) -> Opti
     ))
 }
 
-/// The word count one assembly's static region spans, INCLUDING the reserved word 0 -- the one
+/// The word count one assembly's static region spans, INCLUDING the reserved words 0 and 1 -- the one
 /// derivation of its size, so a region and the offsets written into it come from the same walk.
 /// Gated with its only caller (`build::assembly_statics`): the WASM path places its statics at a
 /// fixed base and emits no region record, so a wasm-only build would carry this unused.
@@ -6462,7 +6574,7 @@ pub(crate) fn non_generic_region_words<'x>(
         .iter()
         .map(|(_, slot, words)| slot + words)
         .max()
-        .unwrap_or(1);
+        .unwrap_or(crate::cil::RESERVED_STATIC_SLOTS);
     type_init_types(assembly, references)
         .last()
         .map_or(fields, |(_, _, slot)| slot + 1)
@@ -8376,6 +8488,51 @@ fn string_ctor_form(params: &[SigType]) -> Option<StringCtorForm> {
     match params {
         [_] => Some(StringCtorForm::WholeArray),
         [_, SigType::I4, SigType::I4] => Some(StringCtorForm::Window),
+        _ => None,
+    }
+}
+
+/// The token a constructor body forwards ALL `arity` of its arguments to, in position: the `call`
+/// in `ldarg.0; ldarg.1; ..; ldarg.N; call base..ctor; ret` (`nop`s ignored, which is what a Debug
+/// build emits). `None` for a body of any other shape.
+///
+/// **IT IS WRITTEN AS A SHAPE TEST RATHER THAN A DATA-FLOW ONE ON PURPOSE.** The question being
+/// asked is narrow -- did argument 1 arrive at `System.Exception`'s constructor still being
+/// argument 1 -- and a shape that does not match is not a body this can reason about, so it is
+/// declined. Widening it later means recognizing MORE shapes, never trusting an unrecognized one.
+fn positional_base_forward(code: &[lamella_cil::Instruction], arity: usize) -> Option<Token> {
+    let mut wanted = 0u16;
+    let mut forwarded = None;
+    for inst in code.iter().filter(|inst| inst.opcode != Opcode::Nop) {
+        match forwarded {
+            None => match argument_slot(inst) {
+                Some(slot) if slot == wanted => wanted += 1,
+                None if inst.opcode == Opcode::Call && usize::from(wanted) == arity + 1 => {
+                    let Operand::Token(token) = inst.operand else {
+                        return None;
+                    };
+                    forwarded = Some(token);
+                }
+                _ => return None,
+            },
+            Some(_) if inst.opcode == Opcode::Ret => return forwarded,
+            Some(_) => return None,
+        }
+    }
+    None
+}
+
+/// The argument slot an instruction loads (`this` is 0), or `None` when it loads none.
+fn argument_slot(inst: &lamella_cil::Instruction) -> Option<u16> {
+    match inst.opcode {
+        Opcode::Ldarg0 => Some(0),
+        Opcode::Ldarg1 => Some(1),
+        Opcode::Ldarg2 => Some(2),
+        Opcode::Ldarg3 => Some(3),
+        Opcode::LdargS | Opcode::Ldarg => match inst.operand {
+            Operand::Variable(slot) => Some(slot),
+            _ => None,
+        },
         _ => None,
     }
 }

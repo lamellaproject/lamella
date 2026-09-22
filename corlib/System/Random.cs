@@ -72,11 +72,19 @@ namespace System
 #if LAMELLA_SURFACE_FLOAT
         public virtual int Next(int maxValue)
         {
+            if (maxValue < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
             return (int)(Sample() * maxValue);
         }
 
         public virtual int Next(int minValue, int maxValue)
         {
+            if (minValue > maxValue)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
             long range = (long)maxValue - (long)minValue;
             return (int)((long)(Sample() * (double)range) + (long)minValue);
         }

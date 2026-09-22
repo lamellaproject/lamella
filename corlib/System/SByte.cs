@@ -51,6 +51,7 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
+            if (!(obj is sbyte)) throw new ArgumentException("Object must be of type SByte.");
             return CompareTo((sbyte)obj);
         }
     }

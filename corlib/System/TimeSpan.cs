@@ -14,15 +14,13 @@ namespace System
         public TimeSpan(long ticks) { _ticks = ticks; }
 
         public TimeSpan(int hours, int minutes, int seconds)
+            : this(0, hours, minutes, seconds, 0)
         {
-            long totalSeconds = (long)hours * 3600 + (long)minutes * 60 + (long)seconds;
-            _ticks = totalSeconds * TicksPerSecond;
         }
 
         public TimeSpan(int days, int hours, int minutes, int seconds)
+            : this(days, hours, minutes, seconds, 0)
         {
-            long totalSeconds = ((long)days * 24 + hours) * 3600 + (long)minutes * 60 + seconds;
-            _ticks = totalSeconds * TicksPerSecond;
         }
 
         /// <summary>A <see cref="TimeSpan"/> of zero.</summary>
@@ -210,6 +208,7 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
+            if (!(obj is TimeSpan)) throw new ArgumentException("Object must be of type TimeSpan.");
             return CompareTo((TimeSpan)obj);
         }
 
@@ -217,7 +216,7 @@ namespace System
 
         public override bool Equals(object obj)
         {
-            if (obj == null) return false;
+            if (!(obj is TimeSpan)) return false;
             return _ticks == ((TimeSpan)obj)._ticks;
         }
 
@@ -242,20 +241,25 @@ namespace System
         {
             System.Text.StringBuilder result = new System.Text.StringBuilder();
             long ticks = _ticks;
+            ulong magnitude;
             if (ticks < 0)
             {
                 result.Append('-');
-                ticks = -ticks;
+                magnitude = (ulong)(-(ticks + 1)) + 1UL;
             }
-            long days = ticks / TicksPerDay;
-            long rest = ticks % TicksPerDay;
-            int hours = (int)(rest / TicksPerHour);
-            int minutes = (int)((rest / TicksPerMinute) % 60);
-            int seconds = (int)((rest / TicksPerSecond) % 60);
-            int fraction = (int)(rest % TicksPerSecond);
+            else
+            {
+                magnitude = (ulong)ticks;
+            }
+            ulong days = magnitude / (ulong)TicksPerDay;
+            ulong rest = magnitude % (ulong)TicksPerDay;
+            int hours = (int)(rest / (ulong)TicksPerHour);
+            int minutes = (int)((rest / (ulong)TicksPerMinute) % 60UL);
+            int seconds = (int)((rest / (ulong)TicksPerSecond) % 60UL);
+            int fraction = (int)(rest % (ulong)TicksPerSecond);
             if (days != 0)
             {
-                result.Append(days);
+                result.Append((long)days);
                 result.Append('.');
             }
             AppendPadded(result, hours, 2);
