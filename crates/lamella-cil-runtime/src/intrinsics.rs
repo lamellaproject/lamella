@@ -3570,6 +3570,11 @@ fn scalar_text(value: &Value) -> String {
 /// `System.Delegate.Combine(a, b)`: a delegate whose invocation list is a's followed by
 /// b's (multicast, the `+=` operator). A null operand contributes nothing.
 ///
+/// The result's TYPE is the first operand's, falling back to the second's, so combining onto a
+/// null source still carries one. That is what makes the cast in `(D)Delegate.Combine(a, b)` --
+/// which every `d += h` lowers to -- a legal one: an untyped result would fail the cast, or pass
+/// it and then answer `GetType()` with nothing.
+///
 /// # Errors
 /// Never errors (a non-delegate operand contributes no invocations).
 pub fn delegate_combine(
@@ -3577,13 +3582,23 @@ pub fn delegate_combine(
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
+    let type_id = delegate_operand_type(vm, args.first())
+        .or_else(|| delegate_operand_type(vm, args.get(1)));
     let mut invocations = delegate_list(vm, args.first());
     invocations.extend(delegate_list(vm, args.get(1)));
     if invocations.is_empty() {
         return Ok(Some(Value::Null));
     }
-    let reference = vm.heap_mut().alloc_multicast(invocations);
+    let reference = vm.heap_mut().alloc_multicast(invocations, type_id);
     Ok(Some(Value::Object(reference)))
+}
+
+/// The recorded delegate type of an operand that is a delegate, for the two combinators above.
+fn delegate_operand_type(vm: &Vm, operand: Option<&Value>) -> Option<u32> {
+    match operand {
+        Some(&Value::Object(reference)) => vm.heap().delegate_type_id(reference),
+        _ => None,
+    }
 }
 
 /// `System.Delegate.Remove(source, value)`: `source`'s invocation list with the LAST
@@ -3615,7 +3630,8 @@ pub fn delegate_remove(
     if invocations.is_empty() {
         return Ok(Some(Value::Null));
     }
-    let reference = vm.heap_mut().alloc_multicast(invocations);
+    let type_id = delegate_operand_type(vm, args.first());
+    let reference = vm.heap_mut().alloc_multicast(invocations, type_id);
     Ok(Some(Value::Object(reference)))
 }
 
@@ -3864,9 +3880,6 @@ pub fn thread_start(
 
 /// `System.Threading.Thread.ThreadFinished(int)`: whether thread `id` has run to completion.
 ///
-/// Backs `Thread.IsAlive`, which answered a hard-coded `true` before this existed -- so an unstarted
-/// thread and a finished one both reported themselves alive. The scheduler publishes this at the one
-/// site that marks a thread `Done`; see `Vm::mark_thread_finished`.
 ///
 /// It is NOT consumed on read, unlike the timed-park verdict beside it: a thread stays finished and
 /// `IsAlive` may be asked any number of times.
@@ -5732,8 +5745,12 @@ pub fn monitor_enter(
 /// the object. When the outermost level is released and a thread is queued, the lock is handed to
 /// the first waiter, which is woken ([`Vm::request_wake`]).
 ///
+/// Releasing a lock this thread does not own is `SynchronizationLockException`, as it is for
+/// `Wait` / `Pulse` / `PulseAll`.
+///
 /// # Errors
-/// [`Trap::TypeMismatch`] if the argument is not an object reference.
+/// [`Trap::TypeMismatch`] if the argument is not an object reference; [`Trap::SynchronizationLock`]
+/// if the running thread does not own the lock.
 pub fn monitor_exit(
     vm: &mut Vm,
     _module: &Module,
@@ -5743,6 +5760,9 @@ pub fn monitor_exit(
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     let thread = vm.current_thread_id();
+    if !vm.lock_is_owner(obj.0, thread) {
+        return Err(Trap::SynchronizationLock);
+    }
     if let Some(woken) = vm.lock_release(obj.0, thread) {
         vm.request_wake(woken);
     }
@@ -5969,9 +5989,15 @@ pub fn object_get_type(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<O
         })
         .or_else(|| {
             vm.heap()
-                .is_string(reference)
-                .then(|| module.string_type_id().and_then(|id| module.type_handle_of(id)))
-                .flatten()
+                .delegate_type_id(reference)
+                .and_then(|id| module.type_handle_of(id))
+        })
+        .or_else(|| {
+            vm.heap()
+                .structural_type(reference)
+                .filter(|which| which.is_exact())
+                .and_then(|which| module.intrinsic_type_id(which))
+                .and_then(|id| module.type_handle_of(id))
         })
         .or_else(|| {
             #[cfg(feature = "exceptions")]
@@ -6757,6 +6783,33 @@ pub fn type_get_methods(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a member handle.
 #[cfg(feature = "reflection")]
+/// `System.Reflection.MemberInfo.get_DeclaringType`: the type that declares the handle-backed member
+/// `this`, as a `Type` handle, or null when it has none the module records.
+///
+/// Reached by `MethodBase`/`FieldInfo`/`Type`, which ARE their asm-folded tokens. `PropertyInfo` is a
+/// managed object and overrides the property instead, so it never arrives here.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not a member handle.
+#[cfg(feature = "reflection")]
+pub fn member_declaring_type(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let declaring = module
+        .resolve_by_handle(handle as u64)
+        .and_then(|method| module.method_type(method))
+        .and_then(|type_id| module.type_handle_of(type_id));
+    Ok(Some(match declaring {
+        Some(type_handle) => Value::NativeInt(type_handle as i64),
+        None => Value::Null,
+    }))
+}
+
 pub fn member_get_type(
     _vm: &mut Vm,
     module: &Module,
@@ -7233,16 +7286,37 @@ pub fn marshal_size_of(
 }
 
 /// The unmanaged (marshaled) size of a primitive type by its full name, or 0 if not a modeled
-/// primitive. `IntPtr`/`UIntPtr` are 8 (this runtime models a 64-bit native int, matching the .NET 8
-/// oracle). The corpus avoids the .NET default-marshaling quirks (e.g. `bool` as a 4-byte `BOOL`).
+/// primitive. `IntPtr`/`UIntPtr` are the ACTIVE tier's pointer width rather than a fixed 8 -- the
+/// same source `System.IntPtr.Size` and the loader's value-type layout now read, because a runtime
+/// that marshals a pointer at one width and lays it out at another is wrong at one of them. The
+/// corpus avoids the .NET default-marshaling quirks (e.g. `bool` as a 4-byte `BOOL`).
 fn primitive_marshal_size(full_name: &str) -> i32 {
     match full_name {
         "System.Boolean" | "System.Byte" | "System.SByte" => 1,
         "System.Char" | "System.Int16" | "System.UInt16" => 2,
         "System.Int32" | "System.UInt32" | "System.Single" => 4,
-        "System.Int64" | "System.UInt64" | "System.Double" | "System.IntPtr" | "System.UIntPtr" => 8,
+        "System.Int64" | "System.UInt64" | "System.Double" => 8,
+        "System.IntPtr" | "System.UIntPtr" => crate::native_pointer_size() as i32,
         _ => 0,
     }
+}
+
+/// `System.IntPtr.Size` / `System.UIntPtr.Size`: the byte width of a native pointer on the tier
+/// this interpreter is executing on.
+///
+/// **It reads [`crate::native_pointer_size`], which is the point.** corlib used to answer a managed
+/// constant 8 while the loader measured a struct holding an `IntPtr` with a 4-byte pointer, so the
+/// two halves of one fact disagreed and a program striding an array by `IntPtr.Size` walked off by
+/// a factor of two -- silently, on the runtime's own heap.
+///
+/// # Errors
+/// Never errors.
+pub fn intptr_size(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(crate::native_pointer_size() as i32)))
 }
 
 /// `System.IntPtr.FromRawValue(long)`: the raw value as a native int. `IntPtr` is field-less and the
@@ -7450,7 +7524,7 @@ pub fn field_get_value(
         };
         vm.heap()
             .instance_field(target, slot)
-            .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?
+            .ok_or(Trap::InvalidArgument)?
     } else if let Some(slot) = module.static_field_slot_by_handle(handle) {
         vm.static_field(slot)
             .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?
@@ -7494,7 +7568,9 @@ pub fn field_set_value(
             Some(Value::Object(reference)) => *reference,
             _ => return Err(Trap::NullReference),
         };
-        vm.heap_mut().set_instance_field(target, slot, incoming);
+        if !vm.heap_mut().set_instance_field(target, slot, incoming) {
+            return Err(Trap::InvalidArgument);
+        }
     } else if let Some(slot) = module.static_field_slot_by_handle(handle) {
         vm.set_static_field(slot, incoming);
     } else {
@@ -8913,6 +8989,7 @@ mod tests {
         assert!(clock_set_ticks(&mut vm, &m, &[Value::Int32(5)]).is_err());
     }
 
+    #[cfg(feature = "bcl")]
     #[test]
     fn hello_world_from_a_hand_built_assembly() {
         let mut module = Module::new();

@@ -297,8 +297,14 @@ pub fn emit_body(
     return_type: &TypeSymbol,
     prologue: Option<&ConstructorPrologue>,
     source: Option<&[u8]>,
+    method_name: &str,
+    declaring_type: Option<&TypeSymbol>,
 ) -> Result<EmittedBody, EmitError> {
     let mut frame = Frame::build(parameters, byref_params, type_parameters, body, arg_base);
+    frame.set_constructor_of(match (method_name, declaring_type) {
+        (".ctor" | ".cctor", Some(owner)) => Some(owner.clone()),
+        _ => None,
+    });
     let lowered = lower(&mut frame, tokens, body, return_type, prologue, source)?;
     Ok(EmittedBody {
         code: lowered.0,
@@ -1339,7 +1345,7 @@ fn emit_statement_expression(
             if let BoundExprKind::Dereference { operand } = &target.kind {
                 emit_expression(operand, frame, tokens, out)?;
                 emit_expression(value, frame, tokens, out)?;
-                out.push(Instruction::simple(crate::expr::stind_opcode(&target.ty)));
+                crate::expr::emit_store_indirect(&target.ty, tokens, out)?;
                 return Ok(());
             }
             if let BoundExprKind::RefValue { reference, target: referent } = &target.kind {
@@ -1615,7 +1621,7 @@ pub(crate) fn emit_compound(
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(address)));
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
-                out.push(Instruction::simple(crate::expr::ldind_opcode(&target.ty)));
+                crate::expr::emit_load_indirect(&target.ty, tokens, out)?;
                 if leave == Leave::Old {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1625,7 +1631,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                out.push(Instruction::simple(crate::expr::stind_opcode(&target.ty)));
+                crate::expr::emit_store_indirect(&target.ty, tokens, out)?;
                 if let Some(slot) = kept {
                     out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
                 }
@@ -1686,7 +1692,7 @@ pub(crate) fn emit_compound(
             out.push(Instruction::new(Opcode::Stloc, Operand::Variable(address)));
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
-            out.push(Instruction::simple(crate::expr::ldind_opcode(&target.ty)));
+            crate::expr::emit_load_indirect(&target.ty, tokens, out)?;
             if leave == Leave::Old {
                 out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1696,7 +1702,7 @@ pub(crate) fn emit_compound(
                 out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
             }
-            out.push(Instruction::simple(crate::expr::stind_opcode(&target.ty)));
+            crate::expr::emit_store_indirect(&target.ty, tokens, out)?;
             if let Some(slot) = kept {
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
             }
@@ -1918,7 +1924,7 @@ mod tests {
     fn emission_records_a_sequence_point_per_statement() {
         let body = parse_statement("{ int x = 1; return x; }").statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
-        let emitted = emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, None)
+        let emitted = emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, None, "Main", None)
             .expect("should lower");
 
         let offsets: Vec<u32> = emitted
@@ -1940,7 +1946,7 @@ mod tests {
         let block_span = body.span;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
         let emitted =
-            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()), "Main", None)
                 .expect("should lower");
 
         assert_eq!(emitted.code[0].opcode, Opcode::Nop);
@@ -1958,7 +1964,7 @@ mod tests {
         let body = parse_statement(source).statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
         let emitted =
-            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()), "Main", None)
                 .expect("should lower");
         let braced = |offset: u32| {
             emitted
@@ -1979,7 +1985,7 @@ mod tests {
         let body = parse_statement(source).statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
         let emitted =
-            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()), "Main", None)
                 .expect("should lower");
         let braced = |offset: u32| {
             emitted

@@ -126,6 +126,21 @@ pub struct Tokens {
     /// Measured: csc reading its own metadata refuses that write at all eight positions a
     /// `ref readonly` member can occupy, and accepts it against a plain `ref` control at each.
     pub(crate) next_return_is_readonly_ref: bool,
+    /// The `MethodImplAttributes` the NEXT method emitted should carry, from a
+    /// `[MethodImpl(...)]` on its declaration -- `Synchronized` (0x0020) and the rest of
+    /// II.23.1.11. Zero means the default, `IL | Managed`.
+    ///
+    /// **A SIDE CHANNEL FOR THE SAME REASON [`Tokens::next_return_is_readonly_ref`] IS ONE**, and
+    /// modelled on it down to the `mem::take` that reads it: the value is known where the
+    /// declaration's ATTRIBUTES are in scope, and it is needed four calls deeper, where they are
+    /// not. `IL_MANAGED` is passed at ten emission sites, so threading a parameter would mean
+    /// touching all ten and picking the right one -- the shape that keeps producing a rule with
+    /// several implementations and a new case in none of them.
+    ///
+    /// Read with `core::mem::take`, never plain, so it cannot leak into the next method emitted.
+    /// A nested body (a lambda, an iterator's `MoveNext`) is emitted through the same path and must
+    /// not inherit its enclosing method's impl flags.
+    pub(crate) next_impl_flags: u16,
     /// Per-enclosing-type counter over async methods, so `<M>d__N` names two same-named
     /// overloads apart. Keyed like `types`.
     pub(crate) async_counters: BTreeMap<String, usize>,

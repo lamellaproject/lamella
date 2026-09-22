@@ -1,0 +1,19 @@
+[package]
+name = "lamella-clock-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "HOST-side monotonic clock for the interpreter's clock seam: milliseconds since the SYSTEM started, which is what .NET's Environment.TickCount reports. Host runners install it via Vm::set_clock; device builds read their own timer peripheral and never link this crate."
+publish = false
+
+[dependencies]
+
+# GetTickCount64, for milliseconds since the system started. windows-sys (not the `windows` crate)
+# per project convention; Windows-only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
+[lints]
+workspace = true

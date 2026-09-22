@@ -30,6 +30,77 @@ pub type MethodId = u32;
 /// An index identifying a declared reference type within a [`Module`].
 pub type TypeId = u32;
 
+/// A type whose instances this runtime represents STRUCTURALLY -- a heap string, an array -- so
+/// they are not field-carrying instances, carry no per-object type id, and can only name their
+/// runtime type from a fact a loader recorded on the [`Module`].
+///
+/// **ONE MECHANISM WITH SEVERAL POSITIONS, RATHER THAN A FIELD AND AN ARM PER POSITION, AND THAT
+/// IS THE WHOLE POINT OF IT.** `System.String` was given its own field and its own arm first. When
+/// the array receiver needed the same fact, a second field beside it would have been this crate's
+/// third instance of a rule with several implementations gaining a new case in none of them -- the
+/// boxed tag, the runtime-raised exception and the string each grew an arm separately, and the
+/// array and the delegate got neither. Every position is recovered through
+/// [`Module::intrinsic_type_id`], and a NEW position is a variant here, which the matches below
+/// then require an answer for instead of silently taking a `None`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntrinsicType {
+    /// `System.String`. A heap string is not a field-carrying instance, so a `callvirt` on one
+    /// dispatches through this type's vtable -- which is how String's own `Equals` / `GetHashCode`
+    /// / `ToString` overrides are reached.
+    String,
+    /// `System.Array`: the base every vector and every rectangular array derives from, which is
+    /// what an interface member dispatched on an ARRAY receiver resolves against --
+    /// `((IEnumerable)someArray).GetEnumerator()`, where the interface is the receiver's static
+    /// type so the call is a real `callvirt`. (`foreach` never reaches this: csc calls
+    /// `Array::GetEnumerator` directly and dispatches through no interface at all.)
+    Array,
+}
+
+impl IntrinsicType {
+    /// Every position. A caller that must consider all of them iterates this rather than listing
+    /// the variants itself, so adding one reaches that caller.
+    pub const ALL: [IntrinsicType; 2] = [IntrinsicType::String, IntrinsicType::Array];
+
+    /// The stable key this position is recorded under inside a baked image.
+    ///
+    #[must_use]
+    pub const fn key(self) -> u64 {
+        match self {
+            IntrinsicType::String => 0,
+            IntrinsicType::Array => 1,
+        }
+    }
+
+    /// The corlib type this position names, as `(namespace, name)`.
+    ///
+    #[must_use]
+    pub const fn qualified_name(self) -> (&'static str, &'static str) {
+        match self {
+            IntrinsicType::String => ("System", "String"),
+            IntrinsicType::Array => ("System", "Array"),
+        }
+    }
+
+    /// The position a corlib type name denotes, if it is one.
+    #[must_use]
+    pub fn from_qualified_name(namespace: &str, name: &str) -> Option<IntrinsicType> {
+        IntrinsicType::ALL
+            .into_iter()
+            .find(|which| which.qualified_name() == (namespace, name))
+    }
+
+    /// Whether the recorded id is the object's EXACT runtime type, so `GetType()` may answer it
+    /// -- not merely a base type good enough to DISPATCH through.
+    ///
+    #[must_use]
+    pub const fn is_exact(self) -> bool {
+        match self {
+            IntrinsicType::String => true,
+            IntrinsicType::Array => false,
+        }
+    }
+}
+
 /// A custom-attribute argument value, decoded from the attribute's value blob at load and
 /// materialized into a runtime [`Value`] when the attribute is instantiated (`GetCustomAttributes`).
 /// The blob is decoded with no heap, so a string keeps its UTF-16 units and a `typeof(X)` argument
@@ -769,6 +840,10 @@ pub struct Module {
     /// `newobj` tokens that construct a delegate (a delegate type's `.ctor`): instead
     /// of running a constructor, the (target, method) on the stack become a delegate.
     delegate_ctors: BTreeSet<u64>,
+    /// The DECLARING type of each delegate constructor in `delegate_ctors`, so the delegate a
+    /// `newobj` mints can record what it is and answer `GetType()`.
+    ///
+    delegate_ctor_types: BTreeMap<u64, TypeId>,
     /// A delegate type's `Invoke` token mapped to its parameter count, so `callvirt` on
     /// it calls the delegate's bound method with the bound target.
     delegate_invokes: BTreeMap<u64, u16>,
@@ -830,6 +905,10 @@ pub struct Module {
     /// type's vtable (reaching String's Equals / GetHashCode / ToString overrides) since a
     /// heap string is not a field-carrying instance and so has no per-object type id.
     string_type_id: Option<u32>,
+    /// The recorded [`TypeId`] of each [`IntrinsicType`], keyed by [`IntrinsicType::key`] -- the
+    /// one facility every structurally-represented object recovers its runtime type through.
+    ///
+    intrinsic_type_ids: BTreeMap<u64, TypeId>,
     /// The canonical (asm-folded) `TypeDef` token of each primitive value type a corlib
     /// defines (`System.Int32`, `System.Int64`, `System.Single`/`Double`, `System.IntPtr`),
     /// keyed by the evaluation-stack [`Value`] kind that represents it. `System.Array.GetValue`
@@ -919,18 +998,17 @@ pub struct Module {
     /// `MemberInfo` whose `GetCustomAttributes` then reads `custom_attributes`. Three separate
     /// maps so a field, a method, and a property of the same name do not collide.
     type_fields_by_name: BTreeMap<(u64, String), u64>,
-    /// `Lamella.Runtime.Clock::SetTicks(long)`, recorded at load so an EMBEDDER can install the wall
-    /// clock through the managed setter rather than into a runtime field the managed clock no longer
-    /// reads. See [`Module::bind_wall_clock_setter`].
-    wall_clock_setter: Option<MethodId>,
-    /// `Lamella.Runtime.Clock::SourceCode()`, the read half of the same door.
-    wall_clock_source: Option<MethodId>,
-    /// `Lamella.Hardware.PinEvents::Dispatch(int, bool)`, recorded at load so a pin-change event a
-    /// board's interrupt handler queued can reach the delegate a driver registered for it. See
-    /// [`Module::bind_pin_event_dispatch`].
-    pin_event_dispatch: Option<MethodId>,
-    /// `Lamella.Hardware.PinEvents::ReportLost()`, the overflow half of the same door.
-    pin_event_lost: Option<MethodId>,
+    /// Methods the RUNTIME itself calls on an EMBEDDER's behalf, keyed by a well-known id rather
+    /// than by a metadata token -- the runtime knows which DOOR it wants and has no token to ask
+    /// with. Four today: the wall clock's setter and source reader
+    /// ([`RUNTIME_METHOD_WALL_CLOCK_SETTER`], [`RUNTIME_METHOD_WALL_CLOCK_SOURCE`]) and the
+    /// pin-change dispatcher and overflow reporter ([`RUNTIME_METHOD_PIN_EVENT_DISPATCH`],
+    /// [`RUNTIME_METHOD_PIN_EVENT_LOST`]). See [`Module::bind_wall_clock_setter`].
+    runtime_methods: BTreeMap<u64, MethodId>,
+    /// Instance-field slots the RUNTIME itself reads, keyed by a well-known id rather than by a
+    /// metadata token -- the runtime knows which FACT it wants and has no token to ask with. One
+    /// today: [`RUNTIME_SLOT_EXCEPTION_MESSAGE`]. See [`Module::bind_exception_message_slot`].
+    runtime_field_slots: BTreeMap<u64, u32>,
     type_methods_by_name: BTreeMap<(u64, String), u64>,
     type_properties_by_name: BTreeMap<(u64, String), u64>,
     /// Reflection introspection metadata per type (the `System.Type` `Namespace`/`FullName`/`Is*`
@@ -1326,6 +1404,19 @@ struct FrozenTables {
     explicit_overrides: SortedTokenTable,
     /// The frozen `delegate_ctors` (`newobj` tokens constructing a delegate).
     delegate_ctors: SortedTokenSet,
+    /// The frozen `delegate_ctor_types` (delegate ctor token -> declaring [`TypeId`]). In the
+    /// TRAILING directory section, so an image baked before it existed simply has none and its
+    /// delegates fall back to the behavior that predates this table.
+    delegate_ctor_types: SortedTokenTable,
+    /// The frozen `intrinsic_type_ids` ([`IntrinsicType::key`] -> [`TypeId`]). Trailing, for the
+    /// same reason.
+    intrinsic_type_ids: SortedTokenTable,
+    /// The frozen `runtime_field_slots` (well-known id -> instance slot). Trailing, for the same
+    /// reason: an image baked before it existed simply has none, and the runtime then reports the
+    /// field absent rather than misreading a slot it never recorded.
+    runtime_field_slots: SortedTokenTable,
+    /// The frozen `runtime_methods` (well-known id -> [`MethodId`]). Trailing, for the same reason.
+    runtime_methods: SortedTokenTable,
     /// The frozen `enum_wide` (enum handles with a 64-bit underlying type).
     enum_wide: SortedTokenSet,
     /// The frozen `enum_flags` (enum handles carrying `[Flags]`).
@@ -1908,6 +1999,39 @@ const HEADER_RESERVED_WORDS: usize = 3;
 /// How many header words this build WRITES. A reader must not assume this of an image.
 const HEADER_WORDS: usize = HEADER_RESERVED_BASE + HEADER_RESERVED_WORDS;
 
+/// The well-known id of `System.Exception`'s message field in [`Module::runtime_field_slots`].
+///
+/// Ids are assigned here and never reused: a baked image records the id alongside the slot, so
+/// changing what an id means would make an older image's slot read as a newer fact.
+///
+const RUNTIME_SLOT_EXCEPTION_MESSAGE: u64 = 1;
+
+/// `Lamella.Runtime.Clock::SetTicks(long)` in [`Module::runtime_methods`] -- and the first of the
+/// four well-known ids of the methods the RUNTIME calls, whose shared reasoning is here.
+///
+/// A SEPARATE id space from [`RUNTIME_SLOT_EXCEPTION_MESSAGE`]'s, because it is a separate table:
+/// an id identifies a row within one table and nothing wider, so both start at 1. Ids are assigned
+/// here and never reused, for the reason the slot table gives -- a baked image records the id
+/// beside the method, so changing what an id means would make an older image's door read as a
+/// newer one.
+///
+/// # Why these are a TABLE and not four fields on the module
+///
+/// A plain Rust field on [`Module`] is set at load, travels the eager and the lazy tiers, and is
+/// GONE the moment the image is baked and read back -- `from_baked` rebuilds the module from the
+/// image and simply answers `None`. For a door that is the worst possible shape of failure: an
+/// `Option` that is `None` is indistinguishable from a program that installed no handler, so a
+/// baked board's pin events go quiet with no error, no missing symbol and no size signature.
+///
+///
+const RUNTIME_METHOD_WALL_CLOCK_SETTER: u64 = 1;
+/// `Lamella.Runtime.Clock::SourceCode()`. See [`RUNTIME_METHOD_WALL_CLOCK_SETTER`].
+const RUNTIME_METHOD_WALL_CLOCK_SOURCE: u64 = 2;
+/// `Lamella.Hardware.PinEvents::Dispatch(int, bool)`. See [`RUNTIME_METHOD_WALL_CLOCK_SETTER`].
+const RUNTIME_METHOD_PIN_EVENT_DISPATCH: u64 = 3;
+/// `Lamella.Hardware.PinEvents::ReportLost()`. See [`RUNTIME_METHOD_WALL_CLOCK_SETTER`].
+const RUNTIME_METHOD_PIN_EVENT_LOST: u64 = 4;
+
 /// Feature bits an image may require of the runtime. **None is defined yet, and that is correct:**
 /// v1 requires nothing beyond the base format, so every v1 image sets zero and any runtime that
 /// understands the base format can boot it. Generics and async are the first two expected to claim
@@ -2092,6 +2216,10 @@ impl FrozenTables {
         pair(out, self.assembly_types.offset, self.assembly_types.entries);
         pair(out, self.enum_constants.offset, self.enum_constants.entries);
         pair(out, self.nullable_underlying.offset, self.nullable_underlying.entries);
+        pair(out, self.delegate_ctor_types.offset, self.delegate_ctor_types.entries);
+        pair(out, self.intrinsic_type_ids.offset, self.intrinsic_type_ids.entries);
+        pair(out, self.runtime_field_slots.offset, self.runtime_field_slots.entries);
+        pair(out, self.runtime_methods.offset, self.runtime_methods.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
@@ -2196,6 +2324,10 @@ impl FrozenTables {
             };
         }
         trailing!(nullable_underlying, SortedWideTable);
+        trailing!(delegate_ctor_types, SortedTokenTable);
+        trailing!(intrinsic_type_ids, SortedTokenTable);
+        trailing!(runtime_field_slots, SortedTokenTable);
+        trailing!(runtime_methods, SortedTokenTable);
         Some((frozen, cursor))
     }
 }
@@ -3120,6 +3252,30 @@ impl Module {
             u32::from,
         );
         frozen.md_array_ctors = drain(arena, frozen.md_array_ctors, &mut self.md_array_ctors, u32::from);
+        frozen.delegate_ctor_types = drain(
+            arena,
+            frozen.delegate_ctor_types,
+            &mut self.delegate_ctor_types,
+            |id| id,
+        );
+        frozen.intrinsic_type_ids = drain(
+            arena,
+            frozen.intrinsic_type_ids,
+            &mut self.intrinsic_type_ids,
+            |id| id,
+        );
+        frozen.runtime_field_slots = drain(
+            arena,
+            frozen.runtime_field_slots,
+            &mut self.runtime_field_slots,
+            |slot| slot,
+        );
+        frozen.runtime_methods = drain(
+            arena,
+            frozen.runtime_methods,
+            &mut self.runtime_methods,
+            |method| method,
+        );
         frozen.string_builder_ctors = drain(
             arena,
             frozen.string_builder_ctors,
@@ -3944,6 +4100,9 @@ impl Module {
         for &ctor in &self.static_ctors {
             push(ctor, &mut keep_method, &mut queue);
         }
+        for door in self.runtime_method_roots() {
+            push(door, &mut keep_method, &mut queue);
+        }
         for attributes in self.custom_attributes.values() {
             for attribute in attributes {
                 push(attribute.ctor, &mut keep_method, &mut queue);
@@ -4396,6 +4555,10 @@ impl Module {
             + self.finalizers.len()
             + self.enum_widths.len()
             + self.md_array_ctors.len()
+            + self.delegate_ctor_types.len()
+            + self.intrinsic_type_ids.len()
+            + self.runtime_field_slots.len()
+            + self.runtime_methods.len()
             + self.string_builder_ctors.len()
             + self.list_ctors.len()
             + self.type_sizes.len()
@@ -4468,6 +4631,10 @@ impl Module {
             ("finalizers", self.finalizers.len()),
             ("enum_widths", self.enum_widths.len()),
             ("md_array_ctors", self.md_array_ctors.len()),
+            ("delegate_ctor_types", self.delegate_ctor_types.len()),
+            ("intrinsic_type_ids", self.intrinsic_type_ids.len()),
+            ("runtime_field_slots", self.runtime_field_slots.len()),
+            ("runtime_methods", self.runtime_methods.len()),
             ("string_builder_ctors", self.string_builder_ctors.len()),
             ("list_ctors", self.list_ctors.len()),
             ("type_sizes", self.type_sizes.len()),
@@ -5286,16 +5453,36 @@ impl Module {
         self.box_primitives.get(&handle).copied()
     }
 
-    /// Records the [`TypeId`] of `System.String`, so a `callvirt` on a heap string can supply
-    /// it as the receiver's runtime type and dispatch through String's vtable.
-    pub fn set_string_type_id(&mut self, id: u32) {
-        self.string_type_id = Some(id);
+    /// Records the [`TypeId`] of an [`IntrinsicType`], so an object this runtime represents
+    /// structurally can name its runtime type: a `callvirt` on a heap string dispatches through
+    /// String's vtable, and one on an array receiver through `System.Array`'s.
+    ///
+    /// Called by BOTH loaders. The eager one walks every type it loads; the lazy one materializes
+    /// a member at a time and must record the same fact as it goes, or the two tiers answer the
+    /// same program differently -- which is the divergence `lazy_program_corlib` exists to catch.
+    pub fn set_intrinsic_type_id(&mut self, which: IntrinsicType, id: TypeId) {
+        self.intrinsic_type_ids.insert(which.key(), id);
+        if matches!(which, IntrinsicType::String) {
+            self.string_type_id = Some(id);
+        }
     }
 
-    /// The [`TypeId`] of `System.String`, if a loaded assembly defined it.
+    /// The recorded [`TypeId`] of an [`IntrinsicType`], if a loaded assembly defined it.
+    ///
+    /// This is the type the object DISPATCHES as, which is its exact type only where
+    /// [`IntrinsicType::is_exact`] says so. A caller answering `GetType()` must ask that first:
+    /// `System.Array` is the right receiver type for an `int[]` and the wrong `GetType()`.
     #[must_use]
-    pub fn string_type_id(&self) -> Option<u32> {
-        self.string_type_id
+    pub fn intrinsic_type_id(&self, which: IntrinsicType) -> Option<TypeId> {
+        self.frozen
+            .intrinsic_type_ids
+            .get(&self.arena, which.key())
+            .or_else(|| self.intrinsic_type_ids.get(&which.key()).copied())
+            .or_else(|| {
+                matches!(which, IntrinsicType::String)
+                    .then_some(self.string_type_id)
+                    .flatten()
+            })
     }
 
     /// Records the canonical `TypeDef` `token` of a primitive value type a corlib defines (in
@@ -5825,9 +6012,31 @@ impl Module {
     }
 
     /// Marks `token` in assembly `asm` as a delegate constructor, so `newobj` on it builds
-    /// a delegate.
-    pub fn mark_delegate_ctor(&mut self, asm: u8, token: Token) {
-        self.delegate_ctors.insert(asm_key(asm, token.0));
+    /// a delegate -- recording the delegate type it constructs, when the loader knows it.
+    ///
+    /// `declaring` is what lets the minted delegate answer `GetType()`, and it is an `Option`
+    /// because a caller that does not have the type must say so rather than pass a plausible
+    /// wrong one. A delegate with no recorded type refuses `GetType()`, which is loud; one
+    /// carrying the wrong type answers confidently, which is not.
+    pub fn mark_delegate_ctor(&mut self, asm: u8, token: Token, declaring: Option<TypeId>) {
+        let key = asm_key(asm, token.0);
+        self.delegate_ctors.insert(key);
+        if let Some(type_id) = declaring {
+            self.delegate_ctor_types.insert(key, type_id);
+        }
+    }
+
+    /// The delegate type `token` in assembly `asm` constructs, if a loader recorded it.
+    ///
+    /// `None` for a ctor marked before this table existed (an older baked image) or by a caller
+    /// that had no type to give -- both of which leave `GetType()` where it was.
+    #[must_use]
+    pub fn delegate_ctor_type(&self, asm: u8, token: Token) -> Option<TypeId> {
+        let key = asm_key(asm, token.0);
+        self.frozen
+            .delegate_ctor_types
+            .get(&self.arena, key)
+            .or_else(|| self.delegate_ctor_types.get(&key).copied())
     }
 
     /// Whether `token` in assembly `asm` constructs a delegate.
@@ -6081,25 +6290,26 @@ impl Module {
     ///
     /// UNGATED, unlike the reflection name tables beside it in the loader: the clock is not a
     /// reflection feature and must work on a build that carries no metadata inspection at all.
+    ///
     pub fn bind_wall_clock_setter(&mut self, method: MethodId) {
-        self.wall_clock_setter = Some(method);
+        self.bind_runtime_method(RUNTIME_METHOD_WALL_CLOCK_SETTER, method);
     }
 
     /// The managed wall clock's setter, or `None` when no corlib declaring one is loaded.
     #[must_use]
     pub fn wall_clock_setter(&self) -> Option<MethodId> {
-        self.wall_clock_setter
+        self.runtime_method(RUNTIME_METHOD_WALL_CLOCK_SETTER)
     }
 
     /// Records the managed wall clock's source reader -- `Lamella.Runtime.Clock::SourceCode()`.
     pub fn bind_wall_clock_source(&mut self, method: MethodId) {
-        self.wall_clock_source = Some(method);
+        self.bind_runtime_method(RUNTIME_METHOD_WALL_CLOCK_SOURCE, method);
     }
 
     /// The managed wall clock's source reader, or `None`.
     #[must_use]
     pub fn wall_clock_source(&self) -> Option<MethodId> {
-        self.wall_clock_source
+        self.runtime_method(RUNTIME_METHOD_WALL_CLOCK_SOURCE)
     }
 
     /// Records the managed pin-change dispatcher -- `Lamella.Hardware.PinEvents::Dispatch(int, bool)`.
@@ -6115,25 +6325,87 @@ impl Module {
     /// UNGATED, like the wall clock's and for the same reason: it is not a reflection feature and
     /// must work on a build carrying no metadata inspection at all.
     pub fn bind_pin_event_dispatch(&mut self, method: MethodId) {
-        self.pin_event_dispatch = Some(method);
+        self.bind_runtime_method(RUNTIME_METHOD_PIN_EVENT_DISPATCH, method);
     }
 
     /// The managed pin-change dispatcher, or `None` when no assembly declaring one is loaded --
     /// which is every program that references no GPIO assembly.
     #[must_use]
     pub fn pin_event_dispatch(&self) -> Option<MethodId> {
-        self.pin_event_dispatch
+        self.runtime_method(RUNTIME_METHOD_PIN_EVENT_DISPATCH)
     }
 
     /// Records the managed pin-change overflow reporter -- `Lamella.Hardware.PinEvents::ReportLost()`.
     pub fn bind_pin_event_lost(&mut self, method: MethodId) {
-        self.pin_event_lost = Some(method);
+        self.bind_runtime_method(RUNTIME_METHOD_PIN_EVENT_LOST, method);
     }
 
     /// The managed pin-change overflow reporter, or `None`.
     #[must_use]
     pub fn pin_event_lost(&self) -> Option<MethodId> {
-        self.pin_event_lost
+        self.runtime_method(RUNTIME_METHOD_PIN_EVENT_LOST)
+    }
+
+    /// Records one of the methods the RUNTIME calls, under its well-known id.
+    fn bind_runtime_method(&mut self, which: u64, method: MethodId) {
+        self.runtime_methods.insert(which, method);
+    }
+
+    /// One of the methods the RUNTIME calls, or `None` where no assembly declaring it was loaded --
+    /// or where the image was baked before that door was carried, which reports the door absent
+    /// rather than calling whatever method happens to hold that id today.
+    ///
+    /// The frozen table first and the live map second, like every other accessor over a table that
+    /// can be either: a baked module has only the frozen one, and a module still being loaded has
+    /// only the live one.
+    fn runtime_method(&self, which: u64) -> Option<MethodId> {
+        self.frozen
+            .runtime_methods
+            .get(&self.arena, which)
+            .or_else(|| self.runtime_methods.get(&which).copied())
+    }
+
+    /// Every method the RUNTIME calls that this module has recorded -- the doors, as ROOTS.
+    ///
+    /// They are roots because nothing in the program names them: the loader binds each from the
+    /// assemblies' own metadata and the interpreter invokes it on an embedder's behalf, so a
+    /// reachability walk from the entry point reaches none of them. Without this the bake-time trim
+    /// empties their bodies and the recorded id then names a body that traps instead of dispatching
+    /// -- a failure quieter still than losing the id, because the door is present and answers.
+    #[cfg(feature = "code-in-place")]
+    fn runtime_method_roots(&self) -> impl Iterator<Item = MethodId> + '_ {
+        self.runtime_methods.values().copied()
+    }
+
+    /// Records the instance slot that holds a managed `System.Exception`'s message.
+    ///
+    /// The runtime keeps the message of an exception IT raised in storage of its own, because such
+    /// an exception has no fields; an exception managed code constructed keeps its message in this
+    /// field, where a constructor assigned it. Reporting an exception that escaped means reading
+    /// both, so the slot is recorded at load, where the layout that decides it is known.
+    ///
+    /// The slot is the same for every exception type, not only for `System.Exception`: a type's
+    /// layout places its base's fields first, so a derived exception's message sits where its base
+    /// put it.
+    ///
+    pub fn bind_exception_message_slot(&mut self, slot: u32) {
+        self.runtime_field_slots
+            .insert(RUNTIME_SLOT_EXCEPTION_MESSAGE, slot);
+    }
+
+    /// The instance slot holding a managed exception's message, or `None` where no corlib defining
+    /// one was loaded -- or where the image was baked before this was recorded, which reports the
+    /// message absent rather than reading whatever sits at some other slot.
+    #[must_use]
+    pub fn exception_message_slot(&self) -> Option<u32> {
+        self.frozen
+            .runtime_field_slots
+            .get(&self.arena, RUNTIME_SLOT_EXCEPTION_MESSAGE)
+            .or_else(|| {
+                self.runtime_field_slots
+                    .get(&RUNTIME_SLOT_EXCEPTION_MESSAGE)
+                    .copied()
+            })
     }
 
     /// Records that the type whose handle is `type_handle` has a field named `name` whose
@@ -6987,6 +7259,67 @@ mod tests {
         assert!(module.implements_interface(derived, ilist));
         assert!(module.implements_interface(derived, ienumerable));
         assert!(!module.implements_interface(derived, icomparer));
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_baked_image_carries_every_recorded_type_id_and_delegate_type() {
+        const METHOD_DEF: u8 = 0x06;
+
+        let mut module = Module::new();
+        let string_type = module.add_type(Vec::new());
+        assert_eq!(string_type, 0, "the first added type is id 0, which is what makes this a test");
+        let array_type = module.add_type(Vec::new());
+        let delegate_type = module.add_type(Vec::new());
+
+        module.set_intrinsic_type_id(IntrinsicType::String, string_type);
+        module.set_intrinsic_type_id(IntrinsicType::Array, array_type);
+        module.mark_delegate_ctor(0, Token::new(METHOD_DEF, 7), Some(delegate_type));
+        module.mark_delegate_ctor(0, Token::new(METHOD_DEF, 9), None);
+
+        for which in IntrinsicType::ALL {
+            assert!(
+                module.intrinsic_type_id(which).is_some(),
+                "{which:?} was recorded on the live module"
+            );
+        }
+
+        let image = module.write_baked(None).expect("bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, _entry) = Module::from_baked(leaked).expect("the image reads back");
+
+        assert_eq!(baked.intrinsic_type_id(IntrinsicType::String), Some(string_type));
+        assert_eq!(baked.intrinsic_type_id(IntrinsicType::Array), Some(array_type));
+        assert_eq!(
+            baked.delegate_ctor_type(0, Token::new(METHOD_DEF, 7)),
+            Some(delegate_type),
+            "a delegate's type must survive the bake, or a device answers GetType differently"
+        );
+        assert!(baked.is_delegate_ctor(0, Token::new(METHOD_DEF, 9)));
+        assert_eq!(
+            baked.delegate_ctor_type(0, Token::new(METHOD_DEF, 9)),
+            None,
+            "a ctor marked without a type stays typeless rather than acquiring id 0"
+        );
+        assert!(!baked.is_delegate_ctor(0, Token::new(METHOD_DEF, 11)));
+        assert_eq!(baked.delegate_ctor_type(0, Token::new(METHOD_DEF, 11)), None);
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn an_image_predating_the_facility_still_resolves_the_string_from_its_header_word() {
+        let mut module = Module::new();
+        let string_type = module.add_type(Vec::new());
+        module.set_intrinsic_type_id(IntrinsicType::String, string_type);
+        let image = module.write_baked(None).expect("bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, _entry) = Module::from_baked(leaked).expect("the image reads back");
+
+        assert_eq!(baked.intrinsic_type_id(IntrinsicType::String), Some(string_type));
+        assert_eq!(
+            baked.string_type_id, Some(string_type),
+            "the grandfathered header word is still written, or an older runtime's \n             string dispatch is lost"
+        );
     }
 
     #[cfg(feature = "code-in-place")]

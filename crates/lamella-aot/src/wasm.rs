@@ -65,6 +65,42 @@ pub enum LowerError {
     },
 }
 
+impl core::fmt::Display for LowerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LowerError::NotWellFormed { errors } => match errors.split_first() {
+                Some((first, rest)) if rest.is_empty() => {
+                    write!(f, "the function does not verify: {first:?}")
+                }
+                Some((first, rest)) => write!(
+                    f,
+                    "the function does not verify: {first:?}, and {} further problem(s)",
+                    rest.len(),
+                ),
+                None => write!(f, "the function does not verify"),
+            },
+            LowerError::Unsupported => write!(
+                f,
+                "the function uses something the WASM backend does not lower yet: a value type \
+                 (which has no memory home in the local-per-value model), a static field, or a \
+                 string literal",
+            ),
+            LowerError::ControlFlowUnsupported => write!(
+                f,
+                "the function has a control-flow shape this target does not lower: a branch \
+                 edge carrying block-parameter arguments (a merge passes its parameters on a \
+                 Jump), or an entry block whose parameters do not match the signature",
+            ),
+            LowerError::UnencodableStringUnit { unit, index } => write!(
+                f,
+                "a string literal holds the UTF-16 code unit 0x{unit:04X} at index {index}, \
+                 which this build's string storage cannot represent -- a lone surrogate has no \
+                 form under `string-utf8`",
+            ),
+        }
+    }
+}
+
 /// Lowers a single [`Function`] to a WebAssembly module's bytes -- a one-function module exporting
 /// the function as `main`.
 pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {

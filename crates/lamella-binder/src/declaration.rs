@@ -2,7 +2,7 @@
 //! clauses 16-18).
 
 use crate::bind::{bind_type, parameter_symbol, tuple_element_names};
-use crate::bound::{coerce_constant, integer_literal, literal_int_value};
+use crate::bound::{cast_constant, coerce_constant, integer_literal, literal_int_value};
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
@@ -78,16 +78,8 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             info.bases.push(enum_base.clone());
             info.base = Some(enum_base);
             let enum_ty = named_symbol(namespace, &declaration.name);
-            let mut next_value: i64 = 0;
-            let mut prior: BTreeMap<Box<str>, i64> = BTreeMap::new();
-            for member in &declaration.members {
-                let value = member
-                    .value
-                    .as_ref()
-                    .and_then(|expr| eval_enum_member(expr, &prior))
-                    .unwrap_or(next_value);
-                next_value = value.wrapping_add(1);
-                prior.insert(member.name.clone(), value);
+            let numbering = enum_member_numbering(&declaration.members, &|_| None);
+            for (member, (_, value)) in declaration.members.iter().zip(numbering) {
                 info.fields.push(FieldSymbol {
                     tuple_names: Vec::new(),
                     name: member.name.clone(),
@@ -114,6 +106,9 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 constraints_by_parameter(&info.type_parameters, &declaration.constraints);
             info.accessibility = accessibility_of(&declaration.modifiers);
             info.is_sealed = true;
+            let delegate_base = named_symbol("System", "MulticastDelegate");
+            info.bases.push(delegate_base.clone());
+            info.base = Some(delegate_base);
             info.methods.push(MethodSymbol {
                 return_tuple_names: tuple_element_names(&declaration.return_type),
                 return_required_modifiers: Vec::new(),
@@ -235,6 +230,61 @@ fn eval_enum_member(expr: &Expr, prior: &BTreeMap<Box<str>, i64>) -> Option<i64>
     literal_int_value(&value)
 }
 
+/// Numbers an enum's members (21.3), in declaration order, BY DEPENDENCY rather than by position.
+///
+/// A member initializer may name any other member of the same enum, including one declared LATER --
+/// `enum E { Forward = Later, Later = 9 }` -- so a single forward walk cannot resolve it: `Later` is
+/// simply not known when `Forward` is reached. Passes repeat until one resolves nothing new, which
+/// terminates because every pass either fixes at least one of the finitely many members or stops.
+///
+/// An IMPLICIT member is its predecessor plus one, so it waits for that predecessor to resolve
+/// rather than for the walk to reach it: `enum E { A = C, B, C = 5 }` gives B = 6.
+///
+/// `extra` resolves an initializer the enum's own members cannot -- a constant declared elsewhere.
+/// It is tried only after them, so a same-named constant outside the enum cannot capture a
+/// same-enum reference.
+///
+/// A member left unresolved is unresolvable: a circular initializer (CS0110), a name that does not
+/// resolve, or a non-constant. Each is diagnosed in `validate_enum_members`, and the value falls
+/// back to the implicit sequence so that an enum which is already an error keeps the numbering it
+/// had rather than becoming a second, different failure.
+fn enum_member_numbering(
+    members: &[lamella_syntax::ast::EnumMember],
+    extra: &dyn Fn(&Expr) -> Option<i64>,
+) -> Vec<(Box<str>, i64)> {
+    let mut resolved: BTreeMap<Box<str>, i64> = BTreeMap::new();
+    loop {
+        let mut progressed = false;
+        for (index, member) in members.iter().enumerate() {
+            if resolved.contains_key(&member.name) {
+                continue;
+            }
+            let value = match &member.value {
+                Some(expr) => eval_enum_member(expr, &resolved).or_else(|| extra(expr)),
+                None => match index.checked_sub(1) {
+                    None => Some(0),
+                    Some(previous) => resolved.get(&members[previous].name).map(|v| v.wrapping_add(1)),
+                },
+            };
+            if let Some(value) = value {
+                resolved.insert(member.name.clone(), value);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let mut next_value: i64 = 0;
+    let mut numbered: Vec<(Box<str>, i64)> = Vec::new();
+    for member in members {
+        let value = resolved.get(&member.name).copied().unwrap_or(next_value);
+        next_value = value.wrapping_add(1);
+        numbered.push((member.name.clone(), value));
+    }
+    numbered
+}
+
 /// Folds a constant expression (14.15) to its [`Literal`] value: a literal, a parenthesized
 /// expression, a name resolved by `lookup` (an enum member; nothing for a field), a unary or
 /// binary operation, a numeric/char cast, or a conditional whose condition folds to a `bool`.
@@ -259,7 +309,11 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
         ExprKind::Cast { target, operand } => {
             let operand = fold_const(operand, lookup)?;
             match bind_type(target) {
-                TypeSymbol::Special(special) => coerce_constant(literal_int_value(&operand)?, special),
+                TypeSymbol::Special(special) => cast_constant(&operand, special),
+                TypeSymbol::Named(_) => match operand {
+                    Literal::Integer { .. } | Literal::Character(_) | Literal::Null => Some(operand),
+                    _ => None,
+                },
                 _ => None,
             }
         }
@@ -649,11 +703,26 @@ pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
             collect_const_field_decls(member, "", &mut pending);
         }
     }
+    let mut values = model_const_values(model);
+    // THE ENUM RENUMBERING RUNS EVEN WHEN NO `const` FIELD IS PENDING, AND IT SITS ABOVE THE EARLY
+    // RETURN FOR EXACTLY THE REASON THE PARAMETER-DEFAULT FILL DOES.
+    //
+    // That return fires for any compilation declaring no const field, and this pass has to run
+    // anyway: an enum member initialized from a constant the FIRST pass cannot resolve -- one in a
+    // REFERENCED ASSEMBLY, which that pass never sees -- would otherwise keep its implicit sequence
+    // value. `enum E { X = Imported.C }` must read the 41 the library declares.
+    //
+    // THERE IS A SECOND CALL AFTER THE FOLD LOOP AND BOTH ARE NEEDED, because the two kinds of
+    // constant name each other in both directions: an enum member may be initialized from a const
+    // field (`FromConstant = Constants.C`) and a const field from an enum member
+    // (`const Choice X = Choice.FromConstant`). This call settles every member whose initializer is
+    // already resolvable; the later one settles those that needed a field folded in the loop.
+    resolve_enum_members(model, units, &values);
+    values = model_const_values(model);
     if pending.is_empty() {
-        resolve_parameter_defaults(model, units, &model_const_values(model));
+        resolve_parameter_defaults(model, units, &values);
         return;
     }
-    let mut values = model_const_values(model);
     loop {
         let mut progress = false;
         for decl in &pending {
@@ -684,7 +753,74 @@ pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
             }
         }
     }
+    normalize_constant_types(model);
     resolve_parameter_defaults(model, units, &values);
+}
+
+/// Retypes every folded `const` value to the type its field DECLARES, for the types whose constant
+/// form is not an integer.
+///
+/// The folds above answer with the literal the INITIALIZER spells, which for `const decimal x = 11`
+/// is the integer 11. Nothing then converted it, and the mismatch was silent rather than loud: a
+/// `decimal` const is emitted as a `newobj System.Decimal(...)` chosen by the literal's KIND, so an
+/// integer sitting in a decimal field took the other branch and every use of it read 0.
+///
+/// One pass over the model rather than a conversion at each fold, because there are three folds
+/// that reach this field -- the declaration walk, the model-wide fill, and the enum numbering --
+/// and a rule with several implementations gains a new case in none of them.
+///
+/// An enum member is deliberately untouched: its field type is the enum, its constant is the
+/// underlying integer, and that pairing is correct.
+fn normalize_constant_types(model: &mut Model) {
+    for info in model.types_mut() {
+        for field in &mut info.fields {
+            let TypeSymbol::Special(target) = &field.ty else {
+                continue;
+            };
+            let Some(literal) = field.constant.clone() else {
+                continue;
+            };
+            let target = *target;
+            if !matches!(
+                target,
+                SpecialType::Decimal | SpecialType::Single | SpecialType::Double
+            ) {
+                continue;
+            }
+            let value = match &literal {
+                Literal::Integer { .. } | Literal::Character(_) => {
+                    match literal_int_value(&literal) {
+                        Some(value) => value,
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            field.constant = Some(match target {
+                SpecialType::Decimal => decimal_constant_from_i64(value),
+                SpecialType::Single => Literal::Real {
+                    bits: f64::from(value as f32).to_bits(),
+                    suffix: lamella_syntax::token::RealSuffix::Float,
+                },
+                _ => Literal::Real {
+                    bits: (value as f64).to_bits(),
+                    suffix: lamella_syntax::token::RealSuffix::Double,
+                },
+            });
+        }
+    }
+}
+
+/// An `i64` as a `decimal` constant: the 96-bit mantissa with a scale of zero.
+fn decimal_constant_from_i64(value: i64) -> Literal {
+    let magnitude = u128::from(value.unsigned_abs());
+    Literal::Decimal {
+        lo: magnitude as u32,
+        mid: (magnitude >> 32) as u32,
+        hi: (magnitude >> 64) as u32,
+        scale: 0,
+        negative: value < 0,
+    }
 }
 
 /// Fills the DEFAULT ARGUMENTS the declaration-order pass could not fold, against the whole model.
@@ -757,8 +893,11 @@ fn type_symbol_of(type_full: &str) -> TypeSymbol {
 ///
 /// The whole enum is re-numbered rather than patched member-by-member, because a late-resolving
 /// member moves every auto-numbered member after it (`enum E { A = Facts.X, B }` -- B is X+1). Same
-/// order of precedence as the first pass: the enum's own earlier members win over the model, so a
-/// same-enum reference cannot be captured by a same-named constant elsewhere.
+/// order of precedence as the first pass: the enum's own members win over the model, so a same-enum
+/// reference cannot be captured by a same-named constant elsewhere.
+///
+/// Members are resolved BY DEPENDENCY rather than in declaration order, because an initializer may
+/// name a member declared later in the same enum (21.3).
 fn resolve_enum_members(
     model: &mut Model,
     units: &[CompilationUnit],
@@ -772,23 +911,9 @@ fn resolve_enum_members(
     }
     for (namespace, name, members) in enums {
         let full = qualified_type_name(&namespace, name);
-        let mut next_value: i64 = 0;
-        let mut prior: BTreeMap<Box<str>, i64> = BTreeMap::new();
-        let mut renumbered: Vec<(Box<str>, i64)> = Vec::new();
-        for member in members {
-            let value = member
-                .value
-                .as_ref()
-                .and_then(|expr| {
-                    eval_enum_member(expr, &prior).or_else(|| {
-                        resolve_const_expr(expr, &full, values).as_ref().and_then(literal_int_value)
-                    })
-                })
-                .unwrap_or(next_value);
-            next_value = value.wrapping_add(1);
-            prior.insert(member.name.clone(), value);
-            renumbered.push((member.name.clone(), value));
-        }
+        let renumbered = enum_member_numbering(members, &|expr| {
+            resolve_const_expr(expr, &full, values).as_ref().and_then(literal_int_value)
+        });
         let (namespace, name) = split_type_full(&full);
         let Some(info) = model.get_mut(&namespace, name) else {
             continue;

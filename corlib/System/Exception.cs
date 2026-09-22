@@ -47,5 +47,22 @@ namespace System
             }
             return current;
         }
+
+        public override string ToString()
+        {
+            string message = Message;
+            string text = GetType().FullName;
+            if (message != null && message.Length != 0)
+            {
+                text = text + ": " + message;
+            }
+            Exception inner = InnerException;
+            if (inner != null)
+            {
+                text = text + Environment.NewLine + " ---> " + inner.ToString()
+                    + Environment.NewLine + "   --- End of inner exception stack trace ---";
+            }
+            return text;
+        }
     }
 }

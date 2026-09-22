@@ -266,7 +266,7 @@ pub fn link_at_base_gc(
     entry: &str,
     text_base: u32,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, false, Some(text_base))
+    link_gc_inner(objects, entry, false, Some(text_base), None)
 }
 
 /// Re-exported from [`lamella_elf`] so the backend that NAMES descriptor symbols and the linker that
@@ -524,6 +524,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         kind: SymbolType::NoType,
         defined: false,
         section: None,
+        bss: false,
     });
     let mut index_of: BTreeMap<String, u32> = BTreeMap::new();
     let mut debug_index_of: BTreeMap<(String, u32), u32> = BTreeMap::new();
@@ -533,6 +534,20 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         let end = start + s.size;
         while text.len() % 4 != 0 {
             text.push(0);
+        }
+        if s.bss {
+            index_of.insert(s.name.clone(), symbols.len() as u32);
+            symbols.push(lamella_elf::ParsedSymbol {
+                name: s.name.clone(),
+                value: s.value,
+                size: s.size,
+                binding: s.binding,
+                kind: s.kind,
+                defined: true,
+                section: None,
+                bss: true,
+            });
+            continue;
         }
         let new_start = text.len() as u32;
         if let Some(slice) = obj.text.get(start as usize..end as usize) {
@@ -548,6 +563,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
             kind: s.kind,
             defined: true,
             section: None,
+            bss: false,
         });
     }
 
@@ -575,6 +591,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                     kind: target.kind,
                     defined: false,
                     section: None,
+                    bss: false,
                 });
                 index_of.insert(target.name.clone(), i);
                 i
@@ -627,6 +644,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                         kind: target.kind,
                         defined: target.defined,
                         section,
+                        bss: target.bss,
                     });
                     debug_index_of.insert(key, i);
                     i
@@ -650,6 +668,8 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         symbols,
         relocations,
         sections,
+        bss_len: obj.bss_len,
+        bss_align: obj.bss_align,
     }
 }
 
@@ -799,6 +819,8 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
         machine,
         text: alloc::vec![0u8; size],
         text_align: 4,
+        bss_len: 0,
+        bss_align: 1,
         symbols: alloc::vec![
             lamella_elf::ParsedSymbol {
                 name: String::new(),
@@ -808,6 +830,7 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
                 kind: SymbolType::NoType,
                 defined: false,
                 section: None,
+                bss: false,
             },
             lamella_elf::ParsedSymbol {
                 name: String::from(STACKMAP_BLOB_SYMBOL),
@@ -817,6 +840,7 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
                 kind: SymbolType::NoType,
                 defined: true,
                 section: None,
+                bss: false,
             },
         ],
         relocations: Vec::new(),
@@ -898,6 +922,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         kind: SymbolType::NoType,
         defined: false,
         section: None,
+        bss: false,
     });
     symbols.push(lamella_elf::ParsedSymbol {
         name: String::from(STACKMAP_START_SYMBOL),
@@ -907,6 +932,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         kind: SymbolType::NoType,
         defined: true,
         section: None,
+        bss: false,
     });
     symbols.push(lamella_elf::ParsedSymbol {
         name: String::from(STACKMAP_END_SYMBOL),
@@ -916,6 +942,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         kind: SymbolType::NoType,
         defined: true,
         section: None,
+        bss: false,
     });
     let mut relocations: Vec<ParsedRelocation> = Vec::with_capacity(names.len());
     for (i, name) in names.into_iter().enumerate() {
@@ -934,6 +961,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
             kind: SymbolType::NoType,
             defined: false,
             section: None,
+            bss: false,
         });
     }
     Some(Object {
@@ -943,6 +971,8 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         symbols,
         relocations,
         sections: Vec::new(),
+        bss_len: 0,
+        bss_align: 1,
     })
 }
 
@@ -963,11 +993,30 @@ fn link_with_base_inner(
         text.extend_from_slice(&obj.text);
     }
 
+    let mut bss_run: Vec<u32> = Vec::with_capacity(objects.len());
+    let mut bss_total = 0u32;
+    let mut bss_align = 1u32;
+    for obj in objects {
+        if obj.bss_len == 0 {
+            bss_run.push(0);
+            continue;
+        }
+        bss_align = bss_align.max(obj.bss_align);
+        bss_total = bss_total.next_multiple_of(obj.bss_align);
+        bss_run.push(bss_total);
+        bss_total += obj.bss_len;
+    }
+
     let mut defined: Vec<Defined> = Vec::new();
     let mut strong: BTreeSet<String> = BTreeSet::new();
+    let mut bss_globals: Vec<(String, usize, u32)> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
             if !sym.defined || sym.name.is_empty() || sym.binding == Binding::Local {
+                continue;
+            }
+            if sym.bss {
+                bss_globals.push((sym.name.clone(), oi, sym.value));
                 continue;
             }
             let (value, thumb) = symbol_target(machine, sym);
@@ -1034,7 +1083,13 @@ fn link_with_base_inner(
         }
     }
     regions.retain(|(n, _)| resolve(&defined, n).is_none());
-    if !regions.is_empty() || eh_referenced || brackets_referenced {
+    let (ram_base, ram_cap) = ram.unwrap_or(match machine {
+        Machine::Arm => (0x2000_1000, 0x1000),
+        Machine::RiscV => (0x8030_0000, 0x1000),
+    });
+    let mut cursor = ram_base;
+    let statics_live = !regions.is_empty() || eh_referenced || brackets_referenced;
+    if statics_live {
         if let Some(entry_region) = objects
             .iter()
             .find(|o| o.symbols.iter().any(|s| s.defined && s.name == entry))
@@ -1051,33 +1106,49 @@ fn link_with_base_inner(
             }
         }
         let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
-        let (ram_base, ram_cap) = ram.unwrap_or(match machine {
-            Machine::Arm => (0x2000_1000, 0x1000),
-            Machine::RiscV => (0x8030_0000, 0x1000),
-        });
-        let mut cursor = ram_base;
         for (name, size) in &regions {
             defined.push((name.clone(), cursor.wrapping_sub(base), false));
             cursor += (*size).max(4).next_multiple_of(4);
         }
-        let eh_addr = match regions.is_empty() {
-            false => ram_base,
-            true => {
-                cursor += 4;
-                ram_base
+        if regions.is_empty() {
+            cursor += 4;
+        }
+    }
+
+    let mut bss_bases: Vec<u32> = Vec::new();
+    bss_bases.resize(objects.len(), 0);
+    if bss_total > 0 {
+        let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+        cursor = cursor.next_multiple_of(bss_align);
+        let run_base = cursor;
+        for (oi, off) in bss_run.iter().enumerate() {
+            bss_bases[oi] = run_base.wrapping_add(*off).wrapping_sub(base);
+        }
+        cursor += bss_total;
+        for (name, oi, value) in &bss_globals {
+            let addr = bss_bases[*oi].wrapping_add(*value);
+            match defined.iter().position(|(n, _, _)| n == name) {
+                Some(_) => return Err(LinkError::DuplicateSymbol(name.clone())),
+                None => defined.push((name.clone(), addr, false)),
             }
-        };
-        defined.push((String::from(EH_TAG_SYMBOL), eh_addr.wrapping_sub(base), false));
-        defined.push((
-            String::from(STATICS_START_SYMBOL),
-            ram_base.wrapping_sub(base),
-            false,
-        ));
-        defined.push((
-            String::from(STATICS_END_SYMBOL),
-            cursor.wrapping_sub(base),
-            false,
-        ));
+        }
+    }
+
+    if cursor > ram_base {
+        let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+        if statics_live {
+            defined.push((String::from(EH_TAG_SYMBOL), ram_base.wrapping_sub(base), false));
+            defined.push((
+                String::from(STATICS_START_SYMBOL),
+                ram_base.wrapping_sub(base),
+                false,
+            ));
+            defined.push((
+                String::from(STATICS_END_SYMBOL),
+                cursor.wrapping_sub(base),
+                false,
+            ));
+        }
         let needed = cursor - ram_base;
         if needed > ram_cap {
             return Err(LinkError::StaticsOverflow {
@@ -1119,6 +1190,7 @@ fn link_with_base_inner(
                 site,
                 text_base,
                 bases[oi],
+                bss_bases[oi],
                 &defined,
                 &obj.symbols,
                 r,
@@ -1129,7 +1201,7 @@ fn link_with_base_inner(
 
     fill_gcmap_blob(&mut text, objects, &defined);
 
-    let debug_sections = link_carried_sections(objects, &bases, machine, text_base, &defined)?;
+    let debug_sections = link_carried_sections(objects, &bases, &bss_bases, machine, text_base, &defined)?;
 
     let entry_offset =
         resolve(&defined, entry).ok_or_else(|| LinkError::MissingEntry(String::from(entry)))?;
@@ -1156,6 +1228,7 @@ fn link_with_base_inner(
 fn link_carried_sections(
     objects: &[Object],
     bases: &[u32],
+    bss_bases: &[u32],
     machine: Machine,
     text_base: Option<u32>,
     defined: &[Defined],
@@ -1204,6 +1277,9 @@ fn link_carried_sections(
                     Some(csi) => {
                         let (_, base) = placed[&(oi, csi as usize)];
                         (base + sym.value, false)
+                    }
+                    None if sym.defined && sym.bss => {
+                        (bss_bases[oi].wrapping_add(sym.value), true)
                     }
                     None if sym.defined && (sym.name.is_empty() || sym.binding == Binding::Local) => {
                         (bases[oi] + symbol_target(machine, sym).0, true)
@@ -1398,6 +1474,7 @@ fn apply_relocation(
     site: u32,
     text_base: Option<u32>,
     obj_base: u32,
+    bss_base: u32,
     defined: &[Defined],
     obj_syms: &[lamella_elf::ParsedSymbol],
     r: &ParsedRelocation,
@@ -1407,9 +1484,9 @@ fn apply_relocation(
         return Ok(());
     }
     let sym = &obj_syms[r.symbol as usize];
-    let (target, target_is_thumb) = if sym.defined
-        && (sym.name.is_empty() || sym.binding == Binding::Local)
-    {
+    let (target, target_is_thumb) = if sym.defined && sym.bss {
+        (bss_base.wrapping_add(sym.value), false)
+    } else if sym.defined && (sym.name.is_empty() || sym.binding == Binding::Local) {
         let (value, thumb) = symbol_target(machine, sym);
         (obj_base + value, thumb)
     } else {
@@ -1527,7 +1604,7 @@ fn relocation_addend(text: &[u8], machine: Machine, site: u32, r: &ParsedRelocat
 /// vtable's methods with it -- and the survivors are linked exactly as [`link`] links them. This is
 /// [`link_at_base_gc`] without a base; the two are one path.
 pub fn link_gc(objects: &[Object], entry: &str) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, false, None)
+    link_gc_inner(objects, entry, false, None, None)
 }
 
 /// Like [`link_gc`], but ALSO folds identical functions (ICF) after dead-stripping: byte-identical
@@ -1542,7 +1619,7 @@ pub fn link_icf(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, true, text_base)
+    link_gc_inner(objects, entry, true, text_base, None)
 }
 
 /// As [`link_gc`], but pulling archive members on demand first, exactly as [`link_with_archives`]
@@ -1561,7 +1638,36 @@ pub fn link_gc_with_archives(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(&include_on_demand(objects, archives), entry, false, text_base)
+    link_gc_inner(&include_on_demand(objects, archives), entry, false, text_base, None)
+}
+
+/// As [`link_gc_with_archives`], but placing the statics window the RAM-resident tier needs -- the
+/// combination [`link_with_archives_ram`] and [`link_gc_with_archives`] each had half of.
+///
+/// [`link_with_archives_ram`] pulls an archive member WHOLE to resolve one undefined symbol and
+/// never revisits it; [`link_gc_with_archives`] trims but places no window. Use this one wherever a
+/// RAM-resident tier would otherwise pay for members it never reaches.
+///
+/// **TRIMMING IS WHAT MAKES REACHABILITY ANSWERABLE AT ALL.** While an archive is pulled whole and
+/// never trimmed, a symbol's PRESENCE in the image proves only that its MEMBER was pulled -- never
+/// that anything reaches it. So no question of the form "is this still reachable" can be asked of an
+/// image built the other way. Dead-stripping the archive is what makes reachability answerable at
+/// all, which is why this path is the prerequisite for any size investigation rather than a parallel
+/// one.
+pub fn link_gc_with_archives_ram(
+    objects: &[Object],
+    archives: &[Archive],
+    entry: &str,
+    text_base: Option<u32>,
+    ram: (u32, u32),
+) -> Result<LinkedImage, LinkError> {
+    link_gc_inner(
+        &include_on_demand(objects, archives),
+        entry,
+        false,
+        text_base,
+        Some(ram),
+    )
 }
 
 /// As [`link_icf`], but pulling archive members on demand first (see [`link_gc_with_archives`]).
@@ -1574,7 +1680,7 @@ pub fn link_icf_with_archives(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(&include_on_demand(objects, archives), entry, true, text_base)
+    link_gc_inner(&include_on_demand(objects, archives), entry, true, text_base, None)
 }
 
 /// Dead-strips from `entry` and then links through the ORDINARY layout, optionally folding
@@ -1596,6 +1702,7 @@ fn link_gc_inner(
     entry: &str,
     fold: bool,
     text_base: Option<u32>,
+    ram: Option<(u32, u32)>,
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
     let mut keep = reachable_from(objects, entry);
@@ -1608,7 +1715,7 @@ fn link_gc_inner(
     }
     let mut trimmed: Vec<Object> = trim_all(objects, &keep);
     define_fold_aliases(&mut trimmed, &folds);
-    link_with_base(&trimmed, entry, text_base, &[])
+    link_with_base_ram(&trimmed, entry, text_base, &[], ram)
 }
 
 /// The ICF decision as `(folded-away name, representative name)` pairs, over the functions that
@@ -3686,10 +3793,6 @@ mod tests {
         );
     }
 
-    /// THE DEFECT THAT WAS, NOW STATED AS THE PROPERTY: the `--gc-sections`/ICF path used to be
-    /// FUNCTION-ONLY, so it could not link any object referencing a defined DATA symbol -- and
-    /// every AOT program does (its type descriptors, its string blobs, its stack-map records, its
-    /// statics region). The predecessor of this test ASSERTED that refusal, with a note saying to
     /// replace it with the positive claim once the path learned about data. This is that
     /// replacement.
     ///

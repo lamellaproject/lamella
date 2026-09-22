@@ -16,7 +16,9 @@ use core::slice;
 
 use crate::heap::{align_up, Ref, ALIGN, HEADER_SIZE};
 #[cfg(feature = "gc-collect")]
-use crate::heap::{mark_compact, StackMapTable, TypeResolver};
+use crate::heap::TypeResolver;
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
+use crate::heap::{mark_compact, StackMapTable};
 
 /// A type's on-device GC layout, in the exact memory shape the AOT backend emits and the
 /// object header points at:
@@ -382,7 +384,7 @@ impl DeviceHeap {
     /// `enumerate_roots`. Delegates to the shared [`mark_compact`] engine through
     /// [`PtrResolver`] (the device header-word -> type lookup), so the device collection
     /// is byte-for-byte the same algorithm the host tests exercise.
-    #[cfg(feature = "gc-collect")]
+    #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
     pub fn collect<R>(&mut self, enumerate_roots: R)
     where
         R: FnMut(&mut dyn FnMut(&mut Ref)),
@@ -390,11 +392,69 @@ impl DeviceHeap {
         self.collect_with_pins(enumerate_roots, &[]);
     }
 
+    /// How many `u32` words of mark bitmap [`Self::collect_no_alloc`] needs for this heap.
+    ///
+    /// Sized from the REGION rather than from the bump pointer, so one buffer allocated once at
+    /// startup serves every collection the program will ever run. A caller that sized it from the
+    /// current top would get a buffer that fitted until the heap grew.
+    #[cfg(feature = "gc-collect")]
+    #[must_use]
+    pub fn mark_words(&self) -> usize {
+        crate::heap::MarkBits::words_for(self.region.len())
+    }
+
+    /// [`Self::collect_with_pins`] WITHOUT A HEAP ALLOCATOR: the same sliding mark-compact, with its
+    /// bookkeeping in `marks` instead of in a `Vec`, a `BTreeSet` and a `BTreeMap`.
+    ///
+    /// **This is the entry a device image collects through, and the reason it exists is arithmetic.**
+    /// The shared engine's bookkeeping costs roughly 31 bytes per live object and about 2.5x the heap
+    /// being compacted, drawn from the Rust global allocator -- which an AOT image does not have, by
+    /// design, because `lamella_gc_alloc` IS its allocator and it is the thing that just failed. On a
+    /// 3.5 KB device heap that scratch would be about 9 KB, so the image would do better spending the
+    /// RAM on the heap and never collecting. See the `collection-scratch-cost` example.
+    ///
+    /// `marks` must hold at least [`Self::mark_words`] words; the caller owns it, so on a device it
+    /// is a static beside the heap and in a test it is a stack array. **Answers `false` when the
+    /// buffer is too small, having collected nothing and moved nothing** -- a bitmap short of the
+    /// region would report every address past its end as unreachable, so live objects would be
+    /// reclaimed. A collector that cannot prove an object dead must not reclaim it.
+    ///
+    /// `enumerate_roots` is called TWICE, as it is for [`Self::collect_with_pins`]: once to mark and
+    /// once to rewrite. It must report the same slots both times and must not allocate.
+    #[cfg(feature = "gc-collect")]
+    pub fn collect_no_alloc<R>(
+        &mut self,
+        enumerate_roots: R,
+        pinned: &[u32],
+        marks: &mut [u32],
+    ) -> bool
+    where
+        R: FnMut(&mut dyn FnMut(&mut Ref)),
+    {
+        let mut bits = crate::heap::MarkBits::new(marks);
+        let top = self.top;
+        match crate::heap::mark_compact_no_alloc(
+            self.region,
+            self.base,
+            top,
+            &PtrResolver,
+            enumerate_roots,
+            pinned,
+            &mut bits,
+        ) {
+            Some(new_top) => {
+                self.top = new_top;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// [`Self::collect`], with `pinned` naming the payload addresses (region-relative, as a
     /// [`Ref`] carries them) of objects the compaction must leave WHERE THEY ARE -- what a C#
     /// `fixed` statement's holder slot promises. See [`crate::heap::Heap::collect_with_pins`] for
     /// the semantics and the space cost; the engine is the same one.
-    #[cfg(feature = "gc-collect")]
+    #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
     pub fn collect_with_pins<R>(&mut self, enumerate_roots: R, pinned: &[u32])
     where
         R: FnMut(&mut dyn FnMut(&mut Ref)),
@@ -420,7 +480,7 @@ impl DeviceHeap {
     /// The walk itself is the SHARED one ([`crate::heap::visit_stack_roots`]) rather than a second
     /// copy of it: the host rehearsal and the device collection must not be able to walk
     /// differently, and only the heap's type lookup differs (pointer, not table index).
-    #[cfg(feature = "gc-collect")]
+    #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
     pub fn collect_stack(
         &mut self,
         stack: &mut [u8],
@@ -435,6 +495,26 @@ impl DeviceHeap {
             },
             &pinned,
         );
+    }
+
+    /// The inverse of [`Self::payload_ptr`]: the [`Ref`] naming the object whose payload the
+    /// backend's emitted code is holding at `payload`. A null pointer maps to the null reference.
+    ///
+    /// **A ROOT REPORTER NEEDS THIS AND CANNOT WRITE IT ITSELF.** What a stack walk finds in a
+    /// frame slot is a RAW PAYLOAD POINTER, because that is what the emitted code stores; what the
+    /// collector marks and relocates is a [`Ref`]. On a device the two are the same number, but on
+    /// a host whose real base does not fit a `u32` the heap reasons in a SYNTHESIZED space (see
+    /// [`Self::base_of`]), and the delta between the two is the heap's own business. Exposing the
+    /// conversion here keeps every caller from reproducing it -- and reproducing it is how a root
+    /// reporter comes to mark the wrong address, which reclaims a live object and reports nothing.
+    #[must_use]
+    pub fn reference_at(&self, payload: *mut u8) -> Ref {
+        if payload.is_null() {
+            Ref::NULL
+        } else {
+            let offset = (payload as usize).wrapping_sub(self.base_ptr() as usize) as u32;
+            Ref(self.base.wrapping_add(offset))
+        }
     }
 
     /// Turns a payload offset (a [`Ref`]) into the real `*mut u8` the backend's emitted
@@ -724,5 +804,41 @@ mod tests {
     #[should_panic(expected = "addressable range")]
     fn an_array_whose_footprint_overflows_is_refused() {
         let _ = payload_extent(ARRAY_RANK1, 6, &[u32::MAX / 4]);
+    }
+
+    /// A MARK BITMAP TOO SMALL FOR THE REGION REFUSES, HAVING MOVED NOTHING.
+    ///
+    /// This is the one property of [`DeviceHeap::collect_no_alloc`] that can be asserted on a 64-bit
+    /// host, and the reason is structural rather than an omission.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_short_mark_bitmap_refuses_to_collect_and_changes_nothing() {
+        let (base, len) = make_region(1024);
+        let mut heap = unsafe { DeviceHeap::from_raw(base, len) };
+        let before_top = heap.top();
+
+        let mut too_small = [0u32; 1];
+        assert!(
+            heap.mark_words() > too_small.len(),
+            "the buffer must actually be short, or this asserts nothing"
+        );
+        let collected = heap.collect_no_alloc(|_visit| {}, &[], &mut too_small);
+
+        assert!(!collected, "a bitmap short of the region must refuse to collect");
+        assert_eq!(
+            heap.top(),
+            before_top,
+            "a refusal must leave the bump pointer where it was"
+        );
+    }
+
+    /// The bitmap size a caller must provide is derived from the REGION, not from what is in use --
+    /// so one buffer taken at startup serves every collection the program will run.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn the_mark_bitmap_is_sized_from_the_whole_region() {
+        let (base, len) = make_region(1024);
+        let heap = unsafe { DeviceHeap::from_raw(base, len) };
+        assert_eq!(heap.mark_words(), 8);
     }
 }

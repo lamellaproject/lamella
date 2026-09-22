@@ -12,6 +12,11 @@ namespace System.Reflection
             [Lamella.Runtime.RuntimeProvided] get { return null; }
         }
 
+        public virtual Type DeclaringType
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return null; }
+        }
+
         [Lamella.Runtime.RuntimeProvided] public virtual object[] GetCustomAttributes(bool inherit) { return null; }
 
         public virtual object[] GetCustomAttributes(Type attributeType, bool inherit)

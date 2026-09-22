@@ -259,6 +259,16 @@ impl<T: TargetAccess> DebugBackend for ProbeBackend<T> {
         1
     }
 
+    /// False: the constant above is a placeholder rather than a reading, and this is what says so.
+    ///
+    /// Without it the adapter cannot tell "this program has one frame" from "I cannot see frames at
+    /// all", so `stepOut`'s depth-relative predicate is unsatisfiable and the loop steps until its
+    /// budget is spent. Answering here is what makes the degradation the doc above describes
+    /// actually happen.
+    fn tracks_depth(&self) -> bool {
+        false
+    }
+
     fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
         self.breakpoints = addresses
             .iter()
@@ -292,12 +302,19 @@ impl<T: TargetAccess> DebugBackend for ProbeBackend<T> {
         }]
     }
 
-    /// Empty: a local's home is in debug info the AOT tier does not emit. The register file and
-    /// target memory are what this backend can show, and both are served in full.
+    /// Empty: this backend does not read the debug info yet. The register file and target memory
+    /// are what it can show today, and both are served in full.
+    ///
     fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
         Vec::new()
     }
 
+    /// `len` bytes from the target, or EMPTY if the read failed -- an address this target cannot
+    /// hold, or a transfer the probe refused. A short answer is the failure signal, as
+    /// [`DebugBackend::read_memory`] states; this backend never returns a partial fill.
+    ///
+    /// One block transfer whatever the width, so asking for the whole of a value costs what asking
+    /// for a byte of it costs. Measured over CMSIS-DAP/HID: 4 bytes and 16 bytes both ~4.0 ms.
     fn read_memory(&self, address: u64, len: usize) -> Vec<u8> {
         let Ok(base) = u32::try_from(address) else {
             return Vec::new();
@@ -382,6 +399,10 @@ mod tests {
         fail_connect: bool,
         /// A unit that refuses the write, so the test can distinguish "armed" from "asked to arm".
         fail_breakpoints: bool,
+        /// A target whose memory reads do not reach it, so the test can distinguish "read zero"
+        /// from "could not read" -- the two that `read_memory`'s one failure signal has to keep
+        /// apart, and which a fake that always succeeds cannot express.
+        fail_reads: bool,
         /// The operations a release is made of, in the order they reached the target: `breakpoints`
         /// for a breakpoint write it took, `resume`, and `dhcsr` for a write to that register.
         order: Vec<&'static str>,
@@ -411,6 +432,9 @@ mod tests {
             Ok(())
         }
         fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+            if self.fail_reads {
+                return Err(ProbeError::Device("the target did not answer"));
+            }
             Ok(self.memory.get(&address).copied().unwrap_or(0))
         }
         fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
@@ -804,6 +828,52 @@ mod tests {
             target.order,
             ["breakpoints", "resume", "dhcsr"],
             "breakpoints off first, then out of Debug state with C_DEBUGEN still set, then C_DEBUGEN cleared"
+        );
+    }
+
+    /// A read this target cannot serve answers EMPTY rather than a partial fill, so the caller's
+    /// length check is a real failure signal and not a convention that happens to hold.
+    ///
+    #[test]
+    fn a_read_that_cannot_be_served_is_empty_rather_than_a_partial_fill() {
+        let mut target = FakeTarget::with_pc(0x1000);
+        target.memory.insert(0x2000_0000, 0xdead_beef);
+        let mut backend = ProbeBackend::new(target, Start::Reset);
+        assert_eq!(backend.launch(), Ok(()));
+
+        assert_eq!(
+            backend.read_memory(0x2000_0000, 4).len(),
+            4,
+            "a served read answers exactly the width asked for"
+        );
+        assert_eq!(
+            backend.read_memory(0x2000_0001, 3).len(),
+            3,
+            "and an unaligned one is trimmed from the covering words"
+        );
+
+        backend.target.get_mut().fail_reads = true;
+        assert!(
+            backend.read_memory(0x2000_0000, 4).is_empty(),
+            "a read that did not reach the target is EMPTY, never a zero-filled four bytes"
+        );
+
+        backend.target.get_mut().fail_reads = false;
+        assert!(
+            backend.read_memory(u64::from(u32::MAX) + 1, 4).is_empty(),
+            "an address wider than this target's address space is not a short read either"
+        );
+    }
+
+    /// This backend says it does not track call depth, which is what its constant `depth` means.
+    ///
+    #[test]
+    fn this_backend_reports_a_constant_depth_and_says_it_does_not_track_depth() {
+        let backend = ProbeBackend::new(FakeTarget::with_pc(0x1000), Start::Reset);
+        assert_eq!(backend.depth(), 1, "there is no unwinder here");
+        assert!(
+            !backend.tracks_depth(),
+            "so the depth is a placeholder and must say so"
         );
     }
 

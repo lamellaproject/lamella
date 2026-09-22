@@ -3,8 +3,9 @@
 
 #[cfg(feature = "interpreter")]
 use crate::interp_backend::InterpreterBackend;
+use crate::frame_eval;
 use crate::protocol::{Event, Message, Request, Response};
-use lamella_debug_backend::{DebugBackend, Scope, Stop};
+use lamella_debug_backend::{DebugBackend, Scope, Stop, Variable};
 #[cfg(feature = "interpreter")]
 use lamella_cil_runtime::Module;
 use serde_json::{Value as Json, json};
@@ -42,6 +43,9 @@ pub struct Debugger {
     /// The inactive (over-capacity) breakpoint count last reported to the user, so the
     /// run-time "N inactive" note fires only when that count changes -- not on every continue.
     last_inactive_note: usize,
+    /// Whether the session has already said in the console that the frame it was asked about
+    /// reports no variables, so the note is made once rather than on every hover.
+    noted_absent_variables: bool,
     out_seq: i64,
     /// The Debug Console REPL, built on the first `evaluate` so a session that never uses the
     /// console pays nothing. See [`crate::repl_eval`].
@@ -135,6 +139,7 @@ impl Debugger {
             instruction_breakpoints: Vec::new(),
             breakpoint_meta: Vec::new(),
             last_inactive_note: 0,
+            noted_absent_variables: false,
             out_seq: 0,
             #[cfg(feature = "interpreter")]
             repl: None,
@@ -281,20 +286,7 @@ impl Debugger {
             "setBreakpoints" => (true, Some(self.set_source_breakpoints(request))),
             "setInstructionBreakpoints" => (true, Some(self.set_instruction_breakpoints(request))),
             "disassemble" => (true, Some(self.disassemble(request))),
-            #[cfg(feature = "interpreter")]
-            "evaluate" => (
-                true,
-                Some(crate::repl_eval::evaluate(
-                    &mut self.repl,
-                    arg_str(request, "expression"),
-                    request
-                        .arguments
-                        .as_ref()
-                        .and_then(|args| args.get("frameId"))
-                        .is_some(),
-                    arg_str(request, "context"),
-                )),
-            ),
+            "evaluate" => return self.evaluate(request),
             "disconnect" => match self.release_target() {
                 Ok(()) => (true, None),
                 Err(reason) => {
@@ -370,10 +362,16 @@ impl Debugger {
                         json!({ "verified": armed, "instructionReference": address.to_string() });
                     if !armed {
                         breakpoint["message"] = json!(over_capacity_message(cap));
+                        breakpoint["reason"] = json!(REASON_PENDING);
                     }
                     results.push(breakpoint);
                 }
-                None => results.push(json!({ "verified": false })),
+                None => results.push(unverified(
+                    REASON_FAILED,
+                    String::from(
+                        "This breakpoint's instruction reference is not an address. A client sends                          one it was given by a stack frame or a disassembly.",
+                    ),
+                )),
             }
         }
         self.instruction_breakpoints = addresses;
@@ -425,21 +423,40 @@ impl Debugger {
                             .map(String::from),
                         hits: 0,
                     });
-                    let line = self
-                        .backend
-                        .source_location(address)
-                        .map_or(requested.unwrap_or(0), |location| u64::from(location.line));
+                    let located = self.backend.source_location(address);
+                    let (line, file) = match &located {
+                        Some(location) => (u64::from(location.line), location.file.as_str()),
+                        None => (requested.unwrap_or(0), document),
+                    };
                     let mut breakpoint = json!({
                         "verified": armed,
                         "line": line,
                         "instructionReference": address.to_string(),
                     });
+                    if !file.is_empty() {
+                        breakpoint["source"] = json!({ "path": file });
+                    }
                     if !armed {
                         breakpoint["message"] = json!(over_capacity_message(cap));
+                        breakpoint["reason"] = json!(REASON_PENDING);
                     }
                     results.push(breakpoint);
                 }
-                None => results.push(json!({ "verified": false })),
+                None if !self.backend.has_source() => results.push(unverified(
+                    REASON_PENDING,
+                    String::from(
+                        "No source mapping is loaded yet, so this line cannot be resolved. It                          binds once the program is running.",
+                    ),
+                )),
+                None => results.push(unverified(
+                    REASON_FAILED,
+                    match requested {
+                        Some(line) => format!(
+                            "There is no code on line {line} of this file, so no breakpoint can be                              set there. Move it to a statement."
+                        ),
+                        None => String::from("This breakpoint names no line."),
+                    },
+                )),
             }
         }
         self.source_breakpoints = addresses;
@@ -462,6 +479,9 @@ impl Debugger {
                 self.source_step(action, events)
             }
             Action::StepIn => self.backend.step(),
+            Action::StepOver | Action::StepOut if !self.backend.tracks_depth() => {
+                self.backend.step()
+            }
             Action::StepOver => self.step_to_depth(|depth, start| depth <= start, events),
             Action::StepOut => self.step_to_depth(|depth, start| depth < start, events),
         };
@@ -704,8 +724,8 @@ impl Debugger {
             let mut entry = json!({
                 "id": index,
                 "name": frame.name,
-                "line": source.as_ref().map_or(frame.line, |location| location.line),
-                "column": source.as_ref().map_or(1, |location| location.column),
+                "line": source.as_ref().map_or(0, |location| location.line),
+                "column": source.as_ref().map_or(0, |location| location.column),
                 "instructionPointerReference": frame.address.to_string(),
             });
             if let Some(location) = &source {
@@ -752,6 +772,98 @@ impl Debugger {
             })
             .collect();
         json!({ "variables": variables })
+    }
+
+    /// Answers a DAP `evaluate`: a hover, a Watch row, or a Debug Console line.
+    ///
+    /// A submission scoped to a frame is read out of that frame's own variables; an unscoped
+    /// console line goes to the debugger's evaluation session. See [`crate::frame_eval`] for why
+    /// neither is ever substituted for the other.
+    fn evaluate(&mut self, request: &Request) -> Vec<Message> {
+        let expression = arg_str(request, "expression").trim().to_owned();
+        match frame_eval::route(arg_opt_u32(request, "frameId"), arg_str(request, "context")) {
+            frame_eval::Target::Frame { index, room } => {
+                let visible = self.frame_variables(index);
+                match frame_eval::resolve(&visible, &expression) {
+                    Ok(variable) => {
+                        let body = json!({
+                            "result": variable.value,
+                            "type": variable.kind,
+                            "variablesReference": 0,
+                        });
+                        vec![self.response(request, true, Some(body))]
+                    }
+                    Err(refusal) => {
+                        let message = refusal.message(&expression, room);
+                        let mut out = self.fail(request, &message);
+                        if let Some(note) = self.absent_variables_note(&refusal) {
+                            let body = json!({ "category": "console", "output": note });
+                            out.push(self.event("output", Some(body)));
+                        }
+                        out
+                    }
+                }
+            }
+            frame_eval::Target::Session => self.session_evaluate(request, &expression),
+        }
+    }
+
+    /// The one console note a session makes when the frame it was asked about reports no
+    /// variables at all, or `None` once it has been made or for any other refusal.
+    ///
+    /// A refused `evaluate` is how a hover stays quiet over a word that is not a variable, and
+    /// that is the right behaviour -- but it is also what an editor does when the target can name
+    /// no variables at all, so on such a target hovering a REAL variable is silent too. Silence at
+    /// the point of use is indistinguishable from a debugger that is not working, and the reason
+    /// only reaches someone who thinks to open a Watch row. This says it once, unprompted, where a
+    /// person can read it, and then stays out of the way.
+    fn absent_variables_note(&mut self, refusal: &frame_eval::Refusal) -> Option<String> {
+        if !matches!(refusal, frame_eval::Refusal::NoVariables) || self.noted_absent_variables {
+            return None;
+        }
+        self.noted_absent_variables = true;
+        Some(String::from(
+            "No value was read from the paused frame: the target reported no arguments and no \
+             locals for it. Hovering a variable shows nothing while that holds, and a Watch row \
+             gives the reason in its value.\n",
+        ))
+    }
+
+    /// The variables a name is read from in frame `index`: its locals, then its arguments.
+    ///
+    /// Locals come first as the inner scope, though C# forbids a local and a parameter of one
+    /// method sharing a name, so the order is a tie-break that valid source cannot reach. The
+    /// evaluation stack is left out on purpose: its slots are interpreter scratch under synthetic
+    /// names, and a name resolving to one would answer a question nobody asked.
+    fn frame_variables(&self, index: usize) -> Vec<Variable> {
+        let mut visible = self.backend.variables(index, Scope::Locals);
+        visible.extend(self.backend.variables(index, Scope::Arguments));
+        visible
+    }
+
+    /// Answers an unscoped Debug Console line from the debugger's own evaluation session.
+    #[cfg(feature = "interpreter")]
+    fn session_evaluate(&mut self, request: &Request, expression: &str) -> Vec<Message> {
+        let body = crate::repl_eval::evaluate(&mut self.repl, expression);
+        vec![self.response(request, true, Some(body))]
+    }
+
+    /// Answers an unscoped Debug Console line in a build that carries no evaluation session of its
+    /// own -- a server whose target is a board, where a submission evaluated here would run in this
+    /// process rather than on the thing being debugged.
+    ///
+    /// The refusal names the two ways to read the target's own values, because a console line is
+    /// usually someone reaching for a value they can have: a refusal that only says no leaves them
+    /// with the impression that the session cannot show them anything.
+    #[cfg(not(feature = "interpreter"))]
+    fn session_evaluate(&mut self, request: &Request, expression: &str) -> Vec<Message> {
+        let _ = expression;
+        self.fail(
+            request,
+            "This debug server evaluates nothing of its own: a submission typed here would run \
+             in this process rather than on the target being debugged. Hover a variable, or add \
+             its name to Watch, to read it from the paused frame.",
+        )
     }
 
     /// Lists code starting near the `memoryReference` address, each entry with its own
@@ -877,9 +989,41 @@ fn withdraw_verification(results: &mut [Json], reason: &str) {
         if breakpoint["verified"] == json!(true) {
             breakpoint["verified"] = json!(false);
             breakpoint["message"] = json!(reason);
+            breakpoint["reason"] = json!(REASON_FAILED);
         }
     }
 }
+
+/// A breakpoint that could not be set, with both of the things DAP gives for saying so.
+///
+/// # A BARE `verified: false` IS A REFUSAL WITH THE REASON REMOVED
+///
+/// DAP carries two fields for this and we were setting neither on most paths. `Breakpoint.message`
+/// is "a message about the state of the breakpoint. This is shown to the user and can be used to
+/// explain why a breakpoint could not be verified", and `Breakpoint.reason` is "a machine-readable
+/// explanation of why a breakpoint may not be verified ... the adapter should omit this property"
+/// when it is verified. So an editor showed a greyed dot with nothing to hover and no way for a
+/// client to tell a breakpoint that may bind later from one that never will.
+///
+/// The two `reason` values the specification defines, and the rule for choosing between them:
+///
+/// * [`REASON_PENDING`] -- "might be verified in the future, but the adapter cannot verify it in the
+///   current state". Capacity, and a line asked about before any source mapping exists.
+/// * [`REASON_FAILED`] -- "not able to be verified, and the adapter does not believe it can be
+///   verified without intervention". A line with no code in a mapping we DO have, a reference that
+///   is not a number, a target that refused the set.
+///
+/// The difference is not cosmetic: `pending` invites the client to wait, `failed` tells a person to
+/// change something.
+fn unverified(reason: &'static str, message: String) -> Json {
+    json!({ "verified": false, "reason": reason, "message": message })
+}
+
+/// `Breakpoint.reason` for a breakpoint that may still bind without anyone doing anything.
+const REASON_PENDING: &str = "pending";
+
+/// `Breakpoint.reason` for one that will not bind until a person changes something.
+const REASON_FAILED: &str = "failed";
 
 /// The message shown on a breakpoint left unverified because the target's hardware
 /// comparators are all in use -- the editor displays it on the greyed breakpoint.
@@ -964,22 +1108,36 @@ impl DebugBackend for Unstartable {
     }
 }
 
+/// What this adapter tells the client it can do, in the `initialize` response.
+///
+/// A client asks for nothing it has not been told about, so a capability left out here is a
+/// feature that never gets exercised and leaves no trace of why: `supportsEvaluateForHovers` is
+/// what makes an editor send an `evaluate` when the pointer rests on a variable, and without it
+/// no hover request is made, no hover appears, and the server sees no request to explain it.
 fn capabilities() -> Json {
     json!({
         "supportsConfigurationDoneRequest": true,
         "supportsInstructionBreakpoints": true,
         "supportsDisassembleRequest": true,
         "supportsSetVariable": true,
+        "supportsEvaluateForHovers": true,
     })
 }
 
 fn arg_u32(request: &Request, field: &str) -> u32 {
+    arg_opt_u32(request, field).unwrap_or(0)
+}
+
+/// A numeric argument the client may have left out, which [`arg_u32`]'s default cannot express:
+/// `frameId` 0 is a real frame -- the innermost one -- so "no frame was named" and "frame 0 was
+/// named" are different requests and have to stay different values.
+fn arg_opt_u32(request: &Request, field: &str) -> Option<u32> {
     request
         .arguments
         .as_ref()
         .and_then(|args| args.get(field))
         .and_then(Json::as_u64)
-        .unwrap_or(0) as u32
+        .map(|value| value as u32)
 }
 
 fn arg_str<'r>(request: &'r Request, field: &str) -> &'r str {
@@ -1091,7 +1249,75 @@ mod tests {
         assert_eq!(dbg.output_string(), "hi\n");
     }
 
-    use lamella_debug_backend::{Disassembled, Frame, Register, Variable};
+    use lamella_debug_backend::{Disassembled, Frame, Register, SourceLocation, Variable};
+
+
+    /// A backend with NO UNWINDER: it counts the steps it is asked for and reports a constant
+    /// depth, which is exactly `lamella-dap-probe`'s shape on a real target.
+    ///
+    struct NoUnwinderBackend {
+        steps: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DebugBackend for NoUnwinderBackend {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Stop::Step
+        }
+        /// Constant, always -- there is no unwinder behind it.
+        fn depth(&self) -> usize {
+            1
+        }
+        fn tracks_depth(&self) -> bool {
+            false
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<Frame> {
+            Vec::new()
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// `stepOut` and `next` on a backend that cannot unwind take ONE step, not the whole budget.
+    ///
+    #[test]
+    fn stepping_out_of_a_backend_that_cannot_unwind_takes_one_step_not_the_whole_budget() {
+        for action in ["stepOut", "next"] {
+            let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let backend = NoUnwinderBackend { steps: std::sync::Arc::clone(&steps) };
+            let mut debugger = Debugger::with_backend(Box::new(backend));
+            let _ = debugger.handle(&request(1, "launch", None));
+            steps.store(0, std::sync::atomic::Ordering::Relaxed);
+            let _ = debugger.handle(&request(2, action, None));
+            let taken = steps.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                taken, 1,
+                "{action} on a backend with no unwinder must degrade to ONE step; it took {taken}"
+            );
+        }
+    }
 
     /// A minimal backend for capacity tests: it resolves source line N to the opaque address
     /// N and reports a fixed hardware-breakpoint limit. Everything else is an inert stub.
@@ -1898,6 +2124,138 @@ mod tests {
         assert!(matches!(&out[0], Message::Response(r) if !r.success));
     }
 
+    /// A backend whose source mapping resolves a requested line into a DIFFERENT FILE, which is what
+    /// the device backend's documented line-only fallback does when a client spells a path the
+    /// producer did not record. It resolves `line 7` of anything to one address, and reports that
+    /// address as line 42 of `other.cs`.
+    struct ResolvesIntoAnotherFile;
+
+    impl DebugBackend for ResolvesIntoAnotherFile {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn resolve_source_breakpoint(&self, _document: &str, line: u32) -> Option<u64> {
+            (line == 7).then_some(0x100)
+        }
+        fn has_source(&self) -> bool {
+            true
+        }
+        fn source_location(&self, address: u64) -> Option<SourceLocation> {
+            (address == 0x100).then(|| SourceLocation {
+                file: String::from("other.cs"),
+                line: 42,
+                column: 1,
+                end_line: 42,
+                end_column: 1,
+            })
+        }
+        fn stack(&self) -> Vec<Frame> {
+            Vec::new()
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// A RESOLVED LINE IS REPORTED WITH THE FILE IT IS A LINE IN, never as a bare number the client
+    /// will read against the file it asked about.
+    ///
+    /// `Breakpoint.line` is "the start line of the actual range covered by the breakpoint" and
+    /// `Breakpoint.source` is "the source where the breakpoint is located" (DAP), so the pair is the
+    /// answer and the number alone is not. The adapter was fetching the location, taking its line and
+    /// **discarding the file it came from** -- so a request about `app.cs` line 7 that bound into
+    /// `other.cs` line 42 came back as "line 42", which an editor shows on line 42 of `app.cs`.
+    #[test]
+    fn a_breakpoint_that_bound_into_another_file_reports_that_file() {
+        let mut dbg = Debugger::with_backend(Box::new(ResolvesIntoAnotherFile));
+        dbg.handle(&request(1, "launch", None));
+        let args = json!({ "source": { "path": "app.cs" }, "breakpoints": [{ "line": 7 }] });
+        let out = dbg.handle(&request(2, "setBreakpoints", Some(args)));
+        let breakpoint = out[0].response_body()["breakpoints"][0].clone();
+
+        assert_eq!(breakpoint["verified"], json!(true), "{breakpoint}");
+        assert_eq!(
+            breakpoint["line"],
+            json!(42),
+            "the actual bound line: {breakpoint}"
+        );
+        assert_eq!(
+            breakpoint["source"]["path"],
+            json!("other.cs"),
+            "and the file that line is in, which the client did not ask about: {breakpoint}"
+        );
+    }
+
+    /// AN UNVERIFIED BREAKPOINT SAYS WHY, AND SAYS IT TWICE -- once for the person and once for the
+    /// client. The two `reason` values are not interchangeable: `pending` invites a client to wait,
+    /// `failed` tells someone to change something, and the same refusal means both depending on
+    /// whether a source mapping exists yet.
+    #[test]
+    fn an_unverified_breakpoint_carries_a_reason_and_a_message() {
+        // A mapping EXISTS and the line has no code in it: nobody waiting will fix that.
+        let mut mapped = Debugger::with_backend(Box::new(ResolvesIntoAnotherFile));
+        mapped.handle(&request(1, "launch", None));
+        let args = json!({ "source": { "path": "app.cs" }, "breakpoints": [{ "line": 9 }] });
+        let out = mapped.handle(&request(2, "setBreakpoints", Some(args)));
+        let refused = out[0].response_body()["breakpoints"][0].clone();
+        assert_eq!(refused["verified"], json!(false), "{refused}");
+        assert_eq!(refused["reason"], json!("failed"), "{refused}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("line 9")),
+            "the message names the line, for a person: {refused}"
+        );
+
+        // NO mapping yet, which is the state VS Code sends its first setBreakpoints in: it may bind
+        // by itself once the program is loaded, and `pending` is how a client is told to wait.
+        let (module, main) = add_program();
+        let mut unmapped = Debugger::new(module, main);
+        let args = json!({ "source": { "path": "app.cs" }, "breakpoints": [{ "line": 9 }] });
+        let out = unmapped.handle(&request(1, "setBreakpoints", Some(args)));
+        let waiting = out[0].response_body()["breakpoints"][0].clone();
+        assert_eq!(waiting["verified"], json!(false), "{waiting}");
+        assert_eq!(waiting["reason"], json!("pending"), "{waiting}");
+        assert!(waiting["message"].as_str().is_some(), "{waiting}");
+    }
+
+    /// A breakpoint that IS verified carries no `reason` -- the specification says to omit it, and a
+    /// client that switches on its presence would read a verified breakpoint as a qualified one.
+    #[test]
+    fn a_verified_breakpoint_carries_no_reason() {
+        let mut dbg = Debugger::with_backend(Box::new(ResolvesIntoAnotherFile));
+        dbg.handle(&request(1, "launch", None));
+        let args = json!({ "source": { "path": "app.cs" }, "breakpoints": [{ "line": 7 }] });
+        let out = dbg.handle(&request(2, "setBreakpoints", Some(args)));
+        let breakpoint = out[0].response_body()["breakpoints"][0].clone();
+        assert_eq!(breakpoint["verified"], json!(true), "{breakpoint}");
+        assert!(breakpoint.get("reason").is_none(), "{breakpoint}");
+    }
+
     #[test]
     fn set_breakpoints_reports_unverified_pending_source_mapping() {
         let (module, main) = add_program();
@@ -2042,6 +2400,28 @@ mod tests {
         );
     }
 
+    /// A frame the backend could not locate reports no position at all, which is the one encoding a
+    /// client is told to ignore: `StackFrame.line` is "the line within the source of the frame. If
+    /// the source attribute is missing or doesn't exist, `line` is 0 and should be ignored by the
+    /// client", and `column` says the same (DAP, `StackFrame`). Passing the backend's own line
+    /// through with no `source` beside it hands the editor a number it is required to believe.
+    #[test]
+    fn a_frame_with_no_source_reports_no_line_or_column() {
+        let mut dbg = Debugger::with_backend(Box::new(TwoFramesDeep));
+        dbg.handle(&request(1, "launch", None));
+        let trace = dbg.handle(&request(2, "stackTrace", None));
+        let frames = trace[0].response_body()["stackFrames"].clone();
+        for index in 0..2 {
+            let frame = &frames[index];
+            assert!(
+                frame.get("source").is_none(),
+                "this backend maps no address to a source: {frame}"
+            );
+            assert_eq!(frame["line"], json!(0), "{frame}");
+            assert_eq!(frame["column"], json!(0), "{frame}");
+        }
+    }
+
     #[test]
     fn step_in_descends_into_a_call_while_next_steps_over_it() {
         let (module, main) = call_program();
@@ -2099,7 +2479,11 @@ mod tests {
                 .any(|m| matches!(m, Message::Event(e) if e.event == "terminated"))
         );
         let trace = dbg.handle(&request(5, "stackTrace", None));
-        assert_eq!(trace[0].response_body()["stackFrames"][0]["line"], json!(3));
+        assert_eq!(
+            trace[0].response_body()["stackFrames"][0]["instructionPointerReference"],
+            json!(encode_address(main, 2).to_string()),
+            "stopped at the instruction the breakpoint was set on"
+        );
 
         let out = dbg.handle(&request(6, "continue", None));
         assert!(
@@ -2153,6 +2537,193 @@ mod tests {
                 other => panic!("expected response, got {other:?}"),
             }
         }
+    }
+
+    /// A backend that stops, lists a frame, and reports no arguments and no locals -- what a
+    /// target whose debug information carries no variable locations does.
+    struct ReportsNoVariables;
+
+    impl DebugBackend for ReportsNoVariables {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Breakpoint
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<Frame> {
+            vec![Frame { address: 0x2000_0100, name: String::from("Main"), line: 1 }]
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// The response to one `evaluate`, which is always the first message back -- anything after it
+    /// is a follow-up event (see [`Debugger::absent_variables_note`]).
+    fn evaluate_request(dbg: &mut Debugger, seq: i64, arguments: Json) -> Response {
+        let mut out = dbg.handle(&request(seq, "evaluate", Some(arguments))).into_iter();
+        let answer = match out.next().expect("an evaluate is answered") {
+            Message::Response(response) => response,
+            other => panic!("the response comes first, got {other:?}"),
+        };
+        for trailing in out {
+            assert!(
+                matches!(trailing, Message::Event(_)),
+                "only events follow a response, got {trailing:?}"
+            );
+        }
+        answer
+    }
+
+    /// A session stopped inside `add`, far enough into its body that the innermost frame has both
+    /// arguments and an evaluation-stack slot.
+    fn stopped_inside_add() -> Debugger {
+        let (module, main) = call_program();
+        let mut dbg = Debugger::new(module, main);
+        dbg.handle(&request(1, "launch", None));
+        for seq in 2..=5 {
+            dbg.handle(&request(seq, "stepIn", None));
+        }
+        assert_eq!(frame_count(&mut dbg), 2, "stopped in the callee");
+        dbg
+    }
+
+    #[test]
+    fn a_hover_reads_a_variables_value_and_type_out_of_the_paused_frame() {
+        let mut dbg = stopped_inside_add();
+        let frame = innermost_frame_id(&mut dbg);
+        let answer = evaluate_request(
+            &mut dbg,
+            10,
+            json!({ "expression": "arg0", "frameId": frame, "context": "hover" }),
+        );
+        assert!(answer.success, "a hover over an argument is answerable: {:?}", answer.message);
+        let body = answer.body.expect("a body");
+        assert_eq!(body["result"], json!("2"));
+        assert_eq!(body["type"], json!("int"));
+    }
+
+    #[test]
+    fn a_stack_slot_is_not_reachable_by_name_though_an_argument_in_the_same_frame_is() {
+        let mut dbg = stopped_inside_add();
+        let frame = innermost_frame_id(&mut dbg);
+        let scopes = dbg.handle(&request(10, "scopes", Some(json!({ "frameId": frame }))));
+        let stack_ref = find_scope(&scopes[0].response_body(), "Stack");
+        let slots = dbg.handle(&request(
+            11,
+            "variables",
+            Some(json!({ "variablesReference": stack_ref })),
+        ));
+        let slot = slots[0].response_body()["variables"][0]["name"]
+            .as_str()
+            .expect("the frame has an evaluation-stack slot to hide")
+            .to_owned();
+
+        let hidden = evaluate_request(
+            &mut dbg,
+            12,
+            json!({ "expression": slot, "frameId": frame, "context": "hover" }),
+        );
+        assert!(!hidden.success, "a stack slot is not read by name: {:?}", hidden.body);
+
+        let control = evaluate_request(
+            &mut dbg,
+            13,
+            json!({ "expression": "arg0", "frameId": frame, "context": "hover" }),
+        );
+        assert!(control.success, "but the frame does answer its arguments");
+    }
+
+    #[test]
+    fn a_name_the_frame_does_not_have_is_refused_without_consulting_the_session() {
+        let mut dbg = stopped_inside_add();
+        dbg.repl = Some(crate::repl_eval::ReplCell::Unavailable(
+            "the session answered a frame-scoped submission".to_owned(),
+        ));
+        let frame = innermost_frame_id(&mut dbg);
+        let answer = evaluate_request(
+            &mut dbg,
+            10,
+            json!({ "expression": "elsewhere", "frameId": frame, "context": "watch" }),
+        );
+        assert!(!answer.success, "a name the frame does not have is refused");
+        let said = answer.message.unwrap_or_default();
+        assert!(said.starts_with('<'), "a watch gets the inline form: {said}");
+        assert!(
+            !said.contains("the session answered"),
+            "the session was consulted, which is the defect this closes: {said}"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_console_line_still_reaches_the_session() {
+        let mut dbg = stopped_inside_add();
+        dbg.repl = Some(crate::repl_eval::ReplCell::Unavailable("no references".to_owned()));
+        let answer =
+            evaluate_request(&mut dbg, 10, json!({ "expression": "1 + 1", "context": "repl" }));
+        assert!(answer.success, "a console line is answered as console output");
+        assert!(
+            answer.body.expect("a body")["result"]
+                .as_str()
+                .is_some_and(|said| said.contains("no references")),
+            "and it is the session that answered it"
+        );
+    }
+
+    #[test]
+    fn a_frame_with_no_variables_reads_differently_from_a_name_that_is_absent() {
+        let mut empty = Debugger::with_backend(Box::new(ReportsNoVariables));
+        empty.handle(&request(1, "launch", None));
+        let nothing = evaluate_request(
+            &mut empty,
+            2,
+            json!({ "expression": "count", "frameId": 0, "context": "repl" }),
+        );
+        assert!(!nothing.success);
+        let nothing = nothing.message.unwrap_or_default();
+
+        let mut some = stopped_inside_add();
+        let frame = innermost_frame_id(&mut some);
+        let absent = evaluate_request(
+            &mut some,
+            10,
+            json!({ "expression": "count", "frameId": frame, "context": "repl" }),
+        );
+        assert!(!absent.success);
+        let absent = absent.message.unwrap_or_default();
+
+        assert_ne!(nothing, absent, "the same submission, two causes, one answer");
+        assert!(nothing.contains("no arguments and no locals"), "got {nothing}");
+        assert!(absent.contains("not an argument or a local"), "got {absent}");
+    }
+
+    #[test]
+    fn initialize_advertises_evaluate_for_hovers() {
+        let (module, main) = add_program();
+        let mut dbg = Debugger::new(module, main);
+        let out = dbg.handle(&request(1, "initialize", None));
+        assert_eq!(out[0].response_body()["supportsEvaluateForHovers"], json!(true));
     }
 
     fn find_scope(scopes_body: &Json, name: &str) -> u32 {

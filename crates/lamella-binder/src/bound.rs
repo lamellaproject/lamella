@@ -5503,8 +5503,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     .iter()
                     .map(|length| {
                         let bound = self.bind_expression(length);
-                        self.check_index_or_length(&bound, length.span);
-                        bound
+                        self.coerce_index_or_length(bound, &Self::ARRAY_INDEX_TYPES, length.span)
                     })
                     .collect();
                 if let Some((lengths, elements)) = initializer
@@ -8561,6 +8560,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     .is_some_and(|info| info.kind == TypeKind::Delegate))
         {
             let delegate_ty = target.ty.clone();
+            let mut spilled = Vec::new();
+            let target = spill_target_operands(target, &mut spilled);
             let delegate_base =
                 TypeSymbol::Named([Box::from("System"), Box::from("Delegate")].into());
             let accessor = if matches!(operator, AssignmentOperator::Add) {
@@ -8604,7 +8605,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 },
                 ty: delegate_ty.clone(),
             };
-            return BoundExpr {
+            let assignment = BoundExpr {
                 kind: BoundExprKind::Assignment {
                     operator: AssignmentOperator::Assign,
                     target: Box::new(target),
@@ -8613,6 +8614,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 },
                 ty: delegate_ty,
             };
+            return Self::spilling(assignment, spilled);
         }
         if !target.ty.is_error() && !value.ty.is_error() {
             if let Some(binary_op) = compound_binary_operator(operator) {
@@ -8620,6 +8622,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     if let Some(result_ty) =
                         pointer_binary_result(binary_op, &target.ty, &value.ty)
                     {
+                        let mut spilled = Vec::new();
+                        let target = spill_target_operands(target, &mut spilled);
                         let binary = BoundExpr {
                             kind: BoundExprKind::Binary {
                                 operator: binary_op,
@@ -8629,7 +8633,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             },
                             ty: result_ty,
                         };
-                        return BoundExpr {
+                        let assignment = BoundExpr {
                             ty: target.ty.clone(),
                             kind: BoundExprKind::Assignment {
                                 operator: AssignmentOperator::Assign,
@@ -8638,8 +8642,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                                 checked: self.checked_context,
                             },
                         };
+                        return Self::spilling(assignment, spilled);
                     }
                     if let Some(result_ty) = self.enum_binary_result(binary_op, &target.ty, &value.ty) {
+                        let mut spilled = Vec::new();
+                        let target = spill_target_operands(target, &mut spilled);
                         let binary = BoundExpr {
                             kind: BoundExprKind::Binary {
                                 operator: binary_op,
@@ -8650,7 +8657,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             ty: result_ty,
                         };
                         let assigned = self.convert(binary, &target.ty);
-                        return BoundExpr {
+                        let assignment = BoundExpr {
                             ty: target.ty.clone(),
                             kind: BoundExprKind::Assignment {
                                 operator: AssignmentOperator::Assign,
@@ -8659,18 +8666,24 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                                 checked: self.checked_context,
                             },
                         };
+                        return Self::spilling(assignment, spilled);
                     }
-                    if let Some(call) = self.bind_user_binary_operator(binary_op, &target, &value) {
-                        let assigned = self.convert(call, &target.ty);
-                        return BoundExpr {
-                            ty: target.ty.clone(),
+                    let mut spilled = Vec::new();
+                    let spilled_target = spill_target_operands(target.clone(), &mut spilled);
+                    if let Some(call) =
+                        self.bind_user_binary_operator(binary_op, &spilled_target, &value)
+                    {
+                        let assigned = self.convert(call, &spilled_target.ty);
+                        let assignment = BoundExpr {
+                            ty: spilled_target.ty.clone(),
                             kind: BoundExprKind::Assignment {
                                 operator: AssignmentOperator::Assign,
-                                target: Box::new(target),
+                                target: Box::new(spilled_target),
                                 value: Box::new(assigned),
                                 checked: self.checked_context,
                             },
                         };
+                        return Self::spilling(assignment, spilled);
                     }
                 }
             }
@@ -9706,7 +9719,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let names: Vec<Option<(&str, Span)>> = argument_names(argument_exprs);
         let mut resolved = match group {
             Some((receiver_ty, name)) if !real_error => {
-                let candidates = self.methods_in_chain(&receiver_ty, &name);
+                let gather_constants: Vec<Option<i64>> =
+                    arguments.iter().map(constant_int_value).collect();
+                let candidates = self.most_derived_candidates(
+                    &receiver_ty,
+                    &name,
+                    &argument_types,
+                    &gather_constants,
+                    &names,
+                );
                 let set = self.candidates_for_type_arguments(
                     &candidates,
                     &type_arguments,
@@ -10943,9 +10964,19 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             _ => None,
         };
         if let Some(ty) = element {
-            for (index, argument) in indices.iter().zip(argument_exprs) {
-                self.check_index_or_length(index, argument.value.span);
-            }
+            let accepted: &[SpecialType] =
+                if matches!(receiver.ty, TypeSymbol::Special(SpecialType::String)) {
+                    &Self::STRING_INDEX_TYPES
+                } else {
+                    &Self::ARRAY_INDEX_TYPES
+                };
+            let indices: Vec<BoundExpr> = indices
+                .into_iter()
+                .zip(argument_exprs)
+                .map(|(index, argument)| {
+                    self.coerce_index_or_length(index, accepted, argument.value.span)
+                })
+                .collect();
             return BoundExpr {
                 kind: BoundExprKind::ElementAccess {
                     receiver: Box::new(receiver),
@@ -10999,13 +11030,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         if receiver_ty.is_error() || arguments.iter().any(|argument| argument.ty.is_error()) {
             return None;
         }
-        let candidates = self.methods_in_chain(receiver_ty, accessor);
         let is_setter = accessor.starts_with("set_");
-        let indexing: Vec<MethodSymbol> = if is_setter {
-            candidates.iter().map(without_trailing_parameter).collect()
-        } else {
-            candidates.clone()
-        };
+        let tiers = self.methods_in_chain_tiered(receiver_ty, accessor);
         let mut arguments = arguments;
         let value = if is_setter { arguments.pop() } else { None };
         if is_setter && value.is_none() {
@@ -11013,6 +11039,27 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let argument_types: Vec<TypeSymbol> = arguments.iter().map(argument_type).collect();
         let arg_constants: Vec<Option<i64>> = arguments.iter().map(constant_int_value).collect();
+        let index_view = |tier: &Vec<MethodSymbol>| -> Vec<MethodSymbol> {
+            if is_setter {
+                tier.iter().map(without_trailing_parameter).collect()
+            } else {
+                tier.clone()
+            }
+        };
+        let reduced = if names.iter().any(Option::is_some) {
+            None
+        } else {
+            tiers.iter().position(|tier| {
+                index_view(tier).iter().any(|candidate| {
+                    is_applicable(&self.model, candidate, &argument_types, &arg_constants)
+                })
+            })
+        };
+        let candidates: Vec<MethodSymbol> = match reduced {
+            Some(tier) => tiers[tier].clone(),
+            None => tiers.concat(),
+        };
+        let indexing: Vec<MethodSymbol> = index_view(&candidates);
         let method = self.resolve_call(
             accessor,
             receiver_ty,
@@ -13757,27 +13804,56 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
-    /// Checks an array/pointer INDEX or an array LENGTH. The permitted type is not `int` alone:
-    /// `int`, `uint`, `long` and `ulong` all serve (12.4, 14.5.10.2), which matters for a pointer
-    /// indexed by a `ulong` offset. Only when none of the four accepts the value is it reported --
-    /// against `int`, which is the type csc names.
-    fn check_index_or_length(&mut self, value: &BoundExpr, span: Span) {
+    /// An index or a length, CONVERTED to the type the standard requires it to have -- not merely
+    /// checked for being convertible.
+    ///
+    /// **THE CONVERSION IS PART OF THE RULE AND NOT A TIDYING STEP.** 14.5.10.2 says an array
+    /// creation's length must be `int`, `uint`, `long` or `ulong` "or implicitly convertible to one
+    /// or more of these types", and 14.5.6.1 says the same of an array index. When the operand gets
+    /// there by a USER-DEFINED implicit conversion, that conversion is the only thing that produces
+    /// a number, so a lowering that accepts the operand and then uses it unconverted uses the
+    /// struct itself as the count. The permitted set is the caller's, because a `string`'s indexer
+    /// is `char this[int]` and admits `int` alone where an array admits all four.
+    ///
+    /// **The four types are tried in the standard's own order,** so a type offering both an `int`
+    /// and a `long` conversion takes the `int` one, which is what csc does. An operand that is
+    /// ALREADY one of the accepted types is returned untouched rather than wrapped in an identity
+    /// conversion, so the ordinary `a[i]` keeps the code it always had. Only when none of them
+    /// accepts the value is it reported, against the first -- the type csc names.
+    fn coerce_index_or_length(
+        &mut self,
+        value: BoundExpr,
+        accepted: &[SpecialType],
+        span: Span,
+    ) -> BoundExpr {
         if value.ty.is_error() {
-            return;
+            return value;
         }
-        let int_ty = TypeSymbol::Special(SpecialType::Int32);
-        let accepted = [
-            SpecialType::Int32,
-            SpecialType::UInt32,
-            SpecialType::Int64,
-            SpecialType::UInt64,
-        ]
-        .iter()
-        .any(|special| self.assignable(value, &TypeSymbol::Special(*special)));
-        if !accepted {
-            self.check_assignable(value, &int_ty, span);
+        if matches!(value.ty, TypeSymbol::Special(special) if accepted.contains(&special)) {
+            return value;
         }
+        for special in accepted {
+            let target = TypeSymbol::Special(*special);
+            if self.assignable(&value, &target) {
+                return self.convert(value, &target);
+            }
+        }
+        self.check_assignable(&value, &TypeSymbol::Special(accepted[0]), span);
+        value
     }
+
+    /// The operand types an array creation's length and an array index admit (14.5.10.2, 14.5.6.1).
+    const ARRAY_INDEX_TYPES: [SpecialType; 4] = [
+        SpecialType::Int32,
+        SpecialType::UInt32,
+        SpecialType::Int64,
+        SpecialType::UInt64,
+    ];
+
+    /// A `string`'s indexer is `char this[int]`, so it admits `int` ALONE -- the wider array rule
+    /// does not apply to it, and csc refuses `s[aLong]` and `s[aUint]` with CS1503 where it accepts
+    /// both on an array.
+    const STRING_INDEX_TYPES: [SpecialType; 1] = [SpecialType::Int32];
 
     /// The shared tail of the property and indexer override rules: given the base slot the member
     /// resolved to (or its absence), report the same family [`Self::check_overrides_have_base`]
@@ -14866,9 +14942,51 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
+    /// The `[Conditional]` symbols governing a call, taken from the declaration that INTRODUCES the
+    /// method rather than the one the call binds to. `[Conditional]` sits on a virtual method and
+    /// governs every override of it -- an override may not declare one itself (csc's CS0243) -- so
+    /// a call binding to `Derived.M()` is conditional exactly when the virtual it overrides is.
+    ///
+    /// **A SEPARATE WALK RATHER THAN `methods_in_chain`, AND THAT IS NOT A PREFERENCE.** That walk
+    /// dedupes candidates by parameter list, deliberately, so that a method overridden at several
+    /// levels collapses to one and cannot raise a spurious ambiguity. The consequence here is that
+    /// the BASE declaration -- the only one carrying the attribute -- is removed by the override
+    /// that hides it, and is never in the returned list at all. Reading `conditional` off the first
+    /// match therefore always read the override's empty set, and the obvious repair (walk past the
+    /// overrides in that list) has nothing left to walk to.
+    ///
+    /// The walk stops at the first declaration that is NOT an override, which is the one that
+    /// introduces the method. **A `new` method that HIDES a base one is a different method and
+    /// keeps its own conditionality**, which falls out of the same rule: hiding is not overriding,
+    /// so the walk stops on it.
+    fn introducing_conditional(&self, method: &MethodReference) -> Vec<Box<str>> {
+        let mut conditional: Vec<Box<str>> = Vec::new();
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = Some(self.lookup_type_of(&method.declaring_type));
+        while let Some(ty) = current.take() {
+            if visited.contains(&ty) {
+                break;
+            }
+            visited.push(ty.clone());
+            let Some(info) = self.type_info_of(&ty) else {
+                break;
+            };
+            let found = info
+                .methods_named(&method.name)
+                .find(|candidate| candidate.parameters == method.parameters);
+            if let Some(candidate) = found {
+                conditional = candidate.conditional.clone();
+                if !candidate.is_override {
+                    break;
+                }
+            }
+            current = info.base.clone();
+        }
+        conditional
+    }
+
     /// Whether a bound call is to a `[Conditional("X")]` method none of whose symbols are
-    /// defined here -- so the call statement is omitted whole (24.4.2), arguments and all. The
-    /// method's `conditional` is recovered from the model by the resolved overload.
+    /// defined here -- so the call statement is omitted whole (24.4.2), arguments and all.
     pub(crate) fn conditional_call_omitted(&self, expr: &BoundExpr) -> bool {
         let BoundExprKind::Call {
             method: Some(method),
@@ -14877,12 +14995,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         else {
             return false;
         };
-        let conditional = self
-            .methods_in_chain(&method.declaring_type, &method.name)
-            .into_iter()
-            .find(|candidate| candidate.parameters == method.parameters)
-            .map(|candidate| candidate.conditional)
-            .unwrap_or_default();
+        let conditional = self.introducing_conditional(method);
         !conditional.is_empty()
             && !conditional
                 .iter()
@@ -14926,9 +15039,56 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.methods_in_chain(ty, name)
     }
 
+    /// The candidate set ECMA-334 14.5.5.1 gives a call, which is NOT every overload in the chain.
+    ///
+    /// **THE SET IS REDUCED TO THE MOST DERIVED TYPE THAT DECLARES AN APPLICABLE MEMBER, AND THAT
+    /// REDUCTION HAPPENS BEFORE BETTERNESS RUNS.** So a derived `M(object)` takes a `string`
+    /// argument over a base `M(string)`: the base member is not a worse candidate, it is not a
+    /// candidate at all. Flattening the chain and letting betterness decide inverts exactly the
+    /// case the rule exists for, and it does so SILENTLY -- the program calls a different method
+    /// than the language says it does, and nothing reports it.
+    ///
+    /// One implementation, because the same hiding rule governs methods, indexers, properties and
+    /// events: they all reach overload resolution through this walk.
+    fn most_derived_candidates(
+        &self,
+        receiver_ty: &TypeSymbol,
+        name: &str,
+        arguments: &[TypeSymbol],
+        arg_constants: &[Option<i64>],
+        names: &[Option<(&str, Span)>],
+    ) -> Vec<MethodSymbol> {
+        let tiers = self.methods_in_chain_tiered(receiver_ty, name);
+        if names.iter().any(Option::is_some) {
+            return tiers.concat();
+        }
+        for tier in &tiers {
+            if tier
+                .iter()
+                .any(|candidate| is_applicable(&self.model, candidate, arguments, arg_constants))
+            {
+                return tier.clone();
+            }
+        }
+        tiers.concat()
+    }
+
+    /// [`Self::methods_in_chain`]'s candidates, kept in the TIERS they were declared in, most
+    /// derived first. Separate from the flat form because applicability is known only against a
+    /// specific argument list, so only a caller can say where the walk should have stopped.
+    fn methods_in_chain_tiered(&self, ty: &TypeSymbol, name: &str) -> Vec<Vec<MethodSymbol>> {
+        self.methods_in_chain_walk(ty, name)
+    }
+
     fn methods_in_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
-        let mut methods: Vec<MethodSymbol> = Vec::new();
-        let mut inaccessible: Vec<MethodSymbol> = Vec::new();
+        self.methods_in_chain_walk(ty, name).concat()
+    }
+
+    fn methods_in_chain_walk(&self, ty: &TypeSymbol, name: &str) -> Vec<Vec<MethodSymbol>> {
+        let mut tiers: Vec<Vec<MethodSymbol>> = Vec::new();
+        let mut inaccessible_tiers: Vec<Vec<MethodSymbol>> = Vec::new();
+        let mut seen: Vec<MethodSymbol> = Vec::new();
+        let mut seen_inaccessible: Vec<MethodSymbol> = Vec::new();
         let mut visited: Vec<TypeSymbol> = Vec::new();
         let lookup = self.lookup_type_of(ty);
         let mut pending = alloc::vec![lookup.clone()];
@@ -14947,28 +15107,38 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 continue;
             };
             let declaring = type_symbol_in(&info.namespace, &info.name);
+            let mut tier: Vec<MethodSymbol> = Vec::new();
+            let mut inaccessible_tier: Vec<MethodSymbol> = Vec::new();
             for method in info.methods_named(name) {
                 let conversion_operator = matches!(name, "op_Implicit" | "op_Explicit");
-                let bucket = if self.is_accessible(&declaring, method.accessibility) {
-                    &mut methods
-                } else {
-                    &mut inaccessible
-                };
-                if !bucket.iter().any(|kept| {
+                let (seen_bucket, tier_bucket) =
+                    if self.is_accessible(&declaring, method.accessibility) {
+                        (&mut seen, &mut tier)
+                    } else {
+                        (&mut seen_inaccessible, &mut inaccessible_tier)
+                    };
+                if !seen_bucket.iter().any(|kept| {
                     kept.parameters == method.parameters
                         && (!conversion_operator || kept.return_type == method.return_type)
                 }) {
-                    bucket.push(method.clone());
+                    seen_bucket.push(method.clone());
+                    tier_bucket.push(method.clone());
                 }
+            }
+            if !tier.is_empty() {
+                tiers.push(tier);
+            }
+            if !inaccessible_tier.is_empty() {
+                inaccessible_tiers.push(inaccessible_tier);
             }
             for base in member_lookup_bases(&info) {
                 pending.push(base);
             }
         }
-        if methods.is_empty() {
-            inaccessible
+        if tiers.is_empty() {
+            inaccessible_tiers
         } else {
-            methods
+            tiers
         }
     }
 
@@ -16128,8 +16298,71 @@ pub(crate) fn cast_constant(operand: &Literal, target: SpecialType) -> Option<Li
                 _ => coerce_constant(value as i64, target),
             }
         }
+        Literal::Boolean(_) if matches!(target, S::Boolean) => Some(operand.clone()),
+        Literal::String(_) if matches!(target, S::String | S::Object) => Some(operand.clone()),
+        Literal::Null if matches!(target, S::String | S::Object) => Some(Literal::Null),
         _ => coerce_constant(literal_int_value(operand)?, target),
     }
+}
+
+/// The exact value of an integer constant, reading its stored bits as signed or unsigned according
+/// to `ty` -- the type of the expression the constant came from.
+///
+/// [`Literal::Integer`] keeps a `u64` that serves both, because folding `-1` stores the negative's
+/// bit pattern. Reading those bits as `i64` regardless is a silent wrong answer for any unsigned
+/// constant above `i64::MAX`: `const double x = ulong.MaxValue` folded to -1 where .NET gives
+/// 1.8446744073709552E+19, and `10000000000000000000` folded to -1981284352.
+///
+/// `char` is unsigned and converts implicitly to every floating type and to `decimal`, so it folds
+/// here too rather than through the signed path.
+fn exact_integer_constant(literal: &Literal, ty: &TypeSymbol) -> Option<i128> {
+    match literal {
+        Literal::Integer { value, .. } => {
+            let unsigned = matches!(ty, TypeSymbol::Special(special) if special.is_unsigned());
+            Some(if unsigned {
+                i128::from(*value)
+            } else {
+                i128::from(*value as i64)
+            })
+        }
+        Literal::Character(unit) => Some(i128::from(*unit)),
+        _ => None,
+    }
+}
+
+/// An exact integer constant as a value of `target`, one of the types an integral constant widens
+/// to implicitly: `float`, `double` (rounded to that precision) or `decimal` (exact).
+fn widen_integer_constant(value: i128, target: SpecialType) -> Option<Literal> {
+    Some(match target {
+        SpecialType::Single => Literal::Real {
+            bits: f64::from(value as f32).to_bits(),
+            suffix: RealSuffix::Float,
+        },
+        SpecialType::Double => Literal::Real {
+            bits: (value as f64).to_bits(),
+            suffix: RealSuffix::Double,
+        },
+        SpecialType::Decimal => decimal_constant(value)?,
+        _ => return None,
+    })
+}
+
+/// An integer value as a `decimal` constant: the 96-bit mantissa with a scale of zero.
+///
+/// `None` above 96 bits, which no integral constant reaches -- the check is here so that a future
+/// caller with a wider value gets a refusal rather than a truncated mantissa.
+fn decimal_constant(value: i128) -> Option<Literal> {
+    let magnitude = value.unsigned_abs();
+    if magnitude >> 96 != 0 {
+        return None;
+    }
+    Some(Literal::Decimal {
+        lo: magnitude as u32,
+        mid: (magnitude >> 32) as u32,
+        hi: (magnitude >> 64) as u32,
+        scale: 0,
+        negative: value < 0,
+    })
 }
 
 pub(crate) fn coerce_constant(value: i64, target: SpecialType) -> Option<Literal> {
@@ -16151,6 +16384,7 @@ pub(crate) fn coerce_constant(value: i64, target: SpecialType) -> Option<Literal
             bits: (value as f64).to_bits(),
             suffix: RealSuffix::Double,
         },
+        S::Decimal => decimal_constant(i128::from(value))?,
         _ => return None,
     })
 }
@@ -16172,9 +16406,11 @@ pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
             let inner = constant_literal_value(operand)?;
             match (&expr.ty, &inner) {
                 (
-                    TypeSymbol::Special(target @ (SpecialType::Single | SpecialType::Double)),
-                    Literal::Integer { .. },
-                ) => coerce_constant(literal_int_value(&inner)?, *target),
+                    TypeSymbol::Special(
+                        target @ (SpecialType::Single | SpecialType::Double | SpecialType::Decimal),
+                    ),
+                    Literal::Integer { .. } | Literal::Character(_),
+                ) => widen_integer_constant(exact_integer_constant(&inner, &operand.ty)?, *target),
                 _ => Some(inner),
             }
         }
@@ -16191,12 +16427,17 @@ pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
             &constant_literal_value(left)?,
             &constant_literal_value(right)?,
         ),
-        BoundExprKind::Cast { operand, .. } => match &expr.ty {
-            TypeSymbol::Special(target) => {
-                cast_constant(&constant_literal_value(operand)?, *target)
+        BoundExprKind::Cast { operand, .. } => {
+            let inner = constant_literal_value(operand)?;
+            match &expr.ty {
+                TypeSymbol::Special(target) => cast_constant(&inner, *target),
+                TypeSymbol::Named(_) => match inner {
+                    Literal::Integer { .. } | Literal::Character(_) | Literal::Null => Some(inner),
+                    _ => None,
+                },
+                _ => None,
             }
-            _ => None,
-        },
+        }
         BoundExprKind::Conditional {
             condition,
             when_true,
@@ -16206,7 +16447,37 @@ pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
             Literal::Boolean(false) => constant_literal_value(when_false),
             _ => None,
         },
+        BoundExprKind::Call {
+            method: Some(method),
+            arguments,
+            ..
+        } if arguments.len() == 1
+            && matches!(&*method.name, "op_Implicit" | "op_Explicit")
+            && is_decimal(&method.declaring_type)
+            && is_decimal(&expr.ty) =>
+        {
+            let inner = constant_literal_value(&arguments[0])?;
+            match inner {
+                Literal::Integer { .. } | Literal::Character(_) => decimal_constant(
+                    exact_integer_constant(&inner, &arguments[0].ty)?,
+                ),
+                Literal::Decimal { .. } => Some(inner),
+                _ => None,
+            }
+        }
         _ => None,
+    }
+}
+
+/// Whether `ty` is `decimal`, by either spelling -- the special type or `System.Decimal`, which is
+/// how the type arrives on a conversion operator resolved against the loaded BCL.
+fn is_decimal(ty: &TypeSymbol) -> bool {
+    match ty {
+        TypeSymbol::Special(SpecialType::Decimal) => true,
+        TypeSymbol::Named(parts) => {
+            matches!(parts.len(), 2 if &*parts[0] == "System" && &*parts[1] == "Decimal")
+        }
+        _ => false,
     }
 }
 
@@ -17230,6 +17501,120 @@ fn is_repeatable(expr: &lamella_syntax::ast::Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether a BOUND expression can be evaluated twice with the same result and no extra effect.
+///
+/// The sibling of [`is_repeatable`], asked of the bound tree rather than of the syntax -- which
+/// lets it answer for the two forms the syntactic test has to refuse. `c.P` is a getter CALL or a
+/// plain field load, and `a[i]` is an indexer call or an array element, depending on what the
+/// names resolved to; by here that is known.
+///
+/// Anything that can run user code or write storage -- a call, a property read, an assignment,
+/// `++`/`--`, `new` -- is not repeatable. A LOAD is, including a load reached through other loads:
+/// a compound assignment evaluates every operand of its target before the value expression runs,
+/// so a repeated read observes the same storage whichever way it is lowered.
+fn bound_is_repeatable(expr: &BoundExpr) -> bool {
+    match &expr.kind {
+        BoundExprKind::Local(_)
+        | BoundExprKind::This
+        | BoundExprKind::Base
+        | BoundExprKind::Literal(_)
+        | BoundExprKind::DefaultValue(_)
+        | BoundExprKind::TypeReference(_)
+        | BoundExprKind::NamespaceReference(_)
+        | BoundExprKind::Temp(_) => true,
+        BoundExprKind::FieldAccess { receiver, .. } => bound_is_repeatable(receiver),
+        BoundExprKind::ElementAccess { receiver, indices } => {
+            bound_is_repeatable(receiver) && indices.iter().all(bound_is_repeatable)
+        }
+        BoundExprKind::Dereference { operand } => bound_is_repeatable(operand),
+        BoundExprKind::Cast { operand, .. } | BoundExprKind::Conversion { operand, .. } => {
+            bound_is_repeatable(operand)
+        }
+        BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
+            bound_is_repeatable(inner)
+        }
+        BoundExprKind::Binary { left, right, .. } => {
+            bound_is_repeatable(left) && bound_is_repeatable(right)
+        }
+        BoundExprKind::Unary {
+            operator, operand, ..
+        } => {
+            !matches!(
+                operator,
+                UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
+            ) && bound_is_repeatable(operand)
+        }
+        _ => false,
+    }
+}
+
+/// Rewrites a compound assignment's TARGET so that every operand it names is evaluated exactly
+/// once, collecting into `spilled` the operands that must run first.
+///
+/// **THE SOURCE NAMES THE TARGET ONCE AND A READ-MODIFY-WRITE LOWERING NAMES IT TWICE** -- once to
+/// read the old value, once to store the new one -- while 14.13.2 requires the target to be
+/// evaluated only once. The standard is explicit about what that means: in `A()[B()] += C()`, `A`,
+/// `B` and `C` are each invoked exactly once, in that order.
+///
+/// So an operand that cannot be repeated moves into a temporary that both halves then name, and
+/// one that can be repeated stays where it is -- which is why `a[i] += 1` over a local array and a
+/// local index still compiles to the code it always did. The operands come out in evaluation
+/// order, receiver before indices, and the caller wraps the finished node with
+/// [`Binder::spilling`].
+fn spill_target_operands(target: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
+    fn once(operand: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
+        if bound_is_repeatable(&operand) {
+            return operand;
+        }
+        let ty = operand.ty.clone();
+        let index = spilled.len() as u32;
+        spilled.push(operand);
+        BoundExpr {
+            ty,
+            kind: BoundExprKind::Temp(index),
+        }
+    }
+    let BoundExpr { kind, ty } = target;
+    let kind = match kind {
+        BoundExprKind::ElementAccess { receiver, indices } => BoundExprKind::ElementAccess {
+            receiver: Box::new(once(*receiver, spilled)),
+            indices: indices
+                .into_iter()
+                .map(|index| once(index, spilled))
+                .collect(),
+        },
+        BoundExprKind::FieldAccess {
+            receiver,
+            name,
+            field,
+        } => BoundExprKind::FieldAccess {
+            receiver: Box::new(once(*receiver, spilled)),
+            name,
+            field,
+        },
+        BoundExprKind::PropertyAccess {
+            receiver,
+            declaring_type,
+            setter_declaring_type,
+            getter_instantiation,
+            setter_instantiation,
+            name,
+        } => BoundExprKind::PropertyAccess {
+            receiver: Box::new(once(*receiver, spilled)),
+            declaring_type,
+            setter_declaring_type,
+            getter_instantiation,
+            setter_instantiation,
+            name,
+        },
+        BoundExprKind::Dereference { operand } => BoundExprKind::Dereference {
+            operand: Box::new(once(*operand, spilled)),
+        },
+        other => other,
+    };
+    BoundExpr { kind, ty }
 }
 
 /// What a `ref` local's DECLARATION decided, for the two rules that cannot be answered at the use.
@@ -19807,6 +20192,63 @@ mod tests {
         assert_eq!(
             codes("class C { static void M() { try { } catch (Whatever e) { object y = e; } } }"),
             [246]
+        );
+    }
+
+    /// The same question asked of a compilation that HAS `System.Exception`, which is the only
+    /// configuration that ships.
+    ///
+    /// The test above cannot fail for a `throw`. Binding a bare source string puts no
+    /// `System.Exception` in the model, so it reaches only the provable-negative fallback, while
+    /// every real compilation has a corlib and takes the assignability branch instead. Those two
+    /// branches disagreed for a month -- the fallback answering `CS0155` and the shipping branch
+    /// answering `CS0029` -- and the test named for `CS0155` passed throughout, because the value
+    /// it asserted was one the defect could also produce. Declaring the type in the source is what
+    /// puts the shipping branch under the assertion.
+    #[test]
+    fn a_throw_against_a_declared_system_exception_is_still_cs0155() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+        let corlib = "namespace System { public class Exception { } } ";
+        for body in [
+            "throw 5;",
+            "throw \"x\";",
+            "throw new object();",
+            "class K { } class C2 { static void M() { throw new K(); } }",
+        ] {
+            let source = if body.starts_with("class") {
+                alloc::format!("{corlib}{body}")
+            } else {
+                alloc::format!("{corlib}class C {{ static void M() {{ {body} }} }}")
+            };
+            assert_eq!(codes(&source), [155], "expected CS0155 for: {source}");
+        }
+
+        assert_eq!(
+            codes(&alloc::format!(
+                "{corlib}class E2 : System.Exception {{ }} class C {{ static void M() {{ throw new E2(); }} }}"
+            )),
+            []
+        );
+        assert_eq!(
+            codes(&alloc::format!(
+                "{corlib}class C {{ static void M() {{ throw new System.Exception(); }} }}"
+            )),
+            []
+        );
+        assert_eq!(
+            codes(&alloc::format!(
+                "{corlib}class C {{ static void M() {{ throw null; }} }}"
+            )),
+            []
         );
     }
 

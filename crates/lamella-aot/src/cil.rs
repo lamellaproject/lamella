@@ -315,6 +315,28 @@ pub trait CallResolver {
         false
     }
 
+    /// Whether this call lowers to the `System.Array::GetLength(int)` intrinsic, which reads the
+    /// length out of the array header at `[array + dim*4]` -- so it dereferences null exactly as
+    /// `ldfld` does and needs the same hoisted check.
+    ///
+    /// ASKED THROUGH [`CallResolver::resolve`] SO IT CANNOT DISAGREE WITH THE LOWERING. The obvious
+    /// implementation -- resolve the token and test the method's name -- would be a SECOND statement
+    /// of a condition the resolver already makes, and a narrower one: that intrinsic is selected only
+    /// for a cross-assembly `MethodKind::Reference`, because corlib's own `GetUpperBound` calls
+    /// `GetLength` with a PARAMETER and must keep the real body. A gate written to the name would
+    /// have made a trap leader for a call the lowering does not treat as the intrinsic at all. Asking
+    /// for the resolved TARGET asks the one question that matters, and there is no second condition
+    /// to keep in step.
+    fn array_length_read(&self, operand: &Operand) -> bool {
+        matches!(
+            self.resolve(operand),
+            Some(CallInfo {
+                target: CallTarget::Intrinsic(Intrinsic::ArrayGetLength),
+                ..
+            })
+        )
+    }
+
     /// The value type a `newobj` constructs, named by its constructor token: the declaring
     /// type's [`MirType::ValueType`] (with size), so the lowering can allocate the instance.
     /// `None` for a reference type (use [`CallResolver::newobj_reference_layout`]).
@@ -878,6 +900,7 @@ fn lower_with_source(
         &body.handlers,
         &|op| resolver.field_on_reference_type(op),
         &|op| rectangular_access(resolver, op).is_some(),
+        &|op| resolver.array_length_read(op),
         &widths,
     );
     let preds = control_flow::predecessors(code, &blocks);
@@ -1156,17 +1179,12 @@ fn lower_with_source(
         .iter()
         .enumerate()
         .map(|(b, &(start, _))| {
-            let kind = trap_kind_at(&code[start], widths[start], resolver);
+            let kind = trap_kind_at(code, start, widths[start], resolver);
             if throw_clauses[b].is_empty()
                 && finally_protect[b].is_none()
-                && !matches!(
-                    kind,
-                    Some(TrapKind::Cast(_))
-                        | Some(TrapKind::CastClass(_))
-                        | Some(TrapKind::CastClassChain(_))
-                        | Some(TrapKind::ConvOverflow { .. })
-                        | Some(TrapKind::Overflow(_))
-                )
+                && !kind
+                    .as_ref()
+                    .is_some_and(TrapKind::raises_without_local_try)
             {
                 return None;
             }
@@ -1219,7 +1237,7 @@ fn lower_with_source(
                     new_value(&mut value_types, ty)
                 })
                 .collect();
-            for ty in trap_operand_types(&code[blocks[b].0], widths[blocks[b].0], resolver) {
+            for ty in trap_operand_types(code, blocks[b].0, widths[blocks[b].0], resolver) {
                 params.push(new_value(&mut value_types, ty));
             }
             params
@@ -1349,7 +1367,7 @@ fn lower_with_source(
                     }
                 }
             }
-            let operand_count = trap_operand_types(&code[start], widths[start], resolver).len();
+            let operand_count = trap_operand_types(code, start, widths[start], resolver).len();
             for k in 0..operand_count {
                 stack.push(block_params[b][local_count + k]);
             }
@@ -1691,7 +1709,7 @@ fn lower_with_source(
                 }
                 if let Some(kind) = trap_access[next].clone() {
                     let operand_types =
-                        trap_operand_types(&code[blocks[next].0], widths[blocks[next].0], resolver);
+                        trap_operand_types(code, blocks[next].0, widths[blocks[next].0], resolver);
                     let operand_count = operand_types.len();
                     let mut operands = Vec::with_capacity(operand_count);
                     for _ in 0..operand_count {
@@ -5451,6 +5469,35 @@ enum TrapKind {
     },
 }
 
+impl TrapKind {
+    /// Whether this check raises on its own with NO enclosing try, so it is hoisted everywhere.
+    ///
+    /// A cast and a checked-arithmetic test raise a catchable exception that PROPAGATES, so a caller
+    /// can catch it across the call and the check has to be emitted even in a method with no handler
+    /// of its own. Every other kind sits behind an inline trap in the backend, which has nowhere to
+    /// route without a local catch or finally, so hoisting it there would change a trap into nothing.
+    ///
+    /// THE MATCH IS EXHAUSTIVE ON PURPOSE AND MUST STAY THAT WAY. A new variant is a compile error
+    /// here, which is the whole point: the answer for a new kind of check has to be given, not
+    /// inherited from a wildcard.
+    fn raises_without_local_try(&self) -> bool {
+        match self {
+            TrapKind::Cast(_)
+            | TrapKind::CastClass(_)
+            | TrapKind::CastClassChain(_)
+            | TrapKind::CastArray(_)
+            | TrapKind::CastInterface(_)
+            | TrapKind::Overflow(_)
+            | TrapKind::ConvOverflow { .. } => true,
+            TrapKind::Bounds
+            | TrapKind::BoundsThenArrayStore
+            | TrapKind::RectangularBounds { .. }
+            | TrapKind::NullRef
+            | TrapKind::DivByZero => false,
+        }
+    }
+}
+
 /// Which checked arithmetic an [`TrapKind::Overflow`] guards, selecting the overflow test.
 #[derive(Clone, Copy)]
 enum OverflowKind {
@@ -5490,11 +5537,42 @@ fn rectangular_access(resolver: &dyn CallResolver, operand: &Operand) -> Option<
 /// `discover_blocks` applies when it makes the leader, so the two agree. `top_of_stack` is the type on
 /// top of the evaluation stack as the instruction runs: a divide is a trap only when that divisor is an
 /// integer, which `discover_blocks` decides by the same predicate.
+/// Whether `code[i]` LEADS an `array.GetLength(<constant>)` read -- a constant dimension push
+/// immediately followed by the call.
+///
+/// THE LEADER IS THE CONSTANT AND NOT THE CALL, WHICH IS THE WHOLE POINT. The lowering needs the
+/// dimension as a compile-time constant: it reads the length from `[array + dim*4]`, and it finds the
+/// value by looking back through the instructions this block has already emitted. Splitting the block
+/// AT the call leaves the constant behind in the predecessor, where that search cannot see it, and the
+/// build then refuses the very program it was trying to fix, as `Unsupported(Callvirt)`. Leading with
+/// the constant puts it inside the trap block, so it is re-emitted there, the search finds it, and the
+/// predecessor hands over ONE operand: the array, which is the only thing the null check needs.
+///
+/// ONE PREDICATE FOR THREE GATES. `discover_blocks` makes the leader, [`trap_kind_at`] names the check
+/// and [`trap_operand_types`] declares its operands; all three have to agree, and where they did not
+/// the result was not a missing check but a PANIC (a trap block built with no operands while the check
+/// reads `operands[0]`). So the question is asked in one place.
+fn array_length_leader(code: &[Instruction], i: usize, resolver: &dyn CallResolver) -> bool {
+    code.get(i)
+        .is_some_and(|inst| control_flow::pushes_i4_constant(inst.opcode))
+        && code.get(i + 1).is_some_and(|next| {
+            matches!(next.opcode, Opcode::Call | Opcode::Callvirt)
+                && resolver.array_length_read(&next.operand)
+        })
+}
+
 fn trap_kind_at(
-    inst: &Instruction,
+    code: &[Instruction],
+    index: usize,
     top_of_stack: MirType,
     resolver: &dyn CallResolver,
 ) -> Option<TrapKind> {
+    let Some(inst) = code.get(index) else {
+        return None;
+    };
+    if array_length_leader(code, index, resolver) {
+        return Some(TrapKind::NullRef);
+    }
     let opcode = inst.opcode;
     if control_flow::is_may_trap_access(opcode) {
         if opcode == Opcode::StelemRef {
@@ -5507,8 +5585,7 @@ fn trap_kind_at(
             return Some(TrapKind::RectangularBounds { rank });
         }
     }
-    if (matches!(opcode, Opcode::Ldfld | Opcode::Stfld)
-        && resolver.field_on_reference_type(&inst.operand))
+    if (control_flow::is_field_access(opcode) && resolver.field_on_reference_type(&inst.operand))
         || opcode == Opcode::Ldlen
     {
         return Some(TrapKind::NullRef);
@@ -5815,11 +5892,27 @@ fn eval_stack_widths(
     widths
 }
 
-fn trap_operand_types(inst: &Instruction, slot: MirType, resolver: &dyn CallResolver) -> Vec<MirType> {
+fn trap_operand_types(
+    code: &[Instruction],
+    index: usize,
+    slot: MirType,
+    resolver: &dyn CallResolver,
+) -> Vec<MirType> {
+    let Some(inst) = code.get(index) else {
+        return Vec::new();
+    };
+    if array_length_leader(code, index, resolver) {
+        return vec![MirType::ObjectRef];
+    }
     let opcode = inst.opcode;
     if matches!(
         opcode,
-        Opcode::Ldfld | Opcode::Ldlen | Opcode::Unbox | Opcode::UnboxAny | Opcode::Castclass
+        Opcode::Ldfld
+            | Opcode::Ldflda
+            | Opcode::Ldlen
+            | Opcode::Unbox
+            | Opcode::UnboxAny
+            | Opcode::Castclass
     ) {
         return vec![MirType::ObjectRef];
     }
@@ -8308,6 +8401,42 @@ mod control_flow {
         is_may_trap_load(op) || is_may_trap_store(op)
     }
 
+    /// The field-access opcodes that reach their field THROUGH A BASE ON THE STACK, so a null base
+    /// dereferences: `ldfld`, `stfld` and `ldflda`.
+    ///
+    /// `ldflda` BELONGS HERE AND WAS MISSING, WHICH IS NOT A SMALL DIFFERENCE. It is what `ref o.F`
+    /// compiles to, and its failure is the worst kind this backend has: the address came back, the
+    /// callee wrote through it, and a word in low memory changed with no fault and no exception --
+    /// measured as RAN 1 on ARM, in a local try and in a handler-less callee alike, while RISC-V took
+    /// a store access fault instead of raising.
+    ///
+    /// Membership alone does not make an access a null candidate: pair it with
+    /// `field_on_reference_type`, since only a field declared on a reference type has a base that can
+    /// be null.
+    pub fn is_field_access(op: Opcode) -> bool {
+        matches!(op, Opcode::Ldfld | Opcode::Stfld | Opcode::Ldflda)
+    }
+
+    /// Whether this opcode pushes an `int32` CONSTANT -- the whole `ldc.i4` family, short forms and
+    /// all. Used to recognize the dimension push in front of an `array.GetLength(<constant>)`.
+    pub fn pushes_i4_constant(op: Opcode) -> bool {
+        matches!(
+            op,
+            Opcode::LdcI4M1
+                | Opcode::LdcI40
+                | Opcode::LdcI41
+                | Opcode::LdcI42
+                | Opcode::LdcI43
+                | Opcode::LdcI44
+                | Opcode::LdcI45
+                | Opcode::LdcI46
+                | Opcode::LdcI47
+                | Opcode::LdcI48
+                | Opcode::LdcI4S
+                | Opcode::LdcI4
+        )
+    }
+
     /// Whether an opcode is a divide or a remainder that raises `DivideByZeroException` -- an integer
     /// one. `divisor` is the type on top of the evaluation stack as the instruction runs, which for
     /// these opcodes is the divisor's. A float divide answers an infinity or a NaN and raises nothing.
@@ -8359,6 +8488,7 @@ mod control_flow {
         handlers: &[EhClause],
         is_reference_field: &dyn Fn(&Operand) -> bool,
         is_rectangular_accessor: &dyn Fn(&Operand) -> bool,
+        is_array_length_read: &dyn Fn(&Operand) -> bool,
         top_of_stack: &[MirType],
     ) -> Vec<(usize, usize)> {
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
@@ -8390,8 +8520,8 @@ mod control_flow {
             }
         }
         for (i, inst) in code.iter().enumerate() {
-            let is_field_null_deref = matches!(inst.opcode, Opcode::Ldfld | Opcode::Stfld)
-                && is_reference_field(&inst.operand);
+            let is_field_null_deref =
+                is_field_access(inst.opcode) && is_reference_field(&inst.operand);
             let is_length_null_deref = inst.opcode == Opcode::Ldlen;
             let is_rectangular = matches!(inst.opcode, Opcode::Call | Opcode::Callvirt)
                 && is_rectangular_accessor(&inst.operand);
@@ -8399,6 +8529,11 @@ mod control_flow {
                 inst.opcode,
                 Opcode::Unbox | Opcode::UnboxAny | Opcode::Castclass
             );
+            let is_array_length = pushes_i4_constant(inst.opcode)
+                && code.get(i + 1).is_some_and(|next| {
+                    matches!(next.opcode, Opcode::Call | Opcode::Callvirt)
+                        && is_array_length_read(&next.operand)
+                });
             let is_div_rem = is_integer_divide(
                 inst.opcode,
                 top_of_stack.get(i).copied().unwrap_or(MirType::I32),
@@ -8420,6 +8555,7 @@ mod control_flow {
             if ((is_may_trap_access(inst.opcode)
                 || is_field_null_deref
                 || is_length_null_deref
+                || is_array_length
                 || is_div_rem
                 || is_rectangular)
                 && in_protected_try)
@@ -8537,7 +8673,7 @@ mod tests {
 
     #[test]
     fn conv_ovf_un_trap_reads_the_source_unsigned() {
-        let range = |op: Opcode| match trap_kind_at(&Instruction::simple(op), MirType::I32, &NoCalls) {
+        let range = |op: Opcode| match trap_kind_at(&[Instruction::simple(op)], 0, MirType::I32, &NoCalls) {
             Some(TrapKind::ConvOverflow {
                 lo,
                 hi,
@@ -8565,7 +8701,7 @@ mod tests {
     fn only_an_integer_divide_is_a_divide_by_zero_trap() {
         let trap = |op: Opcode, divisor: MirType| {
             matches!(
-                trap_kind_at(&Instruction::simple(op), divisor, &NoCalls),
+                trap_kind_at(&[Instruction::simple(op)], 0, divisor, &NoCalls),
                 Some(TrapKind::DivByZero)
             )
         };
@@ -11154,7 +11290,7 @@ mod tests {
             Instruction::simple(Opcode::LdcI41),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &[]);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &|_| false, &[]);
         assert_eq!(blocks, vec![(0, 3), (3, 5), (5, 7)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -11346,7 +11482,7 @@ mod tests {
             Instruction::new(Opcode::LdcI4S, Operand::Int8(30)),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &[]);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &|_| false, &[]);
         assert_eq!(blocks, vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());

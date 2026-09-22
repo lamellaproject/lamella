@@ -438,4 +438,220 @@ mod tests {
         let reason = error["variables"]["reason"].as_str().expect("the reason");
         assert!(reason.contains("the probe stopped answering"), "{reason}");
     }
+
+    /// A FREE-RUNNING TARGET, WHICH IS THE SHAPE THE OTHER TEST TARGETS IN THIS MODULE ARE NOT. Its `resume` returns
+    /// `Running` and records that it was asked; the stop arrives later, from `poll`, as it does on a
+    /// device where the core runs on after the probe lets it go. The synchronous fakes finish inside
+    /// `resume`, so nothing here covered the sequence a board actually takes.
+    struct FreeRunning {
+        /// Times `resume` was asked for, which is what says a run was started at all.
+        resumes: std::rc::Rc<std::cell::Cell<u32>>,
+        /// Polls remaining before the target reports its stop.
+        polls_before_stopping: std::cell::Cell<u32>,
+        /// Set once the stop has been reported, so a client thread can know it may disconnect.
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl lamella_debug_backend::DebugBackend for FreeRunning {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> lamella_debug_backend::Stop {
+            self.resumes.set(self.resumes.get() + 1);
+            lamella_debug_backend::Stop::Running
+        }
+        fn poll(&mut self) -> lamella_debug_backend::Stop {
+            let left = self.polls_before_stopping.get();
+            if left == 0 {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return lamella_debug_backend::Stop::Breakpoint;
+            }
+            self.polls_before_stopping.set(left - 1);
+            lamella_debug_backend::Stop::Running
+        }
+        fn step(&mut self) -> lamella_debug_backend::Stop {
+            lamella_debug_backend::Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<lamella_debug_backend::Frame> {
+            Vec::new()
+        }
+        fn variables(
+            &self,
+            _frame: usize,
+            _scope: lamella_debug_backend::Scope,
+        ) -> Vec<lamella_debug_backend::Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<lamella_debug_backend::Register> {
+            Vec::new()
+        }
+        fn disassemble(
+            &self,
+            _address: u64,
+            _offset: i64,
+            _count: usize,
+        ) -> Vec<lamella_debug_backend::Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    fn free_running(
+        polls: u32,
+    ) -> (
+        Debugger,
+        std::rc::Rc<std::cell::Cell<u32>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let resumes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = FreeRunning {
+            resumes: std::rc::Rc::clone(&resumes),
+            polls_before_stopping: std::cell::Cell::new(polls),
+            stopped: std::sync::Arc::clone(&stopped),
+        };
+        (Debugger::with_backend(Box::new(backend)), resumes, stopped)
+    }
+
+    /// A CLIENT WHOSE STREAM STAYS OPEN WHILE THE TARGET RUNS, which is the condition the polled loop
+    /// is written for and the one a scripted `Cursor` cannot express: at EOF that loop ends without a
+    /// last poll -- correctly, since the client it would tell has gone.
+    ///
+    /// It hands over `opening`, then holds the stream open until `stopped` says the stop has been
+    /// reported, then hands over `closing` and ends.
+    struct ClientStream {
+        opening: std::io::Cursor<Vec<u8>>,
+        closing: std::io::Cursor<Vec<u8>>,
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::io::Read for ClientStream {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.opening.read(out)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            while !self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.closing.read(out)
+        }
+    }
+
+    /// A launch request carrying `arguments`, which the scripted helper above cannot express.
+    fn request_with(seq: i64, command: &str, arguments: serde_json::Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_message(
+            &mut out,
+            &Message::Request(Request {
+                seq,
+                command: command.to_owned(),
+                arguments: Some(arguments),
+            }),
+        )
+        .unwrap();
+        out
+    }
+
+    /// `configurationDone` STARTS THE PROGRAM on a free-running target.
+    ///
+    /// There is no stop to report at launch: DAP's `stopped` says "the execution of the debuggee has
+    /// stopped", and with `stopOnEntry` absent nothing has. What starts the program is
+    /// `configurationDone`, and what says so is the backend being asked to resume -- which every
+    /// test target in this module but this one finishes inside, so the sequence a board takes needs
+    /// the free-running one to be covered at all.
+    #[test]
+    fn configuration_done_starts_a_free_running_target() {
+        let (mut debugger, resumes, _) = free_running(3);
+        let mut input = request_frames(&["initialize", "launch"]);
+        input.extend(request_frames(&["configurationDone"]).iter().copied());
+        serve_polled(&mut debugger, Cursor::new(input), &mut Vec::new()).unwrap();
+
+        assert_eq!(
+            resumes.get(),
+            1,
+            "configurationDone must start the program: a client that sends no continue is a client \
+             whose board never runs"
+        );
+    }
+
+    /// A STOP THE TARGET REACHES AFTER THE RESUME IS REPORTED, which is the other half of what a
+    /// client needs and the half a breakpoint depends on: the program is started by
+    /// `configurationDone` and halts later, on its own, with no request outstanding.
+    ///
+    /// Driven through [`serve_polled`] against a client that keeps its stream open, because that is
+    /// the loop `device-dap-server` runs and the only one that can report this.
+    #[test]
+    fn a_stop_reached_while_running_is_reported_to_the_client() {
+        let (mut debugger, resumes, stopped) = free_running(3);
+        let client = ClientStream {
+            opening: Cursor::new(request_frames(&[
+                "initialize",
+                "launch",
+                "configurationDone",
+            ])),
+            closing: Cursor::new(request_frames(&["disconnect"])),
+            stopped,
+        };
+        let mut output = Vec::new();
+        serve_polled(&mut debugger, std::io::BufReader::new(client), &mut output).unwrap();
+
+        assert_eq!(resumes.get(), 1, "the program was started");
+        let messages = read_all(output);
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, Message::Event(e) if e.event == "stopped")),
+            "the stop the target reached while running must reach the client: {messages:?}"
+        );
+    }
+
+    /// With `stopOnEntry`, the program is NOT started, and the client is told it is stopped.
+    ///
+    /// The other half of the same contract: here there IS something to report at launch, because the
+    /// core is held where the deploy left it, and `stopped` is how a client learns it may set up and
+    /// then continue.
+    #[test]
+    fn stop_on_entry_reports_a_stop_and_starts_nothing() {
+        let (mut debugger, resumes, _) = free_running(0);
+        let mut input = request_frames(&["initialize"]);
+        input.extend(
+            request_with(2, "launch", serde_json::json!({ "stopOnEntry": true }))
+                .iter()
+                .copied(),
+        );
+        input.extend(request_frames(&["configurationDone"]).iter().copied());
+        let mut output = Vec::new();
+        serve_polled(&mut debugger, Cursor::new(input), &mut output).unwrap();
+
+        assert_eq!(resumes.get(), 0, "stopOnEntry runs nothing");
+        let messages = read_all(output);
+        let entry = messages.iter().any(|m| match m {
+            Message::Event(event) if event.event == "stopped" => {
+                event
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("entry")
+            }
+            _ => false,
+        });
+        assert!(
+            entry,
+            "a held core is reported stopped at entry: {messages:?}"
+        );
+    }
 }

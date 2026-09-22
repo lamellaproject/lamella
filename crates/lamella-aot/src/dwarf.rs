@@ -404,8 +404,6 @@ fn split_path(path: &str) -> (&str, &str) {
 /// order, so entry 0 is the primary file's -- which is what makes it the COMPILATION directory
 /// section 6.2.4 requires there, and the string the unit repeats as `DW_AT_comp_dir`.
 ///
-/// A file carrying no directory is filed under `"."`, which is what this whole table used to be.
-/// A unit built from bare file names therefore emits exactly what it emitted before.
 fn directory_table<'a>(files: &[&'a str]) -> Vec<&'a str> {
     let mut directories: Vec<&'a str> = Vec::new();
     for file in files {

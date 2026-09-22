@@ -9,6 +9,8 @@ namespace System.IO
         public static readonly char DirectorySeparatorChar = '\\';
         public static readonly char AltDirectorySeparatorChar = '/';
 
+        public static readonly char PathSeparator = ';';
+
         public static string Combine(string path1, string path2)
         {
             if ((object)path1 == null) throw new ArgumentNullException("path1");

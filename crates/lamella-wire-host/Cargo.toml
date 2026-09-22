@@ -9,6 +9,7 @@ description = "Host side of the Lamella Link debug + REPL channel: a serial (USB
 publish = false
 
 [dependencies]
+lamella-clock-host = { path = "../lamella-clock-host" }
 # The no_std runner core (run_program / serve_one / RunResult / repl), shared with the on-device firmware;
 # it pulls in the interpreter stack (lamella-load / -cil-runtime / -metadata) transitively.
 lamella-runner = { path = "../lamella-runner" }
@@ -23,6 +24,10 @@ lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
 # The project's own C# compiler (lcsc), behind `repl-host`: the engine's [`LcscCompiler`] compiles a
 # submission IN-PROCESS -- the same compiler the `lamella-repl` CLI and the DAP Debug Console drive.
 # (No csc: it resolves BCL types against the .NET reference assemblies, not Microsoft's compiler.)
+# The interpreter's `Vm`, for the clock seam `LoopbackLink` installs through the runner's configure
+# hook. Already in the tree via lamella-runner; declared so this crate can NAME the type that hook
+# hands it, which is the same reason lamella-load is declared below.
+lamella-cil-runtime = { path = "../lamella-cil-runtime" }
 lamella-assemble = { path = "../lamella-assemble", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
 # The `baked` link's host-side bake step (load the submission's PE, write the flash image).

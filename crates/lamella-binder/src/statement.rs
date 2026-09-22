@@ -725,25 +725,54 @@ impl Binder {
     /// by the same rule and csc gives them the same diagnostic, measured on `new object()`, an
     /// `int` and a `string`.
     ///
-    /// csc reports the ordinary CONVERSION diagnostic here: `CS0266` when an explicit conversion
-    /// exists and `CS0029` when none does. It is NOT `CS0155`, which is the code for a `catch`
-    /// clause naming a non-exception TYPE -- a different question, asked of a type rather than of
-    /// a value.
+    /// The diagnostic is `CS0155`, the same code a `catch` clause naming a non-exception type
+    /// gets. csc reports the ordinary CONVERSION diagnostic -- `CS0029`, or `CS0266` where an
+    /// explicit conversion exists -- only from **C# 8.0 onward**, where `throw` began asking a
+    /// conversion question about `System.Exception?`. Measured across every rung csc accepts:
+    /// ISO-1, ISO-2 and 3 through 7.3 all answer `CS0155`, for an `int`, a `string`, an `object`,
+    /// an interface-typed value and a method group alike; 8 and later answer the conversion code.
+    ///
+    /// **WHEN COMPILING AT THE C# 1.0 RUNG, `CS0155` IS THE ANSWER AND THE CONVERSION CODE IS NOT.**
+    /// The conversion code is not a more precise version of the same answer -- it is a different
+    /// language version's answer, and which answer is right is a property of the RUNG rather than of
+    /// this compiler.
     ///
     /// **THE CONSERVATIVE FALLBACK IS KEPT AND IT IS LOAD-BEARING.** A compilation whose corlib
     /// declares no `System.Exception` cannot be asked a conversion question about it, and
-    /// [`Binder::check_assignable`] would answer one anyway -- reporting `CS0029` against a target
-    /// that does not exist. So the conversion check runs only when the model HAS the type, and the
-    /// provable-negative test answers otherwise, exactly as it did before.
+    /// [`Binder::assignable`] would answer one anyway -- against a target that does not exist. So
+    /// the assignability test runs only when the model HAS the type, and the provable-negative
+    /// walk answers otherwise.
     pub(crate) fn check_thrown_operand(&mut self, operand: &BoundExpr, span: Span) {
-        let exception = TypeSymbol::Named([Box::from("System"), Box::from("Exception")].into());
-        if self.model().get_by_symbol(&exception).is_some() {
-            if !operand.ty.is_error() {
-                self.check_assignable(operand, &exception, span);
-            }
+        if let BoundExprKind::TypeReference(ty) = &operand.kind {
+            self.report(Diagnostic::new(
+                DiagnosticKind::TypeUsedAsValue {
+                    type_name: format!("{ty}").into(),
+                },
+                span,
+            ));
+            self.report(Diagnostic::new(
+                DiagnosticKind::CaughtTypeMustBeException,
+                span,
+            ));
             return;
         }
-        if self.is_provably_not_exception(&operand.ty) {
+        if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::CaughtTypeMustBeException,
+                span,
+            ));
+            return;
+        }
+        if operand.ty.is_error() {
+            return;
+        }
+        let exception = TypeSymbol::Named([Box::from("System"), Box::from("Exception")].into());
+        let not_an_exception = if self.model().get_by_symbol(&exception).is_some() {
+            !self.assignable(operand, &exception)
+        } else {
+            self.is_provably_not_exception(&operand.ty)
+        };
+        if not_an_exception {
             self.report(Diagnostic::new(
                 DiagnosticKind::CaughtTypeMustBeException,
                 span,
@@ -753,10 +782,10 @@ impl Binder {
 
     /// Whether `ty` can be PROVEN not to derive from `System.Exception`.
     ///
-    /// A `catch` clause naming such a TYPE is `CS0155`. A `throw` of such a VALUE is not: csc
-    /// gives the ordinary conversion diagnostic there, which [`Self::check_thrown_operand`]
-    /// asks for directly. This walk answers for a `throw` only as that function's fallback, for
-    /// a compilation whose corlib declares no `System.Exception` to convert against.
+    /// A `catch` clause naming such a TYPE is `CS0155`, and at the rung Lamella compiles so is a
+    /// `throw` of such a VALUE -- one code for both, which is why one predicate serves both. This
+    /// walk answers for a `throw` only as [`Self::check_thrown_operand`]'s fallback, for a
+    /// compilation whose corlib declares no `System.Exception` to test assignability against.
     ///
     /// Conservative in ONE direction. An unresolved type, or a class whose base chain leaves
     /// this compilation, answers false, so an exception type we cannot see is never falsely
@@ -913,13 +942,38 @@ impl Binder {
             span,
         };
         let condition = call(enumerator_ref(), move_next);
-        let element_value = BoundExpr {
-            kind: BoundExprKind::Cast {
-                operand: Box::new(call(enumerator_ref(), get_current)),
-                checked: false,
-            },
-            ty: element_type.clone(),
-        };
+        let current = call(enumerator_ref(), get_current);
+        let current_ty = current.ty.clone();
+        // THE ELEMENT CONVERSION IS A CONVERSION, NOT ALWAYS A CAST INSTRUCTION.
+        //
+        // 15.8.4 applies the EXPLICIT conversion from the enumerator's `Current` type to the loop
+        // variable's type, and an explicit conversion includes a user-defined `op_Explicit`. This
+        // built a `Cast` node directly, which the emitter turns into `castclass`/`unbox.any` -- so
+        // a `foreach (Target t in c)` over an enumerator yielding `Source`, with an
+        // `explicit operator Target(Source)` sitting right there, threw InvalidCastException at
+        // run time instead of calling the operator. The conversion existed; nothing asked for it.
+        //
+        // The reference cast stays the fallback, because it is right for every conversion that is
+        // not user-defined -- `object` -> V over a non-generic IEnumerable is exactly an unbox/cast,
+        // and that is the common case.
+        let element_value = self
+            .user_conversion(&current_ty, element_type, "op_Explicit")
+            .or_else(|| self.user_conversion(&current_ty, element_type, "op_Implicit"))
+            .map(|method| BoundExpr {
+                ty: element_type.clone(),
+                kind: BoundExprKind::Call {
+                    callee: Box::new(crate::bound::error_expr()),
+                    arguments: alloc::vec![current.clone()],
+                    method: Some(method),
+                },
+            })
+            .unwrap_or_else(|| BoundExpr {
+                kind: BoundExprKind::Cast {
+                    operand: Box::new(current),
+                    checked: false,
+                },
+                ty: element_type.clone(),
+            });
 
         self.enter_scope_at(span);
         self.declare_local(name, element_type.clone());
@@ -1141,14 +1195,22 @@ impl Binder {
         let mut resources: alloc::vec::Vec<(Box<str>, TypeSymbol)> = Vec::new();
         match resource {
             UsingResource::Declaration { ty, declarators } => {
-                let kind = self.bind_local(ty, declarators);
-                let resource_ty = match &kind {
+                let first = self.bind_local(ty, &declarators[..1]);
+                let resource_ty = match &first {
                     BoundStmtKind::Local { ty, .. } => ty.clone(),
                     _ => TypeSymbol::Error,
                 };
                 self.check_disposable(&resource_ty, ty.span);
-                resource_decls.push(BoundStmt { kind, span: ty.span });
+                let mut first = Some(first);
                 for declarator in declarators {
+                    let one = match first.take() {
+                        Some(bound) => bound,
+                        None => self.bind_local(ty, core::slice::from_ref(declarator)),
+                    };
+                    resource_decls.push(BoundStmt {
+                        kind: one,
+                        span: ty.span,
+                    });
                     resources.push((declarator.name.clone(), resource_ty.clone()));
                     self.enter_readonly_local(&declarator.name, "using variable");
                 }
@@ -1191,8 +1253,10 @@ impl Binder {
             resource_decls.push(bound_body);
             return BoundStmtKind::Block(resource_decls);
         };
-        let mut finally_stmts: alloc::vec::Vec<BoundStmt> = Vec::new();
-        for (index, (name, resource_ty)) in resources.iter().enumerate().rev() {
+        let mut per_resource: alloc::vec::Vec<alloc::vec::Vec<BoundStmt>> =
+            resources.iter().map(|_| Vec::new()).collect();
+        for (index, (name, resource_ty)) in resources.iter().enumerate() {
+            let finally_stmts = &mut per_resource[index];
             if self.is_value_type(resource_ty) {
                 if let Some(dispose) = self.resolve_instance_method(resource_ty, "Dispose", span) {
                     finally_stmts.push(BoundStmt {
@@ -1280,19 +1344,39 @@ impl Binder {
                 span,
             });
         }
-        let guarded = BoundStmt {
-            kind: BoundStmtKind::Try {
-                body: Box::new(bound_body),
-                catches: Vec::new(),
-                finally: Some(Box::new(BoundStmt {
-                    kind: BoundStmtKind::Block(finally_stmts),
-                    span: Span::HIDDEN,
-                })),
-            },
-            span,
-        };
-        resource_decls.push(guarded);
-        BoundStmtKind::Block(resource_decls)
+        // NESTED, ONE `using` PER RESOURCE, WHICH IS WHAT THE SPEC SAYS AND WHAT THE OLD SHAPE DID
+        // NOT DO. `using (A a = x, B b = y) S` means `using (A a = x) { using (B b = y) S }`
+        // (15.13), and the difference only shows when an acquisition THROWS: the flat lowering
+        // acquired every resource BEFORE the try, so a second acquisition that threw escaped with
+        // the first resource never disposed -- a leak in the one construct people write in order
+        // not to leak, and silent, because the exception it throws is the one they expected.
+        //
+        // Built inside out: the body is wrapped by the last resource's try/finally, that by the
+        // one before it, and each declaration sits immediately outside its own guard. Disposal
+        // order falls out of the nesting, innermost first.
+        let mut inner = bound_body;
+        for (decl, finally_stmts) in resource_decls
+            .into_iter()
+            .zip(per_resource.into_iter())
+            .rev()
+        {
+            let guarded = BoundStmt {
+                kind: BoundStmtKind::Try {
+                    body: Box::new(inner),
+                    catches: Vec::new(),
+                    finally: Some(Box::new(BoundStmt {
+                        kind: BoundStmtKind::Block(finally_stmts),
+                        span: Span::HIDDEN,
+                    })),
+                },
+                span,
+            };
+            inner = BoundStmt {
+                kind: BoundStmtKind::Block(alloc::vec![decl, guarded]),
+                span,
+            };
+        }
+        inner.kind
     }
 
     /// Binds a `fixed (T* name = init) body`: `init` (an array/string) is pinned, and `name`

@@ -27,6 +27,7 @@ pub mod compile;
 pub mod debug;
 pub mod expr;
 pub mod frame;
+pub(crate) mod interop;
 pub(crate) mod lambdalower;
 pub mod method;
 pub mod session;
@@ -39,6 +40,14 @@ pub use compile::{
 pub use debug::{LineMap, SpanLines};
 pub use expr::{EmitError, emit_expression};
 pub use frame::{Frame, Slot};
+/// The types [`Diagnostic`]'s own fields are made of.
+///
+/// Re-exported so a caller reaching [`Diagnostic`] through this crate can NAME its fields -- build
+/// one, and match on `namespace` to learn whether a code is a statement about the language or about
+/// this build's coverage. A type re-exported without the types it is made of can be read and never
+/// constructed.
+pub use lamella_syntax::diagnostic::{CodeNamespace, Severity};
+pub use lamella_syntax::span::Span;
 pub use method::{EmittedBody, SequencePoint, emit_method, max_stack};
 pub use session::{Session, SubmissionResult};
 pub use tokens::Tokens;

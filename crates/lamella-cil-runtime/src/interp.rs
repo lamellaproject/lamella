@@ -2,9 +2,11 @@
 
 #[cfg(feature = "bcl")]
 use crate::intrinsic_registry::intrinsic_id;
-use crate::module::{CastElem, CastPrim, MethodId, MethodKind, Module, TypeId, asm_key};
+use crate::module::{
+    CastElem, CastPrim, IntrinsicType, MethodId, MethodKind, Module, TypeId, asm_key,
+};
 use crate::object::{Heap, ObjectRef};
-use crate::trap::Trap;
+use crate::trap::{Trap, UnhandledException};
 use crate::value::{Location, Value};
 #[cfg(feature = "exceptions")]
 use alloc::borrow::Cow;
@@ -1468,9 +1470,18 @@ impl Vm {
         self.wall_anchor.is_some()
     }
 
-    /// The monotonic millisecond count truncated to `int` (wrapping like .NET's `Environment.TickCount`,
-    /// which starts near zero and wraps through `int.MinValue` after ~24.9 days). Zero without a clock
-    /// seam. Backs the `Environment.get_TickCount` intrinsic.
+    /// The monotonic millisecond count truncated to `int`, wrapping through `int.MinValue` after
+    /// ~24.9 days as .NET's `Environment.TickCount` does. Zero without a clock seam. Backs the
+    /// `Environment.get_TickCount` intrinsic.
+    ///
+    /// Counts from when the SYSTEM started, as .NET does. On a desktop the first reading is the
+    /// machine's uptime and is usually large; on a board, which boots and runs one program, system
+    /// uptime is that program's uptime and there is nothing else it could mean.
+    ///
+    ///
+    /// Differences are unaffected, which is how nearly every caller uses this: two readings
+    /// subtracted give the same elapsed milliseconds either way. Only an absolute reading differs,
+    /// and on a board there is nothing else it could mean.
     #[must_use]
     pub fn tick_count(&self) -> i32 {
         self.now_millis().unwrap_or(0) as i32
@@ -1557,6 +1568,54 @@ impl Vm {
     #[cfg(feature = "exceptions")]
     fn take_unhandled(&mut self) -> Option<ObjectRef> {
         self.unhandled.take()
+    }
+
+    /// What this tier can say about the exception that escaped, for [`Trap::UnhandledException`].
+    ///
+    /// Fills each field only where this build genuinely knows it, so a caller can tell "the VES
+    /// cannot say" from "the exception said nothing".
+    ///
+    pub(crate) fn unhandled_detail(&mut self, module: &Module) -> UnhandledException {
+        #[cfg(not(feature = "exceptions"))]
+        {
+            let _ = module;
+            return UnhandledException { tag: 0, type_name: None, message: None };
+        }
+        #[cfg(feature = "exceptions")]
+        {
+        let escaped = self.unhandled;
+        let type_id = escaped.and_then(|exception| match self.heap().type_of(exception) {
+            Some(EXTERNAL_TYPE_ID) | None => self
+                .exception_type_handle(exception)
+                .and_then(|handle| module.type_id_by_handle(handle)),
+            Some(type_id) => Some(type_id),
+        });
+        let type_name = type_id.and_then(|id| module.type_full_name(id).map(String::from));
+        let tag = type_id.and_then(|id| module.exception_tag_of(id)).unwrap_or(0);
+        let message = escaped
+            .and_then(|exception| {
+                self.exception_message(exception)
+                    .or_else(|| self.message_field_of(module, exception))
+            })
+            .and_then(|text| self.heap().as_string(text).map(|units| String::from_utf16_lossy(&units)));
+        UnhandledException { tag, type_name, message }
+        }
+    }
+
+    /// The message string a MANAGED constructor stored in an exception's own field, read from the
+    /// slot the loader recorded for it.
+    ///
+    /// The runtime's own storage is asked first and this second, which is the order corlib's
+    /// `Exception.Message` asks them in: a runtime-raised exception has no fields to read, and one
+    /// managed code constructed has no entry in that storage, so the two are answering about
+    /// different exceptions rather than disagreeing about one.
+    #[cfg(feature = "exceptions")]
+    fn message_field_of(&self, module: &Module, exception: ObjectRef) -> Option<ObjectRef> {
+        let slot = module.exception_message_slot()?;
+        match self.heap().instance_field(exception, slot) {
+            Some(Value::Object(text)) => Some(text),
+            _ => None,
+        }
     }
 }
 
@@ -3111,7 +3170,7 @@ impl Session {
                 Ok(None)
             }
             #[cfg(feature = "exceptions")]
-            Err(Trap::UnhandledException) if self.pause_on_exception => {
+            Err(Trap::UnhandledException(_)) if self.pause_on_exception => {
                 self.unhandled_exception = vm.take_unhandled();
                 Ok(Some(self.stop(StopReason::Exception)))
             }
@@ -4659,7 +4718,7 @@ fn raise(
     exception: ObjectRef,
 ) -> Result<Status, Trap> {
     let Some(frame) = frames.last() else {
-        return Err(Trap::UnhandledException);
+        return Err(Trap::UnhandledException(vm.unhandled_detail(module)));
     };
     let fault_ip = frame.ip.saturating_sub(1);
     raise_from(frames, module, vm, exception, 0, fault_ip)
@@ -4679,7 +4738,7 @@ fn raise_from(
     fault_ip: usize,
 ) -> Result<Status, Trap> {
     let Some(frame) = frames.last() else {
-        return Err(Trap::UnhandledException);
+        return Err(Trap::UnhandledException(vm.unhandled_detail(module)));
     };
     let handlers = method_handlers(module, frame.method)?;
     for (index, clause) in handlers.iter().enumerate().skip(from) {
@@ -5389,6 +5448,7 @@ fn step(
             if module.is_delegate_ctor(asm, token) {
                 let method = function_pointer(frame.pop()?)?;
                 let target = frame.pop()?;
+                let delegate_type = module.delegate_ctor_type(asm, token);
                 let delegate = if method == DELEGATE_INVOKE_FPTR {
                     let operand = object_ref(target, Opcode::Newobj)?;
                     let invocations = vm
@@ -5396,9 +5456,9 @@ fn step(
                         .delegate_invocations(operand)
                         .ok_or(Trap::TypeMismatch(Opcode::Newobj))?
                         .to_vec();
-                    vm.heap_mut().alloc_multicast(invocations)
+                    vm.heap_mut().alloc_multicast(invocations, delegate_type)
                 } else {
-                    vm.heap_mut().alloc_delegate(target, method)
+                    vm.heap_mut().alloc_delegate(target, method, delegate_type)
                 };
                 frame.stack.push(Value::Object(delegate));
                 return Ok(Flow::Next);
@@ -7357,21 +7417,32 @@ fn function_pointer(value: Value) -> Result<MethodId, Trap> {
 }
 
 /// The runtime [`crate::module::TypeId`] a `callvirt` / `ldvirtftn` dispatches on for an
-/// object receiver: a field-carrying instance's own type id; else `System.String`'s for a
-/// heap string (which has no per-object type id) so the call reaches String's overrides;
-/// else a boxed value type's declared type id (resolved from the box's tag) so an interface
-/// method `callvirt` on a boxed struct reaches the struct's implementation. `None` for any
-/// receiver with no resolvable declared type (an array / delegate / builder).
+/// object receiver.
+///
+/// An object that carries its own identity answers from it: a field-carrying instance's type id,
+/// a delegate's recorded delegate type, a boxed value type's declared type (resolved from the
+/// box's tag, so an interface `callvirt` on a boxed struct reaches the struct's implementation).
+/// An object this runtime represents STRUCTURALLY -- a heap string, a vector, a rectangular array
+/// -- has no per-object identity and answers from the [`IntrinsicType`] its shape names, through
+/// the one facility both loaders record.
+///
+///
+/// `None` now means only that no loader recorded a type for this shape, which leaves the caller's
+/// static target in place rather than dispatching against something invented.
 fn receiver_type_id(module: &Module, vm: &Vm, this: ObjectRef) -> Option<u32> {
-    vm.heap().type_of(this).or_else(|| {
-        if vm.heap().is_string(this) {
-            module.string_type_id()
-        } else {
+    vm.heap()
+        .type_of(this)
+        .or_else(|| vm.heap().delegate_type_id(this))
+        .or_else(|| {
             vm.heap()
                 .boxed_type_token(this)
                 .and_then(|token| module.type_id_by_handle(token))
-        }
-    })
+        })
+        .or_else(|| {
+            vm.heap()
+                .structural_type(this)
+                .and_then(|which| module.intrinsic_type_id(which))
+        })
 }
 
 /// Resolves a `callvirt` target on a `this` of `runtime_type`: an explicit interface
@@ -7559,7 +7630,9 @@ fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) 
         if module.is_string_type_token(asm, token) || module.is_object_type_token(asm, token) {
             return true;
         }
-        if let (Some(string_type), Some(target)) = (module.string_type_id(), target_type_id) {
+        if let (Some(string_type), Some(target)) =
+            (module.intrinsic_type_id(IntrinsicType::String), target_type_id)
+        {
             return module.implements_interface(string_type, target);
         }
         return false;
@@ -7712,7 +7785,7 @@ fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: Elem
         (CastElem::String, CastElem::Named(target_handle)) => {
             rule == ElemRule::Array
                 && match (
-                    module.string_type_id(),
+                    module.intrinsic_type_id(IntrinsicType::String),
                     module.type_id_by_handle(*target_handle),
                 ) {
                     (Some(string_id), Some(target_id)) => {
@@ -9358,10 +9431,10 @@ mod tests {
             ]),
             0,
         );
-        assert_eq!(
-            super::run(&module, &mut Vm::new(), main, Vec::new()),
-            Err(Trap::UnhandledException)
-        );
+        let escaped = super::run(&module, &mut Vm::new(), main, Vec::new());
+        let Err(Trap::UnhandledException(_detail)) = escaped else {
+            panic!("expected an unhandled exception, got {escaped:?}");
+        };
     }
 
     #[test]
@@ -9677,11 +9750,10 @@ mod tests {
         let other = module.add_type(vec![]);
         module.set_type_is_value_type(other, true);
         module.bind_type_token(0, unrelated, other);
-        assert_eq!(
-            super::run(&module, &mut Vm::new(), main, Vec::new()),
-            Err(Trap::UnhandledException),
-            "a boxed non-T is InvalidCastException, thrown"
-        );
+        let escaped = super::run(&module, &mut Vm::new(), main, Vec::new());
+        let Err(Trap::UnhandledException(_detail)) = escaped else {
+            panic!("expected an unhandled exception, got {escaped:?}");
+        };
     }
 
     /// III.4.3, verbatim: "When class is the type System.Nullable<T> and the object's class is T,
@@ -9757,10 +9829,10 @@ mod tests {
     #[cfg(feature = "exceptions")]
     fn castclass_to_an_unrelated_type_throws() {
         let (module, main) = cast_program(Opcode::Castclass);
-        assert_eq!(
-            super::run(&module, &mut Vm::new(), main, Vec::new()),
-            Err(Trap::UnhandledException)
-        );
+        let escaped = super::run(&module, &mut Vm::new(), main, Vec::new());
+        let Err(Trap::UnhandledException(_detail)) = escaped else {
+            panic!("expected an unhandled exception, got {escaped:?}");
+        };
     }
 
     #[test]
@@ -9846,11 +9918,46 @@ mod tests {
             ]),
             0,
         );
+        let escaped = super::run(&module, &mut Vm::new(), main, Vec::new());
+        let Err(Trap::UnhandledException(_detail)) = escaped else {
+            panic!("expected an unhandled exception, got {escaped:?}");
+        };
+    }
+
+    /// An escaping exception REPORTS ITS TYPE once the module knows that type's name.
+    ///
+    ///
+    #[cfg(feature = "exceptions")]
+    #[test]
+    fn an_escaping_exception_names_its_type_when_the_module_knows_it() {
+        let e_ctor = Token(0x0600_0051);
+        let mut module = Module::new();
+        let e = module.add_type(vec![]);
+        module.bind_type_full_name(e, String::from("System.InvalidOperationException"));
+        let ctor = module.add_method_image(0, method(vec![ret()]), 1);
+        module.set_method_type(ctor, e);
+        module.bind_token(0, e_ctor, ctor);
+        let main = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
+                Instruction::simple(Opcode::Throw),
+                ret(),
+            ]),
+            0,
+        );
+        let escaped = super::run(&module, &mut Vm::new(), main, Vec::new());
+        let Err(Trap::UnhandledException(detail)) = escaped else {
+            panic!("expected an unhandled exception, got {escaped:?}");
+        };
+        assert_eq!(detail.type_name.as_deref(), Some("System.InvalidOperationException"));
+        assert_ne!(detail.tag, 0, "the tag is the one fact both tiers carry");
         assert_eq!(
-            super::run(&module, &mut Vm::new(), main, Vec::new()),
-            Err(Trap::UnhandledException)
+            format!("{}", Trap::UnhandledException(detail)),
+            "unhandled exception: System.InvalidOperationException"
         );
     }
+
 
     #[cfg(feature = "typed-references")]
     mod typed_references {
@@ -9897,10 +10004,10 @@ mod tests {
                 ]),
                 0,
             );
-            assert_eq!(
-                super::super::run(&module, &mut Vm::new(), main, Vec::new()),
-                Err(Trap::UnhandledException)
-            );
+            let escaped = super::super::run(&module, &mut Vm::new(), main, Vec::new());
+            let Err(Trap::UnhandledException(_detail)) = escaped else {
+                panic!("expected an unhandled exception, got {escaped:?}");
+            };
         }
 
         #[test]
@@ -10179,10 +10286,10 @@ mod tests {
 
             let mut vm = Vm::new();
             let mut session = Session::new(&module, main, Vec::new()).unwrap();
-            assert_eq!(
-                session.continue_(&module, &mut vm),
-                Err(Trap::UnhandledException)
-            );
+            let escaped = session.continue_(&module, &mut vm);
+            let Err(Trap::UnhandledException(_detail)) = escaped else {
+                panic!("expected an unhandled exception, got {escaped:?}");
+            };
 
             let mut vm = Vm::new();
             let mut session = Session::new(&module, main, Vec::new()).unwrap();

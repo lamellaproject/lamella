@@ -249,6 +249,40 @@ pub(crate) fn name_containing(names: &[(u32, u32, String)], offset: u32) -> Opti
         .find(|&&(start, end, _)| start <= offset && offset < end)
 }
 
+/// The name to report for `function`: the QUALIFIED one the producer emitted, when what it emitted
+/// is a qualified form of the source name, and the source name otherwise.
+///
+/// **`DW_AT_name` IS THE SOURCE SPELLING, AND A SOURCE SPELLING IS NOT UNIQUE.** Two methods called
+/// `write` on two different types are both `write` there, so a table built from it alone carries the
+/// same name at two address ranges and a stack frame cannot say which one it is in. The producer
+/// already emitted the answer in `DW_AT_linkage_name` and this consumer was dropping it.
+///
+/// **IT IS TAKEN ONLY WHEN IT IS A QUALIFIED FORM OF THE SAME NAME** -- printable, and ending in the
+/// source name after a `.` or `::`. A linkage name is whatever the language's linkage conventions
+/// say, which for several of them is a mangled symbol that names the types and the arity as well;
+/// putting one of those in a stack frame would answer an ambiguous name with an unreadable one. The
+/// test is that what is shown always ENDS with what the source called it, so the reader loses
+/// nothing and gains the qualifier when there is one.
+fn reported_name(function: &lamella_dwarf::info::Function<'_>) -> String {
+    let source = String::from_utf8_lossy(function.name).into_owned();
+    let Some(linkage) = function.linkage_name else {
+        return source;
+    };
+    if linkage
+        .iter()
+        .any(|byte| !byte.is_ascii_graphic() && *byte != b' ')
+    {
+        return source;
+    }
+    let linkage = String::from_utf8_lossy(linkage).into_owned();
+    let qualifies =
+        !source.is_empty() && linkage.len() > source.len() && linkage.ends_with(&source) && {
+            let before = &linkage[..linkage.len() - source.len()];
+            before.ends_with('.') || before.ends_with("::")
+        };
+    if qualifies { linkage } else { source }
+}
+
 /// Adds a name for code no subprogram describes from the image's function `symbols`, and orders the
 /// table for [`name_containing`].
 ///
@@ -431,7 +465,7 @@ pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
         if let (Ok(offset), Ok(end)) =
             (u32::try_from(function.low_pc - base), u32::try_from(function.high_pc - base))
         {
-            names.push((offset, end, String::from_utf8_lossy(function.name).into_owned()));
+            names.push((offset, end, reported_name(function)));
         }
     }
     add_symbol_names(&mut names, &lamella_elf::symbols::functions(bytes), base, is_code);
@@ -449,7 +483,7 @@ pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
                 && f.low_pc <= u64::from(entry_address)
                 && u64::from(entry_address) < f.high_pc
         })
-        .map(|f| String::from_utf8_lossy(f.name).into_owned())
+        .map(reported_name)
         .or_else(|| {
             let offset = u32::try_from(u64::from(entry_address).checked_sub(base)?).ok()?;
             name_containing(&names, offset).map(|(_, _, name)| name.clone())

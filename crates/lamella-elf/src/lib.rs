@@ -1026,7 +1026,7 @@ fn push_shdr(v: &mut Vec<u8>, s: &Shdr) {
 }
 
 /// An error parsing an ELF object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElfError {
     /// Not an ELF32, little-endian, relocatable object (bad magic / class / data / `e_type`).
     NotRelocatableElf32,
@@ -1046,6 +1046,15 @@ pub enum ElfError {
     /// The executable declares no loadable bytes: either no `PT_LOAD` segment at all, or only
     /// segments whose file size is zero. See [`flat_image`] for why this is an error.
     NoLoadableContent,
+    /// An object carries INITIALIZED writable data (an allocatable, writable `SHT_PROGBITS`
+    /// section -- `.data`), and the image model has no pass that copies it from flash into RAM.
+    ///
+    /// **A refusal rather than a gap**, because the alternative is what this replaced: the section
+    /// was skipped and its symbols silently resolved into the text blob, so a write went nowhere and
+    /// a read answered instruction bytes. Zero-initialized writable data (`.bss`) IS placed -- see
+    /// [`Object::bss_len`] -- because the boot stub already clears the band it goes in; initialized
+    /// data would need a flash-to-RAM copy that does not exist.
+    InitializedDataUnsupported(String),
 }
 
 /// A linked executable flattened into the bytes a flasher writes, and the address they go at.
@@ -1179,6 +1188,15 @@ pub struct ParsedSymbol {
     /// header, not the string table), so a purely NAME-keyed linker cannot resolve it. The section
     /// index is the only handle such a symbol has.
     pub section: Option<u32>,
+    /// Whether this symbol lives in the object's `.bss` extent, with [`Self::value`] its offset
+    /// from the start of that extent rather than from the start of the merged text.
+    ///
+    /// **The two address spaces are different and nothing else distinguishes them**: a text offset
+    /// becomes an address by adding the image's load base, and a `.bss` offset becomes one by adding
+    /// the RAM window the linker placed the object's extent at. Before this flag existed the second
+    /// kind was treated as the first, which resolved a global's address into the middle of a
+    /// function.
+    pub bss: bool,
 }
 
 /// A relocation parsed from an object's `.rela.text` (explicit addend) or `.rel.text` (implicit).
@@ -1217,6 +1235,17 @@ pub struct Object {
     /// `.debug_*` family and the GC map (see [`is_carried_section`]). Empty for an object carrying
     /// neither, so the code path costs nothing when it is not in use.
     pub sections: Vec<ParsedSection>,
+    /// How many bytes of ZERO-INITIALIZED writable data (`.bss`) this object needs in RAM, with
+    /// every such section of the object merged into one extent. `0` for an object with none, which
+    /// is almost all of them.
+    ///
+    /// The bytes are not here because there are none: the linker gives the extent an address in a
+    /// RAM window and the boot stub clears it. A symbol inside it carries its offset from the start
+    /// of THIS object's extent and is marked by [`ParsedSymbol::bss`].
+    pub bss_len: u32,
+    /// The alignment the object's `.bss` extent needs -- the largest `sh_addralign` among the
+    /// sections merged into it, or 1 when there are none.
+    pub bss_align: u32,
 }
 
 fn rd_u16(bytes: &[u8], o: usize) -> Result<u16, ElfError> {
@@ -1310,6 +1339,26 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     }
     let symtab_i = symtab_i.ok_or(ElfError::MissingSymbolTable)?;
 
+    let mut bss_base: Vec<Option<u32>> = Vec::new();
+    bss_base.resize(e_shnum, None);
+    let mut bss_len = 0u32;
+    let mut bss_align = 1u32;
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..e_shnum {
+        let flags = sh(i, SH_FLAGS)?;
+        if flags & SHF_ALLOC == 0 || flags & SHF_WRITE == 0 || sh(i, SH_SIZE)? == 0 {
+            continue;
+        }
+        if sh(i, SH_TYPE)? == SHT_PROGBITS {
+            return Err(ElfError::InitializedDataUnsupported(String::from(sec_name(i)?)));
+        }
+        let align = sh(i, SH_ADDRALIGN)?.max(1);
+        bss_align = bss_align.max(align);
+        bss_len = bss_len.next_multiple_of(align);
+        bss_base[i] = Some(bss_len);
+        bss_len += sh(i, SH_SIZE)?;
+    }
+
     let mut sections: Vec<ParsedSection> = Vec::new();
     let mut carried_of: Vec<Option<u32>> = Vec::new();
     carried_of.resize(e_shnum, None);
@@ -1359,9 +1408,11 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             _ => SymbolType::NoType,
         };
         let carried = carried_of.get(st_shndx as usize).copied().flatten();
-        let rebase = match carried {
-            Some(_) => 0,
-            None => section_base
+        let in_bss = bss_base.get(st_shndx as usize).copied().flatten();
+        let rebase = match (carried, in_bss) {
+            (Some(_), _) => 0,
+            (None, Some(base)) => base,
+            (None, None) => section_base
                 .get(st_shndx as usize)
                 .copied()
                 .flatten()
@@ -1375,6 +1426,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             kind,
             defined: st_shndx != SHN_UNDEF,
             section: carried,
+            bss: in_bss.is_some(),
         });
     }
 
@@ -1428,6 +1480,8 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         symbols,
         relocations,
         sections,
+        bss_len,
+        bss_align,
     })
 }
 
@@ -1588,6 +1642,9 @@ pub fn executable_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
         .map(|section| (section.address, section.address.saturating_add(section.size)))
         .collect()
 }
+
+/// `SHT_PROGBITS` -- a section whose bytes are in the file.
+const SHT_PROGBITS: u32 = 1;
 
 /// `SHT_NOBITS` -- a section that occupies no bytes in the file.
 const SHT_NOBITS: u32 = 8;

@@ -126,6 +126,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-gc"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-mmio"
 version = "0.0.0"
 
@@ -154,6 +158,7 @@ name = "lamella-runtime-support"
 version = "0.0.0"
 dependencies = [
  "lamella-decimal",
+ "lamella-gc",
  "lamella-runtime-support-debug",
  "lamella-runtime-support-net",
  "lamella-softmath",

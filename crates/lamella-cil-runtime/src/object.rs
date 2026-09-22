@@ -1,5 +1,6 @@
 //! The managed heap and the reference-type object model.
 
+use crate::module::IntrinsicType;
 #[cfg(feature = "gc")]
 use crate::value::Location;
 use crate::value::Value;
@@ -255,6 +256,12 @@ pub enum Object {
     Delegate {
         /// The bound methods, called in order; the last one's result is the delegate's.
         invocations: Vec<(Value, u32)>,
+        /// The delegate TYPE this object is an instance of, as a module type id -- recorded at
+        /// `newobj` from the constructor's declaring type, because nothing else about a delegate
+        /// carries its identity. `None` when no loader recorded one (an image baked before the
+        /// table that holds it), which leaves `GetType()` where it was rather than guessing.
+        ///
+        type_id: Option<u32>,
     },
     /// A `System.Text.StringBuilder`: a growable buffer of UTF-16 code units. It holds no
     /// object references, so the collector treats it like a string (nothing to trace).
@@ -986,15 +993,28 @@ impl Heap {
     }
 
     /// Allocates a delegate binding `target` to `method` and returns a reference.
-    pub fn alloc_delegate(&mut self, target: Value, method: u32) -> ObjectRef {
+    pub fn alloc_delegate(
+        &mut self,
+        target: Value,
+        method: u32,
+        type_id: Option<u32>,
+    ) -> ObjectRef {
         self.alloc(Object::Delegate {
             invocations: alloc::vec![(target, method)],
+            type_id,
         })
     }
 
     /// Allocates a (multicast) delegate with the given invocation list.
-    pub fn alloc_multicast(&mut self, invocations: Vec<(Value, u32)>) -> ObjectRef {
-        self.alloc(Object::Delegate { invocations })
+    pub fn alloc_multicast(
+        &mut self,
+        invocations: Vec<(Value, u32)>,
+        type_id: Option<u32>,
+    ) -> ObjectRef {
+        self.alloc(Object::Delegate {
+            invocations,
+            type_id,
+        })
     }
 
     /// Allocates a `System.Text.StringBuilder` seeded with `initial` code units and an
@@ -1053,8 +1073,36 @@ impl Heap {
     #[must_use]
     pub fn delegate_invocations(&self, reference: ObjectRef) -> Option<&[(Value, u32)]> {
         match self.get(reference)? {
-            Object::Delegate { invocations } => Some(invocations),
+            Object::Delegate { invocations, .. } => Some(invocations),
             _ => None,
+        }
+    }
+
+    /// The delegate type at `reference`, if it is a delegate and a loader recorded its type.
+    ///
+    /// The counterpart of [`Heap::boxed_type_token`], which is the precedent: an object whose
+    /// type the VES knows but does not RECORD cannot answer `GetType()`, however healthy it is
+    /// otherwise -- a delegate invoked fine and trapped on the question.
+    #[must_use]
+    pub fn delegate_type_id(&self, reference: ObjectRef) -> Option<u32> {
+        match self.get(reference)? {
+            Object::Delegate { type_id, .. } => *type_id,
+            _ => None,
+        }
+    }
+
+    /// The [`IntrinsicType`] whose recorded id names this object's runtime type, or `None` for an
+    /// object that carries its own identity (an instance, a box, a delegate).
+    ///
+    #[must_use]
+    pub fn structural_type(&self, reference: ObjectRef) -> Option<IntrinsicType> {
+        match self.get(reference)? {
+            Object::Str(_) => Some(IntrinsicType::String),
+            Object::Array { .. } | Object::MdArray { .. } => Some(IntrinsicType::Array),
+            Object::Instance { .. } | Object::Boxed { .. } | Object::Delegate { .. } => None,
+            Object::StringBuilder { .. } => None,
+            #[cfg(feature = "gc")]
+            Object::Weak { .. } => None,
         }
     }
 
@@ -1822,7 +1870,7 @@ fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
         } => elements.iter().for_each(|e| collect_refs(e, visit)),
         Object::MdArray { elements, .. } => elements.iter().for_each(|e| collect_refs(e, visit)),
         Object::Boxed { value, .. } => collect_refs(value, visit),
-        Object::Delegate { invocations } => invocations
+        Object::Delegate { invocations, .. } => invocations
             .iter()
             .for_each(|(target, _)| collect_refs(target, visit)),
         Object::Weak { .. } => {}
@@ -1876,7 +1924,7 @@ fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
         } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
         Object::MdArray { elements, .. } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
         Object::Boxed { value, .. } => remap_value(value, remap),
-        Object::Delegate { invocations } => invocations
+        Object::Delegate { invocations, .. } => invocations
             .iter_mut()
             .for_each(|(target, _)| remap_value(target, remap)),
         Object::Weak { target } => {

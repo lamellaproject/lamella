@@ -1145,6 +1145,12 @@ impl Model {
             .get_mut(&(String::from(namespace), String::from(name)))
     }
 
+    /// Every type in the model, mutably. Used by the constant resolution pass for the step that
+    /// applies to all of them rather than to one it can name.
+    pub fn types_mut(&mut self) -> impl Iterator<Item = &mut TypeInfo> {
+        self.types.values_mut()
+    }
+
     /// The number of program entry points declared in THIS compilation (10.1): a `static Main`
     /// returning `void` or `int` and taking no parameters or a single `string[]`. Types loaded
     /// from a reference assembly are excluded. Two or more is a CS0017 (multiple entry points);

@@ -97,7 +97,7 @@ use lamella_cil_runtime::intrinsics::{
     marshal_alloc_hglobal, marshal_free_hglobal, marshal_read_byte, marshal_read_int16,
     marshal_read_int32, marshal_read_int64, marshal_write_byte, marshal_write_int16,
     marshal_write_int32, marshal_write_int64, marshal_size_of,
-    intptr_from_raw_value, intptr_to_raw_value,
+    intptr_from_raw_value, intptr_size, intptr_to_raw_value,
     mmio_read32, mmio_write32, mmio_read8, mmio_write8, mmio_read16, mmio_write16,
     value_type_equals, value_type_get_hash_code,
 };
@@ -121,7 +121,7 @@ use lamella_cil_runtime::intrinsics::{
     activator_create_instance, app_domain_assemblies, assembly_full_name, assembly_get_type,
     assembly_get_types,
     constructor_invoke, field_get_raw_constant, field_get_value, field_is_literal,
-    field_is_static, field_set_value, member_get_type, method_invoke, method_is_abstract,
+    field_is_static, field_set_value, member_declaring_type, member_get_type, method_invoke, method_is_abstract,
     method_is_final, method_is_public, method_is_static, method_is_virtual,
     method_parameter_count, method_parameter_custom_attributes, method_parameter_name,
     method_parameter_type, type_get_assembly,
@@ -174,7 +174,7 @@ use lamella_cil_runtime::intrinsics::{
     math_pow_f64, math_sin_f64, math_sinh_f64, math_sqrt_f64, math_tan_f64, math_tanh_f64,
 };
 use lamella_cil_runtime::module::{
-    AttrValue, BoxedPrimitive, LoadedAttribute, RawCil, VarargSite, asm_key,
+    AttrValue, BoxedPrimitive, IntrinsicType, LoadedAttribute, RawCil, VarargSite, asm_key,
 };
 #[cfg(feature = "reflection")]
 use lamella_cil_runtime::module::{
@@ -344,6 +344,14 @@ fn full_type_name(name: TypeName<'_>) -> String {
 fn key_type_name(assembly: &Assembly<'_>, type_def: &TypeDef<'_>) -> Option<(String, String)> {
     assembly.type_token_full_name(type_def.token())
 }
+
+/// The corlib field a managed `System.Exception` constructor stores its message in, in the
+/// qualified form both loaders key an instance field by.
+///
+/// The runtime reads this one field itself, to report an exception that escaped with the message
+/// the program gave it, so its slot is recorded as the layout is decided -- see
+/// [`lamella_cil_runtime::Module::bind_exception_message_slot`] for why by name would not do.
+const EXCEPTION_MESSAGE_FIELD: &str = "System.Exception._message";
 
 /// [`field_name_key`] over an already-resolved `(namespace, type)` pair -- the form
 /// [`key_type_name`] produces for a nested type, whose namespace is not its own.
@@ -1754,6 +1762,14 @@ fn materialize_corlib_refs<'c>(
                     Reaches::Member => {
                         if token.table() == MEMBER_REF && seen.insert(*token) {
                             enqueue_corlib_ref(resolution, assembly, corlib, *token, &mut walk.worklist);
+                        } else if token.table() == METHOD_SPEC && seen.insert(*token) {
+                            enqueue_recognized_generic_overload(
+                                resolution,
+                                assembly,
+                                corlib,
+                                *token,
+                                &mut walk.worklist,
+                            );
                         }
                     }
                     Reaches::Type => {
@@ -1784,13 +1800,15 @@ fn materialize_corlib_refs<'c>(
         }
     }
     if needs_string_type {
-        materialize_string_type(
+        materialize_intrinsic_type(
             module,
             resolution,
             corlib,
             &mut walk,
+            IntrinsicType::String,
         );
     }
+    materialize_intrinsic_type(module, resolution, corlib, &mut walk, IntrinsicType::Array);
     for token in type_tokens {
         let Some(name) = assembly.type_token_name(token) else {
             continue;
@@ -1929,7 +1947,7 @@ fn bind_materialized_body_tokens<'c>(
         &tokens.newarr,
     );
     bind_box_primitives(corlib, module, LAZY_CORLIB_ASM, &tokens.boxes);
-    bind_generic_calls(corlib, module, LAZY_CORLIB_ASM, &tokens.generic_calls);
+    bind_generic_calls(corlib, module, LAZY_CORLIB_ASM, &resolution.index, &tokens.generic_calls);
     mark_value_type_ctors(module, LAZY_CORLIB_ASM, &tokens.newobj, &tokens.value_type_methods);
     bind_field_rva_data(corlib, module, LAZY_CORLIB_ASM, &tokens.ldtoken_fields);
     bind_type_names(
@@ -2031,6 +2049,31 @@ fn enqueue_corlib_ref(
     }
     if let Some(row) = find_corlib_method_row(corlib, parent.namespace, parent.name, method_name, &key)
     {
+        worklist.push(row);
+    }
+}
+
+/// Materializes the NON-GENERIC corlib overload that will serve an instantiated generic call, so
+/// the lazy tier can bind it the way the eager tier does.
+///
+/// The counterpart of [`enqueue_corlib_ref`] for a `MethodSpec` operand, and it asks
+/// [`recognized_generic_overload`] rather than repeating its rule -- the binder and this must agree
+/// about which overload serves the call, or one tier binds and the other refuses.
+fn enqueue_recognized_generic_overload(
+    resolution: &CorlibResolution,
+    assembly: &Assembly,
+    corlib: &Assembly,
+    token: Token,
+    worklist: &mut Vec<u32>,
+) {
+    let Some((namespace, type_name, method_name, key)) = recognized_generic_overload(assembly, token)
+    else {
+        return;
+    };
+    if resolution.index.contains_key(&key) {
+        return;
+    }
+    if let Some(row) = find_corlib_method_row(corlib, &namespace, &type_name, method_name, &key) {
         worklist.push(row);
     }
 }
@@ -2216,7 +2259,7 @@ fn materialize_corlib_method_row<'c>(
 
             if is_delegate_type(corlib, type_def.extends()) {
                 if name == ".ctor" {
-                    module.mark_delegate_ctor(LAZY_CORLIB_ASM, token);
+                    module.mark_delegate_ctor(LAZY_CORLIB_ASM, token, Some(type_id));
                 } else if name == "Invoke" {
                     let count = u16::try_from(params.len()).unwrap_or(u16::MAX);
                     module.mark_delegate_invoke(LAZY_CORLIB_ASM, token, count);
@@ -2283,7 +2326,13 @@ fn materialize_corlib_method_row<'c>(
                             continue;
                         }
                         Reaches::Text => {
-                            materialize_string_type(module, resolution, corlib, walk);
+                            materialize_intrinsic_type(
+                                module,
+                                resolution,
+                                corlib,
+                                walk,
+                                IntrinsicType::String,
+                            );
                             continue;
                         }
                         Reaches::Nothing => continue,
@@ -2403,16 +2452,18 @@ fn materialize_corlib_type_token<'c>(
     }
 }
 
-/// Materializes `System.String`, so the module has the canonical string type id `ldstr` and every
-/// string cast is decided against. The eager tier always has it because it loads the corlib whole;
-/// the lazy tier has to be told, because a string literal names no type token in the IL.
-fn materialize_string_type<'c>(
+/// Materializes the corlib type behind an [`IntrinsicType`], so the module holds the canonical id
+/// the recorded-type-id facility answers with.
+///
+fn materialize_intrinsic_type<'c>(
     module: &mut Module,
     resolution: &mut CorlibResolution,
     corlib: &SourceAssembly<'c>,
     walk: &mut CorlibWalk,
+    which: IntrinsicType,
 ) {
-    let name = TypeName { namespace: "System", name: "String" };
+    let (namespace, type_name) = which.qualified_name();
+    let name = TypeName { namespace, name: type_name };
     if resolution.type_index.contains_key(&type_name_key(name)) {
         return;
     }
@@ -2604,9 +2655,7 @@ fn materialize_corlib_type<'c>(
     full.extend(own_instance.iter().map(|field| field.default.clone()));
 
     let type_id = module.add_type(full);
-    if module.string_type_id().is_none() && name.namespace == "System" && name.name == "String" {
-        module.set_string_type_id(type_id);
-    }
+    record_intrinsic_type(module, name.namespace, name.name, type_id);
     module.bind_type_full_name(type_id, full_type_name(name));
     let own_token = Token::new(TYPE_DEF, type_row);
     module.bind_type_token(LAZY_CORLIB_ASM, own_token, type_id);
@@ -2634,10 +2683,11 @@ fn materialize_corlib_type<'c>(
         let slot = (base_count + index) as u32;
         module.bind_field(LAZY_CORLIB_ASM, field.token, slot);
         module.bind_field_type(LAZY_CORLIB_ASM, field.token, type_id);
-        resolution
-            .field_index
-            .instances
-            .insert(field_name_key(name, &field.name), slot);
+        let key = field_name_key(name, &field.name);
+        if key == EXCEPTION_MESSAGE_FIELD {
+            module.bind_exception_message_slot(slot);
+        }
+        resolution.field_index.instances.insert(key, slot);
     }
     let statics_start = module.static_field_count() as u32;
     for field in &own_static {
@@ -3242,6 +3292,19 @@ enum HeirBase {
     Relinked(TypeId),
 }
 
+/// Records `type_id` as the runtime type of an [`IntrinsicType`], when this type is one of the
+/// types whose instances the runtime represents STRUCTURALLY and which therefore cannot name
+/// themselves.
+///
+fn record_intrinsic_type(module: &mut Module, namespace: &str, name: &str, type_id: u32) {
+    let Some(which) = IntrinsicType::from_qualified_name(namespace, name) else {
+        return;
+    };
+    if module.intrinsic_type_id(which).is_none() {
+        module.set_intrinsic_type_id(which, type_id);
+    }
+}
+
 /// [`load_assembly`], additionally collecting every type whose base is a constructed generic
 /// (see [`GenericBaseHeir`]) into `heirs` for the monomorphizer's second pass.
 #[allow(clippy::too_many_arguments)]
@@ -3362,10 +3425,7 @@ fn load_assembly_collecting<'pe>(
             type_id,
         );
         if let Some(name) = type_def.name() {
-            if module.string_type_id().is_none() && name.namespace == "System" && name.name == "String"
-            {
-                module.set_string_type_id(type_id);
-            }
+            record_intrinsic_type(module, name.namespace, name.name, type_id);
             if let Some((ns, tn)) = key_type_name(assembly, &type_def) {
                 type_index.insert(type_key(&ns, &tn), type_id);
             }
@@ -3423,7 +3483,7 @@ fn load_assembly_collecting<'pe>(
             methoddef_sigs.insert(method_row, (name.clone(), params.clone(), generic_arity));
             if is_delegate {
                 if name == ".ctor" {
-                    module.mark_delegate_ctor(asm, token);
+                    module.mark_delegate_ctor(asm, token, Some(type_id));
                 } else if name == "Invoke" {
                     let count = u16::try_from(params.len()).unwrap_or(u16::MAX);
                     module.mark_delegate_invoke(asm, token, count);
@@ -3650,7 +3710,7 @@ fn load_assembly_collecting<'pe>(
     );
     bind_array_defaults(assembly, module, asm, type_index, &field_index.enum_zeros, &newarr_tokens);
     bind_box_primitives(assembly, module, asm, &box_tokens);
-    bind_generic_calls(assembly, module, asm, &generic_call_tokens);
+    bind_generic_calls(assembly, module, asm, index, &generic_call_tokens);
     mark_value_type_ctors(module, asm, &newobj_tokens, &value_type_method_rows);
     mark_same_assembly_ctors(
         module,
@@ -3871,7 +3931,12 @@ fn bind_bcl_calls(
 
         if method_name == ".ctor" {
             if let [SigType::Object, SigType::IntPtr] = params {
-                module.mark_delegate_ctor(asm, *token);
+                let declaring = assembly
+                    .type_token_full_name(parent)
+                    .and_then(|(namespace, name)| {
+                        type_index.get(&type_key(&namespace, &name)).copied()
+                    });
+                module.mark_delegate_ctor(asm, *token, declaring);
                 continue;
             }
         }
@@ -4114,10 +4179,11 @@ fn bind_generic_calls(
     assembly: &Assembly,
     module: &mut Module,
     asm: u8,
+    index: &NameIndex,
     tokens: &BTreeSet<Token>,
 ) {
     for token in tokens {
-        if bind_recognized_generic_call(assembly, module, asm, *token) {
+        if bind_recognized_generic_call(assembly, module, asm, index, *token) {
             continue;
         }
         if module.resolve(asm, *token).is_some() {
@@ -4127,11 +4193,45 @@ fn bind_generic_calls(
     }
 }
 
+/// The NON-GENERIC overload that serves an instantiated generic BCL call, as the declaring type,
+/// the method name and the cross-assembly [`name_key`] the defining assembly registered it under.
+///
+fn recognized_generic_overload(
+    assembly: &Assembly,
+    token: Token,
+) -> Option<(String, String, &'static str, String)> {
+    let method_token = assembly.method_spec_method(token)?;
+    if method_token.table() != MEMBER_REF {
+        return None;
+    }
+    let member = assembly.member_ref(method_token.row())?;
+    let parent = member.parent();
+    if parent.table() != TYPE_REF {
+        return None;
+    }
+    let (namespace, type_name) = assembly.type_token_full_name(parent)?;
+    if namespace != "System" || type_name != "Array" || member.name() != Some("Reverse") {
+        return None;
+    }
+    let params: Vec<SigType> = match member
+        .method_signature()
+        .as_ref()
+        .map_or(0, |sig| sig.parameters.len())
+    {
+        1 => alloc::vec![SigType::Class(parent)],
+        3 => alloc::vec![SigType::Class(parent), SigType::I4, SigType::I4],
+        _ => return None,
+    };
+    let key = name_key(assembly, "System", "Array", "Reverse", &params, None);
+    Some((namespace, type_name, "Reverse", key))
+}
+
 /// Binds one `MethodSpec` if it names a generic BCL method with an intrinsic. `true` when it did.
 fn bind_recognized_generic_call(
     assembly: &Assembly,
     module: &mut Module,
     asm: u8,
+    index: &NameIndex,
     token: Token,
 ) -> bool {
     let Some(method_token) = assembly.method_spec_method(token) else {
@@ -4150,6 +4250,14 @@ fn bind_recognized_generic_call(
     let Some((parent_namespace, parent_name)) = assembly.type_token_full_name(parent) else {
         return false;
     };
+    if let Some((_, _, _, key)) = recognized_generic_overload(assembly, token) {
+        let Some(&target) = index.get(&key) else {
+            return false;
+        };
+        module.bind_token(asm, token, target);
+        return true;
+    }
+
     let recognized: Option<((IntrinsicFn, u32), u16)> =
         match (parent_namespace.as_str(), parent_name.as_str(), member.name()) {
             ("System", "Array", Some("Empty")) => Some((intrinsic!(array_empty), 0)),
@@ -4338,6 +4446,11 @@ fn bcl_intrinsic(
         return Some(intrinsic!(type_get_name));
     }
     #[cfg(feature = "reflection")]
+    if namespace == "System.Reflection" && type_name == "MemberInfo" && method == "get_DeclaringType"
+    {
+        return Some(intrinsic!(member_declaring_type));
+    }
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" {
         match method {
             "op_Equality" => return Some(intrinsic!(reflect_handle_equals)),
@@ -4358,8 +4471,12 @@ fn bcl_intrinsic(
     #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" && type_name == "FieldInfo" {
         match (method, parameters_of(signature)) {
-            ("GetValue", [SigType::Object]) => return Some(intrinsic!(field_get_value)),
-            ("SetValue", [SigType::Object, SigType::Object]) => return Some(intrinsic!(field_set_value)),
+            ("GetValue" | "GetValueCore", [SigType::Object]) => {
+                return Some(intrinsic!(field_get_value));
+            }
+            ("SetValue" | "SetValueCore", [SigType::Object, SigType::Object]) => {
+                return Some(intrinsic!(field_set_value));
+            }
             ("get_FieldType", []) => return Some(intrinsic!(member_get_type)),
             ("get_IsLiteral", []) => return Some(intrinsic!(field_is_literal)),
             ("get_IsStatic", []) => return Some(intrinsic!(field_is_static)),
@@ -4370,7 +4487,7 @@ fn bcl_intrinsic(
     #[cfg(feature = "reflection")]
     if namespace == "System.Reflection"
         && (type_name == "MethodBase" || type_name == "MethodInfo")
-        && method == "Invoke"
+        && (method == "Invoke" || method == "InvokeCore")
     {
         return Some(intrinsic!(method_invoke));
     }
@@ -4416,6 +4533,7 @@ fn bcl_intrinsic(
         match method {
             "FromRawValue" => return Some(intrinsic!(intptr_from_raw_value)),
             "ToRawValue" => return Some(intrinsic!(intptr_to_raw_value)),
+            "get_Size" => return Some(intrinsic!(intptr_size)),
             _ => {}
         }
     }
@@ -4423,6 +4541,7 @@ fn bcl_intrinsic(
         match method {
             "FromRawValue" => return Some(intrinsic!(intptr_from_raw_value)),
             "ToRawValue" => return Some(intrinsic!(intptr_to_raw_value)),
+            "get_Size" => return Some(intrinsic!(intptr_size)),
             _ => {}
         }
     }
@@ -5989,7 +6108,11 @@ fn bind_type_sizes(
     value_type_tokens: &[Token],
     sizeof_tokens: &BTreeSet<Token>,
 ) {
-    let target = TargetLayout::ilp32();
+    let target = if lamella_cil_runtime::native_pointer_size() >= 8 {
+        TargetLayout::lp64()
+    } else {
+        TargetLayout::ilp32()
+    };
     for token in value_type_tokens {
         if let Ok(layout) = assembly.value_type_layout(*token, &target) {
             module.set_type_size(asm, *token, layout.size);
@@ -6004,6 +6127,10 @@ fn bind_type_sizes(
             .and_then(|name| primitive_type_size(name.namespace, name.name, target.pointer_size))
         {
             module.set_type_size(asm, *token, size);
+            continue;
+        }
+        if matches!(assembly.type_spec_signature(*token), Some(SigType::Pointer(_))) {
+            module.set_type_size(asm, *token, target.pointer_size);
         }
     }
 }
@@ -6163,6 +6290,9 @@ fn build_field_layouts(
             let slot = (base_count + index) as u32;
             module.bind_field(asm, *token, slot);
             if let Some(key) = instance_field_keys.get(&token.0) {
+                if key == EXCEPTION_MESSAGE_FIELD {
+                    module.bind_exception_message_slot(slot);
+                }
                 field_index.instances.insert(key.clone(), slot);
             }
         }

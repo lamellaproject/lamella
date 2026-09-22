@@ -11,6 +11,11 @@ mod deploy;
 mod devices;
 mod flash;
 mod program;
+mod project;
+// Test-only: the one place that says what a rendered message may and may not contain.
+#[cfg(test)]
+mod rendered;
+mod tiers;
 mod verdicts;
 
 fn main() -> ExitCode {

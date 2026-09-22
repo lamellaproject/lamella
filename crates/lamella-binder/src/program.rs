@@ -1471,10 +1471,18 @@ fn validate_constraint_type(binder: &mut Binder, reference: &lamella_syntax::ast
 /// | a `static` field of one, even INSIDE a `ref struct` | `CS8345` |
 /// | an INSTANCE field of one inside a `ref struct` | clean |
 /// | an auto-implemented property of one, anywhere | `CS8345` |
+/// | a field of one of the three RESTRICTED types, static or instance | `CS0610` ALONE |
 ///
 /// The static row is the one worth stating: `static` is refused even where an instance field is
 /// allowed, because a stack-only type has nowhere to live for a type's lifetime. csc's message
 /// says INSTANCE member and means it.
+///
+/// **THE RESTRICTED ROW IS WHY THIS RULE STANDS DOWN RATHER THAN ADDING TO CS0610.** The two
+/// families overlap in the model: `System.TypedReference` is genuinely by-ref-like, so this rule
+/// fires on it as readily as on a `Span<T>`. csc does not stack them -- a `TypedReference` field
+/// is `CS0610` and nothing else, measured at ISO-1 and at `latest`, static and instance alike,
+/// for all three restricted types -- while `Span<byte>` is `CS8345` at `latest` (and `CS8022` at
+/// ISO-1, which refuses the generic type before the field rule is ever reached).
 fn validate_by_ref_like_fields(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     binder.enter_type(declared_symbol(namespace, declaration));
     let declaring_is_by_ref_like = matches!(declaration.kind, TypeKind::Struct)
@@ -1492,6 +1500,9 @@ fn validate_by_ref_like_fields(binder: &mut Binder, namespace: &str, declaration
         else {
             continue;
         };
+        if restricted_type_name(ty).is_some() {
+            continue;
+        }
         let field_ty = binder.canonicalize(&bind_type(ty));
         if !binder.type_is_by_ref_like(&field_ty) {
             continue;
@@ -5529,6 +5540,69 @@ mod tests {
                 "using static N1.A; using static N1.B;                  namespace N1 { public class A { public static int F = 1; }                                 public class B { public static int F = 2; } }                  namespace N2 { class P { static int Go() { return 0; } } }"
             )
             .is_empty()
+        );
+    }
+
+    /// A restricted type is `CS0610` and NOT also `CS8345`, although it satisfies both rules.
+    ///
+    /// `System.TypedReference` is genuinely by-ref-like, so the two field rules overlap on it and
+    /// lcsc reported both codes where csc reports one. Declaring it here as a `ref struct` is what
+    /// puts the flag in the model that a real corlib import otherwise supplies -- without it this
+    /// test would pass whatever the rules did, never reaching the by-ref-like branch at all.
+    ///
+    /// The second row is the guard on the first: it holds the `CS8345` rule to still firing on a
+    /// genuine `ref struct`, so a stand-down that went too far and silenced the rule outright
+    /// cannot pass here.
+    #[test]
+    fn a_restricted_type_field_is_cs0610_alone_although_it_is_also_by_ref_like() {
+        assert_eq!(
+            sorted_codes(
+                "namespace System { ref struct TypedReference { } } \
+                 class C { static System.TypedReference f; }"
+            ),
+            [610]
+        );
+        assert_eq!(
+            sorted_codes("ref struct R { } class C { static R f; }"),
+            [8345]
+        );
+    }
+
+    /// A DECLARED delegate reaches the members it inherits, not only the `Invoke` it declares.
+    ///
+    /// The delegate path set no base at all, so `GetType`, `ToString`, `Equals` and `GetHashCode`
+    /// were each `CS1061` on a delegate declared in source while `Invoke` resolved -- everything it
+    /// declares reachable and everything it inherits missing. An IMPORTED delegate was unaffected,
+    /// its base arriving in metadata, so `System.Action` worked in the same compilation that
+    /// refused the delegate declared beside it. That asymmetry is why no corpus program caught it:
+    /// the corpus reaches for `System.Action` far more often than it declares a delegate and then
+    /// asks it a question.
+    ///
+    /// The base member here is a made-up `Tag` rather than `GetType`, so the test asserts the
+    /// LOOKUP WALKED rather than that some name happened to resolve -- there is no second route to
+    /// a method that exists nowhere else.
+    #[test]
+    fn a_declared_delegate_inherits_through_system_multicast_delegate() {
+        let corlib = "namespace System { public class MulticastDelegate { public int Tag() { return 1; } } } ";
+        assert_eq!(
+            sorted_codes(&alloc::format!(
+                "{corlib}delegate int D(int v); \
+                 class P {{ static int F(int v) {{ return v; }} \
+                 static int M() {{ D d = new D(F); return d.Tag(); }} }}"
+            )),
+            []
+        );
+        assert_eq!(
+            sorted_codes(&alloc::format!(
+                "{corlib}delegate int D(int v); \
+                 class P {{ static int F(int v) {{ return v; }} \
+                 static int M() {{ D d = new D(F); return d.Invoke(3); }} }}"
+            )),
+            []
+        );
+        assert_eq!(
+            sorted_codes(&alloc::format!("{corlib}delegate int D(int v); class Q : D {{ }}")),
+            [509]
         );
     }
 

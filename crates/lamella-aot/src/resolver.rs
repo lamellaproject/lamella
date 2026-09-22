@@ -508,7 +508,7 @@ impl<'a> MetadataResolver<'a> {
     }
 
     /// The initialization thunks a lowering may call at a trigger site, as `(TypeDef row, function
-    /// index)` -- see [`precise_init_types`] for which types get one and why the relaxed ones do not.
+    /// index)` -- see [`type_init_types`] for which types get one and why the relaxed ones do not.
     ///
     /// **ATTACH BEFORE LOWERING ANY BODY.** A resolver without this answers `None` everywhere, which
     /// is the eager tier's behavior: correct only while something else runs the initializers.
@@ -1121,18 +1121,6 @@ impl<'a> MetadataResolver<'a> {
         }
     }
 
-    /// The `TypeDef` a `newobj` constructs, from its constructor token: the constructor's
-    /// declaring type, found by name. Shared by the value-type and reference-type resolutions.
-    fn newobj_type_def(&self, operand: &Operand) -> Option<TypeDef<'a>> {
-        let Operand::Token(token) = operand else {
-            return None;
-        };
-        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
-        self.assembly.find_type(declaring.namespace, declaring.name)
-    }
-
-    /// Whether `type_def` is a delegate -- its `extends` chain reaches `System.MulticastDelegate` (or
-    /// `System.Delegate`). The bounded base-chain walk the catch-type and cast detection also use.
     /// The type token a metadata token names: a type token as-is (`TypeRef`/`TypeDef`/
     /// `TypeSpec`), or the declaring type of a constructor token -- a `MemberRef`'s parent (an
     /// external type like `System.Exception`), or a `MethodDef`'s owning type resolved by name
@@ -4922,7 +4910,7 @@ impl CallResolver for MetadataResolver<'_> {
             "Int16" | "UInt16" | "Char" => 2,
             "Int32" | "UInt32" | "Single" => 4,
             "Int64" | "UInt64" | "Double" => 8,
-            "IntPtr" | "UIntPtr" => 4,
+            "IntPtr" | "UIntPtr" => TargetLayout::ilp32().pointer_size,
             _ => return None,
         })
     }
@@ -6184,24 +6172,23 @@ pub(crate) fn static_field_slots<'x>(
     slots
 }
 
-/// The types this assembly declares that demand PRECISE initializer timing, as
+/// The types this assembly declares that own an initializer, as
 /// `(TypeDef row, .cctor MethodDef rid, region slot of the "already ran" flag)`, in metadata order.
 ///
-/// A type qualifies when it declares a `.cctor` and does NOT carry `beforefieldinit` (ECMA-335
-/// II.23.1.15, semantics I.8.9.5). Both halves matter and the second is the whole saving: a relaxed
-/// type's initializer may run at any time before first field access, so running it from the startup
-/// chain is conformant and its access sites cost nothing.
+/// A type qualifies when it declares a `.cctor`, whether or not it carries `beforefieldinit`
+/// (ECMA-335 II.23.1.15, semantics I.8.9.5). **EXCLUDING THE RELAXED TYPES HERE DOES NOT MAKE THEM
+/// LAZY -- IT PUTS THEM IN THE STARTUP CHAIN INSTEAD, WITH THEIR WHOLE TRANSITIVE CLOSURE.** See
+/// [`type_init_cctor`] for why triggering a relaxed type at the precise sites is conformant.
 ///
-/// **RELAXED IS NOT OPTIONAL.** It licenses running the initializer EARLY, never skipping it -- a
-/// relaxed type whose initializer never runs answers from zeroed storage, which is what
-/// `static-init-corlib` scores. So this function names the types that need a TRIGGER, not the types
-/// that need initializing.
+/// This function names the types that need a TRIGGER, which is the same set as the types that need
+/// initializing. Keeping them one set is the point: while the chain did the rest of the work they
+/// were two, and the gap between them was a population nothing could gate.
 ///
 /// The flag slots are numbered from the end of [`static_field_slots`] so the two cannot overlap, and
 /// they are assigned HERE rather than by the caller because the region size and the offsets written
 /// into it must come from one walk -- writing that condition twice is how this backend's two
 /// `mir_type` twins drifted.
-pub(crate) fn precise_init_types<'x>(
+pub(crate) fn type_init_types<'x>(
     assembly: &'x Assembly<'x>,
     references: &[&'x Assembly<'x>],
 ) -> Vec<(u32, u32, u32)> {
@@ -6212,7 +6199,7 @@ pub(crate) fn precise_init_types<'x>(
         .unwrap_or(1);
     let mut types = Vec::new();
     for type_def in assembly.type_defs() {
-        let Some(cctor) = precise_init_cctor(&type_def) else {
+        let Some(cctor) = type_init_cctor(&type_def) else {
             continue;
         };
         types.push((type_def.token().row(), cctor, next));
@@ -6230,21 +6217,39 @@ enum NamedType<'a> {
     Reference(&'a Assembly<'a>, TypeDef<'a>),
 }
 
-/// THE predicate: the `MethodDef` rid of a type's initializer when that type demands PRECISE timing
-/// -- it declares a `.cctor` and does not carry `beforefieldinit` (ECMA-335 II.23.1.15, semantics
-/// I.8.9.5). `None` for a relaxed type and for one with no initializer at all, which are different
-/// facts with the same consequence here: no trigger is owed.
+/// THE predicate: the `MethodDef` rid of a type's initializer, for every type that declares one.
+/// `None` only when the type has no `.cctor` at all, because then no trigger is owed.
 ///
-/// **ONE PREDICATE BECAUSE IT IS ASKED FROM TWO DIRECTIONS.** [`precise_init_types`] asks it of
+/// **EXCLUDING `beforefieldinit` HERE IS A LINK-SIZE DECISION, NOT ONLY A TIMING ONE.** A type this
+/// predicate declines gets no thunk, so its `.cctor` stays in the startup chain -- and `f0` then
+/// holds a direct call to the initializer of every such type in every referenced assembly. The
+/// reachability walk starts at `f0`, so each of those calls is a root: in corlib that reaches
+/// `DateTimeFormatInfo`, `Double.ToString`, `core::num::flt2dec` with its 10,416-byte power-of-five
+/// table, and the Unicode uppercase tables, from a program with no floats and no strings.
+///
+/// **RUNNING A RELAXED TYPE THROUGH THE PRECISE TRIGGERS IS CONFORMANT, AND IT IS WHAT REAL .NET
+/// DOES.** ECMA-335 I.8.9.5 lets a `beforefieldinit` type initialize at any point BEFORE first
+/// static-field access; the trigger set here -- static field access, static call, construction,
+/// constrained value-type call ([`crate::cil::InitTrigger`]) -- is the PRECISE set, which is a
+/// strict superset of the one moment a relaxed type is obliged to be ready by. Firing at a superset
+/// of the required moments can only be early, and early is exactly what the flag licenses. Firing
+/// a relaxed type from the precise trigger set is therefore conformant, not a divergence.
+///
+/// **THE FLAG IS STILL LOAD-BEARING, JUST NOT HERE.** `beforefieldinit` licenses running an
+/// initializer EARLY, never skipping it. A relaxed type whose initializer never runs answers from
+/// zeroed storage, which is a wrong answer rather than a smaller image. Dropping a `.cctor` from
+/// the startup chain is only safe because this same predicate installs the trigger that replaces
+/// it.
+///
+/// **ONE PREDICATE BECAUSE IT IS ASKED FROM TWO DIRECTIONS.** [`type_init_types`] asks it of
 /// every type in the assembly being built, to number the flag words and emit the thunks;
 /// [`cross_assembly_type_init`] asks it of ONE type in a REFERENCED assembly, to decide whether an
 /// access site here must call into that assembly's object. Written out twice, the two would have
 /// to agree -- and a disagreement is not a lost optimization, it is an initializer whose `.cctor`
-/// was dropped from the startup chain by one reading and given no trigger by the other.
-pub(crate) fn precise_init_cctor(type_def: &TypeDef) -> Option<u32> {
-    if type_def.is_before_field_init() {
-        return None;
-    }
+/// was dropped from the startup chain by one reading and given no trigger by the other. That
+/// failure has no size signature and no missing symbol: the image links, it boots, and the type
+/// answers from zeroed storage.
+pub(crate) fn type_init_cctor(type_def: &TypeDef) -> Option<u32> {
     type_def
         .methods()
         .find(|m| m.is_static() && m.name() == Some(".cctor"))
@@ -6269,7 +6274,7 @@ pub(crate) fn cross_assembly_type_init(
     owner: &Assembly,
     type_def: &TypeDef,
 ) -> Option<(u32, String)> {
-    let cctor = precise_init_cctor(type_def)?;
+    let cctor = type_init_cctor(type_def)?;
     Some((cctor, type_init_thunk_symbol(owner, type_def.token().row())?))
 }
 
@@ -6458,7 +6463,7 @@ pub(crate) fn non_generic_region_words<'x>(
         .map(|(_, slot, words)| slot + words)
         .max()
         .unwrap_or(1);
-    precise_init_types(assembly, references)
+    type_init_types(assembly, references)
         .last()
         .map_or(fields, |(_, _, slot)| slot + 1)
 }

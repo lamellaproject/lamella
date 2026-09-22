@@ -220,7 +220,9 @@ fn run_on_target(_path: &Path, _target: &str) -> ExitCode {
 /// **THERE IS NO `--unsafe` HERE AND THAT IS NOT AN OVERSIGHT.** This verb runs the program on THIS
 /// machine, where a raw pointer at a device register addresses host memory and means nothing --
 /// so the switch would buy a program that compiles and then faults. A program written to drive
-/// hardware belongs on `flash`, and the diagnostic below says so where it comes up.
+/// hardware belongs on `deploy`, which takes a source file and `--unsafe`, and the diagnostic below
+/// says so where it comes up. **Not `flash`**, which takes an image rather than a source file and
+/// declares no `--unsafe` at all.
 fn run_csharp(source: &str) -> ExitCode {
     let compiler = match LcscCompiler::discover() {
         Ok(compiler) => compiler,
@@ -241,6 +243,7 @@ fn run_csharp(source: &str) -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 eprintln!("lamella run: the program exited {exit}");
+                eprint!("{}", exit_note(exit));
                 ExitCode::FAILURE
             }
         }
@@ -251,7 +254,7 @@ fn run_csharp(source: &str) -> ExitCode {
                     "\nunsafe code is off by default, as it is in csc without /unsafe -- and this \
                      verb has no switch\nfor it, because a raw pointer at a device register means \
                      nothing on this machine. A program that\ndrives hardware goes on a board:\n\
-                     \x20   lamella flash <file> --board <id> --unsafe"
+                     \x20   lamella deploy <file> --board <id> --unsafe"
                 );
             }
             ExitCode::FAILURE
@@ -438,8 +441,12 @@ Python's shape; this JavaScript profile has no module loader at \
 
 /// `lamella build <file> [--board <id>] [--out <path>]`: produce the artifact a device runs.
 pub fn build_command(args: &[String]) -> ExitCode {
-    let spec =
-        Spec { verb: "build", usage: Some(USAGE), values: &["--board", "--out", "--format"], flags: &["--unsafe"] };
+    let spec = Spec {
+        verb: "build",
+        usage: Some(USAGE),
+        values: &["--board", "--out", "--format"],
+        flags: &["--unsafe", crate::flash::CLASS_LIBRARY_FLAG],
+    };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
         Err(halt) => return halt.code(),
@@ -459,6 +466,9 @@ pub fn build_command(args: &[String]) -> ExitCode {
         }
     };
 
+    let tier = crate::flash::Tier::from_options(&parsed);
+    let libraries: Vec<crate::flash::Library> = Vec::new();
+
     if let Some(name) = parsed.value("--format") {
         return build_flashable(
             &path,
@@ -468,7 +478,38 @@ pub fn build_command(args: &[String]) -> ExitCode {
             parsed.value("--board"),
             parsed.value("--out"),
             parsed.flag("--unsafe"),
+            tier,
+            &libraries,
         );
+    }
+
+    if tier == crate::flash::Tier::ClassLibrary {
+        eprintln!(
+            "{}",
+            crate::flash::tier_flag_where_nothing_links(
+                "build",
+                "Without --format this builds the ordinary artifact -- an assembly, a baked image \
+                 or a\nPython bundle -- and none of those has a link step.",
+                "--format <f> asks for the image a chip takes, which is the build that \
+                 links:\n\n\x20   lamella build <file> --board <id> --format bin \
+                 --class-library",
+                "Nothing was built.",
+            )
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if crate::flash::is_project(&path) {
+        eprintln!(
+            "lamella build: {} is a project, and this build is not producing a chip image.\n\n\
+             --format <f> asks for the image a chip takes, which is the artifact a project \
+             describes:\n\n\
+             \x20   lamella build {} --board <id> --format bin\n\n\
+             Nothing was built.",
+            path.display(),
+            path.display()
+        );
+        return ExitCode::FAILURE;
     }
 
     let built = match language {
@@ -498,7 +539,10 @@ Use lamella run to execute it here.",
         return ExitCode::FAILURE;
     }
     println!("{} <- {}", out.display(), path.display());
-    println!("  {}  {} B", built.what, built.bytes.len());
+    match built.note {
+        Some(note) => println!("  {} ({note})  {} B", built.what, built.bytes.len()),
+        None => println!("  {}  {} B", built.what, built.bytes.len()),
+    }
 
     let Some(board_id) = parsed.value("--board") else {
         return ExitCode::SUCCESS;
@@ -507,7 +551,8 @@ Use lamella run to execute it here.",
 }
 
 const USAGE: &str = "\
-usage: lamella build <file.cs|file.py> [--board <id>] [--format <f>] [--out <path>]
+usage: lamella build <file.cs|file.csproj|file.py> [--board <id>] [--format <f>] [--out <path>]
+                                      [--class-library]
 
 With --format, it builds the BARE-METAL IMAGE for --board and writes it in that format -- which is
 exactly what `lamella flash` takes, so `build` produces what `flash` consumes and neither has to
@@ -515,6 +560,15 @@ touch hardware. Formats: bin, hex (Intel HEX), s19 (Motorola S-records).
 
 Without --format it builds the ordinary artifact -- an assembly, a baked image, or a Python bundle
 -- and with --board it also answers whether that fits.
+
+A .csproj builds every .cs beside it as ONE program and links the assemblies its <Reference>
+elements name, each by a <HintPath>. It goes with --format, which is the build that links.
+
+--class-library links the program with the class library and the runtime support archive, so it
+may allocate, use floating point and call into System.*. Without it the flat tier is used, which
+is linker-free and resolves no call outside the program. Every build says which tier produced it.
+The class-library tier covers fewer boards; asking for it where there is no plan names the ones
+there are.
 ";
 
 /// `lamella build <file> --board <id> --format <f>`: the image a chip takes, written to a file and
@@ -532,6 +586,8 @@ fn build_flashable(
     board_id: Option<&str>,
     out: Option<&str>,
     unsafe_code: bool,
+    tier: crate::flash::Tier,
+    libraries: &[crate::flash::Library],
 ) -> ExitCode {
     let format = match lamella_flash_routes::artifact::Format::parse(format_name) {
         Ok(format) => format,
@@ -556,13 +612,14 @@ fn build_flashable(
         return ExitCode::FAILURE;
     }
 
-    let (image, base) = match crate::flash::image_for_board(path, source, board_id, unsafe_code) {
-        Ok(built) => built,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (image, base) =
+        match crate::flash::image_for_board(path, source, board_id, unsafe_code, tier, libraries) {
+            Ok(built) => built,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
     let format = match (format, crate::flash::uf2_family_for_board(board_id)) {
         (lamella_flash_routes::artifact::Format::Uf2 { .. }, None) => {
             eprintln!(
@@ -592,9 +649,16 @@ fn build_flashable(
         rendered.len(),
         format.description()
     );
+    println!("  {}", tier.line());
     println!("\nwrite it with:\n    lamella flash {} --board {board_id}", out.display());
     ExitCode::SUCCESS
 }
+
+/// The name of each artifact this verb can produce, named once so the rule about those names is
+/// asked of the names the code uses rather than of a copy of them.
+const BAKED_FLASH_IMAGE: &str = "baked flash image";
+const ASSEMBLY: &str = "assembly";
+const PYTHON_BUNDLE: &str = "Python bundle";
 
 /// What a build produced.
 struct Built {
@@ -603,7 +667,18 @@ struct Built {
     /// The extension it is conventionally written with.
     extension: &'static str,
     /// What the artifact IS, in the terms the rest of the toolchain uses for it.
+    ///
+    /// **A NOUN PHRASE, BECAUSE TWO OF ITS THREE READERS PUT IT IN THE MIDDLE OF A SENTENCE.**
+    /// It follows "cannot run this" and "the number compared is the", so anything that is not a
+    /// plain name for the thing arrives inside prose that then reads as nonsense. A warning about
+    /// the artifact belongs in [`Built::note`] or [`Built::excludes`]; this is only its name.
     what: &'static str,
+    /// A warning about the artifact, shown beside its name where it is REPORTED and nowhere else.
+    ///
+    /// Separate from [`Built::what`] because a name and a warning are read in different places:
+    /// this is printed in parentheses after the artifact line, where a reader is looking at what
+    /// they just got, and it is never spliced into a sentence about the board.
+    note: Option<&'static str>,
     /// **WHAT THE BYTE COUNT DOES NOT INCLUDE, AND THEREFORE WHAT A FIT VERDICT OVER IT MEANS.**
     ///
     /// A fit verdict compares a number against a board's whole flash budget, which is the right
@@ -612,6 +687,15 @@ struct Built {
     /// upper bound rather than the space the image will have. Carried with the artifact rather
     /// than reconstructed at the comparison, so the caveat cannot be attached to the wrong tier.
     excludes: &'static str,
+    /// **WHETHER THIS ARTIFACT IS LOADED INTO FIRMWARE ALREADY ON THE BOARD**, rather than being the
+    /// whole flash occupant.
+    ///
+    /// A fit verdict over an artifact of this kind presumes a board that can HOLD that firmware, and
+    /// a board declaring no carrier never can. Declared by the artifact for the same reason
+    /// [`Built::excludes`] is: reconstructing it at the comparison is how an answer gets attached to
+    /// the wrong tier, and an artifact kind added later has to state its own rather than inherit
+    /// whichever happened to be true when the check was written.
+    loaded_into_firmware: bool,
 }
 
 /// Compile a C# program to a .NET assembly.
@@ -633,18 +717,22 @@ fn build_csharp(path: &Path, source: &str, unsafe_code: bool) -> Result<Built, S
         return Ok(Built {
             bytes: image,
             extension: "lmli",
-            what: "baked flash image",
+            what: BAKED_FLASH_IMAGE,
+            note: None,
             excludes: "the serve firmware already resident on the board, which this image is \
                        loaded INTO rather than replacing",
+            loaded_into_firmware: true,
         });
     }
     #[cfg(not(feature = "bake"))]
     Ok(Built {
         bytes: assembly,
         extension: "dll",
-        what: "assembly (NOT a flash image -- this build has no `bake` feature)",
+        what: ASSEMBLY,
+        note: Some("NOT a flash image -- this build has no `bake` feature"),
         excludes: "everything the device supplies -- this is the assembly, not an image. \
                    Build the tool with `--features bake` for the flash image a board runs",
+        loaded_into_firmware: true,
     })
 }
 
@@ -662,12 +750,49 @@ pub fn compile_csharp_assembly(
     source: &str,
     unsafe_code: bool,
 ) -> Result<Vec<u8>, String> {
+    compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[])
+        .map(|(assembly, _)| assembly)
+}
+
+/// As [`compile_csharp_assembly`], and also the corlib the program was BOUND against.
+///
+/// **THE LINKED TIER LINKS THE SAME CORLIB THE PROGRAM WAS BOUND AGAINST, AND THAT IS WHY IT COMES
+/// BACK FROM HERE RATHER THAN FROM A SECOND LOOKUP.** Discovery walks an environment variable, then
+/// beside the executable, then the development tree, and a second walk can answer differently from
+/// the first -- a variable set between them, a file appearing beside the binary. A program bound
+/// against one corlib and linked against another would produce an image whose method tokens resolve
+/// to the wrong members, which is a wrong answer at run time rather than a link error.
+///
+/// `libraries` are the class libraries named on the command line, **in the order given**: the
+/// program BINDS against them here and LINKS against them later, and it has to be the same set in
+/// the same order or the build would resolve a name at compile time that the link cannot find.
+///
+/// # Errors
+/// As [`compile_csharp_assembly`], plus a reference set carrying no corlib to hand back, or a named
+/// library that is not a readable assembly.
+pub fn compile_csharp_assembly_with_corlib(
+    path: &Path,
+    source: &str,
+    unsafe_code: bool,
+    libraries: &[crate::flash::Library],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let compiler = LcscCompiler::discover()?;
-    let references: Vec<lamella_metadata::Assembly> = compiler
+    let mut references: Vec<lamella_metadata::Assembly> = compiler
         .references()
         .iter()
         .filter_map(|bytes| lamella_metadata::Assembly::read(bytes).ok())
         .collect();
+    for library in libraries {
+        let parsed = lamella_metadata::Assembly::read(library.bytes()).map_err(|error| {
+            format!(
+                "lamella: {} is not a readable .NET assembly: {error:?}
+
+                 A <Reference> wants a path to a built `.dll`. `lcsc /target:library` produces one.",
+                library.path().display()
+            )
+        })?;
+        references.push(parsed);
+    }
     let name = assembly_name(path);
     let options = lamella_syntax::lexer::LexOptions {
         unsafe_code,
@@ -684,10 +809,13 @@ pub fn compile_csharp_assembly(
         false,
         options,
     );
-    match compiled.image {
-        Some(image) => Ok(image),
-        None => Err(render_diagnostics(&compiled)),
-    }
+    let Some(image) = compiled.image else {
+        return Err(render_diagnostics(&compiled, &path.display().to_string(), source));
+    };
+    let Some(corlib) = compiler.references().first().cloned() else {
+        return Err("the compiler found no reference assemblies".to_owned());
+    };
+    Ok((image, corlib))
 }
 
 /// A metadata assembly name derived from `path`.
@@ -709,7 +837,116 @@ fn assembly_name(path: &Path) -> String {
 
 /// Render a failed compilation the way the toolchain's other front ends do: one `CSnnnn` line per
 /// diagnostic, or the emit error when binding was clean and a construct is not lowered.
-fn render_diagnostics(compiled: &lamella_assemble::Compilation) -> String {
+/// Compile every source a project names into ONE assembly, and the corlib it was bound against.
+///
+/// **THE PROJECT'S FILES ARE ONE COMPILATION, NOT SEVERAL.** Each file's types enter one model
+/// before any body binds, so a type declared in one names a type declared in another -- which is
+/// what a multi-file compilation means and what somebody splitting a program across files expects.
+/// Compiling them separately and linking after would make declaration order across files matter.
+///
+///
+/// # Errors
+/// A source that cannot be read, the compiler's diagnostics, or a declared reference that is not a
+/// readable assembly.
+pub fn compile_project_assembly(
+    project: &crate::project::Project,
+    libraries: &[crate::flash::Library],
+    verb: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let compiler = LcscCompiler::discover()?;
+    let mut references: Vec<lamella_metadata::Assembly> = compiler
+        .references()
+        .iter()
+        .filter_map(|bytes| lamella_metadata::Assembly::read(bytes).ok())
+        .collect();
+    for library in libraries {
+        let parsed = lamella_metadata::Assembly::read(library.bytes()).map_err(|error| {
+            format!(
+                "lamella {verb}: {} is not a readable .NET assembly: {error:?}\n\n                 A <Reference> wants a path to a built `.dll`. `lcsc /target:library` produces one.",
+                library.path().display()
+            )
+        })?;
+        references.push(parsed);
+    }
+    let mut texts = Vec::with_capacity(project.sources.len());
+    for source in &project.sources {
+        let text = std::fs::read_to_string(source).map_err(|error| {
+            format!(
+                "lamella {verb}: read {}: {error}\n\n                 The project names it, so the build stops rather than compiling a program that is                  missing\na file.",
+                source.display()
+            )
+        })?;
+        texts.push((text, source.display().to_string()));
+    }
+    let sources: Vec<(&str, &str)> = texts
+        .iter()
+        .map(|(text, path)| (text.as_str(), path.as_str()))
+        .collect();
+    let options = lamella_syntax::lexer::LexOptions {
+        unsafe_code: project.allow_unsafe,
+        file_based: false,
+        ..Default::default()
+    };
+    let compiled = lamella_assemble::compile_sources_with(
+        &sources,
+        &project.assembly_name,
+        &project.assembly_name,
+        &references,
+        false,
+        options,
+    );
+    let Some(image) = compiled.image else {
+        return Err(render_multi_diagnostics(&compiled, &texts));
+    };
+    let Some(corlib) = compiler.references().first().cloned() else {
+        return Err("the compiler found no reference assemblies".to_owned());
+    };
+    Ok((image, corlib))
+}
+
+/// A multi-file compilation's diagnostics, each attributed to the file it came from.
+///
+/// **THE FILE NAME IS THE POINT.** A project compiles several sources into one assembly, so a bare
+/// `CS0246` with no path leaves the reader searching every file they listed -- and the diagnostic
+/// lists arrive parallel to the input order precisely so that does not have to happen. The line
+/// and column come with it, out of the text of the file the diagnostic is attributed to.
+fn render_multi_diagnostics(
+    compiled: &lamella_assemble::MultiCompilation,
+    sources: &[(String, String)],
+) -> String {
+    if let Some(emit_error) = &compiled.emit_error {
+        return format!("{emit_error:?}");
+    }
+    let mut text = String::new();
+    for (per_file, (file_text, path)) in compiled.diagnostics.iter().zip(sources) {
+        for diagnostic in per_file {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&diagnostic.render(path, file_text));
+        }
+    }
+    if text.is_empty() {
+        text.push_str("compilation produced no image");
+    }
+    if text.contains("CS0227") {
+        text.push_str(
+            "\n\nunsafe code is off by default, as it is in csc without /unsafe. Turn it on in the              project:\n    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>",
+        );
+    }
+    text
+}
+
+/// A single file's diagnostics, each naming the file and the line it came from.
+///
+/// `path` and `source` are the ones that were compiled: the location is read out of the text the
+/// diagnostic's span indexes, so a caller that passed a different file would report a real code
+/// at an imaginary line.
+fn render_diagnostics(
+    compiled: &lamella_assemble::Compilation,
+    path: &str,
+    source: &str,
+) -> String {
     if let Some(emit_error) = &compiled.emit_error {
         return format!("{emit_error:?}");
     }
@@ -718,11 +955,7 @@ fn render_diagnostics(compiled: &lamella_assemble::Compilation) -> String {
         if !text.is_empty() {
             text.push('\n');
         }
-        let severity = if diagnostic.is_error() { "error" } else { "warning" };
-        text.push_str(&format!(
-            "CS{:04}: {severity}: {}",
-            diagnostic.code, diagnostic.message
-        ));
+        text.push_str(&diagnostic.render(path, source));
     }
     if text.is_empty() {
         text.push_str("compilation produced no image");
@@ -754,10 +987,83 @@ fn build_python(path: &Path, source: &str, board: Option<&str>) -> Result<Built,
     Ok(Built {
         bytes,
         extension: "lpyc",
-        what: "Python bundle",
+        what: PYTHON_BUNDLE,
+        note: None,
         excludes: "the Python interpreter firmware, which is by far the larger half and is \
                    already on the board",
+        loaded_into_firmware: true,
     })
+}
+
+/// The exit code the interpreter uses when a program is stopped by an exception nothing caught.
+const ABORTED_ON_EXCEPTION: i32 = 70;
+
+/// What a nonzero exit means, where this tool knows something the number does not say.
+///
+/// **70 IS TWO DIFFERENT ANSWERS AND THE RUNNER CANNOT TELL THEM APART.** The interpreter aborts on
+/// an unhandled exception with 70, and a program whose own `Main` returns 70 exits identically --
+/// so `lamella run` printed the same line for a thrown `InvalidOperationException` and for
+/// `return 70`, with nothing to choose between them.
+///
+/// **THE EXCEPTION'S TYPE, MESSAGE AND LOCATION DO NOT CROSS THE SEAM AT ALL**, so this cannot
+/// report them and must not imply that looking harder would find them. What it can do is say which
+/// two things the number means and name the way a program can usually answer it itself -- its own
+/// output DOES cross, so a `catch` that prints reaches the reader when the abort does not.
+///
+/// **"USUALLY" IS MEASURED AND NOT A HEDGE.** Some aborts skip the handler: a `new GpioController()`
+/// on the host exits 70 with neither the `try` body's output nor the `catch`'s, which is a trap
+/// rather than an exception and no handler can see it. Promising that a `catch` always answers the
+/// question would send those readers to write one that stays silent.
+///
+/// Empty for every other code: a program that returns 3 means whatever its author decided, and this
+/// tool has nothing to add to it.
+fn exit_note(exit: i32) -> String {
+    if exit != ABORTED_ON_EXCEPTION {
+        return String::new();
+    }
+    "\nThat code means one of two things, and the code alone cannot tell you which:\n\
+     \x20 - the program was stopped by an exception nothing caught, or\n\
+     \x20 - its own Main returned 70.\n\n\
+     A TRAP: line above this one settles it. It is printed when an exception escaped, and it\n\
+     carries that exception's type and message. No TRAP: line means the program returned 70 itself.\n\n\
+     Some aborts skip the handler and print nothing further -- which is itself the answer, because\n\
+     an exception a catch cannot see is not an exception.\n"
+        .to_owned()
+}
+
+/// Why no fit verdict can be given for `built` on `board`, when that is the case.
+///
+/// **A BOARD THAT DECLARES NO CARRIER CANNOT RUN AN ARTIFACT THAT IS LOADED INTO FIRMWARE**, so the
+/// arithmetic is sound and the question is the wrong one. A carrier records how a Lamella Link wire
+/// reaches a board; a part with no room for an interpreter and a wire protocol declares none, and
+/// then there is no resident firmware for an image to be loaded into, and never will be.
+///
+/// **THE HEADROOM IS NOT MERELY UNHELPFUL THERE -- THE CAVEAT ABOVE IT IS FALSE.** That caveat says
+/// the figure excludes "the serve firmware already resident on the board", which asserts a firmware
+/// this board cannot hold: a reader is told the number is an upper bound because of something that
+/// does not exist.
+///
+/// Answered here rather than inside the fit rule because the rule is given a byte count and this
+/// needs the artifact's TIER. `lamella fit --board <id> --image-bytes <n>` and the editor's fit tool
+/// are handed a bare number and structurally cannot know it; this path holds the artifact.
+fn no_carrier_refusal(
+    board_id: &str,
+    board: &lamella_bsp_gen::strata::BoardTable,
+    built: &Built,
+) -> Option<String> {
+    if !built.loaded_into_firmware || !board.carrier.kind.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "lamella build: {board_id} cannot run this {}.\n\n\
+         It declares no carrier -- no Lamella Link wire reaches it -- so there is no resident \
+         firmware for\nthis artifact to be loaded into, and a flash headroom figure would measure \
+         it against a tier the\nboard does not have.\n\n\
+         That is a property of the part rather than a gap in this build. The artifact itself was \
+         written\nand is unaffected; it is the fit question that has no answer here.\n\n\
+         `lamella boards` lists what each board can be given.",
+        built.what
+    ))
 }
 
 /// Answer "does this fit on that board" about what was just built.
@@ -780,6 +1086,10 @@ fn answer_fit(board_id: &str, built: &Built) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(refusal) = no_carrier_refusal(board_id, &board, built) {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
     println!("\ndoes it fit on {board_id}?");
     println!("  the number compared is the {}, which excludes", built.what);
     println!("  {},", built.excludes);
@@ -791,6 +1101,9 @@ fn answer_fit(board_id: &str, built: &Built) -> ExitCode {
 
 /// Read a source file and decide its language.
 fn read(path: &Path) -> Result<(Language, String), String> {
+    if crate::flash::is_project(path) {
+        return Ok((Language::CSharp, String::new()));
+    }
     let language = Language::of(path)?;
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -821,6 +1134,239 @@ fn host_sleep_ns(nanos: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a `Compilation` carrying diagnostics and no image, which is the only state the two
+    /// renderers below are reached in.
+    fn failed(diagnostics: Vec<lamella_assemble::Diagnostic>) -> lamella_assemble::Compilation {
+        lamella_assemble::Compilation {
+            diagnostics,
+            image: None,
+            pdb: None,
+            emit_error: None,
+        }
+    }
+
+    /// A diagnostic in Lamella's own namespace at `offset` in some source.
+    fn lamella_only(offset: u32) -> lamella_assemble::Diagnostic {
+        lamella_assemble::Diagnostic {
+            code: 1,
+            namespace: lamella_syntax::diagnostic::CodeNamespace::Lam,
+            severity: lamella_syntax::diagnostic::Severity::Error,
+            message: String::from("this build cannot emit that construct"),
+            span: lamella_syntax::span::Span::new(offset, offset + 1),
+        }
+    }
+
+    /// What a single-file build PRINTS, pinned: the file, the line, the column, and Lamella's own
+    /// prefix on a condition csc has no concept of.
+    ///
+    /// **THE EXACT TEXT IS THE ASSERTION.** Either renderer can be changed in any direction --
+    /// prefix, location, severity word, ordering -- without another test in this crate noticing,
+    /// so nothing short of the whole line pins what a reader is shown.
+    #[test]
+    fn a_single_file_build_names_the_file_the_line_and_the_namespace_it_is_reporting_in() {
+        let source = "class C\n{\n    void M() { }\n}\n";
+        let offset = source.find("void").expect("the fixture contains `void`") as u32;
+        let rendered = render_diagnostics(&failed(vec![lamella_only(offset)]), "App.cs", source);
+        assert_eq!(
+            rendered,
+            "App.cs(3,5): error LAM0001: this build cannot emit that construct"
+        );
+    }
+
+    /// Each file's diagnostics are rendered against THAT file's text.
+    ///
+    /// **THE PAIRING IS THE DEFECT THIS CATCHES.** The diagnostic lists arrive parallel to the
+    /// input order, so a renderer that zipped them against the wrong source would still print a
+    /// real code and a real path -- and a line number taken from a different file, which is the
+    /// kind of wrong answer a reader believes. The two fixtures put the same offset on different
+    /// lines precisely so a crossed pairing cannot produce the expected text.
+    #[test]
+    fn a_project_build_renders_each_diagnostic_against_the_file_it_is_attributed_to() {
+        let first = String::from("class First { void M() { } }");
+        let second = String::from("class\nSecond\n{ void M() { } }");
+        let texts = vec![
+            (first, String::from("First.cs")),
+            (second, String::from("Second.cs")),
+        ];
+        let compiled = lamella_assemble::MultiCompilation {
+            diagnostics: vec![vec![lamella_only(10)], vec![lamella_only(10)]],
+            image: None,
+            pdb: None,
+            emit_error: None,
+        };
+        let rendered = render_multi_diagnostics(&compiled, &texts);
+        assert_eq!(
+            rendered,
+            concat!(
+                "First.cs(1,11): error LAM0001: this build cannot emit that construct\n",
+                "Second.cs(2,5): error LAM0001: this build cannot emit that construct"
+            )
+        );
+    }
+
+    /// **THE SAME LINE FOR A THROWN EXCEPTION AND FOR `return 70`.** Measured before this note
+    /// existed: a program throwing `InvalidOperationException` and one whose `Main` returns 70
+    /// produced byte-identical output, `lamella run: the program exited 70`, with nothing to choose
+    /// between them and nothing to read.
+    #[test]
+    fn exit_seventy_says_which_two_things_it_means_and_does_not_promise_more() {
+        let note = exit_note(70);
+        assert!(
+            note.contains("one of two things"),
+            "it names the ambiguity: {note}"
+        );
+        assert!(
+            note.contains("nothing caught"),
+            "and the abort case: {note}"
+        );
+        assert!(
+            note.contains("TRAP:"),
+            "and it points at the line that settles it: {note}"
+        );
+        assert!(
+            note.contains("returned 70"),
+            "and the ordinary case: {note}"
+        );
+        assert!(
+            !note.contains("do not reach here"),
+            "and it no longer denies a report the runner now prints: {note}"
+        );
+        assert!(
+            note.contains("catch"),
+            "and the way to answer it from the program: {note}"
+        );
+        assert!(
+            note.contains("skip the handler"),
+            "and says when it will not fire: {note}"
+        );
+    }
+
+    /// **EVERY OTHER CODE MEANS WHATEVER ITS AUTHOR DECIDED.** A note attached to those would be
+    /// this tool inventing a meaning for somebody else's number.
+    #[test]
+    fn a_program_that_chose_its_own_exit_code_is_not_annotated() {
+        for code in [1, 2, 3, 69, 71, -1] {
+            assert!(
+                exit_note(code).is_empty(),
+                "{code} is the program's own answer"
+            );
+        }
+    }
+
+    fn artifact(what: &'static str, loaded_into_firmware: bool) -> Built {
+        Built {
+            bytes: vec![0; 1902],
+            extension: "lmli",
+            what,
+            note: None,
+            excludes: "the serve firmware already resident on the board",
+            loaded_into_firmware,
+        }
+    }
+
+    /// **THE DEFECT: A BOARD THAT CAN NEVER RUN THE ARTIFACT ANSWERED `FITS`.** Measured before the
+    /// fix on this board: `FITS -- 14482 B of flash to spare`, exit 0, for a part whose own fact
+    /// file says in published words that it "does not host an interpreter and a wire protocol".
+    /// The arithmetic was right and the question was the wrong one.
+    #[test]
+    fn a_board_with_no_carrier_cannot_be_asked_whether_a_loaded_artifact_fits() {
+        let Ok((board, _)) = catalog::resolve("muselab-nano-ch32v003") else {
+            return;
+        };
+        assert!(
+            board.carrier.kind.is_empty(),
+            "this board is the no-carrier case; the fixture moved"
+        );
+        let refusal = no_carrier_refusal(
+            "muselab-nano-ch32v003",
+            &board,
+            &artifact("baked flash image", true),
+        )
+        .expect("a board with no carrier cannot hold a loaded artifact");
+        assert!(
+            refusal.contains("muselab-nano-ch32v003"),
+            "it names the board: {refusal}"
+        );
+        assert!(
+            refusal.contains("baked flash image"),
+            "and what was built: {refusal}"
+        );
+        assert!(
+            refusal.contains("no carrier"),
+            "and the fact it read: {refusal}"
+        );
+        assert!(
+            refusal.contains("was written"),
+            "and that the artifact survived: {refusal}"
+        );
+        assert!(
+            refusal.starts_with(
+                "lamella build: muselab-nano-ch32v003 cannot run this baked flash image."
+            ),
+            "the first line is a sentence: {refusal}"
+        );
+    }
+
+    /// An artifact's NAME is a name, and its warning is carried apart from it.
+    ///
+    /// **THE NAME IS READ IN THREE PLACES AND TWO OF THEM ARE MID-SENTENCE**, following "cannot run
+    /// this" and "the number compared is the". A name carrying a parenthetical warning is fine on
+    /// the artifact line, where a reader is looking at what they just got, and arrives as nonsense
+    /// in either sentence -- so the two are separate fields and this asks that they stay separate.
+    ///
+    /// Every artifact this verb can produce is asked, rather than the one that happened to be
+    /// wrong: the defect was introduced by the build with no `bake` feature, which is the arm a
+    /// developer on a workstation gets and the one least likely to be read in a refusal.
+    #[test]
+    fn an_artifacts_name_is_a_name_and_carries_no_warning_of_its_own() {
+        for name in [BAKED_FLASH_IMAGE, ASSEMBLY, PYTHON_BUNDLE] {
+            assert!(
+                !name.contains('(') && !name.contains("NOT"),
+                "{name:?} is a name with a warning in it, and two readers put it mid-sentence"
+            );
+        }
+    }
+
+    /// **A BOARD THAT DECLARES A CARRIER IS STILL ANSWERED.** The control, without which this rule
+    /// could refuse everything and every assertion above would still pass.
+    #[test]
+    fn a_board_with_a_carrier_is_still_given_a_verdict() {
+        let Ok((board, _)) = catalog::resolve("bbc-micro-bit-v2") else {
+            return;
+        };
+        assert!(
+            !board.carrier.kind.is_empty(),
+            "this board is the carrier case; the fixture moved"
+        );
+        assert!(
+            no_carrier_refusal(
+                "bbc-micro-bit-v2",
+                &board,
+                &artifact("baked flash image", true)
+            )
+            .is_none(),
+            "a board with a wire can hold resident firmware, so the question is a real one"
+        );
+    }
+
+    /// An artifact that is NOT loaded into firmware is the whole flash occupant, so a board with no
+    /// wire is exactly where it belongs -- that is how this part is reached.
+    #[test]
+    fn an_artifact_that_is_not_loaded_into_firmware_is_not_refused_for_a_missing_wire() {
+        let Ok((board, _)) = catalog::resolve("muselab-nano-ch32v003") else {
+            return;
+        };
+        assert!(
+            no_carrier_refusal(
+                "muselab-nano-ch32v003",
+                &board,
+                &artifact("bare-metal image", false)
+            )
+            .is_none(),
+            "an image flashed whole needs no resident firmware and so needs no carrier"
+        );
+    }
 
     thread_local! {
         static PRINTED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };

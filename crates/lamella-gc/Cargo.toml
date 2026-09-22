@@ -18,7 +18,30 @@ publish = false
 lamella-aot = { path = "../lamella-aot" }
 
 [features]
-default = ["gc-collect"]
+default = ["gc-collect", "host-heap", "device-entry"]
+# The `Vec`-backed HOST heap and everything that needs a Rust global allocator: `Heap` itself, the
+# `TypeDesc`/`StackMapTable` decoded forms, the allocating `mark_compact`, and the host index-ABI
+# entry points in `device`. ON by default, so every existing consumer is unchanged.
+#
+# OFF is what lets this crate link into a binary that HAS NO GLOBAL ALLOCATOR -- the C# AOT image,
+# whose only allocator is `lamella_gc_alloc` itself. That image gets `DeviceHeap`, the `TypeResolver`
+# contract and `mark_compact_no_alloc`, which allocate nothing. Measured: with this feature on, the
+# staticlib fails to build with "no global memory allocator found but one is required" the moment the
+# crate is linked at all, whatever function is called -- an unconditional `extern crate alloc`
+# reaches the final crate graph on its own.
+host-heap = []
+# The C-ABI DEVICE ALLOCATOR ENTRY this crate exports on ARM: the `lamella_gc_alloc` naked shim and
+# the `#[no_mangle]` on `lamella_gc_alloc_impl`. ON by default, so a binary that wants this crate to
+# BE its allocator gets one.
+#
+# OFF is for an embedder that supplies its OWN entry point and calls the body as a Rust function --
+# which the C# AOT archive must, because the two entries are NOT interchangeable. Both crates define
+# both symbols, so linking them together is a duplicate; and the archive's shim writes the THREAD
+# ANCHOR its stack-map walker walks from, while this crate's captures SP/LR into arguments the body
+# then ignores. Letting this one win would produce a collector with no roots, which reclaims
+# everything -- the failure that looks like a working collector until a program holds a reference
+# across an allocation.
+device-entry = []
 # The mark-compact COLLECTOR ENGINE (Heap/DeviceHeap collect, the frame/stack walks, the
 # OOM retry-collect). Off = the `gc = bump` allocation mode: `alloc` stays (grow-only) and
 # the whole tracing engine compiles out of the binary; an out-of-memory allocation is

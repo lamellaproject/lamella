@@ -90,9 +90,26 @@ pub trait DebugBackend {
     }
 
     /// The current call depth, so the adapter can express depth-relative stepping
-    /// (`next` stays at or above the start depth, `stepOut` runs until below it). A
-    /// backend without unwinding may report `1` (then `next`/`stepOut` degrade to step).
+    /// (`next` stays at or above the start depth, `stepOut` runs until below it).
+    ///
+    /// A backend that cannot unwind reports a constant here and says so through
+    /// [`DebugBackend::tracks_depth`], which is what makes `next` / `stepOut` degrade to a single
+    /// step instead of running the whole [`DebugBackend::step_budget`] against a condition that can
+    /// never be met.
     fn depth(&self) -> usize;
+
+    /// Whether [`DebugBackend::depth`] actually VARIES with the call stack.
+    ///
+    /// `false` for a backend with no unwinder, which can only ever report a constant. The adapter
+    /// then degrades `next` and `stepOut` to a single step -- the right behaviour for an
+    /// instruction-level session, and the one both this trait and those backends already
+    /// documented.
+    ///
+    ///
+    /// The default is `true`: a backend that tracks depth exactly, like the interpreter.
+    fn tracks_depth(&self) -> bool {
+        true
+    }
 
     /// Replaces the breakpoints, each an opaque code address (see the module docs).
     /// Interpreter: `(method, instruction)` pairs. Device: native code addresses, set
@@ -212,8 +229,17 @@ pub trait DebugBackend {
     }
 
     /// Reads `len` bytes of target memory at `address`. Device: an ADIv5 MEM-AP read.
-    /// Interpreter: the managed heap is not flat addressable, so this is typically
-    /// empty -- inspection goes through [`DebugBackend::variables`] instead.
+    ///
+    /// **RETURNS EXACTLY `len` BYTES, OR FEWER BECAUSE THE READ FAILED. A SHORT ANSWER IS THE
+    /// FAILURE SIGNAL AND THERE IS NO OTHER ONE.** An implementor that cannot serve the whole
+    /// request returns what it has -- commonly nothing -- and never pads, invents or partially
+    /// fills to the asked width: a caller sizing a value by the width it asked for cannot detect a
+    /// short read any other way. **Check the length before reading the bytes.**
+    ///
+    /// **A backend that does not serve flat memory at all answers empty to every request**, which
+    /// is the interpreter's case below and is a property of the backend rather than of any one
+    /// read. [`DebugBackend::variables`] is where its inspection goes instead.
+    ///
     fn read_memory(&self, address: u64, len: usize) -> Vec<u8>;
 
     /// The target's registers. Device: the Cortex-M core registers. Interpreter: a

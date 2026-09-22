@@ -65,7 +65,7 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
         verb: "deploy",
         usage: Some(USAGE),
         values: &["--target", "--board", "--probe", "--volume", "--device", "--via"],
-        flags: &["--no-run", "--unsafe"],
+        flags: &["--no-run", "--unsafe", crate::flash::CLASS_LIBRARY_FLAG],
     };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
@@ -89,6 +89,22 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+
+    let tier = crate::flash::Tier::from_options(&parsed);
+    if tier == crate::flash::Tier::ClassLibrary && parsed.value("--target").is_some() {
+        eprintln!(
+            "{}",
+            crate::flash::tier_flag_where_nothing_links(
+                "deploy",
+                "--target hands the program to firmware that is already running, which resolves \
+                 what it needs\non the board itself.",
+                "Use --board <id> to compile and write the chip, which is the route that links.",
+                "Nothing was sent.",
+            )
+        );
+        return ExitCode::FAILURE;
+    }
+    let libraries: Vec<crate::flash::Library> = Vec::new();
 
     match (parsed.value("--board"), parsed.value("--target")) {
         (Some(_), Some(_)) => {
@@ -119,6 +135,8 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
             parsed.value("--device"),
             parsed.value("--via"),
             parsed.flag("--unsafe"),
+            tier,
+            &libraries,
         ),
         (None, Some(target)) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
             send_payload(&path, target, parsed.flag("--no-run"))
@@ -169,9 +187,10 @@ mod source_refusal_tests {
 }
 
 const USAGE: &str = "\
-usage: lamella deploy <file.cs> --target <t> [--no-run]   into firmware already on the board
-       lamella deploy <file.cs> --board <id> [--via probe|volume]                onto the bare chip
+usage: lamella deploy <file.cs|file.csproj> --target <t> [--no-run]    into firmware on the board
+       lamella deploy <file.cs|file.csproj> --board <id> [--via probe|volume]   onto the bare chip
                                [--probe <serial>] [--volume <name>] [--device <serial>]
+                               [--class-library]
 
 --target is a live connection (what `lamella devices` prints); --board is a board model (what
 `lamella boards` lists). The first keeps the board's firmware and takes about a second; the second
@@ -184,19 +203,30 @@ than one probe attached, `--via probe` refuses until you name one with --probe <
 
 --probe, --volume and --device name which probe, which drive and which USB DFU bootloader when
 several are attached, each on its own route, as `lamella flash` takes them.
+
+A .csproj builds every .cs beside it as ONE program and links the assemblies its <Reference>
+elements name, each by a <HintPath>. Nothing is available to a build that its project does not
+name. A single .cs file names no references and binds against the class library alone.
+
+--class-library links the program with the class library and the runtime support archive, so it
+may allocate, use floating point and call into System.*. Without it the flat tier is used, which
+is linker-free and resolves no call outside the program. Every build says which tier produced it.
+The class-library tier covers fewer boards; asking for it where there is no plan names the ones
+there are.
 ";
 
 /// Send a payload that is ALREADY built to firmware running at `target`.
 ///
 /// **THE VERB THAT COMPILES AND THE VERB THAT SENDS ARE THE SAME VERB, AND THAT IS THE POINT.**
 /// Somebody who built a `.lmli` on a build machine, or received one, has to be able to put it on a
-/// board -- and before this existed they could not: `deploy` refused it toward `flash` and `flash`
-/// refused it back toward `deploy`, a loop with no way out for anybody holding one.
+/// board.
 fn send_payload(path: &Path, target: &str, no_run: bool) -> ExitCode {
     if path.extension().and_then(|extension| extension.to_str()) == Some("lpyc") {
         eprintln!(
             "lamella deploy: {} is a Python bundle, which travels by a different wire message \
-             (DEPLOY_BUNDLE)\nthan a baked C# image. This verb does not send bundles.",
+             (DEPLOY_BUNDLE)\nthan a baked C# image. The host side of that message is not a \
+             library call yet, so this verb\ncannot send one -- and sending it down the image path \
+             would deploy successfully and leave the\nboard unable to boot what it holds.",
             path.display()
         );
         return ExitCode::FAILURE;

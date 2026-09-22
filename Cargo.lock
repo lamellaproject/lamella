@@ -391,6 +391,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-clock-host"
+version = "0.0.0"
+dependencies = [
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "lamella-cmsis-dap"
 version = "0.0.0"
 dependencies = [
@@ -679,6 +686,7 @@ dependencies = [
  "lamella-fs-fat",
  "lamella-generics",
  "lamella-metadata",
+ "lamella-pin-events",
  "lamella-token",
 ]
 
@@ -818,6 +826,7 @@ version = "0.0.0"
 dependencies = [
  "lamella-assemble",
  "lamella-cil-runtime",
+ "lamella-clock-host",
  "lamella-load",
  "lamella-metadata",
 ]
@@ -1026,6 +1035,8 @@ name = "lamella-wire-host"
 version = "0.0.0"
 dependencies = [
  "lamella-assemble",
+ "lamella-cil-runtime",
+ "lamella-clock-host",
  "lamella-debug-backend",
  "lamella-flash-format",
  "lamella-load",

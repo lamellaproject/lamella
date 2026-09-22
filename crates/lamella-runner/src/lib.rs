@@ -584,8 +584,28 @@ pub fn stop_exit(payload: &[u8]) -> Option<(i32, u8)> {
 /// runner's actual work -- the host reference runner, the browser runner, and the device firmware all call
 /// it. A bad assembly / load failure is reported as exit -1 with the reason in `stdout`; an unhandled
 /// trap is exit 70 (matching the interpreter's abort convention).
+///
+/// Installs no seams. An embedder with a clock, a monotonic source or a sleep to offer wants
+/// [`run_program_with`]; see its documentation for what a run without them silently does.
 #[must_use]
 pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
+    run_program_with(corlib_bytes, program_bytes, &mut |_vm| {})
+}
+
+/// [`run_program`] with the embedder's [`Vm`]-configure hook (see [`run_image_with`]): the seams the
+/// host or the board supplies are installed before the program runs.
+///
+/// **The CLOCK arrives through this hook, and a run without one does not fail -- it answers wrongly.**
+/// `DateTime.Now` reads zero ticks, `Environment.TickCount` never advances, and a `Thread.Sleep`
+/// computes a deadline that has already passed and returns immediately. So a program that TIMES
+/// itself reports no elapsed time for real work, and a program that PACES itself does not pace,
+/// with nothing in the output to say so.
+#[must_use]
+pub fn run_program_with(
+    corlib_bytes: &[u8],
+    program_bytes: &[u8],
+    configure: &mut dyn FnMut(&mut Vm),
+) -> RunResult {
     let corlib_bytes = lamella_load::resident_bytes(corlib_bytes);
     let program_bytes = lamella_load::resident_bytes(program_bytes);
     let corlib = match Assembly::read(corlib_bytes) {
@@ -601,6 +621,29 @@ pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
         Err(error) => return failure(&format!("load failed: {error}")),
     };
     let mut vm = Vm::default();
+    configure_machine(&mut vm, configure);
+    publish_wall_clock(&loaded.module, &mut vm);
+    let outcome = run(&loaded.module, &mut vm, loaded.entry, Vec::new());
+    let mut stdout = String::from_utf16_lossy(vm.output());
+    let exit = match outcome {
+        Ok(Some(Value::Int32(code))) => code,
+        Ok(_) => 0,
+        Err(trap) => {
+            stdout.push_str(&format!("TRAP: {trap}"));
+            TRAP_EXIT
+        }
+    };
+    RunResult { exit, stdout }
+}
+
+fn failure(reason: &str) -> RunResult {
+    RunResult { exit: -1, stdout: reason.to_string() }
+}
+
+/// Installs this crate's own [`Vm`] seams, then the embedder's, in that order.
+///
+/// Every path a program can start on goes through here, so a seam added here reaches all of them.
+fn configure_machine(vm: &mut Vm, configure: &mut dyn FnMut(&mut Vm)) {
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     #[cfg(target_os = "none")]
@@ -611,17 +654,33 @@ pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
         lamella_mmio::read16,
     );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
-    let outcome = run(&loaded.module, &mut vm, loaded.entry, Vec::new());
-    let exit = match outcome {
-        Ok(Some(Value::Int32(code))) => code,
-        Ok(_) => 0,
-        Err(_) => 70,
-    };
-    RunResult { exit, stdout: String::from_utf16_lossy(vm.output()) }
+    configure(vm);
 }
 
-fn failure(reason: &str) -> RunResult {
-    RunResult { exit: -1, stdout: reason.to_string() }
+/// Publishes a wall clock the embedder installed on the [`Vm`] into the MANAGED clock that actually
+/// answers `DateTime` -- and does nothing when the embedder installed none.
+///
+/// # The wrong answer this exists to stop
+///
+/// The wall clock's state is managed: `Lamella.Runtime.Clock` owns the anchor and the arithmetic,
+/// and `DateTime.UtcNow` reads it and nothing else. An embedder reaches that store by INVOKING a
+/// method on the loaded module ([`lamella_cil_runtime::set_wall_clock`]), which needs a `&Module`.
+///
+/// The configure hook is handed a `&mut Vm` and no module, so the only clock call reachable from
+/// inside it is [`Vm::set_now_ticks`] -- whose own doc says it writes a runtime field the managed
+/// clock does not read. An embedder holding the correct time therefore has exactly one call
+/// reachable from inside the hook, and that call alone does not reach `DateTime`: without this
+/// function, `Environment.TickCount` reads 200 across a 200 ms sleep while `DateTime.Now.Ticks`
+/// reads 0 in the same process, because `TickCount` is a `Vm` seam and `DateTime` is not.
+///
+/// Calling this after the hook closes that gap without changing the hook's signature, which is what
+/// makes it reach the embedders that already exist rather than only the ones written after it.
+fn publish_wall_clock(module: &lamella_cil_runtime::Module, vm: &mut Vm) {
+    if !vm.clock_is_set() {
+        return;
+    }
+    let ticks = vm.now_ticks();
+    lamella_cil_runtime::set_wall_clock(module, vm, ticks);
 }
 
 /// Answers a `HELLO` with this baked target's honest advertisement (or a `NAK` on a
@@ -1481,7 +1540,6 @@ fn fault_stop(
 }
 
 /// The exit code a trapped run reports, matching the interpreter's abort convention.
-#[cfg(feature = "baked-image")]
 const TRAP_EXIT: i32 = 70;
 
 /// Step until the call stack is no deeper than `floor`, or -- with `floor` `None` -- exactly one
@@ -1519,7 +1577,7 @@ fn step_to_depth(
             }
             Err(trap) => {
                 stream_output(transport, vm, sent)?;
-                return Ok(RunStop::Trap(fault(transport, vm, &format!("TRAP: {trap:?}"))?));
+                return Ok(RunStop::Trap(fault(transport, vm, &format!("TRAP: {trap}"))?));
             }
             Ok(Status::Running | Status::Paused) => {}
         }
@@ -1620,7 +1678,7 @@ fn run_until_stop(
                     return Ok(RunStop::Trap(fault(
                         transport,
                         vm,
-                        &format!("TRAP: {trap:?}"),
+                        &format!("TRAP: {trap}"),
                     )?));
                 }
                 Ok(Status::Running | Status::Paused) => {
@@ -1758,26 +1816,17 @@ pub fn run_debug_session_static(
         Err(why) => return fault_stop(transport, image_seq, &why),
     };
     let mut vm = Vm::default();
-    #[cfg(target_os = "none")]
-    vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
-    #[cfg(target_os = "none")]
-    vm.set_mmio_subword(
-        lamella_mmio::write8,
-        lamella_mmio::read8,
-        lamella_mmio::write16,
-        lamella_mmio::read16,
-    );
-    vm.set_memory_backend(Box::new(SafeMemory::new()));
-    configure(&mut vm);
+    configure_machine(&mut vm, configure);
+    publish_wall_clock(&module, &mut vm);
     let entry = match lamella_cil_runtime::boot_baked(&module, &mut vm, entry) {
         Ok(entry) => entry,
         Err(trap) => {
-            return fault_stop(transport, image_seq, &format!("static constructor: {trap:?}"));
+            return fault_stop(transport, image_seq, &format!("static constructor: {trap}"));
         }
     };
     let mut session = match Session::new(&module, entry, Vec::new()) {
         Ok(session) => session,
-        Err(trap) => return fault_stop(transport, image_seq, &format!("session: {trap:?}")),
+        Err(trap) => return fault_stop(transport, image_seq, &format!("session: {trap}")),
     };
     let mut at_reported_breakpoint = false;
     let mut sent = OutputCursors::at_end_of(&vm);
@@ -2040,24 +2089,15 @@ fn run_image_reporting(
         Err(why) => return (RunResult { exit: -1, stdout: String::new() }, Some(why)),
     };
     let mut vm = Vm::default();
-    #[cfg(target_os = "none")]
-    vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
-    #[cfg(target_os = "none")]
-    vm.set_mmio_subword(
-        lamella_mmio::write8,
-        lamella_mmio::read8,
-        lamella_mmio::write16,
-        lamella_mmio::read16,
-    );
-    vm.set_memory_backend(Box::new(SafeMemory::new()));
-    configure(&mut vm);
+    configure_machine(&mut vm, configure);
+    publish_wall_clock(&module, &mut vm);
     let entry = match lamella_cil_runtime::boot_baked(&module, &mut vm, entry) {
         Ok(entry) => entry,
         Err(trap) => {
             let stdout = String::from_utf16_lossy(vm.output());
             return (
                 RunResult { exit: TRAP_EXIT, stdout },
-                Some(format!("BOOT TRAP (static constructor): {trap:?}")),
+                Some(format!("BOOT TRAP (static constructor): {trap}")),
             );
         }
     };
@@ -2067,7 +2107,7 @@ fn run_image_reporting(
         Ok(lamella_cil_runtime::Ran::Finished(Some(Value::Int32(code)))) => (code, None),
         Ok(lamella_cil_runtime::Ran::Finished(_)) => (0, None),
         Ok(lamella_cil_runtime::Ran::Interrupted) => (INTERRUPTED_EXIT, None),
-        Err(trap) => (TRAP_EXIT, Some(format!("TRAP: {trap:?}"))),
+        Err(trap) => (TRAP_EXIT, Some(format!("TRAP: {trap}"))),
     };
     (RunResult { exit, stdout: String::from_utf16_lossy(vm.output()) }, fault)
 }
@@ -2848,24 +2888,15 @@ pub fn run_deployed_with(
 ) -> Result<Deployed, TransportError> {
     use lamella_wire::msg;
     let mut vm = Vm::default();
-    #[cfg(target_os = "none")]
-    vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
-    #[cfg(target_os = "none")]
-    vm.set_mmio_subword(
-        lamella_mmio::write8,
-        lamella_mmio::read8,
-        lamella_mmio::write16,
-        lamella_mmio::read16,
-    );
-    vm.set_memory_backend(Box::new(SafeMemory::new()));
-    configure(&mut vm);
+    configure_machine(&mut vm, configure);
+    publish_wall_clock(module, &mut vm);
     let entry = match lamella_cil_runtime::boot_baked(module, &mut vm, entry) {
         Ok(entry) => entry,
         Err(trap) => {
             let mut sent = OutputCursors::default();
             stream_output(transport, &vm, &mut sent)?;
             let result =
-                fault(transport, &vm, &format!("BOOT TRAP (static constructor): {trap:?}"))?;
+                fault(transport, &vm, &format!("BOOT TRAP (static constructor): {trap}"))?;
             return Ok(completed(transport, result, debug::reason::TRAP));
         }
     };
@@ -2923,7 +2954,7 @@ pub fn run_deployed_with(
         }
         Ok(lamella_cil_runtime::Ran::Interrupted) => Ok(Deployed::Interrupted),
         Err(trap) => {
-            let result = fault(transport, &vm, &format!("TRAP: {trap:?}"))?;
+            let result = fault(transport, &vm, &format!("TRAP: {trap}"))?;
             Ok(completed(transport, result, debug::reason::TRAP))
         }
     }
@@ -3098,17 +3129,7 @@ impl ReplSessionState {
             .map_err(|error| format!("bootstrap does not parse: {error:?}"))?;
 
         let mut vm = Vm::default();
-        #[cfg(target_os = "none")]
-        vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
-        #[cfg(target_os = "none")]
-        vm.set_mmio_subword(
-            lamella_mmio::write8,
-            lamella_mmio::read8,
-            lamella_mmio::write16,
-            lamella_mmio::read16,
-        );
-        vm.set_memory_backend(Box::new(SafeMemory::new()));
-        configure(&mut vm);
+        configure_machine(&mut vm, configure);
 
         if !has_open_headroom(&vm, bootstrap.len()) {
             return Err(String::from("not enough heap to open a session"));
@@ -3121,6 +3142,8 @@ impl ReplSessionState {
             let (module, name_index, type_index) = load_bootstrap(&assembly);
             (module, name_index, type_index, 1)
         };
+
+        publish_wall_clock(&module, &mut vm);
 
         let ctor = find_method(&module, REPL_CTOR_NAME)
             .ok_or_else(|| format!("bootstrap defines no {REPL_CTOR_NAME}"))?;
@@ -3139,7 +3162,7 @@ impl ReplSessionState {
         vm.set_static_field(root_slot, Value::Object(instance));
 
         run(&module, &mut vm, ctor, alloc::vec![Value::Object(instance)])
-            .map_err(|trap| format!("trap running {REPL_CTOR_NAME}: {trap:?}"))?;
+            .map_err(|trap| format!("trap running {REPL_CTOR_NAME}: {trap}"))?;
         let instance = current_instance(&vm, root_slot)?;
 
         Ok(ReplSessionState {
@@ -3198,7 +3221,7 @@ impl ReplSessionState {
             info.submit,
             alloc::vec![Value::Object(self.instance)],
         )
-        .map_err(|trap| SubmitError::Trapped(format!("submission trapped: {trap:?}")))?;
+        .map_err(|trap| SubmitError::Trapped(format!("submission trapped: {trap}")))?;
         self.instance = current_instance(&self.vm, self.root_slot)
             .map_err(SubmitError::Trapped)?;
         let output = String::from_utf16_lossy(&self.vm.output()[output_before..]);
@@ -3493,11 +3516,33 @@ pub fn serve_one_repl(
 ///
 /// `load` is the transfer arena: a transfer is chunked, so it has to survive between frames.
 ///
+/// Installs no seams; [`serve_one_with`] is the form that takes the embedder's hook, and the one a
+/// host driving this over a loopback link wants.
+///
 /// # Errors
 /// Propagates a [`TransportError`] from the carrier.
 pub fn serve_one(
     transport: &mut impl Transport,
     corlib_bytes: &[u8],
+    load: &mut ArtifactLoad,
+) -> Result<bool, TransportError> {
+    serve_one_with(transport, corlib_bytes, &mut |_vm| {}, load)
+}
+
+/// [`serve_one`] with the embedder's [`Vm`]-configure hook (see [`run_image_with`]): every program
+/// this serve runs gets the host's or the board's seams installed.
+///
+/// **The CLOCK arrives through this hook**, and a serve without one runs programs that read zero
+/// ticks and do not wait -- see [`run_program_with`] for what that looks like from the program's
+/// side. This is the path a host loopback link drives, so it is the path a developer's own machine
+/// takes.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+pub fn serve_one_with(
+    transport: &mut impl Transport,
+    corlib_bytes: &[u8],
+    configure: &mut dyn FnMut(&mut Vm),
     load: &mut ArtifactLoad,
 ) -> Result<bool, TransportError> {
     let Some(frame) = transport.poll()? else {
@@ -3529,12 +3574,12 @@ pub fn serve_one(
             transport.send(exec::EXEC_ACK, frame.seq, &[exec::ack::STARTED])?;
             #[cfg(feature = "baked-image")]
             let result = if kind == load::LOAD_IMAGE {
-                run_image(artifact.to_vec())
+                run_image_with(artifact.to_vec(), configure)
             } else {
-                run_program(corlib_bytes, artifact)
+                run_program_with(corlib_bytes, artifact, configure)
             };
             #[cfg(not(feature = "baked-image"))]
-            let result = run_program(corlib_bytes, artifact);
+            let result = run_program_with(corlib_bytes, artifact, configure);
             send_output(transport, debug::output::STDOUT, &result.stdout)?;
             let why = if result.exit == 70 { debug::reason::TRAP } else { debug::reason::DONE };
             send_stopped_result(transport, frame.seq, why, result.exit)?;

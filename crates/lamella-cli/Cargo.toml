@@ -121,11 +121,26 @@ lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 #
 # `wasm` is deliberately absent: no board is a WebAssembly board, and that target reaches users
 # through the embedding path rather than through this tool.
-default = ["aot-arm32", "aot-riscv32"]
+default = ["aot-arm32", "aot-riscv32", "class-library"]
 # Thumb code generation -- every Cortex-M board in the catalog.
 aot-arm32 = ["lamella-aot/arm32"]
 # RV32 code generation -- `muselab-nano-ch32v003` (RV32EC) and `esp-esp32c6-devkitc` in the catalog.
 aot-riscv32 = ["lamella-aot/riscv32"]
+# The CLASS-LIBRARY tier `--class-library` asks for: the program linked against corlib and the
+# runtime support archive, which is the only tier that can reach allocation, floating point and
+# System.* on a chip. Declared here as well as on the dependency for the reason stated above -- a
+# cargo feature is not visible to `cfg` outside the crate that declares it, and the refusal that
+# names this flag has to read what this build actually carries rather than a list written by hand.
+#
+# ON BY DEFAULT, AND THAT IS NOT THE SAME AS THE TIER BEING THE DEFAULT. The flat tier is still what
+# a build without the flag uses. What this decides is whether `--class-library` WORKS, and a flag
+# the tool's own refusals name has to work in the binary those refusals are printed by: a build that
+# names a way out and then refuses it is worse than one that never mentioned it.
+#
+# It pulls in `lamella-linker`, which `lamella-aot` keeps optional behind its own `linked` feature
+# and off by default -- correct there, because a consumer that only lowers wants no linker at all.
+# This tool is the shipping caller that crate is written for.
+class-library = ["lamella-aot/linked"]
 # The flash image and the deploy path: compile -> bake (`Module::write_baked`, which needs
 # `code-in-place`) -> `.lmli`, and the chunked deploy over Lamella Link. Default-OFF for the
 # reason above, which means a workspace build produces a `lamella` that cannot deploy -- stated in
@@ -136,6 +151,11 @@ bake = [
     "lamella-wire-host/baked",
     "lamella-wire-host/debug-backend", "dep:lamella-debug-backend",
 ]
+
+[[package.metadata.lamella.test-configuration]]
+name = "bake"
+args = ["--features", "bake"]
+why = "the flash image and `deploy`, which are off in a workspace build"
 
 [lints]
 workspace = true

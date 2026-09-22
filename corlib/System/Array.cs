@@ -96,8 +96,18 @@ namespace System
 
         public static void Reverse(Array array)
         {
-            int i = 0;
-            int j = array.Length - 1;
+            if ((object)array == null) throw new ArgumentNullException("array");
+            Reverse(array, 0, array.Length);
+        }
+
+        public static void Reverse(Array array, int index, int length)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            if (index < 0) throw new ArgumentOutOfRangeException("index");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+            if (array.Length - index < length) throw new ArgumentException("array");
+            int i = index;
+            int j = index + length - 1;
             while (i < j)
             {
                 object tmp = array.GetValue(i);
@@ -106,6 +116,10 @@ namespace System
                 i = i + 1;
                 j = j - 1;
             }
+        }
+
+        public void Initialize()
+        {
         }
 
         public static void Copy(Array sourceArray, Array destinationArray, int length)

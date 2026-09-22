@@ -261,9 +261,7 @@ pub const EXEC_STATUS: u8 = 0x4C;
 /// Host -> target: start something. Payload = `source(u8)` (see [`exec_source`]), `flags(u8)`
 /// (see [`exec_flags`]). Answered by [`EXEC_ACK`]; completion arrives later as [`EVT_STOPPED`].
 ///
-/// RESERVED, and refused by name where it is not implemented. One op replaces a
-/// two-by-two -- where the code comes from, and whether it starts halted -- that had been written as
-/// four message types.
+/// RESERVED, and refused by name where it is not implemented.
 pub const EXEC: u8 = 0x4D;
 /// Target -> host: `status(u8)` -- STARTED, not finished. Flushed before any reset the start
 /// implies. RESERVED alongside [`EXEC`].

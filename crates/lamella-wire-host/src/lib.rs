@@ -2,7 +2,7 @@
 
 pub use lamella_runner::{
     ArtifactLoad, OutputChunk, RunCollector, RunResult, baked_image_checksum, debug, deploy, exec,
-    load, repl, run_program, send_image, send_program, serve_one, stop_exit,
+    load, repl, run_program, send_image, send_program, serve_one, serve_one_with, stop_exit,
 };
 
 pub mod engine;

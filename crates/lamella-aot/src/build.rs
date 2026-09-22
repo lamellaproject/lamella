@@ -44,6 +44,15 @@ pub enum BuildError {
     UnmetDemand(alloc::string::String),
     /// The target string is not one this build supports.
     UnsupportedTarget,
+    /// The objects and the runtime-support archive did not link into one image.
+    #[cfg(feature = "linked")]
+    Link(lamella_linker::LinkError),
+    /// An object or archive THIS BUILD JUST PRODUCED could not be read back for the link step. It is
+    /// not an input error: the bytes came from `build_object_with_corlib` / `build_library_object` a
+    /// moment earlier, so this reports an emitter and a reader disagreeing about the format rather
+    /// than anything a caller passed in.
+    #[cfg(feature = "linked")]
+    ObjectRead(alloc::string::String),
     /// A function could not be lowered to the WASM target.
     #[cfg(feature = "wasm")]
     LowerWasm(wasm::LowerError),
@@ -57,6 +66,26 @@ pub enum BuildError {
     /// around. (`build_object_riscv` requires one; a library object has no entry -- that path differs.)
     #[cfg(feature = "riscv32")]
     NoEntryPoint,
+    /// The program names an assembly the build was never given, so every type and member it declares
+    /// resolves to nothing.
+    ///
+    /// **IT NAMES THE MISSING ASSEMBLY, BECAUSE NOTHING FURTHER DOWN CAN.** Without the supplying
+    /// assembly a call into it lowers as a bad operand, and a failure reported that way names no
+    /// assembly, no library and no tier -- so someone who factored a helper into a library reads it
+    /// as a defect in their own code, or in this compiler, rather than as a reference the build was
+    /// not handed.
+    ///
+    /// The name can only come from here. A caller can refuse a library file that does not exist or
+    /// cannot be read, but not one that was simply never mentioned -- only the program's own
+    /// `AssemblyRef` table records what it expected to be given.
+    UnresolvedAssemblyReference {
+        /// Every assembly the program references that the build was not given, in table order.
+        missing: alloc::vec::Vec<alloc::string::String>,
+        /// Every assembly the build WAS given, in the order the resolver searches them (corlib
+        /// first). Named because the useful question is which reference is absent FROM THIS SET,
+        /// and a caller that passed the wrong build of the right library sees it here.
+        supplied: alloc::vec::Vec<alloc::string::String>,
+    },
     /// A method's CIL body could not be lowered to MIR (e.g. an unsupported construct). Reported rather
     /// than silently leaving the method an empty stub, which would miscompile the program -- a stubbed
     /// `Main` returns nothing.
@@ -191,6 +220,145 @@ pub enum BuildError {
         /// Its size in bytes, so the refusal says how far past the bound it is.
         size: u32,
     },
+}
+
+/// Why an AOT build failed, as a sentence naming WHAT could not be built and WHERE.
+///
+/// **A refusal names the thing, not the variant.** A build failure is rendered with `{error:?}`
+/// wherever a caller has no better renderer, so an arm that adds nothing leaves someone compiling a
+/// program holding two enum names -- no method, no assembly, no remedy. Every arm below spends the
+/// payload its variant already carries, as [`BuildError::UnresolvedAssemblyReference`] spends the
+/// library list rather than naming the method that tripped over the gap.
+impl core::fmt::Display for BuildError {
+    #[allow(clippy::too_many_lines)]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BuildError::Parse => write!(f, "the assembly's metadata could not be read"),
+            BuildError::UnmetDemand(what) => write!(
+                f,
+                "the assembly requires something this backend does not implement: {what}",
+            ),
+            BuildError::UnsupportedTarget => {
+                write!(f, "the target named is not one this build supports")
+            }
+            #[cfg(feature = "linked")]
+            BuildError::Link(error) => write!(
+                f,
+                "the objects and the runtime-support archive did not link into one image: {error}",
+            ),
+            #[cfg(feature = "linked")]
+            BuildError::ObjectRead(what) => write!(
+                f,
+                "an object this build had just produced could not be read back for linking: {what} \
+                 -- the emitter and the reader disagree about the format, so this is not something a \
+                 caller passed in",
+            ),
+            #[cfg(feature = "wasm")]
+            BuildError::LowerWasm(error) => {
+                write!(f, "the WASM backend could not lower a function: {error}")
+            }
+            #[cfg(feature = "arm32")]
+            BuildError::LowerArm(error) => {
+                write!(f, "the ARM32 backend could not lower a function: {error}")
+            }
+            #[cfg(feature = "riscv32")]
+            BuildError::LowerRiscv(error) => {
+                write!(f, "the RISC-V backend could not lower a function: {error}")
+            }
+            #[cfg(feature = "riscv32")]
+            BuildError::NoEntryPoint => write!(
+                f,
+                "the assembly declares no static `Main`, so there is no entry point to build a \
+                 runnable image around",
+            ),
+            BuildError::UnresolvedAssemblyReference { missing, supplied } => write!(
+                f,
+                "the program references {} that the build was not given, and was given {}",
+                NameList(missing),
+                NameList(supplied),
+            ),
+            BuildError::LowerCil { rid, error } => {
+                write!(f, "the CIL body of method {rid} did not lower: {error:?}")
+            }
+            BuildError::SilentSeamCallEdge { caller, seam, total } => write!(
+                f,
+                "`{caller}` calls the runtime seam `{seam}`, which this build does not synthesize \
+                 and which is not marked as having an intended default -- so the call would link \
+                 and then answer a constant the caller cannot tell from a real result{}",
+                AndOthers(*total),
+            ),
+            BuildError::StubbedLibraryMethod { method, reason, total } => write!(
+                f,
+                "the library method `{method}` could not be emitted ({reason}), and a bare return \
+                 in its place would answer its first argument at every call{}",
+                AndOthers(*total),
+            ),
+            BuildError::PlaceholderLibraryMethod { method, reason, total } => write!(
+                f,
+                "the library method `{method}` kept the assembly's placeholder body, which answers \
+                 a constant at every call, because its own body did not lower ({reason}){}",
+                AndOthers(*total),
+            ),
+            BuildError::DuplicateMethodBody { rid, total } => {
+                write!(f, "two bodies were written for method {rid}{}", AndOthers(*total))
+            }
+            BuildError::MonomorphizedBody { index, instantiation, method, reason } => write!(
+                f,
+                "the monomorphized body {index} of `{method}` for `{instantiation}` did not \
+                 resolve: {reason:?}",
+            ),
+            BuildError::Instantiations(refusal) => {
+                write!(f, "the generic instantiations could not be planned: {refusal:?}")
+            }
+            BuildError::ValueTypeInstantiationSlot { instantiation } => write!(
+                f,
+                "`{instantiation}` needs a value-type slot this build cannot lay out",
+            ),
+            BuildError::UndispatchableInstantiation { instantiation } => {
+                write!(f, "`{instantiation}` has no dispatchable form in this build")
+            }
+            BuildError::ValueTypeTraceMap { type_name, size } => write!(
+                f,
+                "the value type `{type_name}` is {size} bytes, which is past the bound this \
+                 build's trace map can represent",
+            ),
+        }
+    }
+}
+
+/// A comma-separated list of names for a message, or `none` when the list is empty.
+///
+/// **`none` rather than nothing**, because an empty list is the interesting case in
+/// [`BuildError::UnresolvedAssemblyReference`]: "and was given" followed by silence reads as a
+/// truncated message rather than as the fact that no library was supplied at all.
+struct NameList<'a>(&'a [alloc::string::String]);
+
+impl core::fmt::Display for NameList<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return write!(f, "none");
+        }
+        for (i, name) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "`{name}`")?;
+        }
+        Ok(())
+    }
+}
+
+/// The tail a message gets when the named item is the FIRST of several, and nothing at all when it
+/// is the only one -- so one occurrence does not read as "and 0 others".
+struct AndOthers(usize);
+
+impl core::fmt::Display for AndOthers {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            0 | 1 => Ok(()),
+            n => write!(f, "; it is the first of {n}"),
+        }
+    }
 }
 
 /// Which part of a monomorphized body did not resolve, for a [`BuildError::MonomorphizedBody`] that
@@ -338,16 +506,23 @@ pub fn build_riscv32(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     }
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, _plan) = lower_assembly(&assembly, entry, &[])?;
+    let (funcs, plan) = lower_assembly(&assembly, entry, &[])?;
     let code = riscv32::lower_module(&funcs).map_err(BuildError::LowerRiscv)?;
-    Ok(riscv_virt_boot_image(&code))
+    let statics_words = crate::resolver::static_region_words(&assembly, &plan, &[]);
+    Ok(riscv_virt_boot_image(&code, statics_words))
 }
 
 /// Wraps RV32IM code whose function 0 is the entry in a QEMU `virt` boot image. Single-sourced here
 /// so [`build_riscv32`] and any harness that wants the same shape agree by construction, the way
 /// [`rp2350_boot_image`] serves both the browser export and the object-path flasher.
+///
+/// `statics_words` is the module's static region in words, which the stub CLEARS before it calls the
+/// entry -- the RISC-V half of what [`nordic_flat_image`] does, and for the same reason: the region's
+/// word 0 is the exception tag every call site tests on return, and a flat image has no linker and no
+/// crt0 to have written RAM before managed code reads it. An emulator that hands out zeroed RAM hides
+/// the difference; a part does not.
 #[cfg(feature = "riscv32")]
-pub fn riscv_virt_boot_image(code: &[u8]) -> Vec<u8> {
+pub fn riscv_virt_boot_image(code: &[u8], statics_words: u32) -> Vec<u8> {
     use lamella_asm_riscv32::{BranchCond, Encoder, Reg};
     let mut enc = Encoder::new();
     let entry = enc.new_label();
@@ -355,6 +530,16 @@ pub fn riscv_virt_boot_image(code: &[u8]) -> Vec<u8> {
     let write = enc.new_label();
     let halt = enc.new_label();
     enc.li(Reg::SP, RISCV_VIRT_SP_TOP as i32);
+    enc.li(Reg::T0, riscv32::STATIC_FIELD_BASE as i32);
+    let end = riscv32::STATIC_FIELD_BASE + statics_words * 4;
+    let upper = ((i64::from(end) + 0x800) >> 12) as u32;
+    enc.lui(Reg::T1, upper);
+    enc.addi(Reg::T1, Reg::T1, (end as i32).wrapping_sub((upper << 12) as i32));
+    let clear = enc.new_label();
+    enc.bind_label(clear);
+    enc.sw(Reg::ZERO, Reg::T0, 0);
+    enc.addi(Reg::T0, Reg::T0, 4);
+    enc.branch(BranchCond::LtU, Reg::T0, Reg::T1, clear);
     enc.jal(Reg::RA, entry);
     enc.branch(BranchCond::Eq, Reg::A0, Reg::ZERO, pass);
     enc.slli(Reg::T2, Reg::A0, 16);
@@ -423,6 +608,7 @@ pub fn build_ch32v003(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 /// The stub sets `sp` to the top of SRAM and calls the entry trampoline; a `Main` that returns lands
 /// in the spin below it. A real chip has no SiFive finisher to write a pass/fail word to, so unlike
 /// [`riscv_virt_boot_image`] there is nowhere to report a result -- the image parks instead.
+///
 #[cfg(feature = "riscv32")]
 pub fn ch32v003_boot_image(code: &[u8]) -> Vec<u8> {
     use lamella_asm_riscv32::{Encoder, Reg};
@@ -487,9 +673,10 @@ pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     }
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, _plan) = lower_assembly(&assembly, entry, &[])?;
+    let (funcs, plan) = lower_assembly(&assembly, entry, &[])?;
     let code = arm32::lower_module(&funcs).map_err(BuildError::LowerArm)?;
-    cortex_m_boot_image(target, &code)
+    let statics_words = crate::resolver::static_region_words(&assembly, &plan, &[]);
+    cortex_m_boot_image(target, &code, statics_words)
 }
 
 /// The Cortex-M chips this crate can shape a boot image for. Both the up-front validation in
@@ -504,7 +691,11 @@ pub const CORTEX_M_TARGETS: [&str; 4] = ["microbit", "nrf52833", "rp2040", "rp23
 /// [`build_py`] -- gets the SAME bytes in front of the same code, the way [`rp2350_boot_image`],
 /// [`riscv_virt_boot_image`] and [`ch32v003_boot_image`] already serve their own callers.
 #[cfg(feature = "arm32")]
-fn cortex_m_boot_image(target: &str, code: &[u8]) -> Result<Vec<u8>, BuildError> {
+fn cortex_m_boot_image(
+    target: &str,
+    code: &[u8],
+    statics_words: u32,
+) -> Result<Vec<u8>, BuildError> {
     Ok(match target {
         "rp2350" => rp2350_boot_image(0, code),
         "rp2040" => rp2040_boot_image(0, code),
@@ -513,14 +704,397 @@ fn cortex_m_boot_image(target: &str, code: &[u8]) -> Result<Vec<u8>, BuildError>
                 "nrf52833" => 0x2002_0000,
                 _ => 0x2000_4000,
             };
-            let mut image = Vec::with_capacity(8 + code.len());
-            image.extend_from_slice(&initial_sp.to_le_bytes());
-            image.extend_from_slice(&0x0000_0009u32.to_le_bytes());
-            image.extend_from_slice(code);
-            image
+            nordic_flat_image(initial_sp, code, statics_words)
         }
         _ => return Err(BuildError::UnsupportedTarget),
     })
+}
+
+/// Where a Nordic image's startup and fault handler live: after the sixteen-entry vector table and
+/// before the text, in the same place on both tiers.
+#[cfg(feature = "arm32")]
+const NORDIC_STUB_BASE: u32 = 0x40;
+/// Where a Nordic image's module text begins -- FLAT AND LINKED ALIKE. One layout for both tiers,
+/// so the question "which shape am I in" has one answer.
+#[cfg(feature = "arm32")]
+const NORDIC_TEXT_BASE: u32 = 0x100;
+/// Three words at the base of RAM where the fault handler records what it caught: the stacked PC,
+/// the stacked LR, and a magic written LAST as the commit flag. Free on both tiers -- the linked
+/// heap cursor starts at `0x2000_0100` and the flat statics at `0x2000_1000` -- and readable over
+/// SWD WITHOUT halting, which matters because halting is how a core leaves Lockup and loses the
+/// evidence.
+#[cfg(feature = "arm32")]
+const NORDIC_FAULT_RECORD: u32 = 0x2000_0000;
+/// Stamped over the record's third word once the first two are written, so a reader can tell a
+/// fault THIS run from an uncleared one left by whatever ran before -- the startup clears the record
+/// precisely so the distinction exists.
+#[cfg(feature = "arm32")]
+const NORDIC_FAULT_MAGIC: u32 = 0xFA17_1EDD;
+
+/// Emits the fault handler every Nordic image vectors its NMI, HardFault and the rest to: it records
+/// the exception frame's PC and LR into [`NORDIC_FAULT_RECORD`], stamps the magic, and parks.
+///
+/// **Without it a fault has nowhere to go.** A two-word vector table leaves words 2 to 15 -- NMI,
+/// HardFault, SVCall, PendSV, SysTick -- as whatever bytes follow, which for a flat image is the
+/// program's own code read as addresses: the core jumps into them and the second fault escalates to
+/// Lockup, where the PC reads as `0xFFFFFFFE` and the instruction that started it is gone. With the
+/// handler the same fault stops at a known address and leaves the faulting PC in RAM.
+///
+/// On exception entry the core stacks `{R0-R3, R12, LR, PC, xPSR}`, so the return address is at
+/// `SP+24` and the interrupted `LR` at `SP+20`; the handler runs on the same stack and pushes
+/// nothing before reading them.
+#[cfg(feature = "arm32")]
+fn emit_fault_handler(
+    enc: &mut lamella_asm_arm32::Encoder,
+    record_word: lamella_asm_arm32::Label,
+    magic_word: lamella_asm_arm32::Label,
+) {
+    use lamella_asm_arm32::Reg;
+    enc.ldr_sp(Reg::R0, 24).unwrap();
+    enc.ldr_literal(Reg::R1, record_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_sp(Reg::R0, 20).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    enc.ldr_literal(Reg::R0, magic_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 8).unwrap();
+    let park = enc.new_label();
+    enc.bind_label(park);
+    enc.b(park);
+}
+
+/// Clears the three words of [`NORDIC_FAULT_RECORD`] before managed code runs, so a record left by
+/// a PREVIOUS program cannot be read as this run's.
+///
+/// **RAM survives the reset a deploy ends with**, and the workflow that reads this record is deploy,
+/// then peek -- so an uncleared record is not a stale curiosity, it is the default reading.
+#[cfg(feature = "arm32")]
+fn emit_fault_record_clear(
+    enc: &mut lamella_asm_arm32::Encoder,
+    record_word: lamella_asm_arm32::Label,
+) {
+    use lamella_asm_arm32::Reg;
+    enc.movs_imm(Reg::R0, 0).unwrap();
+    enc.ldr_literal(Reg::R1, record_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 8).unwrap();
+}
+
+/// Assembles a Nordic image: the sixteen-entry vector table, the stub region at
+/// [`NORDIC_STUB_BASE`] holding the startup and the fault handler, and the text at
+/// [`NORDIC_TEXT_BASE`].
+///
+/// `fault_offset` is where the handler sits WITHIN `stub`, which is what the fault vectors point at.
+/// Sixteen entries and not forty-eight: the external IRQs would take the table to `0xC0` and leave
+/// too little for the startups, and neither tier enables an interrupt -- a system reset clears the
+/// NVIC enables, so no external IRQ can fire.
+#[cfg(feature = "arm32")]
+fn nordic_image(initial_sp: u32, fault_offset: u32, stub: &[u8], text: &[u8]) -> Vec<u8> {
+    use lamella_asm_arm32::Encoder;
+    assert!(
+        NORDIC_STUB_BASE as usize + stub.len() <= NORDIC_TEXT_BASE as usize,
+        "the startup and fault handler must fit between the vector table and the text"
+    );
+    let mut enc = Encoder::new();
+    enc.emit_word(initial_sp);
+    enc.emit_word(NORDIC_STUB_BASE | 1);
+    for _ in 2..16 {
+        enc.emit_word((NORDIC_STUB_BASE + fault_offset) | 1);
+    }
+    let table = enc.finish().expect("the nordic vector table assembles").bytes;
+    debug_assert_eq!(table.len(), NORDIC_STUB_BASE as usize);
+
+    let mut image = alloc::vec![0u8; NORDIC_TEXT_BASE as usize];
+    image[..table.len()].copy_from_slice(&table);
+    image[NORDIC_STUB_BASE as usize..NORDIC_STUB_BASE as usize + stub.len()].copy_from_slice(stub);
+    image.extend_from_slice(text);
+    image
+}
+
+/// The Nordic flat image: the vector table, a startup that CLEARS THE STATIC REGION and enters the
+/// module at [`NORDIC_TEXT_BASE`], and the fault handler both tiers share.
+///
+/// **The startup is where a linked image's crt0 would be.** These parts boot a raw binary from flash
+/// with no linker and no runtime startup, so nothing in the image writes RAM before managed code
+/// reads it -- and SRAM powers up undefined and keeps whatever was there. The static region's word 0
+/// is `g_exception_tag` (`cil::G_EXCEPTION_TAG_OFFSET`), which EVERY call site tests once its callee
+/// returns, so an undefined word there reads as an exception in flight: the first call in `Main`
+/// takes the method's propagation exit, and the program returns having done nothing. The type
+/// initializer flags in the same region read the same way -- a set flag means "already run", so a
+/// type would answer from storage its `.cctor` never wrote. [`rp2040_boot_image`] and
+/// [`rp2350_boot_image`] clear their band for this reason; so does [`riscv_virt_boot_image`].
+///
+/// The entry is entered with a bare `BX`, with `LR` exactly as reset left it, because on this path
+/// the entry IS the reset handler and its contract is that it never returns.
+#[cfg(feature = "arm32")]
+fn nordic_flat_image(initial_sp: u32, code: &[u8], statics_words: u32) -> Vec<u8> {
+    use lamella_asm_arm32::{Encoder, Reg};
+    let mut enc = Encoder::new();
+    let zero_start_word = enc.new_label();
+    let zero_end_word = enc.new_label();
+    let record_word = enc.new_label();
+    let magic_word = enc.new_label();
+    let entry_word = enc.new_label();
+
+    emit_fault_record_clear(&mut enc, record_word);
+    emit_zero_band(&mut enc, zero_start_word, zero_end_word);
+    enc.ldr_literal(Reg::R0, entry_word).unwrap();
+    enc.bx(Reg::R0);
+    let fault_offset = enc.position();
+    emit_fault_handler(&mut enc, record_word, magic_word);
+    enc.align_to_word();
+    enc.bind_label(zero_start_word);
+    enc.emit_word(arm32::STATIC_FIELD_BASE);
+    enc.bind_label(zero_end_word);
+    enc.emit_word(arm32::STATIC_FIELD_BASE + statics_words * 4);
+    enc.bind_label(record_word);
+    enc.emit_word(NORDIC_FAULT_RECORD);
+    enc.bind_label(magic_word);
+    enc.emit_word(NORDIC_FAULT_MAGIC);
+    enc.bind_label(entry_word);
+    enc.emit_word(NORDIC_TEXT_BASE | 1);
+    let stub = enc.finish().expect("the nordic startup assembles").bytes;
+
+    nordic_image(initial_sp, fault_offset, &stub, code)
+}
+
+/// Emits the band-clearing loop a reset stub runs before managed code: with `start_word` and
+/// `end_word` bound to literals holding the two addresses, it stores zero over `[start, end)` a word
+/// at a time, clobbering R0, R1 and R2. The first store is unconditional, which is right for every
+/// band this backend clears -- each is at least the one reserved word.
+///
+/// One copy for all three stubs: the rule that power-on RAM is cleared before managed code reads it
+/// gains its next chip in this function rather than in whichever stub the chip was added to.
+#[cfg(feature = "arm32")]
+fn emit_zero_band(
+    enc: &mut lamella_asm_arm32::Encoder,
+    start_word: lamella_asm_arm32::Label,
+    end_word: lamella_asm_arm32::Label,
+) {
+    use lamella_asm_arm32::{Cond, Reg};
+    enc.movs_imm(Reg::R0, 0).unwrap();
+    enc.ldr_literal(Reg::R1, start_word).unwrap();
+    enc.ldr_literal(Reg::R2, end_word).unwrap();
+    let zero_loop = enc.new_label();
+    enc.bind_label(zero_loop);
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.adds_imm8(Reg::R1, 4).unwrap();
+    enc.cmp_reg(Reg::R1, Reg::R2).unwrap();
+    enc.b_cond(Cond::CarryClear, zero_loop);
+}
+
+/// The entry symbol every object path names: the program's function 0.
+#[cfg(feature = "linked")]
+const LINKED_ENTRY_SYMBOL: &str = "f0";
+/// The bump allocator's cursor word: the fixed address the runtime-support archive reads, with its
+/// limit in the word directly above it.
+#[cfg(feature = "linked")]
+const NORDIC_HEAP_PTR: u32 = 0x2000_0100;
+/// The bump heap grows up from here.
+#[cfg(feature = "linked")]
+const NORDIC_HEAP_BASE: u32 = 0x2000_0200;
+/// The statics window handed to the linker, and the heap's ceiling in the same number: a heap that
+/// grew past here would overwrite the statics it is about to read.
+#[cfg(feature = "linked")]
+const NORDIC_STATICS_BASE: u32 = 0x2000_1000;
+/// How much of RAM the statics window spans -- the linker's own per-machine default for ARM, stated
+/// here because this path passes it explicitly rather than inheriting it.
+#[cfg(feature = "linked")]
+const NORDIC_STATICS_BYTES: u32 = 0x1000;
+
+/// Compiles a CIL assembly to a flashable bare-metal image for a Nordic Cortex-M chip, LINKED
+/// against `corlib` and the target ISA's runtime-support archive -- **the tier that has the class
+/// library on the chip.**
+///
+/// This is the three-step path the flat [`build_cortex_m`] cannot reach, offered as ONE call:
+/// [`build_object_with_corlib`] and [`build_library_object`] lower the program and the library to
+/// relocatable objects, `garbage_collect` drops what the entry cannot reach, `link_with_archives_ram`
+/// resolves the rest against the archive and places the statics window, and [`nordic_linked_image`]
+/// wraps the result in the part's vector table and startup.
+///
+/// **What it buys, measured rather than claimed:** a program that allocates, reads a static, indexes
+/// an array and calls `Console.Write` builds and runs here, and is REFUSED outright by the flat path
+/// (`LowerArm(CallUnsupported)`), which resolves no call outside the program.
+///
+/// `corlib` and `archive` are the caller's to supply: the assembly this program was compiled
+/// against, and `liblamella_runtime_support.a` built for the target's ISA. A caller with neither on
+/// hand wants [`build_cortex_m`] and its limits.
+#[cfg(feature = "linked")]
+pub fn build_linked_cortex_m(
+    cil: &[u8],
+    corlib: &[u8],
+    archive: &[u8],
+    target: &str,
+) -> Result<Vec<u8>, BuildError> {
+    build_linked_cortex_m_with_libraries(cil, corlib, &[], archive, target)
+}
+
+/// [`build_linked_cortex_m`], with USER CLASS LIBRARIES beside the corlib -- the tier a board
+/// reaches, taking a program that was factored into more than one assembly.
+///
+/// `libraries` are the assemblies BESIDE `corlib`, in the order the resolver should search them;
+/// a cross-assembly name resolves to the FIRST declarer. Passing `&[]` is exactly
+/// [`build_linked_cortex_m`], which delegates here.
+///
+/// # Why corlib is a separate parameter rather than element zero
+///
+/// An ordered set whose first element happened to be a user library would build an image whose
+/// static initializers never run: the `.cctor` chain is threaded from corlib's presence, so corlib
+/// has to be identifiable rather than merely first by convention. Keeping it its own parameter makes
+/// that a type error instead of a silent one.
+///
+/// # Each library is lowered against the ones BEFORE it
+///
+/// A library object is built with references `[corlib] + libraries[..i]`, so a later library may use
+/// an earlier one and the search order is the same one the program was lowered against. A library
+/// built against the whole list including itself would resolve its own names through a second
+/// identity for the same rows.
+#[cfg(feature = "linked")]
+pub fn build_linked_cortex_m_with_libraries(
+    cil: &[u8],
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+    target: &str,
+) -> Result<Vec<u8>, BuildError> {
+    let initial_sp: u32 = match target {
+        "nrf52833" => 0x2002_0000,
+        "microbit" => 0x2000_4000,
+        _ => return Err(BuildError::UnsupportedTarget),
+    };
+    let program_object = build_object_with_libraries(cil, corlib, libraries)?;
+    let library_object = build_library_object(corlib)?;
+    let read = |bytes: &[u8]| {
+        lamella_elf::read_object(bytes).map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))
+    };
+    let mut objects = alloc::vec![read(&program_object)?, read(&library_object)?];
+    let user_objects: Vec<Vec<u8>> = libraries
+        .iter()
+        .enumerate()
+        .map(|(i, library)| {
+            let mut references: Vec<&[u8]> = alloc::vec![corlib];
+            references.extend_from_slice(&libraries[..i]);
+            build_library_object_with_references(library, &references, false)
+        })
+        .collect::<Result<_, _>>()?;
+    for object in &user_objects {
+        objects.push(read(object)?);
+    }
+    let support = lamella_elf::read_archive(archive)
+        .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
+    let trimmed = lamella_linker::garbage_collect(&objects, LINKED_ENTRY_SYMBOL);
+    let linked = link_product_image(&trimmed, &[support], LINKED_ENTRY_SYMBOL, Some(NORDIC_TEXT_BASE))
+        .map_err(BuildError::Link)?;
+    Ok(nordic_linked_image(
+        initial_sp,
+        linked.entry_offset,
+        &linked.text,
+    ))
+}
+
+/// THE PRODUCT LINK, AND IT IS STATED HERE ONCE SO THAT NOTHING CAN STATE IT A SECOND TIME.
+///
+/// Every tier that produces a flashable Cortex-M image reaches the linker through this function,
+/// and so does the tool that records the size ledger's shipping row. A caller that reached
+/// [`lamella_linker`] directly would be stating a second opinion about what the product does, and
+/// the two can then disagree with nothing saying so. A caller of this function cannot drift from
+/// the product, because it IS the product.
+///
+/// **A ROW THAT TRACKS THE DEVICE BY AGREEING WITH IT IS NOT TRACKING THE DEVICE.** The ledger's
+/// `text_gc` row carries the same bytes as this path whenever the statics window below is also the
+/// linker's ARM default. That agreement is a property of the current RAM plan, not a guarantee,
+/// and nothing would report its loss.
+///
+/// `text_base` is the caller's, because placement is a per-tier decision and does not change the
+/// size. The STATICS WINDOW is not the caller's: it is the product's RAM plan, and a ledger that
+/// passed its own copy of it would be the same second opinion one argument further in.
+#[cfg(feature = "linked")]
+pub fn link_product_image(
+    trimmed: &[lamella_elf::Object],
+    archives: &[lamella_elf::Archive],
+    entry: &str,
+    text_base: Option<u32>,
+) -> Result<lamella_linker::LinkedImage, lamella_linker::LinkError> {
+    lamella_linker::link_gc_with_archives_ram(
+        trimmed,
+        archives,
+        entry,
+        text_base,
+        (NORDIC_STATICS_BASE, NORDIC_STATICS_BYTES),
+    )
+}
+
+/// Wraps LINKED text in a Nordic boot image: `[initial SP][reset -> the startup]`, the startup, then
+/// the text at [`NORDIC_TEXT_BASE`].
+///
+/// **The startup is the whole of this part's crt0, and it does three things in this order.** It
+/// CLEARS `[NORDIC_HEAP_PTR, NORDIC_STATICS_BASE + NORDIC_STATICS_BYTES)` -- the allocator's cursor
+/// words, the heap band and the statics window the linker was given, whose word 0 is the VES-global
+/// exception tag every call site tests on return. Then it seeds the cursor and its limit, which the
+/// archive stops on rather than bumping past. Then it enters the entry.
+///
+/// **The order is load-bearing: the clear covers the cursor words, so seeding first would zero the
+/// seed.** And the clear is not optional on a part -- SRAM powers up undefined, there is no crt0 on
+/// this route, and an uncleared window means the first call returns as though an exception were in
+/// flight and a static field reads garbage instead of the CIL default.
+///
+/// A `Main` that returns lands in the park below the call rather than in whatever reset left in `LR`.
+/// The flat path enters its entry with a bare `BX` instead, because there the entry IS the reset
+/// handler and its contract is that it never returns; here the entry is an ordinary linked function.
+///
+/// It shares the flat path's vector table and fault handler, so a fault on this tier is recorded
+/// rather than escalated -- which matters because the linked tier is no more immune to undefined RAM
+/// than the flat one, only better supplied.
+#[cfg(feature = "linked")]
+fn nordic_linked_image(initial_sp: u32, entry_offset: u32, text: &[u8]) -> Vec<u8> {
+    use lamella_asm_arm32::{Encoder, Reg};
+    let mut enc = Encoder::new();
+    let zero_start_word = enc.new_label();
+    let zero_end_word = enc.new_label();
+    let heap_ptr_word = enc.new_label();
+    let heap_base_word = enc.new_label();
+    let heap_limit_word = enc.new_label();
+    let record_word = enc.new_label();
+    let magic_word = enc.new_label();
+    let entry_word = enc.new_label();
+
+    emit_fault_record_clear(&mut enc, record_word);
+    emit_zero_band(&mut enc, zero_start_word, zero_end_word);
+    enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
+    enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, heap_limit_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    enc.ldr_literal(Reg::R0, entry_word).unwrap();
+    enc.blx(Reg::R0);
+    let park = enc.new_label();
+    enc.bind_label(park);
+    enc.b(park);
+    let fault_offset = enc.position();
+    emit_fault_handler(&mut enc, record_word, magic_word);
+    enc.align_to_word();
+    enc.bind_label(zero_start_word);
+    enc.emit_word(NORDIC_HEAP_PTR);
+    enc.bind_label(zero_end_word);
+    enc.emit_word(NORDIC_STATICS_BASE + NORDIC_STATICS_BYTES);
+    enc.bind_label(heap_ptr_word);
+    enc.emit_word(NORDIC_HEAP_PTR);
+    enc.bind_label(heap_base_word);
+    enc.emit_word(NORDIC_HEAP_BASE);
+    enc.bind_label(heap_limit_word);
+    enc.emit_word(NORDIC_STATICS_BASE);
+    enc.bind_label(record_word);
+    enc.emit_word(NORDIC_FAULT_RECORD);
+    enc.bind_label(magic_word);
+    enc.emit_word(NORDIC_FAULT_MAGIC);
+    enc.bind_label(entry_word);
+    enc.emit_word((NORDIC_TEXT_BASE + entry_offset) | 1);
+    let stub = enc
+        .finish()
+        .expect("the nordic linked startup assembles")
+        .bytes;
+
+    nordic_image(initial_sp, fault_offset, &stub, text)
 }
 
 /// Compiles an already-lowered PYTHON module to a flashable bare-metal image for a Cortex-M chip,
@@ -550,7 +1124,7 @@ pub fn build_py(funcs: &[Function], target: &str) -> Result<Vec<u8>, BuildError>
     }
     let (code, _maps) = arm32::lower_module_py(funcs, None, arm32::PySupport::default())
         .map_err(BuildError::LowerArm)?;
-    cortex_m_boot_image(target, &code)
+    cortex_m_boot_image(target, &code, 1)
 }
 
 /// The per-method debug info [`build_debug`] returns: `(MethodDef rid, the function's image offset, its
@@ -562,8 +1136,11 @@ pub type MethodDebug = alloc::vec::Vec<(u32, u32, arm32::LineTable)>;
 /// As [`build_cortex_m`], but also returns per-method debug line tables -- so a device debugger steps the
 /// flashed image. It is build()'s EXACT chip path (the trampoline at code offset 0, rid-indexed methods,
 /// stub gaps), so the SAME bytes are produced and the line tables match the layout BY CONSTRUCTION.
-/// Offsets are IMAGE-relative (the code sits at image offset 8, after the vector table); cross-method
-/// calls resolve (the rid-indexed layout). `device-dap-server` uses this instead of single-method debug.
+/// Offsets are IMAGE-relative -- **the module sits at image offset `0x100`** ([`NORDIC_TEXT_BASE`]),
+/// after the sixteen-entry vector table and the stub region holding the startup and fault handler --
+/// and cross-method calls resolve (the rid-indexed layout). `device-dap-server` uses this instead of
+/// single-method debug.
+///
 #[cfg(feature = "arm32")]
 pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), BuildError> {
     let initial_sp: u32 = match target {
@@ -572,18 +1149,16 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
     };
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, maps, fails, duplicates, _plan) = lower_assembly_debug(&assembly, entry, &[])?;
+    let (funcs, maps, fails, duplicates, plan) = lower_assembly_debug(&assembly, entry, &[])?;
     refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(BuildError::LowerCil { rid, error });
     }
     let (code, method_lines) =
         arm32::lower_module_debug(&funcs, None, &maps).map_err(BuildError::LowerArm)?;
-    let mut image = Vec::with_capacity(8 + code.len());
-    image.extend_from_slice(&initial_sp.to_le_bytes());
-    image.extend_from_slice(&0x0000_0009u32.to_le_bytes());
-    image.extend_from_slice(&code);
-    const PREFIX: u32 = 8;
+    let statics_words = crate::resolver::static_region_words(&assembly, &plan, &[]);
+    let image = nordic_flat_image(initial_sp, &code, statics_words);
+    const PREFIX: u32 = NORDIC_TEXT_BASE;
     let debug = method_lines
         .into_iter()
         .enumerate()
@@ -627,7 +1202,13 @@ pub const RP2350_RESULT_ADDR: u32 = 0x2007_F000;
 /// Stamped at [`RP2350_RESULT_ADDR`] before the entry runs ("booted, in managed code").
 #[cfg(feature = "arm32")]
 pub const RP2350_BOOT_MAGIC: u32 = 0xB007_1A6D;
-/// Stamped over [`RP2350_BOOT_MAGIC`] once the entry returns; `RESULT_ADDR + 4` then holds the result.
+/// Stamped over [`RP2350_BOOT_MAGIC`] once the entry returns; `RESULT_ADDR + 4` then holds the
+/// result. **This magic is the guard, and the result word means nothing without it:**
+/// `RESULT_ADDR + 4` sits above the band the reset stub zeroes, so a warm reset does not clear it,
+/// and after one image is flashed over another it still carries the FIRST program's answer until
+/// this magic replaces [`RP2350_BOOT_MAGIC`]. A mailbox reading `[BOOT_MAGIC, 42]` therefore says
+/// *"this program has not returned"*, and the 42 beside it belongs to whatever ran before. Read the
+/// pair, never the second word alone.
 #[cfg(feature = "arm32")]
 pub const RP2350_DONE_MAGIC: u32 = 0x4C41_4D44;
 
@@ -642,7 +1223,7 @@ pub const RP2350_DONE_MAGIC: u32 = 0x4C41_4D44;
 /// and the object-path flasher agree on the boot layout + verdict mailbox.
 #[cfg(feature = "arm32")]
 pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
-    use lamella_asm_arm32::{Cond, Encoder, Reg};
+    use lamella_asm_arm32::{Encoder, Reg};
     /// XIP flash base: the bootrom boots the vector table here after validating IMAGE_DEF.
     const CODE_REGION: u32 = 0x1000_0000;
     /// Link base for the program text, after the vector table + IMAGE_DEF + reset stub region.
@@ -704,15 +1285,7 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     enc.ldr_literal(Reg::R0, region_word).unwrap();
     enc.ldr_literal(Reg::R1, vtor_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
-    enc.movs_imm(Reg::R0, 0).unwrap();
-    enc.ldr_literal(Reg::R1, zero_start_word).unwrap();
-    enc.ldr_literal(Reg::R2, zero_end_word).unwrap();
-    let zero_loop = enc.new_label();
-    enc.bind_label(zero_loop);
-    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
-    enc.adds_imm8(Reg::R1, 4).unwrap();
-    enc.cmp_reg(Reg::R1, Reg::R2).unwrap();
-    enc.b_cond(Cond::CarryClear, zero_loop);
+    emit_zero_band(&mut enc, zero_start_word, zero_end_word);
     enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
     enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
@@ -900,7 +1473,7 @@ fn boot2_checksum(payload: &[u8]) -> u32 {
 /// of scanning the image), and its RAM is 264 KB rather than 520.
 #[cfg(feature = "arm32")]
 pub fn rp2040_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
-    use lamella_asm_arm32::{Cond, Encoder, Reg};
+    use lamella_asm_arm32::{Encoder, Reg};
     /// Link base for the program text, past the vector table + reset stub region.
     const CODE_BASE: u32 = RP2040_VECTOR_BASE + 0x100;
     /// Top of the 264 KB SRAM window (SRAM0-3 256 KB + SRAM4/5 2x4 KB, contiguous); the stack
@@ -951,15 +1524,7 @@ pub fn rp2040_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     enc.ldr_literal(Reg::R0, vectors_word).unwrap();
     enc.ldr_literal(Reg::R1, vtor_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
-    enc.movs_imm(Reg::R0, 0).unwrap();
-    enc.ldr_literal(Reg::R1, zero_start_word).unwrap();
-    enc.ldr_literal(Reg::R2, zero_end_word).unwrap();
-    let zero_loop = enc.new_label();
-    enc.bind_label(zero_loop);
-    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
-    enc.adds_imm8(Reg::R1, 4).unwrap();
-    enc.cmp_reg(Reg::R1, Reg::R2).unwrap();
-    enc.b_cond(Cond::CarryClear, zero_loop);
+    emit_zero_band(&mut enc, zero_start_word, zero_end_word);
     enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
     enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
@@ -1195,6 +1760,106 @@ fn build_object_inner(
     build_object_core(cil, corlib, libraries, false, false, None).map(|(bytes, _)| bytes)
 }
 
+/// The `TypeRef` a `MemberRef`'s parent names, following a `TypeSpec` through to the generic
+/// DEFINITION it instantiates.
+///
+/// A call into a generic type declared next door -- `Holder<int>::Get` -- is parented by a
+/// `TypeSpec` rather than by the `TypeRef`, so a walk that read only the `TypeRef` case could not
+/// see that the library supplying `Holder` was absent. `None` for a parent that names no referenced
+/// type at all: a `TypeDef` is this assembly's own, and a `ModuleRef` or a `MethodDef` parent names
+/// no assembly to blame.
+#[cfg(feature = "arm32")]
+fn member_parent_type_ref(assembly: &Assembly, parent: Token) -> Option<Token> {
+    match parent.table() {
+        table::TYPE_REF => Some(parent),
+        table::TYPE_SPEC => {
+            let SigType::GenericInst { definition, .. } = assembly.type_spec_signature(parent)?
+            else {
+                return None;
+            };
+            match *definition {
+                SigType::Class(token) | SigType::ValueType(token)
+                    if token.table() == table::TYPE_REF =>
+                {
+                    Some(token)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The referenced assemblies whose members this program USES and that the build was not given.
+///
+/// Consulted only when a body has already failed to lower, so it can name the absent `-r` instead of
+/// leaving the blame on whichever method happened to reach the missing definition first.
+///
+/// **Conservative on purpose, and the direction is the whole design.** A `TypeRef` counts when some
+/// `MemberRef` names it as parent -- a method called, a field read, or a type constructed, all of
+/// which are code that cannot lower without the definition. **A miss leaves the caller the
+/// diagnostic they already had; a misfire hands them a confident wrong one**, and only one of those
+/// is worth risking.
+///
+/// The one exclusion is ATTRIBUTE constructors, and it is drawn by REACHABILITY rather than by
+/// name. Every csc-emitted assembly carries unresolvable
+/// `System.Runtime.CompilerServices.*Attribute` references whose only members are `.ctor`s, so
+/// counting every `.ctor` would blame `System.Runtime` on any unrelated lowering failure in any
+/// program. But an attribute's constructor is named by the **`CustomAttribute` table** and a
+/// `newobj` target never is, so excluding the ones that table names is narrower than excluding
+/// every `.ctor` -- and a library a program merely CONSTRUCTS is named like any other.
+/// A type that is both an attribute and constructed by the program would still be skipped, which
+/// keeps the exclusion on the side that misses rather than the side that misfires.
+/// A GENERIC library is named like any other: [`member_parent_type_ref`] follows a `TypeSpec` parent
+/// through to the definition it instantiates, so `Holder<int>::Get` blames the assembly declaring
+/// `Holder`.
+#[cfg(feature = "arm32")]
+fn used_unresolved_assemblies(
+    assembly: &Assembly,
+    references: &[&Assembly],
+) -> Vec<alloc::string::String> {
+    let mut missing: Vec<alloc::string::String> = Vec::new();
+    let mut attribute_parents: Vec<Token> = Vec::new();
+    for ctor in assembly.custom_attribute_ctors() {
+        if ctor.table() != table::MEMBER_REF {
+            continue;
+        }
+        let Some(ctor_ref) = assembly.member_ref(ctor.row()) else {
+            continue;
+        };
+        let parent = ctor_ref.parent();
+        if !attribute_parents.contains(&parent) {
+            attribute_parents.push(parent);
+        }
+    }
+    for member in assembly.member_refs() {
+        if member.name() == Some(".ctor") && attribute_parents.contains(&member.parent()) {
+            continue;
+        }
+        let Some(parent) = member_parent_type_ref(assembly, member.parent()) else {
+            continue;
+        };
+        let Some(type_ref) = assembly.type_ref(parent.row()) else {
+            continue;
+        };
+        let scope = type_ref.resolution_scope();
+        if scope.table() != table::ASSEMBLY_REF {
+            continue;
+        }
+        let Some(name) = type_ref.name() else { continue };
+        if Assembly::find_in_references(references, name.namespace, name.name).is_some() {
+            continue;
+        }
+        let Some(owner) = assembly.assembly_ref(scope.row()).and_then(|row| row.name()) else {
+            continue;
+        };
+        if !missing.iter().any(|already| already == owner) {
+            missing.push(owner.into());
+        }
+    }
+    missing
+}
+
 #[cfg(feature = "arm32")]
 fn build_object_core(
     cil: &[u8],
@@ -1238,6 +1903,15 @@ fn build_object_core(
         cil_fails
     } else {
         if let Some((rid, error)) = cil_fails.into_iter().next() {
+            let missing = used_unresolved_assemblies(&assembly, &references);
+            if !missing.is_empty() {
+                let supplied = references
+                    .iter()
+                    .filter_map(|a| a.assembly_name())
+                    .map(alloc::string::String::from)
+                    .collect();
+                return Err(BuildError::UnresolvedAssemblyReference { missing, supplied });
+            }
             return Err(BuildError::LowerCil { rid, error });
         }
         Vec::new()
@@ -2791,14 +3465,14 @@ fn lower_reachable<'a>(
         max_rid + 1,
     )
     .map_err(BuildError::Instantiations)?;
-    let precise = crate::resolver::precise_init_types(assembly, references);
+    let type_inits = crate::resolver::type_init_types(assembly, references);
     let thunk_base = max_rid as usize + 1 + plan.len();
-    let thunk_indices: Vec<(u32, u32)> = precise
+    let thunk_indices: Vec<(u32, u32)> = type_inits
         .iter()
         .enumerate()
         .map(|(i, (type_row, _, _))| (*type_row, (thunk_base + i) as u32))
         .collect();
-    let mut funcs: Vec<Function> = (0..thunk_base + precise.len()).map(|_| stub()).collect();
+    let mut funcs: Vec<Function> = (0..thunk_base + type_inits.len()).map(|_| stub()).collect();
     let mut lowered = vec![false; funcs.len()];
     let cctors = startup_cctors(assembly, references);
     let init = find_native_export(assembly, "lamella_time_init");
@@ -2840,7 +3514,7 @@ fn lower_reachable<'a>(
                 Some(body) => lower_monomorphized_method_body(assembly, &resolver, body)?,
                 None => match thunk_indices.iter().position(|(_, index)| *index == rid) {
                     Some(i) => {
-                        let (_, cctor, flag_slot) = precise[i];
+                        let (_, cctor, flag_slot) = type_inits[i];
                         type_init_thunk_body(flag_slot * 4, cctor)
                     }
                     None => match lower_one_reachable(assembly, &resolver, rid)? {
@@ -3878,21 +4552,25 @@ fn find_cctors(assembly: &Assembly) -> Vec<u32> {
 
 /// The type initializers the STARTUP still runs -- [`find_cctors`] minus the ones a trigger owns.
 ///
-/// A type marked `beforefieldinit` licenses running its initializer at any time before first static
-/// field access, so the startup chain remains a conformant place to run it and it stays here. A type
-/// demanding precise timing does not: its initializer must run AT first access, which is what
-/// [`type_init_thunk_body`] does, so running it here as well would defeat the trigger it was built
-/// for -- the observable order would be eager again and every check would find the flag already set.
+/// **THIS IS THE EMPTY SET FOR ANY ASSEMBLY WHOSE INITIALIZERS CAN ALL BE TRIGGERED.** A relaxed
+/// type belongs to its trigger rather than to the chain, and the difference is not only about
+/// observable order: a `.cctor` in the chain is a direct call from `f0`, and `f0` is where the
+/// reachability walk starts, so chaining a relaxed initializer roots everything it touches. See
+/// [`crate::resolver::type_init_cctor`] for the measurement and for why the precise trigger set is
+/// a conformant home for a relaxed initializer.
+///
+/// A `.cctor` a trigger owns must NOT also be run here: the observable order would be eager again
+/// and every check would find the flag already set, which is the trigger defeated rather than added.
 ///
 /// **THE SUBTRACTION IS THE WHOLE CHANGE IN BEHAVIOR, AND IT IS ONLY SAFE BECAUSE THE TRIGGER
 /// EXISTS.** Removing a `.cctor` from this list without a site that calls it does not make the tier
 /// lazy, it makes the initializer never run: `static-init-corlib` answers 2 instead of 42 that way,
 /// a wrong answer rather than a smaller image.
 fn startup_cctors<'x>(assembly: &'x Assembly<'x>, references: &[&'x Assembly<'x>]) -> Vec<u32> {
-    let precise = crate::resolver::precise_init_types(assembly, references);
+    let type_inits = crate::resolver::type_init_types(assembly, references);
     find_cctors(assembly)
         .into_iter()
-        .filter(|rid| !precise.iter().any(|(_, cctor, _)| cctor == rid))
+        .filter(|rid| !type_inits.iter().any(|(_, cctor, _)| cctor == rid))
         .collect()
 }
 
@@ -3900,17 +4578,25 @@ fn startup_cctors<'x>(assembly: &'x Assembly<'x>, references: &[&'x Assembly<'x>
 /// that a linking program's startup still chains, by rid in that reference.
 ///
 /// Same subtraction, decided by the same rule -- but it asks [`crate::resolver::cross_assembly_type_init`]
-/// rather than [`crate::resolver::precise_init_types`], because across the boundary "demands precise
-/// timing" is not sufficient on its own: the thunk must also be NAMEABLE. A reference with no file
-/// bytes has no content hash and therefore no `L<hash>.init<row>` symbol for a site here to call, and
-/// for such a type this keeps the `.cctor` in the chain and the trigger sites emit nothing. Eager,
-/// which is a conformance deviation this tier already carried, rather than never -- which would be a
-/// wrong answer.
+/// rather than [`crate::resolver::type_init_types`], because across the boundary "owns an
+/// initializer" is not sufficient on its own: the thunk must also be NAMEABLE. A reference with no
+/// file bytes has no content hash and therefore no `L<hash>.init<row>` symbol for a site here to
+/// call, and for such a type this keeps the `.cctor` in the chain and the trigger sites emit
+/// nothing. Eager, which is a conformance deviation this tier already carried, rather than never --
+/// which would be a wrong answer.
+///
+/// **`beforefieldinit` MARKS A TYPE WHOSE INITIALIZATION NEED NOT BE PRECISELY TIMED. IT IS A
+/// RELAXATION, NOT AN INSTRUCTION TO INITIALIZE EAGERLY.** Read the other way round, every relaxed
+/// `.cctor` in a referenced assembly joins the startup chain, where it is a direct call from `f0`
+/// and therefore a reachability root -- which in corlib reaches `DateTimeFormatInfo`,
+/// `Double.ToString`, `flt2dec` and the Unicode tables from a program that touches none of them.
 ///
 /// **DROPPING ONE THAT HAS NO TRIGGER IS THE SILENT FAILURE, AND IT IS WHY THIS IS NOT
-/// `find_cctors` MINUS `precise_init_types`.** The image still links and still boots; the type just
-/// answers from zeroed storage. `static-init-corlib` scores exactly that shape as 2 instead of 42,
-/// and `static-init-reference` scores it for a type that demands precise timing.
+/// `find_cctors` MINUS [`crate::resolver::type_init_types`].** The image still links and still
+/// boots; the type just answers from zeroed storage. `static-init-corlib` scores exactly that shape
+/// as 2 instead of 42, `static-init-reference` scores it for a type that demands precise timing, and
+/// `verify-aot-cctor-reach` scores it for a RELAXED type reached without being named -- which is the
+/// case a filter written over this list, rather than over the predicate, gets wrong.
 fn reference_startup_cctors(assembly: &Assembly) -> Vec<u32> {
     let triggered: Vec<u32> = assembly
         .type_defs()
@@ -4291,20 +4977,16 @@ fn type_init_thunk_body(flag_offset: u32, cctor: u32) -> Function {
 /// its side effects, then `return entry()`. With no `.cctor`s this is just `return entry()` -- the
 /// plain trampoline.
 ///
-/// **RUNNING EVERY INITIALIZER EARLY IS CONFORMANT FOR A `beforefieldinit` TYPE AND A DEVIATION FOR
-/// THE REST.** ECMA-335 I.8.9.5 permits a marked type's initializer to run at any point at or before
-/// the first access to one of its static fields, so the chain is exactly right for those. An
-/// UNMARKED type is required to be triggered by first static-field access, first static-method call,
-/// first value-type instance call or first construction, and running it before `Main` is early.
+/// **THE CHAIN IS NOW THE RESIDUE, NOT THE MECHANISM.** Every initializer a trigger can reach is
+/// taken out of it ([`startup_cctors`], [`reference_startup_cctors`]), so what arrives here is only
+/// what nothing could trigger -- today, a reference with no file bytes to hash and therefore no
+/// thunk symbol to call. Eager for those, which is early rather than wrong.
 ///
-/// So the deviation is bounded by the UNMARKED, INITIALIZER-BEARING population and by nothing else.
-/// `lamella-assemble` writes the flag under csc's rule -- every type except one declaring an
-/// explicit `static C()` (`TYPE_BEFORE_FIELD_INIT` in `compile.rs`) -- which keeps that population
-/// small. A cctor census prices it for a given assembly, and it reports
-/// the two halves separately because a type carrying the flag WITHOUT an initializer costs nothing.
-///
-/// Precise, before-first-access initialization is what a trigger-site rewrite replaces this function
-/// with; until then a caller gets eager order.
+/// **A CONFORMANT CHOICE AT THE SEMANTIC LAYER IS A ROOT SET AT THE LINK LAYER, AND NOTHING
+/// CONNECTS THE TWO.** Running a relaxed initializer before `Main` is permitted (ECMA-335 I.8.9.5),
+/// so a chain carrying every one of them is correct and costs nothing observable. It is not free:
+/// a `.cctor` named here is a direct call from `f0`, and `f0` is the root of the reachability walk,
+/// so whatever the chain names, the image keeps. Keep the chain to what nothing can trigger.
 fn startup(init: Option<u32>, cctors: &[u32], entry_rid: u32) -> Function {
     startup_with_references(init, &[], cctors, entry_rid)
 }
@@ -6285,9 +6967,9 @@ fn lower_assembly_seams<'a>(
         max_rid + 1,
     )
     .map_err(BuildError::Instantiations)?;
-    let precise = crate::resolver::precise_init_types(assembly, references);
+    let type_inits = crate::resolver::type_init_types(assembly, references);
     let thunk_base = max_rid as usize + 1 + plan.len();
-    let total = thunk_base + precise.len();
+    let total = thunk_base + type_inits.len();
     let mut bodies = BodySlots::new(total);
     let mut maps: Vec<cil::CilSourceMap> =
         (0..total).map(|_| cil::CilSourceMap::default()).collect();
@@ -6298,7 +6980,7 @@ fn lower_assembly_seams<'a>(
             entry_rid,
         );
     }
-    let thunk_indices: Vec<(u32, u32)> = precise
+    let thunk_indices: Vec<(u32, u32)> = type_inits
         .iter()
         .enumerate()
         .map(|(i, (type_row, _, _))| (*type_row, (thunk_base + i) as u32))
@@ -6401,7 +7083,7 @@ fn lower_assembly_seams<'a>(
             lower_monomorphized_method_body(assembly, &resolver, body)?,
         );
     }
-    for (i, (_, cctor, flag_slot)) in precise.iter().enumerate() {
+    for (i, (_, cctor, flag_slot)) in type_inits.iter().enumerate() {
         bodies.write(
             (thunk_base + i) as u32,
             type_init_thunk_body(flag_slot * 4, *cctor),
@@ -10515,8 +11197,12 @@ mod tests {
     /// rather than imported from the implementation ([`CORTEX_M_TARGETS`]'s two Nordic entries are
     /// the nRF51's 16 KiB and the nRF52833's 128 KiB at `0x2000_0000`), so this is an answer key
     /// rather than a mirror.
+    ///
+    /// It pins the STARTUP too, because the Python path reaches the exception tag as surely as the
+    /// CIL one does: a `raise` writes that word and an `except` reads it. A front end that laid the
+    /// table itself and skipped the startup would build a program that runs until its first call.
     #[test]
-    fn build_py_lays_the_same_nordic_vector_table_the_cil_path_does() {
+    fn build_py_lays_the_same_nordic_boot_image_the_cil_path_does() {
         for (target, sp) in [("microbit", 0x2000_4000u32), ("nrf52833", 0x2002_0000)] {
             let image = build_py(&[py_identity()], target).expect("builds");
             assert_eq!(
@@ -10524,11 +11210,41 @@ mod tests {
                 &sp.to_le_bytes(),
                 "{target}: word 0 is the initial stack pointer"
             );
-            assert_eq!(
-                &image[4..8],
-                &0x0000_0009u32.to_le_bytes(),
-                "{target}: word 1 is the reset vector -> offset 8, Thumb bit set"
+            // Indexed by WORD, because a vector table is a table of words and every number below
+            // is a slot rather than a byte offset.
+            let word = |slot: usize| {
+                let at = slot * 4;
+                u32::from_le_bytes([image[at], image[at + 1], image[at + 2], image[at + 3]])
+            };
+            // The numbers are spelled out rather than imported, so this is an answer key: reset
+            // enters the startup at 0x40, every fault vector reaches the handler above it, and the
+            // module begins at 0x100.
+            assert_eq!(word(1), 0x41, "{target}: reset enters the startup at 0x40, Thumb bit set");
+            let fault = word(2);
+            assert_eq!(fault & 1, 1, "{target}: the fault vector sets the Thumb bit");
+            assert!(
+                (0x40..0x100).contains(&(fault & !1)),
+                "{target}: the fault handler lives in the stub region, not in the program"
             );
+            for slot in 2..16 {
+                assert_eq!(
+                    word(slot),
+                    fault,
+                    "{target}: vector {slot} reaches the handler rather than the module's bytes"
+                );
+            }
+            // The startup's literals, in the order it emits them: the region to clear, then the
+            // fault record, the magic, and the entry. The Python path's region is the reserved word.
+            // The stub region is words 0x10..0x40 -- bytes 0x40 to 0x100.
+            let at = (0x10..0x40)
+                .find(|slot| word(*slot) == arm32::STATIC_FIELD_BASE)
+                .expect("the startup names the static base");
+            assert_eq!(
+                word(at + 1),
+                arm32::STATIC_FIELD_BASE + 4,
+                "{target}: the startup clears the one reserved word the tag lives in"
+            );
+            assert!(image.len() > 0x100, "{target}: the module follows the stub region");
         }
     }
 
@@ -10624,7 +11340,7 @@ mod tests {
     #[test]
     fn the_boot_image_builder_refuses_a_chip_rather_than_defaulting_to_nordic() {
         assert!(matches!(
-            cortex_m_boot_image("ch32v003", &[0x70, 0x47]),
+            cortex_m_boot_image("ch32v003", &[0x70, 0x47], 1),
             Err(BuildError::UnsupportedTarget)
         ));
     }
@@ -10814,5 +11530,237 @@ mod tests {
             );
         }
         assert!(clock_seam_body(Some("MonotonicMilliseconds"), &[SigType::I8]).is_none());
+    }
+
+    /// A BUILD REFUSAL NAMES THE THING, NOT THE VARIANT.
+    ///
+    /// The case that prompted this: a user compiling a program was handed `LowerArm(CallUnsupported)`
+    /// -- two enum names and nothing to act on. These assert the PROPERTY rather than the wording, so
+    /// the sentences stay editable: each message must contain the identifier the caller would search
+    /// for, and must not be the bare `Debug` form.
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn a_lowering_refusal_says_what_could_not_be_lowered_rather_than_naming_a_variant() {
+        let rendered =
+            alloc::format!("{}", BuildError::LowerArm(crate::arm32::LowerError::CallUnsupported));
+        assert!(
+            rendered.contains("ARM32"),
+            "the message must name the backend that gave up: {rendered}"
+        );
+        assert!(
+            rendered.contains("module lowering"),
+            "this refusal means the wrong entry point was called, and the message has to say so \
+             rather than leaving a reader to think their program is unsupported: {rendered}"
+        );
+        assert_ne!(
+            rendered,
+            alloc::format!("{:?}", BuildError::LowerArm(crate::arm32::LowerError::CallUnsupported)),
+            "Display must not fall back to Debug"
+        );
+        assert!(
+            !rendered.contains("CallUnsupported"),
+            "the variant name is what reached the user, so it must not survive: {rendered}"
+        );
+    }
+
+    /// The refusal `lead 364` built names the LIBRARY; this holds it to naming BOTH lists, because
+    /// the useful question is which reference is missing from the set that WAS supplied.
+    #[test]
+    fn a_missing_reference_names_the_library_and_what_was_supplied_instead() {
+        let rendered = alloc::format!(
+            "{}",
+            BuildError::UnresolvedAssemblyReference {
+                missing: alloc::vec![alloc::string::String::from("Math2")],
+                supplied: alloc::vec![alloc::string::String::from("mscorlib")],
+            }
+        );
+        assert!(rendered.contains("Math2"), "the missing library: {rendered}");
+        assert!(rendered.contains("mscorlib"), "what was supplied: {rendered}");
+    }
+
+    /// An EMPTY supplied list must read as a fact, not as a truncated sentence.
+    #[test]
+    fn a_build_given_no_libraries_at_all_says_none_rather_than_trailing_off() {
+        let rendered = alloc::format!(
+            "{}",
+            BuildError::UnresolvedAssemblyReference {
+                missing: alloc::vec![alloc::string::String::from("Math2")],
+                supplied: alloc::vec![],
+            }
+        );
+        assert!(
+            rendered.contains("none"),
+            "'and was given' followed by silence reads as a cut-off message: {rendered}"
+        );
+    }
+
+    /// ONE occurrence must not read as "the first of 1", and several must say how many.
+    #[test]
+    fn a_count_of_one_adds_nothing_and_a_count_of_several_says_how_many() {
+        let one = alloc::format!(
+            "{}",
+            BuildError::DuplicateMethodBody { rid: 7, total: 1 }
+        );
+        assert!(one.contains("method 7"), "{one}");
+        assert!(!one.contains("first of"), "one occurrence is not the first of anything: {one}");
+
+        let several = alloc::format!(
+            "{}",
+            BuildError::DuplicateMethodBody { rid: 7, total: 4 }
+        );
+        assert!(several.contains("first of 4"), "{several}");
+    }
+
+    /// NO MESSAGE CARRIES A RUN OF SPACES.
+    ///
+    /// **This is not tidiness.** A wrapped message is written with a trailing `\` so the literal
+    /// keeps the source's shape, and that continuation is what strips the next line's indentation.
+    /// Without the backslash the indentation is baked into the sentence a user reads -- and every
+    /// `contains` assertion about that message still passes, so nothing else here would catch it.
+    #[test]
+    fn no_build_refusal_renders_a_run_of_spaces() {
+        let name = || alloc::string::String::from("Ns.Type::Method");
+        let messages = alloc::vec![
+            alloc::format!("{}", BuildError::Parse),
+            alloc::format!("{}", BuildError::UnmetDemand(name())),
+            alloc::format!("{}", BuildError::UnsupportedTarget),
+            alloc::format!(
+                "{}",
+                BuildError::UnresolvedAssemblyReference {
+                    missing: alloc::vec![name()],
+                    supplied: alloc::vec![name()],
+                }
+            ),
+            alloc::format!(
+                "{}",
+                BuildError::SilentSeamCallEdge { caller: name(), seam: name(), total: 3 }
+            ),
+            alloc::format!(
+                "{}",
+                BuildError::StubbedLibraryMethod {
+                    method: name(),
+                    reason: name(),
+                    total: 1,
+                }
+            ),
+            alloc::format!(
+                "{}",
+                BuildError::PlaceholderLibraryMethod {
+                    method: name(),
+                    reason: name(),
+                    total: 2,
+                }
+            ),
+            alloc::format!("{}", BuildError::DuplicateMethodBody { rid: 3, total: 5 }),
+            alloc::format!(
+                "{}",
+                BuildError::ValueTypeInstantiationSlot { instantiation: name() }
+            ),
+            alloc::format!(
+                "{}",
+                BuildError::UndispatchableInstantiation { instantiation: name() }
+            ),
+            alloc::format!(
+                "{}",
+                BuildError::ValueTypeTraceMap { type_name: name(), size: 9000 }
+            ),
+        ];
+        assert_renders_as_one_sentence(&messages);
+    }
+
+    /// Asserts the property every refusal in this crate has to have, in ONE place.
+    ///
+    /// A wrapped Rust string literal that loses its trailing `\\` keeps the newline AND the source
+    /// indentation, so the message arrives with a run of spaces in the middle of a sentence. The
+    /// defect is invisible to the assertions people actually write: `contains("could not lower")`
+    /// passes on a message with eighteen spaces in it, because `contains` is blind to everything
+    /// the message ALSO contains.
+    ///
+    /// Extracted rather than copied a fourth time. The lists below are per backend and this is not,
+    /// so a backend added later brings a list and inherits the check instead of inheriting nothing.
+    fn assert_renders_as_one_sentence(messages: &[alloc::string::String]) {
+        for message in messages {
+            assert!(
+                !message.contains("  "),
+                "a refusal reached a reader with its source indentation in it: {message}"
+            );
+            assert!(!message.is_empty(), "every refusal must say something");
+        }
+    }
+
+    /// The same property for the ARM32 lowering's own messages, which is where the defect was.
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn no_arm32_lowering_refusal_renders_a_run_of_spaces() {
+        use crate::arm32::LowerError;
+        let messages = alloc::vec![
+            alloc::format!("{}", LowerError::ControlFlowUnsupported),
+            alloc::format!("{}", LowerError::TooManyValues),
+            alloc::format!("{}", LowerError::NonIntegerValue),
+            alloc::format!("{}", LowerError::CodeTooLarge { site: None }),
+            alloc::format!("{}", LowerError::CallUnsupported),
+            alloc::format!(
+                "{}",
+                LowerError::StringSeamWithoutDescriptor {
+                    seam: alloc::string::String::from("lamella_string_new"),
+                }
+            ),
+            alloc::format!(
+                "{}",
+                LowerError::BigStructResultUnsupported { call: "callvirt" }
+            ),
+            alloc::format!(
+                "{}",
+                LowerError::UnencodableStringUnit { unit: 0xD800, index: 2 }
+            ),
+        ];
+        assert_renders_as_one_sentence(&messages);
+    }
+
+    /// The RISC-V lowering's messages.
+    #[cfg(feature = "riscv32")]
+    #[test]
+    fn no_riscv32_lowering_refusal_renders_a_run_of_spaces() {
+        use crate::riscv32::LowerError;
+        let messages = alloc::vec![
+            alloc::format!("{}", LowerError::Unsupported),
+            alloc::format!("{}", LowerError::TooManyValues),
+            alloc::format!("{}", LowerError::ControlFlowUnsupported),
+            alloc::format!(
+                "{}",
+                LowerError::CodeTooLarge { at: 64, offset: 8192, limit: 4096 }
+            ),
+            alloc::format!(
+                "{}",
+                LowerError::StringSeamWithoutDescriptor {
+                    seam: alloc::string::String::from("lamella_string_new"),
+                }
+            ),
+            alloc::format!(
+                "{}",
+                LowerError::BigStructResultUnsupported { call: "callvirt" }
+            ),
+            alloc::format!(
+                "{}",
+                LowerError::UnencodableStringUnit { unit: 0xD800, index: 2 }
+            ),
+        ];
+        assert_renders_as_one_sentence(&messages);
+    }
+
+    /// The WASM lowering's messages, on the same terms.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn no_wasm_lowering_refusal_renders_a_run_of_spaces() {
+        use crate::wasm::LowerError;
+        let messages = alloc::vec![
+            alloc::format!("{}", LowerError::Unsupported),
+            alloc::format!("{}", LowerError::ControlFlowUnsupported),
+            alloc::format!(
+                "{}",
+                LowerError::UnencodableStringUnit { unit: 0xDC00, index: 0 }
+            ),
+        ];
+        assert_renders_as_one_sentence(&messages);
     }
 }

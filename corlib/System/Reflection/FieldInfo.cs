@@ -11,9 +11,27 @@ namespace System.Reflection
             [Lamella.Runtime.RuntimeProvided] get { return null; }
         }
 
-        [Lamella.Runtime.RuntimeProvided] public object GetValue(object obj) { return null; }
+        public object GetValue(object obj)
+        {
+            if (!IsStatic && (object)obj == null)
+            {
+                throw new TargetException("Non-static field requires a target.");
+            }
+            return GetValueCore(obj);
+        }
 
-        [Lamella.Runtime.RuntimeProvided] public void SetValue(object obj, object value) { }
+        public void SetValue(object obj, object value)
+        {
+            if (!IsStatic && (object)obj == null)
+            {
+                throw new TargetException("Non-static field requires a target.");
+            }
+            SetValueCore(obj, value);
+        }
+
+        [Lamella.Runtime.RuntimeProvided] private object GetValueCore(object obj) { return null; }
+
+        [Lamella.Runtime.RuntimeProvided] private void SetValueCore(object obj, object value) { }
 
         public bool IsLiteral
         {

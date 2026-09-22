@@ -6,6 +6,9 @@ namespace System.Reflection
     {
         protected ConstructorInfo() { }
 
+        public static readonly string ConstructorName = ".ctor";
+        public static readonly string TypeConstructorName = ".cctor";
+
         [Lamella.Runtime.RuntimeProvided] public object Invoke(object[] parameters) { return null; }
     }
 }

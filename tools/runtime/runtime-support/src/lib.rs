@@ -73,43 +73,60 @@ const HEAP_PTR: *mut u32 = 0x2000_0100 as *mut u32;
 /// at its first allocation, printing `HEAPFULL`, where the cause is unmistakable.
 const HEAP_END: *mut u32 = 0x2000_0104 as *mut u32;
 
+/// The smallest heap, in bytes, that is worth handing to the collector: the reserved null word plus
+/// one header plus one payload word. Below this the band cannot hold an object at all, so the first
+/// allocation would fail anyway -- and saying so at adoption names the cause instead of the symptom.
+const HEAP_MIN_BYTES: usize = 12;
+
 /// The device GC-alloc entry the AOT emits `newobj`/`box`/array-alloc calls against:
-/// `lamella_gc_alloc(payload_size [r0], &TypeDesc [r1]) -> payload* [r0]`. Bumps the fixed-RAM heap,
-/// writes the descriptor at the object header (base+0), and returns the payload (base+4).
+/// `lamella_gc_alloc(payload_size [r0], &TypeDesc [r1]) -> payload* [r0]`. Serves the request from
+/// the image's [`lamella_gc::DeviceHeap`], laid over the band the reset stub seeded, and returns the
+/// payload pointer.
 ///
-/// **It never returns on an exhausted heap.** A request that does not fit below [`HEAP_END`] ends
-/// the program through [`lamella_heap_exhausted`], so every pointer this returns is a fresh block and
-/// no caller -- emitted code or a seam in this archive -- has a null to test. Emitted code tests none:
-/// a null handed back from here would reach the program as a reference nothing compares, a store
-/// through it would be discarded, and a read would answer low memory, which on a Cortex-M part is the
-/// vector table. That is a plausible wrong answer, and a stop is the better failure by exactly that
-/// difference.
+/// **This entry stays the entry even though `lamella-gc` exports one of its own.** The two are not
+/// interchangeable: this archive's `lamella_gc_alloc` shim writes the thread anchor the root walker
+/// walks from, while that crate's captures SP/LR into arguments its body then ignores. Letting the
+/// other one win would land a collector that reports no roots -- which reclaims everything, and
+/// looks like a working collector until a program holds a reference across an allocation.
 ///
-/// Refusing to bump past the end is the half that protects everything else. Without the bound the
-/// cursor runs past the end of the heap and overwrites whatever sits above it: a program that keeps
-/// running on corrupted memory, presenting as whatever happens to occupy that address -- a statics
-/// window looks like a backend fault, a stack looks like a codegen defect.
+/// **[`HEAP_PTR`] is a SEED, not a live cursor.** The `DeviceHeap` owns the bump from the first
+/// allocation onward, so that word stops advancing once the heap is adopted. Nothing reads it for
+/// its value: every other site that names it WRITES it, as the reset stub does.
 ///
-/// Every arithmetic step is checked. `payload_size` reaches this seam from a managed `newarr`
-/// count, so a hostile or merely wrong length must not wrap the rounding (or the sum) into a
-/// request that appears to fit.
+/// **It never returns on an exhausted heap, and a COLLECTION happens first.** A request that does
+/// not fit runs one collection against this image's own roots and retries; only then does it end the
+/// program through [`lamella_heap_exhausted`]. So every pointer this returns is a usable block and
+/// no caller -- emitted code or a seam in this archive -- has a null to test. Emitted code tests
+/// none: a null handed back from here would reach the program as a reference nothing compares, a
+/// store through it would be discarded, and a read would answer low memory, which on a Cortex-M part
+/// is the vector table. That is a plausible wrong answer, and a stop is the better failure by
+/// exactly that difference.
+///
+/// Refusing to hand out memory past the end is the half that protects everything else. Without the
+/// bound the cursor runs past the end of the heap and overwrites whatever sits above it: a program
+/// that keeps running on corrupted memory, presenting as whatever happens to occupy that address --
+/// a statics window looks like a backend fault, a stack looks like a codegen defect. The bound now
+/// belongs to the `DeviceHeap`, which cannot hand out an offset past the region it was given, and
+/// [`collector::ensure_device_heap`] is what gives it that region.
+///
+/// `payload_size` reaches this seam from a managed `newarr` count, so a hostile or merely wrong
+/// length must not wrap into a request that appears to fit. Every step of the reservation is checked
+/// arithmetic on the `DeviceHeap` side, and a length that overflows answers `None` -- which arrives
+/// here as the null this stops on.
 #[no_mangle]
 extern "C" fn lamella_gc_alloc_impl(payload_size: u32, type_desc: *const u32) -> *mut u8 {
     unsafe {
-        let base = core::ptr::read_volatile(HEAP_PTR);
-        let end = core::ptr::read_volatile(HEAP_END);
-        let Some(rounded) = payload_size.checked_add(7).map(|n| n & !7) else {
-            lamella_heap_exhausted();
-        };
-        let Some(next) = base.checked_add(4).and_then(|b| b.checked_add(rounded)) else {
-            lamella_heap_exhausted();
-        };
-        if next > end {
+        collector::ensure_device_heap();
+        let payload = lamella_gc::lamella_gc_alloc_impl(
+            payload_size,
+            type_desc as *const lamella_gc::DeviceTypeDesc,
+            0,
+            0,
+        );
+        if payload.is_null() {
             lamella_heap_exhausted();
         }
-        core::ptr::write(base as *mut u32, type_desc as u32);
-        core::ptr::write_volatile(HEAP_PTR, next);
-        (base + 4) as *mut u8
+        payload
     }
 }
 
@@ -2690,4 +2707,215 @@ extern "C" fn lamella_debug_print_hex(value: u32) {
         console_put(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
     }
     console_put(b'\n');
+}
+
+/// THE DEVICE COLLECTOR'S WIRING, IN A MODULE OF ITS OWN SO AN IMAGE THAT DOES NOT COLLECT PAYS
+/// NOTHING FOR IT.
+///
+/// The placement is not tidiness. This archive builds with `codegen-units = 16` precisely so that an
+/// entry point sitting in a member no program references costs that program nothing -- the profile in
+/// entry point sitting in a member no program references costs that program nothing. Collector
+/// wiring left in the crate root shares a codegen unit with symbols every image DOES reference,
+/// so every
+/// image would drag it in whether or not it collects.
+mod collector {
+    use super::lamella_gc_walk_roots_impl;
+
+    /// The root kind a stack-map entry carries in its top two bits: an object reference the collector
+    /// traces and relocates. See [`lamella_gc_walk_roots_impl`].
+    const ROOT_KIND_OBJECT: u32 = 0;
+    /// A managed interior pointer: it addresses the inside of an object, so it is relocated by the same
+    /// delta as the object containing it.
+    const ROOT_KIND_MANAGED_PTR: u32 = 1;
+    /// A PINNED slot -- a `fixed` statement's holder. The object must survive AND must not move, so the
+    /// slot is reported as an ordinary root as well as being listed as a pin: a pinned root left out of
+    /// the root set would let the collection reclaim the very object the pin exists to hold still.
+    const ROOT_KIND_PINNED: u32 = 2;
+    /// A TAGGED word: a managed reference only when its low two bits are clear and it is non-null. A
+    /// fixnum or singleton sets a low bit and must be left exactly as it is.
+    const ROOT_KIND_TAGGED: u32 = 3;
+
+    /// The most PINNED objects one collection can carry.
+    ///
+    /// A pin list cannot grow -- there is no allocator on this path -- so it is a fixed array, and
+    /// overflow is not something to absorb quietly. **A pin the collector does not know about is an
+    /// object it may MOVE**, which leaves a parked native callee holding an address that now names
+    /// something else: a silent wrong answer, not a crash. So an overflow REFUSES the collection
+    /// instead, and the allocation that triggered it fails loudly through `lamella_heap_exhausted`.
+    const MAX_PINS: usize = 32;
+
+    /// The mark bitmap the device collection works in: the TOP of the image's own heap band, carved
+    /// off before the heap is handed over.
+    ///
+    /// **It is carved rather than declared, because the cost has to scale with the heap.** One bit per
+    /// 4-byte word is about 3% of the region -- 112 bytes of a nordic 3,584-byte arena, 2 KB of an
+    /// RP2350 64 KB one -- so the board with a big heap pays for a big bitmap and the board with 16 KB
+    /// of RAM does not pay for a heap it has not got.
+    static mut MARK_BASE: *mut u32 = core::ptr::null_mut();
+    /// How many `u32` words [`MARK_BASE`] addresses. Zero until the heap is adopted.
+    static mut MARK_WORDS: usize = 0;
+
+    /// The pinned payload addresses gathered for the collection in progress; `PIN_COUNT` is how many of
+    /// them are live, and `PIN_OVERFLOW` records that there were more than [`MAX_PINS`].
+    static mut PINS: [u32; MAX_PINS] = [0u32; MAX_PINS];
+    /// How many entries of [`PINS`] the current gather filled.
+    static mut PIN_COUNT: usize = 0;
+    /// Set when a pin did not fit, which REFUSES the collection -- see [`MAX_PINS`].
+    static mut PIN_OVERFLOW: bool = false;
+
+    /// The visitor the collector handed us, parked so the C-ABI walker can reach it.
+    ///
+    /// [`lamella_gc_walk_roots_impl`] takes an `extern "C" fn`, which cannot close over anything, while
+    /// the collector supplies a `&mut dyn FnMut(&mut Ref)`. This is the one place the two meet, and it is
+    /// sound because the walk is driven synchronously from the allocator's critical section: the pointer
+    /// is set, the walk runs to completion, and it is cleared before anything else can observe it.
+    static mut ACTIVE_VISITOR: *mut core::ffi::c_void = core::ptr::null_mut();
+
+    /// Gathers the PINNED roots, as a read-only pre-pass.
+    ///
+    /// The compaction has to know which objects may not move before it places the first survivor, so
+    /// this runs before the collection rather than during it.
+    extern "C" fn gather_pin(slot: *mut u32, kind: u32) {
+        if kind != ROOT_KIND_PINNED {
+            return;
+        }
+        let value = unsafe { core::ptr::read_volatile(slot) };
+        if value == 0 {
+            return;
+        }
+        unsafe {
+            let count = PIN_COUNT;
+            if count < MAX_PINS {
+                PINS[count] = value;
+                PIN_COUNT = count + 1;
+            } else {
+                PIN_OVERFLOW = true;
+            }
+        }
+    }
+
+    /// Reports ONE root slot to the parked visitor and writes back whatever the collector left there.
+    ///
+    /// **A TAGGED slot is reported only when it actually holds a reference** -- low two bits clear and
+    /// non-null. A fixnum or singleton sets a low bit, and handing one to the collector would have it
+    /// treated as an address.
+    extern "C" fn report_root(slot: *mut u32, kind: u32) {
+        let value = unsafe { core::ptr::read_volatile(slot) };
+        match kind {
+            ROOT_KIND_TAGGED if value == 0 || value & 0b11 != 0 => return,
+            ROOT_KIND_OBJECT | ROOT_KIND_MANAGED_PTR | ROOT_KIND_PINNED | ROOT_KIND_TAGGED => {}
+            _ => return,
+        }
+        let visitor = unsafe { ACTIVE_VISITOR };
+        if visitor.is_null() {
+            return;
+        }
+        let mut reference = lamella_gc::Ref(value);
+        let visit = unsafe { &mut *(visitor as *mut &mut dyn FnMut(&mut lamella_gc::Ref)) };
+        visit(&mut reference);
+        if reference.0 != value {
+            unsafe { core::ptr::write_volatile(slot, reference.0) };
+        }
+    }
+
+    /// Runs ONE device collection: gather the pins, then drive the allocation-free mark-compact with the
+    /// archive's own root walker. Answers whether it ran.
+    ///
+    /// **This is the hook `lamella-gc` calls when the heap is exhausted**, and the division of labour is
+    /// why it lives here: this side owns the stack maps, so it is the only side that knows where the
+    /// roots are, which of them are pinned, and where a mark bitmap can live.
+    ///
+    /// **It REFUSES rather than collecting partially.** A pin list that overflowed would let the
+    /// compaction move an object a parked native callee still addresses; a bitmap short of the region
+    /// would report everything past its end as unreachable. Both answer `false`, the allocation fails,
+    /// and `lamella_heap_exhausted` says so loudly -- which is the honest outcome, because a collector
+    /// that cannot prove an object dead must not reclaim it.
+    fn collect_device_heap(heap: &mut lamella_gc::DeviceHeap) -> bool {
+        unsafe {
+            PIN_COUNT = 0;
+            PIN_OVERFLOW = false;
+        }
+        lamella_gc_walk_roots_impl(Some(gather_pin));
+        if unsafe { PIN_OVERFLOW } {
+            return false;
+        }
+        let (pins, marks) = unsafe {
+            (
+                &*core::ptr::addr_of!(PINS),
+                core::slice::from_raw_parts_mut(MARK_BASE, MARK_WORDS),
+            )
+        };
+        if marks.is_empty() {
+            return false;
+        }
+        let pin_count = unsafe { PIN_COUNT };
+        heap.collect_no_alloc(
+            |visit: &mut dyn FnMut(&mut lamella_gc::Ref)| {
+                let mut parked: &mut dyn FnMut(&mut lamella_gc::Ref) = visit;
+                unsafe {
+                    ACTIVE_VISITOR = core::ptr::addr_of_mut!(parked) as *mut core::ffi::c_void;
+                }
+                lamella_gc_walk_roots_impl(Some(report_root));
+                unsafe {
+                    ACTIVE_VISITOR = core::ptr::null_mut();
+                }
+            },
+            &pins[..pin_count],
+            marks,
+        )
+    }
+
+    /// Whether the `DeviceHeap` has adopted the image's heap band yet.
+    static mut HEAP_ADOPTED: bool = false;
+
+    /// Hands the image's heap band to `lamella-gc` on the FIRST allocation, and installs the
+    /// collection above in the same step.
+    ///
+    /// **It has to be lazy, because `DeviceHeap::from_raw` ZEROES the region it adopts.** It cannot
+    /// take over a band that already holds objects, so there is exactly one moment it can run: before
+    /// the first allocation, while the cursor word still holds the base the reset stub seeded.
+    ///
+    /// **Lazy rather than an entry point the image calls**, because an image that forgot to call it
+    /// would allocate onto an uninitialised heap -- a fault with no message, and one that every new
+    /// board bring-up would get the chance to make. Here there is nothing to remember.
+    ///
+    /// # Safety
+    /// The heap words must hold the base and end the reset stub seeded, and that band must be owned
+    /// by the GC for the program's lifetime -- which is what the stub's cleared band is.
+    pub(super) unsafe fn ensure_device_heap() {
+        unsafe {
+            if HEAP_ADOPTED {
+                return;
+            }
+            let base = core::ptr::read_volatile(super::HEAP_PTR);
+            let end = core::ptr::read_volatile(super::HEAP_END);
+            if end <= base {
+                super::lamella_heap_exhausted();
+            }
+            HEAP_ADOPTED = true;
+
+            let total = (end - base) as usize;
+            let mark_bytes = lamella_gc::mark_words_for(total) * 4;
+            let heap_len = total.saturating_sub(mark_bytes) & !3;
+            if heap_len <= super::HEAP_MIN_BYTES {
+                super::lamella_heap_exhausted();
+            }
+            MARK_BASE = base.wrapping_add(heap_len as u32) as *mut u32;
+            MARK_WORDS = (total - heap_len) / 4;
+
+            lamella_gc::lamella_gc_init_device_heap(base as *mut u8, heap_len);
+            lamella_gc::set_device_collect_hook(collect_device_heap);
+        }
+    }
+
+    /// Installs the collection this archive runs when the managed heap is exhausted.
+    ///
+    /// **[`ensure_device_heap`] already does this on the first allocation**, so nothing has to call
+    /// this for the collector to be live. It stays exported because it is the one seam an embedder
+    /// with its OWN allocator can use to reach this archive's root walker, and because a debugger
+    /// halted in it names what wired the two sides together.
+    #[no_mangle]
+    pub extern "C" fn lamella_gc_install_collector() {
+        lamella_gc::set_device_collect_hook(collect_device_heap);
+    }
 }

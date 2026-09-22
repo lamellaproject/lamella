@@ -7,8 +7,10 @@
 //! later increment and is deliberately absent here.
 
 
+#[cfg(feature = "host-heap")]
 extern crate alloc;
 
+#[cfg(feature = "host-heap")]
 use alloc::vec::Vec;
 
 /// The size of an object header, in bytes: one little-endian `u32` holding the
@@ -52,6 +54,7 @@ impl Ref {
 /// This is the decoded form of the backend's `[u32 payload_size][u32 nrefs][u32
 /// ref_offsets...]` descriptor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg(feature = "host-heap")]
 pub struct TypeDesc {
     /// The payload size in bytes (excluding the header). The allocator rounds the
     /// reserved space up to [`ALIGN`].
@@ -68,6 +71,7 @@ pub struct TypeDesc {
     pub tagged_offsets: Vec<u32>,
 }
 
+#[cfg(feature = "host-heap")]
 impl TypeDesc {
     /// Decodes one descriptor from the backend's little-endian blob
     /// `[u32 payload_size][u32 nrefs][u32 type_tag][u32 base_ptr][u32 ref_offsets...]`,
@@ -115,6 +119,7 @@ impl TypeDesc {
     }
 }
 
+#[cfg(feature = "host-heap")]
 /// Reads a little-endian `u32` at byte offset `at` in `bytes`, or `None` if it
 /// would run past the end.
 fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
@@ -123,6 +128,7 @@ fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
+#[cfg(feature = "host-heap")]
 /// Reads a little-endian `u16` at byte offset `at` in `bytes`, or `None` if it
 /// would run past the end.
 fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
@@ -143,6 +149,7 @@ pub(crate) const fn align_up(n: u32) -> u32 {
 /// have ([`Self::pinned_offsets`], which reaches a collection through
 /// [`StackMapTable::from_entries`] and has no place in the wire format).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "host-heap")]
 pub struct StackMapEntry {
     /// The safepoint's return address (a native code offset) -- the lookup key.
     pub return_pc: u32,
@@ -188,10 +195,12 @@ pub struct StackMapEntry {
 /// by `return_pc` for binary search. The decoded counterpart of
 /// `lamella_aot::arm32::StackMaps`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg(feature = "host-heap")]
 pub struct StackMapTable {
     entries: Vec<StackMapEntry>,
 }
 
+#[cfg(feature = "host-heap")]
 impl StackMapTable {
     /// Decodes the little-endian wire format `u32 count`, then each entry
     /// `u32 return_pc; u16 frame_size; u16 saved_bytes; u16 nrefs; u16 ref_offsets[nrefs];
@@ -279,6 +288,7 @@ impl StackMapTable {
 /// addresses; address `0` is reserved as the null reference, so allocation begins at
 /// [`ALIGN`].
 #[derive(Debug)]
+#[cfg(feature = "host-heap")]
 pub struct Heap {
     /// The backing store; an address is an index into this.
     bytes: Vec<u8>,
@@ -302,6 +312,7 @@ pub struct Heap {
     weak_offsets: alloc::collections::BTreeMap<u32, Vec<u32>>,
 }
 
+#[cfg(feature = "host-heap")]
 impl Heap {
     /// This heap's region base, and it is 0 because a `Heap` IS its backing `Vec`: an address and an
     /// index into `bytes` coincide here. That is the single difference from [`crate::DeviceHeap`],
@@ -702,11 +713,13 @@ impl Heap {
     }
 }
 
+#[cfg(feature = "host-heap")]
 /// A frame budget for a stack walk: a real call stack is far shallower, so hitting this means
 /// the saved-LR chain is malformed (or cyclic); stop walking rather than spin forever.
 #[cfg(feature = "gc-collect")]
 const MAX_FRAMES: u32 = 4096;
 
+#[cfg(feature = "host-heap")]
 /// Reads a [`Ref`] out of a frame/stack image at byte index `at`.
 #[cfg(feature = "gc-collect")]
 fn read_slot(image: &[u8], at: usize) -> Ref {
@@ -721,7 +734,7 @@ fn read_slot(image: &[u8], at: usize) -> Ref {
 /// Reports every root slot of ONE frame to `visit` and writes each (possibly relocated)
 /// reference back. Both root lists are walked: a pinned root is a root, so leaving it out would
 /// let the collection reclaim the very object the pin exists to hold still.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 fn visit_frame_roots(
     frame: &mut [u8],
     sp: u32,
@@ -753,7 +766,7 @@ fn visit_frame_roots(
 /// and the saved LR, which is the walk's next `return_pc`, is the word just under it. Every
 /// walk below goes through here, because this is a rule two copies of which would be corrected
 /// in one.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 fn caller_frame(sp: u32, entry: &StackMapEntry) -> (usize, u32) {
     let caller_sp = sp
         .saturating_add(u32::from(entry.frame_size))
@@ -763,7 +776,7 @@ fn caller_frame(sp: u32, entry: &StackMapEntry) -> (usize, u32) {
 
 /// The payload addresses named by ONE frame's pinned slots. A READ-ONLY pre-pass, because
 /// compaction has to know which objects may not move before it places the first survivor.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 fn pinned_frame_roots(frame: &[u8], sp: u32, entry: &StackMapEntry) -> Vec<u32> {
     entry
         .pinned_offsets
@@ -785,7 +798,7 @@ fn pinned_frame_roots(frame: &[u8], sp: u32, entry: &StackMapEntry) -> Vec<u32> 
 ///
 /// Shared by [`Heap::collect_stack`] and [`crate::device_heap::DeviceHeap::collect_stack`] so the
 /// host rehearsal and the device collection cannot walk differently.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub(crate) fn visit_stack_roots(
     stack: &mut [u8],
     top_sp: u32,
@@ -812,7 +825,7 @@ pub(crate) fn visit_stack_roots(
 /// [`visit_stack_roots`], read-only, run first so compaction knows what it may not move.
 /// Returns empty immediately when no entry pins anything, which is every program that uses no
 /// `fixed` statement.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub(crate) fn pinned_stack_roots(
     stack: &[u8],
     top_sp: u32,
@@ -935,14 +948,14 @@ pub(crate) trait TypeResolver {
 /// The host resolver: an object's header word is an index into a [`TypeDesc`] table.
 /// This reproduces exactly the lookup the host engine used before [`mark_compact`] was
 /// factored out, so the host tests see identical behaviour.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub(crate) struct TableResolver<'a> {
     pub(crate) type_descs: &'a [TypeDesc],
     /// The weak layout declared through [`Heap::set_weak_offsets`], keyed by type-descriptor id.
     pub(crate) weak_offsets: &'a alloc::collections::BTreeMap<u32, Vec<u32>>,
 }
 
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 impl TypeResolver for TableResolver<'_> {
     /// `leading` is unread: a host header word is a table index, and the host table states every
     /// payload size outright (the host heap has no length-dependent form -- the one model that keeps
@@ -1003,7 +1016,7 @@ impl TypeResolver for TableResolver<'_> {
 /// gets a forwarding entry to itself, and the packing cursor steps over it rather than through it,
 /// leaving whatever it reclaimed below as a gap. Empty is the ordinary case and costs one
 /// `is_empty` test per survivor.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub(crate) fn mark_compact<R>(
     bytes: &mut [u8],
     base: u32,
@@ -1023,7 +1036,7 @@ where
 /// [`Heap::collect_with_finalization`]: `(registry, queue)` names the objects that must be finalized
 /// before reclamation and where to put the ones whose turn it is. `None` is the ordinary collection,
 /// and takes neither the extra mark pass nor the strong-liveness snapshot.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub(crate) fn mark_compact_with_finalization<R>(
     bytes: &mut [u8],
     base: u32,
@@ -1209,10 +1222,392 @@ where
     dest - base
 }
 
-#[cfg(test)]
+/// A mark bitmap over a heap region: ONE BIT PER [`ALIGN`]-SIZED WORD, in storage the caller owns.
+///
+/// This is what makes an allocation-free collection possible, and the choice of storage is the whole
+/// point: the marks cannot live in the object header, because a header word is a type-descriptor
+/// POINTER on the device and a descriptor-table INDEX on the host, and a bit stolen from one is a
+/// corrupted value in the other. A bitmap beside the heap is the one representation both resolvers
+/// can share, so the device collection and the host rehearsal mark identically.
+/// How many `u32` words of mark bitmap a heap region of `region_len` bytes needs -- one bit per
+/// [`ALIGN`]-sized word, so about 3% of the region it covers.
+///
+/// **Public because the EMBEDDER owns the storage and therefore has to size it**, and a second copy
+/// of this arithmetic is how the two drift: a bitmap one word short does not collect partially, it
+/// REFUSES -- and it would refuse only at the heap sizes nobody happened to test.
+#[cfg(feature = "gc-collect")]
+#[must_use]
+pub const fn mark_words_for(region_len: usize) -> usize {
+    MarkBits::words_for(region_len)
+}
+
+#[cfg(feature = "gc-collect")]
+pub(crate) struct MarkBits<'a> {
+    words: &'a mut [u32],
+}
+
+#[cfg(feature = "gc-collect")]
+impl<'a> MarkBits<'a> {
+    /// How many `u32` words of bitmap a region of `region_len` bytes needs: one bit per [`ALIGN`]
+    /// bytes, rounded up to a whole word.
+    pub(crate) const fn words_for(region_len: usize) -> usize {
+        region_len.div_ceil(ALIGN as usize).div_ceil(32)
+    }
+
+    /// Wraps caller storage and clears it. Every collection starts from no marks; a bitmap carrying
+    /// a previous collection's bits would retain whatever that one reached.
+    pub(crate) fn new(words: &'a mut [u32]) -> MarkBits<'a> {
+        for word in words.iter_mut() {
+            *word = 0;
+        }
+        MarkBits { words }
+    }
+
+    /// How many bitmap words this one holds -- the capacity the collection checks itself against.
+    fn capacity_words(&self) -> usize {
+        self.words.len()
+    }
+
+    /// The bit index for a heap address, relative to the region base.
+    const fn bit(base: u32, addr: u32) -> usize {
+        ((addr - base) / ALIGN) as usize
+    }
+
+    /// Whether `addr` is marked. An address past the bitmap answers `false` rather than panicking;
+    /// the capacity check runs once, before the collection starts, so this cannot be reached.
+    fn test(&self, base: u32, addr: u32) -> bool {
+        let bit = Self::bit(base, addr);
+        self.words
+            .get(bit / 32)
+            .is_some_and(|word| word & (1u32 << (bit % 32)) != 0)
+    }
+
+    /// Marks `addr`, answering whether THIS call is what marked it -- the dedupe that stops a cycle
+    /// from tracing forever.
+    fn set(&mut self, base: u32, addr: u32) -> bool {
+        let bit = Self::bit(base, addr);
+        let Some(word) = self.words.get_mut(bit / 32) else {
+            return false;
+        };
+        let mask = 1u32 << (bit % 32);
+        let already = *word & mask != 0;
+        *word |= mask;
+        !already
+    }
+}
+
+/// How many objects the mark walk holds before it falls back to re-scanning.
+///
+/// A worklist is the one part of a tracing collector that classically needs unbounded storage, and
+/// there is none here. This is a fixed array, and an overflow is NOT an error: the walk records that
+/// it dropped something and finishes by sweeping the heap to a fixpoint instead, which needs no
+/// storage at all and is merely slower. So the shape of a program's object graph changes how long a
+/// collection takes and never whether it is correct.
+#[cfg(feature = "gc-collect")]
+const MARK_STACK: usize = 64;
+
+/// [`mark_compact`]'s ALLOCATION-FREE twin: the same sliding mark-compact, with every piece of
+/// bookkeeping in storage the caller supplies.
+///
+/// # Why this exists beside `mark_compact` rather than replacing it
+///
+/// The shared engine keeps its worklist in a `Vec`, its live set in a `BTreeSet` and its forwarding
+/// table in a `BTreeMap`, so a collection allocates from the Rust global allocator -- measured at
+/// roughly 31 bytes per live object and about 2.5x the heap being compacted. That is affordable on a
+/// host and impossible on a device image, whose only allocator is the one that just failed: an AOT
+/// image installs no `#[global_allocator]` by design, because `lamella_gc_alloc` IS its allocator.
+/// The `collection-scratch-cost` example reports the figures and is re-runnable.
+///
+/// # What replaces each of the three
+///
+/// * the live set becomes [`MarkBits`] -- one bit per word of region, in caller storage;
+/// * the worklist becomes a fixed array that falls back to sweeping to a fixpoint on overflow;
+/// * the forwarding table becomes [`Self::forwarded`], recomputed by a linear scan per reference.
+///
+/// The cost is several passes over the heap instead of one, which is the trade a part with no spare
+/// RAM is asking for.
+///
+/// # The order of operations is load-bearing
+///
+/// **Every reference is rewritten BEFORE any object moves.** A destination address is a function of
+/// the marks and the object footprints, and a footprint depends on the header word and the leading
+/// payload words -- an array's dimensions, never a reference -- so rewriting reference slots cannot
+/// perturb the addresses still being computed. Moving first would destroy the layout that
+/// computation reads. `enumerate_roots` is called TWICE for the same reason: once to mark, once to
+/// rewrite.
+///
+/// # Refusal
+///
+/// Returns `None` when the bitmap is too small for the region, having touched NOTHING -- the caller
+/// still has its heap and its objects. A bitmap short of the region would answer "unmarked" for
+/// every address past its end, so live objects would be reclaimed; a collector that cannot prove an
+/// object dead must not reclaim it.
+#[cfg(feature = "gc-collect")]
+pub(crate) fn mark_compact_no_alloc<R>(
+    bytes: &mut [u8],
+    base: u32,
+    top: u32,
+    resolver: &dyn TypeResolver,
+    mut enumerate_roots: R,
+    pinned: &[u32],
+    marks: &mut MarkBits<'_>,
+) -> Option<u32>
+where
+    R: FnMut(&mut dyn FnMut(&mut Ref)),
+{
+    let top = base + top;
+    if MarkBits::words_for(bytes.len()) > marks.capacity_words() {
+        return None;
+    }
+
+    let is_heap = |reference: Ref| reference.0 >= base + HEADER_SIZE && reference.0 < top;
+    let idx = |addr: u32| -> usize { (addr - base) as usize };
+    let read_word = |bytes: &[u8], addr: u32| -> u32 {
+        let at = idx(addr);
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    };
+    let write_word = |bytes: &mut [u8], addr: u32, value: u32| {
+        let at = idx(addr);
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    let read_leading =
+        |bytes: &[u8], payload: u32, want: u32, buf: &mut [u32; MAX_LEADING]| -> usize {
+            let available = ((top - payload) / 4) as usize;
+            let n = (want as usize).min(MAX_LEADING).min(available);
+            for (i, slot) in buf.iter_mut().enumerate().take(n) {
+                *slot = read_word(bytes, payload + (i as u32) * 4);
+            }
+            n
+        };
+    let footprint = |bytes: &[u8], payload: u32| -> u32 {
+        let header_word = read_word(bytes, Ref(payload).header_addr());
+        let mut leading = [0u32; MAX_LEADING];
+        let n = read_leading(bytes, payload, resolver.leading_words(header_word), &mut leading);
+        HEADER_SIZE + align_up(resolver.payload_size(header_word, &leading[..n]))
+    };
+
+    // ---------------------------------------------------------------- MARK
+    let mut stack = [0u32; MARK_STACK];
+    let mut depth = 0usize;
+    let mut overflowed = false;
+
+    macro_rules! mark {
+        ($reference:expr, $marks:expr, $stack:expr, $depth:expr, $overflowed:expr) => {{
+            let reference: Ref = $reference;
+            if !reference.is_null()
+                && is_heap(reference)
+                && $marks.set(base, reference.0)
+            {
+                if $depth < MARK_STACK {
+                    $stack[$depth] = reference.0;
+                    $depth += 1;
+                } else {
+                    $overflowed = true;
+                }
+            }
+        }};
+    }
+
+    enumerate_roots(&mut |slot: &mut Ref| {
+        mark!(*slot, marks, stack, depth, overflowed);
+    });
+
+    macro_rules! scan {
+        ($payload:expr, $bytes:expr, $marks:expr, $stack:expr, $depth:expr, $overflowed:expr) => {{
+            let payload: u32 = $payload;
+            let header_word = read_word($bytes, Ref(payload).header_addr());
+            let mut leading = [0u32; MAX_LEADING];
+            let n = read_leading($bytes, payload, resolver.leading_words(header_word), &mut leading);
+            resolver.for_each_ref_offset(header_word, &leading[..n], &mut |ref_offset| {
+                let child = Ref(read_word($bytes, payload + ref_offset));
+                mark!(child, $marks, $stack, $depth, $overflowed);
+            });
+            resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| {
+                let word = read_word($bytes, payload + tagged_offset);
+                if word != 0 && word & 0b11 == 0 {
+                    mark!(Ref(word), $marks, $stack, $depth, $overflowed);
+                }
+            });
+        }};
+    }
+
+    while depth > 0 {
+        depth -= 1;
+        let payload = stack[depth];
+        scan!(payload, bytes, marks, stack, depth, overflowed);
+    }
+
+    while overflowed {
+        overflowed = false;
+        let mut added = false;
+        let mut payload = base + ALIGN + HEADER_SIZE;
+        while payload < top {
+            let step = footprint(bytes, payload);
+            if marks.test(base, payload) {
+                let before = depth;
+                scan!(payload, bytes, marks, stack, depth, overflowed);
+                if depth != before {
+                    added = true;
+                }
+                while depth > 0 {
+                    depth -= 1;
+                    let next = stack[depth];
+                    scan!(next, bytes, marks, stack, depth, overflowed);
+                    added = true;
+                }
+            }
+            payload += step;
+        }
+        if !added {
+            break;
+        }
+    }
+
+    // ------------------------------------------------------- FORWARDING
+    let is_pinned = |payload: u32| pinned.contains(&payload);
+    let forwarded = |bytes: &[u8], want: u32| -> u32 {
+        let mut cursor = base + ALIGN;
+        let mut payload = base + ALIGN + HEADER_SIZE;
+        while payload < top {
+            let step = footprint(bytes, payload);
+            if marks.test(base, payload) {
+                if is_pinned(payload) {
+                    if payload == want {
+                        return payload;
+                    }
+                    cursor = payload - HEADER_SIZE + step;
+                } else {
+                    if payload == want {
+                        return cursor + HEADER_SIZE;
+                    }
+                    cursor += step;
+                }
+            }
+            payload += step;
+        }
+        0
+    };
+
+    // -------------------------------------------------------- REWRITE
+    enumerate_roots(&mut |slot: &mut Ref| {
+        if !slot.is_null() && is_heap(*slot) {
+            slot.0 = forwarded(bytes, slot.0);
+        }
+    });
+
+    let mut payload = base + ALIGN + HEADER_SIZE;
+    while payload < top {
+        let step = footprint(bytes, payload);
+        if marks.test(base, payload) {
+            let header_word = read_word(bytes, Ref(payload).header_addr());
+            let mut leading = [0u32; MAX_LEADING];
+            let n = read_leading(bytes, payload, resolver.leading_words(header_word), &mut leading);
+            resolver.for_each_ref_offset(header_word, &leading[..n], &mut |ref_offset| {
+                let slot = payload + ref_offset;
+                let old = read_word(bytes, slot);
+                if old != 0 && is_heap(Ref(old)) {
+                    let new = forwarded(bytes, old);
+                    write_word(bytes, slot, new);
+                }
+            });
+            resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| {
+                let slot = payload + tagged_offset;
+                let old = read_word(bytes, slot);
+                if old != 0 && old & 0b11 == 0 && is_heap(Ref(old)) {
+                    let new = forwarded(bytes, old);
+                    write_word(bytes, slot, new);
+                }
+            });
+            resolver.for_each_weak_offset(header_word, &mut |weak_offset| {
+                let slot = payload + weak_offset;
+                let old = read_word(bytes, slot);
+                if old != 0 && is_heap(Ref(old)) {
+                    let new = if marks.test(base, old) {
+                        forwarded(bytes, old)
+                    } else {
+                        0
+                    };
+                    write_word(bytes, slot, new);
+                }
+            });
+        }
+        payload += step;
+    }
+
+    // ----------------------------------------------------------- MOVE
+    let mut cursor = base + ALIGN;
+    let mut payload = base + ALIGN + HEADER_SIZE;
+    while payload < top {
+        let step = footprint(bytes, payload);
+        if marks.test(base, payload) {
+            let start = payload - HEADER_SIZE;
+            if is_pinned(payload) {
+                cursor = start + step;
+            } else {
+                if cursor != start {
+                    bytes.copy_within(idx(start)..idx(start) + step as usize, idx(cursor));
+                }
+                cursor += step;
+            }
+        }
+        payload += step;
+    }
+    Some(cursor - base)
+}
+
+#[cfg(all(test, feature = "host-heap"))]
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// SIZING THE BITMAP FROM THE WHOLE BAND IS ALWAYS ENOUGH FOR THE HEAP LEFT AFTER CARVING IT OUT.
+    ///
+    /// An embedder with no allocator has to take the bitmap out of the only memory it has -- the heap
+    /// band itself -- which is circular: the bitmap's size depends on the heap's, and the heap's on the
+    /// bitmap's. The archive breaks the circle by sizing from the WHOLE band, which is the larger
+    /// number, and giving the heap the remainder. **This asserts the step that makes that sound**, for
+    /// every band size across four orders of magnitude and at every word boundary near the transitions.
+    ///
+    /// **The failure it catches is silent and one-sided.** A bitmap one word short does not collect
+    /// partially, it REFUSES -- so the heap simply stops reclaiming, at whichever band sizes happen
+    /// to round badly. Sizing from the remainder rather than from the whole band is the natural way
+    /// to write it, and is exactly that bug.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_bitmap_sized_from_the_whole_band_covers_the_heap_carved_out_of_it() {
+        let sizes = (0..64)
+            .map(|i| 3584 + i * 4)
+            .chain((0..64).map(|i| 65536 - i * 4))
+            .chain((4..=20).map(|shift| 1usize << shift))
+            .chain((0..256).map(|i| 12288 + i));
+        for total in sizes {
+            let mark_bytes = mark_words_for(total) * 4;
+            let heap_len = total.saturating_sub(mark_bytes) & !3;
+            assert!(
+                mark_words_for(heap_len) <= mark_words_for(total),
+                "a band of {total} carves {mark_bytes} bytes of bitmap and leaves a {heap_len}-byte                  heap, which needs {} words against the {} reserved",
+                mark_words_for(heap_len),
+                mark_words_for(total),
+            );
+            assert!(
+                total - heap_len >= mark_words_for(heap_len) * 4,
+                "a band of {total} leaves {} bytes above a {heap_len}-byte heap, which needs {}",
+                total - heap_len,
+                mark_words_for(heap_len) * 4,
+            );
+        }
+    }
+
+    /// The ceiling a FIXED bitmap imposed, stated as the number that made it a defect: 96 words cover
+    /// 12,288 bytes, and the RP2350 plan hands the heap 65,536.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn the_bitmap_a_sixty_five_kilobyte_heap_needs_is_far_past_a_ninety_six_word_one() {
+        assert_eq!(mark_words_for(12_288), 96, "the old constant's exact reach");
+        assert_eq!(mark_words_for(65_536), 512, "what the RP2350 band actually needs");
+        assert_eq!(mark_words_for(65_536) * 4, 2_048);
+        assert_eq!(mark_words_for(3_584) * 4, 112);
+    }
 
     /// A leaf type: one word, no references.
     fn leaf() -> TypeDesc {
@@ -2563,5 +2958,243 @@ mod tests {
             "the child reference was not rewritten to its new ABSOLUTE address"
         );
         assert_eq!(new_top, ALIGN + 2 * (HEADER_SIZE + 8), "the bump pointer must come back region-relative");
+    }
+
+    /// THE ALLOCATION-FREE ENGINE, HELD TO THE ONE IT REPLACES.
+    ///
+    /// Every test here is DIFFERENTIAL rather than expectation-based, and that is the point: the
+    /// device collection and the host rehearsal must not be able to walk differently, so the
+    /// assertion is that both engines produce the same new top AND the same heap bytes from the same
+    /// input. An expectation written by hand would let the two drift apart while both stayed green
+    /// against their own idea of the answer.
+    #[cfg(feature = "gc-collect")]
+    mod no_alloc {
+        use super::*;
+
+        /// Runs the ALLOCATING engine over a copy of `heap`, answering its new top, its bytes, and
+        /// the roots as it rewrote them.
+        fn allocating(heap: &Heap, roots: &[Ref], pinned: &[u32]) -> (u32, Vec<u8>, Vec<Ref>) {
+            let mut bytes = heap.bytes.clone();
+            let mut roots = roots.to_vec();
+            let resolver = TableResolver {
+                type_descs: &heap.type_descs,
+                weak_offsets: &heap.weak_offsets,
+            };
+            let top = mark_compact(
+                &mut bytes,
+                Heap::BASE,
+                heap.top,
+                &resolver,
+                |visit: &mut dyn FnMut(&mut Ref)| {
+                    for root in &mut roots {
+                        visit(root);
+                    }
+                },
+                &mut no_interior_refs,
+                pinned,
+            );
+            (top, bytes, roots)
+        }
+
+        /// Runs the ALLOCATION-FREE engine over a copy of `heap`, with a bitmap on the stack -- which
+        /// is the whole claim: no allocator is reachable from this call.
+        fn no_alloc(heap: &Heap, roots: &[Ref], pinned: &[u32]) -> (u32, Vec<u8>, Vec<Ref>) {
+            let mut bytes = heap.bytes.clone();
+            let mut roots = roots.to_vec();
+            let resolver = TableResolver {
+                type_descs: &heap.type_descs,
+                weak_offsets: &heap.weak_offsets,
+            };
+            let mut storage = [0u32; 1024];
+            let mut marks = MarkBits::new(&mut storage);
+            let top = mark_compact_no_alloc(
+                &mut bytes,
+                Heap::BASE,
+                heap.top,
+                &resolver,
+                |visit: &mut dyn FnMut(&mut Ref)| {
+                    for root in &mut roots {
+                        visit(root);
+                    }
+                },
+                pinned,
+                &mut marks,
+            )
+            .expect("the bitmap is sized for this region");
+            (top, bytes, roots)
+        }
+
+        /// Asserts the two engines agree on the new top, on every heap byte BELOW that top, and on
+        /// where each root now points.
+        fn agree(heap: &Heap, roots: &[Ref], pinned: &[u32]) -> u32 {
+            let (want_top, want_bytes, want_roots) = allocating(heap, roots, pinned);
+            let (got_top, got_bytes, got_roots) = no_alloc(heap, roots, pinned);
+            assert_eq!(got_top, want_top, "the two engines disagree about the new top");
+            assert_eq!(got_roots, want_roots, "the two engines relocated a root differently");
+            let live = want_top as usize;
+            assert_eq!(
+                &got_bytes[..live],
+                &want_bytes[..live],
+                "the two engines produced different heaps"
+            );
+            got_top
+        }
+
+        /// A chain of live objects survives whole, and both engines lay it out identically.
+        #[test]
+        fn a_live_chain_survives_and_both_engines_agree() {
+            let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
+            let a = heap.alloc(0).unwrap();
+            let b = heap.alloc(0).unwrap();
+            let c = heap.alloc(1).unwrap();
+            heap.write_ref_field(a, 0, b);
+            heap.write_ref_field(b, 0, c);
+            let before = heap.top;
+            let top = agree(&heap, &[a], &[]);
+            assert_eq!(top, before, "a fully live chain must not shrink");
+        }
+
+        /// Garbage between two survivors is reclaimed and the survivors slide down together.
+        #[test]
+        fn garbage_is_reclaimed_and_survivors_slide_down() {
+            let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
+            let keep = heap.alloc(1).unwrap();
+            let _drop_me = heap.alloc(1).unwrap();
+            let also_keep = heap.alloc(0).unwrap();
+            heap.write_ref_field(also_keep, 0, keep);
+            let before = heap.top;
+            let top = agree(&heap, &[also_keep], &[]);
+            assert!(top < before, "the unreachable object must be reclaimed");
+        }
+
+        /// A CYCLE terminates. Without the bitmap's dedupe this walk would not stop, so the test is
+        /// as much about termination as about the answer.
+        #[test]
+        fn a_cycle_terminates_and_both_engines_agree() {
+            let mut heap = Heap::new(4096, vec![one_ref()]);
+            let a = heap.alloc(0).unwrap();
+            let b = heap.alloc(0).unwrap();
+            heap.write_ref_field(a, 0, b);
+            heap.write_ref_field(b, 0, a);
+            let before = heap.top;
+            let top = agree(&heap, &[a], &[]);
+            assert_eq!(top, before, "both objects are reachable through the cycle");
+        }
+
+        /// A PINNED survivor keeps its address, and the two engines step the cursor over it the same
+        /// way. A pinned object that moved would leave a parked native callee holding a stale
+        /// pointer, which is the failure this whole parameter exists to prevent.
+        #[test]
+        fn a_pinned_object_does_not_move_and_both_engines_agree() {
+            let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
+            let _garbage = heap.alloc(1).unwrap();
+            let pinned = heap.alloc(1).unwrap();
+            let tail = heap.alloc(1).unwrap();
+            agree(&heap, &[tail], &[pinned.0]);
+            let (_, _, roots) = no_alloc(&heap, &[pinned], &[pinned.0]);
+            assert_eq!(roots[0], pinned, "a pinned object must keep its address");
+        }
+
+        /// MORE CHILDREN THAN THE MARK STACK HOLDS, so the fixpoint fallback is what finishes the
+        /// walk -- and it must reach the same answer the stack would have.
+        #[test]
+        fn a_fan_out_wider_than_the_mark_stack_still_marks_every_grandchild() {
+            const WIDTH: usize = MARK_STACK + 16;
+            let wide = TypeDesc {
+                payload_size: (WIDTH as u32) * 4,
+                ref_offsets: (0..WIDTH as u32).map(|i| i * 4).collect(),
+                tagged_offsets: Vec::new(),
+            };
+            let mut heap = Heap::new(64 * 1024, vec![wide, one_ref(), leaf()]);
+            let root = heap.alloc(0).unwrap();
+            for i in 0..WIDTH {
+                let child = heap.alloc(1).unwrap();
+                let grandchild = heap.alloc(2).unwrap();
+                heap.write_ref_field(child, 0, grandchild);
+                heap.write_ref_field(root, (i as u32) * 4, child);
+            }
+            let before = heap.top;
+            let top = agree(&heap, &[root], &[]);
+            assert_eq!(
+                top, before,
+                "every child AND grandchild is reachable, so nothing may be reclaimed"
+            );
+        }
+
+        /// A WEAK slot whose target died is CLEARED, not forwarded -- the one place a slot's
+        /// treatment depends on something other than its own contents.
+        #[test]
+        fn a_weak_slot_to_a_dead_object_is_cleared() {
+            let weak_holder = TypeDesc {
+                payload_size: 4,
+                ref_offsets: Vec::new(),
+                tagged_offsets: Vec::new(),
+            };
+            let mut heap = Heap::new(4096, vec![weak_holder, leaf()]);
+            heap.set_weak_offsets(0, vec![0]);
+            let holder = heap.alloc(0).unwrap();
+            let target = heap.alloc(1).unwrap();
+            heap.write_ref_field(holder, 0, target);
+            agree(&heap, &[holder], &[]);
+            let (_, bytes, roots) = no_alloc(&heap, &[holder], &[]);
+            let slot = roots[0].0 as usize;
+            let word = u32::from_le_bytes([
+                bytes[slot],
+                bytes[slot + 1],
+                bytes[slot + 2],
+                bytes[slot + 3],
+            ]);
+            assert_eq!(word, 0, "a weak slot to a reclaimed object must read null");
+        }
+
+        /// A BITMAP TOO SMALL FOR THE REGION REFUSES, AND REFUSES HAVING CHANGED NOTHING.
+        ///
+        /// This is the failure mode that would otherwise be silent and total: a short bitmap answers
+        /// "unmarked" for every address past its end, so every object up there would be reclaimed
+        /// while live. The refusal is what makes the bitmap's size a checked precondition rather
+        /// than an assumption.
+        #[test]
+        fn a_bitmap_too_small_refuses_and_leaves_the_heap_alone() {
+            let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
+            let a = heap.alloc(1).unwrap();
+            for _ in 0..64 {
+                heap.alloc(1).unwrap();
+            }
+            let before = heap.bytes.clone();
+            let mut bytes = heap.bytes.clone();
+            let mut roots = vec![a];
+            let resolver = TableResolver {
+                type_descs: &heap.type_descs,
+                weak_offsets: &heap.weak_offsets,
+            };
+            let mut storage = [0u32; 1];
+            let mut marks = MarkBits::new(&mut storage);
+            let answer = mark_compact_no_alloc(
+                &mut bytes,
+                Heap::BASE,
+                heap.top,
+                &resolver,
+                |visit: &mut dyn FnMut(&mut Ref)| {
+                    for root in &mut roots {
+                        visit(root);
+                    }
+                },
+                &[],
+                &mut marks,
+            );
+            assert!(answer.is_none(), "a bitmap short of the region must refuse");
+            assert_eq!(bytes, before, "a refusal must not have moved anything");
+            assert_eq!(roots, vec![a], "a refusal must not have rewritten a root");
+        }
+
+        /// The bitmap sizing is the precondition the refusal above tests, so it is stated here too:
+        /// one bit per `ALIGN` bytes, rounded up to whole words.
+        #[test]
+        fn the_bitmap_size_covers_the_region() {
+            assert_eq!(MarkBits::words_for(0), 0);
+            assert_eq!(MarkBits::words_for(128), 1);
+            assert_eq!(MarkBits::words_for(129), 2);
+            assert_eq!(MarkBits::words_for(4096), 32);
+        }
     }
 }

@@ -1,9 +1,45 @@
 //! Traps: controlled execution failures reported instead of panicking.
 
 use crate::object::UnencodableChar;
+use alloc::string::String;
 use core::fmt;
 use lamella_cil::Opcode;
 use lamella_token::Token;
+
+/// What the running tier can say about an exception that escaped without a handler.
+///
+/// Each `Option` means "this tier may not have this", never "this was empty", and the distinction
+/// is the point of the type: an absent message is a tier that cannot tell you, while an empty one
+/// is an exception constructed without a message. A caller that needs to tell them apart can.
+///
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhandledException {
+    /// The exception type's TAG: FNV-1a over `namespace.name` with the high bit set.
+    ///
+    /// The one fact BOTH tiers have, verified against `lamella_metadata::exception_tag_for_name`
+    /// rather than assumed: FNV-1a is a streaming fold, so folding `"Ns"`, `"."`, `"Name"` is
+    /// byte-identical to folding `"Ns.Name"`, and both sides fold the BARE name for a type in the
+    /// global namespace. Not invertible -- it names the type without naming it.
+    pub tag: u32,
+    /// The exception type's full name, when this tier can name it.
+    ///
+    pub type_name: Option<String>,
+    /// The exception's message, when this tier has an object to read one from.
+    ///
+    pub message: Option<String>,
+}
+
+impl fmt::Display for UnhandledException {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unhandled exception")?;
+        match (&self.type_name, &self.message) {
+            (Some(name), Some(message)) => write!(f, ": {name}: {message}"),
+            (Some(name), None) => write!(f, ": {name}"),
+            (None, Some(message)) => write!(f, ": {message}"),
+            (None, None) => write!(f, " (type tag {:#010x})", self.tag),
+        }
+    }
+}
 
 /// A controlled execution failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,8 +128,9 @@ pub enum Trap {
     /// (the `OutOfMemoryException` site) -- raised before the underlying allocator would fail
     /// hard, so it is catchable like the other runtime faults.
     OutOfMemory,
-    /// An exception propagated out of the entry method with no matching handler.
-    UnhandledException,
+    /// An exception propagated out of the entry method with no matching handler, and what the
+    /// running tier could say about it.
+    UnhandledException(UnhandledException),
     /// A BAKED module's entry point was run before its static constructors. A baked image
     /// carries the ordered `.cctor` list but not the lazy-trigger map a loaded module uses,
     /// so no static would ever initialize on first access and every `static readonly` would
@@ -170,7 +207,7 @@ impl fmt::Display for Trap {
             Trap::NoSuchMethod(id) => write!(f, "method id {id} does not exist"),
             Trap::CallStackOverflow => f.write_str("call stack overflow"),
             Trap::OutOfMemory => f.write_str("out of memory"),
-            Trap::UnhandledException => f.write_str("unhandled exception"),
+            Trap::UnhandledException(detail) => detail.fmt(f),
             Trap::StaticCtorsNotRun => {
                 f.write_str("baked module run before its static constructors")
             }

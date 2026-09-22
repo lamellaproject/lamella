@@ -707,3 +707,107 @@ fn an_address_is_described_by_the_function_containing_it_and_only_inside_the_cod
         "a file that named no code cannot bound the last function, and is not refused for it"
     );
 }
+
+fn named<'a>(name: &'a [u8], linkage: Option<&'a [u8]>) -> lamella_dwarf::info::Function<'a> {
+    lamella_dwarf::info::Function {
+        name,
+        linkage_name: linkage,
+        low_pc: 0x100,
+        high_pc: 0x200,
+        decl_file: None,
+        decl_line: None,
+        unit_offset: 0,
+        stmt_list: None,
+        comp_dir: None,
+    }
+}
+
+/// `DW_AT_name` is the source spelling and a source spelling is not unique, so a table built from it
+/// alone carries the same name at two address ranges -- two methods called `write` are then
+/// indistinguishable in a frame. The qualified linkage name is what distinguishes them.
+#[test]
+fn a_qualified_linkage_name_is_what_a_frame_reports() {
+    let uart = named(b"write", Some(b"Nrf51Uart.write"));
+    let gpio = named(b"write", Some(b"Nrf51Gpio.write"));
+    assert_eq!(reported_name(&uart), "Nrf51Uart.write");
+    assert_eq!(reported_name(&gpio), "Nrf51Gpio.write");
+    assert_ne!(
+        reported_name(&uart),
+        reported_name(&gpio),
+        "the whole point is that these stop being the same string"
+    );
+}
+
+/// A `::` qualifier counts too: the separator is the language's, and the relationship being tested
+/// is that one name is the other with a scope in front of it.
+#[test]
+fn a_double_colon_qualifier_counts_as_one() {
+    assert_eq!(
+        reported_name(&named(b"write", Some(b"Nrf51Uart::write"))),
+        "Nrf51Uart::write"
+    );
+}
+
+/// **A LINKAGE NAME IS NOT ALWAYS A READABLE QUALIFIER.** It is whatever the language's linkage
+/// conventions say, which for several of them is a mangled symbol encoding the types and the arity.
+/// Answering an ambiguous name with an unreadable one is not an improvement, so a mangled name is
+/// left alone -- and the reader is no worse off than before this rule existed.
+#[test]
+fn a_mangled_linkage_name_is_not_put_in_a_frame() {
+    assert_eq!(
+        reported_name(&named(b"write", Some(b"$s4Test10Nrf51UartV5writeyySSF"))),
+        "write"
+    );
+    assert_eq!(
+        reported_name(&named(b"write", Some(b"_ZN9Nrf51Uart5writeEv"))),
+        "write"
+    );
+}
+
+/// What is shown always ENDS with what the source called it, so nothing a reader knew is lost.
+#[test]
+fn what_is_reported_always_ends_with_the_source_name() {
+    for (name, linkage) in [
+        (&b"write"[..], Some(&b"Nrf51Uart.write"[..])),
+        (b"write", Some(b"$s4Test5writeF")),
+        (b"write", None),
+        (b"appMain", Some(b"appMain")),
+        (b"write", Some(b"prefixwrite")),
+    ] {
+        let reported = reported_name(&named(name, linkage));
+        assert!(
+            reported.ends_with(&String::from_utf8_lossy(name).into_owned()),
+            "{reported} must end with the source name"
+        );
+    }
+}
+
+/// A qualifier is a SCOPE, not a prefix that happens to end in the same letters. `prefixwrite` is a
+/// different function, and taking it would name a frame after something else entirely.
+#[test]
+fn a_name_that_merely_ends_in_the_source_name_is_not_a_qualifier() {
+    assert_eq!(
+        reported_name(&named(b"write", Some(b"prefixwrite"))),
+        "write"
+    );
+}
+
+/// No linkage name, and a linkage name equal to the source name, both leave today's answer alone --
+/// which is what keeps this rule from being a regression where the producer emitted nothing useful.
+#[test]
+fn an_absent_or_identical_linkage_name_changes_nothing() {
+    assert_eq!(reported_name(&named(b"appMain", None)), "appMain");
+    assert_eq!(
+        reported_name(&named(b"appMain", Some(b"appMain"))),
+        "appMain"
+    );
+}
+
+/// A linkage name carrying bytes that are not printable is not put in front of a person.
+#[test]
+fn an_unprintable_linkage_name_is_refused() {
+    assert_eq!(
+        reported_name(&named(b"write", Some(b"Nrf51\x00Uart.write"))),
+        "write"
+    );
+}

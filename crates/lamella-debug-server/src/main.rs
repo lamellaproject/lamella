@@ -88,7 +88,30 @@ impl Part {
 
 const USAGE: &str = "usage: device-dap-server [--probe cmsis|stlink] \
                      [--part nrf51|samd21|f0|f4|f7|h7] [--pid 0xNNNN] [--attach [--reset]] \
-                     <program.dll|program.elf> [<Type> <Method>] [probe-serial]";
+                     <program.dll|program.elf> [<Type> <Method>] [probe-serial]\n       \
+                     device-dap-server --list-probes    every attached CMSIS-DAP probe, as JSON\n\n\
+                     --part names a part this build can PROGRAM, and is only needed when this \
+                     command\nwrites the program. To debug one that is already on the board, use \
+                     --attach, which\nnames no part.";
+
+/// Why a debug session cannot be served on the class-library tier.
+///
+/// **THE FLAG IS TAKEN AND REFUSED, WHICH IS NOT THE SAME AS NOT TAKING IT.** `lamella build` and
+/// `lamella deploy` both offer `--class-library`, so somebody debugging the program they just
+/// deployed will type it here; an unrecognized option would be read as the program name.
+///
+/// **AND IT DOES NOT SERVE THE FLAT IMAGE INSTEAD.** What this binary serves is a debug session,
+/// whose whole content is a mapping from addresses in the flashed image back to lines of source. An
+/// image built on the other tier with this tier's map would answer every `stackTrace` with a line
+/// that resolves and is wrong, which is worse than refusing: a wrong line is believed.
+const CLASS_LIBRARY_REFUSAL: &str = "\
+device-dap-server: --class-library cannot be debugged yet.
+
+The class-library tier links the program, which moves and drops code, so the line tables built
+while lowering it no longer describe the image that gets flashed. Serving them anyway would give
+you a source line for every stop, and they would be the wrong lines.
+
+Build and deploy on that tier with `lamella deploy --class-library`; debug on the flat tier.";
 
 /// What the command line asks for, once everything this build cannot do as asked has been refused.
 struct Options {
@@ -133,6 +156,12 @@ impl Options {
                     part = part_called(arguments.next().as_deref())?;
                 }
                 "--pid" => pid = Some(product_id(arguments.next().as_deref())?),
+                "--class-library" => return Err(CLASS_LIBRARY_REFUSAL.to_owned()),
+                unknown if unknown.starts_with("--") => {
+                    return Err(format!(
+                        "device-dap-server: unknown option {unknown:?}.\n{USAGE}"
+                    ));
+                }
                 _ => positional.push(argument),
             }
         }
@@ -188,6 +217,27 @@ fn probe_kind(value: Option<&str>) -> Result<ProbeKind, String> {
     }
 }
 
+/// What a reader is told when the part they named is not one of the six.
+///
+/// **THE LIST READS AS THE LIST OF BOARDS THIS DEBUGS, AND IT IS NOT ONE.** `--part` chooses a
+/// flash algorithm and a reset sequence -- it answers *how is this part written and stopped*, which
+/// is a question this command only asks when it is the thing doing the writing. Stopping at a
+/// source line is a Cortex-M facility, so a board whose part is not named here is debugged by
+/// flashing it however that board is flashed and then attaching.
+///
+/// A short list beside a much longer board catalog invites the wrong conclusion, and the conclusion
+/// costs a user their whole board: a reader with a part outside the list has no reason to try
+/// `--attach` and every reason to stop.
+///
+/// Appended to BOTH refusals rather than written into one, because the arm a reader reaches
+/// depends on whether they typed a value at all -- and the one that omits this is the one that
+/// sends them away.
+const PART_IS_FOR_PROGRAMMING: &str = "
+
+Those are the parts this build can PROGRAM: --part picks a flash algorithm and a reset sequence.
+It is not the list of boards that can be debugged. To debug a program already on the board, pass
+--attach, which names no part -- flash the board however that board is flashed, then attach.";
+
 /// `--part`'s value.
 fn part_called(value: Option<&str>) -> Result<Part, String> {
     match value {
@@ -208,10 +258,8 @@ fn part_called(value: Option<&str>) -> Result<Part, String> {
         Some(part @ ("f0" | "f4" | "f7" | "h7")) => {
             Err(missing_feature(&format!("--part {part}"), "st"))
         }
-        Some(other) => Err(format!(
-            "--part takes nrf51, samd21, f0, f4, f7 or h7, not {other:?}"
-        )),
-        None => Err("--part takes nrf51, samd21, f0, f4, f7 or h7".to_owned()),
+        Some(other) => Err(format!("--part takes nrf51, samd21, f0, f4, f7 or h7, not {other:?}.{PART_IS_FOR_PROGRAMMING}")),
+        None => Err(format!("--part takes nrf51, samd21, f0, f4, f7 or h7.{PART_IS_FOR_PROGRAMMING}")),
     }
 }
 
@@ -237,7 +285,81 @@ fn missing_feature(argument: &str, feature: &str) -> String {
     )
 }
 
+/// One JSON string, with the two characters that would end it early and the control range escaped.
+///
+/// A probe reports its product name and serial as the operating system gives them, and neither is
+/// this program's to trust: a quote or a backslash in either would produce a document the caller
+/// cannot parse, and the caller is a debug client choosing which board to write.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            control if (control as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `--list-probes`: every attached CMSIS-DAP probe, as JSON, for a caller that has to CHOOSE one.
+///
+/// # WHY THIS LIVES HERE AND NOT IN A SECOND TOOL
+///
+/// **This is the executable that will open the probe, so the list and the open cannot disagree.**
+/// A separate lister would walk the same ladder a second time and could answer differently -- a
+/// probe replugged between the two, a build with different features, an environment variable set
+/// in one process and not the other -- and the caller would name a board this program then fails to
+/// find. One walk, one answer.
+///
+/// **What a caller does with it is the point.** `Selector::from_environment` refuses an ambiguous
+/// bench rather than guessing, which is right and is not enough by itself: a CLI can print "name
+/// one with `--probe`", but an editor that can ASK should ask, and it needs the candidates to ask
+/// with. Every micro:bit is `0d28:0204` and every RPi Debug Probe is `2e8a:000c`, so the serial is
+/// the only thing that distinguishes two of a kind -- and it is reported WHOLE, because these
+/// serials share long suffixes (the interface chip's) and differ in the middle.
+///
+/// A probe the operating system reports with no serial is listed with `"serial": null` rather than
+/// dropped: it is attached, it is why a bench looks ambiguous, and a caller that cannot see it
+/// cannot explain its own refusal.
+fn list_probes() -> std::io::Result<()> {
+    use std::io::Write;
+
+    let probes = lamella_probe::list();
+    let rows: Vec<String> = probes
+        .iter()
+        .map(|probe| {
+            let serial = probe
+                .serial
+                .as_deref()
+                .map_or_else(|| String::from("null"), json_string);
+            let product = probe
+                .product
+                .as_deref()
+                .map_or_else(|| String::from("null"), json_string);
+            format!(
+                "{{\"serial\":{serial},\"product\":{product},\"vendorId\":{},\"productId\":{}}}",
+                probe.vendor_id, probe.product_id
+            )
+        })
+        .collect();
+    let mut out = std::io::stdout();
+    writeln!(out, "[{}]", rows.join(","))?;
+    out.flush()
+}
+
 fn main() -> std::io::Result<()> {
+    if std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--list-probes")
+    {
+        return list_probes();
+    }
     let options = match Options::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(reason) => return refuse(&reason),
@@ -563,7 +685,12 @@ fn flash<A: TargetAccess>(
         .map_err(deploy_step("reach the part's memory"))?;
     #[cfg(feature = "st")]
     if let Some(family) = part.route_family() {
-        return write_through_the_route(target, family, part.flash_base(), image);
+        return leave_held(write_through_the_route(
+            target,
+            family,
+            part.flash_base(),
+            image,
+        )?);
     }
     target.halt().map_err(deploy_step("halt the core"))?;
     let base = part.flash_base();
@@ -588,6 +715,7 @@ fn flash<A: TargetAccess>(
             target
                 .write_flash(base, &words)
                 .map_err(deploy_step("write the flash"))?;
+            read_back(&mut target, base, image)?;
         }
         #[cfg(feature = "st")]
         Part::Stm32F0 => {
@@ -606,6 +734,7 @@ fn flash<A: TargetAccess>(
             target
                 .f0_lock_flash()
                 .map_err(deploy_step("lock the flash"))?;
+            read_back(&mut target, base, image)?;
         }
         #[cfg(feature = "st")]
         Part::Stm32F4 => {
@@ -638,34 +767,49 @@ fn flash<A: TargetAccess>(
                 .program_words(base, &words)
                 .map_err(deploy_step("program the flash"))?;
             target.lock_flash().map_err(deploy_step("lock the flash"))?;
-            let held: Vec<u8> = target
-                .read_words(base, words.len())
-                .map_err(deploy_step("read the image back"))?
-                .iter()
-                .flat_map(|word| word.to_le_bytes())
-                .collect();
-            if let Some(offset) = image
-                .iter()
-                .zip(&held)
-                .position(|(wrote, read)| wrote != read)
-            {
-                return Err(format!(
-                    "the image did not read back as written: {:#010x} holds {:#04x} where {:#04x} \
-                     was written",
-                    base + offset as u32,
-                    held[offset],
-                    image[offset]
-                ));
-            }
+            read_back(&mut target, base, image)?;
         }
         #[cfg(feature = "st")]
         Part::Stm32F7 | Part::Stm32H7 => {
             unreachable!("an STM32F7 or H7 is written through its route before the halt")
         }
     }
-    target
-        .reset_and_run()
-        .map_err(deploy_step("reset the part to run"))?;
+    leave_held(target)
+}
+
+/// Leaves `target` reset and HELD at its reset vector, so the session about to be served can arm
+/// its breakpoints before the program runs.
+///
+/// # A DEPLOY THAT RESETS THE PART TO RUN CANNOT BE DEBUGGED FROM ITS START
+///
+/// A deploy that ends by letting the part RUN has executed the program's setup before the client
+/// sends its first `setBreakpoints`, so a breakpoint on any line that runs early can never be hit
+/// -- and nothing says so, because resolving the line and arming the comparator both succeed. The
+/// breakpoint is reported verified, at the right file and the right address, and the code it names
+/// has already gone past.
+///
+/// So the part is left STOPPED where a plain deploy would leave it running, and the session's
+/// `configurationDone` is what starts the program. A client that connects and never configures
+/// leaves a board that looks dark: that is what a debugger holding a target looks like, and it is
+/// the cost of being able to stop on the first line.
+///
+/// A part whose debug port cannot be held across a reset is let go instead rather than failing the
+/// deploy: a session against a running program is still a session, and the reason says which
+/// breakpoints it cannot honor.
+///
+/// # Errors
+/// Only if the part can neither be held nor let go, which is a part that is no longer answering.
+fn leave_held<A: TargetAccess>(mut target: A) -> Result<A, String> {
+    if let Err(error) = target.reset_and_halt() {
+        eprintln!(
+            "reset: this part could not be held at its entry after the deploy ({error:?}), so it \
+             is running the new image instead. A breakpoint on a line that runs before the \
+             session attaches will not be hit."
+        );
+        target
+            .reset_and_run()
+            .map_err(deploy_step("reset the part to run"))?;
+    }
     Ok(target)
 }
 
@@ -695,6 +839,47 @@ fn write_through_the_route<A: TargetAccess>(
     let target = backend.into_target();
     written.map_err(|why| format!("could not write the image: {why}"))?;
     Ok(target)
+}
+
+/// Reads `image` back from `base` and refuses at the first byte that is not what was written.
+///
+/// # A WRITE NOBODY READS BACK IS A DEPLOY THAT CANNOT FAIL
+///
+/// Every arm here programs through a controller that can decline: a page whose erase did not take
+/// programs to whatever it still held, and the nRF51 write path deliberately drops the per-word
+/// `NVMC READY` poll on the hypothesis that the controller stalls the bus -- its own documentation
+/// names the read-back as the control for that hypothesis, because a wrong one loses words. None of
+/// those failures reports itself. The deploy then resets the part, says it wrote the image, and the
+/// program that does not run looks like a compiler or a debugger problem.
+///
+/// So this is not an extra check: it is the only thing standing between a flash that silently did
+/// nothing and a session spent looking somewhere else. It lives in one function because it was
+/// written into one arm of four, and an arm without it is indistinguishable from an arm with it right
+/// up to the moment it matters.
+///
+/// # Errors
+/// The first address whose byte differs, with what it holds and what was written.
+fn read_back<A: TargetAccess>(target: &mut A, base: u32, image: &[u8]) -> Result<(), String> {
+    let held: Vec<u8> = target
+        .read_words(base, image.len().div_ceil(4))
+        .map_err(deploy_step("read the image back"))?
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    if let Some(offset) = image
+        .iter()
+        .zip(&held)
+        .position(|(wrote, read)| wrote != read)
+    {
+        return Err(format!(
+            "the image did not read back as written: {:#010x} holds {:#04x} where {:#04x} was \
+             written",
+            base + offset as u32,
+            held[offset],
+            image[offset]
+        ));
+    }
+    Ok(())
 }
 
 /// The reason a deploy gives when the probe or the part refuses `step`.
@@ -798,6 +983,18 @@ mod tests {
     #[cfg(feature = "st")]
     use std::{cell::Cell, rc::Rc};
 
+    /// How a deploy left the part.
+    ///
+    /// **THE LAST ONE, NOT WHETHER EACH HAPPENED.** An ST route resets the part to run on its way
+    /// out and the hold then follows it, so a pair of sticky "was reset to run" / "was held" flags
+    /// reads TRUE for both and cannot say which the session actually meets. What a session sees is
+    /// the ending, so that is what the fakes record.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Ending {
+        Running,
+        HeldAtEntry,
+    }
+
     fn parse(arguments: &[&str]) -> Result<Options, String> {
         Options::parse(arguments.iter().map(|argument| (*argument).to_owned()))
     }
@@ -807,6 +1004,76 @@ mod tests {
             Ok(_) => panic!("{arguments:?} should have been refused"),
             Err(reason) => reason,
         }
+    }
+
+    /// A part this build cannot program is told how to debug the board anyway.
+    ///
+    /// **THE SIX NAMES READ AS THE SUPPORTED-BOARD LIST.** A reader with a part outside them has
+    /// no reason to try `--attach` and every reason to conclude the debugger is not for their
+    /// board -- so the refusal that turns them away is the one place the other route has to be
+    /// named. Both arms are asked because a reader reaches a different one depending on whether
+    /// they typed a value at all, and the arm with no value is reached by simply writing `--part`.
+    #[test]
+    fn a_part_this_build_cannot_program_is_still_told_how_to_debug_the_board() {
+        for arguments in [
+            &["--part", "l0", "program.elf"][..],
+            &["--part"][..],
+        ] {
+            let reason = refusal(arguments);
+            assert!(
+                reason.contains("--attach"),
+                "{arguments:?} sends the reader away without the route that works: {reason}"
+            );
+            assert!(
+                reason.contains("PROGRAM"),
+                "{arguments:?} does not say what --part is for: {reason}"
+            );
+        }
+    }
+
+    /// **AN UNRECOGNIZED OPTION WAS READ AS A FILE NAME.** This parser ended
+    /// `_ => positional.push(argument)`, and its positionals are `<program> [<Type> <Method>]
+    /// [probe-serial]` disambiguated BY COUNT -- so a misspelled flag became the program to debug,
+    /// and one typed alongside a program became a PROBE SERIAL, selecting which board gets written.
+    /// This binary is launched by a VS Code configuration, where nobody reads the command line.
+    #[test]
+    fn an_unknown_option_is_refused_rather_than_read_as_a_positional() {
+        let reason = refusal(&["--reset-halt", "prog.dll"]);
+        assert!(
+            reason.contains("--reset-halt"),
+            "it names what was wrong: {reason}"
+        );
+        assert!(
+            reason.contains("device-dap-server"),
+            "and who is refusing: {reason}"
+        );
+    }
+
+    /// A near-miss on a real flag must not become a probe serial either.
+    #[test]
+    fn a_misspelled_flag_beside_a_program_does_not_become_a_probe_serial() {
+        let reason = refusal(&["prog.dll", "--prb", "cmsis"]);
+        assert!(
+            reason.contains("--prb"),
+            "it names the misspelling: {reason}"
+        );
+    }
+
+    /// **THE FLAG IS ACCEPTED AND REFUSED BY NAME, WHICH IS NOT THE SAME AS NOT TAKING IT.** The
+    /// other two verbs offer `--class-library`, so it will be typed here; the linked tier has no
+    /// debug map, so it cannot be served. Saying that is the answer. Falling through to the flat
+    /// tier would serve a debug session for an image the user did not ask for.
+    #[test]
+    fn asking_for_the_class_library_is_refused_by_name_rather_than_served_flat() {
+        let reason = refusal(&["--class-library", "prog.dll"]);
+        assert!(
+            reason.contains("--class-library"),
+            "it names what was asked for: {reason}"
+        );
+        assert!(
+            reason.contains("line table"),
+            "and what is missing: {reason}"
+        );
     }
 
     #[test]
@@ -1049,6 +1316,273 @@ mod tests {
         );
     }
 
+    /// The nRF51's non-volatile memory controller, and the flash geometry a page erase needs.
+    ///
+    /// Spelled out here rather than imported from `lamella-cmsis-dap-nrf`, where they are private
+    /// anyway: a fixture that shares its constants with the code under test agrees with a wrong
+    /// address as readily as a right one. These are the nRF51 Series Reference Manual's NVMC
+    /// registers, which is also where that crate took them from.
+    mod nvmc {
+        /// `READY`: bit 0 set means the controller is idle.
+        pub const READY: u32 = 0x4001_E400;
+        /// `CONFIG`: the write/erase enable.
+        pub const CONFIG: u32 = 0x4001_E504;
+        /// `ERASEPAGE`: the address of the page to erase.
+        pub const ERASEPAGE: u32 = 0x4001_E508;
+        /// `CONFIG` = 1, writes enabled.
+        pub const WEN: u32 = 1;
+        /// `CONFIG` = 2, erase enabled.
+        pub const EEN: u32 = 2;
+        /// The part's page, and its whole main flash block.
+        pub const PAGE: u32 = 1024;
+        pub const FLASH: usize = 256 * 1024;
+    }
+
+    /// An nRF51 whose flash is programmed through its NVMC: a page erases to `0xFF` only while
+    /// `CONFIG` is `EEN`, a cell takes a write only while `CONFIG` is `WEN`, and a write clears bits
+    /// without ever setting one -- which is what flash does and what makes an unerased page visible.
+    ///
+    /// `drops_writes_from` is the failure this part exists to model: the nRF51 write path drops the
+    /// per-word `NVMC READY` poll on the hypothesis that the controller stalls the bus, so if that
+    /// hypothesis is ever wrong the words after some point are simply LOST -- accepted by the probe,
+    /// never stored. Nothing about the write reports it. Only reading the image back does.
+    #[derive(Default)]
+    struct Nrf51Part {
+        flash: Vec<u8>,
+        config: u32,
+        /// The word index, counted from the start of flash, from which a write is silently dropped.
+        drops_writes_from: Option<usize>,
+        /// How the deploy LEFT the part, which is what a session about to be served sees.
+        ending: Option<Ending>,
+        /// Makes the hold fail, for the part whose debug port cannot be held across a reset.
+        hold_fails: bool,
+    }
+
+    impl Nrf51Part {
+        /// A part holding an older firmware, so an unerased page is distinguishable from an erased
+        /// one and from the image about to be written.
+        fn holding_old_firmware() -> Self {
+            Nrf51Part {
+                flash: (0..nvmc::FLASH).map(|index| (index % 97) as u8).collect(),
+                ..Nrf51Part::default()
+            }
+        }
+
+        /// The offset in flash `address` addresses, for a whole word inside the block.
+        fn cell(&self, address: u32) -> Option<usize> {
+            let at = address as usize;
+            (at + 4 <= self.flash.len()).then_some(at)
+        }
+    }
+
+    impl TargetAccess for Nrf51Part {
+        fn connect(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+            Ok(0x0BB1_1477)
+        }
+        fn init_mem(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn halt(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+            self.ending = Some(Ending::Running);
+            Ok(())
+        }
+        fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+            if let Some(at) = self.cell(address) {
+                let word = &self.flash[at..at + 4];
+                return Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+            }
+            Ok(u32::from(address == nvmc::READY))
+        }
+        fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+            if let Some(at) = self.cell(address) {
+                if self.config == nvmc::WEN
+                    && self.drops_writes_from.is_none_or(|from| at / 4 < from)
+                {
+                    for (cell, byte) in self.flash[at..at + 4].iter_mut().zip(value.to_le_bytes()) {
+                        *cell &= byte;
+                    }
+                }
+                return Ok(());
+            }
+            match address {
+                nvmc::CONFIG => self.config = value,
+                nvmc::ERASEPAGE if self.config == nvmc::EEN => {
+                    let start = (value & !(nvmc::PAGE - 1)) as usize;
+                    let end = (start + nvmc::PAGE as usize).min(self.flash.len());
+                    if start < end {
+                        self.flash[start..end].fill(0xFF);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
+            for (index, &word) in words.iter().enumerate() {
+                self.write_word(address + (index * 4) as u32, word)?;
+            }
+            Ok(())
+        }
+        fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = self.read_word(address + (index * 4) as u32)?;
+            }
+            Ok(())
+        }
+
+        // An access an nRF51 deploy has no reason to make panics, so this fixture states the
+        // dependency surface rather than quietly absorbing a call nobody meant to write.
+        fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
+            unreachable!("an nRF51 deploy programs words")
+        }
+        fn write_byte(&mut self, _address: u32, _value: u8) -> Result<(), ProbeError> {
+            unreachable!("an nRF51 deploy programs words")
+        }
+        fn read_halfword(&mut self, _address: u32) -> Result<u16, ProbeError> {
+            unreachable!("an nRF51 deploy programs words")
+        }
+        fn write_halfword(&mut self, _address: u32, _value: u16) -> Result<(), ProbeError> {
+            unreachable!("an nRF51 deploy programs words")
+        }
+        fn read_core_reg(&mut self, _selector: u8) -> Result<u32, ProbeError> {
+            unreachable!("a deploy reads no core register")
+        }
+        fn write_core_reg(&mut self, _selector: u8, _value: u32) -> Result<(), ProbeError> {
+            unreachable!("a deploy writes no core register")
+        }
+        fn resume(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a deploy resets the part rather than resuming it")
+        }
+        fn step(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a deploy does not step")
+        }
+        fn is_halted(&mut self) -> Result<bool, ProbeError> {
+            unreachable!("a deploy halts and does not ask again")
+        }
+        fn wait_halted(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a deploy halts and does not ask again")
+        }
+        fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+            if self.hold_fails {
+                return Err(ProbeError::Device("reset catch"));
+            }
+            self.ending = Some(Ending::HeldAtEntry);
+            Ok(())
+        }
+        fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+            unreachable!("an nRF51 deploy does not drive the reset line itself")
+        }
+        fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            unreachable!("an nRF51 deploy does not catch the reset")
+        }
+        fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            unreachable!("an nRF51 deploy does not catch the reset")
+        }
+        fn set_breakpoint(&mut self, _address: u32) -> Result<(), ProbeError> {
+            unreachable!("a deploy arms no breakpoint")
+        }
+        fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a deploy arms no breakpoint")
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
+            unreachable!("a deploy arms no breakpoint")
+        }
+        fn call_target(
+            &mut self,
+            _address: u32,
+            _args: &[u32],
+            _frame: &lamella_probe_core::CallFrame,
+        ) -> Result<u32, ProbeError> {
+            unreachable!("an nRF51 is programmed through its NVMC, not by a loader on the part")
+        }
+    }
+
+    /// An nRF51 deploy reads its image back, so a write the controller did not take is refused
+    /// rather than reported as a successful deploy and reset to run.
+    ///
+    /// This arm erased and wrote and checked nothing, while the F4 arm beside it read every byte
+    /// back -- so the same silent failure was caught on one part and reported as success on another.
+    #[test]
+    fn an_nrf51_deploy_that_does_not_read_back_as_written_is_refused_naming_where() {
+        let image = image_of(4096);
+        let mut part = Nrf51Part::holding_old_firmware();
+        part.drops_writes_from = Some(350);
+        let Err(reason) = flash(part, Part::Nrf51, &image, None) else {
+            panic!("a write the NVMC dropped left the old firmware behind, and a deploy hid that");
+        };
+        assert!(
+            reason.contains("0x00000578"),
+            "the first address that differs is named: {reason}"
+        );
+    }
+
+    /// The control: the same part with nothing dropped takes the whole image and is left running it.
+    #[test]
+    fn an_nrf51_deploy_that_takes_puts_every_byte_on_the_part() {
+        let image = image_of(4096);
+        let part = flash(Nrf51Part::holding_old_firmware(), Part::Nrf51, &image, None)
+            .unwrap_or_else(|reason| panic!("an image this size fits an nRF51: {reason}"));
+        assert_eq!(
+            &part.flash[..image.len()],
+            &image[..],
+            "every byte of the image is on the part"
+        );
+        assert_eq!(
+            part.ending,
+            Some(Ending::HeldAtEntry),
+            "the part is left held at its entry, so the session can arm breakpoints before it runs"
+        );
+    }
+
+    /// **A PROBE NAME IS NOT THIS PROGRAM'S TO TRUST.** The product string and the serial come from
+    /// the operating system, and the consumer is a debug client parsing JSON to decide which board
+    /// to write -- so a quote or a backslash in either must not be able to end the string early.
+    #[test]
+    fn a_probe_name_carrying_json_punctuation_is_escaped_rather_than_ending_the_string() {
+        assert_eq!(json_string(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(json_string(r"a\b"), r#""a\\b""#);
+        assert_eq!(json_string("a\tb"), r#""a\u0009b""#);
+        assert_eq!(
+            json_string("BBC micro:bit CMSIS-DAP"),
+            "\"BBC micro:bit CMSIS-DAP\""
+        );
+    }
+
+    /// A part that cannot be held is let go, and the deploy still succeeds.
+    ///
+    /// The hold is what makes a breakpoint on an early line hittable, and a part whose debug port
+    /// cannot be caught across a reset cannot offer it -- a SAM D21 over an EDBG answers
+    /// `Timeout("reset catch")`. But a session against a running program is still a session and is
+    /// worth far more than a refused deploy, so the part is let go, the image is left on it, and
+    /// the reason says which breakpoints cannot be honored.
+    #[test]
+    fn a_part_that_cannot_be_held_is_let_go_rather_than_failing_the_deploy() {
+        let image = image_of(4096);
+        let part = Nrf51Part {
+            hold_fails: true,
+            ..Nrf51Part::holding_old_firmware()
+        };
+        let part = flash(part, Part::Nrf51, &image, None).unwrap_or_else(|reason| {
+            panic!("a hold that cannot be caught is not a failed deploy: {reason}")
+        });
+        assert_eq!(
+            part.ending,
+            Some(Ending::Running),
+            "the part is let go, so the program it was given at least runs"
+        );
+        assert_eq!(
+            &part.flash[..image.len()],
+            &image[..],
+            "and the image is still on it"
+        );
+    }
+
     /// One kilobyte, as the manuals size sectors and flash.
     #[cfg(feature = "st")]
     const KB: usize = 1024;
@@ -1098,8 +1632,8 @@ mod tests {
         watchdogs: u32,
         /// How many sector erases were started, shared with the test because a deploy takes the part.
         erases: Rc<Cell<u32>>,
-        /// Whether the part was reset to run.
-        reset_to_run: bool,
+        /// How the deploy LEFT the part, which is what a session about to be served sees.
+        ending: Option<Ending>,
     }
 
     #[cfg(feature = "st")]
@@ -1164,7 +1698,7 @@ mod tests {
                 erase_does_not_take: None,
                 watchdogs: 0,
                 erases: Rc::new(Cell::new(0)),
-                reset_to_run: false,
+                ending: None,
             }
         }
 
@@ -1261,7 +1795,7 @@ mod tests {
             Ok(())
         }
         fn reset_and_run(&mut self) -> Result<(), ProbeError> {
-            self.reset_to_run = true;
+            self.ending = Some(Ending::Running);
             Ok(())
         }
         fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
@@ -1289,7 +1823,8 @@ mod tests {
             unreachable!("a deploy does not wait for a halt")
         }
         fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
-            unreachable!("a deploy ends with a reset to run")
+            self.ending = Some(Ending::HeldAtEntry);
+            Ok(())
         }
         fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
             unreachable!("a deploy drives no reset line of its own")
@@ -1327,7 +1862,11 @@ mod tests {
 
     /// An image of `len` bytes with no zero byte in it, so a cell programmed without an erase first
     /// cannot match it.
-    #[cfg(feature = "st")]
+    ///
+    /// **NOT GATED, BECAUSE THE nRF51 DEPLOY TESTS USE IT TOO.** It was `#[cfg(feature = "st")]`
+    /// while three nRF51 tests called it, so a build with `st` off did not compile at all -- and
+    /// nothing noticed, because that configuration had never been built. The helper is arithmetic
+    /// and has no part-specific anything in it.
     fn image_of(len: usize) -> Vec<u8> {
         (0..len).map(|index| (index % 251) as u8 | 1).collect()
     }
@@ -1352,7 +1891,11 @@ mod tests {
             None,
             "every byte of the image is on the part, the ones past the first megabyte included"
         );
-        assert!(part.reset_to_run, "the part is left running its new image");
+        assert_eq!(
+            part.ending,
+            Some(Ending::HeldAtEntry),
+            "the part is left held at its entry, so the session can arm breakpoints before it runs"
+        );
     }
 
     #[cfg(feature = "st")]
@@ -1452,8 +1995,8 @@ mod tests {
         erase_does_not_take: Option<u32>,
         /// How many sector erases were started, shared with the test because a deploy takes the part.
         erases: Rc<Cell<u32>>,
-        /// Whether the part was reset to run.
-        reset_to_run: bool,
+        /// How the deploy LEFT the part, which is what a session about to be served sees.
+        ending: Option<Ending>,
     }
 
     #[cfg(feature = "st")]
@@ -1467,7 +2010,7 @@ mod tests {
                 first_key: [false; 2],
                 erase_does_not_take: None,
                 erases: Rc::new(Cell::new(0)),
-                reset_to_run: false,
+                ending: None,
             }
         }
 
@@ -1562,7 +2105,7 @@ mod tests {
             Ok(())
         }
         fn reset_and_run(&mut self) -> Result<(), ProbeError> {
-            self.reset_to_run = true;
+            self.ending = Some(Ending::Running);
             Ok(())
         }
         fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
@@ -1590,7 +2133,8 @@ mod tests {
             unreachable!("a deploy does not wait for a halt")
         }
         fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
-            unreachable!("a deploy ends with a reset to run")
+            self.ending = Some(Ending::HeldAtEntry);
+            Ok(())
         }
         fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
             unreachable!("a deploy drives no reset line of its own")
@@ -1637,7 +2181,11 @@ mod tests {
             None,
             "every byte of the image is on the part, the ones in its second bank included"
         );
-        assert!(part.reset_to_run, "the part is left running its new image");
+        assert_eq!(
+            part.ending,
+            Some(Ending::HeldAtEntry),
+            "the part is left held at its entry, so the session can arm breakpoints before it runs"
+        );
     }
 
     #[cfg(feature = "st")]

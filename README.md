@@ -4,10 +4,7 @@
 
 A C# toolchain built from scratch in Rust: a compiler, an interpreted runtime (VES/CLR), an ahead-of-time backend (Cortex-M, RISC-V, WebAssembly), and a base class library. The language and runtime are implemented directly from their ECMA standards.
 
-Lamella was born as a research project and for use in student theses. While its scope has outgrown those original purposes,
-that academic discipline continues--with standards' clauses cited beside the code implementing them.
-
-It is free and open source under the [licenses below](#license).
+Lamella is free and open source under the [licenses below](#license).
 
 ## Status
 

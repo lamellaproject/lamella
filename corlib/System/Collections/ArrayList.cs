@@ -8,7 +8,23 @@ namespace System.Collections
 
         private const int DefaultCapacity = 4;
 
-        public ArrayList() { items = new object[DefaultCapacity]; size = 0; }
+        public ArrayList() { items = new object[0]; size = 0; }
+
+        public ArrayList(int capacity)
+        {
+            if (capacity < 0) throw new ArgumentOutOfRangeException("capacity");
+            items = new object[capacity];
+            size = 0;
+        }
+
+
+        private void Grow()
+        {
+            int capacity = items.Length == 0 ? DefaultCapacity : items.Length * 2;
+            object[] bigger = new object[capacity];
+            for (int i = 0; i < size; i++) bigger[i] = items[i];
+            items = bigger;
+        }
 
         public int Count { get { return size; } }
 
@@ -50,12 +66,7 @@ namespace System.Collections
 
         public int Add(object value)
         {
-            if (size == items.Length)
-            {
-                object[] bigger = new object[items.Length * 2];
-                for (int i = 0; i < size; i++) bigger[i] = items[i];
-                items = bigger;
-            }
+            if (size == items.Length) Grow();
             items[size] = value;
             size = size + 1;
             return size - 1;
@@ -125,12 +136,7 @@ namespace System.Collections
         public void Insert(int index, object value)
         {
             if (index < 0 || index > size) throw new ArgumentOutOfRangeException("index");
-            if (size == items.Length)
-            {
-                object[] bigger = new object[items.Length * 2];
-                for (int i = 0; i < size; i++) bigger[i] = items[i];
-                items = bigger;
-            }
+            if (size == items.Length) Grow();
             for (int i = size; i > index; i--) items[i] = items[i - 1];
             items[index] = value;
             size = size + 1;

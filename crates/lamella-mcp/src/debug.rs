@@ -34,7 +34,8 @@ fn compile_bake_srcmap(code: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         let mut t = String::from("compile failed:\n");
         for d in &compiled.diagnostics {
             if d.is_error() {
-                t.push_str(&format!("CS{:04}: {}\n", d.code, d.message));
+                t.push_str(&d.render(DOCUMENT, code));
+                t.push('\n');
             }
         }
         if let Some(e) = &compiled.emit_error {

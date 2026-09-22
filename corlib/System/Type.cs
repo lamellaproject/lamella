@@ -5,6 +5,9 @@ namespace System
     {
         protected Type() { }
 
+        public static readonly char Delimiter = '.';
+        public static readonly Type[] EmptyTypes = new Type[0];
+
 
 #if LAMELLA_SURFACE_REFLECTION
         public string Namespace

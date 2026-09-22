@@ -12,14 +12,22 @@ pub mod device;
 #[allow(unsafe_code)]
 pub mod device_heap;
 
-pub use device::{
-    lamella_gc_alloc, lamella_gc_alloc_impl, lamella_gc_init, lamella_gc_init_region,
-    lamella_gc_teardown, set_oom_roots_hook, OomRootsHook,
-};
+pub use device::{lamella_gc_alloc_impl, lamella_gc_init_device_heap};
 #[cfg(feature = "gc-collect")]
+pub use device::{set_device_collect_hook, set_device_oom_roots_hook, DeviceCollectHook};
+#[cfg(feature = "gc-collect")]
+pub use heap::mark_words_for;
+#[cfg(feature = "host-heap")]
+pub use device::{
+    lamella_gc_alloc, lamella_gc_init, lamella_gc_init_region, lamella_gc_teardown,
+    set_oom_roots_hook, OomRootsHook,
+};
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub use device::{lamella_gc_collect, lamella_gc_collect_device};
 pub use device_heap::{DeviceHeap, DeviceTypeDesc};
-pub use heap::{Heap, Ref, StackMapEntry, StackMapTable, TypeDesc};
+pub use heap::Ref;
+#[cfg(feature = "host-heap")]
+pub use heap::{Heap, StackMapEntry, StackMapTable, TypeDesc};
 
 /// An opaque reference to a managed object on the collector's heap.
 ///

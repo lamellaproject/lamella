@@ -99,6 +99,85 @@ pub enum LowerError {
     },
 }
 
+/// Why a function could not be lowered, as a sentence a caller can act on rather than as a variant
+/// name.
+///
+/// A build failure is rendered with `{error:?}`, so without this a refusal reads as
+/// `LowerArm(CallUnsupported)` -- naming no function, no construct and no remedy, and sounding like
+/// an internal assertion rather than something the caller did or can change. **Each arm spends the
+/// payload the variant already carries.**
+impl core::fmt::Display for LowerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LowerError::NotWellFormed { errors } => match errors.split_first() {
+                Some((first, rest)) if rest.is_empty() => {
+                    write!(f, "the function does not verify: {first:?}")
+                }
+                Some((first, rest)) => write!(
+                    f,
+                    "the function does not verify: {first:?}, and {} further problem(s)",
+                    rest.len(),
+                ),
+                None => write!(f, "the function does not verify"),
+            },
+            LowerError::ControlFlowUnsupported => write!(
+                f,
+                "the function has a control-flow shape this target does not lower: a branch \
+                 target that takes parameters (a merge must go through a Jump), or a reference \
+                 to a block that is not there",
+            ),
+            LowerError::TooManyValues => write!(
+                f,
+                "the function needs more stack or registers than this lowering provides: more \
+                 than eight live values across a branch, more than four parameters, or a frame \
+                 past the reach of a single stack adjustment",
+            ),
+            LowerError::NonIntegerValue => write!(
+                f,
+                "the function holds a value that is not an integer, and this lowering emits \
+                 only integers",
+            ),
+            LowerError::CodeTooLarge {
+                site: Some((offset, kind)),
+            } => write!(
+                f,
+                "a {kind:?} reference at byte {offset} could not reach its target after every \
+                 relaxation and veneer this encoder can apply -- the function is too large for \
+                 that reach, not for the image",
+            ),
+            LowerError::CodeTooLarge { site: None } => write!(
+                f,
+                "the code could not be laid out, and the encoder named no failing site -- an \
+                 unbound label, an operand that does not encode, or a layout query with no answer",
+            ),
+            LowerError::CallUnsupported => write!(
+                f,
+                "the function contains a call, and single-function lowering cannot resolve one \
+                 -- calls are resolved by the module lowering, so this names the wrong entry \
+                 point rather than an unsupported program",
+            ),
+            LowerError::StringSeamWithoutDescriptor { seam } => write!(
+                f,
+                "this image calls the string-allocating seam `{seam}` but cannot name \
+                 `System.String`, so every string that seam returns would carry a null type \
+                 descriptor",
+            ),
+            LowerError::BigStructResultUnsupported { call } => write!(
+                f,
+                "a `{call}` returns a value type too wide for registers, and that dispatch has \
+                 no register left for the hidden result pointer -- its first one is already the \
+                 receiver or the target",
+            ),
+            LowerError::UnencodableStringUnit { unit, index } => write!(
+                f,
+                "a string literal holds the UTF-16 code unit 0x{unit:04X} at index {index}, \
+                 which this build's string storage cannot represent -- a lone surrogate has no \
+                 form under `string-utf8`",
+            ),
+        }
+    }
+}
+
 /// Maps a string blob's encoding refusal into this backend's error, so the four blob-emission sites
 /// across the three backends carry the same two facts and the encoder stays the ONE place that decides
 /// whether a unit is representable.
@@ -1019,6 +1098,16 @@ fn lower_spilled_inst(
             let mdone = enc.new_label();
             let e = |_| LowerError::TooManyValues;
             enc.movs_imm(Reg::R4, 0).map_err(e)?;
+            static_slot_addr(
+                enc,
+                pool,
+                sym_pool,
+                relocate,
+                StaticOwner::Own,
+                crate::cil::G_EXCEPTION_TAG_OFFSET,
+            )?;
+            enc.ldr_imm(Reg::R0, Reg::R0, 0).map_err(e)?;
+            enc.movs_reg(Reg::R6, Reg::R0).map_err(e)?;
             enc.bind_label(mloop);
             slot_load(enc, Reg::R3, slot(*delegate))?;
             enc.ldr_imm(Reg::R2, Reg::R3, 8).map_err(e)?;
@@ -1048,6 +1137,17 @@ fn lower_spilled_inst(
             enc.blx(Reg::R12);
             let return_pc = enc.safepoint_label();
             enc.movs_reg(Reg::R5, Reg::R0).map_err(e)?;
+            static_slot_addr(
+                enc,
+                pool,
+                sym_pool,
+                relocate,
+                StaticOwner::Own,
+                crate::cil::G_EXCEPTION_TAG_OFFSET,
+            )?;
+            enc.ldr_imm(Reg::R0, Reg::R0, 0).map_err(e)?;
+            enc.cmp_reg(Reg::R0, Reg::R6).map_err(e)?;
+            enc.b_cond(Cond::Ne, mdone);
             enc.adds_imm8(Reg::R4, 1).map_err(e)?;
             enc.b(mloop);
             enc.bind_label(mdone);
@@ -1456,6 +1556,7 @@ fn lower_spilled_inst(
         Inst::FieldAddr { base, offset } => {
             if is_pointer_base(value_types, *base) {
                 slot_load(enc, Reg::R0, slot(*base))?;
+                emit_null_test(enc, value_types, *base, Reg::R0, stubs)?;
                 if *offset != 0 {
                     enc.adds_imm8(Reg::R0, *offset as u8)
                         .map_err(|_| LowerError::TooManyValues)?;
@@ -1803,6 +1904,11 @@ fn lower_spilled_inst(
 /// does not use this constant: each assembly's accesses relocate against its own
 /// `__lamella_statics_<hash>` symbol and `lamella-linker` places the regions -- its per-machine
 /// default window starts at this same value, so flat and linked images share one RAM plan.
+///
+/// **A flat image's boot stub CLEARS this region before it enters the entry** (`build`'s startup for
+/// the Nordic parts, the reset stub for the RP2040 and RP2350), which is what makes an unwritten
+/// static read 0 and the exception tag at offset 0 read "nothing in flight" on a part whose RAM
+/// powers up undefined.
 pub const STATIC_FIELD_BASE: u32 = 0x2000_1000;
 
 /// Emits the array bounds check: with `r0` = the array and `r1` = the index, branches to the function's
@@ -2784,7 +2890,7 @@ fn lower_spilled_into(
             .iter()
             .any(|(_, i)| matches!(i, Inst::InvokeDelegate { .. }))
     });
-    let saved_mask: u8 = if invokes_delegate { 0x30 } else { 0 };
+    let saved_mask: u8 = if invokes_delegate { 0x70 } else { 0 };
     let saved_bytes: u16 = (saved_mask.count_ones() as u16 + 1) * 4;
     let lr_bytes = if has_calls { 4 } else { 0 };
     let returns_big_struct = matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4);
@@ -11908,6 +12014,85 @@ mod tests {
     }
 
     #[test]
+    fn a_struct_local_s_interior_references_are_roots_at_their_own_word_offsets() {
+        let refs = lamella_ir::RefWords::from_offsets(&[4, 12])
+            .expect("two word-aligned references inside a 16-byte struct");
+        let main = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![
+                MirType::ValueType {
+                    handle: lamella_ir::TypeHandle(0),
+                    size: 16,
+                    refs,
+                },
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::InitStruct),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let g = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let obj = lamella_elf::read_object(&lower_object(&[main, g], &["main", "g"], &[]).unwrap())
+            .unwrap();
+        let rec = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_smrec_main")
+            .expect("main gets a method record");
+        let bytes = &obj.text[rec.value as usize..(rec.value + rec.size) as usize];
+        let (_, _, mode, _, _, roots) = decode_stackmap_record(bytes);
+        assert_eq!(mode, STACKMAP_MODE_METHOD_SLOTS);
+        assert_eq!(
+            roots.len(),
+            2,
+            "both of the struct's reference words are roots, not the struct as one slot"
+        );
+        for root in &roots {
+            assert_eq!(
+                root >> 14,
+                STACKMAP_KIND_OBJECT_REF,
+                "a reference inside a value-type local is an ordinary object reference root"
+            );
+        }
+        let mut words: Vec<u16> = roots.iter().map(|r| r & 0x3FFF).collect();
+        words.sort_unstable();
+        assert_eq!(
+            words[1] - words[0],
+            2,
+            "the roots keep the references' own spacing (words 1 and 3 of the struct)"
+        );
+    }
+
+    #[test]
     fn a_seam_shaped_function_pins_its_reftoint_source() {
         let seam = Function {
             params: vec![MirType::ObjectRef],
@@ -12764,5 +12949,123 @@ mod tests {
             assert_eq!(handle >> 24, lamella_ir::SYNTHETIC_ARRAY_HANDLE_TABLE);
             assert!(handle < 1 << 27, "handle {handle:#x} reaches the flag bits");
         }
+    }
+
+    /// WHERE A METHOD'S VALUES LIVE, over the whole committed corlib -- the population behind the
+    /// question a debugger asks: to show a local, does it read target MEMORY or a core REGISTER?
+    ///
+    /// This calls [`prepare`] rather than re-deriving its predicate. A second copy would answer
+    /// correctly on the day it was written and drift silently afterwards, and the answer here is one
+    /// another lane is holding a design decision on.
+    ///
+    /// IT ASSERTS THE FACT IT REPORTS, so it is not a print that cannot fail: register-homed values
+    /// OCCUR, and they occur for reference types too. If a future change spilled everything, the
+    /// answer given downstream would have changed and this goes red saying so.
+    #[test]
+    fn a_corlib_method_keeps_values_in_registers_and_not_only_in_frame_slots() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
+        if !std::path::Path::new(directory).is_dir() {
+            eprintln!("{directory} absent (a stripped drop); skipping");
+            return;
+        }
+        let path = alloc::format!("{directory}/corlib.dll");
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("the fixture directory exists but {path} does not read: {error}")
+        });
+        let assembly = lamella_metadata::Assembly::read(&bytes).expect("parse corlib");
+        let methods: Vec<_> = assembly
+            .type_defs()
+            .flat_map(|t| t.methods().collect::<Vec<_>>())
+            .filter(|m| m.body().is_some())
+            .collect();
+        let rids: Vec<u32> = methods.iter().map(lamella_metadata::Method::rid).collect();
+        let resolver = crate::resolver::MetadataResolver::for_module(&assembly, &rids);
+        let target = lamella_metadata::TargetLayout::ilp32();
+        let mut funcs: Vec<lamella_ir::Function> = Vec::new();
+        let mut unlowered = 0usize;
+        for method in &methods {
+            let Some(body) = method.body() else { continue };
+            let Ok((arg_types, local_types)) =
+                crate::resolver::slot_types(&assembly, method, &target)
+            else {
+                unlowered += 1;
+                continue;
+            };
+            let (arg_narrow, local_narrow) = crate::resolver::narrowing_of(&assembly, method, &[]);
+            match crate::cil::lower_method_typed(
+                &body,
+                &resolver,
+                &arg_types,
+                &local_types,
+                crate::cil::Narrowing {
+                    args: &arg_narrow,
+                    locals: &local_narrow,
+                },
+            ) {
+                Ok((func, _)) => funcs.push(func),
+                Err(_) => unlowered += 1,
+            }
+        }
+
+        let (mut all_regs, mut mixed, mut spilled, mut refused) = (0usize, 0, 0, 0);
+        let (mut reg_values, mut frame_values, mut reg_refs) = (0usize, 0, 0);
+        for func in &funcs {
+            match prepare(func) {
+                Ok(Assignment::Registers { regs, .. }) => {
+                    all_regs += 1;
+                    reg_values += regs.len();
+                    reg_refs += func
+                        .value_types
+                        .iter()
+                        .filter(|t| matches!(t, MirType::ObjectRef))
+                        .count();
+                }
+                Ok(Assignment::Mixed { homes, .. }) => {
+                    mixed += 1;
+                    for (value, home) in homes.iter().enumerate() {
+                        match home {
+                            Home::Reg(_) => {
+                                reg_values += 1;
+                                if matches!(
+                                    func.value_types.get(value),
+                                    Some(MirType::ObjectRef)
+                                ) {
+                                    reg_refs += 1;
+                                }
+                            }
+                            Home::Spill(_) => frame_values += 1,
+                        }
+                    }
+                }
+                Ok(Assignment::Spilled) => {
+                    spilled += 1;
+                    frame_values += func.value_types.len();
+                }
+                Err(_) => refused += 1,
+            }
+        }
+
+        println!(
+            "corlib bodies {}: all-registers {all_regs}, register/frame mix {mixed}, \
+             all-frame {spilled}, refused by this backend {refused}, not lowered {unlowered}",
+            funcs.len()
+        );
+        println!(
+            "values: register-homed {reg_values} (of which object references {reg_refs}), \
+             frame-homed {frame_values}"
+        );
+
+        assert!(
+            all_regs + mixed > 0,
+            "no corlib method keeps a value in a register, so every local would be readable from \
+             memory alone -- if that is now true it is a change downstream has been told the \
+             opposite of"
+        );
+        assert!(
+            reg_refs > 0,
+            "no OBJECT REFERENCE is register-homed. `prepare` spills I64, value types, managed \
+             pointers and floats but NOT ObjectRef, so this is expected to occur; if it has \
+             stopped, the reason belongs in this test"
+        );
     }
 }

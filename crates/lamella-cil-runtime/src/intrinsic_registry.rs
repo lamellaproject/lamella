@@ -197,6 +197,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(int64_to_string),
     entry!(interlocked_compare_exchange),
     entry!(intptr_from_raw_value),
+    entry!(intptr_size),
     entry!(intptr_to_raw_value),
     #[cfg(feature = "collections")]
     entry!(list_add),
@@ -306,6 +307,8 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(md_array_get_length),
     entry!(md_array_length),
     entry!(md_array_set),
+    #[cfg(feature = "reflection")]
+    entry!(member_declaring_type),
     #[cfg(feature = "reflection")]
     entry!(member_get_type),
     entry!(mmio_read32),

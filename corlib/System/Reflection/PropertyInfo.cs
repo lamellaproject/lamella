@@ -21,6 +21,8 @@ namespace System.Reflection
 
         public override string Name { get { return _name; } }
 
+        public override Type DeclaringType { get { return _declaringType; } }
+
         public override object[] GetCustomAttributes(bool inherit)
         {
             return _declaringType.GetPropertyCustomAttributes(_name, inherit);

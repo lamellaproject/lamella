@@ -15,6 +15,7 @@ lamella-assemble = { path = "../lamella-assemble" }
 lamella-load = { path = "../lamella-load" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-cil-runtime = { path = "../lamella-cil-runtime" }
+lamella-clock-host = { path = "../lamella-clock-host" }
 
 [lints]
 workspace = true

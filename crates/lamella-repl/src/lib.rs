@@ -79,10 +79,7 @@ fn eval_in(source_line: &str, tools: &Toolchain, work: &TempProgram) -> Result<S
 /// The runtime is `no_std` and has no platform underneath it, so a clock can only come from whatever
 /// embeds it. This crate IS the host driver, so this is that clock.
 fn host_now_millis() -> u64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static BASE: OnceLock<Instant> = OnceLock::new();
-    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+    lamella_clock_host::system_uptime_millis()
 }
 
 /// The OS-thread sleep half of the clock seam -- what the reactor blocks in when only timers pend.
@@ -133,7 +130,7 @@ fn compile(tools: &Toolchain, work: &TempProgram) -> Result<(), String> {
     let compilation =
         lamella_assemble::compile_source(&source, &work.source.display().to_string(), "repl", "repl", &references, false);
     let Some(image) = compilation.image else {
-        return Err(format_diagnostics(&compilation.diagnostics, compilation.emit_error));
+        return Err(format_diagnostics(&compilation.diagnostics, compilation.emit_error, &source));
     };
     fs::write(&work.assembly, &image).map_err(|error| {
         format!("cannot write compiled assembly {}: {error}", work.assembly.display())
@@ -581,7 +578,7 @@ impl IncrementalSession {
             .ok_or("this IncrementalSession was not opened with a compiler (use open_compiler)")?;
         let result = compiler.compile_submission(src);
         let Some(delta) = result.delta else {
-            return Err(format_diagnostics(&result.diagnostics, result.emit_error));
+            return Err(format_diagnostics(&result.diagnostics, result.emit_error, src));
         };
         self.submit_delta_bytes(&delta, "submission")
     }
@@ -1289,6 +1286,7 @@ fn ends_with_dangling_operator(text: &str) -> bool {
 fn format_diagnostics(
     diagnostics: &[lamella_assemble::Diagnostic],
     emit_error: Option<lamella_assemble::EmitError>,
+    source: &str,
 ) -> String {
     if diagnostics.is_empty() {
         return match emit_error {
@@ -1306,7 +1304,7 @@ fn format_diagnostics(
         if !rendered.is_empty() {
             rendered.push('\n');
         }
-        rendered.push_str(&format!("CS{:04}: {}", diagnostic.code, diagnostic.message));
+        rendered.push_str(&diagnostic.render("", source));
     }
     rendered
 }

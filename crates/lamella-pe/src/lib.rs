@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod deflate;
 pub mod heap;
+pub mod marshal;
 pub mod module;
 pub mod pdb;
 pub mod pe;
@@ -19,7 +20,8 @@ pub use heap::{
     BlobHeapBuilder, GuidHeapBuilder, StringHeapBuilder, UserStringHeapBuilder, compress_i32,
     compress_u32,
 };
-pub use module::{ImageBuilder, PARAM_HAS_DEFAULT, PARAM_OPTIONAL, PARAM_OUT, ParamRow};
+pub use marshal::{MarshalSpec, NATIVE_TYPE_MAX};
+pub use module::{ImageBuilder, PARAM_HAS_DEFAULT, PARAM_IN, PARAM_OPTIONAL, PARAM_OUT, ParamRow};
 pub use pdb::{
     DebugDocument, LocalVariable, MethodDebug, SequencePoint, build_portable_pdb,
     sequence_points_blob,

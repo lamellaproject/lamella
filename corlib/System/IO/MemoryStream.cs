@@ -8,6 +8,7 @@ namespace System.IO
         private int _position;
         private int _origin;
         private bool _expandable;
+        private bool _exposable;
         private bool _writable;
         private bool _isOpen;
 
@@ -18,6 +19,7 @@ namespace System.IO
             _position = 0;
             _origin = 0;
             _expandable = true;
+            _exposable = true;
             _writable = true;
             _isOpen = true;
         }
@@ -30,6 +32,7 @@ namespace System.IO
             _position = 0;
             _origin = 0;
             _expandable = true;
+            _exposable = true;
             _writable = true;
             _isOpen = true;
         }
@@ -42,6 +45,7 @@ namespace System.IO
             _position = 0;
             _origin = 0;
             _expandable = false;
+            _exposable = false;
             _writable = true;
             _isOpen = true;
         }
@@ -54,6 +58,7 @@ namespace System.IO
             _position = 0;
             _origin = 0;
             _expandable = false;
+            _exposable = false;
             _writable = writable;
             _isOpen = true;
         }
@@ -124,9 +129,9 @@ namespace System.IO
             }
         }
 
-        private void EnsureCapacity(int value)
+        private bool EnsureCapacity(int value)
         {
-            if (value <= _buffer.Length - _origin) return;
+            if (value <= _buffer.Length - _origin) return false;
             int newCapacity = value;
             if (newCapacity < 256) newCapacity = 256;
             int doubled = (_buffer.Length - _origin) * 2;
@@ -136,6 +141,7 @@ namespace System.IO
             if (_length > 0) Buffer.BlockCopy(_buffer, oldOrigin, grown, 0, _length);
             _buffer = grown;
             _origin = 0;
+            return true;
         }
 
         public override int Read(byte[] buffer, int offset, int count)
@@ -177,11 +183,13 @@ namespace System.IO
 
             if (end > _length)
             {
+                bool mustZero = _position > _length;
                 if (end > _buffer.Length - _origin)
                 {
                     if (!_expandable) throw new NotSupportedException("Memory stream is not expandable.");
-                    EnsureCapacity(end);
+                    if (EnsureCapacity(end)) mustZero = false;
                 }
+                if (mustZero) { for (int i = _length; i < _position; i++) _buffer[_origin + i] = 0; }
                 _length = end;
             }
             if (count > 0) Buffer.BlockCopy(buffer, offset, _buffer, _origin + _position, count);
@@ -195,11 +203,13 @@ namespace System.IO
             int end = _position + 1;
             if (end > _length)
             {
+                bool mustZero = _position > _length;
                 if (end > _buffer.Length - _origin)
                 {
                     if (!_expandable) throw new NotSupportedException("Memory stream is not expandable.");
-                    EnsureCapacity(end);
+                    if (EnsureCapacity(end)) mustZero = false;
                 }
+                if (mustZero) { for (int i = _length; i < _position; i++) _buffer[_origin + i] = 0; }
                 _length = end;
             }
             _buffer[_origin + _position] = value;
@@ -230,6 +240,7 @@ namespace System.IO
             }
 
             if (target < 0) throw new IOException("An attempt was made to move the position before the beginning of the stream.");
+            if (target > 2147483647) throw new IOException("Stream was too long.");
             _position = (int)target;
             return _position;
         }
@@ -257,7 +268,6 @@ namespace System.IO
 
         public byte[] ToArray()
         {
-            EnsureOpen();
             byte[] copy = new byte[_length];
             if (_length > 0) Buffer.BlockCopy(_buffer, _origin, copy, 0, _length);
             return copy;
@@ -265,7 +275,7 @@ namespace System.IO
 
         public byte[] GetBuffer()
         {
-            EnsureOpen();
+            if (!_exposable) throw new UnauthorizedAccessException("MemoryStream's internal buffer cannot be accessed.");
             return _buffer;
         }
 
@@ -278,7 +288,6 @@ namespace System.IO
 
         public override void Flush()
         {
-            EnsureOpen();
         }
 
         protected override void Dispose(bool disposing)

@@ -2,6 +2,7 @@
 
 use crate::debug::LineMap;
 use crate::expr::is_value_type;
+use crate::interop;
 use crate::method::{ConstructorPrologue, EmittedBody, emit_body, max_stack};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
@@ -19,8 +20,8 @@ use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, encode_with_off
 use lamella_metadata::signature::element;
 use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_name};
 use lamella_pe::{
-    DebugDocument, ImageBuilder, LocalVariable, MethodDebug, PARAM_HAS_DEFAULT, PARAM_OPTIONAL,
-    PARAM_OUT, ParamRow, SequencePoint,
+    DebugDocument, ImageBuilder, LocalVariable, MethodDebug, PARAM_HAS_DEFAULT, PARAM_IN,
+    PARAM_OPTIONAL, PARAM_OUT, ParamRow, SequencePoint,
     TypeSig,
     field_signature, generic_method_signature, local_signature, method_signature,
     method_spec_signature, property_signature, type_signature, vararg_call_site_signature,
@@ -44,6 +45,7 @@ const TYPE_REF: u8 = 0x01;
 const TYPE_DEF: u8 = 0x02;
 const FIELD: u8 = 0x04;
 const METHOD_DEF: u8 = 0x06;
+const PARAM: u8 = 0x08;
 const PUBLIC_CLASS: u32 = 0x0000_0001;
 const PUBLIC_STRUCT: u32 = 0x0000_0001 | 0x0000_0008 | 0x0000_0100;
 const TYPE_ABSTRACT: u32 = 0x0000_0080;
@@ -182,6 +184,53 @@ impl Diagnostic {
     #[must_use]
     pub fn is_error(&self) -> bool {
         matches!(self.severity, Severity::Error)
+    }
+
+    /// `error` or `warning` -- the severity word csc, MSBuild and an editor's problem matcher
+    /// expect, and the one the rendered forms below take.
+    #[must_use]
+    pub fn severity_word(&self) -> &'static str {
+        if self.is_error() { "error" } else { "warning" }
+    }
+
+    /// Renders this diagnostic as `path(line,column): severity CODE: message`.
+    ///
+    /// The code's prefix comes from [`Diagnostic::namespace`], so a condition csc has no concept
+    /// of is reported in Lamella's namespace rather than wearing csc's.
+    ///
+    /// The shape is MSBuild's, and it is not free to vary: `path(line,column): severity CODE:
+    /// message` is what puts the code in a Problems pane's code column rather than inside the
+    /// message text, and what an editor's problem matcher, MSBuild and a log scraper each parse.
+    ///
+    /// `source` must be the text this diagnostic's span indexes, or the line and column will
+    /// describe a different file. A submission with no file of its own passes an empty `path` and
+    /// renders `(line,column): severity CODE: message`, the form C# interactive uses.
+    #[must_use]
+    pub fn render(&self, path: &str, source: &str) -> String {
+        let (line, column) = LineMap::new(source).position(source, self.span.start);
+        format!(
+            "{path}({line},{column}): {} {}{:04}: {}",
+            self.severity_word(),
+            self.namespace.prefix(),
+            self.code,
+            self.message
+        )
+    }
+
+    /// Renders this diagnostic without a location, as `severity CODE: message`, for a caller that
+    /// does not hold the source text its span indexes.
+    ///
+    /// [`Diagnostic::render`] is the better answer wherever that text is to hand: a diagnostic
+    /// that names no line leaves the reader to find it.
+    #[must_use]
+    pub fn render_without_source(&self) -> String {
+        format!(
+            "{} {}{:04}: {}",
+            self.severity_word(),
+            self.namespace.prefix(),
+            self.code,
+            self.message
+        )
     }
 }
 
@@ -886,6 +935,17 @@ fn emit_attributes(
             Some(_) => continue,
         };
         for attribute in &section.attributes {
+            if attribute_parent.table() == PARAM
+                && matches!(
+                    attribute.name.parts.last().map(|part| &**part),
+                    Some("MarshalAs" | "MarshalAsAttribute")
+                )
+            {
+                if let Some(spec) = interop::marshal_spec_of(binder, attribute) {
+                    image.add_field_marshal(attribute_parent, &spec.encode());
+                }
+                continue;
+            }
             emit_one_attribute(image, binder, tokens, enclosing, attribute_parent, attribute);
         }
     }
@@ -1562,6 +1622,8 @@ pub(crate) fn build_bootstrap_delta(
         &TypeSymbol::Special(SpecialType::Void),
         Some(&prologue),
         None,
+        ".ctor",
+        None,
     )?;
     let body_image = MethodBodyImage {
         max_stack: max_stack(&emitted.code).max(1),
@@ -1655,6 +1717,8 @@ pub(crate) fn build_submission_delta(
         0,
         return_type,
         None,
+        None,
+        "Submit",
         None,
     )?;
     let local_var_sig = if emitted.local_types.is_empty() {
@@ -1908,8 +1972,6 @@ fn part_file_imports(
 /// `GenericParamConstraint` row (II.22.21) for each named constraint.
 ///
 /// **ONE IMPLEMENTATION FOR EVERY DECLARATION SITE** -- a class, an interface, and a generic method.
-/// All three previously called `add_generic_param` with a hard-coded `0` flags word, which is
-/// exactly the shape where a fourth site arrives without constraints and nothing looks wrong. The
 /// constraints come from `lamella_binder::constraints_by_parameter`, the SAME function the binder
 /// checks against, so the metadata and the diagnostics cannot disagree about what the source wrote.
 ///
@@ -2947,7 +3009,14 @@ fn emit_type_inner(
         if !declares_static_constructor {
             flags |= TYPE_BEFORE_FIELD_INIT;
         }
+        let struct_layout = interop::struct_layout(binder, &declaration.attributes);
+        if let Some(layout) = &struct_layout {
+            flags = (flags & !(interop::LAYOUT_MASK | interop::STRING_FORMAT_MASK)) | layout.type_flags;
+        }
         let type_token = image.add_type(metadata_namespace, &declared_type_name(declaration), base, flags);
+        if let Some((pack, size)) = struct_layout.and_then(|layout| layout.class_layout) {
+            image.add_class_layout(type_token, pack, size);
+        }
         emit_generic_parameters(
             image,
             tokens,
@@ -2960,7 +3029,9 @@ fn emit_type_inner(
                 image.add_nested_class(type_token, enclosing_token);
             }
         }
-        emit_attributes(image, binder, tokens, &enclosing, type_token, &declaration.attributes);
+        let user_attributes =
+            interop::without_pseudo_custom(&declaration.attributes, interop::is_pseudo_custom_type_attribute);
+        emit_attributes(image, binder, tokens, &enclosing, type_token, &user_attributes);
         type_token
         }
     };
@@ -3012,9 +3083,19 @@ fn emit_type_inner(
         } = member
         {
             emit_field(image, binder, tokens, &enclosing, modifiers, ty, declarators)?;
+            let field_offset = interop::field_offset(binder, attributes);
+            let marshal = interop::marshal_spec(binder, attributes);
+            let user_attributes =
+                interop::without_pseudo_custom(attributes, interop::is_pseudo_custom_field_attribute);
             for declarator in declarators {
                 if let Some(field_token) = tokens.field(&enclosing, &declarator.name) {
-                    emit_attributes(image, binder, tokens, &enclosing, field_token, attributes);
+                    if let Some(offset) = field_offset {
+                        image.add_field_layout(field_token, offset);
+                    }
+                    if let Some(spec) = &marshal {
+                        image.add_field_marshal(field_token, &spec.encode());
+                    }
+                    emit_attributes(image, binder, tokens, &enclosing, field_token, &user_attributes);
                     if modifiers.contains(&Modifier::Required) {
                         emit_required_member_marker(image, tokens, field_token);
                     }
@@ -3186,6 +3267,7 @@ fn emit_type_inner(
                 attributes,
                 ..
             } => {
+                tokens.next_impl_flags = method_impl_flags(attributes);
                 let token = emit_one_method(
                     image,
                     binder,
@@ -4218,17 +4300,87 @@ fn integer_constant(value: i64) -> Literal {
     }
 }
 
-/// The `ParameterAttributes` a declared modifier means (II.23.1.13).
+/// The `ParameterAttributes` a parameter's modifier AND its attributes mean (II.23.1.13).
 ///
 /// **`out` AND `ref` ARE THE SAME SIGNATURE AND DIFFERENT METADATA.** Both encode a byref in the
 /// method signature, so the only thing that tells a consumer, a debugger or reflection which one
 /// the author wrote is this bit -- and it was never emitted, so every `out` parameter in every
 /// assembly this compiler has built has been published as a `ref`.
+///
+/// **`[In]` AND `[Out]` ARE PSEUDO-CUSTOM ATTRIBUTES: THEY BECOME THESE BITS AND NO
+/// `CustomAttribute` ROW.** That is measured rather than assumed -- csc emits no custom attribute
+/// on the parameter for either, so a reflector reading `ParameterInfo.IsIn`/`IsOut` is reading the
+/// flags and a reflector listing the parameter's attributes sees nothing. Writing a row as well
+/// would make the second answer disagree with csc while the first agreed.
+///
+/// The full table this implements, one compilation per row against csc:
+///
+/// | declaration | flags |
+/// |---|---|
+/// | `int x` / `ref int x` | `0x0000` |
+/// | `out int x` / `[Out] int x` / `[Out] out int x` | `0x0002` |
+/// | `[In] int x` / `[In] ref int x` | `0x0001` |
+/// | `[In][Out] ref int x` | `0x0003` |
+///
+/// `[In] out int x` is absent from the table because csc refuses that combination outright:
+/// CS0036, *"An out parameter cannot have the In attribute"*.
+///
+/// This builder makes rows for the abstract, interface, delegate and P/Invoke paths only; an
+/// ordinary method's rows come from [`bound_parameter_names`]. The attribute bits are applied in
+/// [`emit_declared_parameter_metadata`], which runs at every site that emits a method from
+/// DECLARED parameters and so reaches both, and that function's own doc explains the seam.
 fn param_flags(modifier: Option<ParameterModifier>) -> u16 {
     match modifier {
         Some(ParameterModifier::Out) => PARAM_OUT,
         _ => 0,
     }
+}
+
+/// Whether a parameter attribute is PSEUDO-CUSTOM -- consumed into metadata the runtime reads
+/// structurally, rather than kept as a `CustomAttribute` row (II.21.2.1).
+///
+/// Measured on csc's output, not taken from the spec's list: a parameter carrying `[In]`, `[Out]`
+/// or `[MarshalAs(...)]` has **no** `CustomAttribute` row in csc's image -- the first two become
+/// `ParameterAttributes` bits and the third becomes the `HasFieldMarshal` bit plus a `FieldMarshal`
+/// row. Emitting rows for them as well would make a reflector that LISTS a parameter's attributes
+/// disagree with csc while one reading `IsIn`/`IsOut` agreed.
+///
+/// `[ParamArray]` is NOT pseudo-custom: csc writes that one as a real `CustomAttribute` row, and
+/// so does this emitter.
+fn is_pseudo_custom_parameter_attribute(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "In" | "InAttribute"
+                | "Out"
+                | "OutAttribute"
+                | "MarshalAs"
+                | "MarshalAsAttribute"
+        )
+    )
+}
+
+/// The `ParameterAttributes` bits an `[In]` / `[Out]` on a declaration asks for (II.23.1.13).
+///
+/// Matched on the LAST name part, so `In`, `InAttribute` and a namespace-qualified
+/// `System.Runtime.InteropServices.In` all answer alike -- the rule the surrounding attribute
+/// readers use. A TARGETED section (`[return: ...]`) is about something else and is skipped, the
+/// same rule [`method_impl_flags`] applies.
+fn param_attribute_flags(parameter: &Parameter) -> u16 {
+    let mut flags = 0u16;
+    for section in &parameter.attributes {
+        if section.target.is_some() {
+            continue;
+        }
+        for attribute in &section.attributes {
+            match attribute.name.parts.last().map(|part| &**part) {
+                Some("In" | "InAttribute") => flags |= PARAM_IN,
+                Some("Out" | "OutAttribute") => flags |= PARAM_OUT,
+                _ => {}
+            }
+        }
+    }
+    flags
 }
 
 /// Just the names out of a `Param` row list, for [`emit_body`] -- which builds the frame and has
@@ -4312,6 +4464,53 @@ fn emit_declared_parameter_metadata(
     parameters: &[Parameter],
 ) {
     let rows = image.method_parameters(method);
+    for (index, parameter) in parameters.iter().enumerate() {
+        let attribute_flags = param_attribute_flags(parameter);
+        if attribute_flags == 0 {
+            continue;
+        }
+        let Some(&param) = rows.get(index) else {
+            continue;
+        };
+        image.set_param_flags(param, image.param_flags(param) | attribute_flags);
+    }
+    for (index, parameter) in parameters.iter().enumerate() {
+        let Some(&param) = rows.get(index) else {
+            continue;
+        };
+        if let Some(spec) = interop::marshal_spec(binder, &parameter.attributes) {
+            image.add_field_marshal(param, &spec.encode());
+        }
+    }
+    for (index, parameter) in parameters.iter().enumerate() {
+        let Some(&param) = rows.get(index) else {
+            continue;
+        };
+        let sections: Vec<AttributeSection> = parameter
+            .attributes
+            .iter()
+            .filter(|section| section.target.is_none())
+            .map(|section| AttributeSection {
+                target: None,
+                span: section.span,
+                attributes: section
+                    .attributes
+                    .iter()
+                    .filter(|attribute| {
+                        !is_pseudo_custom_parameter_attribute(
+                            attribute.name.parts.last().map(|part| &**part),
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            })
+            .filter(|section| !section.attributes.is_empty())
+            .collect();
+        if sections.is_empty() {
+            continue;
+        }
+        emit_attributes(image, binder, tokens, enclosing, param, &sections);
+    }
     for (index, parameter) in parameters.iter().enumerate() {
         let Some(expr) = &parameter.default_value else {
             continue;
@@ -4419,6 +4618,65 @@ fn find_dll_import(method_name: &str, attributes: &[AttributeSection]) -> Option
         }
     }
     None
+}
+
+/// The `MethodImplAttributes` (II.23.1.11) a `[MethodImpl(...)]` on a declaration asks for, or 0
+/// when it carries none -- which is the default `IL | Managed`.
+///
+/// **`MethodImplOptions` AND `MethodImplAttributes` ARE THE SAME NUMBERS**, deliberately so: the
+/// BCL enum a program writes is the metadata mask a compiler emits, value for value. So the
+/// positional argument is read by NAME and mapped to its documented value rather than bound, which
+/// is what the surrounding attribute readers do and what keeps this out of the binder.
+///
+/// `Synchronized` is the one with runtime behavior a program can observe -- the CLR takes a monitor
+/// on `this` (or on the type, for a static method) around the body -- and it is what
+/// `synchronized-runtime` measures by contending the lock from a second thread.
+///
+/// `PreserveSig` is not recognized here, and it is not a no-op being skipped: it changes how a
+/// signature is marshalled, so emitting the bit without the marshalling it implies would be a worse
+/// answer than refusing it.
+fn method_impl_flags(attributes: &[AttributeSection]) -> u16 {
+    let mut flags = 0u16;
+    for section in attributes {
+        if section.target.is_some() {
+            continue;
+        }
+        for attribute in &section.attributes {
+            let last = attribute.name.parts.last().map(|part| &**part);
+            if last != Some("MethodImpl") && last != Some("MethodImplAttribute") {
+                continue;
+            }
+            if let Some(AttributeArgument::Positional(expr)) = attribute.arguments.first() {
+                flags |= method_impl_option_value(expr);
+            }
+        }
+    }
+    flags
+}
+
+/// One `MethodImplOptions` operand -- a member access (`MethodImplOptions.Synchronized`), an
+/// integer, or an `|` of them, which is how the combined form is written.
+fn method_impl_option_value(expr: &Expr) -> u16 {
+    match &expr.kind {
+        ExprKind::Parenthesized(inner) => method_impl_option_value(inner),
+        ExprKind::Binary {
+            operator: lamella_syntax::ast::BinaryOperator::BitwiseOr,
+            left,
+            right,
+        } => method_impl_option_value(left) | method_impl_option_value(right),
+        ExprKind::Literal(Literal::Integer { value, .. }) => *value as u16,
+        ExprKind::MemberAccess { name, .. } => match &**name {
+            "Unmanaged" => 0x0004,
+            "NoInlining" => 0x0008,
+            "ForwardRef" => 0x0010,
+            "Synchronized" => 0x0020,
+            "NoOptimization" => 0x0040,
+            "AggressiveInlining" => 0x0100,
+            "InternalCall" => 0x1000,
+            _ => 0,
+        },
+        _ => 0,
+    }
 }
 
 /// The text of a string-literal expression (a `[DllImport]` library / entry point), else `None`.
@@ -4665,7 +4923,7 @@ fn emit_destructor(
     let void = TypeSymbol::Special(SpecialType::Void);
     let bound =
         binder.bind_method(Some(enclosing.clone()), "Finalize", void.clone(), &[], &[], false, false, body);
-    let bound = wrap_finalizer(bound, &base_finalizer_reference(base_class, tokens));
+    let bound = wrap_finalizer(bound, &base_finalizer_reference(base_class, binder, tokens));
     let finalize = emit_bound_body(
         image,
         tokens,
@@ -4703,17 +4961,39 @@ fn emit_destructor(
     Ok(finalize)
 }
 
-/// The base type's `Finalize` a destructor chains to (17.12): the direct base's own
-/// `Finalize` when it declares a destructor (a this-module method), otherwise
-/// `System.Object::Finalize`, the finalizer every reference type ultimately inherits.
+/// The base type's `Finalize` a destructor chains to (17.12): the NEAREST base up the chain that
+/// declares one, otherwise `System.Object::Finalize`, the finalizer every reference type
+/// ultimately inherits.
+///
+/// **THE WALK IS THE WHOLE POINT, BECAUSE THE DIRECT BASE IS NOT ENOUGH.** For
+/// `Derived : Intermediate : Base` where only `Derived` and `Base` declare a destructor, `Derived`
+/// chains to `Base`: testing the direct base alone and falling back to `System.Object` would run the
+/// derived finalizer and never the base one.
+///
+/// A class with no destructor is not a break in the chain -- it simply contributes no body, and the
+/// finalizer it inherits is still the one below it.
 fn base_finalizer_reference(
     base_class: Option<&TypeSymbol>,
+    binder: &Binder,
     tokens: &Tokens,
 ) -> lamella_binder::MethodReference {
-    let declaring_type = match base_class {
-        Some(symbol) if tokens.method(symbol, "Finalize", &[]).is_some() => symbol.clone(),
-        _ => TypeSymbol::Special(SpecialType::Object),
-    };
+    let mut declaring_type = TypeSymbol::Special(SpecialType::Object);
+    let mut visited: alloc::vec::Vec<TypeSymbol> = Vec::new();
+    let mut current = base_class.cloned();
+    while let Some(ty) = current {
+        if visited.contains(&ty) {
+            break;
+        }
+        visited.push(ty.clone());
+        if tokens.method(&ty, "Finalize", &[]).is_some() {
+            declaring_type = ty;
+            break;
+        }
+        current = binder
+            .model()
+            .get_by_symbol(&ty)
+            .and_then(|info| info.base.clone());
+    }
     lamella_binder::MethodReference {
         declaring_type,
         name: "Finalize".into(),
@@ -5272,6 +5552,7 @@ fn emit_bound_body(
         method_type_parameters,
         method_constraints,
         name,
+        enclosing,
         return_symbol,
         params,
         byref_flags,
@@ -5317,6 +5598,7 @@ fn emit_bound_body_into(
         &[],
         &[],
         name,
+        enclosing,
         return_symbol,
         params,
         byref_flags,
@@ -5342,6 +5624,7 @@ fn emit_bound_body_in_scope(
     method_type_parameters: &[Box<str>],
     method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     name: &str,
+    enclosing: &TypeSymbol,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
     byref_flags: &[ParamPassing],
@@ -5390,6 +5673,8 @@ fn emit_bound_body_in_scope(
         return_symbol,
         prologue,
         debug_source,
+        name,
+        Some(enclosing),
     )
     .map_err(|error| error.in_method(name))?;
     let local_var_sig = if local_types.is_empty() {
@@ -5469,12 +5754,13 @@ fn emit_bound_body_in_scope(
             &return_sig,
         )
     };
+    let impl_flags = core::mem::take(&mut tokens.next_impl_flags);
     let method = image.add_method(
         name,
         &signature,
         &body_bytes,
         flags,
-        IL_MANAGED,
+        IL_MANAGED | impl_flags,
         &parameter_names,
     );
     if readonly_return {
@@ -10653,6 +10939,91 @@ mod tests {
     use super::*;
     use lamella_syntax::parser::parse_compilation_unit;
 
+    /// A diagnostic in Lamella's namespace renders with Lamella's prefix, and a diagnostic in
+    /// csc's renders with csc's -- from the same one renderer, which is the only way the two
+    /// cannot drift apart.
+    ///
+    /// **THE PREFIX IS THE WHOLE POINT.** A caller that spells `CS` itself reports every
+    /// condition as one csc has a concept of, including the ones it does not, and a reader who
+    /// looks up that code in csc's documentation finds either nothing or the wrong entry.
+    ///
+    /// The location rides along in the same assertion rather than in a test of its own: these
+    /// two are the pair that go missing together, because a caller that hard-codes the prefix is
+    /// a caller formatting the code and message alone.
+    #[test]
+    fn a_rendered_diagnostic_carries_its_own_namespace_prefix_and_its_location() {
+        let source = "class C
+{
+    void M() { }
+}
+";
+        let start = source.find("void").expect("the fixture contains `void`") as u32;
+
+        let lamella = Diagnostic {
+            code: 1,
+            namespace: CodeNamespace::Lam,
+            severity: Severity::Error,
+            message: String::from("this build cannot emit that construct"),
+            span: Span::new(start, start + 4),
+        };
+        assert_eq!(
+            lamella.render("App.cs", source),
+            "App.cs(3,5): error LAM0001: this build cannot emit that construct"
+        );
+
+        let csc = Diagnostic {
+            code: 246,
+            namespace: CodeNamespace::Cs,
+            severity: Severity::Error,
+            message: String::from("the type or namespace name could not be found"),
+            span: Span::new(start, start + 4),
+        };
+        assert_eq!(
+            csc.render("App.cs", source),
+            "App.cs(3,5): error CS0246: the type or namespace name could not be found"
+        );
+    }
+
+    /// A warning renders `warning`, and a submission with no file of its own renders the location
+    /// alone -- the form C# interactive uses.
+    ///
+    /// Both are here because both are shapes a caller would otherwise invent for itself: the
+    /// severity word is a ternary, and a REPL has no path to put in front of the parenthesis.
+    #[test]
+    fn a_warning_and_a_pathless_submission_each_render_the_form_their_reader_expects() {
+        let source = "int x = 1;
+";
+        let warning = Diagnostic {
+            code: 168,
+            namespace: CodeNamespace::Cs,
+            severity: Severity::Warning,
+            message: String::from("the variable is declared but never used"),
+            span: Span::new(4, 5),
+        };
+        assert_eq!(
+            warning.render("", source),
+            "(1,5): warning CS0168: the variable is declared but never used"
+        );
+        assert_eq!(warning.severity_word(), "warning");
+    }
+
+    /// The location-free form still carries the namespace, because a caller that cannot supply
+    /// the source text is exactly the caller most likely to have spelled `CS` itself.
+    #[test]
+    fn a_diagnostic_rendered_without_source_still_reports_its_own_namespace() {
+        let diagnostic = Diagnostic {
+            code: 1,
+            namespace: CodeNamespace::Lam,
+            severity: Severity::Error,
+            message: String::from("this build cannot emit that construct"),
+            span: Span::new(0, 1),
+        };
+        assert_eq!(
+            diagnostic.render_without_source(),
+            "error LAM0001: this build cannot emit that construct"
+        );
+    }
+
     /// The WRITER's nested `TypeRef` and the READER's nesting walk are one rule seen from two
     /// sides, and this is the only place both are in scope -- so it is the only place they can be
     /// shown to agree.
@@ -12108,12 +12479,6 @@ mod tests {
 
     /// An IMPORTED generic definition used in every signature position a type can occupy.
     ///
-    /// **THE POSITIONS ARE THE TEST, AND ONE OF THEM FOUND A SECOND MISSING SITE.** Minting is
-    /// spread over eighteen `mint_*` functions; adding the instantiation case to
-    /// `mint_signature_type` fixed the field, the parameter and the return, and an UNUSED LOCAL
-    /// still refused -- a local's declared type comes through `mint_named_type_token` instead, and
-    /// a local that was USED had been minted by the expression path so it passed either way.
-    /// One construct, three minting entries, and the case had landed in a subset of them.
     ///
     /// Each row is a whole compilation that must EMIT, so a refusal anywhere in the pipeline fails
     /// it. `build_image` returning is the assertion.
@@ -16455,6 +16820,132 @@ mod tests {
         );
     }
 
+    /// `[In]` and `[Out]` reach the `Param` row's own FLAGS (II.23.1.13).
+    ///
+    /// **THE METHOD HAS A BODY ON PURPOSE.** Its `Param` rows come from `bound_parameter_names`
+    /// off the BOUND parameter list, which is the path an ordinary method takes and the one that
+    /// cannot see syntax; the abstract/interface/delegate/P-Invoke paths build theirs from
+    /// `parameter_names` instead. A version of this fix that only taught the syntactic builder
+    /// passed nothing and every attributed flag read `0x0000` -- the same tell
+    /// `emit_declared_parameter_metadata` records for the default-value case, which is why the
+    /// bits are applied there rather than in either builder.
+    ///
+    /// Every row measured against csc, one compilation per row.
+    #[test]
+    fn in_and_out_attributes_reach_the_param_flags() {
+        const PARAM_IN: u32 = 0x0001;
+        const PARAM_OUT: u32 = 0x0002;
+
+        let image = image_of_gated_source(
+            "namespace System { public class Attribute { } }
+             namespace System.Runtime.InteropServices {
+                 public class InAttribute : System.Attribute { }
+                 public class OutAttribute : System.Attribute { }
+             }
+             public class P {
+                 public void M(
+                     [System.Runtime.InteropServices.In] int marked_in,
+                     [System.Runtime.InteropServices.Out] int marked_out,
+                     [System.Runtime.InteropServices.In][System.Runtime.InteropServices.Out] ref int both,
+                     out int by_out,
+                     ref int by_ref,
+                     int plain) { by_out = 0; }
+             }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let rows: alloc::vec::Vec<(Option<&str>, u32)> = assembly
+            .type_defs()
+            .find(|def| def.name().is_some_and(|n| n.name == "P"))
+            .expect("P is a TypeDef")
+            .methods()
+            .find(|m| m.name() == Some("M"))
+            .expect("P has M")
+            .params()
+            .map(|p| (p.name(), p.flags()))
+            .collect();
+        let flags = |name: &str| -> u32 {
+            rows.iter()
+                .find(|(n, _)| *n == Some(name))
+                .unwrap_or_else(|| panic!("M has no parameter {name}: {rows:?}"))
+                .1
+                & (PARAM_IN | PARAM_OUT)
+        };
+        assert_eq!(flags("marked_in"), PARAM_IN, "[In] sets In: {rows:?}");
+        assert_eq!(flags("marked_out"), PARAM_OUT, "[Out] sets Out: {rows:?}");
+        assert_eq!(
+            flags("both"),
+            PARAM_IN | PARAM_OUT,
+            "[In][Out] ref sets both: {rows:?}"
+        );
+        assert_eq!(flags("by_out"), PARAM_OUT, "`out` still sets Out: {rows:?}");
+        assert_eq!(flags("by_ref"), 0, "`ref` sets neither: {rows:?}");
+        assert_eq!(flags("plain"), 0, "by-value sets neither: {rows:?}");
+    }
+
+    /// A USER attribute on a parameter becomes a `CustomAttribute` row on that `Param`, and a
+    /// PSEUDO-CUSTOM one does not.
+    ///
+    /// **PLACEMENT, NOT A COUNT.** A count cannot tell a row on the right parameter from one on
+    /// the method or on the parameter beside it, and putting the row on the wrong parent is the
+    /// failure this whole path exists to avoid -- `ParameterInfo.GetCustomAttributes` reads the
+    /// `Param` token and nothing else.
+    ///
+    /// The `[In]` row is the discriminator: `InAttribute` resolves perfectly well, so a version
+    /// that emitted every parameter attribute would produce a row for it and still pass any
+    /// assertion about the user one. csc writes no row for `[In]`, measured.
+    #[test]
+    fn a_user_attribute_on_a_parameter_becomes_a_row_on_that_param() {
+        let image = image_of_gated_source(
+            "namespace System { public class Attribute { } }
+             namespace System.Runtime.InteropServices {
+                 public class InAttribute : System.Attribute { }
+             }
+             public class MarkAttribute : System.Attribute { }
+             public class P {
+                 public void M(
+                     [Mark] int tagged,
+                     [Mark][System.Runtime.InteropServices.In] int tagged_and_in,
+                     [System.Runtime.InteropServices.In] int only_in,
+                     int plain) { }
+             }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let method = assembly
+            .type_defs()
+            .find(|def| def.name().is_some_and(|n| n.name == "P"))
+            .expect("P is a TypeDef")
+            .methods()
+            .find(|m| m.name() == Some("M"))
+            .expect("P has M");
+        let named: alloc::vec::Vec<(Option<&str>, Vec<String>)> = method
+            .params()
+            .map(|p| (p.name(), attribute_names_on(&assembly, p.token())))
+            .collect();
+        let on = |name: &str| -> Vec<String> {
+            named
+                .iter()
+                .find(|(n, _)| *n == Some(name))
+                .unwrap_or_else(|| panic!("M has no parameter {name}: {named:?}"))
+                .1
+                .clone()
+        };
+        assert_eq!(on("tagged"), [".MarkAttribute".to_string()], "{named:?}");
+        assert_eq!(
+            on("tagged_and_in"),
+            [".MarkAttribute".to_string()],
+            "[In] must not add a row beside the user attribute: {named:?}"
+        );
+        assert!(
+            on("only_in").is_empty(),
+            "[In] alone leaves the parameter with no CustomAttribute row: {named:?}"
+        );
+        assert!(on("plain").is_empty(), "{named:?}");
+        assert!(
+            attribute_names_on(&assembly, method.token()).is_empty(),
+            "a parameter's attribute must not hang off the method row"
+        );
+    }
+
     #[test]
     fn compile_source_compiles_clean_source_with_a_pdb() {
         let result = compile_source(
@@ -16782,4 +17273,275 @@ mod tests {
             "a member of a type this module defines was referenced rather than called: {referenced:?}"
         );
     }
+
+    // ---------------------------------------------------------------------------------------
+    // The three interop-layout tables: ClassLayout (II.22.8), FieldLayout (II.22.16) and
+    // FieldMarshal (II.22.17).
+    // ---------------------------------------------------------------------------------------
+
+    /// The interop declarations a layout test needs, DECLARED IN THE TEST'S OWN SOURCE.
+    ///
+    /// **THIS IS NOT CONVENIENCE, IT IS WHAT PUTS THE SHIPPING BRANCH UNDER THE ASSERTION.**
+    /// `interop::constant` resolves `LayoutKind.Explicit` by asking the binder for the type and the
+    /// MODEL for the member's constant. Source that never declares `LayoutKind` leaves the model
+    /// without it, the lookup fails, and the reader returns `None` -- so every assertion below
+    /// would be about a compiler that emitted nothing, and would go on passing if the resolution
+    /// were deleted outright. A bare-source unit test exercising a branch that never ships is the
+    /// exact shape that let `catching_or_throwing_a_non_exception_type_is_cs0155` pass for a month
+    /// against a compiler emitting the wrong code.
+    ///
+    ///
+    /// The attribute classes derive from nothing, the convention every attribute test in this
+    /// module uses: `System.Attribute` needs a corlib, these tests take no reference, and the
+    /// attribute readers match on the NAME and the constructor arity rather than on a base type.
+    const INTEROP_DECLARATIONS: &str = "
+        using System.Runtime.InteropServices;
+        namespace System.Runtime.InteropServices {
+            enum LayoutKind { Sequential = 0, Explicit = 2, Auto = 3 }
+            enum CharSet { None = 1, Ansi = 2, Unicode = 3, Auto = 4 }
+            enum UnmanagedType {
+                Bool = 2, I4 = 7, U4 = 8, LPStr = 20, ByValTStr = 23,
+                ByValArray = 30, LPArray = 42
+            }
+            class StructLayoutAttribute {
+                public StructLayoutAttribute(LayoutKind value) { }
+                public CharSet CharSet;
+                public int Pack;
+                public int Size;
+            }
+            class FieldOffsetAttribute {
+                public FieldOffsetAttribute(int offset) { }
+            }
+            class MarshalAsAttribute {
+                public MarshalAsAttribute(UnmanagedType unmanagedType) { }
+                public UnmanagedType ArraySubType;
+                public int SizeConst;
+                public short SizeParamIndex;
+            }
+        }
+        ";
+
+    /// Compiles `source` beside [`INTEROP_DECLARATIONS`] and returns the image.
+    fn interop_image(source: &str) -> Vec<u8> {
+        let mut whole = String::from(INTEROP_DECLARATIONS);
+        whole.push_str(source);
+        let result = compile_source(&whole, "i.cs", "i.dll", "i", &[], false);
+        assert!(
+            result.diagnostics.iter().all(|d| !d.is_error()),
+            "the interop source must bind cleanly: {:?}",
+            result.diagnostics
+        );
+        result.image.expect("the interop source emits")
+    }
+
+    /// Every `ClassLayout` row as `(type name, PackingSize, ClassSize)`, read back through the
+    /// metadata reader rather than remembered from the write.
+    fn class_layout_rows(image: &[u8]) -> Vec<(String, u32, u32)> {
+        let assembly = lamella_metadata::Assembly::read(image).expect("the image parses");
+        let tables = assembly.tables();
+        (1..=tables.row_count(lamella_metadata::tables::table::CLASS_LAYOUT))
+            .filter_map(|index| {
+                let row = tables.row(lamella_metadata::tables::table::CLASS_LAYOUT, index)?;
+                let parent = Token::new(TYPE_DEF, row.raw(2));
+                let name = assembly
+                    .type_defs()
+                    .find(|def| def.token() == parent)
+                    .and_then(|def| def.name().map(|n| String::from(n.name)))
+                    .unwrap_or_else(|| String::from("<unnamed>"));
+                Some((name, row.raw(0), row.raw(1)))
+            })
+            .collect()
+    }
+
+    /// Every `FieldLayout` row as `(field name, Offset)`.
+    fn field_layout_rows(image: &[u8]) -> Vec<(String, u32)> {
+        let assembly = lamella_metadata::Assembly::read(image).expect("the image parses");
+        let tables = assembly.tables();
+        (1..=tables.row_count(lamella_metadata::tables::table::FIELD_LAYOUT))
+            .filter_map(|index| {
+                let row = tables.row(lamella_metadata::tables::table::FIELD_LAYOUT, index)?;
+                let field = Token::new(FIELD, row.raw(1));
+                let name = assembly
+                    .type_defs()
+                    .flat_map(|def| def.fields().collect::<Vec<_>>())
+                    .find(|f| f.token() == field)
+                    .and_then(|f| f.name())
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+                Some((name, row.raw(0)))
+            })
+            .collect()
+    }
+
+    /// Every `FieldMarshal` row as `(parent token, descriptor bytes)` -- the descriptor fetched
+    /// from the blob heap, so the assertion is on the BYTES a consumer reads and not on a row
+    /// merely existing.
+    fn field_marshal_rows(image: &[u8]) -> Vec<(Token, Vec<u8>)> {
+        let assembly = lamella_metadata::Assembly::read(image).expect("the image parses");
+        let tables = assembly.tables();
+        (1..=tables.row_count(lamella_metadata::tables::table::FIELD_MARSHAL))
+            .filter_map(|index| {
+                let row = tables.row(lamella_metadata::tables::table::FIELD_MARSHAL, index)?;
+                let blob = assembly.image().blob().get(row.raw(1)).ok()?;
+                Some((row.token(0), blob.to_vec()))
+            })
+            .collect()
+    }
+
+    /// The `FieldMarshal` descriptor attached to the field named `name`, with the field's own
+    /// `HasFieldMarshal` bit -- the PAIR, because either half alone is the defect
+    /// `add_field_marshal` exists to make impossible.
+    fn marshal_of_field(image: &[u8], name: &str) -> Option<(bool, Vec<u8>)> {
+        let assembly = lamella_metadata::Assembly::read(image).expect("the image parses");
+        let field = assembly
+            .type_defs()
+            .flat_map(|def| def.fields().collect::<Vec<_>>())
+            .find(|f| f.name() == Some(name))?;
+        let has_bit = field.flags() & 0x1000 != 0;
+        let descriptor = field_marshal_rows(image)
+            .into_iter()
+            .find(|(parent, _)| *parent == field.token())
+            .map(|(_, blob)| blob)?;
+        Some((has_bit, descriptor))
+    }
+
+    #[test]
+    fn a_struct_layout_attribute_becomes_type_flags_and_a_class_layout_row() {
+        let image = interop_image(
+            "
+            [StructLayout(LayoutKind.Explicit, Size = 16)] struct Ex { }
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 1)] class Seq { }
+            [StructLayout(LayoutKind.Auto)] struct Au { }
+            ",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let flags = |name: &str| {
+            assembly
+                .type_defs()
+                .find(|d| d.name().is_some_and(|n| n.name == name))
+                .expect("the type is in the image")
+                .flags()
+        };
+        assert_eq!(flags("Ex") & 0x18, 0x10, "LayoutKind.Explicit");
+        assert_eq!(flags("Seq") & 0x18, 0x08, "LayoutKind.Sequential");
+        assert_eq!(flags("Au") & 0x18, 0x00, "LayoutKind.Auto on a struct");
+        assert_eq!(flags("Seq") & 0x3_0000, 0x1_0000, "CharSet.Unicode");
+        assert_eq!(flags("Ex") & 0x3_0000, 0x0, "no CharSet is AnsiClass");
+
+        let mut rows = class_layout_rows(&image);
+        rows.sort();
+        assert_eq!(
+            rows,
+            alloc::vec![(String::from("Ex"), 0, 16), (String::from("Seq"), 1, 0)],
+            "a ClassLayout row iff Pack or Size is nonzero"
+        );
+    }
+
+    #[test]
+    fn a_field_offset_attribute_becomes_a_field_layout_row_and_no_custom_attribute() {
+        let image = interop_image(
+            "
+            [StructLayout(LayoutKind.Explicit, Size = 12)] struct Overlap {
+                [FieldOffset(4)] public int First;
+                [FieldOffset(6)] public int Second;
+            }
+            ",
+        );
+        let mut rows = field_layout_rows(&image);
+        rows.sort();
+        assert_eq!(
+            rows,
+            alloc::vec![(String::from("First"), 4), (String::from("Second"), 6)]
+        );
+
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let field = assembly
+            .type_defs()
+            .flat_map(|def| def.fields().collect::<Vec<_>>())
+            .find(|f| f.name() == Some("First"))
+            .expect("the field is in the image");
+        assert_eq!(
+            assembly.custom_attributes(field.token()).count(),
+            0,
+            "[FieldOffset] is pseudo-custom: it becomes the row and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_marshal_as_attribute_becomes_a_field_marshal_row_with_the_bytes_csc_writes() {
+        let image = interop_image(
+            "
+            class Carrier {
+                [MarshalAs(UnmanagedType.ByValArray, ArraySubType = UnmanagedType.I4, SizeConst = 3)]
+                public int[] Fixed;
+                [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 4)] public string Text;
+                [MarshalAs(UnmanagedType.LPStr)] public string Plain;
+                [MarshalAs(UnmanagedType.LPArray)] public int[] Loose;
+                [MarshalAs(UnmanagedType.LPArray, SizeConst = 5)] public int[] Counted;
+            }
+            ",
+        );
+        assert_eq!(
+            marshal_of_field(&image, "Fixed"),
+            Some((true, alloc::vec![0x1E, 0x03, 0x07]))
+        );
+        assert_eq!(
+            marshal_of_field(&image, "Text"),
+            Some((true, alloc::vec![0x17, 0x04]))
+        );
+        assert_eq!(
+            marshal_of_field(&image, "Plain"),
+            Some((true, alloc::vec![0x14]))
+        );
+        assert_eq!(
+            marshal_of_field(&image, "Loose"),
+            Some((true, alloc::vec![0x2A, 0x50]))
+        );
+        assert_eq!(
+            marshal_of_field(&image, "Counted"),
+            Some((true, alloc::vec![0x2A, 0x50, 0x00, 0x05, 0x00]))
+        );
+    }
+
+    #[test]
+    fn a_marshal_as_on_a_parameter_and_on_a_return_reaches_their_param_rows() {
+        let image = interop_image(
+            "
+            class MethodCarrier {
+                [return: MarshalAs(UnmanagedType.Bool)]
+                public static bool Convert(
+                    [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.I4, SizeParamIndex = 1)]
+                    int[] values,
+                    int length) { return false; }
+            }
+            ",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let method = assembly
+            .type_defs()
+            .flat_map(|d| d.methods().collect::<Vec<_>>())
+            .find(|m| m.name() == Some("Convert"))
+            .expect("the method is in the image");
+        let mut by_sequence: Vec<(u32, u32, Vec<u8>)> = method
+            .params()
+            .filter_map(|p| {
+                let descriptor = field_marshal_rows(&image)
+                    .into_iter()
+                    .find(|(parent, _)| *parent == p.token())
+                    .map(|(_, blob)| blob)?;
+                Some((p.sequence(), p.flags(), descriptor))
+            })
+            .collect();
+        by_sequence.sort_by_key(|(sequence, _, _)| *sequence);
+        assert_eq!(
+            by_sequence,
+            alloc::vec![
+                (0, 0x2000, alloc::vec![0x02]),
+                (1, 0x2000, alloc::vec![0x2A, 0x07, 0x01]),
+            ],
+            "the return parameter and the first declared one, each with its own descriptor"
+        );
+        assert_eq!(field_marshal_rows(&image).len(), 2);
+    }
+
 }

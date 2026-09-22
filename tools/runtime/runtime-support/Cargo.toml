@@ -14,6 +14,12 @@ edition = "2021"
 # than a copy: an image whose decimal arithmetic differed from the interpreter's would disagree
 # with the tier it was previewed on, one rounding decision at a time.
 lamella-decimal = { path = "../../../crates/lamella-decimal" }
+# The mark-compact COLLECTOR, in its allocation-free form. `default-features = false` is not a
+# preference here, it is the only configuration that can link: this archive installs no Rust
+# `#[global_allocator]` -- `lamella_gc_alloc` IS the image's allocator -- and the crate's host half
+# needs one, while `device-entry` would export a second `lamella_gc_alloc`/`_impl` pair that collides
+# with the ones below AND whose shim does not write the thread anchor our root walker walks from.
+lamella-gc = { path = "../../../crates/lamella-gc", default-features = false, features = ["gc-collect"] }
 # The libm-free double rounding kernel, shared with the interpreter so the two round identically.
 # A path dependency rather than a copy, for the reason stated just above: a device that rounded
 # differently from the tier a program was previewed on would disagree one last digit at a time.

@@ -3,18 +3,23 @@
 //! only the *global heap* and the *entry points*, reusing [`Heap::alloc`] /
 //! [`Heap::collect`] / [`Heap::collect_stack`] unchanged.
 
+#[cfg(feature = "host-heap")]
 extern crate alloc;
 
+#[cfg(feature = "host-heap")]
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
 use crate::device_heap::{ARRAY_DESC_MARK, ARRAY_DESC_MARK_MASK, DeviceHeap, DeviceTypeDesc};
-use crate::heap::{Heap, Ref, StackMapTable, TypeDesc};
+use crate::heap::Ref;
+#[cfg(feature = "host-heap")]
+use crate::heap::{Heap, StackMapTable, TypeDesc};
 
 
 /// The signature of the out-of-memory roots hook: given the live heap, report every
 /// root slot to `visit` so the subsequent compaction relocates them. See
 /// [`set_oom_roots_hook`].
+#[cfg(feature = "host-heap")]
 pub type OomRootsHook = fn(&mut Heap, visit: &mut dyn FnMut(&mut Ref));
 
 /// The process/device-global garbage-collected heap and its OOM roots hook, behind a
@@ -24,6 +29,7 @@ pub type OomRootsHook = fn(&mut Heap, visit: &mut dyn FnMut(&mut Ref));
 /// promise that *every* access happens inside [`critical_section`], which is mutually
 /// exclusive on the single core the device profile targets (interrupts off on
 /// Cortex-M; a no-op on the host). `None` means "not yet initialised".
+#[cfg(feature = "host-heap")]
 struct GcCell {
     /// The global heap; `None` until [`lamella_gc_init`] installs one.
     heap: UnsafeCell<Option<Heap>>,
@@ -32,9 +38,11 @@ struct GcCell {
     oom_roots: UnsafeCell<Option<OomRootsHook>>,
 }
 
+#[cfg(feature = "host-heap")]
 unsafe impl Sync for GcCell {}
 
 /// The one global heap the AOT-emitted allocator and collector operate on.
+#[cfg(feature = "host-heap")]
 static GC: GcCell = GcCell {
     heap: UnsafeCell::new(None),
     oom_roots: UnsafeCell::new(None),
@@ -47,6 +55,7 @@ static GC: GcCell = GcCell {
 /// This installs the `Vec`-backed [`Heap`]. The device's fixed raw region is a separate
 /// entry point, [`lamella_gc_init_region`], and a device build uses that one. The TypeDesc
 /// table is moved in once and lives for the program's lifetime.
+#[cfg(feature = "host-heap")]
 pub fn lamella_gc_init(capacity: usize, type_descs: Vec<TypeDesc>) {
     let heap = Heap::new(capacity, type_descs);
     critical_section(|| unsafe {
@@ -58,6 +67,7 @@ pub fn lamella_gc_init(capacity: usize, type_descs: Vec<TypeDesc>) {
 /// Tears the global heap down (drops it and clears the OOM hook), so an independent test
 /// can `lamella_gc_init` a fresh one without interference. Not part of the device ABI --
 /// the device heap lives forever -- but the global state needs a reset between host tests.
+#[cfg(feature = "host-heap")]
 pub fn lamella_gc_teardown() {
     critical_section(|| unsafe {
         *GC.heap.get() = None;
@@ -69,6 +79,7 @@ pub fn lamella_gc_teardown() {
 /// [`lamella_gc_alloc`]). Unset, an out-of-memory collection runs with no roots and reclaims
 /// every object, live ones included. Exposed for the host tests that prove the
 /// retry-after-collect path.
+#[cfg(feature = "host-heap")]
 pub fn set_oom_roots_hook(hook: OomRootsHook) {
     critical_section(|| unsafe {
         *GC.oom_roots.get() = Some(hook);
@@ -78,6 +89,7 @@ pub fn set_oom_roots_hook(hook: OomRootsHook) {
 /// Runs `body` with exclusive `&mut Heap` access to the global heap inside a critical
 /// section. Panics if the heap is uninitialised (a `newobj` before `lamella_gc_init` is
 /// a backend bug, never a recoverable runtime state).
+#[cfg(feature = "host-heap")]
 fn with_heap<R>(body: impl FnOnce(&mut Heap) -> R) -> R {
     critical_section(|| unsafe {
         let heap = (*GC.heap.get())
@@ -102,6 +114,7 @@ fn with_heap<R>(body: impl FnOnce(&mut Heap) -> R) -> R {
 /// Device ABI note (see module header): the real entry takes a `*const TypeDesc` and
 /// returns a `*mut u8`; here it takes a table index and returns a `u32` offset.
 #[must_use]
+#[cfg(feature = "host-heap")]
 pub fn lamella_gc_alloc(payload_size: u32, type_desc_id: u32) -> u32 {
     with_heap(|heap| {
         debug_assert!(
@@ -133,7 +146,7 @@ pub fn lamella_gc_alloc(payload_size: u32, type_desc_id: u32) -> u32 {
 /// `heap` by the hook and by `collect` is expressed in one place: the hook is handed the
 /// heap to read its roots from (it may inspect object layouts) and the `visit` sink that
 /// `Heap::collect` drives twice (mark, then relocate).
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 fn collect_via_hook(heap: &mut Heap, hook: OomRootsHook) {
     let mut roots: Vec<Ref> = Vec::new();
     hook(heap, &mut |slot: &mut Ref| roots.push(*slot));
@@ -154,7 +167,7 @@ fn collect_via_hook(heap: &mut Heap, hook: OomRootsHook) {
 /// safepoint return address) down through each caller via `stack_maps`, reclaims the
 /// unreachable, compacts the survivors, and writes every relocated reference back into
 /// `stack`. Delegates wholesale to [`Heap::collect_stack`] on the global heap.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub fn lamella_gc_collect(
     stack: &mut [u8],
     sp: u32,
@@ -174,12 +187,19 @@ struct DeviceGcCell {
     /// The global device heap; `None` until [`lamella_gc_init_region`] installs one.
     heap: UnsafeCell<Option<DeviceHeap>>,
     /// The decoded stack maps for the lowered program, installed once at startup. They are what
-    /// [`DeviceHeap::collect_stack`] would resolve a safepoint's roots against; the allocator's
-    /// own OOM path does not walk them today, and collects with whatever roots
-    /// [`set_oom_roots_hook`] supplies -- with none installed, that is no roots at all, so an
-    /// embedder installs the hook before a program holds a reference across an allocation.
-    /// `None` until installed.
+    /// [`DeviceHeap::collect_stack`] resolves a safepoint's roots against. `None` until installed.
+    #[cfg(feature = "host-heap")]
     stack_maps: UnsafeCell<Option<StackMapTable>>,
+    /// The roots reported on this heap's out-of-memory collection, installed by
+    /// [`set_device_oom_roots_hook`]. `None` means the OOM path does not collect at all -- see
+    /// [`lamella_gc_alloc_impl`] for why that refusal is the safe default rather than a
+    /// rootless collection.
+    #[cfg(feature = "gc-collect")]
+    oom_roots: UnsafeCell<Option<DeviceOomRootsHook>>,
+    /// The collection the embedder runs when this heap is exhausted, installed by
+    /// [`set_device_collect_hook`]. `None` means the out-of-memory path does not collect.
+    #[cfg(feature = "gc-collect")]
+    collect: UnsafeCell<Option<DeviceCollectHook>>,
 }
 
 unsafe impl Sync for DeviceGcCell {}
@@ -187,8 +207,102 @@ unsafe impl Sync for DeviceGcCell {}
 /// The one global device heap the AOT-emitted allocator and collector operate on.
 static DEVICE_GC: DeviceGcCell = DeviceGcCell {
     heap: UnsafeCell::new(None),
+    #[cfg(feature = "host-heap")]
     stack_maps: UnsafeCell::new(None),
+    #[cfg(feature = "gc-collect")]
+    oom_roots: UnsafeCell::new(None),
+    #[cfg(feature = "gc-collect")]
+    collect: UnsafeCell::new(None),
 };
+
+/// The signature of the device out-of-memory roots hook: report every root SLOT to `visit`, which
+/// reads the slot to mark from it and writes the relocated reference back into it.
+///
+/// It takes no heap, unlike [`OomRootsHook`]: a device hook reads FRAME memory and the program's
+/// global root regions, never the heap's own bookkeeping.
+///
+/// **IT IS CALLED TWICE PER COLLECTION** -- once to mark and once to relocate -- so it must
+/// enumerate the same slots in the same order both times, and it must not allocate. Re-walking the
+/// stack is exactly that, which is why the device form replays the walk instead of snapshotting the
+/// roots into a `Vec` the way the host's [`collect_via_hook`] does; there is no allocator here.
+#[cfg(feature = "gc-collect")]
+pub type DeviceOomRootsHook = fn(visit: &mut dyn FnMut(&mut Ref));
+
+/// A collection the EMBEDDER runs on this heap when it is exhausted, answering whether it ran.
+///
+/// **This is how a device image collects, and the division of labour is the point.** The embedder --
+/// the runtime-support archive -- is the side that knows where its roots are (its own stack-map
+/// walker), which of them are PINNED, and where a mark bitmap can live, because it owns the image's
+/// memory map. None of those can be handed through a fixed signature without this crate inventing a
+/// storage policy for a binary it knows nothing about.
+///
+/// It is given the live heap and is expected to call [`DeviceHeap::collect_no_alloc`], which
+/// allocates nothing. **Answering `false` means no collection happened**, and the allocation that
+/// triggered it then fails as it would have anyway -- which is the honest outcome when the embedder
+/// cannot prove what is live (a pin list that overflowed, a mark bitmap too small for the region).
+///
+/// It must not allocate, for the reason the whole path exists: it runs at the moment the only
+/// allocator in the image has just failed.
+#[cfg(feature = "gc-collect")]
+pub type DeviceCollectHook = fn(&mut DeviceHeap) -> bool;
+
+/// Installs the collection an exhausted device heap runs. See [`DeviceCollectHook`].
+///
+/// Until one is installed the out-of-memory path does not collect, which is the safe default: a
+/// collector that cannot prove an object dead must not reclaim it.
+#[cfg(feature = "gc-collect")]
+pub fn set_device_collect_hook(hook: DeviceCollectHook) {
+    critical_section(|| unsafe {
+        *DEVICE_GC.collect.get() = Some(hook);
+    });
+}
+
+/// Installs the hook that reports live roots when the device heap runs out of memory.
+///
+/// Until one is installed the out-of-memory path does not collect (see [`lamella_gc_alloc_impl`]),
+/// so an image whose programs hold a reference across an allocation installs this at startup,
+/// before the first allocation.
+///
+/// It is INDEPENDENT of [`lamella_gc_init_region`] and deliberately not cleared by it, so the two
+/// may be called in either order and a re-init does not silently drop the hook.
+#[cfg(feature = "gc-collect")]
+pub fn set_device_oom_roots_hook(hook: DeviceOomRootsHook) {
+    critical_section(|| unsafe {
+        *DEVICE_GC.oom_roots.get() = Some(hook);
+    });
+}
+
+/// Removes the device OOM roots hook, so the next out-of-memory allocation refuses to collect.
+///
+/// **TEST-ONLY.** The hook is global and outlives one test, so a test asserting the no-hook
+/// refusal has to state that it has none -- otherwise it passes or fails on whichever test ran
+/// before it. A device installs its hook once and never removes it.
+#[cfg(all(test, feature = "gc-collect"))]
+fn clear_device_oom_roots_hook() {
+    critical_section(|| unsafe {
+        *DEVICE_GC.oom_roots.get() = None;
+    });
+}
+
+/// One-time device GC setup WITHOUT stack maps: install the global heap over the raw region
+/// `[base, base + len)` and nothing else.
+///
+/// **This is the init a C# AOT image calls**, and it exists separately because
+/// [`lamella_gc_init_region`]'s `stack_maps` parameter is a `Vec`-backed [`StackMapTable`] -- a type
+/// that cannot exist in a binary with no global allocator. The maps it carries are the FLAT tier's
+/// format anyway; the linked tier reports its roots through `.lamella_stackmaps` records that a
+/// walker in the runtime-support archive reads, and hands them over through
+/// [`set_device_oom_roots_hook`].
+///
+/// # Safety
+/// As [`lamella_gc_init_region`]: `base`/`len` must name `len` bytes owned exclusively by the GC for
+/// the program's lifetime and not aliased elsewhere, with `len >= ALIGN`. See [`DeviceHeap::from_raw`].
+pub unsafe fn lamella_gc_init_device_heap(base: *mut u8, len: usize) {
+    let heap = unsafe { DeviceHeap::from_raw(base, len) };
+    critical_section(|| unsafe {
+        *DEVICE_GC.heap.get() = Some(heap);
+    });
+}
 
 /// One-time device GC setup: install the global heap over the raw region `[base, base +
 /// len)` -- the backend's linker `.heap` section -- and the program's decoded stack maps.
@@ -199,6 +313,7 @@ static DEVICE_GC: DeviceGcCell = DeviceGcCell {
 /// `base`/`len` must name `len` bytes of memory exclusively owned by the GC for the
 /// program's lifetime and not aliased elsewhere (the `.heap` section); `len >= ALIGN`.
 /// See [`DeviceHeap::from_raw`].
+#[cfg(feature = "host-heap")]
 pub unsafe fn lamella_gc_init_region(base: *mut u8, len: usize, stack_maps: StackMapTable) {
     let heap = unsafe { DeviceHeap::from_raw(base, len) };
     critical_section(|| unsafe {
@@ -242,7 +357,7 @@ fn with_device_heap<R>(body: impl FnOnce(&mut DeviceHeap) -> R) -> R {
 /// still holds -- and the retry can hand back memory a live object occupies. That is correct
 /// only for a program that holds no reference across an allocation. A program that does must
 /// not use this entry with `gc-collect` enabled.
-#[cfg_attr(target_arch = "arm", unsafe(no_mangle))]
+#[cfg_attr(all(target_arch = "arm", feature = "device-entry"), unsafe(no_mangle))]
 pub unsafe extern "C" fn lamella_gc_alloc_impl(
     payload_size: u32,
     type_desc: *const DeviceTypeDesc,
@@ -261,9 +376,25 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
         if let Some(reference) = unsafe { heap.alloc(payload_size, type_desc) } {
             return heap.payload_ptr(reference);
         }
-        #[cfg(feature = "gc-collect")]
+        #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
         {
-            heap.collect(|_visit| {});
+            let hook = unsafe { *DEVICE_GC.oom_roots.get() };
+            let Some(hook) = hook else {
+                return core::ptr::null_mut();
+            };
+            heap.collect(|visit| hook(visit));
+            unsafe { heap.alloc(payload_size, type_desc) }
+                .map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
+        }
+        #[cfg(all(feature = "gc-collect", not(feature = "host-heap")))]
+        {
+            let hook = unsafe { *DEVICE_GC.collect.get() };
+            let Some(hook) = hook else {
+                return core::ptr::null_mut();
+            };
+            if !hook(heap) {
+                return core::ptr::null_mut();
+            }
             unsafe { heap.alloc(payload_size, type_desc) }
                 .map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
         }
@@ -278,7 +409,7 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
 /// `(sp, return_pc)` against the installed stack maps and relocates the survivors,
 /// rewriting the roots in `stack`. The pointer-ABI counterpart of [`lamella_gc_collect`],
 /// over the global [`DeviceHeap`].
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub fn lamella_gc_collect_device(stack: &mut [u8], sp: u32, return_pc: u32) {
     with_device_heap(|heap| {
         let maps = unsafe { &*DEVICE_GC.stack_maps.get() };
@@ -290,7 +421,7 @@ pub fn lamella_gc_collect_device(stack: &mut [u8], sp: u32, return_pc: u32) {
     });
 }
 
-#[cfg(target_arch = "arm")]
+#[cfg(all(target_arch = "arm", feature = "device-entry"))]
 core::arch::global_asm!(
     ".section .text.lamella_gc_alloc,\"ax\",%progbits",
     ".global lamella_gc_alloc",
@@ -618,6 +749,7 @@ mod device_abi_tests {
     #[test]
     fn device_alloc_impl_returns_null_on_hard_oom_after_a_collect() {
         let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+        set_device_oom_roots_hook(no_roots);
         let big = make_desc(64, &[]);
         let (base, len) = device_region((ALIGN + HEADER_SIZE + 4) as usize);
         unsafe { lamella_gc_init_region(base, len, StackMapTable::default()) };
@@ -625,10 +757,77 @@ mod device_abi_tests {
         assert!(p.is_null());
     }
 
+    /// A hook reporting NO roots: the explicit form of "this heap really is all garbage". It is a
+    /// named function rather than an omission because that is the whole point of the hook -- an
+    /// empty root set is a CLAIM the caller makes, not a default it falls into.
+    #[cfg(feature = "gc-collect")]
+    fn no_roots(_visit: &mut dyn FnMut(&mut Ref)) {}
+
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn device_oom_without_a_roots_hook_refuses_to_collect_rather_than_reclaiming_live_objects() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+        clear_device_oom_roots_hook();
+        let leaf = make_desc(4, &[]);
+        let (base, len) = device_region((ALIGN + HEADER_SIZE + 4) as usize);
+        unsafe { lamella_gc_init_region(base, len, StackMapTable::default()) };
+        let first = unsafe { lamella_gc_alloc_impl(4, leaf, 0, 0) };
+        assert!(!first.is_null(), "the region holds exactly one leaf");
+        let second = unsafe { lamella_gc_alloc_impl(4, leaf, 0, 0) };
+        assert!(
+            second.is_null(),
+            "with no roots hook the OOM path must refuse to collect, not reclaim a live object"
+        );
+    }
+
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn device_oom_drives_the_installed_hook_once_per_collection_pass() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+        set_device_oom_roots_hook(count_the_passes);
+        PASSES.store(0, core::sync::atomic::Ordering::SeqCst);
+        let leaf = make_desc(4, &[]);
+        let (base, len) = device_region((ALIGN + 2 * (HEADER_SIZE + 4)) as usize);
+        unsafe { lamella_gc_init_region(base, len, StackMapTable::default()) };
+
+        let first = unsafe { lamella_gc_alloc_impl(4, leaf, 0, 0) };
+        let second = unsafe { lamella_gc_alloc_impl(4, leaf, 0, 0) };
+        assert!(!first.is_null() && !second.is_null(), "two leaves fit");
+        assert_eq!(
+            PASSES.load(core::sync::atomic::Ordering::SeqCst),
+            0,
+            "a bump that fits must not collect, so the hook is not called on the fast path"
+        );
+
+        let third = unsafe { lamella_gc_alloc_impl(4, leaf, 0, 0) };
+        assert!(
+            !third.is_null(),
+            "the collection reclaims the unreported objects and the retry fits"
+        );
+        assert_eq!(
+            PASSES.load(core::sync::atomic::Ordering::SeqCst),
+            2,
+            "the hook is driven twice per collection -- once to mark, once to relocate"
+        );
+    }
+
+    /// How many times [`count_the_passes`] has been driven since the last reset. A `static`
+    /// rather than a closure capture because [`DeviceOomRootsHook`] is a plain `fn` pointer --
+    /// which is what the device needs, since there is nothing to allocate a closure in.
+    #[cfg(feature = "gc-collect")]
+    static PASSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// A hook that reports no roots and counts how often the collector asked it for them.
+    #[cfg(feature = "gc-collect")]
+    fn count_the_passes(_visit: &mut dyn FnMut(&mut Ref)) {
+        PASSES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+
     #[cfg(feature = "gc-collect")]
     #[test]
     fn device_alloc_impl_oom_collects_unrooted_garbage_then_the_retry_succeeds() {
         let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+        set_device_oom_roots_hook(no_roots);
         let leaf = make_desc(4, &[]);
         let (base, len) = device_region((ALIGN + 3 * (HEADER_SIZE + 4)) as usize);
         unsafe { lamella_gc_init_region(base, len, StackMapTable::default()) };

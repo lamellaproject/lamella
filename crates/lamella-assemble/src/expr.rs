@@ -303,7 +303,7 @@ pub fn emit_expression(
                         .ok_or(EmitError::Unsupported("a value-type `this` with no token"))?;
                     out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
                 } else {
-                    out.push(Instruction::simple(ldind_opcode(&expr.ty)));
+                    emit_load_indirect(&expr.ty, tokens, out)?;
                 }
             }
             Ok(())
@@ -406,7 +406,7 @@ pub fn emit_expression(
             let (TypeSymbol::Pointer(element) | TypeSymbol::ByRef(element)) = &operand.ty else {
                 return Err(EmitError::Unsupported("dereference of a non-pointer"));
             };
-            out.push(Instruction::simple(ldind_opcode(element)));
+            emit_load_indirect(element, tokens, out)?;
             Ok(())
         }
         BoundExprKind::AddressOf { operand } => match &operand.kind {
@@ -520,7 +520,7 @@ pub fn emit_expression(
                 emit_expression(operand, frame, tokens, out)?;
                 emit_expression(value, frame, tokens, out)?;
                 let kept = keep_assigned(true, &value.ty, frame, out);
-                out.push(Instruction::simple(stind_opcode(&target.ty)));
+                emit_store_indirect(&target.ty, tokens, out)?;
                 load_kept(kept, out);
                 Ok(())
             }
@@ -961,7 +961,7 @@ fn emit_element_load(
         emit_sizeof(element_ty, tokens, out)?;
         out.push(Instruction::simple(Opcode::Mul));
         out.push(Instruction::simple(Opcode::Add));
-        out.push(Instruction::simple(ldind_opcode(element_ty)));
+        emit_load_indirect(element_ty, tokens, out)?;
         return Ok(());
     }
     emit_expression(receiver, frame, tokens, out)?;
@@ -1031,7 +1031,7 @@ pub(crate) fn emit_element_store(
         out.push(Instruction::simple(Opcode::Add));
         emit_expression(value, frame, tokens, out)?;
         let kept = keep_assigned(leave, &value.ty, frame, out);
-        out.push(Instruction::simple(stind_opcode(element_ty)));
+        emit_store_indirect(element_ty, tokens, out)?;
         load_kept(kept, out);
         return Ok(());
     }
@@ -2189,6 +2189,31 @@ fn emit_numeric_conversion(
             }
         }
     }
+
+    // THE MIRROR OF THE ARM ABOVE, AND THE SOURCE'S SIGNEDNESS IS WHAT PICKS IT. An UNSIGNED source
+    // widening to `long` takes `conv.u8` so it zero-extends; a SIGNED source widening to `ulong`
+    // must take `conv.i8` so it SIGN-extends. A width-keyed table chosen by the TARGET alone cannot
+    // express that: `ulong` would reach `conv.u8` whatever it converted from, zero-extending the
+    // int32 on the stack, and `unchecked((ulong)(sbyte)-1)` would answer 0x00000000FFFFFFFF where
+    // C# requires ulong.MaxValue.
+    //
+    // THE 32-BIT TARGET NEEDS NO SUCH ARM. `(uint)(sbyte)-1` is already correct: the sbyte sits on
+    // the stack sign-extended to int32, and `conv.u4` keeps its low 32 bits.
+    //
+    // INTEGRAL SOURCES ONLY, named rather than inferred from "not unsigned": a `double` or `float`
+    // converting to `ulong` must still truncate through `conv.u8`, and sign-extending one would be
+    // its own wrong answer.
+    if let (TypeSymbol::Special(source), TypeSymbol::Special(SpecialType::UInt64)) = (source, target)
+    {
+        if matches!(
+            source,
+            SpecialType::SByte | SpecialType::Int16 | SpecialType::Int32 | SpecialType::Int64
+        ) {
+            out.push(Instruction::simple(Opcode::ConvI8));
+            return Ok(());
+        }
+    }
+
     out.push(Instruction::simple(numeric_conversion(target)?));
     Ok(())
 }
@@ -2290,6 +2315,28 @@ pub(crate) fn emit_field_receiver(
 /// local or parameter is taken by `ldloca`/`ldarga`; a nested value-type field is the
 /// address of its container then `ldflda`, so a write stores in place; `this`/`base`
 /// is already a managed pointer (`ldarg.0`), so it is emitted as a value.
+/// Whether a field may be addressed IN PLACE here, rather than through a copy of its value.
+///
+/// A `readonly` field is a variable only in a constructor of the class that DECLARES it (17.4.2);
+/// everywhere else it is a value, so a method called on it is handed the address of a copy and an
+/// `initonly` field's address is never taken where the CLI forbids it.
+///
+/// **COPYING TAKES POSITIVE EVIDENCE, and the asymmetry is deliberate**, because the two mistakes
+/// are not the same size. A needless copy inside a constructor LOSES the write it was meant to
+/// make -- silently, since the program still compiles and runs. A needless in-place address only
+/// mutates a readonly field that should have been copied. So the answer is "copy" only when the
+/// field is known to belong to another type; a constructor whose owner does not match stays where
+/// it was.
+fn addressable_in_place(field: &FieldReference, frame: &Frame) -> bool {
+    if !field.is_readonly {
+        return true;
+    }
+    match frame.constructor_of() {
+        None => false,
+        Some(owner) => owner == &field.declaring_type,
+    }
+}
+
 pub(crate) fn emit_value_type_receiver(
     receiver: &BoundExpr,
     frame: &Frame,
@@ -2309,7 +2356,7 @@ pub(crate) fn emit_value_type_receiver(
             receiver: container,
             field: Some(field),
             ..
-        } if field.constant.is_none() => {
+        } if field.constant.is_none() && addressable_in_place(field, frame) => {
             let token =
                 tokens
                     .field(&field.declaring_type, &field.name)
@@ -2317,14 +2364,7 @@ pub(crate) fn emit_value_type_receiver(
                         "address of a field outside this module",
                     ))?;
             if field.is_static {
-                if field.is_readonly {
-                    out.push(Instruction::new(Opcode::Ldsfld, Operand::Token(token)));
-                    let slot = frame.reserve_local(&receiver.ty);
-                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
-                    out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
-                } else {
-                    out.push(Instruction::new(Opcode::Ldsflda, Operand::Token(token)));
-                }
+                out.push(Instruction::new(Opcode::Ldsflda, Operand::Token(token)));
             } else {
                 if tokens.is_struct(&container.ty) {
                     emit_value_type_receiver(container, frame, tokens, out)?;
@@ -2342,7 +2382,7 @@ pub(crate) fn emit_value_type_receiver(
         BoundExprKind::ElementAccess {
             receiver: array,
             indices,
-        } => {
+        } if !matches!(array.ty, TypeSymbol::Special(SpecialType::String)) => {
             emit_expression(array, frame, tokens, out)?;
             for index in indices {
                 emit_expression(index, frame, tokens, out)?;
@@ -2387,7 +2427,7 @@ pub(crate) fn emit_local(
                 .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
             out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
         } else {
-            out.push(Instruction::simple(ldind_opcode(&element)));
+            emit_load_indirect(&element, tokens, out)?;
         }
         return Ok(());
     }
@@ -2527,6 +2567,50 @@ pub(crate) fn emit_step(
 
 /// The `ldind.*` opcode that loads a value of `ty` through a managed pointer (the
 /// signed/unsigned width follows the type, as csc emits for a byref read).
+/// Loads the value a managed or unmanaged pointer points AT, choosing the instruction by what the
+/// referent IS.
+///
+/// **A STRUCT OR AN ENUM IS NOT A WIDTH, AND `ldind` ONLY KNOWS WIDTHS.** `ldind.*` covers the
+/// primitives and `ldind.ref` covers an object reference; a value type is loaded whole with
+/// `ldobj <token>`. Falling off the end of the width table into `ldind.ref` produces IL the
+/// runtime refuses -- `decimal* p; *p` compiled clean and threw `InvalidProgramException` on entry,
+/// and so did a pointer to any user struct or enum, while `float*` and `double*` were right because
+/// they have widths.
+///
+pub(crate) fn emit_load_indirect(
+    ty: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if is_value_type(ty, tokens) && matches!(ldind_opcode(ty), Opcode::LdindRef) {
+        let token = tokens
+            .instruction_type_token(ty)
+            .ok_or(EmitError::Unsupported("dereferenced value type has no token"))?;
+        out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+        return Ok(());
+    }
+    out.push(Instruction::simple(ldind_opcode(ty)));
+    Ok(())
+}
+
+/// Stores a value THROUGH a pointer, choosing the instruction by what the referent is. The store
+/// half of [`emit_load_indirect`], and wrong in the same way for the same reason.
+pub(crate) fn emit_store_indirect(
+    ty: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if is_value_type(ty, tokens) && matches!(stind_opcode(ty), Opcode::StindRef) {
+        let token = tokens
+            .instruction_type_token(ty)
+            .ok_or(EmitError::Unsupported("stored-through value type has no token"))?;
+        out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
+        return Ok(());
+    }
+    out.push(Instruction::simple(stind_opcode(ty)));
+    Ok(())
+}
+
 pub(crate) fn ldind_opcode(ty: &TypeSymbol) -> Opcode {
     match ty {
         TypeSymbol::Special(SpecialType::Boolean | SpecialType::Byte) => Opcode::LdindU1,
@@ -2574,7 +2658,7 @@ pub(crate) fn emit_byref_load(
             .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
         out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
     } else {
-        out.push(Instruction::simple(ldind_opcode(element)));
+        emit_load_indirect(element, tokens, out)?;
     }
     Ok(())
 }
@@ -2593,7 +2677,7 @@ pub(crate) fn emit_byref_store(
             .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
         out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
     } else {
-        out.push(Instruction::simple(stind_opcode(element)));
+        emit_store_indirect(element, tokens, out)?;
     }
     Ok(())
 }

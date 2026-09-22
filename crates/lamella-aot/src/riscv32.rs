@@ -95,6 +95,64 @@ pub enum LowerError {
     },
 }
 
+impl core::fmt::Display for LowerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LowerError::NotWellFormed { errors } => match errors.split_first() {
+                Some((first, rest)) if rest.is_empty() => {
+                    write!(f, "the function does not verify: {first:?}")
+                }
+                Some((first, rest)) => write!(
+                    f,
+                    "the function does not verify: {first:?}, and {} further problem(s)",
+                    rest.len(),
+                ),
+                None => write!(f, "the function does not verify"),
+            },
+            LowerError::Unsupported => write!(
+                f,
+                "the function uses an instruction or shape the RISC-V backend does not lower yet",
+            ),
+            LowerError::TooManyValues => write!(
+                f,
+                "the function's frame is larger than a single lw/sw immediate can reach -- every \
+                 value is spilled on this target, so a slot past 12 signed bits of the frame \
+                 pointer cannot be addressed (roughly five hundred live values)",
+            ),
+            LowerError::ControlFlowUnsupported => write!(
+                f,
+                "the function has a control-flow shape this target does not lower: a branch \
+                 target that takes parameters (a merge must go through a Jump), or a reference \
+                 to a block that is not there",
+            ),
+            LowerError::CodeTooLarge { at, offset, limit } => write!(
+                f,
+                "a branch at byte {at} had to reach {offset} bytes, past the +/-{limit} this \
+                 encoding covers -- the function is too large for that branch's reach, not for \
+                 the image",
+            ),
+            LowerError::StringSeamWithoutDescriptor { seam } => write!(
+                f,
+                "this image calls the string-allocating seam `{seam}` but cannot name \
+                 `System.String`, so every string that seam returns would carry a null type \
+                 descriptor",
+            ),
+            LowerError::BigStructResultUnsupported { call } => write!(
+                f,
+                "a `{call}` returns a value type too wide for registers, and that dispatch has \
+                 no register left for the hidden result pointer -- a0 is already the receiver or \
+                 the target",
+            ),
+            LowerError::UnencodableStringUnit { unit, index } => write!(
+                f,
+                "a string literal holds the UTF-16 code unit 0x{unit:04X} at index {index}, \
+                 which this build's string storage cannot represent -- a lone surrogate has no \
+                 form under `string-utf8`",
+            ),
+        }
+    }
+}
+
 /// The target register profile. `Rv32im` uses all 32 registers + hardware mul/div (QEMU `virt` and
 /// larger cores); `Rv32ec` -- the CH32V003 and other tiny cores -- is RV32E(C): only x0-x15 exist and
 /// there is no M-extension. RV32E therefore takes an EMPTY allocatable pool (so every value-bearing
@@ -516,10 +574,14 @@ fn emit_soft_mul32(
 
 /// The absolute RAM address where the module's static-field region begins -- a static field at MIR
 /// byte `offset` lives at `STATIC_FIELD_BASE + offset`. Placed above the boot image (start of RAM),
-/// the heap (`0x8010_0000`), and the stack (grows down from `0x8020_0000`) on the QEMU `virt` board,
-/// which zeroes RAM at reset, so an unwritten static reads 0 (the CIL default). Mirrors ARM32's fixed
-/// static base; a device build threads the linker-provided `.bss` address instead.
-const STATIC_FIELD_BASE: u32 = 0x8030_0000;
+/// the heap (`0x8010_0000`), and the stack (grows down from `0x8020_0000`) on the QEMU `virt` board.
+/// Mirrors ARM32's fixed static base; a device build threads the linker-provided `.bss` address
+/// instead.
+///
+/// **An unwritten static reads 0, the CIL default, because the boot image CLEARS this region before
+/// it calls the entry** (`build::riscv_virt_boot_image`) -- not because of where it sits. RAM is
+/// undefined at power-on, and the region's word 0 is the exception tag every call site tests.
+pub(crate) const STATIC_FIELD_BASE: u32 = 0x8030_0000;
 
 /// Marks a call relocation whose target is an EXTERNAL symbol (an `Inst::CallNative`) rather than an
 /// intra-module function index, so `lower_object` maps it to an undefined symbol the linker resolves
@@ -2230,6 +2292,7 @@ fn lower_inst(
             if !is_pointer(value_types, *base) {
                 return Err(LowerError::Unsupported);
             }
+            emit_null_test(enc, value_types, *base, reg(*base), stubs);
             enc.addi(reg(result), reg(*base), field_offset(*offset)?);
         }
         Inst::ArrayLoad {
@@ -2539,7 +2602,7 @@ fn lower_function_spilled(
         + has_calls as i32 * 4
         + saves_scratch as i32 * 4
         + returns_sret as i32 * 4
-        + invokes_delegate as i32 * 8
+        + invokes_delegate as i32 * 12
         + delegate_result_wide as i32 * 4) as usize)
         .div_ceil(16)
         * 16;
@@ -3515,6 +3578,7 @@ fn lower_inst_spilled(
         Inst::FieldAddr { base, offset } => {
             if is_pointer(value_types, *base) {
                 slot_load(enc, t0, slot(*base));
+                emit_null_test(enc, value_types, *base, t0, stubs);
                 enc.addi(t1, t0, field_offset(*offset)?);
             } else {
                 slot_addr(enc, t1, slot(*base) + *offset as i32);
@@ -3793,6 +3857,17 @@ fn lower_inst_spilled(
             let do_call = enc.new_label();
             let mdone = enc.new_label();
             slot_store(enc, Reg::ZERO, mc_off);
+            emit_static_addr(
+                enc,
+                t0,
+                t1,
+                &StaticOwner::Own,
+                crate::cil::G_EXCEPTION_TAG_OFFSET,
+                statics_ptr_pool,
+                relocate,
+            )?;
+            enc.lw(t0, t0, 0);
+            slot_store(enc, t0, mc_off + 8);
             enc.bind_label(mloop);
             slot_load(enc, t0, slot(*delegate));
             enc.lw(t1, t0, 8);
@@ -3821,8 +3896,20 @@ fn lower_inst_spilled(
             let wide = value_words(value_types, result) >= 2;
             slot_store(enc, Reg::A0, mc_off + 4);
             if wide {
-                slot_store(enc, Reg::A1, mc_off + 8);
+                slot_store(enc, Reg::A1, mc_off + 12);
             }
+            emit_static_addr(
+                enc,
+                t0,
+                t1,
+                &StaticOwner::Own,
+                crate::cil::G_EXCEPTION_TAG_OFFSET,
+                statics_ptr_pool,
+                relocate,
+            )?;
+            enc.lw(t0, t0, 0);
+            slot_load(enc, t1, mc_off + 8);
+            enc.branch(BranchCond::Ne, t0, t1, mdone);
             slot_load(enc, t0, mc_off);
             enc.addi(t0, t0, 1);
             slot_store(enc, t0, mc_off);
@@ -3830,7 +3917,7 @@ fn lower_inst_spilled(
             enc.bind_label(mdone);
             slot_load(enc, Reg::A0, mc_off + 4);
             if wide {
-                slot_load(enc, Reg::A1, mc_off + 8);
+                slot_load(enc, Reg::A1, mc_off + 12);
             }
             store_call_result(enc, slot, value_types, result);
         }

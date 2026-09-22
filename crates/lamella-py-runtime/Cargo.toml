@@ -49,7 +49,15 @@ gc-none = []
 # The single shared collector; the interpreter scans its tagged-value slots by tag through this
 # contract. `default-features = false` so THIS crate's `gc-collect` feature drives lamella-gc's
 # collector-engine gate (the `bump` tier drops it).
-lamella-gc = { path = "../lamella-gc", default-features = false }
+#
+# BOTH HALVES OF THIS LINE ARE LOAD-BEARING, AND THEY PULL IN OPPOSITE DIRECTIONS.
+# `default-features = false` is what hands the `gc-collect` decision to this crate, as above --
+# dropping it re-enables lamella-gc's own default and the `bump` tier silently keeps the collector.
+# But turning the defaults off also drops `host-heap`, and `host-heap` is what carries `Heap`,
+# `TypeDesc` and `StackMapTable` -- the `Vec`-backed forms this interpreter runs on. So it is named
+# explicitly here. A reader "simplifying" this to plain `default-features = true` would break the
+# first property; deleting `features = ["host-heap"]` would break the second.
+lamella-gc = { path = "../lamella-gc", default-features = false, features = ["host-heap"] }
 # The shared bytecode contract (single source of truth): the interpreter executes
 # what the front end emits, so both depend on this one definition of the bytecode.
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }

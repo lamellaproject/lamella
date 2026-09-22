@@ -3559,6 +3559,7 @@ impl Parser {
                 default_value = Some(value);
             }
             parameters.push(Parameter {
+                attributes,
                 modifier,
                 ty,
                 name,
@@ -6149,6 +6150,7 @@ fn synth_comparer(argument: TypeRef, span: Span) -> Expr {
 /// An ordinary by-value parameter.
 fn synth_parameter(ty: TypeRef, name: &str, span: Span) -> Parameter {
     Parameter {
+        attributes: Vec::new(),
         modifier: None,
         ty,
         name: Box::from(name),
@@ -6873,6 +6875,7 @@ fn synthesize_record_equality(
         let out_parameters = parameters
             .iter()
             .map(|parameter| Parameter {
+                attributes: Vec::new(),
                 modifier: Some(ParameterModifier::Out),
                 ty: parameter.ty.clone(),
                 name: parameter.name.clone(),

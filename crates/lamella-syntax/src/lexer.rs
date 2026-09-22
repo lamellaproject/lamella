@@ -163,11 +163,18 @@ pub struct LexOptions {
     /// What the compilation produces -- csc's `/target:`. See [`OutputKind`], including why the
     /// default is not csc's.
     pub target: OutputKind,
-    /// Whether unmanaged native interop is enabled: `[DllImport]` P/Invoke (an `ImplMap`), and later
-    /// explicit `[StructLayout]`/`[FieldOffset]` and `[MarshalAs]`. Off by default -- pure-managed
-    /// code (and the NETMFv4_4 profile) does not need it, so a constrained target stays free of an
-    /// unmanaged boundary it cannot honor; on for AOT mixed (managed + native) scenarios. When off,
-    /// those attributes are rejected rather than emitted as inert metadata.
+    /// Whether unmanaged native interop is enabled: `[DllImport]` P/Invoke (an `ImplMap`). Off by
+    /// default -- pure-managed code (and the NETMFv4_4 profile) does not need it, so a constrained
+    /// target stays free of an unmanaged boundary it cannot honor; on for AOT mixed (managed +
+    /// native) scenarios. When off, `[DllImport]` is rejected rather than emitted as inert
+    /// metadata.
+    ///
+    /// **`[StructLayout]`, `[FieldOffset]` and `[MarshalAs]` ARE NOT BEHIND THIS KNOB.** What it
+    /// guards is an unmanaged CALL boundary, and none of those three is one: an explicit-layout
+    /// struct with overlapping fields is a managed union, a `Pack` is a managed layout request, and
+    /// a `[MarshalAs]` on a field is inert until something marshals it. csc emits all three at any
+    /// setting, so gating them would make this compiler's metadata differ from csc's for source
+    /// containing no native call at all.
     pub native_interop: bool,
     /// Whether the Portable PDB is EMBEDDED in the image (the `EmbeddedPortablePdb` debug directory
     /// entry, DEFLATE-compressed) rather than written beside it as a standalone `.pdb`. Purely an

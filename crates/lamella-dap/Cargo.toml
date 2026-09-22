@@ -75,5 +75,19 @@ required-features = ["link-device"]
 [dev-dependencies]
 lamella-assemble = { path = "../lamella-assemble" }
 
+# No single configuration of this crate compiles all of its tests, so the crate names the set that
+# does. The CIL-level tests need the interpreter backend to debug something; the ones that cover the
+# adapter over the backend seam alone have to run where there is no interpreter at all, because that
+# is the build a device server is made of and the one whose gaps are invisible from a default run.
+[[package.metadata.lamella.test-configuration]]
+name = "interpreter"
+args = []
+why = "the default host debugger, where a session has a CIL interpreter to step and inspect"
+
+[[package.metadata.lamella.test-configuration]]
+name = "device"
+args = ["--no-default-features"]
+why = "the adapter over the backend seam alone, as a server that debugs a board links it"
+
 [lints]
 workspace = true

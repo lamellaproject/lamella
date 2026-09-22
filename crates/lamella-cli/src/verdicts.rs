@@ -44,27 +44,52 @@ The readings come from the command line rather than from a probe on purpose. Tak
 wire belongs to whatever drives the board; the COMPARISON is the part that has to be right, and
 keeping them apart is what lets this be exercised with nothing plugged in.";
 
+/// The column headings of `lamella boards`, named once because they are measured as well as
+/// printed: a column has to be at least as wide as its own title.
+const BOARD_HEADING: &str = "BOARD";
+const PART_HEADING: &str = "PART";
+
+/// The `lamella boards` table, rendered rather than printed, so its columns can be checked.
+///
+/// The heading and one line per board, newline-separated, with no trailing newline.
+fn boards_table() -> String {
+    let rows: Vec<(&str, String, &str)> = BOARDS
+        .iter()
+        .map(|(id, text)| {
+            let can = if crate::flash::can_flash(id) { "yes" } else { "-" };
+            match parse(text) {
+                Ok(Strata::Board(board)) => {
+                    let resolved = catalog::load_part(&board).map(|row| row.part);
+                    let part = resolved
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .or(Some(board.part.as_str()).filter(|p| !p.is_empty()))
+                        .unwrap_or("-")
+                        .to_owned();
+                    (*id, part, can)
+                }
+                _ => (*id, String::from("(unreadable)"), can),
+            }
+        })
+        .collect();
+    let board_width = rows.iter().map(|(id, ..)| id.len()).chain([BOARD_HEADING.len()]).max();
+    let part_width = rows.iter().map(|(_, part, _)| part.len()).chain([PART_HEADING.len()]).max();
+    let board_width = board_width.unwrap_or(BOARD_HEADING.len());
+    let part_width = part_width.unwrap_or(PART_HEADING.len());
+    let mut table = format!("{BOARD_HEADING:<board_width$} {PART_HEADING:<part_width$} FLASH");
+    for (id, part, can) in &rows {
+        table.push('\n');
+        table.push_str(&format!("{id:<board_width$} {part:<part_width$} {can}"));
+    }
+    table
+}
+
 pub fn boards_command(args: &[String]) -> ExitCode {
     let spec = Spec { verb: "boards", usage: Some(BOARDS_USAGE), values: &[], flags: &[] };
     if let Err(halt) = args::parse_or_halt(args, &spec) {
         return halt.code();
     }
-    println!("{:<28} {:<14} {}", "BOARD", "PART", "FLASH");
-    for (id, text) in BOARDS {
-        let can = if crate::flash::can_flash(id) { "yes" } else { "-" };
-        match parse(text) {
-            Ok(Strata::Board(board)) => {
-                let resolved = catalog::load_part(&board).map(|row| row.part);
-                let part = resolved
-                    .as_deref()
-                    .filter(|p| !p.is_empty())
-                    .or(Some(board.part.as_str()).filter(|p| !p.is_empty()))
-                    .unwrap_or("-");
-                println!("{id:<28} {part:<14} {can}");
-            }
-            _ => println!("{id:<28} {:<14} {can}", "(unreadable)"),
-        }
-    }
+    println!("{}", boards_table());
     println!(
         "\nFLASH = `lamella flash` can write this board over a probe, with no firmware on it \
          first.\nA `-` means nobody has stated how that board is programmed yet, not that it \
@@ -291,6 +316,41 @@ fn budget_line(budget: &Budget) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every row of `lamella boards` puts PART and FLASH in the same column as the heading does.
+    ///
+    /// **A FIXED COLUMN WIDTH IS A CLAIM ABOUT DATA IT CANNOT SEE.** A padding width pads and
+    /// never truncates, so one id longer than the width pushes PART and FLASH right on that row
+    /// alone. This asks the table this verb prints rather than the format string that built it, so
+    /// a board name longer than any here today fails this the day it is added rather than quietly
+    /// bending the table.
+    #[test]
+    fn every_row_of_the_boards_table_lines_its_columns_up_with_the_heading() {
+        fn column_starts(line: &str) -> Vec<usize> {
+            let mut starts = Vec::new();
+            let mut previous_was_space = true;
+            for (index, character) in line.char_indices() {
+                if !character.is_whitespace() && previous_was_space {
+                    starts.push(index);
+                }
+                previous_was_space = character.is_whitespace();
+            }
+            starts
+        }
+
+        let table = boards_table();
+        let mut lines = table.lines();
+        let heading = lines.next().expect("the table has a heading");
+        let expected = column_starts(heading);
+        assert_eq!(expected.len(), 3, "the heading names three columns: {heading}");
+
+        let mut rows = 0;
+        for line in lines {
+            rows += 1;
+            assert_eq!(column_starts(line), expected, "a row is out of column: {line}");
+        }
+        assert!(rows > 20, "the table listed {rows} boards, which is too few to have rendered");
+    }
 
     /// The rendered verdict names the id the user typed, and discloses the file's own id when
     /// the two differ. They agree on every board in the tree, so the second half is exercised

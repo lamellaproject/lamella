@@ -5,7 +5,7 @@ namespace System
     {
         public static readonly IntPtr Zero = FromRawValue(0L);
 
-        public static int Size { get { return 8; } }
+        public static int Size { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
 
         public int ToInt32() { return (int)ToRawValue(this); }
         public long ToInt64() { return ToRawValue(this); }
@@ -43,7 +43,7 @@ namespace System
     {
         public static readonly UIntPtr Zero = FromRawValue(0);
 
-        public static int Size { get { return 8; } }
+        public static int Size { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
 
         public uint ToUInt32() { return (uint)ToRawValue(this); }
         public ulong ToUInt64() { return ToRawValue(this); }

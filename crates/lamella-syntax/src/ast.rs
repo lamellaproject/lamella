@@ -2216,6 +2216,12 @@ pub struct Accessor {
 /// A formal parameter (17.5.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parameter {
+    /// The parameter's attributes (24.2), for example `[In]`, `[Out]` or `[MarshalAs(...)]`.
+    ///
+    /// A parameter is the one declaration position whose attributes are not merely metadata a
+    /// reflector reads back: `[In]`/`[Out]` set the Param row's own flag bits, so they change the
+    /// signature a consumer sees rather than only the custom-attribute blob beside it.
+    pub attributes: Vec<AttributeSection>,
     /// The `ref`, `out`, or `params` modifier, if any.
     pub modifier: Option<ParameterModifier>,
     /// The parameter type.

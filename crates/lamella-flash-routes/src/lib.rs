@@ -788,10 +788,12 @@ pub const PROGRAMMING: &[Programming] = &[
     Programming {
         board: "arduino-giga-r1-wifi",
         aot_target: None,
-        programmer: Programmer::StExternalProbe {
+        programmer: Programmer::StDfu {
             family: StFamily::H7,
         },
-        alternate: None,
+        alternate: Some(Programmer::StExternalProbe {
+            family: StFamily::H7,
+        }),
     },
     Programming {
         board: "arduino-portenta-h7",
@@ -1758,6 +1760,51 @@ pub const UF2_BLOCK: usize = 512;
 ///
 /// **NO BUILD OF THIS TOOL WRITES A BOARD THAT ANOTHER BUILD REFUSES**, so the wording never
 /// implies one does. A route is a row in [`PROGRAMMING`], not a cargo feature.
+/// Why this tree names no ahead-of-time target for a board.
+///
+/// **THE BUILD QUESTION AND THE WRITE QUESTION HAVE DIFFERENT ANSWERS, AND A CALLER THAT ASKS ONE
+/// MUST NOT BE TOLD THE OTHER.** "What do I compile for this board" and "how do I write this board"
+/// are separate questions, and a caller asking one is never refused for want of the other's answer.
+///
+/// Returned rather than rendered, because the sentence depends on the verb the reader typed and
+/// this crate does not know it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoAotTarget {
+    /// The catalog does not carry this board; the string is the catalog's own wording.
+    UnknownBoard(String),
+    /// This tree can WRITE the board and nothing names a target to compile for it.
+    ///
+    /// Suggesting `lamella flash` is honest here and nowhere else.
+    WritableButNotBuildable,
+    /// This tree can neither compile for the board nor write it.
+    ///
+    /// **A SUGGESTION TO FLASH IT IS FALSE IN THIS STATE**, which is the trap this variant exists
+    /// to keep a caller out of: the board is real, the catalog carries it, and neither verb works.
+    NeitherBuildableNorWritable,
+}
+
+/// The ahead-of-time target this tree compiles for `board_id`, WITHOUT asking how it is written.
+///
+/// **ONE PLACE ANSWERS THIS.** The target lives on the programming row, beside the flash base,
+/// which is an accident of where it was first written down rather than a claim that compiling and
+/// writing are one question -- and reading it through [`programmer_for`] makes a caller inherit the
+/// write question's refusal. A `--format bin` writes a file to disk and needs only this.
+///
+/// # Errors
+/// [`NoAotTarget`], which distinguishes an unknown board from a board this tree can write but not
+/// compile for, and from one it can do neither with. The caller words it, because the wording
+/// depends on the verb that was run.
+#[must_use = "a refused target is the answer, not an error to discard"]
+pub fn aot_target_for(board_id: &str) -> Result<&'static str, NoAotTarget> {
+    if let Err(error) = catalog::resolve(board_id) {
+        return Err(NoAotTarget::UnknownBoard(error));
+    }
+    match PROGRAMMING.iter().find(|row| row.board == board_id) {
+        Some(row) => row.aot_target.ok_or(NoAotTarget::WritableButNotBuildable),
+        None => Err(NoAotTarget::NeitherBuildableNorWritable),
+    }
+}
+
 pub fn cannot_write(board: &str) -> String {
     let mut text = format!("lamella flash: nothing states how to write {board}.\n\n");
     text.push_str("it can write:\n");
@@ -1784,6 +1831,64 @@ pub fn cannot_write(board: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The build question is answered for every board, in the three states a board can be in.
+    ///
+    /// **THE STATES ARE DERIVED FROM THE TABLE, NOT LISTED HERE.** A test naming three board ids
+    /// would pass while the table beneath it changed shape, which is how a fixture outlives the
+    /// thing it fixes. Each state is found in the table at run time, and the test says so when a
+    /// state has no example left rather than quietly checking two of three.
+    #[test]
+    fn the_build_question_is_answered_without_asking_the_write_question() {
+        let buildable = PROGRAMMING.iter().find(|row| row.aot_target.is_some());
+        let writable_only = PROGRAMMING.iter().find(|row| row.aot_target.is_none());
+        let buildable = buildable.expect("some board names an ahead-of-time target");
+        let writable_only = writable_only.expect("some board is writable and names no target");
+
+        assert_eq!(
+            aot_target_for(buildable.board),
+            Ok(buildable.aot_target.expect("selected for having one")),
+            "a buildable board answers its target"
+        );
+        assert_eq!(
+            aot_target_for(writable_only.board),
+            Err(NoAotTarget::WritableButNotBuildable),
+            "a writable board with no target says which of the two it is"
+        );
+    }
+
+    /// A board the catalog carries and this table does not is NOT told how to write it.
+    ///
+    /// It is the majority case, and it must not be answered with the WRITE question's refusal.
+    ///
+    /// The board is found rather than named, for the reason above.
+    #[test]
+    fn a_board_this_table_does_not_carry_is_distinguished_from_one_it_does() {
+        let in_table: Vec<&str> = PROGRAMMING.iter().map(|row| row.board).collect();
+        let absent = catalog::BOARDS
+            .iter()
+            .map(|(id, _)| *id)
+            .find(|id| !in_table.contains(id))
+            .expect("some catalogued board has no programming row");
+
+        assert_eq!(
+            aot_target_for(absent),
+            Err(NoAotTarget::NeitherBuildableNorWritable),
+            "{absent}: the catalog carries it and this table does not, and that is its own state"
+        );
+    }
+
+    /// A board nothing carries is an unknown board, not a board with no target.
+    #[test]
+    fn an_unknown_board_is_refused_as_unknown_rather_than_as_untargeted() {
+        match aot_target_for("no-such-board-exists-here") {
+            Err(NoAotTarget::UnknownBoard(reason)) => assert!(
+                reason.contains("no-such-board-exists-here"),
+                "it names what was asked for: {reason}"
+            ),
+            other => panic!("an unknown board is its own answer, got {other:?}"),
+        }
+    }
 
     /// A linked ELF32 executable with one loadable segment per `(physical address, bytes)`.
     fn linked_elf(segments: &[(u32, &[u8])]) -> Vec<u8> {

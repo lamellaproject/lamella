@@ -24,9 +24,20 @@ const RUNTIME_VERSION: &str = "v4.0.30319";
 /// [`Module::push_method_row`] rather than by each caller -- see that function for why.
 const METHOD_HIDE_BY_SIG: u16 = 0x0080;
 
+/// `ParameterAttributes.In` (II.23.1.13): the argument is read by the callee.
+///
+/// **NO C# MODIFIER SETS THIS ONE.** `out` sets [`PARAM_OUT`] and `ref` sets nothing, so the only
+/// way this bit is ever written is an explicit `[In]` on the parameter. Measured against csc:
+/// `[In] int x` is `0x0001`, `[In] ref int x` is `0x0001`, and `[In][Out] ref int x` is `0x0003`.
+/// `[In] out int x` does not arise -- csc refuses it outright with CS0036.
+pub const PARAM_IN: u16 = 0x0001;
+
 /// `ParameterAttributes.Out` (II.23.1.13): the argument is written by the callee. It is what
 /// separates `out` from `ref` in metadata -- both travel as a byref in the SIGNATURE, so without
 /// this bit a consumer, a debugger and reflection all see an `out` parameter as a `ref` one.
+///
+/// Set by the `out` MODIFIER and by an explicit `[Out]` attribute alike, and the two do not stack:
+/// measured against csc, `[Out] out int x` is `0x0002`, the same as either alone.
 pub const PARAM_OUT: u16 = 0x0002;
 
 /// `ParameterAttributes.Optional` (II.23.1.13): the parameter may be omitted at a call site.
@@ -40,6 +51,21 @@ pub const PARAM_OPTIONAL: u16 = 0x0010;
 /// one shape that cannot have a `Constant` row -- a `decimal`, which takes a
 /// `[DecimalConstant]` attribute instead.
 pub const PARAM_HAS_DEFAULT: u16 = 0x1000;
+
+/// `ParameterAttributes.HasFieldMarshal` (II.23.1.13): a `FieldMarshal` row carries this
+/// parameter's marshalling descriptor.
+///
+/// **THE ROW ALONE IS NOT ENOUGH AND NEITHER IS THE BIT.** `FieldMarshal` is a required-sorted
+/// table a reader BINARY-SEARCHES by parent, and the bit is what tells it to search at all -- so a
+/// row without the bit is never looked for, and a bit without a row sends the reader after
+/// something that is not there. Both are written by the one call that adds the descriptor.
+pub const PARAM_HAS_FIELD_MARSHAL: u16 = 0x2000;
+
+/// `FieldAttributes.HasFieldMarshal` (II.23.1.5): the `Field` half of
+/// [`PARAM_HAS_FIELD_MARSHAL`], and a DIFFERENT bit -- `0x1000` on a field against `0x2000` on a
+/// parameter. Two tables, two flag words, two values for the same idea; using one for the other
+/// sets `HasDefault` on a field, which claims a `Constant` row that does not exist.
+pub const FIELD_HAS_FIELD_MARSHAL: u16 = 0x1000;
 
 /// One `Param` row (II.22.33): the declared name, and the flags that say how the argument travels.
 ///
@@ -656,6 +682,98 @@ impl ImageBuilder {
         );
     }
 
+    /// Adds a `ClassLayout` row (II.22.8): the explicit packing and total size a
+    /// `[StructLayout(..., Pack = p, Size = s)]` asks for, attached to `type_token`.
+    ///
+    /// **THE ROW IS THE SIZE AND THE PACKING; THE *KIND* OF LAYOUT IS NOT HERE.** Sequential
+    /// against explicit against automatic is a pair of `TypeAttributes` bits on the `TypeDef`
+    /// itself (II.23.1.15), so a type can have one without the other in either direction --
+    /// `[StructLayout(LayoutKind.Explicit)]` with no `Size` or `Pack` gets the bits and NO row
+    /// (measured against csc), and a `Pack` alone gets a row while the bits stay sequential.
+    /// Calling this for every laid-out type would write rows csc does not.
+    ///
+    /// Rows may be added in any order; `finish` sorts the table by `Parent` (II.24.2.6).
+    pub fn add_class_layout(&mut self, type_token: Token, packing_size: u16, class_size: u32) {
+        self.tables.add_row(
+            table::CLASS_LAYOUT,
+            alloc::vec![
+                Column::U16(packing_size),
+                Column::U32(class_size),
+                Column::Index(table::TYPE_DEF, type_token.row()),
+            ],
+        );
+    }
+
+    /// Adds a `FieldLayout` row (II.22.16): the byte offset a `[FieldOffset(n)]` puts `field` at
+    /// within its explicit-layout type.
+    ///
+    /// Rows may be added in any order; `finish` sorts the table by `Field` (II.24.2.6).
+    pub fn add_field_layout(&mut self, field: Token, offset: u32) {
+        self.tables.add_row(
+            table::FIELD_LAYOUT,
+            alloc::vec![
+                Column::U32(offset),
+                Column::Index(table::FIELD, field.row()),
+            ],
+        );
+    }
+
+    /// Adds a `FieldMarshal` row (II.22.17): the marshalling descriptor (II.23.4, see
+    /// [`crate::marshal`]) a `[MarshalAs(...)]` puts on `parent` -- a `Field` or a `Param` token
+    /// -- **and the `HasFieldMarshal` flag bit that parent needs for a reader to go looking for
+    /// it.**
+    ///
+    /// The bit is set HERE rather than by the caller because the two are one fact: see
+    /// [`PARAM_HAS_FIELD_MARSHAL`] for what each half alone does. The flag word differs by table,
+    /// which is the other reason this is one call -- a caller passing the parameter bit to a field
+    /// would set `HasDefault` instead and claim a `Constant` row that was never written.
+    ///
+    /// Rows may be added in any order; `finish` sorts the table by `Parent` (II.24.2.6).
+    pub fn add_field_marshal(&mut self, parent: Token, descriptor: &[u8]) {
+        let blob = self.blobs.intern(descriptor);
+        match parent.table() {
+            table::FIELD => {
+                let flags = self.field_flags(parent) | FIELD_HAS_FIELD_MARSHAL;
+                self.set_field_flags(parent, flags);
+            }
+            table::PARAM => {
+                let flags = self.param_flags(parent) | PARAM_HAS_FIELD_MARSHAL;
+                self.set_param_flags(parent, flags);
+            }
+            _ => return,
+        }
+        self.tables.add_row(
+            table::FIELD_MARSHAL,
+            alloc::vec![
+                Column::Coded(CodedIndex::HasFieldMarshal, parent),
+                Column::BlobRef(blob),
+            ],
+        );
+    }
+
+    /// Sets an already-written `Field` row's `Flags` (II.23.1.5) -- the field counterpart of
+    /// [`set_param_flags`](Self::set_param_flags), and for the same reason: a fact read off the
+    /// declaration after the row exists, because the row's token is what names it.
+    pub fn set_field_flags(&mut self, field: Token, flags: u16) {
+        if field.table() != table::FIELD {
+            return;
+        }
+        self.tables
+            .set_cell(table::FIELD, field.row(), 0, Column::U16(flags));
+    }
+
+    /// An already-written `Field` row's `Flags`, so a caller can add bits rather than replace them.
+    #[must_use]
+    pub fn field_flags(&self, field: Token) -> u16 {
+        if field.table() != table::FIELD {
+            return 0;
+        }
+        match self.tables.cell(table::FIELD, field.row(), 0) {
+            Some(&Column::U16(flags)) => flags,
+            _ => 0,
+        }
+    }
+
     /// The token of this module's single `Assembly` row (II.22.2, always row 1) -- the
     /// `HasCustomAttribute` parent an `[assembly: ...]` global attribute (24.2) attaches to.
     #[must_use]
@@ -1175,6 +1293,9 @@ impl ImageBuilder {
             2,
             &[table::GENERIC_PARAM_CONSTRAINT],
         );
+        self.tables.sort_by_index_column(table::CLASS_LAYOUT, 2);
+        self.tables.sort_by_index_column(table::FIELD_LAYOUT, 1);
+        self.tables.sort_by_coded_parent(table::FIELD_MARSHAL);
         self.tables.sort_by_index_column(table::GENERIC_PARAM_CONSTRAINT, 0);
         let tables = self.tables.serialize(HeapSizes::default());
         let strings = self.strings.into_bytes();

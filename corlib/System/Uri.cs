@@ -3,6 +3,16 @@ namespace System
 {
     public class Uri
     {
+        public static readonly string SchemeDelimiter = "://";
+        public static readonly string UriSchemeFile = "file";
+        public static readonly string UriSchemeFtp = "ftp";
+        public static readonly string UriSchemeGopher = "gopher";
+        public static readonly string UriSchemeHttp = "http";
+        public static readonly string UriSchemeHttps = "https";
+        public static readonly string UriSchemeMailto = "mailto";
+        public static readonly string UriSchemeNews = "news";
+        public static readonly string UriSchemeNntp = "nntp";
+
         private string _original;
         private string _scheme;
         private string _host;

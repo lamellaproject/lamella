@@ -11,6 +11,7 @@ use lamella_debug_backend::{
 use lamella_runner::debug::{self, reason};
 use lamella_runner::exec;
 use lamella_wire::{Capabilities, Frame as WireFrame, TargetIdentity, Transport, TransportError};
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 /// Packs a wire `(method_id, offset)` location into the seam's opaque address.
@@ -137,6 +138,13 @@ struct MethodSrc {
     /// The method's qualified display name (`Type.Method`), for stack frames. Empty if the map predates names.
     name: String,
     points: Vec<(u32, u32, u32)>,
+    /// `(slot, name)` for the method's source locals, ascending by slot.
+    ///
+    /// **THE WIRE IS POSITIONAL AND THIS IS THE ONLY THING THAT NAMES A SLOT.** `DBG_VARS` carries
+    /// values in slot order and no names, deliberately -- the host already has them, and a target
+    /// carrying a second copy would be carrying the PDB. So a map without this lane can still show
+    /// a frame's values, as `local0`, `local1`; it is this that makes them `total` and `count`.
+    locals: Vec<(u32, String)>,
 }
 
 /// The deployed image's source map -- `method_id -> (document, qualified name, sequence points)`, parsed from
@@ -151,7 +159,14 @@ impl SrcMap {
         #[derive(serde::Deserialize)]
         struct RawPoint { o: u32, l: u32, #[serde(default)] c: u32 }
         #[derive(serde::Deserialize)]
-        struct RawMethod { document: String, #[serde(default)] name: String, points: Vec<RawPoint> }
+        struct RawLocal { index: u32, name: String }
+        #[derive(serde::Deserialize)]
+        struct RawMethod {
+            document: String,
+            #[serde(default)] name: String,
+            points: Vec<RawPoint>,
+            #[serde(default)] locals: Vec<RawLocal>,
+        }
         #[derive(serde::Deserialize)]
         struct Raw { methods: std::collections::HashMap<String, RawMethod> }
         let raw: Raw = serde_json::from_slice(json).ok()?;
@@ -160,7 +175,10 @@ impl SrcMap {
             let Ok(id) = id.parse::<u32>() else { continue };
             let mut points: Vec<(u32, u32, u32)> = m.points.into_iter().map(|p| (p.o, p.l, p.c)).collect();
             points.sort_by_key(|point| point.0);
-            methods.insert(id, MethodSrc { document: m.document, name: m.name, points });
+            let mut locals: Vec<(u32, String)> =
+                m.locals.into_iter().map(|local| (local.index, local.name)).collect();
+            locals.sort_by_key(|local| local.0);
+            methods.insert(id, MethodSrc { document: m.document, name: m.name, points, locals });
         }
         (!methods.is_empty()).then_some(Self { methods })
     }
@@ -211,6 +229,23 @@ impl SrcMap {
             .map_or(false, |source| source.points.iter().any(|&(o, _, _)| o == offset))
     }
 
+    /// The source name of local `slot` in `method`, if the map names it.
+    ///
+    /// **MATCHED BY THE RECORDED SLOT, NOT BY POSITION IN THE LIST.** A Portable PDB names only the
+    /// locals it has names for, so the list is a SUBSET of the frame's slots: a method whose slot 0
+    /// is a compiler temp and whose slot 1 is `total` records one entry, for slot 1. Indexing this
+    /// list by the wire's slot number would call slot 0 `total` -- the pane would read plausibly and
+    /// name the wrong value, which is the one outcome worse than showing no name at all.
+    fn local_name(&self, method: u32, slot: u32) -> Option<&str> {
+        self.methods
+            .get(&method)?
+            .locals
+            .iter()
+            .find(|(index, _)| *index == slot)
+            .map(|(_, name)| name.as_str())
+            .filter(|name| !name.is_empty())
+    }
+
     /// Every sequence-point offset in `method` (the temp-breakpoint set for a source step-over into a call).
     fn points_of(&self, method: u32) -> Vec<u32> {
         self.methods
@@ -221,7 +256,15 @@ impl SrcMap {
 
 /// A [`DebugBackend`] driving a Lamella Link target's on-device interpreter session.
 pub struct WireHostBackend {
-    transport: WireTransport,
+    /// The carrier, behind a [`RefCell`] for the reason the sibling probe backends give: the seam's
+    /// INSPECTION methods take `&self` while every wire operation needs `&mut`, because asking a
+    /// target for a value is a round trip and not a field access.
+    ///
+    /// [`DebugBackend::variables`] is the method that needs it. The alternative -- caching every
+    /// frame's values at each stop, as this backend does for the call stack -- costs one round trip
+    /// PER FRAME at every stop, for panes the caller may never open. A client asks for the variables
+    /// of the frame a person selected and nothing else, and reading on demand keeps that.
+    transport: RefCell<WireTransport>,
     /// The deployed image's source map, if present -- makes the session source-level; `None` => IL-level.
     srcmap: Option<SrcMap>,
     /// The user's current breakpoint addresses (from set_breakpoints) -- kept armed alongside the temp breakpoints
@@ -229,7 +272,13 @@ pub struct WireHostBackend {
     user_bps: Vec<u64>,
     image: Vec<u8>,
     timeout: Duration,
-    seq: u16,
+    seq: Cell<u16>,
+    /// What the TARGET said it can do, from its HELLO.
+    ///
+    /// Kept because a capability is the difference between a target that cannot answer a question
+    /// and one that answered it with nothing, and only the first of those is worth telling the user
+    /// about. [`DebugBackend::variables`] is the reader.
+    target_caps: Capabilities,
     /// A debug session is live on the target (between the start and Done/Trap/detach).
     session_live: bool,
     /// A resume is in flight: [`DebugBackend::poll`] watches for its stop event.
@@ -237,13 +286,13 @@ pub struct WireHostBackend {
     /// The call stack cached at the last stop, innermost first.
     frames: Vec<(u32, u32)>,
     exit_code: i32,
-    pending_output: Option<String>,
+    pending_output: RefCell<Option<String>>,
     /// The DEBUGGER's channel: what a program writes for a tool rather than for its user.
     ///
     /// Kept apart from the program's own output all the way across, because a client shows the two
     /// in separate panes and only the TARGET knows which is which. The output event names its
     /// stream, and this is the end that keeps them apart afterwards.
-    pending_debug_output: Option<String>,
+    pending_debug_output: RefCell<Option<String>>,
 }
 
 impl WireHostBackend {
@@ -307,6 +356,7 @@ impl WireHostBackend {
             Capabilities::DEBUG_BASIC
                 | Capabilities::BREAKPOINTS
                 | Capabilities::STEPPING
+                | Capabilities::LOCALS
                 | Capabilities::BAKED_IMAGE
                 | Capabilities::PROFILE_CHIPID,
         );
@@ -319,16 +369,17 @@ impl WireHostBackend {
         }
         let pending_output = identity_line(&session.identity);
         Ok(Self {
-            transport,
+            transport: RefCell::new(transport),
             image,
             timeout,
-            seq: 0,
+            seq: Cell::new(0),
+            target_caps: session.caps,
             session_live: false,
             running: false,
             frames: Vec::new(),
             exit_code: 0,
-            pending_output,
-            pending_debug_output: None,
+            pending_output: RefCell::new(pending_output),
+            pending_debug_output: RefCell::new(None),
             srcmap: None,
             user_bps: Vec::new(),
         })
@@ -344,9 +395,10 @@ impl WireHostBackend {
         self
     }
 
-    fn next_seq(&mut self) -> u16 {
-        self.seq = self.seq.wrapping_add(1);
-        self.seq
+    fn next_seq(&self) -> u16 {
+        let next = self.seq.get().wrapping_add(1);
+        self.seq.set(next);
+        next
     }
 
     /// End the session on the target if one is live: `DBG_DETACH`, wait for the ack, forget it.
@@ -361,7 +413,7 @@ impl WireHostBackend {
             return;
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_DETACH, seq, &[]).is_ok() {
+        if self.transport.borrow_mut().send(debug::DBG_DETACH, seq, &[]).is_ok() {
             self.await_type(debug::DBG_ACK);
         }
         self.session_live = false;
@@ -369,10 +421,11 @@ impl WireHostBackend {
 
     /// Blocks until a frame of `msg_type` arrives (dropping others -- the protocol runs
     /// one command in flight), or the timeout passes.
-    fn await_type(&mut self, msg_type: u8) -> Option<WireFrame> {
+    fn await_type(&self, msg_type: u8) -> Option<WireFrame> {
         let deadline = Instant::now() + self.timeout;
         while Instant::now() < deadline {
-            match self.transport.poll() {
+            let polled = self.transport.borrow_mut().poll();
+            match polled {
                 Ok(Some(frame)) if frame.msg_type == msg_type => return Some(frame),
                 Ok(Some(frame)) => self.absorb(&frame),
                 Ok(None) => std::thread::sleep(Duration::from_millis(2)),
@@ -389,7 +442,7 @@ impl WireHostBackend {
     /// resume that has not answered yet, so a loop that drops what it is not waiting for drops
     /// the program's output -- and that failure is silent, because a program that printed nothing
     /// and a host that discarded what it printed look identical.
-    fn absorb(&mut self, frame: &WireFrame) {
+    fn absorb(&self, frame: &WireFrame) {
         use lamella_wire::msg::output;
         if frame.msg_type != debug::EVT_OUTPUT || frame.payload.len() < 2 {
             return;
@@ -398,12 +451,12 @@ impl WireHostBackend {
         if text.is_empty() {
             return;
         }
-        let sink = if frame.payload[0] == output::DEBUG {
-            &mut self.pending_debug_output
+        let mut sink = if frame.payload[0] == output::DEBUG {
+            self.pending_debug_output.borrow_mut()
         } else {
-            &mut self.pending_output
+            self.pending_output.borrow_mut()
         };
-        match sink {
+        match &mut *sink {
             Some(held) => held.push_str(&text),
             None => *sink = Some(text.into_owned()),
         }
@@ -439,7 +492,7 @@ impl WireHostBackend {
     fn refresh_stack(&mut self) {
         self.frames.clear();
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_STACK, seq, &[]).is_err() {
+        if self.transport.borrow_mut().send(debug::DBG_STACK, seq, &[]).is_err() {
             return;
         }
         let Some(frame) = self.await_type(debug::DBG_FRAMES) else {
@@ -476,7 +529,7 @@ impl WireHostBackend {
             payload.extend_from_slice(&offset.to_le_bytes());
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_BREAK, seq, &payload).is_err() {
+        if self.transport.borrow_mut().send(debug::DBG_BREAK, seq, &payload).is_err() {
             return Err("the wire dropped while sending breakpoints".to_string());
         }
         match self.await_type(debug::DBG_ACK) {
@@ -490,9 +543,9 @@ impl WireHostBackend {
     /// `None` on a wire failure/timeout; a target without `Capabilities::LOCALS` never gets asked
     /// (the caller gates on the HELLO). Slot NAMES are the caller's to layer on (the srcmap's
     /// `local_variables` slot -> name lane); the wire is positional by design.
-    pub fn locals(&mut self, frame_index: u16) -> Option<(Vec<WireValue>, Vec<WireValue>)> {
+    pub fn locals(&self, frame_index: u16) -> Option<(Vec<WireValue>, Vec<WireValue>)> {
         let seq = self.next_seq();
-        self.transport.send(debug::DBG_LOCALS, seq, &frame_index.to_le_bytes()).ok()?;
+        self.transport.borrow_mut().send(debug::DBG_LOCALS, seq, &frame_index.to_le_bytes()).ok()?;
         let frame = self.await_type(debug::DBG_VARS)?;
         decode_vars(&frame.payload)
     }
@@ -510,7 +563,7 @@ impl WireHostBackend {
     /// the frame root every time, so a window is a slice of a fresh answer rather than a cursor
     /// anything has to remember.
     pub fn expand(
-        &mut self,
+        &self,
         frame_index: u16,
         root_is_argument: bool,
         root_slot: u16,
@@ -522,7 +575,7 @@ impl WireHostBackend {
     /// One page of children, starting at `first_child`. [`Self::expand`] is this over the first
     /// page; the count the reply carries is how a caller knows whether to ask for another.
     pub fn expand_range(
-        &mut self,
+        &self,
         frame_index: u16,
         root_is_argument: bool,
         root_slot: u16,
@@ -541,7 +594,7 @@ impl WireHostBackend {
         payload.extend_from_slice(&first_child.to_le_bytes());
         payload.extend_from_slice(&max_children.to_le_bytes());
         let seq = self.next_seq();
-        self.transport.send(debug::DBG_EXPAND, seq, &payload).ok()?;
+        self.transport.borrow_mut().send(debug::DBG_EXPAND, seq, &payload).ok()?;
         let frame = self.await_type(debug::DBG_CHILDREN)?;
         decode_children(&frame.payload)
     }
@@ -611,6 +664,55 @@ pub enum WireValue {
         /// The third descriptor word.
         c: u32,
     },
+}
+
+/// A variables row that reports why there is no value, for [`DebugBackend::variables`].
+///
+/// **THE NAME IS IN ANGLE BRACKETS ON PURPOSE.** It shares a pane with the program's own variables
+/// and is matched against by `evaluate` when a person hovers a name, so it has to be a string no C#
+/// identifier can be -- otherwise a hover over a variable could resolve to a diagnostic and display
+/// it as that variable's value.
+fn unavailable(reason: &str) -> Variable {
+    Variable {
+        name: "<unavailable>".to_string(),
+        value: reason.to_string(),
+        kind: "unsupported".to_string(),
+    }
+}
+
+/// Renders one decoded wire value as `(value, type name)` for a variables pane.
+///
+/// The type names are the CIL stack kinds the wire tags carry, which is what the target knows: a
+/// value crosses as INT32 whether its source declared `int`, `bool`, `char` or `short`, because the
+/// interpreter widened it on its own stack. Reporting the declared type would mean reading it from
+/// metadata this host is not given, and guessing it from the tag would name `bool` an `int`.
+///
+/// An [`WireValue::Object`] or a non-empty [`WireValue::Struct`] has CHILDREN, and [`Variable`]
+/// carries a name, a value and a type with no reference a client could expand -- so these render as
+/// an identity a reader can correlate across stops, never as a value.
+/// [`WireHostBackend::expand`] answers for the children of one of them.
+fn render(value: &WireValue) -> (String, String) {
+    match *value {
+        WireValue::Null => ("null".to_string(), "object".to_string()),
+        WireValue::Int32(value) => (value.to_string(), "int".to_string()),
+        WireValue::Int64(value) => (value.to_string(), "long".to_string()),
+        WireValue::NativeInt(value) => (value.to_string(), "nint".to_string()),
+        WireValue::Float(value) => (value.to_string(), "double".to_string()),
+        WireValue::Single(value) => (value.to_string(), "float".to_string()),
+        WireValue::Object { handle, .. } => {
+            (format!("object #{handle}"), "object".to_string())
+        }
+        WireValue::Struct { field_count, .. } => (
+            format!("{field_count} field{}", if field_count == 1 { "" } else { "s" }),
+            "struct".to_string(),
+        ),
+        WireValue::ByRef { .. } => {
+            ("<managed pointer>".to_string(), "byref".to_string())
+        }
+        WireValue::TypedRef { .. } => {
+            ("<typed reference>".to_string(), "typedref".to_string())
+        }
+    }
 }
 
 /// Decodes one `<val>` at `*at`, advancing past it. `None` on a truncated/unknown payload.
@@ -736,7 +838,7 @@ impl DebugBackend for WireHostBackend {
         self.exit_code = 0;
         let seq = self.next_seq();
         let deployed = deploy_image_blocking(
-            &mut self.transport,
+            &mut *self.transport.borrow_mut(),
             seq,
             &self.image,
             8 * 1024,
@@ -762,7 +864,7 @@ impl DebugBackend for WireHostBackend {
         }
         let seq = self.next_seq();
         start_execution(
-            &mut self.transport,
+            &mut *self.transport.borrow_mut(),
             seq,
             exec::exec_source::DEPLOYED,
             exec::exec_flags::START_HALTED,
@@ -790,7 +892,7 @@ impl DebugBackend for WireHostBackend {
             return Stop::Done;
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_RESUME, seq, &[]).is_err() {
+        if self.transport.borrow_mut().send(debug::DBG_RESUME, seq, &[]).is_err() {
             return Stop::Fault("the wire dropped".to_string());
         }
         self.running = true;
@@ -801,7 +903,8 @@ impl DebugBackend for WireHostBackend {
         if !self.running {
             return if self.session_live { Stop::Step } else { Stop::Done };
         }
-        match self.transport.poll() {
+        let polled = self.transport.borrow_mut().poll();
+        match polled {
             Ok(Some(frame)) if frame.msg_type == debug::EVT_STOPPED => self.on_stopped(&frame),
             Ok(Some(frame)) => {
                 self.absorb(&frame);
@@ -817,7 +920,7 @@ impl DebugBackend for WireHostBackend {
             return true;
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_PAUSE, seq, &[]).is_err() {
+        if self.transport.borrow_mut().send(debug::DBG_PAUSE, seq, &[]).is_err() {
             return false;
         }
         match self.await_type(debug::EVT_STOPPED) {
@@ -843,6 +946,7 @@ impl DebugBackend for WireHostBackend {
         if !self.running {
             let seq = self.next_seq();
             self.transport
+                .borrow_mut()
                 .send(debug::DBG_RESUME, seq, &[])
                 .map_err(|_| "could not resume the program: the wire dropped".to_string())?;
         }
@@ -857,7 +961,7 @@ impl DebugBackend for WireHostBackend {
             return Stop::Done;
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_STEP, seq, &[debug::step_mode::IN]).is_err() {
+        if self.transport.borrow_mut().send(debug::DBG_STEP, seq, &[debug::step_mode::IN]).is_err() {
             return Stop::Fault("the wire dropped".to_string());
         }
         match self.await_type(debug::EVT_STOPPED) {
@@ -883,7 +987,7 @@ impl DebugBackend for WireHostBackend {
             self.pause();
             self.send_breakpoints(addresses)?;
             let seq = self.next_seq();
-            if self.transport.send(debug::DBG_RESUME, seq, &[]).is_ok() {
+            if self.transport.borrow_mut().send(debug::DBG_RESUME, seq, &[]).is_ok() {
                 self.running = true;
             }
             Ok(())
@@ -912,7 +1016,7 @@ impl DebugBackend for WireHostBackend {
             return Stop::Fault(reason);
         }
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_RESUME, seq, &[]).is_err() {
+        if self.transport.borrow_mut().send(debug::DBG_RESUME, seq, &[]).is_err() {
             return Stop::Fault("the wire dropped".to_string());
         }
         self.running = true;
@@ -959,8 +1063,66 @@ impl DebugBackend for WireHostBackend {
             .collect()
     }
 
-    fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
-        Vec::new()
+    /// One frame's arguments or locals, read from the paused target over `DBG_LOCALS`.
+    ///
+    /// One round trip per call, and DAP makes the call for the frame a person clicked -- so a stop
+    /// costs nothing until a pane is opened. The wire answers POSITIONALLY; the slot names come from
+    /// the source map, which is why a target carries none.
+    ///
+    /// # A wrong value here is worse than no value
+    ///
+    /// Someone opens this pane precisely to find out whether a value is what they think it is, so
+    /// every way of not knowing answers with a row that SAYS SO rather than with an empty pane or a
+    /// plausible number. The rows are named in angle brackets, which no C# identifier can be, so
+    /// `evaluate` -- which resolves a hover or a watch by matching a name against this list -- can
+    /// never match one and report a diagnostic as the value of somebody's variable.
+    ///
+    fn variables(&self, frame: usize, scope: Scope) -> Vec<Variable> {
+        if matches!(scope, Scope::Stack) {
+            return Vec::new();
+        }
+        if !self.session_live {
+            return Vec::new();
+        }
+        if self.running {
+            return vec![unavailable("the program is running -- pause it to read its variables")];
+        }
+        if !self.target_caps.has(Capabilities::LOCALS) {
+            return vec![unavailable(
+                "this target's firmware does not serve variables (no LOCALS capability in its HELLO)",
+            )];
+        }
+        let Some(&(method, _)) = self.frames.get(frame) else {
+            return vec![unavailable("that frame is not in the target's current call stack")];
+        };
+        let Ok(index) = u16::try_from(frame) else {
+            return vec![unavailable("that frame is deeper than the wire can address")];
+        };
+        let Some((locals, arguments)) = self.locals(index) else {
+            return vec![unavailable(
+                "the target did not answer the request for this frame's variables",
+            )];
+        };
+
+        let arguments_wanted = matches!(scope, Scope::Arguments);
+        let values = if arguments_wanted { arguments } else { locals };
+        values
+            .iter()
+            .enumerate()
+            .map(|(slot, value)| {
+                let slot = slot as u32;
+                let name = if arguments_wanted {
+                    format!("arg{slot}")
+                } else {
+                    self.srcmap
+                        .as_ref()
+                        .and_then(|srcmap| srcmap.local_name(method, slot))
+                        .map_or_else(|| format!("local{slot}"), str::to_owned)
+                };
+                let (value, kind) = render(value);
+                Variable { name, value, kind }
+            })
+            .collect()
     }
 
     fn has_source(&self) -> bool {
@@ -1010,17 +1172,20 @@ impl DebugBackend for WireHostBackend {
     }
 
     fn take_output(&mut self) -> Option<String> {
-        self.pending_output.take()
+        self.pending_output.borrow_mut().take()
     }
 
     fn take_debug_output(&mut self) -> Option<String> {
-        self.pending_debug_output.take()
+        self.pending_debug_output.borrow_mut().take()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SrcMap, WireHostBackend, WireTransport, debug, exec, pack, reason};
+    use super::{
+        Capabilities, Cell, RefCell, SrcMap, WireHostBackend, WireTransport, debug, exec, pack,
+        reason,
+    };
     use lamella_debug_backend::DebugBackend;
     use lamella_wire::{MemTransport, Transport};
     use std::sync::{Arc, Mutex};
@@ -1048,18 +1213,19 @@ mod tests {
 
         let shared = Arc::new(Mutex::new(host));
         let backend = WireHostBackend {
-            transport: WireTransport::Mem(Arc::clone(&shared)),
+            transport: RefCell::new(WireTransport::Mem(Arc::clone(&shared))),
             srcmap: None,
             user_bps: Vec::new(),
             image: Vec::new(),
             timeout: Duration::from_millis(50),
-            seq: 0,
+            seq: Cell::new(0),
+            target_caps: Capabilities(u64::MAX),
             session_live: true,
             running: false,
             frames: Vec::new(),
             exit_code: 0,
-            pending_output: None,
-            pending_debug_output: None,
+            pending_output: RefCell::new(None),
+            pending_debug_output: RefCell::new(None),
         };
         (backend, shared)
     }
@@ -1397,6 +1563,342 @@ mod tests {
         }
         for cut in 0..kids.len() - 1 {
             let _ = decode_children(&kids[..cut]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod variables_tests {
+    use super::{
+        Capabilities, Cell, DebugBackend, RefCell, Scope, SrcMap, WireHostBackend, WireTransport,
+        WireValue, debug, render,
+    };
+    use lamella_wire::{MemTransport, Transport};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Encodes one `<val>` as the wire spells it, so a test builds the bytes a board would send
+    /// rather than reaching past the decoder it is exercising.
+    fn encode(value: &WireValue, out: &mut Vec<u8>) {
+        use debug::val;
+        match *value {
+            WireValue::Null => out.push(val::NULL),
+            WireValue::Int32(value) => {
+                out.push(val::INT32);
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            WireValue::Object { handle, type_token } => {
+                out.push(val::OBJECT);
+                out.extend_from_slice(&handle.to_le_bytes());
+                out.extend_from_slice(&type_token.to_le_bytes());
+            }
+            WireValue::Struct { field_count, type_token } => {
+                out.push(val::STRUCT);
+                out.extend_from_slice(&field_count.to_le_bytes());
+                out.extend_from_slice(&type_token.to_le_bytes());
+            }
+            ref other => unreachable!("no test builds a {other:?} yet"),
+        }
+    }
+
+    /// A `DBG_VARS` payload: `locals(u16 LE)` then their values, `args(u16 LE)` then theirs.
+    fn vars_payload(locals: &[WireValue], arguments: &[WireValue]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(locals.len() as u16).to_le_bytes());
+        for value in locals {
+            encode(value, &mut payload);
+        }
+        payload.extend_from_slice(&(arguments.len() as u16).to_le_bytes());
+        for value in arguments {
+            encode(value, &mut payload);
+        }
+        payload
+    }
+
+    /// A source map naming `locals` (as `(slot, name)`) in method 7, with one sequence point so the
+    /// map parses at all.
+    fn srcmap_naming(locals: &[(u32, &str)]) -> SrcMap {
+        let named: Vec<String> = locals
+            .iter()
+            .map(|(slot, name)| format!("{{\"index\":{slot},\"name\":\"{name}\"}}"))
+            .collect();
+        let json = format!(
+            "{{\"methods\":{{\"7\":{{\"document\":\"Program.cs\",\"name\":\"P.Main\",\
+             \"points\":[{{\"o\":0,\"l\":3,\"c\":1}}],\"locals\":[{}]}}}}}}",
+            named.join(",")
+        );
+        SrcMap::parse(json.as_bytes()).expect("the source map parses")
+    }
+
+    /// Every debug capability, for a test that is not about capabilities.
+    const ALL_CAPS: u64 = u64::MAX;
+
+    /// A halted backend whose stack is one frame in method 7, with `reply` already queued as the
+    /// board's answer to the `DBG_LOCALS` it is about to be asked.
+    fn halted_in_method_7(
+        reply: Option<&[u8]>,
+        srcmap: Option<SrcMap>,
+        caps: u64,
+    ) -> WireHostBackend {
+        halted_with(reply, srcmap, caps, vec![(7, 0)]).0
+    }
+
+    /// As [`halted_in_method_7`], with the stack given and the shared transport handed back so a
+    /// test can read what the host actually sent.
+    fn halted_with(
+        reply: Option<&[u8]>,
+        srcmap: Option<SrcMap>,
+        caps: u64,
+        frames: Vec<(u32, u32)>,
+    ) -> (WireHostBackend, Arc<Mutex<MemTransport>>) {
+        let mut host = MemTransport::new();
+        if let Some(payload) = reply {
+            let mut board = MemTransport::new();
+            board.send(debug::DBG_VARS, 1, payload).expect("queue the board's answer");
+            let queued = board.take_sent();
+            host.feed(&queued);
+        }
+        let shared = Arc::new(Mutex::new(host));
+        let backend = WireHostBackend {
+            transport: RefCell::new(WireTransport::Mem(Arc::clone(&shared))),
+            srcmap,
+            user_bps: Vec::new(),
+            image: Vec::new(),
+            timeout: Duration::from_millis(50),
+            seq: Cell::new(0),
+            target_caps: Capabilities(caps),
+            session_live: true,
+            running: false,
+            frames,
+            exit_code: 0,
+            pending_output: RefCell::new(None),
+            pending_debug_output: RefCell::new(None),
+        };
+        (backend, shared)
+    }
+
+    /// The rows as `(name, value, kind)`, which is the whole of what a pane shows.
+    fn rows(backend: &WireHostBackend, scope: Scope) -> Vec<(String, String, String)> {
+        backend
+            .variables(0, scope)
+            .into_iter()
+            .map(|row| (row.name, row.value, row.kind))
+            .collect()
+    }
+
+    /// A halted frame's locals reach the pane, named from the source map.
+    #[test]
+    fn a_halted_frames_locals_arrive_named() {
+        let payload = vars_payload(&[WireValue::Int32(41), WireValue::Int32(-7)], &[]);
+        let backend = halted_in_method_7(
+            Some(&payload),
+            Some(srcmap_naming(&[(0, "total"), (1, "delta")])),
+            ALL_CAPS,
+        );
+        assert_eq!(
+            rows(&backend, Scope::Locals),
+            vec![
+                ("total".to_string(), "41".to_string(), "int".to_string()),
+                ("delta".to_string(), "-7".to_string(), "int".to_string()),
+            ],
+        );
+    }
+
+    /// A name is matched by its recorded slot, not by its position in the list.
+    ///
+    /// A Portable PDB names only the locals it has names for, so the list is a SUBSET of the
+    /// frame's slots: here slot 0 is a compiler temp the map does not name and slot 1 is `total`.
+    /// Indexing the list by the wire's slot number would label slot 0 `total` -- a pane that reads
+    /// perfectly and names the wrong value, which is worse than showing no name.
+    #[test]
+    fn an_unnamed_slot_does_not_borrow_the_next_names_label() {
+        let payload = vars_payload(&[WireValue::Int32(999), WireValue::Int32(41)], &[]);
+        let backend =
+            halted_in_method_7(Some(&payload), Some(srcmap_naming(&[(1, "total")])), ALL_CAPS);
+        let named: Vec<(String, String)> = rows(&backend, Scope::Locals)
+            .into_iter()
+            .map(|(name, value, _)| (name, value))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("local0".to_string(), "999".to_string()),
+                ("total".to_string(), "41".to_string()),
+            ],
+            "the unnamed slot keeps its slot spelling and `total` stays on the value it names",
+        );
+    }
+
+    /// A map with no `locals` lane at all still shows the values, by slot.
+    ///
+    /// Which is what keeps a source map written before this lane existed from turning a missing
+    /// NAME into a missing SESSION.
+    #[test]
+    fn a_map_without_names_still_shows_the_values() {
+        let payload = vars_payload(&[WireValue::Int32(5)], &[]);
+        let backend = halted_in_method_7(Some(&payload), Some(srcmap_naming(&[])), ALL_CAPS);
+        assert_eq!(rows(&backend, Scope::Locals)[0].0, "local0");
+    }
+
+    /// Arguments come from the same reply's second half, and are spelled `argN`.
+    ///
+    /// A parameter's name is in the assembly's `Param` table rather than in the Portable PDB, so
+    /// the source map cannot name one and this does not pretend otherwise.
+    #[test]
+    fn arguments_come_from_the_replys_second_half() {
+        let payload =
+            vars_payload(&[WireValue::Int32(1)], &[WireValue::Int32(2), WireValue::Null]);
+        let backend =
+            halted_in_method_7(Some(&payload), Some(srcmap_naming(&[(0, "total")])), ALL_CAPS);
+        assert_eq!(
+            rows(&backend, Scope::Arguments),
+            vec![
+                ("arg0".to_string(), "2".to_string(), "int".to_string()),
+                ("arg1".to_string(), "null".to_string(), "object".to_string()),
+            ],
+            "the arguments, not the locals -- one reply carries both and the scope picks",
+        );
+    }
+
+    /// The evaluation stack is empty rather than refused: a compiled target has none.
+    #[test]
+    fn the_evaluation_stack_scope_is_empty_and_costs_no_round_trip() {
+        let backend = halted_in_method_7(None, None, ALL_CAPS);
+        assert!(backend.variables(0, Scope::Stack).is_empty());
+    }
+
+    /// A silent target says so instead of showing an empty pane.
+    ///
+    /// A variables pane draws the distinction the `read_memory` contract draws: "this read failed"
+    /// is not "there is nothing here". Someone opens this pane to find out whether a value is what
+    /// they think it is, so a wire that dropped has to reach them.
+    #[test]
+    fn a_target_that_does_not_answer_is_reported_rather_than_shown_as_empty() {
+        let backend = halted_in_method_7(None, None, ALL_CAPS);
+        let rows = rows(&backend, Scope::Locals);
+        assert_eq!(rows.len(), 1, "one diagnostic row, not an empty pane");
+        assert_eq!(rows[0].0, "<unavailable>");
+        assert!(
+            rows[0].1.contains("did not answer"),
+            "and it says what went wrong: {}",
+            rows[0].1,
+        );
+    }
+
+    /// A frame index the target's current stack does not hold is refused here.
+    ///
+    /// It has to be, because `DBG_VARS` answers `0, 0` to an unknown frame index -- byte-identical
+    /// to a frame that genuinely holds nothing. Only the host's own stack can tell them apart.
+    #[test]
+    fn a_frame_outside_the_current_stack_is_refused_not_asked_about() {
+        let payload = vars_payload(&[], &[]);
+        let backend = halted_in_method_7(Some(&payload), None, ALL_CAPS);
+        let rows = backend.variables(4, Scope::Locals);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "<unavailable>");
+        assert!(
+            rows[0].value.contains("call stack"),
+            "and it names the reason: {}",
+            rows[0].value,
+        );
+    }
+
+    /// A firmware that never advertised LOCALS is reported as such, and is never asked.
+    ///
+    /// "This target cannot answer" and "this frame has nothing" are different facts, and only the
+    /// capability distinguishes them before a round trip is spent.
+    #[test]
+    fn a_target_without_the_locals_capability_says_so() {
+        let payload = vars_payload(&[WireValue::Int32(1)], &[]);
+        let backend = halted_in_method_7(Some(&payload), None, !Capabilities::LOCALS);
+        let rows = rows(&backend, Scope::Locals);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].1.contains("LOCALS"),
+            "and it names the missing capability: {}",
+            rows[0].1,
+        );
+    }
+
+    /// A running target is not asked: between stops the values are in motion.
+    #[test]
+    fn a_running_target_is_told_to_pause_rather_than_read_mid_flight() {
+        let mut backend = halted_in_method_7(None, None, ALL_CAPS);
+        backend.running = true;
+        let rows = rows(&backend, Scope::Locals);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("running"), "{}", rows[0].1);
+    }
+
+    /// Between sessions the pane is EMPTY rather than diagnostic: with no paused program there is
+    /// no subject, and a refusal row in every not-yet-started session would be noise.
+    #[test]
+    fn no_session_shows_nothing_rather_than_a_refusal() {
+        let mut backend = halted_in_method_7(None, None, ALL_CAPS);
+        backend.session_live = false;
+        assert!(backend.variables(0, Scope::Locals).is_empty());
+    }
+
+    /// One `DBG_LOCALS` goes out per call, carrying the frame index the caller asked about -- so a
+    /// stop costs nothing until a pane is opened, which is the whole reason the carrier is behind a
+    /// `RefCell` rather than the values being cached for every frame at every stop.
+    #[test]
+    fn one_request_per_call_carries_the_frame_index() {
+        let payload = vars_payload(&[WireValue::Int32(1)], &[]);
+        let (backend, shared) =
+            halted_with(Some(&payload), None, ALL_CAPS, vec![(7, 0), (9, 4)]);
+        let _ = backend.variables(1, Scope::Locals);
+        let bytes = shared.lock().expect("the test transport").take_sent();
+        let mut reader = MemTransport::new();
+        reader.feed(&bytes);
+        let mut asked = Vec::new();
+        while let Ok(Some(frame)) = reader.poll() {
+            asked.push((frame.msg_type, frame.payload.to_vec()));
+        }
+        assert_eq!(asked.len(), 1, "one round trip, not one per frame");
+        assert_eq!(asked[0].0, debug::DBG_LOCALS);
+        assert_eq!(asked[0].1, 1u16.to_le_bytes(), "the frame the caller asked about");
+    }
+
+    /// The renderings, including the two that must not look like numbers.
+    ///
+    /// An object's handle is a heap slot and is labelled as one, because a bare hex number reads as
+    /// a pointer and invites someone to follow it in a memory view. A managed pointer is not
+    /// dereferenced at all: showing its descriptor words would be showing the machinery and calling
+    /// it somebody's variable.
+    #[test]
+    fn a_value_that_is_not_a_number_never_renders_as_one() {
+        assert_eq!(render(&WireValue::Int32(7)), ("7".to_string(), "int".to_string()));
+        assert_eq!(render(&WireValue::Null), ("null".to_string(), "object".to_string()));
+        assert_eq!(
+            render(&WireValue::Object { handle: 3, type_token: 0 }),
+            ("object #3".to_string(), "object".to_string()),
+        );
+        assert_eq!(
+            render(&WireValue::Struct { field_count: 1, type_token: 0 }).0,
+            "1 field",
+            "singular, because a pane reads as prose",
+        );
+        assert_eq!(render(&WireValue::Struct { field_count: 3, type_token: 0 }).0, "3 fields");
+        assert_eq!(
+            render(&WireValue::ByRef { kind: 1, a: 0xdead_beef, b: 0, c: 0 }),
+            ("<managed pointer>".to_string(), "byref".to_string()),
+            "the descriptor words are machinery and never reach the pane",
+        );
+    }
+
+    /// A diagnostic row can never be mistaken for a program variable, which is what keeps a hover
+    /// honest: `evaluate` resolves a hovered name by matching it against these rows, so a row named
+    /// like an identifier could be returned as the value of somebody's variable.
+    #[test]
+    fn a_diagnostic_row_is_named_so_no_identifier_can_match_it() {
+        let backend = halted_in_method_7(None, None, ALL_CAPS);
+        for row in backend.variables(0, Scope::Locals) {
+            assert!(
+                row.name.starts_with('<') && row.name.ends_with('>'),
+                "{} would be a legal C# identifier",
+                row.name,
+            );
         }
     }
 }

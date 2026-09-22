@@ -93,6 +93,7 @@ pub struct Frame {
     /// The DECLARING TYPE's own type-parameter names, in declaration order, so emission can turn
     /// a `T` into the `!n` a token spells it with. Empty for a method of a non-generic type.
     type_parameters: Vec<Box<str>>,
+    constructor_of: Option<TypeSymbol>,
 }
 
 impl Frame {
@@ -125,6 +126,26 @@ impl Frame {
         frame.type_parameters = type_parameters.to_vec();
         frame.collect_locals(body);
         frame
+    }
+
+    /// Records that the body being emitted is a CONSTRUCTOR -- `.ctor` or `.cctor` -- of the given
+    /// type, which is the one place a `readonly` field is a variable rather than a value (17.4.2).
+    /// Everywhere else a readonly field of value type is addressed through a copy, so a method that
+    /// mutates it mutates the copy, and `initonly` storage is never addressed where the CLI forbids
+    /// it. `None` for every other method.
+    ///
+    /// **THE TYPE IS PART OF THE ANSWER AND NOT DECORATION:** 17.4.2 names a constructor of the
+    /// class that DECLARES the field, so a derived class's constructor addresses an inherited
+    /// readonly field through a copy exactly as an ordinary method does.
+    pub fn set_constructor_of(&mut self, owner: Option<TypeSymbol>) {
+        self.constructor_of = owner;
+    }
+
+    /// The type whose constructor is being emitted, if this body is one. See
+    /// [`Frame::set_constructor_of`].
+    #[must_use]
+    pub fn constructor_of(&self) -> Option<&TypeSymbol> {
+        self.constructor_of.as_ref()
     }
 
     /// The POSITION of `name` in the declaring type's parameter list -- the `n` of the `!n` a

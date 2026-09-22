@@ -3,6 +3,7 @@
 //! A Debug Adapter Protocol server over the Lamella interpreter.
 
 pub mod adapter;
+mod frame_eval;
 #[cfg(feature = "interpreter")]
 pub mod interp_backend;
 #[cfg(feature = "interpreter")]

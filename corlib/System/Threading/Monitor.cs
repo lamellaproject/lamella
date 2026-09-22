@@ -6,39 +6,76 @@ namespace System.Threading
     {
         private Monitor() { }
 
-        public static void Enter(object obj) { EnterLock(obj); }
+        private static void RequireObject(object obj)
+        {
+            if (obj == null) throw new ArgumentNullException("obj");
+        }
 
-        public static void Enter(object obj, ref bool lockTaken) { EnterLock(obj); lockTaken = true; }
+        public static void Enter(object obj) { RequireObject(obj); EnterLock(obj); }
 
-        public static void Exit(object obj) { ExitLock(obj); }
+        public static void Enter(object obj, ref bool lockTaken)
+        {
+            RequireObject(obj);
+            EnterLock(obj);
+            lockTaken = true;
+        }
 
-        public static bool TryEnter(object obj) { return TryEnterLock(obj); }
+        public static void Exit(object obj) { RequireObject(obj); ExitLock(obj); }
+
+        public static bool TryEnter(object obj) { RequireObject(obj); return TryEnterLock(obj); }
 
         public static bool TryEnter(object obj, int millisecondsTimeout)
         {
-            if (millisecondsTimeout < 0) { EnterLock(obj); return true; }
+            RequireObject(obj);
+            if (millisecondsTimeout == Timeout.Infinite) { EnterLock(obj); return true; }
+            if (millisecondsTimeout < 0) throw new ArgumentOutOfRangeException("millisecondsTimeout");
             if (TryEnterLock(obj)) return true;
             if (millisecondsTimeout == 0) return false;
             TryEnterLockTimeout(obj, millisecondsTimeout);
             return !WaitTimedOut();
         }
 
-        public static bool Wait(object obj) { WaitLock(obj); return true; }
+        public static bool Wait(object obj) { RequireObject(obj); WaitLock(obj); return true; }
 
         public static bool Wait(object obj, int millisecondsTimeout)
         {
-            if (millisecondsTimeout < 0)
+            RequireObject(obj);
+            if (millisecondsTimeout == Timeout.Infinite)
             {
                 WaitLock(obj);
                 return true;
             }
+            if (millisecondsTimeout < 0) throw new ArgumentOutOfRangeException("millisecondsTimeout");
             WaitLockTimeout(obj, millisecondsTimeout);
             return !WaitTimedOut();
         }
 
-        public static void Pulse(object obj) { PulseLock(obj); }
+        private static int TimeoutMilliseconds(TimeSpan timeout)
+        {
+            long milliseconds = timeout.Ticks / TimeSpan.TicksPerMillisecond;
+            if (milliseconds == Timeout.Infinite) return Timeout.Infinite;
+            if (milliseconds < 0 || milliseconds > Int32.MaxValue)
+            {
+                throw new ArgumentOutOfRangeException("timeout");
+            }
+            return (int)milliseconds;
+        }
 
-        public static void PulseAll(object obj) { PulseAllLock(obj); }
+        public static bool TryEnter(object obj, TimeSpan timeout)
+        {
+            RequireObject(obj);
+            return TryEnter(obj, TimeoutMilliseconds(timeout));
+        }
+
+        public static bool Wait(object obj, TimeSpan timeout)
+        {
+            RequireObject(obj);
+            return Wait(obj, TimeoutMilliseconds(timeout));
+        }
+
+        public static void Pulse(object obj) { RequireObject(obj); PulseLock(obj); }
+
+        public static void PulseAll(object obj) { RequireObject(obj); PulseAllLock(obj); }
 
         [Lamella.Runtime.RuntimeProvided] private static void EnterLock(object obj) { }
         [Lamella.Runtime.RuntimeProvided] private static void ExitLock(object obj) { }

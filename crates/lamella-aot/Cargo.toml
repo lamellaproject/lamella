@@ -23,6 +23,11 @@ lamella-generics = { path = "../lamella-generics" }
 lamella-token = { path = "../lamella-token" }
 # The backend emits ELF relocatable objects (riscv32::lower_object) for the own linker.
 lamella-elf = { path = "../lamella-elf" }
+# The LINKED image path (`linked` feature): `build_linked_cortex_m` drives program + corlib + the
+# runtime-support archive through this to a flashable image, which is the only tier that can
+# allocate, reach the class library or print on a board. Optional, because the flat path and the
+# object emitters need none of it, and one-way -- the linker does not depend on this crate.
+lamella-linker = { path = "../lamella-linker", optional = true }
 
 [dev-dependencies]
 lamella-dwarf = { path = "../lamella-dwarf" }
@@ -45,6 +50,10 @@ default = ["arm32"]
 # the code generators it needs -- an ARM32 device never builds the RISC-V or WASM
 # paths, and vice versa.
 arm32 = ["dep:lamella-asm-arm32"]
+# The LINKED image path: compile, link against corlib + the runtime-support archive, and wrap the
+# result in a part's boot image. Off by default because it pulls the linker in, and a consumer that
+# only lowers (the browser export, a differential runner) wants neither.
+linked = ["dep:lamella-linker", "arm32"]
 riscv32 = ["dep:lamella-asm-riscv32"]
 wasm = ["dep:lamella-asm-wasm"]
 # String storage encoding (runtime's seam): UTF-16 is the DEFAULT and has no feature of its own.
@@ -63,6 +72,24 @@ string-utf8-wtf8 = []
 # the descriptor still carries the name WORD (a zero), so the format stays total across tiers and a
 # reader never has to know which way the knob was thrown.
 strip-type-names = []
+
+# THE CONFIGURATIONS THAT TOGETHER RUN EVERY TEST IN THIS CRATE. No single one does, and that is a
+# property of the features above rather than an oversight: `string-utf8` and `string-utf8-wtf8` are
+# mutually exclusive in intent, so `--all-features` sets both, wtf8 wins, and the two tests that
+# check the STRICT UTF-8 refusal compile in neither the default build nor the all-features one.
+#
+# Together they run every test this crate has; neither does alone. Adding a configuration is an edit
+# to this table and to nothing else.
+
+[[package.metadata.lamella.test-configuration]]
+name = "all-features"
+args = ["--all-features"]
+why = "every backend and both string tiers -- the broad pass, and the denominator"
+
+[[package.metadata.lamella.test-configuration]]
+name = "strict-utf8"
+args = ["--no-default-features", "--features", "arm32,string-utf8"]
+why = "exactly one of the two string tiers, which is the only way the strict UTF-8 refusal tests compile"
 
 [lints]
 workspace = true

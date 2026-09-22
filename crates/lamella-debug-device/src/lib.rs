@@ -153,7 +153,7 @@ impl<A: TargetAccess> DeviceBackend<A> {
         let mut registers = live;
         for depth in 0..32u32 {
             let lookup = if depth == 0 { pc } else { pc.saturating_sub(1) };
-            let offset = lookup.saturating_sub(self.base);
+            let offset = self.image_offset(lookup);
             out.push((
                 Frame {
                     address: u64::from(pc),
@@ -463,8 +463,61 @@ impl<A: TargetAccess> DeviceBackend<A> {
         self.row_at(offset).map_or(0, |row| row.line)
     }
 
-    /// The row whose native code contains `offset` -- the last one at or before it.
+    /// Whether the core is locked up, read from `DHCSR.S_LOCKUP` rather than guessed from the PC.
+    ///
+    /// # THE BIT, NOT THE ADDRESS
+    ///
+    /// A locked-up Cortex-M0 fetches from `0xFFFFFFFE` and a halt lands the PC there (Armv6-M ARM
+    /// DDI 0419E, B1.5), which makes that value tempting to test for. It is not portable: Armv7-M
+    /// fetches from "the Lockup address, determined by the nature of the fault" (Armv7-M ARM
+    /// DDI 0403E.d, B1.5.15), so the address is a property of the fault on that profile and of the
+    /// architecture only on this one. [`S_LOCKUP`] means the same thing on all of them.
+    ///
+    /// A read that fails answers false: a probe that cannot reach `DHCSR` has not established that
+    /// the part is locked up, and the caller's own error path covers a transport that is not
+    /// answering.
+    fn locked_up(&mut self) -> bool {
+        self.probe
+            .get_mut()
+            .read_word(DHCSR)
+            .is_ok_and(|status| status & S_LOCKUP != 0)
+    }
+
+    /// The image offset of a target `address`, for the lookups that take one.
+    ///
+    /// # AN ADDRESS BELOW THE IMAGE MUST NOT BECOME ITS FIRST BYTE
+    ///
+    /// Saturating the subtraction would put every address below the image at offset 0 -- inside the
+    /// first method, on the first line -- so a PC, an LR or a breakpoint address from outside the
+    /// program would be named and located as the program's own first statement.
+    ///
+    /// An address below the base has no offset in this image, and this answers [`u32::MAX`] for it:
+    /// no method range can contain it (they are half-open, so `MAX < end` is false whatever `end`
+    /// is) and no row's offset equals it, so every bounded lookup here reports "outside" on its own
+    /// terms -- no name, no line, no row -- without a caller having to test for it.
+    fn image_offset(&self, address: u32) -> u32 {
+        address.checked_sub(self.base).unwrap_or(u32::MAX)
+    }
+
+    /// The row whose native code contains `offset` -- the last one at or before it, and only where
+    /// the program has code at `offset` at all.
+    ///
+    /// # THE BOUND IS THE POINT, BECAUSE A BACKWARD SEARCH ALONE CLAMPS
+    ///
+    /// The rows carry no end, so "the last row at or before the offset" is the right rule *inside*
+    /// the program and answers the FINAL row for every address above it. An address far outside the
+    /// image therefore came back as the program's last line, and the further wrong the address was,
+    /// the more definite the answer looked. [`Self::method_name_at`] has always been bounded -- it
+    /// answers `?` for code no subprogram covers -- so the two lookups disagreed about the same
+    /// address, and a frame could carry a line with no name.
+    ///
+    /// The method table is the bound: an offset inside no method has no row, which is
+    /// [`program::name_containing`]'s own test. A program whose table is empty keeps the unbounded
+    /// search, because then nothing here knows where its code ends.
     fn row_at(&self, offset: u32) -> Option<LineRow> {
+        if !self.names.is_empty() && program::name_containing(&self.names, offset).is_none() {
+            return None;
+        }
         self.lines.iter().rev().find(|row| row.offset <= offset).copied()
     }
 
@@ -566,12 +619,12 @@ impl<A: TargetAccess> DeviceBackend<A> {
             }
             Some(a)
         } else {
-            let call_line = self.source_line_at(target.saturating_sub(self.base).saturating_sub(4));
+            let call_line = self.source_line_at(self.image_offset(target.saturating_sub(4)));
             let borrow = (call_line != 0)
                 .then(|| {
-                    self.breakpoints.iter().position(|&bp| {
-                        self.source_line_at(bp.saturating_sub(self.base)) == call_line
-                    })
+                    self.breakpoints
+                        .iter()
+                        .position(|&bp| self.source_line_at(self.image_offset(bp)) == call_line)
                 })
                 .flatten();
             borrow.map(|index| {
@@ -642,7 +695,7 @@ impl<A: TargetAccess> DeviceBackend<A> {
     /// body). Decodes those two Thumb instructions at the method's entry. Returns `None` if the
     /// prologue is not that shape (e.g. a leaf that never saved LR), so the caller can fall back.
     fn frame_return_address(&mut self, pc: u32) -> Option<u32> {
-        let off = pc.saturating_sub(self.base);
+        let off = self.image_offset(pc);
         let method_off = program::name_containing(&self.names, off).map(|&(start, _, _)| start)?;
         let method_start = self.base + method_off;
         let probe = self.probe.get_mut();
@@ -679,6 +732,15 @@ impl<A: TargetAccess> DeviceBackend<A> {
 const DHCSR: u32 = 0xE000_EDF0;
 /// `DHCSR.DBGKEY`, bits 31:16: a write to the register's lower half takes effect only with this key.
 const DBGKEY: u32 = 0xA05F_0000;
+/// `DHCSR.S_LOCKUP`, bit 19 on every profile this project targets -- Armv6-M ARM (DDI 0419E)
+/// Table C1-13, Armv7-M ARM (DDI 0403E.d) B1.5.15, Armv8-M ARM (DDI 0553B.y) D1.2.36: the processor
+/// is locked up because of an unrecoverable exception.
+///
+/// **IT READS 1 WHILE THE PROCESSOR IS RUNNING, WHICH IS THE WHOLE REASON THIS CONSTANT EXISTS.**
+/// Armv6-M ARM Table C1-13: the bit "can only read as 1 when accessed by a remote debugger using the
+/// DAP. The value of 1 indicates that the processor is running but locked up." So `S_HALT` is clear
+/// and a poll that asks only "is it halted?" answers "still running" for the rest of the session.
+const S_LOCKUP: u32 = 1 << 19;
 
 /// The breakpoint unit's control register, at one address on every Cortex-M: `BP_CTRL` in Armv6-M ARM
 /// (DDI 0419E) C1.8.2, and `FP_CTRL` in Armv7-M ARM (DDI 0403E.d) C1.11.3 and Armv8-M ARM (DDI
@@ -782,11 +844,11 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
                 probe.read_core_reg(14).unwrap_or(0) & !1,
             )
         };
-        let here = self.method_name_at(pc.saturating_sub(self.base));
+        let here = self.method_name_at(self.image_offset(pc));
         if here == self.entry {
             return Some(self.resume());
         }
-        if self.method_name_at(lr.saturating_sub(self.base)) == here {
+        if self.method_name_at(self.image_offset(lr)) == here {
             return Some(match self.frame_return_address(pc) {
                 Some(ret) => self.run_to_address(ret),
                 None => Stop::Step,
@@ -797,6 +859,11 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
 
     fn poll(&mut self) -> Stop {
         match self.probe.get_mut().is_halted() {
+            Ok(false) if self.locked_up() => Stop::Fault(String::from(
+                "the target is locked up: an unrecoverable exception was taken and the core is \
+                 fetching from the lockup address instead of running the program. Only a reset or \
+                 an NMI leaves that state, so the session cannot continue. DHCSR.S_LOCKUP reads 1",
+            )),
             Ok(false) => Stop::Running,
             Ok(true) => match self.service_semihosting() {
                 Some(true) => Stop::Running,
@@ -865,7 +932,7 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     }
 
     fn source_location(&self, address: u64) -> Option<SourceLocation> {
-        let row = self.row_at((address as u32).saturating_sub(self.base))?;
+        let row = self.row_at(self.image_offset(address as u32))?;
         if row.line == 0 {
             return None;
         }
@@ -888,7 +955,7 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
 
     fn at_source_boundary(&self) -> bool {
         let pc = self.probe.borrow_mut().read_core_reg(15).unwrap_or(0);
-        let offset = pc.saturating_sub(self.base);
+        let offset = self.image_offset(pc);
         match self.lines.iter().position(|row| row.offset == offset) {
             Some(0) => true,
             Some(i) => {
