@@ -65,6 +65,38 @@ namespace Lamella.Boards.Bbc
         static MicroBitV2()
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
+            Buses.BindSpi(EdgeSpiBusId, new SpiDriverFactory(MakeSpi));
+        }
+
+        /// <summary>The logical bus id of the edge connector's SPI (edge pins 13, 14 and 15: SCK,
+        /// MISO, MOSI), as <c>SpiConnectionSettings</c> names it.</summary>
+        public const int EdgeSpiBusId = 0;
+
+        private static SpiDriver MakeSpi() { return new Nrf52833SpiDriver(SpiBinding()); }
+
+        /// <summary>The `spi` binding descriptor -- the edge connector's SPI -- lifted from the
+        /// generated constants.</summary>
+        public Nrf52833SpiBinding CreateSpiBinding() { return SpiBinding(); }
+
+        private static Nrf52833SpiBinding SpiBinding()
+        {
+            return new Nrf52833SpiBinding(
+                BbcMicroBitV2Bindings.SPI_SPI_BASE,
+                BbcMicroBitV2Bindings.SPI_PSEL_SCK,
+                BbcMicroBitV2Bindings.SPI_PSEL_MOSI,
+                BbcMicroBitV2Bindings.SPI_PSEL_MISO,
+                BbcMicroBitV2Bindings.SPI_PIN_CNF_SCK_REG,
+                BbcMicroBitV2Bindings.SPI_PIN_CNF_MOSI_REG,
+                BbcMicroBitV2Bindings.SPI_PIN_CNF_MISO_REG);
+        }
+
+        /// <summary>The edge connector's SPI as the layer-1 driver the board's table binds for
+        /// <see cref="EdgeSpiBusId"/>, not yet configured.</summary>
+        /// <remarks>THE SAME INSTANCE <c>SpiDevice.Create</c> uses for that bus, for the reason
+        /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
+        public SpiDriver CreateSpiDriver()
+        {
+            return Buses.ResolveSpi(EdgeSpiBusId);
         }
 
         private static GpioDriver MakeGpio() { return new Nrf52833GpioDriver(1u << 6, 1u << 8); }

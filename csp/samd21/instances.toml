@@ -6,13 +6,20 @@
 [table]
 kind = "instances"
 family = "samd21"
-record = ["base", "gclk_core_id", "apbc_bit", "irq"]
+record = ["base", "gclk_core_id", "apbc_bit", "irq", "wo_count", "cc_count", "counter_bits", "gclk_max_hz"]
 sources = [
-    "SAMD21 datasheet DS40001882: peripheral base addresses (product mapping, ch 12), GCLK CLKCTRL IDs (ch 15), PM APBCMASK bits (ch 16), NVIC line assignments (ch 11)",
+    "SAMD21 datasheet DS40001882: peripheral base addresses (product mapping, ch 9, and the peripherals configuration summary, ch 12), GCLK CLKCTRL IDs (ch 15), PM APBCMASK bits (ch 16), NVIC line assignments (ch 11)",
+    "sercom0 checked against DS40001882D before its first binding: base 0x42000800 (Figure 9-1, page 39, and Table 12-1, page 69), GCLK_SERCOM0_CORE id 0x14 (15.8.3, page 130), PM.APBCMASK bit 2 (16.8.10, page 166), NVIC line 9 (Table 11-3, page 48)",
+    "adc checked against DS40001882D before its first binding: base 0x42004000 (Figure 9-1, page 39, and Table 12-1, page 70), GCLK_ADC id 0x1E (15.8.3, page 130), PM.APBCMASK bit 16 (16.8.10, pages 164-165), NVIC line 23 (Table 11-3, continued on page 49)",
+    "sysctrl: base 0x40000800 (Table 12-1, page 69)",
+    "tcc0-tcc2 and tc3-tc7 checked against DS40001882D before their first binding: bases (Figure 9-1, page 39, and Table 12-1, pages 69-70), GCLK ids 0x1A-0x1D (15.8.3, page 130), PM.APBCMASK bits 8-15 (16.8.10, pages 164-166), NVIC lines 15-22 (Table 11-3, pages 48-49), each TCC's compare channels, waveform outputs and counter size (Table 7-7, page 34), a TC's two compare channels and WO[1:0] (30.2 and 30.4, pages 662-663), and each generic clock channel's ceiling (Table 37-7, page 986)",
 ]
 notes = [
     "SERCOM bases stride 0x400 from 0x42000800; GCLK core-clock IDs stride 1 from 0x14; APBCMASK bits stride 1 from bit 2; NVIC lines stride 1 from 9 -- each row is still stated explicitly (a table is data, not a formula).",
     "THE RECORD NAMES AN APB *C* BIT AND THE EIC IS ON APB A, so its clock gate cannot be expressed in a row here. It is PM.APBAMASK bit 6, stated in blocks/eic.toml, and that bit is SET at reset -- the reset value is 0x0000007F -- so nothing has to enable it and nothing currently reads it. The gap is recorded rather than closed because widening the record touches every row in this file and changes what every samd21 board emits; the sibling family csp/same54 carries a general apb_mask_offset plus apb_bit pair and has no such limitation, which is where the shape should come from when this is widened.",
+    "wo_count, cc_count, counter_bits and gclk_max_hz are the timers' facts, and only the timer rows state them; every other row states -1, because no binding of its block reads them. wo_count is how many waveform outputs WO[n] the instance drives and cc_count how many compare channels it has, which differ on TCC0 (8 and 4) and TCC1 (4 and 2): there, with the output matrix at its default, an output past the last channel repeats a channel (Table 31-4 note). counter_bits is a TCC's counter size; a TC's is its mode's (8, 16 or 32 bits), so a TC row states -1 and its mode's block states the size. gclk_max_hz is the ceiling Table 37-7 gives the instance's generic clock channel, and it is per channel rather than per block: TC3 shares 0x1B with TCC2 and takes 96 MHz, where TC4-TC7 take 48.",
+    "THE GENERIC CLOCK CHANNELS ARE SHARED IN PAIRS (15.8.3): TCC0 and TCC1 on 0x1A, TCC2 and TC3 on 0x1B, TC4 and TC5 on 0x1C, TC6 and TC7 on 0x1D. One CLKCTRL write clocks both members of a pair, so two bindings on a pair must name one generator.",
+    "TC6 and TC7 are absent from the SAM D21E and G parts (Table 7-1 note 4); the rows describe the family's map, and a part's present-list is what says which pads exist.",
 ]
 
 [[instances]]
@@ -22,6 +29,10 @@ base = 0x42000800
 gclk_core_id = 0x14
 apbc_bit = 2
 irq = 9
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "sercom1"
@@ -30,6 +41,10 @@ base = 0x42000C00
 gclk_core_id = 0x15
 apbc_bit = 3
 irq = 10
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "sercom2"
@@ -38,6 +53,10 @@ base = 0x42001000
 gclk_core_id = 0x16
 apbc_bit = 4
 irq = 11
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "sercom3"
@@ -46,6 +65,10 @@ base = 0x42001400
 gclk_core_id = 0x17
 apbc_bit = 5
 irq = 12
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "sercom4"
@@ -54,6 +77,10 @@ base = 0x42001800
 gclk_core_id = 0x18
 apbc_bit = 6
 irq = 13
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "sercom5"
@@ -62,6 +89,10 @@ base = 0x42001C00
 gclk_core_id = 0x19
 apbc_bit = 7
 irq = 14
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "pm"
@@ -70,6 +101,10 @@ base = 0x40000400
 gclk_core_id = -1
 apbc_bit = -1
 irq = -1
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "gclk"
@@ -78,6 +113,10 @@ base = 0x40000C00
 gclk_core_id = -1
 apbc_bit = -1
 irq = -1
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "porta"
@@ -86,6 +125,10 @@ base = 0x41004400
 gclk_core_id = -1
 apbc_bit = -1
 irq = -1
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 [[instances]]
 name = "portb"
@@ -94,6 +137,10 @@ base = 0x41004480
 gclk_core_id = -1
 apbc_bit = -1
 irq = -1
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
 
 # --- the external interrupt controller ------------------------------------------------------------
 #
@@ -109,3 +156,139 @@ gclk_core_id = 0x05        # GCLK_EIC. Needed for the filter and for every edge 
 apbc_bit = -1              # NOT ABSENT: PM.APBAMASK bit 6, which this record cannot express
 irq = 4                    # DS40001882D Table 11-3. ONE line for all sixteen EXTINTs; NMI is separate
                            # and is not an NVIC line at all.
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
+
+# --- the analog-to-digital converter ------------------------------------------------------------
+
+[[instances]]
+name = "adc"
+block = "adc"
+base = 0x42004000          # DS40001882D Figure 9-1 and Table 12-1
+gclk_core_id = 0x1E        # GCLK_ADC
+apbc_bit = 16              # SET at reset: APBCMASK resets to 0x00010000, this bit alone
+irq = 23
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
+
+# --- the system controller ----------------------------------------------------------------------
+#
+# Placed for one register: VREF, whose BGOUTEN bit routes the bandgap to an ADC input. SYSCTRL is
+# on APB A, so its gate is not an APBC bit, and no driver takes its interrupt.
+
+[[instances]]
+name = "sysctrl"
+block = "sysctrl"
+base = 0x40000800
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+wo_count = -1
+cc_count = -1
+counter_bits = -1
+gclk_max_hz = -1
+
+# --- the timer/counters -------------------------------------------------------------------------
+#
+# TCC0-TCC2 and TC3-TC7, each with its outputs, its compare channels, a TCC's counter size and its
+# generic clock's ceiling. Every bus clock here is off at reset (APBCMASK resets to 0x00010000).
+
+[[instances]]
+name = "tcc0"
+block = "tcc"
+base = 0x42002000
+gclk_core_id = 0x1A
+apbc_bit = 8
+irq = 15
+wo_count = 8
+cc_count = 4
+counter_bits = 24
+gclk_max_hz = 96000000
+
+[[instances]]
+name = "tcc1"
+block = "tcc"
+base = 0x42002400
+gclk_core_id = 0x1A
+apbc_bit = 9
+irq = 16
+wo_count = 4
+cc_count = 2
+counter_bits = 24
+gclk_max_hz = 96000000
+
+[[instances]]
+name = "tcc2"
+block = "tcc"
+base = 0x42002800
+gclk_core_id = 0x1B
+apbc_bit = 10
+irq = 17
+wo_count = 2
+cc_count = 2
+counter_bits = 16
+gclk_max_hz = 96000000
+
+[[instances]]
+name = "tc3"
+block = "tc"
+base = 0x42002C00
+gclk_core_id = 0x1B
+apbc_bit = 11
+irq = 18
+wo_count = 2
+cc_count = 2
+counter_bits = -1
+gclk_max_hz = 96000000
+
+[[instances]]
+name = "tc4"
+block = "tc"
+base = 0x42003000
+gclk_core_id = 0x1C
+apbc_bit = 12
+irq = 19
+wo_count = 2
+cc_count = 2
+counter_bits = -1
+gclk_max_hz = 48000000
+
+[[instances]]
+name = "tc5"
+block = "tc"
+base = 0x42003400
+gclk_core_id = 0x1C
+apbc_bit = 13
+irq = 20
+wo_count = 2
+cc_count = 2
+counter_bits = -1
+gclk_max_hz = 48000000
+
+[[instances]]
+name = "tc6"
+block = "tc"
+base = 0x42003800
+gclk_core_id = 0x1D
+apbc_bit = 14
+irq = 21
+wo_count = 2
+cc_count = 2
+counter_bits = -1
+gclk_max_hz = 48000000
+
+[[instances]]
+name = "tc7"
+block = "tc"
+base = 0x42003C00
+gclk_core_id = 0x1D
+apbc_bit = 15
+irq = 22
+wo_count = 2
+cc_count = 2
+counter_bits = -1
+gclk_max_hz = 48000000

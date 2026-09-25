@@ -9,6 +9,7 @@ BOARD_VENDOR = "Bbc"
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
 # below, never through a surface-private enum.
 INTERNAL_I2C = "internal-i2c"
+SPI = "spi"
 
 CARRIER = {
     "kind": "daplink-vcp",
@@ -33,6 +34,18 @@ FACTS = {
         "pin_cnf_scl_reg": 0x50000720,
         "pin_cnf_sda_reg": 0x50000740,
     },
+    "spi": {
+        "kind": "spi",
+        "driver_family": "nrf52833-spi",
+        "instance": "spi2",
+        "spi_base": 0x40023000,
+        "psel_sck": 0x11,
+        "psel_mosi": 0xD,
+        "psel_miso": 0x1,
+        "pin_cnf_sck_reg": 0x50000744,
+        "pin_cnf_mosi_reg": 0x50000734,
+        "pin_cnf_miso_reg": 0x50000704,
+    },
 }
 
 # The chip's instance map: every block this family places, with its base address and
@@ -46,10 +59,12 @@ INSTANCES = {
     "twi0": {"block": "twi", "base": 0x40003000},
     "port0": {"block": "gpio", "base": 0x50000000},
     "port1": {"block": "gpio", "base": 0x50000300},
+    "spi2": {"block": "spi", "base": 0x40023000},
+    "uart0": {"block": "uart", "base": 0x40002000},
 }
 
 PLANS = {
-    "hfclk-default": {"default": True, "source": "hfclk"},
+    "xtal-32mhz": {"default": True, "source": "xtal", "xtal_hz": 32000000},
 }
 
 # On-board devices + module control lines: PORT group base + pin index + mask + polarity.

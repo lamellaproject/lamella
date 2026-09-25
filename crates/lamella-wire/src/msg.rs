@@ -246,10 +246,14 @@ pub const DEPLOY_CLEAR: u8 = 0x49;
 /// Host -> target: what is deployed? Empty payload. Answered by [`DEPLOY_STATUS_RESULT`].
 pub const DEPLOY_STATUS: u8 = 0x4A;
 /// Target -> host: `state(u8)` (see [`deploy_state`]), `tier(u8)` (see [`tier`]),
-/// `checksum(u64 LE)`.
+/// `checksum(u64 LE)`, `window(u32 LE)`.
 ///
 /// `tier` rides along so a host learns WHAT is installed without a second round trip, which is the
 /// case a board holding more than one runtime exists for.
+///
+/// `window` is how many bytes a deploy may write, so a host refuses an artifact that cannot fit
+/// before it sends any of it. A target built before the field sends the first ten bytes only, and a
+/// host reads that as a window it does not know -- never as a window of zero.
 pub const DEPLOY_STATUS_RESULT: u8 = 0x4B;
 /// Host -> target: what is EXECUTING, and in what state? Empty payload. Answered by [`EVT_STOPPED`]
 /// when something is stopped, paused or trapped, and by a running form when it is not.
@@ -637,6 +641,20 @@ pub mod val {
     pub const BYREF: u8 = 0x08;
     /// A typed reference: `type_token(u64 LE)` then a [`BYREF`] location descriptor.
     pub const TYPED_REF: u8 = 0x09;
+    /// A string's text: `units(u32 LE)`, the whole string's length in UTF-16 code units; then
+    /// `len(u16 LE)` and `len` bytes of UTF-8, the string's first characters, cut at a character
+    /// boundary and at most [`STRING_TEXT_MAX`] bytes. When the text stops short of `units`, the
+    /// string is longer than what was sent, and a host says so rather than showing a cut string as
+    /// whole.
+    ///
+    /// Sent ONLY in a session that negotiated [`crate::Capabilities::STRING_VALUES`]: a `<val>`
+    /// carries no length a reader could skip by, so an unknown tag costs a reader every value after
+    /// it in the same reply. Without the bit, a string crosses as an [`OBJECT`] handle.
+    pub const STRING: u8 = 0x0A;
+
+    /// The most UTF-8 bytes of text a [`STRING`] carries. A variables pane shows one line of a value,
+    /// and a reply holds every local of a frame, so one long string must not crowd out the rest.
+    pub const STRING_TEXT_MAX: usize = 200;
 }
 
 /// The result of one artifact chunk. Byte 0 of [`XFER_RESULT`] and of [`FW_RESULT`].

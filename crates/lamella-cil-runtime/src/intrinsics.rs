@@ -1,14 +1,15 @@
 //! Runtime-native intrinsics: the Rust implementations a few BCL methods bind to.
 
 use crate::interp::{Session, Vm};
-use crate::module::{AttrValue, BoxedPrimitive, Module};
+use crate::module::{AttrValue, BoxedPrimitive, CastElem, CastPrim, Module, TypeId};
 #[cfg(feature = "reflection")]
 use crate::module::param_attr_key;
 use crate::net::{Interest, NetResult};
 use crate::tls::{TlsStack, VerifyMode};
 use crate::object::{Object, ObjectRef, decode_string};
-use crate::trap::Trap;
+use crate::trap::{RefusedWith, Trap};
 use crate::value::{Location, Value};
+use alloc::borrow::Cow;
 #[cfg(feature = "float")]
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -3419,7 +3420,8 @@ pub fn single_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
 }
 
 /// `System.Object.ToString()`: a value's display text -- a boxed value type by its
-/// representation, a string verbatim, anything else as "object".
+/// representation, a string verbatim, an instance or a delegate by its type's full name, anything
+/// else as "object".
 ///
 /// # Errors
 /// Never errors.
@@ -3447,14 +3449,21 @@ pub fn console_write_line_object(
 }
 
 /// Renders an object for `Object.ToString` / `WriteLine(object)`: a string verbatim, a
-/// boxed value type by its representation, null/absent as empty, else "object".
+/// boxed value type by its representation, an instance or a delegate by its type's full name,
+/// null/absent as empty, else "object".
 fn object_text(vm: &Vm, module: &Module, value: Option<&Value>) -> String {
     match value {
         Some(Value::Object(reference)) => match vm.heap().get(*reference) {
             Some(Object::Str(chars)) => String::from_utf16_lossy(&decode_string(chars)),
             Some(Object::StringBuilder { buf, .. }) => String::from_utf16_lossy(buf),
             Some(Object::Boxed { type_token, value }) => boxed_text(module, *type_token, value),
-            Some(Object::Instance { type_id, .. }) => module
+            Some(
+                Object::Instance { type_id, .. }
+                | Object::Delegate {
+                    type_id: Some(type_id),
+                    ..
+                },
+            ) => module
                 .type_full_name(*type_id)
                 .map_or_else(|| String::from("object"), String::from),
             _ => String::from("object"),
@@ -3526,10 +3535,11 @@ pub fn string_concat_object3(
 
 /// Renders a boxed value type: a `bool`/`char` by its true kind (`box` collapses both to
 /// [`Value::Int32`]), an enum as its constant name (when the value is a known constant of that
-/// enum), otherwise the underlying value's text. The boxed `type_token` is the asm-folded handle
-/// (the assembly folded in at the `box` site), so the primitive-kind and enum maps are queried by
-/// that handle directly -- no `TypeRef`-to-type resolution, which the incremental REPL (corlib not
-/// loaded in the runtime) cannot do at display time.
+/// enum), a struct as its type's full name, otherwise the underlying value's text. The boxed
+/// `type_token` is the asm-folded handle (the assembly folded in at the `box` site), so the
+/// primitive-kind and enum maps are queried by that handle directly. Only the struct's name needs
+/// the handle resolved to a type, and where it cannot be -- the incremental REPL, with no corlib
+/// loaded in the runtime -- a struct keeps the underlying value's text.
 fn boxed_text(module: &Module, type_token: u64, value: &Value) -> String {
     if let (Some(kind), &Value::Int32(raw)) = (module.box_primitive_by_handle(type_token), value) {
         return match kind {
@@ -3540,6 +3550,14 @@ fn boxed_text(module: &Module, type_token: u64, value: &Value) -> String {
     if let Some(integer) = enum_underlying(value) {
         if let Some(text) = module.enum_name_or_flags(type_token, integer, false) {
             return text;
+        }
+    }
+    if matches!(value, Value::Struct(_)) {
+        if let Some(name) = module
+            .type_id_by_handle(type_token)
+            .and_then(|type_id| module.type_full_name(type_id))
+        {
+            return String::from(name);
         }
     }
     scalar_text(value)
@@ -3635,10 +3653,22 @@ pub fn delegate_remove(
     Ok(Some(Value::Object(reference)))
 }
 
-/// `System.Delegate.op_Equality` (`a == b` on delegates): VALUE equality -- the invocation
-/// lists match pairwise (target reference identity + bound method), `delegate_remove`'s
-/// matching rule. Two separately-constructed `new A(M)` are equal; `null == null` is equal
-/// (two empty lists); `null` against any delegate is not.
+/// Whether two operands are EQUAL DELEGATES, the one rule behind `==`, `!=` and `Equals`: of the
+/// same type, with invocation lists that match entry for entry -- the same method, bound to the
+/// same target by reference identity, or to none for a static method -- in the same order.
+/// `delegate_remove` matches entries by the same pair. Two separately-constructed `new A(M)` are
+/// equal; `null` against `null` is equal (two empty lists); `null` against any delegate is not.
+///
+fn delegates_equal(vm: &Vm, a: Option<&Value>, b: Option<&Value>) -> bool {
+    if let (Some(a_type), Some(b_type)) = (delegate_operand_type(vm, a), delegate_operand_type(vm, b)) {
+        if a_type != b_type {
+            return false;
+        }
+    }
+    delegate_list(vm, a) == delegate_list(vm, b)
+}
+
+/// `System.Delegate.op_Equality` (`a == b` on delegates): [`delegates_equal`].
 ///
 /// # Errors
 /// Never errors.
@@ -3647,9 +3677,7 @@ pub fn delegate_equals(
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let a = delegate_list(vm, args.first());
-    let b = delegate_list(vm, args.get(1));
-    Ok(Some(Value::Int32(i32::from(a == b))))
+    Ok(Some(Value::Int32(i32::from(delegates_equal(vm, args.first(), args.get(1))))))
 }
 
 /// `System.Delegate.op_Inequality`: the complement of [`delegate_equals`].
@@ -3661,9 +3689,66 @@ pub fn delegate_not_equals(
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let a = delegate_list(vm, args.first());
-    let b = delegate_list(vm, args.get(1));
-    Ok(Some(Value::Int32(i32::from(a != b))))
+    Ok(Some(Value::Int32(i32::from(!delegates_equal(vm, args.first(), args.get(1))))))
+}
+
+/// `System.Delegate.Equals(object)` and `System.MulticastDelegate.Equals(object)`: whether `obj`
+/// is a delegate equal to the receiver by [`delegates_equal`]. Anything that is not a delegate --
+/// null, a string, any other object -- is not equal to one.
+///
+/// # Errors
+/// Never errors.
+pub fn delegate_equals_object(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let other_is_delegate = match args.get(1) {
+        Some(Value::Object(reference)) => vm.heap().delegate_invocations(*reference).is_some(),
+        _ => false,
+    };
+    let equal = other_is_delegate && delegates_equal(vm, args.first(), args.get(1));
+    Ok(Some(Value::Int32(i32::from(equal))))
+}
+
+/// `System.Delegate.GetHashCode()` and `System.MulticastDelegate.GetHashCode()`: a hash of the
+/// invocation list's METHODS, in order.
+///
+///
+/// # Errors
+/// Never errors.
+pub fn delegate_get_hash_code(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let mut hash = FNV_OFFSET;
+    for (_, method) in delegate_list(vm, args.first()) {
+        hash = fnv_mix(hash, method as i32);
+    }
+    Ok(Some(Value::Int32(hash as i32)))
+}
+
+/// `System.Delegate.Clone()`: .NET's shallow copy -- a NEW delegate of the receiver's type over
+/// the same invocation list, so it is `Equals` to the receiver and is not the same object.
+///
+/// # Errors
+/// Never errors; a receiver that is not a delegate clones to null.
+pub fn delegate_clone(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(reference)) = args.first() else {
+        return Ok(Some(Value::Null));
+    };
+    let Some(invocations) = vm.heap().delegate_invocations(reference).map(<[(Value, u32)]>::to_vec)
+    else {
+        return Ok(Some(Value::Null));
+    };
+    let type_id = vm.heap().delegate_type_id(reference);
+    let copy = vm.heap_mut().alloc_multicast(invocations, type_id);
+    Ok(Some(Value::Object(copy)))
 }
 
 /// `System.Threading.Interlocked.CompareExchange<T>(ref T location, T value, T comparand)`:
@@ -6265,22 +6350,35 @@ pub fn array_clear_range(vm: &mut Vm, _module: &Module, args: &[Value]) -> Resul
     Ok(None)
 }
 
-/// `Array.CopyCore(source, sourceIndex, destination, destinationIndex, length)`: move an element
-/// RANGE between two arrays in their stored representation, answering whether the move was made. A
-/// packed primitive range moves as one contiguous byte range, so a bulk copy costs one operation
-/// rather than one per element -- and, unlike the untyped `GetValue`/`SetValue` seam it replaces,
-/// it boxes nothing.
+/// `Array.CopyCore(source, sourceIndex, destination, destinationIndex, length)`: copy an element
+/// RANGE between two arrays under `Array.Copy`'s element rules, answering whether this core made
+/// the copy. The managed `Array.Copy` has already checked the arguments and the ranges.
 ///
-/// A `false` answer means the core declined the pair -- a mismatched element representation, a
-/// covariant store needing a per-element type check, or a range outside either array -- and the
-/// managed `Array.Copy` then runs its untyped element seam instead. Declining costs speed, never
-/// correctness.
+/// When both arrays record their element types, the pair is decided here, the way .NET decides it:
+/// - the same type, two primitives that differ only in signedness (an enum counting as its
+///   underlying type), or a reference type into one it is assignable to: each element moves as
+///   stored, and a packed range moves as one contiguous byte range;
+/// - a primitive into a wider primitive: each element is widened;
+/// - a value type into `object`, `ValueType`, `Enum` (for an enum) or an interface it implements:
+///   each element is boxed as the source's element type;
+/// - `object`, `ValueType`, `Enum` or an interface into a value type that could be boxed as it:
+///   each element must be a box of exactly the destination's type, or null into a `Nullable<T>`;
+/// - a reference type into one it is not always assignable to: each element is cast-checked.
+///
+/// Any other pair raises `ArrayTypeMismatchException` before anything is copied. An element that
+/// fails its unbox or cast raises `InvalidCastException`, with the elements before it already copied,
+/// as .NET's does.
+///
+/// A `false` answer means the core declined: one side records no element type (an array the runtime
+/// minted untracked, or a multi-dimensional array), and the representations do not allow a verbatim
+/// move. The managed `Array.Copy` then runs its untyped element seam instead.
 ///
 /// # Errors
-/// Returns [`Trap::TypeMismatch`] unless the arguments are (array, int, array, int, int).
+/// Returns [`Trap::TypeMismatch`] unless the arguments are (array, int, array, int, int);
+/// [`Trap::Refused`] for an incompatible pair, or for an element that cannot be stored.
 pub fn array_copy_range(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let Some(&Value::Object(source)) = args.first() else {
@@ -6301,14 +6399,304 @@ pub fn array_copy_range(
     if source_index < 0 || destination_index < 0 || length < 0 {
         return Ok(Some(Value::Int32(0)));
     }
+    let (source_index, destination_index, length) =
+        (source_index as usize, destination_index as usize, length as usize);
+    let destination_element = vm.heap().array_element_type(destination);
+    let plan = match (vm.heap().array_element_type(source), destination_element) {
+        (Some(from), Some(to)) if source != destination => copy_plan(module, from, to),
+        _ => CopyPlan::Decline,
+    };
+    match plan {
+        CopyPlan::Decline => {}
+        CopyPlan::Mismatch => {
+            return Err(Trap::Refused(RefusedWith::ArrayTypeMismatch, Cow::Borrowed(COPY_MISMATCH)));
+        }
+        CopyPlan::Move
+            if vm.heap_mut().copy_range(
+                source,
+                source_index,
+                destination,
+                destination_index,
+                length,
+            ) =>
+        {
+            return Ok(Some(Value::Int32(1)));
+        }
+        plan => {
+            let element = destination_element.unwrap_or(0);
+            for offset in 0..length {
+                let value = vm
+                    .heap()
+                    .array_get(source, source_index + offset)
+                    .ok_or(Trap::IndexOutOfRange((source_index + offset) as i32))?;
+                let stored = copy_element(vm, module, plan, source, element, value)?;
+                if !vm.heap_mut().array_set(destination, destination_index + offset, stored) {
+                    return Err(Trap::IndexOutOfRange((destination_index + offset) as i32));
+                }
+            }
+            return Ok(Some(Value::Int32(1)));
+        }
+    }
     let moved = vm.heap_mut().copy_range(
         source,
-        source_index as usize,
+        source_index,
         destination,
-        destination_index as usize,
-        length as usize,
+        destination_index,
+        length,
     );
     Ok(Some(Value::Int32(i32::from(moved))))
+}
+
+/// .NET's message when `Array.Copy` refuses a pair of element types.
+const COPY_MISMATCH: &str = "Source array type cannot be assigned to destination array type.";
+
+/// .NET's message when `Array.Copy` cannot store one element of an otherwise compatible pair.
+const COPY_CANNOT_CAST: &str =
+    "At least one element in the source array could not be cast down to the destination array type.";
+
+/// How `Array.Copy` moves elements between two arrays whose element types are both recorded,
+/// decided once for the pair. See [`array_copy_range`] for the rules.
+#[derive(Clone, Copy)]
+enum CopyPlan {
+    /// This core does not decide the pair, and the copy runs as it did before these rules.
+    Decline,
+    /// The element types are incompatible.
+    Mismatch,
+    /// Each element moves as it is stored.
+    Move,
+    /// Each element widens from the first primitive to the second.
+    Widen(CastPrim, CastPrim),
+    /// Each value-type element is boxed as the source's element type.
+    Box,
+    /// Each element must be a box of exactly the destination's value type.
+    Unbox,
+    /// Each reference must pass a cast to the destination's element type.
+    Cast,
+}
+
+/// Decides [`CopyPlan`] for elements of the type `source` names moving into an array of the type
+/// `destination` names (both asm-folded handles, `0` for an untracked array).
+fn copy_plan(module: &Module, source: u64, destination: u64) -> CopyPlan {
+    if source == 0 || destination == 0 {
+        return CopyPlan::Decline;
+    }
+    if source == destination {
+        return CopyPlan::Move;
+    }
+    let from = module.type_id_by_handle(source);
+    let to = module.type_id_by_handle(destination);
+    if from.is_some() && from == to {
+        return CopyPlan::Move;
+    }
+    if let (Some(from_prim), Some(to_prim)) = (
+        element_prim(module, source, true),
+        element_prim(module, destination, true),
+    ) {
+        return if same_bits(from_prim, to_prim) {
+            CopyPlan::Move
+        } else if widens(from_prim, to_prim) {
+            CopyPlan::Widen(from_prim, to_prim)
+        } else {
+            CopyPlan::Mismatch
+        };
+    }
+    let (Some(from_value), Some(to_value)) = (
+        element_is_value_type(module, source),
+        element_is_value_type(module, destination),
+    ) else {
+        return CopyPlan::Decline;
+    };
+    let (Some(from), Some(to)) = (from, to) else {
+        return match (from_value, to_value) {
+            (false, false) if is_object_handle(module, destination) => CopyPlan::Move,
+            (false, false) => CopyPlan::Cast,
+            _ => CopyPlan::Mismatch,
+        };
+    };
+    let into = |a: TypeId, b: TypeId, b_handle: u64| {
+        is_object_handle(module, b_handle)
+            || module.is_subtype(a, b)
+            || module.implements_interface(a, b)
+    };
+    match (from_value, to_value) {
+        (true, true) => CopyPlan::Mismatch,
+        (true, false) if into(from, to, destination) => CopyPlan::Box,
+        (false, true) if into(to, from, source) => CopyPlan::Unbox,
+        (false, false) if into(from, to, destination) => CopyPlan::Move,
+        (false, false)
+            if module.is_subtype(to, from)
+                || is_interface_handle(module, source)
+                || is_interface_handle(module, destination) =>
+        {
+            CopyPlan::Cast
+        }
+        _ => CopyPlan::Mismatch,
+    }
+}
+
+/// Stores one element of a [`CopyPlan`] copy: `value` read from `source_array`, bound for an array
+/// whose element type is `destination` (an asm-folded handle).
+///
+/// # Errors
+/// [`Trap::Refused`] with InvalidCastException when the element cannot be stored.
+fn copy_element(
+    vm: &mut Vm,
+    module: &Module,
+    plan: CopyPlan,
+    source_array: ObjectRef,
+    destination: u64,
+    value: Value,
+) -> Result<Value, Trap> {
+    let cannot_cast = || Trap::Refused(RefusedWith::InvalidCast, Cow::Borrowed(COPY_CANNOT_CAST));
+    let asm = (destination >> 32) as u8;
+    let token = lamella_token::Token(destination as u32);
+    Ok(match plan {
+        CopyPlan::Widen(from, to) => widen_value(from, to, &value).ok_or_else(cannot_cast)?,
+        CopyPlan::Box => match value {
+            reference @ (Value::Object(_) | Value::Null) => reference,
+            value => box_array_element(vm, module, source_array, value),
+        },
+        CopyPlan::Unbox => {
+            if let Some(underlying) = crate::interp::nullable_underlying_of(module, asm, token) {
+                crate::interp::nullable_from_boxed(module, vm, asm, token, underlying, &value)
+                    .ok_or_else(cannot_cast)?
+            } else {
+                let Value::Object(reference) = value else {
+                    return Err(cannot_cast());
+                };
+                vm.heap()
+                    .boxed_type_token(reference)
+                    .filter(|&tag| crate::interp::boxed_is_underlying(module, tag, destination))
+                    .and_then(|_| vm.heap().boxed_value(reference))
+                    .ok_or_else(cannot_cast)?
+            }
+        }
+        CopyPlan::Cast => {
+            if !matches!(value, Value::Null)
+                && !crate::interp::cast_matches(module, asm, vm, &value, token)
+            {
+                return Err(cannot_cast());
+            }
+            value
+        }
+        CopyPlan::Move | CopyPlan::Decline | CopyPlan::Mismatch => value,
+    })
+}
+
+/// The primitive the element type `handle` names, for the array element rules: its own kind, or
+/// an enum's underlying kind when `enum_as_underlying`. `None` for any other type.
+fn element_prim(module: &Module, handle: u64, enum_as_underlying: bool) -> Option<CastPrim> {
+    if let Some(underlying) = module.enum_underlying_prim_by_handle(handle) {
+        return enum_as_underlying.then_some(underlying);
+    }
+    match module.cast_elem(handle) {
+        Some(CastElem::Prim(prim)) => Some(prim),
+        _ => None,
+    }
+}
+
+/// Whether the element type `handle` names is a value type, or `None` when the module cannot say.
+fn element_is_value_type(module: &Module, handle: u64) -> Option<bool> {
+    match module.cast_elem(handle) {
+        Some(CastElem::Prim(_) | CastElem::GenericValueType) => return Some(true),
+        Some(
+            CastElem::String | CastElem::Object | CastElem::Array(_) | CastElem::VectorInterface(_),
+        ) => return Some(false),
+        _ => {}
+    }
+    module
+        .type_id_by_handle(handle)
+        .map(|type_id| module.type_is_value_type(type_id))
+}
+
+/// Whether the asm-folded type handle names `System.Object`.
+fn is_object_handle(module: &Module, handle: u64) -> bool {
+    module.is_object_type_token((handle >> 32) as u8, lamella_token::Token(handle as u32))
+}
+
+/// Whether the asm-folded type handle names an interface.
+fn is_interface_handle(module: &Module, handle: u64) -> bool {
+    module
+        .reflect_type(handle)
+        .is_some_and(|reflect| reflect.is_interface)
+}
+
+/// Whether two primitives are the same except for signedness, so an element moves between them as
+/// its bits: `sbyte`/`byte`, `short`/`ushort`, `int`/`uint`, `long`/`ulong`, and the native pair.
+/// `bool` and `char` pair with nothing but themselves.
+fn same_bits(a: CastPrim, b: CastPrim) -> bool {
+    use CastPrim::{I, I1, I2, I4, I8, U, U1, U2, U4, U8};
+    a == b
+        || matches!(
+            (a, b),
+            (I1, U1) | (U1, I1) | (I2, U2) | (U2, I2) | (I4, U4) | (U4, I4) | (I8, U8) | (U8, I8)
+                | (I, U) | (U, I)
+        )
+}
+
+/// Whether a value of primitive `from` widens to primitive `to` without loss, the table
+/// `Array.SetValue` and `Array.Copy` share (measured on .NET 8 for every pair of the twelve numeric
+/// primitives; `IntPtr` and `UIntPtr` widen to nothing but themselves).
+fn widens(from: CastPrim, to: CastPrim) -> bool {
+    const WIDENS: [u16; 14] = [
+        0b00_0000_0000_0001, // Bool
+        0b00_1111_1110_0010, // Char -> U2 I4 U4 I8 U8 F4 F8
+        0b00_1101_0101_0100, // I1 -> I2 I4 I8 F4 F8
+        0b00_1111_1111_1010, // U1 -> Char I2 U2 I4 U4 I8 U8 F4 F8
+        0b00_1101_0101_0000, // I2 -> I4 I8 F4 F8
+        0b00_1111_1110_0010, // U2 -> Char I4 U4 I8 U8 F4 F8
+        0b00_1101_0100_0000, // I4 -> I8 F4 F8
+        0b00_1111_1000_0000, // U4 -> I8 U8 F4 F8
+        0b00_1101_0000_0000, // I8 -> F4 F8
+        0b00_1110_0000_0000, // U8 -> F4 F8
+        0b00_1100_0000_0000, // F4 -> F8
+        0b00_1000_0000_0000, // F8
+        0b01_0000_0000_0000, // I
+        0b10_0000_0000_0000, // U
+    ];
+    let row = from as usize - CastPrim::Bool as usize;
+    let bit = to as usize - CastPrim::Bool as usize;
+    WIDENS[row] & (1 << bit) != 0
+}
+
+/// `value`, a primitive of kind `from`, as the stack value of the wider kind `to`; `None` when the
+/// value does not have `from`'s shape or `to` has no stack value in this build.
+fn widen_value(from: CastPrim, to: CastPrim, value: &Value) -> Option<Value> {
+    use CastPrim::{Char, I2, I4, I8, U2, U4, U8};
+    #[cfg(feature = "float")]
+    if from == CastPrim::F4 {
+        let Value::Single(single) = value else {
+            return None;
+        };
+        return (to == CastPrim::F8).then(|| Value::Float(f64::from(*single)));
+    }
+    #[cfg(feature = "float")]
+    if from == U8 {
+        let Value::Int64(bits) = value else {
+            return None;
+        };
+        let unsigned = *bits as u64;
+        return match to {
+            CastPrim::F4 => Some(Value::Single(unsigned as f32)),
+            CastPrim::F8 => Some(Value::Float(unsigned as f64)),
+            _ => None,
+        };
+    }
+    let integer: i64 = match (from, value) {
+        (U4, Value::Int32(bits)) => i64::from(*bits as u32),
+        (_, Value::Int32(n)) => i64::from(*n),
+        (_, Value::Int64(n)) => *n,
+        _ => return None,
+    };
+    match to {
+        Char | I2 | U2 | I4 | U4 => Some(Value::Int32(integer as i32)),
+        I8 | U8 => Some(Value::Int64(integer)),
+        #[cfg(feature = "float")]
+        CastPrim::F4 => Some(Value::Single(integer as f32)),
+        #[cfg(feature = "float")]
+        CastPrim::F8 => Some(Value::Float(integer as f64)),
+        _ => None,
+    }
 }
 
 /// `Environment.get_TickCount()`: the monotonic millisecond count as `int` (the host clock seam),
@@ -7748,13 +8136,16 @@ pub fn method_invoke(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
 }
 
 /// `System.Activator.CreateInstance(Type type)`: allocates an instance of `type` (fields
-/// zero-initialized) and runs its parameterless constructor, returning the new object -- the
-/// reflection analogue of `newobj` of a default constructor. Collection is suspended across the
-/// allocation + constructor run so the fresh instance (held only in a Rust local) is not relocated.
+/// zero-initialized) and runs its public parameterless constructor, returning the new object -- the
+/// reflection analogue of `newobj` of a default constructor. A value type needs no constructor, so
+/// its answer is the box of its zero. Collection is suspended across the allocation + constructor
+/// run so the fresh instance (held only in a Rust local) is not relocated.
 ///
 /// # Errors
-/// [`Trap::TypeMismatch`] if the argument is not a type handle with a recorded layout; propagates a
-/// [`Trap`] from running the constructor.
+/// [`Trap::TypeMismatch`] if the argument is not a type handle with a recorded layout;
+/// [`Trap::Refused`] with `MissingMethodException` and .NET's message, before any constructor runs,
+/// for an interface, an abstract class, and a class with no public parameterless constructor;
+/// propagates a [`Trap`] from running the constructor.
 #[cfg(feature = "reflection")]
 pub fn activator_create_instance(
     vm: &mut Vm,
@@ -7768,25 +8159,53 @@ pub fn activator_create_instance(
     let type_id = module
         .type_id_by_handle(handle)
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+    if module.type_is_value_type(type_id) {
+        let zero = crate::interp::zero_of_type(module, Some(type_id), handle);
+        return Ok(Some(Value::Object(vm.heap_mut().alloc_boxed(handle, zero))));
+    }
+    let is_abstract = module.reflect_type(handle).is_some_and(|kind| kind.is_abstract);
+    let Some(ctor) = module.type_ctor(handle).filter(|_| !is_abstract) else {
+        return Err(activator_refusal(module, type_id, handle));
+    };
     let defaults = module
         .type_field_defaults(type_id)
         .unwrap_or_default();
     #[cfg(feature = "gc")]
     vm.suspend_collection();
     let instance = vm.heap_mut().alloc_instance(type_id, defaults);
-    let outcome = match module.type_ctor(handle) {
-        Some(ctor) => {
-            let mut ctor_args = Vec::with_capacity(1);
-            ctor_args.push(Value::Object(instance));
-            Session::new(module, ctor, ctor_args)
-                .and_then(|mut session| session.run(module, vm))
-                .map(|_| ())
-        }
-        None => Ok(()),
-    };
+    let outcome = Session::new(module, ctor, alloc::vec![Value::Object(instance)])
+        .and_then(|mut session| session.run(module, vm));
     #[cfg(feature = "gc")]
     vm.resume_collection();
-    outcome.map(|()| Some(Value::Object(instance)))
+    outcome.map(|_| Some(Value::Object(instance)))
+}
+
+/// Why `Activator.CreateInstance` cannot construct the class `type_id`, as .NET says it: an
+/// interface, an abstract class, a class whose parameterless constructor is not public, or one with
+/// none at all.
+///
+#[cfg(feature = "reflection")]
+fn activator_refusal(module: &Module, type_id: TypeId, handle: u64) -> Trap {
+    let name = module.type_full_name(type_id).unwrap_or("<unknown>");
+    let kind = module.reflect_type(handle);
+    let reason = if kind.as_ref().is_some_and(|kind| kind.is_interface) {
+        "Cannot create an instance of an interface."
+    } else if kind.as_ref().is_some_and(|kind| kind.is_abstract) {
+        "Cannot create an abstract class."
+    } else if module.type_ctors_list(handle).iter().any(|&(_, arity)| arity == 0) {
+        return Trap::Refused(
+            RefusedWith::MissingMethod,
+            Cow::Owned(alloc::format!("No parameterless constructor defined for type '{name}'.")),
+        );
+    } else {
+        "No parameterless constructor defined."
+    };
+    Trap::Refused(
+        RefusedWith::MissingMethod,
+        Cow::Owned(alloc::format!(
+            "Cannot dynamically create an instance of type '{name}'. Reason: {reason}"
+        )),
+    )
 }
 
 /// `System.Type.GetConstructor(Type[])`: the instance constructor whose parameter count matches the
@@ -8320,8 +8739,9 @@ pub fn array_rank(
 }
 
 /// `System.Array.GetValue(int)`: the element at `index` as an `object`. A reference
-/// element (or null) is returned as-is; a value-type element is boxed (III.4.1), so the
-/// untyped accessor always yields an object reference, matching .NET.
+/// element (or null) is returned as-is; a value-type element is boxed as the array's ELEMENT
+/// type (III.4.1), so a `byte[]` element answers `GetType()`, `is` and `Equals` as a `Byte`
+/// and a `Nullable<T>` element boxes as its `T`, or is null when it has no value, matching .NET.
 ///
 /// # Errors
 /// [`Trap::NullReference`] for a null array; [`Trap::IndexOutOfRange`] if `index` is out
@@ -8343,24 +8763,59 @@ pub fn array_get_value(
         .ok_or(Trap::IndexOutOfRange(index))?;
     let boxed = match element {
         reference @ (Value::Object(_) | Value::Null) => reference,
-        value => {
-            let token = module.primitive_type_token(&value).unwrap_or(0);
-            Value::Object(vm.heap_mut().alloc_boxed(token, value))
-        }
+        value => box_array_element(vm, module, array, value),
     };
     Ok(Some(boxed))
 }
 
-/// `System.Array.SetValue(object value, int index)`: stores `value` at `index`. A
-/// reference-element array stores the reference directly; a value-type-element array
-/// unboxes `value` first (III.4.1), recovering the value-type value from its box.
+/// Boxes a value-type `value` read out of `array` as the array's element type: tagged with that
+/// type's canonical handle, so the box has the element type's identity. A `Nullable<T>` element
+/// boxes as its `T`, or is null when it has no value (III.4.1).
+///
+fn box_array_element(vm: &mut Vm, module: &Module, array: ObjectRef, value: Value) -> Value {
+    let element_type = vm.heap().array_element_type(array).unwrap_or(0);
+    if let Some(type_id) = (element_type != 0)
+        .then(|| module.type_id_by_handle(element_type))
+        .flatten()
+    {
+        let asm = (element_type >> 32) as u8;
+        let token = lamella_token::Token(element_type as u32);
+        if let Some(underlying) = crate::interp::nullable_underlying_of(module, asm, token) {
+            let underlying = module.canonical_type_handle(underlying).unwrap_or(underlying);
+            return match value {
+                Value::Struct(fields) if matches!(fields.first(), Some(Value::Int32(0))) => Value::Null,
+                Value::Struct(fields) => match fields.get(1) {
+                    Some(inner) => Value::Object(vm.heap_mut().alloc_boxed(underlying, inner.clone())),
+                    None => Value::Null,
+                },
+                other => Value::Object(vm.heap_mut().alloc_boxed(underlying, other)),
+            };
+        }
+        let tag = module.type_handle_of(type_id).unwrap_or(element_type);
+        return Value::Object(vm.heap_mut().alloc_boxed(tag, value));
+    }
+    let token = module.primitive_type_token(&value).unwrap_or(0);
+    Value::Object(vm.heap_mut().alloc_boxed(token, value))
+}
+
+/// `System.Array.SetValue(object value, int index)`: stores `value` at `index`, or refuses it the way
+/// .NET does. The index is checked first; then the array's ELEMENT type decides:
+/// - a reference element takes null, or any reference its type admits;
+/// - a `Nullable<T>` element takes null (no value) or a box of exactly `T`;
+/// - any other value-type element takes null as its zero, or a box of exactly its own type, and a
+///   PRIMITIVE element also takes a primitive -- or an enum, as its underlying type -- that widens
+///   to it, converted.
+///
+/// A primitive that does not widen raises `ArgumentException`; every other refused value raises
+/// `InvalidCastException`, each with .NET's message.
+///
 ///
 /// # Errors
-/// [`Trap::NullReference`] for a null array; [`Trap::IndexOutOfRange`] if `index` is out
-/// of range; [`Trap::TypeMismatch`] if a value-type array's `value` is not a box.
+/// [`Trap::NullReference`] for a null array; [`Trap::IndexOutOfRange`] if `index` is out of
+/// range; [`Trap::Refused`] for a value the element type neither is nor converts from.
 pub fn array_set_value(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let Some(&Value::Object(array)) = args.first() else {
@@ -8375,21 +8830,88 @@ pub fn array_set_value(
         .heap()
         .array_get(array, slot)
         .ok_or(Trap::IndexOutOfRange(index))?;
-    let to_store = match current {
-        Value::Object(_) | Value::Null => value,
-        _ => match value {
-            Value::Object(boxed) => vm
-                .heap()
-                .boxed_value(boxed)
-                .ok_or(Trap::TypeMismatch(Opcode::Call))?,
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        },
-    };
+    let element = vm.heap().array_element_type(array).unwrap_or(0);
+    let to_store = store_value(vm, module, element, &current, value)?;
     if vm.heap_mut().array_set(array, slot, to_store) {
         Ok(None)
     } else {
         Err(Trap::IndexOutOfRange(index))
     }
+}
+
+/// .NET's message when `Array.SetValue` refuses a value.
+const STORE_CANNOT_CAST: &str = "Object cannot be stored in an array of this type.";
+
+/// .NET's message when `Array.SetValue` refuses a primitive that does not widen to the element.
+const STORE_CANNOT_WIDEN: &str = "Cannot widen from source type to target type either because the source type is a not a primitive type or the conversion cannot be accomplished.";
+
+/// The value [`array_set_value`] stores for `value` in an array whose element type is `element`
+/// (an asm-folded handle, `0` when the array records none) and whose target slot holds `current`.
+///
+/// # Errors
+/// [`Trap::Refused`] when the element type refuses `value`.
+fn store_value(
+    vm: &mut Vm,
+    module: &Module,
+    element: u64,
+    current: &Value,
+    value: Value,
+) -> Result<Value, Trap> {
+    let cannot_cast = || Trap::Refused(RefusedWith::InvalidCast, Cow::Borrowed(STORE_CANNOT_CAST));
+    let asm = (element >> 32) as u8;
+    let token = lamella_token::Token(element as u32);
+    if matches!(current, Value::Object(_) | Value::Null) {
+        return match value {
+            Value::Null => Ok(Value::Null),
+            value
+                if element == 0
+                    || is_object_handle(module, element)
+                    || crate::interp::cast_matches(module, asm, vm, &value, token) =>
+            {
+                Ok(value)
+            }
+            _ => Err(cannot_cast()),
+        };
+    }
+    if value == Value::Null {
+        if element != 0 {
+            if let Some(underlying) = crate::interp::nullable_underlying_of(module, asm, token) {
+                return crate::interp::nullable_from_boxed(module, vm, asm, token, underlying, &value)
+                    .ok_or_else(cannot_cast);
+            }
+        }
+        return Ok(crate::object::zeroed_value(current));
+    }
+    let Value::Object(reference) = value else {
+        return Err(cannot_cast());
+    };
+    let Some(tag) = vm.heap().boxed_type_token(reference) else {
+        return Err(cannot_cast());
+    };
+    if element == 0 {
+        return vm.heap().boxed_value(reference).ok_or_else(cannot_cast);
+    }
+    if let Some(underlying) = crate::interp::nullable_underlying_of(module, asm, token) {
+        return crate::interp::nullable_from_boxed(module, vm, asm, token, underlying, &value)
+            .ok_or_else(cannot_cast);
+    }
+    if crate::interp::boxed_is_underlying(module, tag, element) {
+        return vm.heap().boxed_value(reference).ok_or_else(cannot_cast);
+    }
+    if let (Some(to), Some(from)) = (
+        element_prim(module, element, false),
+        element_prim(module, tag, true),
+    ) {
+        let boxed = vm.heap().boxed_value(reference).ok_or_else(cannot_cast)?;
+        return if from == to {
+            Ok(boxed)
+        } else if widens(from, to) {
+            widen_value(from, to, &boxed).ok_or_else(cannot_cast)
+        } else {
+            Err(Trap::Refused(RefusedWith::Argument, Cow::Borrowed(STORE_CANNOT_WIDEN)))
+        };
+    }
+    Err(cannot_cast())
 }
 
 /// `System.Array.Clone()` (the `ICloneable.Clone` implementation): a SHALLOW copy -- a new
@@ -8733,6 +9255,35 @@ mod tests {
     use alloc::vec;
     use lamella_cil::{Instruction, MethodBodyImage, Operand};
     use lamella_token::Token;
+
+    /// The bit table in [`widens`] answers exactly the relation it encodes -- the widening .NET 8
+    /// applies to Array.SetValue and Array.Copy, measured for every pair of the twelve numeric
+    /// primitives -- for all fourteen kinds, both ends included.
+    #[test]
+    fn widens_is_dotnets_widening_relation() {
+        use CastPrim::{Bool, Char, F4, F8, I, I1, I2, I4, I8, U, U1, U2, U4, U8};
+        let expected = |from: CastPrim, to: CastPrim| {
+            from == to
+                || match from {
+                    Char => matches!(to, U2 | I4 | U4 | I8 | U8 | F4 | F8),
+                    I1 => matches!(to, I2 | I4 | I8 | F4 | F8),
+                    U1 => matches!(to, Char | I2 | U2 | I4 | U4 | I8 | U8 | F4 | F8),
+                    I2 => matches!(to, I4 | I8 | F4 | F8),
+                    U2 => matches!(to, Char | I4 | U4 | I8 | U8 | F4 | F8),
+                    I4 => matches!(to, I8 | F4 | F8),
+                    U4 => matches!(to, I8 | U8 | F4 | F8),
+                    I8 | U8 => matches!(to, F4 | F8),
+                    F4 => matches!(to, F8),
+                    Bool | F8 | I | U => false,
+                }
+        };
+        let kinds = [Bool, Char, I1, U1, I2, U2, I4, U4, I8, U8, F4, F8, I, U];
+        for from in kinds {
+            for to in kinds {
+                assert_eq!(widens(from, to), expected(from, to), "{from:?} -> {to:?}");
+            }
+        }
+    }
 
     /// `Type.IsAssignableFrom` -- the only one of the five BCL-baseline members that carries real
     /// logic rather than a type-model constant, so it is the one that can be wrong. Partition IV gives three true-cases and one false-case and each
@@ -9449,6 +10000,21 @@ pub fn value_type_get_hash_code(
     Ok(Some(Value::Int32(hash)))
 }
 
+/// FNV-1a's offset basis, the start of every fold [`fnv_mix`] continues.
+const FNV_OFFSET: u32 = 2_166_136_261;
+
+/// Folds `part`'s four bytes into an FNV-1a `accumulator`: order-sensitive, cheap, and no table.
+/// The field-wise value-type hash and the delegate hash share it.
+fn fnv_mix(accumulator: u32, part: i32) -> u32 {
+    const PRIME: u32 = 16_777_619;
+    let mut hash = accumulator;
+    for byte in (part as u32).to_le_bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// The field-wise hash behind [`value_type_get_hash_code`], mirroring [`struct_fields_equal`].
 ///
 /// # A reference field contributes its IDENTITY hash, and that is why this takes the heap mutably
@@ -9459,29 +10025,19 @@ pub fn value_type_get_hash_code(
 /// collection, which compacts: a struct holding a reference would then hash differently before and
 /// after a GC, breaking the one property `GetHashCode` exists to guarantee.
 fn struct_fields_hash(vm: &mut Vm, value: &Value) -> i32 {
-    const OFFSET: u32 = 2_166_136_261;
-    const PRIME: u32 = 16_777_619;
-    fn mix(accumulator: u32, part: i32) -> u32 {
-        let mut hash = accumulator;
-        for byte in (part as u32).to_le_bytes() {
-            hash ^= u32::from(byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
-        hash
-    }
     match value {
         Value::Struct(fields) => {
-            let mut hash = OFFSET;
+            let mut hash = FNV_OFFSET;
             for field in fields.iter() {
-                hash = mix(hash, struct_fields_hash(vm, field));
+                hash = fnv_mix(hash, struct_fields_hash(vm, field));
             }
             hash as i32
         }
         Value::Object(reference) => {
             let as_characters = vm.heap().as_string(*reference).map(|text| {
-                let mut hash = OFFSET;
+                let mut hash = FNV_OFFSET;
                 for unit in text.iter() {
-                    hash = mix(hash, i32::from(*unit));
+                    hash = fnv_mix(hash, i32::from(*unit));
                 }
                 hash as i32
             });

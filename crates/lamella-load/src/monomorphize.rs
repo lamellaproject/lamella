@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use lamella_cil::Opcode;
-use lamella_cil_runtime::module::RawCil;
+use lamella_cil_runtime::module::{IntrinsicType, RawCil};
 use lamella_cil_runtime::{MethodId, Module, TypeId, Value};
 use lamella_metadata::{Assembly, SigType};
 use lamella_token::Token;
@@ -16,7 +16,7 @@ use super::{
     FIELD, FieldNameIndex, MEMBER_REF, METHOD_DEF, METHOD_SPEC, TYPE_DEF, TYPE_REF, TYPE_SPEC,
     TypeNameIndex,
     arg_count, cast_elem_of_sig, default_field_value, is_special_reference_base,
-    type_key, type_name_key,
+    type_index_key, type_key,
 };
 
 /// The metadata table id the rewritten tokens live in.
@@ -92,7 +92,23 @@ pub fn collect_instantiations<'pe>(
     assemblies.push(program.clone());
     assemblies.extend(references.iter().cloned());
     let walk = lamella_generics::Program::new(&assemblies);
-    let Ok(closed) = walk.instantiations() else {
+    let servers: Vec<(&str, &str)> = VECTOR_INTERFACES
+        .iter()
+        .copied()
+        .filter(|&(_, server)| references_define(references, server))
+        .collect();
+    let derive = |found: &lamella_generics::Instantiation| -> Vec<lamella_generics::TypeArg> {
+        servers
+            .iter()
+            .filter(|&&(interface, _)| found.definition.as_ref() == interface)
+            .map(|&(_, server)| lamella_generics::TypeArg::Instance {
+                definition: server.into(),
+                value_type: false,
+                arguments: found.arguments.clone(),
+            })
+            .collect()
+    };
+    let Ok(closed) = walk.instantiations_deriving(&derive) else {
         return Vec::new();
     };
 
@@ -125,7 +141,7 @@ pub fn collect_instantiations<'pe>(
         rows.push((name, parts));
     }
 
-    closed
+    let found = closed
         .into_iter()
         .filter_map(|found| {
             let (definition, arguments) = match rows
@@ -145,7 +161,76 @@ pub fn collect_instantiations<'pe>(
                 name: found.name.into_string(),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    with_vector_servers(found, &servers)
+}
+
+/// The generic interfaces a vector implements at its element type (ECMA-335 I.8.9.1) that the
+/// loader routes, and the corlib types whose statics serve their members.
+pub(crate) const VECTOR_ENUMERABLE: &str = "System.Collections.Generic.IEnumerable`1";
+pub(crate) const VECTOR_COLLECTION: &str = "System.Collections.Generic.ICollection`1";
+pub(crate) const VECTOR_READ_ONLY_COLLECTION: &str = "System.Collections.Generic.IReadOnlyCollection`1";
+pub(crate) const VECTOR_ENUMERATOR: &str = "System.SZGenericArrayEnumerator`1";
+pub(crate) const VECTOR_HELPER: &str = "System.SZArrayHelper`1";
+
+/// Each routed vector interface, with the corlib type that serves its members at the same element
+/// type: the enumerator for `IEnumerable<X>`, whose `Of` hands one out, and the helper for the
+/// collection interfaces, whose statics are named after the members they serve.
+pub(crate) const VECTOR_INTERFACES: &[(&str, &str)] = &[
+    (VECTOR_ENUMERABLE, VECTOR_ENUMERATOR),
+    (VECTOR_COLLECTION, VECTOR_HELPER),
+    (VECTOR_READ_ONLY_COLLECTION, VECTOR_HELPER),
+];
+
+/// Whether `definition` is a vector interface of [`VECTOR_INTERFACES`].
+pub(crate) fn is_vector_interface(definition: &str) -> bool {
+    VECTOR_INTERFACES.iter().any(|&(interface, _)| interface == definition)
+}
+
+/// The static of `server` that serves the interface member `member`: the enumerator serves its one
+/// member, `GetEnumerator`, with `Of`; the helper's statics carry the members' own names.
+fn serving_static<'a>(server: &str, member: &'a str) -> &'a str {
+    if server == VECTOR_ENUMERATOR { "Of" } else { member }
+}
+
+/// Whether a reference assembly defines the type named `name`.
+#[cfg(feature = "generics")]
+fn references_define(references: &[Assembly<'_>], name: &str) -> bool {
+    references.iter().any(|assembly| {
+        assembly.type_defs().any(|type_def| {
+            lamella_generics::type_def_full_name(assembly, type_def.token()).as_deref() == Some(name)
+        })
+    })
+}
+
+/// `found` and, for each vector interface at X in it, the corlib type that serves its members at X
+/// (`servers`, the pairs of [`VECTOR_INTERFACES`] whose server a reference defines). The walk finds
+/// them as derived roots; this is where each gets its row when no `TypeSpec` names it and the walk's
+/// own arguments did not express, built from the interface's row, whose arguments it shares.
+#[cfg(feature = "generics")]
+fn with_vector_servers(mut found: Vec<Instantiation>, servers: &[(&str, &str)]) -> Vec<Instantiation> {
+    let derived: Vec<Instantiation> = found
+        .iter()
+        .flat_map(|instantiation| {
+            servers
+                .iter()
+                .filter(move |&&(interface, _)| instantiation.definition == interface)
+                .filter_map(move |&(interface, server)| {
+                    let rest = instantiation.name.strip_prefix(interface)?;
+                    Some(Instantiation {
+                        definition: String::from(server),
+                        arguments: instantiation.arguments.clone(),
+                        name: alloc::format!("{server}{rest}"),
+                    })
+                })
+        })
+        .collect();
+    for server in derived {
+        if !found.iter().any(|instantiation| instantiation.name == server.name) {
+            found.push(server);
+        }
+    }
+    found
 }
 
 /// The walk's decoded arguments as THIS assembly's signatures: a payload-free element byte carries
@@ -512,6 +597,18 @@ pub enum Refusal {
         /// The method's name.
         method: String,
     },
+    /// An interface member the instantiation implements neither EXPLICITLY nor with a VIRTUAL
+    /// method, while the instantiation declares a NON-virtual method under the member's name and
+    /// parameters. A call through the interface would reach that method by its key, and ECMA-335
+    /// II.12.2 lets only a virtual method implement an interface member, so it is never the right
+    /// answer: `Dictionary<int,string>`'s public `GetEnumerator` returns the enumerator STRUCT where
+    /// `IEnumerable.GetEnumerator` returns it boxed. The binding is made anyway; this names it.
+    InterfaceMemberFallsToNonVirtual {
+        /// The instantiation's canonical name.
+        instantiation: String,
+        /// The interface member, as `Interface::Name`.
+        member: String,
+    },
 }
 
 impl fmt::Display for Refusal {
@@ -565,6 +662,9 @@ impl fmt::Display for Refusal {
             Refusal::VirtualGenericBodyNotEmitted { token, method } => {
                 write!(formatter, "the VIRTUAL generic method `{method}` at token 0x{token:08X} had an override whose body did not emit, and a site that dispatched a derived receiver to a base body would be worse than a refusal")
             }
+            Refusal::InterfaceMemberFallsToNonVirtual { instantiation, member } => {
+                write!(formatter, "`{instantiation}` implements the interface member `{member}` neither explicitly nor with a virtual method, and a call through the interface would reach its NON-virtual method of the same name and parameters -- a wrong answer rather than a refusal")
+            }
             Refusal::VirtualGenericDispatchDiverged { token, method } => {
                 write!(formatter, "the VIRTUAL generic method `{method}` at token 0x{token:08X} lowered a body no loaded type dispatches to, so the override closure and the load's own hierarchy disagree -- a defect rather than a limit")
             }
@@ -579,6 +679,11 @@ pub struct Lowering {
     /// Everything it refused. Empty means every instantiation in the set now has a type identity
     /// and every call site that reaches one is bound.
     pub refusals: Vec<Refusal>,
+    /// Each generic definition whose bodies it copied, as (the declaring assembly's id, its
+    /// `TypeDef` row), once each. A copy keeps each token its substitution did not rewrite and relies
+    /// on that token already being bound, so a caller that resolved the DEFINING assembly lazily has
+    /// to materialize what those bodies reach itself.
+    pub copied_definitions: Vec<(u8, u32)>,
 }
 
 /// One instantiation, after its type identity exists but before its bodies do.
@@ -646,6 +751,7 @@ pub(crate) fn monomorphize<'pe>(
     let mut lowering = Lowering {
         types: Vec::new(),
         refusals: Vec::new(),
+        copied_definitions: Vec::new(),
     };
 
     let mut definition_rows: BTreeMap<String, (usize, u32)> = BTreeMap::new();
@@ -699,6 +805,7 @@ pub(crate) fn monomorphize<'pe>(
             let extends = source.assembly.type_def(entry.def_row)?.extends();
             instantiation_of_spec(
                 &source.assembly,
+                &sources[PROGRAM_SOURCE].assembly,
                 extends,
                 &instantiations[*index].arguments,
                 instantiations,
@@ -819,6 +926,7 @@ pub(crate) fn monomorphize<'pe>(
             let interface_id = if token.table() == TYPE_SPEC {
                 instantiation_of_spec(
                     assembly,
+                    &sources[PROGRAM_SOURCE].assembly,
                     token,
                     &want.arguments,
                     instantiations,
@@ -826,9 +934,7 @@ pub(crate) fn monomorphize<'pe>(
                 )
             } else {
                 module.type_id_of(asm, token).or_else(|| {
-                    assembly
-                        .type_token_name(token)
-                        .and_then(|name| type_index.get(&type_name_key(name)).copied())
+                    type_index_key(assembly, token).and_then(|key| type_index.get(&key).copied())
                 })
             };
             if let Some(interface_id) = interface_id {
@@ -837,6 +943,42 @@ pub(crate) fn monomorphize<'pe>(
         }
         if !resolved.is_empty() {
             module.set_type_interfaces(entry.type_id, resolved);
+        }
+    }
+
+    for source in sources {
+        let assembly = &source.assembly;
+        let generic_definitions = super::generic_definition_rows(assembly);
+        let mut row = 0u32;
+        for type_def in assembly.type_defs() {
+            row += 1;
+            if generic_definitions.contains(&row) {
+                continue;
+            }
+            let constructed: Vec<TypeId> = type_def
+                .interfaces()
+                .filter(|token| token.table() == TYPE_SPEC)
+                .filter_map(|token| {
+                    instantiation_of_spec(
+                        assembly,
+                        &sources[PROGRAM_SOURCE].assembly,
+                        token,
+                        &[],
+                        instantiations,
+                        &emitted,
+                    )
+                })
+                .collect();
+            if constructed.is_empty() {
+                continue;
+            }
+            let type_id = match source.type_offset {
+                Some(offset) => Some((offset + row as usize - 1) as TypeId),
+                None => module.type_id_of(source.asm, Token::new(TYPE_DEF, row)),
+            };
+            if let Some(type_id) = type_id {
+                module.add_type_interfaces(type_id, &constructed);
+            }
         }
     }
 
@@ -890,6 +1032,9 @@ pub(crate) fn monomorphize<'pe>(
             if method.name == ".cctor" {
                 module.add_static_ctor(id);
             }
+            if super::overrides_finalize(&method.name, method.arg_count, method.is_virtual, method.newslot) {
+                module.set_finalizer(type_id, id);
+            }
             #[cfg(feature = "debug-names")]
             module.set_method_debug(
                 id,
@@ -902,6 +1047,14 @@ pub(crate) fn monomorphize<'pe>(
         emitted[position].1.methods = ids;
         plans.push(method_plans);
     }
+
+    let explicit = index_explicit_implementations(
+        module,
+        sources,
+        instantiations,
+        &emitted,
+        &definition_methods,
+    );
 
     let mut withdrawn: Vec<(usize, usize)> = Vec::new();
     for position in 0..emitted.len() {
@@ -963,6 +1116,7 @@ pub(crate) fn monomorphize<'pe>(
                     site,
                     synthetic,
                     &mut deferred,
+                    &explicit,
                 ) {
                     Ok(()) => {
                         let at = site.operand_at;
@@ -983,6 +1137,12 @@ pub(crate) fn monomorphize<'pe>(
     }
     for (position, method_position) in withdrawn {
         emitted[position].1.methods[method_position] = None;
+    }
+    for (_, entry) in &emitted {
+        let definition = (sources[entry.source].asm, entry.def_row);
+        if !lowering.copied_definitions.contains(&definition) {
+            lowering.copied_definitions.push(definition);
+        }
     }
 
     for position in &order {
@@ -1008,6 +1168,7 @@ pub(crate) fn monomorphize<'pe>(
             };
             let Some(key) = substituted_sig_key(
                 assembly,
+                &sources[PROGRAM_SOURCE].assembly,
                 &method.name,
                 &method.params,
                 &want.arguments,
@@ -1057,6 +1218,18 @@ pub(crate) fn monomorphize<'pe>(
                 nonvirtuals.insert(key, id);
             }
         }
+        flag_interface_fallbacks(
+            entry,
+            want,
+            sources,
+            instantiations,
+            &emitted,
+            &definition_methods,
+            &explicit,
+            &virtuals,
+            &nonvirtuals,
+            &mut lowering,
+        );
         module.set_vtable_slot_keys(entry.type_id, vtable.clone());
         if !vtable.is_empty() {
             module.set_vtable(entry.type_id, vtable.iter().map(|(_, id)| *id).collect());
@@ -1094,6 +1267,7 @@ pub(crate) fn monomorphize<'pe>(
             &emitted,
             &definition_methods,
             &mut lowering,
+            &explicit,
         );
     }
 
@@ -1111,7 +1285,9 @@ pub(crate) fn monomorphize<'pe>(
         &deferred,
         &mut next_synthetic_row,
         &mut lowering,
+        &explicit,
     );
+    register_named_interface_sites(module, sources, &explicit);
 
     for (index, entry) in &emitted {
         let Some(handle) = module.type_handle_of(entry.type_id) else {
@@ -1139,6 +1315,27 @@ pub(crate) fn monomorphize<'pe>(
                     .unwrap_or(0),
             },
         );
+        #[cfg(feature = "reflection")]
+        for (method, copy) in type_def.methods().zip(entry.methods.iter()) {
+            let Some(copy) = *copy else {
+                continue;
+            };
+            if method.name() != Some(".ctor") {
+                continue;
+            }
+            let arity = method.signature().map_or(0, |signature| signature.parameters.len());
+            let synthetic = Token::new(SYNTHETIC_TABLE, next_synthetic_row);
+            next_synthetic_row += 1;
+            module.bind_token(source.asm, synthetic, copy);
+            module.bind_type_ctor_overload(
+                handle,
+                lamella_cil_runtime::module::asm_key(source.asm, synthetic.0),
+                arity,
+            );
+            if arity == 0 && method.flags() & 0x0007 == 0x0006 {
+                module.bind_type_ctor(handle, copy);
+            }
+        }
     }
 
     lowering
@@ -1211,6 +1408,7 @@ fn lower_method_pairs<'pe>(
     _deferred: &[DeferredMethodSite],
     _next_synthetic_row: &mut u32,
     _lowering: &mut Lowering,
+    _explicit: &ExplicitIndex,
 ) {
 }
 
@@ -1276,6 +1474,7 @@ fn lower_method_pairs<'pe>(
     deferred: &[DeferredMethodSite],
     next_synthetic_row: &mut u32,
     lowering: &mut Lowering,
+    explicit: &ExplicitIndex,
 ) {
     let mut declaring_rows: Option<BTreeMap<u32, u32>> = None;
 
@@ -1469,6 +1668,7 @@ fn lower_method_pairs<'pe>(
                     site,
                     synthetic,
                     &mut Vec::new(),
+                    explicit,
                 ) {
                     Ok(()) => {
                         let at = site.operand_at;
@@ -1489,9 +1689,8 @@ fn lower_method_pairs<'pe>(
         emitted_ids[position] = Some(id);
         if let Some(type_id) = rows
             .get(&pair.def_row)
-            .and_then(|&type_row| assembly.type_def(type_row))
-            .and_then(|type_def| type_def.name())
-            .and_then(|name| type_index.get(&type_name_key(name)).copied())
+            .and_then(|&type_row| type_index_key(assembly, Token::new(TYPE_DEF, type_row)))
+            .and_then(|key| type_index.get(&key).copied())
         {
             module.set_method_type(id, type_id);
         }
@@ -2205,16 +2404,59 @@ fn relisted_dispatch_keys(assembly: &Assembly<'_>, def_row: u32) -> BTreeSet<Str
 
 fn substituted_sig_key<'pe>(
     assembly: &Assembly<'pe>,
+    arguments_from: &Assembly<'pe>,
     name: &str,
     params: &[SigType],
     arguments: &[SigType],
     generic_arity: u32,
 ) -> Option<String> {
-    let substituted: Vec<SigType> = params
+    let encoded: Vec<String> = params
         .iter()
-        .map(|param| substitute(param, arguments))
+        .map(|param| encode_across(assembly, arguments_from, param, arguments))
         .collect::<Option<_>>()?;
-    Some(super::sig_encode(assembly, name, &substituted, generic_arity, &[]))
+    Some(super::sig_encode_encoded(assembly, name, generic_arity, &encoded))
+}
+
+/// One declared parameter of a generic definition, closed under `arguments` and encoded for a
+/// dispatch key with each token named in the assembly that wrote it: the parameter's own types in
+/// `definition`, and each type parameter's argument in `arguments_from`.
+fn encode_across<'pe>(
+    definition: &Assembly<'pe>,
+    arguments_from: &Assembly<'pe>,
+    param: &SigType,
+    arguments: &[SigType],
+) -> Option<String> {
+    Some(match param {
+        SigType::Var(index) => {
+            super::encode_sig_type(arguments_from, arguments.get(*index as usize)?)
+        }
+        SigType::SzArray(element) => alloc::format!(
+            "SzArray({})",
+            encode_across(definition, arguments_from, element, arguments)?
+        ),
+        SigType::Pointer(pointee) => alloc::format!(
+            "Pointer({})",
+            encode_across(definition, arguments_from, pointee, arguments)?
+        ),
+        SigType::ByRef(referent) => alloc::format!(
+            "ByRef({})",
+            encode_across(definition, arguments_from, referent, arguments)?
+        ),
+        SigType::GenericInst {
+            definition: generic,
+            arguments: inner,
+        } => {
+            let mut key =
+                alloc::format!("GenericInst({}", super::encode_sig_type(definition, generic));
+            for argument in inner {
+                key.push(',');
+                key.push_str(&encode_across(definition, arguments_from, argument, arguments)?);
+            }
+            key.push(')');
+            key
+        }
+        other => super::encode_sig_type(definition, &substitute(other, arguments)?),
+    })
 }
 
 /// The zero value one substituted field signature takes, read in the world that wrote it.
@@ -2240,8 +2482,8 @@ fn default_field_value_substituted<'pe>(
         owner_source
     }];
     if let SigType::ValueType(token) = substituted {
-        if let Some(name) = world.assembly.type_token_name(*token) {
-            if let Some(zero) = enum_zeros.get(&type_name_key(name)) {
+        if let Some(key) = type_index_key(&world.assembly, *token) {
+            if let Some(zero) = enum_zeros.get(&key) {
                 return zero.clone();
             }
         }
@@ -2313,9 +2555,7 @@ fn base_type_of<'pe>(
             }
             None => module.type_id_of(asm, extends),
         },
-        TYPE_REF => assembly
-            .type_token_name(extends)
-            .and_then(|name| type_index.get(&type_name_key(name)).copied()),
+        TYPE_REF => type_index_key(assembly, extends).and_then(|key| type_index.get(&key).copied()),
         _ => None,
     }
 }
@@ -2332,6 +2572,7 @@ fn base_type_of<'pe>(
 #[cfg(feature = "generics")]
 fn instantiation_of_spec<'pe>(
     assembly: &Assembly<'pe>,
+    program: &Assembly<'pe>,
     token: Token,
     arguments: &[SigType],
     instantiations: &[Instantiation],
@@ -2340,10 +2581,12 @@ fn instantiation_of_spec<'pe>(
     if token.table() != TYPE_SPEC {
         return None;
     }
+    let open = assembly.type_spec_signature(token)?;
+    let spelled = spell_instantiation(assembly, program, &open, arguments);
     let SigType::GenericInst {
         definition,
         arguments: closed,
-    } = substitute(&assembly.type_spec_signature(token)?, arguments)?
+    } = substitute(&open, arguments)?
     else {
         return None;
     };
@@ -2352,7 +2595,8 @@ fn instantiation_of_spec<'pe>(
         _ => return None,
     };
     let name = definition_key(assembly, definition_token)?;
-    let target = find_instantiation(instantiations, emitted, &name, &closed)?;
+    let target =
+        find_instantiation_named(instantiations, emitted, &name, &closed, spelled.as_deref())?;
     Some(emitted[target].1.type_id)
 }
 
@@ -2360,6 +2604,7 @@ fn instantiation_of_spec<'pe>(
 #[cfg(not(feature = "generics"))]
 fn instantiation_of_spec<'pe>(
     _assembly: &Assembly<'pe>,
+    _program: &Assembly<'pe>,
     _token: Token,
     _arguments: &[SigType],
     _instantiations: &[Instantiation],
@@ -2461,12 +2706,10 @@ fn bind_nullable_underlying<'pe>(
         | SigType::R8
         | SigType::IntPtr
         | SigType::UIntPtr) => type_key("System", primitive_display_name(argument)),
-        SigType::Class(token) | SigType::ValueType(token) => {
-            match program.type_token_name(*token) {
-                Some(name) => type_name_key(name),
-                None => return,
-            }
-        }
+        SigType::Class(token) | SigType::ValueType(token) => match type_index_key(program, *token) {
+            Some(key) => key,
+            None => return,
+        },
         _ => return,
     };
     let Some(&underlying_id) = type_index.get(&key) else {
@@ -2500,6 +2743,525 @@ fn mark_value_type_newobj(
     if is_value_type && member_name == ".ctor" {
         module.mark_value_type_ctor(asm, token);
     }
+}
+
+/// Binds the call site `token` in `asm` to the method at `position` of instantiation `entry`, and
+/// answers whether anything a call through it can use was bound.
+///
+/// A call needs two halves: the token bound to the instantiation's own method id when that method
+/// has a body, and the call target bound to the method's substituted signature key in either case,
+/// so a `callvirt` reaches the receiver's implementation through its dispatch map. `definition` is
+/// the assembly that declares the definition `methods` were read from, `arguments` are the
+/// instantiation's type arguments, and `site_params` is the parameter count the site's signature
+/// declares.
+///
+#[allow(clippy::too_many_arguments)]
+fn bind_member_call<'pe>(
+    module: &mut Module,
+    asm: u8,
+    token: Token,
+    entry: &Emitted,
+    methods: &[DefMethod<'pe>],
+    position: usize,
+    definition: &Assembly<'pe>,
+    arguments_from: &Assembly<'pe>,
+    arguments: &[SigType],
+    site_params: usize,
+    explicit: &ExplicitIndex,
+) -> bool {
+    let method = &methods[position];
+    if matches!(method.name.as_str(), "Invoke" | ".ctor")
+        && definition
+            .type_def(entry.def_row)
+            .is_some_and(|type_def| super::is_delegate_type(definition, type_def.extends()))
+    {
+        if method.name == "Invoke" {
+            let count = u16::try_from(site_params).unwrap_or(u16::MAX);
+            module.mark_delegate_invoke(asm, token, count);
+        } else {
+            module.mark_delegate_ctor(asm, token, Some(entry.type_id));
+        }
+        return true;
+    }
+    let id = match entry.methods.get(position).copied().flatten() {
+        Some(id) => Some(id),
+        None if method.raw.is_none() => None,
+        None => return false,
+    };
+    if let Some(id) = id {
+        module.bind_token(asm, token, id);
+        mark_value_type_newobj(module, asm, token, &method.name, entry.is_value_type);
+    }
+    let key = substituted_sig_key(
+        definition,
+        arguments_from,
+        &method.name,
+        &method.params,
+        arguments,
+        method.generic_arity,
+    );
+    if let Some(key) = &key {
+        let count = u16::try_from(site_params + 1).unwrap_or(u16::MAX);
+        module.bind_call_target(asm, token, key.clone(), count);
+    }
+    if id.is_none() {
+        let member = ImplementedMember::Instantiated(entry.type_id, position);
+        for &(implementer, body) in explicit.implementers(&member) {
+            module.add_explicit_override(asm, implementer, token, body);
+        }
+    }
+    id.is_some() || key.is_some()
+}
+
+/// The interface member an explicit implementation (II.22.27 `MethodImpl`) implements, spelled so
+/// that every call site naming that member arrives at the same value, whichever assembly it is in
+/// and whether or not its body was duplicated per instantiation.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ImplementedMember {
+    /// A member of a generic interface's INSTANTIATION: that instantiation's type, and the member's
+    /// position among its definition's methods -- the pair [`bind_member_call`] binds a site to.
+    Instantiated(TypeId, usize),
+    /// A member of a non-generic interface, as `member_ref_row_identity` spells a row that names
+    /// it: the interface's qualified name, the member's name and its parameters. Names rather than
+    /// tokens, so it compares across assemblies.
+    Named(String),
+}
+
+/// Which bodies EXPLICITLY implement each interface member, for the types whose explicit
+/// implementations the load walk's `bind_explicit_overrides` cannot register: every instantiation
+/// this pass emitted, whose `MethodImpl` rows the walk recorded against the generic DEFINITION
+/// only, and every non-generic type that implements a CONSTRUCTED generic interface, which a site
+/// inside a duplicated generic body names through a token the walk never saw.
+///
+/// It is read at each site that names an interface member -- [`bind_member_call`] for a generic
+/// interface's member, [`register_named_interface_sites`] for a non-generic one -- and each site
+/// becomes an ordinary `Module::add_explicit_override` row under the site's own token, so dispatch
+/// stays the single token probe the interpreter makes.
+#[derive(Default)]
+struct ExplicitIndex {
+    members: BTreeMap<ImplementedMember, Vec<(TypeId, MethodId)>>,
+}
+
+impl ExplicitIndex {
+    /// The types that explicitly implement `member`, each with its body.
+    fn implementers(&self, member: &ImplementedMember) -> &[(TypeId, MethodId)] {
+        self.members.get(member).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `type_id` explicitly implements `member`.
+    fn implements(&self, member: &ImplementedMember, type_id: TypeId) -> bool {
+        self.implementers(member)
+            .iter()
+            .any(|&(implementer, _)| implementer == type_id)
+    }
+}
+
+/// The position, among a definition's `methods`, of the member a site names by `name` and `params`
+/// (decoded against `site`) under the instantiation `arguments`: structural equality first, then
+/// the spelling each side closes to. See [`bind_closed_member_refs`] for why the second test is the
+/// cross-assembly case rather than an optimization.
+fn member_position<'pe>(
+    site: &Assembly<'pe>,
+    name: &str,
+    params: &[SigType],
+    definition: &Assembly<'pe>,
+    methods: &[DefMethod<'pe>],
+    arguments: &[SigType],
+) -> Option<usize> {
+    let spelled_site: Option<Vec<String>> = params
+        .iter()
+        .map(|param| spell_closed_param(site, param, arguments))
+        .collect();
+    methods.iter().position(|method| {
+        if method.name != name {
+            return false;
+        }
+        if method.params == params {
+            return true;
+        }
+        let Some(spelled) = spelled_site.as_ref() else {
+            return false;
+        };
+        method.params.len() == spelled.len()
+            && method.params.iter().zip(spelled).all(|(declared, spelled)| {
+                spell_closed_param(definition, declared, arguments)
+                    .is_some_and(|name| &name == spelled)
+            })
+    })
+}
+
+/// The interface member a `MethodImpl` row's `declaration` names, for a type declared in
+/// `assembly` and instantiated at `arguments` (none for a non-generic type): a generic interface's
+/// member through the instantiation its `TypeSpec` closes to, or a non-generic one by name. `None`
+/// for an instantiation this pass did not emit.
+fn implemented_member<'pe>(
+    assembly: &Assembly<'pe>,
+    declaration: Token,
+    arguments: &[SigType],
+    sources: &[DefinitionSource<'pe>],
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+    definition_methods: &BTreeMap<(usize, u32), Vec<DefMethod<'pe>>>,
+) -> Option<ImplementedMember> {
+    if declaration.table() == METHOD_DEF {
+        return super::method_def_identity(assembly, declaration).map(ImplementedMember::Named);
+    }
+    if declaration.table() != MEMBER_REF {
+        return None;
+    }
+    let member = assembly.member_ref(declaration.row())?;
+    let parent = member.parent();
+    if parent.table() != TYPE_SPEC {
+        return super::member_ref_row_identity(assembly, &member).map(ImplementedMember::Named);
+    }
+    let interface = instantiation_of_spec(
+        assembly,
+        &sources[PROGRAM_SOURCE].assembly,
+        parent,
+        arguments,
+        instantiations,
+        emitted,
+    )?;
+    let (index, entry) = emitted.iter().find(|(_, entry)| entry.type_id == interface)?;
+    let methods = definition_methods.get(&(entry.source, entry.def_row))?;
+    let params = member
+        .method_signature()
+        .map(|sig| sig.parameters)
+        .unwrap_or_default();
+    let position = member_position(
+        assembly,
+        member.name()?,
+        &params,
+        &sources[entry.source].assembly,
+        methods,
+        &instantiations[*index].arguments,
+    )?;
+    Some(ImplementedMember::Instantiated(interface, position))
+}
+
+/// Builds the [`ExplicitIndex`]: every emitted instantiation's `MethodImpl` rows, each body its
+/// own copy, and every non-generic type's rows that name a constructed generic interface. Runs once
+/// every method identity exists and before any call site is bound.
+fn index_explicit_implementations<'pe>(
+    module: &Module,
+    sources: &[DefinitionSource<'pe>],
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+    definition_methods: &BTreeMap<(usize, u32), Vec<DefMethod<'pe>>>,
+) -> ExplicitIndex {
+    let mut index = ExplicitIndex::default();
+    for (instantiation, entry) in emitted {
+        let assembly = &sources[entry.source].assembly;
+        let Some(type_def) = assembly.type_def(entry.def_row) else {
+            continue;
+        };
+        let method_tokens: Vec<Token> = type_def.methods().map(|method| method.token()).collect();
+        for (body_token, declaration) in type_def.method_impls() {
+            let Some(Some(body)) = method_tokens
+                .iter()
+                .position(|token| *token == body_token)
+                .and_then(|position| entry.methods.get(position).copied())
+            else {
+                continue;
+            };
+            if let Some(member) = implemented_member(
+                assembly,
+                declaration,
+                &instantiations[*instantiation].arguments,
+                sources,
+                instantiations,
+                emitted,
+                definition_methods,
+            ) {
+                index.members.entry(member).or_default().push((entry.type_id, body));
+            }
+        }
+    }
+    if let Some(array_type) = module.intrinsic_type_id(IntrinsicType::Array) {
+        for (server_instantiation, server_entry) in emitted {
+            let server = instantiations[*server_instantiation].definition.as_str();
+            if !VECTOR_INTERFACES.iter().any(|&(_, serves)| serves == server) {
+                continue;
+            }
+            let Some(server_methods) = definition_methods.get(&(server_entry.source, server_entry.def_row))
+            else {
+                continue;
+            };
+            let arguments = &instantiations[*server_instantiation].arguments;
+            for (interface_instantiation, interface_entry) in emitted {
+                let interface = &instantiations[*interface_instantiation];
+                let routed = VECTOR_INTERFACES
+                    .iter()
+                    .any(|&(routes, serves)| routes == interface.definition && serves == server);
+                if !routed || &interface.arguments != arguments {
+                    continue;
+                }
+                let Some(members) = definition_methods.get(&(interface_entry.source, interface_entry.def_row))
+                else {
+                    continue;
+                };
+                for (position, member) in members.iter().enumerate() {
+                    let wanted = serving_static(server, &member.name);
+                    let Some(body) = server_methods
+                        .iter()
+                        .position(|method| method.name == wanted)
+                        .and_then(|at| server_entry.methods.get(at).copied().flatten())
+                    else {
+                        continue;
+                    };
+                    index
+                        .members
+                        .entry(ImplementedMember::Instantiated(interface_entry.type_id, position))
+                        .or_default()
+                        .push((array_type, body));
+                }
+            }
+        }
+    }
+    for source in sources {
+        let assembly = &source.assembly;
+        let generic_definitions = super::generic_definition_rows(assembly);
+        let mut row = 0u32;
+        for type_def in assembly.type_defs() {
+            row += 1;
+            if generic_definitions.contains(&row) {
+                continue;
+            }
+            for (body_token, declaration) in type_def.method_impls() {
+                let names_constructed_interface = declaration.table() == MEMBER_REF
+                    && assembly
+                        .member_ref(declaration.row())
+                        .is_some_and(|member| member.parent().table() == TYPE_SPEC);
+                if !names_constructed_interface {
+                    continue;
+                }
+                let Some(member @ ImplementedMember::Instantiated(..)) = implemented_member(
+                    assembly,
+                    declaration,
+                    &[],
+                    sources,
+                    instantiations,
+                    emitted,
+                    definition_methods,
+                ) else {
+                    continue;
+                };
+                let type_id = match source.type_offset {
+                    Some(offset) => Some((offset + row as usize - 1) as TypeId),
+                    None => module.type_id_of(source.asm, Token::new(TYPE_DEF, row)),
+                };
+                if let (Some(type_id), Some(body)) = (type_id, module.resolve(source.asm, body_token)) {
+                    index.members.entry(member).or_default().push((type_id, body));
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Registers each instantiation's explicit implementation of a NON-generic interface member under
+/// every row, in every assembly, that names that member: each `MemberRef` whose parent is not a
+/// `TypeSpec`, and the member's own `MethodDef` in the assembly that declares the interface.
+///
+/// The same rule `bind_explicit_overrides` applies within one assembly, extended across them,
+/// because a program's `((IEnumerable)dictionary).GetEnumerator()` names the member through its own
+/// `TypeRef` row while the corlib names it by `MethodDef`.
+fn register_named_interface_sites<'pe>(
+    module: &mut Module,
+    sources: &[DefinitionSource<'pe>],
+    explicit: &ExplicitIndex,
+) {
+    let names: BTreeSet<&str> = explicit
+        .members
+        .keys()
+        .filter_map(|member| match member {
+            ImplementedMember::Named(identity) => identity.split('|').nth(1),
+            ImplementedMember::Instantiated(..) => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    for source in sources {
+        let assembly = &source.assembly;
+        for row in 1..=u32::from(u16::MAX) {
+            let Some(member) = assembly.member_ref(row) else {
+                break;
+            };
+            if member.parent().table() == TYPE_SPEC
+                || !member.name().is_some_and(|name| names.contains(name))
+            {
+                continue;
+            }
+            let Some(identity) = super::member_ref_row_identity(assembly, &member) else {
+                continue;
+            };
+            for &(implementer, body) in explicit.implementers(&ImplementedMember::Named(identity)) {
+                module.add_explicit_override(source.asm, implementer, Token::new(MEMBER_REF, row), body);
+            }
+        }
+        for type_def in assembly.type_defs().filter(|type_def| type_def.is_interface()) {
+            for method in type_def.methods() {
+                if !method.name().is_some_and(|name| names.contains(name)) {
+                    continue;
+                }
+                let identity = super::method_identity_on(assembly, type_def.token(), method.token());
+                let Some(identity) = identity else {
+                    continue;
+                };
+                for &(implementer, body) in explicit.implementers(&ImplementedMember::Named(identity)) {
+                    module.add_explicit_override(source.asm, implementer, method.token(), body);
+                }
+            }
+        }
+    }
+}
+
+/// Pushes [`Refusal::InterfaceMemberFallsToNonVirtual`] for each member of an interface the
+/// instantiation `entry`'s definition lists that it implements neither explicitly (`explicit`) nor
+/// with a virtual method (`virtuals`, its own and inherited), when `nonvirtuals` holds a method
+/// under the member's key: the method a call through the interface would otherwise reach.
+#[allow(clippy::too_many_arguments)]
+fn flag_interface_fallbacks<'pe>(
+    entry: &Emitted,
+    want: &Instantiation,
+    sources: &[DefinitionSource<'pe>],
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+    definition_methods: &BTreeMap<(usize, u32), Vec<DefMethod<'pe>>>,
+    explicit: &ExplicitIndex,
+    virtuals: &BTreeMap<String, MethodId>,
+    nonvirtuals: &BTreeMap<String, MethodId>,
+    lowering: &mut Lowering,
+) {
+    if nonvirtuals.is_empty() {
+        return;
+    }
+    let assembly = &sources[entry.source].assembly;
+    let program = &sources[PROGRAM_SOURCE].assembly;
+    let Some(type_def) = assembly.type_def(entry.def_row) else {
+        return;
+    };
+    let falls = |key: &str| nonvirtuals.contains_key(key) && !virtuals.contains_key(key);
+    let mut flag = |member: &ImplementedMember, interface: &str, name: &str| {
+        if !explicit.implements(member, entry.type_id) {
+            lowering.refusals.push(Refusal::InterfaceMemberFallsToNonVirtual {
+                instantiation: want.name.clone(),
+                member: alloc::format!("{interface}::{name}"),
+            });
+        }
+    };
+    for token in type_def.interfaces() {
+        if token.table() == TYPE_SPEC {
+            let Some(interface) =
+                instantiation_of_spec(
+                    assembly,
+                    &sources[PROGRAM_SOURCE].assembly,
+                    token,
+                    &want.arguments,
+                    instantiations,
+                    emitted,
+                )
+            else {
+                continue;
+            };
+            let Some((index, interface_entry)) =
+                emitted.iter().find(|(_, candidate)| candidate.type_id == interface)
+            else {
+                continue;
+            };
+            let interface_assembly = &sources[interface_entry.source].assembly;
+            let label = &instantiations[*index];
+            let methods = definition_methods
+                .get(&(interface_entry.source, interface_entry.def_row))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for (position, method) in methods.iter().enumerate() {
+                if method.is_static {
+                    continue;
+                }
+                let Some(key) = substituted_sig_key(
+                    interface_assembly,
+                    program,
+                    &method.name,
+                    &method.params,
+                    &label.arguments,
+                    method.generic_arity,
+                ) else {
+                    continue;
+                };
+                if !falls(&key) {
+                    continue;
+                }
+                flag(
+                    &ImplementedMember::Instantiated(interface, position),
+                    &label.name,
+                    &method.name,
+                );
+            }
+            continue;
+        }
+        let Some((interface_source, row)) = interface_definition(sources, entry.source, token) else {
+            continue;
+        };
+        let interface_assembly = &sources[interface_source].assembly;
+        let Some(interface_def) = interface_assembly.type_def(row) else {
+            continue;
+        };
+        let label = interface_assembly
+            .type_token_full_name(interface_def.token())
+            .map(|(namespace, name)| type_key(&namespace, &name))
+            .unwrap_or_default();
+        for method in interface_def.methods() {
+            if method.is_static() {
+                continue;
+            }
+            let Some(name) = method.name() else {
+                continue;
+            };
+            let signature = method.signature();
+            let arity = signature.as_ref().map_or(0, |sig| sig.generic_param_count);
+            let params = signature.map(|sig| sig.parameters).unwrap_or_default();
+            let Some(key) =
+                substituted_sig_key(interface_assembly, program, name, &params, &[], arity)
+            else {
+                continue;
+            };
+            if !falls(&key) {
+                continue;
+            }
+            let Some(identity) =
+                super::method_identity_on(interface_assembly, interface_def.token(), method.token())
+            else {
+                continue;
+            };
+            flag(&ImplementedMember::Named(identity), &label, name);
+        }
+    }
+}
+
+/// The definition of the NON-generic interface `token` names in `sources[source]`'s assembly, as
+/// (source index, `TypeDef` row): a `TypeDef` of that assembly as it is, a `TypeRef` found by its
+/// qualified name among the sources.
+fn interface_definition<'pe>(
+    sources: &[DefinitionSource<'pe>],
+    source: usize,
+    token: Token,
+) -> Option<(usize, u32)> {
+    if token.table() == TYPE_DEF {
+        return Some((source, token.row()));
+    }
+    let wanted = sources[source].assembly.type_token_full_name(token)?;
+    sources.iter().enumerate().find_map(|(index, candidate)| {
+        let mut row = 0u32;
+        for type_def in candidate.assembly.type_defs() {
+            row += 1;
+            if candidate.assembly.type_token_full_name(type_def.token()).as_ref() == Some(&wanted) {
+                return Some((index, row));
+            }
+        }
+        None
+    })
 }
 
 /// Finds the instantiation of `definition` with exactly `arguments`.
@@ -2624,6 +3386,7 @@ fn bind_open_token<'pe>(
     site: &OpenSite,
     synthetic: Token,
     deferred: &mut Vec<DeferredMethodSite>,
+    explicit: &ExplicitIndex,
 ) -> Result<(), Refusal> {
     let unbound = || Refusal::UnboundAfterSubstitution {
         instantiation: owner.into(),
@@ -2698,6 +3461,7 @@ fn bind_open_token<'pe>(
                 module,
                 operand,
                 asm,
+                sources[PROGRAM_SOURCE].asm,
                 type_index,
                 instantiations,
                 emitted,
@@ -2788,23 +3552,20 @@ fn bind_open_token<'pe>(
                 .iter()
                 .position(|method| method.name == name && method.params == params)
                 .ok_or_else(unbound)?;
-            let id = target_entry
-                .methods
-                .get(position)
-                .copied()
-                .flatten()
-                .ok_or_else(unbound)?;
-            module.bind_token(asm, synthetic, id);
-            mark_value_type_newobj(module, asm, synthetic, name, target_entry.is_value_type);
-            if let Some(key) = substituted_sig_key(
+            if !bind_member_call(
+                module,
+                asm,
+                synthetic,
+                target_entry,
+                methods,
+                position,
                 target_assembly,
-                name,
-                &methods[position].params,
+                &sources[PROGRAM_SOURCE].assembly,
                 &target_want.arguments,
-                methods[position].generic_arity,
+                params.len(),
+                explicit,
             ) {
-                let count = u16::try_from(params.len() + 1).unwrap_or(u16::MAX);
-                module.bind_call_target(asm, synthetic, key, count);
+                return Err(unbound());
             }
             Ok(())
         }
@@ -2836,6 +3597,7 @@ fn bind_type_operand<'pe>(
     module: &mut Module,
     operand: &DefinitionSource<'pe>,
     site_asm: u8,
+    program_asm: u8,
     type_index: &TypeNameIndex,
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
@@ -2879,11 +3641,15 @@ fn bind_type_operand<'pe>(
             let (target_index, target_entry) = &emitted[target];
             module.bind_type_token(site_asm, synthetic, target_entry.type_id);
             module.bind_type_name(site_asm, synthetic, instantiations[*target_index].name.clone());
+            let target = &instantiations[*target_index];
+            if let Some(shape) = vector_interface_shape(program_asm, &target.definition, &target.arguments) {
+                module.bind_cast_elem(site_asm, synthetic, shape);
+            }
             Ok(())
         }
         SigType::Class(token) | SigType::ValueType(token) => {
             let name = assembly.type_token_name(*token).ok_or_else(unbound)?;
-            if let Some(&type_id) = type_index.get(&type_name_key(name)) {
+            if let Some(&type_id) = type_index_key(assembly, *token).and_then(|key| type_index.get(&key)) {
                 module.bind_type_token(site_asm, synthetic, type_id);
             }
             module.bind_type_name(site_asm, synthetic, name.name.into());
@@ -2993,6 +3759,19 @@ pub(crate) fn primitive_display_name(sig: &SigType) -> &'static str {
     }
 }
 
+/// The cast shape of a type test whose target is a routed vector interface at one element type --
+/// [`VECTOR_INTERFACES`] -- as `CastElem::VectorInterface` over the element's shape, the tokens in
+/// `arguments` read in assembly `asm`; `None` for any other instantiation, which a test compares by
+/// its type.
+fn vector_interface_shape(asm: u8, definition: &str, arguments: &[SigType]) -> Option<lamella_cil_runtime::CastElem> {
+    match arguments {
+        [element] if is_vector_interface(definition) => Some(lamella_cil_runtime::CastElem::VectorInterface(
+            Box::new(cast_elem_of_sig(asm, element)),
+        )),
+        _ => None,
+    }
+}
+
 /// Binds every CLOSED `TypeSpec` row naming one of these instantiations to its type identity, so a
 /// `castclass` / `isinst` / `ldtoken` / `box` of `Pair<int,string>` reaches the type this pass made.
 fn bind_closed_type_specs<'pe>(
@@ -3027,11 +3806,11 @@ fn bind_closed_type_specs<'pe>(
         let (index, entry) = &emitted[target];
         module.bind_type_token(asm, token, entry.type_id);
         module.bind_type_name(asm, token, instantiations[*index].name.clone());
-        module.bind_cast_elem(
-            asm,
-            token,
-            lamella_cil_runtime::CastElem::Named(lamella_cil_runtime::module::asm_key(asm, token.0)),
-        );
+        let shape = match vector_interface_shape(asm, &instantiations[*index].definition, arguments) {
+            Some(shape) => shape,
+            None => lamella_cil_runtime::CastElem::Named(lamella_cil_runtime::module::asm_key(asm, token.0)),
+        };
+        module.bind_cast_elem(asm, token, shape);
         #[cfg(feature = "exceptions")]
         {
             let tag = lamella_cil_runtime::exception::exception_tag(&instantiations[*index].name);
@@ -3095,6 +3874,7 @@ fn bind_closed_member_refs<'pe>(
     emitted: &[(usize, Emitted)],
     definition_methods: &BTreeMap<(usize, u32), Vec<DefMethod<'pe>>>,
     lowering: &mut Lowering,
+    explicit: &ExplicitIndex,
 ) {
     for row in 1..=u32::from(u16::MAX) {
         let token = Token::new(MEMBER_REF, row);
@@ -3164,65 +3944,33 @@ fn bind_closed_member_refs<'pe>(
             .get(&(entry.source, entry.def_row))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let spelled_site: Option<Vec<String>> = params
-            .iter()
-            .map(|param| spell_closed_param(assembly, param, &want.arguments))
-            .collect();
-        let Some(position) = methods
-            .iter()
-            .position(|method| {
-                if method.name != name {
-                    return false;
-                }
-                if method.params == params {
-                    return true;
-                }
-                let Some(site) = spelled_site.as_ref() else {
-                    return false;
-                };
-                if method.params.len() != site.len() {
-                    return false;
-                }
-                method.params.iter().zip(site).all(|(declared, spelled)| {
-                    spell_closed_param(definition_assembly, declared, &want.arguments)
-                        .is_some_and(|name| &name == spelled)
-                })
-            })
-        else {
+        let Some(position) = member_position(
+            assembly,
+            name,
+            &params,
+            definition_assembly,
+            methods,
+            &want.arguments,
+        ) else {
             lowering.refusals.push(Refusal::UnboundAfterSubstitution {
                 instantiation: want.name.clone(),
                 token: token.0,
             });
             continue;
         };
-        let bodyless = methods[position].raw.is_none();
-        let id = match entry.methods.get(position).copied().flatten() {
-            Some(id) => Some(id),
-            None if bodyless => None,
-            None => {
-                lowering.refusals.push(Refusal::UnboundAfterSubstitution {
-                    instantiation: want.name.clone(),
-                    token: token.0,
-                });
-                continue;
-            }
-        };
-        if let Some(id) = id {
-            module.bind_token(asm, token, id);
-            mark_value_type_newobj(module, asm, token, name, entry.is_value_type);
-        }
-        let key = substituted_sig_key(
+        if !bind_member_call(
+            module,
+            asm,
+            token,
+            entry,
+            methods,
+            position,
             definition_assembly,
-            name,
-            &methods[position].params,
+            &sources[PROGRAM_SOURCE].assembly,
             &want.arguments,
-            methods[position].generic_arity,
-        );
-        if let Some(key) = key.clone() {
-            let count = u16::try_from(params.len() + 1).unwrap_or(u16::MAX);
-            module.bind_call_target(asm, token, key, count);
-        }
-        if id.is_none() && key.is_none() {
+            params.len(),
+            explicit,
+        ) {
             lowering.refusals.push(Refusal::UnboundAfterSubstitution {
                 instantiation: want.name.clone(),
                 token: token.0,

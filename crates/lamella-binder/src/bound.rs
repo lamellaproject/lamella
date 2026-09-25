@@ -1515,17 +1515,20 @@ impl Binder {
         let current = self.language_version;
         let kind = match feature.gate_against(current) {
             None => return,
-            Some(FeatureGate::RequiresLaterVersion { required }) => {
+            Some(FeatureGate::RequiresLaterVersion { feature, required }) => {
                 DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: feature.description().into(),
+                    feature: feature.into(),
                     required: required.into(),
                     current,
                 }
             }
-            Some(FeatureGate::NotInThisBuild) => DiagnosticKind::FeatureNotInThisBuild {
-                feature: feature.description().into(),
-                permitted_by: current,
-            },
+            Some(FeatureGate::NotInThisBuild { feature, instead }) => {
+                DiagnosticKind::FeatureNotInThisBuild {
+                    feature: feature.into(),
+                    permitted_by: current,
+                    instead,
+                }
+            }
         };
         self.report(Diagnostic::new(kind, span));
     }
@@ -1634,6 +1637,36 @@ impl Binder {
             return member_lookup_type(ty);
         }
         self.effective_base_class(ty, self.type_parameters_in_scope.len())
+    }
+
+    /// Whether one of `ty`'s INTERFACE constraints -- or an interface one of them extends --
+    /// declares a member named `name`, when `ty` is a type parameter in scope.
+    fn interface_constraint_declares(&self, ty: &TypeSymbol, name: &str) -> bool {
+        let Some(constraints) = self.constraints_of_type_parameter(ty) else {
+            return false;
+        };
+        let mut pending: Vec<TypeSymbol> = constraints.types.to_vec();
+        let mut seen: Vec<TypeSymbol> = Vec::new();
+        while let Some(candidate) = pending.pop() {
+            if seen.contains(&candidate) {
+                continue;
+            }
+            let Some(info) = self.type_info_of(&candidate) else {
+                seen.push(candidate);
+                continue;
+            };
+            if info.kind == TypeKind::Interface {
+                if info.methods.iter().any(|m| &*m.name == name)
+                    || info.properties.iter().any(|p| &*p.name == name)
+                    || info.events.iter().any(|e| &*e.name == name)
+                {
+                    return true;
+                }
+                pending.extend(info.bases.iter().cloned());
+            }
+            seen.push(candidate);
+        }
+        false
     }
 
     /// A type parameter's effective base class (25.7): its written class-type constraint, and --
@@ -5577,187 +5610,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         ));
                     }
                 }
-                if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) && !ty.is_error() {
-                    let candidates: Vec<(Box<str>, MethodSymbol)> = self
-                        .type_info_of(&ty)
-                        .map(|info| {
-                            info.methods
-                                .iter()
-                                .filter(|m| {
-                                    (&*m.name == "op_Explicit" || &*m.name == "op_Implicit")
-                                        && m.parameters.len() == 1
-                                        && m.return_type == ty
-                                        && self
-                                            .type_info_of(&m.parameters[0])
-                                            .is_some_and(|d| d.kind == TypeKind::Delegate)
-                                })
-                                .map(|m| (m.name.clone(), m.clone()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for (op_name, method) in candidates {
-                        let delegate = method.parameters[0].clone();
-                        let as_delegate = self.bind_delegate_creation(
-                            &delegate,
-                            core::slice::from_ref(&operand),
-                            target.span,
-                        );
-                        if matches!(as_delegate.kind, BoundExprKind::DelegateCreation { .. }) {
-                            let declaring_type =
-                                self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
-                            let declaring_instantiation = self.declaring_instantiation_of(
-                                &declaring_type,
-                                &op_name,
-                                &method.parameters,
-                            );
-                            return BoundExpr {
-                                ty: ty.clone(),
-                                kind: BoundExprKind::Call {
-                                    callee: Box::new(error_expr()),
-                                    arguments: alloc::vec![as_delegate],
-                                    method: Some(MethodReference {
-                                        declaring_type,
-                                        name: op_name,
-                                        parameters: method.parameters,
-                                        return_type: method.return_type,
-                                        is_static: true,
-                                        is_vararg: false,
-                                        instantiation: None,
-                                        declaring_instantiation,
-                                    }),
-                                },
-                            };
-                        }
-                    }
-                }
-                if !operand.ty.is_error() && !ty.is_error() {
-                    if crate::conversion::nullable_underlying(&ty).is_some()
-                        && self.assignable(&operand, &ty)
-                    {
-                        return self.convert(operand, &ty);
-                    }
-                    if matches!(ty, TypeSymbol::Special(SpecialType::Decimal))
-                        != matches!(operand.ty, TypeSymbol::Special(SpecialType::Decimal))
-                    {
-                        if let Some(method) = self
-                            .user_conversion(&operand.ty, &ty, "op_Implicit")
-                            .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Explicit"))
-                        {
-                            let argument = self.convert(operand, &method.parameters[0].clone());
-                            return BoundExpr {
-                                ty,
-                                kind: BoundExprKind::Call {
-                                    callee: Box::new(error_expr()),
-                                    arguments: alloc::vec![argument],
-                                    method: Some(method),
-                                },
-                            };
-                        }
-                    }
-                    if let Some(method) = self
-                        .user_conversion(&operand.ty, &ty, "op_Explicit")
-                        .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Implicit"))
-                    {
-                        return BoundExpr {
-                            ty,
-                            kind: BoundExprKind::Call {
-                                callee: Box::new(error_expr()),
-                                arguments: alloc::vec![operand],
-                                method: Some(method),
-                            },
-                        };
-                    }
-                    if let Some(value) = constant_int_value(&operand) {
-                        let via = self.type_info_of(&ty).and_then(|info| {
-                            info.methods.iter().find_map(|m| {
-                                ((&*m.name == "op_Explicit" || &*m.name == "op_Implicit")
-                                    && m.parameters.len() == 1
-                                    && m.return_type == ty
-                                    && matches!(
-                                        m.parameters.first(),
-                                        Some(TypeSymbol::Special(t)) if constant_fits(value, *t)
-                                    ))
-                                .then(|| (m.name.clone(), m.clone()))
-                            })
-                        });
-                        if let Some((op_name, method)) = via {
-                            let param = method.parameters[0].clone();
-                            let argument = self.convert(operand, &param);
-                            let declaring_type =
-                                self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
-                            let declaring_instantiation = self.declaring_instantiation_of(
-                                &declaring_type,
-                                &op_name,
-                                &method.parameters,
-                            );
-                            return BoundExpr {
-                                ty: ty.clone(),
-                                kind: BoundExprKind::Call {
-                                    callee: Box::new(error_expr()),
-                                    arguments: alloc::vec![argument],
-                                    method: Some(MethodReference {
-                                        declaring_type,
-                                        name: op_name,
-                                        parameters: method.parameters,
-                                        return_type: method.return_type,
-                                        is_static: true,
-                                        is_vararg: false,
-                                        instantiation: None,
-                                        declaring_instantiation,
-                                    }),
-                                },
-                            };
-                        }
-                    }
-                    if let Some(underlying) = self.enum_underlying_type(&ty) {
-                        if let Some(method) = self
-                            .user_conversion(&operand.ty, &underlying, "op_Explicit")
-                            .or_else(|| self.user_conversion(&operand.ty, &underlying, "op_Implicit"))
-                        {
-                            return BoundExpr {
-                                ty,
-                                kind: BoundExprKind::Call {
-                                    callee: Box::new(error_expr()),
-                                    arguments: alloc::vec![operand],
-                                    method: Some(method),
-                                },
-                            };
-                        }
-                    }
-                    if let Some(underlying) = self.enum_underlying_type(&operand.ty) {
-                        if let Some(method) = self
-                            .user_conversion(&underlying, &ty, "op_Implicit")
-                            .or_else(|| self.user_conversion(&underlying, &ty, "op_Explicit"))
-                        {
-                            let mut as_underlying = operand;
-                            as_underlying.ty = underlying;
-                            return BoundExpr {
-                                ty,
-                                kind: BoundExprKind::Call {
-                                    callee: Box::new(error_expr()),
-                                    arguments: alloc::vec![as_underlying],
-                                    method: Some(method),
-                                },
-                            };
-                        }
-                    }
-                    if !can_cast(&self.model, &operand.ty, &ty) {
-                        self.diagnostics.push(Diagnostic::new(
-                            DiagnosticKind::CannotCast {
-                                from: operand.ty.to_string().into(),
-                                to: ty.to_string().into(),
-                            },
-                            target.span,
-                        ));
-                    }
-                }
-                BoundExpr {
-                    kind: BoundExprKind::Cast {
-                        operand: Box::new(operand),
-                        checked: self.checked_context,
-                    },
-                    ty,
-                }
+                self.bind_cast(operand, ty, target.span)
             }
             ExprKind::TypeTest {
                 operation,
@@ -7170,6 +7023,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 DiagnosticKind::FeatureNotInThisBuild {
                     feature: "a declaration pattern over a nullable operand".into(),
                     permitted_by: self.language_version,
+                    instead: None,
                 },
                 span,
             ));
@@ -7231,6 +7085,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             DiagnosticKind::FeatureNotInThisBuild {
                 feature: "a constant pattern over this operand type".into(),
                 permitted_by: self.language_version,
+                instead: None,
             },
             value.span,
         ));
@@ -7950,6 +7805,221 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         })
     }
 
+    /// Binds `(ty)operand` for an operand that is already bound -- the conversion half of a cast
+    /// expression, separate from the syntax so that a conversion that is itself a composition can
+    /// bind its second step with the same rules as the first.
+    fn bind_cast(&mut self, operand: BoundExpr, ty: TypeSymbol, span: Span) -> BoundExpr {
+        if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) && !ty.is_error() {
+            let candidates: Vec<(Box<str>, MethodSymbol)> = self
+                .type_info_of(&ty)
+                .map(|info| {
+                    info.methods
+                        .iter()
+                        .filter(|m| {
+                            (&*m.name == "op_Explicit" || &*m.name == "op_Implicit")
+                                && m.parameters.len() == 1
+                                && m.return_type == ty
+                                && self
+                                    .type_info_of(&m.parameters[0])
+                                    .is_some_and(|d| d.kind == TypeKind::Delegate)
+                        })
+                        .map(|m| (m.name.clone(), m.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (op_name, method) in candidates {
+                let delegate = method.parameters[0].clone();
+                let as_delegate = self.bind_delegate_creation(
+                    &delegate,
+                    core::slice::from_ref(&operand),
+                    span,
+                );
+                if matches!(as_delegate.kind, BoundExprKind::DelegateCreation { .. }) {
+                    let declaring_type =
+                        self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
+                    let declaring_instantiation = self.declaring_instantiation_of(
+                        &declaring_type,
+                        &op_name,
+                        &method.parameters,
+                    );
+                    return BoundExpr {
+                        ty: ty.clone(),
+                        kind: BoundExprKind::Call {
+                            callee: Box::new(error_expr()),
+                            arguments: alloc::vec![as_delegate],
+                            method: Some(MethodReference {
+                                declaring_type,
+                                name: op_name,
+                                parameters: method.parameters,
+                                return_type: method.return_type,
+                                is_static: true,
+                                is_vararg: false,
+                                instantiation: None,
+                                declaring_instantiation,
+                            }),
+                        },
+                    };
+                }
+            }
+        }
+        if !operand.ty.is_error() && !ty.is_error() {
+            if crate::conversion::nullable_underlying(&ty).is_some()
+                && self.assignable(&operand, &ty)
+            {
+                return self.convert(operand, &ty);
+            }
+            if let Some(underlying) = crate::conversion::nullable_underlying(&operand.ty).cloned() {
+                if crate::conversion::nullable_underlying(&ty).is_none()
+                    && self.is_value_type(&ty)
+                    && (underlying == ty || can_cast(&self.model, &underlying, &ty))
+                {
+                    if let Some(getter) = self.resolve_property_getter(&operand.ty, "Value", span) {
+                        let value_ty = getter.return_type.clone();
+                        let value = BoundExpr {
+                            kind: BoundExprKind::Call {
+                                callee: Box::new(BoundExpr {
+                                    kind: BoundExprKind::MethodGroup {
+                                        receiver: Box::new(operand),
+                                        name: getter.name.clone(),
+                                    },
+                                    ty: TypeSymbol::Error,
+                                }),
+                                arguments: Vec::new(),
+                                method: Some(getter),
+                            },
+                            ty: value_ty,
+                        };
+                        if value.ty == ty {
+                            return value;
+                        }
+                        return self.bind_cast(value, ty, span);
+                    }
+                }
+            }
+            if matches!(ty, TypeSymbol::Special(SpecialType::Decimal))
+                != matches!(operand.ty, TypeSymbol::Special(SpecialType::Decimal))
+            {
+                if let Some(method) = self
+                    .user_conversion(&operand.ty, &ty, "op_Implicit")
+                    .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Explicit"))
+                {
+                    let argument = self.convert(operand, &method.parameters[0].clone());
+                    return BoundExpr {
+                        ty,
+                        kind: BoundExprKind::Call {
+                            callee: Box::new(error_expr()),
+                            arguments: alloc::vec![argument],
+                            method: Some(method),
+                        },
+                    };
+                }
+            }
+            if let Some(method) = self
+                .user_conversion(&operand.ty, &ty, "op_Explicit")
+                .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Implicit"))
+            {
+                return BoundExpr {
+                    ty,
+                    kind: BoundExprKind::Call {
+                        callee: Box::new(error_expr()),
+                        arguments: alloc::vec![operand],
+                        method: Some(method),
+                    },
+                };
+            }
+            if let Some(value) = constant_int_value(&operand) {
+                let via = self.type_info_of(&ty).and_then(|info| {
+                    info.methods.iter().find_map(|m| {
+                        ((&*m.name == "op_Explicit" || &*m.name == "op_Implicit")
+                            && m.parameters.len() == 1
+                            && m.return_type == ty
+                            && matches!(
+                                m.parameters.first(),
+                                Some(TypeSymbol::Special(t)) if constant_fits(value, *t)
+                            ))
+                        .then(|| (m.name.clone(), m.clone()))
+                    })
+                });
+                if let Some((op_name, method)) = via {
+                    let param = method.parameters[0].clone();
+                    let argument = self.convert(operand, &param);
+                    let declaring_type =
+                        self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
+                    let declaring_instantiation = self.declaring_instantiation_of(
+                        &declaring_type,
+                        &op_name,
+                        &method.parameters,
+                    );
+                    return BoundExpr {
+                        ty: ty.clone(),
+                        kind: BoundExprKind::Call {
+                            callee: Box::new(error_expr()),
+                            arguments: alloc::vec![argument],
+                            method: Some(MethodReference {
+                                declaring_type,
+                                name: op_name,
+                                parameters: method.parameters,
+                                return_type: method.return_type,
+                                is_static: true,
+                                is_vararg: false,
+                                instantiation: None,
+                                declaring_instantiation,
+                            }),
+                        },
+                    };
+                }
+            }
+            if let Some(underlying) = self.enum_underlying_type(&ty) {
+                if let Some(method) = self
+                    .user_conversion(&operand.ty, &underlying, "op_Explicit")
+                    .or_else(|| self.user_conversion(&operand.ty, &underlying, "op_Implicit"))
+                {
+                    return BoundExpr {
+                        ty,
+                        kind: BoundExprKind::Call {
+                            callee: Box::new(error_expr()),
+                            arguments: alloc::vec![operand],
+                            method: Some(method),
+                        },
+                    };
+                }
+            }
+            if let Some(underlying) = self.enum_underlying_type(&operand.ty) {
+                if let Some(method) = self
+                    .user_conversion(&underlying, &ty, "op_Implicit")
+                    .or_else(|| self.user_conversion(&underlying, &ty, "op_Explicit"))
+                {
+                    let mut as_underlying = operand;
+                    as_underlying.ty = underlying;
+                    return BoundExpr {
+                        ty,
+                        kind: BoundExprKind::Call {
+                            callee: Box::new(error_expr()),
+                            arguments: alloc::vec![as_underlying],
+                            method: Some(method),
+                        },
+                    };
+                }
+            }
+            if !can_cast(&self.model, &operand.ty, &ty) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::CannotCast {
+                        from: operand.ty.to_string().into(),
+                        to: ty.to_string().into(),
+                    },
+                    span,
+                ));
+            }
+        }
+        BoundExpr {
+            kind: BoundExprKind::Cast {
+                operand: Box::new(operand),
+                checked: self.checked_context,
+            },
+            ty,
+        }
+    }
+
     /// `System.Nullable<underlying>`, the type `T?` denotes (11.4).
     fn nullable_of(&self, underlying: &TypeSymbol) -> TypeSymbol {
         TypeSymbol::Instantiation {
@@ -8221,7 +8291,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         operator: AssignmentOperator,
         value_expr: &Expr,
     ) -> BoundExpr {
-        let value = self.bind_expression(value_expr);
+        let value = match lambda_through_parentheses(value_expr) {
+            Some(lambda) => self
+                .bind_target_typed(lambda, &event.ty)
+                .unwrap_or_else(error_expr),
+            None => self.bind_expression(value_expr),
+        };
         let handler = self.convert(value, &event.ty);
         let prefix = if matches!(operator, AssignmentOperator::Add) {
             "add_"
@@ -8545,6 +8620,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 kind: BoundExprKind::ArrayCreation { lengths, elements },
                 ty: declared,
             }
+        } else if matches!(
+            operator,
+            AssignmentOperator::Add | AssignmentOperator::Subtract
+        ) && let Some(lambda) = lambda_through_parentheses(value_expr)
+            && self
+                .type_info_of(&target.ty)
+                .is_some_and(|info| info.kind == TypeKind::Delegate)
+        {
+            let delegate_ty = target.ty.clone();
+            self.bind_target_typed(lambda, &delegate_ty)
+                .unwrap_or_else(error_expr)
         } else {
             self.bind_expression(value_expr)
         };
@@ -9185,6 +9271,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         info.undecodable_members.iter().any(|m| &**m == name)
                     });
                 let on_a_type = matches!(receiver.kind, BoundExprKind::TypeReference(_));
+                if !on_a_type
+                    && !unreadable
+                    && self.interface_constraint_declares(&receiver.ty, name)
+                {
+                    self.gate_feature(Feature::InterfaceConstraintMember, span);
+                    return error_expr();
+                }
                 let kind = if unreadable {
                     DiagnosticKind::MemberSignatureNotSupported {
                         type_name: type_name.into(),
@@ -9643,6 +9736,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
+    /// Binds one call ARGUMENT's value, refusing a LAMBDA by name.
+    ///
+    /// A lambda takes its type from the parameter it converts to, and in an argument position that
+    /// parameter is chosen by overload resolution, which runs after the arguments are bound. The
+    /// refusal is `LAM0001` naming the position, with the replacement this build compiles: a local
+    /// of the delegate type, passed in the lambda's place.
+    fn bind_argument_value(&mut self, value: &Expr) -> BoundExpr {
+        if let Some(lambda) = lambda_through_parentheses(value) {
+            self.gate_feature(Feature::LambdaArgument, lambda.span);
+            return error_expr();
+        }
+        self.bind_expression(value)
+    }
+
     fn bind_invocation(
         &mut self,
         receiver_expr: &Expr,
@@ -9677,7 +9784,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .collect();
         let arguments: Vec<BoundExpr> = argument_exprs
             .iter()
-            .map(|argument| self.bind_expression(&argument.value))
+            .map(|argument| self.bind_argument_value(&argument.value))
             .collect();
         let group = match &callee.kind {
             BoundExprKind::MethodGroup { receiver, name } => {
@@ -11826,11 +11933,22 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         initializer: Option<&Initializer>,
         span: Span,
     ) -> BoundExpr {
+        if let [argument] = argument_exprs
+            && initializer.is_none()
+            && let Some(lambda) = lambda_through_parentheses(&argument.value)
+            && self
+                .type_info_of(&target_ty)
+                .is_some_and(|info| info.kind == TypeKind::Delegate)
+        {
+            return self
+                .bind_target_typed(lambda, &target_ty)
+                .unwrap_or_else(error_expr);
+        }
         let bound_initializer =
             initializer.map(|initializer| self.bind_initializer(&target_ty, initializer, span));
         let arguments: Vec<BoundExpr> = argument_exprs
             .iter()
-            .map(|argument| self.bind_expression(&argument.value))
+            .map(|argument| self.bind_argument_value(&argument.value))
             .collect();
         let names = argument_names(argument_exprs);
         let mut ctor_spill: Vec<BoundExpr> = Vec::new();
@@ -13050,6 +13168,25 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// see [`crate::symbols::Model::get_by_symbol`].
     fn type_info_of(&self, ty: &TypeSymbol) -> Option<alloc::borrow::Cow<'_, TypeInfo>> {
         self.model.get_by_symbol(ty)
+    }
+
+    /// Whether `ty` names a type this compilation can see -- a predefined type, a type in scope as
+    /// a type parameter, or a definition the model holds -- asked without reporting anything.
+    ///
+    /// A check that a type is the WRONG type has nothing to say about one that does not exist: the
+    /// name's own diagnostic (`CS0246`, `CS0308`) is the whole report, and csc adds nothing to it.
+    pub(crate) fn names_a_known_type(&self, ty: &TypeSymbol) -> bool {
+        match ty {
+            TypeSymbol::Error => false,
+            TypeSymbol::Special(_) => true,
+            TypeSymbol::Array { element, .. } => self.names_a_known_type(element),
+            TypeSymbol::Pointer(inner) | TypeSymbol::ByRef(inner) => self.names_a_known_type(inner),
+            TypeSymbol::Named(parts) => {
+                self.type_info_of(ty).is_some()
+                    || matches!(&parts[..], [name] if self.type_parameter_in_scope(name).is_some())
+            }
+            TypeSymbol::Instantiation { .. } => self.type_info_of(ty).is_some(),
+        }
     }
 
     /// Whether `ty` is a delegate type (its values are invocable via `Invoke`).
@@ -14372,6 +14509,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// declared (non-virtual unless `virtual`/`abstract`/`override`), matching csc; merely
     /// implementing SOME interface does not virtualize a type's unrelated members. `params` is
     /// canonicalized so a body-bound signature matches the interface's model signature.
+    ///
+    /// A property accessor matches only an accessor the interface's property DECLARES: `set_P`
+    /// implements nothing when the interface's `P` is get-only.
     #[must_use]
     pub fn member_implements_interface(
         &self,
@@ -14402,7 +14542,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 return !self.explicitly_implements(class_ty, interface, candidate);
             }
             if let Some(name) = property
-                && info.properties.iter().any(|p| &*p.name == name)
+                && info.properties.iter().any(|p| {
+                    &*p.name == name
+                        && if method_name.starts_with("get_") {
+                            p.has_getter
+                        } else {
+                            p.has_setter
+                        }
+                })
             {
                 return !self.property_is_explicitly_implemented(class_ty, interface, name);
             }
@@ -16146,6 +16293,15 @@ fn push_signed_decimal(out: &mut String, value: i32) {
         out.push('-');
     }
     push_decimal(out, value.unsigned_abs() as usize);
+}
+
+/// The lambda `expr` is, looking through any parentheses around it, or `None`.
+fn lambda_through_parentheses(expr: &Expr) -> Option<&Expr> {
+    match &expr.kind {
+        ExprKind::Lambda { .. } => Some(expr),
+        ExprKind::Parenthesized(inner) => lambda_through_parentheses(inner),
+        _ => None,
+    }
 }
 
 pub(crate) fn error_expr() -> BoundExpr {
@@ -20205,15 +20361,24 @@ mod tests {
     /// answering `CS0029` -- and the test named for `CS0155` passed throughout, because the value
     /// it asserted was one the defect could also produce. Declaring the type in the source is what
     /// puts the shipping branch under the assertion.
+    ///
+    /// **THE RUNG IS NAMED, BECAUSE THE ANSWER DEPENDS ON IT**: `CS0155` is csc's answer below C#
+    /// 8.0 and the conversion diagnostic is its answer from 8.0 on (the test after this one). The
+    /// default rung is derived from the features this build implements and sits above 8.0.
     #[test]
     fn a_throw_against_a_declared_system_exception_is_still_cs0155() {
         use lamella_syntax::parser::parse_compilation_unit;
         let codes = |source: &str| {
             let unit = parse_compilation_unit(source).unit;
-            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
-                .iter()
-                .map(Diagnostic::code)
-                .collect();
+            let mut codes: Vec<u16> = crate::bind_compilation_unit_with_dialect(
+                &unit,
+                &[],
+                false,
+                lamella_syntax::version::LanguageVersion::CSharp7_3,
+            )
+            .iter()
+            .map(Diagnostic::code)
+            .collect();
             codes.sort_unstable();
             codes
         };
@@ -20250,6 +20415,49 @@ mod tests {
             )),
             []
         );
+    }
+
+    /// FROM C# 8.0 A THROWN VALUE IS CONVERTED TO `System.Exception`, so one that does not convert
+    /// gets the conversion diagnostic an assignment would -- and not `CS0155`, which is the answer
+    /// only below 8.0. Every row is csc's, measured at 8.0 and at `latest`; the last one is the
+    /// same program one rung down, where `CS0155` is still right.
+    #[test]
+    fn from_csharp_8_a_throw_reports_the_conversion_not_cs0155() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        use lamella_syntax::version::LanguageVersion;
+        let codes = |body: &str, version: LanguageVersion| {
+            let source = alloc::format!(
+                "namespace System {{ public class Exception {{ }} }} \
+                 class K {{ }} struct S {{ }} interface I {{ }} \
+                 class C {{ static void M() {{ }} static void F() {{ {body} }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let mut codes: Vec<u16> =
+                crate::bind_compilation_unit_with_dialect(&unit, &[], false, version)
+                    .iter()
+                    .map(Diagnostic::code)
+                    .collect();
+            codes.sort_unstable();
+            codes
+        };
+        let eight = LanguageVersion::CSharp8;
+        for (body, expected) in [
+            ("throw 5;", &[29][..]),
+            ("throw \"x\";", &[29]),
+            ("throw new K();", &[29]),
+            ("throw new S();", &[29]),
+            ("throw new object();", &[266]),
+            ("I i = null; throw i;", &[266]),
+            ("throw K;", &[119]),
+            ("throw M;", &[428]),
+            ("throw null;", &[]),
+        ] {
+            assert_eq!(codes(body, eight), expected, "at 8.0: {body}");
+        }
+        assert_eq!(codes("throw 5;", LanguageVersion::CSharp7_3), [155]);
+        assert_eq!(codes("throw new object();", LanguageVersion::CSharp7_3), [155]);
+        assert_eq!(codes("throw K;", LanguageVersion::CSharp7_3), [119, 155]);
+        assert_eq!(codes("throw M;", LanguageVersion::CSharp7_3), [155]);
     }
 
     #[test]

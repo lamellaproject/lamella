@@ -1,0 +1,200 @@
+# BLOCK layout: the nRF51 CLOCK controller, which selects and starts the sources of the high- and
+# low-frequency clocks. A board's plan names the HFCLK source; this block is where a startup starts
+# the crystal the plan names and tells the part which crystal it has.
+#
+# Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
+# chapter 13, Tables 62-73, with the document open, and chapter 7's UICR Table 34 for XTALFREQ's
+# reset.
+#
+# Every bit position below was placed from the printed table's column coordinates: each field
+# letter was assigned to the bit column it is printed over, and INTENSET and INTENCLR were required
+# to agree.
+
+[table]
+kind = "block"
+family = "nrf51"
+block = "clock"
+# Rust only: the one reader is a board's native startup, which starts the crystal before any
+# managed code runs.
+emit = ["rust"]
+sources = [
+    "nRF51 Series Reference Manual v3.0 (Nordic Semiconductor), ch. 13 CLOCK: 13.1.1 HFCLK clock controller (the 16 or 32 MHz crystal oscillator and the 16 MHz RC oscillator; HFCLKSTART and HFCLKSTARTED; HFCLKSTOP only once HFCLKSTAT reports running; XTALFREQ for a 32 MHz crystal), 13.1.2 LFCLK clock controller, 13.1.3 RC calibration, 13.1.4 calibration timer, Table 62 instances (CLOCK 0x40000000), Table 63 register overview, Tables 64/65 INTENSET/INTENCLR, Table 66 HFCLKRUN, Table 67 HFCLKSTAT, Table 68 LFCLKRUN, Table 69 LFCLKSTAT, Table 70 LFCLKSRCCOPY, Table 71 LFCLKSRC, Table 72 CTIV, Table 73 XTALFREQ",
+    "nRF51 Series Reference Manual v3.0, Table 34 UICR XTALFREQ: the reset value for CLOCK's XTALFREQ, 0xFF (16 MHz) when the UICR word is erased -- where Table 73's own reset row prints 0x00 (32 MHz). The two disagree, so a startup writes XTALFREQ from the board plan's xtal_hz and trusts neither reset value",
+]
+notes = [
+    "HFCLK sources (13.1.1): the HFCLK crystal oscillator, 16 or 32 MHz, and the 16 MHz RC oscillator. The RC starts automatically when the system enters ON mode, so the part runs from it until the crystal is started. The CPU clock HCLK is 16 MHz either way.",
+    "Starting the crystal (13.1.1): write 1 to TASKS_HFCLKSTART, and EVENTS_HFCLKSTARTED is generated once the selected crystal oscillator has started; its start-up time is in the product specification. HFCLKSTAT then reads SRC = Xtal (1) and STATE = Running (1). The RC switches itself off while the crystal runs and back on when it stops.",
+    "HFCLKSTOP may be triggered only after HFCLKSTAT's STATE field reports HFCLK running (13.1.1).",
+    "XTALFREQ must match the crystal fitted: 0xFF for 16 MHz, 0x00 for 32 MHz (Table 73). Its reset value is taken from the UICR's XTALFREQ word (Table 34), which reads 0xFF (16 MHz) when erased, while Table 73's own reset row prints 0; the two tables disagree, so a startup writes XTALFREQ from the board's crystal rather than trusting either.",
+    "LFCLK sources (13.1.2): the 32.768 kHz crystal oscillator on XL1 and XL2, the 32.768 kHz RC oscillator, and a 32.768 kHz clock synthesized from HFCLK. All are off when the system enters ON mode. LFCLKSRC selects the source and may be written only while LFCLK is not running; LFCLKSTART then starts it, with the RC standing in until the selected source is available. The synthesized clock needs HFCLK, and needs HFCLK from the crystal for 250 ppm accuracy.",
+    "Calibration (13.1.3, 13.1.4): CAL calibrates the LFCLK RC oscillator against HFCLK and works only while HFCLK runs from the crystal; DONE marks the end. The calibration timer counts down from CTIV (in quarter seconds) after CTSTART and raises CTTO at zero. Only one of CAL, CTSTART and CTSTOP may be triggered per LFCLK period.",
+]
+
+[registers.TASKS_HFCLKSTART]
+offset = 0x000
+width = 32
+fields = { TASKS_HFCLKSTART = [0, 1] }
+notes = "Write 1: start the HFCLK crystal oscillator (Table 63)."
+
+[registers.TASKS_HFCLKSTOP]
+offset = 0x004
+width = 32
+fields = { TASKS_HFCLKSTOP = [0, 1] }
+notes = "Write 1: stop the HFCLK crystal oscillator. Only after HFCLKSTAT reports running (13.1.1)."
+
+[registers.TASKS_LFCLKSTART]
+offset = 0x008
+width = 32
+fields = { TASKS_LFCLKSTART = [0, 1] }
+notes = "Write 1: start the LFCLK source LFCLKSRC selects."
+
+[registers.TASKS_LFCLKSTOP]
+offset = 0x00C
+width = 32
+fields = { TASKS_LFCLKSTOP = [0, 1] }
+notes = "Write 1: stop LFCLK. Only after LFCLKSTAT reports running (13.1.2)."
+
+[registers.TASKS_CAL]
+offset = 0x010
+width = 32
+fields = { TASKS_CAL = [0, 1] }
+notes = "Write 1: calibrate the LFCLK RC oscillator against HFCLK, which must run from the crystal (13.1.3)."
+
+[registers.TASKS_CTSTART]
+offset = 0x014
+width = 32
+fields = { TASKS_CTSTART = [0, 1] }
+notes = "Write 1: start the calibration timer from CTIV."
+
+[registers.TASKS_CTSTOP]
+offset = 0x018
+width = 32
+fields = { TASKS_CTSTOP = [0, 1] }
+notes = "Write 1: stop the calibration timer."
+
+[registers.EVENTS_HFCLKSTARTED]
+offset = 0x100
+width = 32
+fields = { EVENTS_HFCLKSTARTED = [0, 1] }
+notes = "1 = the HFCLK crystal oscillator has started. Write 0 to clear before triggering HFCLKSTART, then poll."
+
+[registers.EVENTS_LFCLKSTARTED]
+offset = 0x104
+width = 32
+fields = { EVENTS_LFCLKSTARTED = [0, 1] }
+notes = "1 = LFCLK has started."
+
+[registers.EVENTS_DONE]
+offset = 0x10C
+width = 32
+fields = { EVENTS_DONE = [0, 1] }
+notes = "1 = the LFCLK RC oscillator's calibration has finished."
+
+[registers.EVENTS_CTTO]
+offset = 0x110
+width = 32
+fields = { EVENTS_CTTO = [0, 1] }
+notes = "1 = the calibration timer reached zero."
+
+[registers.INTENSET]
+offset = 0x304
+width = 32
+fields = { HFCLKSTARTED = [0, 1], LFCLKSTARTED = [1, 1], DONE = [3, 1], CTTO = [4, 1] }
+notes = "Write 1 to a bit to enable that interrupt; reads return INTEN (Table 64). Bit 2 is not used; INTENCLR has the same layout."
+
+[registers.INTENCLR]
+offset = 0x308
+width = 32
+fields = { HFCLKSTARTED = [0, 1], LFCLKSTARTED = [1, 1], DONE = [3, 1], CTTO = [4, 1] }
+notes = "Write 1 to a bit to disable that interrupt (Table 65)."
+
+[registers.HFCLKRUN]
+offset = 0x408
+width = 32
+fields = { STATUS = [0, 1] }
+notes = "1 = HFCLKSTART has been triggered (Table 66)."
+
+[registers.HFCLKSTAT]
+offset = 0x40C
+width = 32
+fields = { SRC = [0, 1], STATE = [16, 1] }
+notes = "SRC: 0 = the 16 MHz RC oscillator generates HFCLK, 1 = the crystal oscillator does. STATE: 1 = HFCLK running (Table 67)."
+
+[registers.LFCLKRUN]
+offset = 0x414
+width = 32
+fields = { STATUS = [0, 1] }
+notes = "1 = LFCLKSTART has been triggered (Table 68)."
+
+[registers.LFCLKSTAT]
+offset = 0x418
+width = 32
+fields = { SRC = [0, 2], STATE = [16, 1] }
+notes = "SRC: 0 = RC, 1 = crystal, 2 = synthesized from HFCLK. STATE: 1 = LFCLK running (Table 69)."
+
+[registers.LFCLKSRCCOPY]
+offset = 0x41C
+width = 32
+fields = { SRC = [0, 2] }
+notes = "The LFCLKSRC value latched when LFCLKSTART was triggered (Table 70)."
+
+[registers.LFCLKSRC]
+offset = 0x518
+width = 32
+fields = { SRC = [0, 2] }
+notes = "0 = RC, 1 = crystal, 2 = synthesized from HFCLK (Table 71). Write only while LFCLK is not running."
+
+[registers.CTIV]
+offset = 0x538
+width = 32
+fields = { CTIV = [0, 7] }
+notes = "The calibration timer interval in quarter seconds, 0.25 to 31.75 seconds (Table 72)."
+
+[registers.XTALFREQ]
+offset = 0x550
+width = 32
+fields = { XTALFREQ = [0, 8] }
+notes = "0xFF = 16 MHz crystal, 0x00 = 32 MHz crystal (Table 73). Reset comes from the UICR's XTALFREQ word (Table 34); write it from the board's crystal."
+
+[constants]
+HFCLKSTAT_SRC_RC = 0
+HFCLKSTAT_SRC_XTAL = 1
+LFCLKSRC_RC = 0
+LFCLKSRC_XTAL = 1
+LFCLKSRC_SYNTH = 2
+XTALFREQ_16MHZ = 0xFF
+XTALFREQ_32MHZ = 0x00
+HCLK_HZ = 16000000
+
+[parameters]
+xtalfreq = "The XTALFREQ value for the board's crystal (XTALFREQ_16MHZ or XTALFREQ_32MHZ)."
+
+# Start the HFCLK crystal (13.1.1): say which crystal is fitted, clear the event, start, wait.
+
+[[sequences.hfclk_start]]
+op = "write"
+reg = "XTALFREQ"
+value = "$xtalfreq"
+note = "from the board's crystal, not the reset value (the notes)"
+
+[[sequences.hfclk_start]]
+op = "write"
+reg = "EVENTS_HFCLKSTARTED"
+value = 0x0
+
+[[sequences.hfclk_start]]
+op = "write"
+reg = "TASKS_HFCLKSTART"
+value = 0x1
+
+[[sequences.hfclk_start]]
+op = "poll"
+reg = "EVENTS_HFCLKSTARTED"
+mask = 0x1
+note = "bounded: a startup falls through on the RC rather than waiting forever"
+
+[[sequences.hfclk_start]]
+op = "read"
+reg = "HFCLKSTAT"
+mask = 0x10001
+note = "SRC bit 0 and STATE bit 16 both 1 when the crystal generates HFCLK"

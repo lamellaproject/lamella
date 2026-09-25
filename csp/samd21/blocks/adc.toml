@@ -1,0 +1,273 @@
+# The ADC on the Microchip SAMD21 family -- the BLOCK layout: register offsets are
+# instance-relative; nothing in this file names a board, a pin wiring or a clock plan. The instance
+# lives in ../instances.toml; which AIN pads a board wires lives in bsp/<board>/board.toml.
+#
+# Every offset, width and bit position is read from each register's OWN description (33.8.1 to
+# 33.8.20) and checked against the bit grid on the same page.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "adc"
+sources = [
+    "SAMD21 datasheet DS40001882D chapter 33 (ADC): the register summary 33.7 (p904-905) and each register's description 33.8.1-33.8.20 (p906-929); initialization and operation 33.6.2 (p894-895); synchronization 33.6.15 (p902-903); debug 33.5.7 and calibration 33.5.10 (p894)",
+    "DS40001882D Table 10-5 (NVM Software Calibration Area at 0x806020, p44); 17.8.16 SYSCTRL VREF (p231); Table 37-7 (GCLK_ADC at most 48 MHz, p986); Table 37-24 (CLK_ADC 30 to 2100 kHz, p1001)",
+]
+notes = [
+    "One 12-bit converter, muxed by INPUTCTRL.MUXPOS. A channel number IS the MUXPOS code, and the codes have gaps: AIN0-AIN19 are 0x00-0x13, 0x14-0x17 are reserved, 0x18 has no row in Rev D, and the internal inputs are BANDGAP 0x19, SCALEDCOREVCC 0x1A and SCALEDIOVCC 0x1B. 0x1C, the DAC, is not listed below: no DAC is in scope.",
+    "NO TEMPERATURE CHANNEL. 33.2 counts a temperature sensor among the internal inputs, but Rev D prints no MUXPOS code for it -- the table skips 0x18 without a row -- so it is not offered until a document names its code.",
+    "Initialization (33.6.2.1): GCLK_ADC routed and enabled, the reference configured, then CTRLA.ENABLE. The first conversion after the reference changes must not be used. The ADC must be disabled before a software reset (33.6.2.2).",
+    "Calibration (33.5.10, 33.8.19): LINEARITY_CAL and BIAS_CAL must be copied, unchanged, from the NVM Software Calibration Area into CALIB before the converter meets its specified accuracy. LINEARITY straddles the area's two words -- its bits 4:0 are word 0x806020 bits 31:27 and its bits 7:5 are word 0x806024 bits 2:0 -- and BIASCAL is word 0x806024 bits 5:3 (Table 10-5).",
+    "Clocks: the APB gate is PM.APBCMASK bit 16, which is SET at reset; GCLK_ADC is CLKCTRL.ID 0x1E and must be 48 MHz or less; CLK_ADC = GCLK_ADC / 2^(PRESCALER + 2) must lie within 30 to 2100 kHz, so an 8 MHz generator takes DIV4 (2 MHz) and a 48 MHz one DIV32 (1.5 MHz).",
+    "Synchronization (33.6.15): CTRLA.SWRST, CTRLA.ENABLE, CTRLB, SWTRIG, WINCTRL, INPUTCTRL, WINLT and WINUT are write-synchronized -- wait for STATUS.SYNCBUSY to clear after each. A write made while SYNCBUSY is set stalls the bus rather than being lost.",
+    "One-shot protocol: INPUTCTRL (MUXPOS, MUXNEG = GND, GAIN), SWTRIG.START, poll INTFLAG.RESRDY, read RESULT. Reading RESULT clears RESRDY and WINMON, so a read that is not the CPU's may leave them set.",
+    "The bandgap reaches the ADC only with SYSCTRL VREF.BGOUTEN set (17.8.16), and selecting it requires SAMPCTRL to be written (33.8.8). The scaled supplies need nothing.",
+    "DEBUG: when the core halts in debug mode the ADC halts too (33.5.7), unless DBGCTRL.DBGRUN is set, which may be written only while the ADC is disabled. A driver leaves it at 0; a test that runs with the core halted sets it.",
+    "Analog pads: every AIN is on peripheral function B, and selecting function B is what disconnects the pin's digital control (Table 7-1, note 2).",
+]
+
+[registers.CTRLA]
+offset = 0x00
+width = 8
+fields = { SWRST = [0, 1], ENABLE = [1, 1], RUNSTDBY = [2, 1] }
+notes = "SWRST and ENABLE are write-synchronized. SWRST resets every register except DBGCTRL and leaves the ADC disabled."
+
+[registers.REFCTRL]
+offset = 0x01
+width = 8
+fields = { REFSEL = [0, 4], REFCOMP = [7, 1] }
+notes = "REFSEL per Table 33-5; see the REFSEL_* constants. REFCOMP trades input impedance and reference start-up time for gain-stage accuracy."
+
+[registers.AVGCTRL]
+offset = 0x02
+width = 8
+fields = { SAMPLENUM = [0, 4], ADJRES = [4, 3] }
+notes = "SAMPLENUM 0x0-0xA = 1 to 1024 samples accumulated. Averaging needs CTRLB.RESSEL = 16BIT."
+
+[registers.SAMPCTRL]
+offset = 0x03
+width = 8
+fields = { SAMPLEN = [0, 6] }
+notes = "Sampling time = (SAMPLEN + 1) * (CLK_ADC / 2), in half CLK_ADC cycles."
+
+[registers.CTRLB]
+offset = 0x04
+width = 16
+fields = { DIFFMODE = [0, 1], LEFTADJ = [1, 1], FREERUN = [2, 1], CORREN = [3, 1], RESSEL = [4, 2], PRESCALER = [8, 3] }
+notes = "Write-synchronized. PRESCALER divides GCLK_ADC by 2^(PRESCALER + 2); RESSEL per the RESSEL_* constants."
+
+[registers.WINCTRL]
+offset = 0x08
+width = 8
+fields = { WINMODE = [0, 3] }
+notes = "Write-synchronized. 0 = no window monitor."
+
+[registers.SWTRIG]
+offset = 0x0C
+width = 8
+fields = { FLUSH = [0, 1], START = [1, 1] }
+notes = "Write-synchronized. START is cleared by hardware once the conversion has started."
+
+[registers.INPUTCTRL]
+offset = 0x10
+width = 32
+fields = { MUXPOS = [0, 5], MUXNEG = [8, 5], INPUTSCAN = [16, 4], INPUTOFFSET = [20, 4], GAIN = [24, 4] }
+notes = "Write-synchronized. MUXPOS is the channel number (see the channel rows); MUXNEG per the MUXNEG_* constants for a single-ended conversion; GAIN per the GAIN_* constants."
+
+[registers.EVCTRL]
+offset = 0x14
+width = 8
+fields = { STARTEI = [0, 1], SYNCEI = [1, 1], RESRDYEO = [4, 1], WINMONEO = [5, 1] }
+
+[registers.INTENCLR]
+offset = 0x16
+width = 8
+fields = { RESRDY = [0, 1], OVERRUN = [1, 1], WINMON = [2, 1], SYNCRDY = [3, 1] }
+
+[registers.INTENSET]
+offset = 0x17
+width = 8
+fields = { RESRDY = [0, 1], OVERRUN = [1, 1], WINMON = [2, 1], SYNCRDY = [3, 1] }
+
+[registers.INTFLAG]
+offset = 0x18
+width = 8
+fields = { RESRDY = [0, 1], OVERRUN = [1, 1], WINMON = [2, 1], SYNCRDY = [3, 1] }
+notes = "RESRDY and WINMON clear on a RESULT read or a write of one; OVERRUN and SYNCRDY on a write of one."
+
+[registers.STATUS]
+offset = 0x19
+width = 8
+fields = { SYNCBUSY = [7, 1] }
+
+[registers.RESULT]
+offset = 0x1A
+width = 16
+fields = { RESULT = [0, 16] }
+notes = "Right-adjusted 12-bit results occupy bits 11:0; left-adjusted or accumulated results use more of the register."
+
+[registers.WINLT]
+offset = 0x1C
+width = 16
+fields = { WINLT = [0, 16] }
+
+[registers.WINUT]
+offset = 0x20
+width = 16
+fields = { WINUT = [0, 16] }
+
+[registers.GAINCORR]
+offset = 0x24
+width = 16
+fields = { GAINCORR = [0, 12] }
+
+[registers.OFFSETCORR]
+offset = 0x26
+width = 16
+fields = { OFFSETCORR = [0, 12] }
+
+[registers.CALIB]
+offset = 0x28
+width = 16
+fields = { LINEARITY_CAL = [0, 8], BIAS_CAL = [8, 3] }
+notes = "Loaded from the NVM Software Calibration Area, unchanged (see the block notes)."
+
+[registers.DBGCTRL]
+offset = 0x2A
+width = 8
+fields = { DBGRUN = [0, 1] }
+notes = "Writable only while the ADC is disabled. 0 = the ADC halts while the core is halted in debug mode."
+
+[constants]
+REFSEL_INT1V = 0
+REFSEL_INTVCC0 = 1
+REFSEL_INTVCC1 = 2
+REFSEL_VREFA = 3
+REFSEL_VREFB = 4
+RESSEL_12BIT = 0
+RESSEL_16BIT = 1
+RESSEL_10BIT = 2
+RESSEL_8BIT = 3
+PRESCALER_DIV4 = 0
+PRESCALER_DIV8 = 1
+PRESCALER_DIV16 = 2
+PRESCALER_DIV32 = 3
+PRESCALER_DIV64 = 4
+PRESCALER_DIV128 = 5
+PRESCALER_DIV256 = 6
+PRESCALER_DIV512 = 7
+GAIN_1X = 0
+GAIN_DIV2 = 15
+MUXNEG_GND = 24
+MUXNEG_IOGND = 25
+NVM_CALIBRATION_AREA = 0x806020
+NVM_LINEARITY_LSB = 27
+NVM_LINEARITY_WIDTH = 8
+NVM_BIASCAL_LSB = 35
+NVM_BIASCAL_WIDTH = 3
+
+[facts]
+resolution_bits = 12
+min_value = 0
+max_value = 4095
+gclk_adc_max_hz = 48000000
+clk_adc_min_hz = 30000
+clk_adc_max_hz = 2100000
+
+[facts.notes]
+nvm = "NVM_CALIBRATION_AREA is the NVM Software Calibration Area (Table 10-5, p44), read-only. The two NVM_*_LSB values number bits from bit 0 of its first word, as the table does: LINEARITY is bits 34:27 and BIASCAL bits 37:35, so LINEARITY crosses from the first word into the second."
+gclk_adc_max_hz = "Table 37-7 (p986): the ADC input clock, GCLK_ADC, runs at 48 MHz or less."
+clk_adc = "Table 37-24 (p1001): CLK_ADC, the prescaled converter clock, must lie within 30 to 2100 kHz. PRESCALER divides GCLK_ADC by 2^(PRESCALER + 2), so a binding's core clock decides which settings are legal."
+
+[[channels]]
+index = 0
+source = "AIN0"
+
+[[channels]]
+index = 1
+source = "AIN1"
+
+[[channels]]
+index = 2
+source = "AIN2"
+
+[[channels]]
+index = 3
+source = "AIN3"
+
+[[channels]]
+index = 4
+source = "AIN4"
+
+[[channels]]
+index = 5
+source = "AIN5"
+
+[[channels]]
+index = 6
+source = "AIN6"
+
+[[channels]]
+index = 7
+source = "AIN7"
+
+[[channels]]
+index = 8
+source = "AIN8"
+
+[[channels]]
+index = 9
+source = "AIN9"
+
+[[channels]]
+index = 10
+source = "AIN10"
+
+[[channels]]
+index = 11
+source = "AIN11"
+
+[[channels]]
+index = 12
+source = "AIN12"
+
+[[channels]]
+index = 13
+source = "AIN13"
+
+[[channels]]
+index = 14
+source = "AIN14"
+
+[[channels]]
+index = 15
+source = "AIN15"
+
+[[channels]]
+index = 16
+source = "AIN16"
+
+[[channels]]
+index = 17
+source = "AIN17"
+
+[[channels]]
+index = 18
+source = "AIN18"
+
+[[channels]]
+index = 19
+source = "AIN19"
+
+[[channels]]
+index = 25
+source = "bandgap"
+enable = "SYSCTRL VREF.BGOUTEN (17.8.16), with SAMPCTRL written (33.8.8)"
+
+[[channels]]
+index = 26
+source = "scaled_core_supply"
+
+[[channels]]
+index = 27
+source = "scaled_io_supply"

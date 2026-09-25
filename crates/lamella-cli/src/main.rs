@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 mod args;
+mod bootprot;
 #[cfg(feature = "bake")]
 mod attach;
 #[cfg(feature = "bake")]

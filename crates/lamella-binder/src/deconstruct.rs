@@ -75,6 +75,7 @@ impl Binder {
             DiagnosticKind::FeatureNotInThisBuild {
                 feature: "deconstruction as a value".into(),
                 permitted_by: self.language_version(),
+                instead: None,
             },
             span,
         ));

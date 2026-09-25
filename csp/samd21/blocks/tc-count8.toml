@@ -1,0 +1,132 @@
+# The TC (Timer/Counter) on the Microchip SAMD21 family in its 8-bit counter mode -- the BLOCK
+# layout: register offsets are instance-relative; nothing in this file names a board, a pin wiring
+# or a clock plan. The instances live in ../instances.toml; which outputs a board wires lives in
+# bsp/<board>/board.toml.
+#
+# THE SAME TC IN A DIFFERENT MODE HAS A DIFFERENT MAP. CTRLA.MODE selects 8, 16 or 32 bits, and
+# COUNT, PER and the CCx registers change width and place with it (Tables 30-4 to 30-6), so this
+# file is the 8-bit map only and no other mode may be read from it.
+#
+# Every offset is read from the 8-bit register summary, Table 30-4, and every bit position from
+# the register's OWN description (30.8.1 to 30.8.14), by word coordinates on the page. PARTIAL:
+# the registers the single-slope PWM a board binds uses, and the ones a test reads to observe it.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "tc"
+mode = "count8"
+sources = [
+    "SAMD21 datasheet DS40001882D chapter 30 (TC): Table 30-4, the register summary in 8-bit mode (pp. 677-678); 30.8.1 CTRLA (p681), 30.8.2 READREQ (p684), 30.8.3 CTRLBCLR (p685), 30.8.4 CTRLBSET (p687), 30.8.5 CTRLC (p689), 30.8.6 DBGCTRL (p690), 30.8.10 INTFLAG (p695), 30.8.11 STATUS (p696), 30.8.12.1 COUNT (p697), 30.8.13.1 PER (p699), 30.8.14.1 CC (p700)",
+    "DS40001882D 30.6.2.6.1 to 30.6.2.6.4 (waveform output, single-slope PWM and changing TOP, pp. 670-672), 30.6.2.1 (enable protection, p666), 30.6.6 (synchronization, pp. 676-677), 14.3.1.5 (read request, p112)",
+]
+notes = [
+    "Single-slope PWM is CTRLA.WAVEGEN = NPWM. In 8-bit mode TOP is PER (30.6.2.6.1). Counting up, an output WO[x] is set at the start of each period and cleared when the counter matches CCx (30.6.2.6.3), so it is high for CCx counts of every PER + 1.",
+    "f_PWM = f_GCLK_TC / (N (TOP + 1)), where N is the prescaler's division, one of 1, 2, 4, 8, 16, 64, 256 or 1024 (30.6.2.6.3). The PRESCALER_DIV<n> constants name each code by its division.",
+    "NO BUFFER REGISTER: the 8-bit summary (Table 30-4) places none, so PER and CCx are written directly, wherever in its period the counter is. PER's own description speaks of a PERBUF copied at UPDATE, which that summary does not place. Counting up, a TOP written below the current COUNT lets the counter run to its maximum and wrap before the new TOP is met, one long period (30.6.2.6.4); by the same comparison, a CCx written below the current COUNT is not matched until the next period.",
+    "Write-synchronized (30.6.6): CTRLA.SWRST and ENABLE, CTRLBCLR, CTRLBSET, CTRLC, COUNT, PER and CCx. STATUS.SYNCBUSY is set while one runs. A register is read-synchronized by writing its offset to READREQ.ADDR with RREQ set, and is readable once SYNCBUSY clears (14.3.1.5).",
+    "Enable-protected (30.6.2.1): CTRLA except ENABLE, SWRST and RUNSTDBY. They may be written in the same write that sets ENABLE, but not in one that clears it.",
+    "TWO INSTANCES SHARE EACH GENERIC CLOCK CHANNEL, so a pair takes one generator; the instance rows name the pairs from the CLKCTRL.ID table (15.8.3), which pairs TCC2 with TC3, TC4 with TC5 and TC6 with TC7. 30.5.3 describes TCs paired even and odd from TC3, which the ID table does not bear out, and the ID table is what CLKCTRL is written with.",
+    "DEBUG: DBGCTRL.DBGRUN at 0 halts the TC while the device is halted in debug mode. The bit survives a software reset and must not be changed while the TC is enabled (30.8.6). A driver leaves it as found; a test that runs with the core halted sets it first.",
+]
+
+[registers.CTRLA]
+offset = 0x00
+width = 16
+fields = { SWRST = [0, 1], ENABLE = [1, 1], MODE = [2, 2], WAVEGEN = [5, 2], PRESCALER = [8, 3], RUNSTDBY = [11, 1], PRESCSYNC = [12, 2] }
+notes = "SWRST and ENABLE are write-synchronized. MODE and WAVEGEN per the MODE_* and WAVEGEN_* constants; PRESCALER per the PRESCALER_DIV<n> constants."
+
+[registers.READREQ]
+offset = 0x02
+width = 16
+fields = { ADDR = [0, 5], RCONT = [14, 1], RREQ = [15, 1] }
+notes = "Only COUNT and the CCx registers can be read-synchronized in the TC."
+
+[registers.CTRLBCLR]
+offset = 0x04
+width = 8
+fields = { DIR = [0, 1], ONESHOT = [2, 1], CMD = [6, 2] }
+notes = "Write one to clear a bit. Write-synchronized."
+
+[registers.CTRLBSET]
+offset = 0x05
+width = 8
+fields = { DIR = [0, 1], ONESHOT = [2, 1], CMD = [6, 2] }
+notes = "Write one to set a bit, or a command into CMD (the CMD_* constants). Write-synchronized."
+
+[registers.CTRLC]
+offset = 0x06
+width = 8
+fields = { INVEN0 = [0, 1], INVEN1 = [1, 1], CPTEN0 = [4, 1], CPTEN1 = [5, 1] }
+notes = "INVENx inverts WO[x]. Write-synchronized."
+
+[registers.DBGCTRL]
+offset = 0x08
+width = 8
+fields = { DBGRUN = [0, 1] }
+notes = "DBGRUN 1: the TC keeps running while the device is halted in debug mode."
+
+[registers.INTFLAG]
+offset = 0x0E
+width = 8
+fields = { OVF = [0, 1], ERR = [1, 1], SYNCRDY = [3, 1], MC0 = [4, 1], MC1 = [5, 1] }
+notes = "Write one to clear a flag."
+
+[registers.STATUS]
+offset = 0x0F
+width = 8
+fields = { STOP = [3, 1], SLAVE = [4, 1], SYNCBUSY = [7, 1] }
+notes = "STOP resets to 1 and reads 0 while the counter runs. SYNCBUSY is set while a synchronization runs."
+
+[registers.COUNT]
+offset = 0x10
+width = 8
+fields = { COUNT = [0, 8] }
+notes = "Read-synchronized through READREQ. Write-synchronized."
+
+[registers.PER]
+offset = 0x14
+width = 8
+fields = { PER = [0, 8] }
+notes = "TOP in 8-bit NPWM. Write-synchronized."
+
+[registers.CC0]
+offset = 0x18
+width = 8
+fields = { CC = [0, 8] }
+notes = "Channel 0's compare value; channel n's is at CC0_OFF + n * CC_STRIDE. Write-synchronized."
+
+[registers.CC1]
+offset = 0x19
+width = 8
+fields = { CC = [0, 8] }
+
+[constants]
+MODE_COUNT16 = 0
+MODE_COUNT8 = 1
+MODE_COUNT32 = 2
+WAVEGEN_NFRQ = 0
+WAVEGEN_MFRQ = 1
+WAVEGEN_NPWM = 2
+WAVEGEN_MPWM = 3
+PRESCALER_DIV1 = 0
+PRESCALER_DIV2 = 1
+PRESCALER_DIV4 = 2
+PRESCALER_DIV8 = 3
+PRESCALER_DIV16 = 4
+PRESCALER_DIV64 = 5
+PRESCALER_DIV256 = 6
+PRESCALER_DIV1024 = 7
+PRESCSYNC_GCLK = 0
+PRESCSYNC_PRESC = 1
+PRESCSYNC_RESYNC = 2
+CMD_NONE = 0
+CMD_RETRIGGER = 1
+CMD_STOP = 2
+CC_STRIDE = 1
+
+[facts]
+counter_bits = 8
+
+[facts.notes]
+counter_bits = "The counter's size in this mode: COUNT, PER and each CCx are 8 bits (Table 30-4)."

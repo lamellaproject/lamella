@@ -37,4 +37,22 @@ public enum Nrf51GpioLayout {
 
     // -- block constants --
     public static let PIN_CNF_STRIDE: UInt32 = 4
+    public static let DIR_INPUT: UInt32 = 0
+    public static let DIR_OUTPUT: UInt32 = 1
+    public static let INPUT_CONNECT: UInt32 = 0
+    public static let INPUT_DISCONNECT: UInt32 = 1
+    public static let PULL_DISABLED: UInt32 = 0
+    public static let PULL_PULLDOWN: UInt32 = 1
+    public static let PULL_PULLUP: UInt32 = 3
+    public static let DRIVE_S0S1: UInt32 = 0
+    public static let DRIVE_H0S1: UInt32 = 1
+    public static let DRIVE_S0H1: UInt32 = 2
+    public static let DRIVE_H0H1: UInt32 = 3
+    public static let DRIVE_D0S1: UInt32 = 4
+    public static let DRIVE_D0H1: UInt32 = 5
+    public static let DRIVE_S0D1: UInt32 = 6
+    public static let DRIVE_H0D1: UInt32 = 7
+    public static let SENSE_DISABLED: UInt32 = 0
+    public static let SENSE_HIGH: UInt32 = 2
+    public static let SENSE_LOW: UInt32 = 3
 }

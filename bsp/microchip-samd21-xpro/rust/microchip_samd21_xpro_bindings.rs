@@ -19,6 +19,12 @@ pub const CARRIER_USB_PID: u16 = 0x2169;
 /// name a driver; and a uart is a different register map on every family, so the kind does
 /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
 pub const VCP_DRIVER_FAMILY: &str = "samd21-sercom";
+pub const EXT1_SPI_DRIVER_FAMILY: &str = "samd21-sercom";
+pub const EXT_TWI_DRIVER_FAMILY: &str = "samd21-sercom";
+pub const ADC_DRIVER_FAMILY: &str = "samd21-adc";
+pub const EXT1_PWM_DRIVER_FAMILY: &str = "samd21-tc";
+pub const EXT2_PWM_DRIVER_FAMILY: &str = "samd21-tc";
+pub const EXT3_PWM_DRIVER_FAMILY: &str = "samd21-tcc";
 
 // -- VCP: a sercom-usart binding descriptor --
 pub const VCP_SERCOM_BASE: u32 = 0x42001400;
@@ -38,6 +44,127 @@ pub const VCP_PINCFG_RX_REG: u32 = 0x41004457;
 pub const VCP_TXPO: u32 = 0;
 pub const VCP_RXPO: u32 = 1;
 pub const VCP_BAUD_115200_OSC8M_8MHZ: u32 = 0xC505;
+
+// -- EXT1_SPI: a sercom-spi binding descriptor (ONE plan: the composed clock word
+// and the core-clock RATE, from which the driver derives BAUD) --
+pub const EXT1_SPI_SERCOM_BASE: u32 = 0x42000800;
+pub const EXT1_SPI_IRQ: u32 = 9;
+pub const EXT1_SPI_APBC_MASK: u32 = 0x4;
+pub const EXT1_SPI_GCLK_CORE_ID: u32 = 20;
+pub const EXT1_SPI_GCLK_CLKCTRL_VALUE: u32 = 0x4014;
+pub const EXT1_SPI_CORE_CLOCK_HZ: u32 = 8000000;
+pub const EXT1_SPI_PMUX_MOSI_REG: u32 = 0x41004433;
+pub const EXT1_SPI_PMUX_MOSI_SHIFT: u32 = 0;
+pub const EXT1_SPI_PINCFG_MOSI_REG: u32 = 0x41004446;
+pub const EXT1_SPI_PMUX_SCK_REG: u32 = 0x41004433;
+pub const EXT1_SPI_PMUX_SCK_SHIFT: u32 = 4;
+pub const EXT1_SPI_PINCFG_SCK_REG: u32 = 0x41004447;
+pub const EXT1_SPI_PMUX_MISO_REG: u32 = 0x41004432;
+pub const EXT1_SPI_PMUX_MISO_SHIFT: u32 = 0;
+pub const EXT1_SPI_PINCFG_MISO_REG: u32 = 0x41004444;
+pub const EXT1_SPI_PMUX_FUNC: u32 = 3;
+pub const EXT1_SPI_DOPO: u32 = 1;
+pub const EXT1_SPI_DIPO: u32 = 0;
+pub const EXT1_SPI_CS_PORT_BASE: u32 = 0x41004400;
+pub const EXT1_SPI_CS_PIN: u32 = 5;
+pub const EXT1_SPI_CS_MASK: u32 = 0x20;
+
+//  -- EXT_TWI: a sercom-i2c binding descriptor (the CORE-CLOCK RATE, not a
+//  divisor: an I2C bus speed is a runtime Configure choice) --
+pub const EXT_TWI_SERCOM_BASE: u32 = 0x42001000;
+pub const EXT_TWI_IRQ: u32 = 11;
+pub const EXT_TWI_GCLK_CLKCTRL_VALUE: u32 = 0x4016;
+pub const EXT_TWI_APBC_MASK: u32 = 0x10;
+pub const EXT_TWI_PMUX_REG: u32 = 0x41004434;
+pub const EXT_TWI_PMUX_PAIR: u32 = 0x33;
+pub const EXT_TWI_PINCFG_SDA_REG: u32 = 0x41004448;
+pub const EXT_TWI_PINCFG_SCL_REG: u32 = 0x41004449;
+pub const EXT_TWI_CORE_CLOCK_HZ: u32 = 8000000;
+
+//  -- ADC: a samd21 adc binding descriptor. The converter's clocks and prescaler, then each
+//  analog pad the board wires: its channel (MUXPOS code), PMUX nibble and PINCFG byte --
+pub const ADC_BASE: u32 = 0x42004000;
+pub const ADC_IRQ: u32 = 23;
+pub const ADC_APBC_MASK: u32 = 0x10000;
+pub const ADC_GCLK_CLKCTRL_VALUE: u32 = 0x401E;
+pub const ADC_CORE_CLOCK_HZ: u32 = 8000000;
+pub const ADC_PRESCALER: u32 = 0;
+pub const ADC_PMUX_FUNC: u32 = 1;
+pub const ADC_REFERENCE_UV: u32 = 3300000;
+pub const ADC_MUXPOS_EXT1_PIN3: u32 = 8;
+pub const ADC_PMUX_EXT1_PIN3_REG: u32 = 0x410044B0;
+pub const ADC_PMUX_EXT1_PIN3_SHIFT: u32 = 0;
+pub const ADC_PINCFG_EXT1_PIN3_REG: u32 = 0x410044C0;
+pub const ADC_MUXPOS_EXT1_PIN4: u32 = 9;
+pub const ADC_PMUX_EXT1_PIN4_REG: u32 = 0x410044B0;
+pub const ADC_PMUX_EXT1_PIN4_SHIFT: u32 = 4;
+pub const ADC_PINCFG_EXT1_PIN4_REG: u32 = 0x410044C1;
+pub const ADC_MUXPOS_EXT2_PIN3: u32 = 18;
+pub const ADC_PMUX_EXT2_PIN3_REG: u32 = 0x41004435;
+pub const ADC_PMUX_EXT2_PIN3_SHIFT: u32 = 0;
+pub const ADC_PINCFG_EXT2_PIN3_REG: u32 = 0x4100444A;
+pub const ADC_MUXPOS_EXT2_PIN4: u32 = 19;
+pub const ADC_PMUX_EXT2_PIN4_REG: u32 = 0x41004435;
+pub const ADC_PMUX_EXT2_PIN4_SHIFT: u32 = 4;
+pub const ADC_PINCFG_EXT2_PIN4_REG: u32 = 0x4100444B;
+pub const ADC_MUXPOS_EXT3_PIN3: u32 = 0;
+pub const ADC_PMUX_EXT3_PIN3_REG: u32 = 0x41004431;
+pub const ADC_PMUX_EXT3_PIN3_SHIFT: u32 = 0;
+pub const ADC_PINCFG_EXT3_PIN3_REG: u32 = 0x41004442;
+pub const ADC_MUXPOS_EXT3_PIN4: u32 = 1;
+pub const ADC_PMUX_EXT3_PIN4_REG: u32 = 0x41004431;
+pub const ADC_PMUX_EXT3_PIN4_SHIFT: u32 = 4;
+pub const ADC_PINCFG_EXT3_PIN4_REG: u32 = 0x41004443;
+
+//  -- EXT1_PWM: a samd21 pwm binding descriptor. The counter's clocks and size, then each waveform
+//  output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+pub const EXT1_PWM_BASE: u32 = 0x42003800;
+pub const EXT1_PWM_IRQ: u32 = 21;
+pub const EXT1_PWM_APBC_MASK: u32 = 0x4000;
+pub const EXT1_PWM_GCLK_CLKCTRL_VALUE: u32 = 0x401D;
+pub const EXT1_PWM_CORE_CLOCK_HZ: u32 = 8000000;
+pub const EXT1_PWM_COUNTER_BITS: u32 = 8;
+pub const EXT1_PWM_PMUX_FUNC: u32 = 4;
+pub const EXT1_PWM_CC_WO0: u32 = 0;
+pub const EXT1_PWM_PMUX_WO0_REG: u32 = 0x410044B1;
+pub const EXT1_PWM_PMUX_WO0_SHIFT: u32 = 0;
+pub const EXT1_PWM_PINCFG_WO0_REG: u32 = 0x410044C2;
+pub const EXT1_PWM_CC_WO1: u32 = 1;
+pub const EXT1_PWM_PMUX_WO1_REG: u32 = 0x410044B1;
+pub const EXT1_PWM_PMUX_WO1_SHIFT: u32 = 4;
+pub const EXT1_PWM_PINCFG_WO1_REG: u32 = 0x410044C3;
+
+//  -- EXT2_PWM: a samd21 pwm binding descriptor. The counter's clocks and size, then each waveform
+//  output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+pub const EXT2_PWM_BASE: u32 = 0x42003000;
+pub const EXT2_PWM_IRQ: u32 = 19;
+pub const EXT2_PWM_APBC_MASK: u32 = 0x1000;
+pub const EXT2_PWM_GCLK_CLKCTRL_VALUE: u32 = 0x401C;
+pub const EXT2_PWM_CORE_CLOCK_HZ: u32 = 8000000;
+pub const EXT2_PWM_COUNTER_BITS: u32 = 8;
+pub const EXT2_PWM_PMUX_FUNC: u32 = 4;
+pub const EXT2_PWM_CC_WO0: u32 = 0;
+pub const EXT2_PWM_PMUX_WO0_REG: u32 = 0x410044B6;
+pub const EXT2_PWM_PMUX_WO0_SHIFT: u32 = 0;
+pub const EXT2_PWM_PINCFG_WO0_REG: u32 = 0x410044CC;
+pub const EXT2_PWM_CC_WO1: u32 = 1;
+pub const EXT2_PWM_PMUX_WO1_REG: u32 = 0x410044B6;
+pub const EXT2_PWM_PMUX_WO1_SHIFT: u32 = 4;
+pub const EXT2_PWM_PINCFG_WO1_REG: u32 = 0x410044CD;
+
+//  -- EXT3_PWM: a samd21 pwm binding descriptor. The counter's clocks and size, then each waveform
+//  output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+pub const EXT3_PWM_BASE: u32 = 0x42002800;
+pub const EXT3_PWM_IRQ: u32 = 17;
+pub const EXT3_PWM_APBC_MASK: u32 = 0x400;
+pub const EXT3_PWM_GCLK_CLKCTRL_VALUE: u32 = 0x401B;
+pub const EXT3_PWM_CORE_CLOCK_HZ: u32 = 8000000;
+pub const EXT3_PWM_COUNTER_BITS: u32 = 16;
+pub const EXT3_PWM_PMUX_FUNC: u32 = 4;
+pub const EXT3_PWM_CC_WO0: u32 = 0;
+pub const EXT3_PWM_PMUX_WO0_REG: u32 = 0x41004436;
+pub const EXT3_PWM_PMUX_WO0_SHIFT: u32 = 0;
+pub const EXT3_PWM_PINCFG_WO0_REG: u32 = 0x4100444C;
 pub const DEVICE_COUNT: u32 = 2;
 
 // -- on-board devices: PORT group base + pin index + mask --

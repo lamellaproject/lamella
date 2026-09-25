@@ -66,11 +66,11 @@ impl ReplCompiler for WasmCompiler {
 }
 
 /// Build a fresh process-global REPL: the compiler binds against `references` (the net8.0
-/// ref assemblies) and the link runs against `corlib` (the managed corlib). Replaces any
-/// existing session.
+/// ref assemblies) and the link runs against `corlib` (the managed corlib), every submission
+/// with the page's clock ([`crate::clock::configure`]). Replaces any existing session.
 fn new_session(corlib: &[u8], references: Vec<Vec<u8>>) {
     let compiler = Box::new(WasmCompiler { references });
-    let link = Box::new(LoopbackLink::new(corlib.to_vec()));
+    let link = Box::new(LoopbackLink::new(corlib.to_vec(), crate::clock::configure));
     let repl = Repl::new(compiler, link);
     REPL.with(|cell| *cell.borrow_mut() = Some(repl));
 }

@@ -1,0 +1,138 @@
+# BLOCK layout: the nRF51 SPI master, register-per-byte (TXD/RXD) with one event -- the polled shape
+# a table-driven driver wants. This part has no EasyDMA SPI master to choose against.
+#
+# The peripheral SHARES its ID and its registers with the other serial personalities at the same
+# base: SPI0 with TWI0 (ID 3), SPI1 with SPIS1 and TWI1 (ID 4). ENABLE selects the personality, and
+# disabling a sibling resets none of the shared registers, so a bring-up writes every register it
+# relies on (26.1.2).
+#
+# Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
+# chapter 26, Tables 220-234, with the document open; every bit position was placed from the printed
+# table's column coordinates, and INTEN, INTENSET and INTENCLR were required to agree.
+#
+# THE PIN SELECT REGISTERS DIFFER FROM THE SIBLING FAMILY'S: here each is a plain 32-bit pin number,
+# 0xFFFFFFFF meaning disconnected, because this part has one GPIO port and no connect bit.
+
+[table]
+kind = "block"
+family = "nrf51"
+block = "spi"
+sources = [
+    "nRF51 Series Reference Manual v3.0 (Nordic Semiconductor), ch. 26 SPI master (pp. 132-136): 26.1 functional description, Table 220 SPI modes, Table 221 GPIO configuration, 26.1.1 pin configuration, 26.1.2 shared resources, 26.1.3 transaction sequence, Table 222 instances (SPI0 0x40003000, SPI1 0x40004000), Table 223 register overview, Tables 224-234 fields",
+    "nRF51822 Product Specification v3.4, section 8.9 Table 46 and Table 47: SPI bit rate and SCK frequency 0.125 to 4 Mbps",
+]
+notes = [
+    "Config envelope: FREQUENCY is enumerated -- 125 kbps, 250 kbps, 500 kbps, 1, 2 and 4 Mbps on the nRF51822. The manual also defines an 8 Mbps word (FREQUENCY_M8), but the nRF51822 product specification limits SPI to 4 Mbps, so a driver for this part offers nothing above M4. FREQUENCY resets to 250 kbps (0x04000000).",
+    "Frames are 8 bits. CONFIG selects the bit order (ORDER: 0 most significant bit first, 1 least significant first) and SPI modes 0 to 3 (CPOL bit 2 and CPHA bit 1: mode 0 = 0,0; mode 1 = 0,1; mode 2 = 1,0; mode 3 = 1,1, Table 220).",
+    "The master drives no chip select; the CPU selects the slave with a GPIO of its own (26.1).",
+    "PSELSCK, PSELMOSI and PSELMISO are used only while the master is enabled and are retained only in ON mode, and must be written only while it is DISABLED (26.1.1): route pins first, ENABLE last.",
+    "Table 221 GPIO configuration, set before ENABLE and held while enabled: SCK an output whose OUT level equals CONFIG.CPOL, MOSI an output at 0, MISO an input. SCK's input buffer must stay connected for the master to work, and PIN_CNF resets with the buffer disconnected, so the bring-up writes it (26.1.1). PIN_CNF_SPI_OUTPUT and PIN_CNF_SPI_INPUT are those two PIN_CNF words: DIR output or input, INPUT connected, no pull, standard drive, no sensing (gpio block, Table 83).",
+    "TXD and RXD are double buffered: a second byte may be written to TXD immediately after the first, and the master sends them in order. READY fires each time a byte is moved into RXD; a byte waiting behind it moves in, raising READY again, only after RXD is read. The master stops when TXD and its second buffer are both empty (26.1.3).",
+    "READY is raised a short delay after the last SCK period of a byte, so a driver clears it on every byte, even when the received data is not used (26.1.3).",
+]
+
+[registers.EVENTS_READY]
+offset = 0x108
+width = 32
+fields = { EVENTS_READY = [0, 1] }
+notes = "1 = a byte was moved into RXD. Write 0 to clear, on every byte."
+
+[registers.INTENSET]
+offset = 0x304
+width = 32
+fields = { READY = [2, 1] }
+notes = "Write 1 to enable the READY interrupt. A polled driver leaves it disabled."
+
+[registers.INTENCLR]
+offset = 0x308
+width = 32
+fields = { READY = [2, 1] }
+notes = "Write 1 to disable the READY interrupt; bit 2 in INTEN, INTENSET and INTENCLR alike (Tables 224-226)."
+
+[registers.ENABLE]
+offset = 0x500
+width = 32
+fields = { ENABLE = [0, 3] }
+notes = "0 = disabled, 1 = SPI master enabled (Table 227). One register shared with every personality at this base, so the value selects the SPI and writing 0 disables them all."
+
+[registers.PSELSCK]
+offset = 0x508
+width = 32
+fields = { PSELSCK = [0, 32] }
+notes = "Pin number for SCK (Table 228). Reset 0xFFFFFFFF = disconnected. Write only while disabled."
+
+[registers.PSELMOSI]
+offset = 0x50C
+width = 32
+fields = { PSELMOSI = [0, 32] }
+notes = "Pin number for MOSI (Table 229). Reset 0xFFFFFFFF = disconnected."
+
+[registers.PSELMISO]
+offset = 0x510
+width = 32
+fields = { PSELMISO = [0, 32] }
+notes = "Pin number for MISO (Table 230). Reset 0xFFFFFFFF = disconnected."
+
+[registers.RXD]
+offset = 0x518
+width = 32
+fields = { RXD = [0, 8] }
+notes = "The received byte, double buffered (Table 231). Read it exactly once per READY."
+
+[registers.TXD]
+offset = 0x51C
+width = 32
+fields = { TXD = [0, 8] }
+notes = "The next byte to send, double buffered (Table 232). Writing it starts a transfer when the master is idle."
+
+[registers.FREQUENCY]
+offset = 0x524
+width = 32
+fields = { FREQUENCY = [0, 32] }
+notes = "Enumerated (Table 233); see the FREQUENCY_* constants. Resets to 250 kbps."
+
+[registers.CONFIG]
+offset = 0x554
+width = 32
+fields = { ORDER = [0, 1], CPHA = [1, 1], CPOL = [2, 1] }
+notes = "ORDER 1 = least significant bit first. CPHA 1 = sample on the trailing edge. CPOL 1 = clock idles high (Table 234)."
+
+[constants]
+ENABLE_DISABLED = 0
+ENABLE_SPI = 1
+FREQUENCY_K125 = 0x02000000
+FREQUENCY_K250 = 0x04000000
+FREQUENCY_K500 = 0x08000000
+FREQUENCY_M1 = 0x10000000
+FREQUENCY_M2 = 0x20000000
+FREQUENCY_M4 = 0x40000000
+FREQUENCY_M8 = 0x80000000
+PIN_CNF_SPI_OUTPUT = 0x1
+PIN_CNF_SPI_INPUT = 0x0
+
+[parameters]
+tx_byte = "The byte to send."
+
+# One full-duplex byte: send it, wait for its echo in RXD, clear READY, take the byte.
+
+[[sequences.transfer_byte]]
+op = "write"
+reg = "TXD"
+value = "$tx_byte"
+
+[[sequences.transfer_byte]]
+op = "poll"
+reg = "EVENTS_READY"
+mask = 0x1
+note = "the byte clocked out and the received byte reached RXD"
+
+[[sequences.transfer_byte]]
+op = "write"
+reg = "EVENTS_READY"
+value = 0x0
+
+[[sequences.transfer_byte]]
+op = "read"
+reg = "RXD"
+mask = 0xFF
+note = "exactly one read per READY"

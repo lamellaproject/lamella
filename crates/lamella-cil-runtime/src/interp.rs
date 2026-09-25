@@ -1160,6 +1160,9 @@ impl Vm {
     /// host default). On a bump-allocator device tier an unbounded console is a leak an
     /// output-happy program feeds forever; a capped one is a fixed-cost diagnostic window
     /// (the embedder reads [`Vm::output_clipped`] to note the loss).
+    ///
+    /// For an embedder that discards what it has delivered ([`Vm::discard_output`]), the cap
+    /// bounds what is waiting to be delivered, not everything the run has printed.
     pub fn set_output_cap(&mut self, cap: Option<usize>) {
         self.output_cap = cap;
     }
@@ -1177,9 +1180,27 @@ impl Vm {
     }
 
     /// The console output so far, as UTF-16 code units.
+    ///
+    /// Everything the run has printed, unless the embedder has discarded what it delivered
+    /// ([`Vm::discard_output`]); then it is what has not been delivered yet.
     #[must_use]
     pub fn output(&self) -> &[u16] {
         &self.output
+    }
+
+    /// Forgets the first `units` UTF-16 units of the console output, which the embedder has
+    /// delivered and will not read here again. More than there are forgets them all.
+    ///
+    /// This is for an embedder that STREAMS a run's output while it runs. Without it the buffer
+    /// keeps every unit the program ever printed, so a program that prints for as long as it runs
+    /// holds a copy of all of it -- on a device, until the memory runs out. With it, the buffer
+    /// holds only what was printed since the last delivery.
+    ///
+    /// Nothing calls it for you. An embedder that never does sees [`Vm::output`] exactly as before.
+    /// The buffer keeps its capacity, so a streaming run reuses the same storage instead of
+    /// allocating it again.
+    pub fn discard_output(&mut self, units: usize) {
+        discard_front(&mut self.output, units);
     }
 
     /// Appends UTF-16 code units to the DEBUG channel (the `Debug.WriteLine` sink). Kept
@@ -1189,10 +1210,17 @@ impl Vm {
         self.debug_output.extend_from_slice(chars);
     }
 
-    /// The DEBUG-channel output so far, as UTF-16 code units.
+    /// The DEBUG-channel output so far, as UTF-16 code units -- or, for an embedder that discards
+    /// what it delivered ([`Vm::discard_debug_output`]), what has not been delivered yet.
     #[must_use]
     pub fn debug_output(&self) -> &[u16] {
         &self.debug_output
+    }
+
+    /// [`Vm::discard_output`] for the DEBUG channel: forgets its first `units` UTF-16 units, which
+    /// the embedder has delivered.
+    pub fn discard_debug_output(&mut self, units: usize) {
+        discard_front(&mut self.debug_output, units);
     }
 
     /// The DEBUG-channel output so far, decoded to a `String` (lossily, for display
@@ -1545,6 +1573,23 @@ impl Vm {
             .map(|(_, fault)| fault.chain.as_slice())
     }
 
+    /// The type a RUNTIME-RAISED `exception` is an instance of: the one the VES recorded when it
+    /// minted the object, which wears `EXTERNAL_TYPE_ID` in place of a type id of its own. `None`
+    /// when nothing was recorded (its leaf type is not loaded).
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub(crate) fn raised_exception_type(&self, module: &Module, exception: ObjectRef) -> Option<TypeId> {
+        self.exception_type_handle(exception)
+            .and_then(|handle| module.type_id_by_handle(handle))
+    }
+
+    /// Without `exceptions` the VES raises nothing catchable, so no object carries a recorded type.
+    #[cfg(not(feature = "exceptions"))]
+    #[must_use]
+    pub(crate) fn raised_exception_type(&self, _module: &Module, _exception: ObjectRef) -> Option<TypeId> {
+        None
+    }
+
     /// The recorded `Type` handle of a runtime-fault `exception`, if its leaf type was loaded.
     #[cfg(feature = "exceptions")]
     #[must_use]
@@ -1585,9 +1630,7 @@ impl Vm {
         {
         let escaped = self.unhandled;
         let type_id = escaped.and_then(|exception| match self.heap().type_of(exception) {
-            Some(EXTERNAL_TYPE_ID) | None => self
-                .exception_type_handle(exception)
-                .and_then(|handle| module.type_id_by_handle(handle)),
+            Some(EXTERNAL_TYPE_ID) | None => self.raised_exception_type(module, exception),
             Some(type_id) => Some(type_id),
         });
         let type_name = type_id.and_then(|id| module.type_full_name(id).map(String::from));
@@ -1619,6 +1662,14 @@ impl Vm {
     }
 }
 
+/// Removes the first `units` UTF-16 units of `buffer` (all of them, if it holds fewer) and keeps its
+/// capacity -- [`Vm::discard_output`] and [`Vm::discard_debug_output`].
+fn discard_front(buffer: &mut Vec<u16>, units: usize) {
+    let units = units.min(buffer.len());
+    buffer.copy_within(units.., 0);
+    buffer.truncate(buffer.len() - units);
+}
+
 /// A multicast delegate's bound method: a `(target, method)` pair.
 type Invocation = (Value, u32);
 
@@ -1643,9 +1694,11 @@ struct Frame {
     /// temporary the ctor built in place, whose struct VALUE -- not a heap reference -- is
     /// left on the caller's stack when the frame returns.
     new_value: Option<Location>,
-    /// The exception currently being handled in a catch block of this frame, so
-    /// `rethrow` can re-propagate it.
-    current_exception: Option<ObjectRef>,
+    /// The exception each catch handler of this frame caught, keyed by the handler's start, so a
+    /// `rethrow` re-raises the one its own handler caught (III.4.24) and not whichever a nested
+    /// handler caught last. Sized when the frame is set up ([`Frame::prepare_for_handlers`]), so
+    /// recording a catch never allocates.
+    caught_exceptions: Vec<(usize, ObjectRef)>,
     /// An in-progress `finally` chain (from a `leave` or an exception unwind).
     pending: Option<PendingFinally>,
     /// A `filter` expression being evaluated mid-unwind: the exception, the handler to
@@ -1732,7 +1785,7 @@ impl FramePool {
         frame.buffers.clear();
         frame.new_object = None;
         frame.new_value = None;
-        frame.current_exception = None;
+        frame.caught_exceptions.clear();
         frame.pending = None;
         frame.pending_filter = None;
         frame.multicast = None;
@@ -2537,6 +2590,11 @@ pub enum Ran {
 /// The callback is also fired around the idle block, so a program that is merely SLEEPING keeps its
 /// carrier pumped and stays reclaimable.
 ///
+/// It gets the machine MUTABLY, so a serve that streams the program's output can let go of what it
+/// has sent ([`Vm::discard_output`]) -- the one thing that keeps a program that prints for as long as
+/// it runs from holding a copy of everything it printed. It runs between instructions, where no
+/// session is part-way through one.
+///
 /// # Errors
 /// Propagates a [`Trap`] from any thread's execution.
 pub fn run_interruptible(
@@ -2544,7 +2602,7 @@ pub fn run_interruptible(
     vm: &mut Vm,
     entry: MethodId,
     args: Vec<Value>,
-    service: &mut dyn FnMut(&Vm) -> bool,
+    service: &mut dyn FnMut(&mut Vm) -> bool,
 ) -> Result<Ran, Trap> {
     if module.is_baked() && !vm.all_cctors_run(module) && !module.static_ctors().contains(&entry) {
         return Err(Trap::StaticCtorsNotRun);
@@ -2941,7 +2999,7 @@ impl Session {
         &mut self,
         module: &Module,
         vm: &mut Vm,
-        service: &mut dyn FnMut(&Vm) -> bool,
+        service: &mut dyn FnMut(&mut Vm) -> bool,
     ) -> Result<ThreadStatus, Trap> {
         let mut quantum = TIME_SLICE_QUANTUM;
         loop {
@@ -3638,27 +3696,7 @@ impl Session {
                 Ok(Status::Running)
             }
             Flow::InitObj { location, kind } => {
-                let type_id = module.type_id_of(asm, kind);
-                let defaults = type_id.and_then(|type_id| module.type_field_defaults(type_id));
-                if defaults.as_ref().is_none_or(|fields| fields.is_empty())
-                    && !module.is_enum_by_handle(asm_key(asm, kind.0))
-                {
-                    if let Some(zero) = type_id.and_then(|id| module.primitive_zero_of_type(id)) {
-                        write_location_value(frames, vm, location, zero)?;
-                        return Ok(Status::Running);
-                    }
-                    if type_id.is_some_and(|type_id| !module.type_is_value_type(type_id)) {
-                        write_location_value(frames, vm, location, Value::Null)?;
-                        return Ok(Status::Running);
-                    }
-                }
-                let value = match defaults {
-                    Some(defaults) if module.is_enum_by_handle(asm_key(asm, kind.0)) => {
-                        defaults.into_iter().next().unwrap_or(Value::Int32(0))
-                    }
-                    Some(defaults) => Value::Struct(defaults.into_boxed_slice()),
-                    None => Value::Int32(0),
-                };
+                let value = zero_of_type(module, module.type_id_of(asm, kind), asm_key(asm, kind.0));
                 write_location_value(frames, vm, location, value)?;
                 Ok(Status::Running)
             }
@@ -4414,7 +4452,11 @@ fn run_pending_cctor_nested(module: &Module, vm: &mut Vm, method: MethodId) -> R
 
 fn new_frame(vm: &mut Vm, module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
     match module.method_kind(id) {
-        Some(MethodKind::Managed) => Ok(vm.frame_pool.revive(id, args)),
+        Some(MethodKind::Managed) => {
+            let mut frame = vm.frame_pool.revive(id, args);
+            frame.prepare_for_handlers(eh_clause_count(module, id));
+            Ok(frame)
+        }
         _ => Err(Trap::NoSuchMethod(id)),
     }
 }
@@ -4423,7 +4465,11 @@ fn new_frame(vm: &mut Vm, module: &Module, id: MethodId, args: Vec<Value>) -> Re
 /// program start -- the per-call recycling happens in `advance`, which always has the `Vm`.
 fn new_frame_cold(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
     match module.method_kind(id) {
-        Some(MethodKind::Managed) => Ok(Frame::new(id, args)),
+        Some(MethodKind::Managed) => {
+            let mut frame = Frame::new(id, args);
+            frame.prepare_for_handlers(eh_clause_count(module, id));
+            Ok(frame)
+        }
         _ => Err(Trap::NoSuchMethod(id)),
     }
 }
@@ -4482,6 +4528,17 @@ fn method_handlers(module: &Module, id: MethodId) -> Result<&[EhClause], Trap> {
 #[cfg(feature = "code-in-place")]
 fn method_handlers(module: &Module, id: MethodId) -> Result<Vec<EhClause>, Trap> {
     module.method_eh(id).ok_or(Trap::NoSuchMethod(id))
+}
+
+/// How many exception clauses a managed method declares, read without materializing them -- the
+/// most caught exceptions its frame can hold at once, since each is keyed by its handler.
+#[cfg(not(feature = "code-in-place"))]
+fn eh_clause_count(module: &Module, id: MethodId) -> usize {
+    module.method_body(id).map_or(0, |body| body.handlers.len())
+}
+#[cfg(feature = "code-in-place")]
+fn eh_clause_count(module: &Module, id: MethodId) -> usize {
+    module.method_eh_count(id)
 }
 
 /// A reserved type id for objects whose type is external to this module: a runtime-fault
@@ -4585,6 +4642,14 @@ fn fault_exception(trap: &Trap) -> Option<(Cow<'static, str>, &'static [&'static
         "System.Exception",
         "System.Object",
     ];
+    const MISSING_METHOD: &[&str] = &[
+        "System.MissingMethodException",
+        "System.MissingMemberException",
+        "System.MemberAccessException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
     const ENCODER_FALLBACK: &[&str] = &[
         "System.Text.EncoderFallbackException",
         "System.ArgumentException",
@@ -4621,6 +4686,17 @@ fn fault_exception(trap: &Trap) -> Option<(Cow<'static, str>, &'static [&'static
             ARRAY_MISMATCH,
         ),
         Trap::InvalidArgument => ("Requested value was not found.", ARGUMENT),
+        Trap::Refused(with, message) => {
+            return Some((
+                message.clone(),
+                match with {
+                    crate::trap::RefusedWith::Argument => ARGUMENT,
+                    crate::trap::RefusedWith::ArrayTypeMismatch => ARRAY_MISMATCH,
+                    crate::trap::RefusedWith::InvalidCast => INVALID_CAST,
+                    crate::trap::RefusedWith::MissingMethod => MISSING_METHOD,
+                },
+            ));
+        }
         Trap::SynchronizationLock => (
             "Object synchronization method was called from an unsynchronized block of code.",
             SYNC_LOCK,
@@ -4832,7 +4908,8 @@ fn complete_finally(
             let frame = frames.last_mut().ok_or(Trap::StackUnderflow)?;
             frame.stack.clear();
             frame.stack.push(Value::Object(exception));
-            frame.current_exception = Some(exception);
+            frame.caught_exceptions.retain(|&(start, _)| start != handler);
+            frame.caught_exceptions.push((handler, exception));
             frame.ip = handler;
             Ok(Status::Running)
         }
@@ -4858,7 +4935,7 @@ fn covers(range: InstructionRange, ip: usize) -> bool {
 /// The finally handlers a `leave` from `from_ip` to `target` exits: those whose try
 /// covers `from_ip` but not `target`. Ordered so `pop` yields innermost first.
 fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<usize> {
-    finally_handlers(handlers, false, |clause| {
+    finally_handlers(handlers, false, &|clause| {
         covers(clause.try_range, from_ip) && !covers(clause.try_range, target)
     })
 }
@@ -4866,7 +4943,7 @@ fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<
 /// The finally handlers in this frame covering `fault_ip` (run as the frame unwinds
 /// when it has no matching catch).
 fn finallys_covering(handlers: &[EhClause], fault_ip: usize) -> Vec<usize> {
-    finally_handlers(handlers, true, |clause| covers(clause.try_range, fault_ip))
+    finally_handlers(handlers, true, &|clause| covers(clause.try_range, fault_ip))
 }
 
 /// The finally handlers nested between `fault_ip` and a catch -- covering the fault
@@ -4876,7 +4953,7 @@ fn finallys_inside(
     fault_ip: usize,
     catch_try: InstructionRange,
 ) -> Vec<usize> {
-    finally_handlers(handlers, true, |clause| {
+    finally_handlers(handlers, true, &|clause| {
         covers(clause.try_range, fault_ip)
             && clause.try_range.start >= catch_try.start
             && clause.try_range.end <= catch_try.end
@@ -4887,10 +4964,13 @@ fn finallys_inside(
 /// unwind, not a `leave`), the fault clauses -- kept by `keep`, ordered outermost-first so
 /// that `pop` runs them innermost-first. A fault handler runs like a finally during unwind
 /// and ends with `endfault` (the same opcode as `endfinally`).
+///
+/// `keep` is a `dyn` so this is compiled once. Taken as a generic, each of its three callers got
+/// a copy of its own, and every copy carried a copy of the sort below.
 fn finally_handlers(
     handlers: &[EhClause],
     include_fault: bool,
-    keep: impl Fn(&EhClause) -> bool,
+    keep: &dyn Fn(&EhClause) -> bool,
 ) -> Vec<usize> {
     let mut clauses: Vec<&EhClause> = handlers
         .iter()
@@ -5962,7 +6042,12 @@ fn step(
                 frame.stack.push(value);
                 return Ok(Flow::Next);
             }
-            let reference = object_ref(frame.pop()?, Opcode::UnboxAny)?;
+            let popped = frame.pop()?;
+            if matches!(popped, Value::Null) && is_value_type_operand(module, asm, token) == Some(false) {
+                frame.stack.push(Value::Null);
+                return Ok(Flow::Next);
+            }
+            let reference = object_ref(popped, Opcode::UnboxAny)?;
             match vm.heap().boxed_value(reference) {
                 Some(value) => {
                     if !unbox_matches(module, asm, vm, reference, token) {
@@ -6015,6 +6100,16 @@ fn step(
                 .heap()
                 .array_get(array, index)
                 .ok_or(Trap::IndexOutOfRange(index as i32))?;
+            if instruction.opcode == Opcode::Ldelem
+                && matches!(value, Value::Object(_))
+                && vm.heap().array_element_type(array) == Some(0)
+                && module.is_some_and(|module| {
+                    token_operand(instruction)
+                        .is_ok_and(|token| is_value_type_operand(module, asm, token) == Some(true))
+                })
+            {
+                return Err(Trap::TypeMismatch(Opcode::Ldelem));
+            }
             let value = match (instruction.opcode, value) {
                 (Opcode::LdelemU1, Value::Int32(raw)) => Value::Int32(raw & 0xFF),
                 (Opcode::LdelemI1, Value::Int32(raw)) => Value::Int32(i32::from(raw as u8 as i8)),
@@ -6039,15 +6134,21 @@ fn step(
             let array = object_ref(frame.pop()?, instruction.opcode)?;
             let len = vm.heap().array_len(array).ok_or(Trap::NullReference)?;
             let index = bounded_index(index, len)?;
-            if instruction.opcode == Opcode::StelemRef {
+            if matches!(instruction.opcode, Opcode::StelemRef | Opcode::Stelem) {
                 if let (Value::Object(_), Some(element_type)) =
                     (&value, vm.heap().array_element_type(array))
                 {
-                    if element_type != 0 {
+                    let exact_element = instruction.opcode == Opcode::Stelem
+                        && module.is_some_and(|module| {
+                            token_operand(instruction)
+                                .is_ok_and(|token| array_element_is(module, element_type, asm, token))
+                        });
+                    if element_type != 0 && !exact_element {
                         let element_asm = (element_type >> 32) as u8;
                         let element_token = Token((element_type & 0xFFFF_FFFF) as u32);
                         let matches = module.is_some_and(|module| {
                             module.is_object_type_token(element_asm, element_token)
+                                || matches!(module.cast_elem(element_type), Some(CastElem::Object))
                                 || cast_matches(module, element_asm, vm, &value, element_token)
                         });
                         if !matches {
@@ -6068,9 +6169,27 @@ fn step(
         }
         #[cfg(feature = "exceptions")]
         Opcode::Rethrow => {
-            let exception = frame
-                .current_exception
-                .ok_or(Trap::Unsupported(Opcode::Rethrow))?;
+            let here = frame.ip.saturating_sub(1);
+            let owner = match module {
+                Some(module) => method_handlers(module, frame.method)?
+                    .iter()
+                    .filter(|clause| {
+                        matches!(clause.kind, EhKind::Catch(_) | EhKind::Filter { .. })
+                            && covers(clause.handler_range, here)
+                    })
+                    .min_by_key(|clause| clause.handler_range.end - clause.handler_range.start)
+                    .map(|clause| clause.handler_range.start as usize),
+                None => None,
+            };
+            let exception = match owner {
+                Some(start) => frame
+                    .caught_exceptions
+                    .iter()
+                    .find(|&&(handler, _)| handler == start),
+                None => frame.caught_exceptions.last(),
+            }
+            .map(|&(_, exception)| exception)
+            .ok_or(Trap::Unsupported(Opcode::Rethrow))?;
             return Ok(Flow::Throw(exception));
         }
         #[cfg(feature = "exceptions")]
@@ -6254,6 +6373,19 @@ fn step(
 }
 
 impl Frame {
+    /// Sizes the frame for its method's `clauses` exception clauses when it is set up, so that a
+    /// CATCH only writes: an entry per handler in [`Frame::caught_exceptions`], and room on the
+    /// evaluation stack for the exception the handler starts with. A catch is where a program
+    /// meets an `OutOfMemoryException`, raised at the object budget with only the headroom below
+    /// capacity left, so it must need no memory of its own. A method with no clauses is untouched,
+    /// and a pooled shell that already has the room is not grown.
+    fn prepare_for_handlers(&mut self, clauses: usize) {
+        if clauses > 0 {
+            self.caught_exceptions.reserve(clauses);
+            self.stack.reserve(1);
+        }
+    }
+
     fn new(method: MethodId, args: Vec<Value>) -> Frame {
         Frame {
             method,
@@ -6263,7 +6395,7 @@ impl Frame {
             args,
             new_object: None,
             new_value: None,
-            current_exception: None,
+            caught_exceptions: Vec::new(),
             pending: None,
             pending_filter: None,
             multicast: None,
@@ -7500,6 +7632,29 @@ fn resolve_callvirt(
     static_method
 }
 
+/// The zero of the type `type_id` names, whose asm-folded handle is `handle`: what `initobj` writes,
+/// and what the box of a value type holds when no constructor has run. A primitive answers its zero
+/// at its width, an enum its underlying zero, a struct its zeroed fields, and a reference type null.
+pub(crate) fn zero_of_type(module: &Module, type_id: Option<TypeId>, handle: u64) -> Value {
+    let defaults = type_id.and_then(|type_id| module.type_field_defaults(type_id));
+    if defaults.as_ref().is_none_or(|fields| fields.is_empty()) && !module.is_enum_by_handle(handle)
+    {
+        if let Some(zero) = type_id.and_then(|id| module.primitive_zero_of_type(id)) {
+            return zero;
+        }
+        if type_id.is_some_and(|type_id| !module.type_is_value_type(type_id)) {
+            return Value::Null;
+        }
+    }
+    match defaults {
+        Some(defaults) if module.is_enum_by_handle(handle) => {
+            defaults.into_iter().next().unwrap_or(Value::Int32(0))
+        }
+        Some(defaults) => Value::Struct(defaults.into_boxed_slice()),
+        None => Value::Int32(0),
+    }
+}
+
 /// The asm-folded handle of `T` when the type `token` names is an instantiation of
 /// `System.Nullable<T>`, else `None` -- the one question the four special-cased instruction arms
 /// (III.4.1 `box`, III.4.3 `castclass`, III.4.6 `isinst`, III.4.32 / III.4.33 `unbox` /
@@ -7508,7 +7663,7 @@ fn resolve_callvirt(
 /// Recorded per TYPE at load rather than per token, so a closed `TypeSpec` in a program and a
 /// synthetic token in a rewritten generic body reach the same answer.
 #[cfg(feature = "generics")]
-fn nullable_underlying_of(module: &Module, asm: u8, token: Token) -> Option<u64> {
+pub(crate) fn nullable_underlying_of(module: &Module, asm: u8, token: Token) -> Option<u64> {
     module
         .type_id_of(asm, token)
         .and_then(|type_id| module.nullable_underlying(type_id))
@@ -7524,7 +7679,7 @@ fn nullable_underlying_of(module: &Module, asm: u8, token: Token) -> Option<u64>
 /// the whole rule set leaves the build through dead-code elimination rather than through four
 /// conditionally-compiled blocks that could drift apart.
 #[cfg(not(feature = "generics"))]
-fn nullable_underlying_of(_module: &Module, _asm: u8, _token: Token) -> Option<u64> {
+pub(crate) fn nullable_underlying_of(_module: &Module, _asm: u8, _token: Token) -> Option<u64> {
     None
 }
 
@@ -7534,7 +7689,7 @@ fn nullable_underlying_of(_module: &Module, _asm: u8, _token: Token) -> Option<u
 /// `token` names the `Nullable<T>` instantiation and `underlying` is `T`'s handle. A null reference
 /// yields the type's own zero -- the same value `initobj` writes, read from the same field defaults,
 /// so `(int?)(object)null` and `default(int?)` cannot disagree.
-fn nullable_from_boxed(
+pub(crate) fn nullable_from_boxed(
     module: &Module,
     vm: &Vm,
     asm: u8,
@@ -7561,7 +7716,7 @@ fn nullable_from_boxed(
 /// Whether a box tagged `box_handle` holds the `underlying` type -- the "obj is a boxed T" test
 /// every nullable arm makes.
 ///
-fn boxed_is_underlying(module: &Module, box_handle: u64, underlying: u64) -> bool {
+pub(crate) fn boxed_is_underlying(module: &Module, box_handle: u64, underlying: u64) -> bool {
     if box_handle == underlying {
         return true;
     }
@@ -7582,14 +7737,16 @@ fn boxed_is_underlying(module: &Module, box_handle: u64, underlying: u64) -> boo
 /// unverifiable (an external core type with no module [`crate::module::TypeId`]):
 /// - a declared **instance** matches via the subtype relation, or when its runtime type
 ///   (or a base) implements the target interface; an unresolved non-core target is treated
-///   as a match (unverified -- an interface this module cannot see);
-/// - a **boxed** value type matches `System.Object`, its own exact value type, or an
-///   interface its value type declares -- so a boxed `int` is precisely *not* a `string` /
-///   an unrelated class, but IS castable to an interface it implements;
+///   as a match (unverified -- an interface this module cannot see). A **delegate** whose type
+///   its `newobj` recorded is tested the same way, as an instance of that type;
+/// - a **boxed** value type matches `System.Object`, its own exact value type, a base class of
+///   it (`System.ValueType`, and `System.Enum` for an enum), or an interface its value type
+///   declares -- so a boxed `int` is precisely *not* a `string` / an unrelated class, but IS a
+///   `ValueType` and IS castable to an interface it implements;
 /// - a heap **string** matches `System.String`, `System.Object`, or an interface the
 ///   `System.String` type declares, and nothing else;
 /// - a target that is a `Nullable<T>` matches a boxed **T**, per III.4.3 and III.4.6.
-fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) -> bool {
+pub(crate) fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) -> bool {
     let reference = match value {
         Value::Null => return true,
         Value::Object(reference) => *reference,
@@ -7602,13 +7759,25 @@ fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) 
             .is_some_and(|box_handle| boxed_is_underlying(module, box_handle, underlying));
     }
     let target_type_id = module.type_id_of(asm, token);
-    if let Some(runtime) = vm.heap().type_of(reference) {
+    let declared = vm
+        .heap()
+        .type_of(reference)
+        .or_else(|| vm.heap().delegate_type_id(reference));
+    if let Some(runtime) = declared {
+        let runtime = if runtime == EXTERNAL_TYPE_ID {
+            vm.raised_exception_type(module, reference).unwrap_or(runtime)
+        } else {
+            runtime
+        };
         return match target_type_id {
             Some(target) => {
                 module.is_subtype(runtime, target) || module.implements_interface(runtime, target)
             }
             None if module.is_object_type_token(asm, token) => true,
             None if module.is_string_type_token(asm, token) => false,
+            None if matches!(module.cast_elem(asm_key(asm, token.0)), Some(CastElem::Array(_))) => {
+                false
+            }
             None => true,
         };
     }
@@ -7621,7 +7790,8 @@ fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) 
         }
         if let Some(box_type) = module.type_id_by_handle(box_token) {
             if let Some(target) = target_type_id {
-                return box_type == target || module.implements_interface(box_type, target);
+                return module.is_subtype(box_type, target)
+                    || module.implements_interface(box_type, target);
             }
         }
         return false;
@@ -7633,14 +7803,51 @@ fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) 
         if let (Some(string_type), Some(target)) =
             (module.intrinsic_type_id(IntrinsicType::String), target_type_id)
         {
-            return module.implements_interface(string_type, target);
+            return module.is_subtype(string_type, target)
+                || module.implements_interface(string_type, target);
         }
         return false;
     }
     if let Some(op_elem) = vm.heap().array_element_type(reference) {
         return array_cast_matches(module, asm, op_elem, token);
     }
+    if matches!(module.cast_elem(asm_key(asm, token.0)), Some(CastElem::VectorInterface(_))) {
+        return false;
+    }
     true
+}
+
+/// Whether the type operand `token` in assembly `asm` names a VALUE type: `Some(true)` for a
+/// primitive or a type the module records as a struct or an enum, `Some(false)` for a reference
+/// type -- a class, an interface, `string`, `object` or an array -- and `None` for a type the module
+/// cannot resolve or a shape the checks do not model.
+fn is_value_type_operand(module: &Module, asm: u8, token: Token) -> Option<bool> {
+    match module.cast_elem(asm_key(asm, token.0)) {
+        Some(CastElem::Prim(_) | CastElem::GenericValueType) => Some(true),
+        Some(
+            CastElem::String | CastElem::Object | CastElem::Array(_) | CastElem::VectorInterface(_),
+        ) => Some(false),
+        Some(CastElem::Lenient) => None,
+        _ => module.type_id_of(asm, token).map(|type_id| module.type_is_value_type(type_id)),
+    }
+}
+
+/// Whether an array whose `newarr` element handle is `element` (asm-folded) holds exactly the type
+/// `token` names in assembly `asm`: the same handle, the same resolved type, or -- where neither
+/// side resolves to a type, as for an array, `object` or `string` type argument on a tier with no
+/// managed corlib -- the same cast shape.
+fn array_element_is(module: &Module, element: u64, asm: u8, token: Token) -> bool {
+    let handle = asm_key(asm, token.0);
+    if element == handle {
+        return true;
+    }
+    if let (Some(held), Some(wanted)) = (module.type_id_by_handle(element), module.type_id_of(asm, token)) {
+        return held == wanted;
+    }
+    match (module.cast_elem(element), module.cast_elem(handle)) {
+        (Some(held), Some(wanted)) => held == wanted && held != CastElem::Lenient,
+        _ => false,
+    }
 }
 
 /// Whether an ARRAY whose `newarr` element handle is `op_elem` (asm-folded; `0` = an
@@ -7658,14 +7865,22 @@ fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> b
         return false;
     }
     match module.cast_elem(asm_key(asm, token.0)) {
+        Some(CastElem::VectorInterface(target_elem)) => {
+            if op_elem == 0 {
+                return true;
+            }
+            let op = classify_elem_handle(module, op_elem);
+            elem_compatible(module, &op, &target_elem, ElemRule::Array)
+        }
         Some(CastElem::Array(target_elem)) => {
             if op_elem == 0 {
                 return true;
             }
             let op = classify_elem_handle(module, op_elem);
-            elem_compatible(module, &op, target_elem, ElemRule::Array)
+            elem_compatible(module, &op, &target_elem, ElemRule::Array)
         }
-        Some(CastElem::Prim(_) | CastElem::String | CastElem::Object) => false,
+        Some(CastElem::Object) => true,
+        Some(CastElem::Prim(_) | CastElem::String | CastElem::GenericValueType) => false,
         Some(CastElem::Named(_)) | Some(CastElem::Lenient) | None => {
             let target_id = module.type_id_of(asm, token);
             match target_id
@@ -7716,7 +7931,10 @@ enum ElemRule {
 /// handle is [`CastElem::Lenient`] (unverified).
 fn classify_elem_handle(module: &Module, handle: u64) -> CastElem {
     if let Some(elem) = module.cast_elem(handle) {
-        return elem.clone();
+        if matches!(elem, CastElem::VectorInterface(_)) {
+            return CastElem::Named(handle);
+        }
+        return elem;
     }
     let asm = (handle >> 32) as u8;
     let token = Token(handle as u32);
@@ -7734,7 +7952,7 @@ fn classify_elem_handle(module: &Module, handle: u64) -> CastElem {
 
 /// The exact [`CastPrim`] a primitive value type's full name denotes, for a handle that
 /// reached the matcher as [`CastElem::Named`] (a path the loader did not classify).
-fn prim_of_full_name(full_name: &str) -> Option<CastPrim> {
+pub(crate) fn prim_of_full_name(full_name: &str) -> Option<CastPrim> {
     Some(match full_name {
         "System.Boolean" => CastPrim::Bool,
         "System.Char" => CastPrim::Char,
@@ -7771,6 +7989,10 @@ fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: Elem
     let op = normalize(op);
     let target = normalize(target);
     match (&op, &target) {
+        (CastElem::Prim(_), CastElem::Lenient) | (CastElem::Lenient, CastElem::Prim(_)) => false,
+        (CastElem::GenericValueType, CastElem::GenericValueType | CastElem::Named(_) | CastElem::Lenient)
+        | (CastElem::Named(_) | CastElem::Lenient, CastElem::GenericValueType) => true,
+        (CastElem::GenericValueType, _) | (_, CastElem::GenericValueType) => false,
         (CastElem::Lenient, _) | (_, CastElem::Lenient) => true,
         (CastElem::Prim(a), CastElem::Prim(b)) => {
             a == b
@@ -7910,7 +8132,7 @@ fn bounded_index(index: i32, len: usize) -> Result<usize, Trap> {
 impl Session {
     /// Reclaims unreachable objects and compacts the heap, relocating every live
     /// reference. Enumerates all roots -- each frame's eval stack, locals, arguments, and
-    /// continuation state (`new_object`, `current_exception`, a pending `finally` chain's
+    /// continuation state (`new_object`, `caught_exceptions`, a pending `finally` chain's
     /// exception, an in-flight multicast), the entry's result, the statics, and the
     /// exception-message table. Called at an instruction boundary, where the frame state
     /// is consistent, so anything still live is reachable from these roots.
@@ -7927,7 +8149,7 @@ impl Session {
     }
 
     fn collect_garbage(&mut self, module: &Module, vm: &mut Vm) {
-        run_collection(vm, module, |visit| self.visit_roots(visit));
+        run_collection(vm, module, &mut |visit| self.visit_roots(visit));
     }
 }
 
@@ -7952,7 +8174,9 @@ fn visit_frames(frames: &mut [Frame], visit: &mut dyn FnMut(&mut Value)) {
         }
         visit_optional_ref(&mut frame.new_object, visit);
         visit_optional_location(&mut frame.new_value, visit);
-        visit_optional_ref(&mut frame.current_exception, visit);
+        for (_, exception) in &mut frame.caught_exceptions {
+            visit_ref(exception, visit);
+        }
         if let Some(pending) = &mut frame.pending {
             match &mut pending.then {
                 AfterFinally::Catch { exception, .. } | AfterFinally::Unwind(exception) => {
@@ -7987,8 +8211,13 @@ fn visit_frames(frames: &mut [Frame], visit: &mut dyn FnMut(&mut Value)) {
 /// place exactly like the exception-message keys -- and the table is rebuilt from the new indices.
 /// The lock objects are independently reachable (the owner's and every waiter's frame holds the
 /// `lock(obj)` reference, walked by `roots`), so this never resurrects a dead lock.
+///
+/// `roots` is a `dyn`, and the side tables are rebuilt by insertion, both so that the collector is
+/// compiled ONCE. Taken as a generic, each caller got its own copy of the whole collector; and a
+/// `collect()` into a `BTreeMap` sorts its input with a sort compiled per iterator type, so every
+/// rebuild in every copy carried a sort of its own.
 #[cfg(feature = "gc")]
-fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn FnMut(&mut Value))) {
+fn run_collection(vm: &mut Vm, module: &Module, roots: &mut dyn FnMut(&mut dyn FnMut(&mut Value))) {
     #[cfg(feature = "finalizers")]
     if vm.finalizing {
         return;
@@ -8054,20 +8283,8 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
         }
     });
 
-    vm.exception_messages = messages
-        .chunks_exact(2)
-        .filter_map(|pair| match (&pair[0], &pair[1]) {
-            (Value::Object(key), Value::Object(value)) => Some((*key, *value)),
-            _ => None,
-        })
-        .collect();
-    vm.exception_inners = inners
-        .chunks_exact(2)
-        .filter_map(|pair| match (&pair[0], &pair[1]) {
-            (Value::Object(key), Value::Object(value)) => Some((*key, *value)),
-            _ => None,
-        })
-        .collect();
+    vm.exception_messages = object_pairs(&messages);
+    vm.exception_inners = object_pairs(&inners);
     #[cfg(feature = "exceptions")]
     for (slot, key) in vm.exception_faults.iter_mut().zip(&fault_keys) {
         if let Value::Object(reference) = key {
@@ -8085,14 +8302,13 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
             })
             .collect();
     }
-    vm.locks = lock_keys
-        .into_iter()
-        .zip(lock_states)
-        .filter_map(|(key, state)| match key {
-            Value::Object(reference) => Some((reference.0, state)),
-            _ => None,
-        })
-        .collect();
+    let mut locks = BTreeMap::new();
+    for (key, state) in lock_keys.into_iter().zip(lock_states) {
+        if let Value::Object(reference) = key {
+            locks.insert(reference.0, state);
+        }
+    }
+    vm.locks = locks;
 
     #[cfg(not(feature = "finalizers"))]
     let _ = finalizable;
@@ -8124,11 +8340,23 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
 /// [`Session::visit_roots`].
 #[cfg(feature = "gc")]
 fn collect_all_threads(threads: &mut [ThreadSlot], module: &Module, vm: &mut Vm) {
-    run_collection(vm, module, |visit| {
+    run_collection(vm, module, &mut |visit| {
         for slot in threads.iter_mut() {
             slot.session.visit_roots(visit);
         }
     });
+}
+
+/// Rebuilds an exception side table from its relocated mirror of `[key, value]` pairs.
+#[cfg(feature = "gc")]
+fn object_pairs(mirror: &[Value]) -> BTreeMap<ObjectRef, ObjectRef> {
+    let mut table = BTreeMap::new();
+    for pair in mirror.chunks_exact(2) {
+        if let (Value::Object(key), Value::Object(value)) = (&pair[0], &pair[1]) {
+            table.insert(*key, *value);
+        }
+    }
+    table
 }
 
 /// Relocates an optional heap-reference root through the collector's value visitor.
@@ -8189,6 +8417,39 @@ mod tests {
 
     fn run(code: Vec<Instruction>) -> Result<Option<Value>, Trap> {
         run_method(&method(code), Vec::new())
+    }
+
+    /// Discarding delivered output keeps what was not delivered, in order, keeps the buffer's
+    /// storage, and opens the cap's window again -- and a VM whose embedder never discards keeps
+    /// everything, as before.
+    #[test]
+    fn discarded_output_is_forgotten_and_the_rest_is_kept() {
+        let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        let mut vm = Vm::default();
+        vm.write(&units("sent|kept"));
+        vm.debug_write(&units("trace"));
+        let capacity = vm.output.capacity();
+
+        vm.discard_output(5);
+        assert_eq!(vm.output(), units("kept"), "the undelivered tail stays, in order");
+        assert_eq!(vm.output.capacity(), capacity, "the storage is reused, not given back");
+        assert_eq!(vm.debug_output(), units("trace"), "each channel is discarded on its own");
+
+        vm.discard_output(99);
+        vm.discard_debug_output(99);
+        assert!(vm.output().is_empty() && vm.debug_output().is_empty(), "more than there is is all");
+
+        vm.set_output_cap(Some(4));
+        vm.write(&units("abcdef"));
+        assert!(vm.take_output_clipped());
+        vm.discard_output(4);
+        vm.write(&units("gh"));
+        assert_eq!(vm.output(), units("gh"), "the window opened again once the first four went");
+
+        let mut kept = Vm::default();
+        kept.write(&units("one"));
+        kept.write(&units("two"));
+        assert_eq!(kept.output(), units("onetwo"), "nothing is let go unless the embedder asks");
     }
 
     #[test]
@@ -10331,6 +10592,121 @@ mod tests {
             let stop = session.continue_(&module, &mut vm).unwrap();
             assert_eq!(stop.returned, Some(Value::Int32(42)));
             assert_eq!(session.stopped_exception(), None);
+        }
+
+        #[cfg(feature = "exceptions")]
+        #[test]
+        fn a_frame_is_set_up_so_that_a_catch_never_allocates() {
+            use lamella_cil::{EhClause, EhKind, InstructionRange};
+            let catch_type = Token(0x0100_00C2);
+            let mut module = Module::new();
+            let mut body = method(vec![
+                Instruction::simple(Opcode::Nop),
+                Instruction::simple(Opcode::Nop),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Pop),
+                ret(),
+            ]);
+            body.handlers = alloc::vec![
+                EhClause {
+                    try_range: InstructionRange { start: 0, end: 1 },
+                    handler_range: InstructionRange { start: 2, end: 3 },
+                    kind: EhKind::Catch(catch_type),
+                },
+                EhClause {
+                    try_range: InstructionRange { start: 1, end: 2 },
+                    handler_range: InstructionRange { start: 3, end: 4 },
+                    kind: EhKind::Catch(catch_type),
+                },
+            ]
+            .into_boxed_slice();
+            let main = module.add_method_image(0, body, 0);
+
+            let mut vm = Vm::new();
+            let exception = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
+            let frame = new_frame(&mut vm, &module, main, Vec::new()).unwrap();
+            let caught = (frame.caught_exceptions.capacity(), frame.caught_exceptions.as_ptr());
+            let stack = (frame.stack.capacity(), frame.stack.as_ptr());
+            assert!(caught.0 >= 2, "a caught-exception entry for each of the two handlers");
+
+            let mut frames = alloc::vec![frame];
+            for handler in [2, 3] {
+                complete_finally(
+                    &mut frames,
+                    &module,
+                    &mut vm,
+                    AfterFinally::Catch { handler, exception },
+                )
+                .unwrap();
+            }
+            let frame = &frames[0];
+            assert_eq!(frame.caught_exceptions.len(), 2, "both catches were recorded");
+            assert_eq!(
+                (frame.caught_exceptions.capacity(), frame.caught_exceptions.as_ptr()),
+                caught,
+                "recording a catch must not grow the caught-exception list"
+            );
+            assert_eq!(
+                (frame.stack.capacity(), frame.stack.as_ptr()),
+                stack,
+                "pushing the caught exception must not grow the evaluation stack"
+            );
+        }
+
+        #[cfg(feature = "exceptions")]
+        #[test]
+        fn a_rethrow_after_a_nested_catch_re_raises_its_own_handlers_exception() {
+            use lamella_cil::{EhClause, EhKind, InstructionRange};
+            let e_ctor = Token(0x0600_00C1);
+            let catch_type = Token(0x0100_00C2);
+            let mut module = Module::new();
+            let e = module.add_type(vec![]);
+            let ctor = module.add_method_image(0, method(vec![ret()]), 1);
+            module.set_method_type(ctor, e);
+            module.bind_token(0, e_ctor, ctor);
+            let mut body = method(vec![
+                Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Throw),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
+                Instruction::simple(Opcode::Throw),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Leave, Operand::Target(9)),
+                Instruction::simple(Opcode::Rethrow),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ceq),
+                ret(),
+            ]);
+            body.handlers = alloc::vec![
+                EhClause {
+                    try_range: InstructionRange { start: 5, end: 7 },
+                    handler_range: InstructionRange { start: 7, end: 9 },
+                    kind: EhKind::Catch(catch_type),
+                },
+                EhClause {
+                    try_range: InstructionRange { start: 0, end: 4 },
+                    handler_range: InstructionRange { start: 4, end: 10 },
+                    kind: EhKind::Catch(catch_type),
+                },
+                EhClause {
+                    try_range: InstructionRange { start: 0, end: 10 },
+                    handler_range: InstructionRange { start: 10, end: 13 },
+                    kind: EhKind::Catch(catch_type),
+                },
+            ]
+            .into_boxed_slice();
+            let main = module.add_method_image(0, body, 0);
+
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(
+                stop.returned,
+                Some(Value::Int32(1)),
+                "the rethrow must re-raise the exception its own handler caught, not the nested one"
+            );
         }
     }
 

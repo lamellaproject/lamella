@@ -334,30 +334,35 @@ fn with_device_heap<R>(body: impl FnOnce(&mut DeviceHeap) -> R) -> R {
     })
 }
 
-/// The device allocator body, the impl half of the `lamella_gc_alloc` C-ABI entry (the
-/// naked SP/PC shim, below, is the entry on ARM and tail-calls this). Bump-allocates a
-/// zeroed `[header][payload]` block for the backend's `newobj` / `box` / array-alloc and
-/// returns the real *payload* pointer (`region_base + offset`). On out-of-memory with
-/// `gc-collect` it runs one collection and retries, returning null (`0`) if the object still
-/// does not fit; without `gc-collect` an out-of-memory allocation returns null.
+/// The device allocator body: bump-allocates a zeroed `[header][payload]` block for the backend's
+/// `newobj` / `box` / array-alloc and returns the real *payload* pointer (`region_base + offset`).
 ///
-/// The object header holds the `type_desc` *pointer* (so the collector reads the
-/// `payload_size` and `ref_offsets` by dereferencing it -- the device representation),
-/// where the host [`lamella_gc_alloc`] entry uses a table index. `sp` and `return_pc` are
-/// the mutator's SP-at-the-call and the safepoint return address, captured for free by the
-/// shim from `r2`/`r3`. Both are accepted and ignored.
+/// This crate exports no allocator entry of its own. An embedder defines the `lamella_gc_alloc`
+/// symbol its code calls and calls this body from it as a Rust function; the C# AOT runtime archive
+/// does, from a shim that also writes the thread anchor its root walker walks from.
+///
+/// The object header holds the `type_desc` *pointer* (so the collector reads the `payload_size`
+/// and `ref_offsets` by dereferencing it -- the device representation), where the host
+/// [`lamella_gc_alloc`] entry uses a table index. `sp` and `return_pc` are accepted and ignored.
 ///
 /// # Safety
 /// `type_desc` must be a valid [`DeviceTypeDesc`] address the backend emitted (its
 /// `payload_size`/`nrefs`/`ref_offsets` are read on alloc and on every trace).
 ///
-/// # The out-of-memory collection has no roots
+/// # Out of memory
 ///
-/// The collection marks nothing, so it reclaims every object -- including objects the caller
-/// still holds -- and the retry can hand back memory a live object occupies. That is correct
-/// only for a program that holds no reference across an allocation. A program that does must
-/// not use this entry with `gc-collect` enabled.
-#[cfg_attr(all(target_arch = "arm", feature = "device-entry"), unsafe(no_mangle))]
+/// When the block does not fit, it collects only through a hook the embedder installed, and it
+/// returns null whenever no collection ran or the block still does not fit after one:
+/// - With `gc-collect` and `host-heap`, the roots hook ([`set_device_oom_roots_hook`]) reports
+///   the roots, the allocating engine collects against them once, and the bump is retried.
+/// - With `gc-collect` and no `host-heap` -- the configuration a C# AOT image links -- the
+///   collection hook ([`set_device_collect_hook`]) runs the embedder's own collection, and the
+///   bump is retried unless the hook declined.
+/// - With no hook installed, it does not collect: a collection with no roots would reclaim objects
+///   the caller still holds. Without `gc-collect` there is no collector to run.
+///
+/// So a null is this body's out-of-memory answer, and its caller decides what that means: the C#
+/// AOT archive stops the program rather than hand a null to code that tests none.
 pub unsafe extern "C" fn lamella_gc_alloc_impl(
     payload_size: u32,
     type_desc: *const DeviceTypeDesc,
@@ -420,18 +425,6 @@ pub fn lamella_gc_collect_device(stack: &mut [u8], sp: u32, return_pc: u32) {
         }
     });
 }
-
-#[cfg(all(target_arch = "arm", feature = "device-entry"))]
-core::arch::global_asm!(
-    ".section .text.lamella_gc_alloc,\"ax\",%progbits",
-    ".global lamella_gc_alloc",
-    ".thumb_func",
-    ".type lamella_gc_alloc,%function",
-    "lamella_gc_alloc:",
-    "    mov   r2, sp",
-    "    mov   r3, lr",
-    "    b     lamella_gc_alloc_impl",
-);
 
 /// Runs `body` with interrupts disabled on a Cortex-M target, restoring the prior
 /// interrupt state afterward, so a bump or collection is atomic against an interrupt

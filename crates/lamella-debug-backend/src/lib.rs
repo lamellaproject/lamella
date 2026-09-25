@@ -212,6 +212,28 @@ pub trait DebugBackend {
     /// (register or stack-slot homes), read via memory/regs.
     fn variables(&self, frame: usize, scope: Scope) -> Vec<Variable>;
 
+    /// [`DebugBackend::variables`], each row paired with the reference that lists its members --
+    /// an object's fields, an array's elements -- for a client that expands it.
+    ///
+    /// The default pairs every row with [`ChildReference::NONE`], so a backend with nothing to
+    /// expand needs no code for this, and a client shows its rows as leaves.
+    fn variables_with_children(&self, frame: usize, scope: Scope) -> Vec<(Variable, ChildReference)> {
+        self.variables(frame, scope)
+            .into_iter()
+            .map(|variable| (variable, ChildReference::NONE))
+            .collect()
+    }
+
+    /// The members of the value `reference` names, each with the reference that lists ITS members.
+    ///
+    /// `reference` is one this backend returned -- from [`DebugBackend::variables_with_children`] or
+    /// from this -- since the target last stopped; a reference from before that names nothing, as a
+    /// DAP `variablesReference` does. The default has no members to list.
+    fn children(&self, reference: ChildReference) -> Vec<(Variable, ChildReference)> {
+        let _ = reference;
+        Vec::new()
+    }
+
     /// Writes a new value into the variable named `name` in one scope of frame `frame`, counted
     /// as [`DebugBackend::stack`] lists the frames, for DAP's `setVariable`. `value` is the new
     /// value as the user typed it; the backend
@@ -226,6 +248,15 @@ pub trait DebugBackend {
     fn set_variable(&mut self, frame: usize, scope: Scope, name: &str, value: &str) -> Option<String> {
         let _ = (frame, scope, name, value);
         None
+    }
+
+    /// Whether [`DebugBackend::set_variable`] can succeed on this backend at all, so a client offers
+    /// an edit only where one can be made.
+    ///
+    /// The default is `false`, matching `set_variable`'s own default of refusing every edit. A
+    /// backend that overrides `set_variable` says `true` here, or its edit is never offered.
+    fn can_set_variables(&self) -> bool {
+        false
     }
 
     /// Reads `len` bytes of target memory at `address`. Device: an ADIv5 MEM-AP read.
@@ -329,6 +360,21 @@ pub struct Variable {
     pub value: String,
     /// The type name shown beside the value.
     pub kind: String,
+}
+
+/// Where a value's members are listed: [`ChildReference::NONE`] for a leaf, and otherwise a handle
+/// the backend that issued it resolves in [`DebugBackend::children`].
+///
+/// It travels BESIDE a [`Variable`] rather than inside it, so that a backend with nothing to expand
+/// builds its rows exactly as before. It means something only to the backend that issued it, and
+/// only until the target next stops -- as DAP's own `variablesReference` does -- so an adapter hands
+/// it back unchanged and never reads anything into its value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ChildReference(pub u32);
+
+impl ChildReference {
+    /// A value with no members: a number, a null, anything a client shows without an expander.
+    pub const NONE: ChildReference = ChildReference(0);
 }
 
 /// One target register and its value.

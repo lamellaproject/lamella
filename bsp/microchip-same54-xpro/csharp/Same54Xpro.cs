@@ -102,6 +102,7 @@ namespace Lamella.Boards.Microchip
                 MicrochipSame54XproBindings.EXT1_ADC_P_ADC_BASE,
                 MicrochipSame54XproBindings.EXT1_ADC_P_GCLK_PCHCTRL_REG,
                 MicrochipSame54XproBindings.EXT1_ADC_P_GCLK_PCHCTRL_VALUE,
+                MicrochipSame54XproBindings.EXT1_ADC_P_PRESCALER,
                 MicrochipSame54XproBindings.EXT1_ADC_P_APB_MASK_REG,
                 MicrochipSame54XproBindings.EXT1_ADC_P_APB_MASK,
                 MicrochipSame54XproBindings.EXT1_ADC_P_CALIB_REG,
@@ -115,7 +116,8 @@ namespace Lamella.Boards.Microchip
                 MicrochipSame54XproBindings.EXT1_ADC_P_REFERENCE_UV);
         }
 
-        /// <summary>An ADC driver over EXT1's analog pad, configured and ready to read.</summary>
+        /// <summary>An ADC driver over EXT1's analog pad, ready to read. Creating it touches no
+        /// hardware: the converter is brought up by the first open or read.</summary>
         /// <remarks>ONE CHANNEL, and channel 0 is that pad. The converter has sixteen inputs and
         /// this board has handed one pad to the analog function, so the other fifteen would sample
         /// pins the PORT still owns -- a number with no error, meaning nothing.</remarks>

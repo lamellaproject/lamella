@@ -5,7 +5,9 @@
 
 use lamella_wire::{Capabilities, Negotiated, TransportError};
 use lamella_wire_host::debug_backend::WireTransport;
-use lamella_wire_host::engine::{CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler};
+use lamella_wire_host::engine::{
+    CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler, install_host_clock,
+};
 #[cfg(feature = "bake")]
 use lamella_wire_host::engine::BakedSerialLink;
 use lamella_wire_host::{deployed_status_blocking, hello_blocking, list_serial, SerialTransport, UsbTransport};
@@ -444,7 +446,10 @@ impl Server {
         let corlib = corlib_bytes()?;
         let check = LcscCompiler::discover().map_err(|e| e.to_string())?;
         let run_compiler = LcscCompiler::discover().map_err(|e| e.to_string())?;
-        let repl = Repl::new(Box::new(run_compiler), Box::new(LoopbackLink::new(corlib)));
+        let repl = Repl::new(
+            Box::new(run_compiler),
+            Box::new(LoopbackLink::new(corlib, install_host_clock)),
+        );
         Ok(Self {
             check,
             repl,
@@ -630,13 +635,22 @@ That is set when the server starts.",
             Err(error) => return text_result(error, true),
         };
 
-        let prepared = match lamella_flash_routes::prepare_image(path, row, chosen) {
+        let placement = match lamella_flash_routes::placement::placement_for(
+            row,
+            chosen,
+            lamella_flash_routes::placement::BootloaderChoice::Keep,
+        ) {
+            Ok(placement) => placement,
+            Err(error) => return text_result(error, true),
+        };
+        let prepared = match lamella_flash_routes::prepare_image(path, row, chosen, &placement) {
             Ok(prepared) => prepared,
             Err(error) => return text_result(error, true),
         };
 
         match lamella_flash_routes::write_scoped(
             chosen,
+            &placement,
             &prepared.bytes,
             selector.as_deref(),
             &self.scope.identities(),

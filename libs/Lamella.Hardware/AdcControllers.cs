@@ -32,6 +32,16 @@ namespace Lamella.Hardware
             return (object)_factory != null;
         }
 
+        /// <summary>A <see cref="System.Device.Analog.AnalogController"/> over the bound ADC driver,
+        /// whose pins are the converter's channels, numbered as the driver numbers them.</summary>
+        /// <remarks>Creating one touches no hardware and resolves nothing: the driver is resolved,
+        /// and the converter brought up, by the first call that needs it. Every controller created
+        /// here, and every other surface over the binding, acts on the same driver instance.</remarks>
+        public static System.Device.Analog.AnalogController CreateAnalogController()
+        {
+            return new AdcAnalogController();
+        }
+
         /// <summary>The bound ADC driver, creating it on first use.</summary>
         /// <remarks>
         /// <para>THE SAME INSTANCE <see cref="Adc"/> and the compatibility surface use. One

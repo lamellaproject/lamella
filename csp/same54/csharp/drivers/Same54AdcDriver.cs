@@ -17,7 +17,10 @@ public sealed class Same54AdcDriver : AdcDriver
     readonly uint _intflag;
     readonly uint _syncbusy;
     readonly uint _result;
+    bool _up;
 
+    /// <summary>Binds the driver to the board's pad. No hardware is touched until the channel is
+    /// first opened or read, which is when the converter is brought up.</summary>
     public Same54AdcDriver(Same54AdcBinding binding)
     {
         _binding = binding;
@@ -31,7 +34,6 @@ public sealed class Same54AdcDriver : AdcDriver
         _intflag = block + Same54AdcLayout.INTFLAG_OFF;
         _syncbusy = block + Same54AdcLayout.SYNCBUSY_OFF;
         _result = block + Same54AdcLayout.RESULT_OFF;
-        Configure();
     }
 
     /// <summary>The pad this driver was bound to, and only that one. See the header.</summary>
@@ -65,14 +67,15 @@ public sealed class Same54AdcDriver : AdcDriver
         }
     }
 
-    /// <summary>Nothing to do: the pad was muxed and the converter enabled at construction, and
-    /// this driver has exactly one channel to open.</summary>
+    /// <summary>Opens the one channel, bringing the converter up if it is not already: the pad
+    /// muxed, the converter calibrated, configured and enabled.</summary>
     public override void OpenChannel(int channel)
     {
         if (channel != 0)
         {
             throw new System.ArgumentOutOfRangeException();
         }
+        EnsureUp();
     }
 
     public override void CloseChannel(int channel) { }
@@ -84,6 +87,7 @@ public sealed class Same54AdcDriver : AdcDriver
         {
             throw new System.ArgumentOutOfRangeException();
         }
+        EnsureUp();
         Mmio.Write8(_intflag, (byte)Same54AdcLayout.INTFLAG_RESRDY);
         Mmio.Write8(_swtrig, (byte)Same54AdcLayout.SWTRIG_START);
         WaitSync(Same54AdcLayout.SYNCBUSY_SWTRIG);
@@ -95,6 +99,17 @@ public sealed class Same54AdcDriver : AdcDriver
             }
         }
         return -1;
+    }
+
+    // Brings the converter up once, on first use.
+    void EnsureUp()
+    {
+        if (_up)
+        {
+            return;
+        }
+        Configure();
+        _up = true;
     }
 
     void Configure()
@@ -109,6 +124,11 @@ public sealed class Same54AdcDriver : AdcDriver
 
         Mmio.Write16(_ctrla, (ushort)Same54AdcLayout.CTRLA_SWRST);
         WaitSync(Same54AdcLayout.SYNCBUSY_SWRST);
+
+        // The converter's clock is its generic clock divided by PRESCALER, which resets to DIV2, and
+        // the part bounds that clock. The binding carries the division that keeps it within the limit,
+        // and it goes in while the converter is disabled, because CTRLA is enable-protected.
+        Mmio.Write16(_ctrla, (ushort)(_binding.Prescaler << (int)Same54AdcLayout.CTRLA_PRESCALER_LSB));
 
         LoadCalibration();
 

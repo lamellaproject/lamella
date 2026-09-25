@@ -11,5 +11,7 @@ public enum Nrf51Instances {
     public static let TWI0_BASE: UInt32 = 0x40003000
     public static let UART0_BASE: UInt32 = 0x40002000
     public static let TIMER0_BASE: UInt32 = 0x40008000
+    public static let CLOCK_BASE: UInt32 = 0x40000000
     public static let NVMC_BASE: UInt32 = 0x4001E000
+    public static let SPI1_BASE: UInt32 = 0x40004000
 }

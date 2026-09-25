@@ -5,22 +5,36 @@ using Lamella.Hardware;
 
 public sealed class Samd21GpioDriver : GpioDriver
 {
-    private PinChangeEventHandler[] _callbacks;
-    private int[] _armedEdges;
     private int[] _lineHolder;
+    private int[] _armedEdges;
+    private PinChangeEventHandler[] _rows;
 
-    protected override int PinCount { get { return 64; } }
+    const int Pins = 64;
+
+    protected override int PinCount { get { return Pins; } }
 
     protected override int ConvertPinNumberToLogicalNumberingScheme(int pinNumber) { return pinNumber; }
 
-    protected override void OpenPin(int pinNumber) { }
+    protected override void OpenPin(int pinNumber)
+    {
+        CheckPin(pinNumber);
+    }
 
     protected override void ClosePin(int pinNumber)
     {
+        CheckPin(pinNumber);
         if (IsArmed(pinNumber))
         {
-            PinEvents.Unregister(pinNumber, _callbacks[pinNumber]);
-            _callbacks[pinNumber] = null;
+            int line = LineOf(pinNumber);
+            for (int edges = 1; edges <= EdgeSets; edges = edges + 1)
+            {
+                PinChangeEventHandler row = _rows[RowOf(line, edges)];
+                if ((object)row != null)
+                {
+                    PinEvents.Unregister(pinNumber, row);
+                    RemoveFromRows(line, row);
+                }
+            }
             Disarm(pinNumber);
         }
         Mmio.Write32(GroupBase(pinNumber) + Samd21PortLayout.DIRCLR_OFF, PinMask(pinNumber));
@@ -29,6 +43,7 @@ public sealed class Samd21GpioDriver : GpioDriver
 
     protected override void SetPinMode(int pinNumber, PinMode mode)
     {
+        CheckPin(pinNumber);
         uint group = GroupBase(pinNumber);
         uint mask = PinMask(pinNumber);
         if (mode == PinMode.Output)
@@ -63,6 +78,7 @@ public sealed class Samd21GpioDriver : GpioDriver
 
     protected override PinMode GetPinMode(int pinNumber)
     {
+        CheckPin(pinNumber);
         if ((Mmio.Read32(GroupBase(pinNumber) + Samd21PortLayout.DIR_OFF) & PinMask(pinNumber)) != 0u)
         {
             return PinMode.Output;
@@ -78,18 +94,21 @@ public sealed class Samd21GpioDriver : GpioDriver
 
     protected override bool IsPinModeSupported(int pinNumber, PinMode mode)
     {
+        CheckPin(pinNumber);
         return mode == PinMode.Input || mode == PinMode.Output
             || mode == PinMode.InputPullUp || mode == PinMode.InputPullDown;
     }
 
     protected override PinValue Read(int pinNumber)
     {
+        CheckPin(pinNumber);
         uint levels = Mmio.Read32(GroupBase(pinNumber) + Samd21PortLayout.IN_OFF);
         return (levels & PinMask(pinNumber)) != 0u ? PinValue.High : PinValue.Low;
     }
 
     protected override void Write(int pinNumber, PinValue value)
     {
+        CheckPin(pinNumber);
         uint offset = (bool)value ? Samd21PortLayout.OUTSET_OFF : Samd21PortLayout.OUTCLR_OFF;
         Mmio.Write32(GroupBase(pinNumber) + offset, PinMask(pinNumber));
     }
@@ -118,8 +137,8 @@ public sealed class Samd21GpioDriver : GpioDriver
     /// <remarks>The pin's callbacks start arriving once its pad is connected to its external
     /// interrupt line, which this call does. The firmware must already route the EIC's generic clock
     /// and enable the EIC's interrupt. A refused registration leaves every pin unarmed.</remarks>
-    /// <exception cref="System.ArgumentException"><paramref name="eventTypes"/> names neither a rising
-    /// nor a falling edge.</exception>
+    /// <exception cref="System.ArgumentException"><paramref name="pinNumber"/> is not a pin of this
+    /// driver, or <paramref name="eventTypes"/> names neither a rising nor a falling edge.</exception>
     /// <exception cref="System.NotSupportedException">The pad raises no external interrupt, or raises
     /// the non-maskable interrupt, which cannot serve a pin-change event.</exception>
     /// <exception cref="System.InvalidOperationException">The EIC's generic clock is not running, the
@@ -128,6 +147,7 @@ public sealed class Samd21GpioDriver : GpioDriver
     protected override void AddCallbackForPinValueChangedEvent(
         int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
     {
+        CheckPin(pinNumber);
         int edges = (int)eventTypes & ((int)PinEventTypes.Rising | (int)PinEventTypes.Falling);
         if (edges == 0)
         {
@@ -144,9 +164,9 @@ public sealed class Samd21GpioDriver : GpioDriver
         }
         if (_lineHolder == null)
         {
-            _callbacks = new PinChangeEventHandler[PinCount];
-            _armedEdges = new int[PinCount];
             _lineHolder = new int[(int)Samd21EicLayout.LINE_COUNT];
+            _armedEdges = new int[(int)Samd21EicLayout.LINE_COUNT];
+            _rows = new PinChangeEventHandler[(int)Samd21EicLayout.LINE_COUNT * EdgeSets];
             for (int i = 0; i < _lineHolder.Length; i = i + 1)
             {
                 _lineHolder[i] = -1;
@@ -157,15 +177,16 @@ public sealed class Samd21GpioDriver : GpioDriver
             Invalid("another pin already holds the external interrupt line this pad raises");
         }
 
-        PinEvents.Register(this, pinNumber, pinNumber, eventTypes, callback);
+        PinEvents.Register(this, pinNumber, pinNumber, (PinEventTypes)edges, callback);
 
-        int wanted = _armedEdges[pinNumber] | edges;
+        int row = RowOf(line, edges);
+        int wanted = _armedEdges[line] | edges;
         if (IsArmed(pinNumber))
         {
-            _callbacks[pinNumber] = (PinChangeEventHandler)System.Delegate.Combine(_callbacks[pinNumber], callback);
-            if (wanted != _armedEdges[pinNumber])
+            _rows[row] = (PinChangeEventHandler)System.Delegate.Combine(_rows[row], callback);
+            if (wanted != _armedEdges[line])
             {
-                _armedEdges[pinNumber] = wanted;
+                _armedEdges[line] = wanted;
                 WriteSense(line, wanted);
             }
             return;
@@ -177,24 +198,34 @@ public sealed class Samd21GpioDriver : GpioDriver
             PinEvents.Unregister(pinNumber, callback);
             Invalid(refusal);
         }
-        _callbacks[pinNumber] = callback;
-        _armedEdges[pinNumber] = wanted;
+        _rows[row] = callback;
+        _armedEdges[line] = wanted;
         _lineHolder[line] = pinNumber;
     }
 
     /// <summary>Removes <paramref name="callback"/> from the pin, and releases the pad's external
     /// interrupt line once no callback remains on it.</summary>
+    /// <exception cref="System.ArgumentException"><paramref name="pinNumber"/> is not a pin of this
+    /// driver.</exception>
     protected override void RemoveCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
     {
+        CheckPin(pinNumber);
         PinEvents.Unregister(pinNumber, callback);
         if (!IsArmed(pinNumber))
         {
             return;
         }
-        _callbacks[pinNumber] = (PinChangeEventHandler)System.Delegate.Remove(_callbacks[pinNumber], callback);
-        if ((object)_callbacks[pinNumber] == null)
+        if (!RemoveFromRows(LineOf(pinNumber), callback))
         {
             Disarm(pinNumber);
+        }
+    }
+
+    static void CheckPin(int pinNumber)
+    {
+        if (pinNumber < 0 || pinNumber >= Pins)
+        {
+            BadArgument("pinNumber is not a pin of this driver: PA00..PA31 are 0..31 and PB00..PB31 are 32..63");
         }
     }
 
@@ -220,8 +251,34 @@ public sealed class Samd21GpioDriver : GpioDriver
 
     bool IsArmed(int pinNumber)
     {
-        return _callbacks != null && pinNumber >= 0 && pinNumber < PinCount
-            && (object)_callbacks[pinNumber] != null;
+        if (_lineHolder == null)
+        {
+            return false;
+        }
+        int line = LineOf(pinNumber);
+        return line >= 0 && _lineHolder[line] == pinNumber;
+    }
+
+    const int EdgeSets = 3;
+
+    static int RowOf(int line, int edges)
+    {
+        return line * EdgeSets + edges - 1;
+    }
+
+    bool RemoveFromRows(int line, PinChangeEventHandler callback)
+    {
+        bool left = false;
+        for (int edges = 1; edges <= EdgeSets; edges = edges + 1)
+        {
+            int row = RowOf(line, edges);
+            _rows[row] = (PinChangeEventHandler)System.Delegate.Remove(_rows[row], callback);
+            if ((object)_rows[row] != null)
+            {
+                left = true;
+            }
+        }
+        return left;
     }
 
     void Disarm(int pinNumber)
@@ -242,7 +299,7 @@ public sealed class Samd21GpioDriver : GpioDriver
         }
         Mmio.Write32(Samd21Instances.EIC_BASE + Samd21EicLayout.INTFLAG_OFF, bit);
         WriteSense(line, 0);
-        _armedEdges[pinNumber] = 0;
+        _armedEdges[line] = 0;
         _lineHolder[line] = -1;
     }
 
@@ -296,7 +353,8 @@ public sealed class Samd21GpioDriver : GpioDriver
         {
             return "pin-change events need the EIC's generic clock (GCLK_EIC) running, and the EIC did not finish synchronizing";
         }
-        WriteSense(line, edges);
+        int connecting = edges | (int)PinEventTypes.Rising;
+        WriteSense(line, connecting);
         if (!EicClockRunning())
         {
             WriteSense(line, 0);
@@ -309,9 +367,13 @@ public sealed class Samd21GpioDriver : GpioDriver
         uint bit = 1u << line;
         Mmio.Write32(Samd21Instances.EIC_BASE + Samd21EicLayout.INTFLAG_OFF, bit);
         MuxToEic(pinNumber);
-        if ((edges & (int)PinEventTypes.Rising) != 0 && (bool)Read(pinNumber))
+        if ((bool)Read(pinNumber))
         {
             WaitForFlag(bit);
+        }
+        if (connecting != edges)
+        {
+            WriteSense(line, edges);
         }
         Mmio.Write32(Samd21Instances.EIC_BASE + Samd21EicLayout.INTFLAG_OFF, bit);
         Mmio.Write32(Samd21Instances.EIC_BASE + Samd21EicLayout.INTENSET_OFF, bit);

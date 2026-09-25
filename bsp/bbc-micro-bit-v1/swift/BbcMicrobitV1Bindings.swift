@@ -18,6 +18,8 @@ public enum BbcMicroBitV1Bindings {
     /// name a driver; and a uart is a different register map on every family, so the kind does
     /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
     public static let I2C_DRIVER_FAMILY: String = "nrf51-twi"
+    public static let VCP_DRIVER_FAMILY: String = "nrf51-uart"
+    public static let SPI_DRIVER_FAMILY: String = "nrf51-spi"
 
     // -- I2C: an nrf-twi binding descriptor --
     public static let I2C_TWI_BASE: UInt32 = 0x40003000
@@ -25,6 +27,23 @@ public enum BbcMicroBitV1Bindings {
     public static let I2C_PSEL_SDA: UInt32 = 0x1E
     public static let I2C_PIN_CNF_SCL_REG: UInt32 = 0x50000700
     public static let I2C_PIN_CNF_SDA_REG: UInt32 = 0x50000778
+
+    // -- SPI: an nrf-spi binding descriptor --
+    public static let SPI_SPI_BASE: UInt32 = 0x40004000
+    public static let SPI_PSEL_SCK: UInt32 = 0x17
+    public static let SPI_PSEL_MOSI: UInt32 = 0x15
+    public static let SPI_PSEL_MISO: UInt32 = 0x16
+    public static let SPI_PIN_CNF_SCK_REG: UInt32 = 0x5000075C
+    public static let SPI_PIN_CNF_MOSI_REG: UInt32 = 0x50000754
+    public static let SPI_PIN_CNF_MISO_REG: UInt32 = 0x50000758
+
+    // -- VCP: an nrf-uart binding descriptor --
+    public static let VCP_UART_BASE: UInt32 = 0x40002000
+    public static let VCP_PSEL_TXD: UInt32 = 0x18
+    public static let VCP_PSEL_RXD: UInt32 = 0x19
+    public static let VCP_PIN_CNF_TXD_REG: UInt32 = 0x50000760
+    public static let VCP_PIN_CNF_RXD_REG: UInt32 = 0x50000764
+    public static let VCP_BAUDRATE_115200_XTAL_16MHZ: UInt32 = 0x1D7E000
     public static let DEVICE_COUNT: UInt32 = 12
 
     // -- on-board devices: PORT group base + pin index + mask --

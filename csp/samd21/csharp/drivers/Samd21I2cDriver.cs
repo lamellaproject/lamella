@@ -36,8 +36,14 @@ public sealed class Samd21I2cDriver : I2cDriver
     {
         uint apbcMask = Samd21Instances.PM_BASE + Samd21PmLayout.APBCMASK_OFF;
         Mmio.Write32(apbcMask, Mmio.Read32(apbcMask) | _binding.ApbcMask);
-        Mmio.Write16(Samd21Instances.GCLK_BASE + Samd21GclkLayout.CLKCTRL_OFF,
-            (ushort)_binding.GclkClkctrlValue);
+        // A core clock already running from another generator is stopped before it moves
+        // (DS40001882D 15.6.3.3). One that cannot be routed leaves the SERCOM unconfigured: its
+        // registers would never synchronize, and every transfer then answers with a status, as this
+        // driver reports every failure.
+        if (!Samd21GenericClock.Route(_binding.GclkClkctrlValue))
+        {
+            return;
+        }
 
         Mmio.Write8(_binding.PmuxReg, (byte)_binding.PmuxPair);
         byte pinConfig = (byte)(Samd21PortLayout.PINCFG0_PMUXEN | Samd21PortLayout.PINCFG0_INEN);

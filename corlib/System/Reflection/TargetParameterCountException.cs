@@ -2,7 +2,7 @@
 #if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
-    public class TargetParameterCountException : ApplicationException
+    public sealed class TargetParameterCountException : ApplicationException
     {
         public TargetParameterCountException() : base() { }
         public TargetParameterCountException(string message) : base(message) { }

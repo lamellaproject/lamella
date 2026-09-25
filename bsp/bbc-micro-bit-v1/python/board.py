@@ -9,9 +9,12 @@ BOARD_VENDOR = "Bbc"
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
 # below, never through a surface-private enum.
 I2C = "i2c"
+SPI = "spi"
+VCP = "vcp"
 
 CARRIER = {
     "kind": "daplink-vcp",
+    "role": "vcp",
 }
 
 # Per-role descriptor dicts, grouped by the role each belongs to.
@@ -33,6 +36,29 @@ FACTS = {
         "pin_cnf_scl_reg": 0x50000700,
         "pin_cnf_sda_reg": 0x50000778,
     },
+    "spi": {
+        "kind": "spi",
+        "driver_family": "nrf51-spi",
+        "instance": "spi1",
+        "spi_base": 0x40004000,
+        "psel_sck": 0x17,
+        "psel_mosi": 0x15,
+        "psel_miso": 0x16,
+        "pin_cnf_sck_reg": 0x5000075C,
+        "pin_cnf_mosi_reg": 0x50000754,
+        "pin_cnf_miso_reg": 0x50000758,
+    },
+    "vcp": {
+        "kind": "uart",
+        "driver_family": "nrf51-uart",
+        "instance": "uart0",
+        "uart_base": 0x40002000,
+        "psel_txd": 0x18,
+        "psel_rxd": 0x19,
+        "pin_cnf_txd_reg": 0x50000760,
+        "pin_cnf_rxd_reg": 0x50000764,
+        "baudrate_115200_xtal_16mhz": 0x1D7E000,
+    },
 }
 
 # The chip's instance map: every block this family places, with its base address and
@@ -47,11 +73,13 @@ INSTANCES = {
     "twi0": {"block": "twi", "base": 0x40003000},
     "uart0": {"block": "uart", "base": 0x40002000},
     "timer0": {"block": "timer", "base": 0x40008000},
+    "clock": {"block": "clock", "base": 0x40000000},
     "nvmc": {"block": "nvmc", "base": 0x4001E000},
+    "spi1": {"block": "spi", "base": 0x40004000},
 }
 
 PLANS = {
-    "hfclk-default": {"default": True, "source": "hfclk"},
+    "xtal-16mhz": {"default": True, "source": "xtal", "xtal_hz": 16000000},
 }
 
 # On-board devices + module control lines: PORT group base + pin index + mask + polarity.

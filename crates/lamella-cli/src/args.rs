@@ -67,6 +67,12 @@ impl Options {
         self.flags.iter().any(|option| option == name)
     }
 
+    /// Every positional word, in the order given.
+    #[must_use]
+    pub fn positionals(&self) -> &[String] {
+        &self.positional
+    }
+
     /// The single positional word this verb wants, or an error naming what was found instead.
     ///
     /// # Errors

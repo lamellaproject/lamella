@@ -3,7 +3,9 @@
 use crate::args::{self, Spec};
 use lamella_catalog::{self as catalog, BOARD_PYTHON};
 use lamella_bsp_gen::fit::fit;
-use lamella_wire_host::engine::{LcscCompiler, LoopbackLink, Outcome, Repl};
+use lamella_wire_host::engine::{
+    LcscCompiler, LoopbackLink, Outcome, Repl, ReplError, ReplLink, install_host_clock,
+};
 use lamella_js_frontend::interpreter::{Completion, Interpreter};
 use lamella_js_frontend::value::JsValue;
 use std::path::Path;
@@ -31,7 +33,8 @@ impl Language {
             Some("py") => Ok(Language::Python),
             Some("js") => Ok(Language::JavaScript),
             _ => Err(format!(
-                "{}: lamella run and lamella build read .cs (C#), .py (Python) and .js (JavaScript).\n\n\
+                "{}: lamella run and lamella build read .cs (C#), .csproj (a C# project), .py (Python) and\n\
+.js (ECMAScript, also known as JavaScript).\n\n\
 An image another toolchain has already produced -- .elf, .bin, .hex or .s19 -- is written by\n\
 `lamella flash <image> --board <id>`, which compiles nothing. A linked .elf is taken directly\n\
 and flattened by physical address, so it needs no conversion step first.",
@@ -55,7 +58,7 @@ which is not what `run` means to a reader.
     --target <t>      run it ON the board at <t>, with its output here";
 
 const RUN_USAGE: &str = "\
-usage: lamella run <file.cs|file.py|file.js> [--target <t>]
+usage: lamella run <file.cs|file.csproj|file.py|file.js> [--target <t>]
 
 Compiles and runs the program, and STAYS until it ends -- its output appears here as it is
 printed. A program written to loop forever runs until you stop this tool.
@@ -63,9 +66,15 @@ printed. A program written to loop forever runs until you stop this tool.
 With neither option it runs on this machine, which needs no hardware and is the fastest way to
 find out whether a program compiles and does what you meant.
 
---target <t> runs it ON a board that already has firmware, with the output still appearing here.
-`lamella devices` prints the word to pass. A cycle is about a second, and the board keeps its
-firmware. C# only: a Python or JavaScript program runs on this machine.
+A .csproj compiles every .cs beside it as one program, as `lamella build` compiles it. This
+machine and firmware on a board both run a program against the class library alone, so a project
+that references libraries of its own is built with `lamella build --class-library`, which links
+them.
+
+--target <t> runs a C# program -- a .cs or a .csproj -- ON a board that already has firmware, with
+the output still appearing here. `lamella devices` prints the word to pass. A cycle is about a
+second, and the board keeps its firmware. A Python program and a JavaScript program run on this
+machine.
 
 Two questions this verb does not answer: whether a program FITS a board is `build --board <id>`,
 and putting it on one is `deploy`.";
@@ -92,6 +101,9 @@ pub fn run_command(args: &[String]) -> ExitCode {
     if let Some(target) = parsed.value("--target") {
         return run_on_target(&path, target);
     }
+    if crate::flash::is_project(&path) {
+        return run_project(&path);
+    }
 
     let (language, source) = match read(&path) {
         Ok(read) => read,
@@ -101,7 +113,7 @@ pub fn run_command(args: &[String]) -> ExitCode {
         }
     };
     match language {
-        Language::CSharp => run_csharp(&source),
+        Language::CSharp => run_csharp(&path, &source),
         Language::Python => run_python(&path, &source, None),
         Language::JavaScript => run_javascript(&path, &source),
     }
@@ -223,9 +235,9 @@ fn run_on_target(_path: &Path, _target: &str) -> ExitCode {
 /// hardware belongs on `deploy`, which takes a source file and `--unsafe`, and the diagnostic below
 /// says so where it comes up. **Not `flash`**, which takes an image rather than a source file and
 /// declares no `--unsafe` at all.
-fn run_csharp(source: &str) -> ExitCode {
+fn run_csharp(path: &Path, source: &str) -> ExitCode {
     let compiler = match LcscCompiler::discover() {
-        Ok(compiler) => compiler,
+        Ok(compiler) => compiler.for_source_file(&path.display().to_string()),
         Err(error) => {
             eprintln!("lamella run: {error}");
             return ExitCode::FAILURE;
@@ -235,8 +247,112 @@ fn run_csharp(source: &str) -> ExitCode {
         eprintln!("lamella run: the compiler found no reference assemblies");
         return ExitCode::FAILURE;
     };
-    let mut repl = Repl::new(Box::new(compiler), Box::new(LoopbackLink::new(corlib)));
-    match repl.eval_program(source) {
+    let mut repl = Repl::new(
+        Box::new(compiler),
+        Box::new(LoopbackLink::new(corlib, install_host_clock)),
+    );
+    report(repl.eval_program(source))
+}
+
+/// Compile a C# project and run it on the host interpreter, as a single source file is run.
+///
+/// **THE COMPILATION `build` MAKES OF IT** -- every `.cs` beside the project as one program, under
+/// the project's own settings -- so a project checked here is the project a board gets. Only where
+/// it runs differs.
+///
+/// **A PROJECT THAT NAMES LIBRARIES IS REFUSED, NOT RUN.** This machine runs a program against the
+/// class library alone, so a name that resolves into a library of the project's own would load with
+/// nothing to resolve to -- a failure that would point at the program rather than at this verb.
+fn run_project(path: &Path) -> ExitCode {
+    match project_outcome(path) {
+        Ok(outcome) => report(outcome),
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Compiles the project at `path` and runs it on this machine, or says why it will not -- the half
+/// of [`run_project`] that decides, kept apart from the half that prints.
+///
+/// # Errors
+/// A project that cannot be read or compiled, a class library, or a project naming libraries of its
+/// own, each with the sentence that says so.
+fn project_outcome(path: &Path) -> Result<Result<Outcome, ReplError>, String> {
+    let project = program_project(
+        path,
+        "run",
+        "This verb runs a program on this machine",
+        &format!(
+            "lamella build {} --board <id> --format <f> --class-library",
+            path.display()
+        ),
+    )?;
+    let (assembly, corlib) = compile_project_assembly(&project, &[], "run")?;
+    let mut link = LoopbackLink::new(corlib, install_host_clock);
+    Ok(link
+        .run(1, &assembly)
+        .map_err(ReplError::Transport)
+        .map(|ran| Outcome::Ran {
+            output: ran.stdout,
+            exit: ran.exit,
+            persisted: false,
+        }))
+}
+
+/// The C# project at `path`, read as a program that runs against the class library alone, or why
+/// it is not one.
+///
+/// **ONE RULE FOR EVERY ROUTE THAT RUNS A PROJECT WITHOUT LINKING IT** -- this machine, and firmware
+/// already on a board. A class library has no entry point, and a project that names libraries of
+/// its own would run with none of their code, so both are refused. Only the words differ: `runs`
+/// says where the program would run, and `linked_build` is the command that builds it with its
+/// libraries linked.
+///
+/// # Errors
+/// A project that cannot be read, a class library, or a project naming libraries of its own.
+pub(crate) fn program_project(
+    path: &Path,
+    verb: &str,
+    runs: &str,
+    linked_build: &str,
+) -> Result<crate::project::Project, String> {
+    let project = crate::project::Project::read_file(path, verb)?;
+    if project.output_type == crate::project::OutputType::Library {
+        return Err(format!(
+            "lamella {verb}: {} builds a class library, which has no entry point, so there is \
+             nothing to run.\n\n\
+             A library runs as part of a program: name it in that program's project with a \
+             <Reference>.",
+            path.display()
+        ));
+    }
+    if !project.references.is_empty() {
+        let named: Vec<String> = project
+            .references
+            .iter()
+            .map(|library| format!("    {}", library.display()))
+            .collect();
+        return Err(format!(
+            "lamella {verb}: {} references libraries of its own:\n\n{}\n\n\
+             {runs} against the class library alone, so a name that resolves into\none of those \
+             would have nothing to resolve to. A build that links them is:\n\n\
+             \x20   {linked_build}",
+            path.display(),
+            named.join("\n"),
+        ));
+    }
+    Ok(project)
+}
+
+/// What `run` shows for a C# program, however it was compiled: its output, and -- when it did not
+/// exit 0 -- the code it exited with and what that code can mean.
+///
+/// **ONE REPORTER FOR BOTH ROUTES**, so a source file and a project that run the same program are
+/// reported the same way rather than by two copies that drift.
+fn report(outcome: Result<Outcome, ReplError>) -> ExitCode {
+    match outcome {
         Ok(Outcome::Ran { output, exit, .. }) => {
             print!("{output}");
             if exit == 0 {
@@ -254,7 +370,9 @@ fn run_csharp(source: &str) -> ExitCode {
                     "\nunsafe code is off by default, as it is in csc without /unsafe -- and this \
                      verb has no switch\nfor it, because a raw pointer at a device register means \
                      nothing on this machine. A program that\ndrives hardware goes on a board:\n\
-                     \x20   lamella deploy <file> --board <id> --unsafe"
+                     \x20   lamella deploy <file> --board <id> --unsafe\n\n\
+                     Not `flash`: that verb writes an image somebody already built, so it\n\
+                     takes no --unsafe -- by the time it runs, the compiling is over."
                 );
             }
             ExitCode::FAILURE
@@ -429,9 +547,9 @@ pub fn board_module_run_command(args: &[String]) -> ExitCode {
         Language::Python => run_python(&path, &source, Some(id)),
         Language::JavaScript => {
             eprintln!(
-                "lamella board-module-run: {} is JavaScript. This path serves a generated `board`                  MODULE, which is
-Python's shape; this JavaScript profile has no module loader at \
-                 all, so nothing could import it.",
+                "lamella board-module-run: {} is JavaScript. This path serves a generated `board` \
+                 MODULE, which is\nPython's shape; this JavaScript profile has no module loader \
+                 at all, so nothing could import it.",
                 path.display()
             );
             ExitCode::FAILURE
@@ -441,9 +559,10 @@ Python's shape; this JavaScript profile has no module loader at \
 
 /// `lamella build <file> [--board <id>] [--out <path>]`: produce the artifact a device runs.
 pub fn build_command(args: &[String]) -> ExitCode {
+    let usage = usage();
     let spec = Spec {
         verb: "build",
-        usage: Some(USAGE),
+        usage: Some(&usage),
         values: &["--board", "--out", "--format"],
         flags: &["--unsafe", crate::flash::CLASS_LIBRARY_FLAG],
     };
@@ -454,7 +573,7 @@ pub fn build_command(args: &[String]) -> ExitCode {
     let path = match parsed.only_positional("build", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
         Err(error) => {
-            eprintln!("{error}\n\n{USAGE}");
+            eprintln!("{error}\n\n{usage}");
             return ExitCode::FAILURE;
         }
     };
@@ -550,13 +669,26 @@ Use lamella run to execute it here.",
     answer_fit(board_id, &built)
 }
 
-const USAGE: &str = "\
+/// The verb's usage text.
+///
+/// **THE FORMATS ARE READ FROM THE TABLE `--format` IS PARSED AGAINST**, one row each, so this text
+/// cannot offer a format the parser refuses or leave out one it takes.
+fn usage() -> String {
+    let formats: String = lamella_flash_routes::artifact::Output::all()
+        .map(|output| match output.gloss() {
+            Some(gloss) => format!("\n    {:<5} {gloss}", output.extension()),
+            None => format!("\n    {}", output.extension()),
+        })
+        .collect();
+    format!(
+        "\
 usage: lamella build <file.cs|file.csproj|file.py> [--board <id>] [--format <f>] [--out <path>]
                                       [--class-library]
 
 With --format, it builds the BARE-METAL IMAGE for --board and writes it in that format -- which is
 exactly what `lamella flash` takes, so `build` produces what `flash` consumes and neither has to
-touch hardware. Formats: bin, hex (Intel HEX), s19 (Motorola S-records).
+touch hardware. The formats:
+{formats}
 
 Without --format it builds the ordinary artifact -- an assembly, a baked image, or a Python bundle
 -- and with --board it also answers whether that fits.
@@ -564,12 +696,24 @@ Without --format it builds the ordinary artifact -- an assembly, a baked image, 
 A .csproj builds every .cs beside it as ONE program and links the assemblies its <Reference>
 elements name, each by a <HintPath>. It goes with --format, which is the build that links.
 
---class-library links the program with the class library and the runtime support archive, so it
-may allocate, use floating point and call into System.*. Without it the flat tier is used, which
-is linker-free and resolves no call outside the program. Every build says which tier produced it.
-The class-library tier covers fewer boards; asking for it where there is no plan names the ones
-there are.
-";
+--class-library links the program with the class library and the runtime support archive, so it may
+allocate, use floating point and call into System.*. That tier's collector reclaims an object
+without finalizing it, so a finalizer (a class's ~destructor) never runs there. Without it the flat
+tier is used, which is linker-free and resolves no call outside the program. Every build says which
+tier produced it. The class-library tier covers fewer boards; asking for it where there is no plan
+names the ones there are.
+
+--format elf writes the image as a linked ELF that also carries the program's debug information,
+which is the file a debugger takes as the program. It goes with --class-library, the one tier
+that carries debug information into an image.
+
+A class-library image is always compiled as a debug build is, whatever format it is written in:
+--format elf writes the debug information beside it and every other format sets it aside. So the
+image a board is written with is the one --format elf describes, and a debugger can attach to any
+board running it. The flat tier is compiled without debug information.
+"
+    )
+}
 
 /// `lamella build <file> --board <id> --format <f>`: the image a chip takes, written to a file and
 /// nowhere else.
@@ -589,8 +733,8 @@ fn build_flashable(
     tier: crate::flash::Tier,
     libraries: &[crate::flash::Library],
 ) -> ExitCode {
-    let format = match lamella_flash_routes::artifact::Format::parse(format_name) {
-        Ok(format) => format,
+    let output = match lamella_flash_routes::artifact::Output::parse(format_name) {
+        Ok(output) => output,
         Err(error) => {
             eprintln!("lamella build: {error}");
             return ExitCode::FAILURE;
@@ -611,6 +755,12 @@ fn build_flashable(
         );
         return ExitCode::FAILURE;
     }
+    let format = match output {
+        lamella_flash_routes::artifact::Output::Image(format) => format,
+        lamella_flash_routes::artifact::Output::Elf => {
+            return build_debug_elf(path, source, board_id, out, unsafe_code, tier, libraries);
+        }
+    };
 
     let (image, base) =
         match crate::flash::image_for_board(path, source, board_id, unsafe_code, tier, libraries) {
@@ -652,6 +802,82 @@ fn build_flashable(
     println!("  {}", tier.line());
     println!("\nwrite it with:\n    lamella flash {} --board {board_id}", out.display());
     ExitCode::SUCCESS
+}
+
+/// `lamella build <file> --board <id> --class-library --format elf`: the image with the program's
+/// debug information, as the linked ELF a debugger takes as the program.
+///
+/// **ITS LOADED BYTES ARE THE IMAGE `deploy --class-library` WRITES**, because every class-library
+/// image is compiled as a debug build is: the image formats set the debug information aside, and
+/// this writes it beside the image. So the file is as flashable as the image formats -- `lamella
+/// flash` reads an ELF -- a debugger shown it is shown the program the board runs, and a debugger
+/// can attach to any board a class-library image of the same program was deployed to. The flat
+/// tier is compiled without debug information and has no ELF.
+fn build_debug_elf(
+    path: &Path,
+    source: &str,
+    board_id: &str,
+    out: Option<&str>,
+    unsafe_code: bool,
+    tier: crate::flash::Tier,
+    libraries: &[crate::flash::Library],
+) -> ExitCode {
+    if let Some(refusal) = elf_refusal(tier) {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
+    let elf =
+        match crate::flash::debug_elf_for_board(path, source, board_id, unsafe_code, libraries) {
+            Ok(elf) => elf,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let loaded = match lamella_elf::flat_image(&elf) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("lamella build: the ELF this built does not read back as one: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let out = match out {
+        Some(given) => Path::new(given).to_path_buf(),
+        None => path.with_extension(lamella_flash_routes::artifact::Output::Elf.extension()),
+    };
+    if let Err(error) = std::fs::write(&out, &elf) {
+        eprintln!("lamella build: write {}: {error}", out.display());
+        return ExitCode::FAILURE;
+    }
+    println!("{} <- {}", out.display(), path.display());
+    println!(
+        "  ELF at {:#010x}, {} B of image and the program's debug information in {} B of ELF",
+        loaded.base,
+        loaded.bytes.len(),
+        elf.len()
+    );
+    println!("  {}", tier.line());
+    println!("\nwrite it with:\n    lamella flash {} --board {board_id}", out.display());
+    ExitCode::SUCCESS
+}
+
+/// Why `--format elf` cannot be written on `tier`, or `None` where it can.
+///
+/// **ONLY THE CLASS-LIBRARY TIER CARRIES DEBUG INFORMATION INTO AN IMAGE**, so on the flat tier the
+/// refusal names the flag that makes the ELF work, and the formats the flat tier's image can be
+/// written in instead.
+fn elf_refusal(tier: crate::flash::Tier) -> Option<String> {
+    if tier == crate::flash::Tier::ClassLibrary {
+        return None;
+    }
+    Some(format!(
+        "lamella build: --format elf writes the image with the program's debug information, and \
+         only the\nclass-library tier carries debug information into an image. Add {}, or write \
+         the flat\ntier's image in a format that carries none:\n\n\x20   {}\n\n\
+         Nothing was built.",
+        crate::flash::CLASS_LIBRARY_FLAG,
+        lamella_flash_routes::artifact::Format::listing()
+    ))
 }
 
 /// The name of each artifact this verb can produce, named once so the rule about those names is
@@ -710,7 +936,7 @@ struct Built {
 /// assembly is as far as this verb goes. See the crate documentation for why that feature is not
 /// on by default.
 fn build_csharp(path: &Path, source: &str, unsafe_code: bool) -> Result<Built, String> {
-    let assembly = compile_csharp_assembly(path, source, unsafe_code)?;
+    let assembly = compile_csharp_assembly(path, source, unsafe_code, "build")?;
     #[cfg(feature = "bake")]
     {
         let image = crate::bake::bake(assembly)?;
@@ -749,8 +975,9 @@ pub fn compile_csharp_assembly(
     path: &Path,
     source: &str,
     unsafe_code: bool,
+    verb: &str,
 ) -> Result<Vec<u8>, String> {
-    compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[])
+    compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], verb)
         .map(|(assembly, _)| assembly)
 }
 
@@ -775,7 +1002,105 @@ pub fn compile_csharp_assembly_with_corlib(
     source: &str,
     unsafe_code: bool,
     libraries: &[crate::flash::Library],
+    verb: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    compile_csharp_file(path, source, unsafe_code, libraries, verb, false)
+        .map(|compiled| (compiled.assembly, compiled.corlib))
+}
+
+/// As [`compile_csharp_assembly_with_corlib`], compiled for a debugger: the program, the corlib it
+/// was bound against, and the Portable PDB that maps its IL back to its source.
+///
+/// **THE PDB NAMES THE SOURCE BY ITS ABSOLUTE PATH** ([`document_path`]), because that is the path
+/// an editor sends with a breakpoint. The compiler's diagnostics still name the file as it was
+/// typed.
+///
+/// # Errors
+/// As [`compile_csharp_assembly_with_corlib`], plus a path that cannot be made absolute.
+pub fn compile_csharp_for_debugging(
+    path: &Path,
+    source: &str,
+    unsafe_code: bool,
+    libraries: &[crate::flash::Library],
+    verb: &str,
+) -> Result<Debuggable, String> {
+    let compiled = compile_csharp_file(path, source, unsafe_code, libraries, verb, true)?;
+    compiled.debuggable(|| format!("lamella {verb}: {}", path.display()))
+}
+
+/// A C# program compiled for a debugger, as [`compile_csharp_for_debugging`] and
+/// [`compile_project_for_debugging`] produce it.
+pub struct Debuggable {
+    /// The assembly.
+    pub assembly: Vec<u8>,
+    /// The corlib the program was bound against, which is the one its link has to take.
+    pub corlib: Vec<u8>,
+    /// The standalone Portable PDB: each method's sequence points and local names, and each
+    /// source by its absolute path.
+    pub pdb: Vec<u8>,
+}
+
+/// What one compilation produced: the assembly, its corlib, and the PDB when one was asked for.
+struct Compiled {
+    assembly: Vec<u8>,
+    corlib: Vec<u8>,
+    pdb: Option<Vec<u8>>,
+}
+
+impl Compiled {
+    /// This compilation as a [`Debuggable`], or a refusal led by `subject` when it carries no PDB.
+    fn debuggable(self, subject: impl FnOnce() -> String) -> Result<Debuggable, String> {
+        let Compiled { assembly, corlib, pdb } = self;
+        match pdb {
+            Some(pdb) => Ok(Debuggable { assembly, corlib, pdb }),
+            None => Err(format!(
+                "{}: the compiler was asked for debug information and wrote none.",
+                subject()
+            )),
+        }
+    }
+}
+
+/// The path a debugger is given for a source file: absolute, and with no `.` or `..` in it.
+///
+/// **AN EDITOR SENDS A BREAKPOINT WITH THE FILE'S ABSOLUTE PATH, AND THE DEBUG INFORMATION HAS TO
+/// NAME THE SAME ONE.** A relative path names the directory the build happened to run in, which
+/// no editor sends. The `.` and `..` components are resolved from the path alone, not from the
+/// disk, so a symbolic link stays where the developer wrote it.
+fn document_path(path: &Path) -> std::io::Result<String> {
+    let absolute = std::path::absolute(path)?;
+    Ok(without_dot_segments(&absolute).display().to_string())
+}
+
+/// `path` with its `.` and `..` components resolved from the path alone: a `..` removes the
+/// component before it, and at the root it stays at the root.
+fn without_dot_segments(path: &Path) -> std::path::PathBuf {
+    let mut resolved = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    resolved
+}
+
+/// The one single-file compilation behind [`compile_csharp_assembly_with_corlib`] and
+/// [`compile_csharp_for_debugging`]; `debug` also asks the compiler for the PDB.
+///
+/// **ONE PATH, SO A PROGRAM IS BOUND THE SAME WAY WHETHER IT IS DEPLOYED OR DEBUGGED**: against
+/// the same references in the same order, under the same assembly name and the same options.
+fn compile_csharp_file(
+    path: &Path,
+    source: &str,
+    unsafe_code: bool,
+    libraries: &[crate::flash::Library],
+    verb: &str,
+    debug: bool,
+) -> Result<Compiled, String> {
     let compiler = LcscCompiler::discover()?;
     let mut references: Vec<lamella_metadata::Assembly> = compiler
         .references()
@@ -785,9 +1110,9 @@ pub fn compile_csharp_assembly_with_corlib(
     for library in libraries {
         let parsed = lamella_metadata::Assembly::read(library.bytes()).map_err(|error| {
             format!(
-                "lamella: {} is not a readable .NET assembly: {error:?}
-
-                 A <Reference> wants a path to a built `.dll`. `lcsc /target:library` produces one.",
+                "lamella {verb}: {} is not a readable .NET assembly: {error:?}\n\n\
+                 A <Reference> wants a path to a built `.dll`. `lcsc /target:library` \
+                 produces one.",
                 library.path().display()
             )
         })?;
@@ -800,22 +1125,37 @@ pub fn compile_csharp_assembly_with_corlib(
         ..Default::default()
     };
     refuse_unhonored_directives(source, options.clone())?;
+    let typed = path.display().to_string();
+    let document = if debug {
+        document_path(path).map_err(|error| {
+            format!(
+                "lamella: {typed}: cannot make it an absolute path for its debug information: \
+                 {error}"
+            )
+        })?
+    } else {
+        typed.clone()
+    };
     let compiled = lamella_assemble::compile_source_with(
         source,
-        &path.display().to_string(),
+        &document,
         &name,
         &name,
         &references,
-        false,
+        debug,
         options,
     );
     let Some(image) = compiled.image else {
-        return Err(render_diagnostics(&compiled, &path.display().to_string(), source));
+        return Err(render_diagnostics(&compiled, &typed, source));
     };
     let Some(corlib) = compiler.references().first().cloned() else {
         return Err("the compiler found no reference assemblies".to_owned());
     };
-    Ok((image, corlib))
+    Ok(Compiled {
+        assembly: image,
+        corlib,
+        pdb: compiled.pdb,
+    })
 }
 
 /// A metadata assembly name derived from `path`.
@@ -835,8 +1175,6 @@ fn assembly_name(path: &Path) -> String {
     name
 }
 
-/// Render a failed compilation the way the toolchain's other front ends do: one `CSnnnn` line per
-/// diagnostic, or the emit error when binding was clean and a construct is not lowered.
 /// Compile every source a project names into ONE assembly, and the corlib it was bound against.
 ///
 /// **THE PROJECT'S FILES ARE ONE COMPILATION, NOT SEVERAL.** Each file's types enter one model
@@ -853,6 +1191,33 @@ pub fn compile_project_assembly(
     libraries: &[crate::flash::Library],
     verb: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    compile_project(project, libraries, verb, false)
+        .map(|compiled| (compiled.assembly, compiled.corlib))
+}
+
+/// As [`compile_project_assembly`], compiled for a debugger: the program, its corlib, and the
+/// Portable PDB, which names each of the project's sources by its absolute path
+/// ([`document_path`]).
+///
+/// # Errors
+/// As [`compile_project_assembly`], plus a source path that cannot be made absolute.
+pub fn compile_project_for_debugging(
+    project: &crate::project::Project,
+    libraries: &[crate::flash::Library],
+    verb: &str,
+) -> Result<Debuggable, String> {
+    let compiled = compile_project(project, libraries, verb, true)?;
+    compiled.debuggable(|| format!("lamella {verb}: {}", project.assembly_name))
+}
+
+/// The one project compilation behind [`compile_project_assembly`] and
+/// [`compile_project_for_debugging`]; `debug` also asks the compiler for the PDB.
+fn compile_project(
+    project: &crate::project::Project,
+    libraries: &[crate::flash::Library],
+    verb: &str,
+    debug: bool,
+) -> Result<Compiled, String> {
     let compiler = LcscCompiler::discover()?;
     let mut references: Vec<lamella_metadata::Assembly> = compiler
         .references()
@@ -862,25 +1227,42 @@ pub fn compile_project_assembly(
     for library in libraries {
         let parsed = lamella_metadata::Assembly::read(library.bytes()).map_err(|error| {
             format!(
-                "lamella {verb}: {} is not a readable .NET assembly: {error:?}\n\n                 A <Reference> wants a path to a built `.dll`. `lcsc /target:library` produces one.",
+                "lamella {verb}: {} is not a readable .NET assembly: {error:?}\n\n\
+                 A <Reference> wants a path to a built `.dll`. `lcsc /target:library` \
+                 produces one.",
                 library.path().display()
             )
         })?;
         references.push(parsed);
     }
     let mut texts = Vec::with_capacity(project.sources.len());
+    let mut documents = Vec::with_capacity(project.sources.len());
     for source in &project.sources {
         let text = std::fs::read_to_string(source).map_err(|error| {
             format!(
-                "lamella {verb}: read {}: {error}\n\n                 The project names it, so the build stops rather than compiling a program that is                  missing\na file.",
+                "lamella {verb}: read {}: {error}\n\n\
+                 The project names it, so the build stops rather than compiling a program \
+                 that is missing\na file.",
                 source.display()
             )
         })?;
-        texts.push((text, source.display().to_string()));
+        let typed = source.display().to_string();
+        documents.push(if debug {
+            document_path(source).map_err(|error| {
+                format!(
+                    "lamella {verb}: {typed}: cannot make it an absolute path for its debug \
+                     information: {error}"
+                )
+            })?
+        } else {
+            typed.clone()
+        });
+        texts.push((text, typed));
     }
     let sources: Vec<(&str, &str)> = texts
         .iter()
-        .map(|(text, path)| (text.as_str(), path.as_str()))
+        .zip(&documents)
+        .map(|((text, _), document)| (text.as_str(), document.as_str()))
         .collect();
     let options = lamella_syntax::lexer::LexOptions {
         unsafe_code: project.allow_unsafe,
@@ -892,7 +1274,7 @@ pub fn compile_project_assembly(
         &project.assembly_name,
         &project.assembly_name,
         &references,
-        false,
+        debug,
         options,
     );
     let Some(image) = compiled.image else {
@@ -901,7 +1283,11 @@ pub fn compile_project_assembly(
     let Some(corlib) = compiler.references().first().cloned() else {
         return Err("the compiler found no reference assemblies".to_owned());
     };
-    Ok((image, corlib))
+    Ok(Compiled {
+        assembly: image,
+        corlib,
+        pdb: compiled.pdb,
+    })
 }
 
 /// A multi-file compilation's diagnostics, each attributed to the file it came from.
@@ -915,7 +1301,7 @@ fn render_multi_diagnostics(
     sources: &[(String, String)],
 ) -> String {
     if let Some(emit_error) = &compiled.emit_error {
-        return format!("{emit_error:?}");
+        return format!("error: this construct is not yet supported by lcsc: {emit_error}");
     }
     let mut text = String::new();
     for (per_file, (file_text, path)) in compiled.diagnostics.iter().zip(sources) {
@@ -931,13 +1317,15 @@ fn render_multi_diagnostics(
     }
     if text.contains("CS0227") {
         text.push_str(
-            "\n\nunsafe code is off by default, as it is in csc without /unsafe. Turn it on in the              project:\n    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>",
+            "\n\nunsafe code is off by default, as it is in csc without /unsafe. Turn it on in the \
+             project:\n    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>",
         );
     }
     text
 }
 
-/// A single file's diagnostics, each naming the file and the line it came from.
+/// A single file's diagnostics, each naming the file and the line it came from -- or, when binding
+/// was clean and a construct is not lowered, the emit error.
 ///
 /// `path` and `source` are the ones that were compiled: the location is read out of the text the
 /// diagnostic's span indexes, so a caller that passed a different file would report a real code
@@ -948,7 +1336,7 @@ fn render_diagnostics(
     source: &str,
 ) -> String {
     if let Some(emit_error) = &compiled.emit_error {
-        return format!("{emit_error:?}");
+        return format!("{path}: error: this construct is not yet supported by lcsc: {emit_error}");
     }
     let mut text = String::new();
     for diagnostic in &compiled.diagnostics {
@@ -1134,6 +1522,83 @@ fn host_sleep_ns(nanos: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A project directory of the test's own: `App.csproj` of `output_type` with `items` inside its
+    /// `<Project>` element, and `Program.cs` beside it holding `program`.
+    fn project_at(name: &str, output_type: &str, items: &str, program: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(
+            dir.join("App.csproj"),
+            format!(
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
+                 <OutputType>{output_type}</OutputType>\n    \
+                 <TargetFramework>lamella1.0</TargetFramework>\n  </PropertyGroup>\n{items}</Project>\n"
+            ),
+        )
+        .expect("write the project");
+        std::fs::write(dir.join("Program.cs"), program).expect("write the program");
+        dir.join("App.csproj")
+    }
+
+    const PRINTS: &str = "class Program\n{\n    static void Main()\n    {\n        \
+                          System.Console.WriteLine(\"from the project\");\n    }\n}\n";
+
+    /// **A PROJECT RUNS AS `build` COMPILES IT.** `run` compiled the project file's own text, which
+    /// holds no source, and reported a project with a perfectly good `Main` as having no entry point.
+    #[test]
+    fn a_project_runs_on_this_machine_as_build_compiles_it() {
+        if LcscCompiler::discover().is_err() {
+            return;
+        }
+        let project = project_at("runs", "Exe", "", PRINTS);
+        let exit = run_command(&[project.to_string_lossy().into_owned()]);
+        assert_eq!(format!("{exit:?}"), format!("{:?}", ExitCode::SUCCESS));
+        match project_outcome(&project) {
+            Ok(Ok(Outcome::Ran { output, exit, .. })) => {
+                assert_eq!(output, "from the project\n", "the program's own output");
+                assert_eq!(exit, 0);
+            }
+            Ok(Err(error)) => panic!("the run failed: {error:?}"),
+            Ok(Ok(_)) => panic!("the project ran as something other than a program"),
+            Err(refusal) => panic!("refused: {refusal}"),
+        }
+        let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
+    }
+
+    /// A class library has nothing to run, and a project that names libraries of its own would run
+    /// here without them, so both are refused -- each saying what does work, in prose that renders.
+    #[test]
+    fn a_library_project_and_one_naming_libraries_are_refused_by_run() {
+        let library = project_at("library", "Library", "", PRINTS);
+        let refusal = project_outcome(&library).expect_err("a class library has no entry point");
+        assert!(
+            refusal.contains("builds a class library") && refusal.contains("<Reference>"),
+            "{refusal}"
+        );
+        crate::rendered::assert_renders_cleanly(&refusal, crate::rendered::four_space_sample);
+
+        let gpio = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../lamella-load/tests/fixtures/System.Device.Gpio.dll");
+        let items = format!(
+            "  <ItemGroup>\n    <Reference Include=\"System.Device.Gpio\">\n      \
+             <HintPath>{}</HintPath>\n    </Reference>\n  </ItemGroup>\n",
+            gpio.display()
+        );
+        let referencing = project_at("referencing", "Exe", &items, PRINTS);
+        let refusal = project_outcome(&referencing).expect_err("its libraries are not linked here");
+        assert!(
+            refusal.contains("references libraries of its own")
+                && refusal.contains("System.Device.Gpio.dll")
+                && refusal.contains("--class-library"),
+            "{refusal}"
+        );
+        crate::rendered::assert_renders_cleanly(&refusal, crate::rendered::four_space_sample);
+        for project in [library, referencing] {
+            let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
+        }
+    }
 
     /// Builds a `Compilation` carrying diagnostics and no image, which is the only state the two
     /// renderers below are reached in.
@@ -1589,6 +2054,17 @@ mod tests {
             );
         }
     }
+    /// **A KIND OF FILE THE VERBS TAKE IS NAMED WHERE A READER LOOKS FOR IT**: the usage line a
+    /// reader retypes, and the refusal met after naming a file the verbs do not take. Both took a
+    /// project and neither said so.
+    #[test]
+    fn run_names_the_project_it_takes() {
+        let first = RUN_USAGE.lines().next().unwrap_or_default();
+        assert!(first.contains("file.csproj"), "the usage line: {first}");
+        let refusal = Language::of(Path::new("app.ts")).expect_err("refuses");
+        assert!(refusal.contains(".csproj"), "the refusal: {refusal}");
+    }
+
     /// **A VERB WITH NO USAGE TEXT ANSWERS `--help` BY PRINTING NOTHING AND EXITING 0**, which
     /// reads to a person as "this tool has no help" and to a script as success.
     ///
@@ -1602,10 +2078,104 @@ mod tests {
             RUN_USAGE.lines().next().unwrap_or_default()
         );
         assert!(
-            USAGE.starts_with("usage: lamella build"),
+            usage().starts_with("usage: lamella build"),
             "`build` must open with the line a reader retypes: {}",
-            USAGE.lines().next().unwrap_or_default()
+            usage().lines().next().unwrap_or_default()
         );
+    }
+
+    /// **THE USAGE OFFERS EVERY FORMAT THE PARSER TAKES, BY THE NAME IT TAKES IT UNDER.** Every
+    /// output `--format` parses -- each image format and the ELF -- must appear as a row of the
+    /// usage, so one the parser gains cannot go unoffered.
+    #[test]
+    fn the_build_usage_offers_every_format_the_parser_takes() {
+        let usage = usage();
+        for output in lamella_flash_routes::artifact::Output::all() {
+            assert!(
+                usage
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(output.extension())),
+                "no row offers `--format {}`:\n{usage}",
+                output.extension()
+            );
+        }
+    }
+
+    /// **A DEBUG BUILD NAMES ITS SOURCE BY THE ABSOLUTE PATH AN EDITOR SENDS**, however the path
+    /// was typed: relative, through `.` and `..`, or already absolute.
+    #[test]
+    fn a_debug_build_names_its_source_by_the_absolute_path_an_editor_sends() {
+        let here = std::env::current_dir().expect("a working directory");
+        let expected = here.join("samples").join("Program.cs");
+        for typed in [
+            "samples/Program.cs",
+            "./samples/Program.cs",
+            "samples/./Program.cs",
+            "elsewhere/../samples/Program.cs",
+            "samples/deeper/../../samples/Program.cs",
+        ] {
+            assert_eq!(
+                document_path(Path::new(typed)).expect("an absolute path"),
+                expected.display().to_string(),
+                "typed as {typed}"
+            );
+        }
+        assert_eq!(
+            document_path(&expected).expect("an absolute path"),
+            expected.display().to_string(),
+            "an absolute path is already the one an editor sends"
+        );
+    }
+
+    /// **`.` AND `..` ARE RESOLVED FROM THE PATH ALONE**, including where the path is already
+    /// absolute -- which is where POSIX's `std::path::absolute` leaves a `..` in place -- and a
+    /// `..` at the root stays at the root.
+    #[test]
+    fn dot_segments_are_resolved_from_the_path_alone() {
+        let here = std::env::current_dir().expect("a working directory");
+        let dotted = here
+            .join("elsewhere")
+            .join("..")
+            .join("samples")
+            .join("deeper")
+            .join("..")
+            .join("Program.cs");
+        assert_eq!(
+            without_dot_segments(&dotted),
+            here.join("samples").join("Program.cs")
+        );
+        let root = here.ancestors().last().expect("a root").to_path_buf();
+        assert_eq!(
+            without_dot_segments(&root.join("..").join("..").join("Program.cs")),
+            root.join("Program.cs")
+        );
+    }
+
+    /// **`--format elf` IS BUILT ON THE CLASS-LIBRARY TIER AND REFUSED BY NAME ON THE FLAT ONE**: the
+    /// refusal names the flag that makes it work and offers, on a line of its own, exactly the
+    /// formats the flat tier's image can be written in -- which the ELF is not one of.
+    #[test]
+    fn an_elf_on_the_flat_tier_names_the_flag_and_the_formats_that_work() {
+        assert_eq!(elf_refusal(crate::flash::Tier::ClassLibrary), None);
+        let message =
+            elf_refusal(crate::flash::Tier::Flat).expect("the flat tier refuses an ELF");
+        assert!(
+            message.contains(&format!("Add {},", crate::flash::CLASS_LIBRARY_FLAG)),
+            "the refusal must name the flag that makes the ELF work:\n{message}"
+        );
+        let listing = format!("    {}", lamella_flash_routes::artifact::Format::listing());
+        assert!(
+            message.lines().any(|line| line == listing),
+            "the refusal must offer the image formats as the table lists them:\n{message}"
+        );
+        assert!(
+            !listing.contains("elf"),
+            "the flat tier cannot write the ELF, so it must not be offered:\n{message}"
+        );
+        crate::rendered::assert_renders_cleanly(&message, crate::rendered::four_space_sample);
+        for line in message.lines() {
+            assert!(line.len() <= 100, "a line runs to {}:\n{message}", line.len());
+        }
     }
 
     /// `run` has three modes and each serves a different language set, so the usage has to state

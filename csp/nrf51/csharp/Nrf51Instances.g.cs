@@ -13,6 +13,8 @@ namespace Lamella.Generated
         public const uint TWI0_BASE = 0x40003000;
         public const uint UART0_BASE = 0x40002000;
         public const uint TIMER0_BASE = 0x40008000;
+        public const uint CLOCK_BASE = 0x40000000;
         public const uint NVMC_BASE = 0x4001E000;
+        public const uint SPI1_BASE = 0x40004000;
     }
 }

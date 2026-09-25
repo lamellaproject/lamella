@@ -94,6 +94,16 @@ INSTANCES = {
     "porta": {"block": "port", "base": 0x41004400},
     "portb": {"block": "port", "base": 0x41004480},
     "eic": {"block": "eic", "base": 0x40001800, "gclk_core_id": 0x5, "irq": 0x4},
+    "adc": {"block": "adc", "base": 0x42004000, "gclk_core_id": 0x1E, "apbc_bit": 0x10, "irq": 0x17},
+    "sysctrl": {"block": "sysctrl", "base": 0x40000800},
+    "tcc0": {"block": "tcc", "base": 0x42002000, "gclk_core_id": 0x1A, "apbc_bit": 0x8, "irq": 0xF, "wo_count": 0x8, "cc_count": 0x4, "counter_bits": 0x18, "gclk_max_hz": 0x5B8D800},
+    "tcc1": {"block": "tcc", "base": 0x42002400, "gclk_core_id": 0x1A, "apbc_bit": 0x9, "irq": 0x10, "wo_count": 0x4, "cc_count": 0x2, "counter_bits": 0x18, "gclk_max_hz": 0x5B8D800},
+    "tcc2": {"block": "tcc", "base": 0x42002800, "gclk_core_id": 0x1B, "apbc_bit": 0xA, "irq": 0x11, "wo_count": 0x2, "cc_count": 0x2, "counter_bits": 0x10, "gclk_max_hz": 0x5B8D800},
+    "tc3": {"block": "tc", "base": 0x42002C00, "gclk_core_id": 0x1B, "apbc_bit": 0xB, "irq": 0x12, "wo_count": 0x2, "cc_count": 0x2, "gclk_max_hz": 0x5B8D800},
+    "tc4": {"block": "tc", "base": 0x42003000, "gclk_core_id": 0x1C, "apbc_bit": 0xC, "irq": 0x13, "wo_count": 0x2, "cc_count": 0x2, "gclk_max_hz": 0x2DC6C00},
+    "tc5": {"block": "tc", "base": 0x42003400, "gclk_core_id": 0x1C, "apbc_bit": 0xD, "irq": 0x14, "wo_count": 0x2, "cc_count": 0x2, "gclk_max_hz": 0x2DC6C00},
+    "tc6": {"block": "tc", "base": 0x42003800, "gclk_core_id": 0x1D, "apbc_bit": 0xE, "irq": 0x15, "wo_count": 0x2, "cc_count": 0x2, "gclk_max_hz": 0x2DC6C00},
+    "tc7": {"block": "tc", "base": 0x42003C00, "gclk_core_id": 0x1D, "apbc_bit": 0xF, "irq": 0x16, "wo_count": 0x2, "cc_count": 0x2, "gclk_max_hz": 0x2DC6C00},
 }
 
 PLANS = {

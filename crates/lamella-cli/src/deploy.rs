@@ -2,13 +2,12 @@
 
 use crate::args::{self, Spec};
 use lamella_wire::Capabilities;
-use lamella_wire_host::{deploy_chunked_blocking, hello_blocking, open_target};
+use lamella_wire_host::{
+    TransferAck, board_name, deploy_image_blocking, hello_blocking, image_too_large, open_target,
+};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
-
-#[cfg(feature = "bake")]
-use {crate::bake::compile_and_bake, lamella_wire_host::engine::LcscCompiler};
 
 /// The default serial baud for a Lamella Link carrier (USB-CDC ignores it; a real UART wants it).
 const BAUD: u32 = 115_200;
@@ -208,11 +207,17 @@ A .csproj builds every .cs beside it as ONE program and links the assemblies its
 elements name, each by a <HintPath>. Nothing is available to a build that its project does not
 name. A single .cs file names no references and binds against the class library alone.
 
---class-library links the program with the class library and the runtime support archive, so it
-may allocate, use floating point and call into System.*. Without it the flat tier is used, which
-is linker-free and resolves no call outside the program. Every build says which tier produced it.
-The class-library tier covers fewer boards; asking for it where there is no plan names the ones
-there are.
+--class-library links the program with the class library and the runtime support archive, so it may
+allocate, use floating point and call into System.*. That tier's collector reclaims an object
+without finalizing it, so a finalizer (a class's ~destructor) never runs there. Without it the flat
+tier is used, which is linker-free and resolves no call outside the program. Every build says which
+tier produced it. The class-library tier covers fewer boards; asking for it where there is no plan
+names the ones there are.
+
+A class-library image is compiled as a debug build is, with the debug information set aside, so
+`lamella build <file> --board <id> --class-library --format elf` for the same program describes
+exactly the image deployed, and a debugger can attach to the board with it. The flat tier is
+compiled without debug information.
 ";
 
 /// Send a payload that is ALREADY built to firmware running at `target`.
@@ -291,26 +296,7 @@ pub fn deploy_refusal(path: &Path, what: &Uncompilable) -> String {
 /// Compile `path` and send it to Lamella firmware already running at `target`.
 #[cfg(feature = "bake")]
 fn to_running_firmware(path: &Path, target: &str, no_run: bool) -> ExitCode {
-    if let Some(what) = uncompilable_source(path) {
-        eprintln!("{}", deploy_refusal(path, &what));
-        return ExitCode::FAILURE;
-    }
-    let source = match std::fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("lamella deploy: read {}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let compiler = match LcscCompiler::discover() {
-        Ok(compiler) => compiler,
-        Err(error) => {
-            eprintln!("lamella deploy: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let image = match compile_and_bake(&compiler, &source) {
+    let image = match crate::bake::image_for_firmware(path, "deploy", deploy_refusal) {
         Ok(image) => image,
         Err(error) => {
             eprintln!("{error}");
@@ -339,25 +325,33 @@ fn send_image(image: &[u8], target: &str, no_run: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = hello_blocking(&mut transport, 0, host_caps(), TIMEOUT) {
-        if let lamella_wire::TransportError::Refused { reason, .. } = error {
-            eprintln!("lamella deploy: {target} refused the connection: {}", refusal(reason));
+    let session = match hello_blocking(&mut transport, 0, host_caps(), TIMEOUT) {
+        Ok(session) => session,
+        Err(error) => {
+            if let lamella_wire::TransportError::Refused { reason, .. } = error {
+                eprintln!("lamella deploy: {target} refused the connection: {}", refusal(reason));
+                return ExitCode::FAILURE;
+            }
+            if let lamella_wire::TransportError::VersionMismatch { target_min, target_max } = error {
+                eprintln!(
+                    "lamella deploy: cannot talk to {target}: {}",
+                    lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
+                );
+                return ExitCode::FAILURE;
+            }
+            eprintln!("lamella deploy: {target} did not answer a HELLO ({error:?}).");
+            eprintln!("{}", no_answer());
             return ExitCode::FAILURE;
         }
-        if let lamella_wire::TransportError::VersionMismatch { target_min, target_max } = error {
-            eprintln!(
-                "lamella deploy: cannot talk to {target}: {}",
-                lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
-            );
+    };
+    match deploy_image_blocking(&mut transport, 1, image, CHUNK, TIMEOUT, Capabilities(0)) {
+        Ok(TransferAck::Accepted) => {}
+        Ok(TransferAck::TooLarge { image: size, window }) => {
+            let board = board_name(session.identity.product_model);
+            eprintln!("lamella deploy: {}.", image_too_large(board, size, window));
             return ExitCode::FAILURE;
         }
-        eprintln!("lamella deploy: {target} did not answer a HELLO ({error:?}).");
-        eprintln!("{}", no_answer());
-        return ExitCode::FAILURE;
-    }
-    match deploy_chunked_blocking(&mut transport, 1, image, CHUNK, TIMEOUT) {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(_) => {
             eprintln!("lamella deploy: a chunk failed to verify on {target}; nothing was started.");
             return ExitCode::FAILURE;
         }

@@ -493,6 +493,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-dap-wire"
+version = "0.0.0"
+dependencies = [
+ "lamella-dap",
+ "lamella-wire-host",
+]
+
+[[package]]
 name = "lamella-debug-agent"
 version = "0.0.0"
 dependencies = [
@@ -522,6 +530,8 @@ name = "lamella-debug-server"
 version = "0.0.0"
 dependencies = [
  "lamella-aot",
+ "lamella-assemble",
+ "lamella-catalog",
  "lamella-cmsis-dap-nrf",
  "lamella-cmsis-dap-sam",
  "lamella-cmsis-dap-stm32",

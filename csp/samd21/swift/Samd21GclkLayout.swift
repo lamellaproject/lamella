@@ -18,6 +18,8 @@ public enum Samd21GclkLayout {
     public static let CLKCTRL_GEN_LSB: UInt32 = 8
     public static let CLKCTRL_CLKEN: UInt32 = 0x4000
     public static let CLKCTRL_CLKEN_LSB: UInt32 = 14
+    public static let CLKCTRL_WRTLOCK: UInt32 = 0x8000
+    public static let CLKCTRL_WRTLOCK_LSB: UInt32 = 15
     public static let STATUS_SYNCBUSY: UInt32 = 0x80
     public static let STATUS_SYNCBUSY_LSB: UInt32 = 7
 }

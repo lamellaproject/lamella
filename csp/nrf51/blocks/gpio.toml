@@ -3,13 +3,7 @@
 # PIN_CNF[n] = 0x700 + 4*n.
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
-# section 14.2, Tables 74/75/83, with the document open. PROVENANCE NOTE, because it is not the
-# ordinary case: Nordic's own download for this manual was returning errors, so the copy read was
-# a third-party mirror of the same manual. It was accepted
-# only after checking that the document SELF-IDENTIFIES on its title page as the Nordic "nRF51
-# Series Reference Manual, Version 3.0" -- the host is a mirror, the document is Nordic's. Nordic
-# currently publishes v3.0.1; if a register fact here is ever disputed, re-read that revision
-# before trusting this file.
+# section 14.2, Tables 74/75/83, with the document open.
 #
 # The offsets below happen to match the nRF52833's. That was NOT assumed -- it was read -- and the
 # two parts genuinely differ elsewhere: Table 74 lists ONE GPIO instance on this part, where the
@@ -79,3 +73,23 @@ notes = "PIN_CNF[0]; PIN_CNF[n] = this offset + PIN_CNF_STRIDE * n. Reset 0x2 (i
 
 [constants]
 PIN_CNF_STRIDE = 4
+# PIN_CNF[n] field values, Table 83. Each is a value for its field, not a mask: a driver shifts it
+# by the field's _LSB. PULL has no value 2, and SENSE has no value 1.
+DIR_INPUT = 0
+DIR_OUTPUT = 1
+INPUT_CONNECT = 0
+INPUT_DISCONNECT = 1
+PULL_DISABLED = 0
+PULL_PULLDOWN = 1
+PULL_PULLUP = 3
+DRIVE_S0S1 = 0
+DRIVE_H0S1 = 1
+DRIVE_S0H1 = 2
+DRIVE_H0H1 = 3
+DRIVE_D0S1 = 4
+DRIVE_D0H1 = 5
+DRIVE_S0D1 = 6
+DRIVE_H0D1 = 7
+SENSE_DISABLED = 0
+SENSE_HIGH = 2
+SENSE_LOW = 3

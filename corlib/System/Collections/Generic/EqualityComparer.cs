@@ -4,7 +4,7 @@ namespace System.Collections.Generic
 {
     /// <summary>Provides a default equality comparison for <typeparamref name="T"/>.</summary>
     /// <typeparam name="T">The type of objects to compare.</typeparam>
-    public abstract class EqualityComparer<T>
+    public abstract class EqualityComparer<T> : IEqualityComparer<T>
     {
         private static EqualityComparer<T> _default;
 

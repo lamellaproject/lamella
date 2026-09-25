@@ -54,15 +54,35 @@ fn wall_unix_millis() -> u64 {
 pub fn install(module: &lamella_cil_runtime::Module, vm: &mut lamella_cil_runtime::Vm) {
     vm.set_clock(now_millis, sleep_millis);
 
-    let unix_millis = wall_unix_millis();
-    if unix_millis > 0 {
-        const UNIX_EPOCH_IN_NET_TICKS: i64 = 621_355_968_000_000_000;
-        let ticks = i64::try_from(unix_millis)
-            .ok()
-            .and_then(|ms| ms.checked_mul(10_000))
-            .and_then(|t| t.checked_add(UNIX_EPOCH_IN_NET_TICKS));
-        if let Some(ticks) = ticks {
-            lamella_cil_runtime::set_wall_clock(module, vm, ticks);
-        }
+    if let Some(ticks) = wall_ticks() {
+        lamella_cil_runtime::set_wall_clock(module, vm, ticks);
     }
+}
+
+/// Installs the same clock as [`install`] through a runner's configure hook, which hands its
+/// embedder the machine and not the module: the hook the REPL's loopback link calls for every
+/// submission.
+///
+/// The wall clock goes in through [`lamella_cil_runtime::Vm::set_now_ticks`] rather than the managed
+/// setter [`install`] calls. The hook runs before the program's module is loaded, and the runner
+/// publishes that anchor into the managed clock once it is.
+pub fn configure(vm: &mut lamella_cil_runtime::Vm) {
+    vm.set_clock(now_millis, sleep_millis);
+    if let Some(ticks) = wall_ticks() {
+        vm.set_now_ticks(ticks);
+    }
+}
+
+/// The host's wall clock in .NET ticks (100 ns since 0001-01-01), or `None` when the host does not
+/// know the time.
+fn wall_ticks() -> Option<i64> {
+    const UNIX_EPOCH_IN_NET_TICKS: i64 = 621_355_968_000_000_000;
+    let unix_millis = wall_unix_millis();
+    if unix_millis == 0 {
+        return None;
+    }
+    i64::try_from(unix_millis)
+        .ok()
+        .and_then(|ms| ms.checked_mul(10_000))
+        .and_then(|t| t.checked_add(UNIX_EPOCH_IN_NET_TICKS))
 }

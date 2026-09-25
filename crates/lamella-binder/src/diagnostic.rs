@@ -95,6 +95,7 @@ mod namespace_tests {
         let kind = DiagnosticKind::FeatureNotInThisBuild {
             feature: "generics".into(),
             permitted_by: LanguageVersion::CSharp7,
+            instead: None,
         };
         assert_eq!(kind.namespace(), CodeNamespace::Lam);
         assert_eq!(kind.code(), 1);
@@ -1291,10 +1292,14 @@ pub enum DiagnosticKind {
     /// them looking for a switch that cannot help. The message names the permitting dialect
     /// precisely so they stop suspecting the language version.
     FeatureNotInThisBuild {
-        /// The feature name, spelled as csc spells it (e.g. "generics").
+        /// The construct being refused -- csc's noun where csc's noun is exactly the missing
+        /// construct, and the construct itself where csc's covers something built
+        /// ([`lamella_syntax::version::Feature::refusal_description`]).
         feature: Box<str>,
         /// The dialect that permits the construct -- the one the user already selected.
         permitted_by: LanguageVersion,
+        /// What to write instead, appended as its own sentence, where this build has one.
+        instead: Option<&'static str>,
     },
     /// `CS0626` (warning): an `extern` member carries no attributes, so nothing says where its
     /// implementation comes from.
@@ -3140,11 +3145,18 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::FeatureNotInThisBuild {
                 feature,
                 permitted_by,
-            } => write!(
-                f,
-                "Feature '{feature}' is permitted by C# {} but is not provided by this build of Lamella.",
-                permitted_by.message_name()
-            ),
+                instead,
+            } => {
+                write!(
+                    f,
+                    "Feature '{feature}' is permitted by C# {} but is not provided by this build of Lamella.",
+                    permitted_by.message_name()
+                )?;
+                match instead {
+                    Some(sentence) => write!(f, " {sentence}"),
+                    None => Ok(()),
+                }
+            }
             DiagnosticKind::AbstractMemberInNonAbstractType { member, type_name } => write!(
                 f,
                 "'{member}' is abstract but it is contained in non-abstract type '{type_name}'"

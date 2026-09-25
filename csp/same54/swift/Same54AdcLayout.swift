@@ -160,4 +160,33 @@ public enum Same54AdcLayout {
     public static let REFSEL_AREFA: UInt32 = 4
     public static let REFSEL_AREFB: UInt32 = 5
     public static let REFSEL_AREFC: UInt32 = 6
+    public static let PRESCALER_DIV2: UInt32 = 0
+    public static let PRESCALER_DIV4: UInt32 = 1
+    public static let PRESCALER_DIV8: UInt32 = 2
+    public static let PRESCALER_DIV16: UInt32 = 3
+    public static let PRESCALER_DIV32: UInt32 = 4
+    public static let PRESCALER_DIV64: UInt32 = 5
+    public static let PRESCALER_DIV128: UInt32 = 6
+    public static let PRESCALER_DIV256: UInt32 = 7
+
+    /// The division PRESCALER code `code` selects, from the PRESCALER_DIV constants above, or 0
+    /// for a code none of them names.
+    public static func prescalerDivisor(_ code: UInt32) -> UInt32 {
+        switch code {
+        case 0: return 2
+        case 1: return 4
+        case 2: return 8
+        case 3: return 16
+        case 4: return 32
+        case 5: return 64
+        case 6: return 128
+        case 7: return 256
+        default: return 0
+        }
+    }
+
+    // -- facts as data (chip/electrical facts conversions read) --
+    public static let GclkAdcMaxHz: UInt32 = 100000000
+    public static let ClkAdcMinHz: UInt32 = 320000
+    public static let ClkAdcMaxHz: UInt32 = 16000000
 }

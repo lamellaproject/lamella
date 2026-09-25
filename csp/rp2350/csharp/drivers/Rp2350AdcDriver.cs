@@ -18,9 +18,10 @@ public sealed class Rp2350AdcDriver : AdcDriver
     private readonly int _minValue;
     private readonly int _maxValue;
     private readonly Rp2350AdcBinding _binding;
+    private bool _up;
 
-    /// <summary>Brings the converter up ready to sample: clk_adc from PLL_USB, block out of
-    /// reset, CS.EN power-up sequence run, temperature bias on (the proven init).</summary>
+    /// <summary>Binds the driver to the converter. No hardware is touched until a channel is first
+    /// opened or read, which is when the converter is brought up.</summary>
     public Rp2350AdcDriver(Rp2350AdcBinding binding)
     {
         _binding = binding;
@@ -35,19 +36,35 @@ public sealed class Rp2350AdcDriver : AdcDriver
         _resolutionBits = (int)Rp2350AdcLayout.ResolutionBits;
         _minValue = (int)Rp2350AdcLayout.MinValue;
         _maxValue = (int)Rp2350AdcLayout.MaxValue;
+    }
+
+    void EnsureUp()
+    {
+        if (_up) return;
 
         uint auxPllUsb = Rp2350ClocksLayout.CLK_ADC_AUXSRC_PLL_USB << (int)Rp2350ClocksLayout.CLK_ADC_CTRL_AUXSRC_LSB;
-        Mmio.Write32(_clkAdcCtrl, auxPllUsb);
-        Mmio.Write32(_clkAdcCtrl, auxPllUsb | Rp2350ClocksLayout.CLK_ADC_CTRL_ENABLE);
-        for (int spin = 0; spin < 100000; spin++)
+        uint ctrl = Mmio.Read32(_clkAdcCtrl);
+        bool running = (ctrl & Rp2350ClocksLayout.CLK_ADC_CTRL_ENABLED) != 0u;
+        bool onPllUsb = (ctrl & Rp2350ClocksLayout.CLK_ADC_CTRL_AUXSRC) == auxPllUsb;
+        if (!running || !onPllUsb)
         {
-            if ((Mmio.Read32(_clkAdcCtrl) & Rp2350ClocksLayout.CLK_ADC_CTRL_ENABLED) != 0u) break;
+            Mmio.Write32(_clkAdcCtrl, ctrl & ~Rp2350ClocksLayout.CLK_ADC_CTRL_ENABLE);
+            for (int spin = 0; spin < 100000; spin++)
+            {
+                if ((Mmio.Read32(_clkAdcCtrl) & Rp2350ClocksLayout.CLK_ADC_CTRL_ENABLED) == 0u) break;
+            }
+            Mmio.Write32(_clkAdcCtrl, auxPllUsb);
+            Mmio.Write32(_clkAdcCtrl, auxPllUsb | Rp2350ClocksLayout.CLK_ADC_CTRL_ENABLE);
+            for (int spin = 0; spin < 100000; spin++)
+            {
+                if ((Mmio.Read32(_clkAdcCtrl) & Rp2350ClocksLayout.CLK_ADC_CTRL_ENABLED) != 0u) break;
+            }
         }
 
-        Mmio.Write32(_resetsClr, binding.ResetMask);
+        Mmio.Write32(_resetsClr, _binding.ResetMask);
         for (int spin = 0; spin < 100000; spin++)
         {
-            if ((Mmio.Read32(_resetsDone) & binding.ResetMask) == binding.ResetMask) break;
+            if ((Mmio.Read32(_resetsDone) & _binding.ResetMask) == _binding.ResetMask) break;
         }
 
         Mmio.Write32(_cs, Rp2350AdcLayout.CS_EN | Rp2350AdcLayout.CS_TS_EN);
@@ -55,6 +72,7 @@ public sealed class Rp2350AdcDriver : AdcDriver
         {
             if ((Mmio.Read32(_cs) & Rp2350AdcLayout.CS_READY) != 0u) break;
         }
+        _up = true;
     }
 
     /// <summary>The board's reference rail in microvolts (the binding's board truth) --
@@ -66,6 +84,8 @@ public sealed class Rp2350AdcDriver : AdcDriver
 
     /// <summary>12-bit SAR (ENOB min 9 / typ 9.5 per the datasheet's electrical table).</summary>
     public override int ResolutionInBits { get { return _resolutionBits; } }
+
+    const int ConversionFailed = -3;
 
     public override int MinValue { get { return _minValue; } }
 
@@ -90,10 +110,11 @@ public sealed class Rp2350AdcDriver : AdcDriver
     /// CS.TS_EN from init.</summary>
     public override void OpenChannel(int channel)
     {
+        EnsureUp();
         int pin = ChannelPin(channel);
         if (pin < 0) return;
-        Mmio.Write32(_pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)pin, Rp2350PadsBank0Layout.GPIO0_OD);
         Mmio.Write32(_ioCtrl0 + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * (uint)pin, Rp2350IoBank0Layout.FUNCSEL_NULL);
+        Mmio.Write32(_pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)pin, Rp2350PadsBank0Layout.GPIO0_OD);
     }
 
     public override void CloseChannel(int channel)
@@ -105,6 +126,7 @@ public sealed class Rp2350AdcDriver : AdcDriver
     /// (the datasheet CAUTION: an error sample is undefined and must be discarded).</summary>
     public override int ReadValue(int channel)
     {
+        EnsureUp();
         uint select = ((uint)channel << (int)Rp2350AdcLayout.CS_AINSEL_LSB)
             | Rp2350AdcLayout.CS_EN | Rp2350AdcLayout.CS_TS_EN;
         for (int attempt = 0; attempt < 8; attempt++)
@@ -120,7 +142,7 @@ public sealed class Rp2350AdcDriver : AdcDriver
                 return (int)(Mmio.Read32(_result) & Rp2350AdcLayout.RESULT_RESULT);
             }
         }
-        return (int)(Mmio.Read32(_result) & Rp2350AdcLayout.RESULT_RESULT);
+        return ConversionFailed;
     }
 
     static int ChannelPin(int channel)

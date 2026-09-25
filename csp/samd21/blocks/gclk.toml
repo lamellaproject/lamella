@@ -12,14 +12,16 @@ sources = [
 ]
 notes = [
     "CLKCTRL is 16-bit at an UNALIGNED offset (base + 0x2) and STATUS is 8-bit at base + 0x1 -- sub-word access only on this M0+ family.",
-    "Route a generator to a peripheral channel: write CLKCTRL = ID | (GEN << 8) | CLKEN, then wait STATUS.SYNCBUSY clear. Each instance row carries its CLKCTRL ID.",
+    "Route a generator to a peripheral channel with CLKCTRL = ID | (GEN << 8) | CLKEN. Each instance row carries its CLKCTRL ID.",
+    "A channel already running is switched by the sequence of DS40001882D 15.6.3.3 (p122): write CLKEN = 0, see CLKEN read 0, write the new GEN, then CLKEN = 1. Writing a new GEN into a running channel is the glitch that sequence prevents.",
+    "CLKCTRL is read indirectly (15.6.4.1, p123): an 8-bit write of a channel's ID selects it, and the next read of CLKCTRL returns that channel's setting. CLKEN reads its previous state until the write that changed it has synchronized (15.6.3.1).",
 ]
 
 [registers.CLKCTRL]
 offset = 0x2
 width = 16
-fields = { ID = [0, 6], GEN = [8, 4], CLKEN = [14, 1] }
-notes = "Peripheral channel control: ID selects the peripheral channel, GEN the source generator, CLKEN enables the route."
+fields = { ID = [0, 6], GEN = [8, 4], CLKEN = [14, 1], WRTLOCK = [15, 1] }
+notes = "Peripheral channel control: ID selects the peripheral channel, GEN the source generator, CLKEN enables the route. WRTLOCK, once set, makes every write to this channel's CLKCTRL ignored until a power reset (15.6.3.4)."
 
 [registers.STATUS]
 offset = 0x1

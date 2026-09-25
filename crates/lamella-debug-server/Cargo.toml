@@ -30,6 +30,9 @@ lamella-metadata = { path = "../lamella-metadata" }
 lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
 # The server flashes the built image on launch (F5 = deploy + debug).
 lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
+# `--board`: a board id resolves here exactly as it does for every `lamella` verb, to the family
+# whose part this server writes and the debug-port IDCODE that part answers.
+lamella-catalog = { path = "../lamella-catalog" }
 lamella-stlink = { path = "../lamella-stlink", optional = true }
 lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32", optional = true }
 # An STM32F7 or H7 deploy writes through the route `lamella flash` takes: the part identified, the write
@@ -37,6 +40,11 @@ lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32", optional = true
 lamella-flash-routes = { path = "../lamella-flash-routes", optional = true }
 lamella-flash-backend = { path = "../lamella-flash-backend", optional = true }
 lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam", optional = true }
+
+# The refusal tests compile the programs they are refused with, so no assembly is committed to go
+# stale against the compiler.
+[dev-dependencies]
+lamella-assemble = { path = "../lamella-assemble" }
 
 # EVERY PROBE AND PART THE SERVER KNOWS IS ON BY DEFAULT. A server is installed to debug the board in
 # front of someone, and one built without that board's probe is not the server they asked for. The

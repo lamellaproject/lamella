@@ -22,6 +22,8 @@ namespace Lamella.Generated
         public const uint CLKCTRL_GEN_LSB = 8;
         public const uint CLKCTRL_CLKEN = 0x4000;
         public const uint CLKCTRL_CLKEN_LSB = 14;
+        public const uint CLKCTRL_WRTLOCK = 0x8000;
+        public const uint CLKCTRL_WRTLOCK_LSB = 15;
         public const uint STATUS_SYNCBUSY = 0x80;
         public const uint STATUS_SYNCBUSY_LSB = 7;
     }

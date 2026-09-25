@@ -29,15 +29,30 @@ base = 0x40003000   # TWI0, nRF51 Series RM v3.0 Table 259. Peripheral ID follow
 [[instances]]
 name = "uart0"
 block = "uart"
-base = 0x40002000   # UART0 (IRQ line 2)
+base = 0x40002000   # UART0, nRF51 Series RM v3.0 Table 274. ID 2, which it holds alone (Table 2), so
+                    # no other peripheral shares its registers; its interrupt number follows the ID
+                    # (10.1.6), so it is interrupt 2.
 
 [[instances]]
 name = "timer0"
 block = "timer"
-base = 0x40008000   # TIMER0 (IRQ line 8)
+base = 0x40008000   # TIMER0, nRF51 Series RM v3.0 Table 140; ID 8 (Table 2), so interrupt 8. The only
+                    # TIMER on this part with a 24- or 32-bit mode (PS v3.4 Table 12).
+
+[[instances]]
+name = "clock"
+block = "clock"
+base = 0x40000000   # CLOCK, nRF51 Series RM v3.0 Table 62. ID 0, shared with POWER and MPU (Table 2).
 
 [[instances]]
 name = "nvmc"
 block = "nvmc"
 base = 0x4001E000   # NVMC flash controller: READY +0x400, CONFIG +0x504,
                     # ERASEPAGE +0x508 all sit on this block base (1 KB pages)
+
+[[instances]]
+name = "spi1"
+block = "spi"
+base = 0x40004000   # SPI1, nRF51 Series RM v3.0 Table 222. ID 4, shared with SPIS1 and TWI1 (Table 2),
+                    # so it leaves TWI0 -- a board's I2C bus -- to itself. SPI0 at 0x40003000 would
+                    # share ID 3 with TWI0 and is not placed here.

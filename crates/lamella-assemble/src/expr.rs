@@ -628,7 +628,7 @@ fn emit_declaration_pattern(
         out.push(load_i4(1));
         return Ok(());
     }
-    if !is_value_type(target, tokens) {
+    if !boxes_to_a_reference(target, tokens) {
         emit_expression(operand, frame, tokens, out)?;
         if is_value_type(&operand.ty, tokens) {
             let box_token = tokens
@@ -1980,6 +1980,24 @@ fn emit_cast(
         ))?;
         out.push(Instruction::new(Opcode::Unbox, Operand::Token(token)));
         out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+        return Ok(());
+    }
+    // A cast TO A TYPE PARAMETER is `unbox.any`, whatever the parameter's constraints: its
+    // instantiation decides at run time whether the value is unboxed or the reference is cast
+    // (ECMA-335 III.4.33). `unbox` cannot name a type parameter at all, and `castclass !T` leaves a
+    // value-type instantiation's value boxed. A source that travels as a box itself -- a value, or
+    // another type parameter -- is boxed first, so `(U)t` is `box !T; unbox.any !U`.
+    if tokens.body_type_parameter(to).is_some() {
+        if boxes_to_a_reference(from, tokens) {
+            let box_token = tokens.instruction_type_token(from).ok_or(EmitError::Unsupported(
+                "boxing the source of a cast to a type parameter with no metadata token",
+            ))?;
+            out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
+        }
+        let token = tokens.instruction_type_token(to).ok_or(EmitError::Unsupported(
+            "a cast to a type parameter with no metadata token",
+        ))?;
+        out.push(Instruction::new(Opcode::UnboxAny, Operand::Token(token)));
         return Ok(());
     }
     if matches!(to, TypeSymbol::Special(SpecialType::String)) {

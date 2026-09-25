@@ -1035,6 +1035,49 @@ pub enum TransferAck {
         /// The CRC the target reported over the prefix it read back.
         reported: u32,
     },
+    /// The image is larger than the target's deploy window, so NOTHING was sent. The target said
+    /// how large its window is when it was asked what it holds; see [`image_too_large`] for the
+    /// sentence a host shows.
+    TooLarge {
+        /// The image's length in bytes.
+        image: usize,
+        /// The deploy window's length in bytes, as the target reported it.
+        window: usize,
+    },
+    /// The target refused a chunk's RANGE rather than failing to write it. On a deploy that means the
+    /// artifact reaches past the target's deploy window; a target that reports its window is refused
+    /// before any chunk is sent ([`TooLarge`](Self::TooLarge)), so a deploy meets this only when the
+    /// window was not known in advance.
+    OutOfRange {
+        /// The index of the refused chunk in the plan that produced it.
+        chunk: usize,
+    },
+}
+
+/// A display name for a Lamella Link `product_model` code, or `None` for UNKNOWN / a model the registry does not
+/// name. DERIVES from [`lamella_wire::product_model::name`] -- the ONE canonical value -> name map -- so it cannot
+/// drift from the registry. (Hand-mirroring it drifted twice: "SAM E54" for canonical "SAME54", and four boards
+/// missing entirely.) UNKNOWN maps to `None` rather than the canonical "custom board", so a host with nothing to
+/// identify stays silent rather than naming a board that was never named.
+#[must_use]
+pub fn board_name(model: u16) -> Option<&'static str> {
+    if model == lamella_wire::product_model::UNKNOWN {
+        return None;
+    }
+    lamella_wire::product_model::name(model)
+}
+
+/// The sentence a host shows when an image does not fit the board's deploy window
+/// ([`TransferAck::TooLarge`]): both sizes, the board, and that nothing was sent.
+///
+/// One sentence for every host, so a CLI, a debugger and a flashing tool cannot drift into saying
+/// three different things about the same refusal. `board` is the product the target named in its
+/// HELLO, or `None` when it named none.
+#[must_use]
+pub fn image_too_large(board: Option<&str>, image: usize, window: usize) -> String {
+    let over = image.saturating_sub(window);
+    let place = board.map_or_else(|| "this board".to_string(), |name| format!("the {name}"));
+    format!("the image is {image} bytes, {over} more than the {window}-byte deploy window on {place}, so nothing was sent")
 }
 
 /// What running a loaded artifact did: it ran, or the target refused the transfer and nothing
@@ -1086,6 +1129,9 @@ fn deploy_chunk_outcome(
     expected: Option<u32>,
 ) -> Result<TransferAck, TransportError> {
     use lamella_wire::msg::xfer;
+    if reply.first() == Some(&xfer::RANGE_REJECTED) {
+        return Ok(TransferAck::OutOfRange { chunk });
+    }
     if !transfer_accepted(reply) {
         return Ok(TransferAck::Rejected { chunk });
     }
@@ -1200,6 +1246,10 @@ pub fn deploy_chunked_blocking(
 /// Host driver, blocking: deploy a baked image in chunks as [`deploy_chunked_blocking`] does, and say
 /// what the acknowledgements said.
 ///
+/// **An image larger than the target's deploy window is refused before any of it is sent**
+/// ([`TransferAck::TooLarge`]): the target is asked what it holds first, under the same `seq`, and
+/// its answer carries the window. A target that does not report one is deployed to as before.
+///
 /// When `session_caps` has [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`], the CRC in each
 /// [`lamella_wire::msg::xfer::MATCHED`] acknowledgement is compared with the CRC of the image up to the
 /// end of that chunk, so a flash that does not hold what was sent is reported at the first chunk
@@ -1223,6 +1273,9 @@ pub fn deploy_image_blocking(
     session_caps: lamella_wire::Capabilities,
 ) -> Result<TransferAck, TransportError> {
     use lamella_wire::{Frame, crc32};
+    if let Some(refused) = refuse_if_larger_than_the_window(transport, seq, image.len(), timeout) {
+        return Ok(refused);
+    }
     let chunk_len = chunk_len.clamp(1, CHUNK_DATA_CAP);
     let compare = session_caps.has(lamella_wire::Capabilities::DEPLOY_PREFIX_CRC);
     let total = image.len() as u32;
@@ -1357,7 +1410,9 @@ pub fn run_bundle_blocking(
     let mut index = 0usize;
     while let Some(chunk) = chunks.next() {
         send_run_bundle(transport, seq, &chunk)?;
-        if let TransferAck::Rejected { chunk } = await_transfer_ack(transport, seq, index, None, timeout)? {
+        if let TransferAck::Rejected { chunk } | TransferAck::OutOfRange { chunk } =
+            await_transfer_ack(transport, seq, index, None, timeout)?
+        {
             return Ok(RunOutcome::Rejected { chunk });
         }
         index += 1;
@@ -1548,6 +1603,9 @@ pub fn try_recv_deploy_ack(
 /// When `session_caps` has [`lamella_wire::Capabilities::DEPLOY_PREFIX_CRC`], each acknowledgement is
 /// compared as [`deploy_image_blocking`] compares one, and the first that differs is
 /// [`TransferAck::Mismatched`]. Pass [`lamella_wire::Negotiated::caps`].
+///
+/// A bundle larger than the target's deploy window is refused before any of it is sent, as
+/// [`deploy_image_blocking`] refuses an image: [`TransferAck::TooLarge`].
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn deploy_bundle_blocking(
     transport: &mut impl Transport,
@@ -1557,6 +1615,9 @@ pub fn deploy_bundle_blocking(
     timeout: Duration,
     session_caps: lamella_wire::Capabilities,
 ) -> Result<TransferAck, TransportError> {
+    if let Some(refused) = refuse_if_larger_than_the_window(transport, seq, bundle.len(), timeout) {
+        return Ok(refused);
+    }
     let compare = session_caps.has(lamella_wire::Capabilities::DEPLOY_PREFIX_CRC);
     let mut chunks = BundleChunks::new(bundle, chunk_len);
     let mut index = 0usize;
@@ -1583,6 +1644,7 @@ pub fn deploy_bundle_blocking(
 /// four is a case where the caller should deploy; a caller that wants to say WHY reads the reply.
 ///
 /// # Errors
+/// [`TransportError::Refused`] when the target does not implement the question, at once;
 /// [`TransportError::Closed`] on timeout; otherwise a carrier [`TransportError`].
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn deployed_status_blocking(
@@ -1590,18 +1652,122 @@ pub fn deployed_status_blocking(
     seq: u16,
     timeout: Duration,
 ) -> Result<Option<u64>, TransportError> {
-    use lamella_wire::Frame;
+    deploy_status_blocking(transport, seq, timeout).map(|status| status.checksum)
+}
+
+/// What a target said when asked what is deployed: the verified image's checksum, and how large its
+/// deploy window is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeployStatus {
+    /// The content checksum of an image the target holds and has VERIFIED; `None` otherwise, as
+    /// [`deployed_status_blocking`] reduces it.
+    pub checksum: Option<u64>,
+    /// How many bytes a deploy may write, or `None` when the target did not say -- a firmware from
+    /// before the field. `None` is an unknown window, never a window of zero.
+    pub window: Option<u32>,
+}
+
+/// Host driver, blocking: ask what is deployed, as [`deployed_status_blocking`] does, and read the
+/// target's deploy window from the same answer.
+///
+/// # Errors
+/// [`TransportError::Refused`] when the target does not implement the question, at once;
+/// [`TransportError::Closed`] on timeout; otherwise a carrier [`TransportError`].
+pub fn deploy_status_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    timeout: Duration,
+) -> Result<DeployStatus, TransportError> {
+    use lamella_wire::{Frame, msg};
     transport.send(deploy::DEPLOY_STATUS, seq, &[])?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
+            if msg_type == msg::ERROR && reply_seq == seq {
+                return Err(lamella_wire::error::refusal(&payload));
+            }
             if msg_type == deploy::DEPLOY_STATUS_RESULT && reply_seq == seq {
                 let verified = payload.first().copied() == Some(deploy::deploy_state::VERIFIED);
-                if verified && payload.len() >= 10 {
-                    let sum = u64::from_le_bytes(payload[2..10].try_into().unwrap());
-                    return Ok(Some(sum));
+                let checksum = payload
+                    .get(2..10)
+                    .filter(|_| verified)
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or_default()));
+                let window =
+                    payload.get(10..14).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap_or_default()));
+                return Ok(DeployStatus { checksum, window });
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Err(TransportError::Closed)
+}
+
+/// The refusal a deploy makes before it sends anything: [`TransferAck::TooLarge`] when the target
+/// reports a deploy window and `len` does not fit it, `None` when it fits or the window is unknown.
+///
+/// Asked under the deploy's own `seq`, so it costs a caller nothing to number: the answer is a
+/// different message type from every chunk acknowledgement that follows. A target that does not
+/// answer, or answers without a window, is deployed to as before -- an unknown window is not a
+/// window of zero.
+fn refuse_if_larger_than_the_window(
+    transport: &mut impl Transport,
+    seq: u16,
+    len: usize,
+    timeout: Duration,
+) -> Option<TransferAck> {
+    if len == 0 {
+        return None;
+    }
+    let window = deploy_status_blocking(transport, seq, timeout).ok()?.window?;
+    let window = usize::try_from(window).unwrap_or(usize::MAX);
+    (len > window).then_some(TransferAck::TooLarge { image: len, window })
+}
+
+/// What [`abort_blocking`] found the target doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aborted {
+    /// Nothing was executing: the target answered from its serve loop.
+    NothingWasRunning,
+    /// A program was executing, and the target stopped it.
+    StoppedAProgram,
+}
+
+/// Host driver, blocking: bring the target back to its serve loop by ABORTing whatever it is
+/// executing, and wait until it says it is there.
+///
+/// **This is how a host gets a board it did not leave in a known state.** A program the board is
+/// running -- one a debugger disconnected from without stopping, as VS Code's detach does -- keeps
+/// running, and a running target answers only the few requests a run can act on: a `HELLO`, and not
+/// a deploy's questions. A host that goes straight to deploying waits out its timeout and reports
+/// the link, which is the wrong thing to look at.
+///
+/// The target answers an `ABORT` on every path, so the host does not have to know the state first:
+/// a board with nothing running acknowledges from its serve loop ([`exec::ack::IDLE`]), and any
+/// execution, running or halted, stops and reports [`debug::reason::ABORTED`] at the abort's own
+/// `seq`. What a stopped program was still sending is skipped: it is being replaced.
+///
+/// # Errors
+/// [`TransportError::Closed`] when neither answer arrives within `timeout`; otherwise a carrier
+/// [`TransportError`].
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn abort_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    timeout: Duration,
+) -> Result<Aborted, TransportError> {
+    transport.send(debug::ABORT, seq, &[])?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        while let Some(frame) = transport.poll()? {
+            if frame.seq != seq {
+                continue;
+            }
+            match (frame.msg_type, frame.payload.first().copied()) {
+                (exec::EXEC_ACK, Some(exec::ack::IDLE)) => return Ok(Aborted::NothingWasRunning),
+                (debug::EVT_STOPPED, Some(debug::reason::ABORTED)) => {
+                    return Ok(Aborted::StoppedAProgram);
                 }
-                return Ok(None);
+                _ => {}
             }
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -1817,6 +1983,152 @@ mod tests {
     use super::*;
     use lamella_wire::MemTransport;
 
+    /// A board running a program the way a resumed debug session runs one -- the runner's mid-run
+    /// `service_wire`: it drops every request but a few, and stops on an `ABORT`, answering with the
+    /// stop at the abort's own sequence number. Once stopped, its serve loop answers everything, an
+    /// `ABORT` with nothing to abort included.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    struct RunningBoard {
+        running: bool,
+        replies: std::collections::VecDeque<Frame>,
+    }
+
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    impl Transport for RunningBoard {
+        fn send(&mut self, msg_type: u8, seq: u16, _payload: &[u8]) -> Result<(), TransportError> {
+            let mut answer = |msg_type, seq, payload: Vec<u8>| {
+                self.replies.push_back(Frame { msg_type, seq, payload });
+            };
+            match (self.running, msg_type) {
+                (true, debug::ABORT) => {
+                    answer(debug::EVT_OUTPUT, 0, vec![debug::output::STDOUT, 0, b'x']);
+                    answer(debug::EVT_STOPPED, seq, vec![debug::reason::ABORTED, 0, 0, 0, 0, 0, 0, 0, 0]);
+                    self.running = false;
+                }
+                (true, _) => {}
+                (false, debug::ABORT) => answer(exec::EXEC_ACK, seq, vec![exec::ack::IDLE]),
+                (false, deploy::DEPLOY_STATUS) => {
+                    answer(deploy::DEPLOY_STATUS_RESULT, seq, vec![deploy::deploy_state::NONE, 0]);
+                }
+                (false, _) => {}
+            }
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
+            Ok(self.replies.pop_front())
+        }
+    }
+
+    /// **A deploy takes back a board that is still running a program.** A debugger that disconnects
+    /// without stopping the program leaves it running, as VS Code's detach expects, and such a board
+    /// drops the deploy's own questions.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn a_deploy_takes_back_a_board_that_is_running_a_program() {
+        let patience = Duration::from_millis(300);
+        let mut board = RunningBoard { running: true, replies: Default::default() };
+        assert_eq!(abort_blocking(&mut board, 7, patience), Ok(Aborted::StoppedAProgram));
+        assert_eq!(
+            deployed_status_blocking(&mut board, 8, patience),
+            Ok(None),
+            "once the program is stopped, the board answers what it holds"
+        );
+        assert_eq!(abort_blocking(&mut board, 9, patience), Ok(Aborted::NothingWasRunning));
+        let mut silent = MemTransport::new();
+        assert_eq!(abort_blocking(&mut silent, 10, patience), Err(TransportError::Closed));
+    }
+
+    /// A board with a deploy window, answering as a serve loop does. Asked what it holds, it holds
+    /// nothing, and it adds its window's length when `window` is set -- a firmware from before that
+    /// field existed leaves it off. A chunk of an artifact larger than the window is refused as a
+    /// failed write, which is what every firmware answered before it could say "out of range".
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    struct WindowedBoard {
+        window: Option<u32>,
+        chunks_received: usize,
+        replies: std::collections::VecDeque<Frame>,
+    }
+
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    impl WindowedBoard {
+        fn new(window: Option<u32>) -> Self {
+            Self { window, chunks_received: 0, replies: Default::default() }
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    impl Transport for WindowedBoard {
+        fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+            use lamella_wire::msg::xfer;
+            match msg_type {
+                deploy::DEPLOY_STATUS => {
+                    let mut status = vec![deploy::deploy_state::NONE, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                    if let Some(window) = self.window {
+                        status.extend_from_slice(&window.to_le_bytes());
+                    }
+                    self.replies.push_back(Frame { msg_type: deploy::DEPLOY_STATUS_RESULT, seq, payload: status });
+                }
+                deploy::DEPLOY_IMAGE | deploy::DEPLOY_BUNDLE => {
+                    self.chunks_received += 1;
+                    let total = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    let fits = self.window.is_none_or(|window| total <= window);
+                    let status = if fits { xfer::MATCHED } else { xfer::WRITE_FAILED };
+                    self.replies.push_back(Frame { msg_type: deploy::XFER_RESULT, seq, payload: vec![status, 0, 0, 0, 0] });
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
+            Ok(self.replies.pop_front())
+        }
+    }
+
+    /// **An image larger than the board's deploy window is refused before a byte of it is sent**, and
+    /// the refusal carries both sizes so the host can say which is which.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn an_image_larger_than_the_window_is_refused_before_a_byte_is_sent() {
+        let mut board = WindowedBoard::new(Some(4096));
+        let image = vec![0x5A; 8192];
+        let ack = deploy_image_blocking(&mut board, 3, &image, 1024, Duration::from_millis(300), lamella_wire::Capabilities(0));
+        assert_eq!(ack, Ok(TransferAck::TooLarge { image: 8192, window: 4096 }));
+        assert_eq!(board.chunks_received, 0, "and not one chunk crossed");
+        assert_eq!(
+            image_too_large(Some("BBC micro:bit v2"), 8192, 4096),
+            "the image is 8192 bytes, 4096 more than the 4096-byte deploy window on the BBC micro:bit v2, so \
+             nothing was sent"
+        );
+    }
+
+    /// The same rule on the other chunked deploy: a Python bundle goes to the same window.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn a_bundle_larger_than_the_window_is_refused_before_a_byte_is_sent() {
+        let mut board = WindowedBoard::new(Some(4096));
+        let bundle = vec![0x5A; 8192];
+        let ack = deploy_bundle_blocking(&mut board, 3, &bundle, 1024, Duration::from_millis(300), lamella_wire::Capabilities(0));
+        assert_eq!(ack, Ok(TransferAck::TooLarge { image: 8192, window: 4096 }));
+        assert_eq!(board.chunks_received, 0);
+    }
+
+    /// THE CONTROL, and the compatibility rule: a board that does not report its window -- every
+    /// firmware from before the field -- is sent the image, because an unknown window is not a
+    /// window of zero. And an image that fits a reported window is sent whole.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn an_image_is_sent_when_the_window_is_unknown_or_large_enough() {
+        let image = vec![0x5A; 8192];
+        for window in [None, Some(8192)] {
+            let mut board = WindowedBoard::new(window);
+            let ack = deploy_image_blocking(&mut board, 3, &image, 1024, Duration::from_millis(300), lamella_wire::Capabilities(0));
+            assert_eq!(ack, Ok(TransferAck::Accepted), "window {window:?}");
+            assert_eq!(board.chunks_received, 8, "window {window:?}: every chunk crossed");
+        }
+    }
+
     /// A TARGET THAT REFUSES THE VERSION IS REPORTED AS A VERSION REFUSAL, NOT AS A CLOSED LINK.
     ///
     /// This is the defect the variant was added for. `hello_blocking` decoded the `HELLO_NAK` and
@@ -1988,6 +2300,15 @@ mod tests {
         encode_frame(deploy::XFER_RESULT, seq, &payload).expect("a 5-byte ack frames")
     }
 
+    /// A target's answer to the question a deploy asks first: nothing deployed, and a deploy window
+    /// of `window` bytes.
+    fn holds_nothing_with_a_window_of(seq: u16, window: u32) -> Vec<u8> {
+        let mut payload = vec![deploy::deploy_state::NONE, 0];
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&window.to_le_bytes());
+        encode_frame(deploy::DEPLOY_STATUS_RESULT, seq, &payload).expect("a 14-byte status frames")
+    }
+
     fn corlib() -> Option<Vec<u8>> {
         std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll")).ok()
     }
@@ -2070,6 +2391,7 @@ mod tests {
     fn every_byte_crosses_even_when_the_caller_asks_for_an_oversized_chunk() {
         let image: Vec<u8> = (0..(2 * 65536 + 777)).map(|i| (i % 251) as u8).collect();
         let mut transport = MemTransport::new();
+        transport.feed(&holds_nothing_with_a_window_of(3, 1 << 20));
         for _ in 0..8 {
             transport.feed(&xfer_ack(3));
         }
@@ -2107,6 +2429,7 @@ mod tests {
     fn every_bundle_chunk_starts_on_a_word_and_the_whole_bundle_crosses() {
         let bundle: Vec<u8> = (0..10_003).map(|i| (i % 251) as u8).collect();
         let mut transport = MemTransport::new();
+        transport.feed(&holds_nothing_with_a_window_of(7, 1 << 20));
         for _ in 0..32 {
             transport.feed(&xfer_ack(7));
         }
@@ -2121,6 +2444,8 @@ mod tests {
         let mut frames = 0usize;
         let mut reader = FrameReader::new();
         reader.push(&transport.take_sent());
+        let asked = reader.next_frame().expect("the deploy asks the window first");
+        assert_eq!(asked.msg_type, deploy::DEPLOY_STATUS);
         while let Some(frame) = reader.next_frame() {
             assert_eq!(
                 frame.msg_type,
@@ -2172,6 +2497,7 @@ mod tests {
     fn a_target_that_refuses_the_bundle_op_is_reported_as_refused_not_as_a_closed_link() {
         let mut transport = MemTransport::new();
         transport.feed(&encode_frame(lamella_wire::msg::ERROR, 5, &[]).expect("an ERROR frames"));
+        transport.feed(&encode_frame(lamella_wire::msg::ERROR, 5, &[]).expect("an ERROR frames"));
 
         let none = lamella_wire::Capabilities(0);
         let error = deploy_bundle_blocking(&mut transport, 5, &[1, 2, 3, 4], 4096, Duration::from_secs(5), none)
@@ -2200,12 +2526,14 @@ mod tests {
         let timeout = Duration::from_secs(5);
 
         let mut transport = MemTransport::new();
+        transport.feed(&holds_nothing_with_a_window_of(3, 4096));
         for end in [4, 8, 12] {
             transport.feed(&ack(prefix(end)));
         }
         assert_eq!(deploy_bundle_blocking(&mut transport, 3, &bundle, 4, timeout, caps), Ok(TransferAck::Accepted));
 
         let mut transport = MemTransport::new();
+        transport.feed(&holds_nothing_with_a_window_of(3, 4096));
         transport.feed(&ack(prefix(4)));
         transport.feed(&ack(0xDEAD_BEEF));
         assert_eq!(

@@ -77,6 +77,17 @@ pub struct BlockTable {
     /// is an external SPI-NOR chip has no answer here that is a property of the part, and gets no
     /// flash block at all rather than a plausible 256.
     pub write_unit: Option<Int>,
+    /// The languages this block's layout is emitted in, when its table narrows them (`emit`);
+    /// `None` emits it in every language its family emits.
+    ///
+    /// It is for a block that only native code reads, such as the clock a board's startup starts
+    /// or the counter its clock reads. A board assembly compiles every C# layout of its family,
+    /// and a deployed image pays for a constant no program reaches, so such a block is emitted in
+    /// Rust alone.
+    ///
+    /// It only narrows. Naming a language the family does not emit is refused, and so is naming
+    /// every language it does, so a block that carries the key is always a narrowed one.
+    pub emit: Option<Vec<String>>,
 }
 
 impl BlockRegister {
@@ -92,6 +103,13 @@ impl BlockTable {
     #[must_use]
     pub fn register(&self, name: &str) -> Option<&BlockRegister> {
         self.registers.iter().find(|r| r.name == name)
+    }
+
+    /// Whether this block's table lets its layout be emitted in `language` (`csharp`, `rust` or
+    /// `swift`). Whether the family emits that language at all is the family's to say.
+    #[must_use]
+    pub fn emits(&self, language: &str) -> bool {
+        self.emit.as_ref().is_none_or(|list| list.iter().any(|named| named == language))
     }
 
     /// A `value` placed in register `register`'s field `field`, shifted and checked to fit.
@@ -936,6 +954,43 @@ pub struct DebugAccess {
     pub source: String,
 }
 
+/// The layouts an image can take on a board whose product ships a bootloader in flash.
+///
+/// `bare` writes the image at the start of flash, over the bootloader; `keep` writes it behind the
+/// bootloader, which then starts it.
+pub const BOOTLOADER_LAYOUTS: [&str; 2] = ["bare", "keep"];
+
+/// The bootloader a board's product ships in flash, and what an image kept behind it must leave
+/// alone.
+///
+/// IT STATES THE PRODUCT, NOT ONE UNIT. A unit whose bootloader was overwritten is still this
+/// board, so whether a given part holds the bootloader is read from the part when an image is
+/// written, never from this record.
+///
+/// STATING NOTHING AND STATING NONE ARE DIFFERENT CLAIMS, as for [`DebugAccess`]: a board that
+/// omits the section has not been read, and `reserved_ram = []` states that the bootloader keeps
+/// nothing in SRAM across a reset.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BootloaderLayout {
+    /// The bootloader's name, as its own source gives it.
+    pub name: String,
+    /// Where it sits in flash.
+    pub base: i64,
+    /// How many bytes of flash it occupies from [`Self::base`]. An image kept behind it starts at
+    /// `base + size`.
+    pub size: i64,
+    /// The SRAM words it reads across a reset, which an image kept behind it must never write.
+    /// `None` when the file has not stated them.
+    pub reserved_ram: Option<Vec<i64>>,
+    /// How long it waits after a reset before it starts the image, where its source states a wait.
+    pub reset_wait_ms: Option<i64>,
+    /// The layout the interpreter's image takes on this board, from [`BOOTLOADER_LAYOUTS`], or
+    /// empty where the file does not say.
+    pub interpreter: String,
+    /// Where the claim is stated. Required, as every board fact is.
+    pub source: String,
+}
+
 /// One position of a connector STANDARD: the join vocabulary two files meet in.
 ///
 /// A standard describes neither a chip nor a board, which is why it is neither. It exists
@@ -1097,6 +1152,8 @@ pub struct BoardTable {
     /// How a debugger reaches this board. `None` means the file has not stated it, which is NOT
     /// the same as stating that nothing reaches it -- see [`DebugAccess`].
     pub debug: Option<DebugAccess>,
+    /// The bootloader the board's product ships in flash. `None` means the file states none.
+    pub bootloader: Option<BootloaderLayout>,
 }
 
 impl BoardTable {
@@ -1672,7 +1729,7 @@ fn build_block(
 ) -> Result<BlockTable, String> {
     header_reject_unknown(
         header,
-        &["kind", "family", "block", "mode", "erased_value", "write_unit", "sources", "notes"],
+        &["kind", "family", "block", "mode", "erased_value", "write_unit", "emit", "sources", "notes"],
     )?;
     let mut table = BlockTable {
         family: header_str(header, "family")?,
@@ -1680,6 +1737,29 @@ fn build_block(
         mode: header_str_opt(header, "mode")?,
         ..BlockTable::default()
     };
+
+    if let Some((line, key, value)) = header.iter().find(|(_, k, _)| k == "emit") {
+        let emit = as_str_array(*line, key, value)?;
+        if emit.is_empty() {
+            return Err(err(
+                *line,
+                "`emit` is empty, which would describe a layout no language states -- name the \
+                 languages this block's readers use, or leave the key out for every language",
+            ));
+        }
+        for (index, language) in emit.iter().enumerate() {
+            if !["csharp", "rust", "swift"].contains(&language.as_str()) {
+                return Err(err(
+                    *line,
+                    &format!("`emit` names '{language}' -- a block layout is emitted in csharp, rust and swift only"),
+                ));
+            }
+            if emit[..index].contains(language) {
+                return Err(err(*line, &format!("`emit` names '{language}' twice")));
+            }
+        }
+        table.emit = Some(emit);
+    }
 
     table.erased_value = match header.iter().find(|(_, k, _)| k == "erased_value") {
         Some((line, k, v)) => Some(as_int(*line, k, v)?),
@@ -3345,6 +3425,8 @@ fn build_board(
         ConnectorPin(usize),
         /// The board's debug-access record (`[debug]`).
         Debug,
+        /// The bootloader its product ships (`[bootloader]`).
+        Bootloader,
     }
     let mut at = At::None;
     let mut memory_source_cited = false;
@@ -3374,6 +3456,17 @@ fn build_board(
                 }
                 table.debug = Some(DebugAccess::default());
                 at = At::Debug;
+            }
+            Item::Section(name) if name == "bootloader" => {
+                if table.bootloader.is_some() {
+                    return Err(err(
+                        *line,
+                        "a board states [bootloader] once -- the bootloader its product ships is one \
+                         fact, and a second section would be a second answer to it",
+                    ));
+                }
+                table.bootloader = Some(BootloaderLayout { base: -1, size: -1, ..BootloaderLayout::default() });
+                at = At::Bootloader;
             }
             Item::ArraySection(name) if name == "bindings" => {
                 table.bindings.push(build_binding(*line));
@@ -3528,6 +3621,35 @@ fn build_board(
                                 *line,
                                 &format!(
                                     "unexpected debug key '{other}' -- a debug record takes signals/exposure/fitted/pitch_mm/onboard/recovery/source"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                At::Bootloader => {
+                    let record = table.bootloader.as_mut().expect("open bootloader record");
+                    match (key.as_str(), value) {
+                        ("name", RawValue::Str(s)) => record.name = s.clone(),
+                        ("base", RawValue::Int(i)) => record.base = i.value,
+                        ("size", RawValue::Int(i)) => record.size = i.value,
+                        ("reserved_ram", RawValue::Array(items)) => {
+                            let mut words = Vec::new();
+                            for item in items {
+                                let RawValue::Int(i) = item else {
+                                    return Err(err(*line, "a reserved_ram entry is an address"));
+                                };
+                                words.push(i.value);
+                            }
+                            record.reserved_ram = Some(words);
+                        }
+                        ("reset_wait_ms", RawValue::Int(i)) => record.reset_wait_ms = Some(i.value),
+                        ("interpreter", RawValue::Str(s)) => record.interpreter = s.clone(),
+                        ("source", RawValue::Str(s)) => record.source = s.clone(),
+                        (other, _) => {
+                            return Err(err(
+                                *line,
+                                &format!(
+                                    "unexpected bootloader key '{other}' -- a bootloader record takes name/base/size/reserved_ram/reset_wait_ms/interpreter/source"
                                 ),
                             ));
                         }
@@ -3760,6 +3882,45 @@ fn build_board(
             ));
         }
     }
+    if let Some(record) = &table.bootloader {
+        if record.source.is_empty() {
+            return Err(format!(
+                "board {}: a [bootloader] record must be SOURCE-CITED -- where the bootloader sits and what it keeps are read from its own source, and an uncited claim cannot be checked against it",
+                table.board
+            ));
+        }
+        if record.name.is_empty() {
+            return Err(format!("board {}: a [bootloader] record states no name", table.board));
+        }
+        if record.base < 0 {
+            return Err(format!("board {}: a [bootloader] record states no base", table.board));
+        }
+        if record.size <= 0 {
+            return Err(format!(
+                "board {}: a [bootloader] record states no size -- an image kept behind the bootloader starts at base + size",
+                table.board
+            ));
+        }
+        if !record.interpreter.is_empty() && !BOOTLOADER_LAYOUTS.contains(&record.interpreter.as_str()) {
+            return Err(format!(
+                "board {}: bootloader interpreter layout '{}' is not one of {}",
+                table.board,
+                record.interpreter,
+                BOOTLOADER_LAYOUTS.join("/")
+            ));
+        }
+        for word in record.reserved_ram.iter().flatten() {
+            if word % 4 != 0 {
+                return Err(format!(
+                    "board {}: bootloader reserved_ram word 0x{word:X} is not word-aligned",
+                    table.board
+                ));
+            }
+        }
+        if record.reset_wait_ms.is_some_and(|wait| wait < 0) {
+            return Err(format!("board {}: a bootloader cannot wait a negative time", table.board));
+        }
+    }
     for (at, region) in table.memory.iter().enumerate() {
         if region.name.is_empty() {
             return Err(format!("board {}: memory region {at} states no name", table.board));
@@ -3958,10 +4119,31 @@ impl FamilySet {
         self.blocks.iter().find(|b| b.block == block && b.mode == mode)
     }
 
-    /// The pin-map row for (pin, function), when present.
+    /// The (pin, function) cell's row, when the cell holds one.
+    ///
+    /// A cell may hold a row per block where its column serves several -- the samd21's analog
+    /// column carries the ADC's inputs beside the comparators', the touch controller's lines and the
+    /// references, each row naming its own instance. Such a cell is refused here rather than
+    /// answered by whichever row comes first, because the column alone does not say which block a
+    /// pad reaches and a first match would decide it by table order. A caller that knows the block
+    /// asks [`Self::pin_row_for`].
+    pub fn pin_row(&self, pin: &str, function: &str) -> Result<Option<&PinRow>, String> {
+        let rows: Vec<&PinRow> =
+            self.pins.rows.iter().filter(|r| r.pin == pin && r.function == function).collect();
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => Ok(Some(*row)),
+            many => Err(format!(
+                "pins: {pin} function {function} holds a row for each of {} -- the column alone does not say which block the pad reaches, so its lookup must name the instance",
+                many.iter().map(|row| row.instance.as_str()).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
+    /// The row of the (pin, function) cell that routes to `instance`, when the cell has one.
     #[must_use]
-    pub fn pin_row(&self, pin: &str, function: &str) -> Option<&PinRow> {
-        self.pins.rows.iter().find(|r| r.pin == pin && r.function == function)
+    pub fn pin_row_for(&self, pin: &str, function: &str, instance: &str) -> Option<&PinRow> {
+        self.pins.rows.iter().find(|r| r.pin == pin && r.function == function && r.instance == instance)
     }
 
     /// The module named `module`, when loaded.
@@ -4058,6 +4240,36 @@ fn validate_family(set: &FamilySet) -> Result<(), String> {
         }
         validate_bindings(set, &module.bindings, &module.part, &module.module)?;
     }
+    refuse_two_ceilings_on_one_clock_channel(&set.instances)
+}
+
+/// Refuses two instance rows that share a generic clock channel but state different ceilings for it.
+///
+/// THE CEILING IS THE CHANNEL'S, NOT THE INSTANCE'S. Where a family routes one channel to two
+/// instances -- the SAM D21's timers, in pairs -- the datasheet limits the channel, so both rows state
+/// the one fact, and an edit to one row alone would leave the pair disagreeing about one clock. A row
+/// that states no ceiling, beside one that does, disagrees with it too.
+fn refuse_two_ceilings_on_one_clock_channel(instances: &InstancesTable) -> Result<(), String> {
+    if !instances.record.iter().any(|field| field == "gclk_max_hz") {
+        return Ok(());
+    }
+    let mut seen: Vec<(i64, &str, i64)> = Vec::new();
+    for row in &instances.rows {
+        let Some(channel) = instances.value(&row.name, "gclk_core_id").filter(|id| *id >= 0) else {
+            continue;
+        };
+        let ceiling = instances.value(&row.name, "gclk_max_hz").unwrap_or(-1);
+        if let Some(&(_, other, other_ceiling)) = seen.iter().find(|(id, _, _)| *id == channel) {
+            if other_ceiling != ceiling {
+                return Err(format!(
+                    "instances: {other} and {} share generic clock channel 0x{channel:X} but state its ceiling as {other_ceiling} and {ceiling} -- the ceiling is the channel's, so both rows state the one value (-1 is none)",
+                    row.name
+                ));
+            }
+        } else {
+            seen.push((channel, &row.name, ceiling));
+        }
+    }
     Ok(())
 }
 
@@ -4100,11 +4312,17 @@ fn validate_bindings(
             if pin.soft {
                 continue;
             }
-            let Some(cell) = set.pin_row(&pin.pin, &binding.function) else {
-                return Err(format!(
-                    "{owner}: binding '{}' claims {} function {} but pins.toml has no such row (grow the pin map from the datasheet, never from the binding)",
-                    binding.role, pin.pin, binding.function
-                ));
+            let cell = match set.pin_row_for(&pin.pin, &binding.function, &binding.instance) {
+                Some(cell) => cell,
+                None => {
+                    let Some(cell) = set.pin_row(&pin.pin, &binding.function)? else {
+                        return Err(format!(
+                            "{owner}: binding '{}' claims {} function {} but pins.toml has no such row (grow the pin map from the datasheet, never from the binding)",
+                            binding.role, pin.pin, binding.function
+                        ));
+                    };
+                    cell
+                }
             };
             if cell.is_unrouted() {
                 return Err(format!(
@@ -4556,6 +4774,25 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
             push_const(&mut out, kind, name, &format_int(*value));
         }
     }
+    let prescaler = prescaler_lookup(block)?;
+    if !prescaler.is_empty() {
+        out.push_str("
+        /// <summary>The division PRESCALER code <paramref name=\"code\"/> selects, from the
+        /// PRESCALER_DIV constants above, or 0 for a code none of them names.</summary>
+        public static uint PrescalerDivisor(uint code)
+        {
+            switch (code)
+            {
+");
+        for (code, division) in &prescaler {
+            out.push_str(&format!("                case {code}: return {division};
+"));
+        }
+        out.push_str("            }
+            return 0;
+        }
+");
+    }
 
     if !block.facts.is_empty() {
         out.push_str("\n        // -- facts as data (chip/electrical facts conversions read) --\n");
@@ -4572,7 +4809,7 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
         }
     }
     if !block.channels.is_empty() {
-        out.push_str("\n        // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n        // GPIO index a pin-fed channel taps (the inverse, so no driver carries a pin\n        // literal); ChannelCount = the package's mux width --\n");
+        out.push_str("\n        // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n        // GPIO index a pin-fed channel taps (the inverse, so no driver carries a pin\n        // literal); ChannelCount = how many rows the map has; IsChannel = whether an\n        // index is one of them --\n");
         for channel in &block.channels {
             push_const(
                 &mut out,
@@ -4592,6 +4829,11 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
             }
         }
         push_const(&mut out, "int", "ChannelCount", &block.channels.len().to_string());
+        out.push_str("\n        /// <summary>Whether <paramref name=\"channel\"/> is the index of a row in the\n        /// channel map above. The indexes need not run without gaps, so ChannelCount alone\n        /// does not answer this.</summary>\n        public static bool IsChannel(int channel)\n        {\n            switch (channel)\n            {\n");
+        for channel in &block.channels {
+            out.push_str(&format!("                case {}: return true;\n", channel.index));
+        }
+        out.push_str("            }\n            return false;\n        }\n");
     }
     for record in &block.calibrations {
         out.push_str(&format!(
@@ -4713,6 +4955,12 @@ fn extint_map(set: &FamilySet) -> Result<Option<ExtIntMap>, String> {
     let eic = set
         .block("eic", "")
         .ok_or_else(|| format!("pins.toml states EIC rows but there is no eic block table"))?;
+    if eic.emit.is_some() {
+        return Err(String::from(
+            "the eic block's table narrows its languages with `emit`, but the pad-to-EXTINT lookup \
+             names that block's layout in every language the family emits -- leave the key out",
+        ));
+    }
     let line_count = eic
         .constant("LINE_COUNT")
         .and_then(|count| u32::try_from(count).ok())
@@ -5004,6 +5252,177 @@ struct UartEmission {
     bauds: Vec<(String, i64)>,
 }
 
+/// The GCLK.CLKCTRL word that routes one peripheral's core clock from one generator on a samd21:
+/// ID | GEN | CLKEN, each placed by the gclk block's own CLKCTRL fields. The ONE composition the
+/// uart, i2c and spi arms share, so a rule added here reaches all three.
+fn gclk_clkctrl_value(
+    set: &FamilySet,
+    board: &str,
+    gclk_core_id: i64,
+    generator: i64,
+) -> Result<i64, String> {
+    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
+    let clkctrl = gclk.register("CLKCTRL").ok_or_else(|| format!("{board}: gclk has no CLKCTRL"))?;
+    let shift = |field: &str| -> Result<u32, String> {
+        clkctrl
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.lsb)
+            .ok_or_else(|| format!("{board}: CLKCTRL has no {field} field"))
+    };
+    Ok(gclk_core_id << shift("ID")? | generator << shift("GEN")? | 1i64 << shift("CLKEN")?)
+}
+
+/// The GCLK peripheral channel that clocks one peripheral on a same54-shape part, as
+/// `(register address, word)`. The channel is a REGISTER, addressed by the instance's channel
+/// index: element `gclk_id` of the PCHCTRL array, strided by the register's own declared width
+/// rather than a literal 4, so an array whose elements are not 32 bits cannot be silently
+/// mis-strided. The word is GEN | CHEN: GEN selects the generator and CHEN is what actually starts
+/// the clock -- composing without CHEN yields a register that reads back the right generator and a
+/// peripheral that never ticks. The ONE composition the uart, i2c and adc arms share.
+fn gclk_pchctrl(
+    set: &FamilySet,
+    board: &str,
+    gclk_id: i64,
+    generator: i64,
+) -> Result<(i64, i64), String> {
+    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
+    let pchctrl =
+        gclk.register("PCHCTRL0").ok_or_else(|| format!("{board}: gclk has no PCHCTRL0"))?;
+    let gclk_base = set
+        .instances
+        .value("gclk", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'gclk'"))?;
+    let pch_shift = |field: &str| -> Result<u32, String> {
+        pchctrl
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.lsb)
+            .ok_or_else(|| format!("{board}: PCHCTRL0 has no {field} field"))
+    };
+    let register = gclk_base + pchctrl.offset.value + gclk_id * i64::from(pchctrl.width / 8);
+    let word = generator << pch_shift("GEN")? | 1i64 << pch_shift("CHEN")?;
+    Ok((register, word))
+}
+
+/// The rate of `binding`'s generator under `plan`, refused when the plan states none. `which`
+/// names the plan the way the refusal should -- a carrier's own "plan", or the board's "default
+/// plan" -- because that is the table the author has to edit.
+fn plan_gclk_hz(board: &str, plan: &Plan, which: &str, binding: &Binding) -> Result<i64, String> {
+    plan.gclk_hz(binding.gclk_gen).ok_or_else(|| {
+        format!(
+            "{board}: {which} '{}' states no gclk{}_hz rate for binding '{}'",
+            plan.name, binding.gclk_gen, binding.role
+        )
+    })
+}
+
+/// A block's `PRESCALER_DIV<n>` constants as a table of `(division, code)`, sorted by division.
+///
+/// The constants' NAMES carry the divisions -- read as a table, not as the power of two behind some
+/// of them, because the timers' list skips 32 and 128 -- so a block states its prescaler once and
+/// every reader takes the same rows: a resolver choosing a code when it generates, and the lookup a
+/// block's layout answers with at run time.
+///
+/// A name whose suffix is not a positive whole number, written without a leading zero, is refused
+/// rather than skipped: skipped, its code would answer 0 at run time, and a resolver would choose
+/// among the rows that remained. So is a division named twice, whose code would depend on which row
+/// a reader met first.
+fn prescaler_divisions(block: &BlockTable) -> Result<Vec<(i64, i64)>, String> {
+    let mut divisions: Vec<(i64, i64)> = Vec::new();
+    for (name, value) in &block.constants {
+        let Some(suffix) = name.strip_prefix("PRESCALER_DIV") else {
+            continue;
+        };
+        let whole = !suffix.is_empty() && !suffix.starts_with('0') && suffix.bytes().all(|b| b.is_ascii_digit());
+        let Some(division) = whole.then(|| suffix.parse::<i64>().ok()).flatten() else {
+            return Err(format!(
+                "block {}: constant {name} names no division -- the suffix of a PRESCALER_DIV<n> constant is the positive whole number the code divides by",
+                block.block
+            ));
+        };
+        divisions.push((division, value.value));
+    }
+    divisions.sort_unstable();
+    if let Some(pair) = divisions.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "block {}: division {} is named twice, for PRESCALER codes {} and {}",
+            block.block, pair[0].0, pair[0].1, pair[1].1
+        ));
+    }
+    Ok(divisions)
+}
+
+/// The rows [`prescaler_divisions`] reads as `(code, division)`, ordered by code for a layout's
+/// lookup, with a code named for two divisions refused: the lookup's answer would depend on row
+/// order.
+fn prescaler_lookup(block: &BlockTable) -> Result<Vec<(i64, i64)>, String> {
+    let mut by_code: Vec<(i64, i64)> = prescaler_divisions(block)?.into_iter().map(|(d, c)| (c, d)).collect();
+    by_code.sort_unstable();
+    if let Some(pair) = by_code.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "block {}: PRESCALER code {} is named for two divisions, {} and {}",
+            block.block, pair[0].0, pair[0].1, pair[1].1
+        ));
+    }
+    Ok(by_code)
+}
+
+/// The PRESCALER code that runs an adc binding's converter as fast as its block permits, from the
+/// binding's generic-clock rate under `plan`.
+///
+/// STATE-AND-VERIFY, as the rp2350 arm does for its clk_adc. The block states the limits -- the
+/// generic clock's ceiling `gclk_adc_max_hz`, and the range `clk_adc_min_hz` to `clk_adc_max_hz` of
+/// the prescaled converter clock -- and its `PRESCALER_DIV<n>` codes; the plan states the rate. A
+/// board whose rate no code serves is refused here rather than converting out of specification at
+/// run time, which a converter does without complaint: its results keep arriving. Every family
+/// whose converter divides a generic clock this way calls this one function.
+fn adc_prescaler(
+    board: &str,
+    binding: &Binding,
+    plan: &Plan,
+    adc: &BlockTable,
+    core_clock_hz: i64,
+) -> Result<i64, String> {
+    let fact = |key: &str| -> Result<i64, String> {
+        adc.facts
+            .iter()
+            .find(|(n, _)| n == key)
+            .and_then(|(_, f)| match f {
+                Fact::Int(int) => Some(int.value),
+                Fact::Float(_) => None,
+            })
+            .ok_or_else(|| format!("{board}: the adc block states no integer fact '{key}'"))
+    };
+    let gclk_max = fact("gclk_adc_max_hz")?;
+    if core_clock_hz > gclk_max {
+        return Err(format!(
+            "{board}: adc binding '{}' clocks the converter at {core_clock_hz} Hz under plan '{}', above the block's gclk_adc_max_hz {gclk_max}",
+            binding.role, plan.name
+        ));
+    }
+    let clk_min = fact("clk_adc_min_hz")?;
+    let clk_max = fact("clk_adc_max_hz")?;
+    let divisions = prescaler_divisions(adc)?;
+    let Some(&(division, prescaler)) =
+        divisions.iter().find(|(division, _)| core_clock_hz <= clk_max * division)
+    else {
+        return Err(format!(
+            "{board}: adc binding '{}': no PRESCALER_DIV<n> constant of the adc block brings {core_clock_hz} Hz to clk_adc_max_hz {clk_max} or below",
+            binding.role
+        ));
+    };
+    if core_clock_hz < clk_min * division {
+        return Err(format!(
+            "{board}: adc binding '{}': {core_clock_hz} Hz divided by {division}, the least division under the ceiling, is below clk_adc_min_hz {clk_min}",
+            binding.role
+        ));
+    }
+    Ok(prescaler)
+}
+
 fn resolve_uart(
     set: &FamilySet,
     resolved: &ResolvedBoard,
@@ -5029,18 +5448,7 @@ fn resolve_uart(
             binding.role
         ));
     }
-    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
-    let clkctrl = gclk.register("CLKCTRL").ok_or_else(|| format!("{board}: gclk has no CLKCTRL"))?;
-    let shift = |field: &str| -> Result<u32, String> {
-        clkctrl
-            .fields
-            .iter()
-            .find(|f| f.name == field)
-            .map(|f| f.lsb)
-            .ok_or_else(|| format!("{board}: CLKCTRL has no {field} field"))
-    };
-    let gclk_clkctrl_value =
-        gclk_id << shift("ID")? | binding.gclk_gen << shift("GEN")? | 1i64 << shift("CLKEN")?;
+    let gclk_clkctrl_value = gclk_clkctrl_value(set, board, gclk_id, binding.gclk_gen)?;
 
     let tx = binding.pins.iter().find(|(s, _)| s == "tx").map(|(_, p)| p);
     let rx = binding.pins.iter().find(|(s, _)| s == "rx").map(|(_, p)| p);
@@ -5087,12 +5495,7 @@ fn resolve_uart(
 
     let mut bauds = Vec::new();
     for (carrier, plan) in resolved.board.carrier_points(&binding.role) {
-        let f = plan.gclk_hz(binding.gclk_gen).ok_or_else(|| {
-            format!(
-                "{board}: plan '{}' states no gclk{}_hz rate for binding '{}'",
-                plan.name, binding.gclk_gen, binding.role
-            )
-        })?;
+        let f = plan_gclk_hz(board, plan, "plan", binding)?;
         let rate = carrier.baud;
         let divisor = 65536 - (65536 * 16 * rate) / f;
         bauds.push((format!("BAUD_{rate}_{}", upper_snake(&plan.name)), divisor));
@@ -5200,23 +5603,8 @@ fn resolve_uart_pchctrl(
         ));
     }
 
-    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
-    let pchctrl =
-        gclk.register("PCHCTRL0").ok_or_else(|| format!("{board}: gclk has no PCHCTRL0"))?;
-    let gclk_base = instances
-        .value("gclk", "base")
-        .ok_or_else(|| format!("{board}: no instance row for 'gclk'"))?;
-    let pch_shift = |field: &str| -> Result<u32, String> {
-        pchctrl
-            .fields
-            .iter()
-            .find(|f| f.name == field)
-            .map(|f| f.lsb)
-            .ok_or_else(|| format!("{board}: PCHCTRL0 has no {field} field"))
-    };
-    let gclk_pchctrl_reg =
-        gclk_base + pchctrl.offset.value + gclk_id * i64::from(pchctrl.width / 8);
-    let gclk_pchctrl_value = binding.gclk_gen << pch_shift("GEN")? | 1i64 << pch_shift("CHEN")?;
+    let (gclk_pchctrl_reg, gclk_pchctrl_value) =
+        gclk_pchctrl(set, board, gclk_id, binding.gclk_gen)?;
 
     let mclk_base = instances
         .value("mclk", "base")
@@ -5265,12 +5653,7 @@ fn resolve_uart_pchctrl(
 
     let mut bauds = Vec::new();
     for (carrier, plan) in resolved.board.carrier_points(&binding.role) {
-        let f = plan.gclk_hz(binding.gclk_gen).ok_or_else(|| {
-            format!(
-                "{board}: plan '{}' states no gclk{}_hz rate for binding '{}'",
-                plan.name, binding.gclk_gen, binding.role
-            )
-        })?;
+        let f = plan_gclk_hz(board, plan, "plan", binding)?;
         let rate = carrier.baud;
         let divisor = 65536 - (65536 * 16 * rate) / f;
         bauds.push((format!("BAUD_{rate}_{}", upper_snake(&plan.name)), divisor));
@@ -5349,18 +5732,7 @@ fn resolve_i2c_samd21(
             binding.role
         ));
     }
-    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
-    let clkctrl = gclk.register("CLKCTRL").ok_or_else(|| format!("{board}: gclk has no CLKCTRL"))?;
-    let shift = |field: &str| -> Result<u32, String> {
-        clkctrl
-            .fields
-            .iter()
-            .find(|f| f.name == field)
-            .map(|f| f.lsb)
-            .ok_or_else(|| format!("{board}: CLKCTRL has no {field} field"))
-    };
-    let gclk_clkctrl_value =
-        gclk_id << shift("ID")? | binding.gclk_gen << shift("GEN")? | 1i64 << shift("CLKEN")?;
+    let gclk_clkctrl_value = gclk_clkctrl_value(set, board, gclk_id, binding.gclk_gen)?;
 
     let sda = binding.pins.iter().find(|(s, _)| s == "sda").map(|(_, p)| p);
     let scl = binding.pins.iter().find(|(s, _)| s == "scl").map(|(_, p)| p);
@@ -5387,12 +5759,7 @@ fn resolve_i2c_samd21(
         .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
 
     let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
-    let core_clock_hz = plan.gclk_hz(binding.gclk_gen).ok_or_else(|| {
-        format!(
-            "{board}: default plan '{}' states no gclk{}_hz rate for binding '{}'",
-            plan.name, binding.gclk_gen, binding.role
-        )
-    })?;
+    let core_clock_hz = plan_gclk_hz(board, plan, "default plan", binding)?;
 
     Ok(SercomI2cEmission {
         prefix: upper_snake(&binding.role),
@@ -5476,23 +5843,8 @@ fn resolve_i2c_same54(
         ));
     }
 
-    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
-    let pchctrl =
-        gclk.register("PCHCTRL0").ok_or_else(|| format!("{board}: gclk has no PCHCTRL0"))?;
-    let gclk_base = instances
-        .value("gclk", "base")
-        .ok_or_else(|| format!("{board}: no instance row for 'gclk'"))?;
-    let pch_shift = |field: &str| -> Result<u32, String> {
-        pchctrl
-            .fields
-            .iter()
-            .find(|f| f.name == field)
-            .map(|f| f.lsb)
-            .ok_or_else(|| format!("{board}: PCHCTRL0 has no {field} field"))
-    };
-    let gclk_pchctrl_reg =
-        gclk_base + pchctrl.offset.value + gclk_id * i64::from(pchctrl.width / 8);
-    let gclk_pchctrl_value = binding.gclk_gen << pch_shift("GEN")? | 1i64 << pch_shift("CHEN")?;
+    let (gclk_pchctrl_reg, gclk_pchctrl_value) =
+        gclk_pchctrl(set, board, gclk_id, binding.gclk_gen)?;
 
     let mclk_base = instances
         .value("mclk", "base")
@@ -5525,12 +5877,7 @@ fn resolve_i2c_same54(
         .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
 
     let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
-    let core_clock_hz = plan.gclk_hz(binding.gclk_gen).ok_or_else(|| {
-        format!(
-            "{board}: default plan '{}' states no gclk{}_hz rate for binding '{}'",
-            plan.name, binding.gclk_gen, binding.role
-        )
-    })?;
+    let core_clock_hz = plan_gclk_hz(board, plan, "default plan", binding)?;
 
     Ok(Same54SercomI2cEmission {
         prefix: upper_snake(&binding.role),
@@ -5835,7 +6182,7 @@ fn resolve_spi_pl022(
             ));
         }
         let cell = set
-            .pin_row(&pin.pin, &binding.function)
+            .pin_row(&pin.pin, &binding.function)?
             .ok_or_else(|| {
                 format!(
                     "{board}: spi binding '{}' claims {} function {} but pins.toml has no such row",
@@ -5909,7 +6256,7 @@ fn resolve_i2c_dw(
     let sda = signal("sda")?;
     let scl = signal("scl")?;
     for (pin, cell_signal) in [(sda, "sda"), (scl, "scl")] {
-        let cell = set.pin_row(&pin.pin, &binding.function).ok_or_else(|| {
+        let cell = set.pin_row(&pin.pin, &binding.function)?.ok_or_else(|| {
             format!(
                 "{board}: i2c binding '{}' claims {} function {} but pins.toml has no such row",
                 binding.role, pin.pin, binding.function
@@ -5968,6 +6315,11 @@ struct Same54AdcEmission {
     adc_base: i64,
     gclk_pchctrl_reg: i64,
     gclk_pchctrl_value: i64,
+    /// The binding's generic-clock rate under the default plan.
+    core_clock_hz: i64,
+    /// The CTRLA.PRESCALER value that rate needs: the least division that brings CLK_ADC within
+    /// the block's ceiling.
+    prescaler: i64,
     apb_mask_reg: i64,
     apb_mask: i64,
     calib_reg: i64,
@@ -6030,23 +6382,8 @@ fn resolve_adc_same54(
         ));
     }
 
-    let gclk = set.block("gclk", "").ok_or_else(|| format!("{board}: no gclk block table"))?;
-    let pchctrl =
-        gclk.register("PCHCTRL0").ok_or_else(|| format!("{board}: gclk has no PCHCTRL0"))?;
-    let gclk_base = instances
-        .value("gclk", "base")
-        .ok_or_else(|| format!("{board}: no instance row for 'gclk'"))?;
-    let pch_shift = |field: &str| -> Result<u32, String> {
-        pchctrl
-            .fields
-            .iter()
-            .find(|f| f.name == field)
-            .map(|f| f.lsb)
-            .ok_or_else(|| format!("{board}: PCHCTRL0 has no {field} field"))
-    };
-    let gclk_pchctrl_reg =
-        gclk_base + pchctrl.offset.value + gclk_id * i64::from(pchctrl.width / 8);
-    let gclk_pchctrl_value = binding.gclk_gen << pch_shift("GEN")? | 1i64 << pch_shift("CHEN")?;
+    let (gclk_pchctrl_reg, gclk_pchctrl_value) =
+        gclk_pchctrl(set, board, gclk_id, binding.gclk_gen)?;
 
     let mclk_base = instances
         .value("mclk", "base")
@@ -6058,6 +6395,10 @@ fn resolve_adc_same54(
         .constant("NVM_CALIBRATION_AREA")
         .ok_or_else(|| format!("{board}: adc block has no NVM_CALIBRATION_AREA constant"))?;
 
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let core_clock_hz = plan_gclk_hz(board, plan, "default plan", binding)?;
+    let prescaler = adc_prescaler(board, binding, plan, adc, core_clock_hz)?;
+
     let ain = binding.pins.iter().find(|(s, _)| s == "ain").map(|(_, p)| p);
     let Some(ain) = ain else {
         return Err(format!("{board}: adc binding '{}' needs an `ain` pin", binding.role));
@@ -6065,10 +6406,10 @@ fn resolve_adc_same54(
     let (port, index) =
         split_pin(&ain.pin).ok_or_else(|| format!("{board}: bad pin {}", ain.pin))?;
 
-    let cell = set.pin_row(&ain.pin, &binding.function).ok_or_else(|| {
+    let cell = set.pin_row_for(&ain.pin, &binding.function, &binding.instance).ok_or_else(|| {
         format!(
-            "{board}: adc binding '{}' claims {} function {} but pins.toml has no such row",
-            binding.role, ain.pin, binding.function
+            "{board}: adc binding '{}' claims {} function {} for {} but pins.toml has no such row",
+            binding.role, ain.pin, binding.function, binding.instance
         )
     })?;
     let muxpos = cell
@@ -6104,6 +6445,8 @@ fn resolve_adc_same54(
         adc_base: base,
         gclk_pchctrl_reg,
         gclk_pchctrl_value,
+        core_clock_hz,
+        prescaler,
         apb_mask_reg: mclk_base + apb_mask_offset,
         apb_mask: 1i64 << apb_bit,
         calib_reg: base + calib.offset.value,
@@ -6183,6 +6526,406 @@ fn resolve_adc_rp(
         reset_mask: 1i64 << reset_bit,
         reference_uv: binding.reference_uv,
     })
+}
+
+/// One resolved samd21 `kind = "adc"` binding: the converter, clocked under the default plan, and
+/// every analog pad the board wires to it.
+struct Samd21AdcEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    base: i64,
+    irq: i64,
+    apbc_mask: i64,
+    gclk_clkctrl_value: i64,
+    core_clock_hz: i64,
+    /// The CTRLB.PRESCALER value this binding's core clock needs: the smallest division that
+    /// brings CLK_ADC within the block's ceiling.
+    prescaler: i64,
+    /// The PMUX nibble value of the binding's function letter, the analog column.
+    pmux_func: i64,
+    reference_uv: i64,
+    /// One per wired pad, in the binding's order.
+    pads: Vec<Samd21AdcPad>,
+}
+
+/// One analog pad a samd21 adc binding wires: the board's name for it, the converter channel it is,
+/// and where its multiplexer nibble and pin configuration are. Named fields, because three byte
+/// addresses in a row are a transposition no single board's anchors can see.
+struct Samd21AdcPad {
+    /// The binding's signal name for the pad (`ext1_pin3`).
+    name: String,
+    /// The pin map's `ain<N>`: the INPUTCTRL.MUXPOS code that selects the pad.
+    channel: i64,
+    /// The PORT PMUX byte covering the pad.
+    pmux_reg: i64,
+    /// The pad's nibble within that byte: 0 for an even pad, 4 for an odd one.
+    pmux_shift: i64,
+    /// The PORT PINCFG byte of the pad.
+    pincfg_reg: i64,
+}
+
+/// Resolves a samd21 `kind = "adc"` binding: ONE converter, and every analog pad the board wired
+/// to it, where the same54 arm resolves one pad per binding.
+///
+/// The difference is the driver behind each. The same54 one offers its single pad as channel 0.
+/// This one numbers its channels by the multiplexer's own codes, so the internal inputs -- the
+/// bandgap and the two scaled supplies -- sit under one controller beside the pads, and a board
+/// states the pads it wired in one place. Each is named by the board, as a signal of the binding,
+/// and its channel is read off the pin map rather than restated.
+fn resolve_adc_samd21(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<Samd21AdcEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let name = &binding.instance;
+    let base = instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    let irq = instances.value(name, "irq").unwrap_or(-1);
+    let gclk_core_id = instances
+        .value(name, "gclk_core_id")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no gclk_core_id"))?;
+    let apbc_bit = instances
+        .value(name, "apbc_bit")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance {name} has no apbc_bit"))?;
+    if binding.gclk_gen < 0 {
+        return Err(format!(
+            "{board}: adc binding '{}' declares no gclk_gen (which generator its core clock rides under the default plan)",
+            binding.role
+        ));
+    }
+    if binding.reference_uv <= 0 {
+        return Err(format!(
+            "{board}: adc binding '{}' states no reference_uv -- a count means nothing without the reference it is a fraction of",
+            binding.role
+        ));
+    }
+
+    let adc = set.block("adc", "").ok_or_else(|| format!("{board}: no adc block table"))?;
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let gclk_clkctrl_value = gclk_clkctrl_value(set, board, gclk_core_id, binding.gclk_gen)?;
+    let core_clock_hz = plan_gclk_hz(board, plan, "default plan", binding)?;
+    let prescaler = adc_prescaler(board, binding, plan, adc, core_clock_hz)?;
+
+    let port = set.block("port", "").ok_or_else(|| format!("{board}: no port block table"))?;
+    let pmux0 = port.register("PMUX0").ok_or_else(|| format!("{board}: port has no PMUX0"))?;
+    let pincfg0 = port.register("PINCFG0").ok_or_else(|| format!("{board}: port has no PINCFG0"))?;
+    let pmux_func = port
+        .constant(&format!("FUNC_{}", binding.function.to_ascii_uppercase()))
+        .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
+
+    let mut pads: Vec<Samd21AdcPad> = Vec::new();
+    for (label, pin) in &binding.pins {
+        if pin.soft {
+            return Err(format!(
+                "{board}: adc binding '{}' marks pad '{label}' ({}) soft -- an analog input reaches the converter through its multiplexer, never as a GPIO",
+                binding.role, pin.pin
+            ));
+        }
+        let cell = set.pin_row_for(&pin.pin, &binding.function, &binding.instance).ok_or_else(|| {
+            format!(
+                "{board}: adc binding '{}' claims {} function {} for {} but pins.toml has no such row",
+                binding.role, pin.pin, binding.function, binding.instance
+            )
+        })?;
+        let channel = cell
+            .signal
+            .strip_prefix("ain")
+            .and_then(|rest| rest.parse::<i64>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "{board}: adc binding '{}' routes {} to pin-map signal '{}', which does not name an \
+                     analog input -- an adc cell reads `ain<N>` and the N is the converter's channel",
+                    binding.role, pin.pin, cell.signal
+                )
+            })?;
+        if !adc.channels.iter().any(|c| c.index == channel) {
+            return Err(format!(
+                "{board}: adc binding '{}' wires {} as ain{channel}, but the adc block has no channel row {channel}",
+                binding.role, pin.pin
+            ));
+        }
+        if let Some(other) = pads.iter().find(|pad| pad.channel == channel) {
+            return Err(format!(
+                "{board}: adc binding '{}' wires channel {channel} twice, as '{}' and as '{label}'",
+                binding.role, other.name
+            ));
+        }
+        let (port_letter, index) =
+            split_pin(&pin.pin).ok_or_else(|| format!("{board}: bad pin {}", pin.pin))?;
+        let group = format!("port{port_letter}");
+        let group_base = instances
+            .value(&group, "base")
+            .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+        pads.push(Samd21AdcPad {
+            name: label.clone(),
+            channel,
+            pmux_reg: group_base + pmux0.offset.value + i64::from(index / 2),
+            pmux_shift: i64::from(index % 2) * 4,
+            pincfg_reg: group_base + pincfg0.offset.value + i64::from(index),
+        });
+    }
+
+    Ok(Samd21AdcEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        base,
+        irq,
+        apbc_mask: 1i64 << apbc_bit,
+        gclk_clkctrl_value,
+        core_clock_hz,
+        prescaler,
+        pmux_func,
+        reference_uv: binding.reference_uv,
+        pads,
+    })
+}
+
+/// One resolved samd21 `kind = "pwm"` binding: a TC or TCC counter clocked under the default plan,
+/// and each waveform output the board wires to it.
+struct Samd21PwmEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    base: i64,
+    irq: i64,
+    apbc_mask: i64,
+    gclk_clkctrl_value: i64,
+    core_clock_hz: i64,
+    /// The counter's size in bits: a TCC's from its instance row, a TC's from its mode's block.
+    counter_bits: i64,
+    /// The PMUX nibble value of the binding's function letter, the timers' column.
+    pmux_func: i64,
+    /// One per wired output, in the binding's order.
+    outputs: Vec<Samd21PwmOutput>,
+}
+
+/// One waveform output a samd21 pwm binding wires: the binding's name for it, `wo<n>` for WO[n], the
+/// compare channel that drives it, and where its multiplexer nibble and pin configuration are.
+struct Samd21PwmOutput {
+    /// The binding's signal name for the output (`wo0`).
+    name: String,
+    /// The compare channel whose CCx sets the output's duty.
+    cc: i64,
+    /// The PORT PMUX byte covering the pad.
+    pmux_reg: i64,
+    /// The pad's nibble within that byte: 0 for an even pad, 4 for an odd one.
+    pmux_shift: i64,
+    /// The PORT PINCFG byte of the pad.
+    pincfg_reg: i64,
+}
+
+/// Resolves a samd21 `kind = "pwm"` binding: one counter, a TC in its 8-bit mode or a TCC, and the
+/// waveform outputs the board wires to it, each named by the binding as `wo<n>` for WO[n].
+///
+/// The instance row states what the counter has -- its outputs, its compare channels, a TCC's counter
+/// size and its generic clock's ceiling -- so each refusal reads the row rather than a list kept here.
+/// A TC runs in its 8-bit mode, the `tc` block's `count8` table, where PER sets the period and both
+/// outputs carry a duty; a TCC runs single-slope PWM, where PER sets it too.
+fn resolve_pwm_samd21(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<Samd21PwmEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let name = &binding.instance;
+    let row = instances
+        .row(name)
+        .ok_or_else(|| format!("{board}: pwm binding '{}' names instance '{name}', which is not placed", binding.role))?;
+    let block = match row.block.as_str() {
+        "tc" => set
+            .block("tc", "count8")
+            .ok_or_else(|| format!("{board}: no tc block table in count8 mode"))?,
+        "tcc" => set.block("tcc", "").ok_or_else(|| format!("{board}: no tcc block table"))?,
+        other => {
+            return Err(format!(
+                "{board}: pwm binding '{}' names instance '{name}', a {other} block -- a samd21 pwm counter is a tc or a tcc",
+                binding.role
+            ));
+        }
+    };
+    let stated = |key: &str| -> Result<i64, String> {
+        instances
+            .value(name, key)
+            .filter(|v| *v >= 0)
+            .ok_or_else(|| format!("{board}: instance {name} states no {key}"))
+    };
+    let base = stated("base")?;
+    let irq = instances.value(name, "irq").unwrap_or(-1);
+    let gclk_core_id = stated("gclk_core_id")?;
+    let apbc_bit = stated("apbc_bit")?;
+    let wo_count = stated("wo_count")?;
+    let cc_count = stated("cc_count")?;
+    let gclk_max_hz = stated("gclk_max_hz")?;
+    let row_bits = instances.value(name, "counter_bits").filter(|v| *v >= 0);
+    let block_bits = block.facts.iter().find(|(n, _)| n == "counter_bits").and_then(|(_, f)| match f {
+        Fact::Int(int) => Some(int.value),
+        Fact::Float(_) => None,
+    });
+    let counter_bits = match (row_bits, block_bits) {
+        (Some(bits), None) | (None, Some(bits)) => bits,
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{board}: {name}'s counter size is stated twice, by its instance row and by its mode's block -- a TCC's is its row's, a TC's its mode's"
+            ));
+        }
+        (None, None) => {
+            return Err(format!(
+                "{board}: {name} states no counter size -- a TCC's is its instance row's counter_bits, a TC's its mode's block fact"
+            ));
+        }
+    };
+    if binding.gclk_gen < 0 {
+        return Err(format!(
+            "{board}: pwm binding '{}' declares no gclk_gen (which generator its counter rides under the default plan)",
+            binding.role
+        ));
+    }
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let gclk_clkctrl_value = gclk_clkctrl_value(set, board, gclk_core_id, binding.gclk_gen)?;
+    let core_clock_hz = plan_gclk_hz(board, plan, "default plan", binding)?;
+    if core_clock_hz > gclk_max_hz {
+        return Err(format!(
+            "{board}: pwm binding '{}' clocks {name} at {core_clock_hz} Hz under plan '{}', above its generic clock channel's {gclk_max_hz} Hz (the instance row's gclk_max_hz)",
+            binding.role, plan.name
+        ));
+    }
+
+    let port = set.block("port", "").ok_or_else(|| format!("{board}: no port block table"))?;
+    let pmux0 = port.register("PMUX0").ok_or_else(|| format!("{board}: port has no PMUX0"))?;
+    let pincfg0 = port.register("PINCFG0").ok_or_else(|| format!("{board}: port has no PINCFG0"))?;
+    let pmux_func = port
+        .constant(&format!("FUNC_{}", binding.function.to_ascii_uppercase()))
+        .ok_or_else(|| format!("{board}: port block has no FUNC_{} constant", binding.function))?;
+
+    let mut outputs: Vec<Samd21PwmOutput> = Vec::new();
+    for (label, pin) in &binding.pins {
+        if pin.soft {
+            return Err(format!(
+                "{board}: pwm binding '{}' marks output '{label}' ({}) soft -- a waveform output reaches its pad through the multiplexer, never as a GPIO",
+                binding.role, pin.pin
+            ));
+        }
+        let wo = label
+            .strip_prefix("wo")
+            .and_then(|n| n.parse::<i64>().ok())
+            .filter(|n| *label == format!("wo{n}"))
+            .ok_or_else(|| {
+                format!(
+                    "{board}: pwm binding '{}' names a signal '{label}' -- a pwm binding names each output it wires wo<n>, for WO[n]",
+                    binding.role
+                )
+            })?;
+        if wo >= wo_count {
+            return Err(format!(
+                "{board}: pwm binding '{}' wires {label}, but {name} has {wo_count} waveform outputs, WO[0] to WO[{}]",
+                binding.role,
+                wo_count - 1
+            ));
+        }
+        if wo >= cc_count {
+            return Err(format!(
+                "{board}: pwm binding '{}' wires {label}, past {name}'s {cc_count} compare channels -- that output repeats a channel through the output matrix, which this binding does not program",
+                binding.role
+            ));
+        }
+        let cell = set.pin_row_for(&pin.pin, &binding.function, name).ok_or_else(|| {
+            format!(
+                "{board}: pwm binding '{}' claims {} function {} for {name} but pins.toml has no such row",
+                binding.role, pin.pin, binding.function
+            )
+        })?;
+        if cell.signal != *label {
+            return Err(format!(
+                "{board}: pwm binding '{}' wires {} as {label}, but pins.toml says that cell of {name} is {}",
+                binding.role, pin.pin, cell.signal
+            ));
+        }
+        let (port_letter, index) = split_pin(&pin.pin).ok_or_else(|| format!("{board}: bad pin {}", pin.pin))?;
+        let group = format!("port{port_letter}");
+        let group_base = instances
+            .value(&group, "base")
+            .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+        outputs.push(Samd21PwmOutput {
+            name: label.clone(),
+            cc: wo,
+            pmux_reg: group_base + pmux0.offset.value + i64::from(index / 2),
+            pmux_shift: i64::from(index % 2) * 4,
+            pincfg_reg: group_base + pincfg0.offset.value + i64::from(index),
+        });
+    }
+    if outputs.is_empty() {
+        return Err(format!("{board}: pwm binding '{}' wires no output", binding.role));
+    }
+
+    Ok(Samd21PwmEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        base,
+        irq,
+        apbc_mask: 1i64 << apbc_bit,
+        gclk_clkctrl_value,
+        core_clock_hz,
+        counter_bits,
+        pmux_func,
+        outputs,
+    })
+}
+
+/// Refuses a board whose pwm bindings drive one counter twice, or whose bindings put one generic
+/// clock channel on two generators.
+///
+/// BOTH ARE SILENT ON THE PART. Two bindings on one counter are two drivers over one register block,
+/// each re-timing the other's outputs. And a generic clock channel may serve two instances -- the SAM
+/// D21 routes its timers' clocks in pairs, TCC0 with TCC1, TCC2 with TC3, TC4 with TC5 and TC6 with
+/// TC7, one CLKCTRL.ID each (15.8.3) -- so a write routing the channel for one clocks both: the
+/// second of two bindings a program brings up re-clocks the first, whose rates then change with
+/// nothing to report it.
+///
+/// The channel half reads every binding the board resolves, a module's included, whose instance row
+/// states a channel and which names a generator, rather than trusting that only one binding kind
+/// routes a shared channel: a later kind that routes one is covered with no edit here.
+fn refuse_shared_timer_clocks(
+    board: &str,
+    instances: &InstancesTable,
+    bindings: &[Binding],
+    pwms: &[Samd21PwmEmission],
+) -> Result<(), String> {
+    for (index, pwm) in pwms.iter().enumerate() {
+        if let Some(other) = pwms[index + 1..].iter().find(|other| other.instance == pwm.instance) {
+            return Err(format!(
+                "{board}: pwm bindings '{}' and '{}' both drive {} -- one counter has one driver, and a second would re-time the first's outputs",
+                pwm.role, other.role, pwm.instance
+            ));
+        }
+    }
+    let routed: Vec<(&Binding, i64)> = bindings
+        .iter()
+        .filter(|binding| binding.gclk_gen >= 0)
+        .filter_map(|binding| {
+            let channel = instances.value(&binding.instance, "gclk_core_id").filter(|id| *id >= 0)?;
+            Some((binding, channel))
+        })
+        .collect();
+    for (index, &(binding, channel)) in routed.iter().enumerate() {
+        for &(other, other_channel) in &routed[index + 1..] {
+            if channel == other_channel && binding.gclk_gen != other.gclk_gen {
+                return Err(format!(
+                    "{board}: bindings '{}' ({}) and '{}' ({}) share generic clock channel 0x{channel:X} but name generators {} and {} -- one write routing the channel clocks both, so bringing up the second re-clocks the first; put both on one generator",
+                    binding.role, binding.instance, other.role, other.instance, binding.gclk_gen, other.gclk_gen
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The rp2350 clock-plan emission (the state-and-verify case): the plan
@@ -6690,7 +7433,7 @@ fn resolve_interrupt_stm32(
         .ok_or_else(|| format!("{board}: interrupt binding '{}' names no pin", binding.role))?;
 
     let row = set
-        .pin_row(&pin.pin, &binding.function)
+        .pin_row(&pin.pin, &binding.function)?
         .ok_or_else(|| format!(
             "{board}: interrupt binding '{}' claims {} function {} but pins.toml has no such row              (grow the pin map from the datasheet, never from the binding)",
             binding.role, pin.pin, binding.function
@@ -7197,32 +7940,9 @@ fn resolve_i2c_nrf(
     let scl = signal("scl")?;
     let sda = signal("sda")?;
 
-    let gpio = set.block("gpio", "").ok_or_else(|| format!("{board}: no gpio block table"))?;
-    let cnf0 = gpio
-        .register("PIN_CNF0")
-        .ok_or_else(|| format!("{board}: gpio has no PIN_CNF0"))?;
-    let stride = gpio
-        .constant("PIN_CNF_STRIDE")
-        .ok_or_else(|| format!("{board}: gpio block has no PIN_CNF_STRIDE constant"))?;
-
-    let resolve_pin = |pin: &PinRef| -> Result<(i64, i64), String> {
-        let (port, index) = split_pin(&pin.pin).ok_or_else(|| format!("{board}: bad pin {}", pin.pin))?;
-        let port_digit = port
-            .to_digit(10)
-            .ok_or_else(|| format!("{board}: '{}' is not a P<port>.<pin> nRF pin", pin.pin))?;
-        if index > 31 {
-            return Err(format!("{board}: pin index {index} exceeds the PSEL PIN field (0..31)"));
-        }
-        let group = format!("port{port}");
-        let group_base = instances
-            .value(&group, "base")
-            .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
-        let psel = (i64::from(port_digit) << 5) | i64::from(index);
-        let pin_cnf = group_base + cnf0.offset.value + stride * i64::from(index);
-        Ok((psel, pin_cnf))
-    };
-    let (psel_scl, pin_cnf_scl_reg) = resolve_pin(scl)?;
-    let (psel_sda, pin_cnf_sda_reg) = resolve_pin(sda)?;
+    let twi = set.block("twi", "").ok_or_else(|| format!("{board}: no twi block table"))?;
+    let (psel_scl, pin_cnf_scl_reg) = resolve_nrf_pin(set, board, twi, "SCL", scl)?;
+    let (psel_sda, pin_cnf_sda_reg) = resolve_nrf_pin(set, board, twi, "SDA", sda)?;
 
     Ok(NrfTwiEmission {
         prefix: upper_snake(&binding.role),
@@ -7233,6 +7953,237 @@ fn resolve_i2c_nrf(
         psel_sda,
         pin_cnf_scl_reg,
         pin_cnf_sda_reg,
+    })
+}
+
+/// The PSEL register VALUE that routes one pin to an nRF peripheral, and the address of that pin's
+/// PIN_CNF register -- shared by every nRF binding resolver, so the routing rule is stated once.
+///
+/// The value is composed through the peripheral block's own PSEL register fields, never through a
+/// shift written here. The two nRF generations state that register differently, and each is read
+/// as its block states it: a two-port part splits it into PIN, PORT and CONNECT fields (the block
+/// names it `PSEL_<SIGNAL>`), and a single-port part makes the whole word one pin-number field (the
+/// block names it `PSEL<SIGNAL>`), so its port can only be 0. CONNECT stays 0, which is "connected"
+/// on the parts that have the bit. A pin whose port group has no instance row fails here, before
+/// any word is composed.
+fn resolve_nrf_pin(
+    set: &FamilySet,
+    board: &str,
+    block: &BlockTable,
+    signal: &str,
+    pin: &PinRef,
+) -> Result<(i64, i64), String> {
+    let (port, index) = split_pin(&pin.pin).ok_or_else(|| format!("{board}: bad pin {}", pin.pin))?;
+    let port_digit = port
+        .to_digit(10)
+        .ok_or_else(|| format!("{board}: '{}' is not a P<port>.<pin> nRF pin", pin.pin))?;
+    if index > 31 {
+        return Err(format!("{board}: pin index {index} exceeds a GPIO port's 32 pins"));
+    }
+    let group = format!("port{port}");
+    let group_base = set
+        .instances
+        .value(&group, "base")
+        .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+
+    let split = format!("PSEL_{signal}");
+    let whole = format!("PSEL{signal}");
+    let psel = if block.register(&split).is_some() {
+        block.place(&split, "PIN", i64::from(index))? | block.place(&split, "PORT", i64::from(port_digit))?
+    } else if block.register(&whole).is_some() {
+        if port_digit != 0 {
+            return Err(format!(
+                "{board}: {} is on port {port_digit}, but the {} block's {whole} is a plain pin number with no port field",
+                pin.pin, block.block
+            ));
+        }
+        block.place(&whole, &whole, i64::from(index))?
+    } else {
+        return Err(format!("{board}: the {} block states neither {split} nor {whole}", block.block));
+    };
+
+    let gpio = set.block("gpio", "").ok_or_else(|| format!("{board}: no gpio block table"))?;
+    let cnf0 = gpio
+        .register("PIN_CNF0")
+        .ok_or_else(|| format!("{board}: gpio has no PIN_CNF0"))?;
+    let stride = gpio
+        .constant("PIN_CNF_STRIDE")
+        .ok_or_else(|| format!("{board}: gpio block has no PIN_CNF_STRIDE constant"))?;
+    Ok((psel, group_base + cnf0.offset.value + stride * i64::from(index)))
+}
+
+/// One resolved nrf-spi binding emission (the polled SPI master, the legacy one on a part that
+/// also has an EasyDMA master): the SPI base, the PSEL register VALUES for SCK, MOSI and MISO, and
+/// each pin's PIN_CNF register address -- the nrf-twi shape with three signals, resolved by the
+/// same routing helper.
+///
+/// It carries NO chip select, and that is the master's own shape rather than an omission: the
+/// part drives none, both manuals leave slave selection to a GPIO the program owns, and dotnet/iot's
+/// `SpiConnectionSettings.ChipSelectLine` names that GPIO at run time. A binding that names a `cs`
+/// is refused, because a select fixed by the board would be a second answer to one question.
+struct NrfSpiEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    spi_base: i64,
+    psel_sck: i64,
+    psel_mosi: i64,
+    psel_miso: i64,
+    pin_cnf_sck_reg: i64,
+    pin_cnf_mosi_reg: i64,
+    pin_cnf_miso_reg: i64,
+}
+
+fn resolve_spi_nrf(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<NrfSpiEmission, String> {
+    let board = &resolved.board.board;
+    let name = &binding.instance;
+    let row = set
+        .instances
+        .row(name)
+        .ok_or_else(|| format!("{board}: spi binding '{}' names instance '{name}', which is not placed", binding.role))?;
+    if row.block != "spi" {
+        return Err(format!(
+            "{board}: spi binding '{}' names instance '{name}', a {} block -- this emitter derives from the spi block's registers",
+            binding.role, row.block
+        ));
+    }
+    let spi_base = set.instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    if binding.pins.iter().any(|(s, _)| s == "cs") {
+        return Err(format!(
+            "{board}: spi binding '{}' names a chip select, and an nRF spi binding carries none: the master drives no chip select, and SpiConnectionSettings.ChipSelectLine names the GPIO that does at run time",
+            binding.role
+        ));
+    }
+
+    let signal = |signal_name: &str| -> Result<&PinRef, String> {
+        binding
+            .pins
+            .iter()
+            .find(|(s, _)| s == signal_name)
+            .map(|(_, p)| p)
+            .ok_or_else(|| {
+                format!("{board}: spi binding '{}' needs a {signal_name} pin", binding.role)
+            })
+    };
+    let sck = signal("sck")?;
+    let mosi = signal("mosi")?;
+    let miso = signal("miso")?;
+
+    let spi = set.block("spi", "").ok_or_else(|| format!("{board}: no spi block table"))?;
+    let (psel_sck, pin_cnf_sck_reg) = resolve_nrf_pin(set, board, spi, "SCK", sck)?;
+    let (psel_mosi, pin_cnf_mosi_reg) = resolve_nrf_pin(set, board, spi, "MOSI", mosi)?;
+    let (psel_miso, pin_cnf_miso_reg) = resolve_nrf_pin(set, board, spi, "MISO", miso)?;
+
+    Ok(NrfSpiEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        spi_base,
+        psel_sck,
+        psel_mosi,
+        psel_miso,
+        pin_cnf_sck_reg,
+        pin_cnf_mosi_reg,
+        pin_cnf_miso_reg,
+    })
+}
+
+/// One resolved nrf-uart binding emission (the register-per-byte UART, the legacy one on a part that
+/// also has an EasyDMA UARTE): the UART base, the PSEL register VALUES for TXD and RXD, each pin's
+/// PIN_CNF register address -- the nrf-twi shape, resolved by the same routing helper -- and one
+/// BAUDRATE word per carrier whose wire rides the binding.
+///
+/// THE BAUDRATE WORD IS LOOKED UP, NEVER COMPUTED. The register is enumerated: the part's manual
+/// documents one word per supported rate, which the block states as `BAUDRATE_<rate>`, and documents
+/// no rule for composing another. So a carrier rate with no word is refused rather than computed or
+/// rounded to a neighbour.
+///
+/// THE WORD IS ONLY AS ACCURATE AS HFCLK, so a carrier's plan must run HFCLK from the crystal.
+/// After reset these parts run HFCLK from an internal oscillator whose stated tolerance reaches 5%
+/// on the nRF51 and 8% on the nRF52833, and the nRF52833's specification requires the crystal for
+/// stable communication. A plan whose `source` is not `xtal` emits no word; it is refused instead.
+struct NrfUartEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    uart_base: i64,
+    psel_txd: i64,
+    psel_rxd: i64,
+    pin_cnf_txd_reg: i64,
+    pin_cnf_rxd_reg: i64,
+    /// (`BAUDRATE_<rate>_<PLAN>` suffix, BAUDRATE word), one per carrier whose wire rides this
+    /// binding, under THAT carrier's plan; empty when no carrier rides it.
+    bauds: Vec<(String, i64)>,
+}
+
+fn resolve_uart_nrf(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<NrfUartEmission, String> {
+    let board = &resolved.board.board;
+    let name = &binding.instance;
+    let row = set
+        .instances
+        .row(name)
+        .ok_or_else(|| format!("{board}: uart binding '{}' names instance '{name}', which is not placed", binding.role))?;
+    if row.block != "uart" {
+        return Err(format!(
+            "{board}: uart binding '{}' names instance '{name}', a {} block -- this emitter derives from the uart block's registers",
+            binding.role, row.block
+        ));
+    }
+    let uart_base = set.instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+
+    let signal = |signal_name: &str| -> Result<&PinRef, String> {
+        binding
+            .pins
+            .iter()
+            .find(|(s, _)| s == signal_name)
+            .map(|(_, p)| p)
+            .ok_or_else(|| {
+                format!("{board}: uart binding '{}' needs a {signal_name} pin", binding.role)
+            })
+    };
+    let tx = signal("tx")?;
+    let rx = signal("rx")?;
+
+    let uart = set.block("uart", "").ok_or_else(|| format!("{board}: no uart block table"))?;
+    let (psel_txd, pin_cnf_txd_reg) = resolve_nrf_pin(set, board, uart, "TXD", tx)?;
+    let (psel_rxd, pin_cnf_rxd_reg) = resolve_nrf_pin(set, board, uart, "RXD", rx)?;
+
+    let mut bauds = Vec::new();
+    for (carrier, plan) in resolved.board.carrier_points(&binding.role) {
+        if plan.source != "xtal" {
+            return Err(format!(
+                "{board}: the carrier on uart binding '{}' runs under plan '{}', whose HFCLK source is '{}' -- a BAUDRATE word is only as accurate as HFCLK, and a serial link needs HFCLK from the crystal (the uart block's notes); state a plan whose source is \"xtal\"",
+                binding.role, plan.name, plan.source
+            ));
+        }
+        let rate = carrier.baud;
+        let word = uart.constant(&format!("BAUDRATE_{rate}")).ok_or_else(|| {
+            format!(
+                "{board}: carrier rate {rate} on uart binding '{}' has no BAUDRATE word -- the {} uart's BAUDRATE register is enumerated (its BAUDRATE_<rate> constants), so a rate with no stated word has no documented setting",
+                binding.role, set.family
+            )
+        })?;
+        bauds.push((format!("BAUDRATE_{rate}_{}", upper_snake(&plan.name)), word));
+    }
+
+    Ok(NrfUartEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        uart_base,
+        psel_txd,
+        psel_rxd,
+        pin_cnf_txd_reg,
+        pin_cnf_rxd_reg,
+        bauds,
     })
 }
 
@@ -7265,6 +8216,11 @@ struct SpiEmission {
     cs_port_base: i64,
     cs_pin: i64,
     cs_mask: i64,
+    /// `(GCLK.CLKCTRL word, core-clock Hz)` when the binding names the generator its core clock
+    /// rides under the default plan -- the pair the i2c arm emits, from the same helpers. `None`
+    /// for a binding that names no generator (a module's SPI riding two plans), whose consumer
+    /// composes the word from the unshifted id itself.
+    plan_clock: Option<(i64, i64)>,
 }
 
 fn resolve_spi(
@@ -7285,6 +8241,16 @@ fn resolve_spi(
         .value(name, "apbc_bit")
         .filter(|v| *v >= 0)
         .ok_or_else(|| format!("{board}: instance {name} has no apbc_bit"))?;
+
+    let plan_clock = if binding.gclk_gen >= 0 {
+        let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+        Some((
+            gclk_clkctrl_value(set, board, gclk_core_id, binding.gclk_gen)?,
+            plan_gclk_hz(board, plan, "default plan", binding)?,
+        ))
+    } else {
+        None
+    };
 
     let signal = |signal_name: &str| -> Result<&PinRef, String> {
         binding
@@ -7365,6 +8331,7 @@ fn resolve_spi(
         cs_port_base: group_base(&cs.pin)?,
         cs_pin: i64::from(cs_index),
         cs_mask: 1i64 << cs_index,
+        plan_clock,
     })
 }
 
@@ -7386,9 +8353,13 @@ struct BoardEmissions {
     pchctrl_uarts: Vec<PchctrlSercomUartEmission>,
     same54_i2cs: Vec<Same54SercomI2cEmission>,
     same54_adcs: Vec<Same54AdcEmission>,
+    samd21_adcs: Vec<Samd21AdcEmission>,
+    samd21_pwms: Vec<Samd21PwmEmission>,
     pl022_spis: Vec<SpiPl022Emission>,
     st_spis: Vec<StSpiEmission>,
     nrf_twis: Vec<NrfTwiEmission>,
+    nrf_spis: Vec<NrfSpiEmission>,
+    nrf_uarts: Vec<NrfUartEmission>,
     dw_i2cs: Vec<DwI2cEmission>,
     rp_adcs: Vec<RpAdcEmission>,
     rp_clocks: Vec<RpClockEmission>,
@@ -7448,9 +8419,13 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         pchctrl_uarts: Vec::new(),
         same54_i2cs: Vec::new(),
         same54_adcs: Vec::new(),
+        samd21_adcs: Vec::new(),
+        samd21_pwms: Vec::new(),
         pl022_spis: Vec::new(),
         st_spis: Vec::new(),
         nrf_twis: Vec::new(),
+        nrf_spis: Vec::new(),
+        nrf_uarts: Vec::new(),
         dw_i2cs: Vec::new(),
         rp_adcs: Vec::new(),
         rp_clocks: resolve_clocks_rp(set, resolved)?,
@@ -7469,6 +8444,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                 "rp2350" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, true)?),
                 "esp32c6" => emissions.esp_uarts.push(resolve_uart_esp32c6(set, resolved, binding)?),
                 "sam3x" => emissions.sam3x_uarts.push(resolve_uart_sam3x(set, resolved, binding)?),
+                "nrf51" | "nrf52833" => emissions.nrf_uarts.push(resolve_uart_nrf(set, resolved, binding)?),
                 "stm32l476" | "stm32l0" | "stm32l053" | "stm32l073" | "stm32u5a5" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
                     emissions.st_uarts.push(resolve_uart_stm32(set, resolved, binding)?);
                 }
@@ -7485,6 +8461,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                 "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" => {
                     emissions.st_spis.push(resolve_spi_stm32(set, resolved, binding)?);
                 }
+                "nrf52833" | "nrf51" => emissions.nrf_spis.push(resolve_spi_nrf(set, resolved, binding)?),
                 other => {
                     return Err(format!(
                         "{}: no spi emission shape for family '{other}' -- add its derivation path first",
@@ -7523,9 +8500,19 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             "adc" => match set.family.as_str() {
                 "rp2350" => emissions.rp_adcs.push(resolve_adc_rp(set, resolved, binding)?),
                 "same54" => emissions.same54_adcs.push(resolve_adc_same54(set, resolved, binding)?),
+                "samd21" => emissions.samd21_adcs.push(resolve_adc_samd21(set, resolved, binding)?),
                 other => {
                     return Err(format!(
                         "{}: no adc emission shape for family '{other}' -- add its derivation path first",
+                        resolved.board.board
+                    ));
+                }
+            },
+            "pwm" => match set.family.as_str() {
+                "samd21" => emissions.samd21_pwms.push(resolve_pwm_samd21(set, resolved, binding)?),
+                other => {
+                    return Err(format!(
+                        "{}: no pwm emission shape for family '{other}' -- add its derivation path first",
                         resolved.board.board
                     ));
                 }
@@ -7537,6 +8524,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         }
     }
     refuse_colliding_interrupts(&resolved.board.board, &emissions.st_interrupts)?;
+    refuse_shared_timer_clocks(&resolved.board.board, &set.instances, &resolved.bindings, &emissions.samd21_pwms)?;
     Ok(emissions)
 }
 
@@ -7609,9 +8597,13 @@ pub fn emit_board_csharp(
         pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
+        samd21_adcs,
+        samd21_pwms,
         pl022_spis,
         st_spis,
         nrf_twis,
+        nrf_spis,
+        nrf_uarts,
         dw_i2cs,
         rp_adcs,
         rp_clocks,
@@ -7806,13 +8798,21 @@ pub fn emit_board_csharp(
 
     for spi in &sercom_spis {
         let p = &spi.prefix;
-        out.push_str(&format!("\n        // -- {p}: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the\n        // consumer composes ID | GEN | CLKEN per its runtime-selected plan) --\n"));
+        if spi.plan_clock.is_some() {
+            out.push_str(&format!("\n        // -- {p}: a sercom-spi binding descriptor (ONE plan: the composed clock word\n        // and the core-clock RATE, from which the driver derives BAUD) --\n"));
+        } else {
+            out.push_str(&format!("\n        // -- {p}: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the\n        // consumer composes ID | GEN | CLKEN per its runtime-selected plan) --\n"));
+        }
         push_const(&mut out, "uint", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", spi.sercom_base));
         if spi.irq >= 0 {
             push_const(&mut out, "uint", &format!("{p}_IRQ"), &spi.irq.to_string());
         }
         push_const(&mut out, "uint", &format!("{p}_APBC_MASK"), &format!("0x{:X}", spi.apbc_mask));
         push_const(&mut out, "uint", &format!("{p}_GCLK_CORE_ID"), &spi.gclk_core_id.to_string());
+        if let Some((clkctrl, hz)) = spi.plan_clock {
+            push_const(&mut out, "uint", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{clkctrl:X}"));
+            push_const(&mut out, "uint", &format!("{p}_CORE_CLOCK_HZ"), &hz.to_string());
+        }
         for (signal, pmux_reg, pmux_shift, pincfg_reg) in &spi.signals {
             let s = upper_snake(signal);
             push_const(&mut out, "uint", &format!("{p}_PMUX_{s}_REG"), &format!("0x{pmux_reg:X}"));
@@ -7847,14 +8847,17 @@ pub fn emit_board_csharp(
     for adc in &same54_adcs {
         let p = &adc.prefix;
         out.push_str(&format!("
-        // -- {p}: a same54 adc binding descriptor. It carries a CALIBRATION ADDRESS
-        // because this converter does not convert until three production values are
-        // copied out of NVM, and a PMUX MASK because one pad is muxed without
+        // -- {p}: a same54 adc binding descriptor. It carries the PRESCALER its generic
+        // clock needs, because the part bounds the converter's clock; a CALIBRATION
+        // ADDRESS, because this converter does not convert until three production values
+        // are copied out of NVM; and a PMUX MASK, because one pad is muxed without
         // disturbing its neighbour --
 "));
         push_const(&mut out, "uint", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
         push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
         push_const(&mut out, "uint", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", adc.gclk_pchctrl_value));
+        push_const(&mut out, "uint", &format!("{p}_CORE_CLOCK_HZ"), &adc.core_clock_hz.to_string());
+        push_const(&mut out, "uint", &format!("{p}_PRESCALER"), &adc.prescaler.to_string());
         push_const(&mut out, "uint", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", adc.apb_mask_reg));
         push_const(&mut out, "uint", &format!("{p}_APB_MASK"), &format!("0x{:X}", adc.apb_mask));
         push_const(&mut out, "uint", &format!("{p}_CALIB_REG"), &format!("0x{:X}", adc.calib_reg));
@@ -7866,6 +8869,55 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_PINCFG_REG"), &format!("0x{:X}", adc.pincfg_reg));
         push_const(&mut out, "uint", &format!("{p}_MUXPOS"), &adc.muxpos.to_string());
         push_const(&mut out, "uint", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+    }
+    for adc in &samd21_adcs {
+        let p = &adc.prefix;
+        out.push_str(&format!("
+        // -- {p}: a samd21 adc binding descriptor. The converter's clocks and its
+        // prescaler under the default plan, then each analog pad the board wires: the
+        // channel it is (its MUXPOS code) and where its PMUX nibble and PINCFG byte sit --
+"));
+        push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", adc.base));
+        if adc.irq >= 0 {
+            push_const(&mut out, "uint", &format!("{p}_IRQ"), &adc.irq.to_string());
+        }
+        push_const(&mut out, "uint", &format!("{p}_APBC_MASK"), &format!("0x{:X}", adc.apbc_mask));
+        push_const(&mut out, "uint", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", adc.gclk_clkctrl_value));
+        push_const(&mut out, "uint", &format!("{p}_CORE_CLOCK_HZ"), &adc.core_clock_hz.to_string());
+        push_const(&mut out, "uint", &format!("{p}_PRESCALER"), &adc.prescaler.to_string());
+        push_const(&mut out, "uint", &format!("{p}_PMUX_FUNC"), &adc.pmux_func.to_string());
+        push_const(&mut out, "uint", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+        for pad in &adc.pads {
+            let s = upper_snake(&pad.name);
+            push_const(&mut out, "uint", &format!("{p}_MUXPOS_{s}"), &pad.channel.to_string());
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{s}_REG"), &format!("0x{:X}", pad.pmux_reg));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{s}_SHIFT"), &pad.pmux_shift.to_string());
+            push_const(&mut out, "uint", &format!("{p}_PINCFG_{s}_REG"), &format!("0x{:X}", pad.pincfg_reg));
+        }
+    }
+    for pwm in &samd21_pwms {
+        let p = &pwm.prefix;
+        out.push_str(&format!("
+        // -- {p}: a samd21 pwm binding descriptor. The counter's clocks under the default plan
+        // and its size, then each waveform output the board wires: the compare channel that
+        // drives it and where its PMUX nibble and PINCFG byte sit --
+"));
+        push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", pwm.base));
+        if pwm.irq >= 0 {
+            push_const(&mut out, "uint", &format!("{p}_IRQ"), &pwm.irq.to_string());
+        }
+        push_const(&mut out, "uint", &format!("{p}_APBC_MASK"), &format!("0x{:X}", pwm.apbc_mask));
+        push_const(&mut out, "uint", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", pwm.gclk_clkctrl_value));
+        push_const(&mut out, "uint", &format!("{p}_CORE_CLOCK_HZ"), &pwm.core_clock_hz.to_string());
+        push_const(&mut out, "uint", &format!("{p}_COUNTER_BITS"), &pwm.counter_bits.to_string());
+        push_const(&mut out, "uint", &format!("{p}_PMUX_FUNC"), &pwm.pmux_func.to_string());
+        for output in &pwm.outputs {
+            let s = upper_snake(&output.name);
+            push_const(&mut out, "uint", &format!("{p}_CC_{s}"), &output.cc.to_string());
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{s}_REG"), &format!("0x{:X}", output.pmux_reg));
+            push_const(&mut out, "uint", &format!("{p}_PMUX_{s}_SHIFT"), &output.pmux_shift.to_string());
+            push_const(&mut out, "uint", &format!("{p}_PINCFG_{s}_REG"), &format!("0x{:X}", output.pincfg_reg));
+        }
     }
     for i2c in &same54_i2cs {
         let p = &i2c.prefix;
@@ -7968,6 +9020,33 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_PSEL_SDA"), &format!("0x{:X}", twi.psel_sda));
         push_const(&mut out, "uint", &format!("{p}_PIN_CNF_SCL_REG"), &format!("0x{:X}", twi.pin_cnf_scl_reg));
         push_const(&mut out, "uint", &format!("{p}_PIN_CNF_SDA_REG"), &format!("0x{:X}", twi.pin_cnf_sda_reg));
+    }
+    for spi in &nrf_spis {
+        let p = &spi.prefix;
+        out.push_str(&format!("
+        // -- {p}: an nrf-spi binding descriptor --
+"));
+        push_const(&mut out, "uint", &format!("{p}_SPI_BASE"), &format!("0x{:X}", spi.spi_base));
+        push_const(&mut out, "uint", &format!("{p}_PSEL_SCK"), &format!("0x{:X}", spi.psel_sck));
+        push_const(&mut out, "uint", &format!("{p}_PSEL_MOSI"), &format!("0x{:X}", spi.psel_mosi));
+        push_const(&mut out, "uint", &format!("{p}_PSEL_MISO"), &format!("0x{:X}", spi.psel_miso));
+        push_const(&mut out, "uint", &format!("{p}_PIN_CNF_SCK_REG"), &format!("0x{:X}", spi.pin_cnf_sck_reg));
+        push_const(&mut out, "uint", &format!("{p}_PIN_CNF_MOSI_REG"), &format!("0x{:X}", spi.pin_cnf_mosi_reg));
+        push_const(&mut out, "uint", &format!("{p}_PIN_CNF_MISO_REG"), &format!("0x{:X}", spi.pin_cnf_miso_reg));
+    }
+    for uart in &nrf_uarts {
+        let p = &uart.prefix;
+        out.push_str(&format!("
+        // -- {p}: an nrf-uart binding descriptor --
+"));
+        push_const(&mut out, "uint", &format!("{p}_UART_BASE"), &format!("0x{:X}", uart.uart_base));
+        push_const(&mut out, "uint", &format!("{p}_PSEL_TXD"), &format!("0x{:X}", uart.psel_txd));
+        push_const(&mut out, "uint", &format!("{p}_PSEL_RXD"), &format!("0x{:X}", uart.psel_rxd));
+        push_const(&mut out, "uint", &format!("{p}_PIN_CNF_TXD_REG"), &format!("0x{:X}", uart.pin_cnf_txd_reg));
+        push_const(&mut out, "uint", &format!("{p}_PIN_CNF_RXD_REG"), &format!("0x{:X}", uart.pin_cnf_rxd_reg));
+        for (suffix, word) in &uart.bauds {
+            push_const(&mut out, "uint", &format!("{p}_{suffix}"), &format!("0x{word:X}"));
+        }
     }
 
     for i2c in &dw_i2cs {
@@ -8741,14 +9820,23 @@ pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result
         .filter(|(_, fact)| matches!(fact, Fact::Float(_)))
         .map(|(name, _)| name.as_str())
         .collect();
-    let what = format!(
-        "The {} {}{} block layout as Rust consts, name/value-identical to {}.g.cs:\n// offsets are instance-base-relative (`base + *_OFF`) and the instance bases live in\n// {}_instances.rs. Widths are access widths.",
-        block.family,
-        block.block,
-        if block.mode.is_empty() { String::new() } else { format!(" ({} mode)", block.mode) },
-        layout_class(block),
-        snake(&block.family),
-    );
+    let mode = if block.mode.is_empty() { String::new() } else { format!(" ({} mode)", block.mode) };
+    let what = if block.emits("csharp") {
+        format!(
+            "The {} {}{mode} block layout as Rust consts, name/value-identical to {}.g.cs:\n// offsets are instance-base-relative (`base + *_OFF`) and the instance bases live in\n// {}_instances.rs. Widths are access widths.",
+            block.family,
+            block.block,
+            layout_class(block),
+            snake(&block.family),
+        )
+    } else {
+        format!(
+            "The {} {}{mode} block layout as Rust consts: offsets are instance-base-relative\n// (`base + *_OFF`) and the instance bases live in {}_instances.rs. Widths are access widths.\n// Its block table's `emit` list leaves C# out, so no C# layout of it exists.",
+            block.family,
+            block.block,
+            snake(&block.family),
+        )
+    };
     let withheld_note = if withheld.is_empty() {
         String::new()
     } else {
@@ -8791,6 +9879,24 @@ pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result
             push_rust_const(&mut out, kind, name, &format_int(*value));
         }
     }
+    let prescaler = prescaler_lookup(block)?;
+    if !prescaler.is_empty() {
+        let arms: Vec<String> = prescaler.iter().map(|(code, division)| format!("        {code} => {division},
+")).collect();
+        out.push_str(&format!(
+            "
+/// The division PRESCALER code `code` selects, from the PRESCALER_DIV constants above, or 0 for a
+/// code none of them names.
+#[must_use]
+pub const fn prescaler_divisor(code: u32) -> u32 {{
+    match code {{
+{}        _ => 0,
+    }}
+}}
+",
+            arms.concat()
+        ));
+    }
 
     let integers: Vec<(&String, &Int)> = block
         .facts
@@ -8811,7 +9917,7 @@ pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result
     }
 
     if !block.channels.is_empty() {
-        out.push_str("\n/// -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n/// GPIO index a pin-fed channel taps; ChannelCount = the package's mux width --\n");
+        out.push_str("\n/// -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n/// GPIO index a pin-fed channel taps; ChannelCount = how many rows the map has;\n/// is_channel = whether an index is one of them --\n");
         for channel in &block.channels {
             push_rust_const(&mut out, "i32", &format!("Channel_{}", pascal(&channel.source)), &channel.index.to_string());
         }
@@ -8821,6 +9927,11 @@ pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result
             }
         }
         push_rust_const(&mut out, "i32", "ChannelCount", &block.channels.len().to_string());
+        let indexes: Vec<String> = block.channels.iter().map(|c| c.index.to_string()).collect();
+        out.push_str(&format!(
+            "\n/// Whether `channel` is the index of a row in the channel map above. The indexes need not run\n/// without gaps, so `ChannelCount` alone does not answer this.\n#[must_use]\npub const fn is_channel(channel: i32) -> bool {{\n    matches!(channel, {})\n}}\n",
+            indexes.join(" | ")
+        ));
     }
 
     for record in &block.calibrations {
@@ -8922,9 +10033,13 @@ pub fn emit_board_rust(
         pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
+        samd21_adcs,
+        samd21_pwms,
         pl022_spis,
         st_spis,
         nrf_twis,
+        nrf_spis,
+        nrf_uarts,
         dw_i2cs,
         rp_adcs,
         rp_clocks,
@@ -9121,13 +10236,21 @@ pub fn emit_board_rust(
 
     for spi in &sercom_spis {
         let p = &spi.prefix;
-        out.push_str(&format!("\n// -- {p}: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the\n// consumer composes ID | GEN | CLKEN per its runtime-selected plan) --\n"));
+        if spi.plan_clock.is_some() {
+            out.push_str(&format!("\n// -- {p}: a sercom-spi binding descriptor (ONE plan: the composed clock word\n// and the core-clock RATE, from which the driver derives BAUD) --\n"));
+        } else {
+            out.push_str(&format!("\n// -- {p}: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the\n// consumer composes ID | GEN | CLKEN per its runtime-selected plan) --\n"));
+        }
         push_rust_const(&mut out, "u32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", spi.sercom_base));
         if spi.irq >= 0 {
             push_rust_const(&mut out, "u32", &format!("{p}_IRQ"), &spi.irq.to_string());
         }
         push_rust_const(&mut out, "u32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", spi.apbc_mask));
         push_rust_const(&mut out, "u32", &format!("{p}_GCLK_CORE_ID"), &spi.gclk_core_id.to_string());
+        if let Some((clkctrl, hz)) = spi.plan_clock {
+            push_rust_const(&mut out, "u32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{clkctrl:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_CORE_CLOCK_HZ"), &hz.to_string());
+        }
         for (signal, pmux_reg, pmux_shift, pincfg_reg) in &spi.signals {
             let s = upper_snake(signal);
             push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{s}_REG"), &format!("0x{pmux_reg:X}"));
@@ -9162,11 +10285,13 @@ pub fn emit_board_rust(
     for adc in &same54_adcs {
         let p = &adc.prefix;
         out.push_str(&format!("
-//  -- {p}: a same54 adc binding descriptor. A CALIBRATION ADDRESS and a PMUX MASK --
+//  -- {p}: a same54 adc binding descriptor. A PRESCALER, a CALIBRATION ADDRESS and a PMUX MASK --
 "));
         push_rust_const(&mut out, "u32", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
         push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", adc.gclk_pchctrl_value));
+        push_rust_const(&mut out, "u32", &format!("{p}_CORE_CLOCK_HZ"), &adc.core_clock_hz.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_PRESCALER"), &adc.prescaler.to_string());
         push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", adc.apb_mask_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_APB_MASK"), &format!("0x{:X}", adc.apb_mask));
         push_rust_const(&mut out, "u32", &format!("{p}_CALIB_REG"), &format!("0x{:X}", adc.calib_reg));
@@ -9178,6 +10303,53 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_REG"), &format!("0x{:X}", adc.pincfg_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_MUXPOS"), &adc.muxpos.to_string());
         push_rust_const(&mut out, "u32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+    }
+    for adc in &samd21_adcs {
+        let p = &adc.prefix;
+        out.push_str(&format!("
+//  -- {p}: a samd21 adc binding descriptor. The converter's clocks and prescaler, then each
+//  analog pad the board wires: its channel (MUXPOS code), PMUX nibble and PINCFG byte --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", adc.base));
+        if adc.irq >= 0 {
+            push_rust_const(&mut out, "u32", &format!("{p}_IRQ"), &adc.irq.to_string());
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", adc.apbc_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", adc.gclk_clkctrl_value));
+        push_rust_const(&mut out, "u32", &format!("{p}_CORE_CLOCK_HZ"), &adc.core_clock_hz.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_PRESCALER"), &adc.prescaler.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_FUNC"), &adc.pmux_func.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+        for pad in &adc.pads {
+            let s = upper_snake(&pad.name);
+            push_rust_const(&mut out, "u32", &format!("{p}_MUXPOS_{s}"), &pad.channel.to_string());
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{s}_REG"), &format!("0x{:X}", pad.pmux_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{s}_SHIFT"), &pad.pmux_shift.to_string());
+            push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_{s}_REG"), &format!("0x{:X}", pad.pincfg_reg));
+        }
+    }
+    for pwm in &samd21_pwms {
+        let p = &pwm.prefix;
+        out.push_str(&format!("
+//  -- {p}: a samd21 pwm binding descriptor. The counter's clocks and size, then each waveform
+//  output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", pwm.base));
+        if pwm.irq >= 0 {
+            push_rust_const(&mut out, "u32", &format!("{p}_IRQ"), &pwm.irq.to_string());
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", pwm.apbc_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", pwm.gclk_clkctrl_value));
+        push_rust_const(&mut out, "u32", &format!("{p}_CORE_CLOCK_HZ"), &pwm.core_clock_hz.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_COUNTER_BITS"), &pwm.counter_bits.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_PMUX_FUNC"), &pwm.pmux_func.to_string());
+        for output in &pwm.outputs {
+            let s = upper_snake(&output.name);
+            push_rust_const(&mut out, "u32", &format!("{p}_CC_{s}"), &output.cc.to_string());
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{s}_REG"), &format!("0x{:X}", output.pmux_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_PMUX_{s}_SHIFT"), &output.pmux_shift.to_string());
+            push_rust_const(&mut out, "u32", &format!("{p}_PINCFG_{s}_REG"), &format!("0x{:X}", output.pincfg_reg));
+        }
     }
     for i2c in &same54_i2cs {
         let p = &i2c.prefix;
@@ -9278,6 +10450,33 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_PSEL_SDA"), &format!("0x{:X}", twi.psel_sda));
         push_rust_const(&mut out, "u32", &format!("{p}_PIN_CNF_SCL_REG"), &format!("0x{:X}", twi.pin_cnf_scl_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_PIN_CNF_SDA_REG"), &format!("0x{:X}", twi.pin_cnf_sda_reg));
+    }
+    for spi in &nrf_spis {
+        let p = &spi.prefix;
+        out.push_str(&format!("
+// -- {p}: an nrf-spi binding descriptor --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_SPI_BASE"), &format!("0x{:X}", spi.spi_base));
+        push_rust_const(&mut out, "u32", &format!("{p}_PSEL_SCK"), &format!("0x{:X}", spi.psel_sck));
+        push_rust_const(&mut out, "u32", &format!("{p}_PSEL_MOSI"), &format!("0x{:X}", spi.psel_mosi));
+        push_rust_const(&mut out, "u32", &format!("{p}_PSEL_MISO"), &format!("0x{:X}", spi.psel_miso));
+        push_rust_const(&mut out, "u32", &format!("{p}_PIN_CNF_SCK_REG"), &format!("0x{:X}", spi.pin_cnf_sck_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PIN_CNF_MOSI_REG"), &format!("0x{:X}", spi.pin_cnf_mosi_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PIN_CNF_MISO_REG"), &format!("0x{:X}", spi.pin_cnf_miso_reg));
+    }
+    for uart in &nrf_uarts {
+        let p = &uart.prefix;
+        out.push_str(&format!("
+// -- {p}: an nrf-uart binding descriptor --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_UART_BASE"), &format!("0x{:X}", uart.uart_base));
+        push_rust_const(&mut out, "u32", &format!("{p}_PSEL_TXD"), &format!("0x{:X}", uart.psel_txd));
+        push_rust_const(&mut out, "u32", &format!("{p}_PSEL_RXD"), &format!("0x{:X}", uart.psel_rxd));
+        push_rust_const(&mut out, "u32", &format!("{p}_PIN_CNF_TXD_REG"), &format!("0x{:X}", uart.pin_cnf_txd_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PIN_CNF_RXD_REG"), &format!("0x{:X}", uart.pin_cnf_rxd_reg));
+        for (suffix, word) in &uart.bauds {
+            push_rust_const(&mut out, "u32", &format!("{p}_{suffix}"), &format!("0x{word:X}"));
+        }
     }
 
     for i2c in &dw_i2cs {
@@ -9458,6 +10657,23 @@ pub fn emit_layout_swift(block: &BlockTable, source: &str, regen: &str) -> Resul
             push_swift_const(&mut out, kind, name, &format_int(*value));
         }
     }
+    let prescaler = prescaler_lookup(block)?;
+    if !prescaler.is_empty() {
+        let arms: Vec<String> = prescaler.iter().map(|(code, division)| format!("        case {code}: return {division}
+")).collect();
+        out.push_str(&format!(
+            "
+    /// The division PRESCALER code `code` selects, from the PRESCALER_DIV constants above, or 0
+    /// for a code none of them names.
+    public static func prescalerDivisor(_ code: UInt32) -> UInt32 {{
+        switch code {{
+{}        default: return 0
+        }}
+    }}
+",
+            arms.concat()
+        ));
+    }
 
     if !block.facts.is_empty() {
         out.push_str("\n    // -- facts as data (chip/electrical facts conversions read) --\n");
@@ -9474,7 +10690,7 @@ pub fn emit_layout_swift(block: &BlockTable, source: &str, regen: &str) -> Resul
         }
     }
     if !block.channels.is_empty() {
-        out.push_str("\n    // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n    // GPIO index a pin-fed channel taps; ChannelCount = the package's mux width --\n");
+        out.push_str("\n    // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n    // GPIO index a pin-fed channel taps; ChannelCount = how many rows the map has;\n    // isChannel = whether an index is one of them --\n");
         for channel in &block.channels {
             push_swift_const(
                 &mut out,
@@ -9494,6 +10710,11 @@ pub fn emit_layout_swift(block: &BlockTable, source: &str, regen: &str) -> Resul
             }
         }
         push_swift_const(&mut out, "Int32", "ChannelCount", &block.channels.len().to_string());
+        let indexes: Vec<String> = block.channels.iter().map(|c| c.index.to_string()).collect();
+        out.push_str(&format!(
+            "\n    /// Whether `channel` is the index of a row in the channel map above. The indexes need\n    /// not run without gaps, so `ChannelCount` alone does not answer this.\n    public static func isChannel(_ channel: Int32) -> Bool {{\n        switch channel {{\n        case {}: return true\n        default: return false\n        }}\n    }}\n",
+            indexes.join(", ")
+        ));
     }
     for record in &block.calibrations {
         out.push_str(&format!(
@@ -9581,9 +10802,13 @@ pub fn emit_board_swift(
         pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
+        samd21_adcs,
+        samd21_pwms,
         pl022_spis,
         st_spis,
         nrf_twis,
+        nrf_spis,
+        nrf_uarts,
         dw_i2cs,
         rp_adcs,
         rp_clocks,
@@ -9780,13 +11005,21 @@ pub fn emit_board_swift(
 
     for spi in &sercom_spis {
         let p = &spi.prefix;
-        out.push_str(&format!("\n    // -- {p}: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the\n    // consumer composes ID | GEN | CLKEN per its runtime-selected plan) --\n"));
+        if spi.plan_clock.is_some() {
+            out.push_str(&format!("\n    // -- {p}: a sercom-spi binding descriptor (ONE plan: the composed clock word\n    // and the core-clock RATE, from which the driver derives BAUD) --\n"));
+        } else {
+            out.push_str(&format!("\n    // -- {p}: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the\n    // consumer composes ID | GEN | CLKEN per its runtime-selected plan) --\n"));
+        }
         push_swift_const(&mut out, "UInt32", &format!("{p}_SERCOM_BASE"), &format!("0x{:X}", spi.sercom_base));
         if spi.irq >= 0 {
             push_swift_const(&mut out, "UInt32", &format!("{p}_IRQ"), &spi.irq.to_string());
         }
         push_swift_const(&mut out, "UInt32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", spi.apbc_mask));
         push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_CORE_ID"), &spi.gclk_core_id.to_string());
+        if let Some((clkctrl, hz)) = spi.plan_clock {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{clkctrl:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CORE_CLOCK_HZ"), &hz.to_string());
+        }
         for (signal, pmux_reg, pmux_shift, pincfg_reg) in &spi.signals {
             let s = upper_snake(signal);
             push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{s}_REG"), &format!("0x{pmux_reg:X}"));
@@ -9821,11 +11054,13 @@ pub fn emit_board_swift(
     for adc in &same54_adcs {
         let p = &adc.prefix;
         out.push_str(&format!("
-    // -- {p}: a same54 adc binding descriptor. A CALIBRATION ADDRESS and a PMUX MASK --
+    // -- {p}: a same54 adc binding descriptor. A PRESCALER, a CALIBRATION ADDRESS and a PMUX MASK --
 "));
         push_swift_const(&mut out, "UInt32", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
         push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_VALUE"), &format!("0x{:X}", adc.gclk_pchctrl_value));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_CORE_CLOCK_HZ"), &adc.core_clock_hz.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PRESCALER"), &adc.prescaler.to_string());
         push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK_REG"), &format!("0x{:X}", adc.apb_mask_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_APB_MASK"), &format!("0x{:X}", adc.apb_mask));
         push_swift_const(&mut out, "UInt32", &format!("{p}_CALIB_REG"), &format!("0x{:X}", adc.calib_reg));
@@ -9837,6 +11072,53 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_REG"), &format!("0x{:X}", adc.pincfg_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_MUXPOS"), &adc.muxpos.to_string());
         push_swift_const(&mut out, "UInt32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+    }
+    for adc in &samd21_adcs {
+        let p = &adc.prefix;
+        out.push_str(&format!("
+    // -- {p}: a samd21 adc binding descriptor. The converter's clocks and prescaler, then
+    // each analog pad the board wires: its channel (MUXPOS code), PMUX nibble and PINCFG byte --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", adc.base));
+        if adc.irq >= 0 {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_IRQ"), &adc.irq.to_string());
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", adc.apbc_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", adc.gclk_clkctrl_value));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_CORE_CLOCK_HZ"), &adc.core_clock_hz.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PRESCALER"), &adc.prescaler.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_FUNC"), &adc.pmux_func.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+        for pad in &adc.pads {
+            let s = upper_snake(&pad.name);
+            push_swift_const(&mut out, "UInt32", &format!("{p}_MUXPOS_{s}"), &pad.channel.to_string());
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{s}_REG"), &format!("0x{:X}", pad.pmux_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{s}_SHIFT"), &pad.pmux_shift.to_string());
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_{s}_REG"), &format!("0x{:X}", pad.pincfg_reg));
+        }
+    }
+    for pwm in &samd21_pwms {
+        let p = &pwm.prefix;
+        out.push_str(&format!("
+    // -- {p}: a samd21 pwm binding descriptor. The counter's clocks and size, then each
+    // waveform output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", pwm.base));
+        if pwm.irq >= 0 {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_IRQ"), &pwm.irq.to_string());
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_APBC_MASK"), &format!("0x{:X}", pwm.apbc_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_CLKCTRL_VALUE"), &format!("0x{:X}", pwm.gclk_clkctrl_value));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_CORE_CLOCK_HZ"), &pwm.core_clock_hz.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_COUNTER_BITS"), &pwm.counter_bits.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_FUNC"), &pwm.pmux_func.to_string());
+        for output in &pwm.outputs {
+            let s = upper_snake(&output.name);
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CC_{s}"), &output.cc.to_string());
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{s}_REG"), &format!("0x{:X}", output.pmux_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PMUX_{s}_SHIFT"), &output.pmux_shift.to_string());
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PINCFG_{s}_REG"), &format!("0x{:X}", output.pincfg_reg));
+        }
     }
     for i2c in &same54_i2cs {
         let p = &i2c.prefix;
@@ -9937,6 +11219,33 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_PSEL_SDA"), &format!("0x{:X}", twi.psel_sda));
         push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_CNF_SCL_REG"), &format!("0x{:X}", twi.pin_cnf_scl_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_CNF_SDA_REG"), &format!("0x{:X}", twi.pin_cnf_sda_reg));
+    }
+    for spi in &nrf_spis {
+        let p = &spi.prefix;
+        out.push_str(&format!("
+    // -- {p}: an nrf-spi binding descriptor --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_SPI_BASE"), &format!("0x{:X}", spi.spi_base));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PSEL_SCK"), &format!("0x{:X}", spi.psel_sck));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PSEL_MOSI"), &format!("0x{:X}", spi.psel_mosi));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PSEL_MISO"), &format!("0x{:X}", spi.psel_miso));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_CNF_SCK_REG"), &format!("0x{:X}", spi.pin_cnf_sck_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_CNF_MOSI_REG"), &format!("0x{:X}", spi.pin_cnf_mosi_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_CNF_MISO_REG"), &format!("0x{:X}", spi.pin_cnf_miso_reg));
+    }
+    for uart in &nrf_uarts {
+        let p = &uart.prefix;
+        out.push_str(&format!("
+    // -- {p}: an nrf-uart binding descriptor --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_UART_BASE"), &format!("0x{:X}", uart.uart_base));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PSEL_TXD"), &format!("0x{:X}", uart.psel_txd));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PSEL_RXD"), &format!("0x{:X}", uart.psel_rxd));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_CNF_TXD_REG"), &format!("0x{:X}", uart.pin_cnf_txd_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PIN_CNF_RXD_REG"), &format!("0x{:X}", uart.pin_cnf_rxd_reg));
+        for (suffix, word) in &uart.bauds {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{suffix}"), &format!("0x{word:X}"));
+        }
     }
 
     for i2c in &dw_i2cs {
@@ -10055,9 +11364,13 @@ pub fn emit_board_python(
         pchctrl_uarts,
         same54_i2cs,
         same54_adcs,
+        samd21_adcs,
+        samd21_pwms,
         pl022_spis,
         st_spis,
         nrf_twis,
+        nrf_spis,
+        nrf_uarts,
         dw_i2cs,
         rp_adcs,
         rp_clocks: _,
@@ -10281,6 +11594,10 @@ pub fn emit_board_python(
         }
         rows.push(("apbc_mask".to_string(), format!("0x{:X}", spi.apbc_mask)));
         rows.push(("gclk_core_id".to_string(), spi.gclk_core_id.to_string()));
+        if let Some((clkctrl, hz)) = spi.plan_clock {
+            rows.push(("gclk_clkctrl_value".to_string(), format!("0x{clkctrl:X}")));
+            rows.push(("core_clock_hz".to_string(), hz.to_string()));
+        }
         for (signal, pmux_reg, pmux_shift, pincfg_reg) in &spi.signals {
             rows.push((format!("pmux_{signal}_reg"), format!("0x{pmux_reg:X}")));
             rows.push((format!("pmux_{signal}_shift"), pmux_shift.to_string()));
@@ -10319,6 +11636,8 @@ pub fn emit_board_python(
             ("adc_base".to_string(), format!("0x{:X}", adc.adc_base)),
             ("gclk_pchctrl_reg".to_string(), format!("0x{:X}", adc.gclk_pchctrl_reg)),
             ("gclk_pchctrl_value".to_string(), format!("0x{:X}", adc.gclk_pchctrl_value)),
+            ("core_clock_hz".to_string(), adc.core_clock_hz.to_string()),
+            ("prescaler".to_string(), adc.prescaler.to_string()),
             ("apb_mask_reg".to_string(), format!("0x{:X}", adc.apb_mask_reg)),
             ("apb_mask".to_string(), format!("0x{:X}", adc.apb_mask)),
             ("calib_reg".to_string(), format!("0x{:X}", adc.calib_reg)),
@@ -10332,6 +11651,53 @@ pub fn emit_board_python(
             ("reference_uv".to_string(), adc.reference_uv.to_string()),
         ];
         roles.push((&adc.role, rows));
+    }
+    for adc in &samd21_adcs {
+        let mut rows = vec![
+            ("kind".to_string(), "\"adc\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", adc.instance)),
+            ("base".to_string(), format!("0x{:X}", adc.base)),
+        ];
+        if adc.irq >= 0 {
+            rows.push(("irq".to_string(), adc.irq.to_string()));
+        }
+        rows.push(("apbc_mask".to_string(), format!("0x{:X}", adc.apbc_mask)));
+        rows.push(("gclk_clkctrl_value".to_string(), format!("0x{:X}", adc.gclk_clkctrl_value)));
+        rows.push(("core_clock_hz".to_string(), adc.core_clock_hz.to_string()));
+        rows.push(("prescaler".to_string(), adc.prescaler.to_string()));
+        rows.push(("pmux_func".to_string(), adc.pmux_func.to_string()));
+        rows.push(("reference_uv".to_string(), adc.reference_uv.to_string()));
+        for pad in &adc.pads {
+            let s = snake(&pad.name);
+            rows.push((format!("muxpos_{s}"), pad.channel.to_string()));
+            rows.push((format!("pmux_{s}_reg"), format!("0x{:X}", pad.pmux_reg)));
+            rows.push((format!("pmux_{s}_shift"), pad.pmux_shift.to_string()));
+            rows.push((format!("pincfg_{s}_reg"), format!("0x{:X}", pad.pincfg_reg)));
+        }
+        roles.push((&adc.role, rows));
+    }
+    for pwm in &samd21_pwms {
+        let mut rows = vec![
+            ("kind".to_string(), "\"pwm\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", pwm.instance)),
+            ("base".to_string(), format!("0x{:X}", pwm.base)),
+        ];
+        if pwm.irq >= 0 {
+            rows.push(("irq".to_string(), pwm.irq.to_string()));
+        }
+        rows.push(("apbc_mask".to_string(), format!("0x{:X}", pwm.apbc_mask)));
+        rows.push(("gclk_clkctrl_value".to_string(), format!("0x{:X}", pwm.gclk_clkctrl_value)));
+        rows.push(("core_clock_hz".to_string(), pwm.core_clock_hz.to_string()));
+        rows.push(("counter_bits".to_string(), pwm.counter_bits.to_string()));
+        rows.push(("pmux_func".to_string(), pwm.pmux_func.to_string()));
+        for output in &pwm.outputs {
+            let s = snake(&output.name);
+            rows.push((format!("cc_{s}"), output.cc.to_string()));
+            rows.push((format!("pmux_{s}_reg"), format!("0x{:X}", output.pmux_reg)));
+            rows.push((format!("pmux_{s}_shift"), output.pmux_shift.to_string()));
+            rows.push((format!("pincfg_{s}_reg"), format!("0x{:X}", output.pincfg_reg)));
+        }
+        roles.push((&pwm.role, rows));
     }
     for i2c in &same54_i2cs {
         let mut rows = vec![
@@ -10412,6 +11778,37 @@ pub fn emit_board_python(
                 ("pin_cnf_sda_reg".to_string(), format!("0x{:X}", twi.pin_cnf_sda_reg)),
             ],
         ));
+    }
+    for spi in &nrf_spis {
+        roles.push((
+            &spi.role,
+            vec![
+                ("kind".to_string(), "\"spi\"".to_string()),
+                ("instance".to_string(), format!("\"{}\"", spi.instance)),
+                ("spi_base".to_string(), format!("0x{:X}", spi.spi_base)),
+                ("psel_sck".to_string(), format!("0x{:X}", spi.psel_sck)),
+                ("psel_mosi".to_string(), format!("0x{:X}", spi.psel_mosi)),
+                ("psel_miso".to_string(), format!("0x{:X}", spi.psel_miso)),
+                ("pin_cnf_sck_reg".to_string(), format!("0x{:X}", spi.pin_cnf_sck_reg)),
+                ("pin_cnf_mosi_reg".to_string(), format!("0x{:X}", spi.pin_cnf_mosi_reg)),
+                ("pin_cnf_miso_reg".to_string(), format!("0x{:X}", spi.pin_cnf_miso_reg)),
+            ],
+        ));
+    }
+    for uart in &nrf_uarts {
+        let mut rows = vec![
+            ("kind".to_string(), "\"uart\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", uart.instance)),
+            ("uart_base".to_string(), format!("0x{:X}", uart.uart_base)),
+            ("psel_txd".to_string(), format!("0x{:X}", uart.psel_txd)),
+            ("psel_rxd".to_string(), format!("0x{:X}", uart.psel_rxd)),
+            ("pin_cnf_txd_reg".to_string(), format!("0x{:X}", uart.pin_cnf_txd_reg)),
+            ("pin_cnf_rxd_reg".to_string(), format!("0x{:X}", uart.pin_cnf_rxd_reg)),
+        ];
+        for (suffix, word) in &uart.bauds {
+            rows.push((suffix.to_ascii_lowercase(), format!("0x{word:X}")));
+        }
+        roles.push((&uart.role, rows));
     }
     for i2c in &dw_i2cs {
         roles.push((
@@ -11715,6 +13112,33 @@ pub struct Generated {
     pub contents: String,
 }
 
+/// The languages a block's layout is emitted in, in the order its family emits them: every one
+/// of the family's languages, or the ones its table's `emit` key names.
+///
+/// The key only narrows, so two lists are refused here, where the family's languages are known.
+/// One names a language the family does not emit, which would promise a layout nothing
+/// generates. The other names every language the family emits, which restates the default and
+/// would make a narrowed block look like any other.
+fn layout_languages(block: &BlockTable, source: &str, swift: bool) -> Result<Vec<&'static str>, String> {
+    let family: &[&'static str] = if swift { &["csharp", "rust", "swift"] } else { &["csharp", "rust"] };
+    let Some(emit) = &block.emit else { return Ok(family.to_vec()) };
+    if let Some(stranger) = emit.iter().find(|language| !family.contains(&language.as_str())) {
+        return Err(format!(
+            "{source}: `emit` names '{stranger}', a language csp/{} does not emit -- the key narrows \
+             a family's languages and cannot add one",
+            block.family
+        ));
+    }
+    if family.iter().all(|language| emit.iter().any(|named| named == language)) {
+        return Err(format!(
+            "{source}: `emit` names every language csp/{} emits, which is what leaving the key out \
+             means -- the key marks a narrowed block, so leave it out",
+            block.family
+        ));
+    }
+    Ok(family.iter().copied().filter(|language| block.emits(language)).collect())
+}
+
 /// Generates every artifact of a family: the C# layout classes, the instances class (C# and
 /// its 1:1 Rust twin), the pad-to-EXTINT lookup when the pin table states the die's EIC map, and
 /// per board under `bsp/*/board.toml` whose family (or module's family) matches, a bindings class
@@ -11729,15 +13153,20 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
     for block in &set.blocks {
         let mode = if block.mode.is_empty() { String::new() } else { format!("-{}", block.mode) };
         let source = format!("csp/{family}/blocks/{}{mode}.toml", block.block);
-        out.push(Generated {
-            path: format!("csp/{family}/csharp/{}.g.cs", layout_class(block)),
-            contents: emit_layout_csharp(block, &source, &regen)?,
-        });
-        out.push(Generated {
-            path: format!("csp/{family}/rust/{}.rs", layout_module(block)),
-            contents: emit_layout_rust(block, &source, &regen)?,
-        });
-        if swift {
+        let languages = layout_languages(block, &source, swift)?;
+        if languages.contains(&"csharp") {
+            out.push(Generated {
+                path: format!("csp/{family}/csharp/{}.g.cs", layout_class(block)),
+                contents: emit_layout_csharp(block, &source, &regen)?,
+            });
+        }
+        if languages.contains(&"rust") {
+            out.push(Generated {
+                path: format!("csp/{family}/rust/{}.rs", layout_module(block)),
+                contents: emit_layout_rust(block, &source, &regen)?,
+            });
+        }
+        if languages.contains(&"swift") {
             out.push(Generated {
                 path: format!("csp/{family}/swift/{}.swift", layout_class(block)),
                 contents: emit_layout_swift(block, &source, &regen)?,
@@ -11939,6 +13368,77 @@ write_unit = 4
             let Strata::Block(block) = parse(&text).expect("parses") else { panic!("kind") };
             assert_eq!(block.write_unit.expect("write_unit").value, value);
         }
+    }
+
+    /// `BLOCK` with an `emit` key in its header, spelled as the TOML value `list`.
+    fn block_emitting(list: &str) -> Result<Strata, String> {
+        parse(&BLOCK.replace("mode = \"m\"", &format!("mode = \"m\"\nemit = {list}")))
+    }
+
+    #[test]
+    fn a_block_may_narrow_its_emitted_languages() {
+        let Strata::Block(plain) = parse(BLOCK).expect("parses") else { panic!("kind") };
+        assert_eq!(plain.emit, None);
+        assert!(plain.emits("csharp") && plain.emits("rust") && plain.emits("swift"));
+
+        let Strata::Block(block) = block_emitting("[\"rust\"]").expect("parses") else { panic!("kind") };
+        assert_eq!(block.emit, Some(vec![String::from("rust")]));
+        assert!(block.emits("rust") && !block.emits("csharp") && !block.emits("swift"));
+    }
+
+    /// Each list that could not narrow a block to a language it can be emitted in is refused, with
+    /// a message naming what is wrong with it.
+    #[test]
+    fn an_emit_list_naming_no_emittable_language_is_refused() {
+        for (list, expect) in [
+            ("[]", "`emit` is empty"),
+            ("[\"python\"]", "`emit` names 'python'"),
+            ("[\"Rust\"]", "`emit` names 'Rust'"),
+            ("[\"rust\", \"rust\"]", "`emit` names 'rust' twice"),
+            ("\"rust\"", "'emit' must be an array of strings"),
+        ] {
+            let error = block_emitting(list).unwrap_err();
+            assert!(error.contains(expect), "{list}: expected '{expect}' in: {error}");
+        }
+    }
+
+    /// The key narrows its family's languages and cannot add one, and a list naming all of them is
+    /// refused as the default it restates.
+    #[test]
+    fn an_emit_list_is_checked_against_its_family_languages() {
+        let with = |list: &str| {
+            let Strata::Block(block) = block_emitting(list).expect("parses") else { panic!("kind") };
+            block
+        };
+        let Strata::Block(plain) = parse(BLOCK).expect("parses") else { panic!("kind") };
+        assert_eq!(layout_languages(&plain, "src.toml", true).unwrap(), ["csharp", "rust", "swift"]);
+        assert_eq!(layout_languages(&plain, "src.toml", false).unwrap(), ["csharp", "rust"]);
+        assert_eq!(layout_languages(&with("[\"rust\"]"), "src.toml", true).unwrap(), ["rust"]);
+        assert_eq!(layout_languages(&with("[\"swift\", \"rust\"]"), "src.toml", true).unwrap(), ["rust", "swift"]);
+
+        let error = layout_languages(&with("[\"rust\", \"swift\"]"), "src.toml", false).unwrap_err();
+        assert!(error.contains("src.toml: `emit` names 'swift', a language csp/fam does not emit"), "{error}");
+        for (list, swift) in [("[\"csharp\", \"rust\", \"swift\"]", true), ("[\"rust\", \"csharp\"]", false)] {
+            let error = layout_languages(&with(list), "src.toml", swift).unwrap_err();
+            assert!(error.contains("names every language csp/fam emits"), "{list}: {error}");
+        }
+    }
+
+    /// A Rust layout names its C# twin only when there is one. The header of a block narrowed out of
+    /// C# says so instead, and its constants are the ones it would have emitted anyway.
+    #[test]
+    fn a_rust_layout_names_a_csharp_twin_only_when_one_is_emitted() {
+        let Strata::Block(plain) = parse(BLOCK).expect("parses") else { panic!("kind") };
+        let Strata::Block(narrowed) = block_emitting("[\"rust\"]").expect("parses") else { panic!("kind") };
+        let whole = emit_layout_rust(&plain, "src.toml", "regen").expect("emits");
+        let alone = emit_layout_rust(&narrowed, "src.toml", "regen").expect("emits");
+        assert!(whole.contains("name/value-identical to FamBlkMLayout.g.cs"), "{whole}");
+        assert!(!alone.contains("FamBlkMLayout"), "{alone}");
+        assert!(alone.contains("Its block table's `emit` list leaves C# out"), "{alone}");
+        let constants =
+            |text: &str| text.lines().filter(|line| line.starts_with("pub const ")).map(str::to_owned).collect::<Vec<_>>();
+        assert!(!constants(&whole).is_empty());
+        assert_eq!(constants(&whole), constants(&alone));
     }
 
     #[test]
@@ -12310,6 +13810,41 @@ base = 0x1000
 
         set.parts.rows.clear();
         assert!(validate_family(&set).is_ok(), "a family with no parts row states no present-list");
+    }
+
+    /// Two instance rows on one generic clock channel stating different ceilings for it: the
+    /// datasheet limits the channel, so the family load refuses the pair rather than letting an
+    /// edit to one row leave them disagreeing about one clock. A row stating none beside one that
+    /// states one disagrees too.
+    #[test]
+    fn two_ceilings_on_one_clock_channel_are_refused() {
+        let row = |name: &str, channel: i64, ceiling: i64| InstanceRow {
+            name: name.into(),
+            block: "tc".into(),
+            values: vec![0x4200_2800, channel, ceiling],
+            port: String::new(),
+        };
+        let mut set = FamilySet {
+            family: "fam".into(),
+            instances: InstancesTable {
+                family: "fam".into(),
+                record: vec!["base".into(), "gclk_core_id".into(), "gclk_max_hz".into()],
+                rows: vec![row("tcc2", 0x1B, 96_000_000), row("tc3", 0x1B, 96_000_000), row("tc4", 0x1C, 48_000_000)],
+            },
+            ..Default::default()
+        };
+        assert!(validate_family(&set).is_ok(), "one ceiling per channel, stated on both members");
+
+        set.instances.rows[1].values[2] = 48_000_000;
+        let error = validate_family(&set).unwrap_err();
+        assert!(
+            error.contains("tcc2 and tc3 share generic clock channel 0x1B but state its ceiling as 96000000 and 48000000"),
+            "{error}"
+        );
+
+        set.instances.rows[1].values[2] = -1;
+        let error = validate_family(&set).unwrap_err();
+        assert!(error.contains("state its ceiling as 96000000 and -1"), "{error}");
     }
 
     /// A board's WIRED CONTROL LINE naming a pin its part does not carry -- the third list stating
@@ -12774,6 +14309,7 @@ source = \"a datasheet\"
         refused(|set| set.blocks[0].constants.clear(), "states no LINE_COUNT");
         refused(|set| set.blocks[1].constants.clear(), "no FUNC_A constant");
         refused(|set| set.blocks.retain(|block| block.block != "eic"), "no eic block table");
+        refused(|set| set.blocks[0].emit = Some(vec!["rust".into()]), "the eic block's table narrows its languages");
     }
 
     #[test]
@@ -13418,5 +14954,65 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         let error = refuse_colliding_interrupts("b", &[irq("button", 13, 0), irq("wake", 2, 0)])
             .expect_err("two pads minted one token must be refused");
         assert!(error.contains("minted token 0"), "{error}");
+    }
+
+    const ZERO: &str = include_str!("../../../bsp/arduino-zero/board.toml");
+
+    fn board_text(text: &str) -> Result<BoardTable, String> {
+        match parse(text)? {
+            Strata::Board(board) => Ok(board),
+            _ => Err("not a board table".to_owned()),
+        }
+    }
+
+    /// The Zero's file with `section` in place of its own `[bootloader]`, which is its last.
+    fn zero_with(section: &str) -> Result<BoardTable, String> {
+        let (head, _) = ZERO
+            .split_once("\n[bootloader]")
+            .expect("the Zero states [bootloader], last in its file");
+        board_text(&format!("{head}\n{section}"))
+    }
+
+    const SECTION: &str = "[bootloader]\nname = \"a bootloader\"\nbase = 0x0\nsize = 0x2000\nsource = \"s\"\n";
+
+    #[test]
+    fn the_zero_states_the_bootloader_its_product_ships() {
+        let bootloader = board_text(ZERO).unwrap().bootloader.expect("the Zero states [bootloader]");
+        assert_eq!(bootloader.name, "Arduino Zero Bootloader");
+        assert_eq!((bootloader.base, bootloader.size), (0, 0x2000));
+        assert_eq!(bootloader.reserved_ram, Some(vec![0x2000_7ffc]));
+        assert_eq!(bootloader.reset_wait_ms, Some(500));
+        assert_eq!(bootloader.interpreter, "bare");
+        assert!(bootloader.source.contains("APP_START_ADDRESS"), "{}", bootloader.source);
+    }
+
+    /// Omitted and empty are two answers: a board without the section has stated nothing, and an
+    /// empty `reserved_ram` states that the bootloader keeps nothing in SRAM.
+    #[test]
+    fn an_omitted_bootloader_and_an_empty_reserved_list_are_different_answers() {
+        assert_eq!(zero_with("").unwrap().bootloader, None);
+        let bare = zero_with(SECTION).unwrap().bootloader.unwrap();
+        assert_eq!((bare.reserved_ram, bare.reset_wait_ms, bare.interpreter.as_str()), (None, None, ""));
+        let empty = zero_with(&format!("{SECTION}reserved_ram = []\n")).unwrap().bootloader.unwrap();
+        assert_eq!(empty.reserved_ram, Some(vec![]));
+    }
+
+    #[test]
+    fn a_bootloader_record_that_cannot_be_checked_or_says_nothing_is_refused() {
+        let cases = [
+            (format!("{SECTION}{SECTION}"), "states [bootloader] once"),
+            (SECTION.replace("source = \"s\"\n", ""), "SOURCE-CITED"),
+            (SECTION.replace("name = \"a bootloader\"\n", ""), "states no name"),
+            (SECTION.replace("base = 0x0\n", ""), "states no base"),
+            (SECTION.replace("size = 0x2000", "size = 0"), "states no size"),
+            (format!("{SECTION}interpreter = \"fast\"\n"), "interpreter layout 'fast'"),
+            (format!("{SECTION}reserved_ram = [0x20007FFE]\n"), "not word-aligned"),
+            (format!("{SECTION}reset_wait_ms = -1\n"), "negative time"),
+            (format!("{SECTION}double_tap = 1\n"), "unexpected bootloader key 'double_tap'"),
+        ];
+        for (section, expected) in cases {
+            let error = zero_with(&section).expect_err(expected);
+            assert!(error.contains(expected), "{expected:?} in {error:?}");
+        }
     }
 }

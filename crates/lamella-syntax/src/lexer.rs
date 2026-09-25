@@ -1816,17 +1816,20 @@ impl<'a> Lexer<'a> {
     fn gate_feature(&mut self, feature: Feature, start: usize) {
         let kind = match feature.gate_against(self.options.version) {
             None => return,
-            Some(FeatureGate::RequiresLaterVersion { required }) => {
+            Some(FeatureGate::RequiresLaterVersion { feature, required }) => {
                 DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: feature.description(),
+                    feature,
                     required,
                     current: self.options.version,
                 }
             }
-            Some(FeatureGate::NotInThisBuild) => DiagnosticKind::FeatureNotInThisBuild {
-                feature: feature.description(),
-                permitted_by: self.options.version,
-            },
+            Some(FeatureGate::NotInThisBuild { feature, instead }) => {
+                DiagnosticKind::FeatureNotInThisBuild {
+                    feature,
+                    permitted_by: self.options.version,
+                    instead,
+                }
+            }
         };
         self.report(kind, start);
     }

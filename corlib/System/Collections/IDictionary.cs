@@ -3,6 +3,7 @@ namespace System.Collections
 {
     public interface IDictionary : ICollection
     {
+        new IDictionaryEnumerator GetEnumerator();
         object this[object key] { get; set; }
         void Add(object key, object value);
         bool Contains(object key);

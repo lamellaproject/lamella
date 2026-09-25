@@ -22,6 +22,8 @@ namespace Lamella.Generated
         /// name a driver; and a uart is a different register map on every family, so the kind does
         /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
         public const string I2C_DRIVER_FAMILY = "nrf51-twi";
+        public const string VCP_DRIVER_FAMILY = "nrf51-uart";
+        public const string SPI_DRIVER_FAMILY = "nrf51-spi";
 
         // -- I2C: an nrf-twi binding descriptor --
         public const uint I2C_TWI_BASE = 0x40003000;
@@ -29,6 +31,23 @@ namespace Lamella.Generated
         public const uint I2C_PSEL_SDA = 0x1E;
         public const uint I2C_PIN_CNF_SCL_REG = 0x50000700;
         public const uint I2C_PIN_CNF_SDA_REG = 0x50000778;
+
+        // -- SPI: an nrf-spi binding descriptor --
+        public const uint SPI_SPI_BASE = 0x40004000;
+        public const uint SPI_PSEL_SCK = 0x17;
+        public const uint SPI_PSEL_MOSI = 0x15;
+        public const uint SPI_PSEL_MISO = 0x16;
+        public const uint SPI_PIN_CNF_SCK_REG = 0x5000075C;
+        public const uint SPI_PIN_CNF_MOSI_REG = 0x50000754;
+        public const uint SPI_PIN_CNF_MISO_REG = 0x50000758;
+
+        // -- VCP: an nrf-uart binding descriptor --
+        public const uint VCP_UART_BASE = 0x40002000;
+        public const uint VCP_PSEL_TXD = 0x18;
+        public const uint VCP_PSEL_RXD = 0x19;
+        public const uint VCP_PIN_CNF_TXD_REG = 0x50000760;
+        public const uint VCP_PIN_CNF_RXD_REG = 0x50000764;
+        public const uint VCP_BAUDRATE_115200_XTAL_16MHZ = 0x1D7E000;
         public const uint DEVICE_COUNT = 12;
 
         // -- on-board devices: PORT group base + pin index + mask --

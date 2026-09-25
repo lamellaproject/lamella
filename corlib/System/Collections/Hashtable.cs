@@ -226,7 +226,7 @@ namespace System.Collections
             }
         }
 
-        public IEnumerator GetEnumerator()
+        public IDictionaryEnumerator GetEnumerator()
         {
             object[] ks = new object[count];
             object[] vs = new object[count];
@@ -239,6 +239,11 @@ namespace System.Collections
                 n = n + 1;
             }
             return new HashtableEnumerator(ks, vs, count);
+        }
+
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
         }
 
         public void CopyTo(System.Array array, int index)

@@ -17,8 +17,8 @@ namespace Lamella.Hardware
         private const int PreparedMaskWidth = 32;
         private static uint _prepared;
 
-        /// <summary>The number of channels the board's converter has, so valid channel numbers are
-        /// 0 to <c>ChannelCount - 1</c>.</summary>
+        /// <summary>The span of the board's converter's channel numbers: every channel is numbered
+        /// below it, and <see cref="IsChannelSupported"/> says which numbers are channels.</summary>
         /// <exception cref="System.InvalidOperationException">No ADC driver is bound.</exception>
         public static int ChannelCount
         {
@@ -51,8 +51,7 @@ namespace Lamella.Hardware
         /// <exception cref="System.InvalidOperationException">No ADC driver is bound.</exception>
         public static bool IsChannelSupported(int channel)
         {
-            if (channel < 0) return false;
-            return channel < AdcControllers.Resolve().ChannelCount;
+            return AdcControllers.Resolve().IsChannelSupported(channel);
         }
 
         /// <summary>Performs one conversion on <paramref name="channel"/> and returns the hardware
@@ -61,12 +60,13 @@ namespace Lamella.Hardware
         /// <exception cref="System.ArgumentOutOfRangeException">The board's converter has no such
         /// channel.</exception>
         /// <exception cref="System.InvalidOperationException">No ADC driver is bound.</exception>
+        /// <exception cref="System.IO.IOException">The converter could not produce a count.</exception>
         public static int ReadRaw(int channel)
         {
             AdcDriver driver = AdcControllers.Resolve();
             CheckChannel(driver, channel);
             Prepare(driver, channel);
-            return driver.ReadValue(channel);
+            return Checked(driver.ReadValue(channel));
         }
 
 #if LAMELLA_SURFACE_FLOAT
@@ -75,18 +75,28 @@ namespace Lamella.Hardware
         /// <exception cref="System.ArgumentOutOfRangeException">The board's converter has no such
         /// channel.</exception>
         /// <exception cref="System.InvalidOperationException">No ADC driver is bound.</exception>
+        /// <exception cref="System.IO.IOException">The converter could not produce a count.</exception>
         public static double ReadRatio(int channel)
         {
             AdcDriver driver = AdcControllers.Resolve();
             CheckChannel(driver, channel);
             Prepare(driver, channel);
-            return driver.ReadValue(channel) / (double)driver.MaxValue;
+            return Checked(driver.ReadValue(channel)) / (double)driver.MaxValue;
         }
 #endif
 
+        private static int Checked(int count)
+        {
+            if (count < 0)
+            {
+                throw new System.IO.IOException("the analog-to-digital conversion failed (status " + (-count) + ")");
+            }
+            return count;
+        }
+
         private static void CheckChannel(AdcDriver driver, int channel)
         {
-            if (channel < 0 || channel >= driver.ChannelCount)
+            if (!driver.IsChannelSupported(channel))
             {
                 throw new System.ArgumentOutOfRangeException("channel");
             }

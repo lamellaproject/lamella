@@ -52,6 +52,9 @@ $DefaultSurface = @(
     'LAMELLA_SURFACE_NETFX_2_0',
     'LAMELLA_SURFACE_NETFX_4_0',
     'LAMELLA_SURFACE_NETFX_4_5',
+    # The rung above 4.5: members .NET Core 2.0 introduced, each gated where it was introduced, like
+    # the four eras below it. It takes no language version of its own.
+    'LAMELLA_SURFACE_NETCORE_2_0',
     'LAMELLA_SURFACE_FILE_IO',
     'LAMELLA_SURFACE_SERIAL',
     'LAMELLA_SURFACE_STRING_COMPARISON',
@@ -79,6 +82,9 @@ $SurfaceRequires = [ordered]@{
     'LAMELLA_SURFACE_SERIAL'    = @('LAMELLA_SURFACE_NETFX_2_0')
     'LAMELLA_SURFACE_SPAN'      = @('LAMELLA_SURFACE_GENERICS')
     'LAMELLA_SURFACE_TUPLES'    = @('LAMELLA_SURFACE_GENERICS')
+    # A rung stands on the one below it: .NET Core 2.0 members without the 4.5 surface describe no
+    # .NET that ever shipped.
+    'LAMELLA_SURFACE_NETCORE_2_0' = @('LAMELLA_SURFACE_NETFX_4_5')
 }
 foreach ($symbol in $SurfaceRequires.Keys) {
     if ($Define -notcontains $symbol) { continue }
@@ -92,17 +98,20 @@ foreach ($symbol in $SurfaceRequires.Keys) {
 # Every assembly under libs/, in an order where each is built after what it references. `references`
 # names other entries in this list; all of them reference the corlib implicitly.
 $Assemblies = @(
-    @{ name = 'Lamella.Hardware';                      references = @() },
+    # Its own assembly, and the contrast with `System.Device.Pwm`'s fold below is the whole reason. Upstream's
+    # `System.Device.Gpio` holds Gpio, I2c, Pwm and Spi and no Analog, so folding `System.Device.Pwm`
+    # converges on that shape and folding Analog would be a deviation dressed as convergence.
+    # References only corlib: these sources name `System.IDisposable` and nothing else.
+    @{ name = 'System.Device.Analog';                  references = @() },
+    # It references System.Device.Analog and not the other way round: the analog controller it offers
+    # over the ADC seam is a System.Device.Analog.AnalogController, and the dotnet/iot-shaped surface
+    # a portable program references depends on nothing of ours.
+    @{ name = 'Lamella.Hardware';                      references = @('System.Device.Analog') },
     # `System.Device.Pwm`'s sources build INTO this assembly and it gets no assembly of its own:
     # upstream ships `PwmChannel` inside `System.Device.Gpio.dll`. The namespace is unchanged;
     # only the assembly is.
     @{ name = 'System.Device.Gpio';                    references = @(); extraSources = @('System.Device.Pwm') },
     @{ name = 'System.Device.Model';                   references = @() },
-    # Its own assembly, and the contrast with the fold above is the whole reason. Upstream's
-    # `System.Device.Gpio` holds Gpio, I2c, Pwm and Spi and no Analog, so folding `System.Device.Pwm`
-    # converges on that shape and folding Analog would be a deviation dressed as convergence.
-    # References only corlib: these sources name `System.IDisposable` and nothing else.
-    @{ name = 'System.Device.Analog';                  references = @() },
     @{ name = 'System.Net.NetworkInformation';         references = @() },
     # Full .NET's own assembly name, bare and unprefixed, because these are full .NET's types in full
     # .NET's namespace: it ships System.IO.Ports out-of-band (dotnet/dotnet) rather than in its

@@ -7,6 +7,8 @@ pub mod contracts;
 pub mod dfu;
 pub mod identity;
 pub mod manifest;
+pub mod placement;
+pub mod user_row;
 
 use lamella_catalog as catalog;
 
@@ -440,6 +442,30 @@ impl Programmer {
         }
     }
 
+    /// The attach under reset a write over this route runs before it touches flash, or `None` for a
+    /// write that attaches without holding the core in reset.
+    ///
+    /// **READ FROM THE PLAN THE WRITE ITSELF FOLLOWS**, so a tool that reads a part ahead of a write
+    /// -- a backup -- reaches it the way the write will, and never holds in reset a part whose
+    /// write does not: some parts do not answer their debug port while they are held.
+    pub fn under_reset(self) -> Option<UnderReset> {
+        match self {
+            Programmer::StlinkOnboard { family, .. } | Programmer::StExternalProbe { family } => {
+                let plan = family.plan();
+                plan.attach_under_reset
+                    .then_some(UnderReset { low_power_debug: plan.low_power_debug })
+            }
+            Programmer::MicrobitV1Daplink
+            | Programmer::MicrobitV2Daplink
+            | Programmer::Uf2Volume { .. }
+            | Programmer::Rp2350Probe { .. }
+            | Programmer::Rp2040Probe { .. }
+            | Programmer::EdbgOnboard { .. }
+            | Programmer::SamExternalProbe { .. }
+            | Programmer::StDfu { .. } => None,
+        }
+    }
+
     /// Whether a board reached this way can also be written by copying the image onto a bootloader
     /// volume -- the drive a part's boot ROM presents over USB.
     ///
@@ -581,6 +607,24 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "rpi-pico2-w",
+        aot_target: Some("rp2350"),
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+    },
+    Programming {
+        board: "pimoroni-pico-plus-2",
+        aot_target: Some("rp2350"),
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+    },
+    Programming {
+        board: "pimoroni-pico-plus-2-w",
         aot_target: Some("rp2350"),
         programmer: Programmer::Uf2Volume {
             family: RP2350_UF2_FAMILY,
@@ -1009,26 +1053,52 @@ pub fn uf2_family_for_board(board_id: &str) -> Option<u32> {
         _ => None,
     }
 }
-/// Check that a prebuilt image belongs where this mechanism writes.
+/// Check that a prebuilt image belongs where this write puts it.
 ///
 /// **A FILE THAT STATES AN ADDRESS IS BELIEVED ABOUT ITS OWN ADDRESS, NOT ABOUT OURS.** Intel HEX
-/// carries a base, and every mechanism here writes from a fixed one; a file built for a different
+/// carries a base, and every write here puts an image at a fixed one; a file built for a different
 /// part -- an STM32 image at `0x0800_0000`, say -- is well-formed, parses cleanly, and would be
 /// written to the wrong place on a Nordic part where flash begins at zero. That is a silent bad
 /// flash, so the disagreement is a refusal rather than a warning.
 ///
+/// On a board that keeps its bootloader, an image linked for the start of flash is one that
+/// replaces the bootloader, and one linked to sit behind it is one that keeps it. Each is refused
+/// with the option that writes it where it was linked to run.
+///
 /// # Errors
-/// When the artifact states a base this mechanism does not write to.
+/// When the artifact states a base other than the one `placement` writes it from.
 pub fn check_base(
     artifact: &crate::artifact::Artifact,
-    programmer: Programmer,
+    placement: &placement::Placement,
 ) -> Result<(), String> {
-    let expected = programmer.flash_base();
+    let expected = placement.base();
     let Some(stated) = artifact.base else {
         return Ok(());
     };
     if stated == expected {
         return Ok(());
+    }
+    if let Some(kept) = placement.kept()
+        && stated == kept.base
+    {
+        return Err(format!(
+            "this image states it belongs at {stated:#010x}, where this board keeps the {}, and an \
+             image\nkept behind the bootloader is written from {expected:#010x}. An image linked \
+             to run from {stated:#010x}\nreplaces the bootloader: --replace-bootloader writes it \
+             there, and the board then has no\nbootloader until one is written back.",
+            kept.name
+        ));
+    }
+    if let Some(replaced) = placement.replaced()
+        && stated == replaced.end()
+    {
+        return Err(format!(
+            "this image states it belongs at {stated:#010x}, behind the {}, and \
+             --replace-bootloader writes\nfrom {expected:#010x}, over it. Without \
+             --replace-bootloader it is written behind the bootloader,\nwhere it was linked to \
+             run.",
+            replaced.name
+        ));
     }
     Err(format!(
         "this image states it belongs at {stated:#010x}, and this board is written from\n\
@@ -1049,7 +1119,7 @@ pub struct Prepared {
 }
 
 /// Read the image file at `path` into the bytes a write through `route` puts on the board `row`
-/// describes. Nothing is opened: no probe, and no drive.
+/// describes, at the address `placement` gives. Nothing is opened: no probe, and no drive.
 ///
 /// A bootloader volume is handed a `.uf2` exactly as the file holds it. Every other image, on
 /// every route, is read to flat bytes at an address -- a `.bin`, Intel HEX, S-records, or a linked
@@ -1057,14 +1127,16 @@ pub struct Prepared {
 /// into a UF2 by [`wrap_for_route`].
 ///
 /// # Errors
-/// A file that cannot be read or parsed; an image that states an address this route does not
-/// write from ([`check_base`]); an RP2350 image with no boot block ([`check_rp2350_stamp`]); or a
-/// flat image larger than the flash the board's facts state. Each is worded for a reader.
+/// A file that cannot be read or parsed; an image that states an address other than the one
+/// `placement` writes it from ([`check_base`]); an RP2350 image with no boot block
+/// ([`check_rp2350_stamp`]); or a flat image larger than the flash the board's facts state, less
+/// any bootloader the write keeps in front of it. Each is worded for a reader.
 ///
 pub fn prepare_image(
     path: &std::path::Path,
     row: &Programming,
     route: Programmer,
+    placement: &placement::Placement,
 ) -> Result<Prepared, String> {
     let extension = crate::artifact::classify_format(path);
     if let Some(required) = route.required_format() {
@@ -1076,12 +1148,12 @@ pub fn prepare_image(
         }
     }
     let artifact = crate::artifact::read(path)?;
-    check_base(&artifact, route)?;
+    check_base(&artifact, placement)?;
     check_rp2350_stamp(&artifact.bytes, row.aot_target)?;
     refuse_unless_it_fits(
         row.board,
         &artifact,
-        route.flash_base(),
+        placement,
         extension.as_deref() == Some("elf"),
     )?;
     let read = format!("{} B of {}", artifact.bytes.len(), artifact.format);
@@ -1112,17 +1184,19 @@ pub fn wrap_for_route(route: Programmer, image: &[u8]) -> Option<(Vec<u8>, Strin
     Some((wrapped, line))
 }
 
-/// Refuse a flat image larger than the flash `board`'s facts state. A board that states no flash
-/// size is not refused, because there is nothing to compare against.
+/// Refuse a flat image larger than the flash `board`'s facts state, less any bootloader
+/// `placement` keeps in front of it. A board that states no flash size is not refused, because
+/// there is nothing to compare against.
 ///
 fn refuse_unless_it_fits(
     board: &str,
     artifact: &crate::artifact::Artifact,
-    base: u32,
+    placement: &placement::Placement,
     from_elf: bool,
 ) -> Result<(), String> {
     let (table, part) = catalog::resolve(board)?;
-    let length = i64::try_from(artifact.bytes.len()).unwrap_or(i64::MAX);
+    let kept = usize::try_from(placement.kept_bytes()).unwrap_or(usize::MAX);
+    let length = i64::try_from(artifact.bytes.len().saturating_add(kept)).unwrap_or(i64::MAX);
     let verdict = lamella_bsp_gen::fit::fit(&table, &part, length);
     let lamella_bsp_gen::fit::Fit::Exceeds { over } = verdict.flash_fit else {
         return Ok(());
@@ -1131,10 +1205,15 @@ fn refuse_unless_it_fits(
         lamella_bsp_gen::fit::BudgetSource::Board { region } => format!("board region '{region}'"),
         lamella_bsp_gen::fit::BudgetSource::Part => format!("part {}", verdict.part),
     };
+    let base = placement.base();
     let end = u64::from(base).saturating_add(u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX));
+    let kept_by = match placement.kept() {
+        Some(bootloader) => format!(", {} B of it kept for the {}", bootloader.size, bootloader.name),
+        None => String::new(),
+    };
     let mut message = format!(
         "this image is {} B, from {base:#010x} to {end:#010x}, and {board} has {} B of flash \
-         ({source}) -- {over} B too many.",
+         ({source}){kept_by} -- {over} B too many.",
         artifact.bytes.len(),
         verdict.flash.bytes
     );
@@ -1147,8 +1226,8 @@ fn refuse_unless_it_fits(
     }
     Err(message)
 }
-/// Write `image` to the board through `programmer`.
-/// Write `image` through `programmer`, with no restriction on which part.
+/// Write `image` through `programmer`, at the address `placement` gives, with no restriction on
+/// which part.
 ///
 /// The shape a front end uses when the human running it IS the permission -- somebody typing
 /// `lamella flash` has already decided. A server acting for an agent wants
@@ -1158,13 +1237,15 @@ fn refuse_unless_it_fits(
 /// Anything that stops a write, already worded for a reader.
 pub fn write(
     programmer: Programmer,
+    placement: &placement::Placement,
     image: &[u8],
     probe: Option<&str>,
 ) -> Result<lamella_flash_backend::Report, String> {
-    write_with(programmer, image, probe, &lamella_flash_backend::Allow::Any)
+    write_with(programmer, placement, image, probe, &lamella_flash_backend::Allow::Any)
 }
 
-/// Write `image` through `programmer`, permitting only the parts `allow` names.
+/// Write `image` through `programmer`, at the address `placement` gives, permitting only the parts
+/// `allow` names.
 ///
 /// **THE PERMISSION IS THE CONTRACT'S TO ENFORCE, NOT THIS FUNCTION'S**, which is why it is handed
 /// straight through: it has to be checked after the part identifies itself and before anything is
@@ -1174,11 +1255,12 @@ pub fn write(
 /// Anything that stops a write, already worded for a reader.
 pub fn write_scoped(
     programmer: Programmer,
+    placement: &placement::Placement,
     image: &[u8],
     selector: Option<&str>,
     allow: &lamella_flash_backend::Allow,
 ) -> Result<lamella_flash_backend::Report, String> {
-    write_with(programmer, image, selector, allow)
+    write_with(programmer, placement, image, selector, allow)
 }
 
 /// What a refusal to find a system bootloader tells its reader.
@@ -1186,15 +1268,62 @@ const ENTER_THE_SYSTEM_BOOTLOADER: &str = "An STM32 answers over USB DFU only wh
 bootloader runs, which it does after a reset with the part's boot pin held high; AN2606 gives the \
 pattern each series follows.";
 
+/// Opens the probe a SAM route writes through, enters SWD, and brings memory access up.
+///
+/// **ONE OPENING FOR EVERYTHING DONE THROUGH A SAM ROUTE**, so a write and a read of the part's
+/// user row reach the same board by the same ladder.
+///
+/// # Errors
+/// A route that is not a probe route to a SAM part, a probe that cannot be chosen or opened, and a
+/// part that does not answer. Each is worded for a reader.
+fn open_sam_route(
+    programmer: Programmer,
+    probe: Option<&str>,
+) -> Result<impl lamella_probe_core::TargetAccess, String> {
+    use lamella_probe_core::TargetAccess as _;
+
+    let (session, through) = match programmer {
+        Programmer::EdbgOnboard { .. } => {
+            let (vid, pid) = programmer
+                .usb_identity()
+                .ok_or_else(|| "this mechanism has no probe to open".to_owned())?;
+            let serial =
+                lamella_probe::resolve_serial(vid, pid, probe).map_err(|why| format!("{why}"))?;
+            let session = lamella_probe::open(&lamella_probe::Selector::by_serial(&serial))
+                .map_err(|why| format!("{why}"))?;
+            (session, "the board's EDBG")
+        }
+        Programmer::SamExternalProbe { .. } => {
+            let selector = lamella_probe::Selector::named_or_environment(probe);
+            let session = lamella_probe::open(&selector)
+                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
+            (session, "the attached probe")
+        }
+        _ => {
+            return Err(format!(
+                "{} does not reach a SAM part through a probe",
+                programmer.description()
+            ));
+        }
+    };
+    let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
+    dap.connect()
+        .map_err(|why| format!("entering SWD through {through}: {why}"))?;
+    dap.init_mem()
+        .map_err(|why| format!("opening memory access through {through}: {why}"))?;
+    Ok(dap)
+}
+
 fn write_with(
     programmer: Programmer,
+    placement: &placement::Placement,
     image: &[u8],
     probe: Option<&str>,
     allow: &lamella_flash_backend::Allow,
 ) -> Result<lamella_flash_backend::Report, String> {
     let image = lamella_flash_backend::Image {
         bytes: image,
-        base: programmer.flash_base(),
+        base: placement.base(),
     };
 
     let (idcode, what) = match programmer {
@@ -1229,46 +1358,10 @@ fn write_with(
             )
             .map_err(|why| why.to_string());
         }
-        Programmer::EdbgOnboard { family, .. } => {
-            let (vid, pid) = programmer
-                .usb_identity()
-                .ok_or_else(|| "this mechanism has no probe to open".to_owned())?;
-            let serial =
-                lamella_probe::resolve_serial(vid, pid, probe).map_err(|why| format!("{why}"))?;
-            let session = lamella_probe::open(&lamella_probe::Selector::by_serial(&serial))
-                .map_err(|why| format!("{why}"))?;
-            let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
-            {
-                use lamella_probe_core::TargetAccess as _;
-                dap.connect()
-                    .map_err(|why| format!("entering SWD through the board's EDBG: {why}"))?;
-                dap.init_mem().map_err(|why| {
-                    format!("opening memory access through the board's EDBG: {why}")
-                })?;
-            }
-            let mut backend =
-                crate::backends::SamProbe::new(dap, family, programmer.description());
-            return lamella_flash_backend::flash(
-                &mut backend,
-                &image,
-                lamella_flash_backend::VerifyPolicy::ReadBack,
-                allow,
-            )
-            .map_err(|why| why.to_string());
-        }
-        Programmer::SamExternalProbe { family } => {
-            use lamella_probe_core::TargetAccess as _;
-
-            let selector = lamella_probe::Selector::named_or_environment(probe);
-            let session = lamella_probe::open(&selector)
-                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
-            let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
-            dap.connect()
-                .map_err(|why| format!("entering SWD through the attached probe: {why}"))?;
-            dap.init_mem()
-                .map_err(|why| format!("opening memory access through the attached probe: {why}"))?;
-            let mut backend =
-                crate::backends::SamProbe::new(dap, family, programmer.description());
+        Programmer::EdbgOnboard { family, .. } | Programmer::SamExternalProbe { family } => {
+            let dap = open_sam_route(programmer, probe)?;
+            let mut backend = crate::backends::SamProbe::new(dap, family, programmer.description())
+                .placed(placement);
             return lamella_flash_backend::flash(
                 &mut backend,
                 &image,
@@ -1399,14 +1492,24 @@ fn write_with(
     )
     .map_err(|why| why.to_string())
 }
+/// An attach that holds the core in reset, as a route's family plan asks for one: see
+/// [`Programmer::under_reset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnderReset {
+    /// The low-power debug bits set while the core is held, for a family whose firmware can sleep
+    /// out of a debugger's reach.
+    pub low_power_debug: Option<lamella_stlink::LowPowerDebug>,
+}
+
 /// Attach to a target held in reset and leave its core halted at the reset vector, through any probe
 /// that speaks [`TargetAccess`](lamella_probe_core::TargetAccess): hold reset, bring up SWD and memory
 /// access, then [`lamella_stlink::attach_held_in_reset`] -- the known answer, `low_power_debug`'s
 /// bits, the reset vector catch, the release and the halt.
 ///
 /// # Errors
-/// Any step the probe or the target refuses. A failure while SWD or memory access is brought up
-/// leaves the core held in reset; a later failure before the release releases it.
+/// Any step the probe or the target refuses. **Every one of them leaves the line released**: the
+/// reset is held by a [`lamella_stlink::HeldInReset`], which releases it on every way out, so a part
+/// whose debug port does not answer while it is held is not left held.
 pub fn attach_under_reset<T>(
     target: &mut T,
     low_power_debug: Option<lamella_stlink::LowPowerDebug>,
@@ -1415,11 +1518,11 @@ where
     T: lamella_probe_core::TargetAccess + lamella_probe_core::CoreMemory,
 {
     const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
-    lamella_probe_core::TargetAccess::set_reset(target, true)?;
+    let mut held = lamella_stlink::HeldInReset::assert(target)?;
     std::thread::sleep(SETTLE);
-    lamella_probe_core::TargetAccess::connect(target)?;
-    lamella_probe_core::TargetAccess::init_mem(target)?;
-    lamella_stlink::attach_held_in_reset(target, low_power_debug)
+    lamella_probe_core::TargetAccess::connect(held.core())?;
+    lamella_probe_core::TargetAccess::init_mem(held.core())?;
+    lamella_stlink::attach_held_in_reset(held, low_power_debug)
 }
 
 /// Writes `image` through an opened ST-LINK on `family`'s plan: the family's attach, memory access,
@@ -1942,6 +2045,12 @@ mod tests {
         programmer_for("rpi-pico2").expect("rpi-pico2 is routed")
     }
 
+    /// Where the default write through `route` puts an image on `row`'s board.
+    fn placed(row: &Programming, route: Programmer) -> placement::Placement {
+        placement::placement_for(row, route, placement::BootloaderChoice::Keep)
+            .expect("every routed board has a default placement")
+    }
+
     /// A serial named with `--probe` that no attached probe carries is refused by that serial, and a
     /// board with no bootloader volume is not sent looking for one.
     #[test]
@@ -2139,8 +2248,8 @@ mod tests {
         ];
         for (name, contents) in files {
             let path = image_file("flat-formats", name, &contents);
-            let prepared =
-                prepare_image(&path, row, volume).unwrap_or_else(|why| panic!("{name}: {why}"));
+            let prepared = prepare_image(&path, row, volume, &placed(row, volume))
+                .unwrap_or_else(|why| panic!("{name}: {why}"));
             assert_eq!(prepared.bytes, expected, "{name} becomes the UF2 of its flat image");
             assert!(prepared.read.starts_with("700 B of "), "{name}: {}", prepared.read);
             assert!(prepared.wrapped.is_some(), "{name}: the wrap is reported");
@@ -2158,7 +2267,8 @@ mod tests {
         let path = image_file("elf-probe", "image.elf", &linked_elf(&[(RP2_XIP_BASE, &code)]));
         let row = pico2();
         let probe = route_for(row, Some("probe")).expect("the probe route");
-        let prepared = prepare_image(&path, row, probe).expect("an ELF is taken");
+        let prepared = prepare_image(&path, row, probe, &placed(row, probe))
+            .expect("an ELF is taken");
         assert_eq!(prepared.bytes, code);
         assert_eq!(prepared.wrapped, None);
     }
@@ -2170,7 +2280,8 @@ mod tests {
         let path = image_file("elf-base", "image.elf", &elf);
         let row = pico2();
         let volume = route_for(row, None).expect("the default route");
-        let error = prepare_image(&path, row, volume).expect_err("not this part's address");
+        let error = prepare_image(&path, row, volume, &placed(row, volume))
+            .expect_err("not this part's address");
         assert!(error.contains("0x08000000") && error.contains("0x10000000"), "{error}");
     }
 
@@ -2183,7 +2294,8 @@ mod tests {
         let row = pico2();
         for via in [None, Some("probe")] {
             let route = route_for(row, via).expect("a route");
-            let error = prepare_image(&path, row, route).expect_err("no boot block");
+            let error = prepare_image(&path, row, route, &placed(row, route))
+                .expect_err("no boot block");
             assert!(error.contains("PICOBIN"), "{via:?}: {error}");
         }
     }
@@ -2199,7 +2311,8 @@ mod tests {
         let row = pico2();
         for via in [None, Some("probe")] {
             let route = route_for(row, via).expect("a route");
-            let error = prepare_image(&path, row, route).expect_err("larger than the flash");
+            let error = prepare_image(&path, row, route, &placed(row, route))
+                .expect_err("larger than the flash");
             assert!(error.contains("0x10400010"), "{via:?}: where it ends: {error}");
             assert!(error.contains("4194304 B of flash"), "{via:?}: what the board holds: {error}");
             assert!(error.contains("load address in RAM"), "{via:?}: the likely cause: {error}");
@@ -2214,12 +2327,81 @@ mod tests {
         let path = image_file("uf2", "image.uf2", &uf2);
         let row = pico2();
         let volume = route_for(row, None).expect("the default route");
-        let prepared = prepare_image(&path, row, volume).expect("what a volume takes");
+        let prepared = prepare_image(&path, row, volume, &placed(row, volume))
+            .expect("what a volume takes");
         assert_eq!(prepared.bytes, uf2);
         assert_eq!(prepared.wrapped, None);
         let probe = route_for(row, Some("probe")).expect("the probe route");
-        let error = prepare_image(&path, row, probe).expect_err("a probe takes raw bytes");
+        let error = prepare_image(&path, row, probe, &placed(row, probe))
+            .expect_err("a probe takes raw bytes");
         assert!(error.contains("bootloader volume"), "{error}");
+    }
+
+    /// Behind the Zero's bootloader a flat image has the flash the bootloader leaves, and the
+    /// refusal of one byte more names the bootloader that holds the rest. Over it, the same image
+    /// has the whole array.
+    #[test]
+    fn behind_the_zeros_bootloader_an_image_fits_what_the_bootloader_leaves() {
+        let row = programmer_for("arduino-zero").expect("the Zero is routed");
+        let route = row.programmer;
+        let keep = placed(row, route);
+        let over = placement::placement_for(row, route, placement::BootloaderChoice::Replace)
+            .expect("the Zero states its bootloader");
+        let (table, part) = catalog::resolve(row.board).expect("the Zero resolves");
+        let array = usize::try_from(lamella_bsp_gen::fit::fit(&table, &part, 0).flash.bytes)
+            .expect("a flash size");
+        let window = array - 0x2000;
+
+        let fits = image_file("zero-window", "fits.bin", &vec![0xA5; window]);
+        let prepared = prepare_image(&fits, row, route, &keep).expect("exactly the window fits");
+        assert_eq!(prepared.bytes.len(), window);
+
+        let over_by_one = image_file("zero-window", "over.bin", &vec![0xA5; window + 1]);
+        let error = prepare_image(&over_by_one, row, route, &keep).expect_err("one byte too many");
+        assert!(error.contains("from 0x00002000"), "where it starts: {error}");
+        assert!(
+            error.contains("8192 B of it kept for the Arduino Zero Bootloader"),
+            "what holds the rest: {error}"
+        );
+        assert!(error.contains("-- 1 B too many"), "by how much: {error}");
+        prepare_image(&over_by_one, row, route, &over)
+            .expect("over the bootloader, the whole array is the image's");
+    }
+
+    /// On a board that keeps its bootloader, an image linked for the start of flash is refused
+    /// naming `--replace-bootloader`, and one linked to sit behind the bootloader is refused by
+    /// `--replace-bootloader` naming the write that keeps it. Each is taken where it was linked.
+    #[test]
+    fn an_image_linked_for_the_other_layout_is_refused_naming_the_option_that_takes_it() {
+        let row = programmer_for("arduino-zero").expect("the Zero is routed");
+        let route = row.programmer;
+        let keep = placed(row, route);
+        let over = placement::placement_for(row, route, placement::BootloaderChoice::Replace)
+            .expect("the Zero states its bootloader");
+        let code = [0x5A_u8; 700];
+        let at_start = image_file(
+            "zero-layouts",
+            "start.hex",
+            &crate::artifact::Format::IntelHex.render(&code, 0x0),
+        );
+        let behind = image_file(
+            "zero-layouts",
+            "behind.hex",
+            &crate::artifact::Format::IntelHex.render(&code, 0x2000),
+        );
+
+        let error = prepare_image(&at_start, row, route, &keep).expect_err("it replaces it");
+        assert!(
+            error.contains("0x00000000") && error.contains("0x00002000"),
+            "both addresses: {error}"
+        );
+        assert!(error.contains("--replace-bootloader writes it"), "the option: {error}");
+        assert!(error.contains("Arduino Zero Bootloader"), "what it replaces: {error}");
+        prepare_image(&behind, row, route, &keep).expect("linked to sit behind it");
+
+        let error = prepare_image(&behind, row, route, &over).expect_err("linked to keep it");
+        assert!(error.contains("Without --replace-bootloader"), "the write that keeps it: {error}");
+        prepare_image(&at_start, row, route, &over).expect("linked for the start of flash");
     }
 
     /// **THE SIZE REFUSAL BINDS ONLY WHERE A BOARD STATES ITS FLASH**, so every routed board must.
@@ -2408,6 +2590,64 @@ mod tests {
                 matches!(route_for(row, None), Ok(Programmer::Uf2Volume { .. })),
                 "{board} still defaults to the bootloader volume"
             );
+        }
+    }
+
+    /// The two Pimoroni boards take the Pico 2's two routes: the bootloader drive by default, which
+    /// checks the RP2350 family, and by `--via probe` the route that reads every byte back.
+    ///
+    /// **THE DIE IS THE PICO 2's AND THE PACKAGE IS NOT.** Both boards carry an RP2350B, the QFN-80
+    /// that bonds 48 GPIO where the Pico 2's RP2350A bonds 30. The bootrom, the memory map and the
+    /// boot block are the die's, so every fact a route states is the Pico 2's. The flash chip
+    /// behind the part is the board's own, and an image is bounded by it rather than by the Pico 2's.
+    #[test]
+    fn both_pimoroni_pico_plus_2s_take_the_pico_2s_two_routes() {
+        for board in ["pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w"] {
+            let row = programmer_for(board).unwrap_or_else(|refusal| panic!("{board}: {refusal}"));
+            assert_eq!(
+                route_for(row, None),
+                Ok(Programmer::Uf2Volume {
+                    family: RP2350_UF2_FAMILY,
+                    base: RP2_XIP_BASE
+                }),
+                "{board}: the bootloader drive, which needs no probe"
+            );
+            assert_eq!(
+                route_for(row, Some("probe")),
+                Ok(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+                "{board}: the probe route, which reads every byte back"
+            );
+            assert_eq!(uf2_family_for_board(board), Some(RP2350_UF2_FAMILY), "{board}");
+            assert_eq!(row.aot_target, Some("rp2350"), "{board}: the die the backend builds for");
+        }
+    }
+
+    /// **A PIMORONI BOARD's IMAGE IS BOUNDED BY ITS OWN 16 MB, NOT BY THE PICO 2's 4 MB.** An ELF
+    /// that runs past 4 MB, which the Pico 2 refuses, fits; one that runs past 16 MB is refused on
+    /// both routes, naming the flash the board states.
+    #[test]
+    fn a_pimoroni_boards_image_is_bounded_by_its_own_flash_and_not_the_pico_2s() {
+        let code = stamped(700);
+        let data = [0xAA_u8; 16];
+        let past_4mb = linked_elf(&[(RP2_XIP_BASE, &code), (RP2_XIP_BASE + 0x40_0000, &data)]);
+        let past_16mb = linked_elf(&[(RP2_XIP_BASE, &code), (RP2_XIP_BASE + 0x100_0000, &data)]);
+        let fits = image_file("plus-2-fit", "fits.elf", &past_4mb);
+        let over = image_file("plus-2-fit", "over.elf", &past_16mb);
+        for board in ["pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w"] {
+            let row = programmer_for(board).unwrap_or_else(|refusal| panic!("{board}: {refusal}"));
+            for via in [None, Some("probe")] {
+                let route = route_for(row, via).expect("a route");
+                prepare_image(&fits, row, route, &placed(row, route))
+                    .unwrap_or_else(|why| panic!("{board} {via:?}: past 4 MB fits 16 MB: {why}"));
+                let error = prepare_image(&over, row, route, &placed(row, route))
+                    .expect_err("larger than the flash");
+                assert!(error.contains("0x11000010"), "{board} {via:?}: where it ends: {error}");
+                assert!(
+                    error.contains("16777216 B of flash"),
+                    "{board} {via:?}: what the board holds: {error}"
+                );
+                assert!(error.contains("-- 16 B too many"), "{board} {via:?}: by how much: {error}");
+            }
         }
     }
 
@@ -2632,5 +2872,192 @@ mod tests {
         let count = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), count, "a board is listed twice: {seen:?}");
+    }
+
+    use lamella_probe_core::{CallFrame, ProbeError};
+
+    /// A probe whose reset line is recorded and whose bring-up can be refused, for the attach that
+    /// holds reset while it brings the wire up.
+    ///
+    /// **ONLY THE BRING-UP AND THE LINE ARE MODELLED.** Everything else refuses, because an attach
+    /// that is refused while it brings the wire up must not go on to touch the part.
+    #[derive(Default)]
+    struct ResetLine {
+        /// Every level the line was driven to, `true` for asserted, in order.
+        driven: Vec<bool>,
+        /// Whether bringing the wire up is refused.
+        connect_refused: bool,
+        /// Whether opening memory access is refused.
+        init_mem_refused: bool,
+    }
+
+    impl ResetLine {
+        /// Whether the line is asserted now: the last level it was driven to.
+        fn held(&self) -> bool {
+            self.driven.last().copied().unwrap_or(false)
+        }
+    }
+
+    fn refused(step: &str) -> ProbeError {
+        ProbeError::Protocol(format!("{step} refused"))
+    }
+
+    impl lamella_probe_core::CoreMemory for ResetLine {
+        fn read_word(&mut self, _address: u32) -> Result<u32, ProbeError> {
+            unreachable!("a refused bring-up reads nothing")
+        }
+        fn write_word(&mut self, _address: u32, _value: u32) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up writes nothing")
+        }
+        fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
+            self.driven.push(assert);
+            Ok(0)
+        }
+    }
+
+    impl lamella_probe_core::TargetAccess for ResetLine {
+        fn connect(&mut self) -> Result<(), ProbeError> {
+            if self.connect_refused { Err(refused("connect")) } else { Ok(()) }
+        }
+        fn init_mem(&mut self) -> Result<(), ProbeError> {
+            if self.init_mem_refused { Err(refused("init_mem")) } else { Ok(()) }
+        }
+        fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
+            lamella_probe_core::CoreMemory::set_reset(self, assert)
+        }
+        fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+            unreachable!("the attach does not read the debug port's id")
+        }
+        fn read_word(&mut self, _address: u32) -> Result<u32, ProbeError> {
+            unreachable!("a refused bring-up reads nothing")
+        }
+        fn write_word(&mut self, _address: u32, _value: u32) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up writes nothing")
+        }
+        fn read_words_into(&mut self, _address: u32, _out: &mut [u32]) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up reads nothing")
+        }
+        fn write_words(&mut self, _address: u32, _words: &[u32]) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up writes nothing")
+        }
+        fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
+            unreachable!("a refused bring-up reads nothing")
+        }
+        fn write_byte(&mut self, _address: u32, _value: u8) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up writes nothing")
+        }
+        fn read_halfword(&mut self, _address: u32) -> Result<u16, ProbeError> {
+            unreachable!("a refused bring-up reads nothing")
+        }
+        fn write_halfword(&mut self, _address: u32, _value: u16) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up writes nothing")
+        }
+        fn halt(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up does not halt the core")
+        }
+        fn resume(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up does not run the core")
+        }
+        fn step(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up does not run the core")
+        }
+        fn is_halted(&mut self) -> Result<bool, ProbeError> {
+            unreachable!("a refused bring-up does not ask")
+        }
+        fn wait_halted(&mut self) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up does not wait")
+        }
+        fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+            unreachable!("the attach drives the line itself")
+        }
+        fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+            unreachable!("the attach drives the line itself")
+        }
+        fn read_core_reg(&mut self, _selector: u8) -> Result<u32, ProbeError> {
+            unreachable!("a refused bring-up reads no register")
+        }
+        fn write_core_reg(&mut self, _selector: u8, _value: u32) -> Result<(), ProbeError> {
+            unreachable!("a refused bring-up writes no register")
+        }
+        fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            unreachable!("the catch is armed only once memory answers")
+        }
+        fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            unreachable!("the catch is armed only once memory answers")
+        }
+        fn set_breakpoint(&mut self, _address: u32) -> Result<(), ProbeError> {
+            unreachable!("an attach plants no breakpoint")
+        }
+        fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+            unreachable!("an attach plants no breakpoint")
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
+            unreachable!("an attach plants no breakpoint")
+        }
+        fn call_target(
+            &mut self,
+            _address: u32,
+            _args: &[u32],
+            _frame: &CallFrame,
+        ) -> Result<u32, ProbeError> {
+            unreachable!("an attach calls nothing on the target")
+        }
+    }
+
+    /// **A TOOL READING AHEAD OF A WRITE HOLDS A PART IN RESET ONLY WHERE THE WRITE DOES.** The two
+    /// cases this exists for: an STM32H7 answers its debug port and refuses memory while it runs,
+    /// so its write attaches under reset; a SAM D21 does not answer its debug port while held, so
+    /// its write attaches plainly and nothing reading it may hold it.
+    #[test]
+    fn a_route_holds_the_core_in_reset_exactly_where_its_write_does() {
+        let row = |board: &str| {
+            PROGRAMMING
+                .iter()
+                .find(|row| row.board == board)
+                .unwrap_or_else(|| panic!("{board} is routed"))
+                .programmer
+        };
+        assert_eq!(
+            row("st-nucleo-h755zi-q").under_reset(),
+            Some(UnderReset { low_power_debug: None }),
+            "an H7's write attaches under reset"
+        );
+        assert_eq!(row("arduino-zero").under_reset(), None, "a SAM D21's write attaches plainly");
+        for row in PROGRAMMING {
+            if let Some(held) = row.programmer.under_reset() {
+                match row.programmer {
+                    Programmer::StlinkOnboard { family, .. } | Programmer::StExternalProbe { family } => {
+                        assert!(family.plan().attach_under_reset, "{}", row.board);
+                        assert_eq!(held.low_power_debug, family.plan().low_power_debug, "{}", row.board);
+                    }
+                    other => panic!("{} attaches plainly and reads as held: {other:?}", row.board),
+                }
+            }
+        }
+    }
+
+    /// **A REFUSED BRING-UP RELEASES THE LINE IT ASSERTED.** The attach holds reset and then brings
+    /// the wire up, and a part whose debug port does not answer while it is held refuses that
+    /// bring-up every time. Returning the refusal with the line still asserted leaves the part held
+    /// in reset, where it answers nothing and looks dead to whoever touches it next.
+    #[test]
+    fn an_attach_refused_while_the_wire_comes_up_releases_the_reset_it_asserted() {
+        for (step, mut probe) in [
+            ("connect", ResetLine { connect_refused: true, ..ResetLine::default() }),
+            ("init_mem", ResetLine { init_mem_refused: true, ..ResetLine::default() }),
+        ] {
+            let refusal = attach_under_reset(&mut probe, None).expect_err("the bring-up is refused");
+            assert_eq!(refusal, refused(step), "the refusal is the step's own");
+            assert_eq!(
+                probe.driven.first(),
+                Some(&true),
+                "the attach asserts reset before it brings the wire up"
+            );
+            assert!(
+                !probe.held(),
+                "a refused {step} left the line asserted: driven {:?}",
+                probe.driven
+            );
+        }
     }
 }

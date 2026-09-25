@@ -1,0 +1,339 @@
+# BLOCK layout: the nRF52833 UART, the LEGACY register-per-byte serial port. It is chosen over UARTE
+# for the reason the legacy TWI and SPI are chosen over TWIM and SPIM: UARTE moves data only through
+# EasyDMA buffer pointers into RAM, while this UART is register-per-byte (TXD/RXD) with TASKS/EVENTS,
+# the polled shape a table-driven driver wants. The product specification marks the instance
+# deprecated -- both in section 6.31's instance table and in the instantiation table (4.2.4) -- and
+# documents it in full; it is instantiated on this part.
+#
+# The peripheral SHARES its ID and its registers with UARTE0 at the same base (ID 2, 4.2.4). ENABLE
+# selects the personality, and disabling a sibling resets none of the shared registers, so a
+# bring-up writes every register it relies on (6.31.3).
+#
+# Transcribed from section 6.31 with the document open. Every bit position was placed from the
+# printed table's column coordinates, and the INTENSET and INTENCLR tables were required to agree.
+# The register map matches the nRF51's UART at every offset both parts have; where this part adds
+# or widens a field, the register below says so.
+
+[table]
+kind = "block"
+family = "nrf52833"
+block = "uart"
+sources = [
+    "Nordic nRF52833 Product Specification 4452_021 v1.7, section 6.31 UART -- Universal asynchronous receiver/transmitter (pp. 718-730): 6.31.1 functional description (and its note that the external crystal oscillator must be enabled for sufficient clock accuracy), 6.31.2 pin configuration with Table 57 GPIO configuration, 6.31.3 shared resources, 6.31.4 transmission, 6.31.5 reception, 6.31.7 error conditions, 6.31.9 parity and stop bit configuration, 6.31.10 registers (instances: UART0 0x40002000, marked deprecated; SHORTS, INTENSET, INTENCLR, ERRORSRC, ENABLE, PSEL.RTS, PSEL.TXD, PSEL.CTS, PSEL.RXD, RXD, TXD, BAUDRATE, CONFIG), 6.31.11 electrical specification; 4.2.4 instantiation (UART0 and UARTE0 at ID 2)",
+    "Nordic nRF52833 Product Specification 4452_021 v1.7, 5.4.1 HFCLK controller (HFINT is used until HFXO is started) and 5.4.4.1 HFINT electrical specification (frequency tolerance typical +-1.5%, maximum +-8%)",
+]
+notes = [
+    "Config envelope: BAUDRATE is ENUMERATED -- eighteen words from 1200 to 1M baud (6.31.10.23), each a BAUDRATE_<rate> constant below, and the specification documents nothing between them. It states each word's ACTUAL rate beside it: 115200 is 115942 baud, 921600 is 941176. It resets to 250000 baud (0x04000000), so a driver writes it unconditionally. A rate with no word here has no documented setting on this part.",
+    "BAUDRATE's accuracy depends on the HFCLK source selected (6.31.10). HFCLK runs from the 64 MHz internal oscillator (HFINT) until the crystal oscillator (HFXO) is started by the CLOCK block's HFCLKSTART task (5.4.1), and HFINT's frequency tolerance reaches +-8% (5.4.4.1). The specification's note to 6.31.1 is that the external crystal oscillator must be enabled to obtain sufficient clock accuracy for stable communication.",
+    "PSEL.RTS, PSEL.TXD, PSEL.CTS and PSEL.RXD are COMPOSED words (6.31.10.17-20): PIN in bits 4:0, PORT in bit 5, CONNECT in bit 31 (0 = connected). Reset 0xFFFFFFFF is disconnected. This part has two GPIO ports, so the port is part of the routing value.",
+    "The PSEL registers are used only while the UART is enabled and retained only in ON mode, and are configured only while the UART is disabled (6.31.2): route pins first, ENABLE last.",
+    "Table 57 GPIO configuration, which holds the pins' levels while the UART is not driving them (in OFF mode, or while it is disabled): TXD an output at 1, RXD an input. PIN_CNF_UART_TXD and PIN_CNF_UART_RXD are those directions with every other PIN_CNF field at its reset value (gpio block, PIN_CNF[n] resets to 0x2: input buffer disconnected, no pull, standard drive, no sensing); OUTSET sets the TXD level before the direction.",
+    "Shared resources (6.31.3): UART0 shares ID 2, and so its registers, with UARTE0. Disabling one does not reset the registers they share, so the bring-up below writes PSEL.RTS, PSEL.CTS and CONFIG rather than trusting their reset values.",
+    "Transmission (6.31.4): STARTTX starts a sequence, each byte is written to TXD, and TXDRDY fires once it is sent, after which the next byte may be written. STOPTX stops the sequence immediately.",
+    "Reception (6.31.5): STARTRX starts a sequence. The receiver holds up to six bytes in a FIFO before data is overwritten; RXDRDY fires each time a byte moves into RXD. Clear RXDRDY BEFORE reading RXD, and read RXD exactly once per RXDRDY: the UART may move the next byte in and raise the event again as soon as RXD is read.",
+    "Frames are one start bit, 8 data bits, an optional parity bit and one or two stop bits (6.31.9). CONFIG selects them: PARITY includes the bit, PARITYTYPE makes it even (0) or odd (1), STOP selects one (0) or two (1) stop bits.",
+    "Errors (6.31.7, 6.31.10.15): EVENTS_ERROR fires with the cause latched in ERRORSRC -- OVERRUN, PARITY, FRAMING, BREAK, each write-1-to-clear. A break always follows a framing error.",
+    "Without hardware flow control (CONFIG.HWFC = 0) the UART behaves as if CTS and RTS were kept active all the time (6.31.8), so PSEL.RTS and PSEL.CTS stay disconnected.",
+    "The maximum rate is 1000 kbps (6.31.11); high rates may need the pins set to high drive (6.31.11, footnote 39).",
+]
+
+[registers.TASKS_STARTRX]
+offset = 0x000
+width = 32
+fields = { TASKS_STARTRX = [0, 1] }
+notes = "Write 1: start the receiver."
+
+[registers.TASKS_STOPRX]
+offset = 0x004
+width = 32
+fields = { TASKS_STOPRX = [0, 1] }
+notes = "Write 1: stop the receiver. Bytes still arriving for a rate-dependent period are received, then RXTO fires (6.31.5)."
+
+[registers.TASKS_STARTTX]
+offset = 0x008
+width = 32
+fields = { TASKS_STARTTX = [0, 1] }
+notes = "Write 1: start the transmitter; bytes are then sent by writing TXD."
+
+[registers.TASKS_STOPTX]
+offset = 0x00C
+width = 32
+fields = { TASKS_STOPTX = [0, 1] }
+notes = "Write 1: stop the transmitter immediately."
+
+[registers.TASKS_SUSPEND]
+offset = 0x01C
+width = 32
+fields = { TASKS_SUSPEND = [0, 1] }
+notes = "Write 1: suspend both directions. A byte in transmission completes first; STARTTX and STARTRX resume (6.31.6)."
+
+[registers.EVENTS_CTS]
+offset = 0x100
+width = 32
+fields = { EVENTS_CTS = [0, 1] }
+notes = "1 = CTS was activated (set low)."
+
+[registers.EVENTS_NCTS]
+offset = 0x104
+width = 32
+fields = { EVENTS_NCTS = [0, 1] }
+notes = "1 = CTS was deactivated (set high)."
+
+[registers.EVENTS_RXDRDY]
+offset = 0x108
+width = 32
+fields = { EVENTS_RXDRDY = [0, 1] }
+notes = "1 = a byte moved into RXD. Write 0 to clear, BEFORE reading RXD (6.31.5)."
+
+[registers.EVENTS_TXDRDY]
+offset = 0x11C
+width = 32
+fields = { EVENTS_TXDRDY = [0, 1] }
+notes = "1 = the TXD byte was sent; the next may be written. Write 0 to clear before writing TXD."
+
+[registers.EVENTS_ERROR]
+offset = 0x124
+width = 32
+fields = { EVENTS_ERROR = [0, 1] }
+notes = "1 = a receive error; the cause is in ERRORSRC."
+
+[registers.EVENTS_RXTO]
+offset = 0x144
+width = 32
+fields = { EVENTS_RXTO = [0, 1] }
+notes = "1 = the receiver timed out after STOPRX (6.31.5)."
+
+# This part adds SHORTS; the nRF51's UART has none. Its two bits sit at 3 and 4, not at 0 and 1.
+[registers.SHORTS]
+offset = 0x200
+width = 32
+fields = { CTS_STARTRX = [3, 1], NCTS_STOPRX = [4, 1] }
+notes = "Hardware event-to-task shortcuts (6.31.10.12): CTS starts the receiver, NCTS stops it. Both 0 at reset; a link without flow control leaves them off."
+
+# No INTEN register at 0x300 on this part: the register overview lists only INTENSET and INTENCLR.
+[registers.INTENSET]
+offset = 0x304
+width = 32
+fields = { CTS = [0, 1], NCTS = [1, 1], RXDRDY = [2, 1], TXDRDY = [7, 1], ERROR = [9, 1], RXTO = [17, 1] }
+notes = "Write 1 to a bit to enable that interrupt; reads return the enabled set (6.31.10.13). The same bit layout as INTENCLR, read from both tables."
+
+[registers.INTENCLR]
+offset = 0x308
+width = 32
+fields = { CTS = [0, 1], NCTS = [1, 1], RXDRDY = [2, 1], TXDRDY = [7, 1], ERROR = [9, 1], RXTO = [17, 1] }
+notes = "Write 1 to a bit to disable that interrupt (6.31.10.14)."
+
+[registers.ERRORSRC]
+offset = 0x480
+width = 32
+fields = { OVERRUN = [0, 1], PARITY = [1, 1], FRAMING = [2, 1], BREAK = [3, 1] }
+notes = "Write 1 to clear each (6.31.10.15). OVERRUN = a start bit arrived while the previous byte still lay in RXD, which is lost; PARITY = bad parity with the check enabled; FRAMING = no valid stop bit; BREAK = RXD held low for longer than a frame (10 bits, 11 with parity)."
+
+# ENABLE is a FOUR-bit field here (bits 3:0), where the nRF51's is three. The enabled value 4 is
+# the same on both parts.
+[registers.ENABLE]
+offset = 0x500
+width = 32
+fields = { ENABLE = [0, 4] }
+notes = "0 = disabled, 4 = UART enabled (6.31.10.16). One register shared with UARTE0, so the value selects the UART, and writing 0 disables them both."
+
+[registers.PSEL_RTS]
+offset = 0x508
+width = 32
+fields = { PIN = [0, 5], PORT = [5, 1], CONNECT = [31, 1] }
+notes = "Reset 0xFFFFFFFF (disconnected). CONNECT 0 = connected. Write only while disabled."
+
+[registers.PSEL_TXD]
+offset = 0x50C
+width = 32
+fields = { PIN = [0, 5], PORT = [5, 1], CONNECT = [31, 1] }
+notes = "Reset 0xFFFFFFFF (disconnected). Write only while disabled."
+
+[registers.PSEL_CTS]
+offset = 0x510
+width = 32
+fields = { PIN = [0, 5], PORT = [5, 1], CONNECT = [31, 1] }
+notes = "Reset 0xFFFFFFFF (disconnected). Write only while disabled."
+
+[registers.PSEL_RXD]
+offset = 0x514
+width = 32
+fields = { PIN = [0, 5], PORT = [5, 1], CONNECT = [31, 1] }
+notes = "Reset 0xFFFFFFFF (disconnected). Write only while disabled."
+
+[registers.RXD]
+offset = 0x518
+width = 32
+fields = { RXD = [0, 8] }
+notes = "The received byte. Cleared on read, which moves the next buffered byte in, so read it once per RXDRDY (6.31.10.21)."
+
+[registers.TXD]
+offset = 0x51C
+width = 32
+fields = { TXD = [0, 8] }
+notes = "The next byte to send (6.31.10.22). Write it only after TXDRDY, or as the first byte after STARTTX."
+
+[registers.BAUDRATE]
+offset = 0x524
+width = 32
+fields = { BAUDRATE = [0, 32] }
+notes = "Enumerated (6.31.10.23): see the BAUDRATE_<rate> constants. Reset 0x04000000 = 250000 baud. Accuracy depends on the HFCLK source selected."
+
+# CONFIG adds STOP (bit 4) and PARITYTYPE (bit 8) to the nRF51's two fields.
+[registers.CONFIG]
+offset = 0x56C
+width = 32
+fields = { HWFC = [0, 1], PARITY = [1, 3], STOP = [4, 1], PARITYTYPE = [8, 1] }
+notes = "HWFC 1 = hardware flow control. PARITY 0x0 = no parity bit, 0x7 = parity bit included. STOP 1 = two stop bits. PARITYTYPE 1 = odd parity (6.31.10.24). 0 in every field is 8 data bits, no parity, one stop bit, no flow control."
+
+[constants]
+ENABLE_DISABLED = 0
+ENABLE_UART = 4
+PSEL_DISCONNECTED = 0xFFFFFFFF
+PARITY_EXCLUDED = 0x0
+PARITY_INCLUDED = 0x7
+ERRORSRC_ALL_W1C = 0xF
+PIN_CNF_UART_TXD = 0x3
+PIN_CNF_UART_RXD = 0x2
+# BAUDRATE words, 6.31.10.23, keyed by the decimal rate so a carrier's `baud` names its word.
+# 921600's word differs from the nRF51's (0x0EBEDFA4 there), and 31250 and 56000 exist only here.
+BAUDRATE_1200 = 0x0004F000
+BAUDRATE_2400 = 0x0009D000
+BAUDRATE_4800 = 0x0013B000
+BAUDRATE_9600 = 0x00275000
+BAUDRATE_14400 = 0x003B0000
+BAUDRATE_19200 = 0x004EA000
+BAUDRATE_28800 = 0x0075F000
+BAUDRATE_31250 = 0x00800000
+BAUDRATE_38400 = 0x009D5000
+BAUDRATE_56000 = 0x00E50000
+BAUDRATE_57600 = 0x00EBF000
+BAUDRATE_76800 = 0x013A9000
+BAUDRATE_115200 = 0x01D7E000
+BAUDRATE_230400 = 0x03AFB000
+BAUDRATE_250000 = 0x04000000
+BAUDRATE_460800 = 0x075F7000
+BAUDRATE_921600 = 0x0EBED000
+BAUDRATE_1000000 = 0x10000000
+
+[parameters]
+psel_txd = "The PSEL.TXD routing word (a board binding's resolved value: PIN | PORT << 5, CONNECT 0)."
+psel_rxd = "The PSEL.RXD routing word."
+baudrate = "The BAUDRATE word for the link's rate."
+tx_byte = "The byte to send."
+
+# Bring-up (6.31.2, 6.31.3): route the pins and set the frame while disabled, enable, then start
+# both directions. Every register the link relies on is written, because UARTE0 shares them.
+
+[[sequences.enable]]
+op = "write"
+reg = "ENABLE"
+value = 0x0
+note = "disables UART0 and UARTE0 alike; the PSEL registers may be configured only while disabled"
+
+[[sequences.enable]]
+op = "write"
+reg = "PSEL_TXD"
+value = "$psel_txd"
+
+[[sequences.enable]]
+op = "write"
+reg = "PSEL_RXD"
+value = "$psel_rxd"
+
+[[sequences.enable]]
+op = "write"
+reg = "PSEL_RTS"
+value = 0xFFFFFFFF
+note = "no flow control: RTS and CTS disconnected, written because a sibling may have left them routed"
+
+[[sequences.enable]]
+op = "write"
+reg = "PSEL_CTS"
+value = 0xFFFFFFFF
+
+[[sequences.enable]]
+op = "write"
+reg = "BAUDRATE"
+value = "$baudrate"
+
+[[sequences.enable]]
+op = "write"
+reg = "CONFIG"
+value = 0x0
+note = "8 data bits, no parity, one stop bit, no flow control"
+
+[[sequences.enable]]
+op = "write"
+reg = "SHORTS"
+value = 0x0
+
+[[sequences.enable]]
+op = "write"
+reg = "ENABLE"
+value = 0x4
+
+[[sequences.enable]]
+op = "write"
+reg = "TASKS_STARTTX"
+value = 0x1
+
+[[sequences.enable]]
+op = "write"
+reg = "TASKS_STARTRX"
+value = 0x1
+
+# One byte out (6.31.4): clear the event, write TXD, wait for it to be sent.
+
+[[sequences.write_byte]]
+op = "write"
+reg = "EVENTS_TXDRDY"
+value = 0x0
+
+[[sequences.write_byte]]
+op = "write"
+reg = "TXD"
+value = "$tx_byte"
+
+[[sequences.write_byte]]
+op = "poll"
+reg = "EVENTS_TXDRDY"
+mask = 0x1
+note = "the byte was sent; the next may be written"
+
+# One byte in (6.31.5): wait for it, clear the event BEFORE the read, read RXD once.
+
+[[sequences.read_byte]]
+op = "poll"
+reg = "EVENTS_RXDRDY"
+mask = 0x1
+
+[[sequences.read_byte]]
+op = "write"
+reg = "EVENTS_RXDRDY"
+value = 0x0
+note = "before reading RXD, so a byte moved in by the read raises a new event rather than being missed"
+
+[[sequences.read_byte]]
+op = "read"
+reg = "RXD"
+mask = 0xFF
+note = "exactly one read per RXDRDY"
+
+# Error epilogue (6.31.7): on EVENTS_ERROR, read and clear the cause.
+
+[[sequences.error_recover]]
+op = "write"
+reg = "EVENTS_ERROR"
+value = 0x0
+
+[[sequences.error_recover]]
+op = "read"
+reg = "ERRORSRC"
+note = "OVERRUN bit 0 / PARITY bit 1 / FRAMING bit 2 / BREAK bit 3"
+
+[[sequences.error_recover]]
+op = "write"
+reg = "ERRORSRC"
+value = 0xF
+note = "write-1-to-clear"

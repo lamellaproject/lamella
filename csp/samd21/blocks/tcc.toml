@@ -1,0 +1,159 @@
+# The TCC (Timer/Counter for Control applications) on the Microchip SAMD21 family -- the BLOCK
+# layout: register offsets are instance-relative; nothing in this file names a board, a pin wiring
+# or a clock plan. The instances live in ../instances.toml, each with its compare channels, its
+# waveform outputs, its counter size and its generic clock's ceiling; which outputs a board wires
+# lives in bsp/<board>/board.toml.
+#
+# Every offset is read from the register summary 31.7 and every bit position from the register's
+# OWN description (31.8.1 to 31.8.22), by word coordinates on the page. PARTIAL: the registers the
+# single-slope PWM a board binds uses, and the ones a test reads to observe it.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "tcc"
+sources = [
+    "SAMD21 datasheet DS40001882D chapter 31 (TCC): the register summary 31.7 (pp. 742-744); 31.8.1 CTRLA (p745), 31.8.2 CTRLBCLR (p748), 31.8.3 CTRLBSET (p750), 31.8.4 SYNCBUSY (p752), 31.8.8 DBGCTRL (p760), 31.8.12 INTFLAG (p770), 31.8.13 STATUS (p773), 31.8.14 COUNT (p776), 31.8.16 WAVE (p778), 31.8.17 PER (p780), 31.8.18 CC (p782), 31.8.21 PERB (p787), 31.8.22 CCB (p789)",
+    "DS40001882D 31.6.2.5.1 and 31.6.2.5.5 (TOP, and single-slope PWM, pp. 714-716), Table 31-3 (the output in single-slope PWM, p717), 31.6.2.6 (double buffering, p718), 31.6.2.1 and 31.6.2.2 (enable protection and reset, pp. 709-710), 31.6.6 (synchronization, pp. 740-741), Table 31-4 and its note (the output matrix, p733)",
+]
+notes = [
+    "Single-slope PWM is WAVE.WAVEGEN = NPWM: TOP is PER, and the counter counts up from zero to TOP and wraps (31.6.2.5.1). With POL at 0, an output is set at TOP and cleared when the counter matches its channel's CCx (Table 31-3), so the output is high for CCx counts of every TOP + 1.",
+    "f_PWM = f_GCLK_TCC / (N (TOP + 1)), where N is the prescaler's division, one of 1, 2, 4, 8, 16, 64, 256 or 1024 (31.6.2.5.5). The PRESCALER_DIV<n> constants name each code by its division.",
+    "WHICH CHANNEL DRIVES WHICH OUTPUT: with WEXCTRL.OTMX at its default 0, channel n drives WO[n], and an instance with more outputs than channels repeats channel 0 on WO[CC_NUM], channel 1 on WO[CC_NUM + 1] and so on (Table 31-4 note). The instance rows state each instance's cc_count and wo_count.",
+    "DOUBLE BUFFERED: a write to PERB or CCBx is copied into PER or CCx at the next UPDATE -- the counter's wraparound in NPWM -- while CTRLB.LUPD is 0 (31.6.2.6). A duty or period change made there never lands mid-period.",
+    "Write-synchronized (31.6.6): CTRLA.SWRST and ENABLE, CTRLBCLR and CTRLBSET, STATUS, COUNT, PATT and PATTB, WAVE and WAVEB, PER and PERB, CCx and CCBx. Each has its SYNCBUSY bit; a second write to a register whose synchronization is still running is discarded (14.3.2.2), so a writer waits for its bit.",
+    "COUNT is read by first writing CTRLBSET.CMD = READSYNC (31.8.14). The command runs on the next prescaled clock, and CMD reads back 0 once it has.",
+    "Enable-protected (31.6.2.1): CTRLA except ENABLE, SWRST and RUNSTDBY, and FCTRLA, FCTRLB, WEXCTRL, DRVCTRL and EVCTRL. CTRLA's enable-protected bits may be written in the same write that sets ENABLE, but not in one that clears it. The TCC should be disabled before it is reset (31.6.2.2).",
+    "A 16-bit TCC reads its counter's excess bits as zero (31.8.17, 31.8.18); the instance row's counter_bits says which size each is.",
+    "DEBUG: DBGCTRL.DBGRUN at 0 halts the TCC while the device is halted in debug mode. The bit survives a software reset and must not be changed while the TCC is enabled (31.8.8). A driver leaves it as found; a test that runs with the core halted sets it first.",
+]
+
+[registers.CTRLA]
+offset = 0x00
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], RESOLUTION = [5, 2], PRESCALER = [8, 3], RUNSTDBY = [11, 1], PRESCSYNC = [12, 2], ALOCK = [14, 1], CPTEN0 = [24, 1], CPTEN1 = [25, 1], CPTEN2 = [26, 1], CPTEN3 = [27, 1] }
+notes = "SWRST and ENABLE are write-synchronized. PRESCALER per the PRESCALER_DIV<n> constants; RESOLUTION 0 is no dithering. The page prints PRESCSYNC as PRESCYNC."
+
+[registers.CTRLBCLR]
+offset = 0x04
+width = 8
+fields = { DIR = [0, 1], LUPD = [1, 1], ONESHOT = [2, 1], IDXCMD = [3, 2], CMD = [5, 3] }
+notes = "Write one to clear a bit. Write-synchronized."
+
+[registers.CTRLBSET]
+offset = 0x05
+width = 8
+fields = { DIR = [0, 1], LUPD = [1, 1], ONESHOT = [2, 1], IDXCMD = [3, 2], CMD = [5, 3] }
+notes = "Write one to set a bit, or a command into CMD (the CMD_* constants). Write-synchronized."
+
+[registers.SYNCBUSY]
+offset = 0x08
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], CTRLB = [2, 1], STATUS = [3, 1], COUNT = [4, 1], PATT = [5, 1], WAVE = [6, 1], PER = [7, 1], CC0 = [8, 1], CC1 = [9, 1], CC2 = [10, 1], CC3 = [11, 1], PATTB = [16, 1], WAVEB = [17, 1], PERB = [18, 1], CCB0 = [19, 1], CCB1 = [20, 1], CCB2 = [21, 1], CCB3 = [22, 1] }
+notes = "Read-only. A bit is set while its register's synchronization runs. CCx and CCBx exist only for the instance's compare channels."
+
+[registers.DBGCTRL]
+offset = 0x1E
+width = 8
+fields = { DBGRUN = [0, 1], FDDBD = [2, 1] }
+notes = "DBGRUN 1: the TCC keeps running while the device is halted in debug mode."
+
+[registers.INTFLAG]
+offset = 0x2C
+width = 32
+fields = { OVF = [0, 1], TRG = [1, 1], CNT = [2, 1], ERR = [3, 1], UFS = [10, 1], DFS = [11, 1], FAULTA = [12, 1], FAULTB = [13, 1], FAULT0 = [14, 1], FAULT1 = [15, 1], MC0 = [16, 1], MC1 = [17, 1], MC2 = [18, 1], MC3 = [19, 1] }
+notes = "Write one to clear a flag. OVF is set at each UPDATE, which in NPWM is the counter's wraparound."
+
+[registers.STATUS]
+offset = 0x30
+width = 32
+fields = { STOP = [0, 1], IDX = [1, 1], UFS = [2, 1], DFS = [3, 1], PATTBV = [5, 1], WAVEBV = [6, 1], PERBV = [7, 1], FAULTAIN = [8, 1], FAULTBIN = [9, 1], FAULT0IN = [10, 1], FAULT1IN = [11, 1], FAULTA = [12, 1], FAULTB = [13, 1], FAULT0 = [14, 1], FAULT1 = [15, 1], CCBV0 = [16, 1], CCBV1 = [17, 1], CCBV2 = [18, 1], CCBV3 = [19, 1], CMP0 = [24, 1], CMP1 = [25, 1], CMP2 = [26, 1], CMP3 = [27, 1] }
+notes = "STOP resets to 1 and reads 0 while the counter runs. PERBV and CCBVx are set while a buffered value waits for UPDATE."
+
+[registers.COUNT]
+offset = 0x34
+width = 32
+fields = { COUNT = [0, 24] }
+notes = "Write CTRLBSET.CMD = READSYNC before a read. A 16-bit TCC reads bits 23:16 as zero."
+
+[registers.WAVE]
+offset = 0x3C
+width = 32
+fields = { WAVEGEN = [0, 3], RAMP = [4, 2], CIPEREN = [7, 1], CICCEN0 = [8, 1], CICCEN1 = [9, 1], CICCEN2 = [10, 1], CICCEN3 = [11, 1], POL0 = [16, 1], POL1 = [17, 1], POL2 = [18, 1], POL3 = [19, 1], SWAP0 = [24, 1], SWAP1 = [25, 1], SWAP2 = [26, 1], SWAP3 = [27, 1] }
+notes = "Write-synchronized. WAVEGEN per the WAVEGEN_* constants."
+
+[registers.PER]
+offset = 0x40
+width = 32
+fields = { PER = [0, 24] }
+notes = "TOP in NPWM. Bits 23:0 with dithering off (RESOLUTION 0); the page draws the field for 6-bit dithering, as PER[17:0] above DITHER[5:0]. Resets to all ones. Write-synchronized."
+
+[registers.CC0]
+offset = 0x44
+width = 32
+fields = { CC = [0, 24] }
+notes = "Channel 0's compare value; channel n's is at CC0_OFF + n * CC_STRIDE. Write-synchronized."
+
+[registers.CC1]
+offset = 0x48
+width = 32
+fields = { CC = [0, 24] }
+
+[registers.CC2]
+offset = 0x4C
+width = 32
+fields = { CC = [0, 24] }
+
+[registers.CC3]
+offset = 0x50
+width = 32
+fields = { CC = [0, 24] }
+
+[registers.PERB]
+offset = 0x6C
+width = 32
+fields = { PERB = [0, 24] }
+notes = "The period's buffer, copied into PER at the next UPDATE. Write-synchronized."
+
+[registers.CCB0]
+offset = 0x70
+width = 32
+fields = { CCB = [0, 24] }
+notes = "Channel 0's compare buffer, copied into CC0 at the next UPDATE; channel n's is at CCB0_OFF + n * CC_STRIDE."
+
+[registers.CCB1]
+offset = 0x74
+width = 32
+fields = { CCB = [0, 24] }
+
+[registers.CCB2]
+offset = 0x78
+width = 32
+fields = { CCB = [0, 24] }
+
+[registers.CCB3]
+offset = 0x7C
+width = 32
+fields = { CCB = [0, 24] }
+
+[constants]
+PRESCALER_DIV1 = 0
+PRESCALER_DIV2 = 1
+PRESCALER_DIV4 = 2
+PRESCALER_DIV8 = 3
+PRESCALER_DIV16 = 4
+PRESCALER_DIV64 = 5
+PRESCALER_DIV256 = 6
+PRESCALER_DIV1024 = 7
+PRESCSYNC_GCLK = 0
+PRESCSYNC_PRESC = 1
+PRESCSYNC_RESYNC = 2
+WAVEGEN_NFRQ = 0
+WAVEGEN_MFRQ = 1
+WAVEGEN_NPWM = 2
+CMD_NONE = 0
+CMD_RETRIGGER = 1
+CMD_STOP = 2
+CMD_UPDATE = 3
+CMD_READSYNC = 4
+CC_STRIDE = 4

@@ -417,6 +417,10 @@ impl DebugBackend for InterpreterBackend {
             .collect()
     }
 
+    fn can_set_variables(&self) -> bool {
+        true
+    }
+
     fn set_variable(
         &mut self,
         frame_index: usize,

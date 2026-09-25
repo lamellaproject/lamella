@@ -1,6 +1,7 @@
 //! The backend driven against a fake target, so the sequence is checked without a board.
 
 use super::*;
+use crate::placement::{BootloaderChoice, Placement, ShippedBootloader};
 use lamella_flash_backend::{Allow, Verification, VerifyPolicy, flash};
 use lamella_probe_core::ProbeError;
 
@@ -145,8 +146,10 @@ impl TargetAccess for FakeTarget {
     fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
         unreachable!("breakpoints are not the flashing path")
     }
-    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-        unreachable!("breakpoints are not the flashing path")
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
     }
     fn call_target(
         &mut self,
@@ -194,6 +197,7 @@ fn a_real_parts_primitives_compose_into_the_contracts_order() {
             "erase_all",
             "write_words",
             "read_words_into",
+            "clear_breakpoints",
             "reset_and_run",
         ],
         "identify reads before init_mem/halt, and the read-back precedes the reset"
@@ -516,8 +520,10 @@ impl TargetAccess for FakeL0 {
     fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
         unreachable!("breakpoints are not the flashing path")
     }
-    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-        unreachable!("breakpoints are not the flashing path")
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
     }
     fn call_target(
         &mut self,
@@ -583,6 +589,11 @@ fn the_l0_primitives_compose_into_the_contracts_order() {
     assert!(
         program < run,
         "the part is released only after it has been written"
+    );
+    assert_eq!(
+        &log[run - 1..],
+        ["clear_breakpoints", "reset_and_run"],
+        "no breakpoint a debug session left armed outlives the reset that starts the image"
     );
     assert!(
         !log.contains(&"notzeroerr"),
@@ -1458,8 +1469,10 @@ impl TargetAccess for FakeC0 {
     fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
         unreachable!("breakpoints are not the flashing path")
     }
-    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-        unreachable!("breakpoints are not the flashing path")
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
     }
     fn call_target(
         &mut self,
@@ -1936,8 +1949,10 @@ impl TargetAccess for FakeSam4l {
     fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
         unreachable!("breakpoints are not the flashing path")
     }
-    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-        unreachable!("breakpoints are not the flashing path")
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
     }
     fn call_target(
         &mut self,
@@ -1989,6 +2004,7 @@ fn the_sam4l_primitives_compose_into_the_contracts_order() {
             "clear_page_buffer",
             "write_page",
             "invalidate_cache",
+            "clear_breakpoints",
             "reset_and_run",
         ],
         "{:?}",
@@ -2529,8 +2545,10 @@ impl TargetAccess for FakeSam3x {
     fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
         unreachable!("breakpoints are not the flashing path")
     }
-    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-        unreachable!("breakpoints are not the flashing path")
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
     }
     fn call_target(
         &mut self,
@@ -2571,6 +2589,7 @@ fn the_sam3x_erase_step_erases_nothing_and_the_write_does_it_per_page() {
             "ggpb", "getd0", "glb0",
             "ewp0:0",
             "ewp0:1",
+            "clear_breakpoints",
             "reset_and_run",
         ],
         "{:?}",
@@ -3062,8 +3081,10 @@ impl TargetAccess for FakeSam4sDual {
     fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
         unreachable!("breakpoints are not the flashing path")
     }
-    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-        unreachable!("breakpoints are not the flashing path")
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
     }
     fn call_target(
         &mut self,
@@ -3103,7 +3124,7 @@ fn the_dual_plane_sam4s_erases_in_blocks_then_writes_in_pages() {
             "ggpb", "getd0", "glb0",
             "halt", "epa0:0",
             "ggpb", "getd0", "glb0",
-            "wp0:0", "wp0:1", "reset_and_run",
+            "wp0:0", "wp0:1", "clear_breakpoints", "reset_and_run",
         ],
         "{:?}",
         backend.target.log
@@ -3636,8 +3657,10 @@ impl TargetAccess for FakeF7 {
     fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
         unreachable!("breakpoints are not the flashing path")
     }
-    fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-        unreachable!("breakpoints are not the flashing path")
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
     }
     fn call_target(
         &mut self,
@@ -3966,4 +3989,588 @@ fn only_the_bootloader_that_answers_early_waits_after_a_second_bank_erase() {
             );
         }
     }
+}
+
+
+/// The NVMCTRL registers the chip crate's `Samd21Flash` drives (DS40001882D 22.8).
+const D21_CTRLA: u32 = 0x4100_4000;
+const D21_CTRLB: u32 = 0x4100_4004;
+const D21_PARAM: u32 = 0x4100_4008;
+const D21_INTFLAG: u32 = 0x4100_4014;
+const D21_STATUS: u32 = 0x4100_4018;
+const D21_ADDR: u32 = 0x4100_401c;
+const D21_LOCK: u32 = 0x4100_4020;
+const D21_CMDEX: u32 = 0xa500;
+const D21_CMD_ER: u32 = 0x02;
+const D21_CMD_WP: u32 = 0x04;
+const D21_CMD_PBC: u32 = 0x44;
+const D21_CTRLB_MANW: u32 = 1 << 7;
+const D21_STATUS_LOCKE: u32 = 1 << 3;
+/// The DSU's DID (DS40001882D 13.13.9).
+const D21_DSU_DID: u32 = 0x4100_2018;
+/// The NVM user row (DS40001882D 10.3.1).
+const D21_USER_ROW: u32 = 0x0080_4000;
+/// An ATSAMD21G18A, as an Arduino Zero's DSU answers.
+const D21_ZERO_DID: u32 = 0x1001_0305;
+/// 4096 pages of 64 bytes: NVMP in bits 15:0 and PSZ = 3 in bits 18:16.
+const D21_ZERO_PARAM: u32 = (3 << 16) | 4096;
+const D21_FLASH_BYTES: usize = 256 * 1024;
+const D21_PAGE: usize = 64;
+const D21_ROW: usize = 256;
+/// The first word of an Arduino Zero's user row, with BOOTPROT at 7: nothing protected.
+const D21_ZERO_ROW_WORD0: u32 = 0xd8e0_c7ff;
+/// A bootloader's vector table: the stack at the top of SRAM less the one word the Zero's
+/// bootloader keeps across a reset, and a reset handler inside its 8 KB.
+const D21_BOOTLOADER_TABLE: [u32; 2] = [0x2000_7ffc, 0x0000_0135];
+/// An image that runs from address zero on its own: its reset handler is at 0x2A88, past the
+/// bootloader's 8 KB.
+const D21_OTHER_IMAGE_TABLE: [u32; 2] = [0x2000_8000, 0x0000_2a89];
+
+/// A SAM D21's main array, user row and NVMCTRL, as the chip crate's `Samd21Flash` drives them.
+struct FakeSamd21 {
+    flash: Vec<u8>,
+    user_row: [u32; 64],
+    buffer: [u8; D21_PAGE],
+    addr: u32,
+    ctrlb: u32,
+    status: u32,
+    /// NVMCTRL.LOCK as it stands: bit n is region n, and 0 locks it.
+    lock: u16,
+    halted: bool,
+    /// Every command, halt and reset, in order, with the address each command acted on.
+    log: Vec<String>,
+}
+
+impl FakeSamd21 {
+    /// An Arduino Zero whose flash is erased except for `table` at 0x0 and a bootloader's 8 KB
+    /// behind it, when a table is given, and whose BOOTPROT is `bootprot`.
+    fn zero(table: Option<[u32; 2]>, bootprot: u32) -> Self {
+        let mut flash = vec![0xff; D21_FLASH_BYTES];
+        if let Some([stack, reset]) = table {
+            flash[0..4].copy_from_slice(&stack.to_le_bytes());
+            flash[4..8].copy_from_slice(&reset.to_le_bytes());
+            flash[8..0x2000].fill(0xb0);
+        }
+        let mut user_row = [u32::MAX; 64];
+        user_row[0] = (D21_ZERO_ROW_WORD0 & !0b111) | bootprot;
+        user_row[1] = 0xffff_fc5d;
+        FakeSamd21 {
+            flash,
+            user_row,
+            buffer: [0xff; D21_PAGE],
+            addr: 0,
+            ctrlb: 0,
+            status: 0,
+            lock: 0xffff,
+            halted: false,
+            log: Vec::new(),
+        }
+    }
+
+    /// Whether the row or page at `at` sits in a locked region and outside the rows the EEPROM
+    /// field reserves at the top of the array (DS40001882D 22.6.3 and Table 22-3).
+    fn locked(&self, at: usize) -> bool {
+        let eeprom = match (self.user_row[0] >> 4) & 0b111 {
+            7 => 0,
+            6 => 256,
+            5 => 512,
+            4 => 1024,
+            3 => 2048,
+            2 => 4096,
+            1 => 8192,
+            _ => 16384,
+        };
+        let region = at / (D21_FLASH_BYTES / 16);
+        self.lock & (1 << region) == 0 && at < D21_FLASH_BYTES - eeprom
+    }
+
+    /// How many bytes from address zero BOOTPROT protects (DS40001882D Table 22-2).
+    fn protected(&self) -> usize {
+        match self.user_row[0] & 0b111 {
+            7 => 0,
+            6 => 512,
+            5 => 1024,
+            4 => 2048,
+            3 => 4096,
+            2 => 8192,
+            1 => 16384,
+            _ => 32768,
+        }
+    }
+
+    fn command(&mut self, value: u32) -> Result<(), ProbeError> {
+        if value & 0xff00 != D21_CMDEX {
+            return Err(ProbeError::Device("a command without the CMDEX key"));
+        }
+        let at = self.addr as usize * 2;
+        match value & 0x7f {
+            D21_CMD_ER => {
+                let row = at & !(D21_ROW - 1);
+                if row >= D21_FLASH_BYTES {
+                    return Err(ProbeError::Device("an erase past the array"));
+                }
+                if row < self.protected() || self.locked(row) {
+                    self.status |= D21_STATUS_LOCKE;
+                    self.log.push(format!("ER {row:#x} refused"));
+                } else {
+                    self.flash[row..row + D21_ROW].fill(0xff);
+                    self.log.push(format!("ER {row:#x}"));
+                }
+            }
+            D21_CMD_WP => {
+                let page = at & !(D21_PAGE - 1);
+                if page >= D21_FLASH_BYTES {
+                    return Err(ProbeError::Device("a page write past the array"));
+                }
+                if page < self.protected() || self.locked(page) {
+                    self.status |= D21_STATUS_LOCKE;
+                    self.log.push(format!("WP {page:#x} refused"));
+                } else {
+                    for (cell, fill) in self.flash[page..page + D21_PAGE].iter_mut().zip(self.buffer)
+                    {
+                        *cell &= fill;
+                    }
+                    self.log.push(format!("WP {page:#x}"));
+                }
+                self.buffer = [0xff; D21_PAGE];
+            }
+            D21_CMD_PBC => self.buffer = [0xff; D21_PAGE],
+            _ => return Err(ProbeError::Device("a command this fake does not model")),
+        }
+        Ok(())
+    }
+}
+
+impl TargetAccess for FakeSamd21 {
+    fn connect(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+        Ok(0x0bc1_1477)
+    }
+    fn init_mem(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+        let at = address as usize;
+        match address {
+            D21_DSU_DID => Ok(D21_ZERO_DID),
+            D21_PARAM => Ok(D21_ZERO_PARAM),
+            D21_INTFLAG => Ok(1),
+            D21_STATUS => Ok(self.status),
+            D21_CTRLB => Ok(self.ctrlb),
+            D21_LOCK => Ok(u32::from(self.lock)),
+            _ if at.is_multiple_of(4) && at + 4 <= D21_FLASH_BYTES => Ok(u32::from_le_bytes(
+                self.flash[at..at + 4].try_into().expect("a word"),
+            )),
+            _ if (D21_USER_ROW..D21_USER_ROW + 256).contains(&address) => {
+                Ok(self.user_row[((address - D21_USER_ROW) / 4) as usize])
+            }
+            _ => Err(ProbeError::Device("a read this fake does not model")),
+        }
+    }
+    fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        let at = address as usize;
+        match address {
+            D21_CTRLA => self.command(value)?,
+            D21_ADDR => self.addr = value & 0x003f_ffff,
+            D21_CTRLB => self.ctrlb = value,
+            D21_STATUS => self.status &= !value,
+            _ if at.is_multiple_of(4) && at + 4 <= D21_FLASH_BYTES => {
+                if self.ctrlb & D21_CTRLB_MANW == 0 {
+                    return Err(ProbeError::Device("a page-buffer write in automatic-write mode"));
+                }
+                let offset = at % D21_PAGE;
+                self.buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            _ => return Err(ProbeError::Device("a write this fake does not model")),
+        }
+        Ok(())
+    }
+    fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+        for (index, word) in out.iter_mut().enumerate() {
+            *word = self.read_word(address + 4 * index as u32)?;
+        }
+        Ok(())
+    }
+    fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
+        for (index, word) in words.iter().enumerate() {
+            self.write_word(address + 4 * index as u32, *word)?;
+        }
+        Ok(())
+    }
+    fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn write_byte(&mut self, _address: u32, _value: u8) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn read_halfword(&mut self, _address: u32) -> Result<u16, ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn write_halfword(&mut self, _address: u32, _value: u16) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn halt(&mut self) -> Result<(), ProbeError> {
+        self.halted = true;
+        self.log.push("halt".to_owned());
+        Ok(())
+    }
+    fn resume(&mut self) -> Result<(), ProbeError> {
+        self.halted = false;
+        self.log.push("resume".to_owned());
+        Ok(())
+    }
+    fn step(&mut self) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn is_halted(&mut self) -> Result<bool, ProbeError> {
+        Ok(self.halted)
+    }
+    fn wait_halted(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.halted = false;
+        self.log.push("reset_and_run".to_owned());
+        Ok(())
+    }
+    fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+        Err(ProbeError::Device("the reset line is not used on this path"))
+    }
+    fn read_core_reg(&mut self, _selector: u8) -> Result<u32, ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn write_core_reg(&mut self, _selector: u8, _value: u32) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn set_breakpoint(&mut self, _address: u32) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        self.log.push("clear_breakpoints".into());
+        Ok(())
+    }
+    fn call_target(
+        &mut self,
+        _address: u32,
+        _args: &[u32],
+        _frame: &lamella_probe_core::CallFrame,
+    ) -> Result<u32, ProbeError> {
+        Err(ProbeError::Device("not modelled"))
+    }
+}
+
+/// Where the Zero's write puts an image when it keeps, or replaces, its bootloader: the board's
+/// own facts, so these tests move with them.
+fn zero_placement(choice: BootloaderChoice) -> Placement {
+    let row = crate::programmer_for("arduino-zero").expect("the Zero is routed");
+    crate::placement::placement_for(row, row.programmer, choice)
+        .expect("the Zero states its bootloader")
+}
+
+fn samd21_backend(part: FakeSamd21, placement: &Placement) -> SamProbe<FakeSamd21> {
+    SamProbe::new(part, crate::SamFamily::Samd21, SAM_TEST_MECHANISM).placed(placement)
+}
+
+/// An image of `length` bytes that is neither erased flash nor the bootloader's filler.
+fn d21_image(length: usize) -> Vec<u8> {
+    (0..length).map(|index| (index % 251) as u8).collect()
+}
+
+/// Behind a kept bootloader the image is written from where the bootloader ends and read back,
+/// and the bootloader's 8 KB are byte for byte as they were.
+#[test]
+fn behind_a_kept_bootloader_the_image_is_written_and_the_bootloader_is_untouched() {
+    let placement = zero_placement(BootloaderChoice::Keep);
+    let part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7);
+    let bootloader = part.flash[..0x2000].to_vec();
+    let mut backend = samd21_backend(part, &placement);
+    let bytes = d21_image(1000);
+    let image = Image { bytes: &bytes, base: placement.base() };
+    let report = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any).expect("written");
+    assert_eq!(report.base, 0x2000);
+    assert_eq!(report.verification, Verification::ReadBack);
+    let part = &backend.target;
+    assert!(part.flash[..0x2000] == bootloader[..], "the bootloader's rows are untouched");
+    assert!(part.flash[0x2000..0x2000 + 1000] == bytes[..], "the image is behind them");
+    let erased: Vec<&str> = part
+        .log
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.starts_with("ER"))
+        .collect();
+    assert_eq!(erased, ["ER 0x2000", "ER 0x2100", "ER 0x2200", "ER 0x2300"], "{:?}", part.log);
+    assert_eq!(part.log.first().map(String::as_str), Some("halt"), "{:?}", part.log);
+    assert_eq!(part.log.last().map(String::as_str), Some("reset_and_run"), "{:?}", part.log);
+}
+
+/// A write that keeps a bootloader the part does not hold is refused before anything is halted or
+/// erased: erased flash, an image that runs from zero on its own, and a table no core would take.
+#[test]
+fn a_kept_bootloader_the_part_does_not_hold_is_refused_before_anything_is_erased() {
+    let placement = zero_placement(BootloaderChoice::Keep);
+    let cases = [
+        (None, "the flash at 0x00000000 is erased"),
+        (
+            Some(D21_OTHER_IMAGE_TABLE),
+            "starts code at 0x00002a88, outside the bootloader's 8192 bytes",
+        ),
+        (Some([0, 0]), "without bit 0 set"),
+    ];
+    for (table, expected) in cases {
+        let part = FakeSamd21::zero(table, 7);
+        let before = part.flash.clone();
+        let mut backend = samd21_backend(part, &placement);
+        let bytes = d21_image(1000);
+        let image = Image { bytes: &bytes, base: placement.base() };
+        let why = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
+            .expect_err("no bootloader to keep")
+            .to_string();
+        assert!(why.contains(expected), "{expected:?} in {why}");
+        assert!(why.contains("Arduino Zero Bootloader at 0x00000000-0x00001fff"), "{why}");
+        assert!(why.contains("Nothing was erased") && why.contains("--replace-bootloader"), "{why}");
+        assert!(backend.target.log.is_empty(), "no halt, no command: {:?}", backend.target.log);
+        assert!(backend.target.flash == before, "{expected}: the flash is as it was");
+    }
+}
+
+/// Over the bootloader, the image is written from the start of flash, and a replace erases the
+/// rows the image covers and no more.
+#[test]
+fn over_the_bootloader_the_image_is_written_from_the_start_of_flash() {
+    let placement = zero_placement(BootloaderChoice::Replace);
+    let part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7);
+    let mut backend = samd21_backend(part, &placement);
+    let bytes = d21_image(600);
+    let image = Image { bytes: &bytes, base: placement.base() };
+    let report = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any).expect("written");
+    assert_eq!(report.base, 0);
+    let part = &backend.target;
+    assert!(part.flash[..600] == bytes[..], "the image is at the start of flash");
+    assert!(part.flash[600..768].iter().all(|&byte| byte == 0xff), "its last row, erased");
+    assert!(part.flash[768..0x2000].iter().all(|&byte| byte == 0xb0), "the rest, untouched");
+}
+
+/// An image that starts in the rows BOOTPROT protects is refused before anything is halted or
+/// erased, on a write placed either way and on a write that was not placed at all. Rows it
+/// protects that are all in front of the image are no obstacle.
+#[test]
+fn an_image_starting_in_rows_bootprot_protects_is_refused_before_anything_is_erased() {
+    let over = zero_placement(BootloaderChoice::Replace);
+    let keep = zero_placement(BootloaderChoice::Keep);
+    let cases = [
+        (Some(&over), 2, true),
+        (None, 2, true),
+        (Some(&keep), 2, false),
+        (Some(&keep), 1, true),
+    ];
+    for (placement, bootprot, refused) in cases {
+        let part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), bootprot);
+        let before = part.flash.clone();
+        let mut backend = match placement {
+            Some(placement) => samd21_backend(part, placement),
+            None => SamProbe::new(part, crate::SamFamily::Samd21, SAM_TEST_MECHANISM),
+        };
+        let bytes = d21_image(1000);
+        let image = Image { bytes: &bytes, base: backend.flash_base() };
+        let outcome = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any);
+        let case = format!("BOOTPROT {bootprot}, from {:#x}", image.base);
+        if refused {
+            let why = outcome.expect_err(&case).to_string();
+            assert!(why.contains(&format!("BOOTPROT is {bootprot}")), "{case}: {why}");
+            assert!(why.contains("--clear-bootprot"), "{case}: {why}");
+            assert!(backend.target.log.is_empty(), "{case}: {:?}", backend.target.log);
+            assert!(backend.target.flash == before, "{case}: the flash is as it was");
+        } else {
+            outcome.unwrap_or_else(|why| panic!("{case}: {why}"));
+        }
+    }
+}
+
+/// The control for the refusal above: this fake leaves a protected row unerased and sets LOCKE,
+/// as the part does, so without the refusal such a write would fail only at its read-back.
+#[test]
+fn the_fake_samd21_leaves_a_protected_row_unerased() {
+    let mut part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 2);
+    let before = part.flash[..D21_ROW].to_vec();
+    part.erase_flash_row(0).expect("the command is taken");
+    assert_eq!(part.status & D21_STATUS_LOCKE, D21_STATUS_LOCKE, "LOCKE is set");
+    assert!(part.flash[..D21_ROW] == before[..], "and the row keeps its bytes");
+    part.erase_flash_row(0x2000).expect("the command is taken");
+    assert!(part.flash[0x2000..0x2100].iter().all(|&byte| byte == 0xff), "a free row erases");
+}
+
+/// The control for the lock refusals below: this fake leaves a row in a locked region unerased and
+/// sets LOCKE, as the part does, except in the rows the EEPROM field reserves, which it erases.
+#[test]
+fn the_fake_samd21_leaves_a_locked_region_unerased() {
+    let mut part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7);
+    part.lock = 0x7ffe;
+    part.user_row[0] = (part.user_row[0] & !0x70) | (6 << 4);
+    let top = D21_FLASH_BYTES - D21_ROW;
+    part.flash[top - D21_ROW..].fill(0xb0);
+    part.flash[0x4000..0x4100].fill(0xb0);
+    let cases = [(0, true), (0x4000, false), (top - D21_ROW, true), (top, false)];
+    for (row, kept) in cases {
+        part.status = 0;
+        let before = part.flash[row..row + D21_ROW].to_vec();
+        part.erase_flash_row(row as u32).expect("the command is taken");
+        let locke = part.status & D21_STATUS_LOCKE != 0;
+        let erased = part.flash[row..row + D21_ROW].iter().all(|&byte| byte == 0xff);
+        assert_eq!((locke, !erased), (kept, kept), "the row at {row:#x}");
+        assert!(!kept || part.flash[row..row + D21_ROW] == before[..], "{row:#x} keeps its bytes");
+    }
+}
+
+/// An image whose erase walk reaches a locked region is refused before anything is halted or
+/// erased, on a write placed either way, and the refusal says whether a reset lifts the lock. A
+/// locked region the walk does not reach is no obstacle, and neither is one that begins exactly
+/// where the walk ends.
+#[test]
+fn an_image_reaching_a_locked_region_is_refused_before_anything_is_erased() {
+    let over = zero_placement(BootloaderChoice::Replace);
+    let keep = zero_placement(BootloaderChoice::Keep);
+    let region = D21_FLASH_BYTES / 16;
+    let first = "\n    region 0   0x00000000-0x00003fff";
+    let second = "\n    region 1   0x00004000-0x00007fff";
+    let both = format!("{first}{second}");
+    let cases = [
+        (&over, 0xfffe, 0xffff_u16, 1000, Some((first, "A reset lifts it,"))),
+        (&over, 0xfffe, 0xfffe, 1000, Some((first, "LOCK field is 0xfffe"))),
+        (&keep, 0xfffe, 0xffff, 1000, Some((first, "A reset lifts it,"))),
+        (&over, 0xfffd, 0xffff, region, None),
+        (&over, 0xfffd, 0xffff, region + 1, Some((second, "A reset lifts it,"))),
+        (&over, 0xfffc, 0xffff, region + 1, Some((both.as_str(), "A reset lifts them,"))),
+        (&over, 0x7fff, 0xffff, 1000, None),
+    ];
+    for (placement, lock, row_lock, length, refusal) in cases {
+        let mut part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7);
+        part.lock = lock;
+        part.user_row[1] = (part.user_row[1] & 0xffff) | (u32::from(row_lock) << 16);
+        let before = part.flash.clone();
+        let mut backend = samd21_backend(part, placement);
+        let bytes = d21_image(length);
+        let image = Image { bytes: &bytes, base: backend.flash_base() };
+        let outcome = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any);
+        let case = format!("LOCK {lock:#06x}, row {row_lock:#06x}, {length} B from {:#x}", image.base);
+        match refusal {
+            Some((regions, origin)) => {
+                let why = outcome.expect_err(&case).to_string();
+                assert!(why.contains(&format!("NVMCTRL.LOCK reads {lock:#06x}")), "{case}: {why}");
+                assert!(why.contains(&format!("Nothing was erased.\n{regions}\n\n")), "{case}: {why}");
+                assert!(why.contains(origin), "{case}: {why}");
+                assert!(why.lines().all(|line| line.len() <= 100), "{case}: {why}");
+                assert!(backend.target.log.is_empty(), "{case}: {:?}", backend.target.log);
+                assert!(backend.target.flash == before, "{case}: the flash is as it was");
+            }
+            None => {
+                outcome.unwrap_or_else(|why| panic!("{case}: {why}"));
+            }
+        }
+    }
+}
+
+/// The rows the EEPROM field reserves at the top of the array are written whatever their region's
+/// lock says, so a write that reaches only them goes ahead and lands, while one that also reaches
+/// the row in front of them is refused.
+#[test]
+fn the_eeprom_rows_of_a_locked_region_are_written() {
+    let eeprom_row = D21_FLASH_BYTES - D21_ROW;
+    for (base, refused) in [(eeprom_row, false), (eeprom_row - D21_ROW, true)] {
+        let mut part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7);
+        part.lock = 0x7fff;
+        part.user_row[0] = (part.user_row[0] & !0x70) | (6 << 4);
+        let before = part.flash.clone();
+        let placement = Placement::Behind(ShippedBootloader {
+            name: "A Bootloader".to_owned(),
+            base: 0,
+            size: base as u32,
+            reset_wait_ms: None,
+        });
+        let mut backend = samd21_backend(part, &placement);
+        let bytes = d21_image(D21_FLASH_BYTES - base);
+        let image = Image { bytes: &bytes, base: base as u32 };
+        let outcome = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any);
+        let case = format!("from {base:#x}");
+        if refused {
+            let why = outcome.expect_err(&case).to_string();
+            assert!(why.contains("\n    region 15  0x0003c000-0x0003ffff\n"), "{case}: {why}");
+            assert!(backend.target.log.is_empty(), "{case}: {:?}", backend.target.log);
+            assert!(backend.target.flash == before, "{case}: the flash is as it was");
+        } else {
+            outcome.unwrap_or_else(|why| panic!("{case}: {why}"));
+            assert!(backend.target.flash[base..] == bytes[..], "{case}: the row holds the image");
+        }
+    }
+}
+
+/// A write placed inside an erase row is refused before anything is halted or erased, because the
+/// erase would take the bytes in front of the image with it.
+#[test]
+fn a_write_placed_inside_an_erase_row_is_refused_before_anything_is_erased() {
+    let odd = Placement::Behind(ShippedBootloader {
+        name: "A Bootloader".to_owned(),
+        base: 0,
+        size: 0x2010,
+        reset_wait_ms: None,
+    });
+    let mut backend = samd21_backend(FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7), &odd);
+    let bytes = d21_image(64);
+    let image = Image { bytes: &bytes, base: odd.base() };
+    let why = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
+        .expect_err("inside a row")
+        .to_string();
+    assert!(why.contains("0x00002010") && why.contains("256-byte erase units"), "{why}");
+    assert!(backend.target.log.is_empty(), "{:?}", backend.target.log);
+}
+
+/// Behind a bootloader the walk is bounded by where the ARRAY ends: exactly the flash the
+/// bootloader leaves is erased, and one byte more is refused naming the array's end.
+#[test]
+fn behind_a_bootloader_the_walk_is_bounded_by_the_array_and_not_by_the_write() {
+    let placement = zero_placement(BootloaderChoice::Keep);
+    let window = D21_FLASH_BYTES - 0x2000;
+
+    let mut backend = samd21_backend(FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7), &placement);
+    let bytes = d21_image(window);
+    let image = Image { bytes: &bytes, base: placement.base() };
+    backend.erase(&image).expect("the flash the bootloader leaves");
+    assert_eq!(
+        backend.target.log.iter().filter(|line| line.starts_with("ER")).count(),
+        window / D21_ROW
+    );
+
+    let mut backend = samd21_backend(FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7), &placement);
+    let bytes = d21_image(window + 1);
+    let image = Image { bytes: &bytes, base: placement.base() };
+    let why = backend.erase(&image).expect_err("one byte too many").to_string();
+    assert!(why.contains("past the 256 KB") && why.contains("0x00040000"), "{why}");
+    assert!(backend.target.log.is_empty(), "{:?}", backend.target.log);
+}
+
+/// A backend placed behind a bootloader by hand, on a family whose arm cannot keep one, is refused
+/// before it erases.
+#[test]
+fn a_kept_bootloader_on_a_family_that_cannot_keep_one_is_refused() {
+    let placement = zero_placement(BootloaderChoice::Keep);
+    let mut backend = SamProbe::new(FakeSam4l::new(), crate::SamFamily::Sam4l, SAM_TEST_MECHANISM)
+        .placed(&placement);
+    let bytes = [0u8; 512];
+    let image = Image { bytes: &bytes, base: placement.base() };
+    let why = backend.erase(&image).expect_err("not a SAM D21").to_string();
+    assert!(why.contains("keeping one is built for a SAM D21"), "{why}");
 }

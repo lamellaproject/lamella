@@ -94,7 +94,7 @@ namespace System.Device.Adc
         /// until its holder closes it.</summary>
         public AdcChannel OpenChannel(int channelNumber)
         {
-            if (channelNumber < 0 || channelNumber >= _driver.ChannelCount)
+            if (!_driver.IsChannelSupported(channelNumber) || channelNumber >= _open.Length)
             {
                 throw new System.ArgumentOutOfRangeException("channelNumber");
             }
@@ -109,7 +109,12 @@ namespace System.Device.Adc
 
         internal int ReadChannel(int channelNumber)
         {
-            return _driver.ReadValue(channelNumber);
+            int count = _driver.ReadValue(channelNumber);
+            if (count < 0)
+            {
+                throw new System.IO.IOException("the analog-to-digital conversion failed (status " + (-count) + ")");
+            }
+            return count;
         }
 
         internal void ReleaseChannel(int channelNumber)

@@ -41,5 +41,23 @@ namespace Lamella.Generated
 
         // -- block constants --
         public const uint PIN_CNF_STRIDE = 4;
+        public const uint DIR_INPUT = 0;
+        public const uint DIR_OUTPUT = 1;
+        public const uint INPUT_CONNECT = 0;
+        public const uint INPUT_DISCONNECT = 1;
+        public const uint PULL_DISABLED = 0;
+        public const uint PULL_PULLDOWN = 1;
+        public const uint PULL_PULLUP = 3;
+        public const uint DRIVE_S0S1 = 0;
+        public const uint DRIVE_H0S1 = 1;
+        public const uint DRIVE_S0H1 = 2;
+        public const uint DRIVE_H0H1 = 3;
+        public const uint DRIVE_D0S1 = 4;
+        public const uint DRIVE_D0H1 = 5;
+        public const uint DRIVE_S0D1 = 6;
+        public const uint DRIVE_H0D1 = 7;
+        public const uint SENSE_DISABLED = 0;
+        public const uint SENSE_HIGH = 2;
+        public const uint SENSE_LOW = 3;
     }
 }

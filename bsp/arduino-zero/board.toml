@@ -53,3 +53,14 @@ fitted = "unknown"
 onboard = "edbg"
 recovery = "probe"
 source = "The board carries an EDBG that programs and debugs the part over SWD. No document held here states where, if anywhere, those signals reach a connector or pads, so the exposure is recorded as unknown rather than assumed from other kits. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."
+
+# The bootloader the Arduino Zero ships with. A unit may have had it overwritten, so whether a part
+# holds it is read from the part at write time; this states the product. Kept last in the file.
+[bootloader]
+name = "Arduino Zero Bootloader"
+base = 0x0000
+size = 0x2000
+reserved_ram = [0x20007FFC]
+reset_wait_ms = 500
+interpreter = "bare"
+source = "The Arduino Zero bootloader's source as the Adafruit SAMD core 1.7.17 ships it, bootloaders/zero: bootloader_samd21x18.ld line 29 (FLASH ORIGIN 0x00000000, LENGTH 0x2000, the first 8 KB) and line 30 (RAM 0x8000 - 4, four bytes kept between resets); main.h line 45 (BOOT_DOUBLE_TAP_ADDRESS 0x20007FFC, a cell the application must not touch) and line 57 (APP_START_ADDRESS 0x00002000); main.c lines 52-74 (every reset that is not a power-on waits 500 ms for a second tap before it starts the image). The interpreter's serve does not fit behind the bootloader, so its image takes the bare layout."

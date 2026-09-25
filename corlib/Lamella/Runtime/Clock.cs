@@ -53,6 +53,11 @@ namespace Lamella.Runtime
             return anchorTicks + elapsedMillis * 10000;
         }
 
+        internal static long MonotonicTicks()
+        {
+            return MonotonicMilliseconds() * 10000;
+        }
+
         [Lamella.Runtime.RuntimeProvided]
         [Lamella.Runtime.IntendedDefault]
         private static long MonotonicMilliseconds() { return 0; }

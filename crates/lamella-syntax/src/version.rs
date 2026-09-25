@@ -1004,6 +1004,76 @@ pub enum Feature {
     /// permitted-but-unbuilt half: resuming inside a handler needs exception spilling and
     /// pending-fault rethrow, which this build does not implement.
     AwaitInCatchOrFinally,
+    /// An IMPLICITLY TYPED ARRAY, `new[] { 1, 2, 3 }`, whose element type is the best common type
+    /// of its elements. Introduced in **C# 3.0**.
+    ///
+    /// csc reports the gate at the `new`, not at the `[` that makes the form implicit. The
+    /// explicit form `new int[] { 1, 2, 3 }` is C# 1.0 and is a different construct.
+    ImplicitlyTypedArray,
+    /// An EXTENSION METHOD -- a static method whose first parameter carries `this`, so that
+    /// `3.Twice()` binds to `E.Twice(3)`. Introduced in **C# 3.0**, and csc's gate is at the
+    /// `this`.
+    ExtensionMethod,
+    /// An ITERATOR -- a method body containing `yield return` or `yield break`, which the compiler
+    /// rewrites into an enumerator class. Introduced in **C# 2.0**.
+    ///
+    /// csc reports the gate once per `yield` statement, at the `yield`. The word is contextual:
+    /// only `yield return` and `yield break` are the statement, and `yield` alone stays an
+    /// ordinary identifier.
+    Iterators,
+    /// A LOCAL FUNCTION -- a method declared inside a block, `int Sq(int a) { return a * a; }`.
+    /// Introduced in **C# 7.0**, and csc's gate is at the function's NAME rather than at its
+    /// return type.
+    LocalFunctions,
+    /// A `static` local function, which may not capture. Introduced in **C# 8.0**, one rung after
+    /// the local function itself; csc's gate is at the `static`.
+    StaticLocalFunctions,
+    /// A PATTERN in a `switch` statement's `case` label -- `case int n:`, or any label with a
+    /// `when` clause. Introduced in **C# 7.0**.
+    ///
+    /// **csc gates it under its one pattern name, at the `case`**, so below C# 7 this variant
+    /// renders `pattern matching` exactly as [`Feature::DeclarationPattern`] does. The refusal
+    /// above the rung names the case label rather than pattern matching as a whole: patterns
+    /// after `is` and in a switch EXPRESSION are built, and a message saying pattern matching is
+    /// missing would send the reader away from the forms that work.
+    PatternCaseLabel,
+    /// A TYPE PATTERN -- a type with no designation, `o switch { int => .., _ => .. }`.
+    /// Introduced in **C# 9.0**, where it is csc's `type pattern`, reported at the type.
+    ///
+    /// Only a switch arm can spell one: after `is`, a bare type is the C# 1.0 type test and stays
+    /// that.
+    TypePattern,
+    /// A `with` EXPRESSION, `p with { Y = 5 }`, which copies a record and then assigns the named
+    /// members. Introduced in **C# 9.0**.
+    ///
+    /// **csc gates it under `records`, at the `with`**, which is the name this variant renders
+    /// below C# 9. Above it the refusal says `with expression`: records themselves are built, and
+    /// a message naming `records` would say the opposite.
+    WithExpression,
+    /// The `record class` spelling of a record. Introduced in **C# 10.0**, where csc gates it --
+    /// and `record struct` beside it -- as `record structs`, the class form included.
+    ///
+    /// **A SEPARATE VARIANT FROM [`Feature::RecordStructs`] BECAUSE ONLY THE STRUCT IS UNBUILT.**
+    /// `record class R` is `record R` written out in full: the same declaration, the same members.
+    RecordClass,
+    /// A LAMBDA written as a method or constructor ARGUMENT, `Run(() => Work())`, where it
+    /// converts to the delegate type of the parameter overload resolution chooses. Introduced
+    /// with the lambda, in **C# 3.0**.
+    ///
+    /// **THE LAMBDA ITSELF IS [`Feature::LambdaExpression`]; THIS IS THE POSITION.** A lambda has
+    /// no type until it has a target, and in an argument position the target is a parameter that
+    /// only overload resolution can name. The positions whose target is known without resolution
+    /// -- a local's declared type, `new D(lambda)`, `e += lambda` on an event or a delegate -- are
+    /// the lambda feature and bind through it.
+    LambdaArgument,
+    /// A member reached through a type parameter's INTERFACE constraint -- `v.Area()` under
+    /// `where T : IShape`, which binds to `IShape.Area` and calls it with the `constrained.` prefix
+    /// so a struct argument is not boxed. Part of generics, **C# 2.0**.
+    ///
+    /// Distinct from a member of the constraint's effective BASE CLASS, which binds: an interface
+    /// constraint is a second root for member lookup, beside the base class, rather than a
+    /// replacement for it.
+    InterfaceConstraintMember,
 }
 
 impl Feature {
@@ -1088,6 +1158,17 @@ impl Feature {
             Feature::NameOf => true,
             Feature::InterpolatedStrings => true,
             Feature::ConstantInterpolatedStrings => true,
+            Feature::RecordClass => true,
+            Feature::ImplicitlyTypedArray
+            | Feature::ExtensionMethod
+            | Feature::Iterators
+            | Feature::LocalFunctions
+            | Feature::StaticLocalFunctions
+            | Feature::PatternCaseLabel
+            | Feature::TypePattern
+            | Feature::WithExpression
+            | Feature::LambdaArgument
+            | Feature::InterfaceConstraintMember => false,
         }
     }
 
@@ -1103,7 +1184,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 69] = [
+    pub const ALL: [Feature; 80] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -1173,6 +1254,17 @@ impl Feature {
         Feature::NameOf,
         Feature::InterpolatedStrings,
         Feature::ConstantInterpolatedStrings,
+        Feature::ImplicitlyTypedArray,
+        Feature::ExtensionMethod,
+        Feature::Iterators,
+        Feature::LocalFunctions,
+        Feature::StaticLocalFunctions,
+        Feature::PatternCaseLabel,
+        Feature::TypePattern,
+        Feature::WithExpression,
+        Feature::RecordClass,
+        Feature::LambdaArgument,
+        Feature::InterfaceConstraintMember,
     ];
 
     /// The first language version in which this feature is available.
@@ -1244,6 +1336,14 @@ impl Feature {
             | Feature::LambdaInGenericScope => LanguageVersion::CSharp3,
             Feature::CallerInfoAttribute => LanguageVersion::CSharp5,
             Feature::AwaitInCatchOrFinally => LanguageVersion::CSharp6,
+            Feature::Iterators | Feature::InterfaceConstraintMember => LanguageVersion::CSharp2,
+            Feature::ImplicitlyTypedArray
+            | Feature::ExtensionMethod
+            | Feature::LambdaArgument => LanguageVersion::CSharp3,
+            Feature::LocalFunctions | Feature::PatternCaseLabel => LanguageVersion::CSharp7,
+            Feature::StaticLocalFunctions => LanguageVersion::CSharp8,
+            Feature::TypePattern | Feature::WithExpression => LanguageVersion::CSharp9,
+            Feature::RecordClass => LanguageVersion::CSharp10,
         }
     }
 
@@ -1346,6 +1446,72 @@ impl Feature {
             Feature::NameOf => "nameof operator",
             Feature::InterpolatedStrings => "interpolated strings",
             Feature::ConstantInterpolatedStrings => "constant interpolated strings",
+            Feature::ImplicitlyTypedArray => "implicitly typed array",
+            Feature::ExtensionMethod => "extension method",
+            Feature::Iterators => "iterators",
+            Feature::LocalFunctions => "local functions",
+            Feature::StaticLocalFunctions => "static local functions",
+            Feature::PatternCaseLabel => "pattern matching",
+            Feature::TypePattern => "type pattern",
+            Feature::WithExpression => "records",
+            Feature::RecordClass => "record structs",
+            Feature::LambdaArgument => "lambda expression",
+            Feature::InterfaceConstraintMember => "generics",
+        }
+    }
+
+    /// The noun `LAM0001` quotes when the dialect permits this feature and this build lacks it.
+    ///
+    /// **USUALLY [`Self::description`], AND DIFFERENT EXACTLY WHERE csc's NOUN IS WIDER THAN THE
+    /// MISSING PART.** csc names a `with` expression `records` and a pattern in a `case` label
+    /// `pattern matching`, and both of those are built here. Quoting csc's noun in a refusal would
+    /// tell the reader that records, or pattern matching, is unavailable -- the opposite of the
+    /// truth -- so the refusal names the construct they actually wrote.
+    ///
+    /// The version gate keeps csc's noun regardless: below the rung csc's message is the right
+    /// one, and it is a search key.
+    #[must_use]
+    pub fn refusal_description(self) -> &'static str {
+        match self {
+            Feature::WithExpression => "with expression",
+            Feature::PatternCaseLabel => "patterns in case labels",
+            Feature::RecordInheritance => "records with a base list",
+            Feature::LambdaArgument => "lambda expression as an argument",
+            Feature::InterfaceConstraintMember => "member access through an interface constraint",
+            _ => self.description(),
+        }
+    }
+
+    /// What to write instead, where this build offers an equivalent, as a sentence `LAM0001`
+    /// appends to its refusal. `None` where there is nothing to point to.
+    ///
+    /// **ONLY A REPLACEMENT THIS BUILD COMPILES IS NAMED.** A suggestion that also fails would cost
+    /// the reader a second round trip, and advice that is merely idiomatic C# is not the point.
+    #[must_use]
+    pub fn instead(self) -> Option<&'static str> {
+        match self {
+            Feature::AnonymousMethods => Some("Write it as a lambda expression instead."),
+            Feature::ImplicitlyTypedArray => {
+                Some("Name the element type instead, as in 'new int[] { 1, 2 }'.")
+            }
+            Feature::ExtensionMethod => {
+                Some("Declare it without 'this' and call it as a static method instead.")
+            }
+            Feature::Iterators => Some("Build and return a collection instead."),
+            Feature::LocalFunctions | Feature::StaticLocalFunctions => {
+                Some("Declare it as a method of the enclosing type instead.")
+            }
+            Feature::TopLevelStatements => {
+                Some("Put the statements in a 'static void Main()' inside a class instead.")
+            }
+            Feature::PatternCaseLabel => {
+                Some("Use a switch expression, or an 'if' with an 'is' pattern, instead.")
+            }
+            Feature::RecordStructs => Some("Declare a 'record' or an ordinary 'struct' instead."),
+            Feature::LambdaArgument => Some(
+                "Assign it to a local of the parameter's delegate type and pass that instead.",
+            ),
+            _ => None,
         }
     }
 
@@ -1356,14 +1522,23 @@ impl Feature {
     /// the two failures want different diagnostics because they want different actions from the
     /// reader: raising `/langversion` fixes the first and cannot touch the second.
     ///
+    ///
+    /// **THE GATE CARRIES THE NOUN ITS MESSAGE QUOTES, SO NO RENDERER CHOOSES ONE.** The version
+    /// half quotes csc's [`Self::description`] and the build half quotes
+    /// [`Self::refusal_description`]; three renderers (lexer, parser, binder) print whichever the
+    /// gate hands them.
     #[must_use]
     pub fn gate_against(self, version: LanguageVersion) -> Option<FeatureGate> {
         if !version.supports(self) {
             Some(FeatureGate::RequiresLaterVersion {
+                feature: self.description(),
                 required: self.introduced_in().required_name(),
             })
         } else if !self.is_implemented() {
-            Some(FeatureGate::NotInThisBuild)
+            Some(FeatureGate::NotInThisBuild {
+                feature: self.refusal_description(),
+                instead: self.instead(),
+            })
         } else {
             None
         }
@@ -1379,13 +1554,20 @@ pub enum FeatureGate {
     /// The dialect being compiled predates the feature. csc's `CS8022` family; the message names
     /// the version that would work, and moving `/langversion` up fixes it.
     RequiresLaterVersion {
+        /// csc's noun for the feature, [`Feature::description`].
+        feature: &'static str,
         /// The version that introduced it, as csc renders a REQUIRED version -- `"2"`, `"7.0"`.
         required: &'static str,
     },
     /// The dialect permits it and this build cannot produce it. `LAM0001`, and **moving
     /// `/langversion` up does NOT fix it** -- which is exactly why it must not borrow the other
     /// message.
-    NotInThisBuild,
+    NotInThisBuild {
+        /// The construct being refused, [`Feature::refusal_description`].
+        feature: &'static str,
+        /// What to write instead, [`Feature::instead`].
+        instead: Option<&'static str>,
+    },
 }
 
 /// The reason a `/langversion` value could not be turned into a
@@ -1583,12 +1765,23 @@ mod tests {
                 | Feature::NameOf
                 | Feature::InterpolatedStrings
                 | Feature::ConstantInterpolatedStrings
-                | Feature::PartialTypes => {}
+                | Feature::PartialTypes
+                | Feature::ImplicitlyTypedArray
+                | Feature::ExtensionMethod
+                | Feature::Iterators
+                | Feature::LocalFunctions
+                | Feature::StaticLocalFunctions
+                | Feature::PatternCaseLabel
+                | Feature::TypePattern
+                | Feature::WithExpression
+                | Feature::RecordClass
+                | Feature::LambdaArgument
+                | Feature::InterfaceConstraintMember => {}
             }
         }
         assert_eq!(
             Feature::ALL.len(),
-            69,
+            80,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }
@@ -1818,12 +2011,12 @@ mod tests {
                     "{} is admitted at the ceiling while is_implemented() says it is not built",
                     feature.description()
                 ),
-                Some(FeatureGate::NotInThisBuild) => {
+                Some(FeatureGate::NotInThisBuild { .. }) => {
                     unbuilt += 1;
                     assert!(ceiling.supports(feature));
                     assert!(!feature.is_implemented());
                 }
-                Some(FeatureGate::RequiresLaterVersion { required }) => assert!(
+                Some(FeatureGate::RequiresLaterVersion { required, .. }) => assert!(
                     !ceiling.supports(feature),
                     "{} asks for language version {required} at a compilation that is already at                      the ceiling -- advice the reader has already taken",
                     feature.description()
@@ -1840,12 +2033,78 @@ mod tests {
         assert!(!Feature::RecordInheritance.is_implemented());
         assert!(matches!(
             Feature::RecordInheritance.gate_against(LanguageVersion::CSharp1),
-            Some(FeatureGate::RequiresLaterVersion { required: "9.0" })
+            Some(FeatureGate::RequiresLaterVersion { required: "9.0", .. })
         ));
         assert!(matches!(
             Feature::RecordInheritance.gate_against(LanguageVersion::CSharp9),
-            Some(FeatureGate::NotInThisBuild)
+            Some(FeatureGate::NotInThisBuild { .. })
         ));
+    }
+
+    /// Below the rung a gate quotes csc's noun, and above it the construct the reader wrote --
+    /// which differ exactly where csc's noun covers something this build has.
+    #[test]
+    fn a_refusal_names_the_missing_construct_where_csc_names_a_built_one() {
+        assert_eq!(
+            Feature::WithExpression.gate_against(LanguageVersion::CSharp8),
+            Some(FeatureGate::RequiresLaterVersion {
+                feature: "records",
+                required: "9.0"
+            })
+        );
+        assert_eq!(
+            Feature::WithExpression.gate_against(LanguageVersion::CSharp11),
+            Some(FeatureGate::NotInThisBuild {
+                feature: "with expression",
+                instead: None
+            })
+        );
+        assert_eq!(
+            Feature::PatternCaseLabel.gate_against(LanguageVersion::CSharp6),
+            Some(FeatureGate::RequiresLaterVersion {
+                feature: "pattern matching",
+                required: "7.0"
+            })
+        );
+        assert!(matches!(
+            Feature::PatternCaseLabel.gate_against(LanguageVersion::CSharp7),
+            Some(FeatureGate::NotInThisBuild {
+                feature: "patterns in case labels",
+                instead: Some(_)
+            })
+        ));
+        assert!(matches!(
+            Feature::RecordInheritance.gate_against(LanguageVersion::CSharp9),
+            Some(FeatureGate::NotInThisBuild {
+                feature: "records with a base list",
+                ..
+            })
+        ));
+        assert!(matches!(
+            Feature::Iterators.gate_against(LanguageVersion::CSharp11),
+            Some(FeatureGate::NotInThisBuild { feature: "iterators", .. })
+        ));
+        assert_eq!(Feature::RecordClass.gate_against(LanguageVersion::CSharp10), None);
+        assert!(matches!(
+            Feature::RecordClass.gate_against(LanguageVersion::CSharp9),
+            Some(FeatureGate::RequiresLaterVersion {
+                feature: "record structs",
+                ..
+            })
+        ));
+        for feature in Feature::ALL {
+            let name = feature.refusal_description();
+            assert!(
+                !name.is_empty() && !name.contains('\'') && !name.ends_with('.'),
+                "{feature:?}'s refusal noun is not a bare noun phrase: {name:?}"
+            );
+            if let Some(sentence) = feature.instead() {
+                assert!(
+                    sentence.ends_with('.') && sentence.starts_with(char::is_uppercase),
+                    "{feature:?}'s replacement is appended as a sentence: {sentence:?}"
+                );
+            }
+        }
     }
 
     /// `is_implemented` is the only record that a feature is emittable, so one the compiler emits

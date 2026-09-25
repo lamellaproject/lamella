@@ -161,33 +161,33 @@ pub struct LoadedAttribute {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CastPrim {
     /// `bool`.
-    Bool,
+    Bool = 1,
     /// `char`.
-    Char,
+    Char = 2,
     /// `sbyte`.
-    I1,
+    I1 = 3,
     /// `byte`.
-    U1,
+    U1 = 4,
     /// `short`.
-    I2,
+    I2 = 5,
     /// `ushort`.
-    U2,
+    U2 = 6,
     /// `int`.
-    I4,
+    I4 = 7,
     /// `uint`.
-    U4,
+    U4 = 8,
     /// `long`.
-    I8,
+    I8 = 9,
     /// `ulong`.
-    U8,
+    U8 = 10,
     /// `float`.
-    F4,
+    F4 = 11,
     /// `double`.
-    F8,
+    F8 = 12,
     /// `native int`.
-    I,
+    I = 13,
     /// `native uint`.
-    U,
+    U = 14,
 }
 
 impl CastPrim {
@@ -205,14 +205,121 @@ impl CastPrim {
             CastPrim::Bool | CastPrim::Char | CastPrim::F4 | CastPrim::F8 => None,
         }
     }
+
+    /// The stable frozen-image code (the enum discriminant).
+    #[must_use]
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The primitive for a frozen-image code, `None` for an unknown one (a future image on an older
+    /// runtime, whose shape is then matched leniently rather than misread).
+    #[must_use]
+    pub fn from_code(code: u8) -> Option<CastPrim> {
+        Some(match code {
+            1 => CastPrim::Bool,
+            2 => CastPrim::Char,
+            3 => CastPrim::I1,
+            4 => CastPrim::U1,
+            5 => CastPrim::I2,
+            6 => CastPrim::U2,
+            7 => CastPrim::I4,
+            8 => CastPrim::U4,
+            9 => CastPrim::I8,
+            10 => CastPrim::U8,
+            11 => CastPrim::F4,
+            12 => CastPrim::F8,
+            13 => CastPrim::I,
+            14 => CastPrim::U,
+            _ => return None,
+        })
+    }
+}
+
+/// The leaf kinds of a frozen [`CastElem`] record, in bits 8-15 of its shape word. Stable codes: an
+/// image stores them.
+const CAST_LEAF_PRIM: u32 = 1;
+const CAST_LEAF_STRING: u32 = 2;
+const CAST_LEAF_OBJECT: u32 = 3;
+const CAST_LEAF_NAMED: u32 = 4;
+const CAST_LEAF_LENIENT: u32 = 5;
+const CAST_LEAF_GENERIC_VALUE_TYPE: u32 = 6;
+/// [`CastElem::VectorInterface`]: its element's shape rides in the rest of the record -- the depth
+/// byte, the element's own leaf kind in bits 16-23 and its payload in bits 24-31 -- and an older
+/// runtime, which knows no kind 7, reads the whole record as none.
+const CAST_LEAF_VECTOR_INTERFACE: u32 = 7;
+
+impl CastElem {
+    /// This shape as a frozen-image record `(shape, token)`: the shape word packs the array depth
+    /// (bits 0-7), the leaf's kind (bits 8-15) and the leaf's payload (bits 16-23: a primitive's
+    /// code, or a named type's assembly), and `token` is a named type's token. `None` for a shape
+    /// nested in more than 255 arrays, which then stays in the live map.
+    #[must_use]
+    fn frozen_record(&self) -> Option<(u32, u32)> {
+        if let CastElem::VectorInterface(element) = self {
+            let (inner, token) = element.frozen_record()?;
+            let kind = (inner >> 8) & 0xFF;
+            if kind == CAST_LEAF_VECTOR_INTERFACE {
+                return None;
+            }
+            let shape = (inner & 0xFF) | (CAST_LEAF_VECTOR_INTERFACE << 8) | (kind << 16);
+            return Some((shape | (((inner >> 16) & 0xFF) << 24), token));
+        }
+        let mut depth = 0u32;
+        let mut leaf = self;
+        while let CastElem::Array(inner) = leaf {
+            depth += 1;
+            leaf = inner;
+        }
+        if depth > 0xFF {
+            return None;
+        }
+        let (kind, payload, token) = match leaf {
+            CastElem::Prim(prim) => (CAST_LEAF_PRIM, u32::from(prim.code()), 0),
+            CastElem::String => (CAST_LEAF_STRING, 0, 0),
+            CastElem::Object => (CAST_LEAF_OBJECT, 0, 0),
+            CastElem::Named(handle) => (CAST_LEAF_NAMED, (*handle >> 32) as u32 & 0xFF, *handle as u32),
+            CastElem::Lenient => (CAST_LEAF_LENIENT, 0, 0),
+            CastElem::GenericValueType => (CAST_LEAF_GENERIC_VALUE_TYPE, 0, 0),
+            CastElem::Array(_) | CastElem::VectorInterface(_) => return None,
+        };
+        Some((depth | (kind << 8) | (payload << 16), token))
+    }
+
+    /// The shape a [`Self::frozen_record`] record stores, or `None` for a leaf kind or primitive
+    /// code this runtime does not know -- a later image's, which is then matched leniently.
+    #[must_use]
+    fn from_frozen_record(shape: u32, token: u32) -> Option<CastElem> {
+        if (shape >> 8) & 0xFF == CAST_LEAF_VECTOR_INTERFACE {
+            let inner = (shape & 0xFF) | (((shape >> 16) & 0xFF) << 8) | (((shape >> 24) & 0xFF) << 16);
+            if (inner >> 8) & 0xFF == CAST_LEAF_VECTOR_INTERFACE {
+                return None;
+            }
+            return Some(CastElem::VectorInterface(Box::new(Self::from_frozen_record(inner, token)?)));
+        }
+        let payload = (shape >> 16) & 0xFF;
+        let mut elem = match (shape >> 8) & 0xFF {
+            CAST_LEAF_PRIM => CastElem::Prim(CastPrim::from_code(payload as u8)?),
+            CAST_LEAF_STRING => CastElem::String,
+            CAST_LEAF_OBJECT => CastElem::Object,
+            CAST_LEAF_NAMED => CastElem::Named((u64::from(payload) << 32) | u64::from(token)),
+            CAST_LEAF_LENIENT => CastElem::Lenient,
+            CAST_LEAF_GENERIC_VALUE_TYPE => CastElem::GenericValueType,
+            _ => return None,
+        };
+        for _ in 0..(shape & 0xFF) {
+            elem = CastElem::Array(Box::new(elem));
+        }
+        Some(elem)
+    }
 }
 
 /// What a cast-test token (`castclass` / `isinst` / `unbox.any` operand, or a `newarr`
 /// element) names, in the shape the runtime cast checks compare: the loader classifies each
 /// token once (decoding an array `TypeSpec`'s signature blob where needed), and `castclass`
 /// on an array or `unbox.any` on a box matches the operand's recorded shape against the
-/// target's. A token with no recorded shape is matched leniently (unverified), which is also
-/// the behavior for a module booted from a baked image (this table is not baked).
+/// target's. A token with no recorded shape is matched leniently (unverified), as is every token
+/// of an image baked before the shapes were carried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CastElem {
     /// An exact CTS primitive.
@@ -225,9 +332,20 @@ pub enum CastElem {
     Named(u64),
     /// A single-dimensional zero-based array of the element shape.
     Array(Box<CastElem>),
-    /// A shape the checks do not model (multi-dimensional array, pointer, byref):
-    /// matched leniently.
+    /// A shape the checks do not model (multi-dimensional array, pointer, byref, a generic
+    /// instantiation of a class or an interface): matched leniently.
     Lenient,
+    /// An instantiation of a generic VALUE type -- `KeyValuePair<int, string>`, `int?` -- which a
+    /// signature marks as one. Its instantiation is not carried, only that it is a value type: an
+    /// array of one holds exactly that type, so no primitive, string, object or array element array
+    /// is an array of it, and it is none of theirs.
+    GenericValueType,
+    /// A generic interface every VECTOR implements at its element type (ECMA-335 I.8.9.1) --
+    /// `IEnumerable<X>` -- carrying X's shape, so an array is tested against it by its element: an
+    /// int[] is an IEnumerable<int>, a string[] an IEnumerable<object> by array covariance, and an
+    /// int[] is not an IEnumerable<long>. Only a type test's own target takes this shape; as an
+    /// array's element the interface stays [`CastElem::Lenient`].
+    VectorInterface(Box<CastElem>),
 }
 
 /// Reflection metadata for a type, keyed by its asm-folded handle (the `System.Type` a `typeof`
@@ -1018,8 +1136,9 @@ pub struct Module {
     /// Each type's fields in declaration order (the `Type.GetFields` enumeration), keyed by the
     /// type's asm-folded handle. Recorded only under the `NETMFv4_4` reflection tier.
     type_fields: BTreeMap<u64, Vec<ReflectField>>,
-    /// Each type's parameterless instance `.ctor` (what `Activator.CreateInstance(Type)` runs),
-    /// keyed by the type's asm-folded handle. Recorded only under the `NETMFv4_4` reflection tier.
+    /// Each type's PUBLIC parameterless instance `.ctor` (what `Activator.CreateInstance(Type)`
+    /// runs), keyed by the type's asm-folded handle. Recorded only under the `NETMFv4_4` reflection
+    /// tier.
     type_ctors: BTreeMap<u64, MethodId>,
     /// Each type's instance constructors as `(ctor handle, parameter count)`, keyed by the type's
     /// asm-folded handle -- `Type.GetConstructor(Type[])` matches by arity. NETMFv4_4 tier only.
@@ -1417,6 +1536,14 @@ struct FrozenTables {
     runtime_field_slots: SortedTokenTable,
     /// The frozen `runtime_methods` (well-known id -> [`MethodId`]). Trailing, for the same reason.
     runtime_methods: SortedTokenTable,
+    /// The frozen `enum_unsigned` (enum handles whose underlying type is unsigned). Trailing, for
+    /// the same reason: an image baked before it existed reads every enum as signed, as it always
+    /// did.
+    enum_unsigned: SortedTokenSet,
+    /// The frozen `cast_elems` (cast-test token -> its [`CastElem::frozen_record`]). Trailing, for
+    /// the same reason: an image baked before it existed matches every cast test leniently, as it
+    /// always did.
+    cast_elems: SortedWideTable,
     /// The frozen `enum_wide` (enum handles with a 64-bit underlying type).
     enum_wide: SortedTokenSet,
     /// The frozen `enum_flags` (enum handles carrying `[Flags]`).
@@ -1447,7 +1574,7 @@ struct FrozenTables {
     properties_by_name: SortedWideTable,
     /// The frozen `name_to_handle` (full-name id -> type handle, split u32s).
     name_to_handle: SortedWideTable,
-    /// The frozen `type_ctors` (type handle -> parameterless ctor).
+    /// The frozen `type_ctors` (type handle -> public parameterless ctor).
     type_ctors: SortedTokenTable,
     /// The frozen `method_attrs` (method handle -> flags).
     method_attrs: SortedTokenTable,
@@ -2220,6 +2347,8 @@ impl FrozenTables {
         pair(out, self.intrinsic_type_ids.offset, self.intrinsic_type_ids.entries);
         pair(out, self.runtime_field_slots.offset, self.runtime_field_slots.entries);
         pair(out, self.runtime_methods.offset, self.runtime_methods.entries);
+        pair(out, self.enum_unsigned.offset, self.enum_unsigned.entries);
+        pair(out, self.cast_elems.offset, self.cast_elems.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
@@ -2328,6 +2457,8 @@ impl FrozenTables {
         trailing!(intrinsic_type_ids, SortedTokenTable);
         trailing!(runtime_field_slots, SortedTokenTable);
         trailing!(runtime_methods, SortedTokenTable);
+        trailing!(enum_unsigned, SortedTokenSet);
+        trailing!(cast_elems, SortedWideTable);
         Some((frozen, cursor))
     }
 }
@@ -3308,6 +3439,18 @@ impl Module {
             );
             frozen.nullable_underlying = SortedWideTable::write(arena, records);
         }
+        if !self.cast_elems.is_empty() {
+            let mut records = frozen.cast_elems.entries_of(arena);
+            for (handle, elem) in core::mem::take(&mut self.cast_elems) {
+                match elem.frozen_record() {
+                    Some((shape, token)) => records.push((handle, shape, token)),
+                    None => {
+                        self.cast_elems.insert(handle, elem);
+                    }
+                }
+            }
+            frozen.cast_elems = SortedWideTable::write(arena, records);
+        }
         frozen.catch_type_tags = drain(arena, frozen.catch_type_tags, &mut self.catch_type_tags, |tag| {
             tag
         });
@@ -3357,6 +3500,7 @@ impl Module {
         frozen.object_type_tokens = drain(arena, frozen.object_type_tokens, &mut self.object_type_tokens);
         frozen.string_type_tokens = drain(arena, frozen.string_type_tokens, &mut self.string_type_tokens);
         frozen.value_type_ctors = drain(arena, frozen.value_type_ctors, &mut self.value_type_ctors);
+        frozen.enum_unsigned = drain(arena, frozen.enum_unsigned, &mut self.enum_unsigned);
     }
 
     /// Drains `type_handles` into its dense-by-[`TypeId`] `u64` column.
@@ -3727,6 +3871,23 @@ impl Module {
         match self.method(id)? {
             Method::Managed { body, .. } => Some(body.eh().to_vec()),
             Method::Intrinsic { .. } => None,
+        }
+    }
+
+    /// How many exception clauses a managed method declares, read without materializing them, so a
+    /// frame can be sized for its handlers when it is set up. `0` for an intrinsic or unknown method.
+    #[must_use]
+    #[cfg(feature = "code-in-place")]
+    pub fn method_eh_count(&self, id: MethodId) -> usize {
+        if self.baked.is_some() {
+            return match self.baked_record(id) {
+                Some((0, _, _, _, _, eh_count)) => eh_count as usize,
+                _ => 0,
+            };
+        }
+        match self.method(id) {
+            Some(Method::Managed { body, .. }) => body.eh().len(),
+            _ => 0,
         }
     }
 
@@ -4116,6 +4277,15 @@ impl Module {
             .map(|attribute| (attribute.type_id, false))
             .collect();
 
+        let mut overrides_by_site: BTreeMap<u64, Vec<(TypeId, MethodId)>> = BTreeMap::new();
+        let mut overrides_by_type: BTreeMap<TypeId, Vec<(u64, MethodId)>> = BTreeMap::new();
+        for (&(type_id, site), &body) in &self.explicit_overrides {
+            overrides_by_site.entry(site).or_default().push((type_id, body));
+            overrides_by_type.entry(type_id).or_default().push((site, body));
+        }
+        let array_type = self.intrinsic_type_id(IntrinsicType::Array);
+        let mut reached_sites: BTreeSet<u64> = BTreeSet::new();
+
         while !queue.is_empty() || !type_queue.is_empty() {
             while let Some((type_id, as_reflection_root)) = type_queue.pop() {
                 let index = type_id as usize;
@@ -4153,6 +4323,11 @@ impl Module {
                         }
                         if let Some(finalizer) = self.finalizers.get(&type_id).copied() {
                             push(finalizer, &mut keep_method, &mut queue);
+                        }
+                        for &(site, body) in overrides_by_type.get(&type_id).into_iter().flatten() {
+                            if reached_sites.contains(&site) {
+                                push(body, &mut keep_method, &mut queue);
+                            }
                         }
                     }
                 }
@@ -4211,6 +4386,22 @@ impl Module {
                     | Opcode::Ldvirtftn => {
                         if let Some(target) = self.resolve(asm, token) {
                             push(target, &mut keep_method, &mut queue);
+                        }
+                        if instruction.opcode == Opcode::Newobj && self.is_delegate_ctor(asm, token) {
+                            if let Some(type_id) = self.delegate_ctor_type(asm, token) {
+                                type_queue.push((type_id, false));
+                            }
+                        }
+                        if matches!(instruction.opcode, Opcode::Callvirt | Opcode::Ldvirtftn)
+                            && reached_sites.insert(asm_key(asm, token.0))
+                        {
+                            let site = asm_key(asm, token.0);
+                            for &(type_id, body) in overrides_by_site.get(&site).into_iter().flatten() {
+                                let type_kept = keep_type.get(type_id as usize).copied().unwrap_or(false);
+                                if type_kept || Some(type_id) == array_type {
+                                    push(body, &mut keep_method, &mut queue);
+                                }
+                            }
                         }
                     }
                     Opcode::Ldstr => {
@@ -4567,6 +4758,8 @@ impl Module {
             + self.delegate_ctors.len()
             + self.enum_wide.len()
             + self.enum_flags.len()
+            + self.enum_unsigned.len()
+            + self.cast_elems.len()
             + self.object_type_tokens.len()
             + self.string_type_tokens.len())
             * 48;
@@ -4643,6 +4836,8 @@ impl Module {
             ("delegate_ctors", self.delegate_ctors.len()),
             ("enum_wide", self.enum_wide.len()),
             ("enum_flags", self.enum_flags.len()),
+            ("enum_unsigned", self.enum_unsigned.len()),
+            ("cast_elems", self.cast_elems.len()),
             ("object_type_tokens", self.object_type_tokens.len()),
             ("string_type_tokens", self.string_type_tokens.len()),
             ("call_targets", self.call_targets.len()),
@@ -4895,11 +5090,16 @@ impl Module {
     }
 
     /// The recorded [`CastElem`] shape of an already-asm-folded type-token handle, or `None`
-    /// if the loader recorded none (the cast checks then match leniently). A module booted
-    /// from a baked image has no entries (the table is not baked), so it matches leniently too.
+    /// if the loader recorded none (the cast checks then match leniently). Owned rather than
+    /// borrowed, because a frozen module holds each shape as a record and decodes it here; only
+    /// an array shape allocates.
     #[must_use]
-    pub fn cast_elem(&self, handle: u64) -> Option<&CastElem> {
-        self.cast_elems.get(&handle)
+    pub fn cast_elem(&self, handle: u64) -> Option<CastElem> {
+        self.frozen
+            .cast_elems
+            .get(&self.arena, handle)
+            .and_then(|(shape, token)| CastElem::from_frozen_record(shape, token))
+            .or_else(|| self.cast_elems.get(&handle).cloned())
     }
 
     /// The element type's primitive kind of a `newarr` element-type token in assembly `asm`,
@@ -5157,10 +5357,36 @@ impl Module {
         self.finalizers.insert(type_id, method);
     }
 
-    /// The `Finalize` method `type_id` declares, if any.
+    /// The `Finalize` an instance of `type_id` runs when it is finalized: the one its type declares,
+    /// or else the nearest one a base type declares. A type with no destructor of its own inherits
+    /// its base's, and is finalized (ECMA-334 17.12: when an instance is destructed, the destructors
+    /// in its inheritance chain are called). `None` when no type in the chain declares one --
+    /// System.Object's own `Finalize` is never recorded.
     #[must_use]
     pub fn finalizer_of(&self, type_id: TypeId) -> Option<MethodId> {
+        if self.frozen.finalizers.entries == 0 && self.finalizers.is_empty() {
+            return None;
+        }
+        let mut current = Some(type_id);
+        for _ in 0..=self.type_count() {
+            let id = current?;
+            if let Some(method) = self.declared_finalizer(id) {
+                return Some(method);
+            }
+            current = self.type_base(id);
+        }
+        None
+    }
+
+    /// The `Finalize` `type_id` itself declares, as [`Self::set_finalizer`] recorded it.
+    fn declared_finalizer(&self, type_id: TypeId) -> Option<MethodId> {
         self.frozen.finalizers.get(&self.arena, type_id as u64).or_else(|| self.finalizers.get(&type_id).copied())
+    }
+
+    /// Records that the type `token` in assembly `asm` IS an enum, before or without any constant:
+    /// an enum with no members is still an enum.
+    pub fn mark_enum(&mut self, asm: u8, token: u32) {
+        self.enum_constants.entry(asm_key(asm, token)).or_default();
     }
 
     /// Records that the enum type `token` in assembly `asm` has a constant `name` with
@@ -5343,10 +5569,10 @@ impl Module {
         if !self.is_enum_by_handle(handle) {
             return None;
         }
-        let unsigned = self.enum_unsigned.contains(&handle)
+        let unsigned = self.enum_unsigned_contains(handle)
             || self
                 .canonical_type_handle(handle)
-                .is_some_and(|canonical| self.enum_unsigned.contains(&canonical));
+                .is_some_and(|canonical| self.enum_unsigned_contains(canonical));
         Some(match (self.enum_width_by_handle(handle), unsigned) {
             (1, false) => CastPrim::I1,
             (1, true) => CastPrim::U1,
@@ -5378,6 +5604,11 @@ impl Module {
             .get(&self.arena, handle)
             .map(|width| width as u8)
             .or_else(|| self.enum_widths.get(&handle).copied())
+    }
+
+    /// Whether the enum named by `handle` has an unsigned underlying type, frozen set first.
+    fn enum_unsigned_contains(&self, handle: u64) -> bool {
+        self.frozen.enum_unsigned.contains(&self.arena, handle) || self.enum_unsigned.contains(&handle)
     }
 
     /// Whether the enum named by `handle` carries `[Flags]`, frozen set first.
@@ -5658,6 +5889,19 @@ impl Module {
     pub fn set_type_interfaces(&mut self, type_id: TypeId, interfaces: Vec<TypeId>) {
         if let Some(info) = self.types.get_mut(type_id as usize) {
             info.interfaces = interfaces;
+        }
+    }
+
+    /// Adds `interfaces` to the ones `type_id` already records, skipping any it records already --
+    /// for a pass that learns an interface later than the walk that recorded the rest (a constructed
+    /// generic interface, which names an instantiation the load walk could not yet resolve).
+    pub fn add_type_interfaces(&mut self, type_id: TypeId, interfaces: &[TypeId]) {
+        if let Some(info) = self.types.get_mut(type_id as usize) {
+            for &interface in interfaces {
+                if !info.interfaces.contains(&interface) {
+                    info.interfaces.push(interface);
+                }
+            }
         }
     }
 
@@ -6628,14 +6872,14 @@ impl Module {
         self.type_fields.get(&type_handle).cloned().unwrap_or_default()
     }
 
-    /// Records the parameterless instance constructor of the type whose asm-folded handle is
+    /// Records the PUBLIC parameterless instance constructor of the type whose asm-folded handle is
     /// `type_handle` (what `Activator.CreateInstance(Type)` runs).
     pub fn bind_type_ctor(&mut self, type_handle: u64, ctor: MethodId) {
         self.type_ctors.insert(type_handle, ctor);
     }
 
-    /// The parameterless instance constructor recorded for the type whose asm-folded handle is
-    /// `type_handle`, or `None`. Resolves across assemblies through
+    /// The public parameterless instance constructor recorded for the type whose asm-folded handle
+    /// is `type_handle`, or `None`. Resolves across assemblies through
     /// [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_ctor(&self, type_handle: u64) -> Option<MethodId> {
@@ -7319,6 +7563,124 @@ mod tests {
         assert_eq!(
             baked.string_type_id, Some(string_type),
             "the grandfathered header word is still written, or an older runtime's \n             string dispatch is lost"
+        );
+    }
+
+    /// An enum's SIGN survives a bake, at every unsigned width. `unbox.any` normalizes an enum's box
+    /// to the enum's underlying primitive, so a module that read every enum as signed unboxed a
+    /// `byte`-backed enum as `sbyte` and refused it as `byte` -- at every width.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_baked_image_keeps_an_unsigned_enum_unsigned() {
+        const TYPE_DEF: u8 = 0x02;
+        let cases: [(u32, u8, bool, CastPrim); 5] = [
+            (1, 1, true, CastPrim::U1),
+            (2, 2, true, CastPrim::U2),
+            (3, 4, true, CastPrim::U4),
+            (4, 8, true, CastPrim::U8),
+            (5, 4, false, CastPrim::I4),
+        ];
+        let mut module = Module::new();
+        for &(row, width, unsigned, _) in &cases {
+            let token = Token::new(TYPE_DEF, row).0;
+            module.set_enum_constant(0, token, 1, String::from("A"));
+            module.set_enum_width(0, token, width);
+            if unsigned {
+                module.set_enum_unsigned(0, token);
+            }
+        }
+        for &(row, _, _, want) in &cases {
+            let handle = asm_key(0, Token::new(TYPE_DEF, row).0);
+            assert_eq!(
+                module.enum_underlying_prim_by_handle(handle),
+                Some(want),
+                "the live module, row {row}"
+            );
+        }
+
+        let image = module.write_baked(None).expect("bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, _entry) = Module::from_baked(leaked).expect("the image reads back");
+        for &(row, _, _, want) in &cases {
+            let handle = asm_key(0, Token::new(TYPE_DEF, row).0);
+            assert_eq!(
+                baked.enum_underlying_prim_by_handle(handle),
+                Some(want),
+                "the baked module, row {row}: an enum's sign must survive the bake, or unbox.any \
+                 of its box accepts the wrong primitive"
+            );
+        }
+    }
+
+    /// Every cast-test shape survives a bake. A module that dropped them matched each cast leniently:
+    /// on a baked image any class instance `is string[]` and `int[] is object[]` answered true.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_baked_image_keeps_every_cast_shape() {
+        const TYPE_SPEC: u8 = 0x1B;
+        let named = asm_key(3, Token::new(0x02, 9).0);
+        let prims = [
+            CastPrim::Bool,
+            CastPrim::Char,
+            CastPrim::I1,
+            CastPrim::U1,
+            CastPrim::I2,
+            CastPrim::U2,
+            CastPrim::I4,
+            CastPrim::U4,
+            CastPrim::I8,
+            CastPrim::U8,
+            CastPrim::F4,
+            CastPrim::F8,
+            CastPrim::I,
+            CastPrim::U,
+        ];
+        let mut shapes: Vec<CastElem> = prims.iter().map(|&prim| CastElem::Prim(prim)).collect();
+        shapes.extend([
+            CastElem::String,
+            CastElem::Object,
+            CastElem::Named(named),
+            CastElem::Lenient,
+            CastElem::GenericValueType,
+            CastElem::Array(Box::new(CastElem::GenericValueType)),
+            CastElem::VectorInterface(Box::new(CastElem::Prim(CastPrim::I4))),
+            CastElem::VectorInterface(Box::new(CastElem::Object)),
+            CastElem::VectorInterface(Box::new(CastElem::Named(named))),
+            CastElem::VectorInterface(Box::new(CastElem::Array(Box::new(CastElem::String)))),
+            CastElem::VectorInterface(Box::new(CastElem::GenericValueType)),
+            CastElem::Array(Box::new(CastElem::Prim(CastPrim::I4))),
+            CastElem::Array(Box::new(CastElem::Array(Box::new(CastElem::Named(named))))),
+            CastElem::Array(Box::new(CastElem::Lenient)),
+            CastElem::Array(Box::new(CastElem::Object)),
+        ]);
+
+        let mut module = Module::new();
+        for (row, shape) in shapes.iter().enumerate() {
+            module.bind_cast_elem(1, Token::new(TYPE_SPEC, row as u32 + 1), shape.clone());
+        }
+        let image = module.write_baked(None).expect("bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, _entry) = Module::from_baked(leaked).expect("the image reads back");
+        for (row, shape) in shapes.iter().enumerate() {
+            let handle = asm_key(1, Token::new(TYPE_SPEC, row as u32 + 1).0);
+            assert_eq!(
+                baked.cast_elem(handle).as_ref(),
+                Some(shape),
+                "a cast shape must survive the bake, or its cast is matched leniently on a device"
+            );
+        }
+        assert_eq!(baked.cast_elem(asm_key(1, Token::new(TYPE_SPEC, 99).0)), None);
+
+        assert_eq!(CastElem::from_frozen_record(0x63 << 8, 0), None);
+        assert_eq!(CastElem::from_frozen_record((CAST_LEAF_PRIM << 8) | (99 << 16), 0), None);
+        let (vector, token) = CastElem::VectorInterface(Box::new(CastElem::Prim(CastPrim::I4)))
+            .frozen_record()
+            .expect("a vector interface freezes");
+        assert_eq!((vector >> 8) & 0xFF, CAST_LEAF_VECTOR_INTERFACE);
+        assert!(((vector >> 8) & 0xFF) > CAST_LEAF_GENERIC_VALUE_TYPE, "a kind no older runtime knows");
+        assert_eq!(
+            CastElem::from_frozen_record(vector, token),
+            Some(CastElem::VectorInterface(Box::new(CastElem::Prim(CastPrim::I4))))
         );
     }
 

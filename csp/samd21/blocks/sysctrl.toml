@@ -1,0 +1,20 @@
+# The SAMD21 System Controller block: only the register a driver touches is transcribed here
+# (partial, append-only, schema total). Offsets are SYSCTRL-base-relative; the base lives in
+# ../instances.toml.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "sysctrl"
+sources = [
+    "SAMD21 datasheet DS40001882D 17.8.16 Voltage References System (VREF) Control (p231) and 17.6.10.1 User Control of the Voltage Reference System (p189)",
+]
+notes = [
+    "VREF routes the bandgap and the temperature sensor to ADC input channels. Its CALIB field is loaded from the flash calibration row at startup, so a driver setting BGOUTEN or TSEN read-modify-writes the register and leaves CALIB as it found it.",
+]
+
+[registers.VREF]
+offset = 0x40
+width = 32
+fields = { TSEN = [1, 1], BGOUTEN = [2, 1], CALIB = [16, 11] }
+notes = "BGOUTEN routes the bandgap output to an ADC input channel; TSEN enables the temperature sensor and routes it to one. Both reset to 0. CALIB (26:16) calibrates the bandgap's output level and resets to the factory value."

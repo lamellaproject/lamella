@@ -164,5 +164,36 @@ namespace Lamella.Generated
         public const uint REFSEL_AREFA = 4;
         public const uint REFSEL_AREFB = 5;
         public const uint REFSEL_AREFC = 6;
+        public const uint PRESCALER_DIV2 = 0;
+        public const uint PRESCALER_DIV4 = 1;
+        public const uint PRESCALER_DIV8 = 2;
+        public const uint PRESCALER_DIV16 = 3;
+        public const uint PRESCALER_DIV32 = 4;
+        public const uint PRESCALER_DIV64 = 5;
+        public const uint PRESCALER_DIV128 = 6;
+        public const uint PRESCALER_DIV256 = 7;
+
+        /// <summary>The division PRESCALER code <paramref name="code"/> selects, from the
+        /// PRESCALER_DIV constants above, or 0 for a code none of them names.</summary>
+        public static uint PrescalerDivisor(uint code)
+        {
+            switch (code)
+            {
+                case 0: return 2;
+                case 1: return 4;
+                case 2: return 8;
+                case 3: return 16;
+                case 4: return 32;
+                case 5: return 64;
+                case 6: return 128;
+                case 7: return 256;
+            }
+            return 0;
+        }
+
+        // -- facts as data (chip/electrical facts conversions read) --
+        public const uint GclkAdcMaxHz = 100000000;
+        public const uint ClkAdcMinHz = 320000;
+        public const uint ClkAdcMaxHz = 16000000;
     }
 }

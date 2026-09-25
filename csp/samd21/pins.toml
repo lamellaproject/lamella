@@ -87,6 +87,201 @@ instance = "sercom5"
 signal = "pad3"
 source = "DS40001882 Table 7-1"
 
+[[pins]]
+pin = "PA04"
+function = "D"
+instance = "sercom0"
+signal = "pad0"
+source = "DS40001882D Table 7-1 as printed on page 28: column D (SERCOM-ALT) reads SERCOM0/PAD[0], and column C is empty for this pin"
+
+[[pins]]
+pin = "PA06"
+function = "D"
+instance = "sercom0"
+signal = "pad2"
+source = "DS40001882D Table 7-1 as printed on page 28: column D (SERCOM-ALT) reads SERCOM0/PAD[2], and column C is empty for this pin"
+
+[[pins]]
+pin = "PA07"
+function = "D"
+instance = "sercom0"
+signal = "pad3"
+source = "DS40001882D Table 7-1 as printed on page 28: column D (SERCOM-ALT) reads SERCOM0/PAD[3], and column C is empty for this pin"
+
+[[pins]]
+pin = "PA08"
+function = "D"
+instance = "sercom2"
+signal = "pad0"
+source = "DS40001882D Table 7-1 as printed on page 28: column D (SERCOM-ALT) reads SERCOM2/PAD[0], where column C reads SERCOM0/PAD[0]; Table 7-5 lists PA08 among the pins that carry I2C"
+
+[[pins]]
+pin = "PA09"
+function = "D"
+instance = "sercom2"
+signal = "pad1"
+source = "DS40001882D Table 7-1 as printed on page 28: column D (SERCOM-ALT) reads SERCOM2/PAD[1], where column C reads SERCOM0/PAD[1]; Table 7-5 lists PA09 among the pins that carry I2C"
+
+# --- ADC: the COMPLETE pad-to-AIN map for this die ---------------------------------------------
+#
+# EVERY PAD THE CONVERTER CAN SAMPLE IS HERE, for the reason the EIC section below gives for its
+# lines: which AIN a pad carries is a property of the silicon, not of a board, and the set is bounded
+# -- twenty inputs, one pad each -- so completeness costs one transcription. A board still offers
+# only the pads it wires, by naming them in its adc binding.
+#
+# FUNCTION B IS THE ANALOG COLUMN, and it serves several analog peripherals at once: the ADC's
+# inputs, the analog comparators' (PA04-PA07 also carry AC AIN[0]-AIN[3]), the touch controller's X
+# and Y lines, the references and the DAC output. So the letter does not say which block a pad
+# reaches; the instance does. Only the ADC's cells are transcribed here, and the rest join when a
+# binding needs them. Selecting function B also does something no other column does: "Peripheral
+# function B must be selected to disable the digital control of the pin" (Table 7-1, note 2).
+#
+# The signal is ain<N>, and N is the ADC channel: INPUTCTRL.MUXPOS selects AIN N with the code N.
+# Every row: DS40001882D Table 7-1, the ADC cell of column B, read by word coordinates -- the column
+# the header prints ADC over, apart from the comparator's cell beside it. Anchored twice: each of
+# AIN0 to AIN19 occurs exactly once, and every pad is in the atsamd21j18a pad set in parts.toml --
+# both checked by crates/lamella-bsp-gen/tests/samd21_adc_binding.rs.
+
+[[pins]]
+pin = "PA02"
+function = "B"
+instance = "adc"
+signal = "ain0"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[0]"
+
+[[pins]]
+pin = "PA03"
+function = "B"
+instance = "adc"
+signal = "ain1"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[1]"
+
+[[pins]]
+pin = "PB08"
+function = "B"
+instance = "adc"
+signal = "ain2"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[2]"
+
+[[pins]]
+pin = "PB09"
+function = "B"
+instance = "adc"
+signal = "ain3"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[3]"
+
+[[pins]]
+pin = "PA04"
+function = "B"
+instance = "adc"
+signal = "ain4"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[4]"
+
+[[pins]]
+pin = "PA05"
+function = "B"
+instance = "adc"
+signal = "ain5"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[5]"
+
+[[pins]]
+pin = "PA06"
+function = "B"
+instance = "adc"
+signal = "ain6"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[6]"
+
+[[pins]]
+pin = "PA07"
+function = "B"
+instance = "adc"
+signal = "ain7"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[7]"
+
+[[pins]]
+pin = "PB00"
+function = "B"
+instance = "adc"
+signal = "ain8"
+source = "DS40001882D Table 7-1 as printed on page 29: the ADC cell of column B reads AIN[8]"
+
+[[pins]]
+pin = "PB01"
+function = "B"
+instance = "adc"
+signal = "ain9"
+source = "DS40001882D Table 7-1 as printed on page 29: the ADC cell of column B reads AIN[9]"
+
+[[pins]]
+pin = "PB02"
+function = "B"
+instance = "adc"
+signal = "ain10"
+source = "DS40001882D Table 7-1 as printed on page 29: the ADC cell of column B reads AIN[10]"
+
+[[pins]]
+pin = "PB03"
+function = "B"
+instance = "adc"
+signal = "ain11"
+source = "DS40001882D Table 7-1 as printed on page 30: the ADC cell of column B reads AIN[11]"
+
+[[pins]]
+pin = "PB04"
+function = "B"
+instance = "adc"
+signal = "ain12"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[12]"
+
+[[pins]]
+pin = "PB05"
+function = "B"
+instance = "adc"
+signal = "ain13"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[13]"
+
+[[pins]]
+pin = "PB06"
+function = "B"
+instance = "adc"
+signal = "ain14"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[14]"
+
+[[pins]]
+pin = "PB07"
+function = "B"
+instance = "adc"
+signal = "ain15"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[15]"
+
+[[pins]]
+pin = "PA08"
+function = "B"
+instance = "adc"
+signal = "ain16"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[16]"
+
+[[pins]]
+pin = "PA09"
+function = "B"
+instance = "adc"
+signal = "ain17"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[17]"
+
+[[pins]]
+pin = "PA10"
+function = "B"
+instance = "adc"
+signal = "ain18"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[18]"
+
+[[pins]]
+pin = "PA11"
+function = "B"
+instance = "adc"
+signal = "ain19"
+source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B reads AIN[19]"
+
 # --- EIC: the COMPLETE pad-to-EXTINT map for this die ------------------------------------------
 #
 # EVERY PAD ON THE DIE IS HERE, AND THAT IS THE WHOLE POINT OF THE SECTION. Which EXTINT a pad can
@@ -484,3 +679,48 @@ instance = "eic"
 signal = "extint15"
 source = "DS40001882D Table 7-1, column A (EIC)"
 
+
+# The timers' waveform outputs on function E, the column Table 7-1 heads TC/TCC. A signal names the
+# output, wo<n> for WO[n], and which compare channel drives it is the instance's to say.
+
+[[pins]]
+pin = "PB02"
+function = "E"
+instance = "tc6"
+signal = "wo0"
+source = "DS40001882D Table 7-1 as printed on page 29: the cell of column E (TC/TCC) reads TC6/WO[0]"
+
+[[pins]]
+pin = "PB03"
+function = "E"
+instance = "tc6"
+signal = "wo1"
+source = "DS40001882D Table 7-1 as printed on page 30: the cell of column E (TC/TCC) reads TC6/WO[1]"
+
+[[pins]]
+pin = "PB12"
+function = "E"
+instance = "tc4"
+signal = "wo0"
+source = "DS40001882D Table 7-1 as printed on page 28: the cell of column E (TC/TCC) reads TC4/WO[0]"
+
+[[pins]]
+pin = "PB13"
+function = "E"
+instance = "tc4"
+signal = "wo1"
+source = "DS40001882D Table 7-1 as printed on page 29: the cell of column E (TC/TCC) reads TC4/WO[1]"
+
+[[pins]]
+pin = "PA12"
+function = "E"
+instance = "tcc2"
+signal = "wo0"
+source = "DS40001882D Table 7-1 as printed on page 29: the cell of column E (TC/TCC) reads TCC2/WO[0]"
+
+[[pins]]
+pin = "PA13"
+function = "E"
+instance = "tcc2"
+signal = "wo1"
+source = "DS40001882D Table 7-1 as printed on page 29: the cell of column E (TC/TCC) reads TCC2/WO[1]"

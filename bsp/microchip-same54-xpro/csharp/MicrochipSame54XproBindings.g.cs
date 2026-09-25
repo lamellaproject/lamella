@@ -26,13 +26,16 @@ namespace Lamella.Generated
         public const string EXT1_I2C_DRIVER_FAMILY = "same54-sercom";
         public const string EXT1_ADC_P_DRIVER_FAMILY = "same54-adc";
 
-        // -- EXT1_ADC_P: a same54 adc binding descriptor. It carries a CALIBRATION ADDRESS
-        // because this converter does not convert until three production values are
-        // copied out of NVM, and a PMUX MASK because one pad is muxed without
+        // -- EXT1_ADC_P: a same54 adc binding descriptor. It carries the PRESCALER its generic
+        // clock needs, because the part bounds the converter's clock; a CALIBRATION
+        // ADDRESS, because this converter does not convert until three production values
+        // are copied out of NVM; and a PMUX MASK, because one pad is muxed without
         // disturbing its neighbour --
         public const uint EXT1_ADC_P_ADC_BASE = 0x43002000;
         public const uint EXT1_ADC_P_GCLK_PCHCTRL_REG = 0x40001D24;
         public const uint EXT1_ADC_P_GCLK_PCHCTRL_VALUE = 0x40;
+        public const uint EXT1_ADC_P_CORE_CLOCK_HZ = 48000000;
+        public const uint EXT1_ADC_P_PRESCALER = 1;
         public const uint EXT1_ADC_P_APB_MASK_REG = 0x40000820;
         public const uint EXT1_ADC_P_APB_MASK = 0x100;
         public const uint EXT1_ADC_P_CALIB_REG = 0x43002048;

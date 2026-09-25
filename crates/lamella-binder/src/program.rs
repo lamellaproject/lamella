@@ -2832,6 +2832,10 @@ fn validate_async_method_signatures(binder: &mut Binder, declaration: &TypeDecl)
         if !return_symbol.is_void() {
             if crate::bound::is_system_task_of_t(&return_symbol) {
                 binder.gate_feature(Feature::AsyncTaskOfT, *span);
+            } else if !binder.names_a_known_type(&return_symbol) {
+                if written_as_task_of_t(return_type) {
+                    binder.gate_feature(Feature::AsyncTaskOfT, *span);
+                }
             } else if !crate::bound::is_system_task(&return_symbol) {
                 binder.report(Diagnostic::new(DiagnosticKind::AsyncReturnType, *span));
             }
@@ -2848,6 +2852,20 @@ fn validate_async_method_signatures(binder: &mut Binder, declaration: &TypeDecl)
             binder.gate_feature(Feature::AsyncGenericMethod, *span);
         }
     }
+}
+
+/// Whether a return type is WRITTEN `Task<T>` -- `Task<int>`, or qualified as
+/// `System.Threading.Tasks.Task<int>` -- whatever it resolves to.
+fn written_as_task_of_t(ty: &lamella_syntax::ast::TypeRef) -> bool {
+    let lamella_syntax::ast::TypeRefKind::Generic { parts } = &ty.kind else {
+        return false;
+    };
+    let Some((last, qualifiers)) = parts.split_last() else {
+        return false;
+    };
+    &*last.name == "Task"
+        && last.arguments.len() == 1
+        && qualifiers.iter().all(|part| part.arguments.is_empty())
 }
 
 /// The async ENTRY-POINT rules, measured: `static async void Main()` (or `int`) is CS4009 `A
@@ -9502,5 +9520,55 @@ mod tests {
             ),
             []
         );
+    }
+
+    /// A lambda binds wherever its delegate type is known without overload resolution --
+    /// `new D(lambda)`, and `+=` or `-=` on an event or a delegate -- exactly as it does after `=`.
+    /// As a method or constructor ARGUMENT, whose parameter only overload resolution can name, it
+    /// is refused once, by name: `LAM0001`, not `CS8917`, which says no delegate type exists.
+    #[test]
+    fn a_lambda_binds_where_its_delegate_type_is_known_and_is_refused_as_an_argument() {
+        let v11 = LanguageVersion::CSharp11;
+        let program = |body: &str| {
+            alloc::format!(
+                "delegate void D();                  class B {{ public event D E; public void Raise() {{ E(); }} }}                  class T {{ public T(D d) {{ }} }}                  class P {{ static void Run(D d) {{ d(); }} void M(B b) {{ {body} }} }}"
+            )
+        };
+        for body in [
+            "D d = new D(() => { });",
+            "D d = new D((() => { }));",
+            "b.E += () => { };",
+            "b.E -= () => { };",
+            "D d = null; d += () => { };",
+        ] {
+            assert_eq!(sorted_codes_parsed_at(&program(body), v11), [], "{body}");
+        }
+        for body in ["Run(() => { });", "Run((() => { }));", "new T(() => { });"] {
+            assert_eq!(
+                sorted_codes_parsed_at(&program(body), v11),
+                [(CodeNamespace::Lam, 1)],
+                "{body}"
+            );
+        }
+    }
+
+    /// An async method's return type that does not RESOLVE is not the wrong type: its own
+    /// diagnostic is the report and csc adds no CS1983 to it. A `Task<T>` written there is still
+    /// the construct this build refuses by name. A type that resolves and is not task-like keeps
+    /// its CS1983.
+    #[test]
+    fn an_unresolved_async_return_type_draws_no_cs1983_and_a_task_of_t_is_refused_by_name() {
+        let v11 = LanguageVersion::CSharp11;
+        let codes = sorted_codes_parsed_at(
+            "class P { static async Task<int> F() { return 1; } }",
+            v11,
+        );
+        assert!(codes.contains(&(CodeNamespace::Lam, 1)), "{codes:?}");
+        assert!(!codes.iter().any(|&(_, code)| code == 1983), "{codes:?}");
+        let codes = sorted_codes_parsed_at("class P { static async Nope F() { } }", v11);
+        assert!(!codes.iter().any(|&(_, code)| code == 1983), "{codes:?}");
+        assert!(!codes.contains(&(CodeNamespace::Lam, 1)), "{codes:?}");
+        let codes = sorted_codes_parsed_at("class P { static async int F() { return 1; } }", v11);
+        assert!(codes.contains(&(CodeNamespace::Cs, 1983)), "{codes:?}");
     }
 }

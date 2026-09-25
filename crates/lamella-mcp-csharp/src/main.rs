@@ -4,7 +4,9 @@
 //! no tokio, no MCP SDK -- matching the workspace's dependency-minimal ethos. The compile+run path is the
 //! Lamella Link REPL engine (`LcscCompiler` + `LoopbackLink`), the same one `wire-repl` and the Debug Console use.
 
-use lamella_wire_host::engine::{CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler};
+use lamella_wire_host::engine::{
+    CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler, install_host_clock,
+};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
@@ -72,7 +74,10 @@ fn main() {
     let corlib = corlib_bytes().unwrap_or_else(|error| { eprintln!("lamella-mcp-csharp: {error}"); std::process::exit(1) });
     let check = LcscCompiler::discover().unwrap_or_else(|error| { eprintln!("lamella-mcp-csharp: {error}"); std::process::exit(1) });
     let run_compiler = LcscCompiler::discover().unwrap_or_else(|error| { eprintln!("lamella-mcp-csharp: {error}"); std::process::exit(1) });
-    let mut repl = Repl::new(Box::new(run_compiler), Box::new(LoopbackLink::new(corlib)));
+    let mut repl = Repl::new(
+        Box::new(run_compiler),
+        Box::new(LoopbackLink::new(corlib, install_host_clock)),
+    );
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

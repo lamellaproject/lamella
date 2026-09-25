@@ -96,7 +96,8 @@ pub const ConversionClkAdcCycles: u32 = 96;
 pub const ClkAdcHz: u32 = 48000000;
 
 /// -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the
-/// GPIO index a pin-fed channel taps; ChannelCount = the package's mux width --
+/// GPIO index a pin-fed channel taps; ChannelCount = how many rows the map has;
+/// is_channel = whether an index is one of them --
 pub const Channel_GPIO26: i32 = 0;
 pub const Channel_GPIO27: i32 = 1;
 pub const Channel_GPIO28: i32 = 2;
@@ -107,6 +108,13 @@ pub const Channel1_Pin: i32 = 27;
 pub const Channel2_Pin: i32 = 28;
 pub const Channel3_Pin: i32 = 29;
 pub const ChannelCount: i32 = 5;
+
+/// Whether `channel` is the index of a row in the channel map above. The indexes need not run
+/// without gaps, so `ChannelCount` alone does not answer this.
+#[must_use]
+pub const fn is_channel(channel: i32) -> bool {
+    matches!(channel, 0 | 1 | 2 | 3 | 4)
+}
 
 /// -- calibration 'temperature_sensor' (form: vbe-linear); integer coefficients, no hardcoding downstream --
 pub const TemperatureSensor_Channel: u32 = 4;

@@ -145,21 +145,33 @@ pub enum Format {
 }
 
 impl Format {
-    /// The format `name` selects, or the list of names that work.
+    /// Every format, in the order a reader is shown them.
     ///
-    /// # Errors
-    /// A name no format claims. The message lists every one, because the reader is reading it
-    /// precisely because they guessed.
-    pub fn parse(name: &str) -> Result<Format, String> {
-        match name {
-            "bin" => Ok(Format::Bin),
-            "hex" | "ihex" => Ok(Format::IntelHex),
-            "s19" | "srec" => Ok(Format::SRecord),
-            "uf2" => Ok(Format::Uf2 { family: 0 }),
-            other => Err(format!(
-                "{other:?} is not a format this writes. Try: bin, hex (Intel HEX), s19 (Motorola \
-                 S-records), uf2 (a bootloader volume)."
-            )),
+    /// **THE ONE LIST.** The parser, the refusal of a name that is not a format, and the usage
+    /// text that offers them all read this, so none of them can offer a format another does not.
+    /// A format added to the enum is added here too, or it is writable and never offered.
+    ///
+    /// A UF2 appears with a placeholder family: the family is a property of the chip rather than
+    /// of the name, so the board supplies it through [`Format::for_family`].
+    pub const ALL: [Format; 4] =
+        [Format::Bin, Format::IntelHex, Format::SRecord, Format::Uf2 { family: 0 }];
+
+    /// Every format, each followed by what it is where its name does not say:
+    /// `bin, hex (Intel HEX), s19 (Motorola S-records), uf2 (a bootloader volume)`.
+    #[must_use]
+    pub fn listing() -> String {
+        listing(Format::ALL.into_iter().map(Output::Image))
+    }
+
+    /// What this format is, beside its name wherever formats are listed -- `None` where the name
+    /// says it already.
+    #[must_use]
+    pub fn gloss(self) -> Option<&'static str> {
+        match self {
+            Format::Bin => None,
+            Format::IntelHex => Some("Intel HEX"),
+            Format::SRecord => Some("Motorola S-records"),
+            Format::Uf2 { .. } => Some("a bootloader volume"),
         }
     }
 
@@ -204,6 +216,84 @@ impl Format {
             Format::Uf2 { family } => write_uf2(image, base, family),
         }
     }
+}
+
+/// What `--format` names: an image in one of the [`Format`]s, or a linked ELF.
+///
+/// **THE ELF IS NOT A FORMAT AN IMAGE IS RENDERED IN**, which is why it is not a [`Format`]. Its
+/// loadable bytes are the image, and what makes it worth writing is the debug information beside
+/// them -- which only the build that produced the image holds. So [`Format::render`] stays a
+/// function of the image's bytes and nothing else, and the build writes the ELF itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    /// The image alone, in `Format`.
+    Image(Format),
+    /// A linked ELF: the image as its loadable bytes, and the program's debug information.
+    Elf,
+}
+
+impl Output {
+    /// Every output, in the order a reader is shown them: each [`Format`] in [`Format::ALL`]'s order,
+    /// then the ELF.
+    ///
+    /// **DERIVED FROM [`Format::ALL`] RATHER THAN LISTED AGAIN**, so a format added there is offered
+    /// here without anyone writing it twice.
+    pub fn all() -> impl Iterator<Item = Output> {
+        Format::ALL.into_iter().map(Output::Image).chain([Output::Elf])
+    }
+
+    /// The output `name` selects, or the list of names that work.
+    ///
+    /// **AN OUTPUT IS NAMED BY THE EXTENSION ITS FILE CARRIES**, so the name typed and the file
+    /// written agree: `--format s19` writes a `.s19`, and `lamella flash` reads that file by the
+    /// same extension. `ihex` and `srec`, the spellings some toolchains use, are taken as well.
+    ///
+    /// # Errors
+    /// A name no output claims. The message lists every one, because the reader is reading it
+    /// precisely because they guessed.
+    pub fn parse(name: &str) -> Result<Output, String> {
+        let extension = match name {
+            "ihex" => "hex",
+            "srec" => "s19",
+            other => other,
+        };
+        Output::all()
+            .find(|output| output.extension() == extension)
+            .ok_or_else(|| {
+                format!("{name:?} is not a format this writes. Try: {}.", listing(Output::all()))
+            })
+    }
+
+    /// The extension a file of this output carries, which is also the name `--format` takes.
+    #[must_use]
+    pub fn extension(self) -> &'static str {
+        match self {
+            Output::Image(format) => format.extension(),
+            Output::Elf => "elf",
+        }
+    }
+
+    /// What this output is, beside its name wherever outputs are listed -- `None` where the name
+    /// says it already.
+    #[must_use]
+    pub fn gloss(self) -> Option<&'static str> {
+        match self {
+            Output::Image(format) => format.gloss(),
+            Output::Elf => Some("the image with its debug information, for a debugger"),
+        }
+    }
+}
+
+/// `outputs` as a reader is shown them in a sentence: each name, followed by what it is where the
+/// name does not say.
+fn listing(outputs: impl Iterator<Item = Output>) -> String {
+    outputs
+        .map(|output| match output.gloss() {
+            Some(gloss) => format!("{} ({gloss})", output.extension()),
+            None => output.extension().to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Render `image` as UF2, to be COPIED to a bootloader volume, for the chip family `family`.
@@ -778,19 +868,45 @@ mod tests {
     /// would produce an image every bootloader refuses.
     #[test]
     fn a_uf2_family_comes_from_the_board_and_not_the_format_name() {
-        let parsed = Format::parse("uf2").expect("a format this writes");
-        assert_eq!(parsed, Format::Uf2 { family: 0 });
-        assert_eq!(parsed.for_family(0xe48b_ff59), Format::Uf2 { family: 0xe48b_ff59 });
+        let parsed = Output::parse("uf2").expect("a format this writes");
+        assert_eq!(parsed, Output::Image(Format::Uf2 { family: 0 }));
+        let Output::Image(format) = parsed else { unreachable!("asserted above") };
+        assert_eq!(format.for_family(0xe48b_ff59), Format::Uf2 { family: 0xe48b_ff59 });
         assert_eq!(Format::IntelHex.for_family(0xe48b_ff59), Format::IntelHex);
     }
 
     #[test]
     fn a_format_name_that_is_not_one_lists_the_names_that_are() {
-        assert_eq!(Format::parse("hex"), Ok(Format::IntelHex));
-        assert_eq!(Format::parse("s19"), Ok(Format::SRecord));
-        assert_eq!(Format::parse("bin"), Ok(Format::Bin));
-        let error = Format::parse("elf").expect_err("not a format this writes");
-        assert!(error.contains("hex") && error.contains("s19"), "got {error}");
+        assert_eq!(Output::parse("hex"), Ok(Output::Image(Format::IntelHex)));
+        assert_eq!(Output::parse("ihex"), Ok(Output::Image(Format::IntelHex)));
+        assert_eq!(Output::parse("s19"), Ok(Output::Image(Format::SRecord)));
+        assert_eq!(Output::parse("srec"), Ok(Output::Image(Format::SRecord)));
+        assert_eq!(Output::parse("bin"), Ok(Output::Image(Format::Bin)));
+        assert_eq!(Output::parse("elf"), Ok(Output::Elf));
+        let error = Output::parse("coff").expect_err("not a format this writes");
+        assert!(error.starts_with("\"coff\" is not a format"), "names what was typed: {error}");
+        for output in Output::all() {
+            assert!(
+                error.contains(output.extension()),
+                "the refusal must offer {}: {error}",
+                output.extension()
+            );
+        }
+    }
+
+    /// **EVERY OUTPUT IN THE LIST IS ONE THE PARSER TAKES, BY THE NAME THE LIST SHOWS.** The list
+    /// and the parser are two readers of one table, and this is what holds them to it: a name the
+    /// list offers and the parser refuses would send a reader round in a circle.
+    #[test]
+    fn every_listed_output_parses_by_the_name_it_is_listed_under() {
+        for output in Output::all() {
+            assert_eq!(Output::parse(output.extension()), Ok(output));
+        }
+        assert_eq!(Output::all().count(), Format::ALL.len() + 1);
+        for format in Format::ALL {
+            assert!(Format::listing().contains(format.extension()));
+        }
+        assert!(!Format::listing().contains("elf"), "an ELF is not rendered from an image");
     }
 
     /// **THE THREE KINDS EXIST BECAUSE TWO PRODUCED A CIRCULAR REFUSAL.** With only "source or

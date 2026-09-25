@@ -31,15 +31,18 @@ public sealed class Samd21Uart
     /// the TX/RX pins (RX input buffer ON), configures, then enables -- each enable-protected
     /// write waiting out its SYNCBUSY bit. Idempotent -- safe over a SERCOM the resident
     /// firmware already configured.</summary>
+    /// <exception cref="System.InvalidOperationException">The SERCOM's core clock could not be
+    /// routed from its generator, or the SERCOM did not finish synchronizing its setup.</exception>
     public void Init()
     {
+        // The instance's bus clock, then its core clock. A core clock already running from another
+        // generator -- the resident firmware's, say -- is stopped before it moves (DS40001882D
+        // 15.6.3.3).
         uint apbcmask = Samd21Instances.PM_BASE + Samd21PmLayout.APBCMASK_OFF;
         Mmio.Write32(apbcmask, Mmio.Read32(apbcmask) | _binding.ApbcMask);
-        Mmio.Write16(Samd21Instances.GCLK_BASE + Samd21GclkLayout.CLKCTRL_OFF,
-            (ushort)_binding.GclkClkctrlValue);
-        while ((Mmio.Read8(Samd21Instances.GCLK_BASE + Samd21GclkLayout.STATUS_OFF)
-            & (byte)Samd21GclkLayout.STATUS_SYNCBUSY) != 0)
+        if (!Samd21GenericClock.Route(_binding.GclkClkctrlValue))
         {
+            Invalid("the SERCOM's core clock could not be routed from its generator");
         }
 
         Mmio.Write8(_binding.PmuxReg, (byte)_binding.PmuxPair);
@@ -57,13 +60,36 @@ public sealed class Samd21Uart
         Mmio.Write16(_baud, (ushort)_binding.BaudDivisor);
         Mmio.Write32(_ctrlb,
             Samd21SercomUsartLayout.CTRLB_TXEN | Samd21SercomUsartLayout.CTRLB_RXEN);
-        while ((Mmio.Read32(_syncbusy) & Samd21SercomUsartLayout.SYNCBUSY_CTRLB) != 0u)
-        {
-        }
+        WaitSync(Samd21SercomUsartLayout.SYNCBUSY_CTRLB);
         Mmio.Write32(_ctrla, Mmio.Read32(_ctrla) | Samd21SercomUsartLayout.CTRLA_ENABLE);
-        while ((Mmio.Read32(_syncbusy) & Samd21SercomUsartLayout.SYNCBUSY_ENABLE) != 0u)
+        WaitSync(Samd21SercomUsartLayout.SYNCBUSY_ENABLE);
+    }
+
+    // A bound on each synchronization wait, so a SERCOM that never finishes is reported rather than
+    // waited on forever.
+    const int WaitBound = 100000;
+
+    void WaitSync(uint bits)
+    {
+        for (int spin = 0; spin < WaitBound; spin++)
         {
+            if ((Mmio.Read32(_syncbusy) & bits) == 0u)
+            {
+                return;
+            }
         }
+        Invalid("the SERCOM did not finish synchronizing its setup");
+    }
+
+    // The corlib-free tiers bind only System.Exception's constructor, so the precise type is chosen
+    // where a corlib is linked, as the family's other drivers do.
+    static void Invalid(string why)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.InvalidOperationException(why);
+#else
+        throw new System.Exception(why);
+#endif
     }
 
     /// <summary>Sends one byte, waiting (bounded) for the Data Register Empty flag first.</summary>

@@ -14,13 +14,16 @@ vendor = "bbc"
 family = "nrf52833"
 part = "nrf52833"
 product_model = 11          # lamella_wire::product_model::MICROBIT_V2
-sources = ["micro:bit v2.0.0_S schematic (I2C_INT wiring, bus residents, 1k pulls)"]
+sources = [
+    "micro:bit v2.0.0_S schematic (I2C_INT wiring, bus residents, 1k pulls)",
+    "micro:bit v2.0.0_S schematic, page 3: crystal X1 (32 MHz) across the nRF52833's XC1 and XC2 (balls B24 and A23)",
+]
 
 [[carriers]]
 kind = "daplink-vcp"        # the on-board DAPLink bridge's VCP. The carrier states the bridge
                             # identity class only; its fixed USB ids are stated once host
                             # tooling pins them with evidence.
-plan = "hfclk-default"
+plan = "xtal-32mhz"
 default = true
 
 [[bindings]]
@@ -31,13 +34,32 @@ function = "twi"
 scl = { pin = "P0.08" }
 sda = { pin = "P0.16" }
 
+# THE EDGE CONNECTOR'S SPI. Edge pins 13, 14 and 15 carry the SPI clock, MISO and MOSI. The binding
+# rides the legacy SPI master's instance SPI2, which shares its base only with the EasyDMA SPI
+# siblings and with neither TWI, so the internal I2C bus on TWI0 stays its own. The master drives no
+# chip select: the program names the GPIO that selects its device, as
+# SpiConnectionSettings.ChipSelectLine.
+[[bindings]]
+role = "spi"
+kind = "spi"
+instance = "spi2"
+function = "spi"
+sck = { pin = "P0.17" }
+mosi = { pin = "P0.13" }
+miso = { pin = "P0.01" }
+source = "micro:bit v2.0.0_S schematic: edge connector J1 contacts 23, 24 and 25 (P13, P14, P15) carry SPI_EXT_SCK, SPI_EXT_MISO and SPI_EXT_MOSI, which reach the nRF52833 at balls AD12 (P0.17), F2 (P0.01) and AD8 (P0.13)"
+
+# THE CLOCK PLAN: HFCLK from the board's 32 MHz crystal, through the part's crystal oscillator
+# (HFXO), which the CLOCK block's HFCLKSTART task starts. Until it is started the part runs HFCLK
+# from its internal oscillator (HFINT), whose tolerance reaches 8%, and the product specification
+# requires the crystal for stable serial communication -- so a startup that applies this plan
+# starts HFXO before anything relies on a rate. The peripherals' rate registers are ENUMERATED (the
+# UART's BAUDRATE, the TWI's and the SPI's FREQUENCY), so no divisor derives from a plan rate.
 [[plans]]
-name = "hfclk-default"
+name = "xtal-32mhz"
 default = true
-source = "hfclk"            # the TWI times itself from HFCLK and its FREQUENCY register is
-                            # ENUMERATED (K100/K250/K400) -- no divisor derives from a rate,
-                            # so this plan states the operating point's name only; rates
-                            # join when a consumer actually derives from them.
+source = "xtal"             # HFCLKSTAT.SRC's name for the crystal oscillator (HFXO)
+xtal_hz = 32000000          # crystal X1 across XC1 and XC2 (schematic page 3)
 
 # THE MOTION SENSOR PART IS NOT GUARANTEED BY THE BOARD REVISION, and the two rows below assert
 # one. The vendor's own hardware documentation, https://tech.microbit.org/hardware/2-0-revision/ ,

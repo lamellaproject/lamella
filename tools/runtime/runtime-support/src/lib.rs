@@ -83,11 +83,9 @@ const HEAP_MIN_BYTES: usize = 12;
 /// the image's [`lamella_gc::DeviceHeap`], laid over the band the reset stub seeded, and returns the
 /// payload pointer.
 ///
-/// **This entry stays the entry even though `lamella-gc` exports one of its own.** The two are not
-/// interchangeable: this archive's `lamella_gc_alloc` shim writes the thread anchor the root walker
-/// walks from, while that crate's captures SP/LR into arguments its body then ignores. Letting the
-/// other one win would land a collector that reports no roots -- which reclaims everything, and
-/// looks like a working collector until a program holds a reference across an allocation.
+/// **This archive's `lamella_gc_alloc` is the image's only allocator entry.** `lamella-gc` supplies
+/// the body and exports no entry of its own, and the entry has to be this one: its shim writes the
+/// thread anchor the root walker walks from, which is how a collection finds the roots it must keep.
 ///
 /// **[`HEAP_PTR`] is a SEED, not a live cursor.** The `DeviceHeap` owns the bump from the first
 /// allocation onward, so that word stops advancing once the heap is adopted. Nothing reads it for
@@ -1477,13 +1475,13 @@ enum ParkReason {
 
 /// The scheduler's state: one saved context per thread, the live count, the running thread, the runnable
 /// bitmap (bit `i` set = thread `i` is ready), the per-thread GC anchors, each thread's park reason (the
-/// reactor's timer/socket wait set), and the C# bridge's per-thread entry pair + exit bitmap. Lives at a
-/// fixed RAM address (no `.bss`).
+/// reactor's timer/socket wait set), and the C# bridge's per-thread entry pair + exit bitmap. It is
+/// [`SCHED_STATE`], a zero-initialized static.
 ///
 /// LAYOUT CONTRACT (the anchor shims read these by offset): every field up to and including
-/// `anchor_pc` is `repr(C)`-deterministic -- `contexts` = 4 x 40 bytes, so `count` is at +160,
-/// `current` at +164, `anchor_sp[0]` at +172, `anchor_pc[0]` at +188 (the two arrays sit 16 bytes
-/// apart). `parks` (a Rust enum, unspecified layout) and everything after it are Rust-only.
+/// `anchor_pc` is `repr(C)`-deterministic. The shims take each offset from `offset_of!` rather than
+/// from a number written into the assembly, so the contract is checked by the compiler.
+/// `parks` (a Rust enum, unspecified layout) and everything after it are Rust-only.
 #[repr(C)]
 struct Scheduler {
     contexts: [ThreadContext; MAX_THREADS],
@@ -1508,8 +1506,27 @@ struct Scheduler {
     /// Bit `i` set = thread `i` has exited -- what `lamella_thread_join` waits on.
     done: u32,
 }
-const SCHED: *mut Scheduler = 0x2000_3000 as *mut Scheduler;
-const SCHED_COUNTER: *mut u32 = 0x2000_3400 as *mut u32;
+
+/// The one scheduler, zero-initialized so that it is `.bss`: the linker places it in the statics
+/// window beside the managed statics, and a boot path clears that window before managed code runs.
+/// All-zero is the designed initial state -- `count == 0` means "never used", and
+/// [`sched_ensure_init`] turns it into a live thread 0.
+static mut SCHED_STATE: core::mem::MaybeUninit<Scheduler> = core::mem::MaybeUninit::zeroed();
+
+/// [`SCHED_STATE`] as a raw pointer. No reference to the `static mut` itself is ever formed; each
+/// caller reborrows through this for exactly as long as it holds the scheduler.
+#[inline(always)]
+fn sched() -> *mut Scheduler {
+    core::ptr::addr_of_mut!(SCHED_STATE).cast()
+}
+
+/// The scheduler demos' shared counter, zero-initialized for the same reason as [`SCHED_STATE`].
+static mut SCHED_COUNTER_CELL: u32 = 0;
+
+#[inline(always)]
+fn sched_counter() -> *mut u32 {
+    core::ptr::addr_of_mut!(SCHED_COUNTER_CELL)
+}
 
 macro_rules! anchor_seam_shim {
     ($name:literal) => {
@@ -1521,16 +1538,16 @@ macro_rules! anchor_seam_shim {
             concat!(".type ", $name, ", %function"),
             concat!($name, ":"),
             "push {{r0-r3}}",
-            "ldr  r0, =0x200030A4",
+            "ldr  r0, ={sched}+{current}",
             "ldr  r0, [r0]",
             "lsls r0, r0, #2",
-            "ldr  r1, =0x200030AC",
+            "ldr  r1, ={sched}+{anchor_sp}",
             "adds r1, r0",
             "mov  r2, sp",
             "adds r2, #16",
             "str  r2, [r1, #0]",
             "mov  r2, lr",
-            "str  r2, [r1, #16]",
+            "str  r2, [r1, #{pc_from_sp}]",
             concat!("ldr  r3, =", $name, "_impl"),
             "movs r0, #1",
             "orrs r3, r0",
@@ -1539,6 +1556,11 @@ macro_rules! anchor_seam_shim {
             "bx   r12",
             ".ltorg",
             concat!(".size ", $name, ", . - ", $name),
+            sched = sym SCHED_STATE,
+            current = const core::mem::offset_of!(Scheduler, current),
+            anchor_sp = const core::mem::offset_of!(Scheduler, anchor_sp),
+            pc_from_sp = const core::mem::offset_of!(Scheduler, anchor_pc)
+                - core::mem::offset_of!(Scheduler, anchor_sp),
         );
     };
 }
@@ -1577,7 +1599,7 @@ fn sched_next_runnable(s: &Scheduler, from: usize) -> usize {
 /// Yield the CPU: pick the next runnable thread and switch to it (a no-op if the caller is the only one
 /// runnable). The caller resumes here on its next turn, its callee-saved state restored by the switch.
 unsafe fn sched_yield() {
-    let s = &mut *SCHED;
+    let s = &mut *sched();
     let from = s.current as usize;
     let next = sched_next_runnable(s, from);
     if next == from {
@@ -1593,7 +1615,7 @@ unsafe fn sched_yield() {
 /// stack hosts that wait -- still valid, nothing reclaims stacks; switching to a stale saved context
 /// instead would re-run dead code). Never returns -- a cleared thread is never scheduled again.
 unsafe fn sched_exit() -> ! {
-    let s = &mut *SCHED;
+    let s = &mut *sched();
     let cur = s.current as usize;
     s.runnable &= !(1u32 << cur);
     s.done |= 1u32 << cur;
@@ -1620,7 +1642,7 @@ unsafe fn sched_exit() -> ! {
 /// -- after the entry shim already wrote the calling thread's anchor): a spawned-never-run thread
 /// has no managed frames, and anchor_pc 0 is how the root walk knows to skip its stack.
 unsafe fn sched_spawn(entry: extern "C" fn() -> !) {
-    let s = &mut *SCHED;
+    let s = &mut *sched();
     let id = s.count as usize;
     core::ptr::write(
         &mut s.contexts[id],
@@ -1642,8 +1664,8 @@ extern "C" fn sched_worker() -> ! {
     unsafe {
         let mut i = 0u32;
         while i < 7 {
-            let c = core::ptr::read_volatile(SCHED_COUNTER);
-            core::ptr::write_volatile(SCHED_COUNTER, c.wrapping_add(2));
+            let c = core::ptr::read_volatile(sched_counter());
+            core::ptr::write_volatile(sched_counter(), c.wrapping_add(2));
             sched_yield();
             i += 1;
         }
@@ -1658,18 +1680,18 @@ extern "C" fn sched_worker() -> ! {
 #[no_mangle]
 pub extern "C" fn lamella_sched_demo() -> u32 {
     unsafe {
-        let s = &mut *SCHED;
+        let s = &mut *sched();
         s.count = 1;
         s.current = 0;
         s.runnable = 1;
-        core::ptr::write_volatile(SCHED_COUNTER, 0);
+        core::ptr::write_volatile(sched_counter(), 0);
         sched_spawn(sched_worker);
         sched_spawn(sched_worker);
         sched_spawn(sched_worker);
-        while (*SCHED).runnable != 1 {
+        while (*sched()).runnable != 1 {
             sched_yield();
         }
-        core::ptr::read_volatile(SCHED_COUNTER)
+        core::ptr::read_volatile(sched_counter())
     }
 }
 
@@ -1753,12 +1775,27 @@ extern "C" fn lamella_clock_now_ms() -> u64 {
     monotonic_now_ms().unwrap_or(0)
 }
 
-/// Mock monotonic clock (ms) for the self-contained reactor demo; the `net` build reads the real clock seam.
+/// Mock monotonic clock (ms) for the self-contained reactor demo; the `net` build reads the real clock
+/// seam. Zero-initialized, so it is `.bss` in the statics window a boot path clears -- the clock
+/// starts at zero, which is the no-clock answer, rather than at whatever RAM held.
 #[cfg(not(feature = "net"))]
-const REACTOR_NOW: *mut u64 = 0x2000_3800 as *mut u64;
-/// The one socket handle the mock poll reports ready (0 = none); the `net` build calls the real network poll.
+static mut REACTOR_NOW_CELL: u64 = 0;
+/// The one socket handle the mock poll reports ready (0 = none); the `net` build calls the real
+/// network poll. Zero-initialized for the same reason as [`REACTOR_NOW_CELL`].
 #[cfg(not(feature = "net"))]
-const REACTOR_NET_READY: *mut u32 = 0x2000_3808 as *mut u32;
+static mut REACTOR_NET_READY_CELL: u32 = 0;
+
+#[cfg(not(feature = "net"))]
+#[inline(always)]
+fn reactor_now() -> *mut u64 {
+    core::ptr::addr_of_mut!(REACTOR_NOW_CELL)
+}
+
+#[cfg(not(feature = "net"))]
+#[inline(always)]
+fn reactor_net_ready() -> *mut u32 {
+    core::ptr::addr_of_mut!(REACTOR_NET_READY_CELL)
+}
 
 /// The `net` reactor environment: the real C-ABI seams over the installed network stack
 /// (lamella-runtime-support-net). One monotonic clock -- `lamella_net_now_ms` forwards to the SAME
@@ -1797,24 +1834,25 @@ mod reactor_env {
     }
 }
 
-/// The featureless (mock) reactor environment over [`REACTOR_NOW`]/[`REACTOR_NET_READY`], for the
-/// self-contained reactor demo -- no clock hardware, no net stack. The mock "wait" ADVANCES the clock
-/// by the timeout (there is no real time source), so a timed park deterministically wakes.
+/// The featureless (mock) reactor environment over [`REACTOR_NOW_CELL`] and
+/// [`REACTOR_NET_READY_CELL`], for the self-contained reactor demo -- no clock hardware, no net
+/// stack. The mock "wait" ADVANCES the clock by the timeout (there is no real time source), so a
+/// timed park deterministically wakes.
 #[cfg(not(feature = "net"))]
 mod reactor_env {
-    use super::{REACTOR_NET_READY, REACTOR_NOW};
+    use super::{reactor_net_ready, reactor_now};
 
     pub fn now_millis() -> Option<u64> {
         if let Some(now) = super::monotonic_now_ms() {
             return Some(now);
         }
-        Some(unsafe { core::ptr::read_volatile(REACTOR_NOW) })
+        Some(unsafe { core::ptr::read_volatile(reactor_now()) })
     }
 
     pub fn sleep_millis(millis: u64) {
         unsafe {
-            let now = core::ptr::read_volatile(REACTOR_NOW);
-            core::ptr::write_volatile(REACTOR_NOW, now + millis);
+            let now = core::ptr::read_volatile(reactor_now());
+            core::ptr::write_volatile(reactor_now(), now + millis);
         }
     }
 
@@ -1822,7 +1860,7 @@ mod reactor_env {
         if let Some(millis) = timeout {
             sleep_millis(millis);
         }
-        let handle = unsafe { core::ptr::read_volatile(REACTOR_NET_READY) };
+        let handle = unsafe { core::ptr::read_volatile(reactor_net_ready()) };
         if handle != 0 && !ready.is_empty() {
             ready[0] = handle;
             1
@@ -1855,7 +1893,7 @@ fn sched_deadlock_trap() -> ! {
 /// through the shared re-entry loop. The thread resumes here once woken and rescheduled -- by the
 /// block point's wake pass (its `reason` came due) or, single-threaded, by its own wait completing.
 unsafe fn sched_park(reason: ParkReason) {
-    let s = &mut *SCHED;
+    let s = &mut *sched();
     let cur = s.current as usize;
     s.parks[cur] = reason;
     s.runnable &= !(1u32 << cur);
@@ -1892,7 +1930,7 @@ unsafe fn sched_block_current(s: &mut Scheduler) {
 /// exactly what lets a pure lock cycle fall through the block point's nothing-external rule into
 /// the deadlock trap.
 unsafe fn sched_block_for_handoff() {
-    let s = &mut *SCHED;
+    let s = &mut *sched();
     let cur = s.current as usize;
     s.runnable &= !(1u32 << cur);
     sched_block_current(s);
@@ -1901,7 +1939,7 @@ unsafe fn sched_block_for_handoff() {
 /// The Monitor hand-off wake (the interp scheduler's `WakeThread` twin): make thread `id` runnable
 /// again. A lock-blocked thread is `NotParked`, so only the runnable bit changes.
 unsafe fn sched_wake(id: usize) {
-    (*SCHED).runnable |= 1u32 << id;
+    (*sched()).runnable |= 1u32 << id;
 }
 
 /// The most ready sockets one block point drains (its fixed stack poll buffer) -- the no-alloc
@@ -1970,11 +2008,11 @@ unsafe fn sched_block_point(s: &mut Scheduler) -> bool {
 /// -- bump by 7 more and exit. The after-wake bump happens ONLY if park + block point + wake round-trip.
 #[cfg(not(feature = "net"))]
 unsafe fn reactor_worker(reason: ParkReason) -> ! {
-    let c = core::ptr::read_volatile(SCHED_COUNTER);
-    core::ptr::write_volatile(SCHED_COUNTER, c.wrapping_add(14));
+    let c = core::ptr::read_volatile(sched_counter());
+    core::ptr::write_volatile(sched_counter(), c.wrapping_add(14));
     sched_park(reason);
-    let c = core::ptr::read_volatile(SCHED_COUNTER);
-    core::ptr::write_volatile(SCHED_COUNTER, c.wrapping_add(7));
+    let c = core::ptr::read_volatile(sched_counter());
+    core::ptr::write_volatile(sched_counter(), c.wrapping_add(7));
     sched_exit();
 }
 
@@ -1998,53 +2036,53 @@ extern "C" fn reactor_worker_sleep() -> ! {
 #[no_mangle]
 pub extern "C" fn lamella_reactor_demo() -> u32 {
     unsafe {
-        (*SCHED).count = 1;
-        (*SCHED).current = 0;
-        (*SCHED).runnable = 1;
+        (*sched()).count = 1;
+        (*sched()).current = 0;
+        (*sched()).runnable = 1;
         for i in 0..MAX_THREADS {
-            (*SCHED).parks[i] = ParkReason::NotParked;
+            (*sched()).parks[i] = ParkReason::NotParked;
         }
-        core::ptr::write_volatile(SCHED_COUNTER, 0);
-        core::ptr::write_volatile(REACTOR_NOW, 0);
-        core::ptr::write_volatile(REACTOR_NET_READY, 7);
+        core::ptr::write_volatile(sched_counter(), 0);
+        core::ptr::write_volatile(reactor_now(), 0);
+        core::ptr::write_volatile(reactor_net_ready(), 7);
         sched_spawn(reactor_worker_io);
         sched_spawn(reactor_worker_sleep);
         loop {
-            if (*SCHED).runnable & !1u32 != 0 {
+            if (*sched()).runnable & !1u32 != 0 {
                 sched_yield();
-            } else if sched_any_parked(&*SCHED) {
-                if !sched_block_point(&mut *SCHED) {
+            } else if sched_any_parked(&*sched()) {
+                if !sched_block_point(&mut *sched()) {
                     break;
                 }
             } else {
                 break;
             }
         }
-        core::ptr::read_volatile(SCHED_COUNTER)
+        core::ptr::read_volatile(sched_counter())
     }
 }
 
 
 /// The generic native entry of every C#-spawned thread: call the slot's managed entry helper with its
-/// delegate on this thread's fresh stack, then exit through the scheduler. Runs as `SCHED.current`
+/// delegate on this thread's fresh stack, then exit through the scheduler. Runs as the scheduler's `current`
 /// (the switch that first ran this thread set `current` to its slot).
 extern "C" fn thread_entry_trampoline() -> ! {
     unsafe {
-        let cur = (*SCHED).current as usize;
+        let cur = (*sched()).current as usize;
         let entry: extern "C" fn(u32) =
-            core::mem::transmute(((*SCHED).entries[cur] | 1) as usize);
-        let arg = (*SCHED).entry_args[cur];
+            core::mem::transmute(((*sched()).entries[cur] | 1) as usize);
+        let arg = (*sched()).entry_args[cur];
         entry(arg);
         sched_exit();
     }
 }
 
-/// First-use scheduler init: the CALLER becomes thread 0 on the boot stack. QEMU zeroes RAM, so
-/// `count == 0` marks "never used"; a real-silicon boot path zeroes SCHED explicitly before managed
-/// code. Idempotent -- a later call with threads live is a no-op. Every seam that can spawn OR park
+/// First-use scheduler init: the CALLER becomes thread 0 on the boot stack. The scheduler is `.bss`, so
+/// a boot path has cleared it before managed code runs and `count == 0` marks "never used".
+/// Idempotent -- a later call with threads live is a no-op. Every seam that can spawn OR park
 /// calls this first, so a single-threaded program's very first park finds a coherent scheduler.
 unsafe fn sched_ensure_init() {
-    let s = &mut *SCHED;
+    let s = &mut *sched();
     if s.count == 0 {
         s.count = 1;
         s.current = 0;
@@ -2063,7 +2101,7 @@ unsafe fn sched_ensure_init() {
 pub extern "C" fn lamella_thread_start(entry: u32, delegate: u32, _is_background: i32) -> i32 {
     unsafe {
         sched_ensure_init();
-        let s = &mut *SCHED;
+        let s = &mut *sched();
         let id = s.count as usize;
         if id >= MAX_THREADS {
             return -1;
@@ -2080,7 +2118,7 @@ pub extern "C" fn lamella_thread_start(entry: u32, delegate: u32, _is_background
 #[no_mangle]
 extern "C" fn lamella_thread_yield_impl() {
     unsafe {
-        if (*SCHED).count > 1 {
+        if (*sched()).count > 1 {
             sched_yield();
         }
     }
@@ -2095,11 +2133,11 @@ extern "C" fn lamella_thread_yield_impl() {
 #[no_mangle]
 extern "C" fn lamella_thread_join_impl(id: i32) {
     unsafe {
-        if id < 1 || id as u32 >= (*SCHED).count {
+        if id < 1 || id as u32 >= (*sched()).count {
             return;
         }
-        while (*SCHED).done & (1u32 << id) == 0 {
-            let s = &mut *SCHED;
+        while (*sched()).done & (1u32 << id) == 0 {
+            let s = &mut *sched();
             let cur = s.current as usize;
             if sched_next_runnable(s, cur) != cur {
                 sched_yield();
@@ -2130,10 +2168,10 @@ extern "C" fn lamella_thread_join_impl(id: i32) {
 #[no_mangle]
 pub extern "C" fn lamella_thread_finished(id: i32) -> i32 {
     unsafe {
-        if id < 1 || id as u32 >= (*SCHED).count {
+        if id < 1 || id as u32 >= (*sched()).count {
             return 1;
         }
-        i32::from((*SCHED).done & (1u32 << id) != 0)
+        i32::from((*sched()).done & (1u32 << id) != 0)
     }
 }
 
@@ -2274,7 +2312,7 @@ const MAX_LOCKS: usize = 8;
 struct LockEntry {
     /// The locked object's address (the managed reference, marshalled RefToInt); 0 = a free slot.
     /// Keying on the ADDRESS makes every locked object part of the GC pin/relocate contract, the
-    /// same family as `SCHED.entry_args`.
+    /// same family as the scheduler's `entry_args`.
     obj: u32,
     /// The owning thread id; meaningful only while `recursion != 0`.
     owner: u32,
@@ -2295,11 +2333,15 @@ struct LockTable {
     grant_depth: [u32; MAX_THREADS],
 }
 
-/// Fixed device RAM directly after [`SCHED_COUNTER`], placed rather than `.bss`: 176 bytes at
-/// 0x2000_3410..0x2000_34C0, clear of the featureless mock reactor cells (0x2000_3800+) and the
-/// `net` build's worker stacks (0x2000_3800..0x2000_6800). QEMU zeroes RAM (= every slot free);
-/// a silicon boot zeroes it alongside SCHED.
-const LOCKS: *mut LockTable = 0x2000_3410 as *mut LockTable;
+/// The lock table, zero-initialized so that it is `.bss` in the statics window a boot path clears:
+/// an all-zero table is every slot free, which is the only state a program may start from.
+static mut LOCKS_STATE: core::mem::MaybeUninit<LockTable> = core::mem::MaybeUninit::zeroed();
+
+/// [`LOCKS_STATE`] as a raw pointer, for the reason [`sched`] gives.
+#[inline(always)]
+fn locks() -> *mut LockTable {
+    core::ptr::addr_of_mut!(LOCKS_STATE).cast()
+}
 
 /// More than [`MAX_LOCKS`] DISTINCT objects locked/awaited at once: the fixed table cannot grow,
 /// and proceeding without a slot would drop mutual exclusion. Prints `LOCKFULL` over semihosting
@@ -2338,7 +2380,7 @@ fn monitor_null_trap() -> ! {
 /// `false` on contention (NO enqueue). Fails loud when a NEW entry is needed and the table is full
 /// -- also for `TryEnter`, where returning 0 would misreport a capacity failure as contention.
 unsafe fn lock_try_acquire(obj: u32, me: u32) -> bool {
-    let t = &mut *LOCKS;
+    let t = &mut *locks();
     for e in t.entries.iter_mut() {
         if e.obj == obj {
             if e.recursion == 0 {
@@ -2391,7 +2433,7 @@ unsafe fn lock_release_outermost(t: &mut LockTable, i: usize) {
 /// Whether `me` holds the lock on `obj` right now -- what a woken contender re-checks (it may only
 /// run after further hand-offs) and the Wait/Pulse ownership precondition.
 unsafe fn lock_owned_by(obj: u32, me: u32) -> bool {
-    (*LOCKS)
+    (*locks())
         .entries
         .iter()
         .any(|e| e.obj == obj && e.recursion != 0 && e.owner == me)
@@ -2407,13 +2449,13 @@ extern "C" fn lamella_monitor_enter_impl(obj: u32) {
     }
     unsafe {
         sched_ensure_init();
-        let me = (*SCHED).current;
+        let me = (*sched()).current;
         loop {
             if lock_try_acquire(obj, me) {
                 return;
             }
             {
-                let t = &mut *LOCKS;
+                let t = &mut *locks();
                 t.grant_depth[me as usize] = 1;
                 if let Some(e) = t.entries.iter_mut().find(|e| e.obj == obj) {
                     e.waiters |= 1u32 << me;
@@ -2434,8 +2476,8 @@ extern "C" fn lamella_monitor_enter_impl(obj: u32) {
 pub extern "C" fn lamella_monitor_exit(obj: u32) {
     unsafe {
         sched_ensure_init();
-        let me = (*SCHED).current;
-        let t = &mut *LOCKS;
+        let me = (*sched()).current;
+        let t = &mut *locks();
         let Some(i) = t.entries.iter().position(|e| e.obj == obj) else {
             return;
         };
@@ -2458,7 +2500,7 @@ pub extern "C" fn lamella_monitor_try_enter(obj: u32) -> i32 {
     }
     unsafe {
         sched_ensure_init();
-        let me = (*SCHED).current;
+        let me = (*sched()).current;
         i32::from(lock_try_acquire(obj, me))
     }
 }
@@ -2472,9 +2514,9 @@ pub extern "C" fn lamella_monitor_try_enter(obj: u32) -> i32 {
 extern "C" fn lamella_monitor_wait_impl(obj: u32) {
     unsafe {
         sched_ensure_init();
-        let me = (*SCHED).current;
+        let me = (*sched()).current;
         {
-            let t = &mut *LOCKS;
+            let t = &mut *locks();
             let Some(i) = t.entries.iter().position(|e| e.obj == obj) else {
                 monitor_not_owner_trap();
             };
@@ -2518,8 +2560,8 @@ pub extern "C" fn lamella_monitor_pulse_all(obj: u32) {
 /// lowest-id / every wait-set thread into `waiters`. Their saved grant depths ride
 /// `LockTable::grant_depth` untouched.
 unsafe fn monitor_pulse_impl(obj: u32, one: bool) {
-    let me = (*SCHED).current;
-    let t = &mut *LOCKS;
+    let me = (*sched()).current;
+    let t = &mut *locks();
     let Some(i) = t.entries.iter().position(|e| e.obj == obj) else {
         monitor_not_owner_trap();
     };
@@ -2636,7 +2678,7 @@ unsafe fn walk_thread_stack(mut sp: u32, mut pc: u32, visit: RootVisitor, live: 
 }
 
 /// The root walk: every live thread's managed stack from its anchor, then the global roots -- the
-/// spawned-unfinished threads' entry delegates (`SCHED.entry_args`), the lock table's object keys
+/// spawned-unfinished threads' entry delegates (the scheduler's `entry_args`), the lock table's object keys
 /// (the Tier 3 pin/relocate contract: Monitor keys on object ADDRESSES, so a relocator must be able
 /// to rewrite them), and every mode-2 STATICS record's rows (the program's ref-bearing statics plus
 /// the EH in-flight word at row 0). Returns the count of NONZERO enumerated slots. The calling
@@ -2646,7 +2688,7 @@ unsafe fn walk_thread_stack(mut sp: u32, mut pc: u32, visit: RootVisitor, live: 
 extern "C" fn lamella_gc_walk_roots_impl(visit: RootVisitor) -> u32 {
     unsafe {
         let mut live = 0u32;
-        let s = &mut *SCHED;
+        let s = &mut *sched();
         let thread_count = (s.count as usize).clamp(1, MAX_THREADS);
         for i in 0..thread_count {
             if s.done & (1u32 << i) != 0 || s.anchor_pc[i] == 0 {
@@ -2659,7 +2701,7 @@ extern "C" fn lamella_gc_walk_roots_impl(visit: RootVisitor) -> u32 {
                 visit_root(core::ptr::addr_of_mut!(s.entry_args[i]), 0, visit, &mut live);
             }
         }
-        let table = &mut *LOCKS;
+        let table = &mut *locks();
         for entry in table.entries.iter_mut() {
             if entry.obj != 0 {
                 visit_root(core::ptr::addr_of_mut!(entry.obj), 0, visit, &mut live);

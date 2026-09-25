@@ -2,9 +2,10 @@
 
 use crate::args::{self, Spec};
 pub use lamella_flash_routes::{can_flash, uf2_family_for_board};
+use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
 use lamella_flash_routes::{
-    NoAotTarget, Programmer, aot_target_for, prepare_image, programmer_for, route_for,
-    selector_for, wrap_for_route, write,
+    NoAotTarget, Programmer, Programming, aot_target_for, prepare_image, programmer_for,
+    route_for, selector_for, wrap_for_route, write,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,7 +28,7 @@ use std::process::ExitCode;
 /// driving the tool -- there is nobody to answer, and a prompt that times out or reads end-of-file
 /// would have to fall back to something. Falling back means guessing, and the thing being guessed
 /// at is which board gets erased. So without a terminal it refuses exactly as before.
-fn choose_board(
+pub(crate) fn choose_board(
     programmer: Programmer,
     requested: Option<&str>,
 ) -> Result<Option<String>, String> {
@@ -108,13 +109,50 @@ pub fn flash_command(args: &[String]) -> ExitCode {
     let spec = Spec {
         verb: "flash",
         usage: Some(USAGE),
-        values: &["--board", "--probe", "--volume", "--device", "--via"],
-        flags: &[],
+        values: &[
+            "--board",
+            "--probe",
+            "--volume",
+            "--device",
+            "--via",
+            crate::bootprot::RESTORE_USER_ROW,
+        ],
+        flags: &[
+            crate::bootprot::CLEAR_BOOTPROT,
+            crate::bootprot::DRY_RUN,
+            REPLACE_BOOTLOADER,
+        ],
     };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
         Err(halt) => return halt.code(),
     };
+    if let Some(step) = user_row_step_beside_a_replace(
+        parsed.flag(REPLACE_BOOTLOADER),
+        parsed.flag(crate::bootprot::CLEAR_BOOTPROT),
+        parsed.value(crate::bootprot::RESTORE_USER_ROW).is_some(),
+    ) {
+        eprintln!(
+            "lamella flash: {REPLACE_BOOTLOADER} says where an image is written, and {step} \
+             writes no image.\nRun them as two commands.\n\n{USAGE}"
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Some(file) = parsed.value(crate::bootprot::RESTORE_USER_ROW) {
+        return crate::bootprot::restore_user_row_command(&parsed, file);
+    }
+    if parsed.flag(crate::bootprot::CLEAR_BOOTPROT) {
+        return crate::bootprot::clear_bootprot_command(&parsed);
+    }
+    if parsed.flag(crate::bootprot::DRY_RUN) {
+        eprintln!(
+            "lamella flash: {} plans {} or {}, and an image write has no dry run.\n\n{USAGE}",
+            crate::bootprot::DRY_RUN,
+            crate::bootprot::CLEAR_BOOTPROT,
+            crate::bootprot::RESTORE_USER_ROW
+        );
+        return ExitCode::FAILURE;
+    }
     let path = match parsed.only_positional("flash", POSITIONAL) {
         Ok(path) => Path::new(path).to_path_buf(),
         Err(error) => {
@@ -210,7 +248,19 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let prepared = match prepare_image(&path, row, chosen) {
+    let choice = if parsed.flag(REPLACE_BOOTLOADER) {
+        BootloaderChoice::Replace
+    } else {
+        BootloaderChoice::Keep
+    };
+    let placement = match placement_for(row, chosen, choice) {
+        Ok(placement) => placement,
+        Err(why) => {
+            eprintln!("lamella flash: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let prepared = match prepare_image(&path, row, chosen, &placement) {
         Ok(prepared) => prepared,
         Err(why) => {
             eprintln!("lamella flash: {why}");
@@ -233,10 +283,48 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    write_image(chosen, row.aot_target, &prepared.bytes, selector.as_deref())
+    write_image(chosen, &placement, &prepared.bytes, selector.as_deref())
 }
 
+/// The user-row step asked for alongside `--replace-bootloader`, which the command refuses: the
+/// option says where an image is written, and neither step writes one.
+fn user_row_step_beside_a_replace(
+    replace: bool,
+    clear_bootprot: bool,
+    restore_user_row: bool,
+) -> Option<&'static str> {
+    if !replace {
+        return None;
+    }
+    if restore_user_row {
+        return Some(crate::bootprot::RESTORE_USER_ROW);
+    }
+    clear_bootprot.then_some(crate::bootprot::CLEAR_BOOTPROT)
+}
 
+/// What a person is told before a write about the bootloader it keeps or replaces, or `None` on a
+/// board whose facts state no bootloader.
+fn placement_line(placement: &Placement) -> Option<String> {
+    match placement {
+        Placement::Start { .. } => None,
+        Placement::Behind(bootloader) => Some(format!(
+            "keeping the {} at {:#010x}-{:#010x}; the image is written behind it, from {:#010x}",
+            bootloader.name,
+            bootloader.base,
+            bootloader.end() - 1,
+            bootloader.end()
+        )),
+        Placement::Over(bootloader) => Some(format!(
+            "replacing the {} at {:#010x}-{:#010x}. Until a bootloader is written back the board \
+             has none:\nnothing uploads through it, an IDE over USB included, and no double-tap \
+             reset enters it.\nThe way back is {REPLACE_BOOTLOADER} with the bootloader's own \
+             file.",
+            bootloader.name,
+            bootloader.base,
+            bootloader.end() - 1
+        )),
+    }
+}
 
 
 /// What to tell the reader about a completed write.
@@ -294,14 +382,15 @@ VERIFICATION WAS SKIPPED at your \
 
 
 
-/// Write `image` to the board `row` describes, settling which physical board first.
+/// Write `image` through `programmer` at the address `placement` gives, settling which physical
+/// board first.
 ///
 /// Shared by `flash` and by `deploy --board`, so the probe ladder, the interactive rung and the
 /// reporting are identical whether the bytes were compiled a moment ago or read off disk. The
 /// board cannot tell the difference and neither should the output.
 fn write_image(
     programmer: Programmer,
-    _aot_target: Option<&str>,
+    placement: &Placement,
     image: &[u8],
     probe: Option<&str>,
 ) -> ExitCode {
@@ -320,14 +409,24 @@ fn write_image(
         }
         None => image,
     };
+    if let Some(line) = placement_line(placement) {
+        println!("{line}");
+    }
     println!("writing over {}...", programmer.description());
-    match write(programmer, image, probe.as_deref()) {
+    match write(programmer, placement, image, probe.as_deref()) {
         Ok(report) => {
             println!(
                 "  the part answered {:#x} -- {}",
                 report.identity.value, report.identity.what
             );
             println!("{}", completion_line(programmer, &report));
+            if let Some(bootloader) = placement.kept() {
+                let wait = match bootloader.reset_wait_ms {
+                    Some(ms) => format!(", after the {ms} ms it waits on a reset"),
+                    None => String::new(),
+                };
+                println!("  the {} starts it{wait}", bootloader.name);
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -415,6 +514,13 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
+    let placement = match deploy_placement(row, chosen) {
+        Ok(placement) => placement,
+        Err(why) => {
+            eprintln!("lamella deploy: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     let selector = match selector_for(chosen, probe, volume, device) {
         Ok(selector) => selector,
         Err(error) => {
@@ -422,7 +528,33 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
-    write_image(chosen, row.aot_target, &image, selector.as_deref())
+    write_image(chosen, &placement, &image, selector.as_deref())
+}
+
+/// Where `deploy --board` writes the image it compiled for `row`'s board through `route`.
+///
+/// It keeps a bootloader the board's product ships, as every write does unless asked otherwise,
+/// and a compiled image is linked to run from where the route writes. So a board that keeps a
+/// bootloader there is refused rather than written: behind the bootloader the image would not run,
+/// and over it the bootloader would be gone without anybody asking.
+///
+/// # Errors
+/// A board that keeps a bootloader where its route writes from, and a board whose facts do not
+/// give a placement.
+fn deploy_placement(row: &Programming, route: Programmer) -> Result<Placement, String> {
+    let placement = placement_for(row, route, BootloaderChoice::Keep)?;
+    if let Some(bootloader) = placement.kept() {
+        return Err(format!(
+            "{} keeps the {} at {:#010x}-{:#010x}, and this deploy links an image to run from \
+             {:#010x},\nwhere the bootloader is. Nothing was written.",
+            row.board,
+            bootloader.name,
+            bootloader.base,
+            bootloader.end() - 1,
+            route.flash_base()
+        ));
+    }
+    Ok(placement)
 }
 
 /// The bare-metal image for `board_id`, and the address it belongs at -- what `build --format`
@@ -446,10 +578,7 @@ pub fn image_for_board(
     tier: Tier,
     libraries: &[Library],
 ) -> Result<(Vec<u8>, u32), String> {
-    let aot_target = aot_target_for(board_id).map_err(|reason| match &reason {
-        NoAotTarget::UnknownBoard(error) => format!("lamella build: {error}"),
-        _ => cannot_build_for(board_id, "build", &reason),
-    })?;
+    let aot_target = target_to_build_for(board_id)?;
     let row = programmer_for(board_id)?;
     let image = if is_project(path) {
         let project = crate::project::Project::read_file(path, "build")?;
@@ -458,6 +587,76 @@ pub fn image_for_board(
         build_image(path, source, aot_target, unsafe_code, tier, libraries, "build")?
     };
     Ok((image, row.programmer.flash_base()))
+}
+
+/// The ahead-of-time target `build` compiles for `board_id`, or the refusal worded for `build`.
+fn target_to_build_for(board_id: &str) -> Result<&'static str, String> {
+    aot_target_for(board_id).map_err(|reason| match &reason {
+        NoAotTarget::UnknownBoard(error) => format!("lamella build: {error}"),
+        _ => cannot_build_for(board_id, "build", &reason),
+    })
+}
+
+/// The class-library image for `board_id` as a linked ELF that also carries the program's debug
+/// information -- what `build --class-library --format elf` writes.
+///
+/// **THE PROGRAM IS COMPILED FOR A DEBUGGER AND LINKED BY THE PIPELINE THE CLASS-LIBRARY IMAGE IS
+/// LINKED BY**, so the debug information is placed by the link that placed the code. Only the
+/// program is described; corlib, the libraries beside it and the runtime support archive are linked
+/// as the image links them.
+///
+/// **`build` IS THE ONLY VERB THAT REACHES HERE**, as for [`image_for_board`], and the refusals
+/// name it.
+///
+/// # Errors
+/// As [`image_for_board`] on the class-library tier.
+pub fn debug_elf_for_board(
+    path: &Path,
+    source: &str,
+    board_id: &str,
+    unsafe_code: bool,
+    libraries: &[Library],
+) -> Result<Vec<u8>, String> {
+    let aot_target = target_to_build_for(board_id)?;
+    if is_project(path) {
+        let project = crate::project::Project::read_file(path, "build")?;
+        let libraries = project_libraries(&project, Tier::ClassLibrary, "build")?;
+        let debuggable =
+            crate::program::compile_project_for_debugging(&project, &libraries, "build")?;
+        debug_elf_from(&debuggable, &libraries, aot_target, "build", path)
+    } else {
+        let debuggable = crate::program::compile_csharp_for_debugging(
+            path,
+            source,
+            unsafe_code,
+            libraries,
+            "build",
+        )?;
+        debug_elf_from(&debuggable, libraries, aot_target, "build", path)
+    }
+}
+
+/// Link a program compiled for a debugger into the class-library tier's ELF for `aot_target`.
+///
+/// `path` is what the reader named, as for [`image_from_assembly`].
+fn debug_elf_from(
+    debuggable: &crate::program::Debuggable,
+    libraries: &[Library],
+    aot_target: &str,
+    verb: &str,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    require_static_main(&debuggable.assembly, verb, path)?;
+    class_library_build(aot_target, verb, |archive| {
+        linked_debug_build(
+            &debuggable.assembly,
+            &debuggable.pdb,
+            &debuggable.corlib,
+            libraries,
+            archive,
+            aot_target,
+        )
+    })
 }
 
 
@@ -657,9 +856,9 @@ pub fn libraries_from(named: &[&str], tier: Tier, verb: &str) -> Result<Vec<Libr
                 .map(|bytes| Library { path, bytes })
                 .map_err(|error| {
                     format!(
-                        "lamella {verb}: read the class library {named}: {error}
-
-                         A <Reference> names an assembly to link, by a path to a built `.dll`.                          Nothing was built."
+                        "lamella {verb}: read the class library {named}: {error}\n\n\
+                         A <Reference> names an assembly to link, by a path to a built \
+                         `.dll`.\nNothing was built."
                     )
                 })
         })
@@ -677,23 +876,22 @@ fn reference_without_the_tier(verb: &str, named: &[&str]) -> String {
         .iter()
         .map(|named| format!("    {named}"))
         .collect::<Vec<_>>()
-        .join("
-");
+        .join("\n");
     format!(
-        "lamella {verb}: this project declares a reference, and {CLASS_LIBRARY_FLAG} was not          asked for.
-
-         Declared:
-{listed}
-
-         The flat tier is linker-free and resolves no call outside the program, so it cannot link          a class
-library and these would have no effect. Add {CLASS_LIBRARY_FLAG} to link them,          or drop them to
-build the program on its own.
-
+        "lamella {verb}: this project declares a reference, and {CLASS_LIBRARY_FLAG} was not \
+         asked for.\n\n\
+         Declared:\n{listed}\n\n\
+         The flat tier is linker-free and resolves no call outside the program, so it cannot \
+         link a class\nlibrary and these would have no effect. Add {CLASS_LIBRARY_FLAG} to link \
+         them, or drop them to\nbuild the program on its own.\n\n\
          Nothing was built."
     )
 }
 
 /// Compile `source` and lower it ahead of time to a bare-metal image for `aot_target`, on `tier`.
+///
+/// **ON THE CLASS-LIBRARY TIER THE PROGRAM IS COMPILED AS A DEBUG BUILD IS**, so the image is the
+/// one `build --format elf` describes; see [`compiles_as_debug_build`].
 ///
 /// `verb` is the command the reader typed, so a refusal names the verb they ran rather than a
 /// sibling that shares this path.
@@ -706,9 +904,39 @@ fn build_image(
     libraries: &[Library],
     verb: &str,
 ) -> Result<Vec<u8>, String> {
-    let (assembly, corlib) =
-        crate::program::compile_csharp_assembly_with_corlib(path, source, unsafe_code, libraries)?;
+    let (assembly, corlib) = if compiles_as_debug_build(tier) {
+        let compiled = crate::program::compile_csharp_for_debugging(
+            path,
+            source,
+            unsafe_code,
+            libraries,
+            verb,
+        )?;
+        (compiled.assembly, compiled.corlib)
+    } else {
+        crate::program::compile_csharp_assembly_with_corlib(
+            path,
+            source,
+            unsafe_code,
+            libraries,
+            verb,
+        )?
+    };
     image_from_assembly(&assembly, &corlib, aot_target, tier, libraries, verb, path)
+}
+
+/// Whether a program built on `tier` is compiled as a debug build is, even for an image that is
+/// only written to a board.
+///
+/// **THE CLASS-LIBRARY TIER IS THE ONE WHOSE IMAGE A DEBUGGER IS GIVEN**, as the ELF
+/// `build --format elf` writes, and that ELF is only true of the board if the board runs the same
+/// bytes. A debug compile does not lower to the same bytes as a plain one: its IL differs -- a
+/// method that returns a value gets a return slot -- and so does the assembly file, whose hash is
+/// part of symbol names the link orders by. So every class-library image comes from the debug
+/// compile, and the debug information is set aside where it is not written. The flat tier carries
+/// no debug information into an image and is compiled without it.
+fn compiles_as_debug_build(tier: Tier) -> bool {
+    tier == Tier::ClassLibrary
 }
 
 /// The image for a PROJECT: every source it names compiled into one assembly, then lowered.
@@ -726,14 +954,32 @@ fn build_project_image(
     verb: &str,
     path: &Path,
 ) -> Result<Vec<u8>, String> {
+    let libraries = project_libraries(project, tier, verb)?;
+    let (assembly, corlib) = if compiles_as_debug_build(tier) {
+        let compiled =
+            crate::program::compile_project_for_debugging(project, &libraries, verb)?;
+        (compiled.assembly, compiled.corlib)
+    } else {
+        crate::program::compile_project_assembly(project, &libraries, verb)?
+    };
+    image_from_assembly(&assembly, &corlib, aot_target, tier, &libraries, verb, path)
+}
+
+/// The class libraries `project` references, read and in the order it declares them.
+///
+/// # Errors
+/// As [`libraries_from`].
+fn project_libraries(
+    project: &crate::project::Project,
+    tier: Tier,
+    verb: &str,
+) -> Result<Vec<Library>, String> {
     let named: Vec<&str> = project
         .references
         .iter()
         .filter_map(|one| one.to_str())
         .collect();
-    let libraries = libraries_from(&named, tier, verb)?;
-    let (assembly, corlib) = crate::program::compile_project_assembly(project, &libraries, verb)?;
-    image_from_assembly(&assembly, &corlib, aot_target, tier, &libraries, verb, path)
+    libraries_from(&named, tier, verb)
 }
 
 /// Lower an assembly that is already compiled, on `tier`.
@@ -749,49 +995,63 @@ fn image_from_assembly(
     verb: &str,
     path: &Path,
 ) -> Result<Vec<u8>, String> {
-    if !has_static_main(assembly) {
-        return Err(format!(
-            "lamella {verb}: {} declares no static Main.\n\n\
-             A flashed image IS the program: the chip resets straight into it, so it needs one \
-             entry point.\nAdd `static void Main()` (or `static int Main()`) to a class in this \
-             file. A sample written as a\nlibrary -- a `Run()` that a harness calls -- has to gain \
-             a Main before it can be deployed on its own.",
-            path.display()
-        ));
-    }
+    require_static_main(assembly, verb, path)?;
     if tier == Tier::ClassLibrary {
-        return class_library_image(assembly, corlib, libraries, aot_target, verb);
+        return class_library_build(aot_target, verb, |archive| {
+            linked_build(assembly, corlib, libraries, archive, aot_target)
+        });
     }
     lamella_aot::build::build(assembly, aot_target)
         .map_err(|error| flat_refusal(verb, aot_target, &error))
 }
 
-/// Build `assembly` on the class-library tier, or say why not.
+/// Refuse an assembly with no static `Main`, naming `path`, the thing the reader typed.
+///
+/// **THE ENTRY CONTRACT IS CHECKED BEFORE AN IMAGE IS BUILT.** The boot image's reset vector points
+/// at the entry, so an assembly with no static `Main` would produce an image that boots into
+/// whatever lowered first -- which looks exactly like a board that took the write and then
+/// misbehaved.
+fn require_static_main(assembly: &[u8], verb: &str, path: &Path) -> Result<(), String> {
+    if has_static_main(assembly) {
+        return Ok(());
+    }
+    Err(format!(
+        "lamella {verb}: {} declares no static Main.\n\n\
+         A flashed image IS the program: the chip resets straight into it, so it needs one \
+         entry point.\nAdd `static void Main()` (or `static int Main()`) to a class in this \
+         file. A sample written as a\nlibrary -- a `Run()` that a harness calls -- has to gain \
+         a Main before it can be deployed on its own.",
+        path.display()
+    ))
+}
+
+/// Run `link` on the class-library tier for `aot_target` with the runtime support archive it
+/// needs, or say why not.
+///
+/// **ONE COPY OF THE TIER'S REFUSALS, ITS ARCHIVE DISCOVERY AND ITS FAILURE WORDING**, shared by the
+/// image a board is written with and the ELF a debugger is given, so the two builds cannot come to
+/// disagree about when the tier is available or which archive they link.
 ///
 /// **THE REFUSALS ARE ORDERED BY WHAT A READER CAN DO ABOUT THEM, MOST FUNDAMENTAL FIRST.** A
 /// target the tier has no plan for is not fixed by finding an archive, and an archive is not worth
 /// looking for in a binary that could not link it -- so sending somebody to hunt for a file when
 /// the answer is neither would waste their afternoon.
-fn class_library_image(
-    assembly: &[u8],
-    corlib: &[u8],
-    libraries: &[Library],
+fn class_library_build<T>(
     aot_target: &str,
     verb: &str,
-) -> Result<Vec<u8>, String> {
+    link: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
     if !crate::tiers::covers(aot_target) || !linked_tier_compiled_in() {
         return Err(class_library_refusal(verb, aot_target));
     }
     let (archive_path, archive) = crate::tiers::runtime_archive(aot_target)
         .map_err(|reason| format!("lamella {verb}: {reason}"))?;
-    linked_build(assembly, corlib, libraries, &archive, aot_target).map_err(|error| {
+    link(&archive).map_err(|error| {
         let head =
             wrapped(&format!("lamella {verb}: the class-library build failed: {error}"));
         format!(
-            "{head}
-
-             The program and the class library were linked against {}.
-Nothing was written.",
+            "{head}\n\nThe program and the class library were linked against {}.\n\
+             Nothing was written.",
             archive_path.display()
         )
     })
@@ -868,6 +1128,45 @@ fn wrapped(text: &str) -> String {
 #[cfg(not(feature = "class-library"))]
 fn linked_build(
     _assembly: &[u8],
+    _corlib: &[u8],
+    _libraries: &[Library],
+    _archive: &[u8],
+    _aot_target: &str,
+) -> Result<Vec<u8>, String> {
+    Err("the class-library tier is not compiled into this build".to_owned())
+}
+
+/// [`linked_build`] for a program compiled for a debugger, with `pdb` the Portable PDB it was
+/// compiled with: the linked ELF carrying its debug information. Present only where the tier was
+/// compiled in, for the same reason.
+#[cfg(feature = "class-library")]
+fn linked_debug_build(
+    assembly: &[u8],
+    pdb: &[u8],
+    corlib: &[u8],
+    libraries: &[Library],
+    archive: &[u8],
+    aot_target: &str,
+) -> Result<Vec<u8>, String> {
+    let pdb = lamella_metadata::PortablePdb::read(pdb).map_err(|error| {
+        format!("the debug information the compiler wrote does not read back: {error:?}")
+    })?;
+    lamella_aot::build::build_linked_cortex_m_debug(
+        assembly,
+        &pdb,
+        corlib,
+        &library_bytes(libraries),
+        archive,
+        aot_target,
+    )
+    .map_err(|error| format!("{error}"))
+}
+
+/// Unreachable in a build without the tier, as the [`linked_build`] beside it is.
+#[cfg(not(feature = "class-library"))]
+fn linked_debug_build(
+    _assembly: &[u8],
+    _pdb: &[u8],
     _corlib: &[u8],
     _libraries: &[Library],
     _archive: &[u8],
@@ -1051,11 +1350,18 @@ fn has_static_main(assembly: &[u8]) -> bool {
 
 
 
+/// The option that writes an image over the bootloader a board's product ships in flash, rather
+/// than behind it.
+const REPLACE_BOOTLOADER: &str = "--replace-bootloader";
+
 const USAGE: &str = "\
 usage: lamella flash <image> [--board <id>] [--via probe|volume]
-                          [--probe <serial>]   which probe, on a probe route
-                          [--volume <name>]    which drive, on a volume route
-                          [--device <serial>]  which bootloader, on a USB DFU route
+                          [--probe <serial>]      which probe, on a probe route
+                          [--volume <name>]       which drive, on a volume route
+                          [--device <serial>]     which bootloader, on a USB DFU route
+                          [--replace-bootloader]  over the board's bootloader, not behind it
+       lamella flash --board <id> --clear-bootprot [--dry-run] [--probe <serial>]
+       lamella flash --board <id> --restore-user-row <file> [--dry-run] [--probe <serial>]
 
 Writes an image that ALREADY EXISTS to the board's chip, over its debug probe. It does not compile
 anything -- `lamella build <file> --board <id> --format <f>` produces what this takes, and
@@ -1098,6 +1404,28 @@ is checked against its own digest before any probe is opened. A file of bytes ca
 board it belongs to, and two boards on a bench with two images in a directory is how the wrong one
 gets written. An absent sidecar changes nothing; a sidecar that will not parse stops the write,
 because a claim nobody can check is worse than no claim.
+
+On a board whose product ships a bootloader in flash, an Arduino Zero among them, the image is
+written BEHIND the bootloader, which stays and starts it, so an IDE can still upload through it.
+The write first reads the start of flash and is refused when no bootloader is there, before
+anything is erased. --replace-bootloader writes the image at the start of flash instead, over the
+bootloader, and the board then has none until one is written back. The way back is the same
+option with the bootloader's own file; none is included here. An image linked for the other
+layout is refused, naming the option that writes it where it was linked to run.
+
+--clear-bootprot writes no image. On a SAM D21 board it clears the part's bootloader protection,
+the BOOTPROT field of its NVM user row, which a write at address 0 needs. It prints every field of
+the row as it is and as it will be, then saves the row to a file in the working directory, named
+for the part's serial number. It erases the row, writes it back with only BOOTPROT changed, reads
+it back and compares it, and resets the part so that the new value is in force. With --dry-run it
+prints the same table and writes nothing.
+
+--restore-user-row <file> is the way back: it writes a saved row back over the part's row, and it
+takes only a file saved from the same part. A written row takes effect only at the part's next
+reset, so a rewrite that is interrupted leaves the part running on its previous configuration
+until then; put the row back before anything resets the board. One case is out of reach: a part
+that has already reset with an erased row can hold itself in brown-out reset, and the plain attach
+these steps make does not reach a part held there.
 ";
 
 /// What `flash` calls the word it wants, in the one place both the error and the usage read it
@@ -1343,7 +1671,7 @@ class Program
         assert!(!line.contains("and verified"), "nothing was verified: {line}");
         assert!(
             !line.contains("NOTHING READ THE FLASH BACK"),
-            "that sentence belongs to a route that CANNOT read back, not one that was told not to:              {line}"
+            "that sentence belongs to a route that CANNOT read back, not one that was told not to: {line}"
         );
     }
 
@@ -1803,6 +2131,26 @@ class Program
         );
     }
 
+    /// **A REFUSAL PRINTS AS PROSE, NOT AS ITS SOURCE'S INDENTATION.** A line break written into a
+    /// literal as a raw newline carries the next source line's indentation into the output, so the
+    /// continuation prints at the column of the code around it. No line may be indented further than
+    /// the four columns a listed path takes, and no sentence may hold a run of spaces.
+    #[test]
+    fn the_reference_refusals_print_as_prose_without_source_columns() {
+        let refusals = [
+            reference_without_the_tier("build", &["Bsp.dll", "Gpio.dll"]),
+            libraries_from(&["no/such/library.dll"], Tier::ClassLibrary, "build")
+                .expect_err("there is no such file"),
+        ];
+        for refusal in &refusals {
+            for line in refusal.lines() {
+                let indent = line.len() - line.trim_start().len();
+                assert!(indent <= 4, "a line indented {indent} columns:\n{refusal}");
+                assert!(!line.trim().contains("   "), "a run of spaces inside a sentence:\n{refusal}");
+            }
+        }
+    }
+
     /// **NO REFERENCES MEANS NO CHANGE**, which is what keeps every existing command line working.
     #[test]
     fn a_build_with_no_references_reads_back_empty() {
@@ -1812,6 +2160,51 @@ class Program
         assert!(libraries_from(&[], Tier::Flat, "deploy")
             .expect("and the flat tier is untouched")
             .is_empty());
+    }
+
+    /// **A LIBRARY THAT IS NOT AN ASSEMBLY IS REFUSED BY THE VERB THAT WAS RUN**, on both ways a
+    /// single file is compiled. Compiling for a debugger is the one a library reaches, because every
+    /// class-library image is compiled that way, `deploy`'s included; the plain compile shares the
+    /// refusal. Each is asked with a different verb, so neither can answer with a fixed one. This
+    /// refusal opened `lamella:` with no verb, the one message on this path that did not say which
+    /// command it came from.
+    #[test]
+    fn a_library_that_is_not_an_assembly_is_refused_by_the_verb_that_was_run() {
+        if !csharp_compiler_is_available() {
+            return;
+        }
+        let broken = [Library {
+            path: PathBuf::from("Broken.dll"),
+            bytes: vec![1, 2, 3],
+        }];
+        let program = "class P\n{\n    static void Main() { }\n}\n";
+        let Err(debug) = crate::program::compile_csharp_for_debugging(
+            Path::new("P.cs"),
+            program,
+            false,
+            &broken,
+            "deploy",
+        ) else {
+            panic!("three bytes are not an assembly");
+        };
+        let Err(plain) = crate::program::compile_csharp_assembly_with_corlib(
+            Path::new("P.cs"),
+            program,
+            false,
+            &broken,
+            "build",
+        ) else {
+            panic!("three bytes are not an assembly, compiled plainly either");
+        };
+        for (refusal, verb) in [(debug, "deploy"), (plain, "build")] {
+            assert!(
+                refusal.starts_with(&format!(
+                    "lamella {verb}: Broken.dll is not a readable .NET assembly"
+                )),
+                "{refusal}"
+            );
+            crate::rendered::assert_renders_cleanly(&refusal, crate::rendered::four_space_sample);
+        }
     }
 
     /// **THE LIBRARY SET REACHES THE LINKED BUILD IN THE ORDER IT WAS DECLARED, AND WHOLE.**
@@ -1835,5 +2228,69 @@ class Program
             vec![&[2u8][..], &[1u8][..], &[3u8][..]],
             "declaration order, nothing sorted and nothing dropped"
         );
+    }
+
+    /// `--replace-bootloader` is refused beside either user-row step, which writes no image for
+    /// the option to place.
+    #[test]
+    fn replace_bootloader_is_refused_beside_either_user_row_step() {
+        use crate::bootprot::{CLEAR_BOOTPROT, RESTORE_USER_ROW};
+        assert_eq!(user_row_step_beside_a_replace(true, true, false), Some(CLEAR_BOOTPROT));
+        assert_eq!(user_row_step_beside_a_replace(true, false, true), Some(RESTORE_USER_ROW));
+        assert_eq!(user_row_step_beside_a_replace(true, false, false), None, "an image write");
+        assert_eq!(
+            user_row_step_beside_a_replace(false, true, true),
+            None,
+            "without the option, the two steps are for their own refusal to settle"
+        );
+    }
+
+    /// Before a write, a kept bootloader is named with where the image goes, and a replaced one
+    /// with what the board loses and the way back. A board with no bootloader is told nothing.
+    #[test]
+    fn a_write_says_what_it_does_with_the_bootloader() {
+        let zero = programmer_for("arduino-zero").expect("the Zero is routed");
+        let keep = placement_for(zero, zero.programmer, BootloaderChoice::Keep).expect("kept");
+        let line = placement_line(&keep).expect("a line");
+        assert!(
+            line.contains("keeping the Arduino Zero Bootloader at 0x00000000-0x00001fff"),
+            "{line}"
+        );
+        assert!(line.contains("from 0x00002000"), "{line}");
+        let over = placement_for(zero, zero.programmer, BootloaderChoice::Replace).expect("over");
+        let line = placement_line(&over).expect("a line");
+        assert!(line.contains("replacing the Arduino Zero Bootloader"), "{line}");
+        assert!(line.contains("an IDE over USB") && line.contains("double-tap"), "lost: {line}");
+        assert!(
+            line.contains("--replace-bootloader with the bootloader's own file"),
+            "the way back: {line}"
+        );
+        let xpro = programmer_for("microchip-samd21-xpro").expect("the XPro is routed");
+        let start = placement_for(xpro, xpro.programmer, BootloaderChoice::Keep).expect("placed");
+        assert_eq!(placement_line(&start), None);
+    }
+
+    /// `deploy --board` links an image to run where its route writes, so a board that keeps its
+    /// bootloader there is refused rather than written behind the bootloader or over it.
+    #[test]
+    fn deploy_refuses_a_board_that_keeps_its_bootloader() {
+        let zero = programmer_for("arduino-zero").expect("the Zero is routed");
+        let why = deploy_placement(zero, zero.programmer).expect_err("it keeps its bootloader");
+        assert!(why.contains("Arduino Zero Bootloader"), "{why}");
+        assert!(why.contains("Nothing was written"), "{why}");
+        let xpro = programmer_for("microchip-samd21-xpro").expect("the XPro is routed");
+        assert_eq!(
+            deploy_placement(xpro, xpro.programmer),
+            Ok(Placement::Start { base: xpro.programmer.flash_base() })
+        );
+    }
+
+    /// The usage says a board's bootloader is kept by default, names the option that replaces it,
+    /// and says that no bootloader is included.
+    #[test]
+    fn the_usage_says_a_bootloader_is_kept_unless_replaced() {
+        assert!(USAGE.contains(REPLACE_BOOTLOADER), "{USAGE}");
+        assert!(USAGE.contains("written BEHIND the bootloader"), "{USAGE}");
+        assert!(USAGE.contains("none is included here"), "{USAGE}");
     }
 }

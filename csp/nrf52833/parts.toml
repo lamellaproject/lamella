@@ -17,7 +17,7 @@ ram = 0x20000
 dp_idcode = 0x2BA01477
 identity_source = "The debug port a BBC micro:bit v2 answers with, read through a CMSIS-DAP probe; the nRF flashing backend distinguishes a v1 from a v2 on it before erasing anything. 0x2ba01477 is Arm's M3/M4-class SW-DP and every STM32 M3 or M4 answers the same, so it narrows a search and names no part. The reading that names a Nordic die is FICR."
 pins = [
-    "P0.08", "P0.11", "P0.15", "P0.16", "P0.19", "P0.21",
-    "P0.22", "P0.24", "P0.28", "P0.30", "P0.31", "P1.05",
+    "P0.01", "P0.08", "P0.11", "P0.13", "P0.15", "P0.16", "P0.17", "P0.19",
+    "P0.21", "P0.22", "P0.24", "P0.28", "P0.30", "P0.31", "P1.05",
 ]
 source = "nRF52833 PS 4452_021 v1.7 (512 kB flash / 128 kB RAM; INFO K512/K128). The pin list is PARTIAL rather than the package's full set."

@@ -22,6 +22,7 @@ namespace Lamella.Generated
         /// name a driver; and a uart is a different register map on every family, so the kind does
         /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
         public const string INTERNAL_I2C_DRIVER_FAMILY = "nrf52833-twi";
+        public const string SPI_DRIVER_FAMILY = "nrf52833-spi";
 
         // -- INTERNAL_I2C: an nrf-twi binding descriptor --
         public const uint INTERNAL_I2C_TWI_BASE = 0x40003000;
@@ -29,6 +30,15 @@ namespace Lamella.Generated
         public const uint INTERNAL_I2C_PSEL_SDA = 0x10;
         public const uint INTERNAL_I2C_PIN_CNF_SCL_REG = 0x50000720;
         public const uint INTERNAL_I2C_PIN_CNF_SDA_REG = 0x50000740;
+
+        // -- SPI: an nrf-spi binding descriptor --
+        public const uint SPI_SPI_BASE = 0x40023000;
+        public const uint SPI_PSEL_SCK = 0x11;
+        public const uint SPI_PSEL_MOSI = 0xD;
+        public const uint SPI_PSEL_MISO = 0x1;
+        public const uint SPI_PIN_CNF_SCK_REG = 0x50000744;
+        public const uint SPI_PIN_CNF_MOSI_REG = 0x50000734;
+        public const uint SPI_PIN_CNF_MISO_REG = 0x50000704;
         public const uint DEVICE_COUNT = 14;
 
         // -- on-board devices: PORT group base + pin index + mask --

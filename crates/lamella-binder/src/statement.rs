@@ -3,7 +3,7 @@
 use crate::bind::bind_type;
 use crate::bound::{Binder, BoundExpr, BoundExprKind, MethodReference};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use lamella_syntax::version::Feature;
+use lamella_syntax::version::{Feature, LanguageVersion};
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
@@ -725,17 +725,22 @@ impl Binder {
     /// by the same rule and csc gives them the same diagnostic, measured on `new object()`, an
     /// `int` and a `string`.
     ///
-    /// The diagnostic is `CS0155`, the same code a `catch` clause naming a non-exception type
-    /// gets. csc reports the ordinary CONVERSION diagnostic -- `CS0029`, or `CS0266` where an
-    /// explicit conversion exists -- only from **C# 8.0 onward**, where `throw` began asking a
-    /// conversion question about `System.Exception?`. Measured across every rung csc accepts:
-    /// ISO-1, ISO-2 and 3 through 7.3 all answer `CS0155`, for an `int`, a `string`, an `object`,
-    /// an interface-typed value and a method group alike; 8 and later answer the conversion code.
+    /// **WHICH DIAGNOSTIC IS A PROPERTY OF THE RUNG, AND THE RUNG IS C# 8.0.** Below it the answer
+    /// is `CS0155`, the code a `catch` clause naming a non-exception type gets. From 8.0 on, `throw`
+    /// CONVERTS its operand to `System.Exception`, and a value that does not convert gets the
+    /// ordinary conversion diagnostic, exactly as an assignment would. Measured against csc at every
+    /// rung it accepts:
     ///
-    /// **WHEN COMPILING AT THE C# 1.0 RUNG, `CS0155` IS THE ANSWER AND THE CONVERSION CODE IS NOT.**
-    /// The conversion code is not a more precise version of the same answer -- it is a different
-    /// language version's answer, and which answer is right is a property of the RUNG rather than of
-    /// this compiler.
+    /// ```text
+    ///   operand                      ISO-1 .. 7.3       8.0 and later
+    ///   int, string, class, struct   CS0155             CS0029
+    ///   object, an interface         CS0155             CS0266 (an explicit conversion exists)
+    ///   a type name                  CS0119 + CS0155    CS0119
+    ///   a method group               CS0155             CS0428
+    ///   null                         none               none
+    /// ```
+    ///
+    /// Neither answer is a more precise version of the other; each is its own language version's.
     ///
     /// **THE CONSERVATIVE FALLBACK IS KEPT AND IT IS LOAD-BEARING.** A compilation whose corlib
     /// declares no `System.Exception` cannot be asked a conversion question about it, and
@@ -743,6 +748,7 @@ impl Binder {
     /// the assignability test runs only when the model HAS the type, and the provable-negative
     /// walk answers otherwise.
     pub(crate) fn check_thrown_operand(&mut self, operand: &BoundExpr, span: Span) {
+        let converts_to_exception = self.language_version() >= LanguageVersion::CSharp8;
         if let BoundExprKind::TypeReference(ty) = &operand.kind {
             self.report(Diagnostic::new(
                 DiagnosticKind::TypeUsedAsValue {
@@ -750,10 +756,20 @@ impl Binder {
                 },
                 span,
             ));
-            self.report(Diagnostic::new(
-                DiagnosticKind::CaughtTypeMustBeException,
-                span,
-            ));
+            if !converts_to_exception {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::CaughtTypeMustBeException,
+                    span,
+                ));
+            }
+            return;
+        }
+        let exception = TypeSymbol::Named([Box::from("System"), Box::from("Exception")].into());
+        let model_has_exception = self.model().get_by_symbol(&exception).is_some();
+        if converts_to_exception && model_has_exception {
+            if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) || !operand.ty.is_error() {
+                self.check_assignable(operand, &exception, span);
+            }
             return;
         }
         if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) {
@@ -766,8 +782,7 @@ impl Binder {
         if operand.ty.is_error() {
             return;
         }
-        let exception = TypeSymbol::Named([Box::from("System"), Box::from("Exception")].into());
-        let not_an_exception = if self.model().get_by_symbol(&exception).is_some() {
+        let not_an_exception = if model_has_exception {
             !self.assignable(operand, &exception)
         } else {
             self.is_provably_not_exception(&operand.ty)

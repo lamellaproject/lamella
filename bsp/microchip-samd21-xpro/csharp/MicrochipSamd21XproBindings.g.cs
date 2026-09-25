@@ -24,6 +24,12 @@ namespace Lamella.Generated
         /// name a driver; and a uart is a different register map on every family, so the kind does
         /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
         public const string VCP_DRIVER_FAMILY = "samd21-sercom";
+        public const string EXT1_SPI_DRIVER_FAMILY = "samd21-sercom";
+        public const string EXT_TWI_DRIVER_FAMILY = "samd21-sercom";
+        public const string ADC_DRIVER_FAMILY = "samd21-adc";
+        public const string EXT1_PWM_DRIVER_FAMILY = "samd21-tc";
+        public const string EXT2_PWM_DRIVER_FAMILY = "samd21-tc";
+        public const string EXT3_PWM_DRIVER_FAMILY = "samd21-tcc";
 
         // -- VCP: a sercom-usart binding descriptor --
         public const uint VCP_SERCOM_BASE = 0x42001400;
@@ -43,6 +49,131 @@ namespace Lamella.Generated
         public const uint VCP_TXPO = 0;
         public const uint VCP_RXPO = 1;
         public const uint VCP_BAUD_115200_OSC8M_8MHZ = 0xC505;
+
+        // -- EXT1_SPI: a sercom-spi binding descriptor (ONE plan: the composed clock word
+        // and the core-clock RATE, from which the driver derives BAUD) --
+        public const uint EXT1_SPI_SERCOM_BASE = 0x42000800;
+        public const uint EXT1_SPI_IRQ = 9;
+        public const uint EXT1_SPI_APBC_MASK = 0x4;
+        public const uint EXT1_SPI_GCLK_CORE_ID = 20;
+        public const uint EXT1_SPI_GCLK_CLKCTRL_VALUE = 0x4014;
+        public const uint EXT1_SPI_CORE_CLOCK_HZ = 8000000;
+        public const uint EXT1_SPI_PMUX_MOSI_REG = 0x41004433;
+        public const uint EXT1_SPI_PMUX_MOSI_SHIFT = 0;
+        public const uint EXT1_SPI_PINCFG_MOSI_REG = 0x41004446;
+        public const uint EXT1_SPI_PMUX_SCK_REG = 0x41004433;
+        public const uint EXT1_SPI_PMUX_SCK_SHIFT = 4;
+        public const uint EXT1_SPI_PINCFG_SCK_REG = 0x41004447;
+        public const uint EXT1_SPI_PMUX_MISO_REG = 0x41004432;
+        public const uint EXT1_SPI_PMUX_MISO_SHIFT = 0;
+        public const uint EXT1_SPI_PINCFG_MISO_REG = 0x41004444;
+        public const uint EXT1_SPI_PMUX_FUNC = 3;
+        public const uint EXT1_SPI_DOPO = 1;
+        public const uint EXT1_SPI_DIPO = 0;
+        public const uint EXT1_SPI_CS_PORT_BASE = 0x41004400;
+        public const uint EXT1_SPI_CS_PIN = 5;
+        public const uint EXT1_SPI_CS_MASK = 0x20;
+
+        // -- EXT_TWI: a sercom-i2c binding descriptor (the CORE-CLOCK RATE, not a
+        // divisor: an I2C bus speed is a runtime Configure choice) --
+        public const uint EXT_TWI_SERCOM_BASE = 0x42001000;
+        public const uint EXT_TWI_IRQ = 11;
+        public const uint EXT_TWI_GCLK_CLKCTRL_VALUE = 0x4016;
+        public const uint EXT_TWI_APBC_MASK = 0x10;
+        public const uint EXT_TWI_PMUX_REG = 0x41004434;
+        public const uint EXT_TWI_PMUX_PAIR = 0x33;
+        public const uint EXT_TWI_PINCFG_SDA_REG = 0x41004448;
+        public const uint EXT_TWI_PINCFG_SCL_REG = 0x41004449;
+        public const uint EXT_TWI_CORE_CLOCK_HZ = 8000000;
+
+        // -- ADC: a samd21 adc binding descriptor. The converter's clocks and its
+        // prescaler under the default plan, then each analog pad the board wires: the
+        // channel it is (its MUXPOS code) and where its PMUX nibble and PINCFG byte sit --
+        public const uint ADC_BASE = 0x42004000;
+        public const uint ADC_IRQ = 23;
+        public const uint ADC_APBC_MASK = 0x10000;
+        public const uint ADC_GCLK_CLKCTRL_VALUE = 0x401E;
+        public const uint ADC_CORE_CLOCK_HZ = 8000000;
+        public const uint ADC_PRESCALER = 0;
+        public const uint ADC_PMUX_FUNC = 1;
+        public const uint ADC_REFERENCE_UV = 3300000;
+        public const uint ADC_MUXPOS_EXT1_PIN3 = 8;
+        public const uint ADC_PMUX_EXT1_PIN3_REG = 0x410044B0;
+        public const uint ADC_PMUX_EXT1_PIN3_SHIFT = 0;
+        public const uint ADC_PINCFG_EXT1_PIN3_REG = 0x410044C0;
+        public const uint ADC_MUXPOS_EXT1_PIN4 = 9;
+        public const uint ADC_PMUX_EXT1_PIN4_REG = 0x410044B0;
+        public const uint ADC_PMUX_EXT1_PIN4_SHIFT = 4;
+        public const uint ADC_PINCFG_EXT1_PIN4_REG = 0x410044C1;
+        public const uint ADC_MUXPOS_EXT2_PIN3 = 18;
+        public const uint ADC_PMUX_EXT2_PIN3_REG = 0x41004435;
+        public const uint ADC_PMUX_EXT2_PIN3_SHIFT = 0;
+        public const uint ADC_PINCFG_EXT2_PIN3_REG = 0x4100444A;
+        public const uint ADC_MUXPOS_EXT2_PIN4 = 19;
+        public const uint ADC_PMUX_EXT2_PIN4_REG = 0x41004435;
+        public const uint ADC_PMUX_EXT2_PIN4_SHIFT = 4;
+        public const uint ADC_PINCFG_EXT2_PIN4_REG = 0x4100444B;
+        public const uint ADC_MUXPOS_EXT3_PIN3 = 0;
+        public const uint ADC_PMUX_EXT3_PIN3_REG = 0x41004431;
+        public const uint ADC_PMUX_EXT3_PIN3_SHIFT = 0;
+        public const uint ADC_PINCFG_EXT3_PIN3_REG = 0x41004442;
+        public const uint ADC_MUXPOS_EXT3_PIN4 = 1;
+        public const uint ADC_PMUX_EXT3_PIN4_REG = 0x41004431;
+        public const uint ADC_PMUX_EXT3_PIN4_SHIFT = 4;
+        public const uint ADC_PINCFG_EXT3_PIN4_REG = 0x41004443;
+
+        // -- EXT1_PWM: a samd21 pwm binding descriptor. The counter's clocks under the default plan
+        // and its size, then each waveform output the board wires: the compare channel that
+        // drives it and where its PMUX nibble and PINCFG byte sit --
+        public const uint EXT1_PWM_BASE = 0x42003800;
+        public const uint EXT1_PWM_IRQ = 21;
+        public const uint EXT1_PWM_APBC_MASK = 0x4000;
+        public const uint EXT1_PWM_GCLK_CLKCTRL_VALUE = 0x401D;
+        public const uint EXT1_PWM_CORE_CLOCK_HZ = 8000000;
+        public const uint EXT1_PWM_COUNTER_BITS = 8;
+        public const uint EXT1_PWM_PMUX_FUNC = 4;
+        public const uint EXT1_PWM_CC_WO0 = 0;
+        public const uint EXT1_PWM_PMUX_WO0_REG = 0x410044B1;
+        public const uint EXT1_PWM_PMUX_WO0_SHIFT = 0;
+        public const uint EXT1_PWM_PINCFG_WO0_REG = 0x410044C2;
+        public const uint EXT1_PWM_CC_WO1 = 1;
+        public const uint EXT1_PWM_PMUX_WO1_REG = 0x410044B1;
+        public const uint EXT1_PWM_PMUX_WO1_SHIFT = 4;
+        public const uint EXT1_PWM_PINCFG_WO1_REG = 0x410044C3;
+
+        // -- EXT2_PWM: a samd21 pwm binding descriptor. The counter's clocks under the default plan
+        // and its size, then each waveform output the board wires: the compare channel that
+        // drives it and where its PMUX nibble and PINCFG byte sit --
+        public const uint EXT2_PWM_BASE = 0x42003000;
+        public const uint EXT2_PWM_IRQ = 19;
+        public const uint EXT2_PWM_APBC_MASK = 0x1000;
+        public const uint EXT2_PWM_GCLK_CLKCTRL_VALUE = 0x401C;
+        public const uint EXT2_PWM_CORE_CLOCK_HZ = 8000000;
+        public const uint EXT2_PWM_COUNTER_BITS = 8;
+        public const uint EXT2_PWM_PMUX_FUNC = 4;
+        public const uint EXT2_PWM_CC_WO0 = 0;
+        public const uint EXT2_PWM_PMUX_WO0_REG = 0x410044B6;
+        public const uint EXT2_PWM_PMUX_WO0_SHIFT = 0;
+        public const uint EXT2_PWM_PINCFG_WO0_REG = 0x410044CC;
+        public const uint EXT2_PWM_CC_WO1 = 1;
+        public const uint EXT2_PWM_PMUX_WO1_REG = 0x410044B6;
+        public const uint EXT2_PWM_PMUX_WO1_SHIFT = 4;
+        public const uint EXT2_PWM_PINCFG_WO1_REG = 0x410044CD;
+
+        // -- EXT3_PWM: a samd21 pwm binding descriptor. The counter's clocks under the default plan
+        // and its size, then each waveform output the board wires: the compare channel that
+        // drives it and where its PMUX nibble and PINCFG byte sit --
+        public const uint EXT3_PWM_BASE = 0x42002800;
+        public const uint EXT3_PWM_IRQ = 17;
+        public const uint EXT3_PWM_APBC_MASK = 0x400;
+        public const uint EXT3_PWM_GCLK_CLKCTRL_VALUE = 0x401B;
+        public const uint EXT3_PWM_CORE_CLOCK_HZ = 8000000;
+        public const uint EXT3_PWM_COUNTER_BITS = 16;
+        public const uint EXT3_PWM_PMUX_FUNC = 4;
+        public const uint EXT3_PWM_CC_WO0 = 0;
+        public const uint EXT3_PWM_PMUX_WO0_REG = 0x41004436;
+        public const uint EXT3_PWM_PMUX_WO0_SHIFT = 0;
+        public const uint EXT3_PWM_PINCFG_WO0_REG = 0x4100444C;
         public const uint DEVICE_COUNT = 2;
 
         // -- on-board devices: PORT group base + pin index + mask --

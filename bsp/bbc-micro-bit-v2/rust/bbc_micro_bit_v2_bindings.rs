@@ -17,6 +17,7 @@ pub const BOARD_VENDOR: &str = "Bbc";
 /// name a driver; and a uart is a different register map on every family, so the kind does
 /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
 pub const INTERNAL_I2C_DRIVER_FAMILY: &str = "nrf52833-twi";
+pub const SPI_DRIVER_FAMILY: &str = "nrf52833-spi";
 
 // -- INTERNAL_I2C: an nrf-twi binding descriptor --
 pub const INTERNAL_I2C_TWI_BASE: u32 = 0x40003000;
@@ -24,6 +25,15 @@ pub const INTERNAL_I2C_PSEL_SCL: u32 = 0x8;
 pub const INTERNAL_I2C_PSEL_SDA: u32 = 0x10;
 pub const INTERNAL_I2C_PIN_CNF_SCL_REG: u32 = 0x50000720;
 pub const INTERNAL_I2C_PIN_CNF_SDA_REG: u32 = 0x50000740;
+
+// -- SPI: an nrf-spi binding descriptor --
+pub const SPI_SPI_BASE: u32 = 0x40023000;
+pub const SPI_PSEL_SCK: u32 = 0x11;
+pub const SPI_PSEL_MOSI: u32 = 0xD;
+pub const SPI_PSEL_MISO: u32 = 0x1;
+pub const SPI_PIN_CNF_SCK_REG: u32 = 0x50000744;
+pub const SPI_PIN_CNF_MOSI_REG: u32 = 0x50000734;
+pub const SPI_PIN_CNF_MISO_REG: u32 = 0x50000704;
 pub const DEVICE_COUNT: u32 = 14;
 
 // -- on-board devices: PORT group base + pin index + mask --

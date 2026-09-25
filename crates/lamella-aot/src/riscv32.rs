@@ -3856,6 +3856,7 @@ fn lower_inst_spilled(
             let static_call = enc.new_label();
             let do_call = enc.new_label();
             let mdone = enc.new_label();
+            let wide = value_words(value_types, result) >= 2;
             slot_store(enc, Reg::ZERO, mc_off);
             emit_static_addr(
                 enc,
@@ -3866,8 +3867,18 @@ fn lower_inst_spilled(
                 statics_ptr_pool,
                 relocate,
             )?;
-            enc.lw(t0, t0, 0);
-            slot_store(enc, t0, mc_off + 8);
+            enc.lw(t1, t0, 0);
+            slot_store(enc, t1, mc_off + 8);
+            slot_load(enc, t2, slot(*delegate));
+            enc.branch(BranchCond::Ne, t2, Reg::ZERO, mloop);
+            enc.li(t1, InlineCheck::NullReference.tag() as i32);
+            enc.sw(t1, t0, 0);
+            enc.sw(Reg::ZERO, t0, crate::cil::G_EXCEPTION_MESSAGE_OFFSET as i32);
+            slot_store(enc, Reg::ZERO, mc_off + 4);
+            if wide {
+                slot_store(enc, Reg::ZERO, mc_off + 12);
+            }
+            enc.j(mdone);
             enc.bind_label(mloop);
             slot_load(enc, t0, slot(*delegate));
             enc.lw(t1, t0, 8);
@@ -3893,7 +3904,6 @@ fn lower_inst_spilled(
             marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.bind_label(do_call);
             enc.jalr(Reg::RA, scratch, 0);
-            let wide = value_words(value_types, result) >= 2;
             slot_store(enc, Reg::A0, mc_off + 4);
             if wide {
                 slot_store(enc, Reg::A1, mc_off + 12);

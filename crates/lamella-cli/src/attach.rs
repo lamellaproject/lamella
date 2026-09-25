@@ -16,26 +16,7 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Compile `path` and run it on the firmware at `target`, streaming its output.
 pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
-    if let Some(what) = crate::deploy::uncompilable_source(path) {
-        eprintln!("{}", cannot_run_on_a_target(path, &what));
-        return ExitCode::FAILURE;
-    }
-    let source = match std::fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("lamella run: read {}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let compiler = match lamella_wire_host::engine::LcscCompiler::discover() {
-        Ok(compiler) => compiler,
-        Err(error) => {
-            eprintln!("lamella run: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let image = match crate::bake::compile_and_bake(&compiler, &source) {
+    let image = match crate::bake::image_for_firmware(path, "run", cannot_run_on_a_target) {
         Ok(image) => image,
         Err(error) => {
             eprintln!("{error}");
@@ -74,17 +55,16 @@ pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
 /// `run --target`'s wording for a source it cannot compile.
 ///
 /// **IT IS NOT `deploy`'s SENTENCE AND MUST NOT BECOME IT.** `deploy` says `--board` builds an
-/// image ahead of time, which is false for this verb: `run --board` executes on THIS machine
-/// against a board's generated `board` module, a fact table rather than hardware, and that is the
-/// one mode a Python program DOES have. A shared sentence would point the reader at something
-/// this verb cannot do.
+/// image ahead of time, which is false for this verb, whose other mode runs the program on THIS
+/// machine. That is the one mode a Python program does have here, so it is the one named. A shared
+/// sentence would point the reader at something this verb cannot do.
 fn cannot_run_on_a_target(path: &Path, what: &crate::deploy::Uncompilable) -> String {
     match what {
         crate::deploy::Uncompilable::Python => format!(
             "lamella run: {} is a Python program, and running ON a board compiles C#.\n\n\
              A Python program reaches a board as a BUNDLE, whose host-side send is not a library \
-             call\nthis tool can make yet. What DOES work today, on this machine:\n\
-             \x20   lamella run {} --board <id>      against that board's generated `board` module",
+             call\nthis tool can make yet. What DOES work today is running it on this machine:\n\
+             \x20   lamella run {}",
             path.display(),
             path.display()
         ),
@@ -167,5 +147,19 @@ mod tests {
         assert!(text.contains("leaves a debug session"), "the cost: {text}");
         assert!(text.contains("next `lamella run` clears it"), "the recovery: {text}");
         assert!(text.contains("lamella deploy"), "and the verb that does not have the cost");
+    }
+
+    /// **A REFUSAL RECOMMENDS ONLY WHAT THIS TOOL STILL TAKES.** `run --board` was removed, and a
+    /// Python program's refusal went on recommending it, so a reader who followed it met a second
+    /// refusal for the flag the first one told them to type.
+    #[test]
+    fn a_python_program_is_pointed_at_a_run_this_tool_still_takes() {
+        let text =
+            cannot_run_on_a_target(Path::new("app.py"), &crate::deploy::Uncompilable::Python);
+        assert!(!text.contains("--board"), "a removed flag: {text}");
+        assert!(
+            text.contains("lamella run app.py") && text.contains("on this machine"),
+            "the run that works: {text}"
+        );
     }
 }

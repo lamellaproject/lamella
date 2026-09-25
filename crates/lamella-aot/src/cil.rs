@@ -645,6 +645,18 @@ pub trait CallResolver {
         None
     }
 
+    /// How a value of this type token is STORED when it is narrower than a word -- a 1- or 2-byte
+    /// primitive, or an enum over one -- as the extension a load of it applies. `None` for every
+    /// other type, which a whole-word access reads and writes right.
+    ///
+    /// [`Self::type_operand_mir`] cannot carry this: every integer narrower than a word is `I32`
+    /// there, which is right for the stack and wrong by up to three bytes for memory. An access
+    /// that sized itself by that type read three neighbors of a byte and wrote over them.
+    /// Defaults to `None`, the whole-word access every token-form load and store made before.
+    fn sub_word_scalar(&self, _operand: &Operand) -> Option<ConvKind> {
+        None
+    }
+
     /// The vtable slot a virtual `callvirt` target dispatches through: its index in its declaring
     /// type's vtable (the same index across the hierarchy, so the receiver's runtime-type vtable at
     /// this slot is the override to call). `None` for a non-virtual target, or one this resolver
@@ -667,6 +679,31 @@ pub trait CallResolver {
     /// an allocation.
     fn box_is_noop(&self, _operand: &Operand) -> bool {
         false
+    }
+
+    /// Whether `unbox.any` of this type token is a `castclass` -- the token names a REFERENCE type
+    /// once the instantiation in force is applied.
+    ///
+    /// ECMA-335 III.4.33 gives `unbox.any` two meanings, chosen by its operand: at a value type it
+    /// unboxes, and at a reference type it is `castclass`, so the object comes back as itself and
+    /// a null comes back null. csc writes `unbox.any !0` for every `(T)o` in a generic body because
+    /// `T` may be either, which leaves the choice to the resolver, the one component that knows the
+    /// instantiation.
+    ///
+    /// It is the question [`Self::box_is_noop`] answers from the other direction, so by default it
+    /// takes that answer.
+    fn unbox_is_castclass(&self, operand: &Operand) -> bool {
+        self.box_is_noop(operand)
+    }
+
+    /// What a cast to a TYPE PARAMETER checks against once the instantiation in force is applied:
+    /// `castclass !0`, and `unbox.any !0` at a reference type. `None` for every other operand, and
+    /// the cast questions are then asked of the operand itself.
+    ///
+    /// Every question a cast asks is asked of a token, and a bare `!0` names no type, so it
+    /// answers none of them. Defaults to `None`, which leaves such a cast with no check.
+    fn closed_cast_target(&self, _operand: &Operand) -> Option<ClosedCastTarget> {
+        None
     }
 
     /// The interface-method identity tag a `callvirt` on an INTERFACE method dispatches through (the
@@ -756,6 +793,20 @@ pub struct ArrayElement {
     /// `ELEMENT_KIND_REFERENCE` at run time, and the collector's scan-by-kind uses it as a SHIFT
     /// amount. Packing anything above it turns a legal `GetValue` on a reference array into a trap.
     pub element_cast_class: u32,
+}
+
+/// What a cast to a type parameter checks, once the parameter is closed -- see
+/// [`CallResolver::closed_cast_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedCastTarget {
+    /// The closed type is named by this token in the lowering assembly's own tables, so every cast
+    /// question is asked of it exactly as if the body had written the type out.
+    Token(lamella_token::Token),
+    /// The closed type accepts exactly these descriptors. `System.String` is sealed, and a
+    /// signature spells it with a byte rather than a row, so it has no token to ask.
+    Exactly(Vec<TypeHandle>),
+    /// The closed type is `System.Object`, which every object is: there is nothing to check.
+    Anything,
 }
 
 /// How a `castclass`/`isinst` whose TARGET is an ARRAY type tests the object -- ECMA-335 4th ed
@@ -966,9 +1017,38 @@ fn lower_with_source(
         &|op| resolver.field_on_reference_type(op),
         &|op| rectangular_access(resolver, op).is_some(),
         &|op| resolver.array_length_read(op),
+        &|op| stores_a_reference(resolver, op),
         &widths,
     );
-    let preds = control_flow::predecessors(code, &blocks);
+    let mut preds = control_flow::predecessors(code, &blocks);
+    let reachable = {
+        let block_at = |instr: usize| blocks.iter().position(|&(s, e)| instr >= s && instr < e);
+        let mut live = alloc::vec![false; blocks.len()];
+        let mut work: Vec<usize> = alloc::vec![0];
+        for clause in body.handlers.iter() {
+            work.extend(block_at(clause.handler_range.start as usize));
+            if let EhKind::Filter { filter_start } = clause.kind {
+                work.extend(block_at(filter_start as usize));
+            }
+        }
+        while let Some(b) = work.pop() {
+            if b >= live.len() || live[b] {
+                continue;
+            }
+            live[b] = true;
+            if let Some(last) = blocks[b].1.checked_sub(1)
+                && let Some(inst) = code.get(last)
+            {
+                for next in control_flow::successors(inst, last) {
+                    work.extend(block_at(next));
+                }
+            }
+        }
+        live
+    };
+    for list in &mut preds {
+        list.retain(|&pred| reachable[pred]);
+    }
     let (used_args, local_count) = scan_slots(code);
     let arg_count = used_args.max(arg_types.len());
 
@@ -1047,6 +1127,46 @@ fn lower_with_source(
             cell_types.len() - 1
         });
     let local_count = local_count + usize::from(continuation_selector.is_some());
+    let catch_list: Vec<&EhClause> = body
+        .handlers
+        .iter()
+        .filter(|clause| matches!(clause.kind, EhKind::Catch(_)))
+        .collect();
+    let rethrow_owner = |i: usize| -> Option<usize> {
+        catch_list
+            .iter()
+            .enumerate()
+            .filter(|(_, clause)| {
+                (clause.handler_range.start as usize..clause.handler_range.end as usize).contains(&i)
+            })
+            .min_by_key(|(_, clause)| clause.handler_range.end - clause.handler_range.start)
+            .map(|(index, _)| index)
+    };
+    let mut rethrow_slots: Vec<Option<(usize, Option<usize>)>> = alloc::vec![None; catch_list.len()];
+    let mut rethrow_slot_count = 0usize;
+    for (i, inst) in code.iter().enumerate() {
+        if inst.opcode != Opcode::Rethrow {
+            continue;
+        }
+        let Some(owner) = rethrow_owner(i) else {
+            continue;
+        };
+        if rethrow_slots[owner].is_some() {
+            continue;
+        }
+        cell_types.push(MirType::I32);
+        mem_elem.push(None);
+        let tag_slot = cell_types.len() - 1;
+        rethrow_slot_count += 1;
+        let message_slot = resolver.exception_message_offset().map(|_| {
+            cell_types.push(MirType::ObjectRef);
+            mem_elem.push(None);
+            rethrow_slot_count += 1;
+            cell_types.len() - 1
+        });
+        rethrow_slots[owner] = Some((tag_slot, message_slot));
+    }
+    let local_count = local_count + rethrow_slot_count;
     let local_types: &[MirType] = &cell_types;
 
     let mut mem_arg: Vec<Option<MirType>> = alloc::vec![None; arg_count];
@@ -1264,17 +1384,6 @@ fn lower_with_source(
                 .collect();
             params.push(new_value(&mut value_types, MirType::ObjectRef));
             params
-        } else if trap_access[b].is_some() {
-            let mut params: Vec<ValueId> = (0..local_count)
-                .map(|i| {
-                    let ty = local_types.get(i).copied().unwrap_or(MirType::I32);
-                    new_value(&mut value_types, ty)
-                })
-                .collect();
-            for ty in trap_operand_types(code, blocks[b].0, widths[blocks[b].0], resolver) {
-                params.push(new_value(&mut value_types, ty));
-            }
-            params
         } else if takes_local_params(b) {
             (0..local_count)
                 .map(|i| {
@@ -1302,7 +1411,6 @@ fn lower_with_source(
         if b != 0
             && preds[b].is_empty()
             && handler_clause[b].is_none()
-            && trap_access[b].is_none()
             && finally_handler[b].is_none()
         {
             exit_locals[b] = alloc::vec![None; local_count];
@@ -1317,12 +1425,6 @@ fn lower_with_source(
         let mut locals: Vec<Option<ValueId>> = if b == 0 {
             vec![None; local_count]
         } else if handler_clause[b].is_some() {
-            block_params[b]
-                .iter()
-                .take(local_count)
-                .map(|&p| Some(p))
-                .collect()
-        } else if trap_access[b].is_some() {
             block_params[b]
                 .iter()
                 .take(local_count)
@@ -1393,22 +1495,8 @@ fn lower_with_source(
             }
             None => None,
         };
-        if trap_access[b].is_some() {
-            if !is_merge(b) {
-                if let Some(&pred) = preds[b].first() {
-                    if pred < b {
-                        stack = exit_stack[pred].clone();
-                    }
-                }
-            }
-            let operand_count = trap_operand_types(code, start, widths[start], resolver).len();
-            for k in 0..operand_count {
-                stack.push(block_params[b][local_count + k]);
-            }
-        }
         if b != 0
             && handler_clause[b].is_none()
-            && trap_access[b].is_none()
             && finally_handler[b].is_none()
             && !finally_continuation[b]
         {
@@ -1451,6 +1539,31 @@ fn lower_with_source(
             }
         }
         let mut il_index: Vec<u32> = Vec::new();
+        let saves_its_catch = handler_clause[b]
+            .and_then(|clause| rethrow_slots.get(clause).copied().flatten())
+            .zip(current_exception);
+        if let Some(((tag_slot, message_slot), exception)) = saves_its_catch {
+            locals[tag_slot] = Some(reinterpret_word(
+                exception,
+                MirType::ObjectRef,
+                &mut value_types,
+                &mut insts,
+            ));
+            if let Some(slot) = message_slot {
+                let message = new_value(&mut value_types, MirType::ObjectRef);
+                insts.push((
+                    message,
+                    Inst::StaticLoad {
+                        owner: StaticOwner::Own,
+                        offset: G_EXCEPTION_MESSAGE_OFFSET,
+                    },
+                ));
+                locals[slot] = Some(message);
+            }
+            while il_index.len() < insts.len() {
+                il_index.push(byte_offsets[start]);
+            }
+        }
         let mut terminator: Option<Terminator> = None;
         let mut segment: Option<usize> = None;
         let mut last_local_addr: Option<PendingAddr> = None;
@@ -1485,6 +1598,62 @@ fn lower_with_source(
             }
         }
 
+        if let Some(kind) = trap_access[b].clone() {
+            let operand_types = trap_operand_types(code, start, widths[start], resolver);
+            let first = stack
+                .len()
+                .checked_sub(operand_types.len())
+                .ok_or(CilError::StackUnderflow)?;
+            for (operand, declared) in stack[first..].iter_mut().zip(&operand_types) {
+                let actual = value_types
+                    .get(operand.index())
+                    .copied()
+                    .unwrap_or(MirType::I32);
+                if *declared == MirType::I32
+                    && matches!(actual, MirType::NativeInt | MirType::ManagedPtr)
+                {
+                    *operand = reinterpret_word(*operand, actual, &mut value_types, &mut insts);
+                }
+            }
+            let operands: Vec<ValueId> = stack[first..].to_vec();
+            let continuation = split_blocks.len();
+            split_blocks.push(BasicBlock {
+                params: Vec::new(),
+                insts: Vec::new(),
+                terminator: None,
+            });
+            let check = build_trap_access_check(
+                original_block_count + continuation,
+                kind,
+                &operands,
+                &throw_clauses[b],
+                &catch_clauses,
+                &handler_block_of_clause,
+                finally_protect[b],
+                finally_is_innermost[b],
+                &finally_handler_block,
+                resolver,
+                &locals,
+                local_count,
+                local_types,
+                &mut value_types,
+                &mut insts,
+                &mut split_blocks,
+                original_block_count,
+                &mut propagate_fixups,
+            )?;
+            while il_index.len() < insts.len() {
+                il_index.push(byte_offsets[start]);
+            }
+            mir_blocks.push(BasicBlock {
+                params: block_params[b].clone(),
+                insts: core::mem::take(&mut insts),
+                terminator: Some(check),
+            });
+            source_map.push((core::mem::take(&mut il_index), segment_changes.clone()));
+            segment = Some(continuation);
+        }
+
         for i in start..end {
             let inst = &code[i];
             let is_last = i + 1 == end;
@@ -1493,8 +1662,23 @@ fn lower_with_source(
                 terminator = Some(Terminator::Return(stack.pop()));
             } else if is_last && matches!(inst.opcode, Opcode::Throw | Opcode::Rethrow) {
                 if inst.opcode == Opcode::Rethrow {
-                    let exception =
-                        current_exception.ok_or(CilError::Unsupported(Opcode::Rethrow))?;
+                    let exception = match rethrow_owner(i).and_then(|clause| rethrow_slots[clause]) {
+                        Some((tag_slot, message_slot)) => {
+                            if let Some(message) = message_slot.and_then(|slot| locals[slot]) {
+                                let stored = new_value(&mut value_types, MirType::I32);
+                                insts.push((
+                                    stored,
+                                    Inst::StaticStore {
+                                        owner: StaticOwner::Own,
+                                        offset: G_EXCEPTION_MESSAGE_OFFSET,
+                                        value: message,
+                                    },
+                                ));
+                            }
+                            locals[tag_slot].ok_or(CilError::Unsupported(Opcode::Rethrow))?
+                        }
+                        None => current_exception.ok_or(CilError::Unsupported(Opcode::Rethrow))?,
+                    };
                     stack.push(exception);
                 }
                 terminator = Some(build_eh_throw(
@@ -1763,62 +1947,20 @@ fn lower_with_source(
                 if next >= blocks.len() {
                     return Err(CilError::UnsupportedControlFlow(ControlFlowGap::RanOffEnd));
                 }
-                if let Some(kind) = trap_access[next].clone() {
-                    let operand_types =
-                        trap_operand_types(code, blocks[next].0, widths[blocks[next].0], resolver);
-                    let operand_count = operand_types.len();
-                    let mut operands = Vec::with_capacity(operand_count);
-                    for _ in 0..operand_count {
-                        operands.push(stack.pop().ok_or(CilError::StackUnderflow)?);
-                    }
-                    operands.reverse();
-                    for (operand, declared) in operands.iter_mut().zip(&operand_types) {
-                        let actual = value_types
-                            .get(operand.index())
-                            .copied()
-                            .unwrap_or(MirType::I32);
-                        if *declared == MirType::I32
-                            && matches!(actual, MirType::NativeInt | MirType::ManagedPtr)
-                        {
-                            *operand = reinterpret_word(*operand, actual, &mut value_types, &mut insts);
-                        }
-                    }
-                    build_trap_access_check(
-                        next,
-                        kind,
-                        &operands,
-                        &throw_clauses[b],
-                        &catch_clauses,
-                        &handler_block_of_clause,
-                        finally_protect[b],
-                        finally_is_innermost[b],
-                        &finally_handler_block,
-                        resolver,
-                        &locals,
-                        local_count,
-                        local_types,
-                        &mut value_types,
-                        &mut insts,
-                        &mut split_blocks,
-                        original_block_count,
-                        &mut propagate_fixups,
-                    )?
-                } else {
-                    let mut args = merge_args(
-                        takes_edge_params(next),
-                        local_count,
-                        &locals,
-                        local_types,
-                        &mut value_types,
-                        &mut insts,
-                    );
-                    if takes_edge_params(next) {
-                        args.extend(stack.iter().copied());
-                    }
-                    Terminator::Jump {
-                        target: BlockId(next as u32),
-                        args,
-                    }
+                let mut args = merge_args(
+                    takes_edge_params(next),
+                    local_count,
+                    &locals,
+                    local_types,
+                    &mut value_types,
+                    &mut insts,
+                );
+                if takes_edge_params(next) {
+                    args.extend(stack.iter().copied());
+                }
+                Terminator::Jump {
+                    target: BlockId(next as u32),
+                    args,
                 }
             }
         };
@@ -1970,6 +2112,58 @@ pub struct CilSourceMap {
     /// program is talking about has moved to a promoted local or into a memory cell. Reporting it
     /// would be a confidently wrong answer rather than a stale one.
     pub arg_values: Vec<Option<ValueId>>,
+}
+
+impl CilSourceMap {
+    /// This map, restated for the same function after a pass rebuilt its blocks' instruction lists:
+    /// `origins[block][k]` is the index, in the list this map describes, of the instruction that new
+    /// instruction `k` was made from. A pass that expands one instruction into several lists the
+    /// original's index once per instruction it made.
+    ///
+    /// **BOTH HALVES ARE FOUND BY INDEX, SO A PASS THAT INSERTS MOVES BOTH.** Left as they were,
+    /// every row behind an expansion names an instruction that many places early, and every local
+    /// change takes effect that early too -- so a debugger stops inside the statement before, and
+    /// shows a local holding its next value before it is assigned.
+    ///
+    /// Each new instruction takes the row of the instruction it was made from. A local change in
+    /// force from original instruction `i` is in force from the first instruction made from `i` or
+    /// later, and one at the old terminator index is at the new one. A block `origins` does not
+    /// cover is kept as it was.
+    #[must_use]
+    pub fn expanded(&self, origins: &[Vec<u32>]) -> CilSourceMap {
+        let rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(block, rows)| match origins.get(block) {
+                Some(origin) => origin
+                    .iter()
+                    .map_while(|&from| rows.get(from as usize).copied())
+                    .collect(),
+                None => rows.clone(),
+            })
+            .collect();
+        let local_changes = self
+            .local_changes
+            .iter()
+            .enumerate()
+            .map(|(block, changes)| match origins.get(block) {
+                Some(origin) => changes
+                    .iter()
+                    .map(|&(at, slot, value)| {
+                        let moved = origin.iter().position(|&from| from >= at).unwrap_or(origin.len());
+                        (moved as u32, slot, value)
+                    })
+                    .collect(),
+                None => changes.clone(),
+            })
+            .collect();
+        CilSourceMap {
+            rows,
+            local_changes,
+            arg_values: self.arg_values.clone(),
+        }
+    }
 }
 
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`]. See
@@ -2283,6 +2477,18 @@ fn stind(
         },
     ));
     Ok(())
+}
+
+/// The width and extension a token-form access (`ldobj`, `stobj`, `cpobj`) of `operand` must use,
+/// when [`CallResolver::sub_word_scalar`] says the type is narrower than a word; `None` otherwise.
+fn sub_word_access(resolver: &dyn CallResolver, operand: &Operand) -> Option<(u32, bool)> {
+    match resolver.sub_word_scalar(operand)? {
+        ConvKind::SignExtend8 => Some((1, true)),
+        ConvKind::ZeroExtend8 => Some((1, false)),
+        ConvKind::SignExtend16 => Some((2, true)),
+        ConvKind::ZeroExtend16 => Some((2, false)),
+        _ => None,
+    }
 }
 
 /// Lowers a `ldind.{i,u}{1,2,4}`: `value = *(addr)`, a `width`-byte load sign- or zero-extended to
@@ -4198,28 +4404,50 @@ fn apply_value_op(
                 .type_operand_mir(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
             let address = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let result = new_value(value_types, ty);
-            insts.push((
-                result,
-                Inst::FieldLoad {
-                    base: address,
-                    offset: 0,
-                },
-            ));
+            let result = match sub_word_access(resolver, &inst.operand) {
+                Some((width, signed)) => {
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((
+                        result,
+                        Inst::Load {
+                            address,
+                            width,
+                            signed,
+                        },
+                    ));
+                    result
+                }
+                None => {
+                    let result = new_value(value_types, ty);
+                    insts.push((
+                        result,
+                        Inst::FieldLoad {
+                            base: address,
+                            offset: 0,
+                        },
+                    ));
+                    result
+                }
+            };
             stack.push(result);
         }
         Opcode::Stobj => {
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
             let address = stack.pop().ok_or(CilError::StackUnderflow)?;
             let placeholder = new_value(value_types, MirType::I32);
-            insts.push((
-                placeholder,
-                Inst::FieldStore {
+            let store = match sub_word_access(resolver, &inst.operand) {
+                Some((width, _)) => Inst::Store {
+                    address,
+                    value,
+                    width,
+                },
+                None => Inst::FieldStore {
                     base: address,
                     offset: 0,
                     value,
                 },
-            ));
+            };
+            insts.push((placeholder, store));
         }
         Opcode::Cpobj => {
             let ty = resolver
@@ -4227,6 +4455,27 @@ fn apply_value_op(
                 .ok_or(CilError::BadOperand)?;
             let src = stack.pop().ok_or(CilError::StackUnderflow)?;
             let dst = stack.pop().ok_or(CilError::StackUnderflow)?;
+            if let Some((width, signed)) = sub_word_access(resolver, &inst.operand) {
+                let temp = new_value(value_types, MirType::I32);
+                insts.push((
+                    temp,
+                    Inst::Load {
+                        address: src,
+                        width,
+                        signed,
+                    },
+                ));
+                let placeholder = new_value(value_types, MirType::I32);
+                insts.push((
+                    placeholder,
+                    Inst::Store {
+                        address: dst,
+                        value: temp,
+                        width,
+                    },
+                ));
+                return Ok(());
+            }
             let temp = new_value(value_types, ty);
             insts.push((temp, Inst::FieldLoad { base: src, offset: 0 }));
             let placeholder = new_value(value_types, MirType::I32);
@@ -4262,6 +4511,7 @@ fn apply_value_op(
                 insts.push((result, Inst::FieldLoad { base: addr, offset: 0 }));
                 stack.push(result);
             } else {
+                let signed = matches!(sub_word_access(resolver, &inst.operand), Some((_, true)));
                 let result = new_value(value_types, ty);
                 insts.push((
                     result,
@@ -4269,7 +4519,7 @@ fn apply_value_op(
                         array,
                         index,
                         element_size: element.element_size,
-                        signed: false,
+                        signed,
                     },
                 ));
                 stack.push(result);
@@ -4658,6 +4908,11 @@ fn apply_value_op(
             stack.push(obj);
         }
         Opcode::UnboxAny => {
+            if resolver.unbox_is_castclass(&inst.operand) {
+                let object = stack.pop().ok_or(CilError::StackUnderflow)?;
+                stack.push(object);
+                return Ok(());
+            }
             let result_ty = resolver
                 .boxed_value_type(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
@@ -5650,8 +5905,8 @@ impl TrapKind {
             | TrapKind::CastInterface(_)
             | TrapKind::Overflow(_)
             | TrapKind::ConvOverflow { .. } => true,
+            TrapKind::BoundsThenArrayStore => true,
             TrapKind::Bounds
-            | TrapKind::BoundsThenArrayStore
             | TrapKind::RectangularBounds { .. }
             | TrapKind::NullRef
             | TrapKind::DivByZero => false,
@@ -5722,6 +5977,50 @@ fn array_length_leader(code: &[Instruction], i: usize, resolver: &dyn CallResolv
         })
 }
 
+/// The check a `castclass` to `operand` makes, or `None` where this lowering has none to make.
+///
+/// A TYPE PARAMETER is closed first ([`CallResolver::closed_cast_target`]), and the questions below
+/// are then asked of what it closed to. Asked of `!0` itself, every one of them declined -- it names
+/// no type -- so `castclass !0` and `unbox.any !0` at a reference instantiation passed any object
+/// at all, and a `Box<string>`'s `(T)o` returned a boxed `int` as a string.
+fn castclass_check(resolver: &dyn CallResolver, operand: &Operand) -> Option<TrapKind> {
+    match resolver.closed_cast_target(operand) {
+        Some(ClosedCastTarget::Token(named)) => {
+            return castclass_check_named(resolver, &Operand::Token(named));
+        }
+        Some(ClosedCastTarget::Exactly(handles)) => return Some(TrapKind::CastClass(handles)),
+        Some(ClosedCastTarget::Anything) => return None,
+        None => {}
+    }
+    castclass_check_named(resolver, operand)
+}
+
+/// [`castclass_check`] for an operand that names its type.
+fn castclass_check_named(resolver: &dyn CallResolver, operand: &Operand) -> Option<TrapKind> {
+    if let Some(test) = resolver.array_cast_test(operand) {
+        return Some(TrapKind::CastArray(test));
+    }
+    if let Some(tag) = resolver.cast_interface_tag(operand) {
+        return Some(TrapKind::CastInterface(tag));
+    }
+    let handles = resolver.cast_subtype_handles(operand);
+    if let Some(target) = resolver.cast_target_chain(operand) {
+        if crate::resolver::reference_handle_parts(target).is_some()
+            || handles.len() > CAST_CHAIN_THRESHOLD
+        {
+            return Some(TrapKind::CastClassChain(target));
+        }
+    }
+    (!handles.is_empty()).then_some(TrapKind::CastClass(handles))
+}
+
+/// Whether a `stelem <T>` operand names a REFERENCE type once the instantiation in force closes it
+/// -- the one question [`control_flow::is_covariant_store`] asks of an operand, asked of the type
+/// the store's value is lowered as, so the check and the store cannot disagree about `T`.
+fn stores_a_reference(resolver: &dyn CallResolver, operand: &Operand) -> bool {
+    resolver.type_operand_mir(operand) == Some(MirType::ObjectRef)
+}
+
 fn trap_kind_at(
     code: &[Instruction],
     index: usize,
@@ -5736,7 +6035,7 @@ fn trap_kind_at(
     }
     let opcode = inst.opcode;
     if control_flow::is_may_trap_access(opcode) {
-        if opcode == Opcode::StelemRef {
+        if control_flow::is_covariant_store(inst, &|op| stores_a_reference(resolver, op)) {
             return Some(TrapKind::BoundsThenArrayStore);
         }
         return Some(TrapKind::Bounds);
@@ -5751,6 +6050,9 @@ fn trap_kind_at(
     {
         return Some(TrapKind::NullRef);
     }
+    if opcode == Opcode::UnboxAny && resolver.unbox_is_castclass(&inst.operand) {
+        return castclass_check(resolver, &inst.operand);
+    }
     if matches!(opcode, Opcode::Unbox | Opcode::UnboxAny) {
         let accepted = resolver.unbox_accepted_handles(&inst.operand);
         if !accepted.is_empty() {
@@ -5758,22 +6060,8 @@ fn trap_kind_at(
         }
     }
     if opcode == Opcode::Castclass {
-        if let Some(test) = resolver.array_cast_test(&inst.operand) {
-            return Some(TrapKind::CastArray(test));
-        }
-        if let Some(tag) = resolver.cast_interface_tag(&inst.operand) {
-            return Some(TrapKind::CastInterface(tag));
-        }
-        let handles = resolver.cast_subtype_handles(&inst.operand);
-        if let Some(target) = resolver.cast_target_chain(&inst.operand) {
-            if crate::resolver::reference_handle_parts(target).is_some()
-                || handles.len() > CAST_CHAIN_THRESHOLD
-            {
-                return Some(TrapKind::CastClassChain(target));
-            }
-        }
-        if !handles.is_empty() {
-            return Some(TrapKind::CastClass(handles));
+        if let Some(check) = castclass_check(resolver, &inst.operand) {
+            return Some(check);
         }
     }
     if control_flow::is_integer_divide(opcode, top_of_stack) {
@@ -5801,22 +6089,17 @@ fn trap_kind_at(
     None
 }
 
-/// The operand types a may-trap access takes off the stack, so a trap-access block can receive them
-/// as trailing parameters: `[array, index]` for an array load, `[array, index, value]` for an array
-/// store (the value's width follows the element -- `i8` -> I64, `ref` -> O, else I32), `[object]` for
-/// a field load, `[object, value]` for a field store (the value typed by the field). Empty for a
-/// non-access opcode.
-/// Per-instruction i64-WIDTH of the top eval-stack slot just before that instruction, by a linear sim.
-/// A trap-leader types its integer operands at the STRUCTURAL block-params pass -- before any value
-/// flows -- so it can't read the real types; this re-derives the width (i32 vs i64) so a checked op on
-/// a 64-bit operand (a `long` divide/remainder or a `conv.ovf` from `long`) is checked at i64 width.
+/// Per-instruction type of the top eval-stack slot just before that instruction, by a linear sim.
+/// Block discovery and the trap analysis run before any value flows, so they cannot read the real
+/// types; this re-derives the width (i32 or i64, and the floats) so that an integer divide, which can
+/// trap, is told from a float one, which cannot, and so a may-trap access's operands are declared at
+/// their width.
 ///
 /// SAFE BY DESIGN: every produced slot defaults to NARROW; only the specific i64 PRODUCERS push WIDE
 /// (ldc.i8, conv.i8/u8(.ovf), an i64 local/arg/field, ldelem.i8, an i64 binary result or call return),
-/// and any opcode NOT modeled CLEARS the stack. So an i32 operand is never falsely widened (no regression
-/// to the working i32 trap-leaders); at worst a 64-bit operand reached through an unmodeled op reads
-/// narrow -- the prior behavior. The deeper stack may drift, but a checked op's operands are pushed
-/// immediately before it, so the recorded TOP is correct.
+/// and any opcode NOT modeled CLEARS the stack. So an i32 operand is never falsely widened; at worst a
+/// 64-bit operand reached through an unmodeled op reads narrow. The deeper stack may drift, but a
+/// checked op's operands are pushed immediately before it, so the recorded TOP is correct.
 fn eval_stack_widths(
     code: &[Instruction],
     arg_types: &[MirType],
@@ -6053,6 +6336,14 @@ fn eval_stack_widths(
     widths
 }
 
+/// The operands a may-trap access takes off the stack, which the check leading its block reads:
+/// `[array, index]` for an array load, `[array, index, value]` for an array store (the value's width
+/// follows the element -- `i8` -> I64, `ref` -> O, else I32), `[object]` for a field load,
+/// `[object, value]` for a field store (the value typed by the field). Empty for a non-access opcode.
+///
+/// The types are declared from the width model rather than read from the values: the check takes as
+/// many values as there are types, and an operand declared `I32` that arrives as a pointer is
+/// reinterpreted to that one word.
 fn trap_operand_types(
     code: &[Instruction],
     index: usize,
@@ -6829,8 +7120,13 @@ fn object_is_null(
     is_null
 }
 
+/// Builds the check that leads a block beginning with a may-trap access: the failure test that `kind`
+/// names, over `operands` (the access's own operands, read off that block's entry stack); a route
+/// that raises the builtin exception on failure, to the enclosing handler or through the protecting
+/// finally; and the returned `Branch`, whose pass edge goes to `pass` -- the param-less rest of the
+/// block, which reads the operands and the locals where they already are.
 fn build_trap_access_check(
-    access_block: usize,
+    pass: usize,
     kind: TrapKind,
     operands: &[ValueId],
     throw_clauses: &[usize],
@@ -7218,26 +7514,6 @@ fn build_trap_access_check(
         propagate_fixups,
     )?;
 
-    let landing = block_count + split_blocks.len();
-    let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
-    let mut access_args = merge_args(
-        true,
-        local_count,
-        locals,
-        local_types,
-        value_types,
-        &mut landing_insts,
-    );
-    access_args.extend_from_slice(operands);
-    split_blocks.push(BasicBlock {
-        params: Vec::new(),
-        insts: landing_insts,
-        terminator: Some(Terminator::Jump {
-            target: BlockId(access_block as u32),
-            args: access_args,
-        }),
-    });
-
     let in_range = if covariant_store {
         let array = operands[0];
         let value = operands[2];
@@ -7366,13 +7642,13 @@ fn build_trap_access_check(
                 cond: mismatch,
                 if_true: BlockId(store_trap as u32),
                 true_args: Vec::new(),
-                if_false: BlockId(landing as u32),
+                if_false: BlockId(pass as u32),
                 false_args: Vec::new(),
             }),
         });
         check
     } else {
-        landing
+        pass
     };
 
     if let Some(null_array) = null_array {
@@ -8751,6 +9027,20 @@ mod control_flow {
         is_may_trap_load(op) || is_may_trap_store(op)
     }
 
+    /// Whether `inst` stores a REFERENCE into an array element, which array covariance makes a
+    /// store the array's runtime element type may refuse with ArrayTypeMismatchException:
+    /// `stelem.ref` (III.4.27) and `stelem <T>` at a `T` that is a reference type once the
+    /// instantiation in force closes it (III.4.26), which is how csc writes `a[i] = v` for a `T[]`.
+    ///
+    /// ONE STATEMENT OF THE RULE for the two places that act on it -- [`discover_blocks`], which
+    /// makes such a store lead a block, and `trap_kind_at`, which checks it there. They have to
+    /// agree or the check has no block to lead, and a second enumeration is how `stelem <T>` went
+    /// unchecked while `stelem.ref` was.
+    pub fn is_covariant_store(inst: &Instruction, is_reference_element: &dyn Fn(&Operand) -> bool) -> bool {
+        inst.opcode == Opcode::StelemRef
+            || (inst.opcode == Opcode::Stelem && is_reference_element(&inst.operand))
+    }
+
     /// The field-access opcodes that reach their field THROUGH A BASE ON THE STACK, so a null base
     /// dereferences: `ldfld`, `stfld` and `ldflda`.
     ///
@@ -8839,6 +9129,7 @@ mod control_flow {
         is_reference_field: &dyn Fn(&Operand) -> bool,
         is_rectangular_accessor: &dyn Fn(&Operand) -> bool,
         is_array_length_read: &dyn Fn(&Operand) -> bool,
+        is_reference_element: &dyn Fn(&Operand) -> bool,
         top_of_stack: &[MirType],
     ) -> Vec<(usize, usize)> {
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
@@ -8902,6 +9193,7 @@ mod control_flow {
                 matches!(clause.kind, EhKind::Catch(_) | EhKind::Finally)
                     && (clause.try_range.start as usize..clause.try_range.end as usize).contains(&i)
             });
+            let is_covariant = is_covariant_store(inst, is_reference_element);
             if ((is_may_trap_access(inst.opcode)
                 || is_field_null_deref
                 || is_length_null_deref
@@ -8912,6 +9204,7 @@ mod control_flow {
                 || is_cast
                 || is_conv_ovf
                 || is_overflow
+                || is_covariant
             {
                 leaders.insert(i);
             }
@@ -8948,6 +9241,29 @@ mod control_flow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_map_follows_a_pass_that_expands_an_instruction() {
+        let map = CilSourceMap {
+            rows: vec![vec![10, 20, 30]],
+            local_changes: vec![vec![
+                (0, 0, Some(ValueId(0))),
+                (2, 1, Some(ValueId(1))),
+                (3, 2, None),
+            ]],
+            arg_values: vec![Some(ValueId(5))],
+        };
+        let expanded = map.expanded(&[vec![0, 1, 1, 1, 2]]);
+        assert_eq!(expanded.rows, vec![vec![10, 20, 20, 20, 30]]);
+        assert_eq!(
+            expanded.local_changes,
+            vec![vec![(0, 0, Some(ValueId(0))), (4, 1, Some(ValueId(1))), (5, 2, None)]],
+            "a change moves to the first instruction made from its own, and the terminator's to the new end"
+        );
+        assert_eq!(expanded.arg_values, map.arg_values);
+        assert_eq!(map.expanded(&[vec![0, 1, 2]]), map, "a pass that inserts nothing moves nothing");
+        assert_eq!(map.expanded(&[]), map, "a block the pass does not describe is kept");
+    }
 
     /// A checked reference cast must let NULL THROUGH: `castclass` on null SUCCEEDS in .NET, so the
     /// trap predicate has to be "matched nothing AND there WAS something to match" rather than just
@@ -9825,6 +10141,212 @@ mod tests {
 
 
 
+
+    /// Asserts that the one `I32` multiply in `func` -- the checked operation itself, where the
+    /// check's own product is `I64` -- is entered ONLY through its overflow check: the block holding it
+    /// has a single predecessor, that predecessor ends in a `Branch`, and the branch's other edge
+    /// raises (its block begins with the exception tag).
+    fn assert_multiply_is_entered_only_through_its_check(func: &Function) {
+        let tag = i64::from(0x00C0_FFEE_u32);
+        let holds_operation = |block: &BasicBlock| {
+            block.insts.iter().any(|(value, inst)| {
+                matches!(inst, Inst::Binary { op: BinOp::Mul, .. })
+                    && func.value_types[value.index()] == MirType::I32
+            })
+        };
+        let operation: Vec<usize> = (0..func.blocks.len())
+            .filter(|&b| holds_operation(&func.blocks[b]))
+            .collect();
+        assert_eq!(
+            operation.len(),
+            1,
+            "one block holds the checked multiply, found {operation:?}"
+        );
+        let op = operation[0];
+        let successors = |block: &BasicBlock| -> Vec<usize> {
+            match &block.terminator {
+                Some(Terminator::Jump { target, .. }) => vec![target.index()],
+                Some(Terminator::Branch {
+                    if_true, if_false, ..
+                }) => vec![if_true.index(), if_false.index()],
+                _ => Vec::new(),
+            }
+        };
+        let entering: Vec<usize> = (0..func.blocks.len())
+            .filter(|&b| successors(&func.blocks[b]).contains(&op))
+            .collect();
+        assert_eq!(
+            entering.len(),
+            1,
+            "the multiply must be entered only through its check, but blocks {entering:?} reach it"
+        );
+        let Some(Terminator::Branch {
+            if_true, if_false, ..
+        }) = &func.blocks[entering[0]].terminator
+        else {
+            panic!(
+                "the block entering the multiply must end in its check, got {:?}",
+                func.blocks[entering[0]].terminator
+            );
+        };
+        let failure = if if_true.index() == op {
+            if_false.index()
+        } else {
+            if_true.index()
+        };
+        assert!(
+            matches!(
+                func.blocks[failure].insts.first(),
+                Some((_, Inst::ConstInt { value, .. })) if *value == tag
+            ),
+            "the check's other edge must raise OverflowException"
+        );
+    }
+
+    /// Lowers `code` as `int M(int a, int c)` and asserts the result verifies.
+    fn lower_checked_join(code: Vec<Instruction>) -> Function {
+        let body = MethodBodyImage {
+            max_stack: 4,
+            init_locals: false,
+            local_var_sig: None,
+            code: code.into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_two_arg(body, MirType::I32).expect("a checked multiply at a join lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        func
+    }
+
+    #[test]
+    fn a_checked_operation_at_a_join_is_checked_on_the_arm_that_branches_to_it() {
+        let func = lower_checked_join(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::BrfalseS, Operand::Target(5)),
+            Instruction::simple(Opcode::LdcI48),
+            Instruction::new(Opcode::BrS, Operand::Target(6)),
+            Instruction::simple(Opcode::LdcI47),
+            Instruction::simple(Opcode::MulOvf),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_multiply_is_entered_only_through_its_check(&func);
+    }
+
+    #[test]
+    fn a_checked_operation_at_a_join_is_checked_on_a_conditional_branch_to_it() {
+        let func = lower_checked_join(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdcI48),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::BrtrueS, Operand::Target(6)),
+            Instruction::simple(Opcode::Pop),
+            Instruction::simple(Opcode::LdcI47),
+            Instruction::simple(Opcode::MulOvf),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_multiply_is_entered_only_through_its_check(&func);
+    }
+
+    #[test]
+    fn a_checked_operation_at_a_join_is_checked_on_a_switch_case_to_it() {
+        let func = lower_checked_join(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdcI48),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::Switch, Operand::Switch(vec![6].into())),
+            Instruction::simple(Opcode::Pop),
+            Instruction::simple(Opcode::LdcI47),
+            Instruction::simple(Opcode::MulOvf),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_multiply_is_entered_only_through_its_check(&func);
+    }
+
+    #[test]
+    fn a_checked_operation_at_a_join_keeps_the_value_below_its_operands() {
+        let func = lower_checked_join(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::BrfalseS, Operand::Target(6)),
+            Instruction::simple(Opcode::LdcI48),
+            Instruction::new(Opcode::BrS, Operand::Target(7)),
+            Instruction::simple(Opcode::LdcI47),
+            Instruction::simple(Opcode::MulOvf),
+            Instruction::simple(Opcode::Xor),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_multiply_is_entered_only_through_its_check(&func);
+    }
+
+    /// A resolver that catches every type and lays an exception's message at offset 4, so the
+    /// message word a `rethrow` puts back in flight is emitted and can be counted.
+    struct CatchAllWithMessage;
+
+    impl CallResolver for CatchAllWithMessage {
+        fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+            None
+        }
+        fn is_catch_all_type(&self, _: &Operand) -> bool {
+            true
+        }
+        fn exception_message_offset(&self) -> Option<u32> {
+            Some(4)
+        }
+    }
+
+    #[test]
+    fn a_rethrow_after_a_branch_in_its_handler_lowers_and_restores_the_message() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Throw),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::new(Opcode::BrfalseS, Operand::Target(6)),
+                Instruction::simple(Opcode::Rethrow),
+                Instruction::new(Opcode::Leave, Operand::Target(7)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 2 },
+                handler_range: lamella_cil::InstructionRange { start: 2, end: 7 },
+                kind: EhKind::Catch(lamella_token::Token(0x0100_0001)),
+            }]
+            .into_boxed_slice(),
+        };
+        let func = lower_method_typed(
+            &body,
+            &CatchAllWithMessage,
+            &[MirType::ObjectRef, MirType::I32],
+            &[],
+            Narrowing::default(),
+        )
+        .expect("a rethrow after a branch in its handler lowers")
+        .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+        let message_stores = func
+            .blocks
+            .iter()
+            .flat_map(|block| block.insts.iter())
+            .filter(|(_, inst)| {
+                matches!(
+                    inst,
+                    Inst::StaticStore {
+                        owner: StaticOwner::Own,
+                        offset: G_EXCEPTION_MESSAGE_OFFSET,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(message_stores, 2, "the throw's message store and the rethrow's restore");
+    }
 
     /// A `stackalloc` SIZE IS FOLDED FROM AN EXPRESSION, not just read off a literal.
     ///
@@ -10855,6 +11377,95 @@ mod tests {
         );
     }
 
+    /// How many blocks lowered to a bare trap: no instructions, an `Unreachable` terminator.
+    fn bare_traps(func: &Function) -> usize {
+        func.blocks
+            .iter()
+            .filter(|blk| {
+                matches!(blk.terminator, Some(Terminator::Unreachable)) && blk.insts.is_empty()
+            })
+            .count()
+    }
+
+    #[test]
+    fn dead_code_with_a_join_of_its_own_lowers_to_bare_traps() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::new(Opcode::BrS, Operand::Target(11)),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::new(Opcode::BrfalseS, Operand::Target(8)),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::new(Opcode::BrS, Operand::Target(9)),
+                Instruction::simple(Opcode::LdcI42),
+                Instruction::simple(Opcode::Or),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method_typed(
+            &body,
+            &NoCalls,
+            &[MirType::I32, MirType::I32],
+            &[MirType::I32],
+            Narrowing::default(),
+        )
+        .expect("dead code with a join of its own lowers")
+        .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(bare_traps(&func), 4, "exactly the dead statement lowers to bare traps");
+    }
+
+    #[test]
+    fn dead_code_falling_into_a_catch_handler_lowers_to_bare_traps() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Throw),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::new(Opcode::BrfalseS, Operand::Target(8)),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Nop),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Leave, Operand::Target(11)),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 2, end: 9 },
+                handler_range: lamella_cil::InstructionRange { start: 9, end: 11 },
+                kind: EhKind::Catch(lamella_token::Token(0x0100_0001)),
+            }]
+            .into_boxed_slice(),
+        };
+        let func = lower_method_typed(
+            &body,
+            &CatchAllWithMessage,
+            &[MirType::ObjectRef, MirType::I32],
+            &[MirType::I32],
+            Narrowing::default(),
+        )
+        .expect("dead code falling into a catch handler lowers")
+        .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(bare_traps(&func), 3, "exactly the dead statement lowers to bare traps");
+    }
+
     #[test]
     fn a_dead_ret_after_a_constant_true_guard_returns_a_placeholder() {
         let body = MethodBodyImage {
@@ -11640,7 +12251,7 @@ mod tests {
             Instruction::simple(Opcode::LdcI41),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &|_| false, &[]);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &|_| false, &|_| false, &[]);
         assert_eq!(blocks, vec![(0, 3), (3, 5), (5, 7)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -11832,7 +12443,7 @@ mod tests {
             Instruction::new(Opcode::LdcI4S, Operand::Int8(30)),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &|_| false, &[]);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false, &|_| false, &|_| false, &|_| false, &[]);
         assert_eq!(blocks, vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -11925,6 +12536,9 @@ mod tests {
                     element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
                     element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
                 })
+            }
+            fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+                Some(1)
             }
         }
         let body = MethodBodyImage {

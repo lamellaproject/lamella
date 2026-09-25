@@ -500,9 +500,9 @@ pub fn spell_sig_across(
 ///
 /// The distinction is not cosmetic. An instantiation of a CLASS is an object reference whatever its
 /// arguments are, so it is answerable with no layout at all. An instantiation of a VALUE type
-/// carries a SIZE and a trace map that only the substituted layout can supply, and until this tier
-/// monomorphizes value types it has neither -- so the honest answer is a refusal rather than a
-/// guess one field wide.
+/// carries a SIZE and a trace map that only the substituted layout can supply -- so wherever that
+/// layout cannot be computed exactly, the honest answer is a refusal rather than a guess one field
+/// wide.
 ///
 /// Keyed POSITIVELY on `ValueType`, not as "anything that is not a `Class`". `GENERICINST` is
 /// followed by exactly one of those two element bytes (ECMA-335 II.23.2.12), so the two readings
@@ -511,6 +511,31 @@ pub fn spell_sig_across(
 #[must_use]
 pub fn is_value_type_instantiation(ty: &SigType) -> bool {
     matches!(ty, SigType::GenericInst { definition, .. } if matches!(**definition, SigType::ValueType(_)))
+}
+
+/// Whether a closed type NAMES a type -- carries a `Class` or `ValueType` token anywhere in its
+/// spelling -- where a primitive, `string` or `object` is spelled by a signature byte and carries
+/// none.
+///
+/// A token means something only in the assembly that wrote it, so a type argument that carries one
+/// cannot be read in the tables of a different assembly. The question is asked STRUCTURALLY rather
+/// than by listing the safe cases: every composite spelling is token-bearing exactly when one of its
+/// parts is. A list of primitives would go quiet the day a new primitive `SigType` is added; this
+/// does not.
+#[must_use]
+pub fn names_a_type(sig: &SigType) -> bool {
+    match sig {
+        SigType::Class(_) | SigType::ValueType(_) => true,
+        SigType::SzArray(element) | SigType::ByRef(element) | SigType::Pointer(element) => {
+            names_a_type(element)
+        }
+        SigType::Array { element, .. } => names_a_type(element),
+        SigType::GenericInst {
+            definition,
+            arguments,
+        } => names_a_type(definition) || arguments.iter().any(names_a_type),
+        _ => false,
+    }
 }
 
 /// The type arguments a `TypeSpec` token instantiates its definition with, and the definition's own
@@ -768,6 +793,32 @@ impl<'a> Program<'a> {
 
     /// The closed instantiation set, in discovery order, or the refusal that stopped it.
     pub fn instantiations(&self) -> Result<Vec<Instantiation>, Refusal> {
+        self.instantiations_deriving(&|_| Vec::new())
+    }
+
+    /// [`Self::instantiations`], widened by what a consumer DERIVES from it: every instantiation the
+    /// walk finds is offered to `derive`, and each type `derive` answers is walked as a root of its
+    /// own, so that the instantiations ITS bodies reach are closed as a named one's are.
+    ///
+    /// It is for a tier that emits an instantiation nothing names. The interpreter hands a vector
+    /// out as an `IEnumerable<X>` through the corlib's enumerator at X, and serves its
+    /// `ICollection<X>` members through a helper at X, so it adds those beside each interface
+    /// instantiation the walk finds. Added AFTER the walk, a helper whose body calls
+    /// `EqualityComparer<X>.Default` would find that comparer in the set only if something else had
+    /// closed it; walked as roots here, it finds it every time.
+    ///
+    /// ONE WALK, NOT TWO: the derived roots are visited by the same [`Walk`] after the named ones, as
+    /// a worklist over what it has found so far, so a derived root's own finds are offered to
+    /// `derive` in turn, and a rule the walk learns reaches both. With a deriver that answers
+    /// nothing, the loop below visits nothing, and this is exactly [`Self::instantiations`], which
+    /// is how it is called.
+    ///
+    /// `derive` answers CLOSED types. The walk passes over an open one without a word, which for a
+    /// derived root would be the very miss this exists to remove, so a debug build asserts it.
+    pub fn instantiations_deriving(
+        &self,
+        derive: &dyn Fn(&Instantiation) -> Vec<TypeArg>,
+    ) -> Result<Vec<Instantiation>, Refusal> {
         let mut walk = Walk {
             program: self,
             seen: BTreeSet::new(),
@@ -776,6 +827,14 @@ impl<'a> Program<'a> {
         let mut path = Vec::new();
         for root in self.roots()? {
             walk.visit(&root, &mut path)?;
+        }
+        let mut next = 0;
+        while next < walk.found.len() {
+            for root in derive(&walk.found[next]) {
+                debug_assert!(root.is_closed(), "a derived root must be closed: {}", root.name());
+                walk.visit(&root, &mut path)?;
+            }
+            next += 1;
         }
         let mut minted: BTreeMap<u32, Box<str>> = BTreeMap::new();
         for entry in &walk.found {

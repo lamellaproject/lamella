@@ -37,3 +37,21 @@ pub const PIN_CNF0_SENSE_LSB: u32 = 16;
 
 /// -- block constants --
 pub const PIN_CNF_STRIDE: u32 = 4;
+pub const DIR_INPUT: u32 = 0;
+pub const DIR_OUTPUT: u32 = 1;
+pub const INPUT_CONNECT: u32 = 0;
+pub const INPUT_DISCONNECT: u32 = 1;
+pub const PULL_DISABLED: u32 = 0;
+pub const PULL_PULLDOWN: u32 = 1;
+pub const PULL_PULLUP: u32 = 3;
+pub const DRIVE_S0S1: u32 = 0;
+pub const DRIVE_H0S1: u32 = 1;
+pub const DRIVE_S0H1: u32 = 2;
+pub const DRIVE_H0H1: u32 = 3;
+pub const DRIVE_D0S1: u32 = 4;
+pub const DRIVE_D0H1: u32 = 5;
+pub const DRIVE_S0D1: u32 = 6;
+pub const DRIVE_H0D1: u32 = 7;
+pub const SENSE_DISABLED: u32 = 0;
+pub const SENSE_HIGH: u32 = 2;
+pub const SENSE_LOW: u32 = 3;

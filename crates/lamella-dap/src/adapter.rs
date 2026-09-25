@@ -5,7 +5,7 @@
 use crate::interp_backend::InterpreterBackend;
 use crate::frame_eval;
 use crate::protocol::{Event, Message, Request, Response};
-use lamella_debug_backend::{DebugBackend, Scope, Stop, Variable};
+use lamella_debug_backend::{ChildReference, DebugBackend, Scope, Stop, Variable};
 #[cfg(feature = "interpreter")]
 use lamella_cil_runtime::Module;
 use serde_json::{Value as Json, json};
@@ -212,7 +212,7 @@ impl Debugger {
     pub fn handle(&mut self, request: &Request) -> Vec<Message> {
         let mut events: Vec<(&str, Option<Json>)> = Vec::new();
         let (success, body) = match request.command.as_str() {
-            "initialize" => (true, Some(capabilities())),
+            "initialize" => (true, Some(capabilities(self.backend.can_set_variables()))),
             "launch" => {
                 if let Some(reason) = self.refusal.clone() {
                     return self.fail_for_user(request, ERROR_SESSION_REFUSED, &reason);
@@ -629,6 +629,13 @@ impl Debugger {
     /// and `at_source_boundary` a property of one pc, so a step that leaves the covered region
     /// satisfies the first and never the second -- the loop condition can be unreachable while
     /// the target is perfectly healthy.
+    ///
+    /// **A step in does not stop in code no source covers** (Just My Code): a call into the class
+    /// library, or anything else [`DebugBackend::source_location`] cannot place, runs to its return
+    /// through [`DebugBackend::run_to_return`], and the step lands on the next source statement after
+    /// it. So a callback from that code into the program's own -- an override the library calls --
+    /// runs through rather than stopping; a breakpoint set inside it still stops it. A backend without
+    /// a `run_to_return` of its own single-steps through, as before.
     fn source_step(
         &mut self,
         action: Action,
@@ -656,6 +663,15 @@ impl Debugger {
                             other => break other,
                         }
                     }
+                    if matches!(action, Action::StepIn)
+                        && self.backend.depth() > start
+                        && !self.innermost_frame_has_source()
+                    {
+                        match self.backend.run_to_return() {
+                            Stop::Step => {}
+                            other => break other,
+                        }
+                    }
                     let reached = match action {
                         Action::StepIn | Action::Resume => true,
                         Action::StepOver => self.backend.depth() <= start,
@@ -672,6 +688,14 @@ impl Debugger {
                 }
             }
         }
+    }
+
+    /// Whether the frame execution is in right now is one a source file covers.
+    fn innermost_frame_has_source(&self) -> bool {
+        self.backend
+            .stack()
+            .first()
+            .is_some_and(|frame| self.backend.source_location(frame.address).is_some())
     }
 
     /// Flushes new program output as an `output` event, then emits the event for the
@@ -748,26 +772,31 @@ impl Debugger {
         ]})
     }
 
+    /// Answers `variables` for either kind of reference this adapter hands out: a frame's scope, or
+    /// a value's members at [`CHILDREN_BASE`] and above.
     fn variables(&self, reference: u32) -> Json {
         if reference == 0 {
             return json!({ "variables": [] });
         }
-        let frame_index = ((reference - 1) / 3) as usize;
-        let scope = match (reference - 1) % 3 {
-            0 => Scope::Arguments,
-            1 => Scope::Locals,
-            _ => Scope::Stack,
+        let rows = if reference >= CHILDREN_BASE {
+            self.backend.children(ChildReference(reference - CHILDREN_BASE))
+        } else {
+            let frame_index = ((reference - 1) / 3) as usize;
+            let scope = match (reference - 1) % 3 {
+                0 => Scope::Arguments,
+                1 => Scope::Locals,
+                _ => Scope::Stack,
+            };
+            self.backend.variables_with_children(frame_index, scope)
         };
-        let variables: Vec<Json> = self
-            .backend
-            .variables(frame_index, scope)
+        let variables: Vec<Json> = rows
             .iter()
-            .map(|variable| {
+            .map(|(variable, children)| {
                 json!({
                     "name": variable.name,
                     "value": variable.value,
                     "type": variable.kind,
-                    "variablesReference": 0,
+                    "variablesReference": dap_reference(*children),
                 })
             })
             .collect();
@@ -783,13 +812,19 @@ impl Debugger {
         let expression = arg_str(request, "expression").trim().to_owned();
         match frame_eval::route(arg_opt_u32(request, "frameId"), arg_str(request, "context")) {
             frame_eval::Target::Frame { index, room } => {
-                let visible = self.frame_variables(index);
+                let (visible, references): (Vec<Variable>, Vec<ChildReference>) =
+                    self.frame_variables(index).into_iter().unzip();
                 match frame_eval::resolve(&visible, &expression) {
                     Ok(variable) => {
+                        let children = visible
+                            .iter()
+                            .position(|row| core::ptr::eq(row, variable))
+                            .and_then(|at| references.get(at).copied())
+                            .unwrap_or(ChildReference::NONE);
                         let body = json!({
                             "result": variable.value,
                             "type": variable.kind,
-                            "variablesReference": 0,
+                            "variablesReference": dap_reference(children),
                         });
                         vec![self.response(request, true, Some(body))]
                     }
@@ -835,9 +870,9 @@ impl Debugger {
     /// method sharing a name, so the order is a tie-break that valid source cannot reach. The
     /// evaluation stack is left out on purpose: its slots are interpreter scratch under synthetic
     /// names, and a name resolving to one would answer a question nobody asked.
-    fn frame_variables(&self, index: usize) -> Vec<Variable> {
-        let mut visible = self.backend.variables(index, Scope::Locals);
-        visible.extend(self.backend.variables(index, Scope::Arguments));
+    fn frame_variables(&self, index: usize) -> Vec<(Variable, ChildReference)> {
+        let mut visible = self.backend.variables_with_children(index, Scope::Locals);
+        visible.extend(self.backend.variables_with_children(index, Scope::Arguments));
         visible
     }
 
@@ -901,7 +936,7 @@ impl Debugger {
     /// a value that does not parse as the slot's kind) for the caller to report as a failure.
     fn set_variable(&mut self, request: &Request) -> Option<String> {
         let reference = arg_u32(request, "variablesReference");
-        if reference == 0 {
+        if reference == 0 || reference >= CHILDREN_BASE {
             return None;
         }
         let frame_index = ((reference - 1) / 3) as usize;
@@ -1050,6 +1085,28 @@ fn stopped(reason: &str) -> Json {
     json!({ "reason": reason, "threadId": 1, "allThreadsStopped": true })
 }
 
+/// Where the `variablesReference`s for a value's MEMBERS begin; a frame's scopes use the numbers
+/// below it (`frame * 3 + scope + 1`).
+///
+/// The two kinds share one number space because DAP gives them one field, so they are kept apart by
+/// range: a scope reference reaches this only in a stack about 350,000 frames deep.
+const CHILDREN_BASE: u32 = 1 << 20;
+
+/// The DAP `variablesReference` for a backend's [`ChildReference`]: 0 for a leaf, and otherwise the
+/// backend's number moved up past the scope references.
+///
+/// DAP bounds a reference to 2^31 - 1, so a backend number that would pass that is answered as a leaf:
+/// a row that cannot be expanded is better than a reference that names nothing.
+fn dap_reference(children: ChildReference) -> u32 {
+    if children == ChildReference::NONE {
+        return 0;
+    }
+    CHILDREN_BASE
+        .checked_add(children.0)
+        .filter(|&reference| reference <= i32::MAX as u32)
+        .unwrap_or(0)
+}
+
 /// The identifier of the error a session that cannot start shows the user ([`Debugger::refusing`]).
 /// DAP asks that each message a user can see carry an identifier unique within the adapter, so a
 /// report can name which one it was.
@@ -1114,12 +1171,17 @@ impl DebugBackend for Unstartable {
 /// feature that never gets exercised and leaves no trace of why: `supportsEvaluateForHovers` is
 /// what makes an editor send an `evaluate` when the pointer rests on a variable, and without it
 /// no hover request is made, no hover appears, and the server sees no request to explain it.
-fn capabilities() -> Json {
+/// What this adapter tells a client it can do, for the backend it drives.
+///
+/// `set_variables` is the BACKEND's answer, because the adapter can offer an edit only where the
+/// target can make one: advertised to every backend, it put a "Set Value" in the editor that every
+/// device refused.
+fn capabilities(set_variables: bool) -> Json {
     json!({
         "supportsConfigurationDoneRequest": true,
         "supportsInstructionBreakpoints": true,
         "supportsDisassembleRequest": true,
-        "supportsSetVariable": true,
+        "supportsSetVariable": set_variables,
         "supportsEvaluateForHovers": true,
     })
 }
@@ -2365,6 +2427,280 @@ mod tests {
         fn take_output(&mut self) -> Option<String> {
             None
         }
+    }
+
+    /// A backend whose first step from `Main` enters a call, into code that has source or not as the
+    /// test chooses, and which counts what the adapter asked of it.
+    struct CallsIn {
+        callee_has_source: bool,
+        depth: usize,
+        returned: bool,
+        steps: std::rc::Rc<core::cell::Cell<usize>>,
+        returns: std::rc::Rc<core::cell::Cell<usize>>,
+    }
+
+    /// `Main`'s address, before and after the call; the callee's address.
+    const MAIN: u64 = 0x100;
+    const CALLEE: u64 = 0x900;
+
+    impl DebugBackend for CallsIn {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            self.steps.set(self.steps.get() + 1);
+            self.depth = 2;
+            Stop::Step
+        }
+        fn run_to_return(&mut self) -> Stop {
+            self.returns.set(self.returns.get() + 1);
+            self.depth = 1;
+            self.returned = true;
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            self.depth
+        }
+        fn step_budget(&self) -> usize {
+            50
+        }
+        fn has_source(&self) -> bool {
+            true
+        }
+        fn at_source_boundary(&self) -> bool {
+            self.returned || (self.depth == 2 && self.callee_has_source)
+        }
+        fn source_location(&self, address: u64) -> Option<SourceLocation> {
+            let covered = address == MAIN || (address == CALLEE && self.callee_has_source);
+            covered.then(|| SourceLocation {
+                file: String::from("Program.cs"),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
+            })
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<Frame> {
+            let main = Frame { address: MAIN, name: String::from("Main"), line: 1 };
+            if self.depth == 2 {
+                vec![Frame { address: CALLEE, name: String::from("Callee"), line: 0 }, main]
+            } else {
+                vec![main]
+            }
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// Steps in once over a [`CallsIn`] and reports `(steps, returns)` the adapter asked for.
+    fn step_in_over(callee_has_source: bool) -> (usize, usize) {
+        let steps = std::rc::Rc::new(core::cell::Cell::new(0));
+        let returns = std::rc::Rc::new(core::cell::Cell::new(0));
+        let backend = CallsIn {
+            callee_has_source,
+            depth: 1,
+            returned: false,
+            steps: std::rc::Rc::clone(&steps),
+            returns: std::rc::Rc::clone(&returns),
+        };
+        let mut dbg = Debugger::with_backend(Box::new(backend));
+        dbg.handle(&request(1, "launch", Some(json!({ "stopOnEntry": true }))));
+        dbg.handle(&request(2, "stepIn", Some(json!({ "threadId": 1 }))));
+        (steps.get(), returns.get())
+    }
+
+    /// Set Value is offered for the backend that can make an edit, and not for one that refuses every
+    /// edit -- which is what a device backend does, and why the editor offered it one it always refused.
+    #[test]
+    fn set_value_is_offered_only_by_a_backend_that_can_edit() {
+        let offered = |dbg: &mut Debugger| {
+            let out = dbg.handle(&request(1, "initialize", None));
+            out[0].response_body()["supportsSetVariable"].clone()
+        };
+        let (module, main) = add_program();
+        assert_eq!(offered(&mut Debugger::new(module, main)), json!(true), "the interpreter edits");
+        assert_eq!(
+            offered(&mut Debugger::with_backend(Box::new(TwoFramesDeep))),
+            json!(false),
+            "a backend without an edit of its own is not offered one"
+        );
+    }
+
+    /// A step in that enters code no source covers runs it to its return in one request, instead of
+    /// single-stepping every instruction of it.
+    #[test]
+    fn a_step_in_runs_a_call_into_code_no_source_covers_to_its_return() {
+        let (steps, returns) = step_in_over(false);
+        assert_eq!(returns, 1, "the call is run to its return once");
+        assert_eq!(steps, 1, "after the one step that entered it, not one per instruction inside");
+    }
+
+    /// The control: a step in that enters code WITH source stops in it, as a step in always has.
+    #[test]
+    fn a_step_in_to_a_call_with_source_stops_inside_it() {
+        let (steps, returns) = step_in_over(true);
+        assert_eq!(returns, 0, "nothing is run past");
+        assert_eq!(steps, 1);
+    }
+
+    /// A backend stopped in one frame whose locals are an object with members and a number, and
+    /// which would accept ANY edit -- so a test proving an edit was refused proves the adapter
+    /// refused it.
+    struct HoldsAnObject;
+
+    impl HoldsAnObject {
+        /// The locals, each with the reference the backend hands out for it.
+        fn rows(scope: Scope) -> Vec<(Variable, ChildReference)> {
+            if !matches!(scope, Scope::Locals) {
+                return Vec::new();
+            }
+            let row = |name: &str, value: &str, kind: &str| Variable {
+                name: name.to_string(),
+                value: value.to_string(),
+                kind: kind.to_string(),
+            };
+            vec![
+                (row("counter", "object #3", "object"), ChildReference(4)),
+                (row("round", "7", "int"), ChildReference::NONE),
+            ]
+        }
+    }
+
+    impl DebugBackend for HoldsAnObject {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<Frame> {
+            vec![Frame { address: 0x10, name: String::from("Main"), line: 44 }]
+        }
+        fn variables(&self, _frame: usize, scope: Scope) -> Vec<Variable> {
+            Self::rows(scope).into_iter().map(|(variable, _)| variable).collect()
+        }
+        fn variables_with_children(&self, _frame: usize, scope: Scope) -> Vec<(Variable, ChildReference)> {
+            Self::rows(scope)
+        }
+        fn children(&self, reference: ChildReference) -> Vec<(Variable, ChildReference)> {
+            if reference != ChildReference(4) {
+                return Vec::new();
+            }
+            vec![(
+                Variable { name: String::from("field1"), value: String::from("33"), kind: String::from("int") },
+                ChildReference::NONE,
+            )]
+        }
+        fn set_variable(&mut self, _frame: usize, _scope: Scope, _name: &str, _value: &str) -> Option<String> {
+            Some(String::from("edited"))
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// A row whose value has members carries a reference, and asking for that reference lists them.
+    #[test]
+    fn a_row_with_members_carries_a_reference_that_lists_them() {
+        let mut dbg = Debugger::with_backend(Box::new(HoldsAnObject));
+        dbg.handle(&request(1, "launch", None));
+        let scopes = dbg.handle(&request(2, "scopes", Some(json!({ "frameId": 0 }))));
+        let locals = find_scope(&scopes[0].response_body(), "Locals");
+        let read = dbg.handle(&request(3, "variables", Some(json!({ "variablesReference": locals }))));
+        let rows = read[0].response_body()["variables"].clone();
+        assert_eq!(rows[0]["name"], json!("counter"));
+        assert_eq!(rows[0]["variablesReference"], json!(CHILDREN_BASE + 4), "{rows}");
+        assert_eq!(rows[1]["variablesReference"], json!(0), "a number opens onto nothing: {rows}");
+
+        let opened = dbg.handle(&request(
+            4,
+            "variables",
+            Some(json!({ "variablesReference": rows[0]["variablesReference"].clone() })),
+        ));
+        let members = opened[0].response_body()["variables"].clone();
+        assert_eq!(members[0]["name"], json!("field1"), "{members}");
+        assert_eq!(members[0]["value"], json!("33"), "{members}");
+    }
+
+    /// A hover or a Watch row over an object opens the same way its row in the pane does.
+    #[test]
+    fn a_hovered_object_can_be_opened_like_its_row() {
+        let mut dbg = Debugger::with_backend(Box::new(HoldsAnObject));
+        dbg.handle(&request(1, "launch", None));
+        let hover = |dbg: &mut Debugger, seq: i64, name: &str| {
+            let answer = dbg.handle(&request(
+                seq,
+                "evaluate",
+                Some(json!({ "expression": name, "frameId": 0, "context": "hover" })),
+            ));
+            answer[0].response_body()["variablesReference"].clone()
+        };
+        assert_eq!(hover(&mut dbg, 2, "counter"), json!(CHILDREN_BASE + 4));
+        assert_eq!(hover(&mut dbg, 3, "round"), json!(0));
+    }
+
+    /// An edit aimed at a member is refused before any backend sees it, rather than decoded as a
+    /// scope of a frame thousands deep -- the backend here would have accepted anything.
+    #[test]
+    fn an_edit_aimed_at_a_member_is_refused_rather_than_decoded_as_a_frame() {
+        let mut dbg = Debugger::with_backend(Box::new(HoldsAnObject));
+        dbg.handle(&request(1, "launch", None));
+        let answer = dbg.handle(&request(
+            2,
+            "setVariable",
+            Some(json!({ "variablesReference": CHILDREN_BASE + 4, "name": "field1", "value": "5" })),
+        ));
+        let Message::Response(response) = &answer[0] else {
+            panic!("a response");
+        };
+        assert!(!response.success, "an edit of a member reached the backend");
+    }
+
+    /// A backend's reference moves up past the scope references, and one that would pass DAP's bound
+    /// is answered as a leaf rather than as a reference that names nothing.
+    #[test]
+    fn a_child_reference_stays_inside_the_range_dap_allows() {
+        assert_eq!(dap_reference(ChildReference::NONE), 0);
+        assert_eq!(dap_reference(ChildReference(1)), CHILDREN_BASE + 1);
+        assert_eq!(dap_reference(ChildReference(i32::MAX as u32)), 0);
+        assert_eq!(dap_reference(ChildReference(u32::MAX)), 0);
     }
 
     /// The editor's frame 0 is where the target stopped, and the id that frame carries reads that

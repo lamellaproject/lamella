@@ -25,7 +25,7 @@ sources = [
 notes = [
     "12-bit SAR, one converter muxed over 5 channels on QFN-60/RP2350A or 9 on QFN-80/RP2350B. Precision AS THE DATASHEET STATES IT: ENOB min 9 / typical 9.5 bits (electrical table 1438; the chapter intro quotes 9.2), so the low bits carry noise -- average or accept it.",
     "One conversion = 96 clk_adc cycles (2 us at 48 MHz; 500 kS/s max). Switching AINSEL needs no settling time.",
-    "One-shot protocol (the official driver's): select AINSEL, set START_ONCE, poll READY high, read RESULT[11:0]. READY is low only while a conversion runs.",
+    "One-shot protocol (the official driver's): select AINSEL, set START_ONCE, poll READY high, read RESULT[11:0]. READY is low while a conversion runs, and also from reset until the power-up that CS.EN starts has finished (Table 1121; 12.4.3).",
     "CONVERSION ERRORS: CS.ERR flags the most recent conversion; the datasheet CAUTION says error samples are undefined and must be DISCARDED -- the read sequence re-runs on ERR. ERR_STICKY (write-1-clear) latches any past error.",
     "Input range 0..ADC_AVDD, but pin voltage is capped by IOVDD (leakage through ESD diodes above it). Input impedance >= 100 kohm (about 1 pF sampling cap); DC sources need no buffer.",
     "External channels share pins with Bank-0 GPIOs: before sampling, disable the pin's digital functions -- IE low, OD high (datasheet 12.4) -- and the official adc_gpio_init additionally selects funcsel NULL and disables both pulls. The temperature channel needs NO pad prep (internal).",

@@ -41,7 +41,8 @@ $BoardReferences = @(
     'corlib',                          # every assembly
     'System.Device.Gpio',              # GpioDriver/I2cDriver/SpiDriver seams + the dotnet/iot facades
     'Lamella.Hardware',                # Mmio, and the bus table a board class binds into
-    'nanoFramework.System.Device.Adc'  # AdcDriver/AdcController, for the boards that expose one
+    'nanoFramework.System.Device.Adc', # AdcDriver/AdcController, for the boards that expose one
+    'System.Device.Analog'             # AnalogController, which the boards with a converter hand out
 )
 
 # --- Locate the compiler (same contract as build-managed.ps1) -----------------------------------

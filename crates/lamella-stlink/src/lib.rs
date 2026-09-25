@@ -727,17 +727,22 @@ impl StLink {
     /// power-cycled. The control that would attribute the fix cannot be run twice in one session,
     /// so the honest claim is the smaller one.
     ///
-    /// It leaves reset ASSERTED. The caller decides what happens on release -- ordinarily arming
-    /// the reset vector catch and then [`release_reset`](Self::release_reset), which is what
-    /// [`attach_under_reset`](Self::attach_under_reset) does.
-    pub fn enter_swd_under_reset(&mut self) -> Result<(), ProbeError> {
+    /// It returns the line HELD: reset stays asserted until the returned [`HeldInReset`] is released
+    /// or dropped -- ordinarily by [`attach_held_in_reset`], once the reset vector catch is armed,
+    /// which is what [`attach_under_reset`](Self::attach_under_reset) runs. A second SWD entry the
+    /// probe refuses releases the line before the refusal is returned.
+    ///
+    /// # Errors
+    /// Either SWD entry the probe refuses, or its refusal to drive the line.
+    pub fn enter_swd_under_reset(&mut self) -> Result<HeldInReset<'_, Self>, ProbeError> {
         self.enter_swd()?;
-        self.drive_nrst(true)?;
+        let mut held = HeldInReset::assert(self)?;
         std::thread::sleep(RESET_SETTLE);
-        self.enter_swd()
+        held.core().enter_swd()?;
+        Ok(held)
     }
 
-    /// Releases a reset asserted by [`enter_swd_under_reset`] and lets the line settle.
+    /// Releases the reset line and lets it settle.
     pub fn release_reset(&mut self) -> Result<(), ProbeError> {
         self.drive_nrst(false)?;
         std::thread::sleep(RESET_SETTLE);
@@ -759,8 +764,7 @@ impl StLink {
         &mut self,
         low_power_debug: Option<LowPowerDebug>,
     ) -> Result<(), ProbeError> {
-        self.enter_swd_under_reset()?;
-        attach_held_in_reset(self, low_power_debug)
+        attach_held_in_reset(self.enter_swd_under_reset()?, low_power_debug)
     }
 
     /// The highest application voltage ANY ST-Link in TN1235 states support for, in volts.
@@ -899,25 +903,77 @@ pub struct LowPowerDebug {
 /// back, so a write the probe reports as successful and the part does not keep is refused rather
 /// than trusted.
 ///
-/// A step that fails before the release releases reset before returning, so a refused attach does
-/// not leave the part held in reset. Bits set in a register that a system reset does not clear
-/// stay set after the attach, through later resets.
+/// A step that fails before the release still releases reset, because `held` is dropped as the
+/// refusal is returned: a refused attach does not leave the part held in reset. Bits set in a
+/// register that a system reset does not clear stay set after the attach, through later resets.
 ///
 /// # Errors
 /// [`check_known_answer`]'s refusal, [`ProbeError::Protocol`] naming the register when the bits
 /// do not read back as set, and any read, write or change of the reset line the probe refuses.
 pub fn attach_held_in_reset<M: CoreMemory>(
-    core: &mut M,
+    mut held: HeldInReset<'_, M>,
     low_power_debug: Option<LowPowerDebug>,
 ) -> Result<(), ProbeError> {
-    if let Err(refused) = prepare_held_core(core, low_power_debug) {
-        let _ = core.set_reset(false);
-        return Err(refused);
-    }
-    core.set_reset(false)?;
+    prepare_held_core(held.core(), low_power_debug)?;
+    held.release()?;
     std::thread::sleep(RESET_SETTLE);
-    cortex_m::wait_halted(core)?;
-    cortex_m::disarm_reset_catch(core)
+    cortex_m::wait_halted(held.core())?;
+    cortex_m::disarm_reset_catch(held.core())
+}
+
+/// A core whose reset line is held asserted, and released when this is dropped.
+///
+/// **THE RELEASE IS WRITTEN AT NO RETURN, SO NO RETURN CAN MISS IT.** Every way out of the scope
+/// that holds this -- a refused step's `?`, an early return, a panic -- drops it, and dropping it
+/// drives the line high again. A part left held in reset answers nothing afterwards and looks dead
+/// to whoever touches it next, and a release written out at each return is missed at the next
+/// return somebody adds.
+///
+/// [`release`](Self::release) releases it on the path that completes, where the probe's refusal to
+/// drive the line is worth reporting. A release on drop has nobody to report to, so a refusal there
+/// is not reported.
+pub struct HeldInReset<'a, M: CoreMemory> {
+    core: &'a mut M,
+    held: bool,
+}
+
+impl<'a, M: CoreMemory> HeldInReset<'a, M> {
+    /// Asserts `core`'s reset line and holds it.
+    ///
+    /// # Errors
+    /// The probe's refusal to drive the line. The line is released before the refusal is returned,
+    /// because a refusal does not say whether the line moved.
+    pub fn assert(core: &'a mut M) -> Result<Self, ProbeError> {
+        if let Err(refused) = core.set_reset(true) {
+            let _ = core.set_reset(false);
+            return Err(refused);
+        }
+        Ok(Self { core, held: true })
+    }
+
+    /// The core, for the steps that run while it is held.
+    pub fn core(&mut self) -> &mut M {
+        &mut *self.core
+    }
+
+    /// Releases the line now.
+    ///
+    /// # Errors
+    /// The probe's refusal to drive the line; the release is then tried once more when this is
+    /// dropped.
+    pub fn release(&mut self) -> Result<(), ProbeError> {
+        self.core.set_reset(false)?;
+        self.held = false;
+        Ok(())
+    }
+}
+
+impl<M: CoreMemory> Drop for HeldInReset<'_, M> {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = self.core.set_reset(false);
+        }
+    }
 }
 
 /// The steps of [`attach_held_in_reset`] that run while the core is held: the known answer, the
@@ -1501,11 +1557,72 @@ mod tests {
         }
     }
 
+    /// `part` held in reset, as every caller hands a core to [`attach_held_in_reset`].
+    fn held(part: &mut HeldPart) -> HeldInReset<'_, HeldPart> {
+        HeldInReset::assert(part).expect("the fake drives its line")
+    }
+
+    /// A reset line that records every level it is driven to, and can refuse to be asserted.
+    #[derive(Default)]
+    struct Line {
+        driven: Vec<bool>,
+        refuses_assert: bool,
+    }
+
+    impl CoreMemory for Line {
+        fn read_word(&mut self, _address: u32) -> Result<u32, ProbeError> {
+            unreachable!("holding a line reads nothing")
+        }
+        fn write_word(&mut self, _address: u32, _value: u32) -> Result<(), ProbeError> {
+            unreachable!("holding a line writes nothing")
+        }
+        fn set_reset(&mut self, assert: bool) -> Result<u8, ProbeError> {
+            self.driven.push(assert);
+            if assert && self.refuses_assert {
+                return Err(ProbeError::Device("the probe refused to drive nRESET"));
+            }
+            Ok(0)
+        }
+    }
+
+    /// **EVERY WAY OUT OF THE SCOPE RELEASES THE LINE**, including the ones that write nothing
+    /// about it: a held line is dropped, and dropping it is the release.
+    #[test]
+    fn a_held_line_is_released_when_it_is_dropped() {
+        let mut line = Line::default();
+        let refused: Result<(), ProbeError> = (|| {
+            let _held = HeldInReset::assert(&mut line)?;
+            Err(ProbeError::Device("a step while the line is held"))
+        })();
+        assert!(refused.is_err());
+        assert_eq!(line.driven, [true, false], "asserted, then released by the drop");
+    }
+
+    /// A release on the path that completes is the only one: the drop does not drive the line a
+    /// second time.
+    #[test]
+    fn a_released_line_is_not_released_again_when_it_is_dropped() {
+        let mut line = Line::default();
+        {
+            let mut held = HeldInReset::assert(&mut line).expect("asserted");
+            held.release().expect("released");
+        }
+        assert_eq!(line.driven, [true, false]);
+    }
+
+    /// A refusal to assert does not say whether the line moved, so it is released anyway.
+    #[test]
+    fn a_refused_assert_releases_the_line_before_it_is_reported() {
+        let mut line = Line { refuses_assert: true, ..Line::default() };
+        assert!(HeldInReset::assert(&mut line).is_err());
+        assert_eq!(line.driven, [true, false]);
+    }
+
     #[test]
     fn the_low_power_bits_are_set_on_what_the_register_holds_before_the_core_is_released() {
         let mut part = HeldPart::new();
         assert_eq!(
-            attach_held_in_reset(&mut part, Some(F7_LOW_POWER_DEBUG)),
+            attach_held_in_reset(held(&mut part), Some(F7_LOW_POWER_DEBUG)),
             Ok(())
         );
         let composed = TRACE_CLKINEN | F7_LOW_POWER_DEBUG.bits;
@@ -1540,7 +1657,7 @@ mod tests {
     fn a_part_answering_every_read_with_one_word_is_refused_before_any_write_and_released() {
         let mut part = HeldPart::new();
         part.answers_every_read_with = Some(STALE_ANSWER);
-        let refused = attach_held_in_reset(&mut part, Some(F7_LOW_POWER_DEBUG));
+        let refused = attach_held_in_reset(held(&mut part), Some(F7_LOW_POWER_DEBUG));
         assert!(
             matches!(refused, Err(ProbeError::Protocol(_))),
             "a constant answered with success must be refused, got {refused:?}"
@@ -1557,7 +1674,7 @@ mod tests {
     fn low_power_bits_the_part_does_not_keep_are_refused_naming_the_register() {
         let mut part = HeldPart::new();
         part.keeps = 0;
-        match attach_held_in_reset(&mut part, Some(F7_LOW_POWER_DEBUG)) {
+        match attach_held_in_reset(held(&mut part), Some(F7_LOW_POWER_DEBUG)) {
             Err(ProbeError::Protocol(text)) => {
                 assert!(text.contains("0xe0042004"), "names the register: {text}");
             }
@@ -1574,7 +1691,7 @@ mod tests {
     #[test]
     fn with_no_low_power_register_the_known_answer_is_read_and_only_debug_registers_are_written() {
         let mut part = HeldPart::new();
-        assert_eq!(attach_held_in_reset(&mut part, None), Ok(()));
+        assert_eq!(attach_held_in_reset(held(&mut part), None), Ok(()));
         assert!(
             part.accesses.contains(&Access::Read(CPUID)),
             "the known answer is read: {:?}",

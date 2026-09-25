@@ -6,6 +6,7 @@ const SAMD21_CTRLA: u32 = 0x4100_4000;
 const SAMD21_CTRLB: u32 = 0x4100_4004;
 const SAMD21_INTFLAG: u32 = 0x4100_4014;
 const SAMD21_ADDR: u32 = 0x4100_401c;
+const SAMD21_LOCK: u32 = 0x4100_4020;
 const SAMD21_CMDEX: u32 = 0xa500;
 const SAMD21_CMD_ER: u32 = 0x02;
 const SAMD21_CMD_WP: u32 = 0x04;
@@ -108,9 +109,21 @@ pub trait Samd21Flash {
     /// Programs consecutive 32-bit `words` to flash from `address`, via the NVMCTRL, one 64-byte
     /// page at a time (the rows must already be erased).
     fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError>;
+    /// Reads NVMCTRL.LOCK, the region locks in force now. Bit n is region n's lock, and a region
+    /// whose bit reads 0 is locked (DS40001882D 22.8).
+    ///
+    /// The part loads the register from the user row's LOCK field at every reset, and a Lock or
+    /// Unlock Region command changes it until the next one (22.6.3). A part whose regions are all
+    /// unlocked reads 0xFFFF, as Table 10-4's default for that field says; 22.8's own line that
+    /// the state after an erase is "unlocked (0x0000)" contradicts both.
+    fn read_samd21_region_locks(&mut self) -> Result<u16, ProbeError>;
 }
 
 impl<A: TargetAccess> Samd21Flash for A {
+    fn read_samd21_region_locks(&mut self) -> Result<u16, ProbeError> {
+        Ok((self.read_word(SAMD21_LOCK)? & 0xffff) as u16)
+    }
+
     fn erase_flash_row(&mut self, address: u32) -> Result<(), ProbeError> {
         self.write_word(SAMD21_ADDR, (address & !(SAMD21_ROW - 1)) / 2)?;
         samd21_command(self, SAMD21_CMD_ER)
@@ -142,6 +155,473 @@ fn samd21_command<A: TargetAccess>(target: &mut A, cmd: u32) -> Result<(), Probe
         }
     }
     Err(ProbeError::Timeout("SAMD21 flash controller"))
+}
+
+
+/// Where the SAM D21 maps its NVM User Row: the start of the auxiliary space's AUX0 area
+/// (DS40001882D 10.3.1).
+pub const SAMD21_USER_ROW: u32 = 0x0080_4000;
+
+/// The NVM User Row's length in 32-bit words: one row, which is the controller's erase unit.
+pub const SAMD21_USER_ROW_WORDS: usize = SAMD21_ROW as usize / 4;
+
+/// BOOTPROT's value when it protects no rows (DS40001882D Table 22-2). It is also the factory
+/// value, except on the WLCSP package.
+pub const SAMD21_BOOTPROT_NONE: u8 = 7;
+
+/// The EEPROM field's value when it reserves no rows (DS40001882D Table 22-3).
+pub const SAMD21_EEPROM_NONE: u8 = 7;
+
+/// How many equally sized lock regions the main array is grouped into (DS40001882D 22.6.3): a
+/// region is the array's size over this, 16 KB on a 256 KB part.
+pub const SAMD21_LOCK_REGIONS: u32 = 16;
+
+/// Where the SAM D21 keeps the four words of its 128-bit serial number, in order (DS40001882D
+/// 10.3.3). Only all four together are unique to one part.
+pub const SAMD21_SERIAL_NUMBER: [u32; 4] = [0x0080_a00c, 0x0080_a040, 0x0080_a044, 0x0080_a048];
+
+const SAMD21_STATUS: u32 = 0x4100_4018;
+const SAMD21_STATUS_PROGE: u32 = 1 << 2;
+const SAMD21_STATUS_LOCKE: u32 = 1 << 3;
+const SAMD21_STATUS_NVME: u32 = 1 << 4;
+const SAMD21_STATUS_ERRORS: u32 = SAMD21_STATUS_PROGE | SAMD21_STATUS_LOCKE | SAMD21_STATUS_NVME;
+const SAMD21_STATUS_SB: u32 = 1 << 8;
+const SAMD21_CMD_EAR: u32 = 0x05;
+const SAMD21_CMD_WAP: u32 = 0x06;
+const SAMD21_BOOTPROT_MASK: u32 = 0b111;
+const SAMD21_EEPROM_SHIFT: u32 = 4;
+const SAMD21_EEPROM_MASK: u32 = 0b111;
+const SAMD21_LOCK_SHIFT: u32 = 16;
+const SAMD21_USER_ROW_ATTEMPTS: usize = 3;
+
+/// The SAM D21's NVM User Row, as read from the part.
+///
+/// Its first two words hold the part's power-on configuration (DS40001882D Table 10-4); the rest
+/// of the row holds no defined field. The configuration takes effect at the part's next reset,
+/// not when the row is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Samd21UserRow {
+    /// The row's words in address order, from [`SAMD21_USER_ROW`].
+    pub words: [u32; SAMD21_USER_ROW_WORDS],
+}
+
+/// A field of the NVM User Row's configuration, as DS40001882D Table 10-4 lays it out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Samd21UserRowField {
+    /// The field's name.
+    pub name: &'static str,
+    /// The field's lowest bit, counted across the row's first two words: bit 0 of the second word
+    /// is bit 32.
+    pub low_bit: u32,
+    /// The field's width in bits.
+    pub width: u32,
+}
+
+/// Every field in the first 64 bits of the NVM User Row, reserved ones included, in bit order
+/// (DS40001882D Table 10-4). Together they cover each bit exactly once.
+///
+/// The two fields named `BOD12 configuration` are written in production and must not be changed.
+pub const SAMD21_USER_ROW_FIELDS: &[Samd21UserRowField] = &[
+    user_row_field("BOOTPROT", 0, 3),
+    user_row_field("reserved", 3, 1),
+    user_row_field("EEPROM", 4, 3),
+    user_row_field("reserved", 7, 1),
+    user_row_field("BOD33 level", 8, 6),
+    user_row_field("BOD33 enable", 14, 1),
+    user_row_field("BOD33 action", 15, 2),
+    user_row_field("BOD12 configuration", 17, 8),
+    user_row_field("WDT enable", 25, 1),
+    user_row_field("WDT always-on", 26, 1),
+    user_row_field("WDT period", 27, 4),
+    user_row_field("WDT window", 31, 4),
+    user_row_field("WDT early-warning offset", 35, 4),
+    user_row_field("WDT window mode", 39, 1),
+    user_row_field("BOD33 hysteresis", 40, 1),
+    user_row_field("BOD12 configuration", 41, 1),
+    user_row_field("reserved", 42, 6),
+    user_row_field("LOCK", 48, 16),
+];
+
+const fn user_row_field(name: &'static str, low_bit: u32, width: u32) -> Samd21UserRowField {
+    Samd21UserRowField { name, low_bit, width }
+}
+
+impl Samd21UserRow {
+    /// A row from the bytes a backup holds, in address order. `None` unless there are exactly 256.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != SAMD21_USER_ROW_WORDS * 4 {
+            return None;
+        }
+        let mut words = [0u32; SAMD21_USER_ROW_WORDS];
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        Some(Samd21UserRow { words })
+    }
+
+    /// The row's bytes in address order, which is what a backup of it holds.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// The value `field` holds in this row.
+    pub fn field(&self, field: &Samd21UserRowField) -> u32 {
+        let configuration = u64::from(self.words[0]) | (u64::from(self.words[1]) << 32);
+        ((configuration >> field.low_bit) & ((1u64 << field.width) - 1)) as u32
+    }
+
+    /// BOOTPROT: which bootloader size the part protects from address zero.
+    pub fn bootprot(&self) -> u8 {
+        (self.words[0] & SAMD21_BOOTPROT_MASK) as u8
+    }
+
+    /// EEPROM: how many rows at the top of the main array the part reserves as EEPROM.
+    pub fn eeprom(&self) -> u8 {
+        ((self.words[0] >> SAMD21_EEPROM_SHIFT) & SAMD21_EEPROM_MASK) as u8
+    }
+
+    /// LOCK: the region locks the part loads into NVMCTRL.LOCK at each reset, one bit per region,
+    /// where 0 locks the region.
+    pub fn lock(&self) -> u16 {
+        (self.words[1] >> SAMD21_LOCK_SHIFT) as u16
+    }
+
+    /// The same row with BOOTPROT set to `bootprot`, and every other bit as it was.
+    ///
+    /// `None` when `bootprot` does not fit the field's three bits.
+    pub fn with_bootprot(&self, bootprot: u8) -> Option<Self> {
+        if u32::from(bootprot) > SAMD21_BOOTPROT_MASK {
+            return None;
+        }
+        let mut words = self.words;
+        words[0] = (words[0] & !SAMD21_BOOTPROT_MASK) | u32::from(bootprot);
+        Some(Samd21UserRow { words })
+    }
+
+    /// Whether a rewrite of `saved` that kept every bit but BOOTPROT could have left this row
+    /// part-way: every bit `saved` holds at one, outside BOOTPROT, still reads one here.
+    ///
+    /// Programming only turns ones into zeros. So an erased row is part-way to any row, a row that
+    /// differs from `saved` in BOOTPROT alone is part-way to it, and a row with a bit at zero that
+    /// `saved` holds at one did not come from `saved` by such a rewrite.
+    pub fn is_partway_to(&self, saved: &Samd21UserRow) -> bool {
+        self.words
+            .iter()
+            .zip(saved.words.iter())
+            .enumerate()
+            .all(|(index, (now, saved))| {
+                let kept = if index == 0 { !SAMD21_BOOTPROT_MASK } else { u32::MAX };
+                now & saved & kept == saved & kept
+            })
+    }
+}
+
+/// How many bytes a BOOTPROT value protects from address zero (DS40001882D Table 22-2): none at 7,
+/// then 512 bytes, doubling to 32 KB as the value falls to 0.
+pub fn samd21_bootprot_bytes(bootprot: u8) -> u32 {
+    match bootprot & SAMD21_BOOTPROT_MASK as u8 {
+        SAMD21_BOOTPROT_NONE => 0,
+        value => 32_768 >> value,
+    }
+}
+
+/// How many bytes an EEPROM value reserves at the top of the main array (DS40001882D Table 22-3):
+/// none at 7, then 256 bytes, doubling to 16 KB as the value falls to 0.
+///
+/// Those rows are written whatever their region's lock says (22.6.5).
+pub fn samd21_eeprom_bytes(eeprom: u8) -> u32 {
+    match eeprom & SAMD21_EEPROM_MASK as u8 {
+        SAMD21_EEPROM_NONE => 0,
+        value => 16_384 >> value,
+    }
+}
+
+/// Why a rewrite of the SAM D21's NVM User Row stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Samd21UserRowError {
+    /// Stopped before anything was erased or written. The row is as it was read.
+    Unchanged(String),
+    /// The row was erased, and it did not read back as intended after every attempt to program it.
+    ///
+    /// The part keeps running on its previous configuration until its next reset, because a
+    /// written row takes effect only then (DS40001882D 10.3.1).
+    NotRewritten {
+        /// What stopped the last attempt.
+        reason: String,
+        /// The row as the last attempt read it back, or `None` when it could not be read.
+        now: Option<Box<Samd21UserRow>>,
+    },
+}
+
+impl std::fmt::Display for Samd21UserRowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Samd21UserRowError::Unchanged(why) => write!(f, "{why}; nothing was written"),
+            Samd21UserRowError::NotRewritten { reason, .. } => write!(
+                f,
+                "the user row was erased and did not read back as intended: {reason}"
+            ),
+        }
+    }
+}
+
+/// Reading and rewriting the SAM D21's NVM User Row (DS40001882D 10.3.1).
+///
+/// The row holds the part's power-on configuration, and two of its fields hold BOD12 settings that
+/// are written in production and must not be changed. So two writes are offered and no more: one
+/// changes BOOTPROT and takes every other bit from the row as it was read, and one puts a saved
+/// copy of the row back, over a BOOTPROT rewrite finished or not.
+pub trait Samd21UserRowAccess {
+    /// Reads the whole NVM User Row. It writes nothing, and the core need not be halted.
+    fn read_samd21_user_row(&mut self) -> Result<Samd21UserRow, ProbeError>;
+
+    /// Reads the part's 128-bit serial number, word 0 first. A saved copy of a user row belongs to
+    /// the part with this number, because two BOD12 fields in the row are calibrated per part.
+    fn read_samd21_serial_number(&mut self) -> Result<[u32; 4], ProbeError>;
+
+    /// Rewrites the NVM User Row with BOOTPROT set to `bootprot` and every other bit taken from
+    /// `as_read`, then reads it back.
+    ///
+    /// `as_read` is the row the caller read and kept a copy of. Nothing is written unless the row
+    /// still reads exactly as that copy, the core is halted, the security bit is clear and the
+    /// flash controller is idle. When BOOTPROT already holds `bootprot`, nothing is written and
+    /// the row is returned as it reads.
+    ///
+    /// The row is erased, then programmed a page at a time, and each page that holds data is
+    /// programmed from the page buffer. An attempt that fails is repeated from the erase. The new
+    /// configuration takes effect at the part's next reset.
+    fn rewrite_samd21_bootprot(
+        &mut self,
+        as_read: &Samd21UserRow,
+        bootprot: u8,
+    ) -> Result<Samd21UserRow, Samd21UserRowError>;
+
+    /// Writes `saved` back as the NVM User Row, then reads it back: the way back from a BOOTPROT
+    /// rewrite, finished or not.
+    ///
+    /// `as_read` is the row the caller read and showed, and `saved` is a copy of this part's row
+    /// from before the rewrite. Nothing is written unless the row still reads exactly as `as_read`,
+    /// `as_read` is part-way to `saved` ([`Samd21UserRow::is_partway_to`]), and the core, the
+    /// security bit and the flash controller are as [`Self::rewrite_samd21_bootprot`] requires.
+    /// When the row already reads as `saved`, nothing is written and the row is returned.
+    fn restore_samd21_user_row(
+        &mut self,
+        as_read: &Samd21UserRow,
+        saved: &Samd21UserRow,
+    ) -> Result<Samd21UserRow, Samd21UserRowError>;
+}
+
+impl<A: TargetAccess> Samd21UserRowAccess for A {
+    fn read_samd21_user_row(&mut self) -> Result<Samd21UserRow, ProbeError> {
+        let mut words = [0u32; SAMD21_USER_ROW_WORDS];
+        self.read_words_into(SAMD21_USER_ROW, &mut words)?;
+        Ok(Samd21UserRow { words })
+    }
+
+    fn read_samd21_serial_number(&mut self) -> Result<[u32; 4], ProbeError> {
+        let mut serial = [0u32; 4];
+        for (word, address) in serial.iter_mut().zip(SAMD21_SERIAL_NUMBER) {
+            *word = self.read_word(address)?;
+        }
+        Ok(serial)
+    }
+
+    fn rewrite_samd21_bootprot(
+        &mut self,
+        as_read: &Samd21UserRow,
+        bootprot: u8,
+    ) -> Result<Samd21UserRow, Samd21UserRowError> {
+        let intended = as_read.with_bootprot(bootprot).ok_or_else(|| {
+            Samd21UserRowError::Unchanged(format!(
+                "BOOTPROT is a three-bit field, and {bootprot} does not fit in it"
+            ))
+        })?;
+        let now = samd21_ready_to_write_user_row(self, as_read)?;
+        if now == intended {
+            return Ok(now);
+        }
+        samd21_replace_user_row(self, &intended)
+    }
+
+    fn restore_samd21_user_row(
+        &mut self,
+        as_read: &Samd21UserRow,
+        saved: &Samd21UserRow,
+    ) -> Result<Samd21UserRow, Samd21UserRowError> {
+        let now = samd21_ready_to_write_user_row(self, as_read)?;
+        if now == *saved {
+            return Ok(now);
+        }
+        if !now.is_partway_to(saved) {
+            return Err(Samd21UserRowError::Unchanged(
+                "the user row holds a bit at zero, outside BOOTPROT, that the saved copy holds at \
+                 one, so it is not that copy part-way through a BOOTPROT rewrite; the copy is not \
+                 this row's past"
+                    .to_owned(),
+            ));
+        }
+        samd21_replace_user_row(self, saved)
+    }
+}
+
+/// The checks both writes make before anything is erased: the core is halted, the security bit is
+/// clear, the flash controller is idle, and the row still reads as `as_read`, which it returns.
+fn samd21_ready_to_write_user_row<A: TargetAccess>(
+    target: &mut A,
+    as_read: &Samd21UserRow,
+) -> Result<Samd21UserRow, Samd21UserRowError> {
+    let unchanged = |why: String| Samd21UserRowError::Unchanged(why);
+    let halted = target
+        .is_halted()
+        .map_err(|why| unchanged(format!("reading whether the core is halted: {why}")))?;
+    if !halted {
+        return Err(unchanged(
+            "the core is running, and firmware that drives the flash controller itself would \
+             interleave its commands with these; halt the core first"
+                .to_owned(),
+        ));
+    }
+    let status = target
+        .read_word(SAMD21_STATUS)
+        .map_err(|why| unchanged(format!("reading the flash controller's status: {why}")))?;
+    if status & SAMD21_STATUS_SB != 0 {
+        return Err(unchanged(
+            "the part's security bit is set, and its flash controller refuses to erase or write \
+             the user row while it is"
+                .to_owned(),
+        ));
+    }
+    let ready = target
+        .read_word(SAMD21_INTFLAG)
+        .map_err(|why| unchanged(format!("reading the flash controller's flags: {why}")))?;
+    if ready & 1 == 0 {
+        return Err(unchanged(
+            "the flash controller is still busy with an earlier command".to_owned(),
+        ));
+    }
+    let now = target
+        .read_samd21_user_row()
+        .map_err(|why| unchanged(format!("reading the user row: {why}")))?;
+    if now != *as_read {
+        return Err(unchanged(
+            "the user row no longer reads as the copy that was shown; read it again, and keep \
+             that copy"
+                .to_owned(),
+        ));
+    }
+    Ok(now)
+}
+
+/// Erases the user row and programs `intended`, then reads it back, up to
+/// [`SAMD21_USER_ROW_ATTEMPTS`] times. CTRLB goes back as it was found on every way out.
+fn samd21_replace_user_row<A: TargetAccess>(
+    target: &mut A,
+    intended: &Samd21UserRow,
+) -> Result<Samd21UserRow, Samd21UserRowError> {
+    let ctrlb = target.read_word(SAMD21_CTRLB).map_err(|why| {
+        Samd21UserRowError::Unchanged(format!("reading the flash controller's settings: {why}"))
+    })?;
+    if let Err(why) = target.write_word(SAMD21_CTRLB, ctrlb | SAMD21_MANW) {
+        return Err(Samd21UserRowError::Unchanged(format!(
+            "setting the flash controller to manual writes: {why}"
+        )));
+    }
+
+    let mut outcome = Err(Samd21UserRowError::NotRewritten {
+        reason: "no attempt ran".to_owned(),
+        now: None,
+    });
+    for _ in 0..SAMD21_USER_ROW_ATTEMPTS {
+        let attempt = samd21_erase_and_program_user_row(target, intended);
+        let read_back = target.read_samd21_user_row();
+        outcome = match (attempt, read_back) {
+            (_, Ok(row)) if row == *intended => Ok(row),
+            (Err(why), read_back) => Err(Samd21UserRowError::NotRewritten {
+                reason: why,
+                now: read_back.ok().map(Box::new),
+            }),
+            (Ok(()), Ok(row)) => Err(Samd21UserRowError::NotRewritten {
+                reason: "every command completed, and the row reads back differently".to_owned(),
+                now: Some(Box::new(row)),
+            }),
+            (Ok(()), Err(why)) => Err(Samd21UserRowError::NotRewritten {
+                reason: format!("reading the row back: {why}"),
+                now: None,
+            }),
+        };
+        if outcome.is_ok() {
+            break;
+        }
+    }
+    let _ = target.write_word(SAMD21_CTRLB, ctrlb);
+    outcome
+}
+
+/// One attempt at the rewrite: erase the user row, then program each page of `row` that holds any
+/// zero bit. Every command's error bits are checked, and each is cleared before the next.
+fn samd21_erase_and_program_user_row<A: TargetAccess>(
+    target: &mut A,
+    row: &Samd21UserRow,
+) -> Result<(), String> {
+    samd21_user_row_command(target, SAMD21_USER_ROW, SAMD21_CMD_EAR, "erasing the user row")?;
+    for (page, words) in row.words.chunks(SAMD21_PAGE / 4).enumerate() {
+        if words.iter().all(|word| *word == u32::MAX) {
+            continue;
+        }
+        let address = SAMD21_USER_ROW + (page * SAMD21_PAGE) as u32;
+        samd21_command(target, SAMD21_CMD_PBC)
+            .map_err(|why| format!("clearing the page buffer: {why}"))?;
+        target
+            .write_words(address, words)
+            .map_err(|why| format!("filling the page buffer for page {page}: {why}"))?;
+        target
+            .read_word(address)
+            .map_err(|why| format!("reading back after the fill of page {page}: {why}"))?;
+        samd21_user_row_command(target, address, SAMD21_CMD_WAP, "writing a user-row page")?;
+    }
+    Ok(())
+}
+
+/// Points ADDR at `address`, issues `command`, waits for it, and fails if the controller reports
+/// an error for it. Errors left from before are cleared first, so any error seen is this command's.
+fn samd21_user_row_command<A: TargetAccess>(
+    target: &mut A,
+    address: u32,
+    command: u32,
+    doing: &str,
+) -> Result<(), String> {
+    target
+        .write_word(SAMD21_STATUS, SAMD21_STATUS_ERRORS)
+        .map_err(|why| format!("{doing}: clearing the controller's error bits: {why}"))?;
+    target
+        .write_word(SAMD21_ADDR, address / 2)
+        .map_err(|why| format!("{doing}: setting the address: {why}"))?;
+    samd21_command(target, command).map_err(|why| format!("{doing}: {why}"))?;
+    let status = target
+        .read_word(SAMD21_STATUS)
+        .map_err(|why| format!("{doing}: reading the controller's status: {why}"))?;
+    let errors = status & SAMD21_STATUS_ERRORS;
+    if errors != 0 {
+        return Err(format!(
+            "{doing}: the controller reported {}",
+            samd21_status_errors(errors)
+        ));
+    }
+    Ok(())
+}
+
+/// The error bits of a STATUS value, named for a reader.
+fn samd21_status_errors(errors: u32) -> String {
+    let names: Vec<&str> = [
+        (SAMD21_STATUS_PROGE, "a programming error (PROGE)"),
+        (SAMD21_STATUS_LOCKE, "a lock error (LOCKE)"),
+        (SAMD21_STATUS_NVME, "an NVM error (NVME)"),
+    ]
+    .iter()
+    .filter(|(bit, _)| errors & bit != 0)
+    .map(|(_, name)| *name)
+    .collect();
+    names.join(" and ")
 }
 
 /// SAM DSU `DID` -- the part's own identification word, at DSU base + 0x18.
@@ -277,6 +757,15 @@ impl SamDeviceId {
     /// datasheet for, which is the same refusal for a different reason.
     pub fn drives_samd21_nvmctrl(&self) -> bool {
         self.processor == 0x1 && self.family == 0x0 && matches!(self.series, 0x1 | 0x2 | 0x3)
+    }
+
+    /// Whether this part's NVM User Row is the one [`Samd21UserRowAccess`] reads and rewrites: a
+    /// SAM D21 or DA1 (series 0x1), whose row DS40001882D Table 10-4 lays out.
+    ///
+    /// The SAM D10 and D11 share the flash controller, and their user rows are left to their own
+    /// datasheets rather than assumed to match this one.
+    pub fn has_samd21_user_row(&self) -> bool {
+        self.processor == 0x1 && self.family == 0x0 && self.series == 0x1
     }
 
     /// Whether this part's flash controller is the one the [`Same54Flash`] routines drive: the
@@ -2315,5 +2804,643 @@ mod tests {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
         let mut target = ArmDap::new(Dap::new(Mock::new(vec![ack, word_reply(0)])));
         assert!(target.sam_flash_geometry().is_err(), "a zero-page PARAM decoded instead of refusing");
+    }
+
+    const FAKE_NVMCTRL: u32 = 0x4100_4000;
+    const FAKE_CTRLA: u32 = FAKE_NVMCTRL;
+    const FAKE_CTRLB: u32 = FAKE_NVMCTRL + 0x04;
+    const FAKE_INTFLAG: u32 = FAKE_NVMCTRL + 0x14;
+    const FAKE_STATUS: u32 = FAKE_NVMCTRL + 0x18;
+    const FAKE_ADDR: u32 = FAKE_NVMCTRL + 0x1c;
+    const FAKE_LOCK: u32 = FAKE_NVMCTRL + 0x20;
+    const FAKE_LOCK_WORD: u32 = 0x5a5a_7ffe;
+    const FAKE_ADDR_BITS: u32 = 0x003f_ffff;
+    const FAKE_KEY: u32 = 0xa5 << 8;
+    const FAKE_ER: u32 = 0x02;
+    const FAKE_WP: u32 = 0x04;
+    const FAKE_EAR: u32 = 0x05;
+    const FAKE_WAP: u32 = 0x06;
+    const FAKE_PBC: u32 = 0x44;
+    const FAKE_MANW: u32 = 1 << 7;
+    const FAKE_PROGE: u32 = 1 << 2;
+    const FAKE_LOCKE: u32 = 1 << 3;
+    const FAKE_NVME: u32 = 1 << 4;
+    const FAKE_SB: u32 = 1 << 8;
+    const FAKE_USER_ROW: u32 = 0x0080_4000;
+    const FAKE_USER_ROW_IN_ADDR: u32 = 0x4000;
+    const FAKE_MAIN: usize = 32 * 1024;
+    const ZERO_ROW_WORD0: u32 = 0xd8e0_c7ff;
+    const ZERO_ROW_WORD1: u32 = 0xffff_fc5d;
+
+    /// A SAM D21 as its flash controller, 32 KB of main array, its NVM User Row, and the page buffer
+    /// the two share.
+    struct FakeSamd21 {
+        log: Vec<String>,
+        main: Vec<u8>,
+        user_row: [u8; 256],
+        /// The page buffer. A fill ANDs into it, and only a Page Buffer Clear or a page write sets
+        /// it back to ones -- stricter than overwriting, so a missing clear cannot pass.
+        buffer: [u8; 64],
+        ctrlb: u32,
+        addr: u32,
+        status: u32,
+        halted: bool,
+        busy: bool,
+        /// How many Write Auxiliary Page commands report NVME and program nothing, from the first.
+        failing_writes: usize,
+    }
+
+    impl FakeSamd21 {
+        /// A halted part with a patterned main array and the user row `row`.
+        fn holding(row: &Samd21UserRow) -> Self {
+            let mut user_row = [0u8; 256];
+            user_row.copy_from_slice(&row.to_bytes());
+            FakeSamd21 {
+                log: Vec::new(),
+                main: (0..FAKE_MAIN).map(|at| (at * 7 + 3) as u8).collect(),
+                user_row,
+                buffer: [0xff; 64],
+                ctrlb: 0,
+                addr: 0,
+                status: 0,
+                halted: true,
+                busy: false,
+                failing_writes: 0,
+            }
+        }
+
+        fn row(&self) -> Samd21UserRow {
+            Samd21UserRow::from_bytes(&self.user_row).unwrap()
+        }
+
+        fn in_user_row(address: u32) -> bool {
+            (FAKE_USER_ROW..FAKE_USER_ROW + 256).contains(&address)
+        }
+
+        fn command(&mut self, value: u32) {
+            if value & 0xff00 != FAKE_KEY {
+                self.status |= FAKE_PROGE;
+                self.log.push("bad key".to_owned());
+                return;
+            }
+            let byte = (self.addr & FAKE_ADDR_BITS) << 1;
+            match value & 0x7f {
+                FAKE_PBC => {
+                    self.buffer = [0xff; 64];
+                    self.log.push("PBC".to_owned());
+                }
+                FAKE_EAR if self.status & FAKE_SB != 0 => self.status |= FAKE_PROGE,
+                FAKE_EAR if byte & !0xff == FAKE_USER_ROW_IN_ADDR => {
+                    self.user_row = [0xff; 256];
+                    self.log.push("EAR".to_owned());
+                }
+                FAKE_WAP if self.status & FAKE_SB != 0 => self.status |= FAKE_PROGE,
+                FAKE_WAP if byte & !0xff == FAKE_USER_ROW_IN_ADDR => {
+                    let page = ((byte - FAKE_USER_ROW_IN_ADDR) / 64) as usize;
+                    if self.failing_writes > 0 {
+                        self.failing_writes -= 1;
+                        self.status |= FAKE_NVME;
+                        self.log.push(format!("WAP {page} failed"));
+                        return;
+                    }
+                    for (cell, fill) in self.user_row[page * 64..page * 64 + 64]
+                        .iter_mut()
+                        .zip(self.buffer.iter())
+                    {
+                        *cell &= *fill;
+                    }
+                    self.buffer = [0xff; 64];
+                    self.log.push(format!("WAP {page}"));
+                }
+                FAKE_ER => {
+                    let row = (byte & !0xff) as usize;
+                    if let Some(cells) = self.main.get_mut(row..row + 256) {
+                        cells.fill(0xff);
+                    }
+                    self.log.push(format!("ER {row:#x}"));
+                }
+                FAKE_WP => self.log.push(format!("WP {byte:#x}")),
+                other => {
+                    self.status |= FAKE_PROGE;
+                    self.log.push(format!("refused command {other:#x}"));
+                }
+            }
+        }
+
+        /// A bus write into the NVM address space, which loads the page buffer.
+        fn fill(&mut self, address: u32, value: u32) {
+            if self.ctrlb & FAKE_MANW == 0 {
+                self.status |= FAKE_PROGE;
+                self.log.push("fill with automatic writes on".to_owned());
+                return;
+            }
+            let at = (address % 64) as usize;
+            for (cell, byte) in self.buffer[at..at + 4].iter_mut().zip(value.to_le_bytes()) {
+                *cell &= byte;
+            }
+            self.addr = (address >> 1) & FAKE_ADDR_BITS;
+        }
+    }
+
+    impl TargetAccess for FakeSamd21 {
+        fn connect(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+            Ok(0x0bc1_1477)
+        }
+        fn init_mem(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+            let word = |bytes: &[u8], at: usize| {
+                u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+            };
+            match address {
+                FAKE_INTFLAG => Ok(u32::from(!self.busy)),
+                FAKE_STATUS => Ok(self.status),
+                FAKE_CTRLB => Ok(self.ctrlb),
+                FAKE_ADDR => Ok(self.addr),
+                FAKE_LOCK => Ok(FAKE_LOCK_WORD),
+                0x0080_a00c => Ok(0x5e71_0000),
+                0x0080_a040 => Ok(0x5e71_0001),
+                0x0080_a044 => Ok(0x5e71_0002),
+                0x0080_a048 => Ok(0x5e71_0003),
+                _ if Self::in_user_row(address) => {
+                    Ok(word(&self.user_row, (address - FAKE_USER_ROW) as usize))
+                }
+                _ if (address as usize) < FAKE_MAIN => Ok(word(&self.main, address as usize)),
+                _ => Err(ProbeError::Device("a read of an address this fake does not model")),
+            }
+        }
+        fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+            match address {
+                FAKE_CTRLA => self.command(value),
+                FAKE_CTRLB => self.ctrlb = value,
+                FAKE_STATUS => self.status &= !(value & (FAKE_PROGE | FAKE_LOCKE | FAKE_NVME)),
+                FAKE_ADDR => self.addr = value & FAKE_ADDR_BITS,
+                _ if Self::in_user_row(address) || (address as usize) < FAKE_MAIN => {
+                    self.fill(address, value)
+                }
+                _ => return Err(ProbeError::Device("a write to an address this fake does not model")),
+            }
+            Ok(())
+        }
+        fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+            for (index, word) in out.iter_mut().enumerate() {
+                *word = self.read_word(address + 4 * index as u32)?;
+            }
+            Ok(())
+        }
+        fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
+            for (index, word) in words.iter().enumerate() {
+                self.write_word(address + 4 * index as u32, *word)?;
+            }
+            Ok(())
+        }
+        fn read_byte(&mut self, _: u32) -> Result<u8, ProbeError> {
+            Err(ProbeError::Device("byte access is not modelled"))
+        }
+        fn write_byte(&mut self, _: u32, _: u8) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("byte access is not modelled"))
+        }
+        fn read_halfword(&mut self, _: u32) -> Result<u16, ProbeError> {
+            Err(ProbeError::Device("half-word access is not modelled"))
+        }
+        fn write_halfword(&mut self, _: u32, _: u16) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("half-word access is not modelled"))
+        }
+        fn halt(&mut self) -> Result<(), ProbeError> {
+            self.halted = true;
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<(), ProbeError> {
+            self.halted = false;
+            Ok(())
+        }
+        fn step(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn is_halted(&mut self) -> Result<bool, ProbeError> {
+            Ok(self.halted)
+        }
+        fn wait_halted(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("reset is not modelled"))
+        }
+        fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("reset is not modelled"))
+        }
+        fn set_reset(&mut self, _: bool) -> Result<u8, ProbeError> {
+            Err(ProbeError::Device("reset is not modelled"))
+        }
+        fn read_core_reg(&mut self, _: u8) -> Result<u32, ProbeError> {
+            Err(ProbeError::Device("core registers are not modelled"))
+        }
+        fn write_core_reg(&mut self, _: u8, _: u32) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("core registers are not modelled"))
+        }
+        fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("reset is not modelled"))
+        }
+        fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("reset is not modelled"))
+        }
+        fn set_breakpoint(&mut self, _: u32) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("breakpoints are not modelled"))
+        }
+        fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("breakpoints are not modelled"))
+        }
+        fn set_breakpoints(&mut self, _: &[u32]) -> Result<(), ProbeError> {
+            Err(ProbeError::Device("breakpoints are not modelled"))
+        }
+        fn call_target(
+            &mut self,
+            _: u32,
+            _: &[u32],
+            _: &lamella_probe_core::CallFrame,
+        ) -> Result<u32, ProbeError> {
+            Err(ProbeError::Device("calls are not modelled"))
+        }
+    }
+
+    /// The Zero's row as read, and the same row with an 8 KB bootloader protected -- what a board
+    /// whose bootloader was burned with protection set would read.
+    fn zero_row() -> Samd21UserRow {
+        let mut words = [u32::MAX; SAMD21_USER_ROW_WORDS];
+        words[0] = ZERO_ROW_WORD0;
+        words[1] = ZERO_ROW_WORD1;
+        Samd21UserRow { words }
+    }
+
+    fn protected_row() -> Samd21UserRow {
+        let mut row = zero_row();
+        row.words[0] = (row.words[0] & !0b111) | 0x2;
+        row
+    }
+
+    /// The user row's commands and registers, pinned against DS40001882D. EAR and WAP sit next to
+    /// ER and WP in the command table, and each pair takes the same ADDR -- so one wrong digit
+    /// erases a main-array row instead.
+    #[test]
+    fn the_user_row_constants_are_the_datasheets() {
+        assert_eq!([SAMD21_CMD_EAR, SAMD21_CMD_WAP], [FAKE_EAR, FAKE_WAP]);
+        assert_ne!(SAMD21_CMD_EAR, SAMD21_CMD_ER);
+        assert_ne!(SAMD21_CMD_WAP, SAMD21_CMD_WP);
+        assert_eq!(SAMD21_STATUS, FAKE_STATUS);
+        assert_eq!(
+            [SAMD21_STATUS_PROGE, SAMD21_STATUS_LOCKE, SAMD21_STATUS_NVME, SAMD21_STATUS_SB],
+            [FAKE_PROGE, FAKE_LOCKE, FAKE_NVME, FAKE_SB]
+        );
+        assert_eq!(SAMD21_USER_ROW, FAKE_USER_ROW);
+        assert_eq!(SAMD21_USER_ROW / 2, 0x0040_2000);
+        assert_eq!((SAMD21_USER_ROW / 2) & FAKE_ADDR_BITS, FAKE_USER_ROW_IN_ADDR / 2);
+        assert_eq!(SAMD21_USER_ROW_WORDS * 4, 256);
+    }
+
+    /// The user-row layout is claimed for the SAM D21's series alone, and the Zero's own DID is in it.
+    #[test]
+    fn only_a_sam_d21_claims_this_user_row() {
+        assert!(SamDeviceId::decode(0x1001_0305).has_samd21_user_row(), "the Zero's DID");
+        assert!(SamDeviceId::decode(0x1001_0300).has_samd21_user_row(), "an ATSAMD21J18A");
+        for other in [0x1003_0000u32, 0x1002_0000, 0x6184_0300, 0x6181_0604] {
+            let id = SamDeviceId::decode(other);
+            assert!(!id.has_samd21_user_row(), "{other:#010x}");
+        }
+        assert!(SamDeviceId::decode(0x1003_0000).drives_samd21_nvmctrl());
+    }
+
+    /// The serial number is four words at four addresses, and word 0 sits apart from the other
+    /// three -- so a read that walked one block from word 0 would return three wrong words.
+    #[test]
+    fn the_serial_number_is_read_word_by_word_in_the_datasheets_order() {
+        let mut part = FakeSamd21::holding(&zero_row());
+        assert_eq!(
+            part.read_samd21_serial_number().unwrap(),
+            [0x5e71_0000, 0x5e71_0001, 0x5e71_0002, 0x5e71_0003]
+        );
+        assert!(part.log.is_empty(), "a read issues no command");
+    }
+
+    #[test]
+    fn the_user_row_fields_cover_each_bit_once() {
+        let mut covered = 0u64;
+        let mut next = 0;
+        for field in SAMD21_USER_ROW_FIELDS {
+            assert_eq!(field.low_bit, next, "{} starts where the one before it ends", field.name);
+            let bits = ((1u64 << field.width) - 1) << field.low_bit;
+            assert_eq!(covered & bits, 0, "{} overlaps a field before it", field.name);
+            covered |= bits;
+            next = field.low_bit + field.width;
+        }
+        assert_eq!(covered, u64::MAX, "the fields cover all 64 bits");
+    }
+
+    /// The Zero's row, decoded field by field. Every expected value is read by hand from Table
+    /// 10-4, and the BOD12 values are the table's production defaults.
+    #[test]
+    fn the_zeros_row_decodes_as_table_10_4_lays_it_out() {
+        let row = zero_row();
+        let decoded: Vec<(&str, u32)> = SAMD21_USER_ROW_FIELDS
+            .iter()
+            .map(|field| (field.name, row.field(field)))
+            .collect();
+        assert_eq!(
+            decoded,
+            [
+                ("BOOTPROT", 7),
+                ("reserved", 1),
+                ("EEPROM", 7),
+                ("reserved", 1),
+                ("BOD33 level", 0x07),
+                ("BOD33 enable", 1),
+                ("BOD33 action", 1),
+                ("BOD12 configuration", 0x70),
+                ("WDT enable", 0),
+                ("WDT always-on", 0),
+                ("WDT period", 0xb),
+                ("WDT window", 0xb),
+                ("WDT early-warning offset", 0xb),
+                ("WDT window mode", 0),
+                ("BOD33 hysteresis", 0),
+                ("BOD12 configuration", 0),
+                ("reserved", 0x3f),
+                ("LOCK", 0xffff),
+            ]
+        );
+        assert_eq!(row.bootprot(), SAMD21_BOOTPROT_NONE);
+    }
+
+    #[test]
+    fn bootprot_protects_what_table_22_2_says() {
+        let bytes: Vec<u32> = (0..=7).map(samd21_bootprot_bytes).collect();
+        assert_eq!(bytes, [32_768, 16_384, 8_192, 4_096, 2_048, 1_024, 512, 0]);
+        assert_eq!(samd21_bootprot_bytes(protected_row().bootprot()), 0x2000);
+    }
+
+    #[test]
+    fn eeprom_reserves_what_table_22_3_says() {
+        let bytes: Vec<u32> = (0..=7).map(samd21_eeprom_bytes).collect();
+        assert_eq!(bytes, [16_384, 8_192, 4_096, 2_048, 1_024, 512, 256, 0]);
+        assert_eq!(zero_row().eeprom(), SAMD21_EEPROM_NONE);
+    }
+
+    /// The EEPROM and LOCK accessors read the bits Table 10-4 gives those fields, on rows whose
+    /// neighboring bits are ones, zeros, and a pattern.
+    #[test]
+    fn the_eeprom_and_lock_fields_are_where_table_10_4_puts_them() {
+        let field = |name: &str| {
+            *SAMD21_USER_ROW_FIELDS.iter().find(|field| field.name == name).expect("a field")
+        };
+        let mut patterned = zero_row();
+        for (index, word) in patterned.words.iter_mut().enumerate() {
+            *word = 0x9e37_79b9u32.rotate_left(index as u32);
+        }
+        let rows = [
+            zero_row(),
+            Samd21UserRow { words: [0; SAMD21_USER_ROW_WORDS] },
+            Samd21UserRow { words: [u32::MAX; SAMD21_USER_ROW_WORDS] },
+            patterned,
+        ];
+        for row in rows {
+            assert_eq!(u32::from(row.eeprom()), row.field(&field("EEPROM")), "{row:08x?}");
+            assert_eq!(u32::from(row.lock()), row.field(&field("LOCK")), "{row:08x?}");
+        }
+    }
+
+    /// NVMCTRL.LOCK is the low half of the word at offset 0x20; the reserved half above it is not
+    /// part of the reading.
+    #[test]
+    fn the_region_locks_are_the_low_half_of_nvmctrl_lock() {
+        let mut part = FakeSamd21::holding(&zero_row());
+        assert_eq!(part.read_samd21_region_locks().expect("a read"), 0x7ffe);
+        assert!(part.log.is_empty(), "a read issues no command: {:?}", part.log);
+    }
+
+    /// A BOOTPROT change touches bits 2:0 of the first word and nothing else, for every value and
+    /// for rows whose neighboring bits are ones, zeros, and a pattern.
+    #[test]
+    fn a_bootprot_change_keeps_every_other_bit() {
+        let mut patterned = zero_row();
+        for (index, word) in patterned.words.iter_mut().enumerate() {
+            *word = 0x9e37_79b9u32.rotate_left(index as u32);
+        }
+        let rows = [
+            zero_row(),
+            protected_row(),
+            Samd21UserRow { words: [0; SAMD21_USER_ROW_WORDS] },
+            Samd21UserRow { words: [u32::MAX; SAMD21_USER_ROW_WORDS] },
+            patterned,
+        ];
+        for row in rows {
+            for bootprot in 0..=7u8 {
+                let changed = row.with_bootprot(bootprot).unwrap();
+                assert_eq!(changed.bootprot(), bootprot);
+                assert_eq!(changed.words[0] & !0b111, row.words[0] & !0b111, "word 0 outside BOOTPROT");
+                assert_eq!(changed.words[1..], row.words[1..], "every later word");
+            }
+            assert_eq!(row.with_bootprot(8), None, "a value wider than the field");
+        }
+    }
+
+    #[test]
+    fn a_backup_holds_the_row_in_address_order() {
+        let row = zero_row();
+        let bytes = row.to_bytes();
+        assert_eq!(bytes.len(), 256);
+        assert_eq!(bytes[..8], [0xff, 0xc7, 0xe0, 0xd8, 0x5d, 0xfc, 0xff, 0xff]);
+        assert_eq!(Samd21UserRow::from_bytes(&bytes), Some(row));
+        assert_eq!(Samd21UserRow::from_bytes(&bytes[..255]), None);
+    }
+
+    /// The rewrite a protected board takes: the user row erased by its own command, the one page
+    /// that holds data programmed by its own command, the main array untouched, and the controller's
+    /// settings as they were found.
+    #[test]
+    fn a_rewrite_uses_the_user_rows_own_commands_and_nothing_else() {
+        let before = protected_row();
+        let mut part = FakeSamd21::holding(&before);
+        let main = part.main.clone();
+        let after = part.rewrite_samd21_bootprot(&before, SAMD21_BOOTPROT_NONE).unwrap();
+        assert_eq!(after, zero_row(), "BOOTPROT 7 and every other bit as read");
+        assert_eq!(part.row(), zero_row(), "and the part holds that row");
+        assert_eq!(part.log, ["EAR", "PBC", "WAP 0"], "pages 1 to 3 are erased and stay so");
+        assert!(part.main == main, "the main array is untouched");
+        assert_eq!(part.ctrlb, 0, "CTRLB goes back as it was found");
+        assert_eq!(part.status, 0, "no error left behind");
+    }
+
+    #[test]
+    fn a_rewrite_programs_every_page_that_holds_data() {
+        let mut before = protected_row();
+        before.words[16 * 2 + 3] = 0x1234_5678;
+        let mut part = FakeSamd21::holding(&before);
+        part.rewrite_samd21_bootprot(&before, SAMD21_BOOTPROT_NONE).unwrap();
+        assert_eq!(part.log, ["EAR", "PBC", "WAP 0", "PBC", "WAP 2"]);
+        assert_eq!(part.row(), before.with_bootprot(SAMD21_BOOTPROT_NONE).unwrap());
+    }
+
+    #[test]
+    fn a_rewrite_to_the_value_already_held_writes_nothing() {
+        let row = zero_row();
+        let mut part = FakeSamd21::holding(&row);
+        assert_eq!(part.rewrite_samd21_bootprot(&row, SAMD21_BOOTPROT_NONE), Ok(row));
+        assert!(part.log.is_empty(), "no command: {:?}", part.log);
+    }
+
+    /// Every refusal happens before anything is erased, and says so.
+    #[test]
+    fn a_rewrite_refuses_before_erasing_anything() {
+        type Arrange = fn(&mut FakeSamd21);
+        let row = protected_row();
+        let refusals: [(&str, Arrange); 4] = [
+            ("running", |part| part.halted = false),
+            ("security bit", |part| part.status |= FAKE_SB),
+            ("busy", |part| part.busy = true),
+            ("no longer reads", |part| part.user_row[40] = 0),
+        ];
+        for (expected, arrange) in refusals {
+            let mut part = FakeSamd21::holding(&row);
+            arrange(&mut part);
+            let held = part.user_row;
+            match part.rewrite_samd21_bootprot(&row, SAMD21_BOOTPROT_NONE) {
+                Err(Samd21UserRowError::Unchanged(why)) => {
+                    assert!(why.contains(expected), "{expected:?} in {why:?}")
+                }
+                other => panic!("{expected}: {other:?}"),
+            }
+            assert!(part.log.is_empty(), "{expected}: no command ran, but {:?}", part.log);
+            assert_eq!(part.user_row, held, "{expected}: the row is as it was");
+        }
+        let mut part = FakeSamd21::holding(&row);
+        assert!(matches!(
+            part.rewrite_samd21_bootprot(&row, 8),
+            Err(Samd21UserRowError::Unchanged(_))
+        ));
+    }
+
+    /// A page write the controller reports as failed is repeated from the erase, and the second
+    /// attempt finishes the row.
+    #[test]
+    fn a_failed_page_write_is_repeated_from_the_erase() {
+        let before = protected_row();
+        let mut part = FakeSamd21::holding(&before);
+        part.failing_writes = 1;
+        let after = part.rewrite_samd21_bootprot(&before, SAMD21_BOOTPROT_NONE).unwrap();
+        assert_eq!(after, zero_row());
+        assert_eq!(part.log, ["EAR", "PBC", "WAP 0 failed", "EAR", "PBC", "WAP 0"]);
+        assert_eq!(part.status, 0, "the failure's NVME is cleared, not left behind");
+    }
+
+    /// When no attempt finishes, the error says the row was erased and carries what it holds now.
+    #[test]
+    fn a_rewrite_that_cannot_finish_reports_the_row_it_left() {
+        let before = protected_row();
+        let mut part = FakeSamd21::holding(&before);
+        part.failing_writes = usize::MAX;
+        match part.rewrite_samd21_bootprot(&before, SAMD21_BOOTPROT_NONE) {
+            Err(Samd21UserRowError::NotRewritten { reason, now }) => {
+                assert!(reason.contains("NVME"), "{reason}");
+                assert_eq!(now.as_deref(), Some(&Samd21UserRow { words: [u32::MAX; SAMD21_USER_ROW_WORDS] }));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(part.log.iter().filter(|line| *line == "EAR").count(), SAMD21_USER_ROW_ATTEMPTS);
+        assert_eq!(part.ctrlb, 0, "CTRLB goes back as it was found on this path too");
+    }
+
+    /// What a rewrite can leave on the way to a saved copy, and what it cannot.
+    #[test]
+    fn a_row_is_partway_to_its_saved_copy_only_by_programming() {
+        let saved = protected_row();
+        let erased = Samd21UserRow { words: [u32::MAX; SAMD21_USER_ROW_WORDS] };
+        assert!(erased.is_partway_to(&saved), "erased");
+        assert!(zero_row().is_partway_to(&saved), "BOOTPROT alone differs");
+        assert!(saved.is_partway_to(&saved), "the copy itself");
+        let mut half = erased;
+        half.words[0] = zero_row().words[0];
+        assert!(half.is_partway_to(&saved), "part-way");
+        let mut other = zero_row();
+        other.words[0] &= !(1 << 21);
+        assert!(!other.is_partway_to(&saved), "a production bit cleared");
+    }
+
+    /// The way back from a rewrite that could not finish: the row left erased, then the saved copy
+    /// put back by the user row's own commands, with the main array untouched.
+    #[test]
+    fn a_restore_puts_the_saved_copy_back_over_an_unfinished_rewrite() {
+        let saved = protected_row();
+        let mut part = FakeSamd21::holding(&saved);
+        part.failing_writes = usize::MAX;
+        let left = match part.rewrite_samd21_bootprot(&saved, SAMD21_BOOTPROT_NONE) {
+            Err(Samd21UserRowError::NotRewritten { now: Some(row), .. }) => *row,
+            other => panic!("{other:?}"),
+        };
+        part.failing_writes = 0;
+        part.log.clear();
+        let main = part.main.clone();
+        assert_eq!(part.restore_samd21_user_row(&left, &saved), Ok(saved));
+        assert_eq!(part.row(), saved);
+        assert_eq!(part.log, ["EAR", "PBC", "WAP 0"]);
+        assert!(part.main == main, "the main array is untouched");
+        assert_eq!(part.ctrlb, 0);
+    }
+
+    #[test]
+    fn a_restore_undoes_a_finished_rewrite() {
+        let saved = protected_row();
+        let mut part = FakeSamd21::holding(&saved);
+        let cleared = part.rewrite_samd21_bootprot(&saved, SAMD21_BOOTPROT_NONE).unwrap();
+        part.log.clear();
+        assert_eq!(part.restore_samd21_user_row(&cleared, &saved), Ok(saved));
+        assert_eq!(part.row().bootprot(), 2);
+        assert_eq!(part.log, ["EAR", "PBC", "WAP 0"]);
+    }
+
+    #[test]
+    fn a_restore_of_the_row_already_held_writes_nothing() {
+        let row = zero_row();
+        let mut part = FakeSamd21::holding(&row);
+        assert_eq!(part.restore_samd21_user_row(&row, &row), Ok(row));
+        assert!(part.log.is_empty(), "{:?}", part.log);
+    }
+
+    /// A saved copy the row cannot have come from is refused before anything is erased: its
+    /// production-written bits are not this row's.
+    #[test]
+    fn a_restore_refuses_a_copy_that_is_not_this_rows_past() {
+        let now = zero_row();
+        let mut saved = now;
+        saved.words[0] |= 1 << 17;
+        let mut part = FakeSamd21::holding(&now);
+        match part.restore_samd21_user_row(&now, &saved) {
+            Err(Samd21UserRowError::Unchanged(why)) => {
+                assert!(why.contains("not this row's past"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(part.log.is_empty(), "{:?}", part.log);
+        assert_eq!(part.row(), now);
+    }
+
+    #[test]
+    fn a_restore_makes_the_rewrites_checks_before_erasing() {
+        let saved = protected_row();
+        let mut part = FakeSamd21::holding(&zero_row());
+        part.halted = false;
+        assert!(matches!(
+            part.restore_samd21_user_row(&zero_row(), &saved),
+            Err(Samd21UserRowError::Unchanged(_))
+        ));
+        assert!(part.log.is_empty(), "running: {:?}", part.log);
+        let mut part = FakeSamd21::holding(&zero_row());
+        assert!(matches!(
+            part.restore_samd21_user_row(&saved, &saved),
+            Err(Samd21UserRowError::Unchanged(_))
+        ));
+        assert!(part.log.is_empty(), "the row changed since it was shown: {:?}", part.log);
     }
 }

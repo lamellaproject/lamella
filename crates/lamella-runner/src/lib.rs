@@ -472,6 +472,17 @@ pub trait FlashSink {
         false
     }
 
+    /// How many bytes a deploy may write: the deploy window's length. A host is told it when it asks
+    /// what is deployed, so an artifact that does not fit is refused before any of it is sent, and a
+    /// chunk that would reach past it is refused as out of range rather than as a failed write.
+    ///
+    /// Defaults to [`image_slice`](Self::image_slice)'s length, which is the whole region for a sink
+    /// that answers the region there. A sink whose `image_slice` can answer something else -- an
+    /// image built into the firmware while the region is empty -- says the region's length here.
+    fn window_len(&self) -> usize {
+        self.image_slice().len()
+    }
+
     /// The corlib this firmware holds RESIDENT in flash, if any -- what a deployed bare PE
     /// resolves its corlib references against ([`load_deployed`]).
     ///
@@ -557,6 +568,12 @@ pub struct RunResult {
     /// is a terminal, and a caller that wants them apart reads them apart from the collector that
     /// filled this. What the merge must never do is happen on the WIRE, where a host that wanted to
     /// colour a trap report differently would have no way to recover the split.
+    ///
+    /// **A run that streamed its output does not repeat it here.** On a serve's run, its debug
+    /// session and a deployed boot-run, output goes out while the program runs and the machine lets
+    /// go of it once sent, so this holds only what had not gone out when the run ended -- normally
+    /// nothing but a trap report. Keeping the rest for this field would be a copy of everything the
+    /// program printed, which is the memory the streaming exists not to spend.
     pub stdout: String,
 }
 
@@ -710,9 +727,39 @@ fn serve_caps_with(resident_corlib: bool, monotonic_clock: bool) -> lamella_wire
             | Capabilities::STEPPING
             | Capabilities::LOCALS
             | Capabilities::PROFILE_CHIPID
+            | Capabilities::STRING_VALUES
             | if resident_corlib { Capabilities::RESIDENT_CORLIB } else { 0 }
             | if monotonic_clock { Capabilities::MONOTONIC_CLOCK } else { 0 },
     )
+}
+
+/// Whether the host this board last answered a `HELLO` from asked for string values, and this board
+/// offered them -- so a variables reply may carry a string's text ([`debug::val::STRING`]) where it
+/// would otherwise carry an object handle.
+///
+/// A static because a serve answers one frame per call and keeps nothing between calls, and the
+/// `HELLO` that settles this arrives before the debug session that reads it. It starts FALSE, so a
+/// board no host has greeted sends object handles, which every host can read.
+#[cfg(feature = "baked-image")]
+static STRING_VALUES_AGREED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// What the last answered `HELLO` settled about string values -- [`STRING_VALUES_AGREED`], read.
+#[cfg(feature = "baked-image")]
+fn string_values_now() -> bool {
+    STRING_VALUES_AGREED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a session may send [`debug::val::STRING`]: only when BOTH ends offered
+/// [`lamella_wire::Capabilities::STRING_VALUES`] in the `HELLO` that opened it. A host that did not
+/// offer it cannot read the tag, and loses every value after it in the same reply.
+#[cfg(feature = "baked-image")]
+fn string_values_agreed(
+    host: lamella_wire::Capabilities,
+    target: lamella_wire::Capabilities,
+) -> bool {
+    let bit = lamella_wire::Capabilities::STRING_VALUES;
+    host.has(bit) && target.has(bit)
 }
 
 /// Whether this firmware installed a monotonic clock it CHECKED to be moving -- the source of
@@ -1087,7 +1134,13 @@ fn hello_reply_caps(
             profile_identity(),
             transport.max_inbound_payload(),
         ) {
-            Ok(ack) => transport.send(msg::HELLO_ACK, frame.seq, &ack.encode()),
+            Ok(ack) => {
+                STRING_VALUES_AGREED.store(
+                    string_values_agreed(hello.caps, caps),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                transport.send(msg::HELLO_ACK, frame.seq, &ack.encode())
+            }
             Err(nak) => transport.send(msg::HELLO_NAK, frame.seq, &nak.encode()),
         },
         None => Ok(()),
@@ -1140,15 +1193,23 @@ fn send_stopped(
     location: (u32, u32),
     exit: Option<i32>,
 ) -> Result<(), TransportError> {
-    let mut payload = Vec::with_capacity(14);
-    payload.push(why);
-    payload.extend_from_slice(&location.0.to_le_bytes());
-    payload.extend_from_slice(&location.1.to_le_bytes());
-    if let Some(exit) = exit {
-        payload.extend_from_slice(&exit.to_le_bytes());
-        payload.push(STOP_FLAGS_RESERVED);
-    }
-    transport.send(debug::EVT_STOPPED, seq, &payload)
+    let (payload, len) = stop_payload(why, location, exit);
+    transport.send(debug::EVT_STOPPED, seq, &payload[..len])
+}
+
+/// A stop event's payload, and how many of its bytes it uses: the layout [`send_stopped`] describes.
+///
+/// A fixed array rather than a `Vec` because [`report_abort`] sends one from a panic handler, where
+/// nothing can be allocated. One encoder for both, so the two cannot come to disagree about it.
+#[cfg(feature = "baked-image")]
+fn stop_payload(why: u8, location: (u32, u32), exit: Option<i32>) -> ([u8; 14], usize) {
+    let [m0, m1, m2, m3] = location.0.to_le_bytes();
+    let [o0, o1, o2, o3] = location.1.to_le_bytes();
+    let ([e0, e1, e2, e3], flags, len) = match exit {
+        Some(exit) => (exit.to_le_bytes(), STOP_FLAGS_RESERVED, 14),
+        None => ([0; 4], 0, 9),
+    };
+    ([why, m0, m1, m2, m3, o0, o1, o2, o3, e0, e1, e2, e3, flags], len)
 }
 
 #[cfg(feature = "baked-image")]
@@ -1245,11 +1306,15 @@ fn location_kind(location: &lamella_cil_runtime::Location) -> u32 {
 /// [`debug::DBG_EXPAND`]; source-local NAMES never cross the wire (the host maps slots
 /// through the srcmap). A value whose feature this tier lacks cannot occur; the defensive
 /// tail arm keeps the match total under feature unification and reports such a value null.
+///
+/// A string goes out as its TEXT ([`debug::val::STRING`]) when `string_values` says the host asked
+/// for that ([`string_values_agreed`]), and as an object handle otherwise.
 #[cfg(feature = "baked-image")]
 fn encode_value(
     vm: &Vm,
     module: &lamella_cil_runtime::Module,
     value: &lamella_cil_runtime::Value,
+    string_values: bool,
     out: &mut Vec<u8>,
 ) {
     use lamella_cil_runtime::{Object, Value};
@@ -1278,6 +1343,10 @@ fn encode_value(
             out.extend_from_slice(&v.to_le_bytes());
         }
         Value::Object(reference) => {
+            if string_values && let Some(units) = vm.heap().as_string(*reference) {
+                encode_string(&units, out);
+                return;
+            }
             out.push(debug::val::OBJECT);
             out.extend_from_slice(&reference.index().to_le_bytes());
             let token = match vm.heap().get(*reference) {
@@ -1306,6 +1375,26 @@ fn encode_value(
     }
 }
 
+/// Appends a [`debug::val::STRING`]: the whole string's length in UTF-16 units, then as much of its
+/// text as fits [`debug::val::STRING_TEXT_MAX`] bytes of UTF-8, cut at a character boundary.
+///
+/// The length is the whole string's even when the text is cut, so a host can tell a long string it
+/// was sent the start of from a short one it was sent all of. An unpaired surrogate, which UTF-8
+/// cannot carry, goes out as U+FFFD and is still counted in the length.
+#[cfg(feature = "baked-image")]
+fn encode_string(units: &[u16], out: &mut Vec<u8>) {
+    let limit = debug::val::STRING_TEXT_MAX;
+    let text = String::from_utf16_lossy(&units[..units.len().min(limit)]);
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push(debug::val::STRING);
+    out.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(end as u16).to_le_bytes());
+    out.extend_from_slice(&text.as_bytes()[..end]);
+}
+
 /// Builds the [`debug::DBG_VARS`] payload for the [`debug::DBG_FRAMES`]-ordered
 /// `wire_index` (0 = innermost): the frame's locals then arguments, each a
 /// [`debug::val`]-encoded value. An out-of-range frame answers `0, 0`.
@@ -1315,6 +1404,7 @@ fn locals_reply(
     vm: &Vm,
     module: &lamella_cil_runtime::Module,
     request: &[u8],
+    string_values: bool,
 ) -> Vec<u8> {
     let wire_index = request
         .get(0..2)
@@ -1325,11 +1415,11 @@ fn locals_reply(
         Some(view) => {
             payload.extend_from_slice(&(view.locals.len() as u16).to_le_bytes());
             for value in view.locals {
-                encode_value(vm, module, value, &mut payload);
+                encode_value(vm, module, value, string_values, &mut payload);
             }
             payload.extend_from_slice(&(view.args.len() as u16).to_le_bytes());
             for value in view.args {
-                encode_value(vm, module, value, &mut payload);
+                encode_value(vm, module, value, string_values, &mut payload);
             }
         }
         None => payload.extend_from_slice(&[0, 0, 0, 0]),
@@ -1348,6 +1438,7 @@ fn expand_reply(
     vm: &Vm,
     module: &lamella_cil_runtime::Module,
     request: &[u8],
+    string_values: bool,
 ) -> Vec<u8> {
     let empty = alloc::vec![0u8, 0u8, 0u8, 0u8];
     let (Some(frame_bytes), Some(&root_kind), Some(slot_bytes), Some(&path_len)) = (
@@ -1402,7 +1493,7 @@ fn expand_reply(
         let len = name.len().min(255);
         payload.push(len as u8);
         payload.extend_from_slice(&name[..len]);
-        encode_value(vm, module, &child.value, &mut payload);
+        encode_value(vm, module, &child.value, string_values, &mut payload);
     }
     payload
 }
@@ -1416,48 +1507,31 @@ fn expand_reply(
 #[cfg(feature = "baked-image")]
 const RUN_SERVICE_STEPS: u32 = 256;
 
-/// How much of each of a run's output streams has already gone out as a [`debug::EVT_OUTPUT`] frame.
+/// Sends what the program has produced on each stream and not yet sent, as [`debug::EVT_OUTPUT`]
+/// frames, and then has the VM forget it ([`Vm::discard_output`]).
 ///
-/// One cursor per stream, held across a whole run so a program that prints in a loop streams once
-/// per service point rather than re-sending its history.
-#[cfg(feature = "baked-image")]
-#[derive(Clone, Copy, Debug, Default)]
-struct OutputCursors {
-    /// Units of `vm.output()` already sent on [`debug::output::STDOUT`].
-    stdout: usize,
-    /// Units of `vm.debug_output()` already sent on [`debug::output::DEBUG`].
-    debug: usize,
-}
-
-#[cfg(feature = "baked-image")]
-impl OutputCursors {
-    /// The cursors positioned at everything the machine has ALREADY produced, so a resume streams
-    /// what happens next rather than replaying what the host has seen.
-    fn at_end_of(vm: &Vm) -> Self {
-        Self { stdout: vm.output().len(), debug: vm.debug_output().len() }
-    }
-}
-
-/// Sends whatever the program has produced on each stream since the cursors, as
-/// [`debug::EVT_OUTPUT`] frames, and advances the cursors past what went out.
+/// **The VM's buffers ARE the record of what has not gone out.** A unit leaves them only once it has
+/// been sent, so nothing is lost and nothing is sent twice, however a run's steps, resumes and
+/// service points interleave. And a program that prints for as long as it runs holds only what it
+/// printed since the last service point, rather than a copy of everything it has ever printed.
 ///
-/// The delta is taken from the VM's own buffers rather than a tap, because a buffer IS the record
-/// and a cursor over it cannot lose a write or double-send one -- whereas a tap is a `fn` pointer
+/// The output is taken from the VM's own buffers rather than a tap, because a tap is a `fn` pointer
 /// that cannot capture this transport, and a side buffer for it would be a second copy of the same
 /// bytes with its own overflow question.
 ///
-/// Nothing is sent when there is nothing new, so an idle or silent program adds no wire traffic.
+/// Nothing is sent when there is nothing new, so an idle or silent program adds no wire traffic. A
+/// carrier failure leaves the unsent output where it was.
 #[cfg(feature = "baked-image")]
-fn stream_output(
-    transport: &mut impl Transport,
-    vm: &Vm,
-    sent: &mut OutputCursors,
-) -> Result<(), TransportError> {
-    stream_units(transport, debug::output::STDOUT, vm.output(), &mut sent.stdout)?;
-    stream_units(transport, debug::output::DEBUG, vm.debug_output(), &mut sent.debug)
+fn stream_output(transport: &mut impl Transport, vm: &mut Vm) -> Result<(), TransportError> {
+    let sent = stream_units(transport, debug::output::STDOUT, vm.output())?;
+    vm.discard_output(sent);
+    let sent = stream_units(transport, debug::output::DEBUG, vm.debug_output())?;
+    vm.discard_debug_output(sent);
+    Ok(())
 }
 
-/// One stream's unsent tail as an [`debug::EVT_OUTPUT`] frame: `stream(u8)`, `flags(u8)`, bytes.
+/// One stream's unsent units as an [`debug::EVT_OUTPUT`] frame (`stream(u8)`, `flags(u8)`, bytes),
+/// answering how many of them went out.
 ///
 /// A TRAILING HIGH SURROGATE IS HELD BACK, so a frame never carries half of a pair: the host can
 /// then decode each frame on its own. It costs one comparison here and saves every host a
@@ -1467,21 +1541,16 @@ fn stream_units(
     transport: &mut impl Transport,
     stream: u8,
     units: &[u16],
-    sent: &mut usize,
-) -> Result<(), TransportError> {
+) -> Result<usize, TransportError> {
     let mut end = units.len();
-    if end <= *sent {
-        return Ok(());
-    }
-    if matches!(units[end - 1], 0xD800..=0xDBFF) {
+    if end > 0 && matches!(units[end - 1], 0xD800..=0xDBFF) {
         end -= 1;
-        if end <= *sent {
-            return Ok(());
-        }
     }
-    let text = String::from_utf16_lossy(&units[*sent..end]);
-    *sent = end;
-    send_output(transport, stream, &text)
+    if end == 0 {
+        return Ok(0);
+    }
+    send_output(transport, stream, &String::from_utf16_lossy(&units[..end]))?;
+    Ok(end)
 }
 
 /// One [`debug::EVT_OUTPUT`] frame of `text` on `stream`.
@@ -1495,10 +1564,16 @@ fn send_output(
     text: &str,
 ) -> Result<(), TransportError> {
     let mut payload = Vec::with_capacity(2 + text.len());
-    payload.push(stream);
-    payload.push(if text.ends_with('\n') { debug::output::ENDS_ON_LINE_BOUNDARY } else { 0 });
+    payload.extend_from_slice(&output_header(stream, text));
     payload.extend_from_slice(text.as_bytes());
     transport.send(debug::EVT_OUTPUT, 0, &payload)
+}
+
+/// The two bytes an [`debug::EVT_OUTPUT`] payload starts with: `stream(u8)`, and `flags(u8)` saying
+/// whether `text` ends on a line boundary. Shared by [`send_output`] and [`report_abort`], which
+/// cannot allocate a payload to put them in.
+fn output_header(stream: u8, text: &str) -> [u8; 2] {
+    [stream, if text.ends_with('\n') { debug::output::ENDS_ON_LINE_BOUNDARY } else { 0 }]
 }
 
 /// Report a RUNTIME FAULT -- a trap, a request the tier cannot serve -- on the ERROR stream, and
@@ -1539,6 +1614,25 @@ fn fault_stop(
     send_stopped(transport, seq, debug::reason::TRAP, (0, 0), Some(TRAP_EXIT))
 }
 
+/// [`fault_stop`] for a sender that cannot allocate: `text` on the error stream, then a TRAP stop
+/// carrying the trap exit code, written a byte at a time to `sink`.
+///
+/// **This is for a firmware's panic handler and fault vector.** The likeliest panic on a small part
+/// is an exhausted heap, so a report that allocated would fail in exactly the case it exists for.
+/// With it, a host ends a debug session or a deployed run with `text` as the reason. Without it, the
+/// host watches the program stop talking and is left to guess why.
+///
+/// Both frames go at sequence 0, as a deployed run's announcement does, because the handler cannot
+/// know which request the program was running for, or whether it was running for one. `sink` is the
+/// firmware's raw byte output: the carrier its transport writes to.
+#[cfg(feature = "baked-image")]
+pub fn report_abort(text: &str, sink: &mut dyn FnMut(u8)) {
+    let header = output_header(debug::output::STDERR, text);
+    lamella_wire::write_frame(debug::EVT_OUTPUT, 0, &[&header, text.as_bytes()], sink);
+    let (stop, len) = stop_payload(debug::reason::TRAP, (0, 0), Some(TRAP_EXIT));
+    lamella_wire::write_frame(debug::EVT_STOPPED, 0, &[&stop[..len]], sink);
+}
+
 /// The exit code a trapped run reports, matching the interpreter's abort convention.
 const TRAP_EXIT: i32 = 70;
 
@@ -1564,7 +1658,6 @@ fn step_to_depth(
     vm: &mut Vm,
     session: &mut lamella_cil_runtime::Session,
     floor: Option<usize>,
-    sent: &mut OutputCursors,
     caps: lamella_wire::Capabilities,
 ) -> Result<RunStop, TransportError> {
     use lamella_cil_runtime::Status;
@@ -1572,28 +1665,28 @@ fn step_to_depth(
     loop {
         match session.step(module, vm) {
             Ok(Status::Done(value)) => {
-                stream_output(transport, vm, sent)?;
+                stream_output(transport, vm)?;
                 return Ok(RunStop::Done(run_result_of(vm, &value)));
             }
             Err(trap) => {
-                stream_output(transport, vm, sent)?;
+                stream_output(transport, vm)?;
                 return Ok(RunStop::Trap(fault(transport, vm, &format!("TRAP: {trap}"))?));
             }
             Ok(Status::Running | Status::Paused) => {}
         }
         let landed = floor.is_none_or(|floor| session.depth() <= floor && session.depth() > 0);
         if session.is_at_breakpoint() {
-            stream_output(transport, vm, sent)?;
+            stream_output(transport, vm)?;
             return Ok(RunStop::Breakpoint);
         }
         if landed {
-            stream_output(transport, vm, sent)?;
+            stream_output(transport, vm)?;
             return Ok(RunStop::Stepped);
         }
         until_service -= 1;
         if until_service == 0 {
             until_service = RUN_SERVICE_STEPS;
-            stream_output(transport, vm, sent)?;
+            stream_output(transport, vm)?;
             if let Some(stop) = service_wire(transport, session, caps)? {
                 return Ok(stop);
             }
@@ -1665,16 +1758,15 @@ fn run_until_stop(
     caps: lamella_wire::Capabilities,
 ) -> Result<RunStop, TransportError> {
     use lamella_cil_runtime::{PendingOp, Status};
-    let mut sent = OutputCursors::at_end_of(vm);
     loop {
         for _ in 0..RUN_SERVICE_STEPS {
             match session.step(module, vm) {
                 Ok(Status::Done(value)) => {
-                    stream_output(transport, vm, &mut sent)?;
+                    stream_output(transport, vm)?;
                     return Ok(RunStop::Done(run_result_of(vm, &value)));
                 }
                 Err(trap) => {
-                    stream_output(transport, vm, &mut sent)?;
+                    stream_output(transport, vm)?;
                     return Ok(RunStop::Trap(fault(
                         transport,
                         vm,
@@ -1683,7 +1775,7 @@ fn run_until_stop(
                 }
                 Ok(Status::Running | Status::Paused) => {
                     if session.is_at_breakpoint() {
-                        stream_output(transport, vm, &mut sent)?;
+                        stream_output(transport, vm)?;
                         return Ok(RunStop::Breakpoint);
                     }
                 }
@@ -1691,13 +1783,13 @@ fn run_until_stop(
             match lamella_cil_runtime::take_pending_op(vm) {
                 PendingOp::None | PendingOp::Yield => {}
                 PendingOp::SleepUntil(deadline) => {
-                    stream_output(transport, vm, &mut sent)?;
+                    stream_output(transport, vm)?;
                     if let Some(stop) = wait_until(transport, vm, session, deadline, caps)? {
                         return Ok(stop);
                     }
                 }
                 PendingOp::NeedsScheduler(what) => {
-                    stream_output(transport, vm, &mut sent)?;
+                    stream_output(transport, vm)?;
                     return Ok(RunStop::Trap(fault(
                         transport,
                         vm,
@@ -1709,7 +1801,7 @@ fn run_until_stop(
                 }
             }
         }
-        stream_output(transport, vm, &mut sent)?;
+        stream_output(transport, vm)?;
         if let Some(stop) = service_wire(transport, session, caps)? {
             return Ok(stop);
         }
@@ -1829,7 +1921,7 @@ pub fn run_debug_session_static(
         Err(trap) => return fault_stop(transport, image_seq, &format!("session: {trap}")),
     };
     let mut at_reported_breakpoint = false;
-    let mut sent = OutputCursors::at_end_of(&vm);
+    stream_output(transport, &mut vm)?;
     send_stopped(transport, image_seq, reason::ENTRY, debug_location(&session), None)?;
 
     loop {
@@ -1845,7 +1937,7 @@ pub fn run_debug_session_static(
                     _ => None,
                 };
                 let stop =
-                    step_to_depth(transport, &module, &mut vm, &mut session, floor, &mut sent, caps)?;
+                    step_to_depth(transport, &module, &mut vm, &mut session, floor, caps)?;
                 if !report_stop(transport, frame.seq, stop, &session, &mut at_reported_breakpoint)? {
                     return Ok(());
                 }
@@ -1853,7 +1945,7 @@ pub fn run_debug_session_static(
             debug::DBG_RESUME => {
                 if at_reported_breakpoint {
                     let stepped =
-                        step_to_depth(transport, &module, &mut vm, &mut session, None, &mut sent, caps)?;
+                        step_to_depth(transport, &module, &mut vm, &mut session, None, caps)?;
                     if !matches!(stepped, RunStop::Stepped | RunStop::Breakpoint) {
                         report_stop(transport, frame.seq, stepped, &session, &mut at_reported_breakpoint)?;
                         return Ok(());
@@ -1882,18 +1974,20 @@ pub fn run_debug_session_static(
                 transport.send(debug::DBG_FRAMES, frame.seq, &payload)?;
             }
             debug::DBG_LOCALS => {
-                let payload = locals_reply(&session, &vm, &module, &frame.payload);
+                let payload =
+                    locals_reply(&session, &vm, &module, &frame.payload, string_values_now());
                 transport.send(debug::DBG_VARS, frame.seq, &payload)?;
             }
             debug::DBG_EXPAND => {
-                let payload = expand_reply(&session, &vm, &module, &frame.payload);
+                let payload =
+                    expand_reply(&session, &vm, &module, &frame.payload, string_values_now());
                 transport.send(debug::DBG_CHILDREN, frame.seq, &payload)?;
             }
             debug::DBG_PAUSE => {
                 send_stopped(transport, frame.seq, reason::PAUSED, debug_location(&session), None)?;
             }
             debug::ABORT => {
-                stream_output(transport, &vm, &mut sent)?;
+                stream_output(transport, &mut vm)?;
                 return send_stopped(
                     transport,
                     frame.seq,
@@ -2082,7 +2176,7 @@ fn run_image_reporting(
     image: &'static [u8],
     corlib: Option<&'static [u8]>,
     configure: &mut dyn FnMut(&mut Vm),
-    service: &mut dyn FnMut(&Vm) -> bool,
+    service: &mut dyn FnMut(&mut Vm) -> bool,
 ) -> (RunResult, Option<String>) {
     let (module, entry) = match load_deployed(image, corlib) {
         Ok(booted) => booted,
@@ -2469,11 +2563,10 @@ fn run_image_streaming(
     corlib: Option<&'static [u8]>,
     configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<PlainRun, TransportError> {
-    let mut sent = OutputCursors::default();
     let mut carrier: Result<(), TransportError> = Ok(());
     let mut aborted = None;
     let (result, fault) = run_image_reporting(image, corlib, configure, &mut |vm| {
-        if let Err(error) = stream_output(transport, vm, &mut sent) {
+        if let Err(error) = stream_output(transport, vm) {
             carrier = Err(error);
             return false;
         }
@@ -2490,7 +2583,7 @@ fn run_image_streaming(
         }
     });
     carrier?;
-    stream_final(transport, &result, &mut sent)?;
+    stream_final(transport, &result)?;
     if let Some(text) = &fault {
         send_output(transport, debug::output::STDERR, text)?;
     }
@@ -2508,16 +2601,15 @@ fn run_image_streaming(
 
 /// Flush whatever a finished run produced after its last service point.
 ///
-/// The machine is gone by the time a plain run returns -- `run_image_static` owns and drops it -- so
-/// what is left to send is the difference between the merged result text and what already went out.
+/// The machine is gone by the time a plain run returns -- `run_image_static` owns and drops it -- and
+/// the `stdout` it handed back is exactly what had not gone out yet, because the run's service let go
+/// of everything it sent.
 #[cfg(feature = "baked-image")]
-fn stream_final(
-    transport: &mut impl Transport,
-    result: &RunResult,
-    sent: &mut OutputCursors,
-) -> Result<(), TransportError> {
-    let units: Vec<u16> = result.stdout.encode_utf16().collect();
-    stream_units(transport, debug::output::STDOUT, &units, &mut sent.stdout)
+fn stream_final(transport: &mut impl Transport, result: &RunResult) -> Result<(), TransportError> {
+    if result.stdout.is_empty() {
+        return Ok(());
+    }
+    send_output(transport, debug::output::STDOUT, &result.stdout)
 }
 
 /// The profile manifest as a chunk answering `PROFILE_GET`'s offset: `offset(u32 LE)`,
@@ -2668,7 +2760,11 @@ fn serve_deploy_frame(
                     let total =
                         u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
                     let chunk = &payload[CHUNK_HEADER_LEN..];
-                    if flash.program_chunk(offset, chunk, total) {
+                    let window = flash.window_len();
+                    if total > window || offset.saturating_add(chunk.len()) > window {
+                        load.forget_deployed_prefix();
+                        (xfer::RANGE_REJECTED, 0)
+                    } else if flash.program_chunk(offset, chunk, total) {
                         let read_back = flash.image_slice();
                         (xfer::MATCHED, load.deployed_prefix_crc(read_back, offset, chunk.len()))
                     } else {
@@ -2692,10 +2788,12 @@ fn serve_deploy_frame(
                     None => (deploy::deploy_state::NONE, 0u64),
                 };
             let tier = if state == deploy::deploy_state::VERIFIED { exec::tier::CIL } else { 0 };
-            let mut payload = [0u8; 10];
+            let window = u32::try_from(flash.window_len()).unwrap_or(u32::MAX);
+            let mut payload = [0u8; 14];
             payload[0] = state;
             payload[1] = tier;
-            payload[2..].copy_from_slice(&checksum.to_le_bytes());
+            payload[2..10].copy_from_slice(&checksum.to_le_bytes());
+            payload[10..].copy_from_slice(&window.to_le_bytes());
             transport.send(deploy::DEPLOY_STATUS_RESULT, frame.seq, &payload)?;
         }
         lamella_wire::msg::EXTENDED => {
@@ -2893,18 +2991,16 @@ pub fn run_deployed_with(
     let entry = match lamella_cil_runtime::boot_baked(module, &mut vm, entry) {
         Ok(entry) => entry,
         Err(trap) => {
-            let mut sent = OutputCursors::default();
-            stream_output(transport, &vm, &mut sent)?;
+            stream_output(transport, &mut vm)?;
             let result =
                 fault(transport, &vm, &format!("BOOT TRAP (static constructor): {trap}"))?;
             return Ok(completed(transport, result, debug::reason::TRAP));
         }
     };
     let mut carrier: Result<(), TransportError> = Ok(());
-    let mut sent = OutputCursors::default();
     let mut aborted = None;
     let outcome = lamella_cil_runtime::run_interruptible(module, &mut vm, entry, Vec::new(), &mut |vm| {
-        if let Err(error) = stream_output(transport, vm, &mut sent) {
+        if let Err(error) = stream_output(transport, vm) {
             carrier = Err(error);
             return false;
         }
@@ -2943,7 +3039,7 @@ pub fn run_deployed_with(
         }
     });
     carrier?;
-    stream_output(transport, &vm, &mut sent)?;
+    stream_output(transport, &mut vm)?;
     if let Some(seq) = aborted {
         send_stopped(transport, seq, debug::reason::ABORTED, (0, 0), None)?;
         return Ok(Deployed::Interrupted);
@@ -3225,6 +3321,8 @@ impl ReplSessionState {
         self.instance = current_instance(&self.vm, self.root_slot)
             .map_err(SubmitError::Trapped)?;
         let output = String::from_utf16_lossy(&self.vm.output()[output_before..]);
+        self.vm.discard_output(self.vm.output().len());
+        self.vm.discard_debug_output(self.vm.debug_output().len());
 
         Ok(SubmitOutcome {
             new_fields,
@@ -4376,14 +4474,15 @@ mod tests {
         assert!(arena.held().is_none(), "a clear reclaims the completed artifact too");
     }
 
-    /// Output streams as a DELTA, never re-sent, never split mid-character, and on the stream it
-    /// was written to.
+    /// Output streams as a DELTA, never re-sent, never split mid-character, on the stream it was
+    /// written to -- and what went out is let go.
     ///
-    /// The four ways this can be quietly wrong are a missed delta (output that never arrives), a
+    /// The five ways this can be quietly wrong are a missed delta (output that never arrives), a
     /// re-sent one (the console repeats itself), a chunk cut through a surrogate pair (the host
-    /// decodes a replacement character for text the program did write), and the debug channel
-    /// arriving as standard output (which is what a device debugger saw for as long as the wire
-    /// carried one stream). Each gets a row.
+    /// decodes a replacement character for text the program did write), the debug channel arriving
+    /// as standard output (which is what a device debugger saw for as long as the wire carried one
+    /// stream), and a sent unit kept (a program that prints for as long as it runs holds all of it,
+    /// until a device runs out of memory). Each gets a row.
     #[cfg(feature = "baked-image")]
     #[test]
     fn output_streams_as_a_delta_on_its_own_stream_and_never_splits_a_surrogate_pair() {
@@ -4406,13 +4505,12 @@ mod tests {
 
         let mut vm = Vm::new();
         let mut host = MemTransport::new();
-        let mut sent = OutputCursors::default();
 
-        stream_output(&mut host, &vm, &mut sent).unwrap();
+        stream_output(&mut host, &mut vm).unwrap();
         assert!(taken(&mut host).is_empty(), "an empty delta must send nothing at all");
 
         vm.write(&"first\n".encode_utf16().collect::<Vec<u16>>());
-        stream_output(&mut host, &vm, &mut sent).unwrap();
+        stream_output(&mut host, &mut vm).unwrap();
         assert_eq!(
             taken(&mut host),
             alloc::vec![(
@@ -4421,13 +4519,14 @@ mod tests {
                 "first\n".to_string()
             )]
         );
+        assert!(vm.output().is_empty(), "a sent line is let go, not kept");
 
-        stream_output(&mut host, &vm, &mut sent).unwrap();
+        stream_output(&mut host, &mut vm).unwrap();
         assert!(taken(&mut host).is_empty(), "an unchanged buffer must not be re-sent");
 
         vm.debug_write(&"trace".encode_utf16().collect::<Vec<u16>>());
         vm.write(&"second".encode_utf16().collect::<Vec<u16>>());
-        stream_output(&mut host, &vm, &mut sent).unwrap();
+        stream_output(&mut host, &mut vm).unwrap();
         assert_eq!(
             taken(&mut host),
             alloc::vec![
@@ -4436,16 +4535,19 @@ mod tests {
             ],
             "two streams, two frames, and neither flagged as ending a line"
         );
+        assert!(vm.debug_output().is_empty(), "the debug channel lets go of what it sent too");
 
         vm.write(&[0xD83D]);
-        stream_output(&mut host, &vm, &mut sent).unwrap();
+        stream_output(&mut host, &mut vm).unwrap();
         assert!(taken(&mut host).is_empty(), "a trailing lead surrogate must wait for its trail");
+        assert_eq!(vm.output(), [0xD83D], "a unit that has not been sent is kept");
 
         vm.write(&[0xDE00]);
-        stream_output(&mut host, &vm, &mut sent).unwrap();
+        stream_output(&mut host, &mut vm).unwrap();
         let frames = taken(&mut host);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].2.as_bytes(), [0xF0, 0x9F, 0x98, 0x80], "the pair arrives as one character");
+        assert!(vm.output().is_empty());
     }
 
     #[cfg(feature = "baked-image")]
@@ -5190,6 +5292,196 @@ mod tests {
         assert_eq!(done.payload.len(), 14, "reason, site, exit and flags -- and no output tail");
     }
 
+    /// What a panic handler writes with [`report_abort`] ends a run the way any trap does: a host
+    /// collecting a run it did not start reads the text as the reason, and exit 70.
+    ///
+    /// The frames are compared with the ones the allocating path sends for the same report, so the
+    /// two cannot drift apart in how a stop or an output payload is laid out.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn an_abort_report_ends_a_run_as_a_trap_with_its_text() {
+        use lamella_wire::MemTransport;
+
+        let text = "PANIC: the board stopped the program\n";
+        let mut written = Vec::new();
+        report_abort(text, &mut |byte| written.push(byte));
+
+        let mut allocating = MemTransport::new();
+        fault_stop(&mut allocating, 0, text).unwrap();
+        assert_eq!(written, allocating.take_sent(), "the same two frames fault_stop sends at seq 0");
+
+        let mut driver = MemTransport::new();
+        driver.feed(&written);
+        let mut run = RunCollector::unprompted();
+        assert!(run.poll(&mut driver).unwrap(), "the TRAP stop ends the run");
+        assert_eq!(run.stderr, text, "the text arrives on the error stream");
+        let result = run.finish().expect("an ended run has a result");
+        assert_eq!(result.exit, 70);
+    }
+
+    /// A string crosses as its text only when both ends offered string values, and as an object
+    /// handle otherwise; a long string crosses as its start, cut at a character boundary, beside the
+    /// whole string's length.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_string_crosses_as_its_text_only_when_both_ends_offered_it() {
+        use lamella_cil_runtime::Value;
+        use lamella_wire::Capabilities;
+
+        let target = serve_caps_with(false, false);
+        assert!(target.has(Capabilities::STRING_VALUES), "this target offers string values");
+        let asked = Capabilities(Capabilities::STRING_VALUES);
+        assert!(string_values_agreed(asked, target), "both ends offered it");
+        assert!(!string_values_agreed(Capabilities(0), target), "a host that did not ask gets handles");
+        assert!(!string_values_agreed(asked, Capabilities(0)), "a target that does not offer it sends none");
+
+        fn string_payload(bytes: &[u8]) -> (u32, String) {
+            assert_eq!(bytes[0], debug::val::STRING);
+            let units = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+            let len = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+            assert_eq!(bytes.len(), 7 + len, "the text is the whole of the rest");
+            (units, String::from_utf8(bytes[7..].to_vec()).expect("the text is UTF-8"))
+        }
+        let module = lamella_cil_runtime::Module::default();
+        let mut vm = Vm::default();
+        let mut string = |text: &str| {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            Value::Object(vm.heap_mut().alloc_string(&units).expect("the string allocates"))
+        };
+        let label = string("sum");
+        let long = string(&"x".repeat(300));
+        let accent = string(&format!("{}\u{e9}", "x".repeat(199)));
+        let pair = string(&format!("{}\u{1F600}", "x".repeat(198)));
+        let split = string(&format!("{}\u{1F600}", "x".repeat(199)));
+        let encoded = |value: &Value, string_values: bool| {
+            let mut out = Vec::new();
+            encode_value(&vm, &module, value, string_values, &mut out);
+            out
+        };
+
+        assert_eq!(string_payload(&encoded(&label, true)), (3, "sum".to_string()));
+        let handle = encoded(&label, false);
+        assert_eq!((handle[0], handle.len()), (debug::val::OBJECT, 13), "not agreed: the handle, as before");
+        assert_eq!(string_payload(&encoded(&long, true)), (300, "x".repeat(200)));
+        assert_eq!(string_payload(&encoded(&accent, true)), (200, "x".repeat(199)));
+        assert_eq!(string_payload(&encoded(&pair, true)), (200, "x".repeat(198)));
+        assert_eq!(string_payload(&encoded(&split, true)), (201, "x".repeat(199)));
+    }
+
+    /// A line a resume printed is not sent again by the step after it.
+    ///
+    /// Break just after the program prints, resume to the breakpoint, then step: the host must
+    /// receive `hi` once. A resume and a step are two different ways a session runs the program,
+    /// and each has to know what the other already sent.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_line_a_resume_printed_is_not_sent_again_by_the_next_step() {
+        use lamella_wire::MemTransport;
+
+        let Ok(program) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wire-host/tests/fixtures/hello.exe"
+        )) else {
+            return;
+        };
+        let program: &'static [u8] = Box::leak(program.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+
+        fn frames_of(driver: &mut MemTransport) -> Vec<lamella_wire::Frame> {
+            let mut frames = Vec::new();
+            while let Some(frame) = driver.poll().unwrap() {
+                frames.push(frame);
+            }
+            frames
+        }
+
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        let mut arena = ArtifactLoad::new();
+        load_then_exec(&mut driver, 1, load::LOAD_IMAGE, &image, exec::exec_flags::START_HALTED);
+        for seq in 2..8 {
+            driver.send(debug::DBG_STEP, seq, &[]).unwrap();
+        }
+        driver.send(debug::DBG_DETACH, 8, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        drain_baked(&mut runner, &mut arena);
+        driver.feed(&runner.take_sent());
+        let mut printed_yet = false;
+        let mut after_the_print = None;
+        for frame in frames_of(&mut driver) {
+            if frame.msg_type == debug::EVT_OUTPUT {
+                printed_yet = true;
+            } else if frame.msg_type == debug::EVT_STOPPED
+                && frame.payload[0] == debug::reason::STEP
+                && printed_yet
+            {
+                after_the_print = Some(frame.payload[1..9].to_vec());
+                break;
+            }
+        }
+        let site = after_the_print.expect("single steps reach the point after the program prints");
+
+        let mut break_payload = 1u16.to_le_bytes().to_vec();
+        break_payload.extend_from_slice(&site);
+        load_then_exec(&mut driver, 10, load::LOAD_IMAGE, &image, exec::exec_flags::START_HALTED);
+        driver.send(debug::DBG_BREAK, 11, &break_payload).unwrap();
+        driver.send(debug::DBG_RESUME, 12, &[]).unwrap();
+        driver.send(debug::DBG_STEP, 13, &[]).unwrap();
+        driver.send(debug::DBG_RESUME, 14, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        drain_baked(&mut runner, &mut arena);
+        driver.feed(&runner.take_sent());
+        let frames = frames_of(&mut driver);
+
+        let stops: Vec<u8> = frames
+            .iter()
+            .filter(|frame| frame.msg_type == debug::EVT_STOPPED)
+            .map(|frame| frame.payload[0])
+            .collect();
+        assert_eq!(
+            stops,
+            [debug::reason::ENTRY, debug::reason::BREAKPOINT, debug::reason::STEP, debug::reason::DONE],
+            "the walk under test happened: the resume stopped at the breakpoint, and the step ran"
+        );
+        let printed: String = frames
+            .iter()
+            .filter(|frame| frame.msg_type == debug::EVT_OUTPUT)
+            .filter(|frame| frame.payload[0] == debug::output::STDOUT)
+            .map(|frame| String::from_utf8_lossy(&frame.payload[2..]).into_owned())
+            .collect();
+        assert_eq!(printed, "hi\n", "each line the program printed crosses the wire once");
+    }
+
+    /// A device REPL session lets go of each submission's output once it has handed it back.
+    ///
+    /// The session keeps ONE machine for its whole life, so anything that machine keeps, it keeps
+    /// until the session closes. A submission's output goes back in its own result; a copy left
+    /// behind in the machine is every line the session has ever printed, held on a device until its
+    /// memory runs out.
+    #[cfg(feature = "repl-session")]
+    #[test]
+    fn a_repl_session_lets_go_of_the_output_it_has_returned() {
+        use lamella_assemble::Session;
+
+        static CORLIB: &[u8] = include_bytes!("../../../tools/device-poc/corlib-kernel.dll");
+        let corlib = Assembly::read(CORLIB).expect("the kernel corlib parses as metadata");
+        let mut compiler = Session::new(&[corlib]);
+        let bootstrap = compiler.bootstrap().expect("the session bootstrap emits");
+        let mut state = ReplSessionState::open(&bootstrap, 0, Some(CORLIB), &mut |_vm| {})
+            .expect("the session opens");
+
+        for round in 0..3 {
+            let source = format!("System.Console.WriteLine(\"line {round}\");");
+            let delta = compiler.compile_submission(&source).delta.expect("the submission compiles");
+            let outcome = state.submit(&delta).unwrap_or_else(|_| panic!("`{source}` runs"));
+            assert_eq!(outcome.output, format!("line {round}\n"), "a submission returns its own output");
+            assert!(state.vm.output().is_empty(), "and the session keeps none of it (round {round})");
+        }
+    }
+
     #[cfg(feature = "baked-image")]
     #[test]
     fn a_hello_mid_debug_session_ends_it_for_the_new_host() {
@@ -5242,6 +5534,9 @@ mod tests {
     impl FlashSink for MockFlash {
         fn image_slice(&self) -> &'static [u8] {
             &[]
+        }
+        fn window_len(&self) -> usize {
+            usize::MAX
         }
         fn erase(&mut self) {
             self.data.clear();
@@ -5344,6 +5639,61 @@ mod tests {
             acks.push((ack.payload[0], crc));
         }
         acks
+    }
+
+    /// A deploy window bounded the way every firmware's flash sink bounds one: a chunk is refused
+    /// when the artifact it belongs to, or the chunk itself, would reach past the region.
+    #[cfg(feature = "baked-image")]
+    struct Bounded(&'static [u8]);
+
+    #[cfg(feature = "baked-image")]
+    impl FlashSink for Bounded {
+        fn image_slice(&self) -> &'static [u8] {
+            self.0
+        }
+        fn erase(&mut self) {}
+        fn program(&mut self, image: &[u8]) -> bool {
+            image.len() <= self.0.len()
+        }
+        fn program_chunk(&mut self, offset: usize, chunk: &[u8], total: usize) -> bool {
+            total <= self.0.len() && offset + chunk.len() <= self.0.len()
+        }
+    }
+
+    /// **A board says how large its deploy window is when it is asked what it holds**, so a host can
+    /// refuse an image that does not fit before it sends a byte of it.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn deploy_status_reports_the_window_a_deploy_can_fill() {
+        use lamella_wire::MemTransport;
+
+        let mut flash = Bounded(Box::leak(vec![0xFF; 4096].into_boxed_slice()));
+        let mut arena = ArtifactLoad::new();
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        driver.send(deploy::DEPLOY_STATUS, 5, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert_eq!(serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap(), Served::Handled);
+        driver.feed(&runner.take_sent());
+        let reply = driver.poll().unwrap().expect("a status reply");
+        assert_eq!(reply.msg_type, deploy::DEPLOY_STATUS_RESULT);
+        assert_eq!(
+            reply.payload.get(10..14),
+            Some(&4096u32.to_le_bytes()[..]),
+            "the window's length follows the state, the tier and the checksum"
+        );
+    }
+
+    /// **An artifact larger than the window is refused as out of RANGE, not as a failed write.** The
+    /// bytes crossed intact and the flash is fine, and a host told "the write failed" sends its user
+    /// to the cable.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn an_artifact_larger_than_the_window_is_refused_as_out_of_range() {
+        let mut flash = Bounded(Box::leak(vec![0xFF; 4096].into_boxed_slice()));
+        let first = [0x5Au8; 64];
+        let acks = deploy_chunks(&mut flash, 8192, &[(0, &first)]);
+        assert_eq!(acks[0].0, deploy::xfer::RANGE_REJECTED, "the first chunk declares the whole artifact");
     }
 
     #[cfg(feature = "baked-image")]

@@ -33,6 +33,8 @@ FACTS = {
         "adc_base": 0x43002000,
         "gclk_pchctrl_reg": 0x40001D24,
         "gclk_pchctrl_value": 0x40,
+        "core_clock_hz": 48000000,
+        "prescaler": 1,
         "apb_mask_reg": 0x40000820,
         "apb_mask": 0x100,
         "calib_reg": 0x43002048,

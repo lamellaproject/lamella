@@ -2057,6 +2057,7 @@ fn emit_interface(
         .model()
         .get_by_symbol(&enclosing)
         .and_then(|info| info.enclosing.clone());
+    let own_parameters = type_parameter_names(binder, &enclosing, declaration);
     let type_token = match continuation {
         Some(token) => token,
         None => {
@@ -2077,39 +2078,14 @@ fn emit_interface(
                 image,
                 tokens,
                 token,
-                &type_parameter_names(binder, &enclosing, declaration),
+                &own_parameters,
                 &declaration.constraints,
             );
             token
         }
     };
-    let direct: Vec<TypeSymbol> = if continuation.is_some() {
-        Vec::new()
-    } else {
-        binder
-            .model()
-            .get_by_symbol(&enclosing)
-            .map(|info| {
-                info.bases
-                    .iter()
-                    .filter_map(|base| binder.model().resolve_interface_base(base))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let mut interfaces: Vec<TypeSymbol> = Vec::new();
-    for interface in direct {
-        collect_interface_closure(binder.model(), interface, &mut interfaces);
-    }
-    let mut interface_tokens: Vec<Token> = Vec::new();
-    for interface in &interfaces {
-        mint_named_type_token(interface, image, tokens);
-        if let Some(token) = tokens.type_token(interface) {
-            interface_tokens.push(token);
-        }
-    }
-    for interface in interface_tokens {
-        image.add_interface_impl(type_token, interface);
+    if continuation.is_none() {
+        emit_interface_impls(image, binder, tokens, &enclosing, &own_parameters, type_token);
     }
     for member in &declaration.members {
         if let Member::Method {
@@ -2238,12 +2214,11 @@ fn emit_interface(
         } = member
         {
             let event_ty = binder.canonicalize(&bind_type(ty));
-            let event_type_token =
-                tokens
-                    .type_token(&event_ty)
-                    .ok_or(crate::EmitError::Unsupported(
-                        "an interface event whose delegate type has no metadata token",
-                    ))?;
+            let event_type_token = event_type_token(&event_ty, image, tokens).ok_or(
+                crate::EmitError::Unsupported(
+                    "an interface event whose delegate type has no metadata token",
+                ),
+            )?;
             let signature = method_signature(true, &[member_type_sig(tokens, &enclosing, &event_ty)?], &TypeSig::Void);
             for declarator in declarators {
                 let event = image.add_event(&declarator.name, event_type_token);
@@ -2509,6 +2484,52 @@ fn collect_interface_closure(model: &Model, interface: TypeSymbol, closure: &mut
     closure.push(interface);
     for base in bases {
         collect_interface_closure(model, base, closure);
+    }
+}
+
+/// Writes a type header's `InterfaceImpl` rows (II.22.23): the transitive closure of the
+/// interfaces named after its `:`, each resolved through the model, so an unqualified
+/// `using`-imported interface (`IEnumerator`) is recognized as well as a fully-qualified one.
+///
+/// One list serves both headers: a class states the interfaces it implements, and an interface
+/// the interfaces it derives from, in the same rows by the same rule. The declaring type's type
+/// parameters are in scope while the list is minted -- the enclosing chain's first, then the
+/// type's own -- so `IEnumerable<T>` in the header of `Bag<T>` is `IEnumerable<!0>`, and each
+/// constructed interface is declared through its `TypeSpec`. A partial type calls this from its
+/// first part only, because the model already holds every part's bases unioned.
+fn emit_interface_impls(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &mut Tokens,
+    declaring: &TypeSymbol,
+    own_parameters: &[Box<str>],
+    type_token: Token,
+) {
+    let direct: Vec<TypeSymbol> = binder
+        .model()
+        .get_by_symbol(declaring)
+        .map(|info| {
+            info.bases
+                .iter()
+                .filter_map(|base| binder.model().resolve_interface_base(base))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut interfaces: Vec<TypeSymbol> = Vec::new();
+    for interface in direct {
+        collect_interface_closure(binder.model(), interface, &mut interfaces);
+    }
+    let mut interface_tokens: Vec<Token> = Vec::new();
+    let saved_scope = tokens.enter_body_scope(&[], own_parameters);
+    for interface in &interfaces {
+        mint_named_type_token(interface, image, tokens);
+        if let Some(token) = tokens.instruction_type_token(interface) {
+            interface_tokens.push(token);
+        }
+    }
+    tokens.restore_body_scope(saved_scope);
+    for interface in interface_tokens {
+        image.add_interface_impl(type_token, interface);
     }
 }
 
@@ -3043,35 +3064,8 @@ fn emit_type_inner(
         image,
         tokens,
     )?;
-    let direct_interfaces: Vec<TypeSymbol> = if continuation.is_some() {
-        Vec::new()
-    } else {
-        binder
-            .model()
-            .get_by_symbol(&enclosing)
-            .map(|info| {
-                info.bases
-                    .iter()
-                    .filter_map(|base| binder.model().resolve_interface_base(base))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let mut interfaces: Vec<TypeSymbol> = Vec::new();
-    for interface in direct_interfaces {
-        collect_interface_closure(binder.model(), interface, &mut interfaces);
-    }
-    let mut interface_tokens: Vec<Token> = Vec::new();
-    let saved_scope = tokens.enter_body_scope(&[], &own_parameters);
-    for interface in &interfaces {
-        mint_named_type_token(interface, image, tokens);
-        if let Some(token) = tokens.instruction_type_token(interface) {
-            interface_tokens.push(token);
-        }
-    }
-    tokens.restore_body_scope(saved_scope);
-    for interface in interface_tokens {
-        image.add_interface_impl(type_token, interface);
+    if continuation.is_none() {
+        emit_interface_impls(image, binder, tokens, &enclosing, &own_parameters, type_token);
     }
     for member in &declaration.members {
         if let Member::Field {
@@ -3668,11 +3662,11 @@ fn emit_instance_lambda_rows(
 
 /// Emits a field-like event (17.7): `add_E`/`remove_E` accessors that combine/remove
 /// a handler on the private backing field (`E += value` / `E -= value`, via the existing
-/// delegate-combine lowering), plus an Event row linking them through MethodSemantics. When
-/// the event implements an interface event (13.4.4), its accessors take the interface-impl
-/// slot flags (Virtual | NewSlot | Final | HideBySig, II.23.1.10), filling the interface's
-/// accessor slots as an interface-implementing property's accessors do; otherwise they are
-/// plain public non-virtual.
+/// delegate-combine lowering), plus an Event row linking them through MethodSemantics. The
+/// accessors take the event's accessibility, and their slot from [`member_slot_flags`]: the
+/// slot the event's own modifiers ask for, or, when it has none and implements an interface
+/// event (13.4.4), the interface-impl slot flags (Virtual | NewSlot | Final | HideBySig,
+/// II.23.1.10) that fill the interface's accessor slots.
 #[allow(clippy::too_many_arguments)]
 fn emit_event(
     image: &mut ImageBuilder,
@@ -3686,28 +3680,21 @@ fn emit_event(
 ) -> Result<Token, crate::EmitError> {
     let is_static = modifiers.contains(&Modifier::Static);
     let void = TypeSymbol::Special(SpecialType::Void);
-    let interface_impl = binder.member_implements_interface(
-        enclosing,
-        &accessor_name("add_", name),
-        &[event_ty.clone()],
-    );
-    let flags = if interface_impl && !is_static {
-        METHOD_PUBLIC
-            | METHOD_VIRTUAL
-            | METHOD_NEWSLOT
-            | METHOD_FINAL
-            | METHOD_HIDEBYSIG
-            | SPECIAL_NAME
-    } else {
-        member_visibility(modifiers)
-            | SPECIAL_NAME
-            | METHOD_HIDEBYSIG
-            | if is_static {
-                METHOD_STATIC
-            } else {
-                slot_flags(modifiers, member_visibility(modifiers))
-            }
-    };
+    let flags = member_visibility(modifiers)
+        | SPECIAL_NAME
+        | METHOD_HIDEBYSIG
+        | if is_static {
+            METHOD_STATIC
+        } else {
+            member_slot_flags(
+                binder,
+                enclosing,
+                modifiers,
+                member_visibility(modifiers),
+                &accessor_name("add_", name),
+                &[event_ty.clone()],
+            )
+        };
     let params = [(
         Box::<str>::from("value"),
         event_ty.clone(),
@@ -3765,11 +3752,9 @@ fn emit_event(
         )?;
         (add, remove)
     };
-    let event_type_token = tokens
-        .type_token(event_ty)
-        .ok_or(crate::EmitError::Unsupported(
-            "an event whose delegate type has no metadata token",
-        ))?;
+    let event_type_token = event_type_token(event_ty, image, tokens).ok_or(
+        crate::EmitError::Unsupported("an event whose delegate type has no metadata token"),
+    )?;
     let event = image.add_event(name, event_type_token);
     image.add_method_semantics(SEMANTICS_ADDON, add, event);
     image.add_method_semantics(SEMANTICS_REMOVEON, remove, event);
@@ -3779,7 +3764,8 @@ fn emit_event(
 /// Emits a custom-accessor event (`event H E { add {...} remove {...} }`, 17.7.1): its
 /// user-written add/remove bodies plus an Event row. An explicit-interface event names its
 /// accessors `I.add_E`/`I.remove_E`, private hidebysig newslot virtual final with a
-/// MethodImpl (like an explicit method); an ordinary one's accessors are public.
+/// MethodImpl (like an explicit method); an ordinary one's accessors take the event's
+/// accessibility and their slot from [`member_slot_flags`], as a field-like event's do.
 ///
 /// A `static` event's accessors are static too (17.7.1) -- `is_static` carries the declared
 /// modifier to both the accessor flags (II.23.1.10 Static) and the body's frame, where it
@@ -3816,7 +3802,14 @@ fn emit_custom_event(
             | if is_static {
                 METHOD_STATIC
             } else {
-                slot_flags(modifiers, member_visibility(modifiers))
+                member_slot_flags(
+                    binder,
+                    enclosing,
+                    modifiers,
+                    member_visibility(modifiers),
+                    &accessor_name("add_", name),
+                    &[event_ty.clone()],
+                )
             }
     };
     let params = [(
@@ -3854,11 +3847,9 @@ fn emit_custom_event(
     };
     let add = accessor_token("add_", add_body, image, binder, tokens)?;
     let remove = accessor_token("remove_", remove_body, image, binder, tokens)?;
-    let event_type_token = tokens
-        .type_token(event_ty)
-        .ok_or(crate::EmitError::Unsupported(
-            "an event whose delegate type has no metadata token",
-        ))?;
+    let event_type_token = event_type_token(event_ty, image, tokens).ok_or(
+        crate::EmitError::Unsupported("an event whose delegate type has no metadata token"),
+    )?;
     let event_name = match explicit_interface {
         Some(interface) => explicit_interface_member_name(interface, name),
         None => String::from(name),
@@ -3871,6 +3862,27 @@ fn emit_custom_event(
         image.add_method_semantics(SEMANTICS_REMOVEON, remove, event);
     }
     Ok(event)
+}
+
+/// The token an `Event` row names its delegate type by. The row's type column is a `TypeDefOrRef`
+/// coded index, which may name a `TypeDef`, a `TypeRef` or a `TypeSpec` (ECMA-335 II.22.13): an
+/// ordinary delegate type is named by its own row, and a constructed generic one such as
+/// `EventHandler<Args>` by the `TypeSpec` of that instantiation, which is what csc writes.
+///
+/// **EVERY EVENT FORM ASKS HERE** -- a field-like event, one with its own accessors, and an
+/// interface's -- so the three cannot answer the question differently.
+fn event_type_token(
+    event_ty: &TypeSymbol,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) -> Option<Token> {
+    match event_ty {
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => mint_type_spec(event_ty, definition, arguments, image, tokens),
+        _ => tokens.type_token(event_ty),
+    }
 }
 
 /// The synthesized body of an event accessor: `{ E op= value; }` -- a compound assignment
@@ -4034,6 +4046,15 @@ fn emit_one_method_in_scope(
         })
         .collect();
     let byref_flags = byref_flags(parameters);
+    // The signature an interface member is matched on, by an explicit implementation's
+    // `MethodImpl` and an implicit one's slot alike: each parameter's type as the declaration
+    // model records it, with a `ref` or `out` parameter as `T&`. `params` carries the BARE type
+    // and states by-reference-ness in `byref_flags` beside it, so matching on it would never find
+    // `Get(int, out string)` among an interface's members.
+    let signature_params: Vec<TypeSymbol> = parameters
+        .iter()
+        .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+        .collect();
     if let Some(interface) = explicit_interface {
         let method_name = explicit_interface_member_name(interface, name);
         let flags =
@@ -4058,10 +4079,6 @@ fn emit_one_method_in_scope(
             None,
             debug,
         )?;
-        let signature_params: Vec<TypeSymbol> = parameters
-            .iter()
-            .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
-            .collect();
         emit_explicit_interface_impl(
             image,
             binder,
@@ -4081,18 +4098,14 @@ fn emit_one_method_in_scope(
     if is_static {
         flags |= METHOD_STATIC;
     }
-    let slots = slot_flags(modifiers, member_visibility(modifiers));
-    if slots != 0 {
-        flags |= slots;
-    } else if !is_static
-        && binder.member_implements_interface(
-            enclosing,
-            name,
-            &params.iter().map(|(_, ty, _)| ty.clone()).collect::<Vec<_>>(),
-        )
-    {
-        flags |= METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_HIDEBYSIG;
-    }
+    flags |= member_slot_flags(
+        binder,
+        enclosing,
+        modifiers,
+        member_visibility(modifiers),
+        name,
+        &signature_params,
+    );
     tokens.next_return_is_readonly_ref = is_readonly_ref(return_type);
     let method = emit_method_body(
         image,
@@ -4229,8 +4242,7 @@ fn constructed_interface_member_ref(
         let substituted = binder.model().get_by_symbol(interface).ok_or(
             crate::EmitError::Unsupported("an explicit interface impl of an unresolvable interface"),
         )?;
-        substituted
-            .methods
+        interface_slots(&substituted)
             .iter()
             .position(|candidate| {
                 &*candidate.name == member
@@ -4250,7 +4262,7 @@ fn constructed_interface_member_ref(
         let info = binder.model().get_by_symbol(&definition_symbol).ok_or(
             crate::EmitError::Unsupported("an explicit interface impl of an unresolvable interface"),
         )?;
-        let declared = info.methods.get(index).cloned().ok_or(
+        let declared = interface_slots(&info).into_iter().nth(index).ok_or(
             crate::EmitError::Unsupported("an explicit interface impl of a member the interface does not declare"),
         )?;
         (info.type_parameters.clone(), declared)
@@ -4276,6 +4288,71 @@ fn constructed_interface_member_ref(
     let return_sig = open_type_sig(tokens, &declared.return_type, scope)?;
     let signature = method_signature(true, &parameter_sigs, &return_sig);
     Ok(image.member_ref(parent, member, &signature))
+}
+
+/// A member an explicit implementation can name on an interface, in the form a `MethodImpl`
+/// declaration takes: a method, or the accessor of a property or an event, with its signature.
+struct InterfaceSlot {
+    name: Box<str>,
+    parameters: Vec<TypeSymbol>,
+    return_type: TypeSymbol,
+}
+
+/// Every member of `info` an explicit implementation can name, in one fixed order: its methods,
+/// then each property's accessors, then each event's.
+///
+/// **A PROPERTY OR EVENT DECLARED IN THIS COMPILATION HAS NO ACCESSOR METHODS IN THE MODEL.** A
+/// source property is one `PropertySymbol` and a source event one `EventSymbol`, while a
+/// referenced one also arrives as its `get_`/`set_` or `add_`/`remove_` methods, because metadata
+/// stores accessors as `MethodDef`s. A lookup over `methods` alone therefore found a referenced
+/// interface's accessors and missed those of an interface declared beside the class, and
+/// `int IR<T>.N { get; }` was refused where csc compiles it -- which is every interface the class
+/// library implements while the class library itself is being compiled. The accessors are built
+/// here from the property and event rows, so both kinds of interface answer alike. For a
+/// referenced interface a built accessor repeats a method listed before it, with the same
+/// signature, and the lookup takes the first.
+///
+/// **THE ORDER IS THE CONTRACT.** A slot is chosen by its position in the SUBSTITUTED interface and
+/// read back at that position in the DEFINITION. The two lists line up because
+/// `TypeInfo::instantiate` substitutes every member where it stands, and because both lists are
+/// built by this one function.
+fn interface_slots(info: &lamella_binder::TypeInfo) -> Vec<InterfaceSlot> {
+    let void = TypeSymbol::Special(SpecialType::Void);
+    let mut slots: Vec<InterfaceSlot> = info
+        .methods
+        .iter()
+        .map(|method| InterfaceSlot {
+            name: method.name.clone(),
+            parameters: method.parameters.clone(),
+            return_type: method.return_type.clone(),
+        })
+        .collect();
+    for property in &info.properties {
+        if property.has_getter {
+            slots.push(InterfaceSlot {
+                name: format!("get_{}", property.name).into(),
+                parameters: Vec::new(),
+                return_type: property.ty.clone(),
+            });
+        }
+        if property.has_setter {
+            slots.push(InterfaceSlot {
+                name: format!("set_{}", property.name).into(),
+                parameters: alloc::vec![property.ty.clone()],
+                return_type: void.clone(),
+            });
+        }
+    }
+    for event in &info.events {
+        for prefix in ["add_", "remove_"] {
+            slots.push(InterfaceSlot {
+                name: format!("{prefix}{}", event.name).into(),
+                parameters: alloc::vec![event.ty.clone()],
+                return_type: void.clone(),
+            });
+        }
+    }
+    slots
 }
 
 /// The declared name of each parameter, in order -- the `Param` rows (II.22.33) that make up a
@@ -6777,12 +6854,6 @@ fn self_type_token(
     spec.or_else(|| tokens.type_token(enclosing))
 }
 
-/// The method flags for a property/indexer accessor `accessor` (`get_X`/`set_X`) with `params`.
-/// An explicit-interface accessor is a private sealed virtual (20.4.1). Otherwise it is a sealed
-/// virtual (`public virtual final newslot`) only when it implicitly implements an interface member
-/// -- its name + signature match one -- so an accessor implementing nothing stays non-virtual even
-/// on an interface-implementing type (its vtable-slot flags follow its own modifiers).
-#[allow(clippy::too_many_arguments)]
 /// A bodyless accessor's flags: `property_accessor_flags`' answer plus `hidebysig`.
 ///
 /// **THE BIT ARRIVES FROM `slot_flags` FOR AN ABSTRACT ACCESSOR AND FROM NOWHERE FOR AN EXTERN
@@ -6793,6 +6864,12 @@ fn bodyless_flags(flags: u16) -> u16 {
     flags | METHOD_HIDEBYSIG
 }
 
+/// The method flags for a property/indexer accessor `accessor` (`get_X`/`set_X`) with `params`.
+/// An explicit-interface accessor is a private sealed virtual (20.4.1). Otherwise its
+/// accessibility is its own and its slot is [`member_slot_flags`]' answer: the property's
+/// modifiers first, then the interface, so an accessor implementing nothing stays non-virtual
+/// even on an interface-implementing type.
+#[allow(clippy::too_many_arguments)]
 fn property_accessor_flags(
     binder: &Binder,
     enclosing: &TypeSymbol,
@@ -6810,16 +6887,6 @@ fn property_accessor_flags(
             | METHOD_NEWSLOT
             | METHOD_HIDEBYSIG
             | SPECIAL_NAME
-    } else if !is_static
-        && !modifiers.contains(&Modifier::Abstract)
-        && binder.member_implements_interface(enclosing, accessor, params)
-    {
-        METHOD_PUBLIC
-            | METHOD_VIRTUAL
-            | METHOD_NEWSLOT
-            | METHOD_FINAL
-            | METHOD_HIDEBYSIG
-            | SPECIAL_NAME
     } else {
         let visibility = if accessor_modifiers.is_empty() {
             modifiers
@@ -6831,7 +6898,7 @@ fn property_accessor_flags(
         if is_static {
             flags |= METHOD_STATIC;
         } else {
-            flags |= slot_flags(modifiers, level);
+            flags |= member_slot_flags(binder, enclosing, modifiers, level, accessor, params);
         }
         flags
     }
@@ -7305,6 +7372,43 @@ fn slot_flags(modifiers: &[Modifier], visibility: u16) -> u16 {
         flags |= METHOD_CHECK_ACCESS_ON_OVERRIDE;
     }
     flags
+}
+
+/// The vtable-slot attributes of a member that is not an explicit interface implementation: the
+/// slot its own modifiers ask for ([`slot_flags`]) when they ask for one, and otherwise, for a
+/// public instance member that implements an interface member (20.4.4), a sealed virtual in a
+/// fresh slot (`virtual final newslot`), which is what lets the runtime bind the interface's slot
+/// to it. Anything else has no slot.
+///
+/// `emitted_name` and `params` are the method's own name and parameter types (`add_E`, `get_P`,
+/// `get_Item` with its indices), which is what an interface member is matched on. `visibility`
+/// is the method's effective accessibility: an accessor with its own modifier has its own.
+///
+/// **THE MODIFIERS ARE ASKED FIRST, AND THE ORDER IS THE RULE.** Implementing an interface adds
+/// nothing to a member that already has a slot, which is what csc emits: a `virtual` member stays
+/// overridable, an `override` reuses the inherited slot, a `sealed override` closes it and an
+/// `abstract` member stays bodyless. Asking the interface first gives an `override` a new slot of
+/// its own, so it overrides nothing and a call through the base class runs the base's member.
+///
+/// **EVERY MEMBER KIND ASKS HERE: method, property and indexer accessor, and both event forms.**
+fn member_slot_flags(
+    binder: &Binder,
+    enclosing: &TypeSymbol,
+    modifiers: &[Modifier],
+    visibility: u16,
+    emitted_name: &str,
+    params: &[TypeSymbol],
+) -> u16 {
+    let declared = slot_flags(modifiers, visibility);
+    if declared != 0 {
+        return declared;
+    }
+    let public_instance = !modifiers.contains(&Modifier::Static) && visibility & 0x0007 == 0x0006;
+    if public_instance && binder.member_implements_interface(enclosing, emitted_name, params) {
+        METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_HIDEBYSIG
+    } else {
+        0
+    }
 }
 
 /// The MemberAccess bits (II.23.1.5 / .10) for a member's declared modifiers: Public (6),
@@ -12440,6 +12544,292 @@ mod tests {
         );
     }
 
+    /// **A MEMBER THAT IMPLEMENTS AN INTERFACE MEMBER TAKES ITS SLOT FROM ITS OWN MODIFIERS FIRST,
+    /// AND FROM THE INTERFACE ONLY WHEN IT HAS NONE -- AT EVERY MEMBER KIND.** A plain or `new`
+    /// member becomes a sealed virtual (`virtual final newslot`) so the runtime can bind the
+    /// interface's slot to it (20.4.4); a `virtual`, `abstract`, `override` or `sealed override`
+    /// one keeps exactly the slot those modifiers ask for, and implementing the interface adds
+    /// nothing to it.
+    ///
+    /// Each wrong answer here is a different failure. With no slot at all, the runtime refuses
+    /// the type: `TypeLoadException: Method 'add_F' ... does not have an implementation`. An
+    /// `override` given `newslot` does not override, so a call through the base class runs the
+    /// base's member instead, silently. A `virtual` member given `final` refuses every derived
+    /// override at type load, and an `abstract` event given the interface's bits in place of its
+    /// own is a bodyless method without `Abstract`, which the runtime also refuses.
+    ///
+    /// An accessor the interface does not declare implements nothing, so it takes no slot and
+    /// keeps its own accessibility: a `private set` beside an interface's get-only property is
+    /// private.
+    ///
+    /// Every expected value was measured against csc on the same declarations.
+    #[test]
+    fn an_implementing_member_takes_its_slot_from_its_own_modifiers_before_the_interface() {
+        let image = named_image_of(
+            "Lib",
+            "namespace Lib {
+                 public delegate void H();
+                 public interface IAll {
+                     int M(); int P { get; } int Q { get; set; } int this[int i] { get; }
+                     event H E; event H F;
+                 }
+                 public class Base {
+                     public virtual int M() { return 0; }
+                     public virtual int P { get { return 0; } }
+                     public virtual int Q { get { return 0; } set { } }
+                     public virtual int this[int i] { get { return 0; } }
+                     public virtual event H E;
+                     public virtual event H F { add { } remove { } }
+                     public void Poke() { if (E != null) { E(); } }
+                 }
+                 public class PlainBase {
+                     public int M() { return 0; }
+                     public int P { get { return 0; } }
+                     public int Q { get { return 0; } set { } }
+                     public int this[int i] { get { return 0; } }
+                     public event H E;
+                     public event H F { add { } remove { } }
+                     public void Poke() { if (E != null) { E(); } }
+                 }
+                 public class Plain : IAll {
+                     public int M() { return 1; }
+                     public int P { get { return 1; } }
+                     public int Q { get { return 1; } set { } }
+                     public int this[int i] { get { return 1; } }
+                     public event H E;
+                     public event H F { add { } remove { } }
+                     public void Poke() { if (E != null) { E(); } }
+                 }
+                 public class Virt : IAll {
+                     public virtual int M() { return 1; }
+                     public virtual int P { get { return 1; } }
+                     public virtual int Q { get { return 1; } set { } }
+                     public virtual int this[int i] { get { return 1; } }
+                     public virtual event H E;
+                     public virtual event H F { add { } remove { } }
+                     public void Poke() { if (E != null) { E(); } }
+                 }
+                 public abstract class Abst : IAll {
+                     public abstract int M();
+                     public abstract int P { get; }
+                     public abstract int Q { get; set; }
+                     public abstract int this[int i] { get; }
+                     public abstract event H E;
+                     public abstract event H F;
+                 }
+                 public class Over : Base, IAll {
+                     public override int M() { return 1; }
+                     public override int P { get { return 1; } }
+                     public override int Q { get { return 1; } set { } }
+                     public override int this[int i] { get { return 1; } }
+                     public override event H E;
+                     public override event H F { add { } remove { } }
+                     public void Fire() { if (E != null) { E(); } }
+                 }
+                 public class Closed : Base, IAll {
+                     public sealed override int M() { return 1; }
+                     public sealed override int P { get { return 1; } }
+                     public sealed override int Q { get { return 1; } set { } }
+                     public sealed override int this[int i] { get { return 1; } }
+                     public sealed override event H E;
+                     public sealed override event H F { add { } remove { } }
+                     public void Fire() { if (E != null) { E(); } }
+                 }
+                 public class Hiding : PlainBase, IAll {
+                     public new int M() { return 1; }
+                     public new int P { get { return 1; } }
+                     public new int Q { get { return 1; } set { } }
+                     public new int this[int i] { get { return 1; } }
+                     public new event H E;
+                     public new event H F { add { } remove { } }
+                     public void Fire() { if (E != null) { E(); } }
+                 }
+                 public interface IGet { int R { get; } }
+                 public class Extra : IGet { public int R { get { return 0; } set { } } }
+                 public class Narrow : IGet { public int R { get { return 0; } private set { } } }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the library parses");
+        let mut flags = alloc::collections::BTreeMap::new();
+        for ty in assembly.type_defs() {
+            let Some(type_name) = ty.name().map(|n| n.name) else { continue };
+            for method in ty.methods() {
+                let Some(name) = method.name() else { continue };
+                flags.insert(alloc::format!("{type_name}::{name}"), method.flags() as u16);
+            }
+        }
+        let slot_bits = METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_ABSTRACT;
+        let accessors = [
+            "M", "get_P", "get_Q", "set_Q", "get_Item", "add_E", "remove_E", "add_F", "remove_F",
+        ];
+        let expected = [
+            ("Plain", METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL),
+            ("Hiding", METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL),
+            ("Virt", METHOD_VIRTUAL | METHOD_NEWSLOT),
+            ("Abst", METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_ABSTRACT),
+            ("Over", METHOD_VIRTUAL),
+            ("Closed", METHOD_VIRTUAL | METHOD_FINAL),
+        ];
+        let mut wrong = alloc::vec::Vec::new();
+        for (class, want) in expected {
+            for accessor in accessors {
+                let key = alloc::format!("{class}::{accessor}");
+                let got = flags[&key];
+                if got & slot_bits != want {
+                    wrong.push(alloc::format!(
+                        "{key}: slot {:#06x}, csc {want:#06x}",
+                        got & slot_bits
+                    ));
+                }
+                if got & 0x0007 != 0x0006 {
+                    wrong.push(alloc::format!("{key}: access {:#x}, csc public", got & 0x0007));
+                }
+            }
+        }
+        for (key, access) in [("Extra::set_R", 0x0006), ("Narrow::set_R", 0x0001)] {
+            let got = flags[key];
+            if got & slot_bits != 0 || got & 0x0007 != access {
+                wrong.push(alloc::format!(
+                    "{key}: slot {:#06x} access {:#x}, csc slot 0 access {access:#x}",
+                    got & slot_bits,
+                    got & 0x0007
+                ));
+            }
+        }
+        for key in ["Extra::get_R", "Narrow::get_R"] {
+            if flags[key] & slot_bits != METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL {
+                wrong.push(alloc::format!("{key}: the getter implements IGet.R and keeps its slot"));
+            }
+        }
+        assert!(wrong.is_empty(), "{} accessors differ from csc:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
+    /// **A `ref` OR `out` PARAMETER IS PART OF THE SIGNATURE AN INTERFACE MEMBER IS MATCHED ON.**
+    /// `bool Get(int k, out string v)` implements `IGet.Get` exactly as `bool Has(int k)` implements
+    /// `IGet.Has`, so both are sealed virtuals (`virtual final newslot`). Without the slot the runtime
+    /// refuses the type: `TypeLoadException: Method 'Get' in type 'C' ... does not have an
+    /// implementation`. It is the shape of `Dictionary<TKey, TValue>.TryGetValue`.
+    ///
+    /// The by-reference parameter must match BY REFERENCE: `F(int)` beside `F(ref int)` implements
+    /// nothing, and csc gives it no slot.
+    ///
+    /// Every expected value was measured against csc on the same declarations.
+    #[test]
+    fn an_implementation_with_a_ref_or_out_parameter_takes_the_interface_slot() {
+        let image = named_image_of(
+            "Lib",
+            "namespace Lib {
+                 public interface IGet { bool Get(int k, out string v); bool Has(int k); }
+                 public class C : IGet {
+                     public bool Get(int k, out string v) { v = null; return k == 1; }
+                     public bool Has(int k) { return k == 1; }
+                 }
+                 public interface IG<T> { bool Get(T k, out T v); }
+                 public class G<T> : IG<T> { public bool Get(T k, out T v) { v = k; return true; } }
+                 public interface IMap<K, V> { bool TryGet(K k, out V v); }
+                 public class M : IMap<string, int> { public bool TryGet(string k, out int v) { v = 0; return true; } }
+                 public interface ISwap { void Swap(ref int a, ref int b); }
+                 public class R : ISwap { public void Swap(ref int a, ref int b) { int t = a; a = b; b = t; } }
+                 public interface IF { int F(ref int x); }
+                 public class O : IF { public int F(int x) { return 1; } public int F(ref int x) { return 2; } }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the library parses");
+        let slot_bits = METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_ABSTRACT;
+        let mut slots: alloc::collections::BTreeMap<String, Vec<u16>> = alloc::collections::BTreeMap::new();
+        for ty in assembly.type_defs() {
+            let Some(type_name) = ty.name().map(|n| n.name) else { continue };
+            for method in ty.methods() {
+                let Some(name) = method.name() else { continue };
+                slots
+                    .entry(alloc::format!("{type_name}::{name}"))
+                    .or_default()
+                    .push(method.flags() as u16 & slot_bits);
+            }
+        }
+        let sealed_virtual = METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL;
+        let mut wrong = alloc::vec::Vec::new();
+        for (key, want) in [
+            ("C::Get", alloc::vec![sealed_virtual]),
+            ("C::Has", alloc::vec![sealed_virtual]),
+            ("G`1::Get", alloc::vec![sealed_virtual]),
+            ("M::TryGet", alloc::vec![sealed_virtual]),
+            ("R::Swap", alloc::vec![sealed_virtual]),
+            ("O::F", alloc::vec![0, sealed_virtual]),
+        ] {
+            let got = &slots[key];
+            if *got != want {
+                wrong.push(alloc::format!("{key}: slots {got:x?}, csc {want:x?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{} methods differ from csc:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
+    /// **AN EVENT WHOSE DELEGATE TYPE IS A CONSTRUCTED GENERIC NAMES THAT TYPE BY ITS `TypeSpec`.**
+    /// The `Event` row's type column is a `TypeDefOrRef` coded index, which may name a `TypeDef`, a
+    /// `TypeRef` or a `TypeSpec` (ECMA-335 II.22.13), and csc writes the instantiation's `TypeSpec`
+    /// there for `event EventHandler<Args> E` -- the shape of every event with custom arguments.
+    /// Every event form asks the same question and must get the same answer: a field-like event, one
+    /// with its own accessors, a static one, an interface's, and an explicit implementation of one.
+    ///
+    /// Every expected value was measured against csc on the same declarations.
+    #[test]
+    fn an_event_of_a_constructed_generic_delegate_is_typed_by_its_typespec() {
+        let image = named_image_of(
+            "Lib",
+            "namespace Lib {
+                 public delegate void Handler<T>(object sender, T e);
+                 public class Args { }
+                 public interface ISource { event Handler<Args> Declared; }
+                 public interface IOther { event Handler<Args> Hidden; }
+                 public class Source : ISource, IOther {
+                     public event Handler<Args> Declared;
+                     public event Handler<Args> Custom { add { } remove { } }
+                     public static event Handler<int> Shared;
+                     event Handler<Args> IOther.Hidden { add { } remove { } }
+                     public void Poke() {
+                         if (Declared != null) { Declared(this, null); }
+                         if (Shared != null) { Shared(this, 1); }
+                     }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the library parses");
+        let token_of = |name: &str| {
+            assembly
+                .type_defs()
+                .find(|t| t.name().is_some_and(|n| n.name == name))
+                .unwrap_or_else(|| panic!("{name} is in the image"))
+                .token()
+        };
+        let handler = token_of("Handler`1");
+        let of = |argument: lamella_metadata::SigType| lamella_metadata::SigType::GenericInst {
+            definition: alloc::boxed::Box::new(lamella_metadata::SigType::Class(handler)),
+            arguments: alloc::vec![argument],
+        };
+        let args = of(lamella_metadata::SigType::Class(token_of("Args")));
+        let mut seen = alloc::collections::BTreeMap::new();
+        for ty in assembly.type_defs() {
+            let Some(type_name) = ty.name().map(|n| n.name) else { continue };
+            for event in ty.events() {
+                let Some(name) = event.name() else { continue };
+                seen.insert(alloc::format!("{type_name}::{name}"), event.event_type());
+            }
+        }
+        for (key, want) in [
+            ("ISource::Declared", args.clone()),
+            ("IOther::Hidden", args.clone()),
+            ("Source::Declared", args.clone()),
+            ("Source::Custom", args.clone()),
+            ("Source::IOther.Hidden", args),
+            ("Source::Shared", of(lamella_metadata::SigType::I4)),
+        ] {
+            let token = seen[key];
+            assert_eq!(token.table(), TYPE_SPEC, "{key}'s delegate type is named by a TypeSpec, as csc names it");
+            assert_eq!(assembly.type_spec_signature(token), Some(want), "{key} names Handler<...> itself");
+        }
+    }
+
     /// [`image_of_source_against_generic_fixture`] for any reference assembly.
     ///
     /// Taken as a parameter rather than copied per fixture: the generic-METHOD rows below need
@@ -15077,6 +15467,219 @@ mod tests {
             matches!(arguments.as_slice(), [lamella_metadata::SigType::Var(0)]),
             "IBox<T> at the class's own parameter encodes !0, got {arguments:?}"
         );
+    }
+
+    /// A generic INTERFACE declares the constructed interfaces it derives from as a class declares
+    /// the ones it implements: each as a `TypeSpec` naming the interface's own parameters by
+    /// position, beside the non-generic interfaces they inherit.
+    ///
+    /// Each row is a POSITION a parameter can hold in the list -- a direct argument, the second of
+    /// two, an argument nested in another instantiation, one inherited from an enclosing generic
+    /// class, one reached through a base whose own parameter has another name -- beside the rows
+    /// with no parameter at all. The class row is the control.
+    #[test]
+    fn a_generic_interface_declares_its_constructed_bases_at_its_own_parameters() {
+        use lamella_metadata::SigType;
+
+        fn spell(assembly: &Assembly, signature: &SigType) -> String {
+            match signature {
+                SigType::Var(index) => format!("!{index}"),
+                SigType::I4 => String::from("int"),
+                SigType::String => String::from("string"),
+                SigType::Class(token) | SigType::ValueType(token) => named(assembly, *token),
+                SigType::GenericInst {
+                    definition,
+                    arguments,
+                } => {
+                    let arguments: Vec<String> =
+                        arguments.iter().map(|argument| spell(assembly, argument)).collect();
+                    format!("{}<{}>", spell(assembly, definition), arguments.join(","))
+                }
+                other => format!("{other:?}"),
+            }
+        }
+        fn named(assembly: &Assembly, token: Token) -> String {
+            match assembly.type_spec_signature(token) {
+                Some(signature) => spell(assembly, &signature),
+                None => assembly
+                    .type_token_name(token)
+                    .map_or_else(|| format!("{token:?}"), |name| String::from(name.name)),
+            }
+        }
+
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(
+            "interface IEnumerable { } \
+             interface IEnumerable<T> : IEnumerable { } \
+             interface ICollection<T> : IEnumerable<T> { } \
+             interface ITwo<A, B> { } \
+             interface ISwap<A, B> : ITwo<B, A> { } \
+             interface INest<T> : IEnumerable<IEnumerable<T>> { } \
+             interface IChain<U> : ICollection<U> { } \
+             interface IClosed<T> : IEnumerable<int> { } \
+             interface IPlain : IEnumerable<string> { } \
+             class Outer<T> { public interface IInner : IEnumerable<T> { } } \
+             class Bag<U> : ICollection<U> { }",
+            options,
+        );
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "{:?}",
+            parsed.diagnostics
+        );
+        let result = compile(
+            &parsed.unit, "c.dll", "C", &[], None, false, false, false, LanguageVersion::CSharp2,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+
+        let parameter_refs: Vec<String> = assembly
+            .type_refs()
+            .filter_map(|row| row.name())
+            .filter(|name| ["T", "U", "A", "B"].contains(&name.name))
+            .map(|name| String::from(name.name))
+            .collect();
+        assert!(
+            parameter_refs.is_empty(),
+            "a type parameter must never become a TypeRef, got {parameter_refs:?}"
+        );
+
+        for (declaring, expected) in [
+            ("ICollection`1", &["IEnumerable", "IEnumerable`1<!0>"][..]),
+            ("ISwap`2", &["ITwo`2<!1,!0>"][..]),
+            ("INest`1", &["IEnumerable", "IEnumerable`1<IEnumerable`1<!0>>"][..]),
+            ("IChain`1", &["ICollection`1<!0>", "IEnumerable", "IEnumerable`1<!0>"][..]),
+            ("IClosed`1", &["IEnumerable", "IEnumerable`1<int>"][..]),
+            ("IPlain", &["IEnumerable", "IEnumerable`1<string>"][..]),
+            ("IInner", &["IEnumerable", "IEnumerable`1<!0>"][..]),
+            ("Bag`1", &["ICollection`1<!0>", "IEnumerable", "IEnumerable`1<!0>"][..]),
+        ] {
+            let ty = assembly
+                .find_type("", declaring)
+                .unwrap_or_else(|| panic!("the {declaring} type"));
+            let mut declared: Vec<String> =
+                ty.interfaces().map(|token| named(&assembly, token)).collect();
+            declared.sort();
+            assert_eq!(declared, expected, "the interfaces {declaring} declares");
+        }
+    }
+
+    /// An explicit implementation of a CONSTRUCTED interface's PROPERTY names the interface's own
+    /// accessor, in the interface's own `!0`, exactly as an explicit method does.
+    ///
+    /// **A PROPERTY DECLARED IN THIS COMPILATION HAS NO ACCESSOR METHODS IN THE MODEL**, only its
+    /// `PropertySymbol`, while one imported from metadata also arrives as its `get_`/`set_`
+    /// methods. The lookup that picks the implemented member searched methods alone, so
+    /// `int IR<T>.N` was refused against an `IR<T>` declared beside it -- which is every interface
+    /// the class library implements while the class library is itself being compiled.
+    #[test]
+    fn an_explicit_property_of_a_constructed_interface_names_the_interface_accessor() {
+        use lamella_metadata::SigType;
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(
+            "interface IR<T> { T V { get; set; } int N { get; } } \
+             class C<T> : IR<T> { \
+                 T v; \
+                 T IR<T>.V { get { return v; } set { v = value; } } \
+                 int IR<T>.N { get { return 7; } } } \
+             class Two : IR<int>, IR<string> { \
+                 int IR<int>.V { get { return 1; } set { } } \
+                 int IR<int>.N { get { return 2; } } \
+                 string IR<string>.V { get { return null; } set { } } \
+                 int IR<string>.N { get { return 3; } } }",
+            options,
+        );
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "{:?}",
+            parsed.diagnostics
+        );
+        let result = compile(
+            &parsed.unit, "c.dll", "C", &[], None, false, false, false, LanguageVersion::CSharp2,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result
+            .image
+            .unwrap_or_else(|| panic!("an image, not a refusal: {:?}", result.emit_error));
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+
+        let declarations = |type_name: &str| -> Vec<(String, Token, SigType, Vec<SigType>)> {
+            let class = assembly.find_type("", type_name).expect("the class");
+            class
+                .method_impls()
+                .map(|(_, declaration)| {
+                    assert_eq!(
+                        declaration.table(),
+                        0x0a,
+                        "{type_name}: a constructed interface's member is a MemberRef, got {declaration:?}"
+                    );
+                    let member = assembly.member_ref(declaration.row()).expect("the MemberRef");
+                    assert_eq!(
+                        member.parent().table(),
+                        0x1b,
+                        "{type_name}: the MemberRef is parented by the instantiation's TypeSpec"
+                    );
+                    let signature = member.method_signature().expect("a method signature");
+                    (
+                        String::from(member.name().expect("a name")),
+                        member.parent(),
+                        signature.return_type,
+                        signature.parameters,
+                    )
+                })
+                .collect()
+        };
+        let declared = |name: &str| -> (SigType, Vec<SigType>) {
+            match name {
+                "get_V" => (SigType::Var(0), Vec::new()),
+                "set_V" => (SigType::Void, alloc::vec![SigType::Var(0)]),
+                "get_N" => (SigType::I4, Vec::new()),
+                other => panic!("an accessor IR<T> does not declare: {other}"),
+            }
+        };
+
+        let open = declarations("C`1");
+        let mut names: Vec<&str> = open.iter().map(|(name, ..)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["get_N", "get_V", "set_V"], "C<T> implements all three accessors");
+        for (name, parent, returns, parameters) in &open {
+            assert_eq!((returns.clone(), parameters.clone()), declared(name), "C<T>'s {name}");
+            assert_eq!(*parent, open[0].1, "C<T> implements ONE construction, IR<!0>");
+        }
+
+        let closed = declarations("Two");
+        assert_eq!(closed.len(), 6, "Two implements three accessors twice: {closed:?}");
+        let mut by_argument: Vec<(SigType, Vec<String>)> = Vec::new();
+        for (name, parent, returns, parameters) in &closed {
+            assert_eq!((returns.clone(), parameters.clone()), declared(name), "Two's {name}");
+            let Some(SigType::GenericInst { arguments, .. }) = assembly.type_spec_signature(*parent)
+            else {
+                panic!("Two's {name} is parented by a constructed type");
+            };
+            let [argument] = arguments.as_slice() else {
+                panic!("IR<T> takes one argument, got {arguments:?}");
+            };
+            match by_argument.iter_mut().find(|(seen, _)| seen == argument) {
+                Some((_, names)) => names.push(name.clone()),
+                None => by_argument.push((argument.clone(), alloc::vec![name.clone()])),
+            }
+        }
+        assert_eq!(by_argument.len(), 2, "IR<int> and IR<string> are two parents: {by_argument:?}");
+        for (argument, names) in &mut by_argument {
+            names.sort_unstable();
+            assert!(
+                matches!(argument, SigType::I4 | SigType::String),
+                "an argument Two does not implement: {argument:?}"
+            );
+            assert_eq!(names.as_slice(), ["get_N", "get_V", "set_V"], "IR<{argument:?}>");
+        }
     }
 
     #[test]

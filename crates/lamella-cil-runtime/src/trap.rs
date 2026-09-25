@@ -1,6 +1,7 @@
 //! Traps: controlled execution failures reported instead of panicking.
 
 use crate::object::UnencodableChar;
+use alloc::borrow::Cow;
 use alloc::string::String;
 use core::fmt;
 use lamella_cil::Opcode;
@@ -41,6 +42,20 @@ impl fmt::Display for UnhandledException {
     }
 }
 
+/// The exception a [`Trap::Refused`] raises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusedWith {
+    /// `System.ArgumentException`.
+    Argument,
+    /// `System.ArrayTypeMismatchException`.
+    ArrayTypeMismatch,
+    /// `System.InvalidCastException`.
+    InvalidCast,
+    /// `System.MissingMethodException`.
+    MissingMethod,
+}
+
 /// A controlled execution failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -77,6 +92,14 @@ pub enum Trap {
     /// An argument was invalid (the `ArgumentException` site) -- e.g. `Enum.Parse` of a
     /// name that names no constant of the enum.
     InvalidArgument,
+    /// A library method refused its arguments with .NET's exception and message for the case.
+    ///
+    /// For the cases where .NET's message differs from the one the same exception carries when
+    /// an instruction raises it: `Array.Copy` raises ArrayTypeMismatchException "Source array type
+    /// cannot be assigned to destination array type.", where a `stelem.ref` that stores a wrong
+    /// element raises the same type with a different message. A message that names its argument
+    /// is built, as `Activator.CreateInstance`'s names the type it could not construct.
+    Refused(RefusedWith, Cow<'static, str>),
     /// `Monitor.Wait`/`Pulse`/`PulseAll` by a thread that does not own the object's lock (the
     /// `SynchronizationLockException` site).
     SynchronizationLock,
@@ -180,6 +203,7 @@ impl fmt::Display for Trap {
             Trap::InvalidCast => f.write_str("invalid cast"),
             Trap::ArrayTypeMismatch => f.write_str("array element type mismatch"),
             Trap::InvalidArgument => f.write_str("invalid argument"),
+            Trap::Refused(_, message) => f.write_str(message),
             Trap::SynchronizationLock => {
                 f.write_str("monitor wait/pulse by a thread that does not own the lock")
             }

@@ -136,6 +136,26 @@ pub enum BuildError {
         /// How many methods kept a placeholder; the named one is the first.
         total: usize,
     },
+    /// THE PROGRAM CAN REACH A LIBRARY METHOD WHOSE BODY THIS BUILD COULD NOT PRODUCE.
+    ///
+    /// A library is built before any program that uses it, so on the linked tier it emits such a
+    /// method as a TRAP under its own symbol instead of refusing the whole library, and the link
+    /// decides: the dead-strip removes a trap nothing reaches, and one that survives it is refused
+    /// here. A library with one method this build cannot lower therefore still serves every program
+    /// that does not reach that method.
+    ///
+    /// "Reach" is the linker's: a virtual method is reached through the type descriptor of any type
+    /// the program allocates, whether or not the program calls it.
+    #[cfg(feature = "linked")]
+    UnlowerableMethodReached {
+        /// The first such method's readable name: `Namespace.Type::Method`, or
+        /// `Instantiation::Method` for a monomorphized body.
+        method: alloc::string::String,
+        /// Why its body could not be produced, as text.
+        reason: alloc::string::String,
+        /// How many such methods the image would keep; the named one is the first.
+        total: usize,
+    },
     /// TWO BODIES WERE WRITTEN FOR ONE MethodDef ROW. A program is a `Vec<Function>` indexed by rid
     /// and every emitted symbol is `f<rid>`, so a second body does not collide -- it REPLACES the
     /// first, and the image is built around whichever won with no diagnostic anywhere. Refused
@@ -297,6 +317,13 @@ impl core::fmt::Display for BuildError {
                 f,
                 "the library method `{method}` kept the assembly's placeholder body, which answers \
                  a constant at every call, because its own body did not lower ({reason}){}",
+                AndOthers(*total),
+            ),
+            #[cfg(feature = "linked")]
+            BuildError::UnlowerableMethodReached { method, reason, total } => write!(
+                f,
+                "the program can reach the library method `{method}`, whose body this build could \
+                 not produce ({reason}){}",
                 AndOthers(*total),
             ),
             BuildError::DuplicateMethodBody { rid, total } => {
@@ -957,38 +984,204 @@ pub fn build_linked_cortex_m_with_libraries(
     archive: &[u8],
     target: &str,
 ) -> Result<Vec<u8>, BuildError> {
-    let initial_sp: u32 = match target {
-        "nrf52833" => 0x2002_0000,
-        "microbit" => 0x2000_4000,
-        _ => return Err(BuildError::UnsupportedTarget),
-    };
-    let program_object = build_object_with_libraries(cil, corlib, libraries)?;
-    let library_object = build_library_object(corlib)?;
-    let read = |bytes: &[u8]| {
-        lamella_elf::read_object(bytes).map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))
-    };
-    let mut objects = alloc::vec![read(&program_object)?, read(&library_object)?];
-    let user_objects: Vec<Vec<u8>> = libraries
+    let initial_sp = nordic_initial_sp(target)?;
+    let (program_object, deferred) = build_linked_program_object(cil, corlib, libraries, None)?;
+    link_nordic_image(initial_sp, &program_object, deferred, corlib, libraries, archive)
+        .map(|(image, _)| image)
+}
+
+/// The linked tier's parts, each with the stack top its boot image starts from.
+///
+/// **A PART IS A ROW HERE, NOT A SECOND PIPELINE.** Everything after the stack top is the same
+/// for every row, so a part the linked tier gains is a row and the RAM plan behind it.
+#[cfg(feature = "linked")]
+const NORDIC_LINKED_PARTS: &[(&str, u32)] = &[("nrf52833", 0x2002_0000), ("microbit", 0x2000_4000)];
+
+/// The stack top of `target`'s boot image, or [`BuildError::UnsupportedTarget`] for a target the
+/// linked tier has no row for.
+///
+/// Asked BEFORE any object is built, so an unsupported target is the answer even for a program
+/// that would also have failed to lower.
+#[cfg(feature = "linked")]
+fn nordic_initial_sp(target: &str) -> Result<u32, BuildError> {
+    NORDIC_LINKED_PARTS
         .iter()
-        .enumerate()
-        .map(|(i, library)| {
-            let mut references: Vec<&[u8]> = alloc::vec![corlib];
-            references.extend_from_slice(&libraries[..i]);
-            build_library_object_with_references(library, &references, false)
-        })
-        .collect::<Result<_, _>>()?;
-    for object in &user_objects {
-        objects.push(read(object)?);
-    }
+        .find(|(part, _)| *part == target)
+        .map(|&(_, initial_sp)| initial_sp)
+        .ok_or(BuildError::UnsupportedTarget)
+}
+
+/// Links a lowered PROGRAM object into a Nordic boot image: corlib's object and each user
+/// library's beside it, the runtime-support `archive` on demand, dead-stripped, linked at
+/// [`NORDIC_TEXT_BASE`] and wrapped by [`nordic_linked_image`]. Returns the image and the link it
+/// was cut from.
+///
+/// `deferred` is what [`build_linked_program_object`] deferred while building the program object,
+/// and the link refuses it on the same terms as the libraries' own ([`reachable_objects`]).
+///
+/// **ONE PIPELINE, FOR THE IMAGE THAT SHIPS AND THE ONE THAT IS DEBUGGED.** The callers differ only
+/// in how the program object was built, so everything after that is here once -- and a caller that
+/// wants the link's debug sections takes them from the same link as the bytes.
+#[cfg(feature = "linked")]
+fn link_nordic_image(
+    initial_sp: u32,
+    program_object: &[u8],
+    deferred: Vec<DeferredBody>,
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+) -> Result<(Vec<u8>, lamella_linker::LinkedImage), BuildError> {
+    let trimmed = reachable_objects(program_object, deferred, corlib, libraries)?;
     let support = lamella_elf::read_archive(archive)
         .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
-    let trimmed = lamella_linker::garbage_collect(&objects, LINKED_ENTRY_SYMBOL);
     let linked = link_product_image(&trimmed, &[support], LINKED_ENTRY_SYMBOL, Some(NORDIC_TEXT_BASE))
         .map_err(BuildError::Link)?;
-    Ok(nordic_linked_image(
+    let image = nordic_linked_image(
         initial_sp,
         linked.entry_offset,
         &linked.text,
+        nordic_zero_end(&linked),
+    );
+    Ok((image, linked))
+}
+
+/// The program's object with corlib's and each user library's beside it, dead-stripped to what the
+/// entry reaches -- or the refusal naming a library method the program can reach whose body this
+/// build could not produce ([`BuildError::UnlowerableMethodReached`]). `deferred` is the program
+/// object's own deferred list.
+///
+/// **THE LIBRARIES ARE BUILT DEFERRING, BECAUSE THIS IS WHERE THE QUESTION HAS AN ANSWER.** A library
+/// method this build cannot lower is emitted as a trap ([`build_library_object_deferring`]), and the
+/// dead-strip then says whether the program reaches it. Refusing the library outright instead would
+/// refuse every program that references it for a method most of them never call.
+///
+/// The answer is final at this dead-strip. The product link is handed these trimmed objects, so a trap
+/// dropped here cannot come back, and it trims again from the same entry, so a trap kept here is kept
+/// there too.
+#[cfg(feature = "linked")]
+fn reachable_objects(
+    program_object: &[u8],
+    mut deferred: Vec<DeferredBody>,
+    corlib: &[u8],
+    libraries: &[&[u8]],
+) -> Result<Vec<lamella_elf::Object>, BuildError> {
+    let read = |bytes: &[u8]| {
+        lamella_elf::read_object(bytes).map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))
+    };
+    let (corlib_object, corlib_deferred) = build_library_object_deferring(corlib, &[])?;
+    deferred.extend(corlib_deferred);
+    let mut objects = alloc::vec![read(program_object)?, read(&corlib_object)?];
+    for (i, library) in libraries.iter().enumerate() {
+        let mut references: Vec<&[u8]> = alloc::vec![corlib];
+        references.extend_from_slice(&libraries[..i]);
+        let (object, library_deferred) = build_library_object_deferring(library, &references)?;
+        objects.push(read(&object)?);
+        deferred.extend(library_deferred);
+    }
+    let trimmed = lamella_linker::garbage_collect(&objects, LINKED_ENTRY_SYMBOL);
+    refuse_reached_deferred_bodies(&trimmed, &deferred)?;
+    Ok(trimmed)
+}
+
+/// Refuses a dead-stripped link that still defines a deferred method's symbol, naming the first such
+/// method and counting them.
+#[cfg(feature = "linked")]
+fn refuse_reached_deferred_bodies(
+    trimmed: &[lamella_elf::Object],
+    deferred: &[DeferredBody],
+) -> Result<(), BuildError> {
+    let kept: alloc::collections::BTreeSet<&str> = trimmed
+        .iter()
+        .flat_map(|object| &object.symbols)
+        .filter(|symbol| symbol.defined)
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    let reached: Vec<&DeferredBody> = deferred
+        .iter()
+        .filter(|body| kept.contains(body.symbol.as_str()))
+        .collect();
+    match reached.first() {
+        Some(first) => Err(BuildError::UnlowerableMethodReached {
+            method: first.method.clone(),
+            reason: first.reason.clone(),
+            total: reached.len(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Where the Nordic startup stops clearing RAM: the end of the statics window as THIS link laid it
+/// out, and never below the top of the heap band the startup also owns.
+///
+/// **THE LINKER REPORTS THE EXTENT, SO THE STARTUP DOES NOT RESTATE IT.** Everything the image keeps
+/// in RAM between the heap and the stack is placed by the linker -- the managed statics and every
+/// zero-initialized static of the runtime archive -- and the linker brackets all of it with
+/// [`lamella_elf::STATICS_END_SYMBOL`]. A band written here by hand would have to be kept in step
+/// with the archive by reading its source. A link that placed no statics at all defines no end, and
+/// then the heap band is the whole of what needs clearing.
+#[cfg(feature = "linked")]
+fn nordic_zero_end(linked: &lamella_linker::LinkedImage) -> u32 {
+    linked
+        .symbols
+        .iter()
+        .find(|(name, _)| name == lamella_elf::STATICS_END_SYMBOL)
+        .map(|(_, value)| value.wrapping_add(NORDIC_TEXT_BASE))
+        .map_or(NORDIC_STATICS_BASE, |end| end.max(NORDIC_STATICS_BASE))
+        .next_multiple_of(4)
+}
+
+/// Where a Nordic boot image is loaded: its vector table is the bottom of flash, which is address
+/// zero on every part in [`NORDIC_LINKED_PARTS`].
+#[cfg(feature = "linked")]
+const NORDIC_IMAGE_BASE: u32 = 0;
+
+/// [`build_linked_cortex_m_with_libraries`], carrying the program's debug information: an ELF whose
+/// loaded bytes are the image that gets flashed, and whose `.debug_*` sections describe them.
+///
+/// **THE PRODUCT'S OWN PIPELINE, SO THE DEBUG INFORMATION DESCRIBES THE IMAGE IT ARRIVES WITH.** The
+/// program object is the one the product builds with its debug sections added, and it is linked by
+/// the same [`link_nordic_image`] -- so the debug information is relocated by the link that placed
+/// the code, and every address it names is an address in the image. A table built while lowering
+/// could not promise that: the link moves code and drops what nothing reaches.
+///
+/// `pdb` is the Portable PDB the program was compiled with, which names each method's source. Only
+/// the PROGRAM is described. Corlib and the libraries beside it are linked as the product links them
+/// and carry no debug information of their own.
+///
+/// The ELF's entry is the program's entry function, not the boot image's reset handler: the file is
+/// read by a debugger, which wants the method the program starts in, and the part boots from the
+/// vector table the image carries either way.
+#[cfg(feature = "linked")]
+pub fn build_linked_cortex_m_debug(
+    cil: &[u8],
+    pdb: &lamella_metadata::PortablePdb,
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+    target: &str,
+) -> Result<Vec<u8>, BuildError> {
+    let initial_sp = nordic_initial_sp(target)?;
+    let (program_object, deferred) =
+        build_linked_program_object(cil, corlib, libraries, Some(pdb))?;
+    let (image, linked) =
+        link_nordic_image(initial_sp, &program_object, deferred, corlib, libraries, archive)?;
+    let program = lamella_elf::read_object(&program_object)
+        .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
+    let sections: Vec<(&str, &[u8])> = linked
+        .debug_sections
+        .iter()
+        .filter_map(|(name, bytes)| {
+            let own = program.sections.iter().find(|section| section.name == *name)?;
+            Some((name.as_str(), bytes.get(..own.data.len())?))
+        })
+        .collect();
+    Ok(lamella_elf::write_debuggable_executable(
+        lamella_elf::Machine::Arm,
+        &image,
+        NORDIC_TEXT_BASE + linked.entry_offset,
+        NORDIC_IMAGE_BASE,
+        true,
+        &sections,
     ))
 }
 
@@ -1028,10 +1221,12 @@ pub fn link_product_image(
 /// the text at [`NORDIC_TEXT_BASE`].
 ///
 /// **The startup is the whole of this part's crt0, and it does three things in this order.** It
-/// CLEARS `[NORDIC_HEAP_PTR, NORDIC_STATICS_BASE + NORDIC_STATICS_BYTES)` -- the allocator's cursor
-/// words, the heap band and the statics window the linker was given, whose word 0 is the VES-global
-/// exception tag every call site tests on return. Then it seeds the cursor and its limit, which the
-/// archive stops on rather than bumping past. Then it enters the entry.
+/// CLEARS `[NORDIC_HEAP_PTR, zero_end)` -- the allocator's cursor words, the heap band, and the
+/// statics window up to the end the LINKER reported ([`nordic_zero_end`]). That window holds the
+/// managed statics, whose word 0 is the VES-global exception tag every call site tests on return,
+/// and every zero-initialized static of the runtime archive -- its scheduler, whose `current` every
+/// allocation reads, among them. Then it seeds the cursor and its limit, which the archive stops on
+/// rather than bumping past. Then it enters the entry.
 ///
 /// **The order is load-bearing: the clear covers the cursor words, so seeding first would zero the
 /// seed.** And the clear is not optional on a part -- SRAM powers up undefined, there is no crt0 on
@@ -1046,7 +1241,7 @@ pub fn link_product_image(
 /// rather than escalated -- which matters because the linked tier is no more immune to undefined RAM
 /// than the flat one, only better supplied.
 #[cfg(feature = "linked")]
-fn nordic_linked_image(initial_sp: u32, entry_offset: u32, text: &[u8]) -> Vec<u8> {
+fn nordic_linked_image(initial_sp: u32, entry_offset: u32, text: &[u8], zero_end: u32) -> Vec<u8> {
     use lamella_asm_arm32::{Encoder, Reg};
     let mut enc = Encoder::new();
     let zero_start_word = enc.new_label();
@@ -1076,7 +1271,7 @@ fn nordic_linked_image(initial_sp: u32, entry_offset: u32, text: &[u8]) -> Vec<u
     enc.bind_label(zero_start_word);
     enc.emit_word(NORDIC_HEAP_PTR);
     enc.bind_label(zero_end_word);
-    enc.emit_word(NORDIC_STATICS_BASE + NORDIC_STATICS_BYTES);
+    enc.emit_word(zero_end);
     enc.bind_label(heap_ptr_word);
     enc.emit_word(NORDIC_HEAP_PTR);
     enc.bind_label(heap_base_word);
@@ -1869,6 +2064,43 @@ fn build_object_core(
     wide: bool,
     pdb: Option<&lamella_metadata::PortablePdb>,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
+    build_program_object(cil, corlib, libraries, defer, wide, pdb, false)
+        .map(|(bytes, report, _)| (bytes, report))
+}
+
+/// The PROGRAM object the linked tier links: [`build_object_with_libraries`]'s, with the program's
+/// debug information when `pdb` is given, except that a MONOMORPHIZED body it cannot lower is emitted
+/// as a trap and returned as a [`DeferredBody`] rather than refusing the program.
+///
+/// **A PROGRAM LOWERS INSTANTIATIONS IT NEVER USES, AND THAT IS WHY.** Its plan holds every closed
+/// instantiation any assembly in the build names, the libraries' included, because a body the program
+/// does lower can name one the program never spells. So a library that names `Span<byte>` puts every
+/// method of `Span<byte>` into every program that references it, and one of them failing to lower
+/// refused programs that never reach it. Its own methods stay strict: a method of the program that does
+/// not lower is refused whether or not anything calls it.
+#[cfg(feature = "linked")]
+fn build_linked_program_object(
+    cil: &[u8],
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    pdb: Option<&lamella_metadata::PortablePdb>,
+) -> Result<(Vec<u8>, Vec<DeferredBody>), BuildError> {
+    build_program_object(cil, Some(corlib), libraries, false, false, pdb, true)
+        .map(|(bytes, _, deferred)| (bytes, deferred))
+}
+
+/// [`build_object_core`], and with `defer_monomorphized` the build
+/// [`build_linked_program_object`] describes, which also returns what it deferred.
+#[cfg(feature = "arm32")]
+fn build_program_object(
+    cil: &[u8],
+    corlib: Option<&[u8]>,
+    libraries: &[&[u8]],
+    defer: bool,
+    wide: bool,
+    pdb: Option<&lamella_metadata::PortablePdb>,
+    defer_monomorphized: bool,
+) -> Result<(Vec<u8>, LibraryBuildReport, Vec<DeferredBody>), BuildError> {
     let assembly = read_assembly(cil)?;
     let reference = match corlib {
         Some(bytes) => Some(read_assembly(bytes)?),
@@ -1893,8 +2125,14 @@ fn build_object_core(
             .map(|bytes| alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, bytes)))
             .collect(),
     };
+    let mut monomorphized = Vec::new();
+    let monomorphized_failure = if defer_monomorphized {
+        MonomorphizedFailure::Defer(&mut monomorphized)
+    } else {
+        MonomorphizedFailure::Refuse
+    };
     let (mut funcs, maps, cil_fails, seams, duplicates, _thunks, plan) =
-        lower_assembly_seams(&assembly, entry, &references)?;
+        lower_assembly_seams(&assembly, entry, &references, monomorphized_failure)?;
     refuse_duplicate_bodies(&duplicates)?;
     let cil_fail_rows: Vec<(u32, cil::CilError)> = if defer {
         for (rid, _) in &cil_fails {
@@ -1996,7 +2234,9 @@ fn build_object_core(
             ),
         }
         .map_err(BuildError::LowerArm)?;
-        return Ok((bytes, LibraryBuildReport::default()));
+        let report = LibraryBuildReport::default();
+        let deferred = deferred_bodies(&report, monomorphized, &names)?;
+        return Ok((bytes, report, deferred));
     }
     let (bytes, emit_stubs) = arm32::lower_object_vtables_statics_report(
         &funcs,
@@ -2033,7 +2273,8 @@ fn build_object_core(
         ),
         silent_seam_edges: silent_edges,
     };
-    Ok((bytes, report))
+    let deferred = deferred_bodies(&LibraryBuildReport::default(), monomorphized, &names)?;
+    Ok((bytes, report, deferred))
 }
 
 /// Appends the REFERENCE-OWNED descriptors a lowered module mentions but this assembly does not
@@ -3026,7 +3267,7 @@ pub fn lower_monomorphized_body<'a>(
     };
     let named_argument = rebased
         .is_some()
-        .then(|| arguments.iter().find(|argument| names_a_type(argument)))
+        .then(|| arguments.iter().find(|argument| crate::generics::names_a_type(argument)))
         .flatten()
         .map(|argument| {
             crate::generics::spell_sig(assembly, argument)
@@ -3221,30 +3462,10 @@ fn refuse_undispatchable_instantiations(resolver: &MetadataResolver<'_>) -> Resu
     }
 }
 
-/// Whether a closed type argument NAMES a type -- the criterion that separates the cross-assembly
-/// slice this tier lowers from the one it refuses (see [`MonoGap::CrossAssemblyNamedArgument`]).
-///
-/// It asks the question STRUCTURALLY rather than by listing the safe cases: a `Class`/`ValueType`
-/// carries a token, and every composite spelling is token-bearing exactly when one of its parts is.
-/// A list of primitives would go quiet the day a new primitive `SigType` is added; this does not.
-fn names_a_type(sig: &SigType) -> bool {
-    match sig {
-        SigType::Class(_) | SigType::ValueType(_) => true,
-        SigType::SzArray(element) | SigType::ByRef(element) | SigType::Pointer(element) => {
-            names_a_type(element)
-        }
-        SigType::Array { element, .. } => names_a_type(element),
-        SigType::GenericInst {
-            definition,
-            arguments,
-        } => names_a_type(definition) || arguments.iter().any(names_a_type),
-        _ => false,
-    }
-}
-
 /// Whether a closed type argument is LAID OUT rather than merely referenced -- the criterion for
 /// [`MonoGap::CrossAssemblyValueTypeArgument`], and the reason it is a narrower question than
-/// [`names_a_type`].
+/// [`crate::generics::names_a_type`], which separates the cross-assembly slice this tier lowers from
+/// the one it refuses (see [`MonoGap::CrossAssemblyNamedArgument`]).
 ///
 /// **A REFERENCE NEEDS NO ASSEMBLY TO INTERPRET AND A VALUE TYPE DOES.** `Box<MyProgramClass>` is
 /// lowered here because every reference is four bytes and one traced word, whatever it names -- the
@@ -3255,7 +3476,7 @@ fn names_a_type(sig: &SigType) -> bool {
 ///
 /// **AN ADDRESS IS NOT A LAYOUT, WHICH IS WHY `SzArray`/`ByRef`/`Pointer` DO NOT RECURSE HERE.** An
 /// array of a caller's struct is still an `ObjectRef` in the slot, and the element layout is the
-/// array descriptor's question rather than this slot's. [`names_a_type`] recurses through them
+/// array descriptor's question rather than this slot's. `names_a_type` recurses through them
 /// because it asks whether a token is PRESENT; this asks whether one is READ.
 ///
 /// **A VALUE-TYPE INSTANTIATION RECURSES INTO ITS ARGUMENTS AND A CLASS ONE DOES NOT**, which is
@@ -3381,7 +3602,11 @@ pub fn lower_monomorphized_method_body<'a>(
         .ok_or_else(|| gap(MonoGap::NoDefinitionBody))?;
     let cil_body = method.body().ok_or_else(|| gap(MonoGap::NoDefinitionBody))?;
     if rebased.is_some() {
-        if let Some(argument) = body.arguments.iter().find(|argument| names_a_type(argument)) {
+        if let Some(argument) = body
+            .arguments
+            .iter()
+            .find(|argument| crate::generics::names_a_type(argument))
+        {
             return Err(gap(MonoGap::CrossAssemblyNamedArgument {
                 argument: crate::generics::spell_sig(assembly, argument)
                     .unwrap_or_else(|| alloc::format!("{argument:?}")),
@@ -3440,8 +3665,10 @@ pub fn lower_monomorphized_method_body<'a>(
 ///
 /// **A NESTED instantiation is answered only where the answer is provable.** `` List`1<Box`1<int>> ``
 /// as a slot type is a CLASS instantiation and therefore an `ObjectRef` whatever its arguments are.
-/// A nested VALUE-type instantiation's MIR type needs the instantiated layout's SIZE, which is a
-/// different seam, so it refuses rather than taking `mir_type`'s `I32`.
+/// A nested VALUE-type instantiation's MIR type needs the instantiated layout's SIZE, so it is taken
+/// from [`crate::resolver::instantiated_value_type_slot_across`] -- the one function every
+/// monomorphized site types such a slot by -- and refuses where that does, rather than taking
+/// `mir_type`'s `I32`.
 fn substituted_mir_type<'x>(
     sig: &SigType,
     arguments: &[SigType],
@@ -3454,6 +3681,13 @@ fn substituted_mir_type<'x>(
         SigType::Var(_) | SigType::MVar(_) => None,
         SigType::GenericInst { definition, .. } => match definition.as_ref() {
             SigType::Class(_) => Some(MirType::ObjectRef),
+            SigType::ValueType(_) => crate::resolver::instantiated_value_type_slot_across(
+                &closed,
+                assembly,
+                argument_world,
+                references,
+                &TargetLayout::ilp32(),
+            ),
             _ => None,
         },
         other => mir_type(other, assembly, argument_world, references).ok(),
@@ -3683,7 +3917,7 @@ fn build_library_object_riscv_inner(
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
-        lower_assembly_seams(&assembly, None, &references)?;
+        lower_assembly_seams(&assembly, None, &references, MonomorphizedFailure::Refuse)?;
     refuse_duplicate_bodies(&duplicates)?;
     let prefix = library_prefix(cil);
     let resolver = MetadataResolver::new(&assembly)
@@ -3967,15 +4201,75 @@ fn build_library_object_inner(
     references: &[&[u8]],
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
+    build_library_object_core(cil, references, wide, false)
+        .map(|(bytes, report, _)| (bytes, report))
+}
+
+/// A LIBRARY object for a build that links it into ONE program and dead-strips the result, so that a
+/// method this build cannot produce refuses only a program that reaches it.
+///
+/// The object differs from [`build_library_object_with_references`]'s in exactly the methods that
+/// build refuses or leaves answering a constant: a body that never became MIR, a monomorphized body
+/// that did not lower, and a method the object could not encode with. Each is emitted as a TRAP under
+/// its own symbol and returned beside the object, and [`reachable_objects`] refuses the link if one of
+/// those symbols survives the dead-strip. A library is built before any program that uses it, which is
+/// why the question cannot be answered here.
+///
+/// A core library defers on the same terms. Its own build reports such methods and ships them
+/// answering a constant; here a program that reaches one is refused instead.
+#[cfg(feature = "linked")]
+fn build_library_object_deferring(
+    cil: &[u8],
+    references: &[&[u8]],
+) -> Result<(Vec<u8>, Vec<DeferredBody>), BuildError> {
+    build_library_object_core(cil, references, false, true)
+        .map(|(bytes, _, deferred)| (bytes, deferred))
+}
+
+/// A method a deferring build could not produce and emitted as a TRAP under its own symbol: any
+/// method of a library ([`build_library_object_deferring`]), or a monomorphized body of the program
+/// ([`build_linked_program_object`]).
+#[cfg(feature = "arm32")]
+#[cfg_attr(not(feature = "linked"), allow(dead_code))]
+struct DeferredBody {
+    /// The symbol its object defines the trap under, which is what the link is asked about.
+    symbol: alloc::string::String,
+    /// The method's readable name: `Namespace.Type::Method`, or `Instantiation::Method` for a
+    /// monomorphized body.
+    method: alloc::string::String,
+    /// Why its body could not be produced.
+    reason: alloc::string::String,
+}
+
+/// [`build_library_object_inner`], or with `defer` the build [`build_library_object_deferring`]
+/// describes, which also returns what it deferred.
+#[cfg(feature = "arm32")]
+fn build_library_object_core(
+    cil: &[u8],
+    references: &[&[u8]],
+    wide: bool,
+    defer: bool,
+) -> Result<(Vec<u8>, LibraryBuildReport, Vec<DeferredBody>), BuildError> {
     let assembly = read_assembly(cil)?;
     let reference_assemblies: Vec<Assembly> = references
         .iter()
         .map(|bytes| read_assembly(bytes))
         .collect::<Result<_, _>>()?;
     let reference_list: Vec<&Assembly> = reference_assemblies.iter().collect();
+    let mut monomorphized = Vec::new();
+    let monomorphized_failure = if defer {
+        MonomorphizedFailure::Defer(&mut monomorphized)
+    } else {
+        MonomorphizedFailure::Refuse
+    };
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
-        lower_assembly_seams(&assembly, None, &reference_list)?;
+        lower_assembly_seams(&assembly, None, &reference_list, monomorphized_failure)?;
     refuse_duplicate_bodies(&duplicates)?;
+    if defer {
+        for (rid, _) in &fails {
+            funcs[*rid as usize] = deferred_trap_body();
+        }
+    }
     let prefix = library_prefix(cil);
     let mut names = library_symbol_names(&assembly, &reference_list, funcs.len(), &prefix);
     name_type_init_thunks(&assembly, &thunks, &mut names);
@@ -4009,7 +4303,12 @@ fn build_library_object_inner(
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     point_referenced_enums_at_their_owner(&resolver, references, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized(), resolver.references());
-    let (bytes, stubs) = arm32::lower_object_library_vtables_report(
+    let lower = if defer {
+        arm32::lower_object_library_vtables_deferring
+    } else {
+        arm32::lower_object_library_vtables_report
+    };
+    let (bytes, stubs) = lower(
         &funcs,
         &name_refs,
         &[],
@@ -4044,8 +4343,42 @@ fn build_library_object_inner(
         ),
         silent_seam_edges: silent_seam_call_edges(&assembly, &funcs, &seams, &display_names),
     };
+    if defer {
+        let deferred = deferred_bodies(&report, monomorphized, &names)?;
+        return Ok((bytes, report, deferred));
+    }
     refuse_demoted_library_methods(&assembly, &report)?;
-    Ok((bytes, report))
+    Ok((bytes, report, Vec::new()))
+}
+
+/// What a deferring build deferred: the CIL fails and emit stubs `report` names, and the monomorphized
+/// bodies that did not lower, each keyed by the SYMBOL `names` gives its function index. `names` is
+/// the list the emission was handed, so every symbol here is one the object defines.
+#[cfg(feature = "arm32")]
+fn deferred_bodies(
+    report: &LibraryBuildReport,
+    monomorphized: Vec<(u32, alloc::string::String, alloc::string::String)>,
+    names: &[alloc::string::String],
+) -> Result<Vec<DeferredBody>, BuildError> {
+    report
+        .cil_fails
+        .iter()
+        .chain(&report.emit_stubs)
+        .cloned()
+        .chain(monomorphized)
+        .map(|(index, method, reason)| match names.get(index as usize) {
+            Some(symbol) => Ok(DeferredBody {
+                symbol: symbol.clone(),
+                method,
+                reason,
+            }),
+            None => Err(BuildError::StubbedLibraryMethod {
+                method,
+                reason,
+                total: 1,
+            }),
+        })
+        .collect()
 }
 
 /// The [`LibraryBuildReport`] rows for the seams [`lower_assembly_seams`] left unsynthesized: each
@@ -4182,10 +4515,11 @@ fn silent_seam_call_edges(
 /// That matters -- an unconditional `[RuntimeProvided]` walk of a corlib costs ~230 ms in a debug
 /// build, which no program build can afford to spend on every reference.
 ///
-/// The export condition it mirrors is [`library_symbol_names`]'s, reduced by what is known here: a
-/// marked method is never `is_plain_instance`, and one this backend synthesizes is not silent, so
-/// what remains is `(static || virtual) && accessible`. A symbol two methods share is DEMOTED to
-/// internal by the library build, so it cannot be a silent path -- the program fails to link instead.
+/// It asks [`named_across_assemblies`], the predicate [`library_symbol_names`] exports by, with the
+/// callable kinds reduced by what is known here: a marked method is never `is_plain_instance`, and
+/// one this backend synthesizes is not silent, so a static method is the only callable kind left. A
+/// symbol two methods share is DEMOTED to internal by the library build, so it cannot be a silent
+/// path -- the program fails to link instead.
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
 fn imported_silent_seams<'a>(
     reference: &'a Assembly<'a>,
@@ -4201,9 +4535,7 @@ fn imported_silent_seams<'a>(
             continue;
         };
         for method in type_def.methods() {
-            if !(method.is_static() || method.is_virtual())
-                || !matches!(method.flags() & 0x7, 0x4..=0x6)
-            {
+            if !named_across_assemblies(&method, method.is_static()) {
                 continue;
             }
             let Some(method_name) = method.name() else {
@@ -4392,6 +4724,25 @@ fn method_display_names(
     names
 }
 
+/// Whether another assembly names a LIBRARY method by its extern symbol -- the half of the export
+/// rule that is about the method itself rather than about what this build synthesizes. `callable` is
+/// whether it is a kind another assembly CALLS by name: a static method, a synthesized seam, or a
+/// plain instance method with a body.
+///
+/// **A VIRTUAL METHOD QUALIFIES WHATEVER ITS ACCESSIBILITY.** A program that allocates the type lays
+/// its own copy of the descriptor, and every slot of that copy names its implementation by this
+/// symbol ([`crate::resolver`]'s `reference_explicit_entry` names an explicit interface
+/// implementation that way). An explicit implementation is PRIVATE, so an accessibility test refused
+/// exactly the slots that copy needs, and the program failed to link on the first one. Anything else
+/// must cross the boundary by accessibility (II.23.1.10's low three bits): Family (4), FamORAssem (5)
+/// or Public (6) -- FamANDAssem and below cannot.
+///
+/// ONE PREDICATE FOR BOTH SIDES OF THE AUDIT: [`library_symbol_names`] exports by it, and
+/// `imported_silent_seams` asks it which of a reference's seams a program can have linked against.
+fn named_across_assemblies(method: &lamella_metadata::Method<'_>, callable: bool) -> bool {
+    method.is_virtual() || (callable && matches!(method.flags() & 0x7, 0x4..=0x6))
+}
+
 /// The per-function symbol names for [`build_library_object`]: a cross-assembly-ACCESSIBLE static
 /// method takes its stable cross-assembly symbol (`extern_method_symbol`), so a program links its
 /// extern call against it; an accessible VIRTUAL instance method likewise, so a program type
@@ -4401,6 +4752,8 @@ fn method_display_names(
 /// (internal). Accessible = Public, Family, or FamORAssem -- a `protected`/`protected internal`
 /// member is exactly what a DERIVED type in another assembly calls (`base.Dispose(disposing)`)
 /// or inherits into its vtable, so exporting only Public left those slots undefined at link.
+/// A virtual method is exported WHATEVER its accessibility, for the same reason one step further:
+/// see [`named_across_assemblies`].
 ///
 /// **UNGATED, BECAUSE A CROSS-ASSEMBLY MONOMORPHIZED BODY NEEDS IT UNDER EVERY CODE MODEL.** A
 /// call out of such a body names the symbol the OWNER's object defines, and this is the one function
@@ -4441,9 +4794,10 @@ fn library_symbol_names<'a>(
                 && !method.is_virtual()
                 && !runtime_provided
                 && method.body().is_some();
-            if (method.is_static() || method.is_virtual() || is_synth_seam || is_plain_instance)
-                && matches!(method.flags() & 0x7, 0x4..=0x6)
-            {
+            if named_across_assemblies(
+                &method,
+                method.is_static() || is_synth_seam || is_plain_instance,
+            ) {
                 if let (Some(method_name), Some(sig)) =
                     (method.name(), crate::resolver::decodable_signature(&method))
                 {
@@ -6871,7 +7225,7 @@ fn lower_assembly_debug<'a>(
     references: &[&'a Assembly<'a>],
 ) -> Result<LoweredAssemblyDebug, BuildError> {
     let (funcs, maps, fails, _seams, duplicates, _thunks, plan) =
-        lower_assembly_seams(assembly, entry, references)?;
+        lower_assembly_seams(assembly, entry, references, MonomorphizedFailure::Refuse)?;
     Ok((funcs, maps, fails, duplicates, plan))
 }
 
@@ -6971,15 +7325,56 @@ type LoweredAssembly = (
 /// `seams` records the disposition rather than re-deriving it.
 type SeamRow = (u32, SeamDisposition, bool);
 
+/// What [`lower_assembly_seams`] does with a MONOMORPHIZED body it cannot lower.
+///
+/// **REFUSING IS THE DEFAULT, AND FOR A REASON.** A planned body that is never written stays a
+/// `stub()` that RETURNS, so a build that shrugged here would answer zero at every call to it.
+/// Deferring is right only for a build whose caller goes on to ask the link whether anything keeps
+/// the body, and refuses if something does.
+enum MonomorphizedFailure<'s> {
+    /// Stop the build with the first such body's error.
+    Refuse,
+    /// Write a TRAP at the body's index and record `(index, method, reason)` here.
+    #[cfg_attr(not(feature = "arm32"), allow(dead_code))]
+    Defer(&'s mut Vec<(u32, alloc::string::String, alloc::string::String)>),
+}
+
+impl MonomorphizedFailure<'_> {
+    /// The body to write in place of one that did not lower -- a trap, once the failure is recorded
+    /// -- or the failure itself, for a build that refuses.
+    fn absorb(
+        &mut self,
+        index: u32,
+        instantiation: &str,
+        name: &str,
+        error: BuildError,
+    ) -> Result<Function, BuildError> {
+        let Self::Defer(deferred) = self else {
+            return Err(error);
+        };
+        let reason = match error {
+            BuildError::MonomorphizedBody { reason, .. } => alloc::format!("{reason:?}"),
+            other => alloc::format!("{other}"),
+        };
+        deferred.push((index, alloc::format!("{instantiation}::{name}"), reason));
+        Ok(deferred_trap_body())
+    }
+}
+
 /// As [`lower_assembly_debug`], but ALSO returns the `[RuntimeProvided]` seams this build did not
 /// synthesize -- the third silent-demotion layer, alongside the CIL->MIR fails and the object-emit
 /// stubs (see [`LibraryBuildReport`]). A caller that must not ship a silent wrong answer reads this;
 /// [`lower_assembly_debug`] is the thin wrapper for the callers that do not, so their bytes are
 /// unchanged by construction.
+///
+/// `monomorphized` says what a monomorphized body that does not lower becomes. An ordinary method
+/// that does not lower is always reported rather than refused here (the `fails` list), because its
+/// row names it and the caller decides.
 fn lower_assembly_seams<'a>(
     assembly: &'a Assembly<'a>,
     entry: Option<u32>,
     references: &[&'a Assembly<'a>],
+    mut monomorphized: MonomorphizedFailure<'_>,
 ) -> Result<LoweredAssembly, BuildError> {
     let mut methods = Vec::new();
     let mut max_rid = entry.unwrap_or(0);
@@ -7110,15 +7505,21 @@ fn lower_assembly_seams<'a>(
         let func = if body.declaration_only {
             deferred_trap_body()
         } else {
-            lower_monomorphized_body(assembly, &resolver, body)?
+            match lower_monomorphized_body(assembly, &resolver, body) {
+                Ok(func) => func,
+                Err(error) => {
+                    monomorphized.absorb(body.index, &body.instantiation, &body.name, error)?
+                }
+            }
         };
         bodies.write(body.index, func);
     }
     for body in plan.method_bodies() {
-        bodies.write(
-            body.index,
-            lower_monomorphized_method_body(assembly, &resolver, body)?,
-        );
+        let func = match lower_monomorphized_method_body(assembly, &resolver, body) {
+            Ok(func) => func,
+            Err(error) => monomorphized.absorb(body.index, &body.instantiation, &body.name, error)?,
+        };
+        bodies.write(body.index, func);
     }
     for (i, (_, cctor, flag_slot)) in type_inits.iter().enumerate() {
         bodies.write(
@@ -11657,7 +12058,8 @@ mod tests {
     #[test]
     fn no_build_refusal_renders_a_run_of_spaces() {
         let name = || alloc::string::String::from("Ns.Type::Method");
-        let messages = alloc::vec![
+        #[cfg_attr(not(feature = "linked"), allow(unused_mut))]
+        let mut messages = alloc::vec![
             alloc::format!("{}", BuildError::Parse),
             alloc::format!("{}", BuildError::UnmetDemand(name())),
             alloc::format!("{}", BuildError::UnsupportedTarget),
@@ -11702,6 +12104,15 @@ mod tests {
                 BuildError::ValueTypeTraceMap { type_name: name(), size: 9000 }
             ),
         ];
+        #[cfg(feature = "linked")]
+        messages.push(alloc::format!(
+            "{}",
+            BuildError::UnlowerableMethodReached {
+                method: name(),
+                reason: name(),
+                total: 2,
+            }
+        ));
         assert_renders_as_one_sentence(&messages);
     }
 
@@ -11799,5 +12210,189 @@ mod tests {
             ),
         ];
         assert_renders_as_one_sentence(&messages);
+    }
+
+    fn fixture(relative: &str) -> Option<Vec<u8>> {
+        std::fs::read(alloc::format!("{}/{relative}", env!("CARGO_MANIFEST_DIR"))).ok()
+    }
+
+    /// The fixtures of the reachability test below, each described in its own source's header.
+    #[cfg(feature = "linked")]
+    struct Reach {
+        corlib: Vec<u8>,
+        runtime_stackalloc: Vec<u8>,
+        stackalloc_prog: Vec<u8>,
+        stackalloc_reach: Vec<u8>,
+        mono_unlowerable: Vec<u8>,
+        mono_prog: Vec<u8>,
+        mono_reach: Vec<u8>,
+    }
+
+    #[cfg(feature = "linked")]
+    fn reach_fixtures() -> Option<Reach> {
+        Some(Reach {
+            corlib: fixture("../lamella-load/tests/fixtures/corlib.dll")?,
+            runtime_stackalloc: fixture("tests/fixtures/runtimestackalloc.dll")?,
+            stackalloc_prog: fixture("tests/fixtures/stackallocprog.dll")?,
+            stackalloc_reach: fixture("tests/fixtures/stackallocreach.dll")?,
+            mono_unlowerable: fixture("tests/fixtures/monounlowerable.dll")?,
+            mono_prog: fixture("tests/fixtures/monoprog.dll")?,
+            mono_reach: fixture("tests/fixtures/monoreach.dll")?,
+        })
+    }
+
+    /// `program` built against `corlib` and `library`, and dead-stripped, as the linked tier builds
+    /// and links it.
+    #[cfg(feature = "linked")]
+    fn linked_objects(
+        program: &[u8],
+        corlib: &[u8],
+        library: &[u8],
+    ) -> Result<Vec<lamella_elf::Object>, BuildError> {
+        let (object, deferred) = build_linked_program_object(program, corlib, &[library], None)?;
+        reachable_objects(&object, deferred, corlib, &[library])
+    }
+
+    /// A METHOD THIS BUILD CANNOT LOWER REFUSES A PROGRAM THAT REACHES IT, AND NO OTHER.
+    ///
+    /// Each library holds one method whose body does not lower beside one whose body does -- an
+    /// ordinary method in one library, a monomorphized body in the other -- and each is linked by a
+    /// program that reaches the good method and by one that reaches the bad. The first program
+    /// links; the second is refused, and the refusal names the method it reaches.
+    ///
+    /// The deferral is asserted first, so that if a run-time-sized `stackalloc` ever lowers, this
+    /// test says its fixtures no longer hold an unlowerable method rather than passing on nothing.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_library_method_this_build_cannot_lower_refuses_only_a_program_that_reaches_it() {
+        let Some(reach) = reach_fixtures() else { return };
+        let corlib = &reach.corlib[..];
+        for (library, unlowerable) in [
+            (&reach.runtime_stackalloc[..], "RuntimeStackalloc::RuntimeSized"),
+            (&reach.mono_unlowerable[..], "Holder`1[System.Int32]::Scratch"),
+        ] {
+            let (_, deferred) = build_library_object_deferring(library, &[corlib])
+                .expect("a deferring library build does not refuse a method it cannot lower");
+            let names: Vec<&str> = deferred.iter().map(|body| body.method.as_str()).collect();
+            assert_eq!(
+                names,
+                [unlowerable],
+                "the library defers exactly the method whose body does not lower -- if it defers \
+                 nothing, the fixture no longer holds one; choose another"
+            );
+        }
+        let (_, deferred) =
+            build_linked_program_object(&reach.mono_prog, corlib, &[&reach.mono_unlowerable[..]], None)
+                .expect("a linked program build does not refuse a monomorphized body it cannot lower");
+        let names: Vec<&str> = deferred.iter().map(|body| body.method.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Holder`1[System.Int32]::Scratch"],
+            "the program plans the library's `Holder<int>` and defers its `Scratch` -- if it defers \
+             nothing, the plan stopped rooting other assemblies' instantiations and this half has \
+             nothing left to cover"
+        );
+        for (program, library) in [
+            (&reach.stackalloc_prog[..], &reach.runtime_stackalloc[..]),
+            (&reach.mono_prog[..], &reach.mono_unlowerable[..]),
+        ] {
+            if let Err(error) = linked_objects(program, corlib, library) {
+                panic!("a program that never reaches the unlowerable method was refused: {error}");
+            }
+        }
+        for (program, library, unlowerable) in [
+            (&reach.stackalloc_reach[..], &reach.runtime_stackalloc[..], "RuntimeStackalloc::RuntimeSized"),
+            (&reach.mono_reach[..], &reach.mono_unlowerable[..], "Holder`1[System.Int32]::Scratch"),
+        ] {
+            match linked_objects(program, corlib, library) {
+                Err(BuildError::UnlowerableMethodReached { method, total, .. }) => {
+                    assert_eq!(method, unlowerable, "the refusal names the method reached");
+                    assert_eq!(total, 1, "one unlowerable method is reached");
+                }
+                Err(other) => panic!("expected the reached method to be refused, got {other}"),
+                Ok(_) => panic!("a program that reaches `{unlowerable}` linked"),
+            }
+        }
+    }
+
+    /// `explicitimpl.dll` -- a program allocating `Hashtable` and `SortedList`; see its source's header --
+    /// and the corlib it builds against.
+    fn explicit_impl_fixtures() -> Option<(Vec<u8>, Vec<u8>)> {
+        Some((
+            fixture("tests/fixtures/explicitimpl.dll")?,
+            fixture("../lamella-load/tests/fixtures/corlib.dll")?,
+        ))
+    }
+
+    /// The managed symbols `program` references that neither it nor `library` defines. A name the
+    /// runtime archive or the linker supplies (`lamella_...`, `__...`) is not one.
+    fn managed_symbols_left_undefined(
+        program: &[u8],
+        library: &[u8],
+    ) -> (Vec<alloc::string::String>, Vec<alloc::string::String>) {
+        let program = lamella_elf::read_object(program).expect("the program object reads back");
+        let library = lamella_elf::read_object(library).expect("the library object reads back");
+        let defined: alloc::collections::BTreeSet<&str> = program
+            .symbols
+            .iter()
+            .chain(&library.symbols)
+            .filter(|symbol| symbol.defined)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        let referenced: Vec<alloc::string::String> = program
+            .symbols
+            .iter()
+            .filter(|symbol| !symbol.defined && !symbol.name.is_empty())
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        let left = referenced
+            .iter()
+            .filter(|name| !name.starts_with("lamella_") && !name.starts_with("__"))
+            .filter(|name| !defined.contains(name.as_str()))
+            .cloned()
+            .collect();
+        (left, referenced)
+    }
+
+    /// A PROGRAM THAT ALLOCATES A LIBRARY TYPE LINKS AGAINST THE TYPE'S PRIVATE INTERFACE METHODS.
+    ///
+    /// `Hashtable` and `SortedList` implement `IEnumerable.GetEnumerator` explicitly, so the method is
+    /// private. The program's copy of each descriptor names it by its cross-assembly symbol, and the
+    /// library exported only accessible methods, so the link failed on the first one. The positive
+    /// control is that the program does name both, so this cannot pass on a program that no longer
+    /// lays the copies.
+    fn assert_a_program_names_only_what_corlib_exports(program: &[u8], library: &[u8]) {
+        let (left, referenced) = managed_symbols_left_undefined(program, library);
+        for owner in ["System.Collections.SortedList.", "System.Collections.Hashtable."] {
+            assert!(
+                referenced
+                    .iter()
+                    .any(|name| name.starts_with(owner) && name.contains("IEnumerable.GetEnumerator")),
+                "the program names {owner}'s explicit IEnumerable.GetEnumerator -- if it does not, the                  fixture no longer exercises a private slot; referenced: {referenced:?}"
+            );
+        }
+        assert!(
+            left.is_empty(),
+            "the program references managed symbols corlib does not define: {left:?}"
+        );
+    }
+
+    #[test]
+    fn a_program_links_against_a_private_interface_implementation_on_arm() {
+        let Some((program, corlib)) = explicit_impl_fixtures() else { return };
+        assert_a_program_names_only_what_corlib_exports(
+            &build_object_with_libraries(&program, &corlib, &[]).expect("the program builds"),
+            &build_library_object(&corlib).expect("corlib builds"),
+        );
+    }
+
+    #[cfg(feature = "riscv32")]
+    #[test]
+    fn a_program_links_against_a_private_interface_implementation_on_riscv() {
+        let Some((program, corlib)) = explicit_impl_fixtures() else { return };
+        assert_a_program_names_only_what_corlib_exports(
+            &build_object_riscv_with_reference(&program, &corlib).expect("the program builds"),
+            &build_library_object_riscv(&corlib).expect("corlib builds"),
+        );
     }
 }

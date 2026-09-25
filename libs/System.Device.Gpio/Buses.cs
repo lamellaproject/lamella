@@ -12,16 +12,29 @@ namespace Lamella.Hardware
     /// <summary>Creates the GPIO driver, on first use.</summary>
     public delegate GpioDriver GpioDriverFactory();
 
+#if LAMELLA_SURFACE_FLOAT
+    /// <summary>Creates output <paramref name="channel"/> of one PWM chip at
+    /// <paramref name="frequency"/> and <paramref name="dutyCyclePercentage"/>, not yet started,
+    /// for <see cref="System.Device.Pwm.PwmChannel.Create(int, int, int, double)"/>.</summary>
+    /// <remarks>A factory refuses a channel its chip does not have with
+    /// <see cref="System.ArgumentOutOfRangeException"/> for <c>channel</c>, a frequency or duty cycle
+    /// outside what the channel can produce with <see cref="System.ArgumentOutOfRangeException"/> for
+    /// <c>frequency</c> or <c>dutyCyclePercentage</c>, and a channel that is already open with
+    /// <see cref="System.InvalidOperationException"/>. Disposing the channel it returned releases it,
+    /// so the same channel can then be created again.</remarks>
+    public delegate System.Device.Pwm.PwmChannel PwmChannelFactory(int channel, int frequency, double dutyCyclePercentage);
+#endif
+
     /// <summary>The board's map from bus id to the driver that serves it. A board binds its buses
     /// once at startup; <see cref="System.Device.Spi.SpiDevice.Create(System.Device.Spi.SpiConnectionSettings)"/>
     /// and its siblings then resolve through here, so application code uses the standard factories
     /// and never names a driver.</summary>
     public sealed class Buses
     {
-        /// <summary>The number of logical buses of each kind, so valid ids are 0 to
-        /// <c>BusCount - 1</c>. A bus id is a LOGICAL index the board maps onto a peripheral
-        /// instance, not a peripheral instance number, which is what keeps this a framework
-        /// constant rather than a per-chip fact.</summary>
+        /// <summary>The number of logical buses of each kind, and of PWM chips, so valid ids are 0
+        /// to <c>BusCount - 1</c>. A bus id or a chip is a LOGICAL index the board maps onto a
+        /// peripheral instance, not a peripheral instance number, which is what keeps this a
+        /// framework constant rather than a per-chip fact.</summary>
         public const int BusCount = 8;
 
         private Buses() { }
@@ -32,6 +45,9 @@ namespace Lamella.Hardware
         private static readonly I2cDriver[] _i2cDrivers = new I2cDriver[BusCount];
         private static GpioDriverFactory _gpioFactory;
         private static GpioDriver _gpioDriver;
+#if LAMELLA_SURFACE_FLOAT
+        private static readonly PwmChannelFactory[] _pwmFactories = new PwmChannelFactory[BusCount];
+#endif
 
         /// <summary>Binds the factory that creates SPI bus <paramref name="busId"/>'s driver.
         /// Call it once per bus during board startup; the factory does not run until something
@@ -40,7 +56,7 @@ namespace Lamella.Hardware
         {
             CheckBusId(busId);
             if ((object)factory == null) throw new System.ArgumentNullException("factory");
-            if ((object)_spiFactories[busId] != null) throw AlreadyBound("SPI", busId);
+            if ((object)_spiFactories[busId] != null) throw AlreadyBound("SPI", "bus", busId);
             _spiFactories[busId] = factory;
         }
 
@@ -49,7 +65,7 @@ namespace Lamella.Hardware
         {
             CheckBusId(busId);
             if ((object)factory == null) throw new System.ArgumentNullException("factory");
-            if ((object)_i2cFactories[busId] != null) throw AlreadyBound("I2C", busId);
+            if ((object)_i2cFactories[busId] != null) throw AlreadyBound("I2C", "bus", busId);
             _i2cFactories[busId] = factory;
         }
 
@@ -64,6 +80,20 @@ namespace Lamella.Hardware
             }
             _gpioFactory = factory;
         }
+
+#if LAMELLA_SURFACE_FLOAT
+        /// <summary>Binds the factory that creates PWM chip <paramref name="chip"/>'s channels.
+        /// Call it once per chip during board startup; the factory runs each time
+        /// <see cref="System.Device.Pwm.PwmChannel.Create(int, int, int, double)"/> names the
+        /// chip.</summary>
+        public static void BindPwm(int chip, PwmChannelFactory factory)
+        {
+            CheckChip(chip);
+            if ((object)factory == null) throw new System.ArgumentNullException("factory");
+            if ((object)_pwmFactories[chip] != null) throw AlreadyBound("PWM", "chip", chip);
+            _pwmFactories[chip] = factory;
+        }
+#endif
 
         /// <summary>Whether SPI bus <paramref name="busId"/> has a driver bound.</summary>
         public static bool IsSpiBound(int busId)
@@ -84,6 +114,15 @@ namespace Lamella.Hardware
         {
             return (object)_gpioFactory != null;
         }
+
+#if LAMELLA_SURFACE_FLOAT
+        /// <summary>Whether PWM chip <paramref name="chip"/> has a factory bound.</summary>
+        public static bool IsPwmBound(int chip)
+        {
+            CheckChip(chip);
+            return (object)_pwmFactories[chip] != null;
+        }
+#endif
 
         /// <summary>The SPI driver bound to bus <paramref name="busId"/>, creating it on first
         /// use.</summary>
@@ -108,9 +147,9 @@ namespace Lamella.Hardware
             CheckBusId(busId);
             if ((object)_spiDrivers[busId] != null) return _spiDrivers[busId];
             SpiDriverFactory factory = _spiFactories[busId];
-            if ((object)factory == null) throw NotBound("SPI", busId);
+            if ((object)factory == null) throw NotBound("SPI", "bus", busId);
             SpiDriver created = factory();
-            if ((object)created == null) throw FactoryReturnedNull("SPI", busId);
+            if ((object)created == null) throw FactoryReturnedNull("SPI", "bus", busId);
             _spiDrivers[busId] = created;
             return created;
         }
@@ -126,9 +165,9 @@ namespace Lamella.Hardware
             CheckBusId(busId);
             if ((object)_i2cDrivers[busId] != null) return _i2cDrivers[busId];
             I2cDriverFactory factory = _i2cFactories[busId];
-            if ((object)factory == null) throw NotBound("I2C", busId);
+            if ((object)factory == null) throw NotBound("I2C", "bus", busId);
             I2cDriver created = factory();
-            if ((object)created == null) throw FactoryReturnedNull("I2C", busId);
+            if ((object)created == null) throw FactoryReturnedNull("I2C", "bus", busId);
             _i2cDrivers[busId] = created;
             return created;
         }
@@ -154,6 +193,29 @@ namespace Lamella.Hardware
             return created;
         }
 
+#if LAMELLA_SURFACE_FLOAT
+        /// <summary>A new channel from the factory bound for <paramref name="chip"/>, set to
+        /// <paramref name="frequency"/> and <paramref name="dutyCyclePercentage"/> and not yet
+        /// started. Nothing is cached: every call runs the factory.</summary>
+        internal static System.Device.Pwm.PwmChannel CreatePwmChannel(int chip, int channel, int frequency, double dutyCyclePercentage)
+        {
+            CheckChip(chip);
+            PwmChannelFactory factory = _pwmFactories[chip];
+            if ((object)factory == null) throw NotBound("PWM", "chip", chip);
+            System.Device.Pwm.PwmChannel created = factory(channel, frequency, dutyCyclePercentage);
+            if ((object)created == null) throw FactoryReturnedNull("PWM", "chip", chip);
+            return created;
+        }
+
+        private static void CheckChip(int chip)
+        {
+            if (chip < 0 || chip >= BusCount)
+            {
+                throw new System.ArgumentOutOfRangeException("chip");
+            }
+        }
+#endif
+
         private static void CheckBusId(int busId)
         {
             if (busId < 0 || busId >= BusCount)
@@ -162,23 +224,23 @@ namespace Lamella.Hardware
             }
         }
 
-        private static System.Exception NotBound(string kind, int busId)
+        private static System.Exception NotBound(string kind, string unit, int id)
         {
             return new System.InvalidOperationException(
-                "no " + kind + " driver is bound for bus " + busId.ToString()
+                "no " + kind + " driver is bound for " + unit + " " + id.ToString()
                 + "; the board must bind it at startup");
         }
 
-        private static System.Exception FactoryReturnedNull(string kind, int busId)
+        private static System.Exception FactoryReturnedNull(string kind, string unit, int id)
         {
             return new System.InvalidOperationException(
-                "the bound " + kind + " driver factory for bus " + busId.ToString() + " returned null");
+                "the bound " + kind + " driver factory for " + unit + " " + id.ToString() + " returned null");
         }
 
-        private static System.Exception AlreadyBound(string kind, int busId)
+        private static System.Exception AlreadyBound(string kind, string unit, int id)
         {
             return new System.InvalidOperationException(
-                "a " + kind + " driver is already bound for bus " + busId.ToString());
+                "a " + kind + " driver is already bound for " + unit + " " + id.ToString());
         }
     }
 }

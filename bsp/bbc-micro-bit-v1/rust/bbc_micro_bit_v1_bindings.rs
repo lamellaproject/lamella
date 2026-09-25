@@ -17,6 +17,8 @@ pub const BOARD_VENDOR: &str = "Bbc";
 /// name a driver; and a uart is a different register map on every family, so the kind does
 /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
 pub const I2C_DRIVER_FAMILY: &str = "nrf51-twi";
+pub const VCP_DRIVER_FAMILY: &str = "nrf51-uart";
+pub const SPI_DRIVER_FAMILY: &str = "nrf51-spi";
 
 // -- I2C: an nrf-twi binding descriptor --
 pub const I2C_TWI_BASE: u32 = 0x40003000;
@@ -24,6 +26,23 @@ pub const I2C_PSEL_SCL: u32 = 0x0;
 pub const I2C_PSEL_SDA: u32 = 0x1E;
 pub const I2C_PIN_CNF_SCL_REG: u32 = 0x50000700;
 pub const I2C_PIN_CNF_SDA_REG: u32 = 0x50000778;
+
+// -- SPI: an nrf-spi binding descriptor --
+pub const SPI_SPI_BASE: u32 = 0x40004000;
+pub const SPI_PSEL_SCK: u32 = 0x17;
+pub const SPI_PSEL_MOSI: u32 = 0x15;
+pub const SPI_PSEL_MISO: u32 = 0x16;
+pub const SPI_PIN_CNF_SCK_REG: u32 = 0x5000075C;
+pub const SPI_PIN_CNF_MOSI_REG: u32 = 0x50000754;
+pub const SPI_PIN_CNF_MISO_REG: u32 = 0x50000758;
+
+// -- VCP: an nrf-uart binding descriptor --
+pub const VCP_UART_BASE: u32 = 0x40002000;
+pub const VCP_PSEL_TXD: u32 = 0x18;
+pub const VCP_PSEL_RXD: u32 = 0x19;
+pub const VCP_PIN_CNF_TXD_REG: u32 = 0x50000760;
+pub const VCP_PIN_CNF_RXD_REG: u32 = 0x50000764;
+pub const VCP_BAUDRATE_115200_XTAL_16MHZ: u32 = 0x1D7E000;
 pub const DEVICE_COUNT: u32 = 12;
 
 // -- on-board devices: PORT group base + pin index + mask --

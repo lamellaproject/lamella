@@ -279,6 +279,20 @@ enum DeconstructionTerminator {
     In,
 }
 
+/// An explicit interface member's qualified name, as [`Parser::parse_explicit_member_name`]
+/// reads it.
+struct ExplicitMemberName {
+    /// The interface: every part before the final dot.
+    interface: TypeRef,
+    /// The member's name and where it is written, or `None` when the part after the final dot is
+    /// `this` -- an indexer, whose index list comes next and has not been read.
+    member: Option<(Box<str>, Span)>,
+    /// Where the qualified name starts.
+    name_start: u32,
+    /// Where the last part read ends.
+    end: u32,
+}
+
 impl Parser {
     /// Creates a parser over a lexed source, dropping trivia and keeping the
     /// lexer's diagnostics so the two stages report through one channel.
@@ -476,12 +490,39 @@ impl Parser {
                 _ => {}
             }
         }
+        if self.at_yield_statement() {
+            return self.parse_yield(start);
+        }
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::Colon)
         {
             return self.parse_labeled(start);
         }
         self.parse_declaration_or_expression_statement(start)
+    }
+
+    /// Whether `yield return` or `yield break` begins here.
+    fn at_yield_statement(&self) -> bool {
+        self.current_contextual_keyword() == Some("yield")
+            && matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Keyword(Keyword::Return | Keyword::Break))
+            )
+    }
+
+    /// Parses `yield return e;` or `yield break;`, refusing it by name at the `yield` (the
+    /// ITERATOR feature) and consuming it whole, so the statements after it parse as written.
+    ///
+    fn parse_yield(&mut self, start: u32) -> Stmt {
+        self.gate_feature_here(Feature::Iterators);
+        self.bump();
+        let returns_value = self.current_keyword() == Some(Keyword::Return);
+        self.bump();
+        if returns_value {
+            let _ = self.parse_expression();
+        }
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(StmtKind::Empty, Span::new(start, end))
     }
 
     /// Parses a REPL submission: leading `using` directives (16.3), then top-level
@@ -725,6 +766,9 @@ impl Parser {
         if self.await_blocks_declaration_here() {
             return self.parse_expression_statement(start);
         }
+        if let Some(statement) = self.try_parse_local_function(start) {
+            return statement;
+        }
         let saved_position = self.position;
         let saved_diagnostics = self.diagnostics.len();
         let ty = self.parse_type();
@@ -736,6 +780,74 @@ impl Parser {
         self.position = saved_position;
         self.diagnostics.truncate(saved_diagnostics);
         self.parse_expression_statement(start)
+    }
+
+    /// A LOCAL FUNCTION (C# 7.0) -- `[modifiers] Type Name(parameters) body` inside a block --
+    /// refused by name and consumed whole, or `None`, with nothing consumed, when none begins here.
+    ///
+    /// **A TYPE, A NAME AND THEN `(` OR `<` IS A LOCAL FUNCTION AND NOTHING ELSE.** A local
+    /// declaration's name is followed by `=`, `,` or `;`, and no expression continues with a bare
+    /// name after a type.
+    ///
+    /// The gate is csc's: `local functions` at the NAME, or `static local functions` at the
+    /// `static` when the modifier is there -- one rung later, and one refusal rather than two for
+    /// one declaration.
+    fn try_parse_local_function(&mut self, start: u32) -> Option<Stmt> {
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let mut static_at = None;
+        loop {
+            match self.current_keyword() {
+                Some(Keyword::Static) => {
+                    static_at = Some(self.current().span);
+                    self.bump();
+                }
+                Some(Keyword::Unsafe | Keyword::Extern) => self.bump(),
+                _ if self.current_contextual_keyword() == Some("async")
+                    && matches!(
+                        self.tokens.get(self.position + 1).map(|token| &token.kind),
+                        Some(TokenKind::Identifier(_) | TokenKind::Keyword(_))
+                    ) =>
+                {
+                    self.bump();
+                }
+                _ => break,
+            }
+        }
+        let ty = self.parse_type();
+        let is_local_function = !matches!(ty.kind, TypeRefKind::Error)
+            && matches!(self.current().kind, TokenKind::Identifier(_))
+            && matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Punctuator(Punctuator::OpenParen | Punctuator::LessThan))
+            );
+        if !is_local_function {
+            self.position = saved_position;
+            self.diagnostics.truncate(saved_diagnostics);
+            return None;
+        }
+        match static_at {
+            Some(at) => self.gate_feature(Feature::StaticLocalFunctions, Span::empty_at(at.start)),
+            None => self.gate_feature_here(Feature::LocalFunctions),
+        }
+        self.bump();
+        let _ = self.parse_type_parameter_list();
+        if self.current_punctuator() == Some(Punctuator::OpenParen) {
+            self.skip_balanced(Punctuator::OpenParen, Punctuator::CloseParen);
+        }
+        let _ = self.parse_type_parameter_constraint_clauses();
+        let end = match self.current_punctuator() {
+            Some(Punctuator::OpenBrace) => {
+                self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace)
+            }
+            Some(Punctuator::EqualsGreaterThan) => {
+                self.bump();
+                let _ = self.parse_expression();
+                self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected)
+            }
+            _ => self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected),
+        };
+        Some(Stmt::new(StmtKind::Empty, Span::new(start, end)))
     }
 
     /// An OUT VARIABLE DECLARATION, `out int a` / `out var a` (C# 7.0), or `None` when the `out`
@@ -1564,8 +1676,28 @@ impl Parser {
     fn try_parse_switch_label(&mut self) -> Option<SwitchLabel> {
         match self.current_keyword() {
             Some(Keyword::Case) => {
+                let case_at = Span::empty_at(self.current().span.start);
                 self.bump();
+                if self.case_declaration_pattern_here() {
+                    self.gate_feature(Feature::PatternCaseLabel, case_at);
+                    let ty = self.parse_type();
+                    self.bump();
+                    let span = Span::new(ty.span.start, self.current().span.start);
+                    self.skip_case_guard();
+                    self.expect(
+                        Punctuator::Colon,
+                        DiagnosticKind::TokenExpected { expected: ":" },
+                    );
+                    return Some(SwitchLabel::Case(Expr::new(ExprKind::Error, span)));
+                }
                 let value = self.parse_expression();
+                if matches!(value.kind, ExprKind::PredefinedType(_)) {
+                    self.gate_feature(Feature::TypePattern, Span::empty_at(value.span.start));
+                }
+                if self.current_contextual_keyword() == Some("when") {
+                    self.gate_feature(Feature::PatternCaseLabel, case_at);
+                    self.skip_case_guard();
+                }
                 self.expect(
                     Punctuator::Colon,
                     DiagnosticKind::TokenExpected { expected: ":" },
@@ -1581,6 +1713,34 @@ impl Parser {
                 Some(SwitchLabel::Default)
             }
             _ => None,
+        }
+    }
+
+    /// Whether a DECLARATION PATTERN follows a `case` -- a type and then a designator, as in
+    /// `case int n:` or `case var x:`. Speculative and fully rolled back.
+    ///
+    /// No C# 1.0 case label has that shape: a constant expression is never followed by a name.
+    /// The one name that may follow a constant is `when`, which starts a guard -- so `when` is a
+    /// designator only when the `:` comes straight after it.
+    fn case_declaration_pattern_here(&mut self) -> bool {
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let ty = self.parse_type();
+        let designator = !matches!(ty.kind, TypeRefKind::Error)
+            && match self.current_contextual_keyword() {
+                Some("when") => self.next_is(Punctuator::Colon),
+                _ => matches!(self.current().kind, TokenKind::Identifier(_)),
+            };
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        designator
+    }
+
+    /// Consumes a case label's `when` guard, if one is here, stopping at the label's `:`.
+    fn skip_case_guard(&mut self) {
+        if self.current_contextual_keyword() == Some("when") {
+            self.bump();
+            let _ = self.parse_null_coalescing();
         }
     }
 
@@ -1650,8 +1810,27 @@ impl Parser {
         let usings = self.parse_using_directives();
         let mut members = Vec::new();
         let mut global_attributes = Vec::new();
+        let mut top_level_gated = false;
+        let mut top_level_misplaced = false;
         while !matches!(self.current().kind, TokenKind::EndOfFile) {
             let before = self.position;
+            if self.top_level_statement_here() {
+                let at = Span::empty_at(self.current().span.start);
+                if !members.is_empty() {
+                    if !top_level_misplaced {
+                        self.report(DiagnosticKind::TopLevelStatementsMustPrecedeMembers, at);
+                        top_level_misplaced = true;
+                    }
+                } else if !top_level_gated {
+                    self.gate_feature(Feature::TopLevelStatements, at);
+                    top_level_gated = true;
+                }
+                let _ = self.parse_statement();
+                if self.position == before {
+                    self.bump();
+                }
+                continue;
+            }
             if self.current_punctuator() == Some(Punctuator::OpenBracket)
                 && self.is_global_attribute_target()
             {
@@ -1677,6 +1856,57 @@ impl Parser {
             global_attributes,
             span: Span::new(start, end),
             defined_symbols: core::mem::take(&mut self.defined_symbols),
+        }
+    }
+
+    /// Whether a TOP-LEVEL STATEMENT begins here, in a compilation unit's member list.
+    ///
+    /// **CONSERVATIVE BY CONSTRUCTION: A TOKEN THAT CAN BEGIN A DECLARATION IS NEVER TAKEN.** A
+    /// declaration -- a namespace, attributes, a type behind its modifiers, a record -- keeps its
+    /// own path and its own diagnostics, and so does anything led by an access or type modifier,
+    /// which cannot begin a statement. What remains is a name, a statement keyword, a predefined
+    /// type (a local declaration or a local function), or a bracket or operator that begins an
+    /// expression statement.
+    fn top_level_statement_here(&mut self) -> bool {
+        if self.at_namespace_member() || self.record_declaration_here() {
+            return false;
+        }
+        match &self.current().kind {
+            TokenKind::Identifier(_) => !matches!(
+                self.current_contextual_keyword(),
+                Some("global" | "partial" | "file" | "record")
+            ),
+            TokenKind::Keyword(keyword) => {
+                predefined_type(&self.current().kind).is_some()
+                    || matches!(
+                        keyword,
+                        Keyword::If
+                            | Keyword::For
+                            | Keyword::Foreach
+                            | Keyword::While
+                            | Keyword::Do
+                            | Keyword::Switch
+                            | Keyword::Try
+                            | Keyword::Return
+                            | Keyword::Throw
+                            | Keyword::Lock
+                            | Keyword::Goto
+                            | Keyword::Break
+                            | Keyword::Continue
+                            | Keyword::Checked
+                            | Keyword::Unchecked
+                            | Keyword::Const
+                            | Keyword::Static
+                            | Keyword::New
+                    )
+            }
+            TokenKind::Punctuator(
+                Punctuator::OpenBrace
+                | Punctuator::OpenParen
+                | Punctuator::PlusPlus
+                | Punctuator::MinusMinus,
+            ) => true,
+            _ => false,
         }
     }
 
@@ -1926,15 +2156,10 @@ impl Parser {
         let keyword_span = self.current().span;
         self.bump();
         self.gate_feature(Feature::Records, keyword_span);
-        if matches!(
-            self.current_keyword(),
-            Some(Keyword::Class) | Some(Keyword::Struct)
-        ) {
-            let end = self.current().span.end;
-            self.gate_feature(
-                Feature::RecordStructs,
-                Span::new(keyword_span.start, end),
-            );
+        match self.current_keyword() {
+            Some(Keyword::Class) => self.gate_feature_here(Feature::RecordClass),
+            Some(Keyword::Struct) => self.gate_feature_here(Feature::RecordStructs),
+            _ => {}
         }
         let mut declaration =
             self.parse_class_struct_interface_inner(attributes, modifiers, start, Some(keyword_span));
@@ -2759,54 +2984,12 @@ impl Parser {
             };
         }
         if self.explicit_interface_qualifier_ahead() {
-            let name_start = self.current().span.start;
-            let (first, mut prev_end) = self.expect_identifier();
-            let mut parts: Vec<TypeNamePart> = Vec::new();
-            let mut name = first;
-            let mut arguments: Vec<TypeRef> = Vec::new();
-            let mut constructed = false;
-            let mut interface_end = prev_end;
-            let mut member_span = Span::new(name_start, prev_end);
-            if self.current_punctuator() == Some(Punctuator::LessThan)
-                && self.generic_type_name_ahead()
-            {
-                let (list, list_end, _) = self.parse_type_argument_list(false);
-                arguments = list;
-                constructed = true;
-                prev_end = list_end;
-            }
-            while self.current_punctuator() == Some(Punctuator::Dot) {
-                self.bump();
-                interface_end = prev_end;
-                parts.push(TypeNamePart { name, arguments });
-                arguments = Vec::new();
-                if self.current_keyword() == Some(Keyword::This) {
-                    let explicit_interface = Self::explicit_interface_type(
-                        parts,
-                        constructed,
-                        Span::new(name_start, interface_end),
-                    );
-                    return self.parse_indexer(modifiers, ty, Some(explicit_interface), start);
-                }
-                member_span = self.current().span;
-                let (part, part_end) = self.expect_identifier();
-                name = part;
-                prev_end = part_end;
-                if self.current_punctuator() == Some(Punctuator::LessThan)
-                    && self.generic_type_name_ahead()
-                {
-                    let (list, list_end, _) = self.parse_type_argument_list(false);
-                    arguments = list;
-                    constructed = true;
-                    prev_end = list_end;
-                }
-            }
-            let member = name;
-            let explicit_interface = Self::explicit_interface_type(
-                parts,
-                constructed,
-                Span::new(name_start, interface_end),
-            );
+            let qualified = self.parse_explicit_member_name();
+            let explicit_interface = qualified.interface;
+            let Some((member, member_span)) = qualified.member else {
+                return self.parse_indexer(modifiers, ty, Some(explicit_interface), start);
+            };
+            let (name_start, prev_end) = (qualified.name_start, qualified.end);
             if self.current_punctuator() == Some(Punctuator::OpenBrace)
                 || self.current_punctuator() == Some(Punctuator::EqualsGreaterThan)
             {
@@ -2973,17 +3156,20 @@ impl Parser {
     fn gate_feature(&mut self, feature: Feature, at: Span) {
         let kind = match feature.gate_against(self.version) {
             None => return,
-            Some(FeatureGate::RequiresLaterVersion { required }) => {
+            Some(FeatureGate::RequiresLaterVersion { feature, required }) => {
                 DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: feature.description(),
+                    feature,
                     required,
                     current: self.version,
                 }
             }
-            Some(FeatureGate::NotInThisBuild) => DiagnosticKind::FeatureNotInThisBuild {
-                feature: feature.description(),
-                permitted_by: self.version,
-            },
+            Some(FeatureGate::NotInThisBuild { feature, instead }) => {
+                DiagnosticKind::FeatureNotInThisBuild {
+                    feature,
+                    permitted_by: self.version,
+                    instead,
+                }
+            }
         };
         self.report(kind, at);
     }
@@ -3134,22 +3320,13 @@ impl Parser {
     fn parse_event(&mut self, modifiers: Vec<Modifier>, start: u32) -> Member {
         self.bump();
         let ty = self.parse_type();
-        if matches!(self.current().kind, TokenKind::Identifier(_)) && self.next_is(Punctuator::Dot)
-        {
-            let name_start = self.current().span.start;
-            let (first, mut prev_end) = self.expect_identifier();
-            let mut parts = alloc::vec![first];
-            let mut interface_end = prev_end;
-            while self.current_punctuator() == Some(Punctuator::Dot) {
-                self.bump();
-                interface_end = prev_end;
-                let (part, part_end) = self.expect_identifier();
-                parts.push(part);
-                prev_end = part_end;
-            }
-            let name = parts.pop().expect("a qualified member name has >= 2 parts");
-            let explicit_interface =
-                TypeRef::new(TypeRefKind::Name(parts), Span::new(name_start, interface_end));
+        if self.explicit_interface_qualifier_ahead() {
+            let qualified = self.parse_explicit_member_name();
+            let explicit_interface = qualified.interface;
+            let name = match qualified.member {
+                Some((name, _)) => name,
+                None => self.expect_identifier().0,
+            };
             let (adder, remover, end) = self.parse_event_accessor_block();
             return Member::Event {
                 modifiers,
@@ -3406,6 +3583,74 @@ impl Parser {
 
     /// Parses an indexer given the modifiers and type already parsed (17.8): the
     /// `this` keyword, a bracketed index parameter list, then an accessor body.
+    /// Reads an explicit interface member's qualified name (20.4.1) from its first identifier:
+    /// the interface -- every part before the final dot, each with the type arguments written on
+    /// it -- and then the member.
+    ///
+    /// **ONE LOOP FOR EVERY MEMBER KIND THAT CAN BE EXPLICIT.** Methods, properties and indexers
+    /// shared this loop, and events carried their own copy, which read bare identifiers joined by
+    /// dots. That copy never learned type arguments, so `event H IR<int>.E { ... }` was CS1002 at
+    /// the `<` while `int IR<int>.P { ... }` parsed -- a rule with two implementations gaining a new
+    /// case in one of them.
+    fn parse_explicit_member_name(&mut self) -> ExplicitMemberName {
+        let name_start = self.current().span.start;
+        let (first, mut prev_end) = self.expect_identifier();
+        let mut parts: Vec<TypeNamePart> = Vec::new();
+        let mut name = first;
+        let mut arguments: Vec<TypeRef> = Vec::new();
+        let mut constructed = false;
+        let mut interface_end = prev_end;
+        let mut member_span = Span::new(name_start, prev_end);
+        if self.current_punctuator() == Some(Punctuator::LessThan)
+            && self.generic_type_name_ahead()
+        {
+            let (list, list_end, _) = self.parse_type_argument_list(false);
+            arguments = list;
+            constructed = true;
+            prev_end = list_end;
+        }
+        while self.current_punctuator() == Some(Punctuator::Dot) {
+            self.bump();
+            interface_end = prev_end;
+            parts.push(TypeNamePart { name, arguments });
+            arguments = Vec::new();
+            if self.current_keyword() == Some(Keyword::This) {
+                return ExplicitMemberName {
+                    interface: Self::explicit_interface_type(
+                        parts,
+                        constructed,
+                        Span::new(name_start, interface_end),
+                    ),
+                    member: None,
+                    name_start,
+                    end: prev_end,
+                };
+            }
+            member_span = self.current().span;
+            let (part, part_end) = self.expect_identifier();
+            name = part;
+            prev_end = part_end;
+            if self.current_punctuator() == Some(Punctuator::LessThan)
+                && self.generic_type_name_ahead()
+            {
+                let (list, list_end, _) = self.parse_type_argument_list(false);
+                arguments = list;
+                constructed = true;
+                prev_end = list_end;
+            }
+        }
+        ExplicitMemberName {
+            interface: Self::explicit_interface_type(
+                parts,
+                constructed,
+                Span::new(name_start, interface_end),
+            ),
+            member: Some((name, member_span)),
+            name_start,
+            end: prev_end,
+        }
+    }
+
     /// The `TypeRef` for an explicit interface implementation's QUALIFIER, from the parts read
     /// off the member name and whether any of them carried type arguments.
     ///
@@ -3532,6 +3777,7 @@ impl Parser {
                 }
                 break;
             }
+            self.gate_extension_this();
             let modifier = match self.current_keyword() {
                 Some(Keyword::Ref) => {
                     self.bump();
@@ -3547,6 +3793,7 @@ impl Parser {
                 }
                 _ => None,
             };
+            self.gate_extension_this();
             let ty = self.parse_type();
             let (name, mut end) = self.expect_declared_name();
             let mut default_value = None;
@@ -3571,6 +3818,14 @@ impl Parser {
             }
         }
         (parameters, arglist)
+    }
+
+    /// Refuses and consumes an extension method's `this` parameter modifier, if one is here.
+    fn gate_extension_this(&mut self) {
+        if self.current_keyword() == Some(Keyword::This) {
+            self.gate_feature_here(Feature::ExtensionMethod);
+            self.bump();
+        }
     }
 
     /// The span of a CALLER-INFO ATTRIBUTE among `sections`, if one is present.
@@ -3849,6 +4104,16 @@ impl Parser {
                 left = self.parse_switch_expression(left);
                 continue;
             }
+            if SWITCH_PRECEDENCE >= minimum
+                && self.current_contextual_keyword() == Some("with")
+                && self.next_is(Punctuator::OpenBrace)
+            {
+                self.gate_feature_here(Feature::WithExpression);
+                self.bump();
+                let end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
+                left = Expr::new(ExprKind::Error, Span::new(left.span.start, end));
+                continue;
+            }
             if RELATIONAL_PRECEDENCE >= minimum {
                 if let Some(operation) = type_test_operation(&self.current().kind) {
                     let operator = self.current().span;
@@ -3943,6 +4208,10 @@ impl Parser {
             return Pattern::Declaration { ty, name, span: at };
         }
         if position == PatternPosition::TypeTest {
+            return Pattern::Type(ty);
+        }
+        if !matches!(ty.kind, TypeRefKind::Name(_) | TypeRefKind::Error) {
+            self.gate_feature(Feature::TypePattern, Span::empty_at(ty.span.start));
             return Pattern::Type(ty);
         }
         self.position = saved_position;
@@ -5060,6 +5329,14 @@ impl Parser {
         if self.current_punctuator() == Some(Punctuator::OpenBrace) {
             self.gate_feature(Feature::AnonymousObjectCreation, Span::empty_at(start));
             let end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
+            return Expr::new(ExprKind::Error, Span::new(start, end));
+        }
+        if self.current_punctuator() == Some(Punctuator::OpenBracket) {
+            self.gate_feature(Feature::ImplicitlyTypedArray, Span::empty_at(start));
+            let mut end = self.skip_balanced(Punctuator::OpenBracket, Punctuator::CloseBracket);
+            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
+            }
             return Expr::new(ExprKind::Error, Span::new(start, end));
         }
         if self.current_punctuator() == Some(Punctuator::OpenParen) {
@@ -6209,26 +6486,53 @@ fn synth_return_body(value: Expr, span: Span) -> Stmt {
     synth_block(alloc::vec![synth_return(value, span)], span)
 }
 
-/// The MEMBERS a record's value equality, hash and `ToString` range over, in declaration order:
-/// its positional parameters, then the public instance fields and properties its body declares.
+/// One member of a record's state, as [`record_state_members`] classifies it.
+struct RecordStateMember {
+    /// The member's name, which the generated code reads and writes it through.
+    name: Box<str>,
+    /// Its declared type, which picks the `EqualityComparer<T>` instantiation.
+    ty: TypeRef,
+    /// Whether it is an instance FIELD -- written as one, or an auto-property's backing field.
+    /// Value equality, the hash and the copy constructor range over exactly these.
+    field: bool,
+    /// Whether `PrintMembers` prints it: a public instance field or readable property.
+    printed: bool,
+}
+
+/// The MEMBERS a record's generated methods range over, in declaration order: its positional
+/// parameters, then the instance fields and properties its body declares.
 ///
 /// **csc RANGES OVER THE STATE, NOT OVER THE POSITIONAL LIST**, which is why the body form gets a
 /// full equality group too -- `record R { public int X; }` compares and prints `X`. A `static` or
-/// `const` member is not state and is skipped; a private one is not printed. Each entry is
-/// (name, declared type), and the type is what picks the `EqualityComparer<T>` instantiation.
-fn record_state_members(
-    parameters: &[Parameter],
-    members: &[Member],
-) -> Vec<(Box<str>, TypeRef)> {
-    let mut state: Vec<(Box<str>, TypeRef)> = parameters
+/// `const` member is not state and is skipped.
+///
+/// **TWO SETS, NOT ONE, BECAUSE csc USES TWO.** Value equality, the hash and the copy constructor
+/// range over the record's instance FIELDS, whatever their accessibility -- a private field is
+/// compared and copied, and a computed property, which has no field, is neither. `PrintMembers`
+/// ranges over the PUBLIC fields and readable properties, computed ones included. Measured on
+/// .NET: `record R { private int _s; ... }` answers `new R(1) == new R(2)` with `False`, and
+/// `record R(int X) { public int Twice => X * 2; }` compiles and prints `Twice = 6`.
+///
+fn record_state_members(parameters: &[Parameter], members: &[Member]) -> Vec<RecordStateMember> {
+    let mut state: Vec<RecordStateMember> = parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), parameter.ty.clone()))
+        .map(|parameter| RecordStateMember {
+            name: parameter.name.clone(),
+            ty: parameter.ty.clone(),
+            field: true,
+            printed: true,
+        })
         .collect();
-    let instance_public = |modifiers: &[Modifier]| {
-        modifiers.iter().any(|m| matches!(m, Modifier::Public))
-            && !modifiers
-                .iter()
-                .any(|m| matches!(m, Modifier::Static | Modifier::Const))
+    let is_public = |modifiers: &[Modifier]| modifiers.iter().any(|m| matches!(m, Modifier::Public));
+    let is_instance = |modifiers: &[Modifier]| {
+        !modifiers
+            .iter()
+            .any(|m| matches!(m, Modifier::Static | Modifier::Const))
+    };
+    let add = |state: &mut Vec<RecordStateMember>, member: RecordStateMember| {
+        if !state.iter().any(|had| had.name == member.name) {
+            state.push(member);
+        }
     };
     for member in members {
         match member {
@@ -6237,23 +6541,42 @@ fn record_state_members(
                 ty,
                 declarators,
                 ..
-            } if instance_public(modifiers) => {
+            } if is_instance(modifiers) => {
                 for declarator in declarators {
-                    if !state.iter().any(|(had, _)| *had == declarator.name) {
-                        state.push((declarator.name.clone(), ty.clone()));
-                    }
+                    add(
+                        &mut state,
+                        RecordStateMember {
+                            name: declarator.name.clone(),
+                            ty: ty.clone(),
+                            field: true,
+                            printed: is_public(modifiers),
+                        },
+                    );
                 }
             }
             Member::Property {
                 modifiers,
                 ty,
                 name,
-                getter: Some(_),
+                getter: Some(getter),
+                setter,
+                explicit_interface: None,
                 ..
-            } if instance_public(modifiers) => {
-                if !state.iter().any(|(had, _)| had == name) {
-                    state.push((name.clone(), ty.clone()));
-                }
+            } if is_instance(modifiers) => {
+                let auto = getter.body.is_none()
+                    && setter.as_ref().is_none_or(|setter| setter.body.is_none())
+                    && !modifiers
+                        .iter()
+                        .any(|m| matches!(m, Modifier::Abstract | Modifier::Extern));
+                add(
+                    &mut state,
+                    RecordStateMember {
+                        name: name.clone(),
+                        ty: ty.clone(),
+                        field: auto,
+                        printed: is_public(modifiers),
+                    },
+                );
             }
             _ => {}
         }
@@ -6455,7 +6778,8 @@ fn synthesize_record_equality(
     if !already_copies {
         let copies = state
             .iter()
-            .map(|(name, _)| {
+            .filter(|member| member.field)
+            .map(|RecordStateMember { name, .. }| {
                 Stmt::new(
                     StmtKind::Expression(Expr::new(
                         ExprKind::Assignment {
@@ -6532,7 +6856,7 @@ fn synthesize_record_equality(
             ),
             span,
         );
-        for (name, ty) in &state {
+        for RecordStateMember { name, ty, .. } in state.iter().filter(|member| member.field) {
             let comparer = synth_member(synth_comparer(ty.clone(), span), "Default", span);
             test = synth_binary(
                 test,
@@ -6608,7 +6932,7 @@ fn synthesize_record_equality(
             synth_member(this(), "EqualityContract", span),
             synth_type(&["System", "Type"], span),
         );
-        for (name, ty) in &state {
+        for RecordStateMember { name, ty, .. } in state.iter().filter(|member| member.field) {
             hash = synth_binary(
                 synth_binary(
                     hash,
@@ -6757,7 +7081,9 @@ fn synthesize_record_equality(
             )),
             span,
         )];
-        for (index, (name, _)) in state.iter().enumerate() {
+        for (index, RecordStateMember { name, .. }) in
+            state.iter().filter(|member| member.printed).enumerate()
+        {
             if index > 0 {
                 statements.push(append(literal(", ")));
             }
@@ -6772,7 +7098,10 @@ fn synthesize_record_equality(
             )));
         }
         statements.push(synth_return(
-            Expr::new(ExprKind::Literal(Literal::Boolean(!state.is_empty())), span),
+            Expr::new(
+                ExprKind::Literal(Literal::Boolean(state.iter().any(|member| member.printed))),
+                span,
+            ),
             span,
         ));
         generated.push(Member::Method {
@@ -8641,13 +8970,19 @@ mod tests {
                 name,
                 adder,
                 remover,
+                explicit_interface,
                 ..
             } => {
                 let mut text = String::from("(event");
                 for modifier in modifiers {
                     text.push_str(&format!(" {}", modifier_name(*modifier)));
                 }
-                text.push_str(&format!(" {} {name}", dump_type(ty)));
+                match explicit_interface {
+                    Some(interface) => {
+                        text.push_str(&format!(" {} {}.{name}", dump_type(ty), dump_type(interface)));
+                    }
+                    None => text.push_str(&format!(" {} {name}", dump_type(ty))),
+                }
                 if let Some(adder) = adder {
                     text.push_str(&format!(" {}", dump_accessor("add", adder)));
                 }
@@ -10547,6 +10882,18 @@ mod tests {
             unit_tree("class C { event Handler E { add {} remove {} } }"),
             "(class C (event Handler E (add (block)) (remove (block))))"
         );
+        assert_eq!(
+            unit_tree("class C : I { event H I.E { add {} remove {} } }"),
+            "(class C : I (event H I.E (add (block)) (remove (block))))"
+        );
+        assert_eq!(
+            unit_tree("class C : N.I { event H N.I.E { add {} remove {} } }"),
+            "(class C : N.I (event H N.I.E (add (block)) (remove (block))))"
+        );
+        assert_eq!(
+            unit_tree("class C : I<int> { event H I<int>.E { add {} remove {} } }"),
+            "(class C : I<int> (event H I<int>.E (add (block)) (remove (block))))"
+        );
     }
 
     #[test]
@@ -10744,5 +11091,250 @@ mod tests {
             diagnostic_count, 0,
             "a balanced deeply nested expression parses without a syntax error"
         );
+    }
+
+    /// Every diagnostic of a compilation unit parsed at `version`, as `(code, offset, message)`
+    /// with the code carrying its namespace -- the whole of what a reader is shown.
+    fn unit_diagnostics_at(source: &str, version: LanguageVersion) -> Vec<(String, usize, String)> {
+        parse_compilation_unit_with(
+            source,
+            LexOptions {
+                version,
+                ..LexOptions::default()
+            },
+        )
+        .diagnostics
+        .iter()
+        .map(|d| {
+            (
+                format!("{}{:04}", d.kind.namespace().prefix(), d.code()),
+                d.span.start as usize,
+                format!("{}", d.kind),
+            )
+        })
+        .collect()
+    }
+
+    /// A construct the dialect permits and this build does not produce is refused as ONE
+    /// diagnostic, `LAM0001`, naming the construct, at the position csc reports its own gate.
+    #[test]
+    fn an_unbuilt_construct_is_refused_by_name_at_csc_s_position() {
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "class P { void M() { int[] a = new[] { 1, 2 }; } }",
+                "new[",
+                "implicitly typed array",
+            ),
+            (
+                "static class E { public static int Twice(this int v) { return v * 2; } }",
+                "this",
+                "extension method",
+            ),
+            (
+                "class P { void M() { int Sq(int a) { return a * a; } } }",
+                "Sq",
+                "local functions",
+            ),
+            ("class P { void M() { T Id<T>(T x) => x; } }", "Id", "local functions"),
+            (
+                "class P { void M() { static int Sq(int a) { return a * a; } } }",
+                "static int",
+                "static local functions",
+            ),
+            (
+                "using System.Collections; class P { IEnumerable M() { yield return 1; } }",
+                "yield",
+                "iterators",
+            ),
+            (
+                "using System.Collections; class P { IEnumerable M() { yield break; } }",
+                "yield",
+                "iterators",
+            ),
+            (
+                "System.Console.WriteLine(1);\nSystem.Console.WriteLine(2);\nclass C { }",
+                "System",
+                "top-level statements",
+            ),
+            (
+                "class P { void M(object o) { switch (o) { case int n when n > 0: break; } } }",
+                "case",
+                "patterns in case labels",
+            ),
+            (
+                "class P { void M(int i, bool b) { switch (i) { case 1 when b: break; } } }",
+                "case",
+                "patterns in case labels",
+            ),
+            (
+                "class P { void M(object o) { switch (o) { case var x: break; } } }",
+                "case",
+                "patterns in case labels",
+            ),
+            (
+                "record R(int X); class P { void M(R r) { var s = r with { X = 2 }; } }",
+                "with",
+                "with expression",
+            ),
+            (
+                "class P { string K(object o) => o switch { int => \"i\", _ => \"o\" }; }",
+                "int =>",
+                "type pattern",
+            ),
+            (
+                "class P { void M(object o) { switch (o) { case int: break; } } }",
+                "int:",
+                "type pattern",
+            ),
+            ("record struct S(int X);", "struct", "record structs"),
+        ];
+        for (source, at, noun) in rows {
+            let diagnostics = unit_diagnostics_at(source, LanguageVersion::CSharp11);
+            let expected_at = source.find(at).expect("the row names a position in its source");
+            let expected_message = format!(
+                "Feature '{noun}' is permitted by C# 11.0 but is not provided by this build of Lamella."
+            );
+            assert_eq!(diagnostics.len(), 1, "{source:?} drew {diagnostics:?}");
+            let (code, offset, message) = &diagnostics[0];
+            assert_eq!(code, "LAM0001", "{source:?}");
+            assert_eq!(*offset, expected_at, "{source:?}: {message}");
+            assert!(
+                message.starts_with(&expected_message),
+                "{source:?}: {message:?} does not name {noun:?}"
+            );
+        }
+    }
+
+    /// The words these refusals key on are CONTEXTUAL, so the refusal has to leave every ordinary
+    /// use of them alone -- and the declarations and labels beside them must still parse clean.
+    #[test]
+    fn the_refusals_leave_the_valid_programs_beside_them_alone() {
+        let clean = [
+            "class P { void M() { int yield = 1; yield = yield + 1; } }",
+            "class P { void M() { int with = 1; with = with + 1; } }",
+            "record class R(int X);",
+            "class P { void M(int i) { switch (i) { case 1: case 2: break; default: break; } } }",
+            "enum E { A } class P { void M(E e) { switch (e) { case E.A: break; } } }",
+            "enum E { A } class P { int K(E e) => e switch { E.A => 1, _ => 0 }; }",
+            "class P { void M() { int x = F(1); System.Console.WriteLine(x); } int F(int a) { return a; } }",
+            "class C { } namespace N { class D { } }",
+            "public record R(int X);",
+            "static class S { } partial class Q { }",
+            "class P { string K(object o) => o switch { int _ => \"i\", _ => \"o\" }; }",
+        ];
+        for source in clean {
+            let diagnostics = unit_diagnostics_at(source, LanguageVersion::CSharp11);
+            assert!(diagnostics.is_empty(), "{source:?} drew {diagnostics:?}");
+        }
+    }
+
+    /// Below each construct's rung the diagnostic is csc's own version gate, with csc's noun --
+    /// which for a `with` and a pattern in a `case` label is not the noun `LAM0001` uses above it.
+    /// Every row measured against csc one rung below the construct.
+    #[test]
+    fn below_the_rung_the_refusal_is_csc_s_version_gate() {
+        let rows: &[(&str, LanguageVersion, &str, &str)] = &[
+            (
+                "class P { void M() { int[] a = new[] { 1 }; } }",
+                LanguageVersion::CSharp2,
+                "CS8023",
+                "Feature 'implicitly typed array' is not available in C# 2. Please use language version 3 or greater.",
+            ),
+            (
+                "class P { void M() { int Sq(int a) { return a; } } }",
+                LanguageVersion::CSharp6,
+                "CS8059",
+                "Feature 'local functions' is not available in C# 6. Please use language version 7.0 or greater.",
+            ),
+            (
+                "class P { void M(object o) { switch (o) { case int n: break; } } }",
+                LanguageVersion::CSharp6,
+                "CS8059",
+                "Feature 'pattern matching' is not available in C# 6. Please use language version 7.0 or greater.",
+            ),
+            (
+                "class P { void M(object r) { var s = r with { }; } }",
+                LanguageVersion::CSharp8,
+                "CS8400",
+                "Feature 'records' is not available in C# 8.0. Please use language version 9.0 or greater.",
+            ),
+            (
+                "System.Console.WriteLine(1);",
+                LanguageVersion::CSharp8,
+                "CS8400",
+                "Feature 'top-level statements' is not available in C# 8.0. Please use language version 9.0 or greater.",
+            ),
+            (
+                "record class R(int X);",
+                LanguageVersion::CSharp9,
+                "CS8773",
+                "Feature 'record structs' is not available in C# 9.0. Please use language version 10.0 or greater.",
+            ),
+        ];
+        for (source, version, code, message) in rows {
+            let diagnostics = unit_diagnostics_at(source, *version);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|(c, _, m)| c == code && m == message),
+                "{source:?} at {version:?} drew {diagnostics:?}"
+            );
+            assert!(
+                diagnostics.iter().all(|(c, _, _)| c != "LAM0001"),
+                "{source:?} at {version:?} is refused by the rung, not by the build: {diagnostics:?}"
+            );
+        }
+    }
+
+    /// A statement AFTER a declaration is wrong in its order at every rung, and csc says so with
+    /// CS8803 in place of the feature gate -- measured at C# 8 and at C# 11, once per file.
+    #[test]
+    fn a_top_level_statement_after_a_declaration_is_cs8803_once() {
+        let source = "class C { }\nSystem.Console.WriteLine(1);\nSystem.Console.WriteLine(2);";
+        for version in [LanguageVersion::CSharp8, LanguageVersion::CSharp11] {
+            let diagnostics = unit_diagnostics_at(source, version);
+            assert_eq!(
+                diagnostics,
+                alloc::vec![(
+                    String::from("CS8803"),
+                    source.find("System").expect("present"),
+                    String::from("Top-level statements must precede namespace and type declarations."),
+                )],
+                "at {version:?}"
+            );
+        }
+    }
+
+    /// A record's value equality, hash and copy range over its FIELDS, whatever their
+    /// accessibility, and `PrintMembers` over its PUBLIC members, computed ones included -- the two
+    /// sets csc uses, measured on .NET: a private field makes two records unequal, and a computed
+    /// property is printed and never assigned.
+    #[test]
+    fn a_record_compares_its_fields_and_prints_its_public_members() {
+        let tree = unit_tree_at(
+            "record R(int X) { private int _s; public int Twice => X * 2; }",
+            LanguageVersion::CSharp11,
+        );
+        let member = |name: &str| {
+            let at = tree
+                .find(name)
+                .unwrap_or_else(|| panic!("no generated {name} in {tree}"));
+            let rest = &tree[at..];
+            &rest[..rest.find(") (method ").or_else(|| rest.find(") (operator ")).unwrap_or(rest.len())]
+        };
+        let copy = member("(ctor protected R (R original)");
+        assert!(copy.contains("(= (. this _s) (. original _s))"), "{copy}");
+        assert!(!copy.contains("Twice"), "a computed property has no field to copy: {copy}");
+        let equals = member("(method public virtual bool Equals (R other)");
+        assert!(equals.contains("(. this _s) (. other _s)"), "{equals}");
+        assert!(!equals.contains("Twice"), "{equals}");
+        let hash = member("(method public override int GetHashCode ()");
+        assert!(hash.contains("(. this _s)") && !hash.contains("Twice"), "{hash}");
+        let print = member("(method protected virtual bool PrintMembers");
+        assert!(print.contains("(cast object (. this Twice))"), "{print}");
+        assert!(!print.contains("_s"), "a private field is not printed: {print}");
+        let private_only = unit_tree_at("record R { private int _s; }", LanguageVersion::CSharp11);
+        let at = private_only.find("PrintMembers").expect("generated");
+        assert!(private_only[at..].contains("(return false)"), "{private_only}");
     }
 }

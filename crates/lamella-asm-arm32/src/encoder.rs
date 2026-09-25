@@ -382,8 +382,28 @@ impl Encoder {
     /// Binds `label` to the current position. A label bound more than once keeps
     /// its latest position; a label from another encoder is ignored rather than
     /// allowed to panic.
+    ///
+    /// A bound label is a place a branch may arrive at with any register contents, so it ends
+    /// the window in which [`Encoder::holds_sp_slot`] lets a reload be skipped. For a position
+    /// that is only to be FOUND again after [`Encoder::finish`], use [`Encoder::bind_mark`].
     pub fn bind_label(&mut self, label: Label) {
         self.sp_store = None;
+        self.bind_mark(label);
+    }
+
+    /// Binds `label` to the current position as a MARK: a place to find again once
+    /// [`Encoder::finish`] has laid the code out, such as where a source line's code starts, that
+    /// nothing branches to.
+    ///
+    /// A mark moves with the code exactly as a label does, and it changes nothing that is emitted.
+    /// [`Encoder::bind_label`] does change what is emitted, because a reload it might skip is no
+    /// longer safe to skip after a branch target; execution reaches a mark only by falling through,
+    /// so the same code is right with or without it. That is what lets a build that marks every
+    /// line emit the same instructions as a build that marks none.
+    ///
+    /// Branching to a marked label is a mistake this encoder does not catch: the code before the
+    /// mark may have skipped a reload that the branch's path never performed.
+    pub fn bind_mark(&mut self, label: Label) {
         let here = self.position();
         if let Some(slot) = self.labels.get_mut(label.0 as usize) {
             *slot = Some(here);
@@ -1925,6 +1945,27 @@ mod tests {
         enc.str_sp(Reg::R0, 8).unwrap();
         enc.movs_imm(Reg::R1, 0).unwrap();
         assert!(!enc.holds_sp_slot(Reg::R0, 8), "an instruction emitted after the store");
+    }
+
+    #[test]
+    fn a_mark_keeps_the_store_held_and_moves_with_the_code() {
+        let mut enc = Encoder::new();
+        let far = enc.new_label();
+        enc.b_cond(Cond::Ne, far);
+        enc.str_sp(Reg::R0, 8).unwrap();
+        let mark = enc.new_label();
+        enc.bind_mark(mark);
+        assert!(
+            enc.holds_sp_slot(Reg::R0, 8),
+            "a mark is not a branch target, so the reload after it can still be skipped"
+        );
+        for _ in 0..200 {
+            enc.nop();
+        }
+        enc.bind_label(far);
+        let out = enc.finish().unwrap();
+        assert_eq!(out.label_position(mark), Some(8));
+        assert_eq!(&out.bytes[6..8], &0x9002u16.to_le_bytes(), "the store sits before the mark");
     }
 
     #[test]

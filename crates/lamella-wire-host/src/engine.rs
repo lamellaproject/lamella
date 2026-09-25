@@ -55,13 +55,20 @@ pub struct LoopbackLink {
     corlib: Vec<u8>,
     driver: MemTransport,
     runner: MemTransport,
+    configure: fn(&mut lamella_cil_runtime::Vm),
 }
 
 impl LoopbackLink {
-    /// A loopback link whose reference runner runs programs against `corlib` (the managed corlib bytes).
+    /// A loopback link whose reference runner runs programs against `corlib` (the managed corlib
+    /// bytes), calling `configure` on the machine of every program it runs.
+    ///
+    /// `configure` is where a program's clock comes from, and it is the embedder's to choose because
+    /// the interpreter keeps no clock of its own. A host passes [`install_host_clock`]. A browser
+    /// passes its page's clock: a `wasm32-unknown-unknown` build has no standard-library clock, and
+    /// reading one there panics.
     #[must_use]
-    pub fn new(corlib: Vec<u8>) -> Self {
-        Self { corlib, driver: MemTransport::new(), runner: MemTransport::new() }
+    pub fn new(corlib: Vec<u8>, configure: fn(&mut lamella_cil_runtime::Vm)) -> Self {
+        Self { corlib, driver: MemTransport::new(), runner: MemTransport::new(), configure }
     }
 }
 
@@ -70,12 +77,8 @@ impl ReplLink for LoopbackLink {
         send_program(&mut self.driver, seq, program)?;
         self.runner.feed(&self.driver.take_sent());
         let mut arena = ArtifactLoad::new();
-        while crate::serve_one_with(
-            &mut self.runner,
-            &self.corlib,
-            &mut install_host_clock,
-            &mut arena,
-        )? {}
+        let mut configure = self.configure;
+        while crate::serve_one_with(&mut self.runner, &self.corlib, &mut configure, &mut arena)? {}
         self.driver.feed(&self.runner.take_sent());
         let mut run = RunCollector::new(seq);
         run.poll(&mut self.driver)?;
@@ -423,10 +426,24 @@ impl Repl {
 #[cfg(feature = "repl-host")]
 pub struct LcscCompiler {
     references: Vec<Vec<u8>>,
+    /// The file the source was read from, when there is one; see [`Self::for_source_file`].
+    source_path: Option<String>,
 }
 
 #[cfg(feature = "repl-host")]
 impl LcscCompiler {
+    /// This compiler, reporting against `path` -- the file the program's source was read from.
+    ///
+    /// A diagnostic then names that file the way lcsc's do, `App.cs(3,13): error CS0029: ...`,
+    /// instead of the bare `(3,13)` a line typed at a prompt gets, which has no file for its line
+    /// number to be in. The name is used for rendering only: the assembly and its debug document
+    /// are named as they are for every other submission.
+    #[must_use]
+    pub fn for_source_file(mut self, path: &str) -> LcscCompiler {
+        self.source_path = Some(path.to_owned());
+        self
+    }
+
     /// Sources the reference assemblies to bind against, corlib FIRST: the directory named by
     /// `LAMELLA_REF_DIR`, else `LAMELLA_CORLIB` (an explicit Lamella corlib.dll -- fully
     /// self-hosted), else a `corlib.dll` beside the executable or in the working directory, else
@@ -444,7 +461,10 @@ impl LcscCompiler {
         if let Some(dir) = std::env::var_os("LAMELLA_REF_DIR") {
             let references = Self::references_in_dir(std::path::Path::new(&dir))?;
             if !references.is_empty() {
-                return Ok(LcscCompiler { references });
+                return Ok(LcscCompiler {
+                    references,
+                    source_path: None,
+                });
             }
         }
         if let Some(path) = std::env::var_os("LAMELLA_CORLIB") {
@@ -453,6 +473,7 @@ impl LcscCompiler {
                 .map_err(|error| format!("cannot read LAMELLA_CORLIB {}: {error}", path.display()))?;
             return Ok(LcscCompiler {
                 references: Self::with_libraries_beside(&path, bytes),
+                source_path: None,
             });
         }
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -470,6 +491,7 @@ impl LcscCompiler {
             if let Ok(bytes) = std::fs::read(&candidate) {
                 return Ok(LcscCompiler {
                     references: Self::with_libraries_beside(&candidate, bytes),
+                    source_path: None,
                 });
             }
         }
@@ -597,31 +619,42 @@ impl ReplCompiler for LcscCompiler {
             return Ok(image);
         }
         if let Some(emit_error) = compiled.emit_error {
-            return Err(CompileFailure::Diagnostics(format!("{emit_error:?}")));
+            return Err(CompileFailure::Diagnostics(match self.source_path.as_deref() {
+                Some(path) => format!(
+                    "{path}: error: this construct is not yet supported by lcsc: {emit_error}"
+                ),
+                None => format!("error: this construct is not yet supported by lcsc: {emit_error}"),
+            }));
         }
         Err(CompileFailure::Diagnostics(diagnostic_text(
             &compiled.diagnostics,
             source,
+            self.source_path.as_deref().unwrap_or(""),
         )))
     }
 }
 
-/// Renders a rejected submission's diagnostics as the text its caller prints, one per line.
+/// Renders a rejected submission's diagnostics as the text its caller prints, one per line,
+/// against `path`.
 ///
-/// The path is empty because a submission compiled through this seam has no file of its own: it
-/// was typed at a prompt or handed over a wire, and `compile_source` above names the unit
-/// `Repl.cs` so that the assembly has A name, not because anyone wrote that file. Rendering the
-/// placeholder would put a true line and column against a filename the reader cannot open, which
-/// states a fact that is not one. An empty path renders `(line,column): severity CODE: message`,
-/// the form C# interactive uses for the same reason.
+/// `path` is empty for a submission with no file of its own -- one typed at a prompt or handed
+/// over a wire. `compile_source` above names that unit `Repl.cs` so that the assembly has A name,
+/// not because anyone wrote the file, and rendering the placeholder would put a true line and
+/// column against a filename the reader cannot open. An empty path renders `(line,column):
+/// severity CODE: message`, the form C# interactive uses for the same reason. A program read from
+/// a file names it ([`LcscCompiler::for_source_file`]).
 #[cfg(feature = "repl-host")]
-fn diagnostic_text(diagnostics: &[lamella_assemble::Diagnostic], source: &str) -> String {
+fn diagnostic_text(
+    diagnostics: &[lamella_assemble::Diagnostic],
+    source: &str,
+    path: &str,
+) -> String {
     let mut text = String::new();
     for diagnostic in diagnostics {
         if !text.is_empty() {
             text.push('\n');
         }
-        text.push_str(&diagnostic.render("", source));
+        text.push_str(&diagnostic.render(path, source));
     }
     if text.is_empty() {
         text.push_str("compilation produced no image");
@@ -822,8 +855,12 @@ mod tests {
         }];
 
         assert_eq!(
-            diagnostic_text(&diagnostics, source),
+            diagnostic_text(&diagnostics, source, ""),
             "(3,16): error LAM0001: this build cannot emit that"
+        );
+        assert_eq!(
+            diagnostic_text(&diagnostics, source, "App.cs"),
+            "App.cs(3,16): error LAM0001: this build cannot emit that"
         );
     }
 
@@ -855,6 +892,27 @@ mod tests {
 
     fn hello() -> Option<Vec<u8>> {
         std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hello.exe")).ok()
+    }
+
+    /// Prints `DateTime.Now`'s ticks on its first line.
+    fn datetime_now() -> Option<Vec<u8>> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-load/tests/fixtures/datetime-now-program.dll"
+        ))
+        .ok()
+    }
+
+    /// An instant in .NET ticks that no running clock reads: the one `lamella-runner`'s wall-clock
+    /// hook test sets, so the two tests read one clock a layer apart.
+    const KNOWN_TICKS: i64 = 639_175_590_450_000_000;
+
+    /// The hook this test's embedder hands the link: a clock that never moves, set to
+    /// [`KNOWN_TICKS`]. A frozen monotonic reading makes the elapsed term exactly zero, so the
+    /// program prints the instant that was set.
+    fn a_known_instant(vm: &mut lamella_cil_runtime::Vm) {
+        vm.set_clock(|| 0, |_| {});
+        vm.set_now_ticks(KNOWN_TICKS);
     }
 
     #[test]
@@ -903,10 +961,25 @@ mod tests {
     #[test]
     fn loopback_link_runs_a_program_over_the_framed_protocol() {
         let (Some(program), Some(corlib)) = (hello(), corlib()) else { return };
-        let mut link = LoopbackLink::new(corlib);
+        let mut link = LoopbackLink::new(corlib, install_host_clock);
         let result = link.run(1, &program).expect("the loopback round-trips");
         assert_eq!(result.exit, 7);
         assert_eq!(result.stdout, "hi\n");
+    }
+
+    #[test]
+    fn a_loopback_link_runs_every_program_through_the_hook_its_embedder_gave_it() {
+        let (Some(program), Some(corlib)) = (datetime_now(), corlib()) else {
+            return;
+        };
+        let mut link = LoopbackLink::new(corlib, a_known_instant);
+        let result = link.run(1, &program).expect("the loopback round-trips");
+        assert_eq!(
+            result.stdout.lines().next(),
+            Some(KNOWN_TICKS.to_string().as_str()),
+            "the program must read the clock the link was given: {}",
+            result.stdout
+        );
     }
 
     /// End-to-end through the project's OWN in-process compiler (`lamella-assemble`) -- no Microsoft
@@ -922,7 +995,10 @@ mod tests {
             return;
         };
         let Some(corlib) = corlib() else { return };
-        let mut repl = Repl::new(Box::new(compiler), Box::new(LoopbackLink::new(corlib)));
+        let mut repl = Repl::new(
+            Box::new(compiler),
+            Box::new(LoopbackLink::new(corlib, install_host_clock)),
+        );
 
         match repl.eval("40 + 2").expect("eval") {
             Outcome::Ran { output, exit, persisted } => {
@@ -1032,31 +1108,37 @@ mod tests {
 ///
 /// `DateTime` counts ticks from 0001-01-01; `SystemTime` counts from 1970-01-01. The difference is
 /// a constant of the two calendars and is stated once here rather than at each conversion.
+#[cfg(not(target_arch = "wasm32"))]
 const UNIX_EPOCH_IN_DOTNET_TICKS: i64 = 621_355_968_000_000_000;
 
 /// Gives a program a clock: the seam the interpreter needs to answer `DateTime.Now`,
-/// `Environment.TickCount` and `Thread.Sleep`.
+/// `Environment.TickCount` and `Thread.Sleep`. Pass it to [`LoopbackLink::new`] on a host.
 ///
 /// The interpreter is `no_std` and keeps no clock of its own, so one can only come from whatever
-/// embeds it; this is a host, and on a host a clock is never missing.
+/// embeds it; this is a host, and on a host a clock is never missing. It is not built for `wasm32`,
+/// where the standard library has no clock and reading one panics: an embedder there installs its
+/// own.
 ///
-/// **THE ORDER IS LOAD-BEARING.** [`Vm::set_now_ticks`] anchors the wall clock against the monotonic
-/// reading at the moment it is called, and without a clock seam that reading is 0. Anchoring first
-/// would date the wall clock from an origin the seam does not share, so it would read however long
-/// this process had been up too far ahead -- a wrong answer rather than a missing one, and one that
-/// grows the longer the tool runs.
-fn install_host_clock(vm: &mut lamella_cil_runtime::Vm) {
+/// **THE ORDER IS LOAD-BEARING.** [`lamella_cil_runtime::Vm::set_now_ticks`] anchors the wall clock
+/// against the monotonic reading at the moment it is called, and without a clock seam that reading
+/// is 0. Anchoring first would date the wall clock from an origin the seam does not share, so it
+/// would read however long this process had been up too far ahead -- a wrong answer rather than a
+/// missing one, and one that grows the longer the tool runs.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_host_clock(vm: &mut lamella_cil_runtime::Vm) {
     vm.set_clock(host_monotonic_millis, host_sleep_millis);
     vm.set_now_ticks(host_now_ticks());
 }
 
 /// Milliseconds since the SYSTEM started, which is what .NET's `Environment.TickCount` reports.
 ///
+#[cfg(not(target_arch = "wasm32"))]
 fn host_monotonic_millis() -> u64 {
     lamella_clock_host::system_uptime_millis()
 }
 
 /// Blocks this thread, which is what `Thread.Sleep` means on a host.
+#[cfg(not(target_arch = "wasm32"))]
 fn host_sleep_millis(millis: u64) {
     std::thread::sleep(std::time::Duration::from_millis(millis));
 }
@@ -1066,6 +1148,7 @@ fn host_sleep_millis(millis: u64) {
 /// Saturates rather than panicking on a system clock set before 1970, which is a broken machine
 /// rather than a program error -- the .NET epoch is the honest answer to "what is the date" when
 /// the host cannot say.
+#[cfg(not(target_arch = "wasm32"))]
 fn host_now_ticks() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(since) => i64::try_from(since.as_nanos() / 100)

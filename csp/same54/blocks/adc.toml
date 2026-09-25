@@ -31,6 +31,9 @@ sources = [
     "DS60001507F 9.5 and Table 9-3 (NVM Software Calibration Area Mapping): the area is read at 0x00800080, with ADC0 BIASCOMP at 4:2, BIASREFBUF at 7:5, BIASR2R at 10:8, and ADC1 BIASCOMP at 18:16, BIASREFBUF at 21:19, BIASR2R at 24:22",
     "DS60001507F 45.8.6 REFCTRL: the REFSEL value table",
     "DS60001507F 45.8.8 CTRLB: the RESSEL value table",
+    "DS60001507F 45.8.1 CTRLA: the PRESCALER value table, DIV2 (0x0) to DIV256 (0x7), dividing the peripheral clock",
+    "DS60001507F Table 54-23 (ADC Conversion Timing Requirements): row ADC21, the ADC clock period, 62.5 ns to 6250 ns; row ADC23, the GCLK_ADCx input frequency, 100 MHz at most",
+    "DS60001507F Tables 55-8 (to 105 C) and 56-10 (to 125 C), the same requirements for the higher temperature grades: row ADC21, 62.5 ns to 3125 ns; row ADC23, 100 MHz at most",
 ]
 notes = [
     "EACH ADC's THREE CALIBRATION FIELDS ARE CONTIGUOUS AND EVENLY SPACED IN THE NVM ROW, three bits apart, so one bit position per instance locates all three: BIASCOMP at that position, BIASREFBUF three bits above it, BIASR2R six bits above it. That position is a per-instance fact and is stated on the instance row rather than here, because the two converters sit at different offsets in the same word.",
@@ -45,7 +48,7 @@ notes = [
 offset = 0x00
 width = 16
 fields = { SWRST = [0, 1], ENABLE = [1, 1], DUALSEL = [3, 2], SLAVEEN = [5, 1], RUNSTDBY = [6, 1], ONDEMAND = [7, 1], PRESCALER = [8, 3], R2R = [15, 1] }
-notes = "Enable-protected and write-synchronized. PRESCALER divides the peripheral channel clock down to the converter's own clock, which has a maximum this block does not state."
+notes = "Enable-protected and write-synchronized. PRESCALER divides the peripheral channel clock down to the converter's own clock, and the part bounds that clock: the limits are this block's facts, and a board's division is chosen from them when its bindings are generated."
 
 [registers.EVCTRL]
 offset = 0x02
@@ -139,3 +142,20 @@ REFSEL_INTVCC1 = 3
 REFSEL_AREFA = 4
 REFSEL_AREFB = 5
 REFSEL_AREFC = 6
+PRESCALER_DIV2 = 0
+PRESCALER_DIV4 = 1
+PRESCALER_DIV8 = 2
+PRESCALER_DIV16 = 3
+PRESCALER_DIV32 = 4
+PRESCALER_DIV64 = 5
+PRESCALER_DIV128 = 6
+PRESCALER_DIV256 = 7
+
+[facts]
+gclk_adc_max_hz = 100000000
+clk_adc_min_hz = 320000
+clk_adc_max_hz = 16000000
+
+[facts.notes]
+gclk_adc_max_hz = "Tables 54-23, 55-8 and 56-10 row ADC23: GCLK_ADCx, the converter's generic clock, runs at 100 MHz or less on every temperature grade."
+clk_adc = "Row ADC21 bounds the ADC clock period, and the bound depends on the temperature grade: 62.5 ns to 6250 ns to 85 C (Table 54-23), but 62.5 ns to 3125 ns to 105 C (Table 55-8) and to 125 C (Table 56-10). The floor here is the one every grade meets, so CLK_ADC, the prescaled converter clock, lies within 320 kHz and 16 MHz. PRESCALER divides GCLK_ADCx by 2^(PRESCALER + 1) (45.6.2.8), and it resets to DIV2, so a generator at 48 MHz runs the converter at 24 MHz until PRESCALER is written: a binding's core clock decides which settings are legal."

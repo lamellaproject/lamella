@@ -5,11 +5,7 @@
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
 # chapter 28, Tables 258/259/260/261/262/265/266/267/268/269/270/271/272, with the document
-# open. PROVENANCE NOTE, the same one the gpio block carries: Nordic's own download for this
-# manual was returning errors, so the copy read was a third-party mirror of the same manual,
-# accepted only after checking that the document SELF-IDENTIFIES on its title page as the
-# Nordic "nRF51 Series Reference Manual, Version 3.0". Nordic currently publishes v3.0.1; if a
-# register fact here is ever disputed, re-read that revision before trusting this file.
+# open.
 #
 # EVERY OFFSET AND FIELD BELOW WAS READ FROM THIS PART'S OWN MANUAL. Other Nordic parts
 # document a TWI of the same name whose details differ, and four of the differences are noted

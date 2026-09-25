@@ -87,14 +87,17 @@ impl Part {
 }
 
 const USAGE: &str = "usage: device-dap-server [--probe cmsis|stlink] \
-                     [--part nrf51|samd21|f0|f4|f7|h7] [--pid 0xNNNN] [--attach [--reset]] \
-                     <program.dll|program.elf> [<Type> <Method>] [probe-serial]\n       \
+                     [--board <id> | --part nrf51|samd21|f0|f4|f7|h7] [--pid 0xNNNN] \
+                     [--attach [--reset]] <program.dll|program.elf> [<Type> <Method>] \
+                     [probe-serial]\n       \
                      device-dap-server --list-probes    every attached CMSIS-DAP probe, as JSON\n\n\
-                     --part names a part this build can PROGRAM, and is only needed when this \
-                     command\nwrites the program. To debug one that is already on the board, use \
-                     --attach, which\nnames no part.";
+                     --board names the board as `lamella boards` lists it, and chooses its part. \
+                     --part names\na part this build can PROGRAM directly. Either is only needed \
+                     when this command writes the\nprogram. To debug one that is already on the \
+                     board, use --attach, which names no part.";
 
-/// Why a debug session cannot be served on the class-library tier.
+/// What a reader who asks for the class-library tier is told: that tier is debugged from the ELF
+/// `lamella build` writes for it, not from a flag.
 ///
 /// **THE FLAG IS TAKEN AND REFUSED, WHICH IS NOT THE SAME AS NOT TAKING IT.** `lamella build` and
 /// `lamella deploy` both offer `--class-library`, so somebody debugging the program they just
@@ -104,21 +107,54 @@ const USAGE: &str = "usage: device-dap-server [--probe cmsis|stlink] \
 /// whose whole content is a mapping from addresses in the flashed image back to lines of source. An
 /// image built on the other tier with this tier's map would answer every `stackTrace` with a line
 /// that resolves and is wrong, which is worse than refusing: a wrong line is believed.
+///
+/// **THE ELF IS THE ANSWER BECAUSE IT IS THE IMAGE.** The class-library tier links the program, and
+/// only the linker knows where each line landed. `lamella build --class-library --format elf` writes
+/// the linked image with the debug information that describes it, and every class-library image is
+/// compiled the same way whatever format it is written in, so the ELF describes the image `lamella
+/// deploy --class-library` writes as well as the one this command would write.
 const CLASS_LIBRARY_REFUSAL: &str = "\
-device-dap-server: --class-library cannot be debugged yet.
+device-dap-server: a class-library program is debugged from the ELF `lamella build` writes for it,
+not by a flag here. Build that ELF, then debug it:
 
-The class-library tier links the program, which moves and drops code, so the line tables built
-while lowering it no longer describe the image that gets flashed. Serving them anyway would give
-you a source line for every stop, and they would be the wrong lines.
+lamella build <file.cs|file.csproj> --board <id> --class-library --format elf --out <program.elf>
+device-dap-server --board <id> <program.elf>
 
-Build and deploy on that tier with `lamella deploy --class-library`; debug on the flat tier.";
+The ELF carries the linked image and the debug information that describes it, so this command
+writes that image and stops at the lines it names. To debug the program already on a board,
+deployed with `lamella deploy --class-library`, add --attach.";
+
+/// The board `--board` named, reduced to what this server does with it.
+struct NamedBoard {
+    /// The id as it was given, which every `lamella` verb resolves the same way.
+    id: String,
+    /// The part this build writes for the board, or `None` for a board whose part it writes none of.
+    part: Option<Part>,
+    /// The debug-port IDCODE the board's part answers, where its part row states one.
+    idcode: Option<u32>,
+}
+
+impl NamedBoard {
+    /// Why this command cannot write the board, and how it is debugged instead.
+    fn cannot_write(&self) -> String {
+        let id = &self.id;
+        format!(
+            "device-dap-server: this build cannot write {id}, so it cannot deploy the program before \
+             debugging it.\n\nWrite the board with `lamella deploy <file> --board {id}`, adding \
+             --class-library if that is the tier the program was built on, then debug the running \
+             program with `device-dap-server --attach --board {id} <program.elf|program.dll>`."
+        )
+    }
+}
 
 /// What the command line asks for, once everything this build cannot do as asked has been refused.
 struct Options {
     probe: ProbeKind,
     part: Part,
-    /// Whether `--part` was given, rather than the default standing in for it.
+    /// Whether `--part` or `--board` chose the part, rather than the default standing in for it.
     part_named: bool,
+    /// The board `--board` named, whose part a session checks before it writes or attaches.
+    board: Option<NamedBoard>,
     attach: bool,
     reset: bool,
     /// The ST-Link model to open, by its USB product id.
@@ -141,6 +177,7 @@ impl Options {
         let mut probe = ProbeKind::CmsisDap;
         let mut part = Part::Nrf51;
         let mut part_named = false;
+        let mut board = None;
         let mut attach = false;
         let mut reset = false;
         let mut pid = None;
@@ -155,6 +192,7 @@ impl Options {
                     part_named = true;
                     part = part_called(arguments.next().as_deref())?;
                 }
+                "--board" => board = Some(board_called(arguments.next().as_deref())?),
                 "--pid" => pid = Some(product_id(arguments.next().as_deref())?),
                 "--class-library" => return Err(CLASS_LIBRARY_REFUSAL.to_owned()),
                 unknown if unknown.starts_with("--") => {
@@ -173,6 +211,23 @@ impl Options {
             return Err(
                 "--pid names the ST-Link model to open, so it needs --probe stlink".to_owned(),
             );
+        }
+        if let Some(named) = &board {
+            if part_named {
+                return Err(format!(
+                    "--board {} names the board's part, so --part beside it is a second answer to \
+                     one question. Give one of them.",
+                    named.id
+                ));
+            }
+            match named.part {
+                Some(board_part) => {
+                    part = board_part;
+                    part_named = true;
+                }
+                None if attach => {}
+                None => return Err(named.cannot_write()),
+            }
         }
 
         let mut positional = positional.into_iter();
@@ -193,6 +248,7 @@ impl Options {
             probe,
             part,
             part_named,
+            board,
             attach,
             reset,
             #[cfg(feature = "st")]
@@ -261,6 +317,78 @@ fn part_called(value: Option<&str>) -> Result<Part, String> {
         Some(other) => Err(format!("--part takes nrf51, samd21, f0, f4, f7 or h7, not {other:?}.{PART_IS_FOR_PROGRAMMING}")),
         None => Err(format!("--part takes nrf51, samd21, f0, f4, f7 or h7.{PART_IS_FOR_PROGRAMMING}")),
     }
+}
+
+/// `--board`'s value, resolved through the catalog every `lamella` verb resolves a board through.
+///
+/// **THE SAME ID `lamella build` TOOK.** A class-library program is built for a board, and the ELF
+/// that build writes is what this command debugs; naming the board once, in the same vocabulary,
+/// means the image and the part it is written to cannot be chosen apart.
+fn board_called(value: Option<&str>) -> Result<NamedBoard, String> {
+    let Some(id) = value else {
+        return Err("--board takes a board id, as `lamella boards` lists them".to_owned());
+    };
+    let (board, row) = lamella_catalog::resolve(id).map_err(|error| format!("--board: {error}"))?;
+    Ok(NamedBoard {
+        id: id.to_owned(),
+        part: part_of_family(&board.family)?,
+        idcode: row
+            .dp_idcode
+            .and_then(|idcode| u32::try_from(idcode.value).ok()),
+    })
+}
+
+/// The part this build writes for a catalog family, or `None` for a family it writes none of.
+///
+/// Keyed by the FAMILY because both things a part chooses here, the flash algorithm and the reset
+/// sequence, are family facts: an STM32F746 and an STM32F769 are written by one route, and two
+/// boards carrying one chip are written alike.
+fn part_of_family(family: &str) -> Result<Option<Part>, String> {
+    match family {
+        "nrf51" => Ok(Some(Part::Nrf51)),
+        #[cfg(feature = "sam")]
+        "samd21" => Ok(Some(Part::Samd21)),
+        #[cfg(not(feature = "sam"))]
+        "samd21" => Err(missing_feature("--board with a SAM D21", "sam")),
+        #[cfg(feature = "st")]
+        "stm32f091" => Ok(Some(Part::Stm32F0)),
+        #[cfg(feature = "st")]
+        "stm32f42x" => Ok(Some(Part::Stm32F4)),
+        #[cfg(feature = "st")]
+        "stm32f7" | "stm32f769" => Ok(Some(Part::Stm32F7)),
+        #[cfg(feature = "st")]
+        "stm32h7" => Ok(Some(Part::Stm32H7)),
+        #[cfg(not(feature = "st"))]
+        "stm32f091" | "stm32f42x" | "stm32f7" | "stm32f769" | "stm32h7" => {
+            Err(missing_feature("--board with an STM32", "st"))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Refuses a part whose debug port does not answer the IDCODE the named board's part states.
+///
+/// **A MISMATCH PROVES THE PART IS NOT THE BOARD'S, AND A MATCH DOES NOT PROVE IT IS.** An IDCODE
+/// names a debug-port design, which parts from different vendors share. It still separates the two
+/// micro:bits, whose parts answer differently, so an image built for one is not written to the
+/// other, and a session is not served against the wrong part's program.
+fn check_board(found: u32, board: Option<&NamedBoard>) -> Result<(), String> {
+    let Some(NamedBoard {
+        id,
+        idcode: Some(expected),
+        ..
+    }) = board
+    else {
+        return Ok(());
+    };
+    if found == *expected {
+        return Ok(());
+    }
+    Err(format!(
+        "the part attached is not {id}'s: its debug port answers IDCODE {found:#010x}, and {id}'s \
+         part answers {expected:#010x}. Nothing was written. Check which board this probe is \
+         on, or name the board it is."
+    ))
 }
 
 /// `--pid`'s value: a USB product id in hexadecimal, with or without `0x`.
@@ -410,6 +538,7 @@ fn main() -> std::io::Result<()> {
                     .is_some()
                     .then_some(&attach_under_reset as &PartAttach<lamella_stlink::StLink>),
                 options.part,
+                options.board.as_ref(),
                 image_base,
                 options.attach,
                 options.reset,
@@ -443,6 +572,7 @@ fn main() -> std::io::Result<()> {
                 ArmDap::new(session.into_dap()),
                 None,
                 options.part,
+                options.board.as_ref(),
                 image_base,
                 options.attach,
                 options.reset,
@@ -462,8 +592,9 @@ fn main() -> std::io::Result<()> {
 /// Reads the program and composes what a session needs to map its addresses to source.
 ///
 /// A program this server cannot debug as the command line describes it is an `Err` with the reason:
-/// a file that cannot be read, an ELF that does not parse, or an ELF that would be written somewhere
-/// other than where it was linked to run.
+/// a file that cannot be read, an ELF that does not parse, an ELF that would be written somewhere
+/// other than where it was linked to run, or an assembly that names nothing to start or does not
+/// build on the tier this server debugs.
 fn load_program(options: &Options) -> Result<lamella_debug_device::program::DebugProgram, String> {
     let program = &options.program;
     let bytes =
@@ -490,7 +621,13 @@ fn load_program(options: &Options) -> Result<lamella_debug_device::program::Debu
         return Ok(elf);
     }
 
-    let (lines, names, image, file, entry) = source_lines(program, options.target.as_ref());
+    let SourceLines {
+        lines,
+        names,
+        image,
+        file,
+        entry,
+    } = source_lines(program, &bytes, options.target.as_ref())?;
     let ends: Vec<u32> = names
         .iter()
         .enumerate()
@@ -554,6 +691,7 @@ fn serve<A: TargetAccess + 'static>(
     mut probe: A,
     attach_under_reset: Option<&PartAttach<A>>,
     part: Part,
+    board: Option<&NamedBoard>,
     image_base: u32,
     attach: bool,
     reset: bool,
@@ -567,11 +705,11 @@ fn serve<A: TargetAccess + 'static>(
     unwind: lamella_debug_device::program::UnwindTables,
 ) -> std::io::Result<()> {
     if attach {
-        if let Err(reason) = attach_to_part(&mut probe, part, reset, attach_under_reset) {
+        if let Err(reason) = attach_to_part(&mut probe, part, board, reset, attach_under_reset) {
             return refuse(&reason);
         }
     } else {
-        probe = match flash(probe, part, image, attach_under_reset) {
+        probe = match flash(probe, part, board, image, attach_under_reset) {
             Ok(probe) => probe,
             Err(reason) => return refuse(&reason),
         };
@@ -601,13 +739,24 @@ fn serve<A: TargetAccess + 'static>(
 fn attach_to_part<A: TargetAccess>(
     probe: &mut A,
     part: Part,
+    board: Option<&NamedBoard>,
     reset: bool,
     attach_under_reset: Option<&PartAttach<A>>,
 ) -> Result<(), String> {
+    let check = |probe: &mut A| match board {
+        Some(_) => {
+            let found = probe
+                .read_idcode()
+                .map_err(|error| format!("could not read the debug port's IDCODE: {error}"))?;
+            check_board(found, board)
+        }
+        None => Ok(()),
+    };
     if reset && let Some(attach) = attach_under_reset {
         attach(probe).map_err(|error| {
             format!("could not attach to the part with its core held in reset: {error}")
         })?;
+        check(probe)?;
         eprintln!("reset: the part is halted at its entry, attached with its core held in reset");
         return Ok(());
     }
@@ -619,6 +768,7 @@ fn attach_to_part<A: TargetAccess>(
         ),
         None => format!("could not attach to the part: {error}"),
     })?;
+    check(probe)?;
     probe
         .init_mem()
         .map_err(|error| format!("could not reach the part's memory: {error}"))?;
@@ -661,6 +811,7 @@ fn attach_to_part<A: TargetAccess>(
 fn flash<A: TargetAccess>(
     mut target: A,
     part: Part,
+    board: Option<&NamedBoard>,
     image: &[u8],
     attach_under_reset: Option<&PartAttach<A>>,
 ) -> Result<A, String> {
@@ -677,9 +828,10 @@ fn flash<A: TargetAccess>(
         None => target.connect(),
     }
     .map_err(deploy_step("attach to the part"))?;
-    target
+    let idcode = target
         .read_idcode()
         .map_err(deploy_step("read the debug port's IDCODE"))?;
+    check_board(idcode, board)?;
     target
         .init_mem()
         .map_err(deploy_step("reach the part's memory"))?;
@@ -891,36 +1043,58 @@ fn deploy_step(step: &'static str) -> impl FnOnce(ProbeError) -> String {
 /// `build_debug`'s per-method line tables (native -> CIL, image-relative) joined to the Portable PDB
 /// beside the assembly (CIL -> source line). The `target` selects the source `file` document (its
 /// declaring method, or the entry point). Lines are 0 without a PDB (instruction-level).
+///
+/// A program that cannot be served is an `Err` with the reason, which [`refuse`] shows to whoever
+/// started the session. Every one of these is something a person can do: point the launch at a
+/// different file, name the method to start, or change the program.
 fn source_lines(
     program: &str,
+    bytes: &[u8],
     target: Option<&(String, String)>,
-) -> (Vec<(u32, u32)>, Vec<(u32, String)>, Vec<u8>, String, String) {
-    let bytes = std::fs::read(program).expect("read the program assembly");
-    let assembly = Assembly::read(&bytes).expect("parse metadata");
+) -> Result<SourceLines, String> {
+    let assembly = Assembly::read(bytes).map_err(|error| {
+        format!(
+            "{program} is neither a linked ELF nor a .NET assembly this server can read (the \
+             metadata reader reported {error:?})."
+        )
+    })?;
+    refuse_libraries(program, &assembly)?;
     let method = match target {
         Some((type_name, method_name)) => {
             let (namespace, name) = type_name.rsplit_once('.').unwrap_or(("", type_name));
-            let type_def = assembly.find_type(namespace, name).expect("type not found");
+            let type_def = assembly.find_type(namespace, name).ok_or_else(|| {
+                format!(
+                    "{program} declares no type {type_name}, so there is no \
+                     {type_name}.{method_name} to debug."
+                )
+            })?;
             type_def
                 .methods()
                 .find(|m| m.name() == Some(method_name.as_str()))
-                .expect("method not found")
+                .ok_or_else(|| {
+                    format!("{type_name} in {program} declares no method {method_name}.")
+                })?
         }
         None => {
             let token = assembly.image().entry_point_token();
-            assert!(
-                token != 0,
-                "assembly has no entry point; pass <Type> <Method> explicitly"
-            );
+            if token == 0 {
+                return Err(format!(
+                    "{program} has no entry point -- it is a class library, or it declares no static \
+                     Main -- so nothing says where the program starts. Name the method to debug: \
+                     <Type> <Method> after the program on the command line, or entryType and \
+                     entryMethod in a VS Code launch configuration."
+                ));
+            }
             let rid = token & 0x00ff_ffff;
-            let type_def = assembly
+            assembly
                 .type_defs()
-                .find(|type_def| type_def.methods().any(|m| m.rid() == rid))
-                .expect("entry point's declaring type not found");
-            type_def
-                .methods()
-                .find(|m| m.rid() == rid)
-                .expect("entry point method not found")
+                .find_map(|type_def| type_def.methods().find(|m| m.rid() == rid))
+                .ok_or_else(|| {
+                    format!(
+                        "{program} names method {rid} as its entry point, and no type in it declares \
+                         that method, so its metadata does not hold together."
+                    )
+                })?
         }
     };
     let entry_rid = method.rid();
@@ -942,7 +1116,8 @@ fn source_lines(
         })
         .unwrap_or_default();
 
-    let (image, method_debug) = build::build_debug(&bytes, "microbit").expect("build_debug");
+    let (image, method_debug) =
+        build::build_debug(bytes, "microbit").map_err(|error| flat_refusal(program, &error))?;
     let mut lines: Vec<(u32, u32)> = Vec::new();
     let mut names: Vec<(u32, String)> = Vec::new();
     for (rid, offset, line_table) in &method_debug {
@@ -958,7 +1133,94 @@ fn source_lines(
     lines.sort_by_key(|&(native, _)| native);
     names.sort_by_key(|&(offset, _)| offset);
     let entry = name_of(&assembly, entry_rid);
-    (lines, names, image, file, entry)
+    Ok(SourceLines {
+        lines,
+        names,
+        image,
+        file,
+        entry,
+    })
+}
+
+/// What [`source_lines`] composes from a .NET assembly: the image to flash, and what maps its
+/// addresses back to source.
+struct SourceLines {
+    /// Native offset to source line, image-relative, in offset order.
+    lines: Vec<(u32, u32)>,
+    /// Each method's start offset and `Type.Method` name, in offset order.
+    names: Vec<(u32, String)>,
+    /// The image that gets flashed, the same bytes the line tables were built from.
+    image: Vec<u8>,
+    /// The source document every row of `lines` comes from.
+    file: String,
+    /// The entry method's `Type.Method` name.
+    entry: String,
+}
+
+/// Refuses an assembly compiled against any library beyond its core library.
+///
+/// **THE FLAT TIER LINKS NOTHING, SO SUCH A PROGRAM IS NOT ONE IT CAN BUILD, EVEN WHERE EVERY METHOD
+/// IT REACHES LOWERS.** A method lowered here that names a library's type would run without any of
+/// that library's code on the board. The class-library tier links the libraries a program is compiled
+/// against, and it builds from source, so the refusal names the source.
+///
+/// A core library is an assembly the program's `System.Object` resolves to: `mscorlib` for a
+/// program `lcsc` compiled, and `System.Runtime` for one `dotnet build` compiled. There can be more
+/// than one: a program compiled against the class library's corlib names `System.Object` through
+/// both `mscorlib` and `corlib`.
+fn refuse_libraries(program: &str, assembly: &Assembly) -> Result<(), String> {
+    let core: Vec<u32> = assembly
+        .type_refs()
+        .filter(|type_ref| {
+            type_ref
+                .name()
+                .is_some_and(|name| (name.namespace, name.name) == ("System", "Object"))
+        })
+        .map(|type_ref| type_ref.resolution_scope())
+        .filter(|scope| scope.table() == lamella_metadata::tables::table::ASSEMBLY_REF)
+        .map(|scope| scope.row())
+        .collect();
+    let libraries: Vec<&str> = (1..)
+        .map_while(|index| {
+            assembly
+                .assembly_ref(index)
+                .map(|reference| (index, reference))
+        })
+        .filter(|(index, _)| !core.contains(index))
+        .map(|(_, reference)| reference.name().unwrap_or("an assembly with no name"))
+        .collect();
+    let named = match libraries.as_slice() {
+        [] => return Ok(()),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    Err(format!(
+        "{program} is compiled against {named}. An assembly is debugged here on the flat tier, which \
+         links no library, so that code would not be on the board.\n\n\
+         Point the launch configuration's program at the .cs or .csproj instead: F5 builds it on \
+         the class-library tier, which links what it is compiled against. From a terminal, build the \
+         ELF with `lamella build <file.cs|file.csproj> --board <id> --class-library --format elf \
+         --out <program.elf>`, then debug it with `device-dap-server --board <id> <program.elf>`."
+    ))
+}
+
+/// Why a program did not build on the tier this server builds an assembly on, and where it does
+/// build.
+///
+/// The backend's own sentence comes first, rendered as the prose it was written as. What follows is
+/// the part only a debugger can say: the tier that would build the program is debugged from a file
+/// `lamella build` writes, not from the assembly, so the way out is a different program argument.
+fn flat_refusal(program: &str, error: &build::BuildError) -> String {
+    format!(
+        "the ahead-of-time build of {program} failed: {error}\n\n\
+         An assembly is debugged on the flat tier, whose line tables are built while the image is \
+         lowered. It is linker-free and resolves no call outside the program, so floating point, \
+         allocation, and anything reaching the class library do not build on it.\n\n\
+         A program that needs those builds on the class-library tier, and is debugged from the ELF \
+         `lamella build` writes for it: `lamella build <file.cs|file.csproj> --board <id> \
+         --class-library --format elf --out <program.elf>`, then `device-dap-server --board <id> \
+         <program.elf>`."
+    )
 }
 
 /// The `Type.Method` name for a MethodDef `rid`, or a synthetic `rid<N>` for the entry trampoline
@@ -1060,9 +1322,9 @@ mod tests {
     }
 
     /// **THE FLAG IS ACCEPTED AND REFUSED BY NAME, WHICH IS NOT THE SAME AS NOT TAKING IT.** The
-    /// other two verbs offer `--class-library`, so it will be typed here; the linked tier has no
-    /// debug map, so it cannot be served. Saying that is the answer. Falling through to the flat
-    /// tier would serve a debug session for an image the user did not ask for.
+    /// other two verbs offer `--class-library`, so it will be typed here. That tier is debugged from
+    /// the ELF `lamella build` writes, so the refusal gives both commands. Falling through to the
+    /// flat tier would serve a debug session for an image the user did not ask for.
     #[test]
     fn asking_for_the_class_library_is_refused_by_name_rather_than_served_flat() {
         let reason = refusal(&["--class-library", "prog.dll"]);
@@ -1071,8 +1333,135 @@ mod tests {
             "it names what was asked for: {reason}"
         );
         assert!(
-            reason.contains("line table"),
-            "and what is missing: {reason}"
+            reason.contains(
+                "lamella build <file.cs|file.csproj> --board <id> --class-library --format elf"
+            ) && reason.contains("device-dap-server --board <id> <program.elf>"),
+            "and the two commands that debug it: {reason}"
+        );
+    }
+
+    /// `--board` takes the id `lamella build` took, and chooses the part that board carries.
+    #[test]
+    fn a_board_chooses_its_part_and_the_idcode_that_part_answers() {
+        let options = parse(&["--board", "bbc-micro-bit-v1", "program.elf"]).expect("parses");
+        assert!(options.part == Part::Nrf51, "the v1 carries an nRF51");
+        assert!(options.part_named, "and the part counts as named");
+        let board = options.board.expect("the board is kept");
+        assert_eq!(board.id, "bbc-micro-bit-v1");
+        assert_eq!(board.idcode, Some(0x0BB1_1477), "its part row's IDCODE");
+    }
+
+    /// **A BOARD THIS BUILD CANNOT WRITE IS STILL DEBUGGED.** The micro:bit v2 is on the
+    /// class-library tier and this command has no write for its part, so a write is refused with
+    /// the route that works, and an attach is served.
+    #[test]
+    fn a_board_this_build_cannot_write_is_refused_for_a_write_and_served_for_an_attach() {
+        let reason = refusal(&["--board", "bbc-micro-bit-v2", "program.elf"]);
+        assert!(
+            reason.contains("cannot write bbc-micro-bit-v2")
+                && reason.contains("lamella deploy <file> --board bbc-micro-bit-v2")
+                && reason.contains("device-dap-server --attach --board bbc-micro-bit-v2"),
+            "it names the write that works and the attach after it: {reason}"
+        );
+
+        let options = parse(&["--attach", "--board", "bbc-micro-bit-v2", "program.elf"])
+            .expect("an attach writes nothing");
+        assert!(!options.part_named, "no part is claimed for it");
+        let board = options
+            .board
+            .expect("the board is kept for the attach's check");
+        assert_eq!(board.idcode, Some(0x2BA0_1477));
+    }
+
+    /// A board and a part are two answers to one question, in either order.
+    #[test]
+    fn a_board_beside_a_part_is_refused_in_either_order() {
+        for arguments in [
+            &[
+                "--board",
+                "bbc-micro-bit-v1",
+                "--part",
+                "nrf51",
+                "program.elf",
+            ][..],
+            &[
+                "--part",
+                "nrf51",
+                "--board",
+                "bbc-micro-bit-v1",
+                "program.elf",
+            ][..],
+        ] {
+            let reason = refusal(arguments);
+            assert!(
+                reason.contains("--board bbc-micro-bit-v1") && reason.contains("--part"),
+                "{arguments:?}: {reason}"
+            );
+        }
+    }
+
+    /// An id the catalog does not know is refused in the catalog's own words, which name the
+    /// listing, rather than standing in for a default part.
+    #[test]
+    fn an_unknown_board_is_refused_naming_the_listing() {
+        let reason = refusal(&["--board", "bbc-micro-bit-v9", "program.elf"]);
+        assert!(
+            reason.contains("bbc-micro-bit-v9") && reason.contains("lamella boards"),
+            "{reason}"
+        );
+        let reason = refusal(&["--board"]);
+        assert!(reason.contains("lamella boards"), "{reason}");
+    }
+
+    /// **EVERY FAMILY THE MAP NAMES IS ONE A BOARD CARRIES.** The map is keyed by the catalog's
+    /// family strings, so a family renamed there would make `--board` refuse to write a board this
+    /// build can write, and nothing else would notice.
+    #[test]
+    fn every_family_the_part_map_names_is_carried_by_a_catalog_board() {
+        let families: std::collections::BTreeSet<String> = lamella_catalog::BOARDS
+            .iter()
+            .filter_map(|(id, _)| lamella_catalog::load_board(id))
+            .map(|board| board.family)
+            .collect();
+        let mut mapped = vec!["nrf51"];
+        #[cfg(feature = "sam")]
+        mapped.push("samd21");
+        #[cfg(feature = "st")]
+        mapped.extend(["stm32f091", "stm32f42x", "stm32f7", "stm32f769", "stm32h7"]);
+        for family in mapped {
+            assert!(
+                families.contains(family),
+                "no catalog board carries {family:?}"
+            );
+            assert!(
+                matches!(part_of_family(family), Ok(Some(_))),
+                "{family:?} maps to a part"
+            );
+        }
+    }
+
+    /// The IDCODE check refuses only a mismatch, and says nothing was written.
+    #[test]
+    fn the_board_check_refuses_a_part_answering_another_idcode() {
+        let v1 = NamedBoard {
+            id: "bbc-micro-bit-v1".to_owned(),
+            part: Some(Part::Nrf51),
+            idcode: Some(0x0BB1_1477),
+        };
+        assert_eq!(check_board(0x0BB1_1477, Some(&v1)), Ok(()));
+        let reason = check_board(0x2BA0_1477, Some(&v1)).expect_err("a v2 answered");
+        assert!(
+            reason.contains("0x2ba01477")
+                && reason.contains("0x0bb11477")
+                && reason.contains("Nothing was written"),
+            "{reason}"
+        );
+        assert_eq!(check_board(0x2BA0_1477, None), Ok(()), "no board, no check");
+        let unstated = NamedBoard { idcode: None, ..v1 };
+        assert_eq!(
+            check_board(0x2BA0_1477, Some(&unstated)),
+            Ok(()),
+            "a part row that states no IDCODE checks nothing"
         );
     }
 
@@ -1276,7 +1665,7 @@ mod tests {
         let mut part = SleepingPart::default();
         let attach: &PartAttach<SleepingPart> = &attach_under_reset;
         assert_eq!(
-            attach_to_part(&mut part, Part::Nrf51, true, Some(attach)),
+            attach_to_part(&mut part, Part::Nrf51, None, true, Some(attach)),
             Ok(())
         );
         assert!(part.attached_under_reset);
@@ -1286,7 +1675,7 @@ mod tests {
     fn without_reset_a_part_a_plain_attach_cannot_read_is_refused_naming_reset() {
         let mut part = SleepingPart::default();
         let attach: &PartAttach<SleepingPart> = &attach_under_reset;
-        let Err(reason) = attach_to_part(&mut part, Part::Nrf51, false, Some(attach)) else {
+        let Err(reason) = attach_to_part(&mut part, Part::Nrf51, None, false, Some(attach)) else {
             panic!("a part that refuses a plain attach must not be reported attached");
         };
         assert!(
@@ -1307,7 +1696,7 @@ mod tests {
         };
         let attach: &PartAttach<SleepingPart> = &attach_under_reset;
         assert_eq!(
-            attach_to_part(&mut part, Part::Nrf51, false, Some(attach)),
+            attach_to_part(&mut part, Part::Nrf51, None, false, Some(attach)),
             Ok(())
         );
         assert!(
@@ -1356,6 +1745,8 @@ mod tests {
         ending: Option<Ending>,
         /// Makes the hold fail, for the part whose debug port cannot be held across a reset.
         hold_fails: bool,
+        /// The IDCODE its debug port answers, where it is not an nRF51's: a probe on another board.
+        answers: Option<u32>,
     }
 
     impl Nrf51Part {
@@ -1380,7 +1771,7 @@ mod tests {
             Ok(())
         }
         fn read_idcode(&mut self) -> Result<u32, ProbeError> {
-            Ok(0x0BB1_1477)
+            Ok(self.answers.unwrap_or(0x0BB1_1477))
         }
         fn init_mem(&mut self) -> Result<(), ProbeError> {
             Ok(())
@@ -1513,7 +1904,7 @@ mod tests {
         let image = image_of(4096);
         let mut part = Nrf51Part::holding_old_firmware();
         part.drops_writes_from = Some(350);
-        let Err(reason) = flash(part, Part::Nrf51, &image, None) else {
+        let Err(reason) = flash(part, Part::Nrf51, None, &image, None) else {
             panic!("a write the NVMC dropped left the old firmware behind, and a deploy hid that");
         };
         assert!(
@@ -1522,12 +1913,48 @@ mod tests {
         );
     }
 
+    /// **THE MICRO:BIT MIX-UP IS REFUSED AT THE DEBUG PORT, BEFORE THE ERASE.** An image built for
+    /// the v1, and a probe on a board whose part answers the v2's IDCODE: the write stops there,
+    /// and the same image to the part the board does carry is written as ever.
+    #[test]
+    fn a_write_to_a_part_the_named_board_does_not_carry_is_refused() {
+        let board = board_called(Some("bbc-micro-bit-v1")).expect("the v1 is in the catalog");
+        let image = image_of(4096);
+        let not_the_board = Nrf51Part {
+            answers: Some(0x2BA0_1477),
+            ..Nrf51Part::holding_old_firmware()
+        };
+        let Err(reason) = flash(not_the_board, Part::Nrf51, Some(&board), &image, None) else {
+            panic!("a part answering the v2's IDCODE was written as the v1's");
+        };
+        assert!(
+            reason.contains("is not bbc-micro-bit-v1's") && reason.contains("Nothing was written"),
+            "{reason}"
+        );
+
+        let part = flash(
+            Nrf51Part::holding_old_firmware(),
+            Part::Nrf51,
+            Some(&board),
+            &image,
+            None,
+        )
+        .unwrap_or_else(|reason| panic!("the v1's own part is written: {reason}"));
+        assert_eq!(&part.flash[..image.len()], &image[..]);
+    }
+
     /// The control: the same part with nothing dropped takes the whole image and is left running it.
     #[test]
     fn an_nrf51_deploy_that_takes_puts_every_byte_on_the_part() {
         let image = image_of(4096);
-        let part = flash(Nrf51Part::holding_old_firmware(), Part::Nrf51, &image, None)
-            .unwrap_or_else(|reason| panic!("an image this size fits an nRF51: {reason}"));
+        let part = flash(
+            Nrf51Part::holding_old_firmware(),
+            Part::Nrf51,
+            None,
+            &image,
+            None,
+        )
+        .unwrap_or_else(|reason| panic!("an image this size fits an nRF51: {reason}"));
         assert_eq!(
             &part.flash[..image.len()],
             &image[..],
@@ -1568,7 +1995,7 @@ mod tests {
             hold_fails: true,
             ..Nrf51Part::holding_old_firmware()
         };
-        let part = flash(part, Part::Nrf51, &image, None).unwrap_or_else(|reason| {
+        let part = flash(part, Part::Nrf51, None, &image, None).unwrap_or_else(|reason| {
             panic!("a hold that cannot be caught is not a failed deploy: {reason}")
         });
         assert_eq!(
@@ -1847,8 +2274,9 @@ mod tests {
         fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
             unreachable!("a deploy arms no breakpoint")
         }
-        fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-            unreachable!("a deploy arms no breakpoint")
+        fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+            assert!(addresses.is_empty(), "a deploy arms no breakpoint: {addresses:?}");
+            Ok(())
         }
         fn call_target(
             &mut self,
@@ -1884,7 +2312,7 @@ mod tests {
     #[test]
     fn an_f7_deploy_past_the_first_megabyte_puts_the_whole_image_on_a_two_megabyte_part() {
         let image = image_of(1536 * KB);
-        let part = flash(FlashPart::f769(), Part::Stm32F7, &image, None)
+        let part = flash(FlashPart::f769(), Part::Stm32F7, None, &image, None)
             .unwrap_or_else(|reason| panic!("a 1.5 MB image fits a 2 MB F769: {reason}"));
         assert_eq!(
             first_difference(&part.flash, &image),
@@ -1905,7 +2333,7 @@ mod tests {
         let mut part = FlashPart::f769();
         part.idcode = 0x1000_0413;
         let erases = Rc::clone(&part.erases);
-        let Err(reason) = flash(part, Part::Stm32F7, &image, None) else {
+        let Err(reason) = flash(part, Part::Stm32F7, None, &image, None) else {
             panic!("a part answering DEV_ID 0x413 is no STM32F7, and writing it is not a deploy");
         };
         assert!(
@@ -1925,7 +2353,7 @@ mod tests {
         let image = image_of(1536 * KB);
         let part = FlashPart::f4(2048);
         let erases = Rc::clone(&part.erases);
-        let Err(reason) = flash(part, Part::Stm32F4, &image, None) else {
+        let Err(reason) = flash(part, Part::Stm32F4, None, &image, None) else {
             panic!("an image past the sectors this deploy erases by would be programmed unerased");
         };
         assert_eq!(
@@ -1941,7 +2369,7 @@ mod tests {
         let image = image_of(300 * KB);
         let mut part = FlashPart::f4(1024);
         part.erase_does_not_take = Some(5);
-        let Err(reason) = flash(part, Part::Stm32F4, &image, None) else {
+        let Err(reason) = flash(part, Part::Stm32F4, None, &image, None) else {
             panic!(
                 "a sector whose erase did not take holds the wrong bytes, and a deploy hid that"
             );
@@ -2157,8 +2585,9 @@ mod tests {
         fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
             unreachable!("a deploy arms no breakpoint")
         }
-        fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
-            unreachable!("a deploy arms no breakpoint")
+        fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+            assert!(addresses.is_empty(), "a deploy arms no breakpoint: {addresses:?}");
+            Ok(())
         }
         fn call_target(
             &mut self,
@@ -2174,7 +2603,7 @@ mod tests {
     #[test]
     fn an_h7_deploy_past_the_first_megabyte_puts_the_whole_image_on_both_banks() {
         let image = image_of(1536 * KB);
-        let part = flash(H7Part::h747(), Part::Stm32H7, &image, None)
+        let part = flash(H7Part::h747(), Part::Stm32H7, None, &image, None)
             .unwrap_or_else(|reason| panic!("a 1.5 MB image fits a 2 MB H7: {reason}"));
         assert_eq!(
             first_difference(&part.flash, &image),
@@ -2194,7 +2623,7 @@ mod tests {
         let image = image_of(300 * KB);
         let mut part = H7Part::h747();
         part.erase_does_not_take = Some(0x0802_0000);
-        let Err(reason) = flash(part, Part::Stm32H7, &image, None) else {
+        let Err(reason) = flash(part, Part::Stm32H7, None, &image, None) else {
             panic!(
                 "a sector whose erase did not take holds the wrong bytes, and a deploy hid that"
             );
@@ -2212,7 +2641,7 @@ mod tests {
         let mut part = H7Part::h747();
         part.idc = 0x1000_0413;
         let erases = Rc::clone(&part.erases);
-        let Err(reason) = flash(part, Part::Stm32H7, &image, None) else {
+        let Err(reason) = flash(part, Part::Stm32H7, None, &image, None) else {
             panic!("a part answering DEV_ID 0x413 is no STM32H7, and writing it is not a deploy");
         };
         assert!(

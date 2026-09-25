@@ -11,7 +11,9 @@ kind = "pins"
 family = "nrf51"
 sources = [
     "nRF51 Series Reference Manual v3.0, ch. 14 GPIO and ch. 28.2: pin routing is by the peripheral's PSELSCL/PSELSDA registers rather than a per-pin function table",
-    "nRF51822 PS v3.4 section 3.7 (one GPIO port of up to 32 I/Os depending on package) and the QFN pin assignment table, which lists P0.00 and P0.30 as general purpose I/O",
+    "nRF51822 PS v3.4 section 3.7 (one GPIO port of up to 32 I/Os depending on package) and the QFN pin assignment table, which lists P0.00, P0.21-P0.23 and P0.30 as general purpose I/O",
+    "nRF51 Series Reference Manual v3.0, ch. 26.1.1: the SPI master routes its pins by the PSELSCK/PSELMOSI/PSELMISO registers",
+    "nRF51 Series Reference Manual v3.0, 29.2: the UART routes its pins by the PSELRXD/PSELCTS/PSELRTS/PSELTXD registers",
 ]
 
 [[pins]]
@@ -27,3 +29,38 @@ function = "twi"
 instance = "twi0"
 signal = "psel_sda"
 source = "nRF51822 PS v3.4 QFN pin assignment (pin 3, general purpose I/O); PSELSDA takes the plain pin number, so this pin routes as 30"
+
+[[pins]]
+pin = "P0.23"
+function = "spi"
+instance = "spi1"
+signal = "psel_sck"
+source = "nRF51822 PS v3.4 Table 1 (Pin functions QFN48): pins 40 to 44 are P0.21 to P0.25, general purpose I/O; PSELSCK takes the plain pin number, so this pin routes as 23"
+
+[[pins]]
+pin = "P0.21"
+function = "spi"
+instance = "spi1"
+signal = "psel_mosi"
+source = "nRF51822 PS v3.4 Table 1 (Pin functions QFN48), general purpose I/O; PSELMOSI routes it as 21"
+
+[[pins]]
+pin = "P0.22"
+function = "spi"
+instance = "spi1"
+signal = "psel_miso"
+source = "nRF51822 PS v3.4 Table 1 (Pin functions QFN48), general purpose I/O; PSELMISO routes it as 22"
+
+[[pins]]
+pin = "P0.24"
+function = "uart"
+instance = "uart0"
+signal = "psel_txd"
+source = "nRF51822 PS v3.4 Table 1 (Pin functions QFN48): pin 43, general purpose I/O; PSELTXD takes the plain pin number, so this pin routes as 24"
+
+[[pins]]
+pin = "P0.25"
+function = "uart"
+instance = "uart0"
+signal = "psel_rxd"
+source = "nRF51822 PS v3.4 Table 1 (Pin functions QFN48): pin 44, general purpose I/O; PSELRXD takes the plain pin number, so this pin routes as 25"

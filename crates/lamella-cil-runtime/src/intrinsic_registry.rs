@@ -126,8 +126,11 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(decimal_subtract),
     #[cfg(feature = "float")]
     entry!(decimal_to_double),
+    entry!(delegate_clone),
     entry!(delegate_combine),
     entry!(delegate_equals),
+    entry!(delegate_equals_object),
+    entry!(delegate_get_hash_code),
     entry!(delegate_not_equals),
     entry!(delegate_remove),
     entry!(dns_resolve_host),

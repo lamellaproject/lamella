@@ -2,7 +2,7 @@
 #if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
-    public class TargetInvocationException : ApplicationException
+    public sealed class TargetInvocationException : ApplicationException
     {
         public TargetInvocationException(Exception innerException)
             : base("Exception has been thrown by the target of an invocation.", innerException)

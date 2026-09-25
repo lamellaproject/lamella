@@ -12,5 +12,7 @@ namespace Lamella.Generated
         public const uint TWI0_BASE = 0x40003000;
         public const uint PORT0_BASE = 0x50000000;
         public const uint PORT1_BASE = 0x50000300;
+        public const uint SPI2_BASE = 0x40023000;
+        public const uint UART0_BASE = 0x40002000;
     }
 }

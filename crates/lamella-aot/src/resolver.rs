@@ -15,7 +15,7 @@ use lamella_token::Token;
 
 use crate::cil::{
     Array2DOp, ArrayCastTest, ArrayElement, ArrayElementTest, ArrayMDOp, CallInfo, CallResolver,
-    CallTarget, CilError, Intrinsic,
+    CallTarget, CilError, ClosedCastTarget, Intrinsic,
     PInvokeCall, ReferenceLayout, StringCtorForm, lower_method_typed,
 };
 
@@ -144,6 +144,38 @@ pub(crate) fn instantiated_value_type_slot<'x>(
         size: layout.size,
         refs: ref_words_of(&layout.reference_offsets)?,
     })
+}
+
+/// [`instantiated_value_type_slot`] for a VALUE-type instantiation met inside a monomorphized body --
+/// `Span<T>` inside `Span<T>`'s own `Slice` -- or `None` where this tier cannot give it one identity.
+///
+/// **ONE WORLD IS EXACT UNLESS AN ARGUMENT CARRIES THE OTHER WORLD'S TOKEN.** The slot is spelled and
+/// laid out in `assembly` alone. That is exact in a body the module owns, whose arguments are written
+/// in its own tables, and it is exact in a body read out of a REFERENCE whose arguments carry no token
+/// -- `Span<byte>`, where the only row named is the definition's own. A rebased body whose argument
+/// NAMES a type is the one shape it cannot answer: the token is the caller's, and read in the owner's
+/// tables it would name, or lay out, an unrelated type. That shape answers `None`, which refuses the
+/// body rather than guessing.
+///
+/// Every site that types a value-type instantiation inside a monomorphized body asks this one
+/// function -- the slot a body declares, the value a `newobj` builds, the result a call returns -- so
+/// the three cannot come to disagree about one type's identity where they meet.
+pub(crate) fn instantiated_value_type_slot_across<'x>(
+    closed: &SigType,
+    assembly: &'x Assembly<'x>,
+    argument_world: Option<&'x Assembly<'x>>,
+    references: &[&'x Assembly<'x>],
+    target: &TargetLayout,
+) -> Option<MirType> {
+    if argument_world.is_some() {
+        let SigType::GenericInst { arguments, .. } = closed else {
+            return None;
+        };
+        if arguments.iter().any(crate::generics::names_a_type) {
+            return None;
+        }
+    }
+    instantiated_value_type_slot(closed, assembly, references, target)
 }
 
 /// A value type's GC trace map from the byte offsets its layout already computed, or `None` when it
@@ -3751,6 +3783,55 @@ impl<'a> MetadataResolver<'a> {
         )
     }
 
+    /// The delegate type a delegate member (`.ctor` or `Invoke`) belongs to: the owning assembly's
+    /// ordinal among the references (`None` for this assembly), that assembly, the delegate's
+    /// `TypeDef`, and the type arguments of a CONSTRUCTED generic delegate (empty otherwise). `None`
+    /// for a member of any type that is not a delegate.
+    ///
+    /// **A MEMBER OF A CONSTRUCTED GENERIC DELEGATE IS REACHED THROUGH A `TypeSpec`**, and a spec
+    /// has no name: csc writes `f(6)` for an `Fn<int, int> f` as `callvirt Fn`2<int32,
+    /// int32>::Invoke`, and builds the delegate through that type's `.ctor`. Asked for its declaring
+    /// type's name, such a member answers nothing, so neither the construction nor the call was
+    /// recognized as a delegate's; both fell to the ordinary call path, which cannot resolve a
+    /// runtime-implemented member, and every generic delegate was refused. The definition the spec
+    /// instantiates is the delegate type.
+    fn delegate_member_owner(
+        &self,
+        token: Token,
+    ) -> Option<(Option<usize>, &'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> {
+        let (name, arguments) = match self.assembly.resolve_method(token)?.declaring_type {
+            Some(name) => (name, Vec::new()),
+            None => {
+                if token.table() != table::MEMBER_REF {
+                    return None;
+                }
+                let parent = self.assembly.member_ref(token.row())?.parent();
+                if parent.table() != table::TYPE_SPEC {
+                    return None;
+                }
+                let SigType::GenericInst { definition, arguments } =
+                    self.assembly.type_spec_signature(parent)?
+                else {
+                    return None;
+                };
+                let (SigType::Class(generic) | SigType::ValueType(generic)) = definition.as_ref()
+                else {
+                    return None;
+                };
+                (self.assembly.type_token_name(*generic)?, arguments)
+            }
+        };
+        let (ordinal, owner, type_def) = match self.assembly.find_type(name.namespace, name.name) {
+            Some(type_def) => (None, self.assembly, type_def),
+            None => {
+                let (ordinal, owner, type_def) =
+                    self.find_reference_type(name.namespace, name.name)?;
+                (Some(ordinal), owner, type_def)
+            }
+        };
+        is_delegate_type_of(owner, &type_def).then_some((ordinal, owner, type_def, arguments))
+    }
+
     /// The reference layout of `type_def` (declared in `owner`) -- payload size and
     /// reference-field offsets; `None` for a value type. Used for a `newobj` of either a
     /// this-assembly class or a referenced-assembly class. The payload spans the WHOLE extends
@@ -4122,14 +4203,70 @@ impl<'a> MetadataResolver<'a> {
         (closed != signature).then_some(closed)
     }
 
+    /// A TYPE-PARAMETER operand -- a `TypeSpec` whose whole signature is `!n` or `!!n` -- closed over
+    /// the instantiation in force, in its IDENTITY reading. `None` for every other operand, and for a
+    /// parameter with no argument in force.
+    ///
+    /// **IDENTITY, BECAUSE A CAST ASKS WHICH TYPE THIS IS.** An enum argument must stay the enum here:
+    /// the layout reading would make it its underlying integer, and a cast to it would then accept
+    /// every boxed `int`.
+    fn closed_type_parameter(&self, token: Token) -> Option<SigType> {
+        if token.table() != table::TYPE_SPEC {
+            return None;
+        }
+        let signature = self.assembly.type_spec_signature(token)?;
+        if !matches!(signature, SigType::Var(_) | SigType::MVar(_)) {
+            return None;
+        }
+        crate::generics::substitute_sig_with(&signature, &self.type_arguments, &self.method_arguments)
+    }
+
+    /// The descriptor a `box` of the `System` primitive `namespace.name` writes: this assembly's own
+    /// definition when it declares one (the corlib), else the owning reference's.
+    ///
+    /// ONE ANSWER FOR BOTH SIDES OF A BOX. A `box !0` closed to `int` and an `unbox.any !0` closed to
+    /// `int` must name the descriptor a plain `box int` names, or a value boxed on one side is
+    /// refused on the other.
+    fn primitive_box_handle(&self, namespace: &str, name: &str) -> Option<TypeHandle> {
+        self.assembly
+            .find_type(namespace, name)
+            .map(|type_def| TypeHandle(type_def.token().0))
+            .or_else(|| {
+                self.find_reference_type(namespace, name)
+                    .map(|(ordinal, _, type_def)| reference_handle(ordinal, type_def.token().0))
+            })
+    }
+
+    /// [`CallResolver::unbox_accepted_handles`] for a closed type parameter, or `None` where it
+    /// cannot be answered from here (a named argument written in another assembly).
+    fn unbox_accepted_closed(&self, closed: &SigType) -> Option<Vec<TypeHandle>> {
+        if let SigType::ValueType(named) = closed {
+            return self
+                .argument_assembly
+                .is_none()
+                .then(|| self.unbox_accepted_handles(&Operand::Token(*named)));
+        }
+        let (namespace, name) = primitive_sig_name(closed)?;
+        let form = sig_element_byte(&primitive_sig_type(namespace, name)?);
+        let mut handles = alloc::vec![self.primitive_box_handle(namespace, name)?];
+        for candidate in &self.box_target_tokens {
+            if unbox_normal_form(self.assembly, *candidate, self.references()) == Some(form) {
+                handles.push(self.qualified_type_handle(*candidate));
+            }
+        }
+        handles.sort_unstable_by_key(|h| h.0);
+        handles.dedup_by_key(|h| h.0);
+        Some(handles)
+    }
+
     /// The element of `new T[n]` where the operand is a `TypeSpec` and an instantiation is in force:
     /// the closed ARGUMENT's identity, size and kind. `None` leaves [`CallResolver::array_element`]
     /// on the path it was already on, which is what keeps every ordinary program on exactly the bytes
     /// it was on.
     ///
-    /// **A CLOSED FORM THAT NAMES NO ROW IS THE WHOLE BCL CASE.** A primitive or `String` is spelled
-    /// by a byte in the signature encoding and carries no token from anywhere, so naming it is a
-    /// lookup and not a rebase -- `List<int>` and `List<string>` are exactly this.
+    /// **A CLOSED FORM THAT NAMES NO ROW IS THE WHOLE BCL CASE.** A primitive, `String` or `Object` is
+    /// spelled by a byte in the signature encoding and carries no token from anywhere, so naming it is
+    /// a lookup and not a rebase -- `List<int>`, `List<string>` and `List<object>` are exactly this.
     ///
     /// **A NAMED ARGUMENT -- a class or struct the CALLER declares -- IS ALSO TAKEN, THROUGH THE
     /// ARGUMENT WORLD.** Its token belongs to the caller while this resolver reads the owner, which
@@ -4140,11 +4277,16 @@ impl<'a> MetadataResolver<'a> {
     /// `unwrap_or(4)` where the signature beside it said eight, and a class element was described
     /// OPAQUE, which tells a mark-compact collector not to scan an array full of live references.
     ///
-    /// **ONE SHAPE STILL DECLINES, AND IT IS A PROPERTY OF THE DESCRIPTOR RATHER THAN OF THIS
-    /// FUNCTION:** a struct element holding REFERENCE FIELDS. Word 1 carries a kind and no
-    /// per-element offsets, so such an array cannot be described at all -- see the arm for the
-    /// reasoning. An unsubstituted spec declines too: `new int[][]` and `new Box<int>[n]` close to
-    /// an array and an instantiation, neither of which this names.
+    /// **AN ELEMENT THAT IS ITSELF A REFERENCE AND THAT NO ROW NAMES IS TAKEN AS ONE** -- an array or
+    /// a class instantiation, `List<byte[]>` and `List<List<int>>`. It is one traced word under the
+    /// descriptor every array of references carries when nothing names its element.
+    ///
+    /// **TWO SHAPES STILL DECLINE.** A struct element holding REFERENCE FIELDS is a property of the
+    /// descriptor rather than of this function: word 1 carries a kind and no per-element offsets, so
+    /// such an array cannot be described at all -- see the arm for the reasoning. A VALUE-type
+    /// instantiation declines for want of a layout this tier does not compute. A spec the
+    /// instantiation does not reach is left alone: `new int[][]` and `new Box<int>[n]` are spelled
+    /// closed already, and keep the path code that is not generic takes.
     ///
     /// The identity is resolved OWN-ASSEMBLY FIRST, exactly as [`resolve_value_type_def`] resolves a
     /// value type, and for the same reason: a body lowered out of the corlib is read against the
@@ -4155,7 +4297,7 @@ impl<'a> MetadataResolver<'a> {
     /// `new int[n]` names rather than a second copy of it.
     fn substituted_array_element(&self, spec: Token) -> Option<ArrayElement> {
         let closed = self.closed_operand_sig(spec)?;
-        if let Some((namespace, name)) = primitive_sig_name(&closed) {
+        if let Some((namespace, name)) = row_free_element_name(&closed) {
             let element = self
                 .assembly
                 .find_type(namespace, name)
@@ -4214,6 +4356,15 @@ impl<'a> MetadataResolver<'a> {
                         self.references(),
                     )
                     .map_or(ARRAY_CAST_CLASS_NONE, u32::from),
+                })
+            }
+            composite if type_spec_element_kind(Some(composite)) == ELEMENT_KIND_REFERENCE => {
+                Some(ArrayElement {
+                    handle: lamella_ir::synthetic_array_handle(ELEMENT_KIND_REFERENCE),
+                    element: None,
+                    element_size: 4,
+                    element_kind: ELEMENT_KIND_REFERENCE,
+                    element_cast_class: ARRAY_CAST_CLASS_NONE,
                 })
             }
             _ => None,
@@ -5051,6 +5202,23 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
+        if token.table() == table::MEMBER_REF
+            && let Some(member) = self.assembly.member_ref(token.row())
+            && member.parent().table() == table::TYPE_SPEC
+        {
+            let open = self.assembly.type_spec_signature(member.parent())?;
+            if !crate::generics::is_value_type_instantiation(&open) {
+                return None;
+            }
+            let closed = self.apply_instantiation(&open)?;
+            return instantiated_value_type_slot_across(
+                &closed,
+                self.assembly,
+                self.argument_assembly,
+                &self.references,
+                &TargetLayout::ilp32(),
+            );
+        }
         let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
         let (handle, owner, type_def) =
             match self.assembly.find_type(declaring.namespace, declaring.name) {
@@ -5103,19 +5271,7 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
-        let (ordinal, owner, type_def) =
-            match self.assembly.find_type(declaring.namespace, declaring.name) {
-                Some(type_def) => (None, self.assembly, type_def),
-                None => {
-                    let (ordinal, owner, type_def) =
-                        self.find_reference_type(declaring.namespace, declaring.name)?;
-                    (Some(ordinal), owner, type_def)
-                }
-            };
-        if !is_delegate_type_of(owner, &type_def) {
-            return None;
-        }
+        let (ordinal, _, type_def, _) = self.delegate_member_owner(*token)?;
         Some(ReferenceLayout {
             handle: match ordinal {
                 Some(ordinal) => reference_handle(ordinal, type_def.token().0),
@@ -5152,23 +5308,17 @@ impl CallResolver for MetadataResolver<'_> {
         if method.name != Some("Invoke") {
             return None;
         }
-        let declaring = method.declaring_type?;
-        let (owner, type_def) = match self.assembly.find_type(declaring.namespace, declaring.name) {
-            Some(type_def) => (self.assembly, type_def),
-            None => {
-                let (_, owner, type_def) =
-                    self.find_reference_type(declaring.namespace, declaring.name)?;
-                (owner, type_def)
-            }
-        };
-        if !is_delegate_type_of(owner, &type_def) {
-            return None;
-        }
+        let (_, _, _, type_arguments) = self.delegate_member_owner(*token)?;
         let sig = method.signature?;
         let result_type = if sig.return_type == SigType::Void {
             None
         } else {
-            Some(self.slot_type(&sig.return_type).unwrap_or(MirType::I32))
+            let closed = match type_arguments.is_empty() {
+                true => Some(sig.return_type.clone()),
+                false => crate::generics::substitute_sig_with(&sig.return_type, &type_arguments, &[]),
+            };
+            let closed = closed.and_then(|ty| self.apply_instantiation(&ty));
+            Some(closed.and_then(|ty| self.slot_type(&ty)).unwrap_or(MirType::I32))
         };
         Some((sig.parameters.len(), result_type))
     }
@@ -5777,6 +5927,11 @@ impl CallResolver for MetadataResolver<'_> {
             return Vec::new();
         };
         let own = self.qualified_type_handle(*token);
+        if let Some(closed) = self.closed_type_parameter(*token) {
+            if let Some(handles) = self.unbox_accepted_closed(&closed) {
+                return handles;
+            }
+        }
         let Some(form) = unbox_normal_form(self.assembly, *token, self.references()) else {
             return alloc::vec![own];
         };
@@ -5810,6 +5965,20 @@ impl CallResolver for MetadataResolver<'_> {
         is_reference_signature(&closed)
     }
 
+    fn closed_cast_target(&self, operand: &Operand) -> Option<ClosedCastTarget> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        match self.closed_type_parameter(*token)? {
+            SigType::Object => Some(ClosedCastTarget::Anything),
+            SigType::String => Some(ClosedCastTarget::Exactly(alloc::vec![self.string_type_handle()?])),
+            SigType::Class(named) | SigType::ValueType(named) if self.argument_assembly.is_none() => {
+                Some(ClosedCastTarget::Token(named))
+            }
+            _ => None,
+        }
+    }
+
     fn boxed_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
         let Operand::Token(token) = operand else {
             return None;
@@ -5817,14 +5986,7 @@ impl CallResolver for MetadataResolver<'_> {
         let handle = self.qualified_type_handle(*token);
         if let Some(closed) = self.closed_operand_sig(*token) {
             if let Some((namespace, name)) = primitive_sig_name(&closed) {
-                let boxed = self
-                    .assembly
-                    .find_type(namespace, name)
-                    .map(|type_def| TypeHandle(type_def.token().0))
-                    .or_else(|| {
-                        self.find_reference_type(namespace, name)
-                            .map(|(ordinal, _, td)| reference_handle(ordinal, td.token().0))
-                    })?;
+                let boxed = self.primitive_box_handle(namespace, name)?;
                 let size = primitive_value_size(namespace, name)?;
                 return Some(ReferenceLayout {
                     handle: boxed,
@@ -5897,6 +6059,21 @@ impl CallResolver for MetadataResolver<'_> {
             size: layout.size,
             refs: ref_words_of(&layout.reference_offsets)?,
         })
+    }
+
+    fn sub_word_scalar(&self, operand: &Operand) -> Option<lamella_ir::ConvKind> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let sig = match self.closed_operand_sig(*token) {
+            Some(closed) => closed,
+            None => self
+                .assembly
+                .type_token_name(*token)
+                .and_then(|name| primitive_sig_type(name.namespace, name.name))
+                .unwrap_or(SigType::ValueType(*token)),
+        };
+        declared_narrow(&sig, self.assembly, self.references())
     }
 
     fn type_operand_mir(&self, operand: &Operand) -> Option<MirType> {
@@ -6189,6 +6366,15 @@ fn mir_type_across<'x>(
         SigType::SzArray(_) | SigType::Array { .. } => MirType::ObjectRef,
         SigType::GenericInst { definition, .. } if matches!(**definition, SigType::Class(_)) => {
             MirType::ObjectRef
+        }
+        SigType::GenericInst { definition, .. } if matches!(**definition, SigType::ValueType(_)) => {
+            return instantiated_value_type_slot_across(
+                sig,
+                assembly,
+                argument_world,
+                references,
+                target,
+            );
         }
         SigType::ValueType(token) => match enum_underlying(assembly, *token, references, target) {
             Some(underlying) => underlying,
@@ -7200,6 +7386,21 @@ fn primitive_sig_name(sig: &SigType) -> Option<(&'static str, &'static str)> {
     Some(("System", name))
 }
 
+/// The `System` type an array ELEMENT names when a signature spells it with one element-type byte and
+/// no metadata row: everything [`primitive_sig_name`] names, plus `Object`.
+///
+/// **`Object` BELONGS HERE AND NOT THERE.** [`primitive_sig_name`] is pinned as the exact inverse of
+/// [`primitive_sig_type`], a table `Object` is not in because it has no boxed payload. An array
+/// element is asked only for a name to find, a width and a kind, and for those `object` is as
+/// row-free as `string`: `ELEMENT_TYPE_OBJECT` is a single byte, so `List<object>`'s backing array
+/// is found by name and rebased like `List<string>`'s.
+fn row_free_element_name(sig: &SigType) -> Option<(&'static str, &'static str)> {
+    match sig {
+        SigType::Object => Some(("System", "Object")),
+        other => primitive_sig_name(other),
+    }
+}
+
 /// Lowers the given methods of an `assembly` to MIR as one module: a call from one of them
 /// to another resolves to the callee's index in `methods` (so pass them in the order you
 /// will give a module lowering such as [`crate::arm32::lower_module`], the entry first), and
@@ -8012,6 +8213,165 @@ mod tests {
             None
         );
         assert_eq!(primitive_sig_name(&SigType::Var(0)), None);
+    }
+
+    /// `new T[n]` closed over each argument SHAPE, read off the corlib's own `List<T>` constructor
+    /// so the operand is the definition's real `!0` rather than a token built for the test.
+    ///
+    /// **THE KIND IS THE WORD THAT MATTERS, AND NO BUILD FAILURE EVER REPORTS IT.** An array of
+    /// references described OPAQUE is an array the collector never scans: the program builds, and
+    /// the objects only that array holds are reclaimed at the next collection. `object`, an array
+    /// and a class instantiation all hold references and all must say so. A value-type
+    /// instantiation must DECLINE rather than guess a width.
+    #[test]
+    fn a_type_parameter_array_describes_every_reference_argument_as_references() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
+        if !std::path::Path::new(directory).is_dir() {
+            eprintln!("{directory} absent (a stripped drop); skipping");
+            return;
+        }
+        let path = alloc::format!("{directory}/corlib.dll");
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("the fixture directory exists but {path} does not read: {error}")
+        });
+        let corlib = Assembly::read(&bytes).expect("the corlib fixture parses");
+        let list = corlib
+            .find_type("System.Collections.Generic", "List`1")
+            .expect("the corlib declares List<T>");
+        let spec = list
+            .methods()
+            .filter(|method| method.name() == Some(".ctor"))
+            .filter_map(|method| method.body())
+            .flat_map(|body| body.code.into_vec())
+            .find_map(|instruction| match (instruction.opcode, instruction.operand) {
+                (Opcode::Newarr, Operand::Token(token)) => Some(token),
+                _ => None,
+            })
+            .expect("List<T>'s constructor allocates its backing array with `new T[n]`");
+        assert_eq!(spec.table(), table::TYPE_SPEC, "the operand is the definition's own `!0`");
+        let closed = |argument: SigType| {
+            MetadataResolver::new(&corlib)
+                .with_type_arguments(alloc::vec![argument.clone()])
+                .with_layout_arguments(alloc::vec![argument])
+                .substituted_array_element(spec)
+        };
+
+        let object = TypeHandle(
+            corlib
+                .find_type("System", "Object")
+                .expect("the corlib declares System.Object")
+                .token()
+                .0,
+        );
+        let element = closed(SigType::Object).expect("an `object` element is taken");
+        assert_eq!(element.element_kind, ELEMENT_KIND_REFERENCE);
+        assert_eq!(element.element, Some(object));
+        assert_eq!(element.handle, lamella_ir::array_handle(object));
+        assert_eq!(element.element_size, 4);
+
+        for (name, argument) in [
+            ("byte[]", SigType::SzArray(Box::new(SigType::U1))),
+            (
+                "List<int>",
+                SigType::GenericInst {
+                    definition: Box::new(SigType::Class(list.token())),
+                    arguments: alloc::vec![SigType::I4],
+                },
+            ),
+        ] {
+            let element = closed(argument).unwrap_or_else(|| panic!("a `{name}` element is taken"));
+            assert_eq!(
+                element.element_kind, ELEMENT_KIND_REFERENCE,
+                "{name}: an element that is itself a reference is traced, never stepped over"
+            );
+            assert_eq!(element.element, None, "{name}: no row names the element");
+            assert_eq!(
+                element.handle,
+                lamella_ir::synthetic_array_handle(ELEMENT_KIND_REFERENCE),
+                "{name}: the descriptor every array of references carries when no row names its element"
+            );
+            assert_eq!(element.element_size, 4, "{name}: one word per element");
+        }
+
+        let nullable = corlib
+            .find_type("System", "Nullable`1")
+            .expect("the corlib declares Nullable<T>");
+        assert!(
+            closed(SigType::GenericInst {
+                definition: Box::new(SigType::ValueType(nullable.token())),
+                arguments: alloc::vec![SigType::I4],
+            })
+            .is_none(),
+            "a value-type instantiation is laid inline and this tier has no layout for it"
+        );
+    }
+
+    /// `new Span<T>(...)` inside the corlib's own `Span<T>.Slice`, closed over `byte`: the value a
+    /// `newobj` of a VALUE-type instantiation builds is the very slot a local of that type is typed as.
+    ///
+    /// **ONE IDENTITY, OR A VERIFY MISMATCH WHERE THE TWO MEET.** `Slice` returns what its `newobj`
+    /// built, and its caller receives it into a slot typed from the signature -- so the handle, the
+    /// size and the trace map must agree exactly. Read off the real corlib so the operand is the
+    /// definition's own `MemberRef` over the `Span<!0>` it spells for itself.
+    #[test]
+    fn a_value_type_instantiation_built_by_newobj_is_the_slot_it_is_typed_as() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
+        if !std::path::Path::new(directory).is_dir() {
+            eprintln!("{directory} absent (a stripped drop); skipping");
+            return;
+        }
+        let path = alloc::format!("{directory}/corlib.dll");
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("the fixture directory exists but {path} does not read: {error}")
+        });
+        let corlib = Assembly::read(&bytes).expect("the corlib fixture parses");
+        let span = corlib.find_type("System", "Span`1").expect("the corlib declares Span<T>");
+        let ctor = span
+            .methods()
+            .filter(|method| method.name() == Some("Slice"))
+            .filter_map(|method| method.body())
+            .flat_map(|body| body.code.into_vec())
+            .find_map(|instruction| match (instruction.opcode, instruction.operand) {
+                (Opcode::Newobj, Operand::Token(token))
+                    if match token.table() {
+                        table::METHOD_DEF => span.methods().any(|m| m.rid() == token.row()),
+                        table::MEMBER_REF => corlib.member_ref(token.row()).is_some_and(|m| {
+                            m.parent().table() == table::TYPE_SPEC
+                                && matches!(
+                                    corlib.type_spec_signature(m.parent()),
+                                    Some(SigType::GenericInst { ref definition, .. })
+                                        if matches!(**definition, SigType::ValueType(t) if t == span.token())
+                                )
+                        }),
+                        _ => false,
+                    } =>
+                {
+                    Some(token)
+                }
+                _ => None,
+            })
+            .expect("Span<T>.Slice builds its result with `new Span<T>(...)`");
+        let resolver = MetadataResolver::new(&corlib)
+            .with_type_arguments(alloc::vec![SigType::U1])
+            .with_layout_arguments(alloc::vec![SigType::U1]);
+        let built = resolver
+            .newobj_value_type(&Operand::Token(ctor))
+            .expect("`new Span<byte>` is a value this tier can build");
+        let slot = instantiated_value_type_slot(
+            &SigType::GenericInst {
+                definition: Box::new(SigType::ValueType(span.token())),
+                arguments: alloc::vec![SigType::U1],
+            },
+            &corlib,
+            &[],
+            &TargetLayout::ilp32(),
+        )
+        .expect("a `Span<byte>` local is a slot this tier can type");
+        assert_eq!(built, slot, "the value built and the slot it lands in are one identity");
+        let MirType::ValueType { size, .. } = built else {
+            panic!("a span is laid inline, not referenced: {built:?}");
+        };
+        assert_eq!(size, 12, "array reference, start, length");
     }
 
     /// `Pointer` AND `ByRef` NEED THEIR OWN ARM IN `sig_element_byte`. Falling to a `_ => 0x00`

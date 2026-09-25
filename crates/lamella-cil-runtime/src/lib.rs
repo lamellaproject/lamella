@@ -60,5 +60,5 @@ pub use module::{
 pub use module::verified_image_checksum;
 pub use mount::{DriveType, MountTable, StorageProvider};
 pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind, UnencodableChar};
-pub use trap::Trap;
+pub use trap::{RefusedWith, Trap};
 pub use value::{Location, Value};

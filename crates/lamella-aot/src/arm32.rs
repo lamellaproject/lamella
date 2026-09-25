@@ -1108,8 +1108,21 @@ fn lower_spilled_inst(
                 StaticOwner::Own,
                 crate::cil::G_EXCEPTION_TAG_OFFSET,
             )?;
-            enc.ldr_imm(Reg::R0, Reg::R0, 0).map_err(e)?;
-            enc.movs_reg(Reg::R6, Reg::R0).map_err(e)?;
+            enc.ldr_imm(Reg::R6, Reg::R0, 0).map_err(e)?;
+            slot_load(enc, Reg::R3, slot(*delegate))?;
+            enc.cmp_imm(Reg::R3, 0).map_err(e)?;
+            enc.b_cond(Cond::Ne, mloop);
+            load_const_word(enc, pool, Reg::R1, InlineCheck::NullReference.tag())?;
+            enc.str_imm(Reg::R1, Reg::R0, 0).map_err(e)?;
+            enc.movs_imm(Reg::R1, 0).map_err(e)?;
+            enc.str_imm(
+                Reg::R1,
+                Reg::R0,
+                crate::cil::G_EXCEPTION_MESSAGE_OFFSET as u16,
+            )
+            .map_err(e)?;
+            enc.movs_imm(Reg::R5, 0).map_err(e)?;
+            enc.b(mdone);
             enc.bind_label(mloop);
             slot_load(enc, Reg::R3, slot(*delegate))?;
             enc.ldr_imm(Reg::R2, Reg::R3, 8).map_err(e)?;
@@ -2856,7 +2869,7 @@ fn lower_spilled_into(
     alloc_addr: Option<u32>,
     py_support: PySupport,
     source: &crate::cil::CilSourceMap,
-    line_table: &mut Vec<(u32, u32)>,
+    line_table: &mut PendingRows,
     spilled_homes: &mut Option<SpilledHomes>,
     stack_maps: &mut Vec<StackMapEntry>,
     vtables: &[TypeMeta],
@@ -3050,11 +3063,11 @@ fn lower_spilled_into(
         for (inst_pos, (result, inst)) in block.insts.iter().enumerate() {
             for &(at, label) in &change_labels[index] {
                 if at as usize == inst_pos {
-                    enc.bind_label(label);
+                    enc.bind_mark(label);
                 }
             }
             if let Some(&cil) = source.rows.get(index).and_then(|b| b.get(inst_pos)) {
-                line_table.push((enc.position(), cil));
+                record_row(enc, line_table, cil);
             }
             if matches!(inst, Inst::InitStruct) {
                 let bytes = func
@@ -3583,11 +3596,11 @@ fn lower_spilled_into(
         }
         for &(at, label) in &change_labels[index] {
             if at as usize == block.insts.len() {
-                enc.bind_label(label);
+                enc.bind_mark(label);
             }
         }
         if let Some(&cil) = source.rows.get(index).and_then(|b| b.last()) {
-            line_table.push((enc.position(), cil));
+            record_row(enc, line_table, cil);
         }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
@@ -4128,7 +4141,7 @@ fn lower_into(
     saved: u8,
     func_labels: &[Label],
     source_map: &[Vec<u32>],
-    line_table: &mut Vec<(u32, u32)>,
+    line_table: &mut PendingRows,
     stack_maps: &mut Vec<StackMapEntry>,
     relocate: bool,
 ) -> Result<(), LowerError> {
@@ -4155,7 +4168,7 @@ fn lower_into(
 
         for (inst_pos, (result, inst)) in block.insts.iter().enumerate() {
             if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
-                line_table.push((enc.position(), cil));
+                record_row(enc, line_table, cil);
             }
             if let Inst::Call { callee, args } = inst {
                 lower_call(enc, &assign, *result, *callee, args, func_labels, relocate)?;
@@ -4172,7 +4185,7 @@ fn lower_into(
         }
 
         if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
-            line_table.push((enc.position(), cil));
+            record_row(enc, line_table, cil);
         }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
@@ -4264,7 +4277,7 @@ fn lower_mixed_into(
     frame: u16,
     func_labels: &[Label],
     source_map: &[Vec<u32>],
-    line_table: &mut Vec<(u32, u32)>,
+    line_table: &mut PendingRows,
     stack_maps: &mut Vec<StackMapEntry>,
     relocate: bool,
 ) -> Result<(), LowerError> {
@@ -4308,7 +4321,7 @@ fn lower_mixed_into(
 
         for (inst_pos, (result, inst)) in block.insts.iter().enumerate() {
             if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
-                line_table.push((enc.position(), cil));
+                record_row(enc, line_table, cil);
             }
             if let Inst::Call { callee, args } = inst {
                 lower_mixed_call(enc, &home, *result, *callee, args, func_labels, relocate)?;
@@ -4325,7 +4338,7 @@ fn lower_mixed_into(
         }
 
         if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
-            line_table.push((enc.position(), cil));
+            record_row(enc, line_table, cil);
         }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
@@ -4589,6 +4602,39 @@ fn same_home(a: Home, b: Home) -> bool {
 /// by [`lower_debug`] from a `cil::CilSourceMap`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineTable(pub Vec<(u32, u32)>);
+
+/// A method's line rows while it is being encoded: for each row, the mark bound where the code for
+/// a CIL offset starts, and that offset. [`resolve_rows`] turns them into a [`LineTable`] once
+/// [`Encoder::finish`] has laid the code out.
+type PendingRows = Vec<(Label, u32)>;
+
+/// Records that the code for CIL offset `cil` starts at the encoder's current position.
+///
+/// **A MARK, BECAUSE `finish` MOVES CODE.** It grows a branch that cannot reach its target and
+/// splices veneers into the middle of a function, and everything after the growth moves. A
+/// position taken here would name the right instruction only until the first growth, and after it
+/// the instruction before -- which is where a debugger then says a step stopped. A mark is carried
+/// with the code, as the safepoints' return addresses and the frame transitions already are.
+///
+/// **AND A MARK RATHER THAN [`Encoder::bind_label`],** which would end the window in which a store's
+/// reload is skipped, at a place no branch can reach. A build with line rows would then emit a load
+/// that the same build without them does not, and a debugger would be given code the board is not
+/// running. [`Encoder::bind_mark`] changes nothing that is emitted.
+fn record_row(enc: &mut Encoder, rows: &mut PendingRows, cil: u32) {
+    let mark = enc.new_label();
+    enc.bind_mark(mark);
+    rows.push((mark, cil));
+}
+
+/// A method's rows as `finish` placed them: each mark's final offset in the image, in the order
+/// the rows were recorded, which is address order.
+fn resolve_rows(rows: &[(Label, u32)], assembled: &lamella_asm_arm32::Assembled) -> LineTable {
+    LineTable(
+        rows.iter()
+            .filter_map(|&(mark, cil)| Some((assembled.label_position(mark)?, cil)))
+            .collect(),
+    )
+}
 
 /// Per-method debug info from [`lower_module_debug`]: for each method, its function's image offset
 /// paired with its [`LineTable`], so a native PC maps to a method, then a CIL offset, then source.
@@ -4874,11 +4920,9 @@ pub fn lower_debug(
             None,
         )?,
     }
-    let bytes = enc
-        .finish()
-        .map(|assembled| assembled.bytes)
-        .map_err(reach_failure)?;
-    Ok((bytes, LineTable(lines)))
+    let assembled = enc.finish().map_err(reach_failure)?;
+    let table = resolve_rows(&lines, &assembled);
+    Ok((assembled.bytes, table))
 }
 
 /// Lowers a whole program -- several functions concatenated into one image, the
@@ -4989,7 +5033,8 @@ use crate::resolver::descriptor_symbol;
 pub struct ObjectBuildMode<'a> {
     /// Emit the `lamella_main` entry symbol (a program); `false` = a library object.
     pub emit_entry: bool,
-    /// A program that DEFERS un-lowerable/un-encodable bodies to traps instead of failing.
+    /// DEFER un-lowerable/un-encodable bodies to traps instead of failing (a program) or stubbing
+    /// them to a bare return (a library).
     pub defer_encode: bool,
     /// The descriptor-identity qualifiers (see [`DescQualifiers`]).
     pub qualifiers: &'a DescQualifiers,
@@ -5249,16 +5294,25 @@ fn rewrite_md_alloc(
 /// hard-float (VFP) target would lower it inline instead -- a later knob. A comparison whose CLI form
 /// is a negation (the unordered compares, `!=`) expands to the ordered helper plus a logical-not
 /// (`== 0`), which is why the instruction list is rebuilt rather than edited in place.
+///
+/// Also returns, per block, the index of the original instruction each new one was made from --
+/// what [`crate::cil::CilSourceMap::expanded`] takes. An allocation becomes three instructions and
+/// a negated comparison three, so anything that finds an instruction by its index has to be
+/// restated for the new list or it names an instruction that many places early.
 fn lower_runtime_calls(
     func: &Function,
     externs: &mut Vec<alloc::string::String>,
     descriptors: &[TypeMeta],
-) -> Function {
+) -> (Function, Vec<Vec<u32>>) {
     let mut func = func.clone();
+    let mut origins: Vec<Vec<u32>> = Vec::with_capacity(func.blocks.len());
     for bi in 0..func.blocks.len() {
         let old = core::mem::take(&mut func.blocks[bi].insts);
+        let old_len = old.len() as u32;
         let mut insts = Vec::with_capacity(old.len());
-        for (result, inst) in old {
+        let mut origin: Vec<u32> = Vec::with_capacity(old.len());
+        for (index, (result, inst)) in (0u32..).zip(old) {
+            origin.resize(insts.len(), index.saturating_sub(1));
             if let Inst::PInvoke { import, args } = &inst {
                 let symbol = intern_extern(externs, import);
                 insts.push((
@@ -5567,9 +5621,11 @@ fn lower_runtime_calls(
                 }
             }
         }
+        origin.resize(insts.len(), old_len.saturating_sub(1));
         func.blocks[bi].insts = insts;
+        origins.push(origin);
     }
-    func
+    (func, origins)
 }
 
 /// Lowers a module into an ELF32 relocatable object -- the ARM/Thumb twin of
@@ -5631,12 +5687,13 @@ pub fn lower_object_vtables_statics(
 
 /// As [`lower_object_vtables_statics`], but threading `source_maps` (method `i`'s
 /// [`CilSourceMap`](crate::cil::CilSourceMap)) and returning, per method, `(its code offset within
-/// the object, its LineTable)`.
+/// the object, its LineTable)`. A row's native offset is also an offset within the object, so a
+/// row minus its method's offset is where in the method that row's code starts.
 ///
 /// This is what a LINKED DEVICE image needs to carry DWARF: the flat path has produced line tables
 /// for a long time, but the object path discarded them, so debug info stopped at the linker-less
-/// build. The offsets are resolved AFTER `finish`, so Thumb-2 relaxation cannot leave them naming
-/// the wrong bytes.
+/// build. Every offset is resolved AFTER `finish` -- each method's and each row's -- so a branch
+/// that grew to reach its target cannot leave a row naming the instruction before its own.
 ///
 /// `debug` also carries the resolved source positions the object's `.debug_*` sections are built
 /// from, so the returned object is directly linkable into a DEBUGGABLE device image. Passing a
@@ -5721,6 +5778,24 @@ pub fn lower_object_library_vtables_report(
         .map(|(bytes, report, _)| (bytes, report))
 }
 
+/// As [`lower_object_library_vtables_report`], but a method the object cannot emit is a `udf #0` trap
+/// rather than a bare `bx lr` -- for a library linked into one program and dead-stripped, where a
+/// method nothing reaches is removed and one that is reached must fault rather than answer its first
+/// argument. The report names the same methods.
+pub fn lower_object_library_vtables_deferring(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+    statics: Option<&AssemblyStatics>,
+    qualifiers: &DescQualifiers,
+    wide: bool,
+) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
+    let mode = ObjectBuildMode { emit_entry: false, defer_encode: true, qualifiers, wide };
+    lower_object_inner(funcs, names, extern_syms, descriptors, statics, &mode, None)
+        .map(|(bytes, report, _)| (bytes, report))
+}
+
 /// As [`lower_object_library`], but emitting per-type vtables/TypeDescs from `descriptors` -- so a corlib
 /// (or helper) library object's allocating/virtual methods dispatch correctly once linked. The library
 /// twin of [`lower_object_vtables`].
@@ -5739,9 +5814,10 @@ pub fn lower_object_library_vtables(
 /// method into a scratch encoder (tolerating one that does not lower) before emitting it for real.
 /// Lowers ONE function into an object-path encoder. `source_map` is the method's
 /// [`CilSourceMap`](crate::cil::CilSourceMap) rows (empty for a build with no debug info) and
-/// `lines` collects its native-offset -> CIL-offset pairs -- the same pair the flat path threads, so
-/// an object can carry the line table DWARF is generated from. Both are write-only with respect to
-/// the emitted code: passing an empty `source_map` leaves the emitted bytes unchanged.
+/// `lines` collects its rows as marks to resolve once the object is finished -- the same rows the
+/// flat path threads, so an object can carry the line table DWARF is generated from. Both are
+/// write-only with respect to the emitted code: passing an empty `source_map` leaves the emitted
+/// bytes unchanged.
 #[allow(clippy::too_many_arguments)]
 fn lower_one_func(
     func: &Function,
@@ -5751,7 +5827,7 @@ fn lower_one_func(
     blob_table: Option<&[Box<[u16]>]>,
     console_symbol: Option<u32>,
     source: &crate::cil::CilSourceMap,
-    lines: &mut Vec<(u32, u32)>,
+    lines: &mut PendingRows,
     spilled_homes: &mut Option<SpilledHomes>,
     string_header: Option<(u32, i32)>,
 ) -> Result<(), LowerError> {
@@ -5827,11 +5903,21 @@ fn lower_object_inner(
         .collect();
     let names: Vec<&str> = owned_names.iter().map(|s| s.as_str()).collect();
     let names = names.as_slice();
-    let funcs: Vec<Function> = program
+    let (funcs, origins): (Vec<Function>, Vec<Vec<Vec<u32>>>) = program
         .iter()
         .map(|f| lower_runtime_calls(f, &mut externs, descriptors))
-        .collect();
+        .unzip();
     let funcs = funcs.as_slice();
+    let expanded_maps: Vec<crate::cil::CilSourceMap> = debug.map_or_else(Vec::new, |d| {
+        d.source_maps
+            .iter()
+            .zip(&origins)
+            .map(|(map, origin)| map.expanded(origin))
+            .collect()
+    });
+    let expanded_debug =
+        debug.map(|d| crate::debugmap::ObjectDebug { source_maps: &expanded_maps, ..*d });
+    let debug = expanded_debug.as_ref();
     if funcs
         .iter()
         .flat_map(|f| &f.blocks)
@@ -6113,21 +6199,19 @@ fn emit_object_pass(
     let type_names = !cfg!(feature = "strip-type-names");
     let mut map_ranges: Vec<(usize, usize)> = Vec::with_capacity(funcs.len());
     let mut stub_report: LibraryStubReport = Vec::new();
-    let mut method_lines: Vec<LineTable> = Vec::with_capacity(funcs.len());
+    let mut method_lines: Vec<PendingRows> = Vec::with_capacity(funcs.len());
     let mut method_frames: Vec<lamella_asm_arm32::FrameTrack> = Vec::with_capacity(funcs.len());
     let mut method_homes: Vec<Option<SpilledHomes>> = Vec::with_capacity(funcs.len());
-    let mut func_starts: Vec<u32> = Vec::with_capacity(funcs.len());
     for (index, func) in funcs.iter().enumerate() {
         enc.align_to_word();
         enc.bind_label(func_labels[index]);
         let map_start = stack_maps.len();
-        func_starts.push(enc.position());
         enc.begin_function();
         let empty_source = crate::cil::CilSourceMap::default();
         let source = debug
             .and_then(|d| d.source_maps.get(index))
             .unwrap_or(&empty_source);
-        let mut lines: Vec<(u32, u32)> = Vec::new();
+        let mut lines = PendingRows::new();
         let mut spilled_homes: Option<SpilledHomes> = None;
         if emit_entry && !defer_encode {
             lower_one_func(
@@ -6143,7 +6227,7 @@ fn emit_object_pass(
                 string_header,
             )?;
         } else if stubbed.contains(&index) {
-            if emit_entry {
+            if defer_encode {
                 enc.udf(0);
             } else {
                 enc.bx(Reg::LR);
@@ -6182,7 +6266,7 @@ fn emit_object_pass(
                 }
                 Err(error) => {
                     stub_report.push((index, error));
-                    if emit_entry {
+                    if defer_encode {
                         enc.udf(0);
                     } else {
                         enc.bx(Reg::LR);
@@ -6191,7 +6275,7 @@ fn emit_object_pass(
             }
         }
         map_ranges.push((map_start, stack_maps.len()));
-        method_lines.push(LineTable(lines));
+        method_lines.push(lines);
         method_frames.push(enc.frame().clone());
         method_homes.push(spilled_homes);
     }
@@ -6364,6 +6448,11 @@ fn emit_object_pass(
     let offsets: Vec<u32> = func_labels
         .iter()
         .map(|&l| assembled.label_position(l).unwrap_or(0))
+        .collect();
+    let line_tables: MethodLineTables = method_lines
+        .iter()
+        .enumerate()
+        .map(|(index, rows)| (offsets.get(index).copied().unwrap_or(0), resolve_rows(rows, &assembled)))
         .collect();
     let method_transitions: Vec<Vec<(u32, u32)>> = method_frames
         .iter()
@@ -6780,24 +6869,14 @@ fn emit_object_pass(
             addend: 0,
         });
     }
-    let line_tables: MethodLineTables = method_lines
-        .iter()
-        .enumerate()
-        .map(|(index, table)| (offsets.get(index).copied().unwrap_or(0), table.clone()))
-        .collect();
-
     let object = match debug {
         Some(dbg) => {
             let described: Vec<(usize, Vec<crate::debugmap::SourceLine>)> = line_tables
                 .iter()
                 .enumerate()
-                .filter_map(|(index, (_, table))| {
+                .filter_map(|(index, (start, table))| {
                     let source = dbg.methods.get(index)?;
-                    let rows = crate::debugmap::function_rows(
-                        &table.0,
-                        source,
-                        func_starts.get(index).copied().unwrap_or(0),
-                    );
+                    let rows = crate::debugmap::function_rows(&table.0, source, *start);
                     (!rows.is_empty()).then_some((index, rows))
                 })
                 .collect();
@@ -6949,9 +7028,8 @@ fn lower_module_inner(
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut stack_maps: Vec<StackMapEntry> = Vec::new();
-    let mut method_lines: Vec<(u32, LineTable)> = Vec::new();
+    let mut method_lines: Vec<(Label, PendingRows)> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
-        let func_offset = enc.position();
         enc.bind_label(func_labels[index]);
         let empty_source = crate::cil::CilSourceMap::default();
         let source = source_maps.get(index).unwrap_or(&empty_source);
@@ -7009,7 +7087,7 @@ fn lower_module_inner(
             }
         }
         if index < original_count {
-            method_lines.push((func_offset, LineTable(lines)));
+            method_lines.push((func_labels[index], lines));
         }
     }
     enc.finish()
@@ -7018,6 +7096,12 @@ fn lower_module_inner(
                 entry.return_pc = assembled.label_position_by_id(entry.return_pc).unwrap_or(0);
             }
             stack_maps.sort_by_key(|entry| entry.return_pc);
+            let method_lines = method_lines
+                .iter()
+                .map(|(start, rows)| {
+                    (assembled.label_position(*start).unwrap_or(0), resolve_rows(rows, &assembled))
+                })
+                .collect();
             (assembled.bytes, StackMaps(stack_maps), method_lines)
         })
         .map_err(reach_failure)
@@ -10569,6 +10653,7 @@ mod tests {
         };
         let literal = |descriptors: &[TypeMeta]| {
             lower_runtime_calls(&main, &mut Vec::new(), descriptors)
+                .0
                 .blocks
                 .iter()
                 .flat_map(|b| b.insts.clone())
@@ -10635,6 +10720,7 @@ mod tests {
         }];
         let (words, vtable) =
             lower_runtime_calls(&main, &mut Vec::new(), &descriptors)
+                .0
                 .blocks
                 .iter()
                 .flat_map(|b| b.insts.clone())
@@ -12766,6 +12852,406 @@ mod tests {
             );
         }
         assert_ne!(lines[0].0, lines[1].0, "the two functions sit at different offsets");
+    }
+
+    /// A function with one conditional branch that `finish` must relax: its entry block branches
+    /// over 150 constants to its last block, which the eight-bit reach of `B<c>` cannot span, so the
+    /// branch grows after every row behind it has been recorded. Each constant `k` came from CIL
+    /// offset `k` and lowers to `movs rX, #k`, so where a row's instruction really sits can be read
+    /// back out of the finished bytes by its value alone.
+    ///
+    /// `pinned` constants are defined before the branch and summed after it, which keeps them live
+    /// across it and puts the function on the register/spill mix. `wide` adds a 64-bit value, which
+    /// puts it on the fully spilled path. Neither gives the registers-only path.
+    fn relaxed_branch_function(pinned: u8, wide: bool) -> (Function, crate::cil::CilSourceMap) {
+        let constant = |value: u8| Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(value),
+        };
+        let mut value_types = vec![MirType::I32];
+        let (mut entry, mut entry_rows) = (Vec::new(), Vec::new());
+        for k in 200..200 + pinned {
+            entry.push((ValueId(value_types.len() as u32), constant(k)));
+            entry_rows.push(u32::from(k));
+            value_types.push(MirType::I32);
+        }
+        if wide {
+            entry.push((
+                ValueId(value_types.len() as u32),
+                Inst::ConstInt {
+                    ty: MirType::I64,
+                    value: 0x1_0000_0000,
+                },
+            ));
+            entry_rows.push(900);
+            value_types.push(MirType::I64);
+        }
+        let (mut filler, mut filler_rows) = (Vec::new(), Vec::new());
+        for k in 1..=150u8 {
+            filler.push((ValueId(value_types.len() as u32), constant(k)));
+            filler_rows.push(u32::from(k));
+            value_types.push(MirType::I32);
+        }
+        let mut sum = ValueId(value_types.len() as u32);
+        let (mut last, mut last_rows) = (vec![(sum, constant(250))], vec![250u32]);
+        value_types.push(MirType::I32);
+        for i in 0..u32::from(pinned) {
+            let next = ValueId(value_types.len() as u32);
+            last.push((
+                next,
+                Inst::Binary {
+                    op: BinOp::Add,
+                    lhs: sum,
+                    rhs: ValueId(1 + i),
+                },
+            ));
+            last_rows.push(1000 + i);
+            value_types.push(MirType::I32);
+            sum = next;
+        }
+        let func = Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::I32),
+            value_types,
+            entry: BlockId(0),
+            blocks: vec![
+                BasicBlock {
+                    params: vec![ValueId(0)],
+                    insts: entry,
+                    terminator: Some(Terminator::Branch {
+                        cond: ValueId(0),
+                        if_true: BlockId(2),
+                        true_args: Vec::new(),
+                        if_false: BlockId(1),
+                        false_args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: filler,
+                    terminator: Some(Terminator::Jump {
+                        target: BlockId(2),
+                        args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: last,
+                    terminator: Some(Terminator::Return(Some(sum))),
+                },
+            ],
+        };
+        let source = crate::cil::CilSourceMap {
+            rows: vec![entry_rows, filler_rows, last_rows],
+            local_changes: vec![Vec::new(); 3],
+            arg_values: Vec::new(),
+        };
+        (func, source)
+    }
+
+    /// Whether `text` holds the form `finish` grows an out-of-reach `B<c>` into: the inverted
+    /// condition skipping a following `B`, then the `NOP` that pads the growth to a word.
+    fn holds_a_relaxed_conditional_branch(text: &[u8]) -> bool {
+        let halfwords: Vec<u16> = text
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        halfwords
+            .windows(3)
+            .any(|w| w[0] & 0xF0FF == 0xD001 && w[1] & 0xF800 == 0xE000 && w[2] == 0xBF00)
+    }
+
+    /// Asserts that the row for each 32-bit constant `k` in `func` -- the lowest-addressed row naming
+    /// CIL offset `k` -- sits on that constant's own `movs rX, #k` in `text`, with `rows` holding
+    /// offsets into `text`, and returns how many it checked. An early row lands on the instruction
+    /// before, and that is where a debugger reports a step as stopping.
+    fn assert_each_row_names_its_instruction(
+        text: &[u8],
+        rows: &[(u32, u32)],
+        func: &Function,
+        what: &str,
+    ) -> usize {
+        let mut checked = 0;
+        for (_, inst) in func.blocks.iter().flat_map(|b| &b.insts) {
+            let Inst::ConstInt {
+                ty: MirType::I32,
+                value,
+            } = inst
+            else {
+                continue;
+            };
+            let k = *value as u32;
+            let at = rows
+                .iter()
+                .filter(|&&(_, cil)| cil == k)
+                .map(|&(at, _)| at)
+                .min()
+                .unwrap_or_else(|| panic!("{what}: no row names CIL offset {k}"));
+            let halfword = text
+                .get(at as usize..at as usize + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]));
+            assert!(
+                halfword.is_some_and(|hw| hw & 0xF800 == 0x2000 && u32::from(hw & 0xFF) == k),
+                "{what}: the row for CIL offset {k} is at {at:#x}, which holds {halfword:04x?} \
+                 rather than `movs rX, #{k}`"
+            );
+            checked += 1;
+        }
+        checked
+    }
+
+    #[test]
+    fn every_line_row_names_its_own_instruction_after_a_relaxed_branch() {
+        for (pinned, wide, path) in [(0, false, "registers"), (9, false, "mixed"), (0, true, "spilled")] {
+            let (first, first_source) = relaxed_branch_function(pinned, wide);
+            let taken = match prepare(&first) {
+                Ok(Assignment::Registers { .. }) => "registers",
+                Ok(Assignment::Mixed { .. }) => "mixed",
+                Ok(Assignment::Spilled) => "spilled",
+                Err(error) => panic!("{path}: {error:?}"),
+            };
+            assert_eq!(taken, path, "the case meant for one lowering took another");
+            let (second, second_source) = relaxed_branch_function(pinned, wide);
+            let funcs = [first, second];
+            let maps = [first_source, second_source];
+            let points = [(0u32, 1u32, 1u32)];
+            let method = |name: &'static str| crate::debugmap::MethodSource {
+                name,
+                file: "t.cs",
+                points: &points,
+                locals: &[],
+                params: &[],
+            };
+            let methods = [method("T.first"), method("T.second")];
+            let statics = AssemblyStatics {
+                suffix: alloc::string::String::from("0badf00d"),
+                region_bytes: 0,
+                roots: Vec::new(),
+            };
+            let debug = crate::debugmap::ObjectDebug {
+                source_maps: &maps,
+                methods: &methods,
+                unit_name: "t.cs",
+                producer: "test",
+            };
+            let names = ["first", "second"];
+            let (object, lines) = lower_object_vtables_statics_debug(
+                &funcs,
+                &names,
+                &[],
+                &[],
+                &statics,
+                &DescQualifiers::default(),
+                &debug,
+            )
+            .unwrap();
+            let object = lamella_elf::read_object(&object).unwrap();
+            assert!(
+                holds_a_relaxed_conditional_branch(&object.text),
+                "{path}: nothing relaxed, so this measures nothing"
+            );
+            for (index, name) in names.iter().enumerate() {
+                let (start, table) = &lines[index];
+                let symbol = object.symbols.iter().find(|s| s.name == *name).unwrap();
+                assert_eq!(*start, symbol.value & !1, "{path}: {name} starts where its symbol says");
+                let checked = assert_each_row_names_its_instruction(
+                    &object.text,
+                    &table.0,
+                    &funcs[index],
+                    &alloc::format!("{path}, {name}"),
+                );
+                assert_eq!(checked, 151 + usize::from(pinned), "{path}, {name}: every constant is checked");
+            }
+        }
+    }
+
+    #[test]
+    fn the_flat_path_places_rows_and_methods_after_relaxation() {
+        let (first, first_source) = relaxed_branch_function(0, false);
+        let (second, second_source) = relaxed_branch_function(0, false);
+        let funcs = [first, second];
+
+        let (single, table) = lower_debug(&funcs[0], &first_source).unwrap();
+        assert!(holds_a_relaxed_conditional_branch(&single), "nothing relaxed");
+        assert_eq!(assert_each_row_names_its_instruction(&single, &table.0, &funcs[0], "one method"), 151);
+
+        let (module, lines) = lower_module_debug(&funcs, None, &[first_source, second_source]).unwrap();
+        for (index, (start, table)) in lines.iter().enumerate() {
+            assert_eq!(
+                module.get(*start as usize..*start as usize + 2),
+                Some(&[0x00, 0x28][..]),
+                "method {index} starts at {start:#x}"
+            );
+            let checked = assert_each_row_names_its_instruction(
+                &module,
+                &table.0,
+                &funcs[index],
+                &alloc::format!("method {index}"),
+            );
+            assert_eq!(checked, 151, "method {index}: every constant is checked");
+        }
+    }
+
+    #[test]
+    fn a_local_changing_between_a_store_and_its_reload_moves_no_code() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I64, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 0,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 5,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(1),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let maps = [crate::cil::CilSourceMap {
+            rows: vec![vec![0, 2, 4]],
+            local_changes: vec![vec![(2, 0, Some(ValueId(1))), (3, 1, Some(ValueId(2)))]],
+            arg_values: Vec::new(),
+        }];
+        let points = [(0u32, 10u32, 9u32), (2, 11, 9), (4, 12, 9)];
+        let methods = [crate::debugmap::MethodSource {
+            name: "T.f",
+            file: "t.cs",
+            points: &points,
+            locals: &[],
+            params: &[],
+        }];
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("0badf00d"),
+            region_bytes: 0,
+            roots: Vec::new(),
+        };
+        let debug = crate::debugmap::ObjectDebug {
+            source_maps: &maps,
+            methods: &methods,
+            unit_name: "t.cs",
+            producer: "test",
+        };
+        let funcs = [func];
+        let (with_debug, _) = lower_object_vtables_statics_debug(
+            &funcs,
+            &["f"],
+            &[],
+            &[],
+            &statics,
+            &DescQualifiers::default(),
+            &debug,
+        )
+        .unwrap();
+        let plain =
+            lower_object_vtables_statics(&funcs, &["f"], &[], &[], &statics, &DescQualifiers::default())
+                .unwrap();
+        assert_eq!(
+            lamella_elf::read_object(&with_debug).unwrap().text,
+            lamella_elf::read_object(&plain).unwrap().text,
+            "a debug build must emit the code the plain build does"
+        );
+    }
+
+    #[test]
+    fn a_row_names_its_instruction_behind_an_allocation_the_object_path_expands() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(0),
+                            payload_size: 8,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 7,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 9,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let maps = [crate::cil::CilSourceMap {
+            rows: vec![vec![300, 7, 9]],
+            local_changes: vec![Vec::new()],
+            arg_values: Vec::new(),
+        }];
+        let points = [(7u32, 11u32, 9u32)];
+        let methods = [crate::debugmap::MethodSource {
+            name: "T.f",
+            file: "t.cs",
+            points: &points,
+            locals: &[],
+            params: &[],
+        }];
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("0badf00d"),
+            region_bytes: 0,
+            roots: Vec::new(),
+        };
+        let debug = crate::debugmap::ObjectDebug {
+            source_maps: &maps,
+            methods: &methods,
+            unit_name: "t.cs",
+            producer: "test",
+        };
+        let funcs = [func];
+        let (object, lines) = lower_object_vtables_statics_debug(
+            &funcs,
+            &["f"],
+            &[],
+            &[],
+            &statics,
+            &DescQualifiers::default(),
+            &debug,
+        )
+        .unwrap();
+        let object = lamella_elf::read_object(&object).unwrap();
+        assert!(
+            object.symbols.iter().any(|s| s.name == "lamella_gc_alloc"),
+            "the allocation was rewritten into a call, or this measures nothing"
+        );
+        let checked =
+            assert_each_row_names_its_instruction(&object.text, &lines[0].1 .0, &funcs[0], "after an allocation");
+        assert_eq!(checked, 2, "both constants are checked");
     }
 
     #[test]

@@ -1,0 +1,180 @@
+# BLOCK layout: the nRF51 TIMER, the timer/counter clocked from the high-frequency clock. Its
+# free-running Counter, read through a capture task, is a counter a program can extend in software
+# into a monotonic clock with no interrupt.
+#
+# Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
+# chapter 18, Tables 140-148, with the document open, and the nRF51822 Product Specification v3.4,
+# Table 12, for what each instance supports.
+#
+# Every bit position below was placed from the printed table's column coordinates: each field
+# letter was assigned to the bit column it is printed over, and INTENSET and INTENCLR were required
+# to agree. Two of these tables print their field letters away from the low bits their order
+# suggests: the interrupt bits are 16 to 19, and the shortcut-to-STOP bits are 8 to 11.
+
+[table]
+kind = "block"
+family = "nrf51"
+block = "timer"
+# Rust only: the one reader is a board's native clock, which reads TIMER0 as a free-running
+# counter beneath every managed clock read.
+emit = ["rust"]
+sources = [
+    "nRF51 Series Reference Manual v3.0 (Nordic Semiconductor), ch. 18 TIMER: Figure 30 block schematic, 18.1 functional description (fTIMER = 16 MHz / 2^PRESCALER; PCLK1M when fTIMER <= 1 MHz; PRESCALER and BITMODE only while stopped; overflow restarts from zero), 18.1.1 capture, 18.1.2 compare, 18.1.3 task delays, 18.1.4 task priority, Table 140 instances (TIMER0 0x40008000, TIMER1 0x40009000, TIMER2 0x4000A000), Table 141 register overview, Table 142 SHORTS, Tables 143/144 INTENSET/INTENCLR, Table 145 MODE, Table 146 BITMODE, Table 147 PRESCALER, Table 148 CC[n]",
+    "nRF51822 Product Specification v3.4 (Nordic Semiconductor), 4.2 and Table 12 Timer/counter properties: TIMER0 supports bit widths 8/16/24/32, TIMER1 and TIMER2 8/16, and each has 4 capture/compare registers",
+]
+notes = [
+    "Timer mode: the Counter advances once per tick of fTIMER = 16 MHz / 2^PRESCALER, PRESCALER 0 to 9 (Table 147), so 16 MHz down to 31250 Hz. PRESCALER resets to 4, which is 1 MHz. When fTIMER is 1 MHz or less the TIMER clocks from PCLK1M rather than PCLK16M (18.1). Either way the rate is only as accurate as HFCLK's source.",
+    "BITMODE sets the Counter's width: 16, 8, 24 or 32 bits (Table 146), and it resets to 16. On this part only TIMER0 supports 24 and 32 bits; TIMER1 and TIMER2 support 8 and 16 (PS v3.4 Table 12). A Counter incremented past its maximum wraps to zero and keeps counting (18.1).",
+    "PRESCALER and BITMODE are written only while the timer is stopped; updating either while it runs may give unpredictable behavior (18.1).",
+    "Reading the Counter: the CAPTURE[n] task copies it into CC[n] (18.1.1), so a read is a write of 1 to TASKS_CAPTUREn followed by a read of CCn. The Counter itself has no register.",
+    "START resumes from the value the Counter held when STOP was triggered; CLEAR sets it to zero; SHUTDOWN switches the core off, and restarting from shutdown may take longer than from stop (18.1). STOP wins when START and STOP land in the same PCLK16M period (18.1.4).",
+    "A monotonic clock without an interrupt: TIMER0 in 32-bit mode at PRESCALER 9 counts 31250 ticks a second and wraps every 2^32 / 31250 = 137438.95 seconds, about 38.2 hours. Software that extends it to 64 bits sees every wrap as long as it reads the Counter at least once per wrap period.",
+]
+
+[registers.TASKS_START]
+offset = 0x000
+width = 32
+fields = { TASKS_START = [0, 1] }
+notes = "Write 1: start timing, resuming from the Counter's current value (Table 141)."
+
+[registers.TASKS_STOP]
+offset = 0x004
+width = 32
+fields = { TASKS_STOP = [0, 1] }
+notes = "Write 1: stop timing. Takes effect within one PCLK16M cycle (18.1.3)."
+
+[registers.TASKS_COUNT]
+offset = 0x008
+width = 32
+fields = { TASKS_COUNT = [0, 1] }
+notes = "Write 1: increment the Counter. Counter mode only; no effect in Timer mode (18.1)."
+
+[registers.TASKS_CLEAR]
+offset = 0x00C
+width = 32
+fields = { TASKS_CLEAR = [0, 1] }
+notes = "Write 1: set the Counter to zero."
+
+[registers.TASKS_SHUTDOWN]
+offset = 0x010
+width = 32
+fields = { TASKS_SHUTDOWN = [0, 1] }
+notes = "Write 1: switch the timer core off, for the lowest power in System ON (18.1)."
+
+[registers.TASKS_CAPTURE0]
+offset = 0x040
+width = 32
+fields = { TASKS_CAPTURE0 = [0, 1] }
+notes = "Write 1: copy the Counter into CC0 (18.1.1). CAPTUREn sits at 0x040 + 4n, n = 0 to 3."
+
+[registers.TASKS_CAPTURE1]
+offset = 0x044
+width = 32
+fields = { TASKS_CAPTURE1 = [0, 1] }
+notes = "Write 1: copy the Counter into CC1."
+
+[registers.TASKS_CAPTURE2]
+offset = 0x048
+width = 32
+fields = { TASKS_CAPTURE2 = [0, 1] }
+notes = "Write 1: copy the Counter into CC2."
+
+[registers.TASKS_CAPTURE3]
+offset = 0x04C
+width = 32
+fields = { TASKS_CAPTURE3 = [0, 1] }
+notes = "Write 1: copy the Counter into CC3."
+
+[registers.EVENTS_COMPARE0]
+offset = 0x140
+width = 32
+fields = { EVENTS_COMPARE0 = [0, 1] }
+notes = "1 = the Counter was incremented to equal CC0, compared over BITMODE's width (18.1.2). COMPAREn sits at 0x140 + 4n."
+
+[registers.EVENTS_COMPARE1]
+offset = 0x144
+width = 32
+fields = { EVENTS_COMPARE1 = [0, 1] }
+notes = "1 = the Counter was incremented to equal CC1."
+
+[registers.EVENTS_COMPARE2]
+offset = 0x148
+width = 32
+fields = { EVENTS_COMPARE2 = [0, 1] }
+notes = "1 = the Counter was incremented to equal CC2."
+
+[registers.EVENTS_COMPARE3]
+offset = 0x14C
+width = 32
+fields = { EVENTS_COMPARE3 = [0, 1] }
+notes = "1 = the Counter was incremented to equal CC3."
+
+[registers.SHORTS]
+offset = 0x200
+width = 32
+fields = { COMPARE0_CLEAR = [0, 1], COMPARE1_CLEAR = [1, 1], COMPARE2_CLEAR = [2, 1], COMPARE3_CLEAR = [3, 1], COMPARE0_STOP = [8, 1], COMPARE1_STOP = [9, 1], COMPARE2_STOP = [10, 1], COMPARE3_STOP = [11, 1] }
+notes = "Hardware event-to-task shortcuts (Table 142): COMPAREn to CLEAR in bits 0 to 3, COMPAREn to STOP in bits 8 to 11. All 0 at reset; a free-running counter keeps them off."
+
+[registers.INTENSET]
+offset = 0x304
+width = 32
+fields = { COMPARE0 = [16, 1], COMPARE1 = [17, 1], COMPARE2 = [18, 1], COMPARE3 = [19, 1] }
+notes = "Write 1 to a bit to enable that COMPARE interrupt; reads return INTEN (Table 143). The bits are 16 to 19, the same in INTENCLR."
+
+[registers.INTENCLR]
+offset = 0x308
+width = 32
+fields = { COMPARE0 = [16, 1], COMPARE1 = [17, 1], COMPARE2 = [18, 1], COMPARE3 = [19, 1] }
+notes = "Write 1 to a bit to disable that COMPARE interrupt (Table 144)."
+
+[registers.MODE]
+offset = 0x504
+width = 32
+fields = { MODE = [0, 1] }
+notes = "0 = Timer mode, 1 = Counter mode (Table 145)."
+
+[registers.BITMODE]
+offset = 0x508
+width = 32
+fields = { BITMODE = [0, 2] }
+notes = "0 = 16 bits, 1 = 8 bits, 2 = 24 bits, 3 = 32 bits (Table 146). Resets to 16 bits. Write only while stopped."
+
+[registers.PRESCALER]
+offset = 0x510
+width = 32
+fields = { PRESCALER = [0, 4] }
+notes = "0 to 9: fTIMER = 16 MHz / 2^PRESCALER (Table 147). Resets to 4 (1 MHz). Write only while stopped."
+
+[registers.CC0]
+offset = 0x540
+width = 32
+fields = { CC0 = [0, 32] }
+notes = "Capture/compare register 0; only BITMODE's width of it is used (Table 148). CC[n] sits at 0x540 + 4n."
+
+[registers.CC1]
+offset = 0x544
+width = 32
+fields = { CC1 = [0, 32] }
+notes = "Capture/compare register 1."
+
+[registers.CC2]
+offset = 0x548
+width = 32
+fields = { CC2 = [0, 32] }
+notes = "Capture/compare register 2."
+
+[registers.CC3]
+offset = 0x54C
+width = 32
+fields = { CC3 = [0, 32] }
+notes = "Capture/compare register 3."
+
+[constants]
+MODE_TIMER = 0
+MODE_COUNTER = 1
+BITMODE_16 = 0
+BITMODE_8 = 1
+BITMODE_24 = 2
+BITMODE_32 = 3
+PRESCALER_MAX = 9
+PCLK16M_HZ = 16000000

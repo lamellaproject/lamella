@@ -5,6 +5,8 @@
 //! offsets are instance-base-relative (`base + *_OFF`) and the instance bases live in
 //! same54_instances.rs. Widths are access widths.
 
+#![allow(non_upper_case_globals)]
+
 /// -- register offsets (block-relative) + access widths --
 pub const CTRLA_OFF: u32 = 0x0;
 pub const CTRLA_WIDTH: i32 = 16;
@@ -160,3 +162,33 @@ pub const REFSEL_INTVCC1: u32 = 3;
 pub const REFSEL_AREFA: u32 = 4;
 pub const REFSEL_AREFB: u32 = 5;
 pub const REFSEL_AREFC: u32 = 6;
+pub const PRESCALER_DIV2: u32 = 0;
+pub const PRESCALER_DIV4: u32 = 1;
+pub const PRESCALER_DIV8: u32 = 2;
+pub const PRESCALER_DIV16: u32 = 3;
+pub const PRESCALER_DIV32: u32 = 4;
+pub const PRESCALER_DIV64: u32 = 5;
+pub const PRESCALER_DIV128: u32 = 6;
+pub const PRESCALER_DIV256: u32 = 7;
+
+/// The division PRESCALER code `code` selects, from the PRESCALER_DIV constants above, or 0 for a
+/// code none of them names.
+#[must_use]
+pub const fn prescaler_divisor(code: u32) -> u32 {
+    match code {
+        0 => 2,
+        1 => 4,
+        2 => 8,
+        3 => 16,
+        4 => 32,
+        5 => 64,
+        6 => 128,
+        7 => 256,
+        _ => 0,
+    }
+}
+
+/// -- facts as data (chip/electrical facts conversions read) --
+pub const GclkAdcMaxHz: u32 = 100000000;
+pub const ClkAdcMinHz: u32 = 320000;
+pub const ClkAdcMaxHz: u32 = 16000000;

@@ -20,6 +20,12 @@ public enum MicrochipSamd21XproBindings {
     /// name a driver; and a uart is a different register map on every family, so the kind does
     /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
     public static let VCP_DRIVER_FAMILY: String = "samd21-sercom"
+    public static let EXT1_SPI_DRIVER_FAMILY: String = "samd21-sercom"
+    public static let EXT_TWI_DRIVER_FAMILY: String = "samd21-sercom"
+    public static let ADC_DRIVER_FAMILY: String = "samd21-adc"
+    public static let EXT1_PWM_DRIVER_FAMILY: String = "samd21-tc"
+    public static let EXT2_PWM_DRIVER_FAMILY: String = "samd21-tc"
+    public static let EXT3_PWM_DRIVER_FAMILY: String = "samd21-tcc"
 
     // -- VCP: a sercom-usart binding descriptor --
     public static let VCP_SERCOM_BASE: UInt32 = 0x42001400
@@ -39,6 +45,127 @@ public enum MicrochipSamd21XproBindings {
     public static let VCP_TXPO: UInt32 = 0
     public static let VCP_RXPO: UInt32 = 1
     public static let VCP_BAUD_115200_OSC8M_8MHZ: UInt32 = 0xC505
+
+    // -- EXT1_SPI: a sercom-spi binding descriptor (ONE plan: the composed clock word
+    // and the core-clock RATE, from which the driver derives BAUD) --
+    public static let EXT1_SPI_SERCOM_BASE: UInt32 = 0x42000800
+    public static let EXT1_SPI_IRQ: UInt32 = 9
+    public static let EXT1_SPI_APBC_MASK: UInt32 = 0x4
+    public static let EXT1_SPI_GCLK_CORE_ID: UInt32 = 20
+    public static let EXT1_SPI_GCLK_CLKCTRL_VALUE: UInt32 = 0x4014
+    public static let EXT1_SPI_CORE_CLOCK_HZ: UInt32 = 8000000
+    public static let EXT1_SPI_PMUX_MOSI_REG: UInt32 = 0x41004433
+    public static let EXT1_SPI_PMUX_MOSI_SHIFT: UInt32 = 0
+    public static let EXT1_SPI_PINCFG_MOSI_REG: UInt32 = 0x41004446
+    public static let EXT1_SPI_PMUX_SCK_REG: UInt32 = 0x41004433
+    public static let EXT1_SPI_PMUX_SCK_SHIFT: UInt32 = 4
+    public static let EXT1_SPI_PINCFG_SCK_REG: UInt32 = 0x41004447
+    public static let EXT1_SPI_PMUX_MISO_REG: UInt32 = 0x41004432
+    public static let EXT1_SPI_PMUX_MISO_SHIFT: UInt32 = 0
+    public static let EXT1_SPI_PINCFG_MISO_REG: UInt32 = 0x41004444
+    public static let EXT1_SPI_PMUX_FUNC: UInt32 = 3
+    public static let EXT1_SPI_DOPO: UInt32 = 1
+    public static let EXT1_SPI_DIPO: UInt32 = 0
+    public static let EXT1_SPI_CS_PORT_BASE: UInt32 = 0x41004400
+    public static let EXT1_SPI_CS_PIN: UInt32 = 5
+    public static let EXT1_SPI_CS_MASK: UInt32 = 0x20
+
+    // -- EXT_TWI: a sercom-i2c binding descriptor (the CORE-CLOCK RATE, not a
+    // divisor: an I2C bus speed is a runtime Configure choice) --
+    public static let EXT_TWI_SERCOM_BASE: UInt32 = 0x42001000
+    public static let EXT_TWI_IRQ: UInt32 = 11
+    public static let EXT_TWI_GCLK_CLKCTRL_VALUE: UInt32 = 0x4016
+    public static let EXT_TWI_APBC_MASK: UInt32 = 0x10
+    public static let EXT_TWI_PMUX_REG: UInt32 = 0x41004434
+    public static let EXT_TWI_PMUX_PAIR: UInt32 = 0x33
+    public static let EXT_TWI_PINCFG_SDA_REG: UInt32 = 0x41004448
+    public static let EXT_TWI_PINCFG_SCL_REG: UInt32 = 0x41004449
+    public static let EXT_TWI_CORE_CLOCK_HZ: UInt32 = 8000000
+
+    // -- ADC: a samd21 adc binding descriptor. The converter's clocks and prescaler, then
+    // each analog pad the board wires: its channel (MUXPOS code), PMUX nibble and PINCFG byte --
+    public static let ADC_BASE: UInt32 = 0x42004000
+    public static let ADC_IRQ: UInt32 = 23
+    public static let ADC_APBC_MASK: UInt32 = 0x10000
+    public static let ADC_GCLK_CLKCTRL_VALUE: UInt32 = 0x401E
+    public static let ADC_CORE_CLOCK_HZ: UInt32 = 8000000
+    public static let ADC_PRESCALER: UInt32 = 0
+    public static let ADC_PMUX_FUNC: UInt32 = 1
+    public static let ADC_REFERENCE_UV: UInt32 = 3300000
+    public static let ADC_MUXPOS_EXT1_PIN3: UInt32 = 8
+    public static let ADC_PMUX_EXT1_PIN3_REG: UInt32 = 0x410044B0
+    public static let ADC_PMUX_EXT1_PIN3_SHIFT: UInt32 = 0
+    public static let ADC_PINCFG_EXT1_PIN3_REG: UInt32 = 0x410044C0
+    public static let ADC_MUXPOS_EXT1_PIN4: UInt32 = 9
+    public static let ADC_PMUX_EXT1_PIN4_REG: UInt32 = 0x410044B0
+    public static let ADC_PMUX_EXT1_PIN4_SHIFT: UInt32 = 4
+    public static let ADC_PINCFG_EXT1_PIN4_REG: UInt32 = 0x410044C1
+    public static let ADC_MUXPOS_EXT2_PIN3: UInt32 = 18
+    public static let ADC_PMUX_EXT2_PIN3_REG: UInt32 = 0x41004435
+    public static let ADC_PMUX_EXT2_PIN3_SHIFT: UInt32 = 0
+    public static let ADC_PINCFG_EXT2_PIN3_REG: UInt32 = 0x4100444A
+    public static let ADC_MUXPOS_EXT2_PIN4: UInt32 = 19
+    public static let ADC_PMUX_EXT2_PIN4_REG: UInt32 = 0x41004435
+    public static let ADC_PMUX_EXT2_PIN4_SHIFT: UInt32 = 4
+    public static let ADC_PINCFG_EXT2_PIN4_REG: UInt32 = 0x4100444B
+    public static let ADC_MUXPOS_EXT3_PIN3: UInt32 = 0
+    public static let ADC_PMUX_EXT3_PIN3_REG: UInt32 = 0x41004431
+    public static let ADC_PMUX_EXT3_PIN3_SHIFT: UInt32 = 0
+    public static let ADC_PINCFG_EXT3_PIN3_REG: UInt32 = 0x41004442
+    public static let ADC_MUXPOS_EXT3_PIN4: UInt32 = 1
+    public static let ADC_PMUX_EXT3_PIN4_REG: UInt32 = 0x41004431
+    public static let ADC_PMUX_EXT3_PIN4_SHIFT: UInt32 = 4
+    public static let ADC_PINCFG_EXT3_PIN4_REG: UInt32 = 0x41004443
+
+    // -- EXT1_PWM: a samd21 pwm binding descriptor. The counter's clocks and size, then each
+    // waveform output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+    public static let EXT1_PWM_BASE: UInt32 = 0x42003800
+    public static let EXT1_PWM_IRQ: UInt32 = 21
+    public static let EXT1_PWM_APBC_MASK: UInt32 = 0x4000
+    public static let EXT1_PWM_GCLK_CLKCTRL_VALUE: UInt32 = 0x401D
+    public static let EXT1_PWM_CORE_CLOCK_HZ: UInt32 = 8000000
+    public static let EXT1_PWM_COUNTER_BITS: UInt32 = 8
+    public static let EXT1_PWM_PMUX_FUNC: UInt32 = 4
+    public static let EXT1_PWM_CC_WO0: UInt32 = 0
+    public static let EXT1_PWM_PMUX_WO0_REG: UInt32 = 0x410044B1
+    public static let EXT1_PWM_PMUX_WO0_SHIFT: UInt32 = 0
+    public static let EXT1_PWM_PINCFG_WO0_REG: UInt32 = 0x410044C2
+    public static let EXT1_PWM_CC_WO1: UInt32 = 1
+    public static let EXT1_PWM_PMUX_WO1_REG: UInt32 = 0x410044B1
+    public static let EXT1_PWM_PMUX_WO1_SHIFT: UInt32 = 4
+    public static let EXT1_PWM_PINCFG_WO1_REG: UInt32 = 0x410044C3
+
+    // -- EXT2_PWM: a samd21 pwm binding descriptor. The counter's clocks and size, then each
+    // waveform output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+    public static let EXT2_PWM_BASE: UInt32 = 0x42003000
+    public static let EXT2_PWM_IRQ: UInt32 = 19
+    public static let EXT2_PWM_APBC_MASK: UInt32 = 0x1000
+    public static let EXT2_PWM_GCLK_CLKCTRL_VALUE: UInt32 = 0x401C
+    public static let EXT2_PWM_CORE_CLOCK_HZ: UInt32 = 8000000
+    public static let EXT2_PWM_COUNTER_BITS: UInt32 = 8
+    public static let EXT2_PWM_PMUX_FUNC: UInt32 = 4
+    public static let EXT2_PWM_CC_WO0: UInt32 = 0
+    public static let EXT2_PWM_PMUX_WO0_REG: UInt32 = 0x410044B6
+    public static let EXT2_PWM_PMUX_WO0_SHIFT: UInt32 = 0
+    public static let EXT2_PWM_PINCFG_WO0_REG: UInt32 = 0x410044CC
+    public static let EXT2_PWM_CC_WO1: UInt32 = 1
+    public static let EXT2_PWM_PMUX_WO1_REG: UInt32 = 0x410044B6
+    public static let EXT2_PWM_PMUX_WO1_SHIFT: UInt32 = 4
+    public static let EXT2_PWM_PINCFG_WO1_REG: UInt32 = 0x410044CD
+
+    // -- EXT3_PWM: a samd21 pwm binding descriptor. The counter's clocks and size, then each
+    // waveform output the board wires: its compare channel, PMUX nibble and PINCFG byte --
+    public static let EXT3_PWM_BASE: UInt32 = 0x42002800
+    public static let EXT3_PWM_IRQ: UInt32 = 17
+    public static let EXT3_PWM_APBC_MASK: UInt32 = 0x400
+    public static let EXT3_PWM_GCLK_CLKCTRL_VALUE: UInt32 = 0x401B
+    public static let EXT3_PWM_CORE_CLOCK_HZ: UInt32 = 8000000
+    public static let EXT3_PWM_COUNTER_BITS: UInt32 = 16
+    public static let EXT3_PWM_PMUX_FUNC: UInt32 = 4
+    public static let EXT3_PWM_CC_WO0: UInt32 = 0
+    public static let EXT3_PWM_PMUX_WO0_REG: UInt32 = 0x41004436
+    public static let EXT3_PWM_PMUX_WO0_SHIFT: UInt32 = 0
+    public static let EXT3_PWM_PINCFG_WO0_REG: UInt32 = 0x4100444C
     public static let DEVICE_COUNT: UInt32 = 2
 
     // -- on-board devices: PORT group base + pin index + mask --

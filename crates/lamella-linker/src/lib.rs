@@ -495,6 +495,25 @@ fn kept_regardless(s: &lamella_elf::ParsedSymbol) -> bool {
     s.kind != SymbolType::Func && !s.name.starts_with(TYPE_DESC_PREFIX)
 }
 
+/// The value written in place of a relocation in a carried section whose target was dead-stripped
+/// -- the TOMBSTONE -- for a section named `section`.
+///
+/// **ALL ONES, EXCEPT WHERE ALL ONES ALREADY MEANS SOMETHING.** A tombstone has to be an address no
+/// reader can take for code. Zero is not one on these targets: a Nordic image is linked at address
+/// zero, so a line-table row or a subprogram whose target is gone would land on live code and name
+/// the wrong function. All ones lies past every executable range, and it is the value DWARF readers
+/// already treat as "no address". The exceptions are the DWARF 4 range and location lists,
+/// `.debug_ranges` and `.debug_loc`: there a first word of all ones selects a new base address and
+/// a zero pair ends the list, so a dead entry gets 1 -- a pair whose begin equals its end, which is
+/// empty and is still a pair. This is the rule LLD applies to non-allocated debug sections, taking
+/// all ones where LLD's default still takes zero for hosted images that never load at zero.
+fn carried_tombstone(section: &str) -> u32 {
+    match section {
+        ".debug_ranges" | ".debug_loc" => 1,
+        _ => u32::MAX,
+    }
+}
+
 /// Rebuilds `obj` keeping only reachable functions and reachable descriptors (plus all other data),
 /// re-laid-out. A referenced symbol not among the kept ones stays an undefined extern (the linker resolves
 /// it, or errors if genuinely missing).
@@ -624,7 +643,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                     .data
                     .get_mut(r.offset as usize..r.offset as usize + 4)
                 {
-                    slot.fill(0);
+                    slot.copy_from_slice(&carried_tombstone(&sec.name).to_le_bytes());
                 }
                 continue;
             };
@@ -636,7 +655,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                     symbols.push(lamella_elf::ParsedSymbol {
                         name: target.name.clone(),
                         value,
-                        size: target.size,
+                        size: if target.defined { 0 } else { target.size },
                         binding: match target.defined {
                             true => Binding::Local,
                             false => Binding::Global,
@@ -4065,7 +4084,41 @@ mod tests {
     fn gc_sections_tombstones_a_debug_reference_to_stripped_code() {
         let image = link_at_base_gc(&debug_pair(), "_start", 0x2000).unwrap();
         assert_eq!(debug_word(&image, ".debug_info", 4), 0x2000);
-        assert_eq!(debug_word(&image, ".debug_info", 8), 0);
+        assert_eq!(debug_word(&image, ".debug_info", 8), u32::MAX);
+    }
+
+    #[test]
+    fn a_dead_entry_in_a_dwarf4_range_or_location_list_is_an_empty_pair() {
+        for section in [".debug_ranges", ".debug_loc"] {
+            let obj = debug_obj(
+                Machine::RiscV,
+                &[0u8; 8],
+                &[("_start", 0, 4), ("dead", 4, 4)],
+                &[(
+                    section,
+                    &[0u8; 8],
+                    &[(0, DTarget::Code("dead")), (4, DTarget::Code("dead"))],
+                )],
+            );
+            let image = link_at_base_gc(&[obj], "_start", 0x2000).unwrap();
+            assert_eq!(debug_word(&image, section, 0), 1, "{section}: begin");
+            assert_eq!(debug_word(&image, section, 4), 1, "{section}: end");
+        }
+    }
+
+    #[test]
+    fn a_debug_reference_does_not_copy_its_target_twice_across_two_trims() {
+        let obj = debug_obj(
+            Machine::RiscV,
+            &[0x13, 0x05, 0xa0, 0x02],
+            &[("_start", 0, 4)],
+            &[(".debug_info", &[0u8; 4], &[(0, DTarget::Code("_start"))])],
+        );
+        let once = link_at_base_gc(core::slice::from_ref(&obj), "_start", 0x2000).unwrap();
+        let trimmed = garbage_collect(&[obj], "_start");
+        let twice = link_at_base_gc(&trimmed, "_start", 0x2000).unwrap();
+        assert_eq!(twice.text, once.text, "a second trim must copy nothing the first did not");
+        assert_eq!(debug_word(&twice, ".debug_info", 0), 0x2000);
     }
 
     #[test]

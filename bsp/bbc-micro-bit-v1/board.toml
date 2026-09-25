@@ -1,5 +1,5 @@
-# BOARD binding: the BBC micro:bit v1. Board truth only: the identity, the part, the carrier,
-# the I2C bus wiring, and the display's pin rows.
+# BOARD binding: the BBC micro:bit v1. Board truth only: the identity, the part, the carrier and
+# its serial link, the clock plan, the I2C and SPI bus wiring, and the display's pin rows.
 
 [table]
 kind = "board"
@@ -12,25 +12,30 @@ sources = [
     "micro:bit v1 board identity via the on-board DAPLink bridge the deploy tooling scopes by",
     "micro:bit Foundation edge connector documentation, tech.microbit.org/hardware/edgeconnector/ : pin 19 is I2C SCL and pin 20 is I2C SDA, and those pins are the bus 'used by the on-board motion sensor'",
     "microbit-dal MicroBitPin.h: MICROBIT_PIN_P19 = P0_0 and MICROBIT_PIN_P20 = P0_30, which is what maps those two edge-connector pins onto chip pins",
+    "micro:bit v1.5 and v1.3B schematics, identical in these respects: sheet 5 wires the nRF51822's pins 43 and 44 (P0.24, P0.25) to nets TGT_TX and TGT_RX and puts crystal Q2 (16 MHz) across its XC1 and XC2 pins (37 and 38); sheet 2 carries TGT_TX and TGT_RX to the interface chip's pins 24 and 25",
 ]
 
 [[carriers]]
 kind = "daplink-vcp"        # the on-board DAPLink bridge's VCP. The carrier states the bridge
                             # identity class and the wire rate; its fixed USB ids are stated
                             # once host tooling pins them with evidence.
+role = "vcp"                # the wire rides the vcp binding below
 baud = 115200               # the bridge's wire rate
-plan = "hfclk-default"
+plan = "xtal-16mhz"
 default = true
 
+# THE CLOCK PLAN: HFCLK from the board's 16 MHz crystal oscillator, which the CLOCK block's
+# HFCLKSTART task starts. After reset the part runs HFCLK from its internal RC oscillator, whose
+# tolerance reaches 5%, so a startup that applies this plan starts the crystal before anything
+# relies on a rate -- the serial link above all, because the UART's BAUDRATE word is only as
+# accurate as HFCLK. The peripherals' rate registers are ENUMERATED (the UART's BAUDRATE, the TWI's
+# and the SPI's FREQUENCY), so no divisor derives from a plan rate. `xtal_hz` is the crystal's own
+# frequency: this part accepts a 16 or a 32 MHz crystal and its XTALFREQ register says which.
 [[plans]]
-name = "hfclk-default"
+name = "xtal-16mhz"
 default = true
-source = "hfclk"            # the TWI times itself from the high-frequency clock and its rate
-                            # register is ENUMERATED (K100/K250/K400) -- no divisor derives from
-                            # a rate, so this plan states the operating point's NAME only. It
-                            # exists because the board now declares a binding and a bound board
-                            # must say which operating point its bindings run at; rates join
-                            # when a consumer actually derives from them.
+source = "xtal"             # HFCLKSTAT.SRC's name for the crystal oscillator
+xtal_hz = 16000000          # crystal Q2 across XC1 and XC2 (schematic sheet 5)
 
 # THE ONE I2C BUS. On this board the motion sensor does NOT sit on a private bus: the vendor's
 # edge connector documentation says pins 19 and 20 ARE the I2C, and that this is the bus "used
@@ -67,6 +72,30 @@ instance = "twi0"
 function = "twi"
 scl = { pin = "P0.00" }
 sda = { pin = "P0.30" }
+
+# THE SERIAL LINK. The part's UART reaches the board's interface chip, which bridges it to the host
+# as the USB serial port the carrier above names. The part transmits on P0.24 and receives on P0.25.
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "uart0"
+function = "uart"
+tx = { pin = "P0.24" }
+rx = { pin = "P0.25" }
+source = "micro:bit v1.5 schematic: sheet 5 wires the nRF51822's pin 43 (P0.24) to net TGT_TX and pin 44 (P0.25) to net TGT_RX, and sheet 2 brings those nets to the interface chip's pins 24 and 25, named TGT_TX and TGT_RX; the v1.3B schematic is identical in both"
+
+# THE EDGE CONNECTOR'S SPI. The binding rides SPI1, whose peripheral ID it shares with SPIS1 and TWI1
+# but not with TWI0, so the I2C bus above stays its own. The master drives no chip select: the
+# program names the GPIO that selects its device, as SpiConnectionSettings.ChipSelectLine.
+[[bindings]]
+role = "spi"
+kind = "spi"
+instance = "spi1"
+function = "spi"
+sck = { pin = "P0.23" }
+mosi = { pin = "P0.21" }
+miso = { pin = "P0.22" }
+source = "micro:bit v1.5 schematic: sheet 5 wires the nRF51822's pins 42, 41 and 40 (P0.23, P0.22, P0.21) to nets SCK, MISO and MOSI, and sheet 6 brings those nets to edge connector contacts 14, 15 and 16; the v1.3B schematic is identical in both"
 
 # The display, as twelve pin-wired device rows. Row lines SOURCE current (asserted high) and
 # column lines SINK it (asserted low), the same electrical convention as the v2 -- and that is

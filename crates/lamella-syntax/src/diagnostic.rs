@@ -305,11 +305,14 @@ pub enum DiagnosticKind {
     /// *"please use language version N or greater"* is advice they have already taken.
     ///
     FeatureNotInThisBuild {
-        /// The feature's noun phrase, from [`crate::version::Feature::description`].
+        /// The construct's noun phrase, from [`crate::version::Feature::refusal_description`].
         feature: &'static str,
         /// The dialect that permits it. Naming it is the load-bearing half: without it the
         /// reader's first guess is the language version, which is the one thing that is not wrong.
         permitted_by: crate::version::LanguageVersion,
+        /// What to write instead, appended as its own sentence, from
+        /// [`crate::version::Feature::instead`].
+        instead: Option<&'static str>,
     },
     /// A second file-scoped namespace declaration (`namespace N;`) appeared inside the first one's
     /// body (csc CS8954).
@@ -318,6 +321,13 @@ pub enum DiagnosticKind {
     /// runs to the end of the file, so a second one is never a SIBLING -- it is always written
     /// inside the first. csc reports it at the second declaration's NAME.
     OnlyOneFileScopedNamespace,
+    /// A top-level statement written after a type or namespace declaration (csc CS8803).
+    ///
+    /// MEASURED: csc answers this at every dialect, including those without top-level
+    /// statements at all, and in place of the feature gate rather than beside it -- the program
+    /// is wrong in its ORDER whichever rung it is compiled at. Reported once, at the first
+    /// statement out of place.
+    TopLevelStatementsMustPrecedeMembers,
     /// A file-scoped namespace declaration and a brace-delimited one were nested inside one another
     /// (csc CS8955), in either order.
     ///
@@ -484,6 +494,7 @@ impl DiagnosticKind {
             DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
             DiagnosticKind::FeatureNotInThisBuild { .. } => 1,
             DiagnosticKind::OnlyOneFileScopedNamespace => 8954,
+            DiagnosticKind::TopLevelStatementsMustPrecedeMembers => 8803,
             DiagnosticKind::BothFileScopedAndNormalNamespaces => 8955,
             DiagnosticKind::FileScopedNamespaceMustPrecedeMembers => 8956,
             DiagnosticKind::ArglistMustBeLast => 257,
@@ -666,14 +677,24 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::FeatureNotInThisBuild {
                 feature,
                 permitted_by,
-            } => write!(
-                f,
-                "Feature '{feature}' is permitted by C# {} but is not provided by this build of Lamella.",
-                permitted_by.message_name()
-            ),
+                instead,
+            } => {
+                write!(
+                    f,
+                    "Feature '{feature}' is permitted by C# {} but is not provided by this build of Lamella.",
+                    permitted_by.message_name()
+                )?;
+                match instead {
+                    Some(sentence) => write!(f, " {sentence}"),
+                    None => Ok(()),
+                }
+            }
             DiagnosticKind::OnlyOneFileScopedNamespace => {
                 f.write_str("Source file can only contain one file-scoped namespace declaration.")
             }
+            DiagnosticKind::TopLevelStatementsMustPrecedeMembers => f.write_str(
+                "Top-level statements must precede namespace and type declarations.",
+            ),
             DiagnosticKind::BothFileScopedAndNormalNamespaces => f.write_str(
                 "Source file can not contain both file-scoped and normal namespace declarations.",
             ),

@@ -18,6 +18,7 @@ public enum BbcMicroBitV2Bindings {
     /// name a driver; and a uart is a different register map on every family, so the kind does
     /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
     public static let INTERNAL_I2C_DRIVER_FAMILY: String = "nrf52833-twi"
+    public static let SPI_DRIVER_FAMILY: String = "nrf52833-spi"
 
     // -- INTERNAL_I2C: an nrf-twi binding descriptor --
     public static let INTERNAL_I2C_TWI_BASE: UInt32 = 0x40003000
@@ -25,6 +26,15 @@ public enum BbcMicroBitV2Bindings {
     public static let INTERNAL_I2C_PSEL_SDA: UInt32 = 0x10
     public static let INTERNAL_I2C_PIN_CNF_SCL_REG: UInt32 = 0x50000720
     public static let INTERNAL_I2C_PIN_CNF_SDA_REG: UInt32 = 0x50000740
+
+    // -- SPI: an nrf-spi binding descriptor --
+    public static let SPI_SPI_BASE: UInt32 = 0x40023000
+    public static let SPI_PSEL_SCK: UInt32 = 0x11
+    public static let SPI_PSEL_MOSI: UInt32 = 0xD
+    public static let SPI_PSEL_MISO: UInt32 = 0x1
+    public static let SPI_PIN_CNF_SCK_REG: UInt32 = 0x50000744
+    public static let SPI_PIN_CNF_MOSI_REG: UInt32 = 0x50000734
+    public static let SPI_PIN_CNF_MISO_REG: UInt32 = 0x50000704
     public static let DEVICE_COUNT: UInt32 = 14
 
     // -- on-board devices: PORT group base + pin index + mask --

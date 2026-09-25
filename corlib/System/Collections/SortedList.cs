@@ -218,12 +218,17 @@ namespace System.Collections
             }
         }
 
-        public IEnumerator GetEnumerator()
+        public IDictionaryEnumerator GetEnumerator()
         {
             object[] ks = new object[size];
             object[] vs = new object[size];
             for (int i = 0; i < size; i++) { ks[i] = keys[i]; vs[i] = values[i]; }
             return new SortedListEnumerator(ks, vs, size);
+        }
+
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
         }
 
         public void CopyTo(System.Array array, int index)

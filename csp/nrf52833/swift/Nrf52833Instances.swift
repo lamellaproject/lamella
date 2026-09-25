@@ -10,4 +10,6 @@ public enum Nrf52833Instances {
     public static let TWI0_BASE: UInt32 = 0x40003000
     public static let PORT0_BASE: UInt32 = 0x50000000
     public static let PORT1_BASE: UInt32 = 0x50000300
+    public static let SPI2_BASE: UInt32 = 0x40023000
+    public static let UART0_BASE: UInt32 = 0x40002000
 }

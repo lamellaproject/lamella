@@ -9,6 +9,10 @@ namespace Lamella.Boards
         public readonly uint GclkPchctrlReg;
         /// <summary>The value to store there: a generator selection with the channel enabled.</summary>
         public readonly uint GclkPchctrlValue;
+        /// <summary>The CTRLA.PRESCALER value that keeps the converter's clock within the part's limit
+        /// at that generator's rate: CLK_ADC is the generic clock divided by 2^(PRESCALER + 1), and it
+        /// must not exceed 16 MHz (DS60001507F Table 54-23).</summary>
+        public readonly uint Prescaler;
         /// <summary>The MCLK APB mask register gating this instance's bus clock. WHICH register
         /// differs per instance on this family.</summary>
         public readonly uint ApbMaskReg;
@@ -39,13 +43,14 @@ namespace Lamella.Boards
         public readonly uint ReferenceMicrovolts;
 
         public Same54AdcBinding(uint adcBase, uint gclkPchctrlReg, uint gclkPchctrlValue,
-            uint apbMaskReg, uint apbMask, uint calibReg, uint nvmCalibArea, uint nvmCalibLsb,
-            uint pmuxReg, uint pmuxMask, uint pmuxValue, uint pincfgReg, uint muxpos,
-            uint referenceMicrovolts)
+            uint prescaler, uint apbMaskReg, uint apbMask, uint calibReg, uint nvmCalibArea,
+            uint nvmCalibLsb, uint pmuxReg, uint pmuxMask, uint pmuxValue, uint pincfgReg,
+            uint muxpos, uint referenceMicrovolts)
         {
             AdcBase = adcBase;
             GclkPchctrlReg = gclkPchctrlReg;
             GclkPchctrlValue = gclkPchctrlValue;
+            Prescaler = prescaler;
             ApbMaskReg = apbMaskReg;
             ApbMask = apbMask;
             CalibReg = calibReg;

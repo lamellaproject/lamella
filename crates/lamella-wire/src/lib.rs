@@ -242,7 +242,12 @@ pub mod crc32 {
 
 /// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over the framed bytes, for frame integrity.
 fn crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
+    crc16_update(0xFFFF, data)
+}
+
+/// Extends a running [`crc16`] over `data`, so a frame's check value can be taken as its bytes go
+/// out rather than over a buffer holding all of them.
+fn crc16_update(mut crc: u16, data: &[u8]) -> u16 {
     for &byte in data {
         crc ^= (byte as u16) << 8;
         for _ in 0..8 {
@@ -250,6 +255,42 @@ fn crc16(data: &[u8]) -> u16 {
         }
     }
     crc
+}
+
+/// Writes one frame to `sink` a byte at a time, ALLOCATING NOTHING: the same bytes
+/// [`encode_frame`] builds, for a sender that cannot allocate.
+///
+/// The payload is `parts` sent back to back, so a caller can put a short header in front of a
+/// constant without first assembling the two in memory.
+///
+/// The sender this exists for is a firmware's panic handler. The likeliest panic on a small part is
+/// an exhausted heap, and a report that must allocate its frame cannot describe the one failure
+/// most worth describing.
+///
+/// Answers `false`, having written nothing, wherever [`encode_frame`] answers `None`: a payload
+/// over [`MAX_PAYLOAD`], or a `msg_type` that is not a message type.
+pub fn write_frame(msg_type: u8, seq: u16, parts: &[&[u8]], sink: &mut dyn FnMut(u8)) -> bool {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
+    if len > MAX_PAYLOAD || !msg::is_valid_type(msg_type) {
+        return false;
+    }
+    let [len_low, len_high] = (len as u16).to_le_bytes();
+    let [seq_low, seq_high] = seq.to_le_bytes();
+    let header: [u8; HEADER_LEN] = [SYNC[0], SYNC[1], len_low, len_high, msg_type, seq_low, seq_high];
+    let mut crc = crc16_update(0xFFFF, &header[2..]);
+    for &byte in &header {
+        sink(byte);
+    }
+    for part in parts {
+        crc = crc16_update(crc, part);
+        for &byte in *part {
+            sink(byte);
+        }
+    }
+    for byte in crc.to_le_bytes() {
+        sink(byte);
+    }
+    true
 }
 
 /// Encode one frame: `SYNC | LEN | TYPE | SEQ | PAYLOAD | CRC`, the CRC covering `LEN..=PAYLOAD` (so a
@@ -561,6 +602,14 @@ impl Capabilities {
     /// Sharper on this side than on the interpreted one: on a board with no debug port, attaching to
     /// a running native program is not one way in, it is the way in.
     pub const ATTACH_NATIVE: u64 = 1 << 14;
+    /// Send a string's text as [`msg::val::STRING`] in the variables a debugger reads, rather than as
+    /// an object handle.
+    ///
+    /// NEGOTIATED rather than simply sent, because a `<val>` tag carries no length a reader can skip
+    /// by: a host meeting a tag it does not know cannot read past it, and loses every value after it
+    /// in the same reply. So a target sends the tag only in a session whose HELLO both ends offered
+    /// this in, and a host that does not ask keeps getting object handles, as it always has.
+    pub const STRING_VALUES: u64 = 1 << 15;
 
 
     /// Load and run an assembly. The first of the four ARTIFACT-KIND bits, which are contiguous so
@@ -699,6 +748,7 @@ impl Capabilities {
         (Self::MEM_WRITE, "MEM_WRITE"),
         (Self::ATTACH_INTERPRETED, "ATTACH_INTERPRETED"),
         (Self::ATTACH_NATIVE, "ATTACH_NATIVE"),
+        (Self::STRING_VALUES, "STRING_VALUES"),
         (Self::REPL_RUN, "REPL_RUN"),
         (Self::BAKED_IMAGE, "BAKED_IMAGE"),
         (Self::BUNDLE, "BUNDLE"),
@@ -2140,6 +2190,33 @@ mod tests {
         assert_eq!(error::refusal(&[]), TransportError::Refused { reason: 0, msg_type: 0, holder: None });
     }
 
+    /// A frame written byte by byte is the frame [`encode_frame`] builds, however its payload is
+    /// split, and a reader takes it; and it refuses what `encode_frame` refuses without writing a
+    /// byte.
+    #[test]
+    fn a_frame_written_without_allocating_is_the_frame_encode_frame_builds() {
+        let mut written = Vec::new();
+        let parts: [&[u8]; 3] = [&[0x02, 0x01], b"out of ", b"memory\n"];
+        assert!(write_frame(msg::EXEC, 0x1234, &parts, &mut |byte| written.push(byte)));
+        assert_eq!(Some(written.clone()), encode_frame(msg::EXEC, 0x1234, b"\x02\x01out of memory\n"));
+        let mut reader = FrameReader::new();
+        reader.push(&written);
+        let frame = reader.next_frame().expect("a reader takes the written frame");
+        assert_eq!((frame.msg_type, frame.seq), (msg::EXEC, 0x1234));
+        assert_eq!(frame.payload, b"\x02\x01out of memory\n");
+
+        written.clear();
+        assert!(write_frame(msg::EXEC, 0, &[], &mut |byte| written.push(byte)));
+        assert_eq!(Some(written.clone()), encode_frame(msg::EXEC, 0, &[]));
+
+        written.clear();
+        assert!(!write_frame(0x00, 0, &[b"x"], &mut |byte| written.push(byte)), "0x00 is not a type");
+        assert!(!write_frame(0xFF, 0, &[b"x"], &mut |byte| written.push(byte)), "0xFF is not a type");
+        let too_long = vec![0u8; MAX_PAYLOAD];
+        assert!(!write_frame(msg::EXEC, 0, &[&too_long, b"x"], &mut |byte| written.push(byte)));
+        assert!(written.is_empty(), "a refused frame writes nothing");
+    }
+
     /// The value that proves this is CRC-32/ISO-HDLC, and not one of the other checksums called CRC-32.
     #[test]
     fn crc32_is_iso_hdlc_by_its_check_value() {
@@ -3114,6 +3191,23 @@ mod tests {
         assert_eq!(surface::bit_of("LAMELLA_SURFACE_GENERICS"), Some(surface::GENERICS));
         assert!(surface::accepts(board, program), "a program needing less runs on a board with more");
         assert_eq!(surface::missing(program, program), 0);
+    }
+
+    /// The rung above 4.5 is a bit of its own: a program built against it is refused, by name, on a
+    /// board whose library stops at 4.5, and it stays out of the era mask, which states the .NET
+    /// Framework generation.
+    #[test]
+    fn a_program_past_the_boards_rung_is_refused_by_the_rung() {
+        let board = surface::NETFX_1_1
+            | surface::NETFX_2_0
+            | surface::NETFX_4_0
+            | surface::NETFX_4_5
+            | surface::GENERICS;
+        let program = board | surface::NETCORE_2_0;
+        assert!(!surface::accepts(program, board));
+        assert_eq!(surface::missing(program, board), surface::NETCORE_2_0);
+        assert_eq!(surface::bit_of("LAMELLA_SURFACE_NETCORE_2_0"), Some(surface::NETCORE_2_0));
+        assert_eq!(surface::NETCORE_2_0 & surface::NETFX_MASK, 0, "the rung is not a NETFX era");
     }
 
     #[test]

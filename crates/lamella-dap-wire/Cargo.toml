@@ -1,0 +1,29 @@
+[package]
+name = "lamella-dap-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "lamella-dap-wire: debugs a program running on a board's own interpreter, over Lamella Link, from a Debug Adapter Protocol client such as VS Code."
+publish = false
+
+[[bin]]
+name = "lamella-dap-wire"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The adapter WITHOUT the interpreter, as every server for a board takes it. With the interpreter
+# linked in, a Debug Console line with no frame is evaluated by a session inside this process -- on
+# the PC -- and its answer is shown as though the board had given it.
+lamella-dap = { path = "../lamella-dap", default-features = false }
+# The board's side of the seam: the Link's debug channel over a serial port or the board's own USB
+# device, and the board listing the editor's picker reads.
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = [
+    "serial",
+    "usb",
+    "debug-backend",
+] }

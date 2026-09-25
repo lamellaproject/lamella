@@ -18,5 +18,7 @@ pub const CLKCTRL_GEN: u32 = 0xF00;
 pub const CLKCTRL_GEN_LSB: u32 = 8;
 pub const CLKCTRL_CLKEN: u32 = 0x4000;
 pub const CLKCTRL_CLKEN_LSB: u32 = 14;
+pub const CLKCTRL_WRTLOCK: u32 = 0x8000;
+pub const CLKCTRL_WRTLOCK_LSB: u32 = 15;
 pub const STATUS_SYNCBUSY: u32 = 0x80;
 pub const STATUS_SYNCBUSY_LSB: u32 = 7;

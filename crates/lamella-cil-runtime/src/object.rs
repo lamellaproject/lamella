@@ -445,7 +445,7 @@ impl ArrayStorage {
 /// `Array.Clear`: `0` for a number, `null` for any reference, and a struct whose every field is
 /// recursively zeroed for a value type. A managed pointer / typed reference has no default (it
 /// cannot be an array element in verified IL), so it is left unchanged.
-fn zeroed_value(value: &Value) -> Value {
+pub(crate) fn zeroed_value(value: &Value) -> Value {
     match value {
         Value::Int32(_) => Value::Int32(0),
         Value::Int64(_) => Value::Int64(0),

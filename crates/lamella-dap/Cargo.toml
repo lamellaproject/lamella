@@ -51,26 +51,12 @@ interpreter = [
     "lamella-cil-runtime/typed-references",
 ]
 
-# The Lamella Link DEVICE server: DAP-JSON over stdio on one side, Lamella Link frames over a serial
-# port OR the board's native driverless-WinUSB device on the other -- the on-device interpreter
-# debugged from VS Code with zero adapter changes (WireHostBackend implements the same DebugBackend seam).
-link-device = [
-    "dep:lamella-wire-host",
-    "lamella-wire-host/serial",
-    "lamella-wire-host/usb",
-    "lamella-wire-host/debug-backend",
-]
-
-# The CIL server binary needs the interpreter; a device server is a separate binary.
+# The CIL server binary needs the interpreter. The Lamella Link device server is its own package,
+# `lamella-dap-wire`, so that it can take this crate WITHOUT the interpreter.
 [[bin]]
 name = "lamella-dap"
 path = "src/main.rs"
 required-features = ["interpreter"]
-
-[[bin]]
-name = "lamella-dap-wire"
-path = "src/bin/lamella-dap-wire.rs"
-required-features = ["link-device"]
 
 [dev-dependencies]
 lamella-assemble = { path = "../lamella-assemble" }

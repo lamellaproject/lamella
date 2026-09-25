@@ -1,6 +1,7 @@
 // Lamella.Boards.RaspberryPi.Pico2 -- the Raspberry Pi Pico 2 (RP2350A) board-support package.
 using System;
 using System.Device.Adc;
+using System.Device.Analog;
 using System.Device.Gpio;
 using System.Device.I2c;
 using System.Device.Spi;
@@ -168,6 +169,22 @@ namespace Lamella.Boards.RaspberryPi
         public AdcController CreateAdcController()
         {
             return new AdcController();
+        }
+
+        /// <summary>The on-chip converter as dotnet/iot's analog controller. Each pin is a converter
+        /// channel: <see cref="AdcChannelGp26"/> to <see cref="AdcChannelGp29"/> and
+        /// <see cref="TemperatureSensorChannel"/> name them.</summary>
+        /// <remarks>Creating it touches no hardware; the first pin opened brings the converter up.
+        /// It reads through the same driver as <see cref="CreateAdcController"/>.</remarks>
+        /// <param name="chip">Must be 0: the board has one converter.</param>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="chip"/> is not 0.</exception>
+        public AnalogController CreateAnalogController(int chip)
+        {
+            if (chip != 0)
+            {
+                throw new ArgumentOutOfRangeException("chip");
+            }
+            return AdcControllers.CreateAnalogController();
         }
 
         /// <summary>The `uart0` binding descriptor (GP0 TX / GP1 RX, crystal-exact clk_peri).</summary>

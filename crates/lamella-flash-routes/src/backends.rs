@@ -6,9 +6,10 @@ use lamella_cmsis_dap_sam::{
     SAM3X_GPNVM_PLANE_SWAP, SAM3X_LOCK_PAGES, SAM3X_PAGE, SAM3X_PLANE_SIZE, SAM4E_EEFC,
     SAM4E_FLASH_BASE, SAM4L_FLASH_BASE, SAM4L_LOCK_REGIONS, SAM4S_EEFC0, SAM4S_EEFC1,
     SAM4S_ERASE_PAGES, SAM4S_FLASH0_BASE, SAM4S_FLASH1_BASE, SAM4S_GPNVM_PLANE_SWAP,
-    SAM4S_LOCK_PAGES, SAM4S_PAGE, SAM4_CHIPID_CIDR, SAM4_CHIPID_EXID, SAME54_BLOCK, Sam3xFlash,
-    Sam4lFlash, Sam4sFlash, Samd21Flash, SamIdentify, Same54Flash, sam3x_identify,
-    sam4_family_matches, sam4_identify,
+    SAM4S_LOCK_PAGES, SAM4S_PAGE, SAM4_CHIPID_CIDR, SAM4_CHIPID_EXID, SAMD21_LOCK_REGIONS,
+    SAME54_BLOCK, Sam3xFlash, Sam4lFlash, Sam4sFlash, Samd21Flash, Samd21UserRow,
+    Samd21UserRowAccess, SamIdentify, Same54Flash, sam3x_identify, sam4_family_matches,
+    sam4_identify, samd21_bootprot_bytes, samd21_eeprom_bytes,
 };
 use lamella_cmsis_dap_stm32::{
     STM32C0_DBGMCU_IDCODE, STM32C0_DOUBLE_WORD, STM32C0_ERASED_VALUE, STM32C0_FLASH_BASE,
@@ -26,6 +27,20 @@ use lamella_cmsis_dap_stm32::{
 };
 use lamella_flash_backend::{FlashBackend, FlashError, Image, PartIdentity};
 use lamella_probe_core::{TargetAccess, TargetAccessExt};
+
+/// Leaves a written part running its image: every hardware breakpoint removed, then a reset to run.
+///
+/// **The breakpoints come off first because nothing else takes them off.** A comparator a debug
+/// session armed outlives a system reset -- `FP_CTRL.ENABLE` "resets to zero on a Cold reset"
+/// (Armv8-M Architecture Reference Manual, DDI 0553B.y, D1.2, `FP_CTRL`) -- and a session that ends
+/// without handing the part back leaves its comparators armed. Halting debug is still on after
+/// the reset, so the new image halts at the first of those addresses its own code reaches, with no
+/// debugger attached to resume it.
+fn leave_running<A: TargetAccess>(target: &mut A) -> Result<(), FlashError> {
+    target.set_breakpoints(&[])?;
+    target.reset_and_run()?;
+    Ok(())
+}
 
 /// A micro:bit's on-board DAPLink probe, over SWD.
 ///
@@ -94,7 +109,7 @@ impl<A: TargetAccess> FlashBackend for MicrobitDaplink<A> {
     }
 
     fn finish(&mut self) -> Result<(), FlashError> {
-        self.target.reset_and_run()?;
+        leave_running(&mut self.target)?;
         Ok(())
     }
 }
@@ -235,7 +250,7 @@ impl<A: TargetAccess> FlashBackend for Rp2350Probe<A> {
     }
 
     fn finish(&mut self) -> Result<(), FlashError> {
-        self.target.reset_and_run()?;
+        leave_running(&mut self.target)?;
         Ok(())
     }
 }
@@ -348,7 +363,7 @@ impl<A: TargetAccess> FlashBackend for Rp2040Probe<A> {
     }
 
     fn finish(&mut self) -> Result<(), FlashError> {
-        self.target.reset_and_run()?;
+        leave_running(&mut self.target)?;
         Ok(())
     }
 }
@@ -1155,7 +1170,7 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
         if let (Some(freeze), Some(found)) = (self.plan.watchdog_freeze, self.watchdogs_found.take()) {
             self.target.write_word(freeze.register, found)?;
         }
-        self.target.reset_and_run()?;
+        leave_running(&mut self.target)?;
         Ok(())
     }
 }
@@ -1392,21 +1407,204 @@ impl<P: crate::dfu::ControlPipe> FlashBackend for StDfu<P> {
 ///
 /// As with every backend here: the probe is opened, brought into SWD and given memory access by the
 /// caller. The first thing this does is a read that touches nothing.
+///
+/// # Behind a bootloader
+///
+/// A write [`placed`](Self::placed) behind a bootloader starts where the bootloader ends and leaves
+/// its rows alone. Before it erases anything it reads the vector table where the bootloader
+/// belongs, and refuses when the part does not hold one there: the board's facts state what its
+/// product ships, and a unit whose bootloader was overwritten is still that board.
 pub struct SamProbe<A: TargetAccess> {
     target: A,
     family: crate::SamFamily,
     mechanism: &'static str,
+    /// Where this write puts the image: the family's flash base, or behind a kept bootloader.
+    base: u32,
+    /// The bootloader this write keeps in front of the image, which the part must hold.
+    kept: Option<crate::placement::ShippedBootloader>,
 }
 
 impl<A: TargetAccess> SamProbe<A> {
-    /// A backend for `family`, reached through `target`, describing itself as `mechanism`.
+    /// A backend for `family`, reached through `target`, describing itself as `mechanism`, that
+    /// writes an image from the start of the family's flash.
     ///
     /// **THE MECHANISM IS THE ROUTE'S FACT AND NOT THE FAMILY'S**, which is why it is passed in
     /// rather than derived here. The same controller is reached through a debugger soldered to the
     /// board on an Xplained kit and through a probe the reader supplied on an Arduino Due, and the
     /// sentence a person reads afterwards is about which of those happened.
     pub fn new(target: A, family: crate::SamFamily, mechanism: &'static str) -> Self {
-        SamProbe { target, family, mechanism }
+        SamProbe { target, family, mechanism, base: family.flash_base(), kept: None }
+    }
+
+    /// The same backend, writing where `placement` puts the image.
+    ///
+    /// The image handed to [`lamella_flash_backend::flash`] must be built from the same
+    /// `placement`, which is what the contract's base check compares.
+    #[must_use]
+    pub fn placed(mut self, placement: &crate::placement::Placement) -> Self {
+        self.base = placement.base();
+        self.kept = placement.kept().cloned();
+        self
+    }
+
+    /// Refuse unless the part holds, where this write keeps a bootloader, a vector table whose
+    /// reset vector starts code inside that bootloader.
+    ///
+    /// Word 0 of a Cortex-M vector table is the initial stack pointer and word 1 the reset vector,
+    /// whose bit 0 is set because the core runs Thumb code. An erased word 0, a reset vector
+    /// without that bit, and one that starts code outside the bootloader's span are each refused,
+    /// and nothing has been erased when they are.
+    fn refuse_unless_the_bootloader_is_there(
+        &mut self,
+        kept: &crate::placement::ShippedBootloader,
+    ) -> Result<(), FlashError> {
+        let table = self.target.read_words(kept.base, 2)?;
+        let (stack, reset) = (table[0], table[1]);
+        let span = format!(
+            "{:#010x}-{:#010x}",
+            kept.base,
+            kept.end().saturating_sub(1)
+        );
+        let found = if stack == u32::MAX {
+            format!("the flash at {:#010x} is erased, so this part holds no bootloader", kept.base)
+        } else if reset & 1 == 0 {
+            format!(
+                "the vector table at {:#010x} starts {stack:#010x} {reset:#010x}, and a reset \
+                 vector without bit 0 set is not one a Cortex-M core takes, so that is not a \
+                 bootloader",
+                kept.base
+            )
+        } else if !(kept.base..kept.end()).contains(&(reset & !1)) {
+            format!(
+                "the vector table at {:#010x} starts {stack:#010x} {reset:#010x}, whose reset \
+                 vector starts code at {:#010x}, outside the bootloader's {} bytes: that is an \
+                 image that runs from {:#010x} on its own",
+                kept.base,
+                reset & !1,
+                kept.size,
+                kept.base
+            )
+        } else {
+            return Ok(());
+        };
+        Err(FlashError::Refused(format!(
+            "this write keeps the {} at {span} and writes the image behind it, and {found}. \
+             Nothing was erased.\n\n\
+             To keep a bootloader, write one first from its own file with --replace-bootloader; \
+             none is\nincluded here. To run without one, write an image linked to start at \
+             {:#010x} with\n--replace-bootloader.",
+            kept.name, kept.base
+        )))
+    }
+
+    /// Refuse an image whose erase walk, `image.base` up to `walk_end`, reaches a row a SAM D21 will
+    /// not erase: one inside the rows BOOTPROT protects, or one in a locked region.
+    ///
+    /// An erase in either is not performed: the controller sets STATUS.LOCKE and the row keeps its
+    /// bytes (DS40001882D 22.6.4.5). A write into one would fail only at its read-back, as a
+    /// mismatch that names neither the cause nor the remedy.
+    ///
+    /// BOOTPROT's rows are a boot loader section from the start of the array, which the part
+    /// write-protects (22.6.2, 22.6.5 and Table 22-2). The locks are checked by
+    /// [`Self::refuse_locked_regions`].
+    ///
+    /// Only a part whose DSU names a SAM D21 is checked. The SAM D10 and D11 share this controller,
+    /// and their user rows are left to their own datasheets.
+    fn refuse_protected_rows(
+        &mut self,
+        image: &Image<'_>,
+        walk_end: u32,
+        flash_bytes: u32,
+    ) -> Result<(), FlashError> {
+        if !self.target.sam_device_id()?.has_samd21_user_row() {
+            return Ok(());
+        }
+        let row = self.target.read_samd21_user_row()?;
+        let bootprot = row.bootprot();
+        let start = self.family.flash_base();
+        let protected_end = start.saturating_add(samd21_bootprot_bytes(bootprot));
+        if image.base < protected_end {
+            return Err(FlashError::Refused(format!(
+                "this part's BOOTPROT is {bootprot}, which write-protects {start:#010x}-{:#010x} \
+                 as a boot loader section,\nand this image starts at {:#010x}: an erase there is \
+                 not performed. Nothing was erased.\n\n\
+                 --clear-bootprot clears it. It prints the part's user row, saves it, and changes \
+                 only BOOTPROT.",
+                protected_end - 1,
+                image.base
+            )));
+        }
+        self.refuse_locked_regions(image, walk_end, flash_bytes, &row)
+    }
+
+    /// Refuse an image whose erase walk reaches a locked region of a SAM D21's main array.
+    ///
+    /// The array is sixteen equal regions, and a region is locked while its bit in NVMCTRL.LOCK
+    /// reads 0 (DS40001882D 22.6.3 and 22.8). The register is read as it stands, because a Lock or
+    /// Unlock Region command changes it until the next reset, and `row` says whether the part
+    /// sets each lock again at reset. The rows the EEPROM field reserves at the top of the array
+    /// are written whatever their region's lock says (22.6.5 and Table 22-3), so the walk is
+    /// checked only up to where they begin.
+    fn refuse_locked_regions(
+        &mut self,
+        image: &Image<'_>,
+        walk_end: u32,
+        flash_bytes: u32,
+        row: &Samd21UserRow,
+    ) -> Result<(), FlashError> {
+        let locks = self.target.read_samd21_region_locks()?;
+        let start = self.family.flash_base();
+        let region_bytes = flash_bytes / SAMD21_LOCK_REGIONS;
+        let eeprom_start = start
+            .saturating_add(flash_bytes)
+            .saturating_sub(samd21_eeprom_bytes(row.eeprom()));
+        let checked_end = walk_end.min(eeprom_start);
+        if image.base >= checked_end {
+            return Ok(());
+        }
+        let locked: Vec<(u32, u32, u32)> = (0..SAMD21_LOCK_REGIONS)
+            .filter(|&region| u32::from(locks) & (1 << region) == 0)
+            .map(|region| {
+                let from = start.saturating_add(region.saturating_mul(region_bytes));
+                (region, from, from.saturating_add(region_bytes))
+            })
+            .filter(|&(_, from, to)| from < checked_end && image.base < to)
+            .collect();
+        if locked.is_empty() {
+            return Ok(());
+        }
+        let listed: String = locked
+            .iter()
+            .map(|(region, from, to)| {
+                format!("\n    region {region:<2}  {from:#010x}-{:#010x}", to - 1)
+            })
+            .collect();
+        let (what, regions, locks_were, commands, them) = if locked.len() == 1 {
+            ("a locked region", "that region", "the lock was", "a Lock Region command", "it")
+        } else {
+            ("locked regions", "those regions", "the locks were", "Lock Region commands", "them")
+        };
+        let origin = if locked
+            .iter()
+            .all(|(region, _, _)| u32::from(row.lock()) & (1 << region) != 0)
+        {
+            format!(
+                "The user row's LOCK field leaves {regions} unlocked at reset, so {locks_were} set \
+                 since\nthe last reset, by {commands}. A reset lifts {them}, unless the program on \
+                 the part locks\n{them} again as it starts."
+            )
+        } else {
+            format!(
+                "The user row's LOCK field is {:#06x}, and the part loads it at every reset \
+                 (DS40001882D 22.6.3).\nNo option here changes that field.",
+                row.lock()
+            )
+        };
+        Err(FlashError::Refused(format!(
+            "this part's NVMCTRL.LOCK reads {locks:#06x}, and this write erases rows in {what}:\n\
+             an erase in a locked region is not performed. Nothing was erased.\n{listed}\n\n\
+             {origin}"
+        )))
     }
 
     /// Read back exactly the bytes `image` covers, over the same wire that wrote them.
@@ -1686,7 +1884,7 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
     }
 
     fn flash_base(&self) -> u32 {
-        self.family.flash_base()
+        self.base
     }
 
     /// The DSU device id, which is the reading that names Microchip's die.
@@ -1779,6 +1977,13 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
     /// and the erase granule is derived from the page size rather than assumed -- a SAM D21 row is
     /// four pages of whatever size that part reports, not a constant.
     fn erase(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
+        if self.kept.is_some() && !crate::placement::keeps_a_bootloader(self.family) {
+            return Err(FlashError::Refused(format!(
+                "this write keeps a bootloader in front of the image, and keeping one is built \
+                 for a SAM D21, not a {}",
+                self.family.controller()
+            )));
+        }
         if self.family == crate::SamFamily::Sam4Eefc {
             let descriptor = self.target.sam4s_flash_descriptor(SAM4E_EEFC)?;
             if descriptor.planes != 1 {
@@ -1904,9 +2109,19 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
                 unreachable!("handled above: those controllers walk pages, not addresses")
             }
         };
+        let array_base = self.family.flash_base();
+        let offset = image.base.wrapping_sub(array_base);
+        if image.base < array_base || !offset.is_multiple_of(granule) {
+            return Err(FlashError::Refused(format!(
+                "this image starts at {:#010x}, which is not the start of one of this part's \
+                 {granule}-byte erase units from {array_base:#010x}; erasing it would erase the \
+                 bytes in front of it",
+                image.base
+            )));
+        }
         let granules = wanted.div_ceil(granule);
         let walk_end = image.base.saturating_add(granules.saturating_mul(granule));
-        let array_end = self.flash_base().saturating_add(geometry.flash_bytes());
+        let array_end = array_base.saturating_add(geometry.flash_bytes());
         if walk_end > array_end {
             return Err(FlashError::Refused(format!(
                 "erasing {wanted} bytes from {:#010x} walks to {walk_end:#010x}, past the {} KB \
@@ -1914,6 +2129,12 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
                 image.base,
                 geometry.flash_bytes() / 1024
             )));
+        }
+        if let Some(kept) = self.kept.clone() {
+            self.refuse_unless_the_bootloader_is_there(&kept)?;
+        }
+        if self.family == crate::SamFamily::Samd21 {
+            self.refuse_protected_rows(image, walk_end, geometry.flash_bytes())?;
         }
         self.target.halt()?;
         for granule_index in 0..granules {
@@ -2013,7 +2234,7 @@ impl<A: TargetAccess> FlashBackend for SamProbe<A> {
     }
 
     fn finish(&mut self) -> Result<(), FlashError> {
-        self.target.reset_and_run()?;
+        leave_running(&mut self.target)?;
         Ok(())
     }
 }

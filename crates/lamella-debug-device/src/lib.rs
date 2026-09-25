@@ -76,6 +76,12 @@ pub struct DeviceBackend<A: TargetAccess> {
     files: Vec<String>,
     /// Semihosting output captured from the target, drained by `take_output`.
     output: String,
+    /// The start of a UTF-8 character the target has only partly written.
+    ///
+    /// **A CONSOLE WRITES ONE BYTE PER CALL**, so a character outside ASCII arrives over two to four
+    /// calls. Decoding each byte as it arrived would print every such character as replacement
+    /// marks; these bytes wait here until the character is whole.
+    partial_character: Vec<u8>,
     /// The user's hardware breakpoints (the code addresses last set), kept so a step-over can
     /// re-arm them around its temporary return-address breakpoint.
     breakpoints: Vec<u32>,
@@ -123,6 +129,7 @@ impl<A: TargetAccess> DeviceBackend<A> {
             names,
             files,
             output: String::new(),
+            partial_character: Vec::new(),
             breakpoints: Vec::new(),
             comparators: None,
             entry,
@@ -555,12 +562,42 @@ impl<A: TargetAccess> DeviceBackend<A> {
         bl || blx
     }
 
-    /// Services a halt: if the core stopped at a semihosting `BKPT 0xAB`, captures a
-    /// `SYS_WRITE0` string into the output buffer, steps past it, resumes, and reports
-    /// `Some(true)` (keep running); a non-semihosting halt is `Some(false)` (a real
-    /// stop); a probe error is `None`.
+    /// Services a halt while the target runs free: when the core stopped at a semihosting call,
+    /// performs it and resumes, and goes on doing so while the core keeps stopping at one.
+    ///
+    /// `Some(true)` means the target is running again, `Some(false)` that it is halted for some
+    /// other reason -- a breakpoint -- and `None` a probe error.
+    ///
+    /// **A BURST, BECAUSE A CONSOLE LINE IS ONE CALL PER BYTE.** Handing each call back to the
+    /// adapter's poll would cost a poll interval per character. The target reaches its next call
+    /// far sooner than a probe round trip, so the next halt is usually already there to answer.
+    /// The burst is bounded so a program that prints without end still lets the session act.
     fn service_semihosting(&mut self) -> Option<bool> {
-        let string_bytes = {
+        for _ in 0..SEMIHOSTING_BURST {
+            if !self.perform_semihosting_call()? {
+                return Some(false);
+            }
+            self.probe.get_mut().resume().ok()?;
+            if !self.probe.get_mut().is_halted().ok()? {
+                return Some(true);
+            }
+        }
+        Some(true)
+    }
+
+    /// Performs the semihosting call the core is halted at, if it is halted at one: a `BKPT 0xAB`,
+    /// with the operation in `r0` and its argument in `r1`. What the call writes joins the
+    /// session's output, and the PC moves past the two-byte `BKPT`, which is what executing it
+    /// means. **The core is not resumed**, so a path that is stepping can go on stepping.
+    ///
+    /// `Some(true)` when a call was performed, `Some(false)` when the core is halted at anything
+    /// else, `None` on a probe error.
+    ///
+    /// `SYS_WRITEC` writes the one byte `r1` points at, and is what the runtime's console issues;
+    /// `SYS_WRITE0` writes the NUL-terminated string `r1` points at. Any other operation is stepped
+    /// past with nothing written.
+    fn perform_semihosting_call(&mut self) -> Option<bool> {
+        let written = {
             let probe = self.probe.get_mut();
             let pc = probe.read_core_reg(15).ok()?;
             let word = probe.read_word(pc & !3).ok()?;
@@ -572,32 +609,73 @@ impl<A: TargetAccess> DeviceBackend<A> {
             if halfword != 0xBEAB {
                 return Some(false);
             }
-            let bytes = if probe.read_core_reg(0).ok()? == 0x04 {
-                let mut addr = probe.read_core_reg(1).ok()?;
-                let mut collected = Vec::new();
-                while collected.len() < 4096 {
-                    let w = probe.read_word(addr & !3).ok()?;
-                    let byte = (w >> ((addr & 3) * 8)) as u8;
-                    if byte == 0 {
-                        break;
+            let read_byte = |probe: &mut A, address: u32| -> Option<u8> {
+                let word = probe.read_word(address & !3).ok()?;
+                Some((word >> ((address & 3) * 8)) as u8)
+            };
+            let argument = probe.read_core_reg(1).ok()?;
+            let written = match probe.read_core_reg(0).ok()? {
+                SYS_WRITEC => vec![read_byte(probe, argument)?],
+                SYS_WRITE0 => {
+                    let mut collected = Vec::new();
+                    let mut address = argument;
+                    while collected.len() < 4096 {
+                        let byte = read_byte(probe, address)?;
+                        if byte == 0 {
+                            break;
+                        }
+                        collected.push(byte);
+                        address = address.wrapping_add(1);
                     }
-                    collected.push(byte);
-                    addr = addr.wrapping_add(1);
+                    collected
                 }
-                Some(collected)
-            } else {
-                None
+                _ => Vec::new(),
             };
             probe.write_core_reg(15, pc.wrapping_add(2)).ok()?;
-            probe.resume().ok()?;
-            bytes
+            written
         };
-        if let Some(bytes) = string_bytes {
-            self.output.push_str(&String::from_utf8_lossy(&bytes));
-        }
+        self.append_console_bytes(&written);
         Some(true)
     }
+
+    /// Adds bytes the target wrote to the session's output, holding back the start of a character
+    /// that has not finished arriving.
+    fn append_console_bytes(&mut self, bytes: &[u8]) {
+        self.partial_character.extend_from_slice(bytes);
+        let pending = core::mem::take(&mut self.partial_character);
+        let mut rest: &[u8] = &pending;
+        loop {
+            match core::str::from_utf8(rest) {
+                Ok(text) => {
+                    self.output.push_str(text);
+                    return;
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    self.output
+                        .push_str(core::str::from_utf8(valid).unwrap_or_default());
+                    match error.error_len() {
+                        Some(length) => {
+                            self.output.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[length..];
+                        }
+                        None => {
+                            self.partial_character = after.to_vec();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
+
+/// Semihosting `SYS_WRITEC`: write the one byte `r1` points at.
+const SYS_WRITEC: u32 = 0x03;
+/// Semihosting `SYS_WRITE0`: write the NUL-terminated string `r1` points at.
+const SYS_WRITE0: u32 = 0x04;
+/// How many semihosting calls one poll answers before handing control back to the adapter.
+const SEMIHOSTING_BURST: usize = 256;
 
 impl<A: TargetAccess> DeviceBackend<A> {
     /// Runs the target at full speed to `target` -- a return address -- arming it as a temporary
@@ -635,24 +713,32 @@ impl<A: TargetAccess> DeviceBackend<A> {
         };
 
         if let Some(armed) = armed {
-            let probe = self.probe.get_mut();
-            if probe.set_breakpoints(&armed).is_err() {
+            if self.probe.get_mut().set_breakpoints(&armed).is_err() {
                 return Stop::Fault("arm return breakpoint".into());
             }
-            if probe.resume().is_err() {
+            if self.probe.get_mut().resume().is_err() {
                 return Stop::Fault("resume into call".into());
             }
             let mut halted = false;
             for _ in 0..1_000_000u32 {
-                match probe.is_halted() {
-                    Ok(true) => {
-                        halted = true;
-                        break;
-                    }
+                match self.probe.get_mut().is_halted() {
+                    Ok(true) => match self.perform_semihosting_call() {
+                        Some(true) => {
+                            if self.probe.get_mut().resume().is_err() {
+                                return Stop::Fault("resume after a semihosting call".into());
+                            }
+                        }
+                        Some(false) => {
+                            halted = true;
+                            break;
+                        }
+                        None => return Stop::Fault("semihosting service failed".into()),
+                    },
                     Ok(false) => {}
                     Err(_) => return Stop::Fault("poll halt".into()),
                 }
             }
+            let probe = self.probe.get_mut();
             let _ = probe.set_breakpoints(&self.breakpoints);
             if !halted {
                 let _ = probe.halt();
@@ -668,8 +754,14 @@ impl<A: TargetAccess> DeviceBackend<A> {
 
         const FALLBACK_STEP_LIMIT: u32 = 2048;
         for _ in 0..FALLBACK_STEP_LIMIT {
-            if self.probe.get_mut().step().is_err() {
-                return Stop::Fault("step in call".into());
+            match self.perform_semihosting_call() {
+                Some(true) => {}
+                Some(false) => {
+                    if self.probe.get_mut().step().is_err() {
+                        return Stop::Fault("step in call".into());
+                    }
+                }
+                None => return Stop::Fault("semihosting service failed".into()),
             }
             let pc = self.probe.get_mut().read_core_reg(15).unwrap_or(0) & !1;
             if pc == target {
@@ -875,6 +967,11 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     }
 
     fn step(&mut self) -> Stop {
+        match self.perform_semihosting_call() {
+            Some(true) => return Stop::Step,
+            Some(false) => {}
+            None => return Stop::Fault("semihosting service failed".into()),
+        }
         match self.probe.get_mut().step() {
             Ok(()) => Stop::Step,
             Err(_) => Stop::Fault("step failed".into()),

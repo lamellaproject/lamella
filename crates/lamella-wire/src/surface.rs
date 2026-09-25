@@ -54,6 +54,9 @@ pub const SPAN: u64 = 1 << 19;
 /// `System.ValueTuple<...>`, the eight generic structs that C# tuple types compile to. Requires
 /// [`GENERICS`].
 pub const TUPLES: u64 = 1 << 20;
+/// The .NET Core 2.0 members of types the base contract already carries: the rung above
+/// [`NETFX_4_5`].
+pub const NETCORE_2_0: u64 = 1 << 21;
 
 /// The era bits together, so "which generation was this built against" is one mask rather than four
 /// tests.
@@ -91,6 +94,7 @@ pub const NAMED: &[(u64, &str)] = &[
     (VARARGS, "LAMELLA_SURFACE_VARARGS"),
     (SPAN, "LAMELLA_SURFACE_SPAN"),
     (TUPLES, "LAMELLA_SURFACE_TUPLES"),
+    (NETCORE_2_0, "LAMELLA_SURFACE_NETCORE_2_0"),
 ];
 
 /// The bit a compilation symbol stands for, or `None` when this build does not name it.
