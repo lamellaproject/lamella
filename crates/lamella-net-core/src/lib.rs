@@ -93,6 +93,16 @@ pub trait NetBackend: core::fmt::Debug {
         sender_addr: &mut [u8],
     ) -> NetResult<(usize, usize, u16)>;
 
+    /// The largest datagram [`NetBackend::udp_recv_from`] can deliver on `socket`, so a receive buffer
+    /// this large never truncates one.
+    ///
+    /// The default, 65,536 bytes, holds every UDP payload. A backend whose receive buffers are smaller
+    /// answers their size, and a caller then holds that much instead of 64 KiB for datagrams that can
+    /// never arrive -- which on a microcontroller is most of its memory.
+    fn udp_max_datagram(&mut self, _socket: SocketHandle) -> usize {
+        65_536
+    }
+
     /// The local port a socket/listener is bound to, or `None`.
     fn local_port(&mut self, socket: SocketHandle) -> Option<u16>;
 

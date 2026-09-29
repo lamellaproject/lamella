@@ -646,11 +646,25 @@ pub fn run_program_with(
         Ok(Some(Value::Int32(code))) => code,
         Ok(_) => 0,
         Err(trap) => {
-            stdout.push_str(&format!("TRAP: {trap}"));
+            push_line(&mut stdout, &format!("TRAP: {trap}"));
             TRAP_EXIT
         }
     };
     RunResult { exit, stdout }
+}
+
+/// Append `line` to `output` as a line of its own: after a newline when the output so far stops
+/// mid-line, and ending in one.
+///
+/// A report of how a run ended is read as a line. A host that prints a note after the output points
+/// at a `TRAP:` line above it, and a report glued to a partial line, or left without its newline at
+/// the end of the output, is not a line a reader can find there.
+fn push_line(output: &mut String, line: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(line);
+    output.push('\n');
 }
 
 fn failure(reason: &str) -> RunResult {
@@ -1594,7 +1608,7 @@ fn fault(
 ) -> Result<RunResult, TransportError> {
     send_output(transport, debug::output::STDERR, text)?;
     let mut stdout = String::from_utf16_lossy(vm.output());
-    stdout.push_str(text);
+    push_line(&mut stdout, text);
     Ok(RunResult { exit: 70, stdout })
 }
 
@@ -4049,6 +4063,17 @@ mod headroom_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trap's report is a line of its own wherever the output before it stopped: on a fresh line
+    /// after a partial one, and ending in a newline.
+    #[test]
+    fn a_trap_report_is_a_line_of_its_own() {
+        for (before, after) in [("", "TRAP: x\n"), ("partial", "partial\nTRAP: x\n"), ("whole\n", "whole\nTRAP: x\n")] {
+            let mut output = String::from(before);
+            push_line(&mut output, "TRAP: x");
+            assert_eq!(output, after, "after {before:?}");
+        }
+    }
 
     /// The LIVE agent's refusals, the shape of them, and the one that is a bounds check.
     ///

@@ -1,5 +1,6 @@
-# PARTS table for the stm32u585 family. Pin lists are PARTIAL present-lists: they carry the pins the
-# boards reach, so a consumer must not read one as the package.
+# PARTS table for the stm32u585 family. Its `pins` lists are partial: each names the pins checked
+# against the datasheet's pinout, not the whole package, so a consumer must not read one as the
+# package. A pin that is not listed is refused rather than assumed.
 #
 # WHY THIS FAMILY IS NAMED FOR A PART AND NOT FOR THE SERIES. A family owns ONE reference manual
 # AND one pin-function table, and for this vendor's U5 those two halves disagree. RM0456 is titled for

@@ -3047,9 +3047,9 @@ fn peel_ref(expression: &Expression) -> &Expression {
 ///
 /// **THE EXPRESSION MUST BE EXACTLY A `yield`, NOT MERELY CONTAIN ONE.** `yield x` splits;
 /// `(yield x) + 1` does not, because the addition's right operand is evaluated after the
-/// suspension while its left is the suspension's own result -- which needs a temporary this slice
-/// does not allocate. A caller that reaches here with anything else gets it back unchanged, and
-/// the leftover check in [`classify`] then refuses the statement.
+/// suspension while its left is the suspension's own result -- which needs a temporary this
+/// transform does not allocate. A caller that reaches here with anything else gets it back
+/// unchanged, and the leftover check in [`classify`] then refuses the statement.
 fn split_value(
     expression: Expression,
     diagnostics: &mut Diagnostics,

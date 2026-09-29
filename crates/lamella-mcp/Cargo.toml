@@ -26,6 +26,9 @@ lamella-catalog = { path = "../lamella-catalog" }
 lamella-flash-routes = { path = "../lamella-flash-routes" }
 lamella-flash-backend = { path = "../lamella-flash-backend" }
 lamella-bsp-gen = { path = "../lamella-bsp-gen" }
+# The interpreter's machine, named so the process that runs a `lamella_run` program can bound what
+# that program may hold (its live objects and its console) through the engine's configure hook.
+lamella-cil-runtime = { path = "../lamella-cil-runtime" }
 # JSON-RPC 2.0 framing, the DAP JSON, and the embedded tool contract. serde_json only -- no tokio, no MCP SDK.
 serde_json = "1"
 

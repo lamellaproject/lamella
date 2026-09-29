@@ -1,0 +1,16 @@
+[package]
+name = "lamella-wifi-images"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Wi-Fi radio firmware images, downloaded at build time from their publishers at pinned commits and checked against pinned SHA-256 hashes, with none kept in the repository; today these are the CYW43439's, for the Raspberry Pi Pico 2 W and the Pimoroni Pico Plus 2 W."
+publish = false
+
+[dependencies]
+# The one SHA-256 in the tree: two implementations of a hash disagreeing would be silent.
+lamella-pe = { path = "../lamella-pe" }
+
+[lints]
+workspace = true

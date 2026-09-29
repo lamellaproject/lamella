@@ -1,5 +1,6 @@
-# PARTS table for the stm32h7 family. Pin lists are PARTIAL present-lists: they carry the pins the
-# boards reach, so a consumer must not read one as the package.
+# PARTS table for the stm32h7 family. Its `pins` lists are partial: each names the pins checked
+# against the datasheet's pinout, not the whole package, so a consumer must not read one as the
+# package. A pin that is not listed is refused rather than assumed.
 #
 # THE FAMILY NAME IS NARROWER THAN IT LOOKS, and saying so is the point of this paragraph. A
 # family here owns ONE reference manual and one pin-function table. RM0399's introduction states
@@ -117,8 +118,8 @@ pins = [
 # settles what they are: "Pxy_C and Pxy pins/balls are two separate pads (analog switch open)",
 # closed through a SYSCFG register. A pin name here is a port letter and an index, so PA0_C parses
 # as no pin at all, and writing PA0 in its place would name a different ball that this package also
-# carries. `reserved` cannot hold them either -- a reservation must name a pin the present-list
-# already carries, and the present-list cannot carry a name it cannot parse. Naming an analog-only
+# carries. `reserved` cannot hold them either -- a reservation must name a pin the `pins` list
+# already carries, and the `pins` list cannot carry a name it cannot parse. Naming an analog-only
 # pad is a schema question rather than a transcription, and none of the four is stated below.
 cores = { cm7 = ["cortex-m7f"], cm4 = ["cortex-m4f"] }
 cores_share_memory = true

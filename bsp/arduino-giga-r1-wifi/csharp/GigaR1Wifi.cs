@@ -1,5 +1,5 @@
 // Lamella.Boards.Arduino.GigaR1Wifi -- the Arduino GIGA R1 WiFi (STM32H747XI): the generated
-// board literals lifted into the shapes a consumer uses.
+// board literals in the shapes a consumer uses.
 using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;

@@ -36,7 +36,7 @@ namespace Lamella.Boards.Arduino
 
         /// <summary>The indicator above the user button, fitted only on the WiFi variant.</summary>
         /// <remarks>The board file records no asserted level for this line, so there is no polarity
-        /// constant to lift and none is invented here. The four FACEPLATE status LEDs are a
+        /// constant to read and none is invented here. The four FACEPLATE status LEDs are a
         /// different thing and have no pin at all -- they sit behind a SPI bus, which is why this
         /// class offers no property for them and a program reaching for one does not compile.</remarks>
         public static readonly int UserLedPin =

@@ -913,6 +913,12 @@ fn emit_zero_band(
 /// The entry symbol every object path names: the program's function 0.
 #[cfg(feature = "linked")]
 const LINKED_ENTRY_SYMBOL: &str = "f0";
+/// The board's startup hook: the function a board build's runtime archive defines to bring its part
+/// up, such as applying the board's clock plan and starting its timebase, before managed code runs.
+/// A linked startup calls it when the link kept one; an archive that defines none builds exactly the
+/// image it built before.
+#[cfg(feature = "linked")]
+const BOARD_INIT_SYMBOL: &str = "lamella_board_init";
 /// The bump allocator's cursor word: the fixed address the runtime-support archive reads, with its
 /// limit in the word directly above it.
 #[cfg(feature = "linked")]
@@ -984,37 +990,78 @@ pub fn build_linked_cortex_m_with_libraries(
     archive: &[u8],
     target: &str,
 ) -> Result<Vec<u8>, BuildError> {
-    let initial_sp = nordic_initial_sp(target)?;
-    let (program_object, deferred) = build_linked_program_object(cil, corlib, libraries, None)?;
-    link_nordic_image(initial_sp, &program_object, deferred, corlib, libraries, archive)
-        .map(|(image, _)| image)
+    let part = linked_part(target)?;
+    let (program_object, deferred) =
+        build_linked_program_object(cil, corlib, libraries, None, part.wide())?;
+    link_linked_image(part, &program_object, deferred, corlib, libraries, archive).map(|(image, _)| image)
 }
 
-/// The linked tier's parts, each with the stack top its boot image starts from.
+/// The linked tier's Nordic parts, each with the stack top its boot image starts from.
 ///
 /// **A PART IS A ROW HERE, NOT A SECOND PIPELINE.** Everything after the stack top is the same
-/// for every row, so a part the linked tier gains is a row and the RAM plan behind it.
+/// for every row, so a Nordic part the linked tier gains is a row and the RAM plan behind it.
 #[cfg(feature = "linked")]
 const NORDIC_LINKED_PARTS: &[(&str, u32)] = &[("nrf52833", 0x2002_0000), ("microbit", 0x2000_4000)];
 
-/// The stack top of `target`'s boot image, or [`BuildError::UnsupportedTarget`] for a target the
-/// linked tier has no row for.
+/// A part the linked tier builds for: which boot image wraps the link, where the text is linked,
+/// and how the objects are encoded.
+#[cfg(feature = "linked")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkedPart {
+    /// A Nordic part: the vector table at address 0, and the stack top its boot image starts from.
+    Nordic { initial_sp: u32 },
+    /// The RP2350 (Cortex-M33): XIP flash at `0x1000_0000`, and objects built WIDE, as Thumb-2 --
+    /// the encoding the RP2350 harness proved on silicon, and the one a far branch or a long
+    /// literal needs where Thumb-1 would refuse the method.
+    Rp2350,
+}
+
+#[cfg(feature = "linked")]
+impl LinkedPart {
+    /// Whether this part's objects are built as Thumb-2.
+    fn wide(self) -> bool {
+        matches!(self, LinkedPart::Rp2350)
+    }
+
+    /// Where the link places the text, which is also what every RAM symbol in the link is recorded
+    /// relative to.
+    fn text_base(self) -> u32 {
+        match self {
+            LinkedPart::Nordic { .. } => NORDIC_TEXT_BASE,
+            LinkedPart::Rp2350 => RP2350_CODE_BASE,
+        }
+    }
+
+    /// Where the image is loaded: its first byte's address.
+    fn image_base(self) -> u32 {
+        match self {
+            LinkedPart::Nordic { .. } => NORDIC_IMAGE_BASE,
+            LinkedPart::Rp2350 => RP2350_CODE_REGION,
+        }
+    }
+}
+
+/// The part `target` names, or [`BuildError::UnsupportedTarget`] for a target the linked tier has no
+/// row for.
 ///
 /// Asked BEFORE any object is built, so an unsupported target is the answer even for a program
 /// that would also have failed to lower.
 #[cfg(feature = "linked")]
-fn nordic_initial_sp(target: &str) -> Result<u32, BuildError> {
+fn linked_part(target: &str) -> Result<LinkedPart, BuildError> {
+    if target == "rp2350" {
+        return Ok(LinkedPart::Rp2350);
+    }
     NORDIC_LINKED_PARTS
         .iter()
         .find(|(part, _)| *part == target)
-        .map(|&(_, initial_sp)| initial_sp)
+        .map(|&(_, initial_sp)| LinkedPart::Nordic { initial_sp })
         .ok_or(BuildError::UnsupportedTarget)
 }
 
-/// Links a lowered PROGRAM object into a Nordic boot image: corlib's object and each user
-/// library's beside it, the runtime-support `archive` on demand, dead-stripped, linked at
-/// [`NORDIC_TEXT_BASE`] and wrapped by [`nordic_linked_image`]. Returns the image and the link it
-/// was cut from.
+/// Links a lowered PROGRAM object into `part`'s boot image: corlib's object and each user library's
+/// beside it, the runtime-support `archive` on demand, dead-stripped, linked at the part's text base
+/// and wrapped by [`nordic_linked_image`] or [`rp2350_linked_image`]. Returns the image and the link
+/// it was cut from.
 ///
 /// `deferred` is what [`build_linked_program_object`] deferred while building the program object,
 /// and the link refuses it on the same terms as the libraries' own ([`reachable_objects`]).
@@ -1023,26 +1070,73 @@ fn nordic_initial_sp(target: &str) -> Result<u32, BuildError> {
 /// in how the program object was built, so everything after that is here once -- and a caller that
 /// wants the link's debug sections takes them from the same link as the bytes.
 #[cfg(feature = "linked")]
-fn link_nordic_image(
-    initial_sp: u32,
+fn link_linked_image(
+    part: LinkedPart,
     program_object: &[u8],
     deferred: Vec<DeferredBody>,
     corlib: &[u8],
     libraries: &[&[u8]],
     archive: &[u8],
 ) -> Result<(Vec<u8>, lamella_linker::LinkedImage), BuildError> {
-    let trimmed = reachable_objects(program_object, deferred, corlib, libraries)?;
+    let trimmed = reachable_objects(program_object, deferred, corlib, libraries, part.wide())?;
     let support = lamella_elf::read_archive(archive)
         .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
-    let linked = link_product_image(&trimmed, &[support], LINKED_ENTRY_SYMBOL, Some(NORDIC_TEXT_BASE))
+    let linked = link_product_image(&trimmed, &[support], LINKED_ENTRY_SYMBOL, Some(part.text_base()))
         .map_err(BuildError::Link)?;
-    let image = nordic_linked_image(
-        initial_sp,
-        linked.entry_offset,
-        &linked.text,
-        nordic_zero_end(&linked),
-    );
+    let statics_end = linked_statics_end(&linked, part.text_base());
+    let board_init = linked_board_init(&linked, part.text_base());
+    let image = match part {
+        LinkedPart::Nordic { initial_sp } => nordic_linked_image(
+            initial_sp,
+            linked.entry_offset,
+            &linked.text,
+            statics_end.map_or(NORDIC_STATICS_BASE, |end| end.max(NORDIC_STATICS_BASE)),
+            board_init,
+        ),
+        LinkedPart::Rp2350 => rp2350_linked_image(
+            linked.entry_offset,
+            &linked.text,
+            statics_end.unwrap_or(RP2350_HEAP_BASE),
+            board_init,
+        ),
+    };
     Ok((image, linked))
+}
+
+/// The address a startup calls to run the board's startup hook ([`BOARD_INIT_SYMBOL`]), with the
+/// Thumb bit set, or `None` for a link that kept none, which is every link but a board build's.
+/// `text_base` is the part's, because the link records a function as its offset into the text.
+#[cfg(feature = "linked")]
+fn linked_board_init(linked: &lamella_linker::LinkedImage, text_base: u32) -> Option<u32> {
+    linked
+        .symbols
+        .iter()
+        .find(|(name, _)| name == BOARD_INIT_SYMBOL)
+        .map(|&(_, offset)| (text_base + offset) | 1)
+}
+
+/// Emits the call to the board's startup hook at `hook`, the address [`linked_board_init`] found,
+/// and returns the literal the call loads for the caller to place in its pool. With no hook it emits
+/// nothing, so the startup is byte for byte the one an image without a board gets.
+///
+/// **ONE COPY FOR EVERY LINKED STARTUP**, for the reason [`emit_zero_band`] is one: a part that gains
+/// a board build gets the call from here, not from whichever startup first needed it.
+///
+/// **THE CALLER PLACES IT AFTER THE CLEAR AND BEFORE THE ENTRY.** A hook may keep its state in
+/// zero-initialized statics, which live in the band the clear zeroes, so a clear after the call
+/// would undo what the hook had just set up. And the program's first line runs on the clocks the
+/// hook applied.
+#[cfg(feature = "linked")]
+fn emit_board_init_call(
+    enc: &mut lamella_asm_arm32::Encoder,
+    hook: Option<u32>,
+) -> Option<(lamella_asm_arm32::Label, u32)> {
+    use lamella_asm_arm32::Reg;
+    let hook = hook?;
+    let hook_word = enc.new_label();
+    enc.ldr_literal(Reg::R0, hook_word).unwrap();
+    enc.blx(Reg::R0);
+    Some((hook_word, hook))
 }
 
 /// The program's object with corlib's and each user library's beside it, dead-stripped to what the
@@ -1064,23 +1158,60 @@ fn reachable_objects(
     mut deferred: Vec<DeferredBody>,
     corlib: &[u8],
     libraries: &[&[u8]],
+    wide: bool,
 ) -> Result<Vec<lamella_elf::Object>, BuildError> {
     let read = |bytes: &[u8]| {
         lamella_elf::read_object(bytes).map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))
     };
-    let (corlib_object, corlib_deferred) = build_library_object_deferring(corlib, &[])?;
+    let (corlib_object, corlib_deferred, mut seam_edges) =
+        build_library_object_deferring(corlib, &[], wide)?;
     deferred.extend(corlib_deferred);
     let mut objects = alloc::vec![read(program_object)?, read(&corlib_object)?];
     for (i, library) in libraries.iter().enumerate() {
         let mut references: Vec<&[u8]> = alloc::vec![corlib];
         references.extend_from_slice(&libraries[..i]);
-        let (object, library_deferred) = build_library_object_deferring(library, &references)?;
+        let (object, library_deferred, library_edges) =
+            build_library_object_deferring(library, &references, wide)?;
         objects.push(read(&object)?);
         deferred.extend(library_deferred);
+        seam_edges.extend(library_edges);
     }
     let trimmed = lamella_linker::garbage_collect(&objects, LINKED_ENTRY_SYMBOL);
     refuse_reached_deferred_bodies(&trimmed, &deferred)?;
+    refuse_reached_silent_seam_edges(&trimmed, &seam_edges)?;
     Ok(trimmed)
+}
+
+/// Refuses a dead-stripped link that still defines the caller of a library's own call into one of
+/// its silent seams, naming the first such caller and seam and counting them: the program reaches a
+/// placeholder that answers a constant through the library's own code, which no single assembly's
+/// build can see, because a library is built before the program that decides what it reaches.
+///
+/// A seam kept only by a vtable or itable slot is not refused here: a kept table keeps every slot,
+/// called or not, so the dead-strip cannot say whether the program dispatches to it.
+#[cfg(feature = "linked")]
+fn refuse_reached_silent_seam_edges(
+    trimmed: &[lamella_elf::Object],
+    edges: &[LibrarySeamEdge],
+) -> Result<(), BuildError> {
+    let kept: alloc::collections::BTreeSet<&str> = trimmed
+        .iter()
+        .flat_map(|object| &object.symbols)
+        .filter(|symbol| symbol.defined)
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    let reached: Vec<&LibrarySeamEdge> = edges
+        .iter()
+        .filter(|edge| kept.contains(edge.symbol.as_str()))
+        .collect();
+    match reached.first() {
+        Some(first) => Err(BuildError::SilentSeamCallEdge {
+            caller: first.caller.clone(),
+            seam: first.seam.clone(),
+            total: reached.len(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Refuses a dead-stripped link that still defines a deferred method's symbol, naming the first such
@@ -1110,8 +1241,9 @@ fn refuse_reached_deferred_bodies(
     }
 }
 
-/// Where the Nordic startup stops clearing RAM: the end of the statics window as THIS link laid it
-/// out, and never below the top of the heap band the startup also owns.
+/// Where the statics end as THIS link laid them out -- an absolute address rounded up to a word, or
+/// `None` for a link that placed no statics -- which each part's startup clears up to. `text_base` is
+/// the part's, because every RAM symbol in a link is recorded relative to it.
 ///
 /// **THE LINKER REPORTS THE EXTENT, SO THE STARTUP DOES NOT RESTATE IT.** Everything the image keeps
 /// in RAM between the heap and the stack is placed by the linker -- the managed statics and every
@@ -1120,14 +1252,13 @@ fn refuse_reached_deferred_bodies(
 /// with the archive by reading its source. A link that placed no statics at all defines no end, and
 /// then the heap band is the whole of what needs clearing.
 #[cfg(feature = "linked")]
-fn nordic_zero_end(linked: &lamella_linker::LinkedImage) -> u32 {
+fn linked_statics_end(linked: &lamella_linker::LinkedImage, text_base: u32) -> Option<u32> {
     linked
         .symbols
         .iter()
         .find(|(name, _)| name == lamella_elf::STATICS_END_SYMBOL)
-        .map(|(_, value)| value.wrapping_add(NORDIC_TEXT_BASE))
-        .map_or(NORDIC_STATICS_BASE, |end| end.max(NORDIC_STATICS_BASE))
-        .next_multiple_of(4)
+        .map(|(_, value)| value.wrapping_add(text_base))
+        .map(|end| end.next_multiple_of(4))
 }
 
 /// Where a Nordic boot image is loaded: its vector table is the bottom of flash, which is address
@@ -1140,7 +1271,7 @@ const NORDIC_IMAGE_BASE: u32 = 0;
 ///
 /// **THE PRODUCT'S OWN PIPELINE, SO THE DEBUG INFORMATION DESCRIBES THE IMAGE IT ARRIVES WITH.** The
 /// program object is the one the product builds with its debug sections added, and it is linked by
-/// the same [`link_nordic_image`] -- so the debug information is relocated by the link that placed
+/// the same [`link_linked_image`] -- so the debug information is relocated by the link that placed
 /// the code, and every address it names is an address in the image. A table built while lowering
 /// could not promise that: the link moves code and drops what nothing reaches.
 ///
@@ -1160,11 +1291,10 @@ pub fn build_linked_cortex_m_debug(
     archive: &[u8],
     target: &str,
 ) -> Result<Vec<u8>, BuildError> {
-    let initial_sp = nordic_initial_sp(target)?;
+    let part = linked_part(target)?;
     let (program_object, deferred) =
-        build_linked_program_object(cil, corlib, libraries, Some(pdb))?;
-    let (image, linked) =
-        link_nordic_image(initial_sp, &program_object, deferred, corlib, libraries, archive)?;
+        build_linked_program_object(cil, corlib, libraries, Some(pdb), part.wide())?;
+    let (image, linked) = link_linked_image(part, &program_object, deferred, corlib, libraries, archive)?;
     let program = lamella_elf::read_object(&program_object)
         .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
     let sections: Vec<(&str, &[u8])> = linked
@@ -1178,8 +1308,8 @@ pub fn build_linked_cortex_m_debug(
     Ok(lamella_elf::write_debuggable_executable(
         lamella_elf::Machine::Arm,
         &image,
-        NORDIC_TEXT_BASE + linked.entry_offset,
-        NORDIC_IMAGE_BASE,
+        part.text_base() + linked.entry_offset,
+        part.image_base(),
         true,
         &sections,
     ))
@@ -1201,6 +1331,11 @@ pub fn build_linked_cortex_m_debug(
 /// `text_base` is the caller's, because placement is a per-tier decision and does not change the
 /// size. The STATICS WINDOW is not the caller's: it is the product's RAM plan, and a ledger that
 /// passed its own copy of it would be the same second opinion one argument further in.
+///
+/// **THE BOARD'S STARTUP HOOK IS A ROOT OF THIS LINK** ([`BOARD_INIT_SYMBOL`]). Only the startup
+/// calls it, and the startup is assembled around the link rather than linked, so nothing the link
+/// sees references it: without the root, a board build's archive would never be searched for it,
+/// and the dead-strip would drop it. An archive that defines no hook links exactly as it did.
 #[cfg(feature = "linked")]
 pub fn link_product_image(
     trimmed: &[lamella_elf::Object],
@@ -1212,6 +1347,7 @@ pub fn link_product_image(
         trimmed,
         archives,
         entry,
+        &[BOARD_INIT_SYMBOL],
         text_base,
         (NORDIC_STATICS_BASE, NORDIC_STATICS_BYTES),
     )
@@ -1220,13 +1356,15 @@ pub fn link_product_image(
 /// Wraps LINKED text in a Nordic boot image: `[initial SP][reset -> the startup]`, the startup, then
 /// the text at [`NORDIC_TEXT_BASE`].
 ///
-/// **The startup is the whole of this part's crt0, and it does three things in this order.** It
+/// **The startup is the whole of this part's crt0, and it does three things in this order**, four
+/// in a board build. It
 /// CLEARS `[NORDIC_HEAP_PTR, zero_end)` -- the allocator's cursor words, the heap band, and the
-/// statics window up to the end the LINKER reported ([`nordic_zero_end`]). That window holds the
+/// statics window up to the end the LINKER reported ([`linked_statics_end`]). That window holds the
 /// managed statics, whose word 0 is the VES-global exception tag every call site tests on return,
 /// and every zero-initialized static of the runtime archive -- its scheduler, whose `current` every
 /// allocation reads, among them. Then it seeds the cursor and its limit, which the archive stops on
-/// rather than bumping past. Then it enters the entry.
+/// rather than bumping past. In a board build it then calls the board's startup hook
+/// ([`emit_board_init_call`]). Then it enters the entry.
 ///
 /// **The order is load-bearing: the clear covers the cursor words, so seeding first would zero the
 /// seed.** And the clear is not optional on a part -- SRAM powers up undefined, there is no crt0 on
@@ -1241,7 +1379,13 @@ pub fn link_product_image(
 /// rather than escalated -- which matters because the linked tier is no more immune to undefined RAM
 /// than the flat one, only better supplied.
 #[cfg(feature = "linked")]
-fn nordic_linked_image(initial_sp: u32, entry_offset: u32, text: &[u8], zero_end: u32) -> Vec<u8> {
+fn nordic_linked_image(
+    initial_sp: u32,
+    entry_offset: u32,
+    text: &[u8],
+    zero_end: u32,
+    board_init: Option<u32>,
+) -> Vec<u8> {
     use lamella_asm_arm32::{Encoder, Reg};
     let mut enc = Encoder::new();
     let zero_start_word = enc.new_label();
@@ -1260,6 +1404,7 @@ fn nordic_linked_image(initial_sp: u32, entry_offset: u32, text: &[u8], zero_end
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
     enc.ldr_literal(Reg::R0, heap_limit_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    let board_init_word = emit_board_init_call(&mut enc, board_init);
     enc.ldr_literal(Reg::R0, entry_word).unwrap();
     enc.blx(Reg::R0);
     let park = enc.new_label();
@@ -1284,6 +1429,10 @@ fn nordic_linked_image(initial_sp: u32, entry_offset: u32, text: &[u8], zero_end
     enc.emit_word(NORDIC_FAULT_MAGIC);
     enc.bind_label(entry_word);
     enc.emit_word((NORDIC_TEXT_BASE + entry_offset) | 1);
+    if let Some((label, hook)) = board_init_word {
+        enc.bind_label(label);
+        enc.emit_word(hook);
+    }
     let stub = enc
         .finish()
         .expect("the nordic linked startup assembles")
@@ -1389,6 +1538,30 @@ pub const RP2040_BOOT2_PAYLOAD: usize = 252;
 #[cfg(feature = "arm32")]
 pub const RP2040_VECTOR_BASE: u32 = 0x1000_0100;
 
+/// The bottom of the RP2350's XIP flash: the bootrom boots the vector table here once it has validated
+/// the IMAGE_DEF block, and every RP2350 image, flat or linked, is loaded here.
+#[cfg(feature = "arm32")]
+const RP2350_CODE_REGION: u32 = 0x1000_0000;
+/// Where an RP2350 image's program text begins, flat or linked: past the vector table, the IMAGE_DEF
+/// block and the startup.
+#[cfg(feature = "arm32")]
+const RP2350_CODE_BASE: u32 = RP2350_CODE_REGION + 0x100;
+/// Top of the RP2350's 512 KB main SRAM; the stack descends from here.
+#[cfg(feature = "arm32")]
+const RP2350_SP_TOP: u32 = 0x2008_0000;
+/// The heap cursor word -- the fixed address runtime-support reads -- with the heap's end beside it.
+#[cfg(feature = "arm32")]
+const RP2350_HEAP_PTR: u32 = 0x2000_0100;
+/// The RP2350 heap's floor: above the statics window and the runtime archive's own statics.
+#[cfg(feature = "arm32")]
+const RP2350_HEAP_BASE: u32 = 0x2001_0000;
+/// How many bytes of heap an RP2350 image prepares.
+#[cfg(feature = "arm32")]
+const RP2350_HEAP_BYTES: u32 = 0x1_0000;
+/// The PICOBIN IMAGE_DEF block the bootrom validates: a self-looping Arm RP2350 EXE, no signing.
+#[cfg(feature = "arm32")]
+const RP2350_IMAGE_DEF: [u32; 5] = [0xffff_ded3, 0x1021_0142, 0x0000_01ff, 0x0000_0000, 0xab12_3579];
+
 /// RP2350 (Pico 2 / Pico 2 W) result mailbox: the `rp2350` boot stub stamps `[magic][return value]`
 /// near the top of SRAM, read over SWD WITHOUT halting the core (the flasher's `rp2350-peek`, or the
 /// browser's MEM-AP reads) to confirm the image ran and recover the entry's return value.
@@ -1419,20 +1592,15 @@ pub const RP2350_DONE_MAGIC: u32 = 0x4C41_4D44;
 #[cfg(feature = "arm32")]
 pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     use lamella_asm_arm32::{Encoder, Reg};
-    /// XIP flash base: the bootrom boots the vector table here after validating IMAGE_DEF.
-    const CODE_REGION: u32 = 0x1000_0000;
-    /// Link base for the program text, after the vector table + IMAGE_DEF + reset stub region.
-    const CODE_BASE: u32 = CODE_REGION + 0x100;
-    /// Top of the 512 KB main SRAM; the stack descends from here.
-    const SP_TOP: u32 = 0x2008_0000;
-    /// The bump allocator's high-water pointer word -- the fixed address runtime-support uses.
-    const HEAP_PTR: u32 = 0x2000_0100;
-    /// The bump heap grows up from here -- above the statics window + the archive's static band.
-    const HEAP_BASE: u32 = 0x2001_0000;
+    const CODE_REGION: u32 = RP2350_CODE_REGION;
+    const CODE_BASE: u32 = RP2350_CODE_BASE;
+    const SP_TOP: u32 = RP2350_SP_TOP;
+    const HEAP_PTR: u32 = RP2350_HEAP_PTR;
+    const HEAP_BASE: u32 = RP2350_HEAP_BASE;
     /// The stub ZEROES [ZERO_START, ZERO_END) before managed code runs: power-on RAM is garbage on
     /// real silicon (the statics window's word 0 is the EH tag; garbage there HardFaults startup).
-    const ZERO_START: u32 = 0x2000_0100;
-    const ZERO_END: u32 = HEAP_BASE + 0x1_0000;
+    const ZERO_START: u32 = RP2350_HEAP_PTR;
+    const ZERO_END: u32 = HEAP_BASE + RP2350_HEAP_BYTES;
     /// One past the last byte the bump allocator may hand out -- the archive stops the program with
     /// `HEAPFULL` rather than bumping past it, and a zero here means "no heap", so seeding it is not
     /// optional.
@@ -1443,8 +1611,7 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     /// guarantees that. Handing out memory this stub never cleared would seed live objects from
     /// power-on garbage -- which on a mark-compact heap is a wrong ROOT, not merely a wrong value.
     const HEAP_LIMIT: u32 = ZERO_END;
-    /// The PICOBIN IMAGE_DEF block the bootrom validates: a self-looping Arm RP2350 EXE, no signing.
-    const IMAGE_DEF: [u32; 5] = [0xffff_ded3, 0x1021_0142, 0x0000_01ff, 0x0000_0000, 0xab12_3579];
+    const IMAGE_DEF: [u32; 5] = RP2350_IMAGE_DEF;
 
     let entry_addr = (CODE_BASE + entry_offset) | 1;
     const FAULT_OFF: u32 = 16 * 4 + 5 * 4;
@@ -1528,6 +1695,125 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     enc.emit_bytes(&vec![0u8; pad]);
     enc.emit_bytes(code);
     enc.finish().unwrap().bytes
+}
+
+/// The RP2350 image for the LINKED tier: [`rp2350_boot_image`]'s layout -- the vector table and the
+/// IMAGE_DEF block at the bottom of XIP flash, the startup, the text at `0x1000_0100` and the verdict
+/// mailbox at [`RP2350_RESULT_ADDR`] -- with four things a linked image needs.
+///
+/// * **The RAM plan is driven by the link.** `statics_end` is where the linker says the statics end,
+///   the runtime archive's own included. The heap starts at the higher of `0x2001_0000` and that end,
+///   and the startup zeroes everything from the heap cursor to the heap's end, so no static and no
+///   heap byte is read before it has been cleared.
+/// * **A fault leaves a record**, as a Nordic image's does: the stacked PC and LR at `0x2000_0000`,
+///   then a magic, all readable over SWD without halting the core.
+/// * **The mailbox's result word is cleared at boot**, so a reading can never show the previous
+///   image's answer beside this image's boot magic.
+/// * **A board build's startup hook runs before the entry** ([`emit_board_init_call`]), after the
+///   clear and after the boot magic is stamped, so a hook that never returns reads as "booted, not
+///   returned" and never as the verdict the previous image left.
+#[cfg(feature = "linked")]
+fn rp2350_linked_image(
+    entry_offset: u32,
+    text: &[u8],
+    statics_end: u32,
+    board_init: Option<u32>,
+) -> Vec<u8> {
+    use lamella_asm_arm32::{Encoder, Reg};
+    const STUB_OFF: u32 = 16 * 4 + 5 * 4;
+    let heap_base = statics_end.next_multiple_of(8).max(RP2350_HEAP_BASE);
+    let heap_limit = heap_base + RP2350_HEAP_BYTES;
+    assert!(heap_limit <= RP2350_RESULT_ADDR, "the RP2350 heap must end below the verdict mailbox");
+
+    let mut enc = Encoder::new();
+    let vtor_word = enc.new_label();
+    let region_word = enc.new_label();
+    let record_word = enc.new_label();
+    let fault_magic_word = enc.new_label();
+    let zero_start_word = enc.new_label();
+    let zero_end_word = enc.new_label();
+    let heap_ptr_word = enc.new_label();
+    let heap_base_word = enc.new_label();
+    let heap_limit_word = enc.new_label();
+    let boot_magic_word = enc.new_label();
+    let done_magic_word = enc.new_label();
+    let result_word = enc.new_label();
+    let result_hi_word = enc.new_label();
+    let entry_word = enc.new_label();
+    enc.ldr_literal(Reg::R0, region_word).unwrap();
+    enc.ldr_literal(Reg::R1, vtor_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    emit_fault_record_clear(&mut enc, record_word);
+    emit_zero_band(&mut enc, zero_start_word, zero_end_word);
+    enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
+    enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, heap_limit_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    enc.ldr_literal(Reg::R0, boot_magic_word).unwrap();
+    enc.ldr_literal(Reg::R1, result_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.movs_imm(Reg::R0, 0).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    let board_init_word = emit_board_init_call(&mut enc, board_init);
+    enc.ldr_literal(Reg::R0, entry_word).unwrap();
+    enc.blx(Reg::R0);
+    enc.ldr_literal(Reg::R1, result_hi_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, done_magic_word).unwrap();
+    enc.ldr_literal(Reg::R1, result_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    let park = enc.new_label();
+    enc.bind_label(park);
+    enc.b(park);
+    let fault_offset = enc.position();
+    emit_fault_handler(&mut enc, record_word, fault_magic_word);
+    enc.align_to_word();
+    for (label, word) in [
+        (vtor_word, SCB_VTOR),
+        (region_word, RP2350_CODE_REGION),
+        (record_word, NORDIC_FAULT_RECORD),
+        (fault_magic_word, NORDIC_FAULT_MAGIC),
+        (zero_start_word, RP2350_HEAP_PTR),
+        (zero_end_word, heap_limit),
+        (heap_ptr_word, RP2350_HEAP_PTR),
+        (heap_base_word, heap_base),
+        (heap_limit_word, heap_limit),
+        (boot_magic_word, RP2350_BOOT_MAGIC),
+        (done_magic_word, RP2350_DONE_MAGIC),
+        (result_word, RP2350_RESULT_ADDR),
+        (result_hi_word, RP2350_RESULT_ADDR + 4),
+        (entry_word, (RP2350_CODE_BASE + entry_offset) | 1),
+    ] {
+        enc.bind_label(label);
+        enc.emit_word(word);
+    }
+    if let Some((label, hook)) = board_init_word {
+        enc.bind_label(label);
+        enc.emit_word(hook);
+    }
+    let stub = enc.finish().expect("the RP2350 startup assembles").bytes;
+    assert!(
+        STUB_OFF as usize + stub.len() <= (RP2350_CODE_BASE - RP2350_CODE_REGION) as usize,
+        "the RP2350 startup and fault handler must fit between the IMAGE_DEF block and the text"
+    );
+
+    let mut head = Encoder::new();
+    head.emit_word(RP2350_SP_TOP);
+    head.emit_word((RP2350_CODE_REGION + STUB_OFF) | 1);
+    for _ in 2..16 {
+        head.emit_word((RP2350_CODE_REGION + STUB_OFF + fault_offset) | 1);
+    }
+    for word in RP2350_IMAGE_DEF {
+        head.emit_word(word);
+    }
+    let head = head.finish().expect("the RP2350 vector table assembles").bytes;
+    debug_assert_eq!(head.len(), STUB_OFF as usize);
+    let mut image = alloc::vec![0u8; (RP2350_CODE_BASE - RP2350_CODE_REGION) as usize];
+    image[..head.len()].copy_from_slice(&head);
+    image[STUB_OFF as usize..STUB_OFF as usize + stub.len()].copy_from_slice(&stub);
+    image.extend_from_slice(text);
+    image
 }
 
 /// RP2040 (Pico / Pico H) result mailbox -- the RP2350 mailbox's twin, one bank lower because this
@@ -2084,8 +2370,9 @@ fn build_linked_program_object(
     corlib: &[u8],
     libraries: &[&[u8]],
     pdb: Option<&lamella_metadata::PortablePdb>,
+    wide: bool,
 ) -> Result<(Vec<u8>, Vec<DeferredBody>), BuildError> {
-    build_program_object(cil, Some(corlib), libraries, false, false, pdb, true)
+    build_program_object(cil, Some(corlib), libraries, false, wide, pdb, true)
         .map(|(bytes, _, deferred)| (bytes, deferred))
 }
 
@@ -3274,21 +3561,27 @@ pub fn lower_monomorphized_body<'a>(
                 .unwrap_or_else(|| alloc::format!("{argument:?}"))
         });
     let mut arg_types = Vec::new();
+    let mut pointees = Vec::new();
     if let Some(signature) = method.signature() {
         if signature.has_this {
-            arg_types.push(MirType::ObjectRef);
+            arg_types.push(receiver_type(declared_by_value_type(owner_assembly, body.rid)));
+            pointees.push(None);
         }
         for parameter in &signature.parameters {
-            arg_types.push(
+            let substituted = |sig: &SigType| {
                 substituted_mir_type(
-                    parameter,
+                    sig,
                     &layout_arguments,
                     owner_assembly,
                     argument_world,
                     definitions.references(),
                 )
-                .ok_or_else(|| gap(MonoGap::UnsubstitutedSlot))?,
-            );
+            };
+            arg_types.push(substituted(parameter).ok_or_else(|| gap(MonoGap::UnsubstitutedSlot))?);
+            pointees.push(match parameter {
+                SigType::ByRef(inner) => substituted(inner),
+                _ => None,
+            });
         }
     }
     let mut local_types = Vec::new();
@@ -3312,7 +3605,10 @@ pub fn lower_monomorphized_body<'a>(
         &instantiated,
         &arg_types,
         &local_types,
-        cil::Narrowing::default(),
+        cil::Narrowing {
+            pointees: &pointees,
+            ..cil::Narrowing::default()
+        },
     )
     .map(|(func, _map)| func)
     .map_err(|error| gap(MonoGap::LowerCil(error)))?;
@@ -3625,12 +3921,18 @@ pub fn lower_monomorphized_method_body<'a>(
         }
     };
     let mut arg_types = Vec::new();
+    let mut pointees = Vec::new();
     if let Some(signature) = method.signature() {
         if signature.has_this {
-            arg_types.push(MirType::ObjectRef);
+            arg_types.push(receiver_type(declared_by_value_type(owner_assembly, body.rid)));
+            pointees.push(None);
         }
         for parameter in &signature.parameters {
             arg_types.push(typed(parameter)?);
+            pointees.push(match parameter {
+                SigType::ByRef(inner) => typed(inner).ok(),
+                _ => None,
+            });
         }
     }
     let mut local_types = Vec::new();
@@ -3643,7 +3945,10 @@ pub fn lower_monomorphized_method_body<'a>(
         &instantiated,
         &arg_types,
         &local_types,
-        cil::Narrowing::default(),
+        cil::Narrowing {
+            pointees: &pointees,
+            ..cil::Narrowing::default()
+        },
     )
     .map(|(func, _map)| func)
     .map_err(|error| gap(MonoGap::LowerCil(error)))?;
@@ -3743,14 +4048,19 @@ fn lower_reachable<'a>(
         .enumerate()
         .map(|(i, (type_row, _, _))| (*type_row, (thunk_base + i) as u32))
         .collect();
-    let mut funcs: Vec<Function> = (0..thunk_base + type_inits.len()).map(|_| stub()).collect();
+    let generic_inits = crate::resolver::generic_type_init_types(assembly, &plan, references);
+    let generic_thunk_indices = generic_type_init_indices(&generic_inits, thunk_base + type_inits.len());
+    let mut funcs: Vec<Function> = (0..thunk_base + type_inits.len() + generic_inits.len())
+        .map(|_| stub())
+        .collect();
     let mut lowered = vec![false; funcs.len()];
     let cctors = startup_cctors(assembly, references);
     let init = find_native_export(assembly, "lamella_time_init");
     let resolver = MetadataResolver::new(assembly)
         .with_references(references)
         .with_monomorphized(plan.clone())
-        .with_type_init_thunks(thunk_indices.clone());
+        .with_type_init_thunks(thunk_indices.clone())
+        .with_generic_type_init_thunks(generic_thunk_indices.clone());
     let instantiated = resolver.instantiation_descriptors();
     refuse_undispatchable_instantiations(&resolver)?;
     let mut worklist: Vec<u32> = core::iter::once(entry)
@@ -3788,9 +4098,15 @@ fn lower_reachable<'a>(
                         let (_, cctor, flag_slot) = type_inits[i];
                         type_init_thunk_body(flag_slot * 4, cctor)
                     }
-                    None => match lower_one_reachable(assembly, &resolver, rid)? {
-                        Some(func) => func,
-                        None => continue,
+                    None => match generic_thunk_indices.iter().position(|(_, index)| *index == rid) {
+                        Some(i) => {
+                            let (_, cctor, flag_slot) = &generic_inits[i];
+                            type_init_thunk_body(flag_slot * 4, *cctor)
+                        }
+                        None => match lower_one_reachable(assembly, &resolver, rid)? {
+                            Some(func) => func,
+                            None => continue,
+                        },
                     },
                 },
             },
@@ -3813,6 +4129,30 @@ fn lower_reachable<'a>(
     }
     funcs[0] = startup_with_references(init, reference_cctors, &cctors, entry);
     Ok((funcs, plan))
+}
+
+/// The MIR type of an instance method's `this`: a MANAGED POINTER when the method belongs to a value
+/// type, and an object reference when it belongs to a class.
+///
+/// ECMA-335 II.13.3: a value type's instance methods receive `this` as a managed pointer to the
+/// value, which may lie inside another object -- a struct field of a class instance, or an element of
+/// an array. The type is what the stack maps report the slot as, so it decides whether the collector
+/// resolves the object containing the address or takes the address for an object start.
+fn receiver_type(value_type: bool) -> MirType {
+    if value_type {
+        MirType::ManagedPtr
+    } else {
+        MirType::ObjectRef
+    }
+}
+
+/// Whether the method at MethodDef row `rid` of `assembly` is declared by a value type -- for the
+/// paths that hold the method but not the type that declares it.
+fn declared_by_value_type(assembly: &Assembly<'_>, rid: u32) -> bool {
+    assembly
+        .type_defs()
+        .find(|type_def| type_def.methods().any(|method| method.rid() == rid))
+        .is_some_and(|type_def| type_def.is_value_type())
 }
 
 /// Lowers the method at `MethodDef` rid `rid` to MIR (its plain managed body -- the same path
@@ -3848,7 +4188,7 @@ fn lower_one_reachable(
             let mut arg_types = Vec::new();
             if let Some(sig) = &signature {
                 if sig.has_this {
-                    arg_types.push(MirType::ObjectRef);
+                    arg_types.push(receiver_type(type_def.is_value_type()));
                 }
                 for parameter in &sig.parameters {
                     arg_types.push(mir_type(parameter, assembly, None, resolver.references())?);
@@ -3869,6 +4209,7 @@ fn lower_one_reachable(
                 cil::Narrowing {
                     args: &arg_narrow,
                     locals: &local_narrow,
+                    pointees: &[],
                 },
             ) {
                 Ok((func, _map)) => Ok(Some(func)),
@@ -4202,7 +4543,7 @@ fn build_library_object_inner(
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
     build_library_object_core(cil, references, wide, false)
-        .map(|(bytes, report, _)| (bytes, report))
+        .map(|(bytes, report, _, _)| (bytes, report))
 }
 
 /// A LIBRARY object for a build that links it into ONE program and dead-strips the result, so that a
@@ -4217,13 +4558,17 @@ fn build_library_object_inner(
 ///
 /// A core library defers on the same terms. Its own build reports such methods and ships them
 /// answering a constant; here a program that reaches one is refused instead.
+///
+/// Returned beside them, the library's own calls into its silent seams, keyed by the caller's
+/// symbol, for [`refuse_reached_silent_seam_edges`] to ask of the same dead-strip.
 #[cfg(feature = "linked")]
 fn build_library_object_deferring(
     cil: &[u8],
     references: &[&[u8]],
-) -> Result<(Vec<u8>, Vec<DeferredBody>), BuildError> {
-    build_library_object_core(cil, references, false, true)
-        .map(|(bytes, _, deferred)| (bytes, deferred))
+    wide: bool,
+) -> Result<(Vec<u8>, Vec<DeferredBody>, Vec<LibrarySeamEdge>), BuildError> {
+    build_library_object_core(cil, references, wide, true)
+        .map(|(bytes, _, deferred, seam_edges)| (bytes, deferred, seam_edges))
 }
 
 /// A method a deferring build could not produce and emitted as a TRAP under its own symbol: any
@@ -4249,7 +4594,7 @@ fn build_library_object_core(
     references: &[&[u8]],
     wide: bool,
     defer: bool,
-) -> Result<(Vec<u8>, LibraryBuildReport, Vec<DeferredBody>), BuildError> {
+) -> Result<(Vec<u8>, LibraryBuildReport, Vec<DeferredBody>, Vec<LibrarySeamEdge>), BuildError> {
     let assembly = read_assembly(cil)?;
     let reference_assemblies: Vec<Assembly> = references
         .iter()
@@ -4345,10 +4690,44 @@ fn build_library_object_core(
     };
     if defer {
         let deferred = deferred_bodies(&report, monomorphized, &names)?;
-        return Ok((bytes, report, deferred));
+        let seam_edges = library_seam_edges(&report, &names);
+        return Ok((bytes, report, deferred, seam_edges));
     }
     refuse_demoted_library_methods(&assembly, &report)?;
-    Ok((bytes, report, Vec::new()))
+    Ok((bytes, report, Vec::new(), Vec::new()))
+}
+
+/// A library method's own call into one of the library's silent seams, keyed by the SYMBOL its
+/// object defines the caller under -- what a program's link asks, once the dead-strip has decided
+/// what the program reaches.
+#[cfg(feature = "arm32")]
+#[cfg_attr(not(feature = "linked"), allow(dead_code))]
+struct LibrarySeamEdge {
+    /// The calling method's symbol in the library's object.
+    symbol: alloc::string::String,
+    /// The calling method's readable name (`Namespace.Type::Method`).
+    caller: alloc::string::String,
+    /// The seam's readable name.
+    seam: alloc::string::String,
+}
+
+/// `report`'s silent seam edges, each keyed by the symbol `names` gives its caller's function index.
+#[cfg(feature = "arm32")]
+fn library_seam_edges(
+    report: &LibraryBuildReport,
+    names: &[alloc::string::String],
+) -> Vec<LibrarySeamEdge> {
+    report
+        .silent_seam_edges
+        .iter()
+        .filter_map(|edge| {
+            Some(LibrarySeamEdge {
+                symbol: names.get(edge.caller_rid as usize)?.clone(),
+                caller: edge.caller.clone(),
+                seam: edge.seam.clone(),
+            })
+        })
+        .collect()
 }
 
 /// What a deferring build deferred: the CIL fails and emit stubs `report` names, and the monomorphized
@@ -4886,6 +5265,21 @@ fn name_type_init_thunks(
     }
 }
 
+/// The function index of each generic instantiation's initialization thunk, as `(canonical
+/// instantiation spelling, index)`, numbered up from `base` in the order
+/// [`crate::resolver::generic_type_init_types`] lists them -- assigned once, where the band is laid
+/// out, and handed to the resolver and to the emission alike.
+fn generic_type_init_indices(
+    generic_inits: &[(alloc::string::String, u32, u32)],
+    base: usize,
+) -> Vec<(alloc::string::String, u32)> {
+    generic_inits
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _, _))| (name.clone(), (base + i) as u32))
+        .collect()
+}
+
 /// The MethodDef row of a static `Main` (the run-once widget entry), if the assembly has one.
 fn find_main(assembly: &Assembly) -> Option<u32> {
     let token = assembly.image().entry_point_token();
@@ -4929,16 +5323,15 @@ pub fn entry_returns_void(assembly: &Assembly) -> bool {
 
 /// Every type initializer (`.cctor`) in the assembly, by `MethodDef` rid, in metadata order. The
 /// startup runs these before `Main` so static field initializers (`static int X = 5;`) take effect.
+///
+/// Asked of [`crate::resolver::type_init_cctor`], the predicate the triggers are decided by, so an
+/// open generic definition's `.cctor` is in neither list: it runs once per instantiation, through
+/// that instantiation's own thunk.
 fn find_cctors(assembly: &Assembly) -> Vec<u32> {
-    let mut cctors = Vec::new();
-    for type_def in assembly.type_defs() {
-        for method in type_def.methods() {
-            if method.is_static() && method.name() == Some(".cctor") {
-                cctors.push(method.rid());
-            }
-        }
-    }
-    cctors
+    assembly
+        .type_defs()
+        .filter_map(|type_def| crate::resolver::type_init_cctor(assembly, &type_def))
+        .collect()
 }
 
 /// The type initializers the STARTUP still runs -- [`find_cctors`] minus the ones a trigger owns.
@@ -7390,7 +7783,7 @@ fn lower_assembly_seams<'a>(
             if open_generic || generic_methods.contains_key(&rid) {
                 continue;
             }
-            methods.push((rid, method, type_name, delegate));
+            methods.push((rid, method, type_name, delegate, type_def.is_value_type()));
         }
     }
     let plan = crate::generics::MonoPlan::for_assembly_with_references(
@@ -7401,7 +7794,9 @@ fn lower_assembly_seams<'a>(
     .map_err(BuildError::Instantiations)?;
     let type_inits = crate::resolver::type_init_types(assembly, references);
     let thunk_base = max_rid as usize + 1 + plan.len();
-    let total = thunk_base + type_inits.len();
+    let generic_inits = crate::resolver::generic_type_init_types(assembly, &plan, references);
+    let generic_thunk_indices = generic_type_init_indices(&generic_inits, thunk_base + type_inits.len());
+    let total = thunk_base + type_inits.len() + generic_inits.len();
     let mut bodies = BodySlots::new(total);
     let mut maps: Vec<cil::CilSourceMap> =
         (0..total).map(|_| cil::CilSourceMap::default()).collect();
@@ -7420,11 +7815,12 @@ fn lower_assembly_seams<'a>(
     let resolver = MetadataResolver::new(assembly)
         .with_references(references)
         .with_monomorphized(plan.clone())
-        .with_type_init_thunks(thunk_indices.clone());
+        .with_type_init_thunks(thunk_indices.clone())
+        .with_generic_type_init_thunks(generic_thunk_indices.clone());
     refuse_undispatchable_instantiations(&resolver)?;
     let mut fails: Vec<(u32, cil::CilError)> = Vec::new();
     let mut seams: Vec<SeamRow> = Vec::new();
-    for (rid, method, type_name, is_delegate) in &methods {
+    for (rid, method, type_name, is_delegate, value_type) in &methods {
         let signature = method.signature();
         let Some(body) = method.body() else {
             if let Some(func) = delegate_invoke_synthesis(
@@ -7471,7 +7867,7 @@ fn lower_assembly_seams<'a>(
         let mut arg_types = Vec::new();
         if let Some(sig) = &signature {
             if sig.has_this {
-                arg_types.push(MirType::ObjectRef);
+                arg_types.push(receiver_type(*value_type));
             }
             for parameter in &sig.parameters {
                 arg_types.push(mir_type(parameter, assembly, None, resolver.references())?);
@@ -7492,6 +7888,7 @@ fn lower_assembly_seams<'a>(
             cil::Narrowing {
                 args: &arg_narrow,
                 locals: &local_narrow,
+                pointees: &[],
             },
         ) {
             Ok((func, map)) => {
@@ -7526,6 +7923,9 @@ fn lower_assembly_seams<'a>(
             (thunk_base + i) as u32,
             type_init_thunk_body(flag_slot * 4, *cctor),
         );
+    }
+    for ((_, cctor, flag_slot), (_, index)) in generic_inits.iter().zip(&generic_thunk_indices) {
+        bodies.write(*index, type_init_thunk_body(flag_slot * 4, *cctor));
     }
     Ok((
         bodies.funcs,
@@ -9769,14 +10169,16 @@ pub fn array_clear_core_body() -> Function {
     mb.finish(None)
 }
 
-/// Maps a `[RuntimeProvided]` `System.Net.Sockets.Socket` / `System.Net.Security.TlsNative` seam static
-/// to the C-ABI extern the AOT links against in `lamella-runtime-support-net` (the no_std staticlib
-/// wrapping the SAME lamella-net-smoltcp + lamella-tls-mbedtls crates the interpreter binds). Returns
-/// `None` for any other method (it keeps its normal lowering). The names are PROVISIONAL, chosen to
-/// mirror the managed method names 1:1 -- the whole table reconciles in one place against the
-/// staticlib's exact export list; the marshalling ([`runtime_seam_body`]) is name-independent.
+/// Maps a `[RuntimeProvided]` `System.Net.Dns` / `System.Net.Sockets.Socket` /
+/// `System.Net.Security.TlsNative` seam static to the C-ABI extern the AOT links against in
+/// `lamella-runtime-support-net`, the no_std staticlib that wraps the same `lamella-net-smoltcp` and
+/// `lamella-tls-mbedtls` crates the interpreter binds. Returns `None` for any other method, which
+/// keeps its normal lowering. Each extern mirrors its managed method's name, the whole table is
+/// checked in one place against the staticlib's export list, and the marshalling
+/// ([`runtime_seam_body`]) does not depend on the names.
 fn net_seam_import(namespace: &str, type_name: &str, method: Option<&str>) -> Option<&'static str> {
     Some(match (namespace, type_name, method?) {
+        ("System.Net", "Dns", "ResolveHost") => "lamella_net_resolve_host",
         ("System.Net.Sockets", "Socket", "ConnectStart") => "lamella_net_connect_start",
         ("System.Net.Sockets", "Socket", "ConnectPoll") => "lamella_thread_connect_poll",
         ("System.Net.Sockets", "Socket", "ListenStart") => "lamella_net_listen_start",
@@ -11630,6 +12032,113 @@ mod tests {
         }
     }
 
+    /// AN RP2350 LINKED IMAGE IS WHERE THE BOOTROM LOOKS, AND ITS HEAP SITS ABOVE THE STATICS THE LINK
+    /// REPORTED: the vector table and the IMAGE_DEF block at the bottom of XIP flash, the startup after
+    /// them, the text at `0x1000_0100`, and a heap floor that rises when the statics reach it.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn an_rp2350_linked_image_puts_its_heap_above_the_statics_the_link_reported() {
+        let text = [0xAAu8; 8];
+        let word = |image: &[u8], at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let literals = |image: &[u8]| -> Vec<u32> { (0x54..0x100).step_by(4).map(|at| word(image, at)).collect() };
+
+        let image = rp2350_linked_image(4, &text, 0x2000_2468, None);
+        assert_eq!(word(&image, 0), 0x2008_0000, "the stack starts at the top of main SRAM");
+        assert_eq!(word(&image, 4), 0x1000_0055, "reset enters the startup, in Thumb");
+        let hard_fault = word(&image, 12);
+        assert!(
+            hard_fault > 0x1000_0055 && hard_fault < 0x1000_0100 && hard_fault & 1 == 1,
+            "HardFault reaches the recording handler inside the startup, not a bare spin"
+        );
+        for (i, expected) in [0xffff_ded3u32, 0x1021_0142, 0x0000_01ff, 0x0000_0000, 0xab12_3579].iter().enumerate() {
+            assert_eq!(word(&image, 64 + 4 * i), *expected, "IMAGE_DEF word {i}");
+        }
+        assert_eq!(&image[0x100..], &text, "the text begins at 0x1000_0100");
+        let pool = literals(&image);
+        assert!(pool.contains(&0x2001_0000), "statics below the floor leave the heap at its floor");
+        assert!(pool.contains(&0x2002_0000), "and the startup clears through the heap's end");
+        assert!(pool.contains(&0x1000_0105), "the entry is the text base plus its offset, in Thumb");
+        assert!(pool.contains(&0x2000_0000), "a fault is recorded where a Nordic image records one");
+
+        let raised = literals(&rp2350_linked_image(4, &text, 0x2001_2345, None));
+        assert!(raised.contains(&0x2001_2348), "the heap starts above the statics' end");
+        assert!(raised.contains(&(0x2001_2348 + 0x1_0000)), "and keeps its size");
+    }
+
+    /// A LINKED STARTUP CALLS THE BOARD'S STARTUP HOOK ONLY WHEN THE LINK KEPT ONE, AFTER THE CLEAR
+    /// AND BEFORE THE ENTRY, on both parts. With no hook it makes the one call it always made, and on
+    /// the RP2350 the boot magic is stamped before the hook runs.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_linked_startup_calls_the_board_hook_after_the_clear_and_before_the_entry() {
+        let half = |image: &[u8], at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
+        let word = |image: &[u8], at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let walk = |image: &[u8], start: usize| {
+            let (mut loads, mut calls, mut clear) = (Vec::new(), Vec::new(), None);
+            let mut at = start;
+            while half(image, at) != 0xE7FE {
+                let op = half(image, at);
+                if op & 0xF800 == 0x4800 {
+                    let literal = ((at + 4) & !3) + usize::from(op & 0xFF) * 4;
+                    loads.push((at, word(image, literal)));
+                }
+                if op == 0x4291 {
+                    clear.get_or_insert(at);
+                }
+                if op == 0x4780 {
+                    let &(load_at, target) = loads.last().expect("a call loads its target first");
+                    assert_eq!(load_at, at - 2, "the target is loaded just before the call");
+                    assert_eq!(half(image, load_at) & 0x0700, 0, "into r0, which the call takes");
+                    calls.push((at, target));
+                }
+                at += 2;
+            }
+            (loads, calls, clear.expect("the startup clears RAM"))
+        };
+        let targets = |calls: &[(usize, u32)]| calls.iter().map(|&(_, target)| target).collect::<Vec<_>>();
+        let text = [0xAAu8; 8];
+        const RP2350_STUB: usize = 16 * 4 + 5 * 4;
+        let rp2350 = |hook| rp2350_linked_image(4, &text, 0x2000_2468, hook);
+        let nordic = |hook| nordic_linked_image(0x2000_4000, 4, &text, 0x2000_1000, hook);
+        for (part, plain, hooked, start, entry, hook) in [
+            ("rp2350", rp2350(None), rp2350(Some(0x1000_0201)), RP2350_STUB, 0x1000_0105, 0x1000_0201),
+            (
+                "nordic",
+                nordic(None),
+                nordic(Some(0x0000_0201)),
+                NORDIC_STUB_BASE as usize,
+                (NORDIC_TEXT_BASE + 4) | 1,
+                0x0000_0201,
+            ),
+        ] {
+            let (_, calls, _) = walk(&plain, start);
+            assert_eq!(targets(&calls), [entry], "{part}: with no hook the startup calls the entry alone");
+            let (_, calls, clear) = walk(&hooked, start);
+            assert_eq!(targets(&calls), [hook, entry], "{part}: the hook, then the entry");
+            assert!(clear < calls[0].0, "{part}: the hook runs after the clear");
+        }
+        let (loads, calls, _) = walk(&rp2350(Some(0x1000_0201)), RP2350_STUB);
+        let (stamp, _) = *loads
+            .iter()
+            .find(|&&(_, value)| value == RP2350_BOOT_MAGIC)
+            .expect("the RP2350 startup stamps the boot magic");
+        assert!(stamp < calls[0].0, "the boot magic is stamped before the hook runs");
+    }
+
+    /// The linked tier names its parts once: `rp2350` builds wide Thumb-2 at `0x1000_0100`, a Nordic
+    /// part narrow at its own base, and a target with no row is refused before anything is built.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn the_linked_tier_knows_the_rp2350_and_refuses_a_part_it_has_no_row_for() {
+        let rp2350 = linked_part("rp2350").expect("the RP2350 has a row");
+        assert!(rp2350.wide());
+        assert_eq!((rp2350.text_base(), rp2350.image_base()), (0x1000_0100, 0x1000_0000));
+        let microbit = linked_part("microbit").expect("the micro:bit has a row");
+        assert!(!microbit.wide());
+        assert_eq!(microbit, LinkedPart::Nordic { initial_sp: 0x2000_4000 });
+        assert!(matches!(linked_part("rp2040"), Err(BuildError::UnsupportedTarget)));
+    }
+
     /// The Python front end and the CIL front end get the SAME boot image, because there is only one
     /// that builds it. Checked on the Nordic shape, whose stack top is spelled out from the parts
     /// rather than imported from the implementation ([`CORTEX_M_TARGETS`]'s two Nordic entries are
@@ -12249,8 +12758,38 @@ mod tests {
         corlib: &[u8],
         library: &[u8],
     ) -> Result<Vec<lamella_elf::Object>, BuildError> {
-        let (object, deferred) = build_linked_program_object(program, corlib, &[library], None)?;
-        reachable_objects(&object, deferred, corlib, &[library])
+        let (object, deferred) = build_linked_program_object(program, corlib, &[library], None, false)?;
+        reachable_objects(&object, deferred, corlib, &[library], false)
+    }
+
+    /// A LIBRARY's OWN CALL INTO ITS SILENT SEAM REFUSES A PROGRAM THAT REACHES IT, AND NO OTHER.
+    ///
+    /// `seamreachlib`'s `Through` calls the library's private, unmarked, unsynthesized `Silent`; its
+    /// `Around` calls nothing. No program can name `Silent`, so no program build sees that edge, and
+    /// the library's own build cannot know who links it: only the program's dead-strip can say. A
+    /// program calling `Through` is refused, naming the library method and the seam; one calling
+    /// `Around` links.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_library_s_own_call_into_its_silent_seam_refuses_only_a_program_that_reaches_it() {
+        let (Some(corlib), Some(library), Some(through), Some(around)) = (
+            fixture("../lamella-load/tests/fixtures/corlib.dll"),
+            fixture("tests/fixtures/seamreachlib.dll"),
+            fixture("tests/fixtures/seamreachprog-through.dll"),
+            fixture("tests/fixtures/seamreachprog-around.dll"),
+        ) else {
+            return;
+        };
+        match linked_objects(&through, &corlib, &library) {
+            Err(BuildError::SilentSeamCallEdge { caller, seam, total }) => {
+                assert!(caller.contains("Through"), "the refusal names the library method, got {caller:?}");
+                assert!(seam.contains("Silent"), "the refusal names the seam, got {seam:?}");
+                assert_eq!(total, 1, "exactly one reached edge");
+            }
+            other => panic!("expected a silent-seam refusal, got {:?}", other.map(|objects| objects.len())),
+        }
+        linked_objects(&around, &corlib, &library)
+            .expect("a program that does not reach the library's call into its seam links");
     }
 
     /// A METHOD THIS BUILD CANNOT LOWER REFUSES A PROGRAM THAT REACHES IT, AND NO OTHER.
@@ -12271,7 +12810,7 @@ mod tests {
             (&reach.runtime_stackalloc[..], "RuntimeStackalloc::RuntimeSized"),
             (&reach.mono_unlowerable[..], "Holder`1[System.Int32]::Scratch"),
         ] {
-            let (_, deferred) = build_library_object_deferring(library, &[corlib])
+            let (_, deferred, _) = build_library_object_deferring(library, &[corlib], false)
                 .expect("a deferring library build does not refuse a method it cannot lower");
             let names: Vec<&str> = deferred.iter().map(|body| body.method.as_str()).collect();
             assert_eq!(
@@ -12282,7 +12821,7 @@ mod tests {
             );
         }
         let (_, deferred) =
-            build_linked_program_object(&reach.mono_prog, corlib, &[&reach.mono_unlowerable[..]], None)
+            build_linked_program_object(&reach.mono_prog, corlib, &[&reach.mono_unlowerable[..]], None, false)
                 .expect("a linked program build does not refuse a monomorphized body it cannot lower");
         let names: Vec<&str> = deferred.iter().map(|body| body.method.as_str()).collect();
         assert_eq!(

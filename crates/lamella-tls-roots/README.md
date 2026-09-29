@@ -17,16 +17,11 @@ by `gen/gen_roots.py` from the official curl distribution of the Mozilla store:
 - The snapshot date is carried in the crate as `MOZILLA_SNAPSHOT` (from the bundle's own
   "Certificate data from Mozilla as of" line).
 
-## Licensing
+## Source and license
 
-The Mozilla CA certificate store (NSS `certdata.txt`) is distributed under the **Mozilla Public
-License 2.0** (MPL-2.0); curl redistributes it verbatim as `cacert.pem`. The individual root
-certificates are the public self-signed certificates the CAs themselves publish for exactly this
-use (embedding in trust stores). Redistributing the bundle -- as source (`roots.der`) or baked into
-a firmware image -- is what the store exists for and is freely permitted; MPL-2.0's obligations
-attach to modifications of the *curated file*, not to a program that merely consumes the certs. The
-provenance is recorded here (this README + the generated-file header) so the attribution travels
-with the data.
+The certificates come from the Mozilla CA certificate store (NSS `certdata.txt`), as curl
+redistributes it in `cacert.pem`. The store is published under the Mozilla Public License 2.0
+(MPL-2.0). This README and the generated file's header record that source.
 
 ## Refresh cadence -- IMPORTANT for device longevity
 

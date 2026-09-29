@@ -142,11 +142,17 @@ pub fn parse_compilation_unit_with(
     options: LexOptions,
 ) -> ParsedCompilationUnit {
     let version = options.version;
+    let nullable_option = options.nullable;
     let tokenized = tokenize_with(source, options);
     let pragma_warnings = tokenized.pragma_warnings.clone();
+    let nullable = crate::lexer::NullableContext {
+        option: nullable_option,
+        directives: tokenized.nullable_directives.clone(),
+    };
     let mut parser = Parser::new(tokenized);
     parser.version = version;
-    let unit = parser.parse_compilation_unit();
+    let mut unit = parser.parse_compilation_unit();
+    unit.nullable = nullable;
     ParsedCompilationUnit {
         unit,
         diagnostics: without_gated_operator_cascades(parser.diagnostics),
@@ -1856,6 +1862,7 @@ impl Parser {
             global_attributes,
             span: Span::new(start, end),
             defined_symbols: core::mem::take(&mut self.defined_symbols),
+            nullable: crate::lexer::NullableContext::default(),
         }
     }
 
@@ -4122,7 +4129,7 @@ impl Parser {
                         TypeTestOperation::Is => {
                             self.parse_pattern(operator, PatternPosition::TypeTest)
                         }
-                        TypeTestOperation::As => Pattern::Type(self.parse_is_target_type()),
+                        TypeTestOperation::As => Pattern::Type(self.parse_as_target_type()),
                     };
                     let end = pattern_end(&target);
                     let span = Span::new(left.span.start, end);
@@ -4359,6 +4366,77 @@ impl Parser {
             return self.parse_nullable_suffix(ty, true);
         }
         ty
+    }
+
+    /// The type on the right of an `as`: [`Self::parse_is_target_type`]'s reading, and one more.
+    ///
+    /// **A `?` FOLLOWED BY A TOKEN THAT CANNOT BEGIN AN EXPRESSION IS THE TYPE'S OWN**, because the
+    /// conditional operator it would otherwise be needs an operand there. That is Roslyn's rule for
+    /// this position, and without it `o as int?;` (C# 2.0) and `o as string?;` (C# 8.0) read the
+    /// `?` as a conditional and failed at the `;`, on programs csc compiles (the first) or reports
+    /// by name (the second, CS8651). `x as T ? a : b` keeps its conditional: `a` begins one.
+    fn parse_as_target_type(&mut self) -> TypeRef {
+        let ty = self.parse_is_target_type();
+        if self.current_punctuator() == Some(Punctuator::Question)
+            && !self.can_start_expression_at(self.position + 1)
+        {
+            return self.parse_nullable_suffix(ty, true);
+        }
+        ty
+    }
+
+    /// Whether the token at `index` can begin an expression: a name, a literal, an expression
+    /// keyword or a predefined type, or a prefix operator or opening bracket.
+    fn can_start_expression_at(&self, index: usize) -> bool {
+        let Some(token) = self.tokens.get(index) else {
+            return false;
+        };
+        match &token.kind {
+            TokenKind::Identifier(_)
+            | TokenKind::IntegerLiteral { .. }
+            | TokenKind::RealLiteral { .. }
+            | TokenKind::DecimalLiteral { .. }
+            | TokenKind::CharacterLiteral(_)
+            | TokenKind::StringLiteral(_)
+            | TokenKind::InterpolatedString(_)
+            | TokenKind::TypedRefKeyword(_) => true,
+            TokenKind::Keyword(keyword) => {
+                predefined_type(&token.kind).is_some()
+                    || matches!(
+                        keyword,
+                        Keyword::This
+                            | Keyword::Base
+                            | Keyword::New
+                            | Keyword::Typeof
+                            | Keyword::Default
+                            | Keyword::Checked
+                            | Keyword::Unchecked
+                            | Keyword::Sizeof
+                            | Keyword::True
+                            | Keyword::False
+                            | Keyword::Null
+                            | Keyword::Delegate
+                            | Keyword::Stackalloc
+                            | Keyword::Throw
+                            | Keyword::Ref
+                    )
+            }
+            TokenKind::Punctuator(punctuator) => matches!(
+                punctuator,
+                Punctuator::OpenParen
+                    | Punctuator::OpenBracket
+                    | Punctuator::Exclamation
+                    | Punctuator::Tilde
+                    | Punctuator::Minus
+                    | Punctuator::Plus
+                    | Punctuator::PlusPlus
+                    | Punctuator::MinusMinus
+                    | Punctuator::Ampersand
+                    | Punctuator::Asterisk
+                    | Punctuator::Caret
+            ),
+            _ => false,
+        }
     }
 
     /// Whether the token at the cursor could begin a TYPE -- a predefined type keyword, a name, or
@@ -5318,7 +5396,7 @@ impl Parser {
                 Span::new(start, overall_end),
             );
         }
-        ty
+        self.parse_nullable_suffix(ty, allow_nullable)
     }
 
     /// Parses a `new` expression (14.5.10): object/delegate creation
@@ -6062,7 +6140,16 @@ impl Parser {
         match &self.current().kind {
             TokenKind::Keyword(Keyword::Class) => {
                 self.bump();
-                TypeParameterConstraint::ReferenceType(span)
+                let question = (self.current_punctuator() == Some(Punctuator::Question))
+                    .then(|| self.current().span);
+                if question.is_some() {
+                    self.bump();
+                }
+                let end = question.map_or(span.end, |question| question.end);
+                TypeParameterConstraint::ReferenceType {
+                    span: Span::new(span.start, end),
+                    question,
+                }
             }
             TokenKind::Keyword(Keyword::Struct) => {
                 self.bump();
@@ -8472,6 +8559,17 @@ mod tests {
     }
 
     #[test]
+    fn as_takes_a_nullable_type_where_the_question_mark_cannot_begin_an_operand() {
+        assert_eq!(tree("o as int?"), "(as o int?)");
+        assert_eq!(tree("o as string?"), "(as o string?)");
+        assert_eq!(tree("o as int? == null"), "(== (as o int?) null)");
+        assert_eq!(tree("(o as int?)"), "(paren (as o int?))");
+        assert_eq!(tree("o as T ? a : b"), "(?: (as o T) a b)");
+        assert_eq!(tree("o as T ? -1 : 1"), "(?: (as o T) (- 1) 1)");
+        assert_eq!(tree("o as T ? (a) : b"), "(?: (as o T) (paren a) b)");
+    }
+
+    #[test]
     fn a_constant_pattern_takes_any_constant_and_stops_at_relational() {
         assert_eq!(tree("x is 3"), "(is x 3)");
         assert_eq!(tree("x is -1"), "(is x (- 1))");
@@ -9226,7 +9324,12 @@ mod tests {
                     text.push(',');
                 }
                 let rendered = match constraint {
-                    TypeParameterConstraint::ReferenceType(_) => String::from("class"),
+                    TypeParameterConstraint::ReferenceType { question: None, .. } => {
+                        String::from("class")
+                    }
+                    TypeParameterConstraint::ReferenceType { question: Some(_), .. } => {
+                        String::from("class?")
+                    }
                     TypeParameterConstraint::ValueType(_) => String::from("struct"),
                     TypeParameterConstraint::DefaultConstructor(_) => String::from("new()"),
                     TypeParameterConstraint::Type(reference) => dump_type(reference),
@@ -10394,6 +10497,9 @@ mod tests {
         assert_eq!(tree_at("typeof(int?[,])", LanguageVersion::CSharp6), "(typeof int?[,])");
         assert_eq!(tree_at("typeof(int?[][])", LanguageVersion::CSharp6), "(typeof int?[][])");
         assert_eq!(tree_at("typeof(int? [ ])", LanguageVersion::CSharp6), "(typeof int?[])");
+        assert_eq!(tree_at("typeof(byte[]?)", LanguageVersion::CSharp8), "(typeof byte[]?)");
+        assert_eq!(tree_at("typeof(int?[]?)", LanguageVersion::CSharp8), "(typeof int?[]?)");
+        assert_eq!(tree_at("typeof(int[,]?)", LanguageVersion::CSharp8), "(typeof int[,]?)");
         assert_eq!(tree_at("a?[0]", LanguageVersion::CSharp6), "(?. a (index <recv> 0))");
         assert_eq!(tree_at("a?.B", LanguageVersion::CSharp6), "(?. a (. <recv> B))");
         assert_eq!(tree_at("a?.B.C", LanguageVersion::CSharp6), "(?. a (. (. <recv> B) C))");
@@ -10719,6 +10825,10 @@ mod tests {
         assert_eq!(
             unit_tree("delegate T M<T>() where T : System.IDisposable, new();"),
             "(delegate T M<T> () where T : System.IDisposable, new())"
+        );
+        assert_eq!(
+            unit_tree("delegate R P<T, R>(T value) where R : class?;"),
+            "(delegate R P<T, R> (T value) where R : class?)"
         );
         assert_eq!(unit_tree("delegate void D(int v);"), "(delegate void D (int v))");
     }

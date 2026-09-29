@@ -18,6 +18,7 @@ public sealed class Rp2350I2cDriver : I2cDriver
     private readonly uint _clrTxAbrt;
     private readonly uint _clrStopDet;
     private readonly uint _enable;
+    private readonly uint _enableStatus;
     private readonly uint _status;
     private readonly uint _rxflr;
     private readonly uint _sdaHold;
@@ -34,7 +35,14 @@ public sealed class Rp2350I2cDriver : I2cDriver
     private readonly uint _statusTfnf;
     private readonly uint _abrtAddrNoack;
     private readonly uint _abrtDataNoack;
+    private readonly uint _enableOn;
+    private readonly uint _enableAbort;
+    private readonly uint _enabledNow;
     private readonly Rp2350I2cBinding _binding;
+
+    const int SpinCap = 100000;
+    const int Aborted = -1;
+    const int TimedOut = -2;
 
     /// <summary>Binds the driver to one DW wiring; no hardware is touched until
     /// <see cref="Configure"/>.</summary>
@@ -53,6 +61,7 @@ public sealed class Rp2350I2cDriver : I2cDriver
         _clrTxAbrt = i2c + Rp2350I2cLayout.IC_CLR_TX_ABRT_OFF;
         _clrStopDet = i2c + Rp2350I2cLayout.IC_CLR_STOP_DET_OFF;
         _enable = i2c + Rp2350I2cLayout.IC_ENABLE_OFF;
+        _enableStatus = i2c + Rp2350I2cLayout.IC_ENABLE_STATUS_OFF;
         _status = i2c + Rp2350I2cLayout.IC_STATUS_OFF;
         _rxflr = i2c + Rp2350I2cLayout.IC_RXFLR_OFF;
         _sdaHold = i2c + Rp2350I2cLayout.IC_SDA_HOLD_OFF;
@@ -69,6 +78,9 @@ public sealed class Rp2350I2cDriver : I2cDriver
         _statusTfnf = Rp2350I2cLayout.IC_STATUS_TFNF;
         _abrtAddrNoack = Rp2350I2cLayout.IC_TX_ABRT_SOURCE_ABRT_7B_ADDR_NOACK;
         _abrtDataNoack = Rp2350I2cLayout.IC_TX_ABRT_SOURCE_ABRT_TXDATA_NOACK;
+        _enableOn = Rp2350I2cLayout.IC_ENABLE_ENABLE;
+        _enableAbort = Rp2350I2cLayout.IC_ENABLE_ABORT;
+        _enabledNow = Rp2350I2cLayout.IC_ENABLE_STATUS_IC_EN;
     }
 
     /// <summary>Brings the bound DW up as a 7-bit master at (approximately, never above)
@@ -79,7 +91,7 @@ public sealed class Rp2350I2cDriver : I2cDriver
     public override void Configure(int busHz)
     {
         Mmio.Write32(_resetsClr, _binding.ResetMask);
-        for (int spin = 0; spin < 100000; spin++)
+        for (int spin = 0; spin < SpinCap; spin++)
         {
             if ((Mmio.Read32(_resetsDone) & _binding.ResetMask) == _binding.ResetMask) break;
         }
@@ -124,13 +136,16 @@ public sealed class Rp2350I2cDriver : I2cDriver
 
     /// <summary>The strata's write sequence: START, address+W, <paramref name="count"/> bytes
     /// (STOP riding the last), each fed on TX-FIFO room; completion by TX_EMPTY, verdict from
-    /// the abort source.</summary>
+    /// the abort source. A wait that runs out abandons the transfer and answers
+    /// <see cref="I2cDriver.OtherError"/>, and so does a transfer of no bytes, which this
+    /// controller cannot make: every command it takes carries a byte.</summary>
     public override int Write(int address, System.ReadOnlySpan<byte> buffer, int count)
     {
-        SetTarget(address);
+        if (count < 1) return OtherError;
+        if (!Begin(address)) return OtherError;
         for (int i = 0; i < count; i++)
         {
-            WaitTxRoom();
+            if (!WaitTxRoom()) return GiveUp();
             uint cmd = (uint)(buffer[i] & 0xFF);
             if (i == count - 1) cmd |= _cmdStop;
             Mmio.Write32(_dataCmd, cmd);
@@ -139,85 +154,113 @@ public sealed class Rp2350I2cDriver : I2cDriver
     }
 
     /// <summary>The strata's read sequence: START, address+R, <paramref name="count"/> bytes in
-    /// command/pop lockstep (STOP riding the last command).</summary>
+    /// command/pop lockstep (STOP riding the last command). A wait that runs out abandons the
+    /// transfer and answers <see cref="I2cDriver.OtherError"/>, whatever the buffer holds, and so
+    /// does a read of no bytes.</summary>
     public override int Read(int address, System.Span<byte> buffer, int count)
     {
-        SetTarget(address);
+        if (count < 1) return OtherError;
+        if (!Begin(address)) return OtherError;
         for (int i = 0; i < count; i++)
         {
             int value = ClockOneRead(i == count - 1, false);
-            if (value < 0) return AbortStatus();
+            if (value == Aborted) return AbortStatus();
+            if (value == TimedOut) return GiveUp();
             buffer[i] = (byte)value;
         }
         return FinishTransaction();
     }
 
     /// <summary>The strata's write_then_read sequence: the write bytes go WITHOUT stop, the
-    /// first read command carries RESTART (the repeated start), the last carries STOP.</summary>
+    /// first read command carries RESTART (the repeated start), the last carries STOP. A wait
+    /// that runs out abandons the transfer and answers <see cref="I2cDriver.OtherError"/>, and
+    /// so does a read half of no bytes, which would leave the bus held with no STOP.</summary>
     public override int WriteRead(int address, System.ReadOnlySpan<byte> writeBuffer, int writeCount,
                                   System.Span<byte> readBuffer, int readCount)
     {
-        SetTarget(address);
+        if (readCount < 1) return OtherError;
+        if (!Begin(address)) return OtherError;
         for (int i = 0; i < writeCount; i++)
         {
-            WaitTxRoom();
+            if (!WaitTxRoom()) return GiveUp();
             Mmio.Write32(_dataCmd, (uint)(writeBuffer[i] & 0xFF));
         }
         for (int i = 0; i < readCount; i++)
         {
             int value = ClockOneRead(i == readCount - 1, i == 0);
-            if (value < 0) return AbortStatus();
+            if (value == Aborted) return AbortStatus();
+            if (value == TimedOut) return GiveUp();
             readBuffer[i] = (byte)value;
         }
         return FinishTransaction();
     }
 
-    void SetTarget(int address)
+    bool Begin(int address)
     {
+        if (!WaitClear(_enable, _enableAbort)) return false;
         Mmio.Write32(_enable, 0);
+        if (!WaitClear(_enableStatus, _enabledNow)) return false;
+        Mmio.Read32(_clrTxAbrt);
+        Mmio.Read32(_clrStopDet);
         Mmio.Write32(_tar, (uint)(address & 0x7F));
-        Mmio.Write32(_enable, 1);
+        Mmio.Write32(_enable, _enableOn);
+        return true;
     }
 
-    void WaitTxRoom()
+    bool WaitTxRoom()
     {
-        for (int spin = 0; spin < 100000; spin++)
+        return WaitSet(_status, _statusTfnf);
+    }
+
+    bool WaitSet(uint register, uint bit)
+    {
+        for (int spin = 0; spin < SpinCap; spin++)
         {
-            if ((Mmio.Read32(_status) & _statusTfnf) != 0u) return;
+            if ((Mmio.Read32(register) & bit) != 0u) return true;
         }
+        return false;
+    }
+
+    bool WaitClear(uint register, uint bit)
+    {
+        for (int spin = 0; spin < SpinCap; spin++)
+        {
+            if ((Mmio.Read32(register) & bit) == 0u) return true;
+        }
+        return false;
     }
 
     int ClockOneRead(bool last, bool restart)
     {
-        WaitTxRoom();
+        if (!WaitTxRoom()) return TimedOut;
         uint cmd = _cmdRead;
         if (restart) cmd |= _cmdRestart;
         if (last) cmd |= _cmdStop;
         Mmio.Write32(_dataCmd, cmd);
-        for (int spin = 0; spin < 100000; spin++)
+        for (int spin = 0; spin < SpinCap; spin++)
         {
-            if ((Mmio.Read32(_rawIntrStat) & _intTxAbrt) != 0u) return -1;
+            if ((Mmio.Read32(_rawIntrStat) & _intTxAbrt) != 0u) return Aborted;
             if (Mmio.Read32(_rxflr) != 0u)
             {
                 return (int)(Mmio.Read32(_dataCmd) & 0xFFu);
             }
         }
-        return -1;
+        return TimedOut;
     }
 
     int FinishTransaction()
     {
-        for (int spin = 0; spin < 100000; spin++)
-        {
-            if ((Mmio.Read32(_rawIntrStat) & _intTxEmpty) != 0u) break;
-        }
+        if (!WaitSet(_rawIntrStat, _intTxEmpty)) return GiveUp();
         int status = AbortStatus();
-        for (int spin = 0; spin < 100000; spin++)
-        {
-            if ((Mmio.Read32(_rawIntrStat) & _intStopDet) != 0u) break;
-        }
+        if (!WaitSet(_rawIntrStat, _intStopDet)) return GiveUp();
         Mmio.Read32(_clrStopDet);
         return status;
+    }
+
+    int GiveUp()
+    {
+        Mmio.Write32(_enable, _enableOn | _enableAbort);
+        return OtherError;
     }
 
     int AbortStatus()

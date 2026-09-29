@@ -22,6 +22,7 @@ namespace Lamella.Generated
         public const uint FUNCSEL_SPI = 1;
         public const uint FUNCSEL_UART = 2;
         public const uint FUNCSEL_I2C = 3;
+        public const uint FUNCSEL_PWM = 4;
         public const uint FUNCSEL_SIO = 5;
         public const uint FUNCSEL_NULL = 0x1F;
     }

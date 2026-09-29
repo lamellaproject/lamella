@@ -1582,8 +1582,8 @@ struct FuncSig {
 ///
 /// The MMIO builtins are the AOT half of the language-neutral MMIO contract: `mmio_read{8,16,32}
 /// (addr) -> int` and `mmio_write{8,16,32}(addr, value)`, lowering to the SAME volatile ldr/str
-/// a C / Rust / C#-AOT BSP reaches (the "type gradient" -- no `py_*` runtime call). Names are
-/// provisional pending the cross-lane contract (python-runtime wires the matching interp builtin).
+/// a C / Rust / C#-AOT BSP reaches (the "type gradient" -- no `py_*` runtime call). The
+/// interpreter defines no builtins of these names; only the typed path lowers them.
 #[derive(Clone, Copy)]
 enum Builtin {
     Abs,

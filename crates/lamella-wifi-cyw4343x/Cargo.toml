@@ -1,0 +1,40 @@
+[package]
+name = "lamella-wifi-cyw4343x"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A no_std host driver for the CYW43439 and CYW4343W WiFi radios: the chip's bring-up behind one transport trait, pumped by the caller, with no sleeps and no firmware inside."
+license = "MIT OR Apache-2.0"
+keywords = ["cyw43439", "cyw4343w", "wifi", "no-std", "embedded"]
+categories = ["embedded", "no-std", "network-programming"]
+
+[lib]
+name = "lamella_wifi_cyw4343x"
+path = "src/lib.rs"
+
+# The crate is written on `core` alone; its one dependency comes with the
+# `smoltcp` feature, pinned to an exact release.
+[dependencies]
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-raw"], optional = true }
+
+[features]
+# The device adapter: the driver's data plane as a `smoltcp` network device,
+# for a consumer that runs that stack.
+smoltcp = ["dep:smoltcp"]
+
+# The fake wire, the fake host, the fake transport, the recorder, the fake
+# clock and the harness loop, for a consumer's own tests against recorded
+# exchanges. The crate's own tests need no feature.
+fixture = []
+
+# The STM32H747's SDMMC1 controller as an SDIO host, for the Arduino GIGA R1
+# WiFi and Portenta H7 boards. Register access lives in that module alone.
+stm32h7-sdmmc = []
+
+# The RP2350's programmable I/O block as the gSPI engine, for the Raspberry
+# Pi Pico 2 W and Pimoroni Pico Plus 2 W boards. Register access lives in
+# that module alone.
+rp2350-pio = []
+
+# The crate stands alone; it never joins an enclosing workspace.
+[workspace]

@@ -55,6 +55,19 @@ namespace System
             _length = length;
         }
 
+        /// <summary>A span over the whole of <paramref name="array"/>; a null array is an empty
+        /// span.</summary>
+        public static implicit operator Span<T>(T[] array)
+        {
+            return new Span<T>(array);
+        }
+
+        /// <summary>A read-only view of <paramref name="span"/>'s elements.</summary>
+        public static implicit operator ReadOnlySpan<T>(Span<T> span)
+        {
+            return new ReadOnlySpan<T>(span._items, span._start, span._length);
+        }
+
         /// <summary>The number of elements in this span.</summary>
         public int Length { get { return _length; } }
 
@@ -195,6 +208,13 @@ namespace System
             _items = array;
             _start = start;
             _length = length;
+        }
+
+        /// <summary>A read-only span over the whole of <paramref name="array"/>; a null array is
+        /// an empty span.</summary>
+        public static implicit operator ReadOnlySpan<T>(T[] array)
+        {
+            return new ReadOnlySpan<T>(array);
         }
 
         /// <summary>The number of elements in this span.</summary>

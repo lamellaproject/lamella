@@ -1,5 +1,5 @@
-# PARTS table for the rp2350 family. PARTIAL pin present-list; complete from the datasheet
-# pinout. A binding whose pin is absent here refuses.
+# PARTS table for the rp2350 family. Both rows list the package's whole bonded GPIO set, which the
+# datasheet states as a range. A binding whose pin is not listed is refused.
 #
 # flash = 0: the RP2350 has NO internal flash -- code executes in place from an EXTERNAL QSPI
 # part through the XIP window, so a board's flash size is BOARD truth (its soldered chip,
@@ -19,7 +19,7 @@ part = "rp2350a"
 package = "QFN-60"
 flash = 0
 ram = 0x80000
-pins = ["GP0-GP1", "GP4-GP5", "GP16-GP19", "GP23-GP29"]
+pins = ["GP0-GP29"]
 # TWO PROCESSOR SOCKETS, AND EACH ONE RUNS EITHER ARCHITECTURE. This is why the field below lists
 # architectures per socket rather than naming one: the ARCHSEL register "has one bit for each
 # processor socket", so which core sits in a socket is SELECTED rather than fixed, and the part
@@ -34,7 +34,7 @@ pins = ["GP0-GP1", "GP4-GP5", "GP16-GP19", "GP23-GP29"]
 # threading. Same architecture AND shared memory is the condition; either alone is not.
 cores = { core0 = ["cortex-m33", "hazard3"], core1 = ["cortex-m33", "hazard3"] }
 cores_share_memory = true
-source = "RP2350 datasheet 4.2 (520 kB SRAM = 8 x 64 kB striped to 0x2007ffff + 2 x 4 kB; this row states the contiguous 512 KB window) + ch 1 (QFN-60/RP2350A, external QSPI flash) -- PARTIAL pin list: GP0/1 uart, GP4/5 i2c, GP16-19 spi, GP23-25 + GP29 the wireless-module control lines a board may wire, GP26-29 the ADC channel pads (adc block channel map). The pin list is PARTIAL rather than the package's full set"
+source = "RP2350 datasheet 4.2 (520 kB SRAM = 8 x 64 kB striped to 0x2007ffff + 2 x 4 kB; this row states the contiguous 512 KB window) + ch 1 (QFN-60/RP2350A, external QSPI flash). The pin list is COMPLETE: chapter 1's NOTE puts GPIOs 0 through 29 in all package variants and GPIOs 30 through 47 in the QFN-80 only, and 9.3 counts the QFN-60's bank 0 as GPIOs 0 through 29"
 
 [[parts]]
 part = "rp2350b"
@@ -46,10 +46,6 @@ pins = ["GP0-GP47"]
 # bonded out, not what is behind them.
 cores = { core0 = ["cortex-m33", "hazard3"], core1 = ["cortex-m33", "hazard3"] }
 cores_share_memory = true
-# THE PIN LIST IS COMPLETE HERE RATHER THAN PARTIAL, which is the one place this row differs in kind
-# from the A above: the datasheet states the whole range in one sentence, so there is nothing to add
-# to it later.
-#
 # ANALOGUE INPUT MOVES WITH THE PACKAGE AND IS THE TRAP IN THIS PART. On the QFN-60 the ADC reads
 # GPIO26-29; on the QFN-80 it reads GPIO40-47 and NOT GPIO26-29, so a GPIO number that is analogue on
 # one package is digital-only on the other, and an ADC channel number is not derivable from it.

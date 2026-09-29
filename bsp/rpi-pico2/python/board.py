@@ -11,6 +11,13 @@ BOARD_VENDOR = "RaspberryPi"
 UART0 = "uart0"
 SPI0 = "spi0"
 I2C0 = "i2c0"
+PWM1 = "pwm1"
+PWM2 = "pwm2"
+PWM3 = "pwm3"
+PWM4 = "pwm4"
+PWM5 = "pwm5"
+PWM6 = "pwm6"
+PWM7 = "pwm7"
 ADC = "adc"
 
 CARRIER = {
@@ -71,6 +78,118 @@ FACTS = {
         "funcsel": 3,
         "ic_clk_hz": 150000000,
     },
+    "pwm1": {
+        "kind": "pwm",
+        "driver_family": "rp2350-pwm",
+        "instance": "pwm",
+        "base": 0x400A8000,
+        "reset_mask": 0x10240,
+        "slice": 1,
+        "funcsel": 4,
+        "clk_sys_hz": 150000000,
+        "output_a": 0,
+        "io_a_ctrl": 0x40028014,
+        "pads_a": 0x4003800C,
+        "output_b": 1,
+        "io_b_ctrl": 0x4002801C,
+        "pads_b": 0x40038010,
+    },
+    "pwm2": {
+        "kind": "pwm",
+        "driver_family": "rp2350-pwm",
+        "instance": "pwm",
+        "base": 0x400A8000,
+        "reset_mask": 0x10240,
+        "slice": 2,
+        "funcsel": 4,
+        "clk_sys_hz": 150000000,
+        "output_a": 0,
+        "io_a_ctrl": 0x400280A4,
+        "pads_a": 0x40038054,
+        "output_b": 1,
+        "io_b_ctrl": 0x400280AC,
+        "pads_b": 0x40038058,
+    },
+    "pwm3": {
+        "kind": "pwm",
+        "driver_family": "rp2350-pwm",
+        "instance": "pwm",
+        "base": 0x400A8000,
+        "reset_mask": 0x10240,
+        "slice": 3,
+        "funcsel": 4,
+        "clk_sys_hz": 150000000,
+        "output_a": 0,
+        "io_a_ctrl": 0x40028034,
+        "pads_a": 0x4003801C,
+        "output_b": 1,
+        "io_b_ctrl": 0x4002803C,
+        "pads_b": 0x40038020,
+    },
+    "pwm4": {
+        "kind": "pwm",
+        "driver_family": "rp2350-pwm",
+        "instance": "pwm",
+        "base": 0x400A8000,
+        "reset_mask": 0x10240,
+        "slice": 4,
+        "funcsel": 4,
+        "clk_sys_hz": 150000000,
+        "output_a": 0,
+        "io_a_ctrl": 0x40028044,
+        "pads_a": 0x40038024,
+        "output_b": 1,
+        "io_b_ctrl": 0x4002804C,
+        "pads_b": 0x40038028,
+    },
+    "pwm5": {
+        "kind": "pwm",
+        "driver_family": "rp2350-pwm",
+        "instance": "pwm",
+        "base": 0x400A8000,
+        "reset_mask": 0x10240,
+        "slice": 5,
+        "funcsel": 4,
+        "clk_sys_hz": 150000000,
+        "output_a": 0,
+        "io_a_ctrl": 0x40028054,
+        "pads_a": 0x4003802C,
+        "output_b": 1,
+        "io_b_ctrl": 0x4002805C,
+        "pads_b": 0x40038030,
+    },
+    "pwm6": {
+        "kind": "pwm",
+        "driver_family": "rp2350-pwm",
+        "instance": "pwm",
+        "base": 0x400A8000,
+        "reset_mask": 0x10240,
+        "slice": 6,
+        "funcsel": 4,
+        "clk_sys_hz": 150000000,
+        "output_a": 0,
+        "io_a_ctrl": 0x40028064,
+        "pads_a": 0x40038034,
+        "output_b": 1,
+        "io_b_ctrl": 0x4002806C,
+        "pads_b": 0x40038038,
+    },
+    "pwm7": {
+        "kind": "pwm",
+        "driver_family": "rp2350-pwm",
+        "instance": "pwm",
+        "base": 0x400A8000,
+        "reset_mask": 0x10240,
+        "slice": 7,
+        "funcsel": 4,
+        "clk_sys_hz": 150000000,
+        "output_a": 0,
+        "io_a_ctrl": 0x40028074,
+        "pads_a": 0x4003803C,
+        "output_b": 1,
+        "io_b_ctrl": 0x4002807C,
+        "pads_b": 0x40038040,
+    },
     "adc": {
         "kind": "adc",
         "driver_family": "rp2350-adc",
@@ -78,6 +197,17 @@ FACTS = {
         "base": 0x400A0000,
         "reset_mask": 0x1,
         "reference_uv": 3300000,
+        "channel_count": 5,
+        "temperature_channel": 4,
+        "reserved_channels": 0x0,
+        "channel0_pin": 26,
+        "gpio26_channel": 0,
+        "channel1_pin": 27,
+        "gpio27_channel": 1,
+        "channel2_pin": 28,
+        "gpio28_channel": 2,
+        "channel3_pin": 29,
+        "gpio29_channel": 3,
     },
 }
 
@@ -99,9 +229,14 @@ INSTANCES = {
     "pll_sys": {"block": "pll", "base": 0x40050000, "reset_bit": 0xE},
     "pll_usb": {"block": "pll", "base": 0x40058000, "reset_bit": 0xF},
     "uart0": {"block": "uart", "base": 0x40070000, "reset_bit": 0x1A},
+    "uart1": {"block": "uart", "base": 0x40078000, "reset_bit": 0x1B},
     "spi0": {"block": "spi", "base": 0x40080000, "reset_bit": 0x12},
     "i2c0": {"block": "i2c", "base": 0x40090000, "reset_bit": 0x4},
     "adc": {"block": "adc", "base": 0x400A0000, "reset_bit": 0x0},
+    "timer0": {"block": "timer", "base": 0x400B0000, "reset_bit": 0x17},
+    "ticks": {"block": "ticks", "base": 0x40108000},
+    "trng": {"block": "trng", "base": 0x400F0000, "reset_bit": 0x19},
+    "pwm": {"block": "pwm", "base": 0x400A8000, "reset_bit": 0x10},
 }
 
 PLANS = {
@@ -119,4 +254,14 @@ DEVICES = {
 # that instance is brought up; touching it first is a bus fault, not a wrong value.
 MEMORY = {
     "flash": {"kind": "flash", "size": 0x400000, "optional": False},
+}
+
+# The sockets a removable module plugs into. The socket is board truth -- it is on the
+# schematic and identical on every unit -- and what is plugged into it is not, so no entry here
+# names a module. "buses" holds the roles a socket brings out whole; "pins" holds the single
+# lines, each under the standard's own name for that position. Which of a socket's protocols an
+# attached module speaks is a property of the module, so a board that offers several states all
+# of them and chooses none.
+CONNECTORS = {
+    "header": {"standard": "pico-header", "buses": {}, "pins": {"gp0": {"port_base": 0xD0000000, "pin": 0, "bank": 0, "mask": 0x1}, "gp1": {"port_base": 0xD0000000, "pin": 1, "bank": 0, "mask": 0x2}, "gp2": {"port_base": 0xD0000000, "pin": 2, "bank": 0, "mask": 0x4}, "gp3": {"port_base": 0xD0000000, "pin": 3, "bank": 0, "mask": 0x8}, "gp4": {"port_base": 0xD0000000, "pin": 4, "bank": 0, "mask": 0x10}, "gp5": {"port_base": 0xD0000000, "pin": 5, "bank": 0, "mask": 0x20}, "gp6": {"port_base": 0xD0000000, "pin": 6, "bank": 0, "mask": 0x40}, "gp7": {"port_base": 0xD0000000, "pin": 7, "bank": 0, "mask": 0x80}, "gp8": {"port_base": 0xD0000000, "pin": 8, "bank": 0, "mask": 0x100}, "gp9": {"port_base": 0xD0000000, "pin": 9, "bank": 0, "mask": 0x200}, "gp10": {"port_base": 0xD0000000, "pin": 10, "bank": 0, "mask": 0x400}, "gp11": {"port_base": 0xD0000000, "pin": 11, "bank": 0, "mask": 0x800}, "gp12": {"port_base": 0xD0000000, "pin": 12, "bank": 0, "mask": 0x1000}, "gp13": {"port_base": 0xD0000000, "pin": 13, "bank": 0, "mask": 0x2000}, "gp14": {"port_base": 0xD0000000, "pin": 14, "bank": 0, "mask": 0x4000}, "gp15": {"port_base": 0xD0000000, "pin": 15, "bank": 0, "mask": 0x8000}, "gp16": {"port_base": 0xD0000000, "pin": 16, "bank": 0, "mask": 0x10000}, "gp17": {"port_base": 0xD0000000, "pin": 17, "bank": 0, "mask": 0x20000}, "gp18": {"port_base": 0xD0000000, "pin": 18, "bank": 0, "mask": 0x40000}, "gp19": {"port_base": 0xD0000000, "pin": 19, "bank": 0, "mask": 0x80000}, "gp20": {"port_base": 0xD0000000, "pin": 20, "bank": 0, "mask": 0x100000}, "gp21": {"port_base": 0xD0000000, "pin": 21, "bank": 0, "mask": 0x200000}, "gp22": {"port_base": 0xD0000000, "pin": 22, "bank": 0, "mask": 0x400000}, "gp26": {"port_base": 0xD0000000, "pin": 26, "bank": 0, "mask": 0x4000000}, "gp27": {"port_base": 0xD0000000, "pin": 27, "bank": 0, "mask": 0x8000000}, "gp28": {"port_base": 0xD0000000, "pin": 28, "bank": 0, "mask": 0x10000000}}},
 }

@@ -11,6 +11,11 @@ namespace System.Collections
         private int count;
         private int used;
 
+        internal int version;
+
+        private HashtableKeysOrValues keysView;
+        private HashtableKeysOrValues valuesView;
+
         public Hashtable()
         {
             Initialize(8);
@@ -71,7 +76,7 @@ namespace System.Collections
             return -1;
         }
 
-        private void Insert(object key, object value)
+        private void Insert(object key, object value, bool add)
         {
             if ((used + 1) * 4 >= hashes.Length * 3) Grow();
             int hash = HashOf(key);
@@ -95,6 +100,7 @@ namespace System.Collections
                     keys[index] = key;
                     values[index] = value;
                     count = count + 1;
+                    version = version + 1;
                     return;
                 }
                 if (state == Tombstone)
@@ -103,7 +109,13 @@ namespace System.Collections
                 }
                 else if (state == hash && keys[index] != null && keys[index].Equals(key))
                 {
+                    if (add)
+                    {
+                        throw new ArgumentException("Item has already been added. Key in dictionary: '"
+                            + keys[index].ToString() + "'  Key being added: '" + key.ToString() + "'");
+                    }
                     values[index] = value;
+                    version = version + 1;
                     return;
                 }
                 index = index + 1;
@@ -165,11 +177,15 @@ namespace System.Collections
             set
             {
                 CheckKey(key);
-                Insert(key, value);
+                Insert(key, value, false);
             }
         }
 
-        public void Add(object key, object value) { this[key] = value; }
+        public void Add(object key, object value)
+        {
+            CheckKey(key);
+            Insert(key, value, true);
+        }
 
         public object Clone()
         {
@@ -190,10 +206,12 @@ namespace System.Collections
             keys[i] = null;
             values[i] = null;
             count = count - 1;
+            version = version + 1;
         }
 
         public void Clear()
         {
+            if (count > 0) version = version + 1;
             for (int i = 0; i < hashes.Length; i++)
             {
                 keys[i] = null;
@@ -208,10 +226,8 @@ namespace System.Collections
         {
             get
             {
-                object[] snapshot = new object[count];
-                int n = 0;
-                for (int i = 0; i < hashes.Length; i++) if (hashes[i] >= 0) snapshot[n++] = keys[i];
-                return new ObjectArrayCollection(snapshot, count, this);
+                if (keysView == null) keysView = new HashtableKeysOrValues(this, HashtableEnumerator.Keys);
+                return keysView;
             }
         }
 
@@ -219,26 +235,14 @@ namespace System.Collections
         {
             get
             {
-                object[] snapshot = new object[count];
-                int n = 0;
-                for (int i = 0; i < hashes.Length; i++) if (hashes[i] >= 0) snapshot[n++] = values[i];
-                return new ObjectArrayCollection(snapshot, count, this);
+                if (valuesView == null) valuesView = new HashtableKeysOrValues(this, HashtableEnumerator.Values);
+                return valuesView;
             }
         }
 
         public IDictionaryEnumerator GetEnumerator()
         {
-            object[] ks = new object[count];
-            object[] vs = new object[count];
-            int n = 0;
-            for (int i = 0; i < hashes.Length; i++)
-            {
-                if (hashes[i] < 0) continue;
-                ks[n] = keys[i];
-                vs[n] = values[i];
-                n = n + 1;
-            }
-            return new HashtableEnumerator(ks, vs, count);
+            return new HashtableEnumerator(this, HashtableEnumerator.Entries);
         }
 
         IEnumerator IEnumerable.GetEnumerator()
@@ -246,7 +250,24 @@ namespace System.Collections
             return GetEnumerator();
         }
 
+        internal int NextEntry(int slot)
+        {
+            for (int i = slot; i < hashes.Length; i++)
+            {
+                if (hashes[i] >= 0) return i;
+            }
+            return -1;
+        }
+
+        internal object KeyAt(int slot) { return keys[slot]; }
+        internal object ValueAt(int slot) { return values[slot]; }
+
         public void CopyTo(System.Array array, int index)
+        {
+            CopyTo(array, index, HashtableEnumerator.Entries);
+        }
+
+        internal void CopyTo(System.Array array, int index, int kind)
         {
             if ((object)array == null) throw new ArgumentNullException("array");
             if (array.Rank != 1) throw new ArgumentException("array");
@@ -256,7 +277,9 @@ namespace System.Collections
             for (int i = 0; i < hashes.Length; i++)
             {
                 if (hashes[i] < 0) continue;
-                array.SetValue(new DictionaryEntry(keys[i], values[i]), index + n);
+                if (kind == HashtableEnumerator.Keys) array.SetValue(keys[i], index + n);
+                else if (kind == HashtableEnumerator.Values) array.SetValue(values[i], index + n);
+                else array.SetValue(new DictionaryEntry(keys[i], values[i]), index + n);
                 n = n + 1;
             }
         }

@@ -55,6 +55,123 @@ pin = "GP25"
 active = "high"
 source = "Raspberry Pi Pico datasheet section 2.1 internal-function pin list: 'GPIO25  OP Connected to user LED'. The schematic appendix, Figure 19, (the Pico Rev3 board schematic) wires GPIO25 through R3 (470R, 1%, M1005, 63 mW) to D2's anode, a green LED whose cathode is at ground. The same document's test-point list gives 'TP5  GPIO25/LED (not recommended to be used)' and explains that TP5 taps the node between the resistor and the anode, which is why it 'will only swing from 0 V to the LED forward voltage' -- an independent confirmation of which end of the diode the pin drives."
 
+# --- the header: the forty-position Pico header, ext/standards/pico-header.toml ---------------
+#
+# Each of its twenty-six GPIO positions reaches the GPIO of its own number, as the pinout draws it.
+# The row still states them one by one, because it is this board's half of a join: an extension
+# plugged onto the header names positions, and this row is where each finds its pad. A pin brought
+# out here is exposed rather than owned, so the bindings above keep theirs -- the header's GP0 and
+# GP1 are uart0's transmit and receive.
+
+[[connectors]]
+name = "header"
+standard = "pico-header"
+source = "Raspberry Pi Pico Datasheet section 2.1 and Figure 2 (The pinout of the Raspberry Pi Pico Rev3 board): GP0 to GP22 on header positions 1 to 29 and GP26 to GP28 on positions 31, 32 and 34, each the RP2040's GPIO of the same number. The same section lists the four GPIOs the header does not carry as the board's own: GPIO29 measures VSYS/3 on ADC3, GPIO25 drives the user LED, GPIO24 senses VBUS and GPIO23 controls the SMPS power-save pin."
+
+[[connectors.header.pins]]
+signal = "gp0"
+pin = "GP0"
+
+[[connectors.header.pins]]
+signal = "gp1"
+pin = "GP1"
+
+[[connectors.header.pins]]
+signal = "gp2"
+pin = "GP2"
+
+[[connectors.header.pins]]
+signal = "gp3"
+pin = "GP3"
+
+[[connectors.header.pins]]
+signal = "gp4"
+pin = "GP4"
+
+[[connectors.header.pins]]
+signal = "gp5"
+pin = "GP5"
+
+[[connectors.header.pins]]
+signal = "gp6"
+pin = "GP6"
+
+[[connectors.header.pins]]
+signal = "gp7"
+pin = "GP7"
+
+[[connectors.header.pins]]
+signal = "gp8"
+pin = "GP8"
+
+[[connectors.header.pins]]
+signal = "gp9"
+pin = "GP9"
+
+[[connectors.header.pins]]
+signal = "gp10"
+pin = "GP10"
+
+[[connectors.header.pins]]
+signal = "gp11"
+pin = "GP11"
+
+[[connectors.header.pins]]
+signal = "gp12"
+pin = "GP12"
+
+[[connectors.header.pins]]
+signal = "gp13"
+pin = "GP13"
+
+[[connectors.header.pins]]
+signal = "gp14"
+pin = "GP14"
+
+[[connectors.header.pins]]
+signal = "gp15"
+pin = "GP15"
+
+[[connectors.header.pins]]
+signal = "gp16"
+pin = "GP16"
+
+[[connectors.header.pins]]
+signal = "gp17"
+pin = "GP17"
+
+[[connectors.header.pins]]
+signal = "gp18"
+pin = "GP18"
+
+[[connectors.header.pins]]
+signal = "gp19"
+pin = "GP19"
+
+[[connectors.header.pins]]
+signal = "gp20"
+pin = "GP20"
+
+[[connectors.header.pins]]
+signal = "gp21"
+pin = "GP21"
+
+[[connectors.header.pins]]
+signal = "gp22"
+pin = "GP22"
+
+[[connectors.header.pins]]
+signal = "gp26"
+pin = "GP26"
+
+[[connectors.header.pins]]
+signal = "gp27"
+pin = "GP27"
+
+[[connectors.header.pins]]
+signal = "gp28"
+pin = "GP28"
+
 [[plans]]
 name = "xosc-12mhz"
 default = true

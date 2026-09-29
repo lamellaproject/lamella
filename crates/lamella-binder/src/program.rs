@@ -162,7 +162,7 @@ pub fn bind_compilation_unit_with_options(
     apply_bind_options(&mut binder, options);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
-    bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
+    bind_unit_body(&mut binder, unit);
     binder.report_unused_fields();
     let entry_points = entry_point_diagnostics(binder.model(), target);
     let mut diagnostics = binder.into_diagnostics();
@@ -187,7 +187,7 @@ pub fn bind_compilation_unit_with_model(
     resolve_constants(binder.model_mut(), core::slice::from_ref(unit));
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
-    bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
+    bind_unit_body(&mut binder, unit);
     binder.report_unused_fields();
     let entry_points = entry_point_diagnostics(binder.model(), OutputKind::Inferred);
     let mut diagnostics = binder.into_diagnostics();
@@ -852,7 +852,7 @@ pub fn bind_compilation_units_with_options(
         .iter()
         .map(|unit| {
             report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
-            bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
+            bind_unit_body(&mut binder, unit);
             binder.report_unused_fields();
             binder.take_diagnostics()
         })
@@ -992,7 +992,10 @@ fn qualify_model_info(binder: &mut Binder, namespace: &str, name: &str) {
         event.ty = binder.canonicalize(&event.ty);
     }
     for method in &mut info.methods {
-        let method_parameters = binder.enter_type_parameter_names(&method.type_parameters);
+        let method_parameters = binder.enter_type_parameter_names_with(
+            &method.type_parameters,
+            &method.type_parameter_constraints,
+        );
         method.return_type = binder.canonicalize(&method.return_type);
         for parameter in &mut method.parameters {
             *parameter = binder.canonicalize(parameter);
@@ -1010,6 +1013,16 @@ fn qualify_model_info(binder: &mut Binder, namespace: &str, name: &str) {
     if let Some(slot) = binder.model_mut().info_mut(namespace, name) {
         *slot = info;
     }
+}
+
+/// Binds one unit's declarations and bodies, under that unit's own nullable context.
+///
+/// **THE CONTEXT IS A FACT ABOUT ONE FILE**, like its pragmas: a `#nullable enable` in one file says
+/// nothing about the next, and a multi-file compilation binds them all with one binder. Every
+/// path that binds a unit comes through here, so none of them can bind one under its neighbor's.
+fn bind_unit_body(binder: &mut Binder, unit: &CompilationUnit) {
+    binder.set_nullable_context(unit.nullable.clone());
+    bind_namespace_body(binder, &unit.usings, &unit.members, "");
 }
 
 fn bind_namespace_body(
@@ -1215,8 +1228,12 @@ fn validate_enum_members(binder: &mut Binder, namespace: &str, declaration: &Enu
             binder.check_assignable(&bound, &underlying, initializer.span);
             continue;
         }
-        if let Some(value) = literal_int_value(&literal) {
-            if let Some(rendered) = enum_value_out_of_range(i128::from(value), &underlying) {
+        let value = binder
+            .integral_constant_type(&bound.ty)
+            .and_then(|ty| crate::integral_constant::value(&literal, ty))
+            .or_else(|| literal_int_value(&literal).map(i128::from));
+        if let Some(value) = value {
+            if let Some(rendered) = enum_value_out_of_range(value, &underlying) {
                 binder.report(Diagnostic::new(
                     DiagnosticKind::ConstantOutOfRange {
                         value: rendered,
@@ -1286,6 +1303,13 @@ fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaratio
             parameter.ty.span,
         );
     }
+    let entered =
+        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    binder.bind_annotated_type(&declaration.return_type, true);
+    for parameter in &declaration.parameters {
+        binder.bind_annotated_type(&parameter.ty, true);
+    }
+    binder.exit_type_parameters(entered);
     if let Some(name) = restricted_array_element(binder, &declaration.return_type) {
         binder.report(Diagnostic::new(
             DiagnosticKind::RestrictedTypeArrayElement { ty: name.clone() },
@@ -1397,7 +1421,14 @@ fn validate_constraint_order(binder: &mut Binder, clause: &TypeParameterConstrai
     let mut has_struct = false;
     for (index, constraint) in clause.constraints.iter().enumerate() {
         match constraint {
-            SyntaxConstraint::ReferenceType(span) | SyntaxConstraint::ValueType(span) => {
+            SyntaxConstraint::ReferenceType { span, .. } | SyntaxConstraint::ValueType(span) => {
+                if let SyntaxConstraint::ReferenceType {
+                    question: Some(question),
+                    ..
+                } = constraint
+                {
+                    binder.report_nullable_annotation(*question);
+                }
                 if index > 0 {
                     binder.report(Diagnostic::new(
                         DiagnosticKind::ClassOrStructConstraintMustBeFirst,
@@ -1418,6 +1449,11 @@ fn validate_constraint_order(binder: &mut Binder, clause: &TypeParameterConstrai
                         .report(Diagnostic::new(DiagnosticKind::NewConstraintMustBeLast, *span));
                 }
             }
+            SyntaxConstraint::Type(reference)
+                if crate::declaration::is_notnull_constraint(reference) =>
+            {
+                binder.gate_feature(Feature::NotNullConstraint, reference.span);
+            }
             SyntaxConstraint::Type(reference) => {
                 let _ = has_class_or_struct;
                 validate_constraint_type(binder, reference);
@@ -1433,7 +1469,8 @@ fn validate_constraint_order(binder: &mut Binder, clause: &TypeParameterConstrai
 /// under-report the flag itself documents. A false CS0701 would refuse a legal program against an
 /// assembly we merely could not read.
 fn validate_constraint_type(binder: &mut Binder, reference: &lamella_syntax::ast::TypeRef) {
-    let symbol = binder.resolve_named_type_quietly(&bind_type(reference), reference.span);
+    let annotated = binder.bind_annotated_type(reference, true);
+    let symbol = binder.resolve_named_type_quietly(&annotated, reference.span);
     if symbol.is_error() {
         return;
     }
@@ -2488,6 +2525,10 @@ fn validate_conversion_operators(binder: &mut Binder, declaration: &TypeDecl) {
             continue;
         }
         let names_enclosing = |ty: &lamella_syntax::ast::TypeRef| {
+            let ty = match &ty.kind {
+                lamella_syntax::ast::TypeRefKind::Nullable(underlying) => &**underlying,
+                _ => ty,
+            };
             let named = match bind_type(ty) {
                 TypeSymbol::Named(parts) => parts,
                 TypeSymbol::Instantiation { definition, .. } => definition,
@@ -3722,6 +3763,9 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
         let resolvable: Vec<TypeSymbol> = {
             let mut kept = Vec::new();
             for reference in &declaration.bases {
+                if binder.is_top_level_annotation(reference) {
+                    continue;
+                }
                 let symbol = bind_type(reference);
                 if !binder
                     .resolve_named_type_quietly(&symbol, reference.span)
@@ -3760,7 +3804,12 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
         }
     }
     if matches!(declaration.kind, TypeKind::Struct | TypeKind::Interface) {
-        let written: Vec<TypeSymbol> = declaration.bases.iter().map(bind_type).collect();
+        let mut written: Vec<TypeSymbol> = Vec::new();
+        for reference in &declaration.bases {
+            if !binder.is_top_level_annotation(reference) {
+                written.push(bind_type(reference));
+            }
+        }
         let offenders: Vec<TypeSymbol> = {
             let model = binder.model();
             written
@@ -4362,6 +4411,12 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     }
     binder.enter_type(enclosing.clone());
     for base in &declaration.bases {
+        if binder.is_top_level_annotation(base) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::InvalidBaseType,
+                Span::empty_at(base.span.start),
+            ));
+        }
         binder.resolve_type_ref(base);
     }
     for member in &declaration.members {
@@ -4378,7 +4433,8 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             | Member::Indexer { ty, .. }
             | Member::Method { return_type: ty, .. }
             | Member::Property { ty, .. }
-            | Member::Operator { return_type: ty, .. } => {
+            | Member::Operator { return_type: ty, .. }
+            | Member::ConversionOperator { target: ty, .. } => {
                 binder.resolve_type_ref(ty);
             }
             _ => {}
@@ -4527,7 +4583,9 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 initializer,
                 ..
             } => {
-                let property_ty = bind_type(ty);
+                binder.enter_type(enclosing.clone());
+                let property_ty = binder.canonicalize(&bind_type(ty));
+                binder.exit_type();
                 let is_static = is_static_member(modifiers);
                 if let Some(body) = getter.as_ref().and_then(|accessor| accessor.body.as_ref()) {
                     binder.bind_method(
@@ -8078,6 +8136,48 @@ mod tests {
         );
         assert_eq!(sorted_codes("class C { static int M() { return 2000000000 + 100; } }"), []);
         assert_eq!(sorted_codes("class C { static byte M() { return 200 + 100; } }"), [31]);
+        assert_eq!(sorted_codes("class C { const int X = int.MinValue / -1; }"), [220]);
+        assert_eq!(sorted_codes("class C { const long Y = long.MinValue / -1L; }"), [220]);
+        assert_eq!(sorted_codes("enum E { A = int.MinValue / -1 }"), [220]);
+        assert_eq!(sorted_codes("class C { const int X = unchecked(int.MinValue / -1); }"), []);
+        assert_eq!(sorted_codes("class C { const long Z = long.MinValue % -1L; }"), []);
+    }
+
+    /// **A CONSTANT COMPUTED AT ITS OWN TYPE IS NOT AN ERROR, AND EACH OF THESE WAS ONE** while
+    /// constants were computed as signed 64-bit values. csc accepts every line, measured.
+    #[test]
+    fn a_constant_computed_at_its_own_type_draws_no_false_error() {
+        assert_eq!(
+            sorted_codes(
+                "class C { const long H = 1L << 64; const int P = 1 << -1; const long O = -1 >> 70; }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static int M(ulong v) { switch (v) { case ~0u: return 1; \
+                     case ulong.MaxValue: return 2; } return 0; } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static int M(uint v) { switch (v) { case ~0u - 1: return 1; } return 0; } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes("enum M : ulong { High = 0x8000000000000000, All = ulong.MaxValue }"),
+            []
+        );
+        assert_eq!(sorted_codes("enum U : uint { A = 1, NotA = ~A }"), []);
+        assert_eq!(
+            sorted_codes(
+                "class C { const int Offset = unchecked((int)2166136261); \
+                     const int Wrap = unchecked(int.MaxValue + 1); }"
+            ),
+            []
+        );
     }
 
     #[test]
@@ -8647,6 +8747,52 @@ mod tests {
             sorted_codes("class C { int x = 0; int M() { return x; } }"),
             []
         );
+    }
+
+    #[test]
+    fn calling_what_is_not_a_method_is_cs0149_cs1955_or_cs0118() {
+        assert_eq!(sorted_codes("class C { static void M() { int x = 1; x(); } }"), [149]);
+        assert_eq!(sorted_codes("class C { static void M(int p) { p(); } }"), [149]);
+        assert_eq!(sorted_codes("class C { static void M() { 1(); } }"), [149]);
+        assert_eq!(
+            sorted_codes("class C { static int G() { return 1; } static void M() { G()(); } }"),
+            [149]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void M(int[] a) { a[0](); } }"),
+            [149]
+        );
+        assert_eq!(sorted_codes("class C { static void M() { const int c = 1; c(); } }"), [149]);
+        assert_eq!(sorted_codes("class C { static int F = 0; static void M() { F(); } }"), [1955]);
+        assert_eq!(
+            sorted_codes("class C { static int F = 0; static void M() { C.F(); } }"),
+            [1955]
+        );
+        assert_eq!(sorted_codes("class C { int f = 0; void M() { this.f(); } }"), [1955]);
+        assert_eq!(
+            sorted_codes("class C { static int P { get { return 1; } } static void M() { P(); } }"),
+            [1955]
+        );
+        assert_eq!(sorted_codes("class C { static void M() { C(); } }"), [1955]);
+        assert_eq!(
+            sorted_codes("namespace N { class D { } } class C { static void M() { N(); } }"),
+            [118]
+        );
+        assert_eq!(sorted_codes("class C { static void M() { int x = 1; x<int>(); } }"), [307]);
+        assert_eq!(
+            sorted_codes("class C { static int F = 0; static void M() { F<int>(); } }"),
+            [307]
+        );
+        assert_eq!(sorted_codes("class C { static void M() { C<int>(); } }"), [308]);
+        assert_eq!(
+            sorted_codes("namespace N { class D { } } class C { static void M() { N<int>(); } }"),
+            [307]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void M() { int x = 1; x(missing); } }"),
+            [103, 149]
+        );
+        assert_eq!(sorted_codes("class C { static void M() { var x = missing; x(); } }"), [103]);
     }
 
     #[test]

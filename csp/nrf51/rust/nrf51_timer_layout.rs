@@ -3,7 +3,6 @@
 //!
 //! The nrf51 timer block layout as Rust consts: offsets are instance-base-relative
 //! (`base + *_OFF`) and the instance bases live in nrf51_instances.rs. Widths are access widths.
-//! Its block table's `emit` list leaves C# out, so no C# layout of it exists.
 
 /// -- register offsets (block-relative) + access widths --
 pub const TASKS_START_OFF: u32 = 0x0;

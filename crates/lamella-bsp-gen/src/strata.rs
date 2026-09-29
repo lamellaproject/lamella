@@ -312,6 +312,17 @@ pub struct PartRow {
     /// told apart from a field somebody filled in wrongly, and naming what holds the pin is what
     /// lets a reader decide whether another part of the family carries the same restriction.
     pub reserved: Vec<(String, String)>,
+    /// The pads each separately supplied rail powers, by rail (`vddio2 = ["PG2-PG15"]`), where the
+    /// part isolates them at reset until software validates the rail. Empty for a part with none.
+    ///
+    /// A PAD ON SUCH A RAIL IS PRESENT AND ROUTED AND STILL DOES NOTHING. It passes the pin list,
+    /// its function cell and every mux check, and a write to it lands with no error, because the
+    /// isolation sits between the pad and the rest of the chip. So the rail is a fact of its own,
+    /// and a board whose pins touch one emits the rail's prerequisite.
+    pub rails: Vec<(String, Vec<String>)>,
+    /// The register field that validates each rail in [`rails`](Self::rails), as
+    /// `instance.REGISTER.FIELD` (`pwr.CR2.IOSV`). Every rail names exactly one.
+    pub rail_valid: Vec<(String, String)>,
     /// The core's instruction-set profile (`rv32ec`), lowercase; empty when the family has not
     /// stated one. A part that merely names its architecture tells a code generator nothing it
     /// can act on, so the two consequences a backend must respect are stated BESIDE the name and
@@ -383,6 +394,20 @@ pub struct PartRow {
 /// written.
 pub const DEVICE_ID_SCOPES: &[&str] = &["part", "class"];
 
+/// Whether `pin` is named by a pin list whose entries are single pins (`PH3`) or ranges within one
+/// port (`PG2-PG15`).
+fn list_has_pin(list: &[String], pin: &str) -> bool {
+    let Some((port, index)) = split_pin(pin) else { return false };
+    list.iter().any(|entry| match entry.split_once('-') {
+        None => entry == pin,
+        Some((lo, hi)) => {
+            matches!((split_pin(lo), split_pin(hi)),
+                (Some((lp, li)), Some((hp, hi_i)))
+                    if lp == port && hp == port && li <= index && index <= hi_i)
+        }
+    })
+}
+
 impl PartRow {
     /// Refuses a half-stated identity: the four `device_id*` fields are one fact and travel
     /// together.
@@ -416,15 +441,14 @@ impl PartRow {
     /// Whether `pin` (e.g. `PB10`) is inside this part's present-list.
     #[must_use]
     pub fn has_pin(&self, pin: &str) -> bool {
-        let Some((port, index)) = split_pin(pin) else { return false };
-        self.pins.iter().any(|entry| match entry.split_once('-') {
-            None => entry == pin,
-            Some((lo, hi)) => {
-                matches!((split_pin(lo), split_pin(hi)),
-                    (Some((lp, li)), Some((hp, hi_i)))
-                        if lp == port && hp == port && li <= index && index <= hi_i)
-            }
-        })
+        list_has_pin(&self.pins, pin)
+    }
+
+    /// The rail that isolates `pin` until it is validated, or `None` when the pin rides no such
+    /// rail.
+    #[must_use]
+    pub fn rail_of(&self, pin: &str) -> Option<&str> {
+        self.rails.iter().find(|(_, pins)| list_has_pin(pins, pin)).map(|(rail, _)| rail.as_str())
     }
 
     /// What owns `pin` when the part reserves it, or `None` when a program may use it.
@@ -483,6 +507,9 @@ pub struct Binding {
     /// rail the converter measures against), legal only on an `adc` binding -- it is a
     /// property of the board's wiring, not of the chip.
     pub reference_uv: i64,
+    /// The PWM slice a `pwm` binding drives, on a family whose PWM block is an array of identical
+    /// slices (-1 = not stated). Legal only on a `pwm` binding.
+    pub slice: i64,
     /// The named signal pins (`tx`/`rx` for uart; `mosi`/`sck`/`miso`/`cs` for spi).
     pub pins: Vec<(String, PinRef)>,
 }
@@ -507,6 +534,10 @@ pub struct ControlPin {
     /// The pull a pin-wired row's pad needs, one of [`PULL_STATES`]. Empty where the board file
     /// states none, which is NOT the same as stating `none`.
     pub pull: String,
+    /// A second pad the row's line is wired to on the board, its twin (empty for none): a header
+    /// position that reaches two GPIOs. The board's adc binding gives a twin the same analog pad
+    /// setup as its channel's own pad, since a pull left on it loads the reading.
+    pub twin: String,
 }
 
 impl Default for ControlPin {
@@ -519,6 +550,7 @@ impl Default for ControlPin {
             role: String::new(),
             address: -1,
             pull: String::new(),
+            twin: String::new(),
         }
     }
 }
@@ -568,12 +600,11 @@ pub const PULL_STATES: &[&str] = &["up", "down", "none", "unknown"];
 /// A pad that a document says needs neither resistor is an instruction, so it is emitted as one
 /// (both flags zero) and a consumer can tell it apart from a pad nobody read.
 ///
-/// TWO FLAGS RATHER THAN ONE ENCODED VALUE, and the reason is the failure this lane keeps paying
-/// for. Any small integer chosen here would coincide with some family's register field -- 0/1/2
-/// happens to be the STM32 `PUPDR` encoding and is NOT nRF's `PIN_CNF.PULL` -- and a value that
-/// looks like a register field invites being written into one, which is right on one family and
-/// silently wrong on the next. Two booleans cannot be written to any register directly, so the
-/// translation a family needs stays where it belongs.
+/// TWO FLAGS RATHER THAN ONE ENCODED VALUE. Any small integer chosen here would coincide with
+/// some family's register field -- 0/1/2 happens to be the STM32 `PUPDR` encoding and is NOT
+/// nRF's `PIN_CNF.PULL` -- and a value that looks like a register field invites being written
+/// into one, which is right on one family and silently wrong on the next. Two booleans cannot
+/// be written to any register directly, so the translation a family needs stays where it belongs.
 pub fn pull_flags(control: &ControlPin) -> Option<(bool, bool)> {
     match control.pull.as_str() {
         "up" => Some((true, false)),
@@ -777,8 +808,12 @@ pub struct Discriminator {
 /// because a board's silkscreen carries one of them and not the other. Whether the two are
 /// interchangeable is a claim about the two standards rather than about any board, so it is not
 /// stated here.
-pub const CONNECTOR_STANDARDS: [&str; 5] =
-    ["qwiic", "stemma-qt", "mikrobus", "arduino-uno-v3", "xplained-pro"];
+///
+/// `pico-header` is the forty-position header of the Raspberry Pi Pico boards, which other makers'
+/// boards copy. Its documents name no standard, so the id is chosen here; the positions in
+/// `ext/standards/pico-header.toml` are the Pico's own labels.
+pub const CONNECTOR_STANDARDS: [&str; 6] =
+    ["qwiic", "stemma-qt", "mikrobus", "arduino-uno-v3", "xplained-pro", "pico-header"];
 
 /// The bus kinds a connector may bring out as a whole group, matching the binding kinds.
 pub const CONNECTOR_BUS_SIGNALS: [&str; 3] = ["i2c", "spi", "uart"];
@@ -1049,7 +1084,7 @@ pub struct ExtensionBus {
 pub struct ExtensionDevice {
     /// The extension's own name for it.
     pub name: String,
-    /// `gpio-in`, `gpio-out`, `analog-in`, `spi-device`, `i2c-device`.
+    /// `gpio-in`, `gpio-out`, `pwm-out`, `analog-in`, `spi-device`, `i2c-device`.
     pub kind: String,
     /// The standard position it sits on, for a line-wired device. Empty for a bus-wired one.
     pub signal: String,
@@ -1067,6 +1102,79 @@ pub struct ExtensionDevice {
     pub source: String,
 }
 
+/// One printed revision of an extension board whose wiring differs from another's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionRevision {
+    /// The revision as the maker prints it (`v101`).
+    pub name: String,
+    /// Where the revision's wiring is stated.
+    pub source: String,
+}
+
+/// One line of a socket an extension carries: a position of the socket's standard, and the
+/// position of the extension's OWN standard it is wired to.
+///
+/// A socket on an adapter reaches no pad of its own. Its lines land on the adapter's host
+/// connector, so the far end of each is a position of that connector's standard, and the host
+/// board's row for that position names the pad.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionSocketLine {
+    /// The socket's position (`cs`), in the socket's standard.
+    pub signal: String,
+    /// The extension's own position the line reaches (`gp17`), in the extension's standard.
+    pub host: String,
+    /// The revision this wiring holds for; empty when every revision is wired the same way.
+    pub revision: String,
+}
+
+/// A socket an extension carries, of another standard than the one it plugs into -- which makes
+/// the extension an ADAPTER: a module plugs into it the way the adapter plugs into a board.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionSocket {
+    /// The socket id, extension-scoped (`socket-1`).
+    pub name: String,
+    /// The standard the socket follows, from [`CONNECTOR_STANDARDS`].
+    pub standard: String,
+    /// Where the socket's wiring is stated.
+    pub source: String,
+    /// Its lines, in table order.
+    pub lines: Vec<ExtensionSocketLine>,
+}
+
+/// Where a socket position lands under one revision of its adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SocketWiring<'a> {
+    /// The adapter position the line reaches.
+    Wired(&'a str),
+    /// The socket does not carry the position.
+    Absent,
+    /// The line is wired differently by revision and no revision was named: each revision with
+    /// the adapter position it reaches there.
+    ByRevision(Vec<(&'a str, &'a str)>),
+}
+
+impl ExtensionSocket {
+    /// Where `position` lands on the adapter under `revision` (`None`: the unit's revision is not
+    /// known).
+    #[must_use]
+    pub fn wiring(&self, position: &str, revision: Option<&str>) -> SocketWiring<'_> {
+        let rows: Vec<&ExtensionSocketLine> = self.lines.iter().filter(|line| line.signal == position).collect();
+        if let Some(row) = rows.iter().find(|row| row.revision.is_empty()) {
+            return SocketWiring::Wired(&row.host);
+        }
+        if rows.is_empty() {
+            return SocketWiring::Absent;
+        }
+        match revision {
+            Some(revision) => rows
+                .iter()
+                .find(|row| row.revision == revision)
+                .map_or(SocketWiring::Absent, |row| SocketWiring::Wired(&row.host)),
+            None => SocketWiring::ByRevision(rows.iter().map(|row| (row.revision.as_str(), row.host.as_str())).collect()),
+        }
+    }
+}
+
 /// An extension board: `ext/<extension>/extension.toml`.
 ///
 /// EVERY LINE IS A STANDARD POSITION AND NEVER A HOST PAD, which is what lets one of these bind to
@@ -1081,15 +1189,23 @@ pub struct ExtensionTable {
     pub standard: String,
     /// The `nnnn` field of the serial its identification chip carries, or `-1`.
     pub kit_identifier: i64,
+    /// The printed revisions whose wiring differs, in table order. Empty when the file states one
+    /// wiring for every unit.
+    pub revisions: Vec<ExtensionRevision>,
     /// The buses it presents.
     pub buses: Vec<ExtensionBus>,
     /// The devices a host reaches.
     pub devices: Vec<ExtensionDevice>,
+    /// The sockets it carries, when it is an adapter.
+    pub sockets: Vec<ExtensionSocket>,
 }
 
 impl ExtensionTable {
     /// Every standard position this extension needs a host to wire, without duplicates, in the
     /// order the file states them. THIS IS THE REQUIREMENT SET a socket is measured against.
+    ///
+    /// An adapter's sockets count: each line a socket carries lands on one of its host positions,
+    /// under every revision.
     pub fn required_positions(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for bus in &self.buses {
@@ -1104,7 +1220,20 @@ impl ExtensionTable {
                 out.push(device.signal.clone());
             }
         }
+        for socket in &self.sockets {
+            for line in &socket.lines {
+                if !out.contains(&line.host) {
+                    out.push(line.host.clone());
+                }
+            }
+        }
         out
+    }
+
+    /// The socket of that name, when the extension carries one.
+    #[must_use]
+    pub fn socket(&self, name: &str) -> Option<&ExtensionSocket> {
+        self.sockets.iter().find(|socket| socket.name == name)
     }
 }
 
@@ -1852,7 +1981,7 @@ fn build_block(
             }
             Item::ArraySection(name) => {
                 if name == "channels" {
-                    table.channels.push(Channel { index: 0, source: String::new() });
+                    table.channels.push(Channel { index: 0, source: String::new(), package: String::new() });
                     at = At::Channel;
                     continue;
                 }
@@ -1888,6 +2017,7 @@ fn build_block(
                     match (key.as_str(), value) {
                         ("index", RawValue::Int(int)) => channel.index = int.value,
                         ("source", RawValue::Str(s)) => channel.source = s.clone(),
+                        ("package", RawValue::Str(s)) => channel.package = s.clone(),
                         ("enable", RawValue::Str(_)) => {}
                         (other, _) => {
                             return Err(err(*line, &format!("unexpected channel key '{other}'")));
@@ -2784,6 +2914,8 @@ fn build_parts(
                     cores: Vec::new(),
                     cores_share_memory: None,
                     reserved: Vec::new(),
+                    rails: Vec::new(),
+                    rail_valid: Vec::new(),
                     isa: String::new(),
                     isa_registers: 0,
                     isa_muldiv: String::new(),
@@ -2864,6 +2996,39 @@ fn build_parts(
                             row.cores.push((socket.clone(), archs));
                         }
                     }
+                    ("rails", RawValue::Inline(entries)) => {
+                        for (rail, value) in entries {
+                            let RawValue::Array(items) = value else {
+                                return Err(err(*line, &format!("rail '{rail}' must list its pads as an array")));
+                            };
+                            let mut pins = Vec::new();
+                            for item in items {
+                                match item {
+                                    RawValue::Str(s) => pins.push(s.clone()),
+                                    _ => return Err(err(*line, &format!("rail '{rail}': a pad must be a string"))),
+                                }
+                            }
+                            if pins.is_empty() {
+                                return Err(err(*line, &format!("rail '{rail}' lists no pads")));
+                            }
+                            row.rails.push((rail.clone(), pins));
+                        }
+                    }
+                    ("rail_valid", RawValue::Inline(entries)) => {
+                        for (rail, value) in entries {
+                            match value {
+                                RawValue::Str(s) if s.split('.').count() == 3 && !s.split('.').any(str::is_empty) => {
+                                    row.rail_valid.push((rail.clone(), s.clone()));
+                                }
+                                _ => {
+                                    return Err(err(
+                                        *line,
+                                        &format!("rail_valid '{rail}' must name its field as \"instance.REGISTER.FIELD\""),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     ("cores_share_memory", RawValue::Int(i)) => {
                         row.cores_share_memory = Some(i.value != 0);
                     }
@@ -2897,6 +3062,31 @@ fn build_parts(
         validate_part_isa(row)?;
         validate_part_cores(row)?;
         row.check_identity(&table.family)?;
+        for (rail, pins) in &row.rails {
+            if row.rail_valid.iter().filter(|(r, _)| r == rail).count() != 1 {
+                return Err(format!(
+                    "parts: {} names rail '{rail}' but not exactly one rail_valid field for it -- a rail the part isolates is validated by one field",
+                    row.part
+                ));
+            }
+            for entry in pins {
+                let ends: Vec<&str> = entry.split('-').collect();
+                if ends.iter().any(|pin| !row.has_pin(pin)) {
+                    return Err(format!(
+                        "parts: {} puts {entry} on rail '{rail}', but its ends are not both in the part's pin list",
+                        row.part
+                    ));
+                }
+            }
+        }
+        for (rail, _) in &row.rail_valid {
+            if !row.rails.iter().any(|(r, _)| r == rail) {
+                return Err(format!(
+                    "parts: {} states rail_valid for '{rail}', which lists no pads under rails",
+                    row.part
+                ));
+            }
+        }
         for (pin, owner) in &row.reserved {
             if !row.has_pin(pin) {
                 return Err(format!(
@@ -2911,7 +3101,7 @@ fn build_parts(
 
 fn build_binding(line: usize) -> Binding {
     let _ = line;
-    Binding { gclk_gen: -1, reference_uv: -1, token: -1, ..Default::default() }
+    Binding { gclk_gen: -1, reference_uv: -1, token: -1, slice: -1, ..Default::default() }
 }
 
 fn binding_key(
@@ -2928,6 +3118,7 @@ fn binding_key(
         ("gclk_gen", RawValue::Int(i)) => binding.gclk_gen = i.value,
         ("token", RawValue::Int(i)) => binding.token = i.value,
         ("reference_uv", RawValue::Int(i)) => binding.reference_uv = i.value,
+        ("slice", RawValue::Int(i)) => binding.slice = i.value,
         ("source", RawValue::Str(_)) => {}
         (signal, v @ RawValue::Inline(_)) => {
             binding.pins.push((signal.to_string(), as_pin_ref(line, signal, v)?));
@@ -2976,6 +3167,7 @@ fn control_pin_key(
         ("kind", RawValue::Str(s)) => pin.kind = s.clone(),
         ("role", RawValue::Str(s)) => pin.role = s.clone(),
         ("address", RawValue::Int(i)) => pin.address = i.value,
+        ("twin", v @ RawValue::Inline(_)) => pin.twin = as_pin_ref(line, "twin", v)?.pin,
         ("source", RawValue::Str(_)) => {}
         (other, _) => return Err(err(line, &format!("unexpected control-pin key '{other}'"))),
     }
@@ -3031,9 +3223,11 @@ fn build_module(
 /// board claiming the common answer would produce identical output.
 const EXTENSION_ACTIVE: [&str; 4] = ["low", "high", "none", "unknown"];
 
-/// The device kinds an extension row may declare.
-const EXTENSION_DEVICE_KINDS: [&str; 5] =
-    ["gpio-in", "gpio-out", "analog-in", "spi-device", "i2c-device"];
+/// The device kinds an extension row may declare. `pwm-out` is a line the host drives with a PWM
+/// output, which a plain `gpio-out` cannot say: on a pad a board already binds to PWM, the first
+/// shares that binding and the second takes the pad from it.
+const EXTENSION_DEVICE_KINDS: [&str; 6] =
+    ["gpio-in", "gpio-out", "pwm-out", "analog-in", "spi-device", "i2c-device"];
 
 /// The line names each bus kind states, in the order a reader expects them.
 fn extension_bus_lines(kind: &str) -> &'static [&'static str] {
@@ -3162,6 +3356,10 @@ fn build_extension(
         None,
         Bus,
         Device,
+        Revision,
+        Socket,
+        /// A line of the socket at this index (`[[connectors.<name>.pins]]`).
+        SocketLine(usize),
         /// A feature that is a wire between two positions of the connector, or a part with no line
         /// at all. Neither can be a device row, and both are read and discarded here: they carry
         /// no address and nothing resolves through them.
@@ -3178,6 +3376,25 @@ fn build_extension(
                 table.devices.push(ExtensionDevice { address: -1, ..Default::default() });
                 at = At::Device;
             }
+            Item::ArraySection(name) if name == "revisions" => {
+                table.revisions.push(ExtensionRevision::default());
+                at = At::Revision;
+            }
+            Item::ArraySection(name) if name == "connectors" => {
+                table.sockets.push(ExtensionSocket::default());
+                at = At::Socket;
+            }
+            Item::ArraySection(name) if name.starts_with("connectors.") && name.ends_with(".pins") => {
+                let socket = &name["connectors.".len()..name.len() - ".pins".len()];
+                let Some(index) = table.sockets.iter().position(|s| s.name == socket) else {
+                    return Err(err(
+                        *line,
+                        &format!("'[[{name}]]' names socket '{socket}', which no [[connectors]] row above it declares"),
+                    ));
+                };
+                table.sockets[index].lines.push(ExtensionSocketLine::default());
+                at = At::SocketLine(index);
+            }
             Item::ArraySection(name) if name == "loopbacks" || name == "unbound" => {
                 at = At::Prose;
             }
@@ -3190,6 +3407,47 @@ fn build_extension(
             Item::KeyValue(key, value) => match at {
                 At::None => return Err(err(*line, "key outside any section")),
                 At::Prose => {}
+                At::Revision => {
+                    let row = table.revisions.last_mut().expect("open revision");
+                    match key.as_str() {
+                        "name" => row.name = as_str(*line, key, value)?,
+                        "source" => row.source = as_str(*line, key, value)?,
+                        other => {
+                            return Err(err(
+                                *line,
+                                &format!("unexpected revision key '{other}' -- a revision states name and source"),
+                            ));
+                        }
+                    }
+                }
+                At::Socket => {
+                    let row = table.sockets.last_mut().expect("open socket");
+                    match key.as_str() {
+                        "name" => row.name = as_str(*line, key, value)?,
+                        "standard" => row.standard = as_str(*line, key, value)?,
+                        "source" => row.source = as_str(*line, key, value)?,
+                        other => {
+                            return Err(err(
+                                *line,
+                                &format!("unexpected socket key '{other}' (a socket states name, standard and source; its lines are [[connectors.<name>.pins]] rows)"),
+                            ));
+                        }
+                    }
+                }
+                At::SocketLine(index) => {
+                    let row = table.sockets[index].lines.last_mut().expect("open socket line");
+                    match key.as_str() {
+                        "signal" => row.signal = as_str(*line, key, value)?,
+                        "host" => row.host = as_str(*line, key, value)?,
+                        "revision" => row.revision = as_str(*line, key, value)?,
+                        other => {
+                            return Err(err(
+                                *line,
+                                &format!("unexpected socket line key '{other}' -- a line states signal and host, and revision where the wiring differs by one"),
+                            ));
+                        }
+                    }
+                }
                 At::Bus => {
                     let row = table.buses.last_mut().expect("open");
                     match key.as_str() {
@@ -3255,16 +3513,128 @@ fn build_extension(
     Ok(table)
 }
 
+/// An adapter's revisions and sockets, checked against each other.
+///
+/// A LINE IS WIRED ONE WAY FOR EVERY UNIT, OR ONCE FOR EACH REVISION. A socket position with a row
+/// for some revisions and not others would resolve to nothing on a unit of a missing one, and one
+/// with a row for every unit beside a row for one revision would be two statements of one wire --
+/// so both are refused, and a position whose wiring depends on the revision names every revision.
+fn validate_extension_sockets(table: &ExtensionTable) -> Result<(), String> {
+    let name = &table.extension;
+    for revision in &table.revisions {
+        if revision.name.is_empty() || revision.source.is_empty() {
+            return Err(format!(
+                "extension '{name}': a revision states {}",
+                if revision.name.is_empty() { "no name" } else { "no source" }
+            ));
+        }
+        if table.revisions.iter().filter(|other| other.name == revision.name).count() > 1 {
+            return Err(format!("extension '{name}' declares revision '{}' twice", revision.name));
+        }
+    }
+    for socket in &table.sockets {
+        if socket.name.is_empty() {
+            return Err(format!("extension '{name}': a socket states no name"));
+        }
+        if table.sockets.iter().filter(|other| other.name == socket.name).count() > 1 {
+            return Err(format!(
+                "extension '{name}': two sockets are named '{}' -- an adapter with two sockets of one standard numbers them",
+                socket.name
+            ));
+        }
+        if !CONNECTOR_STANDARDS.contains(&socket.standard.as_str()) {
+            return Err(format!(
+                "extension '{name}': socket '{}' follows standard '{}', which is not one of {}",
+                socket.name,
+                socket.standard,
+                CONNECTOR_STANDARDS.join("/")
+            ));
+        }
+        if socket.source.is_empty() {
+            return Err(format!("extension '{name}': socket '{}' is not SOURCE-CITED", socket.name));
+        }
+        if socket.lines.is_empty() {
+            return Err(format!(
+                "extension '{name}': socket '{}' wires no line -- a socket nothing reaches through is a name, not a fact",
+                socket.name
+            ));
+        }
+        for line in &socket.lines {
+            if line.signal.is_empty() || line.host.is_empty() {
+                return Err(format!(
+                    "extension '{name}': a line of socket '{}' states {}",
+                    socket.name,
+                    if line.signal.is_empty() { "no signal" } else { "no host position" }
+                ));
+            }
+            if !line.revision.is_empty() && !table.revisions.iter().any(|r| r.name == line.revision) {
+                return Err(format!(
+                    "extension '{name}': socket '{}' wires {} for revision '{}', which no [[revisions]] row declares",
+                    socket.name, line.signal, line.revision
+                ));
+            }
+            let rows: Vec<&ExtensionSocketLine> =
+                socket.lines.iter().filter(|other| other.signal == line.signal).collect();
+            if line.revision.is_empty() {
+                if rows.len() > 1 {
+                    return Err(format!(
+                        "extension '{name}': socket '{}' wires {} for every unit and again -- one wire, one statement; a line that differs by revision states one row per revision and none for every unit",
+                        socket.name, line.signal
+                    ));
+                }
+                continue;
+            }
+            for revision in &table.revisions {
+                let stated = rows.iter().filter(|row| row.revision == revision.name).count();
+                if stated != 1 {
+                    return Err(format!(
+                        "extension '{name}': socket '{}' wires {} by revision, and states it {stated} times for revision '{}' -- a line wired by revision names every revision once, or a unit of that one resolves to {}",
+                        socket.name,
+                        line.signal,
+                        revision.name,
+                        if stated == 0 { "nothing" } else { "two wires" }
+                    ));
+                }
+            }
+        }
+        let wirings: Vec<Option<&str>> = if table.revisions.is_empty() {
+            vec![None]
+        } else {
+            table.revisions.iter().map(|r| Some(r.name.as_str())).collect()
+        };
+        for revision in wirings {
+            let mut seen: Vec<(&str, &str)> = Vec::new();
+            for line in &socket.lines {
+                if !line.revision.is_empty() && Some(line.revision.as_str()) != revision {
+                    continue;
+                }
+                if let Some((other, _)) = seen.iter().find(|(_, host)| *host == line.host) {
+                    return Err(format!(
+                        "extension '{name}': socket '{}' wires both {other} and {} to host position {}{} -- one hole, one line",
+                        socket.name,
+                        line.signal,
+                        line.host,
+                        revision.map(|r| format!(" on revision '{r}'")).unwrap_or_default()
+                    ));
+                }
+                seen.push((line.signal.as_str(), line.host.as_str()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_extension(table: &ExtensionTable) -> Result<(), String> {
     if table.extension.is_empty() || table.vendor.is_empty() || table.standard.is_empty() {
         return Err("an extension states extension, vendor and standard".to_string());
     }
-    if table.buses.is_empty() && table.devices.is_empty() {
+    if table.buses.is_empty() && table.devices.is_empty() && table.sockets.is_empty() {
         return Err(format!(
-            "extension '{}' presents neither a bus nor a device -- an extension nothing reaches through is a name, not a fact",
+            "extension '{}' presents neither a bus, a device nor a socket -- an extension nothing reaches through is a name, not a fact",
             table.extension
         ));
     }
+    validate_extension_sockets(table)?;
     for bus in &table.buses {
         if bus.role.is_empty() || bus.source.is_empty() {
             return Err(format!(
@@ -3783,7 +4153,7 @@ fn build_board(
     }
     if table.plans.is_empty() && !table.bindings.is_empty() {
         return Err(format!(
-            "board {}: bindings need a default clock plan (identity-first boards state neither)",
+            "board {}: bindings need a default clock plan (a board that binds no peripheral may state neither)",
             table.board
         ));
     }
@@ -4294,6 +4664,12 @@ fn validate_bindings(
                 binding.role, binding.kind
             ));
         }
+        if binding.slice >= 0 && binding.kind != "pwm" {
+            return Err(format!(
+                "{owner}: binding '{}' states slice but is kind '{}' -- a slice is a pwm-binding fact",
+                binding.role, binding.kind
+            ));
+        }
         for (signal, pin) in &binding.pins {
             if let Some(row) = part_row {
                 if !row.has_pin(&pin.pin) {
@@ -4548,6 +4924,26 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
                 board.board, line.name, line.pin, part, owner
             ));
         }
+        if !line.twin.is_empty() {
+            if line.pin.is_empty() {
+                return Err(format!(
+                    "board {}: device '{}' names a twin, {}, but no pin -- a twin is a second pad of a pin-wired line",
+                    board.board, line.name, line.twin
+                ));
+            }
+            if !part_row.has_pin(&line.twin) {
+                return Err(format!(
+                    "board {}: device '{}' names twin {}, which is not in part {}'s pin list",
+                    board.board, line.name, line.twin, part
+                ));
+            }
+            if let Some(owner) = part_row.reserved_by(&line.twin) {
+                return Err(format!(
+                    "board {}: device '{}' names twin {}, which part {} RESERVES for {}",
+                    board.board, line.name, line.twin, part, owner
+                ));
+            }
+        }
     }
     let mut pin_claims: Vec<(&str, String)> = Vec::new();
     for binding in &bindings {
@@ -4558,6 +4954,9 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
     for line in module_pins.iter().chain(board.devices.iter()) {
         if !line.pin.is_empty() {
             pin_claims.push((line.pin.as_str(), format!("device line '{}'", line.name)));
+        }
+        if !line.twin.is_empty() {
+            pin_claims.push((line.twin.as_str(), format!("device line '{}' (its twin)", line.name)));
         }
     }
     for (index, (pin, claimant)) in pin_claims.iter().enumerate() {
@@ -4733,6 +5132,12 @@ fn finish_class(out: &mut String) -> Result<(), String> {
     Ok(())
 }
 
+/// The rows of `block`'s channel map that its family layout states, by the one rule every layout
+/// emitter shares: [`crate::family_channels`].
+fn family_channels(block: &BlockTable) -> Result<&[crate::Channel], String> {
+    crate::family_channels(&format!("block {}", block.block), &block.channels)
+}
+
 /// The generated layout class name for a block: `Samd21SercomUsartLayout`.
 #[must_use]
 pub fn layout_class(block: &BlockTable) -> String {
@@ -4808,9 +5213,10 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
             }
         }
     }
-    if !block.channels.is_empty() {
+    let channels = family_channels(block)?;
+    if !channels.is_empty() {
         out.push_str("\n        // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n        // GPIO index a pin-fed channel taps (the inverse, so no driver carries a pin\n        // literal); ChannelCount = how many rows the map has; IsChannel = whether an\n        // index is one of them --\n");
-        for channel in &block.channels {
+        for channel in channels {
             push_const(
                 &mut out,
                 "int",
@@ -4818,7 +5224,7 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
                 &channel.index.to_string(),
             );
         }
-        for channel in &block.channels {
+        for channel in channels {
             if let Some(('g', pin_index)) = split_pin(&channel.source) {
                 push_const(
                     &mut out,
@@ -4828,9 +5234,9 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
                 );
             }
         }
-        push_const(&mut out, "int", "ChannelCount", &block.channels.len().to_string());
+        push_const(&mut out, "int", "ChannelCount", &channels.len().to_string());
         out.push_str("\n        /// <summary>Whether <paramref name=\"channel\"/> is the index of a row in the\n        /// channel map above. The indexes need not run without gaps, so ChannelCount alone\n        /// does not answer this.</summary>\n        public static bool IsChannel(int channel)\n        {\n            switch (channel)\n            {\n");
-        for channel in &block.channels {
+        for channel in channels {
             out.push_str(&format!("                case {}: return true;\n", channel.index));
         }
         out.push_str("            }\n            return false;\n        }\n");
@@ -5146,9 +5552,8 @@ fn emit_pins_csharp(map: &ExtIntMap, regen: &str) -> Result<String, String> {
 fn emit_pins_rust(map: &ExtIntMap, regen: &str) -> Result<String, String> {
     let mut out = String::new();
     let what = format!(
-        "The {} external interrupt line each pad raises, with the same constants as {}.g.cs and the\n// lookup spelled `extint_line`. A pad raises its line only while its multiplexer selects the EIC\n// function.",
+        "The {} external interrupt line each pad raises, with the lookup `extint_line`. A pad raises\n// its line only while its multiplexer selects the EIC function.",
         map.family,
-        pins_class(&map.family),
     );
     emit_rust_header(&mut out, &what, &map.sources, regen);
 
@@ -5180,7 +5585,7 @@ fn emit_pins_swift(map: &ExtIntMap, regen: &str) -> Result<String, String> {
     let class = pins_class(&map.family);
     let mut out = String::new();
     let what = format!(
-        "The {} external interrupt line each pad raises, with the same constants as {class}.g.cs and\n// the lookup spelled `extIntLine`. A pad raises its line only while its multiplexer selects the\n// EIC function.",
+        "The {} external interrupt line each pad raises, with the lookup `extIntLine`. A pad raises\n// its line only while its multiplexer selects the EIC function.",
         map.family,
     );
     emit_swift_header(&mut out, &what, &map.sources, regen);
@@ -6293,11 +6698,6 @@ fn resolve_i2c_dw(
     })
 }
 
-/// One resolved rp-adc binding emission: the converter base, its reset-release mask (the ADC
-/// releases alone -- its pins are analogue, no IO-bank route), and the BOARD's reference rail
-/// in microvolts (board truth, so it rides the adc binding and emits per-board).
-/// The channel map and calibration records stay CHIP truth in the adc block's layout
-/// emission; the plan's clk_adc rate is verified against the block's required rate.
 /// One resolved SAM E54 `kind = "adc"` binding. The rp arm binds a WHOLE CONVERTER and names no
 /// pin, because that family's channels are fixed pads a driver selects by number at run time. This
 /// one binds a PAD, because here a channel and a pad are a pairing the chip states per pin, and the
@@ -6461,6 +6861,15 @@ fn resolve_adc_same54(
     })
 }
 
+/// One resolved rp `kind = "adc"` binding: the converter base, its reset-release mask (the ADC
+/// releases alone: its inputs are analog pads, with no IO-bank route), the board's reference rail
+/// in microvolts, and the channel map of the board's own part's package.
+///
+/// THE MAP IS THE PACKAGE'S, SO IT RIDES THE BINDING. The adc block states one map per package and
+/// the part row names its package, so each board emits the map its chip has, with the channels
+/// whose pad the board gives to something else marked as reserved. The calibration records stay
+/// chip truth in the adc block's layout, and the plan's clk_adc rate is verified against the rate
+/// the block requires.
 struct RpAdcEmission {
     prefix: String,
     role: String,
@@ -6468,6 +6877,25 @@ struct RpAdcEmission {
     base: i64,
     reset_mask: i64,
     reference_uv: i64,
+    /// The channel map of the board's own part's package, in AINSEL order.
+    channels: Vec<RpAdcChannel>,
+    /// The temperature sensor's channel in that map.
+    temperature_channel: i64,
+    /// Bit n set: channel n's pad belongs to another line or binding of the board.
+    reserved_mask: i64,
+}
+
+/// One channel of an rp adc binding's map.
+struct RpAdcChannel {
+    index: i64,
+    /// The mux source as the adc block names it (`GPIO26`, `temperature_sensor`).
+    source: String,
+    /// The GPIO a pin-fed channel reads.
+    pin: Option<i64>,
+    /// What owns the channel's pad, when something else on the board does: `line 'psram-cs'`.
+    reserved_by: Option<String>,
+    /// The twin of the channel's own line: its GPIO, IO_BANK0 CTRL and PADS_BANK0 registers.
+    twin: Option<(i64, i64, i64)>,
 }
 
 fn resolve_adc_rp(
@@ -6518,6 +6946,11 @@ fn resolve_adc_rp(
             ));
         }
     }
+    let (channels, temperature_channel) = rp_adc_channels(set, resolved, &adc_block.channels)?;
+    let reserved_mask = channels
+        .iter()
+        .filter(|channel| channel.reserved_by.is_some())
+        .fold(0i64, |mask, channel| mask | (1i64 << channel.index));
     Ok(RpAdcEmission {
         prefix: upper_snake(&binding.role),
         role: binding.role.clone(),
@@ -6525,7 +6958,182 @@ fn resolve_adc_rp(
         base,
         reset_mask: 1i64 << reset_bit,
         reference_uv: binding.reference_uv,
+        channels,
+        temperature_channel,
+        reserved_mask,
     })
+}
+
+/// The channel map of `resolved`'s own part's package, from the adc block's `[[channels]]` rows,
+/// and the temperature sensor's channel in it.
+///
+/// THE ROWS ARE THE PACKAGE'S, AND THEY MUST BE WHOLE. AINSEL selects channels 0 to count - 1, so the
+/// package's rows are those indexes, each once, which is what lets a driver take the count as the
+/// range. Each source is a GPIO or the temperature sensor, which must be there, and a GPIO is a pad
+/// the part bonds.
+///
+/// A CHANNEL WHOSE PAD THE BOARD GIVES TO SOMETHING ELSE IS RESERVED, and names what has it: a line
+/// wired to the pad (`line 'cyw43439-clk'`), a binding that routes it (`binding 'uart1'`), or the
+/// part's own reservation. The one line that does not reserve its pad is the channel's own: a
+/// device row on the pad that names a twin: another pad, which the board ties to the same net. That
+/// channel stays open, and carries the twin, which needs the same analog setup when the channel
+/// opens because a pull or a driven output on it loads the reading. A twin row names the channel's
+/// pad as its pin; a row the other way round is refused, since the channel it reaches would have
+/// no owner and no twin.
+fn rp_adc_channels(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    rows: &[crate::Channel],
+) -> Result<(Vec<RpAdcChannel>, i64), String> {
+    let board = &resolved.board.board;
+    let part = set
+        .parts
+        .rows
+        .iter()
+        .find(|row| row.part == resolved.part)
+        .ok_or_else(|| format!("{board}: part '{}' is not in parts.toml", resolved.part))?;
+    let package = &part.package;
+    let mut rows: Vec<&crate::Channel> = rows.iter().filter(|row| row.package == *package).collect();
+    if rows.is_empty() {
+        return Err(format!(
+            "{board}: the adc block states no channel row for package '{package}', part {}'s -- each [[channels]] row names the package it holds for",
+            part.part
+        ));
+    }
+    rows.sort_by_key(|row| row.index);
+    for (position, row) in rows.iter().enumerate() {
+        if let Some(other) = rows[..position].iter().find(|other| other.index == row.index) {
+            return Err(format!(
+                "{board}: the adc block's package '{package}' map names channel {} twice, for {} and {}",
+                row.index, other.source, row.source
+            ));
+        }
+        if let Some(other) = rows[..position].iter().find(|other| other.source == row.source) {
+            return Err(format!(
+                "{board}: the adc block's package '{package}' map names {} twice, as channels {} and {}",
+                row.source, other.index, row.index
+            ));
+        }
+    }
+    let count = rows.len();
+    if let Some(missing) = (0..count).find(|index| !rows.iter().any(|row| row.index == *index as i64)) {
+        return Err(format!(
+            "{board}: the adc block's package '{package}' map has {count} rows but no channel {missing} -- AINSEL selects channels 0 to {}, so the map runs without gaps",
+            count - 1
+        ));
+    }
+    let temperature_channel = rows
+        .iter()
+        .find(|row| row.source == "temperature_sensor")
+        .map(|row| row.index)
+        .ok_or_else(|| format!("{board}: the adc block's package '{package}' map has no temperature_sensor row"))?;
+
+    let lines: Vec<&ControlPin> = resolved.board.devices.iter().chain(resolved.module_pins.iter()).collect();
+    let mut channels = Vec::with_capacity(count);
+    for row in rows {
+        let mut channel =
+            RpAdcChannel { index: row.index, source: row.source.clone(), pin: None, reserved_by: None, twin: None };
+        if row.source == "temperature_sensor" {
+            channels.push(channel);
+            continue;
+        }
+        let Some(('g', gpio)) = split_pin(&row.source).filter(|_| row.source.starts_with("GPIO")) else {
+            return Err(format!(
+                "{board}: the adc block's package '{package}' map reads '{}' on channel {} -- a source is a GPIO<n> pad or temperature_sensor",
+                row.source, row.index
+            ));
+        };
+        let pad = format!("GP{gpio}");
+        if !part.has_pin(&pad) {
+            return Err(format!(
+                "{board}: the adc block's package '{package}' map reads {pad} on channel {}, which is not in part {}'s pin list",
+                row.index, part.part
+            ));
+        }
+        channel.pin = Some(i64::from(gpio));
+        if let Some(line) = lines.iter().find(|line| line.twin == pad) {
+            return Err(format!(
+                "{board}: channel {}'s pad {pad} is the twin of device '{}' (pin {}) -- a twin row names the channel's own pad as its pin, and the other pad as its twin",
+                row.index, line.name, line.pin
+            ));
+        }
+        if let Some(line) = lines.iter().find(|line| line.pin == pad) {
+            if line.twin.is_empty() {
+                channel.reserved_by = Some(format!("line '{}'", line.name));
+            } else {
+                let Some(('g', twin)) = split_pin(&line.twin) else {
+                    return Err(format!("{board}: device '{}' names twin '{}', which is not a GP<n> pin", line.name, line.twin));
+                };
+                channel.twin = Some((
+                    i64::from(twin),
+                    rp_io_ctrl_address(set, board, &line.twin)?,
+                    rp_pad_address(set, board, &line.twin)?,
+                ));
+            }
+        }
+        if let Some(binding) = resolved.bindings.iter().find(|binding| binding.pins.iter().any(|(_, pin)| pin.pin == pad)) {
+            channel.reserved_by = Some(format!("binding '{}'", binding.role));
+        }
+        if let Some(owner) = part.reserved_by(&pad) {
+            channel.reserved_by = Some(format!("part {} ({owner})", part.part));
+        }
+        channels.push(channel);
+    }
+    Ok((channels, temperature_channel))
+}
+
+/// The rp adc channel that digitizes `pad` on `resolved`'s board -- the channel whose own pad it is,
+/// or whose twin it is -- and what owns that channel's pad when something else on the board does.
+/// `None` when no channel of the part's package reads the pad.
+///
+/// The map is the one the adc binding emits from, so a composition asking which channel serves a
+/// header position gets the answer the board's converter will act on.
+pub fn rp_adc_channel_for_pad(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    pad: &str,
+) -> Result<Option<(i64, Option<String>)>, String> {
+    let board = &resolved.board.board;
+    let block = set.block("adc", "").ok_or_else(|| format!("{board}: the {} family has no adc block", set.family))?;
+    let Some(('g', gpio)) = split_pin(pad) else {
+        return Err(format!("{board}: '{pad}' is not a GP<n> pad"));
+    };
+    let gpio = i64::from(gpio);
+    let (channels, _) = rp_adc_channels(set, resolved, &block.channels)?;
+    Ok(channels
+        .into_iter()
+        .find(|channel| channel.pin == Some(gpio) || channel.twin.map(|(twin, _, _)| twin) == Some(gpio))
+        .map(|channel| (channel.index, channel.reserved_by)))
+}
+
+/// The channel map of an rp adc binding as every language emits it, from ONE derivation: the typed
+/// emitters render each row with their own types, and the Python dict takes each name without the
+/// binding's prefix, lowercased (`ADC_CHANNEL0_PIN` is "channel0_pin"). A count, the temperature
+/// sensor's channel and the reserved mask, then per pin-fed channel its GPIO, the channel named by
+/// its source, what owns it when something does, and its twin's GPIO, IO_BANK0 CTRL and
+/// PADS_BANK0 registers when it has one.
+fn rp_adc_channel_rows(adc: &RpAdcEmission) -> Vec<Row> {
+    let p = &adc.prefix;
+    let mut rows = vec![
+        Row::Uint(format!("{p}_CHANNEL_COUNT"), adc.channels.len().to_string()),
+        Row::Uint(format!("{p}_TEMPERATURE_CHANNEL"), adc.temperature_channel.to_string()),
+        Row::Uint(format!("{p}_RESERVED_CHANNELS"), format!("0x{:X}", adc.reserved_mask)),
+    ];
+    for channel in &adc.channels {
+        let Some(pin) = channel.pin else { continue };
+        let i = channel.index;
+        rows.push(Row::Uint(format!("{p}_CHANNEL{i}_PIN"), pin.to_string()));
+        rows.push(Row::Uint(format!("{p}_{}_CHANNEL", upper_snake(&channel.source)), i.to_string()));
+        if let Some(owner) = &channel.reserved_by {
+            rows.push(Row::Str(format!("{p}_CHANNEL{i}_RESERVED_BY"), owner.clone()));
+        }
+        if let Some((twin, io_ctrl, pads)) = channel.twin {
+            rows.push(Row::Uint(format!("{p}_CHANNEL{i}_TWIN_PIN"), twin.to_string()));
+            rows.push(Row::Uint(format!("{p}_CHANNEL{i}_TWIN_IO_CTRL"), format!("0x{io_ctrl:X}")));
+            rows.push(Row::Uint(format!("{p}_CHANNEL{i}_TWIN_PADS"), format!("0x{pads:X}")));
+        }
+    }
+    rows
 }
 
 /// One resolved samd21 `kind = "adc"` binding: the converter, clocked under the default plan, and
@@ -6750,6 +7358,12 @@ fn resolve_pwm_samd21(
             ));
         }
     };
+    if binding.slice >= 0 {
+        return Err(format!(
+            "{board}: pwm binding '{}' states slice {} -- a samd21 pwm binding names its counter by instance, and has no slice",
+            binding.role, binding.slice
+        ));
+    }
     let stated = |key: &str| -> Result<i64, String> {
         instances
             .value(name, key)
@@ -6923,6 +7537,156 @@ fn refuse_shared_timer_clocks(
                     binding.role, binding.instance, other.role, other.instance, binding.gclk_gen, other.gclk_gen
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// One resolved rp2350 `kind = "pwm"` binding: one slice of the PWM block, and each output the board
+/// routes to a pad.
+struct Rp2350PwmEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    base: i64,
+    reset_mask: i64,
+    slice: i64,
+    funcsel: i64,
+    /// The counter's clock, clk_sys under the default plan.
+    clk_sys_hz: i64,
+    /// One per routed output, in the binding's order.
+    outputs: Vec<Rp2350PwmOutput>,
+}
+
+/// One output an rp2350 pwm binding routes: `a` or `b`, its index in the slice, and its pad.
+struct Rp2350PwmOutput {
+    /// The binding's name for the output (`a`).
+    name: String,
+    /// 0 for A and 1 for B: which half of the slice's CC sets its level.
+    index: i64,
+    io_ctrl: i64,
+    pads: i64,
+}
+
+/// Resolves an rp2350 `kind = "pwm"` binding: one slice, and the outputs the board routes, each named
+/// `a` or `b`.
+///
+/// THE SLICE IS STATED AND VERIFIED. Each output of slices 0 to 7 appears on two GPIOs, and each of
+/// slices 8 to 11 on two more (datasheet 12.5.2, Table 1130), so a pad alone names a slice only through
+/// the pin map, whose F4 cell for the pad is the slice's output by name (`a_1` is Table 1130's channel 1A). The
+/// binding states its slice, and each pad's cell must be that slice's output of the same name: a
+/// mismatch would put a duty cycle on another slice's pin.
+fn resolve_pwm_rp2350(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<Rp2350PwmEmission, String> {
+    let board = &resolved.board.board;
+    let name = &binding.instance;
+    let row = set
+        .instances
+        .row(name)
+        .ok_or_else(|| format!("{board}: pwm binding '{}' names instance '{name}', which is not placed", binding.role))?;
+    if row.block != "pwm" {
+        return Err(format!(
+            "{board}: pwm binding '{}' names instance '{name}', a {} block -- an rp2350 pwm binding drives a slice of the pwm block",
+            binding.role, row.block
+        ));
+    }
+    let block = set.block("pwm", "").ok_or_else(|| format!("{board}: no pwm block table"))?;
+    let slice_count = block
+        .constant("SLICE_COUNT")
+        .ok_or_else(|| format!("{board}: the pwm block states no SLICE_COUNT"))?;
+    if binding.slice < 0 {
+        return Err(format!("{board}: pwm binding '{}' states no slice", binding.role));
+    }
+    if binding.slice >= slice_count {
+        return Err(format!(
+            "{board}: pwm binding '{}' names slice {}, but the pwm block has {slice_count} slices, 0 to {}",
+            binding.role,
+            binding.slice,
+            slice_count - 1
+        ));
+    }
+    let base = set
+        .instances
+        .value(name, "base")
+        .ok_or_else(|| format!("{board}: no base for {name}"))?;
+
+    let mut outputs: Vec<Rp2350PwmOutput> = Vec::new();
+    for (label, pin) in &binding.pins {
+        let index = match label.as_str() {
+            "a" => 0,
+            "b" => 1,
+            _ => {
+                return Err(format!(
+                    "{board}: pwm binding '{}' names an output '{label}' -- a slice's outputs are a and b",
+                    binding.role
+                ));
+            }
+        };
+        if pin.soft {
+            return Err(format!(
+                "{board}: pwm binding '{}' marks output '{label}' ({}) soft -- an output reaches its pad through the function select, never as a GPIO",
+                binding.role, pin.pin
+            ));
+        }
+        if outputs.iter().any(|output| output.name == *label) {
+            return Err(format!("{board}: pwm binding '{}' routes output {label} twice", binding.role));
+        }
+        let cell = set.pin_row_for(&pin.pin, &binding.function, name).ok_or_else(|| {
+            format!(
+                "{board}: pwm binding '{}' claims {} function {} for {name} but pins.toml has no such row",
+                binding.role, pin.pin, binding.function
+            )
+        })?;
+        let expected = format!("{label}_{}", binding.slice);
+        if cell.signal != expected {
+            return Err(format!(
+                "{board}: pwm binding '{}' routes {} as slice {}'s {label}, but pins.toml says that cell is {}",
+                binding.role, pin.pin, binding.slice, cell.signal
+            ));
+        }
+        outputs.push(Rp2350PwmOutput {
+            name: label.clone(),
+            index,
+            io_ctrl: rp_io_ctrl_address(set, board, &pin.pin)?,
+            pads: rp_pad_address(set, board, &pin.pin)?,
+        });
+    }
+    if outputs.is_empty() {
+        return Err(format!("{board}: pwm binding '{}' routes no output", binding.role));
+    }
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let clk_sys_hz = plan.rate("clk_sys_hz").ok_or_else(|| {
+        format!(
+            "{board}: default plan '{}' states no clk_sys_hz rate (the pwm counter runs on clk_sys)",
+            plan.name
+        )
+    })?;
+    Ok(Rp2350PwmEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        base,
+        reset_mask: rp_reset_mask(set, board, name)?,
+        slice: binding.slice,
+        funcsel: rp_funcsel(set, board, binding, "FUNCSEL_PWM")?,
+        clk_sys_hz,
+        outputs,
+    })
+}
+
+/// Refuses a board whose pwm bindings drive one slice twice. That is SILENT ON THE PART: two drivers
+/// over one slice's registers, each re-timing the other's outputs.
+fn refuse_shared_slices(board: &str, pwms: &[Rp2350PwmEmission]) -> Result<(), String> {
+    for (index, pwm) in pwms.iter().enumerate() {
+        if let Some(other) = pwms[index + 1..].iter().find(|other| other.slice == pwm.slice) {
+            return Err(format!(
+                "{board}: pwm bindings '{}' and '{}' both drive slice {} -- one slice has one driver, and a second would re-time the first's outputs",
+                pwm.role, other.role, pwm.slice
+            ));
         }
     }
     Ok(())
@@ -7336,6 +8100,9 @@ struct StUartEmission {
     prefix: String,
     role: String,
     instance: String,
+    /// The bound instance's block, `usart` or `lpuart`: the divisor's formula and the descriptor's
+    /// name both follow it.
+    block: String,
     base: i64,
     rcc_en_reg: i64,
     rcc_en_mask: i64,
@@ -7535,6 +8302,16 @@ fn resolve_uart_stm32(
     let instances = &set.instances;
     let name = &binding.instance;
     let base = instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    let block = instances
+        .row(name)
+        .map(|row| row.block.clone())
+        .ok_or_else(|| format!("{board}: uart binding '{}' names instance '{name}', which is not placed", binding.role))?;
+    if block != "usart" && block != "lpuart" {
+        return Err(format!(
+            "{board}: uart binding '{}' names instance '{name}', a {block} block -- the stm32 uart arm derives a divisor for a usart or an lpuart block",
+            binding.role
+        ));
+    }
     let rcc_base = instances
         .value("rcc", "base")
         .ok_or_else(|| format!("{board}: no instance row for 'rcc'"))?;
@@ -7589,7 +8366,11 @@ fn resolve_uart_stm32(
             format!("{board}: plan '{}' states no pclk_hz rate", carrier_plan.name)
         })?;
         let rate = carrier.baud;
-        let divisor = (pclk1 + rate / 2) / rate;
+        let divisor = if block == "lpuart" {
+            lpuart_divisor(board, &binding.role, name, pclk1, rate)?
+        } else {
+            (pclk1 + rate / 2) / rate
+        };
         bauds.push((format!("BRR_{rate}_{}", upper_snake(&carrier_plan.name)), divisor));
     }
 
@@ -7597,6 +8378,7 @@ fn resolve_uart_stm32(
         prefix: upper_snake(&binding.role),
         role: binding.role.clone(),
         instance: binding.instance.clone(),
+        block,
         base,
         rcc_en_reg,
         rcc_en_mask,
@@ -7605,6 +8387,27 @@ fn resolve_uart_stm32(
         pclk_hz: pclk1_hz,
         bauds,
     })
+}
+
+/// An LPUART's BRR word for `baud` from a kernel clock of `fck`: 256 x fck / baud, rounded.
+///
+/// The part runs an LPUART only with its clock within 3 to 4096 times the baud, and LPUART_BRR
+/// holds 20 bits and may not be written below 0x300 (RM0432 51.4.7 and 51.7.5). A word outside
+/// that range is refused rather than truncated, because a truncated word is a wrong rate that no
+/// part reports.
+fn lpuart_divisor(board: &str, role: &str, instance: &str, fck: i64, baud: i64) -> Result<i64, String> {
+    if fck < 3 * baud || fck > 4096 * baud {
+        return Err(format!(
+            "{board}: uart binding '{role}' runs {instance} at {fck} Hz for {baud} baud -- an lpuart needs its clock within 3 to 4096 times the baud"
+        ));
+    }
+    let word = (256 * fck + baud / 2) / baud;
+    if !(0x300..=0xF_FFFF).contains(&word) {
+        return Err(format!(
+            "{board}: uart binding '{role}' needs LPUART_BRR {word:#X} for {baud} baud at {fck} Hz -- the register holds a 20-bit word, from 0x300"
+        ));
+    }
+    Ok(word)
 }
 
 /// A soft (GPIO-driven) chip select: a plain output the DRIVER toggles, not a muxed cell.
@@ -8337,8 +9140,93 @@ fn resolve_spi(
 
 /// The per-family uart/spi resolutions of a board's bindings, plus the skip notes for kinds
 /// without an emitter -- shared by the C# and Rust emitters so they can never disagree.
+/// One supply rail a board's pads ride, and what validates it: the clock gate of the block that
+/// holds the validating field, when the block has one, then the field itself.
+struct SupplyEmission {
+    prefix: String,
+    rail: String,
+    /// The board's pads on the rail, sorted: every bound and device pin the rail isolates.
+    pads: Vec<String>,
+    gate: Option<(i64, i64)>,
+    valid_reg: i64,
+    valid_mask: i64,
+}
+
+/// The rails this board's pads ride, one emission per rail touched.
+///
+/// PER BOARD, NOT PER PIN, and only where a pad touches the rail. Validating a rail is one write
+/// for every pad on it, so a board states it once; and a board none of whose pins the rail powers
+/// emits nothing, so its output is exactly what it was before rails were stated.
+fn resolve_supplies(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<SupplyEmission>, String> {
+    let board = &resolved.board.board;
+    let Some(part) = set.parts.rows.iter().find(|row| row.part == resolved.part) else {
+        return Ok(Vec::new());
+    };
+    let mut pads: Vec<&str> = resolved
+        .bindings
+        .iter()
+        .flat_map(|binding| binding.pins.iter().map(|(_, pin)| pin.pin.as_str()))
+        .chain(resolved.module_pins.iter().chain(resolved.board.devices.iter()).map(|control| control.pin.as_str()))
+        .filter(|pin| !pin.is_empty())
+        .collect();
+    pads.sort_unstable();
+    pads.dedup();
+    let mut out = Vec::new();
+    for (rail, _) in &part.rails {
+        let touched: Vec<String> =
+            pads.iter().filter(|pin| part.rail_of(pin) == Some(rail.as_str())).map(|pin| (*pin).to_string()).collect();
+        if touched.is_empty() {
+            continue;
+        }
+        let path = part
+            .rail_valid
+            .iter()
+            .find(|(r, _)| r == rail)
+            .map(|(_, path)| path.as_str())
+            .expect("validated: every rail names one field");
+        let mut segments = path.split('.');
+        let (Some(instance), Some(register), Some(field)) = (segments.next(), segments.next(), segments.next()) else {
+            unreachable!("validated: a rail's field is instance.REGISTER.FIELD");
+        };
+        let row = set.instances.row(instance).ok_or_else(|| {
+            format!("{board}: rail '{rail}' is validated through instance '{instance}', which is not placed")
+        })?;
+        let block = set
+            .block(&row.block, "")
+            .ok_or_else(|| format!("{board}: rail '{rail}': no {} block table", row.block))?;
+        let reg = block
+            .register(register)
+            .ok_or_else(|| format!("{board}: rail '{rail}': the {} block states no `{register}` register", row.block))?;
+        let bits = reg
+            .field(field)
+            .ok_or_else(|| format!("{board}: rail '{rail}': `{register}` states no `{field}` field"))?;
+        let base = set.instances.value(instance, "base").ok_or_else(|| format!("{board}: no base for {instance}"))?;
+        let gate = match (set.instances.value(instance, "rcc_en_off"), set.instances.value(instance, "rcc_en_bit")) {
+            (Some(off), Some(bit)) if off >= 0 && bit >= 0 => {
+                let rcc = set
+                    .instances
+                    .value("rcc", "base")
+                    .ok_or_else(|| format!("{board}: no instance row for 'rcc'"))?;
+                Some((rcc + off, 1i64 << bit))
+            }
+            _ => None,
+        };
+        out.push(SupplyEmission {
+            prefix: format!("SUPPLY_{}", upper_snake(rail)),
+            rail: rail.clone(),
+            pads: touched,
+            gate,
+            valid_reg: base + reg.offset.value,
+            valid_mask: i64::try_from(bits.mask()).expect("a field mask fits 32 bits"),
+        });
+    }
+    Ok(out)
+}
+
 struct BoardEmissions {
     skipped: Vec<String>,
+    /// The supply rails the board's pads ride -- see [`resolve_supplies`].
+    supplies: Vec<SupplyEmission>,
     /// Per emitted role, `(role, driver family)` -- see [`driver_family`].
     driver_families: Vec<(String, String)>,
     sercom_uarts: Vec<UartEmission>,
@@ -8355,6 +9243,7 @@ struct BoardEmissions {
     same54_adcs: Vec<Same54AdcEmission>,
     samd21_adcs: Vec<Samd21AdcEmission>,
     samd21_pwms: Vec<Samd21PwmEmission>,
+    rp2350_pwms: Vec<Rp2350PwmEmission>,
     pl022_spis: Vec<SpiPl022Emission>,
     st_spis: Vec<StSpiEmission>,
     nrf_twis: Vec<NrfTwiEmission>,
@@ -8406,6 +9295,7 @@ fn driver_family(set: &FamilySet, binding: &Binding) -> Result<String, String> {
 fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<BoardEmissions, String> {
     let mut emissions = BoardEmissions {
         skipped: Vec::new(),
+        supplies: Vec::new(),
         driver_families: Vec::new(),
         sercom_uarts: Vec::new(),
         rp_uarts: Vec::new(),
@@ -8421,6 +9311,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         same54_adcs: Vec::new(),
         samd21_adcs: Vec::new(),
         samd21_pwms: Vec::new(),
+        rp2350_pwms: Vec::new(),
         pl022_spis: Vec::new(),
         st_spis: Vec::new(),
         nrf_twis: Vec::new(),
@@ -8445,7 +9336,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                 "esp32c6" => emissions.esp_uarts.push(resolve_uart_esp32c6(set, resolved, binding)?),
                 "sam3x" => emissions.sam3x_uarts.push(resolve_uart_sam3x(set, resolved, binding)?),
                 "nrf51" | "nrf52833" => emissions.nrf_uarts.push(resolve_uart_nrf(set, resolved, binding)?),
-                "stm32l476" | "stm32l0" | "stm32l053" | "stm32l073" | "stm32u5a5" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
+                "stm32l476" | "stm32l0" | "stm32l053" | "stm32l073" | "stm32l4r5" | "stm32u5a5" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
                     emissions.st_uarts.push(resolve_uart_stm32(set, resolved, binding)?);
                 }
                 other => {
@@ -8510,6 +9401,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             },
             "pwm" => match set.family.as_str() {
                 "samd21" => emissions.samd21_pwms.push(resolve_pwm_samd21(set, resolved, binding)?),
+                "rp2350" => emissions.rp2350_pwms.push(resolve_pwm_rp2350(set, resolved, binding)?),
                 other => {
                     return Err(format!(
                         "{}: no pwm emission shape for family '{other}' -- add its derivation path first",
@@ -8523,8 +9415,10 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             emissions.driver_families.push((binding.role.clone(), driver_family(set, binding)?));
         }
     }
+    emissions.supplies = resolve_supplies(set, resolved)?;
     refuse_colliding_interrupts(&resolved.board.board, &emissions.st_interrupts)?;
     refuse_shared_timer_clocks(&resolved.board.board, &set.instances, &resolved.bindings, &emissions.samd21_pwms)?;
+    refuse_shared_slices(&resolved.board.board, &emissions.rp2350_pwms)?;
     Ok(emissions)
 }
 
@@ -8599,6 +9493,8 @@ pub fn emit_board_csharp(
         same54_adcs,
         samd21_adcs,
         samd21_pwms,
+        rp2350_pwms,
+        supplies,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -8776,7 +9672,7 @@ pub fn emit_board_csharp(
     }
     for uart in &st_uarts {
         let p = &uart.prefix;
-        out.push_str(&format!("\n        // -- {p}: an st-usart binding descriptor --\n"));
+        out.push_str(&format!("\n        // -- {p}: an st-{} binding descriptor --\n", uart.block));
         push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", uart.base));
         push_const(&mut out, "uint", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", uart.rcc_en_reg));
         push_const(&mut out, "uint", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", uart.rcc_en_mask));
@@ -9062,12 +9958,35 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_IC_CLK_HZ"), &i2c.ic_clk_hz.to_string());
     }
 
+    for pwm in &rp2350_pwms {
+        let p = &pwm.prefix;
+        out.push_str(&format!("\n        // -- {p}: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on\n        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)\n        // and its pad --\n"));
+        push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", pwm.base));
+        push_const(&mut out, "uint", &format!("{p}_RESET_MASK"), &format!("0x{:X}", pwm.reset_mask));
+        push_const(&mut out, "uint", &format!("{p}_SLICE"), &pwm.slice.to_string());
+        push_const(&mut out, "uint", &format!("{p}_FUNCSEL"), &pwm.funcsel.to_string());
+        push_const(&mut out, "uint", &format!("{p}_CLK_SYS_HZ"), &pwm.clk_sys_hz.to_string());
+        for output in &pwm.outputs {
+            let s = upper_snake(&output.name);
+            push_const(&mut out, "uint", &format!("{p}_OUTPUT_{s}"), &output.index.to_string());
+            push_const(&mut out, "uint", &format!("{p}_IO_{s}_CTRL"), &format!("0x{:X}", output.io_ctrl));
+            push_const(&mut out, "uint", &format!("{p}_PADS_{s}"), &format!("0x{:X}", output.pads));
+        }
+    }
+
     for adc in &rp_adcs {
         let p = &adc.prefix;
-        out.push_str(&format!("\n        // -- {p}: an rp-adc binding descriptor (the reference rail is BOARD truth;\n        // the channel map + calibration records are chip truth in the adc layout) --\n"));
+        out.push_str(&format!("\n        // -- {p}: an rp-adc binding descriptor: the converter, the board's reference rail, and\n        // the channel map of this part's package -- each pin-fed channel's GPIO, the channels\n        // whose pad the board gives to another line or binding (RESERVED_CHANNELS, and what\n        // has each), and the twin: a second pad the board ties to a channel's own net. The\n        // calibration records are chip truth in the adc layout --\n"));
         push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", adc.base));
         push_const(&mut out, "uint", &format!("{p}_RESET_MASK"), &format!("0x{:X}", adc.reset_mask));
         push_const(&mut out, "uint", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+        for row in rp_adc_channel_rows(adc) {
+            match row {
+                Row::Uint(name, value) => push_const(&mut out, "uint", &name, &value),
+                Row::Str(name, value) => push_const(&mut out, "string", &name, &format!("\"{value}\"")),
+                _ => unreachable!("an rp adc channel map is integer and string rows"),
+            }
+        }
     }
 
     for clock in &rp_clocks {
@@ -9083,6 +10002,21 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("PLL_SYS_PRIM_{s}"), &format!("0x{:X}", clock.pll_sys_prim));
         push_const(&mut out, "uint", &format!("PLL_USB_FBDIV_{s}"), &clock.pll_usb_fbdiv.to_string());
         push_const(&mut out, "uint", &format!("PLL_USB_PRIM_{s}"), &format!("0x{:X}", clock.pll_usb_prim));
+    }
+
+    for supply in &supplies {
+        let p = &supply.prefix;
+        out.push_str(&format!(
+            "\n        // -- {p}: the part isolates the {} rail at reset, and this board uses it on {}.\n        // Set the gate's mask in its register, then the valid mask, before those pins are used --\n",
+            supply.rail,
+            supply.pads.join(", ")
+        ));
+        if let Some((reg, mask)) = supply.gate {
+            push_const(&mut out, "uint", &format!("{p}_RCC_EN_REG"), &format!("0x{reg:X}"));
+            push_const(&mut out, "uint", &format!("{p}_RCC_EN_MASK"), &format!("0x{mask:X}"));
+        }
+        push_const(&mut out, "uint", &format!("{p}_VALID_REG"), &format!("0x{:X}", supply.valid_reg));
+        push_const(&mut out, "uint", &format!("{p}_VALID_MASK"), &format!("0x{:X}", supply.valid_mask));
     }
 
     let controls: Vec<(&str, &[ControlPin])> = vec![
@@ -9821,22 +10755,12 @@ pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result
         .map(|(name, _)| name.as_str())
         .collect();
     let mode = if block.mode.is_empty() { String::new() } else { format!(" ({} mode)", block.mode) };
-    let what = if block.emits("csharp") {
-        format!(
-            "The {} {}{mode} block layout as Rust consts, name/value-identical to {}.g.cs:\n// offsets are instance-base-relative (`base + *_OFF`) and the instance bases live in\n// {}_instances.rs. Widths are access widths.",
-            block.family,
-            block.block,
-            layout_class(block),
-            snake(&block.family),
-        )
-    } else {
-        format!(
-            "The {} {}{mode} block layout as Rust consts: offsets are instance-base-relative\n// (`base + *_OFF`) and the instance bases live in {}_instances.rs. Widths are access widths.\n// Its block table's `emit` list leaves C# out, so no C# layout of it exists.",
-            block.family,
-            block.block,
-            snake(&block.family),
-        )
-    };
+    let what = format!(
+        "The {} {}{mode} block layout as Rust consts: offsets are instance-base-relative\n// (`base + *_OFF`) and the instance bases live in {}_instances.rs. Widths are access widths.",
+        block.family,
+        block.block,
+        snake(&block.family),
+    );
     let withheld_note = if withheld.is_empty() {
         String::new()
     } else {
@@ -9916,18 +10840,19 @@ pub const fn prescaler_divisor(code: u32) -> u32 {{
         }
     }
 
-    if !block.channels.is_empty() {
+    let channels = family_channels(block)?;
+    if !channels.is_empty() {
         out.push_str("\n/// -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n/// GPIO index a pin-fed channel taps; ChannelCount = how many rows the map has;\n/// is_channel = whether an index is one of them --\n");
-        for channel in &block.channels {
+        for channel in channels {
             push_rust_const(&mut out, "i32", &format!("Channel_{}", pascal(&channel.source)), &channel.index.to_string());
         }
-        for channel in &block.channels {
+        for channel in channels {
             if let Some(('g', pin_index)) = split_pin(&channel.source) {
                 push_rust_const(&mut out, "i32", &format!("Channel{}_Pin", channel.index), &pin_index.to_string());
             }
         }
-        push_rust_const(&mut out, "i32", "ChannelCount", &block.channels.len().to_string());
-        let indexes: Vec<String> = block.channels.iter().map(|c| c.index.to_string()).collect();
+        push_rust_const(&mut out, "i32", "ChannelCount", &channels.len().to_string());
+        let indexes: Vec<String> = channels.iter().map(|c| c.index.to_string()).collect();
         out.push_str(&format!(
             "\n/// Whether `channel` is the index of a row in the channel map above. The indexes need not run\n/// without gaps, so `ChannelCount` alone does not answer this.\n#[must_use]\npub const fn is_channel(channel: i32) -> bool {{\n    matches!(channel, {})\n}}\n",
             indexes.join(" | ")
@@ -9979,9 +10904,8 @@ pub fn emit_instances_rust(
 ) -> Result<String, String> {
     let mut out = String::new();
     let what = format!(
-        "The {} instance map as Rust consts, name/value-identical to {}.g.cs:\n// where each block copy sits and its per-instance ids. Each block's layout is in its own\n// layout module beside this file.",
+        "The {} instance map as Rust consts: where each block copy sits and its per-instance ids.\n// Each block's layout is in its own layout module beside this file.",
         instances.family,
-        instances_class(&instances.family),
     );
     emit_rust_header(&mut out, &what, &[source.to_string()], regen);
     out.push('\n');
@@ -10035,6 +10959,8 @@ pub fn emit_board_rust(
         same54_adcs,
         samd21_adcs,
         samd21_pwms,
+        rp2350_pwms,
+        supplies,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -10047,9 +10973,8 @@ pub fn emit_board_rust(
 
     let mut out = String::new();
     let mut what = format!(
-        "The {} board bindings as Rust consts, name/value-identical to {}.g.cs:\n// every value below is a generation-time literal derived from the strata.\n// The board's facts are stated in board.toml.",
+        "The {} board bindings as Rust consts: every value below is a generation-time literal\n// derived from the strata. The board's facts are stated in board.toml.",
         resolved.board.board,
-        bindings_class(&resolved.board.board),
     );
     if !skipped.is_empty() {
         what.push_str(&format!(
@@ -10214,7 +11139,7 @@ pub fn emit_board_rust(
     push_rust_isr_bodies(&mut out, &st_interrupts);
     for uart in &st_uarts {
         let p = &uart.prefix;
-        out.push_str(&format!("\n// -- {p}: an st-usart binding descriptor --\n"));
+        out.push_str(&format!("\n// -- {p}: an st-{} binding descriptor --\n", uart.block));
         push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", uart.base));
         push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", uart.rcc_en_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", uart.rcc_en_mask));
@@ -10492,12 +11417,35 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_IC_CLK_HZ"), &i2c.ic_clk_hz.to_string());
     }
 
+    for pwm in &rp2350_pwms {
+        let p = &pwm.prefix;
+        out.push_str(&format!("\n// -- {p}: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on\n// clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)\n// and its pad --\n"));
+        push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", pwm.base));
+        push_rust_const(&mut out, "u32", &format!("{p}_RESET_MASK"), &format!("0x{:X}", pwm.reset_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_SLICE"), &pwm.slice.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_FUNCSEL"), &pwm.funcsel.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_CLK_SYS_HZ"), &pwm.clk_sys_hz.to_string());
+        for output in &pwm.outputs {
+            let s = upper_snake(&output.name);
+            push_rust_const(&mut out, "u32", &format!("{p}_OUTPUT_{s}"), &output.index.to_string());
+            push_rust_const(&mut out, "u32", &format!("{p}_IO_{s}_CTRL"), &format!("0x{:X}", output.io_ctrl));
+            push_rust_const(&mut out, "u32", &format!("{p}_PADS_{s}"), &format!("0x{:X}", output.pads));
+        }
+    }
+
     for adc in &rp_adcs {
         let p = &adc.prefix;
-        out.push_str(&format!("\n// -- {p}: an rp-adc binding descriptor (the reference rail is BOARD truth;\n// the channel map + calibration records are chip truth in the adc layout) --\n"));
+        out.push_str(&format!("\n// -- {p}: an rp-adc binding descriptor: the converter, the board's reference rail, and\n// the channel map of this part's package -- each pin-fed channel's GPIO, the channels\n// whose pad the board gives to another line or binding (RESERVED_CHANNELS, and what\n// has each), and the twin: a second pad the board ties to a channel's own net. The\n// calibration records are chip truth in the adc layout --\n"));
         push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", adc.base));
         push_rust_const(&mut out, "u32", &format!("{p}_RESET_MASK"), &format!("0x{:X}", adc.reset_mask));
         push_rust_const(&mut out, "u32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+        for row in rp_adc_channel_rows(adc) {
+            match row {
+                Row::Uint(name, value) => push_rust_const(&mut out, "u32", &name, &value),
+                Row::Str(name, value) => push_rust_const(&mut out, "&str", &name, &format!("\"{value}\"")),
+                _ => unreachable!("an rp adc channel map is integer and string rows"),
+            }
+        }
     }
 
     for clock in &rp_clocks {
@@ -10513,6 +11461,21 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("PLL_SYS_PRIM_{s}"), &format!("0x{:X}", clock.pll_sys_prim));
         push_rust_const(&mut out, "u32", &format!("PLL_USB_FBDIV_{s}"), &clock.pll_usb_fbdiv.to_string());
         push_rust_const(&mut out, "u32", &format!("PLL_USB_PRIM_{s}"), &format!("0x{:X}", clock.pll_usb_prim));
+    }
+
+    for supply in &supplies {
+        let p = &supply.prefix;
+        out.push_str(&format!(
+            "\n// -- {p}: the part isolates the {} rail at reset, and this board uses it on {}.\n// Set the gate's mask in its register, then the valid mask, before those pins are used --\n",
+            supply.rail,
+            supply.pads.join(", ")
+        ));
+        if let Some((reg, mask)) = supply.gate {
+            push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_REG"), &format!("0x{reg:X}"));
+            push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_MASK"), &format!("0x{mask:X}"));
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_VALID_REG"), &format!("0x{:X}", supply.valid_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_VALID_MASK"), &format!("0x{:X}", supply.valid_mask));
     }
 
     let controls: Vec<(&str, &[ControlPin])> = vec![
@@ -10689,9 +11652,10 @@ pub fn emit_layout_swift(block: &BlockTable, source: &str, regen: &str) -> Resul
             }
         }
     }
-    if !block.channels.is_empty() {
+    let channels = family_channels(block)?;
+    if !channels.is_empty() {
         out.push_str("\n    // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n    // GPIO index a pin-fed channel taps; ChannelCount = how many rows the map has;\n    // isChannel = whether an index is one of them --\n");
-        for channel in &block.channels {
+        for channel in channels {
             push_swift_const(
                 &mut out,
                 "Int32",
@@ -10699,7 +11663,7 @@ pub fn emit_layout_swift(block: &BlockTable, source: &str, regen: &str) -> Resul
                 &channel.index.to_string(),
             );
         }
-        for channel in &block.channels {
+        for channel in channels {
             if let Some(('g', pin_index)) = split_pin(&channel.source) {
                 push_swift_const(
                     &mut out,
@@ -10709,8 +11673,8 @@ pub fn emit_layout_swift(block: &BlockTable, source: &str, regen: &str) -> Resul
                 );
             }
         }
-        push_swift_const(&mut out, "Int32", "ChannelCount", &block.channels.len().to_string());
-        let indexes: Vec<String> = block.channels.iter().map(|c| c.index.to_string()).collect();
+        push_swift_const(&mut out, "Int32", "ChannelCount", &channels.len().to_string());
+        let indexes: Vec<String> = channels.iter().map(|c| c.index.to_string()).collect();
         out.push_str(&format!(
             "\n    /// Whether `channel` is the index of a row in the channel map above. The indexes need\n    /// not run without gaps, so `ChannelCount` alone does not answer this.\n    public static func isChannel(_ channel: Int32) -> Bool {{\n        switch channel {{\n        case {}: return true\n        default: return false\n        }}\n    }}\n",
             indexes.join(", ")
@@ -10748,7 +11712,7 @@ pub fn emit_instances_swift(
     let mut out = String::new();
     let class = instances_class(&instances.family);
     let what = format!(
-        "The {} instance map as Swift constants, name/value-identical to {class}.g.cs:\n// where each block copy sits and its per-instance ids. Block-register offsets are not\n// emitted for Swift: a firmware project states its block constants and reads this file\n// for every placed-instance fact.",
+        "The {} instance map as Swift constants: where each block copy sits and its per-instance ids.",
         instances.family,
     );
     emit_swift_header(&mut out, &what, &[source.to_string()], regen);
@@ -10804,6 +11768,8 @@ pub fn emit_board_swift(
         same54_adcs,
         samd21_adcs,
         samd21_pwms,
+        rp2350_pwms,
+        supplies,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -10817,7 +11783,7 @@ pub fn emit_board_swift(
     let mut out = String::new();
     let class = bindings_class(&resolved.board.board);
     let mut what = format!(
-        "The {} board bindings as Swift constants, name/value-identical to {class}.g.cs:\n// every value below is a generation-time literal derived from the strata. The board's\n// facts are stated in board.toml.",
+        "The {} board bindings as Swift constants: every value below is a generation-time literal\n// derived from the strata. The board's facts are stated in board.toml.",
         resolved.board.board,
     );
     if !skipped.is_empty() {
@@ -10983,7 +11949,7 @@ pub fn emit_board_swift(
     }
     for uart in &st_uarts {
         let p = &uart.prefix;
-        out.push_str(&format!("\n    // -- {p}: an st-usart binding descriptor --\n"));
+        out.push_str(&format!("\n    // -- {p}: an st-{} binding descriptor --\n", uart.block));
         push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", uart.base));
         push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", uart.rcc_en_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", uart.rcc_en_mask));
@@ -11261,12 +12227,35 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_IC_CLK_HZ"), &i2c.ic_clk_hz.to_string());
     }
 
+    for pwm in &rp2350_pwms {
+        let p = &pwm.prefix;
+        out.push_str(&format!("\n    // -- {p}: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on\n    // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)\n    // and its pad --\n"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", pwm.base));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_RESET_MASK"), &format!("0x{:X}", pwm.reset_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_SLICE"), &pwm.slice.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_FUNCSEL"), &pwm.funcsel.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_CLK_SYS_HZ"), &pwm.clk_sys_hz.to_string());
+        for output in &pwm.outputs {
+            let s = upper_snake(&output.name);
+            push_swift_const(&mut out, "UInt32", &format!("{p}_OUTPUT_{s}"), &output.index.to_string());
+            push_swift_const(&mut out, "UInt32", &format!("{p}_IO_{s}_CTRL"), &format!("0x{:X}", output.io_ctrl));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_PADS_{s}"), &format!("0x{:X}", output.pads));
+        }
+    }
+
     for adc in &rp_adcs {
         let p = &adc.prefix;
-        out.push_str(&format!("\n    // -- {p}: an rp-adc binding descriptor (the reference rail is board truth;\n    // the channel map + calibration records are chip truth in the adc layout) --\n"));
+        out.push_str(&format!("\n    // -- {p}: an rp-adc binding descriptor: the converter, the board's reference rail, and\n    // the channel map of this part's package -- each pin-fed channel's GPIO, the channels\n    // whose pad the board gives to another line or binding (RESERVED_CHANNELS, and what\n    // has each), and the twin: a second pad the board ties to a channel's own net. The\n    // calibration records are chip truth in the adc layout --\n"));
         push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", adc.base));
         push_swift_const(&mut out, "UInt32", &format!("{p}_RESET_MASK"), &format!("0x{:X}", adc.reset_mask));
         push_swift_const(&mut out, "UInt32", &format!("{p}_REFERENCE_UV"), &adc.reference_uv.to_string());
+        for row in rp_adc_channel_rows(adc) {
+            match row {
+                Row::Uint(name, value) => push_swift_const(&mut out, "UInt32", &name, &value),
+                Row::Str(name, value) => push_swift_const(&mut out, "StaticString", &name, &format!("\"{value}\"")),
+                _ => unreachable!("an rp adc channel map is integer and string rows"),
+            }
+        }
     }
 
     for clock in &rp_clocks {
@@ -11282,6 +12271,21 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("PLL_SYS_PRIM_{s}"), &format!("0x{:X}", clock.pll_sys_prim));
         push_swift_const(&mut out, "UInt32", &format!("PLL_USB_FBDIV_{s}"), &clock.pll_usb_fbdiv.to_string());
         push_swift_const(&mut out, "UInt32", &format!("PLL_USB_PRIM_{s}"), &format!("0x{:X}", clock.pll_usb_prim));
+    }
+
+    for supply in &supplies {
+        let p = &supply.prefix;
+        out.push_str(&format!(
+            "\n    // -- {p}: the part isolates the {} rail at reset, and this board uses it on {}.\n    // Set the gate's mask in its register, then the valid mask, before those pins are used --\n",
+            supply.rail,
+            supply.pads.join(", ")
+        ));
+        if let Some((reg, mask)) = supply.gate {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_REG"), &format!("0x{reg:X}"));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_MASK"), &format!("0x{mask:X}"));
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_VALID_REG"), &format!("0x{:X}", supply.valid_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_VALID_MASK"), &format!("0x{:X}", supply.valid_mask));
     }
 
     let controls: Vec<(&str, &[ControlPin])> = vec![
@@ -11366,6 +12370,8 @@ pub fn emit_board_python(
         same54_adcs,
         samd21_adcs,
         samd21_pwms,
+        rp2350_pwms,
+        supplies,
         pl022_spis,
         st_spis,
         nrf_twis,
@@ -11827,17 +12833,43 @@ pub fn emit_board_python(
             ],
         ));
     }
+    for pwm in &rp2350_pwms {
+        let mut rows = vec![
+            ("kind".to_string(), "\"pwm\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", pwm.instance)),
+            ("base".to_string(), format!("0x{:X}", pwm.base)),
+            ("reset_mask".to_string(), format!("0x{:X}", pwm.reset_mask)),
+            ("slice".to_string(), pwm.slice.to_string()),
+            ("funcsel".to_string(), pwm.funcsel.to_string()),
+            ("clk_sys_hz".to_string(), pwm.clk_sys_hz.to_string()),
+        ];
+        for output in &pwm.outputs {
+            let s = snake(&output.name);
+            rows.push((format!("output_{s}"), output.index.to_string()));
+            rows.push((format!("io_{s}_ctrl"), format!("0x{:X}", output.io_ctrl)));
+            rows.push((format!("pads_{s}"), format!("0x{:X}", output.pads)));
+        }
+        roles.push((&pwm.role, rows));
+    }
     for adc in &rp_adcs {
-        roles.push((
-            &adc.role,
-            vec![
-                ("kind".to_string(), "\"adc\"".to_string()),
-                ("instance".to_string(), format!("\"{}\"", adc.instance)),
-                ("base".to_string(), format!("0x{:X}", adc.base)),
-                ("reset_mask".to_string(), format!("0x{:X}", adc.reset_mask)),
-                ("reference_uv".to_string(), adc.reference_uv.to_string()),
-            ],
-        ));
+        let mut rows = vec![
+            ("kind".to_string(), "\"adc\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", adc.instance)),
+            ("base".to_string(), format!("0x{:X}", adc.base)),
+            ("reset_mask".to_string(), format!("0x{:X}", adc.reset_mask)),
+            ("reference_uv".to_string(), adc.reference_uv.to_string()),
+        ];
+        let head = format!("{}_", adc.prefix);
+        for row in rp_adc_channel_rows(adc) {
+            let (name, value) = match row {
+                Row::Uint(name, value) => (name, value),
+                Row::Str(name, value) => (name, format!("\"{value}\"")),
+                _ => unreachable!("an rp adc channel map is integer and string rows"),
+            };
+            let key = name.strip_prefix(&head).expect("every channel-map row carries the binding's prefix");
+            rows.push((key.to_lowercase(), value));
+        }
+        roles.push((&adc.role, rows));
     }
 
     for (role, rows) in &mut roles {
@@ -11917,6 +12949,25 @@ pub fn emit_board_python(
         out.push_str(&entry);
     }
     out.push_str("}\n");
+
+    if !supplies.is_empty() {
+        out.push_str(
+            "\n# Supply rails this board's pads ride, which the part isolates at reset. Before any of a\n# rail's pads is touched, set the gate's mask in its register, then the valid mask.\nSUPPLIES = {\n",
+        );
+        for supply in &supplies {
+            let pads: Vec<String> = supply.pads.iter().map(|pad| format!("\"{pad}\"")).collect();
+            let mut entry = format!("    \"{}\": {{\"pads\": [{}]", supply.rail, pads.join(", "));
+            if let Some((reg, mask)) = supply.gate {
+                entry.push_str(&format!(", \"rcc_en_reg\": 0x{reg:X}, \"rcc_en_mask\": 0x{mask:X}"));
+            }
+            entry.push_str(&format!(
+                ", \"valid_reg\": 0x{:X}, \"valid_mask\": 0x{:X}}},\n",
+                supply.valid_reg, supply.valid_mask
+            ));
+            out.push_str(&entry);
+        }
+        out.push_str("}\n");
+    }
 
     out.push_str(
         "\n# On-board devices + module control lines: PORT group base + pin index + mask + polarity.\n# Emitted from this board's facts; each supported language states the same set in its\n# own idiom.\nDEVICES = {\n",
@@ -12946,6 +13997,27 @@ pub fn load_extension(
             Some(_) => {}
         }
     }
+
+    for socket in &table.sockets {
+        let vocabulary = load_standard(repo_root, &socket.standard)?;
+        for line in &socket.lines {
+            match vocabulary.pin(&line.signal) {
+                None => {
+                    return Err(format!(
+                        "extension '{}': socket '{}' wires position '{}', which the '{}' standard does not define -- a module naming the standard's positions would find nothing behind it",
+                        table.extension, socket.name, line.signal, socket.standard
+                    ));
+                }
+                Some(row) if !row.routable => {
+                    return Err(format!(
+                        "extension '{}': socket '{}' wires position '{}', which the '{}' standard marks unroutable ({})",
+                        table.extension, socket.name, line.signal, socket.standard, row.description
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
     Ok((table, standard))
 }
 
@@ -13037,6 +14109,9 @@ fn extension_rows(table: &ExtensionTable, standard: &HeaderStandardTable) -> Vec
         }
     }
 
+    if table.devices.is_empty() {
+        return rows;
+    }
     section(
         &mut rows,
         "-- the devices a host reaches. A LINE-wired device names the socket position it sits on\n\
@@ -13424,17 +14499,21 @@ write_unit = 4
         }
     }
 
-    /// A Rust layout names its C# twin only when there is one. The header of a block narrowed out of
-    /// C# says so instead, and its constants are the ones it would have emitted anyway.
+    /// A Rust layout describes its own file and nothing else: it names no other language's output,
+    /// whether or not its block is also emitted in C#, so the two emissions are the same text -- and
+    /// the constants of a block narrowed out of C# are the ones it would have emitted anyway.
     #[test]
-    fn a_rust_layout_names_a_csharp_twin_only_when_one_is_emitted() {
+    fn a_rust_layout_describes_only_its_own_file() {
         let Strata::Block(plain) = parse(BLOCK).expect("parses") else { panic!("kind") };
         let Strata::Block(narrowed) = block_emitting("[\"rust\"]").expect("parses") else { panic!("kind") };
         let whole = emit_layout_rust(&plain, "src.toml", "regen").expect("emits");
         let alone = emit_layout_rust(&narrowed, "src.toml", "regen").expect("emits");
-        assert!(whole.contains("name/value-identical to FamBlkMLayout.g.cs"), "{whole}");
-        assert!(!alone.contains("FamBlkMLayout"), "{alone}");
-        assert!(alone.contains("Its block table's `emit` list leaves C# out"), "{alone}");
+        for text in [&whole, &alone] {
+            for other in ["C#", ".g.cs", "FamBlkMLayout", "Swift", "Python", "emit"] {
+                assert!(!text.contains(other), "a Rust layout names '{other}': {text}");
+            }
+        }
+        assert_eq!(whole, alone, "a block's Rust layout does not depend on the other languages it is emitted in");
         let constants =
             |text: &str| text.lines().filter(|line| line.starts_with("pub const ")).map(str::to_owned).collect::<Vec<_>>();
         assert!(!constants(&whole).is_empty());
@@ -13968,6 +15047,7 @@ base = 0x1000
             gclk_gen: -1,
             token: -1,
             reference_uv: -1,
+            slice: -1,
         };
         let error = validate_bindings(&with_binding, &[binding], "p", "b").unwrap_err();
         assert!(error.contains("claims pin PA10"), "{error}");

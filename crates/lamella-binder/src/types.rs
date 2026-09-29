@@ -114,64 +114,92 @@ pub(crate) fn is_nullable(definition: &[Box<str>], arguments: &[TypeSymbol]) -> 
 /// produce one it takes it from there rather than growing a second implementation here.
 impl fmt::Display for TypeSymbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TypeSymbol::Special(special) => f.write_str(special.keyword()),
-            TypeSymbol::Named(parts) => {
-                for (index, part) in parts.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(".")?;
-                    }
-                    f.write_str(part)?;
+        write_type(f, self, &|_| 0)
+    }
+}
+
+/// Writes `ty` as C# source spells it, leaving out of each named or constructed type the leading
+/// parts of its dotted name that `namespace_parts` counts as its namespace.
+///
+/// [`Display`](fmt::Display) leaves out none, which is the form a conversion's diagnostics quote
+/// (`System.Collections.Generic.List<int>`). A member lookup's diagnostics quote a type without
+/// its namespace but with every type it is nested in (`List<int>`, `Outer.Inner`), and they come
+/// here with a count taken from the declarations. Type arguments are written the same way as the
+/// type that carries them.
+pub(crate) fn write_type(
+    f: &mut dyn fmt::Write,
+    ty: &TypeSymbol,
+    namespace_parts: &dyn Fn(&TypeSymbol) -> usize,
+) -> fmt::Result {
+    match ty {
+        TypeSymbol::Special(special) => f.write_str(special.keyword()),
+        TypeSymbol::Named(parts) => {
+            let first = namespace_parts(ty).min(parts.len().saturating_sub(1));
+            for (index, part) in parts.iter().enumerate().skip(first) {
+                if index > first {
+                    f.write_str(".")?;
                 }
-                Ok(())
+                f.write_str(part)?;
             }
-            TypeSymbol::Instantiation {
-                definition,
-                arguments,
-            } if is_nullable(definition, arguments) => {
-                write!(f, "{}?", arguments[0])
-            }
-            TypeSymbol::Instantiation {
-                definition,
-                arguments,
-            } => {
-                let mut taken = 0usize;
-                for (index, part) in definition.iter().enumerate() {
-                    if index > 0 {
+            Ok(())
+        }
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } if is_nullable(definition, arguments) => {
+            write_type(f, &arguments[0], namespace_parts)?;
+            f.write_str("?")
+        }
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => {
+            let first = namespace_parts(ty).min(definition.len().saturating_sub(1));
+            let mut taken = 0usize;
+            for (index, part) in definition.iter().enumerate() {
+                let own = if index + 1 == definition.len() {
+                    arguments.len().saturating_sub(taken)
+                } else {
+                    crate::symbols::mangled_arity(part)
+                };
+                let end = taken.saturating_add(own).min(arguments.len());
+                if index >= first {
+                    if index > first {
                         f.write_str(".")?;
                     }
                     f.write_str(&crate::symbols::unmangled_type_name(part))?;
-                    let own = if index + 1 == definition.len() {
-                        arguments.len().saturating_sub(taken)
-                    } else {
-                        crate::symbols::mangled_arity(part)
-                    };
-                    let end = taken.saturating_add(own).min(arguments.len());
                     if taken < end {
                         f.write_str("<")?;
                         for (position, argument) in arguments[taken..end].iter().enumerate() {
                             if position > 0 {
                                 f.write_str(", ")?;
                             }
-                            write!(f, "{argument}")?;
+                            write_type(f, argument, namespace_parts)?;
                         }
                         f.write_str(">")?;
                     }
-                    taken = end;
                 }
-                Ok(())
+                taken = end;
             }
-            TypeSymbol::Array { element, rank } => {
-                write!(f, "{element}[")?;
-                for _ in 1..*rank {
-                    f.write_str(",")?;
-                }
-                f.write_str("]")
-            }
-            TypeSymbol::Pointer(element) => write!(f, "{element}*"),
-            TypeSymbol::ByRef(element) => write!(f, "ref {element}"),
-            TypeSymbol::Error => f.write_str("<error>"),
+            Ok(())
         }
+        TypeSymbol::Array { element, rank } => {
+            write_type(f, element, namespace_parts)?;
+            f.write_str("[")?;
+            for _ in 1..*rank {
+                f.write_str(",")?;
+            }
+            f.write_str("]")
+        }
+        TypeSymbol::Pointer(element) => {
+            write_type(f, element, namespace_parts)?;
+            f.write_str("*")
+        }
+        TypeSymbol::ByRef(element) => {
+            f.write_str("ref ")?;
+            write_type(f, element, namespace_parts)
+        }
+        TypeSymbol::Error => f.write_str("<error>"),
     }
 }
 

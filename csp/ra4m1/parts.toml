@@ -1,5 +1,6 @@
-# PARTS table for the ra4m1 family. Pin lists are PARTIAL present-lists: they carry the pins the
-# boards reach, so a consumer must not read one as the package.
+# PARTS table for the ra4m1 family. Its `pins` lists are partial: each names the pins checked
+# against the datasheet's pinout, not the whole package, so a consumer must not read one as the
+# package. A pin that is not listed is refused rather than assumed.
 #
 # WHAT ADMITS A PART TO THIS FAMILY, AND WHY THE TEST READS TWO DOCUMENTS RATHER THAN ONE. A family
 # here owns ONE hardware manual and one pin-function table. This vendor scopes a manual by the GROUP
@@ -37,7 +38,7 @@ sources = [
 notes = [
     "The memory figures are read from a table whose Code flash, Data flash and SRAM cells are MERGED down the whole product list, so they are one statement about every member of the group rather than a row-by-row reading. That was settled by rendering the page: a text conversion of the same table prints those cells as blank on every row after the first, which is indistinguishable from a value the conversion dropped.",
     "Table 19.1 gives a different pin set per package, and a package column is evidence only about its own package. PORT1 runs to P115 on the 100-pin part and stops at P113 on the 64-pin one, so a pin resolved against the wrong column can be a pin the package does not physically carry.",
-    "The pin list below is held to what a board drives rather than to the package's 52 pins. A present-list is evidence-only: a pin is added when a board reaches it.",
+    "The pin list below names the pins a board drives rather than the package's 52 pins.",
 ]
 
 [[parts]]

@@ -431,7 +431,7 @@ pub struct Object {
     /// The obvious alternative -- a `Vec<Collection>` on the interpreter with a `u32` handle in the
     /// object -- is how the Python tier's containers became **immortal**: a heap-tracing collector
     /// reaches an index-addressed table from nothing, so freeing the Map would leave its contents
-    /// alive forever. Measured on this engine (`js-bench --bin region-ram`): everything an object
+    /// alive forever. Measured on this engine with a counting allocator: everything an object
     /// OWNS is reclaimed with it, and everything it reaches by INDEX is not.
     ///
     /// It is also the brand check. `Map.prototype.get.call(new Set())` must be a TypeError, and
@@ -602,8 +602,8 @@ pub struct ArgumentsData {
 ///    the view cannot own them.
 /// 2. `view.buffer === buf` must hold, so the identity has to survive.
 /// 3. An `ObjectId` is a heap EDGE a collector follows. A raw index into a side table is not, which
-///    is the distinction `js-bench --bin region-ram` measured: what an object reaches by reference
-///    is reclaimable with it, what it reaches by index is stranded.
+///    is a measured distinction: what an object reaches by reference is reclaimable with it, what
+///    it reaches by index is stranded.
 #[derive(Debug, Clone)]
 pub enum BinaryData {
     Buffer {

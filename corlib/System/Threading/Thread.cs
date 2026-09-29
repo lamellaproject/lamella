@@ -97,7 +97,11 @@ namespace System.Threading
 
         public static AppDomain GetDomain() { return AppDomain.CurrentDomain; }
 
-        public static void Sleep(int millisecondsTimeout) { SleepThread(millisecondsTimeout); }
+        public static void Sleep(int millisecondsTimeout)
+        {
+            if (millisecondsTimeout < Timeout.Infinite) throw new ArgumentOutOfRangeException("millisecondsTimeout");
+            SleepThread(millisecondsTimeout);
+        }
 
         public static void Sleep(TimeSpan timeout)
         {

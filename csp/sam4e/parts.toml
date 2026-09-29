@@ -1,5 +1,6 @@
 # PARTS table for the SAM4E family: this vendor's connectivity SAM4, with an Ethernet MAC and dual
-# CAN that its siblings do not carry. The pin present-list is PARTIAL and evidence-only.
+# CAN that its siblings do not carry. Its `pins` lists are partial: each names the pins checked
+# against the datasheet's pinout, not the whole package, and a pin that is not listed is refused.
 
 [table]
 kind = "parts"

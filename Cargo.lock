@@ -129,6 +129,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "critical-section"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -222,6 +228,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
 dependencies = [
  "byteorder",
+]
+
+[[package]]
+name = "heapless"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -326,6 +342,10 @@ dependencies = [
  "lamella-syntax",
  "lamella-token",
 ]
+
+[[package]]
+name = "lamella-board-support"
+version = "0.0.0"
 
 [[package]]
 name = "lamella-bsp-gen"
@@ -707,6 +727,7 @@ dependencies = [
  "lamella-assemble",
  "lamella-bsp-gen",
  "lamella-catalog",
+ "lamella-cil-runtime",
  "lamella-dap",
  "lamella-debug-backend",
  "lamella-flash-backend",
@@ -869,6 +890,7 @@ name = "lamella-runtime-support-net"
 version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
+ "lamella-heap",
  "lamella-net-smoltcp",
  "lamella-tls-mbedtls",
  "smoltcp",
@@ -907,6 +929,34 @@ name = "lamella-serial-mem"
 version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
+]
+
+[[package]]
+name = "lamella-serve-core"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-serve-rp2350"
+version = "0.0.0"
+dependencies = [
+ "critical-section",
+ "lamella-cil-runtime",
+ "lamella-heap",
+ "lamella-mmio",
+ "lamella-net-core",
+ "lamella-net-smoltcp",
+ "lamella-py-runtime",
+ "lamella-runner",
+ "lamella-tls-mbedtls",
+ "lamella-tls-roots",
+ "lamella-wasm-bridge",
+ "lamella-wasm-interp",
+ "lamella-wifi-cyw4343x",
+ "lamella-wifi-cyw4343x-smoltcp",
+ "lamella-wifi-images",
+ "lamella-wire",
+ "smoltcp",
+ "usb-device",
 ]
 
 [[package]]
@@ -1023,6 +1073,25 @@ version = "0.0.0"
 dependencies = [
  "lamella-probe",
  "lamella-usbbulk",
+]
+
+[[package]]
+name = "lamella-wifi-cyw4343x"
+version = "0.1.0"
+
+[[package]]
+name = "lamella-wifi-cyw4343x-smoltcp"
+version = "0.0.0"
+dependencies = [
+ "lamella-wifi-cyw4343x",
+ "smoltcp",
+]
+
+[[package]]
+name = "lamella-wifi-images"
+version = "0.0.0"
+dependencies = [
+ "lamella-pe",
 ]
 
 [[package]]
@@ -1152,6 +1221,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "portable-atomic"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1259,7 +1334,7 @@ dependencies = [
  "byteorder",
  "cfg-if",
  "defmt",
- "heapless",
+ "heapless 0.9.3",
  "managed",
 ]
 
@@ -1326,6 +1401,16 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "usb-device"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98816b1accafbb09085168b90f27e93d790b4bfa19d883466b5e53315b5f06a6"
+dependencies = [
+ "heapless 0.8.0",
+ "portable-atomic",
+]
 
 [[package]]
 name = "version_check"

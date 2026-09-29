@@ -8,9 +8,8 @@
 # it. If a family's chip package had board truth hiding in it, a second carrier on one part is
 # where that shows.
 #
-# No peripheral bindings yet: the virtual COM port rides USART3 on PD8/PD9, and this family places
-# no usart3 instance and has no pin-map rows for those two cells. The carrier states the wire it
-# is; the binding lands with those rows.
+# The virtual COM port rides USART3 on PD8/PD9, and this file states it as a carrier without binding
+# it: this family places no usart3 instance and has no pin-map rows for those two cells.
 
 [table]
 kind = "board"

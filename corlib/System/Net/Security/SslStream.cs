@@ -22,6 +22,7 @@ namespace System.Net.Security
         private const int StateEstablished = 1;
         private const int StateError = 3;
         private const int PlainClosed = -2;
+        private const int PlainFailed = -1;
         private const int FlagDatesUnchecked = 1;
         private const int FlagChainErrors = 2;
         private const int FlagNameMismatch = 4;
@@ -169,16 +170,23 @@ namespace System.Net.Security
             _inner.Flush();
         }
 
-        private void FeedIncoming(int count)
+        private int FeedIncoming(int count)
         {
             int fed = 0;
+            int state = StateEstablished;
             while (fed < count)
             {
                 int consumed = TlsNative.ReadTls(_tls, _xfer, fed, count - fed);
                 fed += consumed;
-                TlsNative.Process(_tls);
+                state = TlsNative.Process(_tls);
                 if (consumed == 0) break;
             }
+            return state;
+        }
+
+        private static IOException SessionFailed()
+        {
+            return new IOException("The TLS session failed, so the data received may be incomplete.");
         }
 
         private X509Certificate GetPeerCertificate()
@@ -215,10 +223,11 @@ namespace System.Net.Security
                 int plain = TlsNative.ReadPlain(_tls, buffer, offset, count);
                 if (plain > 0) return plain;
                 if (plain == PlainClosed) return 0;
+                if (plain == PlainFailed) throw SessionFailed();
                 FlushOutgoing();
                 int received = _inner.Read(_xfer, 0, _xfer.Length);
                 if (received <= 0) return 0;
-                FeedIncoming(received);
+                if (FeedIncoming(received) == StateError) throw SessionFailed();
             }
         }
 
@@ -226,12 +235,22 @@ namespace System.Net.Security
         {
             if (!_authenticated) throw new InvalidOperationException("The stream is not authenticated.");
             int written = 0;
+            bool stalled = false;
             while (written < count)
             {
                 int queued = TlsNative.WritePlain(_tls, buffer, offset + written, count - written);
+                if (queued < 0) throw SessionFailed();
                 written += queued;
                 FlushOutgoing();
-                if (queued == 0) break;
+                if (queued == 0)
+                {
+                    if (stalled) throw new IOException("The TLS engine took none of the data to write.");
+                    stalled = true;
+                }
+                else
+                {
+                    stalled = false;
+                }
             }
         }
 
@@ -243,6 +262,20 @@ namespace System.Net.Security
         {
             if (_tls >= 0)
             {
+                if (disposing && _authenticated)
+                {
+                    TlsNative.CloseNotify(_tls);
+                    try
+                    {
+                        FlushOutgoing();
+                    }
+                    catch (IOException)
+                    {
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
+                }
                 TlsNative.CloseTls(_tls);
                 _tls = -1;
             }

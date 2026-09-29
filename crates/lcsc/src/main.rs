@@ -3,8 +3,8 @@
 use lamella_assemble::{Diagnostic, LineMap, compile_source_with, compile_sources_with};
 use lamella_metadata::Assembly;
 use lamella_syntax::decode::decode_source;
-use lamella_syntax::lexer::{LexOptions, Normalization, OutputKind};
-use lamella_syntax::version::{LanguageVersion, LanguageVersionError};
+use lamella_syntax::lexer::{LexOptions, Normalization, NullableOption, OutputKind};
+use lamella_syntax::version::{Feature, LanguageVersion, LanguageVersionError};
 use std::process::ExitCode;
 
 /// The parsed command line.
@@ -116,6 +116,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     ));
                 }
             };
+        } else if let Some(setting) = nullable_option(arg) {
+            lex.nullable = setting?;
         } else if arg == "/nologo" {
         } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
             return Err(format!("unknown option '{arg}'\n{USAGE}"));
@@ -126,12 +128,50 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     if sources.is_empty() {
         return Err(String::from(USAGE));
     }
+    if lex.nullable != NullableOption::Disable
+        && !lex.version.supports(Feature::NullableReferenceTypes)
+    {
+        let setting = match lex.nullable {
+            NullableOption::Enable => "Enable",
+            NullableOption::Warnings => "Warnings",
+            NullableOption::Annotations => "Annotations",
+            NullableOption::Disable => "Disable",
+        };
+        return Err(format!(
+            "CS8630: Invalid 'nullable' value: '{setting}' for C# {}. Please use language version '8.0' or greater.",
+            lex.version.message_name()
+        ));
+    }
     Ok(Options {
         sources,
         output,
         references,
         emit_debug,
         lex,
+    })
+}
+
+/// Reads one `/nullable` option (csc's spellings, and the `--nullable` forms beside them), or
+/// `None` when `arg` is not one. A setting csc does not know is its CS8636, and an empty one its
+/// CS2006, each in csc's words.
+fn nullable_option(arg: &str) -> Option<Result<NullableOption, String>> {
+    match arg {
+        "/nullable" | "/nullable+" | "--nullable" => return Some(Ok(NullableOption::Enable)),
+        "/nullable-" => return Some(Ok(NullableOption::Disable)),
+        _ => {}
+    }
+    let value = strip_option(arg, &["/nullable:", "--nullable=", "--nullable:"])?;
+    Some(match value.to_ascii_lowercase().as_str() {
+        "enable" => Ok(NullableOption::Enable),
+        "disable" => Ok(NullableOption::Disable),
+        "warnings" => Ok(NullableOption::Warnings),
+        "annotations" => Ok(NullableOption::Annotations),
+        "" => Err(String::from(
+            "CS2006: Command-line syntax error: Missing '<text>' for 'nullable' option",
+        )),
+        _ => Err(format!(
+            "CS8636: Invalid option '{value}' for /nullable; must be 'disable', 'enable', 'warnings' or 'annotations'"
+        )),
     })
 }
 
@@ -160,6 +200,11 @@ usage: lcsc <source.cs>... [options]
                           (ISO-1, ISO-2), or latest / latestmajor / default. Selecting a dialect
                           says which constructs are PERMITTED; one this build does not produce is
                           refused by name (LAM0001). Also --langversion=<v>, --langversion:<v>.
+  /nullable[+|-]          the nullable context (C# 8.0): whether `T?` over a reference type is an
+  /nullable:<setting>     annotation (enable, annotations) or draws CS8632 (disable, warnings) where
+                          no #nullable directive says otherwise. Off by default, as csc's is; any
+                          setting but disable needs /langversion:8 or later (CS8630). Nullable
+                          WARNINGS are not produced. Also --nullable, --nullable=<setting>.
   /debug-                 suppress the Portable PDB (it is emitted by default).
   /normalize-identifiers  fold identifiers to NFC (ECMA-334 9.4.2; off by default, to match csc).
   /features:FileBasedProgram
@@ -450,6 +495,44 @@ mod tests {
             let message = parse_args(&args).err().unwrap_or_else(|| panic!("{v} should be refused"));
             assert!(message.contains("not a C# language version"), "{v}: {message}");
         }
+    }
+
+    #[test]
+    fn nullable_takes_cscs_spellings_and_refuses_what_csc_refuses_in_its_words() {
+        let parse = |flags: &[&str]| {
+            let mut args = vec![String::from("App.cs")];
+            args.extend(flags.iter().map(|flag| String::from(*flag)));
+            parse_args(&args).map(|options| options.lex.nullable)
+        };
+        assert_eq!(parse(&[]), Ok(NullableOption::Disable), "off by default, as csc's is");
+        for flag in ["/nullable", "/nullable+", "--nullable", "/nullable:enable", "/nullable:ENABLE"] {
+            assert_eq!(parse(&[flag]), Ok(NullableOption::Enable), "{flag}");
+        }
+        assert_eq!(parse(&["/nullable-"]), Ok(NullableOption::Disable));
+        assert_eq!(parse(&["/nullable:disable"]), Ok(NullableOption::Disable));
+        assert_eq!(parse(&["/nullable:Warnings"]), Ok(NullableOption::Warnings));
+        assert_eq!(parse(&["--nullable=annotations"]), Ok(NullableOption::Annotations));
+        assert_eq!(parse(&["/nullable", "/nullable-"]), Ok(NullableOption::Disable));
+        assert_eq!(
+            parse(&["/nullable:safeonly"]),
+            Err(String::from(
+                "CS8636: Invalid option 'safeonly' for /nullable; must be 'disable', 'enable', 'warnings' or 'annotations'"
+            ))
+        );
+        assert_eq!(
+            parse(&["/nullable:"]),
+            Err(String::from(
+                "CS2006: Command-line syntax error: Missing '<text>' for 'nullable' option"
+            ))
+        );
+        assert_eq!(
+            parse(&["/nullable:annotations", "/langversion:7.3"]),
+            Err(String::from(
+                "CS8630: Invalid 'nullable' value: 'Annotations' for C# 7.3. Please use language version '8.0' or greater."
+            ))
+        );
+        assert!(parse(&["/langversion:2", "/nullable"]).is_err());
+        assert_eq!(parse(&["/langversion:2", "/nullable-"]), Ok(NullableOption::Disable));
     }
 
     #[test]

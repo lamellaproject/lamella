@@ -26,6 +26,11 @@ namespace System
             }
         }
 
+        internal bool RaisedByRuntime
+        {
+            get { return RuntimeMessage() != null; }
+        }
+
         [Lamella.Runtime.RuntimeProvided] private Exception RuntimeInnerException() { return null; }
 
         public Exception InnerException

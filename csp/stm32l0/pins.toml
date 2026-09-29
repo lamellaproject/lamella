@@ -4,7 +4,7 @@
 #
 #
 #
-# THE ROWS ARE EVIDENCE-ONLY: a pin gains a row when something reaches it. The family's full
+# THE MAP LISTS ONLY THE CELLS A BINDING USES. The family's full
 # alternate-function matrix is table 14 of the datasheet and is larger than this.
 
 [table]

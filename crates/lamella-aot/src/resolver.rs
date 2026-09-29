@@ -404,6 +404,13 @@ pub struct MetadataResolver<'a> {
     /// index, and a resolver handed the map late emits no call, leaving a site that reads the
     /// uninitialized field and answers from zeroed storage.
     type_init_thunks: Vec<(u32, u32)>,
+    /// The initialization thunk of each generic INSTANTIATION whose definition declares a type
+    /// initializer, as `(canonical instantiation spelling, function index)` -- keyed by spelling,
+    /// like the plan and the static band, because one definition row stands for every instantiation.
+    ///
+    /// Carried across a rebase, unlike [`Self::type_init_thunks`]: a rebased body is lowered into the
+    /// MODULE's function table, and these thunks and the band they guard are the module's.
+    generic_type_init_thunks: Vec<(String, u32)>,
     /// Set while this resolver is REBASED: `assembly` is a REFERENCE of the module being emitted,
     /// not the module itself. See [`ReferenceOwner`].
     reference_owner: Option<ReferenceOwner>,
@@ -489,6 +496,7 @@ impl<'a> MetadataResolver<'a> {
             mono: crate::generics::MonoPlan::default(),
             box_target_tokens: box_target_tokens(assembly),
             type_init_thunks: Vec::new(),
+            generic_type_init_thunks: Vec::new(),
             reference_owner: None,
         }
     }
@@ -535,6 +543,7 @@ impl<'a> MetadataResolver<'a> {
             mono: self.mono.clone(),
             box_target_tokens: box_target_tokens(owner),
             type_init_thunks: Vec::new(),
+            generic_type_init_thunks: self.generic_type_init_thunks.clone(),
             reference_owner: Some(ReferenceOwner::new(ordinal, symbols)),
         })
     }
@@ -547,6 +556,15 @@ impl<'a> MetadataResolver<'a> {
     #[must_use]
     pub fn with_type_init_thunks(mut self, thunks: Vec<(u32, u32)>) -> MetadataResolver<'a> {
         self.type_init_thunks = thunks;
+        self
+    }
+
+    /// The initialization thunks of the generic instantiations, as `(canonical instantiation
+    /// spelling, function index)` -- see [`generic_type_init_types`]. Attached before lowering, for
+    /// the reason [`Self::with_type_init_thunks`] gives.
+    #[must_use]
+    pub fn with_generic_type_init_thunks(mut self, thunks: Vec<(String, u32)>) -> MetadataResolver<'a> {
+        self.generic_type_init_thunks = thunks;
         self
     }
 
@@ -616,6 +634,63 @@ impl<'a> MetadataResolver<'a> {
         self.argument_references
             .as_deref()
             .unwrap_or(&self.references)
+    }
+
+    /// The canonical spelling of the instantiation a `TypeSpec` of [`Self::assembly`] names, closed
+    /// over the type arguments in force -- the key the plan, the static band and the generic
+    /// initialization thunks are all looked up by. A body of the generic definition spells its own
+    /// type open (`Cmp`1[!0]`), so the arguments are closed before the name is spelled.
+    ///
+    /// **EACH SIDE IS DECODED IN ITS OWN WORLD AND COMPOSED AFTER, WHICH IS WHY THE OPEN SIGNATURE
+    /// IS HANDED OVER RATHER THAN A SUBSTITUTED ONE.** The `TypeSpec` is the OWNER's -- an owner's
+    /// body spells its own parent -- while the arguments are the CALLER's, because the caller is what
+    /// spelled the instantiation. Substituting first and spelling second reads both through ONE
+    /// assembly, and the wrong side then gets a name out of the other's tables:
+    /// `EqualityComparer`1[System.Type]` closes to a corlib definition holding a MODULE `TypeRef`, and
+    /// the corlib has no `TypeRef` table at all. `spell_sig_across` exists for exactly this pair and
+    /// is `spell_sig` byte for byte when the two worlds are the same.
+    fn closed_instantiation_name(&self, spec: Token) -> Option<String> {
+        let signature = self.assembly.type_spec_signature(spec)?;
+        crate::generics::spell_sig_across_with_methods(
+            self.assembly,
+            self.argument_world(),
+            &signature,
+            &self.type_arguments,
+            &self.method_arguments,
+        )
+        .or_else(|| {
+            crate::generics::spell_sig(self.assembly, &signature)
+        })
+    }
+
+    /// The `TypeSpec` a type-initializer trigger site names, when the type it touches is a generic
+    /// instantiation: a static field's parent, a static method's or constructor's parent, or the
+    /// `constrained.` operand itself. `None` for a site naming a plain type, and for an instance
+    /// call, which triggers nothing.
+    fn instantiation_named(&self, token: Token, trigger: crate::cil::InitTrigger) -> Option<Token> {
+        use crate::cil::InitTrigger;
+        let spec = match trigger {
+            InitTrigger::StaticField | InitTrigger::Method => {
+                if token.table() != table::MEMBER_REF {
+                    return None;
+                }
+                let member = self.assembly.member_ref(token.row())?;
+                if trigger == InitTrigger::StaticField {
+                    if !member.is_field() {
+                        return None;
+                    }
+                } else {
+                    let resolved = self.assembly.resolve_method(token)?;
+                    let is_static = resolved.signature.as_ref().is_some_and(|sig| !sig.has_this);
+                    if resolved.name != Some(".ctor") && !is_static {
+                        return None;
+                    }
+                }
+                member.parent()
+            }
+            InitTrigger::ValueTypeCall => token,
+        };
+        (spec.table() == table::TYPE_SPEC).then_some(spec)
     }
 
     /// The METHOD type arguments in force while lowering one generic method's monomorphized body --
@@ -1135,6 +1210,7 @@ impl<'a> MetadataResolver<'a> {
             mono: crate::generics::MonoPlan::default(),
             box_target_tokens: box_target_tokens(assembly),
             type_init_thunks: Vec::new(),
+            generic_type_init_thunks: Vec::new(),
             reference_owner: None,
         }
     }
@@ -1170,29 +1246,38 @@ impl<'a> MetadataResolver<'a> {
     }
 
     /// Whether `type_token` names an exception type, for the no-GC tag model's `newobj`/`catch`
-    /// recognition: a `System.*Exception` (the BCL exceptions live in another assembly the tag
-    /// model never needs to walk into, so they are matched by name), or a this-module type whose
-    /// `extends` chain reaches one. The walk is bounded so a malformed cyclic base cannot loop.
+    /// recognition: a `System.*Exception`, matched by name, or a type whose `extends` chain reaches
+    /// one. The chain is followed across assemblies: a `TypeRef` is walked on in the tables of the
+    /// reference that declares it, because most exception types live outside namespace `System` --
+    /// `System.IO.IOException`, `System.Collections.Generic.KeyNotFoundException`, a driver's own
+    /// `SensorError : IOException` -- and a name test alone answers no for every one of them. The walk
+    /// is bounded so a malformed cyclic base cannot loop.
     fn is_exception_type(&self, type_token: Token) -> bool {
+        let mut assembly = self.assembly;
         let mut current = type_token;
         for _ in 0..64 {
             if current.table() == table::TYPE_SPEC {
-                let Some(definition) = generic_base_definition(self.assembly, current) else {
+                let Some(definition) = generic_base_definition(assembly, current) else {
                     return false;
                 };
                 current = definition;
                 continue;
             }
-            let Some((namespace, name)) = self.assembly.type_token_full_name(current) else {
+            let Some((namespace, name)) = assembly.type_token_full_name(current) else {
                 return false;
             };
             if namespace == "System" && (name == "Exception" || name.ends_with("Exception")) {
                 return true;
             }
-            if current.table() != table::TYPE_DEF {
-                return false;
-            }
-            let Some(type_def) = self.assembly.type_def(current.row()) else {
+            let type_def = match current.table() {
+                table::TYPE_DEF => assembly.type_def(current.row()),
+                table::TYPE_REF => self.find_reference_type(&namespace, &name).map(|(_, owner, type_def)| {
+                    assembly = owner;
+                    type_def
+                }),
+                _ => None,
+            };
+            let Some(type_def) = type_def else {
                 return false;
             };
             let base = type_def.extends();
@@ -3832,16 +3917,6 @@ impl<'a> MetadataResolver<'a> {
         is_delegate_type_of(owner, &type_def).then_some((ordinal, owner, type_def, arguments))
     }
 
-    /// The reference layout of `type_def` (declared in `owner`) -- payload size and
-    /// reference-field offsets; `None` for a value type. Used for a `newobj` of either a
-    /// this-assembly class or a referenced-assembly class. The payload spans the WHOLE extends
-    /// chain, base blocks first ([`Self::cross_class_chain`]) -- INCLUDING a base declared in
-    /// another assembly. A derived class's own TypeDef often declares NO fields
-    /// (`AutoResetEvent : WaitHandle` same-assembly; a BSP's `Rp2350I2cDriver : I2cDriver`
-    /// cross-assembly, where the base carries `_probeScratch`), and sizing it by the visible
-    /// portion alone allocated OVERLAPPING objects -- the first write through an inherited
-    /// field then rewrote the NEXT object's header. Each block computes from its OWNING
-    /// assembly's metadata, so both sides of a boundary agree on every offset.
     /// Whether `ctor` (of `arity` parameters, resolved in `world`) hands its FIRST argument on,
     /// unchanged and in position, until it reaches `System.Exception`'s own constructor -- which is
     /// the one that stores it into `_message`.
@@ -3855,11 +3930,12 @@ impl<'a> MetadataResolver<'a> {
     /// It is also exactly what the throw answered before the message word existed, so declining
     /// costs nothing that was working.
     ///
-    /// **POSITIONAL, NOT MERELY PRESENT.** The body must be `ldarg.0; ldarg.1; ..; ldarg.N; call
-    /// base..ctor; ret`: every argument forwarded in its own place. A body that reorders them, or
-    /// passes a literal, or does anything else at all, is declined rather than guessed at -- and so
-    /// is a constructor whose declaring type this build cannot open, because "cannot read it" and
-    /// "read it and it forwards" are not the same fact.
+    /// **POSITIONAL, NOT MERELY PRESENT.** The body must be `ldarg.0; ldarg.1; ..; ldarg.K; call
+    /// base..ctor`, the leading arguments forwarded each in its own place, followed only by stores
+    /// into the type's own fields and `ret` ([`positional_base_forward`]). A body that reorders them,
+    /// or passes a literal, or does anything else at all, is declined rather than guessed at -- and
+    /// so is a constructor whose declaring type this build cannot open, because "cannot read it"
+    /// and "read it and it forwards" are not the same fact.
     ///
     /// The depth bound is the chain `ArgumentNullException -> ArgumentException -> SystemException
     /// -> Exception` with room over it; a chain longer than that declines rather than walks, since
@@ -3872,6 +3948,7 @@ impl<'a> MetadataResolver<'a> {
     ) -> bool {
         let mut world = world;
         let mut current = ctor;
+        let mut arity = arity;
         for _ in 0..8 {
             let Some(method) = world.resolve_method(current) else {
                 return false;
@@ -3897,11 +3974,14 @@ impl<'a> MetadataResolver<'a> {
             else {
                 return false;
             };
-            let Some(next) = positional_base_forward(&body.code, arity) else {
+            let own_fields: Vec<Token> = type_def.fields().map(|field| field.token()).collect();
+            let Some((next, forwarded)) = positional_base_forward(&body.code, arity, &own_fields)
+            else {
                 return false;
             };
             world = owner;
             current = next;
+            arity = forwarded;
         }
         false
     }
@@ -3921,6 +4001,16 @@ impl<'a> MetadataResolver<'a> {
         Some((*self.references.get(ordinal)?, type_def))
     }
 
+    /// The reference layout of `type_def` (declared in `owner`) -- payload size and
+    /// reference-field offsets; `None` for a value type. Used for a `newobj` of either a
+    /// this-assembly class or a referenced-assembly class. The payload spans the WHOLE extends
+    /// chain, base blocks first ([`Self::cross_class_chain`]) -- INCLUDING a base declared in
+    /// another assembly. A derived class's own TypeDef often declares NO fields
+    /// (`AutoResetEvent : WaitHandle` same-assembly; a BSP's `Rp2350I2cDriver : I2cDriver`
+    /// cross-assembly, where the base carries `_probeScratch`), and sizing it by the visible
+    /// portion alone allocated OVERLAPPING objects -- the first write through an inherited
+    /// field then rewrote the NEXT object's header. Each block computes from its OWNING
+    /// assembly's metadata, so both sides of a boundary agree on every offset.
     fn reference_layout_of(
         &self,
         owner: &'a Assembly<'a>,
@@ -5513,16 +5603,7 @@ impl CallResolver for MetadataResolver<'_> {
                     .is_some_and(|m| m.is_field() && m.parent().table() == table::TYPE_SPEC) =>
             {
                 let member = self.assembly.member_ref(token.row())?;
-                let signature = self.assembly.type_spec_signature(member.parent())?;
-                let name = crate::generics::spell_sig_across(
-                    self.assembly,
-                    self.argument_world(),
-                    &signature,
-                    &self.type_arguments,
-                )
-                .or_else(|| {
-                    crate::generics::spell_sig(self.assembly, &signature)
-                })?;
+                let name = self.closed_instantiation_name(member.parent())?;
                 let field_name = member.name()?;
                 let slot = band_slot_of(
                     self.argument_world(),
@@ -5566,6 +5647,19 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
+        let token = &if trigger == InitTrigger::Method && token.table() == table::METHOD_SPEC {
+            self.assembly.method_spec_method(*token)?
+        } else {
+            *token
+        };
+        if let Some(spec) = self.instantiation_named(*token, trigger) {
+            let name = self.closed_instantiation_name(spec)?;
+            return self
+                .generic_type_init_thunks
+                .iter()
+                .find(|(instantiation, _)| *instantiation == name)
+                .map(|(_, index)| TypeInitThunk::Local(*index));
+        }
         let named = match trigger {
             InitTrigger::StaticField => match token.table() {
                 table::FIELD => NamedType::Own(
@@ -6497,7 +6591,7 @@ pub(crate) fn type_init_types<'x>(
         .unwrap_or(crate::cil::RESERVED_STATIC_SLOTS);
     let mut types = Vec::new();
     for type_def in assembly.type_defs() {
-        let Some(cctor) = type_init_cctor(&type_def) else {
+        let Some(cctor) = type_init_cctor(assembly, &type_def) else {
             continue;
         };
         types.push((type_def.token().row(), cctor, next));
@@ -6516,7 +6610,16 @@ enum NamedType<'a> {
 }
 
 /// THE predicate: the `MethodDef` rid of a type's initializer, for every type that declares one.
-/// `None` only when the type has no `.cctor` at all, because then no trigger is owed.
+/// `None` when the type has no `.cctor` at all, because then no trigger is owed -- and for an OPEN
+/// GENERIC DEFINITION, whose `.cctor` belongs to no type that exists at run time.
+///
+/// **A GENERIC TYPE IS INITIALIZED ONCE PER INSTANTIATION, AND THE DEFINITION IS NOT ONE OF THEM.**
+/// `Reg<int>` and `Reg<string>` are two types with two sets of statics (ECMA-335 II.9.5), so each
+/// runs the initializer once, over its own statics, when a site first touches it. One flag for the
+/// definition would run the first instantiation's initializer and skip every other, and the
+/// definition's own body cannot run at all: its fields are typed by parameters no argument has
+/// closed. Each instantiation gets its own flag and thunk instead ([`generic_type_init_types`]),
+/// and declining the definition here is what keeps its body out of the startup chain as well.
 ///
 /// **EXCLUDING `beforefieldinit` HERE IS A LINK-SIZE DECISION, NOT ONLY A TIMING ONE.** A type this
 /// predicate declines gets no thunk, so its `.cctor` stays in the startup chain -- and `f0` then
@@ -6547,11 +6650,56 @@ enum NamedType<'a> {
 /// was dropped from the startup chain by one reading and given no trigger by the other. That
 /// failure has no size signature and no missing symbol: the image links, it boots, and the type
 /// answers from zeroed storage.
-pub(crate) fn type_init_cctor(type_def: &TypeDef) -> Option<u32> {
+pub(crate) fn type_init_cctor(assembly: &Assembly, type_def: &TypeDef) -> Option<u32> {
+    if is_generic_definition(assembly, type_def) {
+        return None;
+    }
     type_def
         .methods()
         .find(|m| m.is_static() && m.name() == Some(".cctor"))
         .map(|m| m.rid())
+}
+
+/// Whether `type_def` declares type parameters of its own, read from the `GenericParam` rows it owns
+/// (ECMA-335 II.22.20) rather than from an arity suffix in its name. A type nested in a generic type
+/// owns its enclosing type's parameters too, so it answers `true` as well.
+fn is_generic_definition(assembly: &Assembly, type_def: &TypeDef) -> bool {
+    let row = type_def.token().row();
+    assembly
+        .generic_params()
+        .any(|(_, _, owner, _)| owner & 1 == 0 && owner >> 1 == row)
+}
+
+/// The generic instantiations of this module whose definition declares a type initializer, as
+/// `(canonical instantiation spelling, function index of that instantiation's .cctor body, region
+/// slot of its "already ran" flag)`, in the plan's order.
+///
+/// The initializer that runs is the instantiation's own monomorphized `.cctor`, which writes that
+/// instantiation's band in [`generic_static_slots`]. The flags follow the band, so they live in the
+/// module's region beside the statics they guard, and [`static_region_words`] ends after them.
+#[must_use]
+pub(crate) fn generic_type_init_types<'x>(
+    assembly: &'x Assembly<'x>,
+    plan: &crate::generics::MonoPlan,
+    references: &[&'x Assembly<'x>],
+) -> Vec<(String, u32, u32)> {
+    let mut next = generic_static_slots(assembly, plan, references)
+        .last()
+        .map_or_else(
+            || non_generic_region_words(assembly, references),
+            |(_, _, slot, words, _)| slot + words,
+        );
+    let mut types = Vec::new();
+    for (name, _) in plan.instantiations() {
+        let Some(cctor) = plan.bodies().iter().find(|body| {
+            &*body.instantiation == name && &*body.name == ".cctor" && !body.declaration_only
+        }) else {
+            continue;
+        };
+        types.push((String::from(name), cctor.index, next));
+        next += 1;
+    }
+    types
 }
 
 /// What a site in ANOTHER assembly must do when it touches `type_def`, declared by `owner`: the
@@ -6572,7 +6720,7 @@ pub(crate) fn cross_assembly_type_init(
     owner: &Assembly,
     type_def: &TypeDef,
 ) -> Option<(u32, String)> {
-    let cctor = type_init_cctor(type_def)?;
+    let cctor = type_init_cctor(owner, type_def)?;
     Some((cctor, type_init_thunk_symbol(owner, type_def.token().row())?))
 }
 
@@ -6611,12 +6759,15 @@ pub(crate) fn static_region_words<'x>(
     plan: &crate::generics::MonoPlan,
     references: &[&'x Assembly<'x>],
 ) -> u32 {
-    generic_static_slots(assembly, plan, references)
+    let band_end = generic_static_slots(assembly, plan, references)
         .last()
         .map_or_else(
             || non_generic_region_words(assembly, references),
             |(_, _, slot, words, _)| slot + words,
-        )
+        );
+    generic_type_init_types(assembly, plan, references)
+        .last()
+        .map_or(band_end, |(_, _, slot)| slot + 1)
 }
 
 /// The static-field slots a MONOMORPHIZED INSTANTIATION owns, as
@@ -7440,6 +7591,7 @@ pub fn lower_methods_with_references<'a>(
                 crate::cil::Narrowing {
                     args: &arg_narrow,
                     locals: &local_narrow,
+                    pointees: &[],
                 },
             )
             .map(|(func, _)| func)
@@ -7472,6 +7624,7 @@ pub fn lower_methods_debug(
             crate::cil::Narrowing {
                 args: &arg_narrow,
                 locals: &local_narrow,
+                pointees: &[],
             },
         )?;
         funcs.push(func);
@@ -8852,34 +9005,78 @@ fn string_ctor_form(params: &[SigType]) -> Option<StringCtorForm> {
     }
 }
 
-/// The token a constructor body forwards ALL `arity` of its arguments to, in position: the `call`
-/// in `ldarg.0; ldarg.1; ..; ldarg.N; call base..ctor; ret` (`nop`s ignored, which is what a Debug
-/// build emits). `None` for a body of any other shape.
+/// The constructor a constructor body forwards its leading arguments to, in position, and how many
+/// it forwards: the `call` in `ldarg.0; ldarg.1; ..; ldarg.K; call base..ctor` with `1 <= K <=
+/// arity`, then any number of stores into the constructing type's OWN fields, then `ret` (`nop`s
+/// ignored, which is what a Debug build emits). `None` for a body of any other shape.
 ///
 /// **IT IS WRITTEN AS A SHAPE TEST RATHER THAN A DATA-FLOW ONE ON PURPOSE.** The question being
 /// asked is narrow -- did argument 1 arrive at `System.Exception`'s constructor still being
 /// argument 1 -- and a shape that does not match is not a body this can reason about, so it is
-/// declined. Widening it later means recognizing MORE shapes, never trusting an unrecognized one.
-fn positional_base_forward(code: &[lamella_cil::Instruction], arity: usize) -> Option<Token> {
+/// declined. Widening it means recognizing MORE shapes, never trusting an unrecognized one.
+///
+/// **THE STORES AFTER THE CALL ARE THE ONE WIDENING, AND THEY CANNOT TOUCH THE MESSAGE.** Each is
+/// `ldarg.0`, one value (an argument or a constant), and a `stfld` into a field `own_fields` lists --
+/// a field the constructing type declares itself, never `System.Exception`'s `_message`. That is the
+/// shape of `WebException(string message) : base(message) { _status = ...; }` and of a driver's
+/// `SensorError(string message, int code) : base(message) { Code = code; }`, whose message .NET
+/// reports as the one passed in.
+fn positional_base_forward(
+    code: &[lamella_cil::Instruction],
+    arity: usize,
+    own_fields: &[Token],
+) -> Option<(Token, usize)> {
+    let mut code = code.iter().filter(|inst| inst.opcode != Opcode::Nop);
     let mut wanted = 0u16;
-    let mut forwarded = None;
-    for inst in code.iter().filter(|inst| inst.opcode != Opcode::Nop) {
-        match forwarded {
-            None => match argument_slot(inst) {
-                Some(slot) if slot == wanted => wanted += 1,
-                None if inst.opcode == Opcode::Call && usize::from(wanted) == arity + 1 => {
-                    let Operand::Token(token) = inst.operand else {
-                        return None;
-                    };
-                    forwarded = Some(token);
+    let forwarded = loop {
+        let inst = code.next()?;
+        match argument_slot(inst) {
+            Some(slot) if slot == wanted && usize::from(slot) <= arity => wanted += 1,
+            None if inst.opcode == Opcode::Call && wanted >= 2 => {
+                let Operand::Token(token) = inst.operand else {
+                    return None;
+                };
+                break (token, usize::from(wanted) - 1);
+            }
+            _ => return None,
+        }
+    };
+    loop {
+        let inst = code.next()?;
+        match (inst.opcode, argument_slot(inst)) {
+            (Opcode::Ret, _) => return code.next().is_none().then_some(forwarded),
+            (_, Some(0)) => {
+                let value = code.next()?;
+                let is_value = argument_slot(value).is_some_and(|slot| slot >= 1)
+                    || matches!(
+                        value.opcode,
+                        Opcode::LdcI4M1
+                            | Opcode::LdcI40
+                            | Opcode::LdcI41
+                            | Opcode::LdcI42
+                            | Opcode::LdcI43
+                            | Opcode::LdcI44
+                            | Opcode::LdcI45
+                            | Opcode::LdcI46
+                            | Opcode::LdcI47
+                            | Opcode::LdcI48
+                            | Opcode::LdcI4S
+                            | Opcode::LdcI4
+                            | Opcode::LdcI8
+                            | Opcode::LdcR4
+                            | Opcode::LdcR8
+                            | Opcode::Ldnull
+                            | Opcode::Ldstr
+                    );
+                let store = code.next()?;
+                let own = matches!(store.operand, Operand::Token(field) if own_fields.contains(&field));
+                if !is_value || store.opcode != Opcode::Stfld || !own {
+                    return None;
                 }
-                _ => return None,
-            },
-            Some(_) if inst.opcode == Opcode::Ret => return forwarded,
-            Some(_) => return None,
+            }
+            _ => return None,
         }
     }
-    None
 }
 
 /// The argument slot an instruction loads (`this` is 0), or `None` when it loads none.

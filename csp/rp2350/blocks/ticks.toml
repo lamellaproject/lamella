@@ -1,0 +1,28 @@
+# BLOCK layout: the RP2350 tick generators. Each one divides clk_ref into a tick for one
+# destination: the two system timers, each core's SysTick, the watchdog and the RISC-V
+# platform timer. Only the TIMER0 generator is laid out; the map grows with its consumers.
+# The block has no RESETS bit.
+[table]
+kind = "block"
+family = "rp2350"
+block = "ticks"
+# Rust only: the one reader is a board's native clock, which starts TIMER0's tick at reset.
+emit = ["rust"]
+sources = ["RP2350 datasheet ch 8.5 (tick generators)"]
+notes = [
+    "A tick is CYCLES periods of clk_ref. With clk_ref on a 12 MHz crystal, CYCLES = 12 gives the 1 us tick the system timers count, which is the rate the datasheet names for them.",
+    "Stop a generator (ENABLE clear) before changing its CYCLES, then enable it again.",
+    "Both registers reset to 0, so TIMER0 does not count until its generator is configured and enabled.",
+]
+
+[registers.TIMER0_CTRL]
+offset = 0x18
+width = 32
+fields = { ENABLE = [0, 1], RUNNING = [1, 1] }
+notes = "ENABLE starts and stops TIMER0's tick. RUNNING is read-only and reports the generator running."
+
+[registers.TIMER0_CYCLES]
+offset = 0x1C
+width = 32
+fields = { CYCLES = [0, 9] }
+notes = "clk_ref cycles per tick, at most 511."

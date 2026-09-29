@@ -1,0 +1,61 @@
+# BLOCK layout: the RP2350 PWM -- twelve identical slices, each a 16-bit counter behind a
+# fractional clock divider, with two outputs, A and B, that share the slice's period.
+# Offsets are instance-base-relative (the `pwm` instance row at 0x400a8000). The per-slice
+# register ARRAY is CH<n>_<REG> = base + CH0_<REG> offset + CH_STRIDE * n, as io-bank0's
+# per-pin array is.
+#
+# Cross-block bring-up (RESETS, pads, funcsel) is DRIVER code.
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "pwm"
+sources = ["RP2350 datasheet 12.5 (PWM): Table 1131 (register list), Tables 1132-1137 (CH0_CSR, CH0_DIV, CH0_CTR, CH0_CC, CH0_TOP, EN)"]
+notes = [
+    "Slice n's CSR, DIV, CTR, CC and TOP sit CH_STRIDE apart: CH1_CSR is at 0x014 and CH11_CSR at 0x0dc (Table 1132).",
+    "The counter counts at clk_sys divided by DIV, INT + FRAC / 16, where INT 0 divides by 256 and then allows no FRAC bits (Table 1133, 12.5.2.6).",
+    "With CSR.PH_CORRECT clear the counter wraps after TOP, so the period is TOP + 1 counts, at most 65536 (12.5.2.1, 12.5.2.2).",
+    "CC.A and CC.B set each output's level against the count: 0 is a 0% output and TOP + 1 is 100% (12.5.2.2).",
+    "TOP and CC are double-buffered and change race-free while the slice runs (12.5.1).",
+    "The fractional divider is a first-order sigma-delta, so a FRAC other than 0 moves the edges from one period to the next (Table 1133).",
+]
+
+[registers.CH0_CSR]
+offset = 0x0
+width = 32
+fields = { EN = [0, 1], PH_CORRECT = [1, 1], A_INV = [2, 1], B_INV = [3, 1], DIVMODE = [4, 2], PH_RET = [6, 1], PH_ADV = [7, 1] }
+notes = "The control and status register. DIVMODE 0 counts freely at the divided rate; 1 to 3 gate or clock the counter from the B pin (Table 1132)."
+
+[registers.CH0_DIV]
+offset = 0x4
+width = 32
+fields = { FRAC = [0, 4], INT = [4, 8] }
+notes = "Resets to INT 1, FRAC 0: a divider of 1 (Table 1133)."
+
+[registers.CH0_CTR]
+offset = 0x8
+width = 32
+fields = { CTR = [0, 16] }
+notes = "Direct access to the counter (Table 1134)."
+
+[registers.CH0_CC]
+offset = 0xC
+width = 32
+fields = { A = [0, 16], B = [16, 16] }
+notes = "Output A's compare value in the low half, B's in the high half (Table 1135)."
+
+[registers.CH0_TOP]
+offset = 0x10
+width = 32
+fields = { TOP = [0, 16] }
+notes = "The wrap value; resets to 0xffff (Table 1136)."
+
+[registers.EN]
+offset = 0xF0
+width = 32
+notes = "One bit per slice, CH0 to CH11, aliasing each CHn_CSR.EN, so several slices start in the same cycle (Table 1137)."
+
+[constants]
+CH_STRIDE = 0x14
+SLICE_COUNT = 12
+DIVMODE_DIV = 0

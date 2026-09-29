@@ -1,5 +1,6 @@
-# PARTS table for the stm32f769 family. Pin lists are PARTIAL present-lists: they carry the pins
-# the boards reach, so a consumer must not read one as the package.
+# PARTS table for the stm32f769 family. Its `pins` lists are partial: each names the pins checked
+# against the datasheet's pinout, not the whole package, so a consumer must not read one as the
+# package. A pin that is not listed is refused rather than assumed.
 #
 # WHY THIS IS A FAMILY OF ITS OWN AND NOT A ROW ON `stm32f7`, since the two are one letter apart in
 # a marketing name. A family here owns ONE reference manual and one pin-function table, and these

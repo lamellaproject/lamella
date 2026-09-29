@@ -13492,6 +13492,7 @@ mod tests {
                 crate::cil::Narrowing {
                     args: &arg_narrow,
                     locals: &local_narrow,
+                    pointees: &[],
                 },
             ) {
                 Ok((func, _)) => funcs.push(func),

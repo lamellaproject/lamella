@@ -152,6 +152,12 @@ pub enum DiagnosticKind {
     /// directive is ignored and compilation continues, because a pragma is advice to the compiler
     /// and an unknown one is advice it cannot take.
     UnrecognizedPragma,
+    /// `CS8637`: a `#nullable` directive whose setting is not `enable`, `disable` or `restore`
+    /// (C# 8.0) -- including one with no setting at all. The words are case-sensitive.
+    NullableSettingExpected,
+    /// `CS8668`: a `#nullable` setting followed by something other than `warnings`,
+    /// `annotations`, a single-line comment or the end of the line.
+    NullableTargetExpected,
     /// A `#warning` directive, carrying its message text (9.5.5).
     WarningDirective {
         /// The text following `#warning` on the directive line.
@@ -459,6 +465,8 @@ impl DiagnosticKind {
             DiagnosticKind::UnexpectedDirective => 1028,
             DiagnosticKind::ErrorDirective { .. } => 1029,
             DiagnosticKind::UnrecognizedPragma => 1633,
+            DiagnosticKind::NullableSettingExpected => 8637,
+            DiagnosticKind::NullableTargetExpected => 8668,
             DiagnosticKind::WarningDirective { .. } => 1030,
             DiagnosticKind::SymbolAfterFirstToken => 1032,
             DiagnosticKind::EndRegionDirectiveExpected => 1038,
@@ -579,6 +587,12 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UnexpectedDirective => f.write_str("Unexpected preprocessor directive"),
             DiagnosticKind::ErrorDirective { message } => write!(f, "#error: '{message}'"),
             DiagnosticKind::UnrecognizedPragma => f.write_str("Unrecognized #pragma directive"),
+            DiagnosticKind::NullableSettingExpected => {
+                f.write_str("Expected 'enable', 'disable', or 'restore'")
+            }
+            DiagnosticKind::NullableTargetExpected => {
+                f.write_str("Expected 'warnings', 'annotations', or end of directive")
+            }
             DiagnosticKind::WarningDirective { message } => write!(f, "#warning: '{message}'"),
             DiagnosticKind::SymbolAfterFirstToken => {
                 f.write_str("Cannot define/undefine preprocessor symbols after first token in file")

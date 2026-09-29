@@ -17,6 +17,8 @@ pub use device::{lamella_gc_alloc_impl, lamella_gc_init_device_heap};
 pub use device::{set_device_collect_hook, set_device_oom_roots_hook, DeviceCollectHook};
 #[cfg(feature = "gc-collect")]
 pub use heap::mark_words_for;
+#[cfg(feature = "gc-collect")]
+pub use heap::RootKind;
 #[cfg(feature = "host-heap")]
 pub use device::{
     lamella_gc_alloc, lamella_gc_init, lamella_gc_init_region, lamella_gc_teardown,

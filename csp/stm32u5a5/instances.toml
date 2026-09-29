@@ -117,3 +117,12 @@ block = "rcc"
 base = 0x46020C00
 rcc_en_off = -1
 rcc_en_bit = -1
+
+# PWR, at its non-secure alias like RCC above (RM0456 memory map: 0x4602 0800), gated by PWREN in
+# RCC_AHB3ENR.
+[[instances]]
+name = "pwr"
+block = "pwr"
+base = 0x46020800
+rcc_en_off = 0x94   # RCC_AHB3ENR
+rcc_en_bit = 2      # PWREN

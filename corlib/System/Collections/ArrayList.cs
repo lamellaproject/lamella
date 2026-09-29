@@ -6,6 +6,8 @@ namespace System.Collections
         private object[] items;
         private int size;
 
+        internal int version;
+
         private const int DefaultCapacity = 4;
 
         public ArrayList() { items = new object[0]; size = 0; }
@@ -61,6 +63,7 @@ namespace System.Collections
             {
                 if (index < 0 || index >= size) throw new ArgumentOutOfRangeException("index");
                 items[index] = value;
+                version = version + 1;
             }
         }
 
@@ -69,6 +72,7 @@ namespace System.Collections
             if (size == items.Length) Grow();
             items[size] = value;
             size = size + 1;
+            version = version + 1;
             return size - 1;
         }
 
@@ -140,6 +144,7 @@ namespace System.Collections
             for (int i = size; i > index; i--) items[i] = items[i - 1];
             items[index] = value;
             size = size + 1;
+            version = version + 1;
         }
 
         public void RemoveAt(int index)
@@ -148,6 +153,7 @@ namespace System.Collections
             for (int i = index; i < size - 1; i++) items[i] = items[i + 1];
             size = size - 1;
             items[size] = null;
+            version = version + 1;
         }
 
         public void Remove(object value)
@@ -160,6 +166,7 @@ namespace System.Collections
         {
             for (int i = 0; i < size; i++) items[i] = null;
             size = 0;
+            version = version + 1;
         }
 
         public void CopyTo(System.Array array, int index)

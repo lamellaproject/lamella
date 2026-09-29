@@ -1,5 +1,6 @@
 # PIN map: pin x function -> (instance, signal) for the STM32H7.
-# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers (AF0..AF15) that the
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# Function ids are the ST alternate-function numbers (AF0..AF15) that the
 # AFRL/AFRH nibbles select.
 #
 # THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without

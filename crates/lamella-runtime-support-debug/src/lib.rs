@@ -15,8 +15,8 @@ const STATE_OFF: usize = 16;
 
 /// The pinned RAM word holding the caller-provided region base (0 before init).
 ///
-/// On the device it is a fixed low-RAM address adjacent to the networking layer's
-/// (`0x2000_0104`) and `lamella_gc_alloc`'s `HEAP_PTR` (`0x2000_0100`). On the host a real `.bss`
+/// On the device it is a fixed low-RAM address adjacent to `lamella_gc_alloc`'s `HEAP_PTR`
+/// (`0x2000_0100`) and the collector's heap end (`0x2000_0104`). On the host a real `.bss`
 /// word stands in, so the seam is exercised in a test without the device address.
 #[cfg(target_os = "none")]
 #[inline]

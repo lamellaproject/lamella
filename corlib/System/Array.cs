@@ -35,6 +35,7 @@ namespace System
 
         public static int IndexOf(Array array, object value)
         {
+            if ((object)array == null) throw new ArgumentNullException("array");
             int n = array.Length;
             for (int i = 0; i < n; i++)
             {
@@ -131,11 +132,24 @@ namespace System
         {
             if ((object)sourceArray == null) throw new ArgumentNullException("sourceArray");
             if ((object)destinationArray == null) throw new ArgumentNullException("destinationArray");
-            if (sourceIndex < 0) throw new ArgumentOutOfRangeException("sourceIndex");
-            if (destinationIndex < 0) throw new ArgumentOutOfRangeException("destinationIndex");
-            if (length < 0) throw new ArgumentOutOfRangeException("length");
-            if (sourceIndex > sourceArray.Length - length) throw new ArgumentException("sourceArray");
-            if (destinationIndex > destinationArray.Length - length) throw new ArgumentException("destinationArray");
+            if (sourceArray.Rank != destinationArray.Rank) throw new RankException("The specified arrays must have the same number of dimensions.");
+            if (length < 0)
+            {
+                string text = Int32.Decimal(length);
+                throw new ArgumentOutOfRangeException("length", text, "length ('" + text + "') must be a non-negative value.");
+            }
+            if (sourceIndex < 0)
+            {
+                string text = Int32.Decimal(sourceIndex);
+                throw new ArgumentOutOfRangeException("sourceIndex", text, "sourceIndex ('" + text + "') must be greater than or equal to '0'.");
+            }
+            if (destinationIndex < 0)
+            {
+                string text = Int32.Decimal(destinationIndex);
+                throw new ArgumentOutOfRangeException("destinationIndex", text, "destinationIndex ('" + text + "') must be greater than or equal to '0'.");
+            }
+            if (sourceIndex > sourceArray.Length - length) throw new ArgumentException("Source array was not long enough. Check the source index, length, and the array's lower bounds.", "sourceArray");
+            if (destinationIndex > destinationArray.Length - length) throw new ArgumentException("Destination array was not long enough. Check the destination index, length, and the array's lower bounds.", "destinationArray");
             if (CopyCore(sourceArray, sourceIndex, destinationArray, destinationIndex, length)) return;
             bool backward = (object)sourceArray == (object)destinationArray && destinationIndex > sourceIndex;
             if (backward)
@@ -182,13 +196,31 @@ namespace System
 
         public static void Sort(Array array)
         {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            if (array.Rank != 1) throw new RankException("Only single dimensional arrays are supported for the requested action.");
+            try
+            {
+                InsertionSort(array);
+            }
+            catch (ArgumentException e)
+            {
+                throw new InvalidOperationException("Failed to compare two elements in the array.", new ArgumentException(e.Message));
+            }
+            catch (Exception)
+            {
+                throw new InvalidOperationException("Failed to compare two elements in the array.");
+            }
+        }
+
+        private static void InsertionSort(Array array)
+        {
+            System.Collections.IComparer comparer = System.Collections.Comparer.Default;
             int n = array.Length;
             for (int i = 1; i < n; i++)
             {
                 object key = array.GetValue(i);
-                IComparable keyComparable = (IComparable)key;
                 int j = i - 1;
-                while (j >= 0 && keyComparable.CompareTo(array.GetValue(j)) < 0)
+                while (j >= 0 && comparer.Compare(key, array.GetValue(j)) < 0)
                 {
                     array.SetValue(array.GetValue(j), j + 1);
                     j = j - 1;

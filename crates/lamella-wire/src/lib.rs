@@ -1213,7 +1213,7 @@ pub mod product_model {
     pub const SAMW25_XPLAINED_PRO: u16 = 6;
     /// STM32F091 Nucleo-64 (STM32F091RC).
     pub const STM32F091: u16 = 7;
-    /// The STM32L476 bench board.
+    /// STM32L476 Nucleo-64 (STM32L476RG).
     pub const STM32L476: u16 = 8;
     /// Arduino MKR1000 (SAMD21G18A host MCU + WINC1500).
     pub const MKR1000: u16 = 9;
@@ -1536,6 +1536,12 @@ pub mod product_model {
     /// through any RP2350 pin.
     pub const PICO_PLUS_2_W: u16 = 62;
 
+    /// ST NUCLEO-L4R5ZI (STM32L4R5ZIT6, Cortex-M4 with FPU, 2 MB flash / 640 KB SRAM) -- the first
+    /// STM32L4+ board, and its own `csp/stm32l4r5` family rather than a row beside the L476: the
+    /// two parts are described by different reference manuals. Its virtual COM port is a
+    /// low-power UART on two pins that sit on a separately powered rail.
+    pub const NUCLEO_L4R5ZI: u16 = 63;
+
     /// The display name for a `product_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
@@ -1606,6 +1612,7 @@ pub mod product_model {
             SAMG55_XPLAINED_PRO => "SAM G55 Xplained Pro",
             PICO_PLUS_2 => "Pimoroni Pico Plus 2",
             PICO_PLUS_2_W => "Pimoroni Pico Plus 2 W",
+            NUCLEO_L4R5ZI => "NUCLEO-L4R5ZI",
             _ => return None,
         })
     }

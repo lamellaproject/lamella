@@ -79,3 +79,13 @@ DEVICES = {
 MEMORY = {
     "flash": {"kind": "flash", "size": 0x200000, "optional": False},
 }
+
+# The sockets a removable module plugs into. The socket is board truth -- it is on the
+# schematic and identical on every unit -- and what is plugged into it is not, so no entry here
+# names a module. "buses" holds the roles a socket brings out whole; "pins" holds the single
+# lines, each under the standard's own name for that position. Which of a socket's protocols an
+# attached module speaks is a property of the module, so a board that offers several states all
+# of them and chooses none.
+CONNECTORS = {
+    "header": {"standard": "pico-header", "buses": {}, "pins": {"gp0": {"port_base": 0xD0000000, "pin": 0, "bank": 0, "mask": 0x1}, "gp1": {"port_base": 0xD0000000, "pin": 1, "bank": 0, "mask": 0x2}, "gp2": {"port_base": 0xD0000000, "pin": 2, "bank": 0, "mask": 0x4}, "gp3": {"port_base": 0xD0000000, "pin": 3, "bank": 0, "mask": 0x8}, "gp4": {"port_base": 0xD0000000, "pin": 4, "bank": 0, "mask": 0x10}, "gp5": {"port_base": 0xD0000000, "pin": 5, "bank": 0, "mask": 0x20}, "gp6": {"port_base": 0xD0000000, "pin": 6, "bank": 0, "mask": 0x40}, "gp7": {"port_base": 0xD0000000, "pin": 7, "bank": 0, "mask": 0x80}, "gp8": {"port_base": 0xD0000000, "pin": 8, "bank": 0, "mask": 0x100}, "gp9": {"port_base": 0xD0000000, "pin": 9, "bank": 0, "mask": 0x200}, "gp10": {"port_base": 0xD0000000, "pin": 10, "bank": 0, "mask": 0x400}, "gp11": {"port_base": 0xD0000000, "pin": 11, "bank": 0, "mask": 0x800}, "gp12": {"port_base": 0xD0000000, "pin": 12, "bank": 0, "mask": 0x1000}, "gp13": {"port_base": 0xD0000000, "pin": 13, "bank": 0, "mask": 0x2000}, "gp14": {"port_base": 0xD0000000, "pin": 14, "bank": 0, "mask": 0x4000}, "gp15": {"port_base": 0xD0000000, "pin": 15, "bank": 0, "mask": 0x8000}, "gp16": {"port_base": 0xD0000000, "pin": 16, "bank": 0, "mask": 0x10000}, "gp17": {"port_base": 0xD0000000, "pin": 17, "bank": 0, "mask": 0x20000}, "gp18": {"port_base": 0xD0000000, "pin": 18, "bank": 0, "mask": 0x40000}, "gp19": {"port_base": 0xD0000000, "pin": 19, "bank": 0, "mask": 0x80000}, "gp20": {"port_base": 0xD0000000, "pin": 20, "bank": 0, "mask": 0x100000}, "gp21": {"port_base": 0xD0000000, "pin": 21, "bank": 0, "mask": 0x200000}, "gp22": {"port_base": 0xD0000000, "pin": 22, "bank": 0, "mask": 0x400000}, "gp26": {"port_base": 0xD0000000, "pin": 26, "bank": 0, "mask": 0x4000000}, "gp27": {"port_base": 0xD0000000, "pin": 27, "bank": 0, "mask": 0x8000000}, "gp28": {"port_base": 0xD0000000, "pin": 28, "bank": 0, "mask": 0x10000000}}},
+}

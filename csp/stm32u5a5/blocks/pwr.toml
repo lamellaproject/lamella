@@ -1,0 +1,21 @@
+# BLOCK layout: the STM32U5A5 power controller. Only the field a board's bring-up writes is laid
+# out: the one that validates the VDDIO2 rail. The rest of the block grows with its consumers.
+[table]
+kind = "block"
+family = "stm32u5a5"
+block = "pwr"
+# Rust only: a board's bring-up takes the rail's prerequisite from its own bindings, as absolute
+# addresses, so no managed program reads this layout.
+emit = ["rust"]
+sources = ["RM0456 Rev 7 section 10.4 (its independent I/O supply rail subsection) and section 10.10.5 (PWR_SVMCR); the memory map places PWR at 0x4602 0800 and RCC_AHB3ENR (offset 0x094) holds PWREN at bit 2"]
+notes = [
+    "PG[15:2] are supplied through VDDIO2 and are logically and electrically isolated after reset; setting PWR_SVMCR.IO2SV is mandatory to use them.",
+    "The PWR registers answer only with PWREN set in RCC_AHB3ENR, which the pwr instance row states as its clock gate.",
+    "Where VDDIO2 is not always present, the VDDIO2 voltage monitor can confirm it before IO2SV is set. A board that ties VDDIO2 to VDD needs no such check.",
+]
+
+[registers.SVMCR]
+offset = 0x10
+width = 32
+fields = { IO2SV = [29, 1] }
+notes = "The supply voltage monitoring control register; IO2SV is its VDDIO2 supply-valid bit."

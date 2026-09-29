@@ -1,11 +1,11 @@
 # PARTS table for the STM32F42x family.
 #
-# A pin present-list is PARTIAL and is PER ROW, so a consumer must not read either one as the
-# package: both rows below are LQFP144 parts and they name forty pins and four. The difference is
-# not silicon, it is how much of each part a board here has reached. Each entry is either one pin
-# or an inclusive same-port run, and every pin inside a run is a pin that part is established to
-# carry -- a range reaching over a pin that is not would claim the package rather than state what
-# the part is known to have.
+# A `pins` list is partial and PER ROW, so a consumer must not read either one as the package:
+# both rows below are LQFP144 parts and they name forty pins and four. The difference is not
+# silicon; it is how much of each part has been checked against the datasheet. Each entry is
+# either one pin or an inclusive same-port run, and every pin inside a run is a pin that part is
+# established to carry -- a range reaching over a pin that is not would claim the package rather
+# than state what the part is known to have.
 #
 # flash = 0x200000 (2 MB) is DUAL BANK -- 2 x 1 MB, with 128 KB sectors in each bank's upper part.
 # That is not decoration: a firmware and the image it loads have to tile ONE bank rather than the

@@ -17,6 +17,12 @@ namespace System.IO.Ports
         private int _handle;
         private Stream _baseStream;
 
+        private string _newLine;
+        private System.Text.Encoding _encoding;
+        private byte[] _inBuffer;
+        private int _readPos;
+        private int _readLen;
+
         public SerialPort(string portName)
             : this(portName, 9600, Parity.None, 8, StopBits.One)
         {
@@ -50,6 +56,8 @@ namespace System.IO.Ports
             _readTimeout = InfiniteTimeout;
             _writeTimeout = InfiniteTimeout;
             _handle = -1;
+            _newLine = "\n";
+            _encoding = System.Text.Encoding.ASCII;
         }
 
         public string PortName { get { return _portName; } }
@@ -136,6 +144,27 @@ namespace System.IO.Ports
             }
         }
 
+        public string NewLine
+        {
+            get { return _newLine; }
+            set
+            {
+                if ((object)value == null) throw new ArgumentNullException("NewLine");
+                if (value.Length == 0) throw new ArgumentException("Argument NewLine cannot be null or zero-length.", "NewLine");
+                _newLine = value;
+            }
+        }
+
+        public System.Text.Encoding Encoding
+        {
+            get { return _encoding; }
+            set
+            {
+                if ((object)value == null) throw new ArgumentNullException("Encoding");
+                _encoding = value;
+            }
+        }
+
         public int BytesToRead
         {
             get
@@ -143,7 +172,7 @@ namespace System.IO.Ports
                 EnsureOpen();
                 int n = NativeSerial.BytesToRead(_handle);
                 if (n < 0) NativeSerial.Throw(n, _portName);
-                return n;
+                return n + (_readLen - _readPos);
             }
         }
 
@@ -250,8 +279,22 @@ namespace System.IO.Ports
 
         public int Read(byte[] buffer, int offset, int count)
         {
-            ValidateRange(buffer, offset, count);
             EnsureOpen();
+            ValidateRange(buffer, offset, count);
+            int cached = _readLen - _readPos;
+            if (cached > 0)
+            {
+                int taken = cached < count ? cached : count;
+                Array.Copy(_inBuffer, _readPos, buffer, offset, taken);
+                Consume(taken);
+                if (taken == count) return taken;
+                int more = NativeSerial.BytesToRead(_handle);
+                if (more < 0) NativeSerial.Throw(more, _portName);
+                if (more == 0) return taken;
+                int rest = NativeSerial.Read(_handle, buffer, offset + taken, count - taken, 0);
+                if (rest < 0) NativeSerial.Throw(rest, _portName);
+                return taken + rest;
+            }
             int read = NativeSerial.Read(_handle, buffer, offset, count, _readTimeout);
             if (read < 0) NativeSerial.Throw(read, _portName);
             return read;
@@ -259,8 +302,8 @@ namespace System.IO.Ports
 
         public void Write(byte[] buffer, int offset, int count)
         {
-            ValidateRange(buffer, offset, count);
             EnsureOpen();
+            ValidateRange(buffer, offset, count);
             int written = 0;
             while (written < count)
             {
@@ -283,6 +326,8 @@ namespace System.IO.Ports
             EnsureOpen();
             int code = NativeSerial.DiscardIn(_handle);
             if (code < 0) NativeSerial.Throw(code, _portName);
+            _readPos = 0;
+            _readLen = 0;
         }
 
         public void DiscardOutBuffer()
@@ -290,6 +335,214 @@ namespace System.IO.Ports
             EnsureOpen();
             int code = NativeSerial.DiscardOut(_handle);
             if (code < 0) NativeSerial.Throw(code, _portName);
+        }
+
+
+        public void Write(string text)
+        {
+            EnsureOpen();
+            if ((object)text == null) throw new ArgumentNullException("text");
+            if (text.Length == 0) return;
+            byte[] bytes = _encoding.GetBytes(text);
+            Write(bytes, 0, bytes.Length);
+        }
+
+        public void Write(char[] buffer, int offset, int count)
+        {
+            EnsureOpen();
+            if ((object)buffer == null) throw new ArgumentNullException("buffer");
+            ValidateRange(buffer.Length, offset, count);
+            if (count == 0) return;
+            Write(new string(buffer, offset, count));
+        }
+
+        public void WriteLine(string text)
+        {
+            Write(text + _newLine);
+        }
+
+        public int ReadByte()
+        {
+            EnsureOpen();
+            if (_readLen == _readPos && Fill(_readTimeout) == 0) throw new TimeoutException();
+            int b = _inBuffer[_readPos];
+            Consume(1);
+            return b;
+        }
+
+        public int ReadChar()
+        {
+            EnsureOpen();
+            int started = Environment.TickCount;
+            Fill(0);
+            int length = CharLength(_readPos);
+            while (length == 0)
+            {
+                WaitForMore(started);
+                length = CharLength(_readPos);
+            }
+            string c = Decode(_readPos, length);
+            if (c.Length > 1) throw new ArgumentException("The output char buffer is too small to contain the decoded characters.", "chars");
+            Consume(length);
+            return c[0];
+        }
+
+        public int Read(char[] buffer, int offset, int count)
+        {
+            EnsureOpen();
+            if ((object)buffer == null) throw new ArgumentNullException("buffer");
+            ValidateRange(buffer.Length, offset, count);
+            if (count == 0) return 0;
+            int started = Environment.TickCount;
+            Fill(0);
+            while (CharLength(_readPos) == 0) WaitForMore(started);
+            int written = 0;
+            while (written < count)
+            {
+                int length = CharLength(_readPos);
+                if (length == 0) break;
+                string c = Decode(_readPos, length);
+                if (written + c.Length > count) break;
+                for (int i = 0; i < c.Length; i++) buffer[offset + written + i] = c[i];
+                written = written + c.Length;
+                Consume(length);
+            }
+            return written;
+        }
+
+        public string ReadExisting()
+        {
+            EnsureOpen();
+            Fill(0);
+            int whole = 0;
+            int length = CharLength(_readPos);
+            while (length > 0)
+            {
+                whole = whole + length;
+                length = CharLength(_readPos + whole);
+            }
+            if (whole == 0) return "";
+            string text = Decode(_readPos, whole);
+            Consume(whole);
+            return text;
+        }
+
+        public string ReadTo(string value)
+        {
+            EnsureOpen();
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if (value.Length == 0) throw new ArgumentException("Argument value cannot be null or zero-length.", "value");
+            int started = Environment.TickCount;
+            Fill(0);
+            string text = "";
+            int scanned = 0;
+            while (true)
+            {
+                int length = CharLength(_readPos + scanned);
+                if (length == 0)
+                {
+                    WaitForMore(started);
+                    continue;
+                }
+                text = String.Concat(text, Decode(_readPos + scanned, length));
+                scanned = scanned + length;
+                if (text.Length >= value.Length && text.EndsWith(value))
+                {
+                    Consume(scanned);
+                    return text.Substring(0, text.Length - value.Length);
+                }
+            }
+        }
+
+        public string ReadLine()
+        {
+            return ReadTo(_newLine);
+        }
+
+        private void Consume(int count)
+        {
+            _readPos = _readPos + count;
+            if (_readPos == _readLen)
+            {
+                _readPos = 0;
+                _readLen = 0;
+            }
+        }
+
+        private int Fill(int timeoutMs)
+        {
+            int waiting = NativeSerial.BytesToRead(_handle);
+            if (waiting < 0) NativeSerial.Throw(waiting, _portName);
+            if (waiting == 0 && timeoutMs == 0) return 0;
+            int want = waiting > 0 ? waiting : 1;
+            if (_inBuffer == null) _inBuffer = new byte[want > 64 ? want : 64];
+            if (_readPos > 0)
+            {
+                int kept = _readLen - _readPos;
+                for (int i = 0; i < kept; i++) _inBuffer[i] = _inBuffer[_readPos + i];
+                _readPos = 0;
+                _readLen = kept;
+            }
+            if (_inBuffer.Length - _readLen < want)
+            {
+                int size = _inBuffer.Length * 2;
+                while (size - _readLen < want) size = size * 2;
+                byte[] bigger = new byte[size];
+                for (int i = 0; i < _readLen; i++) bigger[i] = _inBuffer[i];
+                _inBuffer = bigger;
+            }
+            int n = NativeSerial.Read(_handle, _inBuffer, _readLen, want, waiting > 0 ? 0 : timeoutMs);
+            if (n < 0) NativeSerial.Throw(n, _portName);
+            _readLen = _readLen + n;
+            return n;
+        }
+
+        private void WaitForMore(int started)
+        {
+            int wait = InfiniteTimeout;
+            if (_readTimeout != InfiniteTimeout)
+            {
+                wait = _readTimeout - (Environment.TickCount - started);
+                if (wait < 0) throw new TimeoutException();
+            }
+            if (Fill(wait) == 0) throw new TimeoutException();
+        }
+
+        private int CharLength(int pos)
+        {
+            int available = _readLen - pos;
+            if (available <= 0) return 0;
+            if (_encoding is System.Text.UTF8Encoding)
+            {
+                int lead = _inBuffer[pos];
+                int length = 1;
+                if ((lead & 0xE0) == 0xC0) length = 2;
+                else if ((lead & 0xF0) == 0xE0) length = 3;
+                else if ((lead & 0xF8) == 0xF0) length = 4;
+                for (int i = 1; i < length; i++)
+                {
+                    if (i >= available) return 0;
+                    if ((_inBuffer[pos + i] & 0xC0) != 0x80) return i;
+                }
+                return length;
+            }
+            if (_encoding is System.Text.UnicodeEncoding)
+            {
+                if (available < 2) return 0;
+                int unit = _inBuffer[pos] | (_inBuffer[pos + 1] << 8);
+                if (unit < 0xD800 || unit > 0xDBFF) return 2;
+                if (available < 4) return 0;
+                int next = _inBuffer[pos + 2] | (_inBuffer[pos + 3] << 8);
+                return (next >= 0xDC00 && next <= 0xDFFF) ? 4 : 2;
+            }
+            return 1;
+        }
+
+        private string Decode(int pos, int length)
+        {
+            byte[] bytes = new byte[length];
+            for (int i = 0; i < length; i++) bytes[i] = _inBuffer[pos + i];
+            return _encoding.GetString(bytes);
         }
 
         public void Close()
@@ -309,6 +562,8 @@ namespace System.IO.Ports
                 NativeSerial.Close(_handle);
                 _handle = -1;
             }
+            _readPos = 0;
+            _readLen = 0;
             if (_baseStream != null)
             {
                 _baseStream.Dispose();
@@ -326,13 +581,18 @@ namespace System.IO.Ports
             if (_handle >= 0) throw new InvalidOperationException("The port setting cannot be changed while the port is open.");
         }
 
+        private static void ValidateRange(int length, int offset, int count)
+        {
+            if (offset < 0) throw new ArgumentOutOfRangeException("offset", "Non-negative number required.");
+            if (count < 0) throw new ArgumentOutOfRangeException("count", "Non-negative number required.");
+            if (length - offset < count)
+                throw new ArgumentException("Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection.");
+        }
+
         private static void ValidateRange(byte[] buffer, int offset, int count)
         {
             if ((object)buffer == null) throw new ArgumentNullException("buffer");
-            if (offset < 0) throw new ArgumentOutOfRangeException("offset");
-            if (count < 0) throw new ArgumentOutOfRangeException("count");
-            if (buffer.Length - offset < count)
-                throw new ArgumentException("Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection.");
+            ValidateRange(buffer.Length, offset, count);
         }
     }
 }

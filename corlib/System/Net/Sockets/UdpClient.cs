@@ -6,7 +6,7 @@ namespace System.Net.Sockets
     {
         private Socket _socket;
 
-        private const int MaxDatagram = 65536;
+        private byte[] _buffer;
 
         public UdpClient()
         {
@@ -40,12 +40,12 @@ namespace System.Net.Sockets
 
         public byte[] Receive(ref IPEndPoint remoteEP)
         {
-            byte[] buffer = new byte[MaxDatagram];
+            if ((object)_buffer == null) _buffer = new byte[_socket.MaxDatagram];
             EndPoint sender = new IPEndPoint(IPAddress.Any, 0);
-            int received = _socket.ReceiveFrom(buffer, ref sender);
+            int received = _socket.ReceiveFrom(_buffer, ref sender);
             remoteEP = (IPEndPoint)sender;
             byte[] result = new byte[received];
-            for (int i = 0; i < received; i++) result[i] = buffer[i];
+            for (int i = 0; i < received; i++) result[i] = _buffer[i];
             return result;
         }
 

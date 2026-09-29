@@ -1,0 +1,34 @@
+# PIN map for the STM32L4R5: pin x function -> (instance, signal).
+# Function ids are the ST alternate-function numbers AF0..AF15 that the AFRL and AFRH nibbles
+# select. The map lists the functions a binding uses, not the datasheet's whole table; a
+# (pin, function) pair that is not listed is refused rather than assumed.
+#
+# AN AF NUMBER IS A PER-PRODUCT FACT. Each row below was read from this part's own datasheet and not
+# carried from another family's table, where the same signal can sit at a different number.
+#
+
+[table]
+kind = "pins"
+family = "stm32l4r5"
+sources = [
+    "STM32L4R5xx STM32L4R7xx STM32L4R9xx datasheet DS12023 Rev 5, table 17 (alternate function AF8 to AF15), port G, page 132: the AF8 column is headed UART4/5/LPUART1/CAN2, and PG7's AF8 cell is LPUART1_TX and PG8's is LPUART1_RX",
+    "DS12023 Rev 5 table 16 (alternate function AF0 to AF7), port G, page 123, for the other functions of the same two pads",
+]
+notes = [
+    "BOTH PADS BELOW ARE ON THE VDDIO2 RAIL. PG7 and PG8 are inside PG[15:2], which is isolated at reset until IOSV in PWR_CR2 is set (RM0432 section 5.1.2; see ../parts.toml). A correct AF8 mux on either pad does nothing until then.",
+    "WHICH AFR REGISTER HOLDS THE NIBBLE IS DECIDED BY THE PIN NUMBER. PG7's nibble is bits 31:28 of AFRL and PG8's is bits 3:0 of AFRH, so the two halves of this one UART are in two different registers.",
+]
+
+[[pins]]
+pin = "PG7"
+function = "AF8"
+instance = "lpuart1"
+signal = "tx"
+source = "DS12023 Rev 5 table 17, port G row PG7, AF8 column = LPUART1_TX. Its other populated functions are SAI1_CK1 at AF3, I2C3_SCL at AF4, OCTOSPIM_P2_DQS at AF5 and DFSDM1_CKOUT at AF6 (table 16), and FMC_INT at AF12, SAI1_MCLK_A at AF13 and EVENTOUT at AF15 (table 17)."
+
+[[pins]]
+pin = "PG8"
+function = "AF8"
+instance = "lpuart1"
+signal = "rx"
+source = "DS12023 Rev 5 table 17, port G row PG8, AF8 column = LPUART1_RX. Its other populated functions are I2C3_SDA at AF4 (table 16) and EVENTOUT at AF15 (table 17)."

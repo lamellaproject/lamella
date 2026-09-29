@@ -1,6 +1,6 @@
 # PIN map for the STM32U5A5: pin x function -> (instance, signal).
 # Function ids are the ST alternate-function numbers AF0..AF15 that the AFRL and AFRH nibbles
-# select. The rows are EVIDENCE-ONLY: a pad gains a row when something reaches it.
+# select. The map lists only the cells a binding uses, not the datasheet's whole table.
 #
 #
 

@@ -161,12 +161,11 @@ fn enumerate() -> (Vec<Attached>, Vec<lamella_probe::PassedOver>) {
 
 /// The target to print for `port`, and a note when it is not the obvious one.
 ///
-/// **A USB SERIAL NUMBER IS NOT UNIQUE PER PORT, AND THE FIRST BENCH THIS RAN ON PROVED IT.** One
-/// MCU-Link presents TWO virtual COM ports under a single serial number, so `serial:<that number>`
-/// matches both -- and the resolver refuses an ambiguous match rather than picking one, which is
-/// correct. A listing that printed that target anyway would be handing the reader a string that
-/// cannot be opened, which is worse than printing the unstable port name: the reader would blame
-/// the board.
+/// **A USB serial number is not unique per port.** One MCU-Link presents TWO virtual COM ports
+/// under a single serial number, so `serial:<that number>` matches both -- and the resolver refuses
+/// an ambiguous match rather than picking one, which is correct. A listing that printed that target
+/// anyway would be handing the reader a string that cannot be opened, which is worse than printing
+/// the unstable port name: the reader would blame the board.
 ///
 /// So the serial-based target is used only when the serial identifies exactly ONE port. Otherwise
 /// the port name is the target, and the note says why, because a reader comparing two rows of this
@@ -328,10 +327,10 @@ mod tests {
         }
     }
 
-    /// **MEASURED ON A REAL BENCH, WHICH IS WHERE THIS CASE CAME FROM.** An MCU-Link presents two
-    /// virtual COM ports under one USB serial number, so `serial:<that number>` resolves to two
-    /// ports and the resolver refuses it. Printing it anyway would give the reader a target that
-    /// cannot be opened -- and they would go looking at the board.
+    /// An MCU-Link presents two virtual COM ports under one USB serial number, so
+    /// `serial:<that number>` resolves to two ports and the resolver refuses it. Printing it
+    /// anyway would give the reader a target that cannot be opened -- and they would go looking at
+    /// the board.
     #[test]
     fn a_serial_number_shared_by_two_ports_is_not_printed_as_a_target() {
         let all = vec![

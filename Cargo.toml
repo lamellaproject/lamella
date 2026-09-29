@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The CYW43439 and CYW4343W Wi-Fi driver is kept here unmodified, and its manifest declares a
+# workspace of its own, which cargo refuses inside another workspace's member glob. Excluded, it
+# builds as its own workspace, and as a path dependency of a member.
+exclude = ["crates/lamella-wifi-cyw4343x"]
 
 # Shared package metadata. Member crates inherit these with `field.workspace = true`
 # so versioning and licensing stay in one place.

@@ -53,7 +53,7 @@ use lamella_cil_runtime::intrinsics::{
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
     console_write_line_uint32, console_write_line_uint64, debug_write,
-    clock_is_set, clock_monotonic_millis, clock_set_ticks,
+    clock_is_set, clock_monotonic_millis, clock_set_ticks, clock_wall_changed,
     datetime_now_ticks, delegate_clone, delegate_combine, delegate_equals, delegate_equals_object,
     delegate_get_hash_code, delegate_not_equals, delegate_remove,
     environment_get_variable, environment_processor_count, environment_tick_count,
@@ -81,12 +81,13 @@ use lamella_cil_runtime::intrinsics::{
     monitor_pulse_all,
     socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
     socket_send, socket_recv, socket_set_recv_timeout, socket_local_port, socket_close,
-    socket_udp_bind, socket_udp_send_to, socket_udp_recv_from, dns_resolve_host,
+    socket_udp_bind, socket_udp_send_to, socket_udp_recv_from, socket_udp_max_datagram,
+    dns_resolve_host,
     net_is_available, net_iface_count, net_iface_oper_status, net_iface_type, net_iface_ipv4,
     net_iface_subnet, net_iface_gateway, net_iface_flags,
     tls_client_config, tls_server_config, tls_client_new, tls_server_new, tls_process,
     tls_wants_write, tls_write_tls, tls_read_tls, tls_read_plain, tls_write_plain, tls_peer_cert,
-    tls_session_flags, tls_close, tls_default_stack, tls_client_config_alpn, tls_alpn_is,
+    tls_session_flags, tls_close_notify, tls_close, tls_default_stack, tls_client_config_alpn, tls_alpn_is,
     tls_exporter_key, tls_drop_key, aead_siv_encrypt, aead_siv_decrypt, aead_import_key,
     fs_open, fs_read, fs_write, fs_seek, fs_length, fs_set_length, fs_flush, fs_close,
     fs_file_exists, fs_dir_exists, fs_delete_file, fs_create_dir, fs_delete_dir, fs_move, fs_list,
@@ -3417,6 +3418,8 @@ fn load_assembly_collecting<'pe>(
     let mut sizeof_tokens: BTreeSet<Token> = BTreeSet::new();
     let mut value_type_tokens: Vec<Token> = Vec::new();
     let mut methoddef_sigs: BTreeMap<u32, (String, Vec<SigType>, u32)> = BTreeMap::new();
+    #[cfg(feature = "reflection")]
+    let mut virtual_methods: BTreeSet<Token> = BTreeSet::new();
     let mut type_extends: Vec<Token> = Vec::new();
     let mut type_interfaces: Vec<Vec<Token>> = Vec::new();
     let mut type_virtuals: Vec<Vec<VirtualMethod>> = Vec::new();
@@ -3557,6 +3560,10 @@ fn load_assembly_collecting<'pe>(
             let return_type: Option<SigType> = method_sig.as_ref().map(|sig| sig.return_type.clone());
             let generic_arity = method_sig.as_ref().map_or(0, |sig| sig.generic_param_count);
             methoddef_sigs.insert(method_row, (name.clone(), params.clone(), generic_arity));
+            #[cfg(feature = "reflection")]
+            if method.flags() & METHOD_VIRTUAL != 0 {
+                virtual_methods.insert(token);
+            }
             if is_delegate {
                 if name == ".ctor" {
                     module.mark_delegate_ctor(asm, token, Some(type_id));
@@ -3852,6 +3859,11 @@ fn load_assembly_collecting<'pe>(
         &relisted,
     );
     bind_call_targets(module, assembly, asm, &callvirt_tokens, &methoddef_sigs);
+    #[cfg(feature = "reflection")]
+    {
+        virtual_methods.retain(|token| module.resolve(asm, *token).is_none());
+        bind_call_targets(module, assembly, asm, &virtual_methods, &methoddef_sigs);
+    }
     bind_explicit_overrides(module, assembly, asm, type_offset);
     let mut heir_base: Vec<Option<HeirBase>> = (0..type_extends.len()).map(|_| None).collect();
     for (local, extends) in type_extends.iter().enumerate() {
@@ -4681,6 +4693,9 @@ fn bcl_intrinsic(
     if namespace == "Lamella.Runtime" && type_name == "Clock" {
         match (method, parameters_of(signature)) {
             ("MonotonicMilliseconds", []) => return Some(intrinsic!(clock_monotonic_millis)),
+            ("WallClockChanged", [SigType::I8, SigType::Boolean]) => {
+                return Some(intrinsic!(clock_wall_changed));
+            }
             ("SetTicks", [SigType::I8]) => return Some(intrinsic!(clock_set_ticks)),
             ("IsSet", []) => return Some(intrinsic!(clock_is_set)),
             _ => {}
@@ -4739,6 +4754,7 @@ fn bcl_intrinsic(
             "ReceivePoll" => return Some(intrinsic!(socket_recv)),
             "SetRecvTimeout" => return Some(intrinsic!(socket_set_recv_timeout)),
             "LocalPort" => return Some(intrinsic!(socket_local_port)),
+            "UdpMaxDatagram" => return Some(intrinsic!(socket_udp_max_datagram)),
             "CloseSocket" => return Some(intrinsic!(socket_close)),
             "UdpBind" => return Some(intrinsic!(socket_udp_bind)),
             "UdpSendTo" => return Some(intrinsic!(socket_udp_send_to)),
@@ -4779,6 +4795,7 @@ fn bcl_intrinsic(
             "WritePlain" => return Some(intrinsic!(tls_write_plain)),
             "PeerCert" => return Some(intrinsic!(tls_peer_cert)),
             "SessionFlags" => return Some(intrinsic!(tls_session_flags)),
+            "CloseNotify" => return Some(intrinsic!(tls_close_notify)),
             "CloseTls" => return Some(intrinsic!(tls_close)),
             "DefaultStack" => return Some(intrinsic!(tls_default_stack)),
             _ => {}
@@ -7802,8 +7819,8 @@ fn console_write_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn,
     Some(intrinsic)
 }
 
-/// Picks the `String.Concat` overload by its parameter types (the two-string form
-/// for now -- what `a + b` on strings emits).
+/// Picks the `String.Concat` overload by its parameter types: two or three strings (what `a + b`
+/// on strings emits) or two or three objects. Any other overload returns `None`.
 fn string_concat_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
         [SigType::String, SigType::String] => Some(intrinsic!(string_concat)),

@@ -104,7 +104,10 @@ pub const ARRAY_DESC_MARK_MASK: u32 = 0xFF00_0000;
 pub const ELEMENT_KIND_REFERENCE: u32 = 0;
 
 /// Element kind for a value type that is not one of the frozen primitives (a struct element). It
-/// deliberately carries NO width, so this scheme can neither stride it nor scan it.
+/// deliberately carries NO width, because a struct holding references needs per-element offsets this
+/// word cannot express. The device resolver strides and scans such an array through the element
+/// type's own descriptor instead, which the array descriptor names in `element_desc@16`, and refuses
+/// one whose `element_desc@16` is absent.
 pub const ELEMENT_KIND_OPAQUE: u32 = 0xFF;
 
 
@@ -140,9 +143,10 @@ fn element_width(element_kind: u32) -> Option<u32> {
 /// what keeps the allocator and the collector agreeing on every object's footprint.
 ///
 /// # Panics
-/// When the array cannot be strided: a rank other than 1 (whose dimension words this scheme does
-/// not read), a value-type element (whose width the descriptor does not carry), or a footprint past
-/// the addressable range. Refusing is deliberate -- a wrong footprint does not corrupt one object,
+/// When the array cannot be strided: dimension words missing from `leading`, a value-type element
+/// (whose width `element_kind` does not carry; the device resolver sizes one from its element
+/// descriptor before it gets here, and only one with no element descriptor arrives), or a footprint
+/// past the addressable range. Refusing is deliberate -- a wrong footprint does not corrupt one object,
 /// it desynchronizes the walk over every object above it.
 #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
 fn payload_extent(word0: u32, word1: u32, leading: &[u32]) -> u32 {
@@ -150,7 +154,18 @@ fn payload_extent(word0: u32, word1: u32, leading: &[u32]) -> u32 {
         return word0;
     };
     let width = element_width(element_kind)
-        .expect("an array of value-type elements carries no element width");
+        .expect("an array of value-type elements whose descriptor names no element type carries no width");
+    array_extent(rank, width, leading)
+}
+
+/// The payload footprint, in bytes, of a rank-`rank` array whose elements are `width` bytes wide and
+/// whose leading payload words are `leading`: the dimension words, then the elements.
+///
+/// # Panics
+/// On the refusals [`payload_extent`] documents: dimensions missing from `leading`, or a footprint
+/// past the addressable range.
+#[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
+fn array_extent(rank: u32, width: u32, leading: &[u32]) -> u32 {
     let dims = leading
         .get(..rank as usize)
         .expect("a rank-N array must present its N dimensions to be sized");
@@ -190,6 +205,62 @@ fn for_each_array_ref_offset(rank: u32, element_kind: u32, dims: &[u32], f: &mut
     }
 }
 
+/// Invokes `f` with the byte offset of each REFERENCE slot of an array of STRUCT elements: `count`
+/// elements `stride` bytes apart after the `rank` dimension words, each holding references at the
+/// `nrefs` offsets `ref_at` answers, relative to the element's start.
+///
+/// # Panics
+/// On the refusals of [`array_extent`], applied first so the loop below cannot overflow either.
+#[cfg(feature = "gc-collect")]
+fn for_each_struct_array_ref_offset(
+    rank: u32,
+    stride: u32,
+    dims: &[u32],
+    nrefs: u32,
+    ref_at: &dyn Fn(u32) -> u32,
+    f: &mut dyn FnMut(u32),
+) {
+    let _ = array_extent(rank, stride, dims);
+    if nrefs == 0 {
+        return;
+    }
+    let count = dims
+        .iter()
+        .take(rank as usize)
+        .try_fold(1u32, |acc, &dim| acc.checked_mul(dim))
+        .expect("array element count exceeds the addressable range");
+    let elements_base = 4 * rank;
+    for i in 0..count {
+        let element = elements_base + i * stride;
+        for r in 0..nrefs {
+            f(element + ref_at(r));
+        }
+    }
+}
+
+/// A STRUCT element's layout, from the array descriptor's `element_desc@16`: the stride and the
+/// element type's own descriptor.
+///
+/// The element descriptor's `payload_size` IS the array's stride -- the resolver sizes a value type's
+/// descriptor with the very call the inline array stride uses -- and its `ref_offsets` are each
+/// element's reference slots, relative to the element's start. `None` when the word is ABSENT (0),
+/// which a consumer must refuse rather than read as an address, and when it names no class-form
+/// descriptor with a size.
+///
+/// # Safety
+/// `desc` must be a valid ARRAY descriptor (word 0 marked), which is `ARRAY_DESC_WORDS` long, so its
+/// fifth word is `element_desc@16`.
+#[cfg(feature = "gc-collect")]
+unsafe fn struct_element(desc: *const DeviceTypeDesc) -> Option<(u32, *const DeviceTypeDesc)> {
+    let relative = unsafe { desc.cast::<u32>().add(4).read_unaligned() };
+    if relative == 0 {
+        return None;
+    }
+    let element = (desc as usize as u32).wrapping_add(relative) as usize as *const DeviceTypeDesc;
+    let (stride, nrefs) = unsafe { DeviceTypeDesc::header_words(element) };
+    (stride != 0 && array_shape(stride, nrefs).is_none()).then_some((stride, element))
+}
+
 /// The device resolver: an object's header word is the *address* of its
 /// [`DeviceTypeDesc`], dereferenced to answer the engine's payload-size and
 /// reference-offset questions. This is the one piece that differs from the host's
@@ -212,6 +283,11 @@ impl TypeResolver for PtrResolver {
     fn payload_size(&self, header_word: u32, leading: &[u32]) -> u32 {
         let desc = header_word as *const DeviceTypeDesc;
         let (word0, word1) = unsafe { DeviceTypeDesc::header_words(desc) };
+        if let Some((rank, ELEMENT_KIND_OPAQUE)) = array_shape(word0, word1) {
+            if let Some((stride, _)) = unsafe { struct_element(desc) } {
+                return array_extent(rank, stride, leading);
+            }
+        }
         payload_extent(word0, word1, leading)
     }
 
@@ -219,6 +295,14 @@ impl TypeResolver for PtrResolver {
         let desc = header_word as *const DeviceTypeDesc;
         let (word0, word1) = unsafe { DeviceTypeDesc::header_words(desc) };
         if let Some((rank, element_kind)) = array_shape(word0, word1) {
+            if element_kind == ELEMENT_KIND_OPAQUE {
+                if let Some((stride, element)) = unsafe { struct_element(desc) } {
+                    let (_, nrefs) = unsafe { DeviceTypeDesc::header_words(element) };
+                    let ref_at = |r: u32| unsafe { DeviceTypeDesc::ref_offset(element, r) };
+                    for_each_struct_array_ref_offset(rank, stride, leading, nrefs, &ref_at, f);
+                    return;
+                }
+            }
             for_each_array_ref_offset(rank, element_kind, leading, f);
             return;
         }
@@ -277,6 +361,10 @@ pub struct DeviceHeap {
     base: u32,
     /// The bump pointer, an OFFSET from `base`. Survivors compact below it.
     top: u32,
+    /// The first FREE BLOCK below `top` that the last collection chained for reuse, as an OFFSET from
+    /// `base`; 0 when there is none. Such a block is the gap a pinned survivor kept, and
+    /// [`Self::alloc`] takes from the chain before it bumps.
+    free: u32,
 }
 
 impl DeviceHeap {
@@ -302,6 +390,7 @@ impl DeviceHeap {
             base: Self::base_of(base),
             region,
             top: ALIGN,
+            free: 0,
         }
     }
 
@@ -345,11 +434,11 @@ impl DeviceHeap {
         self.top
     }
 
-    /// Bump-allocates an object of the type described by `type_desc`: writes the header
-    /// word (the descriptor *address*), reserves a zeroed, 4-aligned payload, advances
-    /// the bump pointer, and returns the *payload* offset as a [`Ref`]. Returns `None`
-    /// if the object does not fit (no collection is attempted here -- the C-ABI entry
-    /// drives [`DeviceHeap::collect_stack`] and retries).
+    /// Allocates an object of the type described by `type_desc`: writes the header word (the
+    /// descriptor *address*), reserves a zeroed, 4-aligned payload, and returns the *payload* address
+    /// as a [`Ref`]. The object goes in the first FREE BLOCK the last collection chained that holds
+    /// it, and otherwise at the bump pointer, which it advances. Returns `None` if the object fits in
+    /// neither (no collection is attempted here -- the C-ABI entry collects and retries).
     ///
     /// `payload_size` is the footprint the CALLER computed, which is the only source that
     /// exists at this point for a length-dependent object: an array's element count is
@@ -368,16 +457,68 @@ impl DeviceHeap {
         type_desc: *const DeviceTypeDesc,
     ) -> Option<Ref> {
         let reserved = align_up(payload_size);
-        let object_start = self.top;
-        let next = object_start.checked_add(HEADER_SIZE)?.checked_add(reserved)?;
-        if next as usize > self.region.len() {
-            return None;
-        }
+        let needed = HEADER_SIZE.checked_add(reserved)?;
+        #[cfg(feature = "gc-collect")]
+        let reused = self.take_free(needed);
+        #[cfg(not(feature = "gc-collect"))]
+        let reused: Option<u32> = None;
+        let object_start = match reused {
+            Some(start) => start,
+            None => {
+                let object_start = self.top;
+                let next = object_start.checked_add(needed)?;
+                if next as usize > self.region.len() {
+                    return None;
+                }
+                self.top = next;
+                object_start
+            }
+        };
         let header_word = type_desc as u32;
         let at = object_start as usize;
         self.region[at..at + 4].copy_from_slice(&header_word.to_le_bytes());
-        self.top = next;
         Some(Ref(self.base + object_start + HEADER_SIZE))
+    }
+
+    /// Takes `needed` bytes from the front of the first FREE BLOCK in the chain that holds them, and
+    /// answers where they start. What is left of the block stays a free block, in the chain when it can
+    /// still hold a link.
+    #[cfg(feature = "gc-collect")]
+    fn take_free(&mut self, needed: u32) -> Option<u32> {
+        use crate::heap::{FREE_BLOCK, FREE_BLOCK_LINKED};
+        let word = |region: &[u8], at: usize| u32::from_le_bytes([region[at], region[at + 1], region[at + 2], region[at + 3]]);
+        let mut pointer: Option<usize> = None;
+        let mut block = self.free;
+        while block != 0 {
+            let at = block as usize;
+            let length = word(self.region, at) & !FREE_BLOCK;
+            let next = word(self.region, at + 4);
+            if length >= needed {
+                let rest = length - needed;
+                let split = at + needed as usize;
+                let replacement = if rest >= FREE_BLOCK_LINKED {
+                    self.region[split..split + 4].copy_from_slice(&(FREE_BLOCK | rest).to_le_bytes());
+                    self.region[split + 4..split + 8].copy_from_slice(&next.to_le_bytes());
+                    block + needed
+                } else {
+                    if rest != 0 {
+                        self.region[split..split + 4].copy_from_slice(&(FREE_BLOCK | rest).to_le_bytes());
+                    }
+                    next
+                };
+                match pointer {
+                    None => self.free = replacement,
+                    Some(link) => self.region[link..link + 4].copy_from_slice(&replacement.to_le_bytes()),
+                }
+                if needed >= FREE_BLOCK_LINKED {
+                    self.region[at + 4..at + 8].fill(0);
+                }
+                return Some(block);
+            }
+            pointer = Some(at + 4);
+            block = next;
+        }
+        None
     }
 
     /// Reclaims unreachable objects and compacts survivors, with the roots reported by
@@ -420,7 +561,10 @@ impl DeviceHeap {
     /// reclaimed. A collector that cannot prove an object dead must not reclaim it.
     ///
     /// `enumerate_roots` is called TWICE, as it is for [`Self::collect_with_pins`]: once to mark and
-    /// once to rewrite. It must report the same slots both times and must not allocate.
+    /// once to rewrite. It must report the same slots both times and must not allocate. Each slot is
+    /// reported with its [`RootKind`](crate::heap::RootKind): a managed pointer is
+    /// [`RootKind::Interior`](crate::heap::RootKind::Interior), and it keeps alive and moves with the
+    /// object it points into.
     #[cfg(feature = "gc-collect")]
     pub fn collect_no_alloc<R>(
         &mut self,
@@ -429,7 +573,7 @@ impl DeviceHeap {
         marks: &mut [u32],
     ) -> bool
     where
-        R: FnMut(&mut dyn FnMut(&mut Ref)),
+        R: FnMut(&mut dyn FnMut(&mut Ref, crate::heap::RootKind)),
     {
         let mut bits = crate::heap::MarkBits::new(marks);
         let top = self.top;
@@ -442,8 +586,9 @@ impl DeviceHeap {
             pinned,
             &mut bits,
         ) {
-            Some(new_top) => {
-                self.top = new_top;
+            Some(compacted) => {
+                self.top = compacted.top;
+                self.free = compacted.free;
                 true
             }
             None => false,
@@ -460,6 +605,7 @@ impl DeviceHeap {
         R: FnMut(&mut dyn FnMut(&mut Ref)),
     {
         let top = self.top;
+        self.free = 0;
         self.top = mark_compact(
             self.region,
             self.base,
@@ -681,6 +827,33 @@ mod tests {
         assert_eq!(payload_extent(ARRAY_RANK1, 5, &[0]), 4);
     }
 
+    /// AN ARRAY OF STRUCTS IS STRIDED AND SCANNED BY ITS ELEMENT TYPE: `stride` bytes per element
+    /// after the dimension words, and each element's references at its own type's offsets.
+    ///
+    /// The descriptor words are read on the device, where a header holds a 32-bit address; this pins
+    /// the arithmetic both answers are built from.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn an_array_of_structs_is_strided_and_scanned_by_its_element_type() {
+        assert_eq!(array_extent(1, 12, &[3]), 4 + 3 * 12);
+        assert_eq!(array_extent(2, 12, &[2, 3]), 8 + 6 * 12);
+
+        let element_refs = [0u32, 8];
+        let ref_at = |r: u32| element_refs[r as usize];
+        let mut seen = Vec::new();
+        for_each_struct_array_ref_offset(1, 12, &[3], 2, &ref_at, &mut |offset| seen.push(offset));
+        assert_eq!(seen, vec![4, 12, 16, 24, 28, 36], "every element's references, element by element");
+
+        seen.clear();
+        for_each_struct_array_ref_offset(2, 12, &[2, 3], 2, &ref_at, &mut |offset| seen.push(offset));
+        assert_eq!(seen.len(), 12, "a rank-2 array scans every one of its six elements");
+        assert_eq!(seen[0], 8, "past both dimension words");
+
+        seen.clear();
+        for_each_struct_array_ref_offset(1, 8, &[100], 0, &ref_at, &mut |offset| seen.push(offset));
+        assert!(seen.is_empty());
+    }
+
     #[test]
     fn the_collector_sizes_an_array_exactly_as_the_emitted_allocation_site_does() {
         for (kind, element_size) in [(ELEMENT_KIND_REFERENCE, 4), (1, 1), (2, 1), (3, 2), (4, 2), (5, 4), (6, 8), (7, 4), (8, 8)] {
@@ -830,6 +1003,54 @@ mod tests {
             before_top,
             "a refusal must leave the bump pointer where it was"
         );
+    }
+
+    /// ALLOCATION TAKES THE FIRST FREE BLOCK THAT HOLDS IT, AND ONLY THEN BUMPS.
+    ///
+    /// The chain is laid out by hand: a collection here would need descriptors that a 64-bit host
+    /// cannot address through a 32-bit header word. The engine's own tests cover how a collection
+    /// builds the chain; this covers how an allocation carves it.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn allocation_takes_the_first_free_block_that_holds_it_before_bumping() {
+        use crate::heap::FREE_BLOCK;
+        let word = |heap: &DeviceHeap, at: u32| {
+            let at = at as usize;
+            u32::from_le_bytes(heap.region[at..at + 4].try_into().unwrap())
+        };
+        let put = |heap: &mut DeviceHeap, at: usize, value: u32| {
+            heap.region[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let (base, len) = make_region(256);
+        let mut heap = unsafe { DeviceHeap::from_raw(base, len) };
+        put(&mut heap, 16, FREE_BLOCK | 12);
+        put(&mut heap, 20, 48);
+        put(&mut heap, 48, FREE_BLOCK | 24);
+        heap.top = 128;
+        heap.free = 16;
+        let four = make_desc(4, &[]);
+        let offset = |heap: &DeviceHeap, r: Ref| r.0 - heap.base();
+
+        let a = unsafe { heap.alloc(4, four) }.unwrap();
+        assert_eq!(offset(&heap, a), 16 + HEADER_SIZE);
+        assert_eq!(word(&heap, 20), 0, "the block's old link word is the new payload and must read zero");
+        assert_eq!(word(&heap, 24), FREE_BLOCK | 4, "the four-byte remainder must stay walkable");
+        assert_eq!(heap.free, 48, "and must leave the chain");
+
+        let b = unsafe { heap.alloc(4, four) }.unwrap();
+        assert_eq!(offset(&heap, b), 48 + HEADER_SIZE);
+        assert_eq!(word(&heap, 56), FREE_BLOCK | 16);
+        assert_eq!(word(&heap, 60), 0, "the remainder inherits the end of the chain");
+        assert_eq!(heap.free, 56);
+
+        let c = unsafe { heap.alloc(40, make_desc(40, &[])) }.unwrap();
+        assert_eq!(offset(&heap, c), 128 + HEADER_SIZE);
+        assert_eq!(heap.top(), 128 + HEADER_SIZE + 40);
+
+        let d = unsafe { heap.alloc(12, make_desc(12, &[])) }.unwrap();
+        assert_eq!(offset(&heap, d), 56 + HEADER_SIZE);
+        assert_eq!(heap.free, 0, "an exact fit must unlink the block");
+        assert_eq!(word(&heap, 60), 0, "and clear the link its payload now covers");
     }
 
     /// The bitmap size a caller must provide is derived from the REGION, not from what is in use --

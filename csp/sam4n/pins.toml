@@ -1,11 +1,9 @@
-# PIN map for the SAM4N family: pin x function -> (instance, signal), or -> nothing. PARTIAL and
-# evidence-only -- a row joins when a binding needs it, and a row naming a pin outside every part's
-# present-list is refused.
+# PIN map for the SAM4N family: pin x function -> (instance, signal), or -> nothing. It lists only
+# the cells a binding uses, and a row naming a pin outside every part's `pins` list is refused.
 #
-# EMPTY OF ROWS, AND THAT IS A PROPERTY OF WHAT THIS FAMILY HAS BOUND SO FAR. The only pins placed
-# are a board's LED and user button, and a control pin rides no alternate function -- it is driven
-# as a plain output or read as a plain input, so it needs no cell here. Rows arrive with the
-# family's first bus binding.
+# IT HAS NO ROWS. The only pins this family's boards place are an LED and a user button, and a
+# control pin rides no alternate function -- it is driven as a plain output or read as a plain
+# input -- so neither needs a cell here.
 #
 # THIS MAP IS WHY THIS FAMILY IS NOT THE SAM4S's. The two series place their controllers at
 # identical addresses and carry identical peripheral ids, so an instance map could have been

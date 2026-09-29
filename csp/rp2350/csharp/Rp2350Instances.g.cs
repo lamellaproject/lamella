@@ -29,6 +29,9 @@ namespace Lamella.Generated
         public const uint UART0_BASE = 0x40070000;
         public const uint UART0_RESET_BIT = 26;
         public const uint UART0_RESET_MASK = 0x4000000;
+        public const uint UART1_BASE = 0x40078000;
+        public const uint UART1_RESET_BIT = 27;
+        public const uint UART1_RESET_MASK = 0x8000000;
         public const uint SPI0_BASE = 0x40080000;
         public const uint SPI0_RESET_BIT = 18;
         public const uint SPI0_RESET_MASK = 0x40000;
@@ -38,5 +41,15 @@ namespace Lamella.Generated
         public const uint ADC_BASE = 0x400A0000;
         public const uint ADC_RESET_BIT = 0;
         public const uint ADC_RESET_MASK = 0x1;
+        public const uint TIMER0_BASE = 0x400B0000;
+        public const uint TIMER0_RESET_BIT = 23;
+        public const uint TIMER0_RESET_MASK = 0x800000;
+        public const uint TICKS_BASE = 0x40108000;
+        public const uint TRNG_BASE = 0x400F0000;
+        public const uint TRNG_RESET_BIT = 25;
+        public const uint TRNG_RESET_MASK = 0x2000000;
+        public const uint PWM_BASE = 0x400A8000;
+        public const uint PWM_RESET_BIT = 16;
+        public const uint PWM_RESET_MASK = 0x10000;
     }
 }

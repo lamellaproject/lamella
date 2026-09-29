@@ -8,10 +8,14 @@ public enum Rp2350ClocksLayout {
     // -- register offsets (block-relative) + access widths --
     public static let CLK_REF_CTRL_OFF: UInt32 = 0x30
     public static let CLK_REF_CTRL_WIDTH: Int32 = 32
+    public static let CLK_REF_DIV_OFF: UInt32 = 0x34
+    public static let CLK_REF_DIV_WIDTH: Int32 = 32
     public static let CLK_REF_SELECTED_OFF: UInt32 = 0x38
     public static let CLK_REF_SELECTED_WIDTH: Int32 = 32
     public static let CLK_SYS_CTRL_OFF: UInt32 = 0x3C
     public static let CLK_SYS_CTRL_WIDTH: Int32 = 32
+    public static let CLK_SYS_DIV_OFF: UInt32 = 0x40
+    public static let CLK_SYS_DIV_WIDTH: Int32 = 32
     public static let CLK_SYS_SELECTED_OFF: UInt32 = 0x44
     public static let CLK_SYS_SELECTED_WIDTH: Int32 = 32
     public static let CLK_PERI_CTRL_OFF: UInt32 = 0x48
@@ -20,6 +24,8 @@ public enum Rp2350ClocksLayout {
     public static let CLK_PERI_DIV_WIDTH: Int32 = 32
     public static let CLK_USB_CTRL_OFF: UInt32 = 0x60
     public static let CLK_USB_CTRL_WIDTH: Int32 = 32
+    public static let CLK_USB_DIV_OFF: UInt32 = 0x64
+    public static let CLK_USB_DIV_WIDTH: Int32 = 32
     public static let CLK_ADC_CTRL_OFF: UInt32 = 0x6C
     public static let CLK_ADC_CTRL_WIDTH: Int32 = 32
     public static let CLK_ADC_DIV_OFF: UInt32 = 0x70
@@ -28,10 +34,16 @@ public enum Rp2350ClocksLayout {
     // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
     public static let CLK_REF_CTRL_SRC: UInt32 = 0x3
     public static let CLK_REF_CTRL_SRC_LSB: UInt32 = 0
+    public static let CLK_REF_DIV_INT: UInt32 = 0xFF0000
+    public static let CLK_REF_DIV_INT_LSB: UInt32 = 16
     public static let CLK_SYS_CTRL_SRC: UInt32 = 0x1
     public static let CLK_SYS_CTRL_SRC_LSB: UInt32 = 0
     public static let CLK_SYS_CTRL_AUXSRC: UInt32 = 0xE0
     public static let CLK_SYS_CTRL_AUXSRC_LSB: UInt32 = 5
+    public static let CLK_SYS_DIV_FRAC: UInt32 = 0xFFFF
+    public static let CLK_SYS_DIV_FRAC_LSB: UInt32 = 0
+    public static let CLK_SYS_DIV_INT: UInt32 = 0xFFFF0000
+    public static let CLK_SYS_DIV_INT_LSB: UInt32 = 16
     public static let CLK_PERI_CTRL_AUXSRC: UInt32 = 0xE0
     public static let CLK_PERI_CTRL_AUXSRC_LSB: UInt32 = 5
     public static let CLK_PERI_CTRL_ENABLE: UInt32 = 0x800
@@ -42,6 +54,8 @@ public enum Rp2350ClocksLayout {
     public static let CLK_USB_CTRL_AUXSRC_LSB: UInt32 = 5
     public static let CLK_USB_CTRL_ENABLE: UInt32 = 0x800
     public static let CLK_USB_CTRL_ENABLE_LSB: UInt32 = 11
+    public static let CLK_USB_DIV_INT: UInt32 = 0xF0000
+    public static let CLK_USB_DIV_INT_LSB: UInt32 = 16
     public static let CLK_ADC_CTRL_AUXSRC: UInt32 = 0xE0
     public static let CLK_ADC_CTRL_AUXSRC_LSB: UInt32 = 5
     public static let CLK_ADC_CTRL_KILL: UInt32 = 0x400

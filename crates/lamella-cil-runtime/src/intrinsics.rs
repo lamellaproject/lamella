@@ -841,6 +841,29 @@ pub fn clock_set_ticks(
     Ok(None)
 }
 
+/// `Lamella.Runtime.Clock.WallClockChanged(long utcTicks, bool isSet)`: tells the embedder's
+/// wall-clock sink ([`Vm::set_wall_clock_sink`]) what the managed clock was just set to --
+/// `Some(utcTicks)`, or `None` when the clock returned to never-set.
+///
+/// The managed `SetTicks` calls this after writing its own state, so every set reaches the sink,
+/// whoever made it: the embedder's [`crate::set_wall_clock`], an RTC read at boot, or a managed
+/// time sync.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the arguments are not a 64-bit integer and a boolean.
+pub fn clock_wall_changed(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (Some(&Value::Int64(ticks)), Some(&Value::Int32(is_set))) = (args.first(), args.get(1))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    vm.notify_wall_clock_sink((is_set != 0).then_some(ticks));
+    Ok(None)
+}
+
 /// `Lamella.Runtime.Clock.MonotonicMilliseconds()` -> milliseconds from an arbitrary origin that
 /// only ever increases, or `0` where the embedder installed no clock.
 ///
@@ -4045,7 +4068,8 @@ pub fn thread_yield(
 /// `System.Threading.Thread.SleepThread(int)`: blocks the running thread for `millisecondsTimeout`
 /// milliseconds (`Thread.Sleep`). Other green threads run meanwhile and the scheduler idle-sleeps the
 /// OS thread to the nearest deadline; without a host clock it degrades to a cooperative yield (no
-/// real delay). A negative timeout is clamped to 0.
+/// real delay). `Timeout.Infinite` (-1) parks the thread for good: nothing wakes it, and the program
+/// goes on running its other threads, timers and pin events.
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the argument is not an int.
@@ -4057,7 +4081,10 @@ pub fn thread_sleep(
     let Some(&Value::Int32(millis)) = args.first() else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
-    vm.request_sleep(millis.max(0) as u64);
+    match u64::try_from(millis) {
+        Ok(millis) => vm.request_sleep(millis),
+        Err(_) => vm.request_sleep_forever(),
+    }
     Ok(None)
 }
 
@@ -4290,6 +4317,22 @@ pub fn socket_local_port(
         None => None,
     };
     Ok(Some(Value::Int32(port.map_or(-1, i32::from))))
+}
+
+/// `Socket.UdpMaxDatagram(int handle)`: the largest datagram the network backend can deliver on the
+/// socket (`NetBackend::udp_max_datagram`), which `UdpClient` sizes its receive buffer by. With no
+/// backend installed it answers 65,536, every UDP payload -- the managed default's own answer.
+pub fn socket_udp_max_datagram(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let size = match vm.net_backend() {
+        Some(backend) => backend.udp_max_datagram(handle),
+        None => 65_536,
+    };
+    Ok(Some(Value::Int32(i32::try_from(size).unwrap_or(i32::MAX))))
 }
 
 /// `Socket.CloseSocket(int handle)`: closes a socket or listener and releases its handle. Any
@@ -5508,16 +5551,18 @@ pub fn tls_read_plain(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<O
         None => return Ok(Some(Value::Int32(TLS_ERROR))),
     };
     match result {
-        Some(n) => {
+        crate::tls::PlainRead::Data(n) => {
             write_byte_segment(vm, array, offset, &out[..n]);
             Ok(Some(Value::Int32(n as i32)))
         }
-        None => Ok(Some(Value::Int32(TLS_CLOSED))),
+        crate::tls::PlainRead::Closed => Ok(Some(Value::Int32(TLS_CLOSED))),
+        crate::tls::PlainRead::Failed => Ok(Some(Value::Int32(TLS_ERROR))),
     }
 }
 
 /// `TlsNative.WritePlain(int tls, byte[] buf, int offset, int count)`: queues `count` bytes of
-/// application data to encrypt. Returns how many bytes were accepted.
+/// application data to encrypt. Returns how many bytes were accepted, or `TLS_ERROR` when the session
+/// has failed.
 pub fn tls_write_plain(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let handle = socket_arg(args, 0)?;
     let Some(&Value::Object(array)) = args.get(1) else {
@@ -5535,7 +5580,7 @@ pub fn tls_write_plain(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<
         Some(backend) => backend.write_plain(handle, &input),
         None => return Ok(Some(Value::Int32(0))),
     };
-    Ok(Some(Value::Int32(n as i32)))
+    Ok(Some(Value::Int32(n.map_or(TLS_ERROR, |n| n as i32))))
 }
 
 /// `TlsNative.PeerCert(int tls, byte[] buf)`: writes the peer's end-entity certificate (DER) into
@@ -5567,6 +5612,16 @@ pub fn tls_session_flags(vm: &mut Vm, _module: &Module, args: &[Value]) -> Resul
         None => 0,
     };
     Ok(Some(Value::Int32(flags)))
+}
+
+/// `TlsNative.CloseNotify(int tls)`: queues close-notify for the peer without releasing the session,
+/// so the managed side sends it before `CloseTls`.
+pub fn tls_close_notify(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    if let Some(backend) = vm.tls_backend() {
+        backend.close_notify(handle);
+    }
+    Ok(None)
 }
 
 /// `TlsNative.CloseTls(int tls)`: closes the session and releases its handle.
@@ -8096,16 +8151,20 @@ fn unbox_reflect_arg(vm: &Vm, value: Value) -> Value {
 /// (an instance method's count includes `this`). A primitive value type is unboxed on the way in
 /// and boxed by its runtime type on the way out; references pass through.
 ///
+/// A virtual method dispatches on `obj`'s runtime type, as a `callvirt` naming it would: the
+/// `MethodInfo` of a base method runs a derived override, and that of an interface or abstract
+/// method runs the implementation `obj`'s type provides.
+///
 /// # Errors
-/// [`Trap::TypeMismatch`] if the receiver is not a method handle; propagates any [`Trap`] from
-/// running the invoked method.
+/// [`Trap::TypeMismatch`] if the receiver is not a method handle, or names a method with no body
+/// that `obj`'s type does not implement; propagates any [`Trap`] from running the invoked method.
 #[cfg(feature = "reflection")]
 pub fn method_invoke(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let Some(&Value::NativeInt(handle)) = args.first() else {
         return Err(Trap::TypeMismatch(Opcode::Callvirt));
     };
-    let method_id = module
-        .resolve_by_handle(handle as u64)
+    let target = args.get(1).cloned().unwrap_or(Value::Null);
+    let method_id = reflected_dispatch(vm, module, handle as u64, &target)
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     let arg_count = module
         .method_arg_count(method_id)
@@ -8121,9 +8180,10 @@ pub fn method_invoke(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
     }
     let mut full_args = Vec::with_capacity(arg_count);
     if arg_count == params.len() + 1 {
-        full_args.push(args.get(1).cloned().unwrap_or(Value::Null));
+        full_args.push(target);
     }
     full_args.extend(params);
+    crate::interp::value_type_receiver(module, vm, method_id, &mut full_args);
     let result = Session::new(module, method_id, full_args)?.run(module, vm)?;
     let boxed = match result {
         Some(value) => match module.primitive_type_token(&value) {
@@ -8133,6 +8193,38 @@ pub fn method_invoke(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
         None => Value::Null,
     };
     Ok(Some(boxed))
+}
+
+/// The method `MethodInfo.Invoke` runs for the method whose handle is `handle` on `target`: for a
+/// VIRTUAL method, the one a `callvirt` naming it dispatches to on `target`'s runtime type
+/// (ECMA-335 III.4.2) -- an override, an interface implementation, an explicit implementation;
+/// for a static or non-virtual method, or a null target, the method itself. `None` when there is
+/// no body to run.
+///
+/// The handle IS the method's asm-folded `MethodDef` token, so it asks the same three questions
+/// the `callvirt` arm asks of its operand, through the same resolver.
+#[cfg(feature = "reflection")]
+fn reflected_dispatch(
+    vm: &Vm,
+    module: &Module,
+    handle: u64,
+    target: &Value,
+) -> Option<crate::module::MethodId> {
+    let method = module.resolve_by_handle(handle);
+    let is_virtual = module.method_attrs(handle).is_some_and(|attrs| attrs & 0x0040 != 0);
+    let &Value::Object(this) = target else {
+        return method;
+    };
+    if !is_virtual {
+        return method;
+    }
+    let asm = (handle >> 32) as u8;
+    let token = lamella_token::Token(handle as u32);
+    let runtime_type = crate::interp::receiver_type_id(module, vm, this);
+    let explicit_override =
+        runtime_type.and_then(|type_id| module.explicit_override(asm, type_id, token));
+    let sig_key = module.call_target(asm, token).map(|(key, _)| key);
+    crate::interp::resolve_callvirt(module, method, sig_key, runtime_type, explicit_override)
 }
 
 /// `System.Activator.CreateInstance(Type type)`: allocates an instance of `type` (fields

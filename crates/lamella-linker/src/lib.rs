@@ -266,7 +266,7 @@ pub fn link_at_base_gc(
     entry: &str,
     text_base: u32,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, false, Some(text_base), None)
+    link_gc_inner(objects, entry, &[], false, Some(text_base), None)
 }
 
 /// Re-exported from [`lamella_elf`] so the backend that NAMES descriptor symbols and the linker that
@@ -366,7 +366,7 @@ pub fn check_instantiation_cap(objects: &[Object], cap: usize) -> Result<(), Lin
 /// and all other data, then rebuilds each object re-laid-out with its symbols and relocations remapped, so
 /// unused functions/descriptors and the undefined externs only they referenced drop out.
 pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
-    trim_all(objects, &reachable_from(objects, entry))
+    trim_all(objects, &reachable_from(objects, entry, &[]))
 }
 
 /// Rebuilds every object against `keep`, EXCEPT the ones [`resolves_against_its_own_layout`] refuses
@@ -416,7 +416,8 @@ fn resolves_against_its_own_layout(obj: &Object) -> bool {
 }
 
 /// The names [`garbage_collect`] keeps: everything the cross-object reference graph reaches from
-/// `entry`, plus everything [`kept_regardless`] keeps without being reached.
+/// `entry` and from each of `optional_roots`, plus everything [`kept_regardless`] keeps without
+/// being reached. An optional root that no object defines reaches nothing.
 ///
 /// **EXTRACTED SO THE FOLD PATH ASKS THE SAME QUESTION RATHER THAN ANSWERING IT AGAIN.**
 /// [`link_gc_inner`] needs the reachable set MINUS the functions ICF folds away, which it cannot get
@@ -424,7 +425,7 @@ fn resolves_against_its_own_layout(obj: &Object) -> bool {
 /// its own that followed a function's calls and NOTHING a data symbol references, so every
 /// descriptor, string blob and statics record fell out of the image and the link died on the first
 /// reference to one.
-fn reachable_from(objects: &[Object], entry: &str) -> BTreeSet<String> {
+fn reachable_from(objects: &[Object], entry: &str, optional_roots: &[&str]) -> BTreeSet<String> {
     let mut defs: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, s) in obj.symbols.iter().enumerate() {
@@ -436,6 +437,7 @@ fn reachable_from(objects: &[Object], entry: &str) -> BTreeSet<String> {
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
     stack.push(String::from(entry));
+    stack.extend(optional_roots.iter().map(|root| String::from(*root)));
     for obj in objects {
         for s in &obj.symbols {
             if s.defined && s.size > 0 && !s.name.is_empty() && kept_regardless(s) {
@@ -1395,7 +1397,7 @@ pub fn link_with_archives(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    let included = include_on_demand(objects, archives);
+    let included = include_on_demand(objects, archives, &[]);
     link_with_base(&included, entry, text_base, &[])
 }
 
@@ -1412,16 +1414,17 @@ pub fn link_with_archives_ram(
     text_base: Option<u32>,
     ram: (u32, u32),
 ) -> Result<LinkedImage, LinkError> {
-    let included = include_on_demand(objects, archives);
+    let included = include_on_demand(objects, archives, &[]);
     link_with_base_ram(&included, entry, text_base, &[], Some(ram))
 }
 
-/// The explicit objects plus the archive members pulled on demand (see [`link_with_archives`]).
-fn include_on_demand(objects: &[Object], archives: &[Archive]) -> Vec<Object> {
+/// The explicit objects plus the archive members pulled on demand (see [`link_with_archives`]),
+/// with each of `optional_roots` searched for as though something referenced it.
+fn include_on_demand(objects: &[Object], archives: &[Archive], optional_roots: &[&str]) -> Vec<Object> {
     let mut included: Vec<Object> = objects.to_vec();
     let mut pulled: BTreeSet<(usize, usize)> = BTreeSet::new();
     loop {
-        let undefined = undefined_symbols(&included);
+        let undefined = undefined_symbols(&included, optional_roots);
         if undefined.is_empty() {
             break;
         }
@@ -1443,10 +1446,12 @@ fn include_on_demand(objects: &[Object], archives: &[Archive]) -> Vec<Object> {
     included
 }
 
-/// The global symbols referenced but not defined anywhere in `objects`.
-fn undefined_symbols(objects: &[Object]) -> BTreeSet<String> {
+/// The global symbols referenced but not defined anywhere in `objects`, each of `optional_roots`
+/// counted as referenced.
+fn undefined_symbols(objects: &[Object], optional_roots: &[&str]) -> BTreeSet<String> {
     let mut defined: BTreeSet<&str> = BTreeSet::new();
-    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    let mut referenced: BTreeSet<String> =
+        optional_roots.iter().map(|root| String::from(*root)).collect();
     for o in objects {
         for s in &o.symbols {
             if s.name.is_empty() || s.binding == Binding::Local {
@@ -1623,7 +1628,7 @@ fn relocation_addend(text: &[u8], machine: Machine, site: u32, r: &ParsedRelocat
 /// vtable's methods with it -- and the survivors are linked exactly as [`link`] links them. This is
 /// [`link_at_base_gc`] without a base; the two are one path.
 pub fn link_gc(objects: &[Object], entry: &str) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, false, None, None)
+    link_gc_inner(objects, entry, &[], false, None, None)
 }
 
 /// Like [`link_gc`], but ALSO folds identical functions (ICF) after dead-stripping: byte-identical
@@ -1638,7 +1643,7 @@ pub fn link_icf(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, true, text_base, None)
+    link_gc_inner(objects, entry, &[], true, text_base, None)
 }
 
 /// As [`link_gc`], but pulling archive members on demand first, exactly as [`link_with_archives`]
@@ -1657,7 +1662,7 @@ pub fn link_gc_with_archives(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(&include_on_demand(objects, archives), entry, false, text_base, None)
+    link_gc_inner(&include_on_demand(objects, archives, &[]), entry, &[], false, text_base, None)
 }
 
 /// As [`link_gc_with_archives`], but placing the statics window the RAM-resident tier needs -- the
@@ -1666,6 +1671,13 @@ pub fn link_gc_with_archives(
 /// [`link_with_archives_ram`] pulls an archive member WHOLE to resolve one undefined symbol and
 /// never revisits it; [`link_gc_with_archives`] trims but places no window. Use this one wherever a
 /// RAM-resident tier would otherwise pay for members it never reaches.
+///
+/// `optional_roots` are names the link keeps although nothing in it references them, such as a
+/// startup hook that code outside the link calls. Each is searched for in the archives as an
+/// undefined reference would be, so the member that defines it is pulled, and each roots the
+/// dead-strip as `entry` does. A name nothing defines is not an error, and the link then comes out
+/// exactly as though it had not been named. This is GNU ld's `--undefined`, whose names are pulled
+/// from archives and kept by `--gc-sections` alike.
 ///
 /// **TRIMMING IS WHAT MAKES REACHABILITY ANSWERABLE AT ALL.** While an archive is pulled whole and
 /// never trimmed, a symbol's PRESENCE in the image proves only that its MEMBER was pulled -- never
@@ -1677,12 +1689,14 @@ pub fn link_gc_with_archives_ram(
     objects: &[Object],
     archives: &[Archive],
     entry: &str,
+    optional_roots: &[&str],
     text_base: Option<u32>,
     ram: (u32, u32),
 ) -> Result<LinkedImage, LinkError> {
     link_gc_inner(
-        &include_on_demand(objects, archives),
+        &include_on_demand(objects, archives, optional_roots),
         entry,
+        optional_roots,
         false,
         text_base,
         Some(ram),
@@ -1699,7 +1713,7 @@ pub fn link_icf_with_archives(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(&include_on_demand(objects, archives), entry, true, text_base, None)
+    link_gc_inner(&include_on_demand(objects, archives, &[]), entry, &[], true, text_base, None)
 }
 
 /// Dead-strips from `entry` and then links through the ORDINARY layout, optionally folding
@@ -1719,12 +1733,13 @@ pub fn link_icf_with_archives(
 fn link_gc_inner(
     objects: &[Object],
     entry: &str,
+    optional_roots: &[&str],
     fold: bool,
     text_base: Option<u32>,
     ram: Option<(u32, u32)>,
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
-    let mut keep = reachable_from(objects, entry);
+    let mut keep = reachable_from(objects, entry, optional_roots);
     let folds = match fold {
         true => plan_folds(objects, machine, &keep, entry),
         false => Vec::new(),
@@ -3598,6 +3613,75 @@ mod tests {
             !img.symbols.iter().any(|(n, _)| n == "unused"),
             "an archive member nothing references must not be pulled"
         );
+    }
+
+    /// `hook` defined in one archive member and calling `helper` in another, beside an entry
+    /// `main` that references neither -- the shape of a board's startup hook, which the image's
+    /// startup calls from outside the link.
+    fn hook_and_archive() -> (Object, Archive) {
+        let main = obj_arm(&[0x2A, 0x20, 0x70, 0x47], &[func("main", 1, 4)], &[]);
+        let hook = ArchiveMember {
+            name: String::from("hook.o"),
+            object: obj_arm(
+                &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+                &[func("hook", 1, 6), undef("helper")],
+                &[Relocation {
+                    offset: 0,
+                    symbol: 1,
+                    kind: arm::R_ARM_THM_CALL,
+                    addend: -4,
+                }],
+            ),
+        };
+        let helper = ArchiveMember {
+            name: String::from("helper.o"),
+            object: obj_arm(&[0x00, 0x20, 0x70, 0x47], &[func("helper", 1, 4)], &[]),
+        };
+        let archive = Archive {
+            members: Vec::from([hook, helper]),
+        };
+        (main, archive)
+    }
+
+    fn symbol_names(image: &LinkedImage) -> Vec<&str> {
+        image.symbols.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// AN OPTIONAL ROOT IS PULLED FROM ITS ARCHIVE AND SURVIVES THE DEAD-STRIP, AND SO DOES WHAT IT
+    /// CALLS. Nothing references `hook`, so without the root neither it nor `helper` is linked.
+    #[test]
+    fn an_optional_root_is_pulled_from_its_archive_and_kept_with_what_it_calls() {
+        const RAM: (u32, u32) = (0x2000_1000, 0x1000);
+        let (main, archive) = hook_and_archive();
+        let rooted =
+            link_gc_with_archives_ram(&[main], &[archive], "main", &["hook"], Some(0x1000), RAM)
+                .unwrap();
+        assert!(symbol_names(&rooted).contains(&"hook"), "the root's member is pulled and kept");
+        assert!(symbol_names(&rooted).contains(&"helper"), "and so is the function the root calls");
+
+        let (main, archive) = hook_and_archive();
+        let plain =
+            link_gc_with_archives_ram(&[main], &[archive], "main", &[], Some(0x1000), RAM).unwrap();
+        assert!(
+            !symbol_names(&plain).iter().any(|&name| name == "hook" || name == "helper"),
+            "without the root nothing references either, so neither is linked"
+        );
+    }
+
+    /// AN OPTIONAL ROOT THAT NOTHING DEFINES IS NOT AN ERROR, AND THE LINK COMES OUT UNCHANGED: the
+    /// same text and the same symbols as a link that never named it.
+    #[test]
+    fn an_optional_root_nothing_defines_leaves_the_link_unchanged() {
+        const RAM: (u32, u32) = (0x2000_1000, 0x1000);
+        let (main, archive) = hook_and_archive();
+        let named =
+            link_gc_with_archives_ram(&[main], &[archive], "main", &["absent"], Some(0x1000), RAM)
+                .expect("an optional root that nothing defines is not an error");
+        let (main, archive) = hook_and_archive();
+        let plain =
+            link_gc_with_archives_ram(&[main], &[archive], "main", &[], Some(0x1000), RAM).unwrap();
+        assert_eq!(named.text, plain.text);
+        assert_eq!(named.symbols, plain.symbols);
     }
 
     #[test]

@@ -1,0 +1,117 @@
+# BLOCK layout: the STM32L4R5 GPIO port block. Offsets are instance-base-relative; the port
+# instance bases live in ../instances.toml.
+#
+# THE RESET MODE IS ANALOG, NOT INPUT, ON EVERY PORT BUT ONE, AND IT FAILS SILENTLY. The encoding is
+# the usual four values but 11, analog mode, is the reset state: an untouched pin has its input
+# buffer off and IDR reads zero forever. A driver that reads a button without first writing MODER
+# reads a permanently unpressed button.
+#
+# THE EXCEPTIONS ARE PER PORT, AND RM0432 section 8.4.1 STATES FOUR RESET VALUES FOR MODER:
+#   * port A, 0xABFF FFFF: PA13, PA14 and PA15 come out of reset in alternate-function mode, because
+#     they are the debug port's JTMS/SWDIO, JTCK/SWCLK and JTDI;
+#   * port B, 0xFFFF FEBF: PB3 and PB4 do the same for JTDO/TRACESWO and NJTRST;
+#   * ports C to G and I, 0xFFFF FFFF: all analog;
+#   * port H, 0x0000 000F: PH0 and PH1 are analog and PH2 to PH15 are INPUTS. A rule that every
+#     untouched pin is analog is wrong for this port. PH3 then leaves input mode for analog when
+#     it is not BOOT0 (section 8.3.15).
+#
+# AND PG2 TO PG15 NEED THEIR RAIL BEFORE THEY NEED THIS BLOCK. Those fourteen pins are isolated at
+# reset until IOSV in PWR_CR2 is set (see ../parts.toml). Every register below still reads and
+# writes on port G, so a correct configuration can be written and read back while the pad itself
+# does nothing.
+#
+
+[table]
+kind = "block"
+family = "stm32l4r5"
+block = "gpio"
+sources = [
+    "STM32L4+ Series reference manual RM0432 Rev 9, per-register sections each stating its own address offset: 8.4.1 GPIOx_MODER 0x00, 8.4.2 GPIOx_OTYPER 0x04, 8.4.3 GPIOx_OSPEEDR 0x08, 8.4.4 GPIOx_PUPDR 0x0C, 8.4.5 GPIOx_IDR 0x10, 8.4.6 GPIOx_ODR 0x14, 8.4.7 GPIOx_BSRR 0x18, 8.4.8 GPIOx_LCKR 0x1C, 8.4.9 GPIOx_AFRL 0x20, 8.4.10 GPIOx_AFRH 0x24, 8.4.11 GPIOx_BRR 0x28, each headed (x = A to I)",
+    "RM0432 Rev 9 section 8.4.1 for the mode encoding -- 00 input, 01 general purpose output, 10 alternate function, 11 analog (reset state) -- and for MODER's per-port reset values",
+    "RM0432 Rev 9 sections 8.4.2 to 8.4.4 for the OTYPER, OSPEEDR and PUPDR encodings",
+    "STM32L4R5xx STM32L4R7xx STM32L4R9xx datasheet DS12023 Rev 5, table 15 (pin definitions), whose pin-name column gives each pin's function after reset: PA13 (JTMS/SWDIO), PA14 (JTCK/SWCLK), PA15 (JTDI), PB3 (JTDO/TRACESWO) and PB4 (NJTRST)",
+]
+notes = [
+    "GPIO config is read-modify-write: MODER holds 2 bits per pin and an AFR nibble 4, so a pin's field span must be CLEARED before the set value is OR-ed in. With the reset value being 11, an OR alone leaves the pin analog.",
+    "WHICH AFR REGISTER A PIN USES IS DECIDED BY THE PIN NUMBER, NOT BY THE FUNCTION: AFRL covers pins 0..7 and AFRH pins 8..15, each with 4 bits per pin counted from its OWN base. Pin 8's nibble is bits 3:0 of AFRH.",
+    "OTYPER, IDR, ODR, BSRR and BRR carry ONE bit per pin rather than two, so their shift is the pin index itself and not twice it. A rule applied uniformly across these registers is wrong for exactly those five.",
+    "BSRR's low half SETS a pin and its high half CLEARS one, so either takes a single write and no read-modify-write. BRR at 0x28 is a second way to clear: its low half alone does what BSRR's high half does.",
+    "The per-pin field rows are stated for the two pins the board's virtual COM port muxes. A pin's span follows from its index by rule -- 2 bits at [2n], a nibble at [4n] within its own AFR half, one bit at [n] -- and that rule is what composes a binding at generation time.",
+]
+
+[registers.MODER]
+offset = 0x0
+width = 32
+fields = { MODE7 = [14, 2], MODE8 = [16, 2] }
+notes = "Port mode, 2 bits per pin at [2n, 2]. RM0432 names the fields MODEy. Reset 0xABFF FFFF on port A, 0xFFFF FEBF on port B, 0xFFFF FFFF on ports C to G and I, and 0x0000 000F on port H."
+
+[registers.OTYPER]
+offset = 0x4
+width = 32
+fields = { }
+notes = "Output type, ONE bit per pin at [n]: 0 = push-pull (reset), 1 = open drain. Bits 31:16 reserved."
+
+[registers.OSPEEDR]
+offset = 0x8
+width = 32
+fields = { }
+notes = "Output speed, 2 bits per pin at [2n]: 00 low, 01 medium, 10 high, 11 very high. A slew-rate setting rather than a clock. Reset 0x0C00 0000 on port A and 0 on the other ports."
+
+[registers.PUPDR]
+offset = 0xC
+width = 32
+fields = { }
+notes = "Pull-up/pull-down, 2 bits per pin at [2n]: 00 none, 01 pull-up, 10 pull-down, 11 reserved. Reset 0x6400 0000 on port A, 0x0000 0100 on port B and 0 on the other ports. Whether an EXTERNAL pull is fitted is a board fact and never this table's."
+
+[registers.IDR]
+offset = 0x10
+width = 32
+fields = { }
+notes = "Input data, ONE bit per pin at [n], read-only. Reads zero while MODER holds the pin in analog mode."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { }
+notes = "Output data, ONE bit per pin at [n]. Read-modify-write; BSRR and BRR are the single-write alternatives."
+
+[registers.BSRR]
+offset = 0x18
+width = 32
+fields = { }
+notes = "Bit set/reset, write-only: bit [n] SETS pin n and bit [n+16] CLEARS it."
+
+[registers.LCKR]
+offset = 0x1C
+width = 32
+fields = { }
+notes = "Configuration lock. Freezes a pin's configuration until the next reset, and takes a write sequence on LCKK (bit 16) rather than a plain write."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { AFSEL0 = [0, 4], AFSEL1 = [4, 4], AFSEL2 = [8, 4], AFSEL3 = [12, 4], AFSEL4 = [16, 4], AFSEL5 = [20, 4], AFSEL6 = [24, 4], AFSEL7 = [28, 4] }
+notes = "Alternate function for pins 0..7, 4 bits per pin. The nibble's value IS the AF number."
+
+[registers.AFRH]
+offset = 0x24
+width = 32
+fields = { AFSEL8 = [0, 4], AFSEL9 = [4, 4], AFSEL10 = [8, 4], AFSEL11 = [12, 4], AFSEL12 = [16, 4], AFSEL13 = [20, 4], AFSEL14 = [24, 4], AFSEL15 = [28, 4] }
+notes = "Alternate function for pins 8..15, 4 bits per pin. Nibble n of this register is pin 8+n, not pin n."
+
+[registers.BRR]
+offset = 0x28
+width = 32
+fields = { }
+notes = "Bit reset, write-only: bit [n] CLEARS pin n. Does with one half-register what BSRR's high half does."
+
+# MODER field values (8.4.1). MODER_MODE_AF is the name the shared STM32 uart resolver reads.
+[constants]
+MODER_MODE_INPUT = 0
+MODER_MODE_OUTPUT = 1
+MODER_MODE_AF = 2
+MODER_MODE_ANALOG = 3
+OTYPER_OPEN_DRAIN = 1
+OSPEEDR_VERY_HIGH = 3
+PUPDR_PULL_UP = 1
+PUPDR_PULL_DOWN = 2

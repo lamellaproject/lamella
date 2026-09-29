@@ -1,7 +1,7 @@
-# INSTANCE map for the SAM4S family -- identity-first: ONLY the placed block copies a current
-# binding references, with the sam3x-shaped record: the peripheral id is one number serving as
-# both the PMC clock-gate bit and the NVIC line; system controllers (PMC, EEFC) have no id
-# (-1 emits nothing). Block layouts arrive with the family's first generated driver.
+# INSTANCE map for the SAM4S family. It places only the block copies a binding or a board uses,
+# so a block that is not listed is not described here, rather than absent from the part. The
+# record is sam3x-shaped: the peripheral id is one number serving as both the PMC clock-gate bit
+# and the NVIC line; system controllers (PMC, EEFC) have no id (-1 emits nothing).
 #
 # THE PORT ROWS SAY WHICH GROUP THEY ARE, RATHER THAN LEAVING IT TO THEIR NAMES. A pin named
 # PC10 has to resolve to the base address of the port group that backs it, and this vendor calls

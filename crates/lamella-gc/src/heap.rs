@@ -903,6 +903,93 @@ pub type InteriorRefs<'a> = &'a mut dyn FnMut(u32, u32, &mut dyn FnMut(&mut Ref)
 #[cfg(feature = "gc-collect")]
 pub fn no_interior_refs(_header_word: u32, _payload_head: u32, _visit: &mut dyn FnMut(&mut Ref)) {}
 
+/// The header word of a FREE BLOCK: the dead bytes a collection leaves below a PINNED survivor, which
+/// the survivors beneath it could not slide over. The word is `FREE_BLOCK | length`, the block's whole
+/// length in bytes, header included, and the rest of the block reads zero.
+///
+/// **It exists because the allocation-free collection walks the heap by header.** A gap with no
+/// header of its own is read as whatever the dead objects left there, so the NEXT collection took two
+/// characters of an old string for a type-descriptor pointer and faulted.
+///
+/// No [`TypeResolver`] can produce this word as an object's header, and each has a reason: a device
+/// header is a descriptor ADDRESS, which is word-aligned, so bit 0 is clear; a host header is an index
+/// into a descriptor table, which never reaches bit 31. A word with both bits set is never an object.
+#[cfg(feature = "gc-collect")]
+pub(crate) const FREE_BLOCK: u32 = 0x8000_0001;
+
+/// The length of the free block a header word opens, or `None` when the word is an object's header.
+#[cfg(feature = "gc-collect")]
+fn free_block_length(header_word: u32) -> Option<u32> {
+    (header_word & FREE_BLOCK == FREE_BLOCK).then_some(header_word & !FREE_BLOCK)
+}
+
+/// Turns `[start, end)` of `bytes` into a FREE BLOCK: the [`FREE_BLOCK`] header, then zeros.
+#[cfg(feature = "gc-collect")]
+fn write_free_block(bytes: &mut [u8], start: usize, end: usize) {
+    let length = (end - start) as u32;
+    bytes[start..start + 4].copy_from_slice(&(FREE_BLOCK | length).to_le_bytes());
+    bytes[start + 4..end].fill(0);
+}
+
+/// Whether any pin lies in the object whose payload starts at `payload` and whose footprint is
+/// `footprint`: from its payload up to the next object's payload. A pin is the address a `fixed`
+/// statement holds, which is the object itself or -- over an array or a field -- an address inside it.
+#[cfg(feature = "gc-collect")]
+fn pinned_within(pinned: &[u32], payload: u32, footprint: u32) -> bool {
+    pinned.iter().any(|&pin| pin >= payload && pin < payload + footprint)
+}
+
+/// The shortest FREE BLOCK that joins the chain the allocator reuses: its header, then the link.
+/// A four-byte block is still stepped over by every walk; it is too short to carry a link, so it
+/// waits for the next collection.
+#[cfg(feature = "gc-collect")]
+pub(crate) const FREE_BLOCK_LINKED: u32 = 2 * ALIGN;
+
+/// The FREE BLOCKS one collection writes, chained in ascending address order for the allocator.
+///
+/// **Without it the space a pin keeps is lost until the next collection, and that is often all of
+/// it.** A collection that runs while a recent object is pinned -- a buffer handed to a native seam
+/// that allocates -- finds that object near the top: everything reclaimed lies in the gap below it,
+/// the bump pointer ends above it, and the allocation that asked for the collection still does not
+/// fit. So each block long enough carries the region offset of the next one in its second word, 0
+/// ends the chain, and the allocator takes the first block that holds what it needs.
+#[cfg(feature = "gc-collect")]
+#[derive(Default)]
+pub(crate) struct FreeChain {
+    /// The region offset of the first linked block, or 0.
+    head: u32,
+    /// The region offset of the last linked block, whose link the next one is written into.
+    last: u32,
+}
+
+#[cfg(feature = "gc-collect")]
+impl FreeChain {
+    /// Turns `[start, end)` (region offsets) into a FREE BLOCK and appends it when it can hold a link.
+    fn add(&mut self, bytes: &mut [u8], start: usize, end: usize) {
+        write_free_block(bytes, start, end);
+        if end - start >= FREE_BLOCK_LINKED as usize {
+            let offset = start as u32;
+            if self.head == 0 {
+                self.head = offset;
+            } else {
+                let link = self.last as usize + ALIGN as usize;
+                bytes[link..link + 4].copy_from_slice(&offset.to_le_bytes());
+            }
+            self.last = offset;
+        }
+    }
+}
+
+/// What an allocation-free collection leaves for the allocator.
+#[cfg(feature = "gc-collect")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Compacted {
+    /// The new bump pointer, region-relative.
+    pub(crate) top: u32,
+    /// The region offset of the first FREE BLOCK in the chain [`FreeChain`] describes, or 0.
+    pub(crate) free: u32,
+}
+
 #[cfg(feature = "gc-collect")]
 pub(crate) trait TypeResolver {
     /// How many LEADING PAYLOAD WORDS this object's footprint depends on: none for a fixed-size
@@ -1012,10 +1099,10 @@ impl TypeResolver for TableResolver<'_> {
 /// references that the allocator never handed out. Such a word is left exactly as it is --
 /// tracing it would index the region out of bounds, and relocating it would rewrite a
 /// flash pointer into a heap address. `top` bounds the live region for that test.
-/// `pinned` names the payload addresses of survivors that must keep their CURRENT address: each
-/// gets a forwarding entry to itself, and the packing cursor steps over it rather than through it,
-/// leaving whatever it reclaimed below as a gap. Empty is the ordinary case and costs one
-/// `is_empty` test per survivor.
+/// `pinned` names addresses whose survivors must keep their CURRENT address -- an object's payload,
+/// or an address inside the object (`fixed` over an array or a field): each such survivor gets a
+/// forwarding entry to itself, and the packing cursor steps over it rather than through it, leaving
+/// whatever it reclaimed below as a FREE BLOCK. Empty is the ordinary case.
 #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub(crate) fn mark_compact<R>(
     bytes: &mut [u8],
@@ -1129,6 +1216,7 @@ where
     }
 
     let mut forward: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut free = FreeChain::default();
     let mut dest = base + ALIGN;
     for old_payload in live.iter().copied() {
         let header_word = read_word(bytes, old_payload - HEADER_SIZE);
@@ -1137,10 +1225,10 @@ where
         let reserved = align_up(resolver.payload_size(header_word, &leading[..n]));
         let object_size = HEADER_SIZE + reserved;
         let start = old_payload - HEADER_SIZE;
-        if !pinned.is_empty() && pinned.contains(&old_payload) {
+        if pinned_within(pinned, old_payload, object_size) {
             debug_assert!(dest <= start, "the packing cursor overran a pinned object");
             if dest < start {
-                bytes[idx(dest)..idx(start)].fill(0);
+                free.add(bytes, idx(dest), idx(start));
             }
             forward.insert(old_payload, old_payload);
             dest = start + object_size;
@@ -1296,6 +1384,19 @@ impl<'a> MarkBits<'a> {
     }
 }
 
+/// What a root slot reported to the allocation-free collection holds, which decides how that slot is
+/// marked and rewritten.
+#[cfg(feature = "gc-collect")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootKind {
+    /// An object reference: null, an address outside the heap, or the payload address of an object.
+    Object,
+    /// A managed pointer, which is what a C# `ref` or a struct method's `this` is: null, an address
+    /// outside the heap, or an address INSIDE an object. It keeps the whole object alive, and it
+    /// moves with that object.
+    Interior,
+}
+
 /// How many objects the mark walk holds before it falls back to re-scanning.
 ///
 /// A worklist is the one part of a tracing collector that classically needs unbounded storage, and
@@ -1336,6 +1437,18 @@ const MARK_STACK: usize = 64;
 /// computation reads. `enumerate_roots` is called TWICE for the same reason: once to mark, once to
 /// rewrite.
 ///
+/// # Interior roots
+///
+/// A root of kind [`RootKind::Interior`] addresses the inside of an object. It marks the object that
+/// contains it, and it is rewritten to the same offset inside that object's new place. The containing
+/// object is found by a walk over the old layout, which both passes still have intact.
+///
+/// # Pins
+///
+/// A pinned survivor stays where it is, and the dead bytes the survivors beneath it could not slide
+/// over become a FREE BLOCK ([`FREE_BLOCK`]), so the next collection can walk past them. The answer
+/// carries the new top and the chain of those blocks ([`FreeChain`]), which the allocator reuses.
+///
 /// # Refusal
 ///
 /// Returns `None` when the bitmap is too small for the region, having touched NOTHING -- the caller
@@ -1351,9 +1464,9 @@ pub(crate) fn mark_compact_no_alloc<R>(
     mut enumerate_roots: R,
     pinned: &[u32],
     marks: &mut MarkBits<'_>,
-) -> Option<u32>
+) -> Option<Compacted>
 where
-    R: FnMut(&mut dyn FnMut(&mut Ref)),
+    R: FnMut(&mut dyn FnMut(&mut Ref, RootKind)),
 {
     let top = base + top;
     if MarkBits::words_for(bytes.len()) > marks.capacity_words() {
@@ -1381,9 +1494,27 @@ where
         };
     let footprint = |bytes: &[u8], payload: u32| -> u32 {
         let header_word = read_word(bytes, Ref(payload).header_addr());
+        if let Some(length) = free_block_length(header_word) {
+            return length;
+        }
         let mut leading = [0u32; MAX_LEADING];
         let n = read_leading(bytes, payload, resolver.leading_words(header_word), &mut leading);
         HEADER_SIZE + align_up(resolver.payload_size(header_word, &leading[..n]))
+    };
+    let owner_of = |bytes: &[u8], address: u32| -> Option<u32> {
+        let mut payload = base + ALIGN + HEADER_SIZE;
+        if address < payload || address > top {
+            return None;
+        }
+        while payload < top {
+            let step = footprint(bytes, payload);
+            if address < payload + step {
+                let header_word = read_word(bytes, Ref(payload).header_addr());
+                return free_block_length(header_word).is_none().then_some(payload);
+            }
+            payload += step;
+        }
+        None
     };
 
     // ---------------------------------------------------------------- MARK
@@ -1408,8 +1539,13 @@ where
         }};
     }
 
-    enumerate_roots(&mut |slot: &mut Ref| {
-        mark!(*slot, marks, stack, depth, overflowed);
+    enumerate_roots(&mut |slot: &mut Ref, kind: RootKind| match kind {
+        RootKind::Object => mark!(*slot, marks, stack, depth, overflowed),
+        RootKind::Interior => {
+            if let Some(owner) = owner_of(bytes, slot.0) {
+                mark!(Ref(owner), marks, stack, depth, overflowed);
+            }
+        }
     });
 
     macro_rules! scan {
@@ -1464,14 +1600,14 @@ where
     }
 
     // ------------------------------------------------------- FORWARDING
-    let is_pinned = |payload: u32| pinned.contains(&payload);
+    let is_pinned = |payload: u32, step: u32| pinned_within(pinned, payload, step);
     let forwarded = |bytes: &[u8], want: u32| -> u32 {
         let mut cursor = base + ALIGN;
         let mut payload = base + ALIGN + HEADER_SIZE;
         while payload < top {
             let step = footprint(bytes, payload);
             if marks.test(base, payload) {
-                if is_pinned(payload) {
+                if is_pinned(payload, step) {
                     if payload == want {
                         return payload;
                     }
@@ -1489,9 +1625,16 @@ where
     };
 
     // -------------------------------------------------------- REWRITE
-    enumerate_roots(&mut |slot: &mut Ref| {
-        if !slot.is_null() && is_heap(*slot) {
-            slot.0 = forwarded(bytes, slot.0);
+    enumerate_roots(&mut |slot: &mut Ref, kind: RootKind| match kind {
+        RootKind::Object => {
+            if !slot.is_null() && is_heap(*slot) {
+                slot.0 = forwarded(bytes, slot.0);
+            }
+        }
+        RootKind::Interior => {
+            if let Some(owner) = owner_of(bytes, slot.0) {
+                slot.0 = forwarded(bytes, owner) + (slot.0 - owner);
+            }
         }
     });
 
@@ -1536,12 +1679,16 @@ where
 
     // ----------------------------------------------------------- MOVE
     let mut cursor = base + ALIGN;
+    let mut free = FreeChain::default();
     let mut payload = base + ALIGN + HEADER_SIZE;
     while payload < top {
         let step = footprint(bytes, payload);
         if marks.test(base, payload) {
             let start = payload - HEADER_SIZE;
-            if is_pinned(payload) {
+            if is_pinned(payload, step) {
+                if cursor < start {
+                    free.add(bytes, idx(cursor), idx(start));
+                }
                 cursor = start + step;
             } else {
                 if cursor != start {
@@ -1552,7 +1699,8 @@ where
         }
         payload += step;
     }
-    Some(cursor - base)
+    bytes[idx(cursor)..idx(top)].fill(0);
+    Some(Compacted { top: cursor - base, free: free.head })
 }
 
 #[cfg(all(test, feature = "host-heap"))]
@@ -2208,7 +2356,8 @@ mod tests {
         assert_eq!(heap.read_u32(raw), 0xA1, "the pinned pointer reads its own element");
         assert_eq!(get_ref(&frame, mover_at), Ref(36), "an unpinned survivor still compacts");
         assert_eq!(heap.top(), 40);
-        assert_eq!(heap.read_u32(ALIGN), 0, "the gap the pin left is zeroed");
+        assert_eq!(heap.read_u32(ALIGN), FREE_BLOCK | 8, "the gap the pin left is a free block");
+        assert_eq!(heap.read_u32(ALIGN + 4), 0, "and the rest of the gap reads zero");
 
         let (mut heap, data, mover) = fixed_statement_heap();
         let raw = data.0 + 4;
@@ -2999,6 +3148,13 @@ mod tests {
         /// Runs the ALLOCATION-FREE engine over a copy of `heap`, with a bitmap on the stack -- which
         /// is the whole claim: no allocator is reachable from this call.
         fn no_alloc(heap: &Heap, roots: &[Ref], pinned: &[u32]) -> (u32, Vec<u8>, Vec<Ref>) {
+            let kinds: Vec<(Ref, RootKind)> = roots.iter().map(|&root| (root, RootKind::Object)).collect();
+            no_alloc_kinds(heap, &kinds, pinned)
+        }
+
+        /// [`no_alloc`] with each root's kind stated, for the interior roots the allocating engine
+        /// has no counterpart for.
+        fn no_alloc_kinds(heap: &Heap, roots: &[(Ref, RootKind)], pinned: &[u32]) -> (u32, Vec<u8>, Vec<Ref>) {
             let mut bytes = heap.bytes.clone();
             let mut roots = roots.to_vec();
             let resolver = TableResolver {
@@ -3012,32 +3168,50 @@ mod tests {
                 Heap::BASE,
                 heap.top,
                 &resolver,
-                |visit: &mut dyn FnMut(&mut Ref)| {
-                    for root in &mut roots {
-                        visit(root);
+                |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
+                    for (root, kind) in &mut roots {
+                        visit(root, *kind);
                     }
                 },
                 pinned,
                 &mut marks,
             )
-            .expect("the bitmap is sized for this region");
-            (top, bytes, roots)
+            .expect("the bitmap is sized for this region")
+            .top;
+            (top, bytes, roots.into_iter().map(|(root, _)| root).collect())
         }
 
-        /// Asserts the two engines agree on the new top, on every heap byte BELOW that top, and on
-        /// where each root now points.
+        /// Asserts the two engines agree on the new top, on EVERY byte of the region, and on where
+        /// each root now points.
         fn agree(heap: &Heap, roots: &[Ref], pinned: &[u32]) -> u32 {
             let (want_top, want_bytes, want_roots) = allocating(heap, roots, pinned);
             let (got_top, got_bytes, got_roots) = no_alloc(heap, roots, pinned);
             assert_eq!(got_top, want_top, "the two engines disagree about the new top");
             assert_eq!(got_roots, want_roots, "the two engines relocated a root differently");
-            let live = want_top as usize;
-            assert_eq!(
-                &got_bytes[..live],
-                &want_bytes[..live],
-                "the two engines produced different heaps"
-            );
+            assert_eq!(got_bytes, want_bytes, "the two engines produced different regions");
             got_top
+        }
+
+        /// THE RECLAIMED TAIL READS ZERO, because it is the next allocation's payload.
+        ///
+        /// [`DeviceHeap::alloc`](crate::DeviceHeap::alloc) writes a header and nothing else, so a
+        /// field the constructor does not assign reads whatever the collection left behind it. Dead
+        /// objects' words there are ints that are not 0 and references the next collection traces.
+        #[test]
+        fn the_reclaimed_tail_reads_zero_for_the_next_allocation() {
+            let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
+            let keep = heap.alloc(1).unwrap();
+            for _ in 0..8 {
+                let dead = heap.alloc(0).unwrap();
+                heap.write_ref_field(dead, 0, keep);
+            }
+            let before = heap.top as usize;
+            let (top, bytes, _) = no_alloc(&heap, &[keep], &[]);
+            assert!((top as usize) < before, "the dead objects must be reclaimed");
+            assert!(
+                bytes[top as usize..before].iter().all(|&b| b == 0),
+                "the reclaimed tail still holds the dead objects' words"
+            );
         }
 
         /// A chain of live objects survives whole, and both engines lay it out identically.
@@ -3093,6 +3267,189 @@ mod tests {
             agree(&heap, &[tail], &[pinned.0]);
             let (_, _, roots) = no_alloc(&heap, &[pinned], &[pinned.0]);
             assert_eq!(roots[0], pinned, "a pinned object must keep its address");
+        }
+
+        /// `heap` as a collection left it: the same types, with that collection's bytes and top.
+        fn after(heap: &Heap, top: u32, bytes: Vec<u8>) -> Heap {
+            Heap {
+                bytes,
+                top,
+                type_descs: heap.type_descs.clone(),
+                alloc_reserve: heap.alloc_reserve,
+                weak_offsets: heap.weak_offsets.clone(),
+            }
+        }
+
+        /// THE GAP BELOW A PINNED SURVIVOR IS WALKABLE BY THE NEXT COLLECTION.
+        ///
+        /// The survivors beneath a pin slide down and leave dead bytes between them and it. The
+        /// allocation-free engine walks the heap by header, so the NEXT collection reads that gap as
+        /// objects -- here the dead words are a descriptor index no table holds.
+        #[test]
+        fn the_gap_below_a_pinned_survivor_is_walkable_by_the_next_collection() {
+            let wide = TypeDesc {
+                payload_size: 20,
+                ref_offsets: Vec::new(),
+                tagged_offsets: Vec::new(),
+            };
+            let mut heap = Heap::new(4096, vec![wide, leaf()]);
+            let dead = heap.alloc(0).unwrap();
+            for word in 0..5 {
+                heap.write_u32(dead.0 + word * 4, 0xFFFF_FF00);
+            }
+            let low = heap.alloc(1).unwrap();
+            let pinned = heap.alloc(1).unwrap();
+            let high = heap.alloc(1).unwrap();
+            heap.write_u32(low.0, 11);
+            heap.write_u32(pinned.0, 22);
+            heap.write_u32(high.0, 33);
+            let roots = [low, pinned, high];
+
+            let top = agree(&heap, &roots, &[pinned.0]);
+            let (_, bytes, moved) = no_alloc(&heap, &roots, &[pinned.0]);
+            assert_eq!(moved[1], pinned, "the pinned survivor must not move");
+            assert!(moved[0].0 + 4 < pinned.header_addr(), "the survivor below must slide down and open a gap");
+
+            let second = after(&heap, top, bytes);
+            agree(&second, &moved, &[pinned.0]);
+            let (_, bytes, moved) = no_alloc(&second, &moved, &[]);
+            let word = |at: Ref| u32::from_le_bytes(bytes[at.0 as usize..at.0 as usize + 4].try_into().unwrap());
+            assert_eq!([word(moved[0]), word(moved[1]), word(moved[2])], [11, 22, 33]);
+            assert_eq!(moved[1].0, moved[0].0 + HEADER_SIZE + 4, "with the pin released, it packs down");
+        }
+
+        /// THE GAPS PINS KEEP ARE CHAINED FOR THE ALLOCATOR, lowest first, each block's second word
+        /// naming the next and the last naming none -- and the answer names the first.
+        #[test]
+        fn the_gaps_pins_keep_are_chained_lowest_first_for_the_allocator() {
+            let mut heap = Heap::new(4096, vec![leaf()]);
+            let _dead = heap.alloc(0).unwrap();
+            let first = heap.alloc(0).unwrap();
+            let _dead_too = heap.alloc(0).unwrap();
+            let second = heap.alloc(0).unwrap();
+            let roots = [first, second];
+            let pins = [first.0, second.0];
+            agree(&heap, &roots, &pins);
+
+            let mut bytes = heap.bytes.clone();
+            let resolver = TableResolver {
+                type_descs: &heap.type_descs,
+                weak_offsets: &heap.weak_offsets,
+            };
+            let mut storage = [0u32; 1024];
+            let mut marks = MarkBits::new(&mut storage);
+            let mut rooted = roots;
+            let compacted = mark_compact_no_alloc(
+                &mut bytes,
+                Heap::BASE,
+                heap.top,
+                &resolver,
+                |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
+                    for root in &mut rooted {
+                        visit(root, RootKind::Object);
+                    }
+                },
+                &pins,
+                &mut marks,
+            )
+            .expect("the bitmap is sized for this region");
+
+            let word = |at: u32| u32::from_le_bytes(bytes[at as usize..at as usize + 4].try_into().unwrap());
+            let low_gap = ALIGN;
+            let high_gap = first.0 + 4;
+            assert_eq!(compacted.free, low_gap, "the chain starts at the lowest gap");
+            assert_eq!(word(low_gap), FREE_BLOCK | 8);
+            assert_eq!(word(low_gap + 4), high_gap, "the lowest gap links to the next");
+            assert_eq!(word(high_gap), FREE_BLOCK | 8);
+            assert_eq!(word(high_gap + 4), 0, "the last gap ends the chain");
+            assert_eq!(compacted.top, second.0 + 4, "nothing lives above the second pin");
+        }
+
+        /// A PIN INSIDE AN OBJECT HOLDS THE WHOLE OBJECT STILL. `fixed` over an array pins the address
+        /// of its first element, never the array's own payload address.
+        #[test]
+        fn a_pin_inside_an_object_holds_that_object_still() {
+            let wide = TypeDesc {
+                payload_size: 12,
+                ref_offsets: Vec::new(),
+                tagged_offsets: Vec::new(),
+            };
+            let mut heap = Heap::new(4096, vec![wide, leaf()]);
+            let _garbage = heap.alloc(1).unwrap();
+            let held = heap.alloc(0).unwrap();
+            heap.write_u32(held.0 + 4, 0x1234_5678);
+            let pin = held.0 + 4;
+
+            let top = agree(&heap, &[held], &[pin]);
+            let (_, bytes, moved) = no_alloc(&heap, &[held], &[pin]);
+
+            assert_eq!(moved[0], held, "an object pinned from inside must not move");
+            let word = u32::from_le_bytes(bytes[pin as usize..pin as usize + 4].try_into().unwrap());
+            assert_eq!(word, 0x1234_5678, "the pinned address must still read its element");
+            assert_eq!(top, held.0 + 12, "the object stays where it was, and the bump pointer after it");
+        }
+
+        /// AN INTERIOR ROOT KEEPS THE OBJECT IT POINTS INTO ALIVE, AND MOVES WITH IT.
+        ///
+        /// The root addresses a field, not the object, and nothing else reaches the object -- which
+        /// is the shape of a struct method's `this` on an element of an array nobody else holds.
+        #[test]
+        fn an_interior_root_keeps_its_owner_alive_and_moves_with_it() {
+            let holder = TypeDesc {
+                payload_size: 12,
+                ref_offsets: vec![0],
+                tagged_offsets: Vec::new(),
+            };
+            let mut heap = Heap::new(4096, vec![holder, leaf()]);
+            let _garbage = heap.alloc(1).unwrap();
+            let owner = heap.alloc(0).unwrap();
+            let child = heap.alloc(1).unwrap();
+            heap.write_ref_field(owner, 0, child);
+            heap.write_u32(owner.0 + 8, 0x5A5A_1234);
+            heap.write_u32(child.0, 77);
+
+            let (top, bytes, roots) = no_alloc_kinds(&heap, &[(Ref(owner.0 + 8), RootKind::Interior)], &[]);
+
+            let word = |at: u32| u32::from_le_bytes(bytes[at as usize..at as usize + 4].try_into().unwrap());
+            let moved_owner = Heap::BASE + ALIGN + HEADER_SIZE;
+            let moved_child = moved_owner + 12 + HEADER_SIZE;
+            assert_eq!(roots[0], Ref(moved_owner + 8), "the root must keep its offset inside the moved owner");
+            assert_eq!(word(roots[0].0), 0x5A5A_1234, "the root must still address the field it addressed");
+            assert_eq!(word(moved_owner), moved_child, "the owner's own reference must be traced and rewritten");
+            assert_eq!(word(moved_child), 77, "the owner's child must survive with it");
+            assert_eq!(top, ALIGN + (HEADER_SIZE + 12) + (HEADER_SIZE + 4), "only the garbage is reclaimed");
+        }
+
+        /// A POINTER ONE PAST AN OBJECT'S LAST BYTE BELONGS TO THAT OBJECT, not to the object whose
+        /// header it lands on: no managed pointer addresses a header.
+        #[test]
+        fn an_interior_root_one_past_its_owner_belongs_to_that_owner() {
+            let mut heap = Heap::new(4096, vec![leaf()]);
+            let _garbage = heap.alloc(0).unwrap();
+            let owner = heap.alloc(0).unwrap();
+            let next = heap.alloc(0).unwrap();
+            assert_eq!(owner.0 + 4, next.header_addr(), "the pointer must land on the next header");
+
+            let (top, _, roots) = no_alloc_kinds(&heap, &[(Ref(owner.0 + 4), RootKind::Interior)], &[]);
+
+            let moved_owner = Heap::BASE + ALIGN + HEADER_SIZE;
+            assert_eq!(roots[0], Ref(moved_owner + 4), "the root must move with the object it ends");
+            assert_eq!(top, ALIGN + HEADER_SIZE + 4, "the object after it is garbage and must go");
+        }
+
+        /// An interior root that is null or outside the heap -- a `ref` to a local or a static -- is
+        /// left exactly as it is and keeps nothing alive.
+        #[test]
+        fn an_interior_root_outside_the_heap_is_left_alone() {
+            let mut heap = Heap::new(4096, vec![leaf()]);
+            let _garbage = heap.alloc(0).unwrap();
+            let outside = Ref(heap.bytes.len() as u32 + 64);
+            let roots = [(Ref::NULL, RootKind::Interior), (outside, RootKind::Interior)];
+
+            let (top, _, after) = no_alloc_kinds(&heap, &roots, &[]);
+
+            assert_eq!(after, vec![Ref::NULL, outside], "a root outside the heap must not be rewritten");
+            assert_eq!(top, ALIGN, "nothing in the heap is reachable");
         }
 
         /// MORE CHILDREN THAN THE MARK STACK HOLDS, so the fixpoint fallback is what finishes the
@@ -3174,9 +3531,9 @@ mod tests {
                 Heap::BASE,
                 heap.top,
                 &resolver,
-                |visit: &mut dyn FnMut(&mut Ref)| {
+                |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
                     for root in &mut roots {
-                        visit(root);
+                        visit(root, RootKind::Object);
                     }
                 },
                 &[],

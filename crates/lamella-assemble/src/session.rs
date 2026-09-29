@@ -133,6 +133,7 @@ impl Session {
                 global_attributes: Vec::new(),
                 span: Span::empty_at(0),
                 defined_symbols: BTreeSet::new(),
+                nullable: lamella_syntax::lexer::NullableContext::default(),
             };
             diagnostics.extend(
                 bind_compilation_unit_with_model(&types_unit, model.clone())
@@ -221,6 +222,7 @@ impl Session {
                 global_attributes: Vec::new(),
                 span: Span::empty_at(0),
                 defined_symbols: BTreeSet::new(),
+                nullable: lamella_syntax::lexer::NullableContext::default(),
             };
             collect_into(&mut model, &unit);
             let mut binder = lamella_binder::Binder::with_model(model);

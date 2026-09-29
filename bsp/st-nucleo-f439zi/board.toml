@@ -15,9 +15,8 @@
 # to a board file is that the two parts answer the SAME DEV_ID and the SAME JTAG ID code, so this
 # board and its sibling cannot be told apart by asking the silicon -- only by the number below.
 #
-# No peripheral bindings yet, for the same reason as the sibling: the virtual COM port rides
-# USART3 on PD8/PD9, and this family places no usart3 instance and has no pin-map rows for those
-# two cells. The carrier states the wire it is; the binding lands with those rows.
+# The virtual COM port rides USART3 on PD8/PD9, and this file states it as a carrier without binding
+# it: this family places no usart3 instance and has no pin-map rows for those two cells.
 
 [table]
 kind = "board"

@@ -1,7 +1,6 @@
-# PIN map for the SAM4S family: pin x function -> (instance, signal). EMPTY on purpose --
-# identity-first. Rows follow the sam3x shape
-# ((P<port><line>, function letter) -> (instance, signal)) when the first binding demands
-# them; the uart1 pin mux (PB2/PB3 peripheral A) becomes the first two rows then.
+# PIN map for the SAM4S family: pin x function -> (instance, signal). It has no rows, because no
+# binding on this family routes a pin through a peripheral. A row takes the sam3x shape:
+# (P<port><line>, function letter) -> (instance, signal).
 
 [table]
 kind = "pins"

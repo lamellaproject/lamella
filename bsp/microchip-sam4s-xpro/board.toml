@@ -1,7 +1,6 @@
-# BOARD binding: the SAM4S Xplained Pro -- identity-first. Board truth only: the identity,
-# the part, and the carrier. NO peripheral bindings yet (the SAM4S family has no generated
-# driver); the vcp binding + its pin rows (UART1, PB2 URXD1 / PB3 UTXD1, peripheral A)
-# land here with the family's driver.
+# BOARD binding: the SAM4S Xplained Pro. It states the board's identity, its part and its carrier,
+# and binds no peripheral. The virtual COM port is UART1 on PB2 (URXD1) and PB3 (UTXD1),
+# peripheral A.
 
 [table]
 kind = "board"

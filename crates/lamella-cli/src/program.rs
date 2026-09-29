@@ -354,14 +354,7 @@ pub(crate) fn program_project(
 fn report(outcome: Result<Outcome, ReplError>) -> ExitCode {
     match outcome {
         Ok(Outcome::Ran { output, exit, .. }) => {
-            print!("{output}");
-            if exit == 0 {
-                ExitCode::SUCCESS
-            } else {
-                eprintln!("lamella run: the program exited {exit}");
-                eprint!("{}", exit_note(exit));
-                ExitCode::FAILURE
-            }
+            print_run(&output, exit, &mut std::io::stdout(), &mut std::io::stderr())
         }
         Ok(Outcome::CompileError(text)) => {
             eprintln!("{text}");
@@ -383,6 +376,19 @@ fn report(outcome: Result<Outcome, ReplError>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Print a run's output to `out`, and -- when it did not exit 0 -- the code it exited with and what
+/// that code can mean to `err`.
+fn print_run(output: &str, exit: i32, out: &mut dyn std::io::Write, err: &mut dyn std::io::Write) -> ExitCode {
+    let _ = write!(out, "{output}");
+    if exit == 0 {
+        return ExitCode::SUCCESS;
+    }
+    let _ = out.flush();
+    let _ = writeln!(err, "lamella run: the program exited {exit}");
+    let _ = write!(err, "{}", exit_note(exit));
+    ExitCode::FAILURE
 }
 
 /// Compile a Python program and run it on the host interpreter, optionally against a board's
@@ -1522,6 +1528,39 @@ fn host_sleep_ns(nanos: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The TRAP line is on screen before the note that points up at it**, in the one screen both
+    /// streams write to. Standard output is buffered by line and standard error is not, so output
+    /// that ends mid-line waits in its buffer while the note goes straight out.
+    #[test]
+    fn a_trapped_runs_output_is_on_screen_before_the_note_that_points_at_it() {
+        use std::cell::RefCell;
+        use std::io::{LineWriter, Write};
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct Screen(Rc<RefCell<Vec<u8>>>);
+        impl Write for Screen {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let screen = Screen(Rc::new(RefCell::new(Vec::new())));
+        let mut out = LineWriter::new(screen.clone());
+        let mut err = screen.clone();
+        print_run("hello\nTRAP: unhandled exception: System.Exception: boom", 70, &mut out, &mut err);
+        drop(out);
+
+        let shown = String::from_utf8(screen.0.borrow().clone()).expect("text");
+        let trap = shown.find("TRAP:").expect("the TRAP line is shown");
+        let note = shown.find("lamella run: the program exited 70").expect("the note is shown");
+        assert!(trap < note, "the note came before the TRAP line it points up at:\n{shown}");
+    }
 
     /// A project directory of the test's own: `App.csproj` of `output_type` with `items` inside its
     /// `<Project>` element, and `Program.cs` beside it holding `program`.

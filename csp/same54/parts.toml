@@ -1,6 +1,6 @@
 # PARTS table for the SAM E54 family.
 #
-# THE PRESENT-LIST IS COMPLETE, WHICH IS A CLAIM AND NOT A CONVENIENCE. A partial list refuses
+# THE `pins` LIST IS COMPLETE, WHICH IS A CLAIM AND NOT A CONVENIENCE. A partial list refuses
 # safely and a complete one promises that everything absent from it is absent from the silicon, so
 # it is written only when a whole package pinout has been read. That happened here because a board
 # carrying three extension sockets needed forty-three pads at once.
@@ -14,7 +14,7 @@
 # AND THE 100-PIN PART IS A DIFFERENT PAD SET THAT LOOKS LIKE THIS ONE. Reading the `P` as 100
 # pins is the natural mistake -- N is 100 and P is next -- and the 100-pin TQFP carries NO PB26,
 # PB27, PB28 or PB29. Port B is COMPLETE on the package below and short of four pads on that one,
-# and those four carry a SERCOM. So a present-list taken from the wrong figure does not merely
+# and those four carry a SERCOM. So a `pins` list taken from the wrong figure does not merely
 # omit: it refuses a binding that names a pad this silicon has, and the refusal reads as though the
 # binding were wrong rather than the list.
 #

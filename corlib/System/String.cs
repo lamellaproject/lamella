@@ -547,11 +547,60 @@ namespace System
             return false;
         }
 
+#if LAMELLA_SURFACE_NETFX_4_0
+        public static string Join(string separator, params string[] value)
+#else
         public static string Join(string separator, string[] value)
+#endif
         {
             if ((object)value == null) throw new ArgumentNullException("value");
             return Join(separator, value, 0, value.Length);
         }
+
+#if LAMELLA_SURFACE_NETFX_4_0
+        public static string Join(string separator, params object[] values)
+        {
+            if ((object)values == null) throw new ArgumentNullException("values");
+            if ((object)separator == null) separator = "";
+            string result = "";
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (i > 0) result = String.Concat(result, separator);
+                result = String.Concat(result, TextOf(values[i]));
+            }
+            return result;
+        }
+
+        public static string Join<T>(string separator, System.Collections.Generic.IEnumerable<T> values)
+        {
+            if ((object)values == null) throw new ArgumentNullException("values");
+            if ((object)separator == null) separator = "";
+            System.Collections.Generic.IEnumerator<T> e = values.GetEnumerator();
+            try
+            {
+                string result = "";
+                bool first = true;
+                while (e.MoveNext())
+                {
+                    if (!first) result = String.Concat(result, separator);
+                    result = String.Concat(result, TextOf(e.Current));
+                    first = false;
+                }
+                return result;
+            }
+            finally
+            {
+                if (e != null) e.Dispose();
+            }
+        }
+
+        private static string TextOf(object item)
+        {
+            if (item == null) return "";
+            string text = item.ToString();
+            return (object)text == null ? "" : text;
+        }
+#endif
 
         public static string Join(string separator, string[] value, int startIndex, int count)
         {
@@ -586,6 +635,7 @@ namespace System
 
         public bool StartsWith(string value)
         {
+            if ((object)value == null) throw new ArgumentNullException("value");
             int n = value.Length;
             if (n > this.Length) return false;
             for (int i = 0; i < n; i++)
@@ -597,6 +647,7 @@ namespace System
 
         public bool EndsWith(string value)
         {
+            if ((object)value == null) throw new ArgumentNullException("value");
             int n = value.Length;
             int offset = this.Length - n;
             if (offset < 0) return false;

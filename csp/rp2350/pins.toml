@@ -1,5 +1,6 @@
 # PIN map: pin x function -> (instance, signal) for the RP2350.
-# PARTIAL, evidence-only, exactly the cells the board packages bind. Function ids are
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# Function ids are
 # the datasheet's GPIO-function columns (F1..F9, SVD-enumerated); GP<n> is the bank-less
 # rp-family spelling. Signals are the SVD's own names -- for the PL022 the master's MOSI is
 # the block's `tx` and MISO its `rx`.
@@ -64,3 +65,115 @@ function = "F1"
 instance = "spi0"
 signal = "tx"
 source = "RP2350.svd (GP19 F1 = SPI0 TX = the master's MOSI)"
+
+[[pins]]
+pin = "GP2"
+function = "F4"
+instance = "pwm"
+signal = "a_1"
+source = "RP2350 datasheet GPIO2_CTRL FUNCSEL 0x04 = PWM_A_1; Table 1130 maps GPIO2 to PWM channel 1A"
+
+[[pins]]
+pin = "GP3"
+function = "F4"
+instance = "pwm"
+signal = "b_1"
+source = "RP2350 datasheet GPIO3_CTRL FUNCSEL 0x04 = PWM_B_1; Table 1130 maps GPIO3 to PWM channel 1B"
+
+[[pins]]
+pin = "GP6"
+function = "F4"
+instance = "pwm"
+signal = "a_3"
+source = "RP2350 datasheet GPIO6_CTRL FUNCSEL 0x04 = PWM_A_3; Table 1130 maps GPIO6 to PWM channel 3A"
+
+[[pins]]
+pin = "GP7"
+function = "F4"
+instance = "pwm"
+signal = "b_3"
+source = "RP2350 datasheet GPIO7_CTRL FUNCSEL 0x04 = PWM_B_3; Table 1130 maps GPIO7 to PWM channel 3B"
+
+[[pins]]
+pin = "GP8"
+function = "F4"
+instance = "pwm"
+signal = "a_4"
+source = "RP2350 datasheet GPIO8_CTRL FUNCSEL 0x04 = PWM_A_4; Table 1130 maps GPIO8 to PWM channel 4A"
+
+[[pins]]
+pin = "GP9"
+function = "F4"
+instance = "pwm"
+signal = "b_4"
+source = "RP2350 datasheet GPIO9_CTRL FUNCSEL 0x04 = PWM_B_4; Table 1130 maps GPIO9 to PWM channel 4B"
+
+[[pins]]
+pin = "GP8"
+function = "F2"
+instance = "uart1"
+signal = "tx"
+source = "RP2350 datasheet 9.4 Table 645 (GPIO Bank 0 Functions): GPIO8 F2 = UART1 TX"
+
+[[pins]]
+pin = "GP9"
+function = "F2"
+instance = "uart1"
+signal = "rx"
+source = "RP2350 datasheet 9.4 Table 645 (GPIO Bank 0 Functions): GPIO9 F2 = UART1 RX"
+
+[[pins]]
+pin = "GP10"
+function = "F4"
+instance = "pwm"
+signal = "a_5"
+source = "RP2350 datasheet GPIO10_CTRL FUNCSEL 0x04 = PWM_A_5; Table 1130 maps GPIO10 to PWM channel 5A"
+
+[[pins]]
+pin = "GP11"
+function = "F4"
+instance = "pwm"
+signal = "b_5"
+source = "RP2350 datasheet GPIO11_CTRL FUNCSEL 0x04 = PWM_B_5; Table 1130 maps GPIO11 to PWM channel 5B"
+
+[[pins]]
+pin = "GP12"
+function = "F4"
+instance = "pwm"
+signal = "a_6"
+source = "RP2350 datasheet GPIO12_CTRL FUNCSEL 0x04 = PWM_A_6; Table 1130 maps GPIO12 to PWM channel 6A"
+
+[[pins]]
+pin = "GP13"
+function = "F4"
+instance = "pwm"
+signal = "b_6"
+source = "RP2350 datasheet GPIO13_CTRL FUNCSEL 0x04 = PWM_B_6; Table 1130 maps GPIO13 to PWM channel 6B"
+
+[[pins]]
+pin = "GP14"
+function = "F4"
+instance = "pwm"
+signal = "a_7"
+source = "RP2350 datasheet GPIO14_CTRL FUNCSEL 0x04 = PWM_A_7; Table 1130 maps GPIO14 to PWM channel 7A"
+
+[[pins]]
+pin = "GP15"
+function = "F4"
+instance = "pwm"
+signal = "b_7"
+source = "RP2350 datasheet GPIO15_CTRL FUNCSEL 0x04 = PWM_B_7; Table 1130 maps GPIO15 to PWM channel 7B"
+
+[[pins]]
+pin = "GP20"
+function = "F4"
+instance = "pwm"
+signal = "a_2"
+source = "RP2350 datasheet GPIO20_CTRL FUNCSEL 0x04 = PWM_A_2; Table 1130 maps GPIO20 to PWM channel 2A"
+
+[[pins]]
+pin = "GP21"
+function = "F4"
+instance = "pwm"
+signal = "b_2"
+source = "RP2350 datasheet GPIO21_CTRL FUNCSEL 0x04 = PWM_B_2; Table 1130 maps GPIO21 to PWM channel 2B"

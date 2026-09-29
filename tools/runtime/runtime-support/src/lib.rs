@@ -29,7 +29,9 @@ mod net_alloc {
             crate::net_support::rt_alloc(layout)
         }
 
-        unsafe fn dealloc(&self, _pointer: *mut u8, _layout: core::alloc::Layout) {}
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: core::alloc::Layout) {
+            unsafe { crate::net_support::rt_dealloc(pointer, layout) }
+        }
     }
 
     #[global_allocator]
@@ -38,6 +40,14 @@ mod net_alloc {
 
 #[cfg(feature = "link-host")]
 pub use lamella_runtime_support_debug as debug_support;
+
+#[cfg(any(
+    feature = "board-rpi-pico2",
+    feature = "board-rpi-pico2-w",
+    feature = "board-pimoroni-pico-plus-2",
+    feature = "board-pimoroni-pico-plus-2-w"
+))]
+pub use lamella_board_support as board_support;
 
 #[cfg(all(feature = "link-host", not(feature = "net")))]
 mod link_alloc {
@@ -1261,6 +1271,28 @@ pub extern "C" fn lamella_console_write_bool(v: i32) {
 #[no_mangle]
 pub extern "C" fn lamella_console_newline() {
     console_put(b'\n');
+}
+
+/// Name resolution in an image built WITHOUT the net layer, in a module of its own for the reason
+/// [`collector`] is: code in the crate root shares a codegen unit with symbols every image links, and
+/// grew each of them by 16 B there.
+#[cfg(not(feature = "net"))]
+mod no_resolver {
+    /// There is no resolver, so every name fails and `Dns` throws `SocketException`, as it does
+    /// wherever nothing answers. Not a mock -- an honest answer. It exists so a program whose `Dns`
+    /// call only ever sees IP literals (which never reach the resolver) still links; the net layer's
+    /// real `lamella_net_resolve_host` replaces it under `net`.
+    #[no_mangle]
+    pub extern "C" fn lamella_net_resolve_host(
+        _host: *const u16,
+        _host_len: u32,
+        _buffer: *mut u8,
+        _buffer_len: u32,
+        _lengths: *mut i32,
+        _lengths_len: u32,
+    ) -> i32 {
+        -1
+    }
 }
 
 
@@ -2769,9 +2801,10 @@ mod collector {
     /// A managed interior pointer: it addresses the inside of an object, so it is relocated by the same
     /// delta as the object containing it.
     const ROOT_KIND_MANAGED_PTR: u32 = 1;
-    /// A PINNED slot -- a `fixed` statement's holder. The object must survive AND must not move, so the
-    /// slot is reported as an ordinary root as well as being listed as a pin: a pinned root left out of
-    /// the root set would let the collection reclaim the very object the pin exists to hold still.
+    /// A PINNED slot -- a `fixed` statement's holder, which holds an object or an address inside one.
+    /// The object must survive AND must not move, so the slot is reported as a root as well as being
+    /// listed as a pin: a pinned root left out of the root set would let the collection reclaim the
+    /// very object the pin exists to hold still.
     const ROOT_KIND_PINNED: u32 = 2;
     /// A TAGGED word: a managed reference only when its low two bits are clear and it is non-null. A
     /// fixnum or singleton sets a low bit and must be left exactly as it is.
@@ -2805,10 +2838,13 @@ mod collector {
     /// Set when a pin did not fit, which REFUSES the collection -- see [`MAX_PINS`].
     static mut PIN_OVERFLOW: bool = false;
 
+    /// The collector's per-slot visitor: the slot, and what kind of root it is.
+    type RootVisitor<'a> = &'a mut dyn FnMut(&mut lamella_gc::Ref, lamella_gc::RootKind);
+
     /// The visitor the collector handed us, parked so the C-ABI walker can reach it.
     ///
     /// [`lamella_gc_walk_roots_impl`] takes an `extern "C" fn`, which cannot close over anything, while
-    /// the collector supplies a `&mut dyn FnMut(&mut Ref)`. This is the one place the two meet, and it is
+    /// the collector supplies a [`RootVisitor`]. This is the one place the two meet, and it is
     /// sound because the walk is driven synchronously from the allocator's critical section: the pointer
     /// is set, the walk runs to completion, and it is cleared before anything else can observe it.
     static mut ACTIVE_VISITOR: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -2843,18 +2879,19 @@ mod collector {
     /// treated as an address.
     extern "C" fn report_root(slot: *mut u32, kind: u32) {
         let value = unsafe { core::ptr::read_volatile(slot) };
-        match kind {
+        let root_kind = match kind {
             ROOT_KIND_TAGGED if value == 0 || value & 0b11 != 0 => return,
-            ROOT_KIND_OBJECT | ROOT_KIND_MANAGED_PTR | ROOT_KIND_PINNED | ROOT_KIND_TAGGED => {}
+            ROOT_KIND_OBJECT | ROOT_KIND_TAGGED => lamella_gc::RootKind::Object,
+            ROOT_KIND_MANAGED_PTR | ROOT_KIND_PINNED => lamella_gc::RootKind::Interior,
             _ => return,
-        }
+        };
         let visitor = unsafe { ACTIVE_VISITOR };
         if visitor.is_null() {
             return;
         }
         let mut reference = lamella_gc::Ref(value);
-        let visit = unsafe { &mut *(visitor as *mut &mut dyn FnMut(&mut lamella_gc::Ref)) };
-        visit(&mut reference);
+        let visit = unsafe { &mut *(visitor as *mut RootVisitor<'_>) };
+        visit(&mut reference, root_kind);
         if reference.0 != value {
             unsafe { core::ptr::write_volatile(slot, reference.0) };
         }
@@ -2892,8 +2929,8 @@ mod collector {
         }
         let pin_count = unsafe { PIN_COUNT };
         heap.collect_no_alloc(
-            |visit: &mut dyn FnMut(&mut lamella_gc::Ref)| {
-                let mut parked: &mut dyn FnMut(&mut lamella_gc::Ref) = visit;
+            |visit: &mut dyn FnMut(&mut lamella_gc::Ref, lamella_gc::RootKind)| {
+                let mut parked: RootVisitor<'_> = visit;
                 unsafe {
                     ACTIVE_VISITOR = core::ptr::addr_of_mut!(parked) as *mut core::ffi::c_void;
                 }

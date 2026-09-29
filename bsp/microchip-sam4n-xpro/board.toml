@@ -1,10 +1,9 @@
-# BOARD binding: the SAM4N Xplained Pro -- identity-first. No peripheral bindings yet, because the
-# SAM4N family has no generated driver; what this file states beyond identity is the board's two
-# control lines, which need no driver -- a control pin rides no alternate function.
+# BOARD binding: the SAM4N Xplained Pro. It states the board's identity, its part and its two
+# control lines, and binds no peripheral. A control pin rides no alternate function, so the LED
+# and the button need no driver.
 #
-# EVERY FACT BELOW IS THE BOARD'S USER GUIDE SAYING IT OUTRIGHT, which is worth noting because the
-# two boards onboarded before this one both needed a schematic to settle a polarity the manual left
-# to inference. This manual states the direction in prose for both the button and the LED.
+# EVERY FACT BELOW IS THE BOARD'S USER GUIDE SAYING IT OUTRIGHT. This manual states the direction
+# in prose for both the button and the LED, so no schematic was needed to settle a polarity.
 
 [table]
 kind = "board"

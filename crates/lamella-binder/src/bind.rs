@@ -83,12 +83,56 @@ pub fn tuple_element_names(type_ref: &TypeRef) -> alloc::vec::Vec<Option<alloc::
 }
 
 /// Binds a syntactic type reference to a [`TypeSymbol`] (11.1).
+///
+/// **A `?` IS DECIDED HERE ONLY WHERE THE SYNTAX ALONE DECIDES IT.** Over `string`, `object` or an
+/// array the underlying type is a reference type whatever is in scope, so the `?` is a nullable
+/// annotation (C# 8.0) and the type is the underlying one. Over anything else -- `int`, a named type,
+/// a type parameter -- the answer depends on what the name resolves to, so this returns
+/// `System.Nullable<T>` (11.4) and leaves the question to whoever resolves it:
+/// [`Binder::canonicalize`](crate::Binder::canonicalize) for a signature, and
+/// [`bind_type_with`] under the binder's own decision for a type it reports on.
 #[must_use]
 pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
+    bind_type_with(type_ref, &mut |_, underlying| {
+        if is_syntactically_reference_type(&underlying) {
+            underlying
+        } else {
+            nullable_of(underlying)
+        }
+    })
+}
+
+/// `System.Nullable<underlying>` -- what `T?` is over a value type (11.4).
+#[must_use]
+pub(crate) fn nullable_of(underlying: TypeSymbol) -> TypeSymbol {
+    TypeSymbol::Instantiation {
+        definition: ["System".into(), "Nullable".into()].into(),
+        arguments: [underlying].into(),
+    }
+}
+
+/// Whether a type is a reference type by its spelling alone: `string`, `object`, or an array.
+fn is_syntactically_reference_type(ty: &TypeSymbol) -> bool {
+    matches!(
+        ty,
+        TypeSymbol::Special(SpecialType::String | SpecialType::Object) | TypeSymbol::Array { .. }
+    )
+}
+
+/// [`bind_type`], with every `?` handed to `on_nullable` to decide: it receives the `T?` node
+/// itself (whose span ends at the `?`) and `T` already bound, and answers the type the whole node
+/// denotes. The walk is the one [`bind_type`] takes, so a caller that decides differently still
+/// binds every other shape exactly as it does.
+pub fn bind_type_with(
+    type_ref: &TypeRef,
+    on_nullable: &mut dyn FnMut(&TypeRef, TypeSymbol) -> TypeSymbol,
+) -> TypeSymbol {
     match &type_ref.kind {
         TypeRefKind::Tuple(elements) => {
-            let bound: alloc::vec::Vec<TypeSymbol> =
-                elements.iter().map(|element| bind_type(&element.ty)).collect();
+            let bound: alloc::vec::Vec<TypeSymbol> = elements
+                .iter()
+                .map(|element| bind_type_with(&element.ty, on_nullable))
+                .collect();
             value_tuple(&bound)
         }
         TypeRefKind::Predefined(predefined) => {
@@ -111,7 +155,8 @@ pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
                 .collect(),
             arguments: parts
                 .iter()
-                .flat_map(|part| part.arguments.iter().map(bind_type))
+                .flat_map(|part| part.arguments.iter())
+                .map(|argument| bind_type_with(argument, on_nullable))
                 .collect(),
         },
         TypeRefKind::Unbound { parts, arity } => TypeSymbol::Instantiation {
@@ -120,16 +165,18 @@ pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
                 .map(|_| TypeSymbol::Special(SpecialType::Object))
                 .collect(),
         },
-        TypeRefKind::Nullable(underlying) => TypeSymbol::Instantiation {
-            definition: ["System".into(), "Nullable".into()].into(),
-            arguments: [bind_type(underlying)].into(),
-        },
-        TypeRefKind::Array { element, rank } => bind_type(element).into_array(*rank),
+        TypeRefKind::Nullable(underlying) => {
+            let underlying = bind_type_with(underlying, on_nullable);
+            on_nullable(type_ref, underlying)
+        }
+        TypeRefKind::Array { element, rank } => {
+            bind_type_with(element, on_nullable).into_array(*rank)
+        }
         TypeRefKind::Pointer(element) => {
-            TypeSymbol::Pointer(alloc::boxed::Box::new(bind_type(element)))
+            TypeSymbol::Pointer(alloc::boxed::Box::new(bind_type_with(element, on_nullable)))
         }
         TypeRefKind::ByRef { referent, .. } => {
-            TypeSymbol::ByRef(alloc::boxed::Box::new(bind_type(referent)))
+            TypeSymbol::ByRef(alloc::boxed::Box::new(bind_type_with(referent, on_nullable)))
         }
         TypeRefKind::Error => TypeSymbol::Error,
     }

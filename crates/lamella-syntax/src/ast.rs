@@ -1083,6 +1083,10 @@ pub struct CompilationUnit {
     /// The `#define`d preprocessor symbols (9.5.3) -- the set a `[Conditional]` call is checked
     /// against to decide inclusion (24.4.2). Empty when none are defined.
     pub defined_symbols: BTreeSet<Box<str>>,
+    /// The file's nullable context (C# 8.0): the compilation's `/nullable` and the file's
+    /// `#nullable` directives, which decide at each `?` over a reference type whether it is an
+    /// annotation or a diagnostic.
+    pub nullable: crate::lexer::NullableContext,
 }
 
 /// A dotted name such as `System.Collections` (10.8).
@@ -1488,7 +1492,16 @@ pub struct TypeParameterConstraintClause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeParameterConstraint {
     /// `class` -- the reference-type constraint. Metadata flag `0x0004`.
-    ReferenceType(Span),
+    ///
+    /// `class?` (C# 8.0) is the same constraint with a nullable annotation: it admits a nullable
+    /// reference type argument, which changes nothing in metadata this compiler writes and one
+    /// thing in the language -- at C# 8.0, `T?` over such a `T` is CS8627.
+    ReferenceType {
+        /// The byte range of `class`, or of `class?` when the `?` is written.
+        span: Span,
+        /// The `?` of `class?`, where its annotation diagnostics point; `None` for plain `class`.
+        question: Option<Span>,
+    },
     /// `struct` -- the non-nullable value-type constraint. Metadata flag `0x0008`, and it implies
     /// `0x0010`: every value type has a parameterless constructor, so `struct` subsumes `new()`,
     /// which is why writing both is CS0451 rather than a redundancy.
@@ -1505,7 +1518,7 @@ impl TypeParameterConstraint {
     #[must_use]
     pub fn span(&self) -> Span {
         match self {
-            TypeParameterConstraint::ReferenceType(span)
+            TypeParameterConstraint::ReferenceType { span, .. }
             | TypeParameterConstraint::ValueType(span)
             | TypeParameterConstraint::DefaultConstructor(span) => *span,
             TypeParameterConstraint::Type(reference) => reference.span,

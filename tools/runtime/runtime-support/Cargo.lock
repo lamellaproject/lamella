@@ -87,6 +87,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-board-support"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-cil"
 version = "0.0.0"
 dependencies = [
@@ -130,6 +134,10 @@ name = "lamella-gc"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-heap"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-mmio"
 version = "0.0.0"
 
@@ -157,6 +165,7 @@ version = "0.0.0"
 name = "lamella-runtime-support"
 version = "0.0.0"
 dependencies = [
+ "lamella-board-support",
  "lamella-decimal",
  "lamella-gc",
  "lamella-runtime-support-debug",
@@ -178,6 +187,7 @@ name = "lamella-runtime-support-net"
 version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
+ "lamella-heap",
  "lamella-net-smoltcp",
  "lamella-tls-mbedtls",
  "smoltcp",

@@ -21,6 +21,26 @@ impl HeapSizes {
     const GUID: u8 = 0x02;
     const BLOB: u8 = 0x04;
 
+    /// The heap size, in bytes, from which references into that heap are 4 bytes wide.
+    pub const WIDE_FROM: usize = 0x1_0000;
+
+    /// The widths the heaps themselves call for, given each heap's bytes as the image holds them
+    /// (before the stream's padding): a heap of [`WIDE_FROM`](Self::WIDE_FROM) bytes or more is
+    /// referenced with 4-byte values, a smaller one with 2-byte values.
+    ///
+    /// A `#Strings` or `#Blob` reference is a byte offset, so it exceeds 0xFFFF only in a heap of
+    /// 0x10000 bytes or more. A `#GUID` reference is a 1-based index, which would stay under
+    /// 0x10000 far longer, but the byte threshold is the one .NET's own metadata writer applies to
+    /// all three heaps, so the flags agree with an assembly csc builds from the same heaps.
+    #[must_use]
+    pub fn for_heaps(strings: &[u8], guids: &[u8], blobs: &[u8]) -> HeapSizes {
+        HeapSizes {
+            wide_strings: strings.len() >= Self::WIDE_FROM,
+            wide_guid: guids.len() >= Self::WIDE_FROM,
+            wide_blob: blobs.len() >= Self::WIDE_FROM,
+        }
+    }
+
     /// The HeapSizes byte.
     #[must_use]
     pub fn flags(self) -> u8 {
@@ -62,6 +82,10 @@ pub enum Column {
 pub struct TableStream {
     rows: BTreeMap<u8, Vec<Vec<Column>>>,
     sorted: u64,
+    /// Row counts of tables that live in another module but that this stream's columns index --
+    /// a standalone Portable PDB's `LocalScope.Method` indexes the image's `MethodDef`. They size
+    /// those columns and are never written as rows here.
+    external_rows: BTreeMap<u8, u32>,
 }
 
 impl TableStream {
@@ -219,6 +243,36 @@ impl TableStream {
         self.rows.get(&table).map_or(0, |rows| rows.len() as u32)
     }
 
+    /// Records that `table` lives in another module, which holds `rows` rows of it, and that
+    /// columns of this stream index it. A standalone Portable PDB is the case: its `LocalScope`
+    /// rows name methods of the image's `MethodDef` table, which the PDB does not contain. A reader
+    /// sizes an index into such a table from the row count the PDB's `#Pdb` stream declares for
+    /// it, so the writer must size it from the same count -- the PDB's own `MethodDef` is empty.
+    pub fn set_external_row_count(&mut self, table: u8, rows: u32) {
+        self.external_rows.insert(table, rows);
+    }
+
+    /// The tables recorded by [`set_external_row_count`](Self::set_external_row_count), as a
+    /// Portable PDB's `#Pdb` stream declares them: the bit vector of tables, and their row counts
+    /// in ascending table order.
+    #[must_use]
+    pub fn external_tables(&self) -> (u64, Vec<u32>) {
+        let mut referenced = 0u64;
+        let mut counts = Vec::with_capacity(self.external_rows.len());
+        for (&table, &rows) in &self.external_rows {
+            referenced |= 1u64 << table;
+            counts.push(rows);
+        }
+        (referenced, counts)
+    }
+
+    /// The row count that sizes a column indexing `table`: the rows present here or the rows it
+    /// has in another module, whichever is larger -- the count a reader sizes the column from.
+    fn sizing_row_count(&self, table: u8) -> u32 {
+        let external = self.external_rows.get(&table).copied().unwrap_or(0);
+        self.row_count(table).max(external)
+    }
+
     /// Serializes the `#~` stream: the header then every present table's rows,
     /// with column widths chosen from `heaps` and the row counts.
     #[must_use]
@@ -260,16 +314,35 @@ impl TableStream {
         match column {
             Column::U16(value) => out.extend_from_slice(&value.to_le_bytes()),
             Column::U32(value) => out.extend_from_slice(&value.to_le_bytes()),
-            Column::StringRef(offset) => write_ref(*offset, heaps.wide_strings, out),
-            Column::GuidRef(index) => write_ref(*index, heaps.wide_guid, out),
-            Column::BlobRef(offset) => write_ref(*offset, heaps.wide_blob, out),
-            Column::Index(table, row) => write_ref(*row, self.row_count(*table) >= 0x1_0000, out),
+            Column::StringRef(offset) => write_heap_ref(*offset, heaps.wide_strings, out),
+            Column::GuidRef(index) => write_heap_ref(*index, heaps.wide_guid, out),
+            Column::BlobRef(offset) => write_heap_ref(*offset, heaps.wide_blob, out),
+            Column::Index(table, row) => {
+                write_ref(*row, self.sizing_row_count(*table) >= 0x1_0000, out);
+            }
             Column::Coded(kind, token) => {
-                let wide = kind.width(|table| self.row_count(table)) == 4;
+                let wide = kind.width(|table| self.sizing_row_count(table)) == 4;
                 write_ref(kind.encode(*token), wide, out);
             }
         }
     }
+}
+
+/// Writes one heap reference, 4 bytes when `wide` and 2 otherwise.
+///
+/// # Panics
+/// When a reference above 0xFFFF is to be written narrow. Its high bits would be dropped and it
+/// would name a different heap entry: a structurally valid image with the wrong names, signatures
+/// or constants in it. Widths chosen by [`HeapSizes::for_heaps`] from the heaps being written never
+/// ask for that.
+fn write_heap_ref(value: u32, wide: bool, out: &mut Vec<u8>) {
+    if !wide {
+        assert!(
+            value <= 0xFFFF,
+            "heap reference {value:#x} does not fit the 2-byte width its heap was given"
+        );
+    }
+    write_ref(value, wide, out);
 }
 
 fn write_ref(value: u32, wide: bool, out: &mut Vec<u8>) {
@@ -304,22 +377,74 @@ mod tests {
     #[test]
     fn a_module_row_sets_its_valid_bit_and_count() {
         let mut tables = TableStream::new();
-        let row = tables.add_row(
-            table::MODULE,
-            alloc::vec![
-                Column::U16(0),
-                Column::StringRef(1),
-                Column::GuidRef(1),
-                Column::GuidRef(0),
-                Column::GuidRef(0),
-            ],
-        );
+        let row = tables.add_row(table::MODULE, module_row(1));
         assert_eq!(row, 1);
 
         let stream = tables.serialize(HeapSizes::default());
         assert_eq!(u64_at(&stream, 8), 1);
         assert_eq!(u32_at(&stream, 24), 1);
         assert_eq!(stream.len(), 24 + 4 + 10);
+    }
+
+    fn module_row(name: u32) -> Vec<Column> {
+        alloc::vec![
+            Column::U16(0),
+            Column::StringRef(name),
+            Column::GuidRef(1),
+            Column::GuidRef(0),
+            Column::GuidRef(0),
+        ]
+    }
+
+    #[test]
+    fn a_heap_of_0x10000_bytes_or_more_is_referenced_wide() {
+        let under = alloc::vec![0u8; HeapSizes::WIDE_FROM - 1];
+        let at = alloc::vec![0u8; HeapSizes::WIDE_FROM];
+        assert_eq!(HeapSizes::for_heaps(&under, &under, &under).flags(), 0);
+        assert_eq!(HeapSizes::for_heaps(&at, &under, &under).flags(), 0x01);
+        assert_eq!(HeapSizes::for_heaps(&under, &at, &under).flags(), 0x02);
+        assert_eq!(HeapSizes::for_heaps(&under, &under, &at).flags(), 0x04);
+        assert_eq!(HeapSizes::for_heaps(&at, &at, &at).flags(), 0x07);
+    }
+
+    #[test]
+    fn a_wide_heap_reference_takes_four_bytes() {
+        let mut tables = TableStream::new();
+        tables.add_row(table::MODULE, module_row(0x1_0001));
+        let heaps = HeapSizes {
+            wide_strings: true,
+            ..HeapSizes::default()
+        };
+        let stream = tables.serialize(heaps);
+        assert_eq!(stream[6], 0x01);
+        assert_eq!(u32_at(&stream, 30), 0x1_0001);
+        assert_eq!(stream.len(), 24 + 4 + 2 + 4 + 2 + 2 + 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit the 2-byte width")]
+    fn a_heap_reference_too_large_for_its_width_is_refused() {
+        let mut tables = TableStream::new();
+        tables.add_row(table::MODULE, module_row(0x1_0001));
+        let _ = tables.serialize(HeapSizes::default());
+    }
+
+    #[test]
+    fn an_index_into_another_modules_table_is_sized_by_that_modules_row_count() {
+        let mut tables = TableStream::new();
+        tables.add_row(
+            table::LOCAL_SCOPE,
+            alloc::vec![Column::Index(table::METHOD_DEF, 0x1_0000)],
+        );
+        tables.set_external_row_count(table::METHOD_DEF, 0x1_0000);
+        let stream = tables.serialize(HeapSizes::default());
+        assert_eq!(u64_at(&stream, 8), 1u64 << table::LOCAL_SCOPE);
+        assert_eq!(u32_at(&stream, 28), 0x1_0000);
+        assert_eq!(stream.len(), 24 + 4 + 4);
+        assert_eq!(
+            tables.external_tables(),
+            (1u64 << table::METHOD_DEF, alloc::vec![0x1_0000])
+        );
     }
 
     #[test]

@@ -3,36 +3,106 @@ namespace System.Collections
 {
     internal class SortedListEnumerator : IDictionaryEnumerator, IDisposable
     {
-        private object[] keys;
-        private object[] values;
-        private int count;
-        private int index;
+        internal const int Keys = 1;
+        internal const int Values = 2;
+        internal const int Entries = 3;
 
-        public SortedListEnumerator(object[] keys, object[] values, int count)
+        private SortedList list;
+        private int kind;
+        private int index;
+        private int end;
+        private int version;
+        private bool holding;
+        private object key;
+        private object value;
+
+        public SortedListEnumerator(SortedList list, int kind)
         {
-            this.keys = keys;
-            this.values = values;
-            this.count = count;
-            this.index = -1;
+            this.list = list;
+            this.kind = kind;
+            this.end = list.Count;
+            this.version = list.version;
         }
 
         public bool MoveNext()
         {
-            index = index + 1;
-            return index < count;
+            CheckVersion();
+            if (index < end)
+            {
+                key = list.GetKey(index);
+                value = list.GetByIndex(index);
+                index = index + 1;
+                holding = true;
+                return true;
+            }
+            key = null;
+            value = null;
+            holding = false;
+            return false;
         }
 
         public DictionaryEntry Entry
         {
-            get { return new DictionaryEntry(keys[index], values[index]); }
+            get
+            {
+                CheckVersion();
+                CheckHolding();
+                return new DictionaryEntry(key, value);
+            }
         }
 
-        public object Key { get { return keys[index]; } }
-        public object Value { get { return values[index]; } }
+        public object Key
+        {
+            get
+            {
+                CheckVersion();
+                CheckHolding();
+                return key;
+            }
+        }
 
-        public object Current { get { return new DictionaryEntry(keys[index], values[index]); } }
+        public object Value
+        {
+            get
+            {
+                CheckVersion();
+                CheckHolding();
+                return value;
+            }
+        }
 
-        public void Reset() { index = -1; }
+        public object Current
+        {
+            get
+            {
+                CheckHolding();
+                if (kind == Keys) return key;
+                if (kind == Values) return value;
+                return new DictionaryEntry(key, value);
+            }
+        }
+
+        public void Reset()
+        {
+            CheckVersion();
+            index = 0;
+            holding = false;
+            key = null;
+            value = null;
+        }
+
+        private void CheckVersion()
+        {
+            if (version != list.version)
+            {
+                throw new InvalidOperationException("Collection was modified after the enumerator was instantiated.");
+            }
+        }
+
+        private void CheckHolding()
+        {
+            if (!holding) throw new InvalidOperationException("Enumeration has either not started or has already finished.");
+        }
 
         public void Dispose() { }
     }

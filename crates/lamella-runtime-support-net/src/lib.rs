@@ -19,26 +19,32 @@ const WOULD_BLOCK: i32 = -1;
 const SOCK_ERROR: i32 = -2;
 
 
-/// The pinned RAM word holding the caller-provided region base (0 before init). On the device
-/// it is a fixed low-RAM address adjacent to lamella_gc_alloc's HEAP_PTR (0x2000_0100); the AOT
-/// host reserves it (confirm against the board RAM map). On the host (tests) a real `.bss` word
-/// stands in, so the seam is exercised without the device address.
-#[cfg(target_os = "none")]
+/// The word holding the caller-provided region base (0 before init): a zero-initialized static, on
+/// the device as on the host.
+///
+/// It is not a fixed RAM address because a fixed address has to be owned, and this one was not: it
+/// was `0x2000_0104`, the word that holds the collector's heap end. Initializing networking moved the
+/// heap's end to the net region's base, so the collector sized a heap that did not exist and carved
+/// its mark bitmap out of unmapped memory. A static is placed by the linker in the archive's `.bss`
+/// run, which every image's startup clears, so it reads 0 until init with nobody else's word in reach.
 #[inline]
 fn rt_base_slot() -> *mut usize {
-    0x2000_0104 as *mut usize
-}
-#[cfg(not(target_os = "none"))]
-#[inline]
-fn rt_base_slot() -> *mut usize {
-    static mut HOST_SLOT: usize = 0;
-    core::ptr::addr_of_mut!(HOST_SLOT)
+    static mut RT_BASE: usize = 0;
+    core::ptr::addr_of_mut!(RT_BASE)
 }
 
-const CURSOR_OFF: usize = 0;
-const END_OFF: usize = 8;
-const TICKS_OFF: usize = 16;
-const STATE_OFF: usize = 24;
+const TICKS_OFF: usize = 0;
+const STATE_OFF: usize = 8;
+
+/// The net/TLS heap: the part of the caller region past the backend cells, handed out through
+/// [`rt_alloc`] and taken back through [`rt_dealloc`]. A freed block returns to its size class's
+/// free list and the next request of that class reuses it, so a program that opens and closes
+/// connections or TLS sessions runs in the same memory however long it runs.
+///
+/// It refuses every request until [`lamella_net_rt_init_ram`] points it at the region. A
+/// zero-initialized static, so it sits in the archive's `.bss` run, which every image's startup
+/// clears.
+static NET_HEAP: lamella_heap::LockedHeap = lamella_heap::LockedHeap::empty();
 
 /// The mutable net/TLS backend cells, placed in the caller region at `base + STATE_OFF`.
 #[repr(C)]
@@ -49,8 +55,7 @@ struct NetRtState {
     /// The SAME monotonic millisecond clock the net stack was constructed with -- copied here so
     /// `lamella_net_now_ms` exposes it to the AOT scheduler's reactor without a board-specific
     /// symbol (single source of truth: the reactor's `now_millis` and `NetSmoltcp`'s `now_ms`
-    /// read one timer). A `static` cannot hold it (the archive has no writable-data segment), so
-    /// it lives in this caller-provided region like the backend cells.
+    /// read one timer). It lives in the caller-provided region with the backend cells.
     now_ms: Option<fn() -> u64>,
 }
 
@@ -71,26 +76,24 @@ fn rt_state() -> Option<&'static mut NetRtState> {
     Some(unsafe { &mut *((base + STATE_OFF) as *mut NetRtState) })
 }
 
-/// Bump-allocate `layout` from the caller region -- RAW cursor/end words only, so it is safe to
-/// call (e.g. from a `net.connect()` that allocates) while a [`NetRtState`] cell is borrowed.
-/// Returns null before init or on exhaustion (the global allocator's OOM signal).
+/// Allocates `layout` from the net/TLS heap, or returns null before init or when the heap cannot
+/// serve it (the global allocator's out-of-memory signal). The heap's bookkeeping is [`NET_HEAP`]'s
+/// rather than the region's, so this is safe to call (e.g. from a `net.connect()` that allocates)
+/// while a [`NetRtState`] cell is borrowed.
 pub fn rt_alloc(layout: core::alloc::Layout) -> *mut u8 {
-    let base = rt_base();
-    if base == 0 {
+    if rt_base() == 0 {
         return core::ptr::null_mut();
     }
-    unsafe {
-        let cursor = (base + CURSOR_OFF) as *mut usize;
-        let end = *((base + END_OFF) as *const usize);
-        let align = layout.align().max(core::mem::size_of::<usize>());
-        let start = (*cursor + align - 1) & !(align - 1);
-        let stop = start + layout.size();
-        if stop > end {
-            return core::ptr::null_mut();
-        }
-        *cursor = stop;
-        start as *mut u8
-    }
+    unsafe { core::alloc::GlobalAlloc::alloc(&NET_HEAP, layout) }
+}
+
+/// Takes back a block [`rt_alloc`] handed out, for the next request of its size to reuse.
+///
+/// # Safety
+/// `pointer` must have come from [`rt_alloc`] with this same `layout`, and must not have been
+/// taken back already.
+pub unsafe fn rt_dealloc(pointer: *mut u8, layout: core::alloc::Layout) {
+    unsafe { core::alloc::GlobalAlloc::dealloc(&NET_HEAP, pointer, layout) }
 }
 
 /// Install the net/TLS runtime state over a caller-provided RAM region `[base, base+len)`. The
@@ -113,10 +116,9 @@ pub unsafe extern "C" fn lamella_net_rt_init_ram(base: *mut u8, len: usize) {
                 now_ms: None,
             },
         );
-        let heap_start = (base + STATE_OFF + core::mem::size_of::<NetRtState>() + 7) & !7;
-        *((base + CURSOR_OFF) as *mut usize) = heap_start;
-        *((base + END_OFF) as *mut usize) = base + len;
+        let heap_start = (base + STATE_OFF + core::mem::size_of::<NetRtState>() + 15) & !15;
         *((base + TICKS_OFF) as *mut u64) = 0;
+        NET_HEAP.init(heap_start as *mut u8, (base + len).saturating_sub(heap_start));
         *rt_base_slot() = base;
     }
 }
@@ -241,6 +243,56 @@ unsafe fn out_slice<'a>(ptr: *mut u8, len: u32) -> &'a mut [u8] {
     } else {
         unsafe { core::slice::from_raw_parts_mut(ptr, len as usize) }
     }
+}
+
+/// `Dns.ResolveHost(host, buffer, lengths)`: resolves `host` through the installed backend. Address `i`'s
+/// network-order bytes go to `buffer[i * 16 ..]` and its byte length (4 or 16) to `lengths[i]`, for as
+/// many addresses as both arrays hold. Answers the count, or -1 when the name did not resolve or no
+/// backend is installed -- the managed side throws `SocketException` for either.
+///
+/// `host` is the managed string's UTF-16 units; a host name is ASCII, and a unit that is not decodes to
+/// a character no name matches.
+///
+/// # Safety
+/// `host` must reference `host_len` readable units, `buffer` `buffer_len` writable bytes, and `lengths`
+/// `lengths_len` writable `i32`s, as the AOT's `(array + 4, array.Length)` pairs do.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_net_resolve_host(
+    host: *const u16,
+    host_len: u32,
+    buffer: *mut u8,
+    buffer_len: u32,
+    lengths: *mut i32,
+    lengths_len: u32,
+) -> i32 {
+    let units: &[u16] = if host.is_null() || host_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(host, host_len as usize) }
+    };
+    let name: alloc::string::String = char::decode_utf16(units.iter().copied())
+        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    let out = unsafe { out_slice(buffer, buffer_len) };
+    let lengths: &mut [i32] = if lengths.is_null() || lengths_len == 0 {
+        &mut []
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(lengths, lengths_len as usize) }
+    };
+    with_net(-1, |net| {
+        let addresses = net.resolve(&name);
+        let mut count = 0usize;
+        for address in &addresses {
+            let at = count * 16;
+            if count == lengths.len() || at + address.len() > out.len() || address.len() > 16 {
+                break;
+            }
+            out[at..at + address.len()].copy_from_slice(address);
+            lengths[count] = address.len() as i32;
+            count += 1;
+        }
+        if count == 0 { -1 } else { count as i32 }
+    })
 }
 
 /// `Socket.ConnectStart(addr, port)`: opens a TCP socket and begins connecting; the
@@ -500,7 +552,8 @@ mod tls {
     }
 
     /// `TlsNative.ReadPlain(tls, buffer, offset, count)` pre-offset: plaintext read, 0 =
-    /// none available yet, -2 = the peer closed (the managed `PlainClosed`).
+    /// none available yet, -2 = the peer closed (the managed `PlainClosed`), -1 = the session
+    /// failed (the managed `PlainFailed`).
     ///
     /// # Safety
     /// `out` must reference `len` writable bytes.
@@ -508,20 +561,21 @@ mod tls {
     pub unsafe extern "C" fn lamella_tls_read_plain(tls: i32, out: *mut u8, len: u32) -> i32 {
         let buffer = unsafe { out_slice(out, len) };
         with_tls(-2, |engine| match engine.read_plain(tls as u32, buffer) {
-            Some(read) => read as i32,
-            None => -2,
+            lamella_cil_runtime::tls::PlainRead::Data(read) => read as i32,
+            lamella_cil_runtime::tls::PlainRead::Closed => -2,
+            lamella_cil_runtime::tls::PlainRead::Failed => -1,
         })
     }
 
     /// `TlsNative.WritePlain(tls, buffer, offset, count)` pre-offset: plaintext accepted
-    /// for encryption.
+    /// for encryption, or -1 when the session has failed.
     ///
     /// # Safety
     /// `input` must reference `len` readable bytes.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn lamella_tls_write_plain(tls: i32, input: *const u8, len: u32) -> i32 {
         let buffer = unsafe { in_slice(input, len) };
-        with_tls(0, |engine| engine.write_plain(tls as u32, buffer) as i32)
+        with_tls(0, |engine| engine.write_plain(tls as u32, buffer).map_or(-1, |accepted| accepted as i32))
     }
 
     /// `TlsNative.PeerCert(tls, buffer)`: the peer certificate's full DER length (written
@@ -553,11 +607,16 @@ mod tests {
     #[repr(align(8))]
     struct Region([u8; 4096]);
 
+    /// THE HEAP IS THE CALLER'S REGION, AND IT TAKES BLOCKS BACK. The state cell and every block
+    /// land inside the region, a freed block is the next one handed out, and a thousand
+    /// allocate-and-free rounds of a quarter of the region never run it out -- the heap this
+    /// replaced never reused a block, so it ran out in the fourth round.
     #[test]
-    fn relocation_bumps_caller_ram_and_places_the_state_cell() {
+    fn the_heap_carves_the_caller_region_and_reuses_what_is_freed() {
         let mut region = Region([0u8; 4096]);
         let base = region.0.as_mut_ptr();
         unsafe { lamella_net_rt_init_ram(base, 4096) };
+        let inside = |p: *mut u8| (base as usize..base as usize + 4096).contains(&(p as usize));
 
         let state = rt_state().expect("the state cell is reachable after init");
         assert!(state.net.is_none());
@@ -565,10 +624,16 @@ mod tests {
         let layout = core::alloc::Layout::from_size_align(16, 8).unwrap();
         let a = rt_alloc(layout);
         let b = rt_alloc(layout);
-        assert!(!a.is_null() && !b.is_null());
-        assert!(b as usize >= a as usize + 16, "allocations bump upward");
-        assert!(a as usize >= base as usize, "allocation is inside the region");
-        assert!((b as usize) < base as usize + 4096, "allocation stays in bounds");
+        assert!(inside(a) && inside(b) && a != b, "two live blocks, both in the region");
+        unsafe { rt_dealloc(a, layout) };
+        assert_eq!(rt_alloc(layout), a, "a freed block is the next one of its size handed out");
+
+        let quarter = core::alloc::Layout::from_size_align(1024, 8).unwrap();
+        for round in 0..1000 {
+            let block = rt_alloc(quarter);
+            assert!(inside(block), "round {round}: a block in the region, not null");
+            unsafe { rt_dealloc(block, quarter) };
+        }
 
         let huge = core::alloc::Layout::from_size_align(8192, 8).unwrap();
         assert!(rt_alloc(huge).is_null(), "an over-budget request reports OOM as null");

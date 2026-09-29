@@ -45,6 +45,13 @@ namespace Lamella.Generated
         public const uint VCP_RX_AFR_VALUE = 0x700;
         public const uint VCP_PCLK_HZ = 4000000;
         public const uint VCP_BRR_115200_MSIS_4MHZ = 0x23;
+
+        // -- SUPPLY_VDDIO2: the part isolates the vddio2 rail at reset, and this board uses it on PG2.
+        // Set the gate's mask in its register, then the valid mask, before those pins are used --
+        public const uint SUPPLY_VDDIO2_RCC_EN_REG = 0x46020C94;
+        public const uint SUPPLY_VDDIO2_RCC_EN_MASK = 0x4;
+        public const uint SUPPLY_VDDIO2_VALID_REG = 0x46020810;
+        public const uint SUPPLY_VDDIO2_VALID_MASK = 0x20000000;
         public const uint DEVICE_COUNT = 4;
 
         // -- on-board devices: PORT group base + pin index + mask --

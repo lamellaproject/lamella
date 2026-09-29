@@ -216,7 +216,7 @@ impl Sessions {
             .ok_or_else(|| text_result(format!("no such debug session '{id}' (launch one first)."), true))
     }
 
-    pub fn launch(&mut self, target: &str, code: &str) -> Value {
+    pub fn launch(&mut self, scope: &crate::DeviceScope, target: &str, code: &str) -> Value {
         let (image, srcmap) = match compile_bake_srcmap(code) {
             Ok(v) => v,
             Err(e) => return text_result(e, true),
@@ -225,6 +225,9 @@ impl Sessions {
             Ok(b) => b.with_srcmap(Some(srcmap)),
             Err(e) => return text_result(format!("cannot open {target} for debug: {e:?}"), true),
         };
+        if let Err(why) = scope.permits_link_board(backend.identity().product_model) {
+            return text_result(why, true);
+        }
         let mut session = Session { debugger: Debugger::with_backend(Box::new(backend)), seq: 1 };
         let _ = handle(&mut session.debugger, &mut session.seq, "initialize", None);
         let launched = handle(&mut session.debugger, &mut session.seq, "launch", Some(json!({ "stopOnEntry": true })));

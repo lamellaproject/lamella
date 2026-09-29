@@ -108,6 +108,123 @@ source = "Pico W datasheet section 2.1: 'GPIO29  OP/IP wireless SPI CLK/ADC mode
 # codec bus. The other two functions in that sentence moved the same way: VBUS sense is WL_GPIO2
 # and the SMPS power-save control is WL_GPIO1.
 
+# --- the header: the forty-position Pico header, ext/standards/pico-header.toml ---------------
+#
+# Each of its twenty-six GPIO positions reaches the GPIO of its own number, as the pinout draws it.
+# The row still states them one by one, because it is this board's half of a join: an extension
+# plugged onto the header names positions, and this row is where each finds its pad. A pin brought
+# out here is exposed rather than owned, so the bindings above keep theirs -- the header's GP0 and
+# GP1 are uart0's transmit and receive.
+
+[[connectors]]
+name = "header"
+standard = "pico-header"
+source = "Raspberry Pi Pico W Datasheet section 2.1 and Figure 2 (The pinout of the Pico W Rev3 board): GP0 to GP22 on header positions 1 to 29 and GP26 to GP28 on positions 31, 32 and 34, each the RP2040's GPIO of the same number. The same section gives the four GPIOs the header does not carry to the wireless chip: GPIO23 is its power-on signal, GPIO24 its SPI data and interrupt, GPIO25 its SPI chip select and GPIO29 its SPI clock, which also measures VSYS/3 on ADC3."
+
+[[connectors.header.pins]]
+signal = "gp0"
+pin = "GP0"
+
+[[connectors.header.pins]]
+signal = "gp1"
+pin = "GP1"
+
+[[connectors.header.pins]]
+signal = "gp2"
+pin = "GP2"
+
+[[connectors.header.pins]]
+signal = "gp3"
+pin = "GP3"
+
+[[connectors.header.pins]]
+signal = "gp4"
+pin = "GP4"
+
+[[connectors.header.pins]]
+signal = "gp5"
+pin = "GP5"
+
+[[connectors.header.pins]]
+signal = "gp6"
+pin = "GP6"
+
+[[connectors.header.pins]]
+signal = "gp7"
+pin = "GP7"
+
+[[connectors.header.pins]]
+signal = "gp8"
+pin = "GP8"
+
+[[connectors.header.pins]]
+signal = "gp9"
+pin = "GP9"
+
+[[connectors.header.pins]]
+signal = "gp10"
+pin = "GP10"
+
+[[connectors.header.pins]]
+signal = "gp11"
+pin = "GP11"
+
+[[connectors.header.pins]]
+signal = "gp12"
+pin = "GP12"
+
+[[connectors.header.pins]]
+signal = "gp13"
+pin = "GP13"
+
+[[connectors.header.pins]]
+signal = "gp14"
+pin = "GP14"
+
+[[connectors.header.pins]]
+signal = "gp15"
+pin = "GP15"
+
+[[connectors.header.pins]]
+signal = "gp16"
+pin = "GP16"
+
+[[connectors.header.pins]]
+signal = "gp17"
+pin = "GP17"
+
+[[connectors.header.pins]]
+signal = "gp18"
+pin = "GP18"
+
+[[connectors.header.pins]]
+signal = "gp19"
+pin = "GP19"
+
+[[connectors.header.pins]]
+signal = "gp20"
+pin = "GP20"
+
+[[connectors.header.pins]]
+signal = "gp21"
+pin = "GP21"
+
+[[connectors.header.pins]]
+signal = "gp22"
+pin = "GP22"
+
+[[connectors.header.pins]]
+signal = "gp26"
+pin = "GP26"
+
+[[connectors.header.pins]]
+signal = "gp27"
+pin = "GP27"
+
+[[connectors.header.pins]]
+signal = "gp28"
+pin = "GP28"
+
 [[plans]]
 name = "xosc-12mhz"
 default = true

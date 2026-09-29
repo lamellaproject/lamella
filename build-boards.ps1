@@ -2,6 +2,9 @@
 #
 #   pwsh -File build-boards.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>] [-Board <name>]
 #
+# -Define defaults to the surface `build-managed.ps1` compiles at, which `build-managed.ps1
+# -PrintSurface` names, so a board assembly built without it matches the libraries it references.
+#
 # Each board's package under `bsp/<board>/csharp/` binds that board's buses to its chip's drivers.
 # Compiling it into a reference assembly is what lets a program name its board once and then use the
 # standard device APIs without naming a Lamella type again:
@@ -67,6 +70,18 @@ foreach ($r in $BoardReferences) {
         throw "'$r.dll' is not in '$out'. Run build-managed.ps1 -OutDir '$OutDir' first."
     }
 }
+# THE SURFACE DEFAULTS TO THE LIBRARIES', read from `build-managed.ps1` rather than repeated here so
+# the two cannot drift. A board's sources gate members on the same symbols the libraries do -- the
+# SAM D21 PWM classes on LAMELLA_SURFACE_FLOAT, which `PwmChannel.DutyCycle` needs -- so a board
+# compiled with none of them against libraries compiled with all of them binds no PWM chip, while
+# `PwmChannel.Create` is there to ask for one. A reduced surface is passed as -Define to both scripts.
+if (-not $Define) {
+    $Define = @(& pwsh -NoProfile -File (Join-Path $root 'build-managed.ps1') -PrintSurface)
+    if ($LASTEXITCODE -ne 0 -or -not $Define.Count) {
+        throw 'build-managed.ps1 -PrintSurface named no symbols, so the default surface is unknown. Pass -Define.'
+    }
+}
+
 # `@()` WRAPS THE WHOLE `if`, not each branch. PowerShell unrolls a statement's output, so an `if`
 # whose taken branch yields a one-element array assigns a bare STRING -- and splatting a string
 # passes it one CHARACTER at a time, which the compiler reports as `unknown option '/'`. This is the

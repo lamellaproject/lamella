@@ -13,8 +13,8 @@
 # csp/samg55/instances.toml states both readings in full. A WRONG PMC BIT DOES NOT FAULT -- the
 # peripheral never clocks while every register reads back what was written -- so binding this on a
 # contested number would ship the failure mode that reads as a wiring problem. The carrier row
-# below is kept because the port is a board fact; the binding lands when somebody reads the
-# identifier off silicon, which is minutes of work with this board on a bench.
+# below is kept because the port is a board fact; binding it needs FLEXCOM6's identifier read off
+# the part itself.
 #
 # THE KIT GUIDE ALSO MISNAMES ONE OF THE TWO PADS AND THE DATASHEET SETTLES IT. Atmel-42389's
 # connection table reads "PB00 USART0 TXD" against "PB01 USART6 RXD" -- two instances for one link,

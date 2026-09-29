@@ -3,9 +3,9 @@
 /// The environment variable naming the probe this shell's work should reach.
 ///
 /// **A bench with one probe per board needs a per-shell default, because the alternative is a
-/// `--serial` on every command and the one time it is forgotten is the one that matters.** A lane
-/// exports its own probe's serial once; every tool that builds its selector with
-/// [`Selector::from_environment`] then reaches that lane's board and no other.
+/// `--serial` on every command and the one time it is forgotten is the one that matters.** Export
+/// the probe's serial once in each shell; every tool that builds its selector with
+/// [`Selector::from_environment`] then reaches that probe's board and no other.
 pub const PROBE_SERIAL_ENV: &str = "LAMELLA_PROBE_SERIAL";
 
 /// What the ladder needs to know about one discovered device, and nothing more.

@@ -1,7 +1,6 @@
-# PARTS table for the rp2040 family. PARTIAL pin present-list
-#, grown from silicon evidence only; complete from the datasheet pinout as bindings
-# and boards demand rows. A binding whose pin is absent here refuses, and so does a board's
-# wired control line -- an LED or a button states a pin about a part exactly as a binding does.
+# PARTS table for the rp2040 family. Its `pins` list is the whole User bank, GPIO0 to GPIO29, which
+# is every GPIO a program owns. A binding whose pin is not listed is refused, and so is a board's LED
+# or button -- a control line states a pin about a part exactly as a binding does.
 #
 # flash = 0: the RP2040 has NO internal flash -- code executes in place from an EXTERNAL QSPI
 # part through the XIP window, so a board's flash size is BOARD truth (its soldered chip),
@@ -23,11 +22,7 @@ device_id_mask = 0x0FFFFFFF
 device_id = 0x2927
 device_id_identifies = "part"
 identity_source = "Measured on silicon through a CMSIS-DAP probe: DPIDR 0x0bc12477 and SYSINFO CHIP_ID 0x20002927 at 0x40000000. The RP2040 datasheet section 2.20 gives CHIP_ID as REVISION in bits 31:28, PART in bits 27:12 and a JEP-106 MANUFACTURER in bits 11:0, so the identity is the low 28 bits and the revision is masked out -- it moves under a part that has not changed. PART 0x0002 with Raspberry Pi's JEP-106 designer code carrying its parity bit, (0x493 << 1) | 1 = 0x927. The DP IDCODE is Arm's M0-class multi-drop port design and names no part."
-pins = ["GP0-GP3", "GP7", "GP13", "GP16-GP17", "GP23-GP25", "GP29"]
-# GP2 and GP3 join on the datasheet rather than on silicon, which the first paragraph allows and
-# which is worth marking as the different kind of evidence it is: Table 615, the part's own pin
-# list, gives GPIO2 as package pin 4 and GPIO3 as pin 5, both digital IO in the IOVDD domain. A
-# board brings them out to an expansion socket, which is what demanded the rows.
+pins = ["GP0-GP29"]
 # TWO PROCESSOR SOCKETS, and the part has had them since the day this family landed -- nothing
 # above changed because nothing an IMAGE is built against differs between them. The datasheet
 # calls it a "symmetric dual-core processor complex": both cores are AHB-Lite masters on one bus
@@ -36,4 +31,4 @@ pins = ["GP0-GP3", "GP7", "GP13", "GP16-GP17", "GP23-GP25", "GP29"]
 # code, via the mailbox" -- so boot is single-core and the SECOND core is started by the program.
 cores = { core0 = ["cortex-m0plus"], core1 = ["cortex-m0plus"] }
 cores_share_memory = true
-source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- the pin list is PARTIAL rather than the package's full set. Every pin here is inside the range section 2.19.1 states outright: RP2040 has 36 GPIOs in two banks, and the QSPI bank aside, the User bank is GPIO0 to GPIO29 for the programmer to use. What SELECTS the pins listed is evidence rather than the package: a uart binding reaches some, wired control lines others, and an expansion socket the two a board brings out. The list grows with the evidence, so it states no total. One cell can be reached for different purposes by different carriers -- GP25 drives an indicator on one and a chip select on another -- which is why nothing about a pin's USE belongs on this row."
+source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash). The pin list is COMPLETE: section 2.19.1 states that RP2040 has 36 GPIOs in two banks, the QSPI bank (QSPI_SS, QSPI_SCLK and QSPI_SD0 to QSPI_SD3) typically executing code from the external flash, which leaves the User bank, GPIO0 to GPIO29, for the programmer to use -- and the part has one package. One cell can be reached for different purposes by different carriers -- GP25 drives an indicator on one and a chip select on another -- which is why nothing about a pin's USE belongs on this row."

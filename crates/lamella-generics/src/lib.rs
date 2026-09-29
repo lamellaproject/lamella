@@ -481,12 +481,33 @@ pub fn spell_sig_across(
     open: &SigType,
     arguments: &[SigType],
 ) -> Option<String> {
+    spell_sig_across_with_methods(definition_assembly, argument_assembly, open, arguments, &[])
+}
+
+/// [`spell_sig_across`] inside a generic METHOD's body as well, where the signature can also hold
+/// the method's own parameters: `!!n` is filled from `method_arguments` as `!n` is from
+/// `type_arguments`, both decoded in `argument_assembly`. `Holder<T>.Count` read in `Note<T>`'s body
+/// is `Holder`1[!!0]`, and with no method arguments it spells nothing.
+#[must_use]
+pub fn spell_sig_across_with_methods(
+    definition_assembly: &Assembly<'_>,
+    argument_assembly: &Assembly<'_>,
+    open: &SigType,
+    type_arguments: &[SigType],
+    method_arguments: &[SigType],
+) -> Option<String> {
     let definition = sig_to_type_arg(definition_assembly, open).ok()?;
-    let decoded: Vec<TypeArg> = arguments
-        .iter()
-        .map(|argument| sig_to_type_arg(argument_assembly, argument).ok())
-        .collect::<Option<_>>()?;
-    Some(definition.substitute(&decoded, &[])?.name())
+    let decode = |arguments: &[SigType]| -> Option<Vec<TypeArg>> {
+        arguments
+            .iter()
+            .map(|argument| sig_to_type_arg(argument_assembly, argument).ok())
+            .collect()
+    };
+    Some(
+        definition
+            .substitute(&decode(type_arguments)?, &decode(method_arguments)?)?
+            .name(),
+    )
 }
 
 /// Whether a signature instantiates a VALUE type -- `Holder<int>`, never `List<int>`.

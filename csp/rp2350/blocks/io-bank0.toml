@@ -3,8 +3,8 @@
 # base + GPIO0_CTRL offset + GPIO_CTRL_STRIDE * n -- the rp-family pin derivation.
 #
 # The function-select values are the SVD-enumerated mux columns this family's consumers bind
-# (grown evidence-first): F1 = SPI, F2 = UART, F3 = I2C, F5 = SIO (the GPIO driver's
-# route), NULL = no digital function (the ADC's analogue pad prep).
+# (grown evidence-first): F1 = SPI, F2 = UART, F3 = I2C, F4 = PWM, F5 = SIO (the GPIO
+# driver's route), NULL = no digital function (the ADC's analogue pad prep).
 
 [table]
 kind = "block"
@@ -23,5 +23,6 @@ GPIO_CTRL_STRIDE = 8
 FUNCSEL_SPI = 1
 FUNCSEL_UART = 2
 FUNCSEL_I2C = 3
+FUNCSEL_PWM = 4
 FUNCSEL_SIO = 5
 FUNCSEL_NULL = 0x1F

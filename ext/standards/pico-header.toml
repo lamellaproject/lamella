@@ -1,0 +1,283 @@
+# The Raspberry Pi Pico HEADER: the forty positions along the two long edges of a Pico-shaped board,
+# twenty a side on a 0.1 inch grid, as through-holes with castellations. This file is the JOIN
+# VOCABULARY between a board that carries the header and an extension that plugs onto it, the way
+# xplained-pro.toml is for that connector.
+#
+# THE POSITIONS ARE NAMED BY THE PICO'S OWN LABELS, IN LOWER CASE. `gp0` is the position the Pico
+# prints GP0, and a board states which pad of ITS chip sits behind it. On the Raspberry Pi Pico
+# boards and on Pimoroni's Pico Plus 2 boards that pad is the GPIO of the same number, so their rows
+# read as the identity -- and each is still stated per board, because the header is a shape other
+# makers copy, and nothing obliges a copy to wire position GP0 to its chip's GPIO0.
+#
+# ONE POSITION CAN REACH TWO PADS, AND THAT IS A BOARD FACT RATHER THAN ONE OF THIS FILE'S. The
+# Pimoroni Pico Plus 2 boards carry an RP2350B, whose analog inputs are GPIO40 to GPIO47, so each of
+# the three analog positions lands on its low-numbered GPIO directly and on an ADC pad through 1k.
+# The position is the same position; which pad digitizes it is stated by the board, next to its
+# converter.
+#
+# ONLY THE TWENTY-SIX GPIO POSITIONS ARE ROUTABLE. RUN is the chip's enable input and ADC_VREF its
+# converter's supply and reference; neither is a GPIO, and no binding reaches either. The power and
+# ground positions reach no pad at all. They are all stated so the table is the connector's rather
+# than a subset chosen by what happens to be bindable.
+
+[table]
+kind = "header-standard"
+standard = "pico-header"
+sources = [
+    "Raspberry Pi Pico 2 Datasheet (build d4e0f1799616), section 3.1 and Figure 2 (The pinout of the Raspberry Pi Pico 2 board): every position's label against its pin number -- GP0 and GP1 on 1 and 2, GND on 3, GP2 to GP5 on 4 to 7, GND on 8, GP6 to GP9 on 9 to 12, GND on 13, GP10 to GP13 on 14 to 17, GND on 18, GP14 and GP15 on 19 and 20, GP16 and GP17 on 21 and 22, GND on 23, GP18 to GP21 on 24 to 27, GND on 28, GP22 on 29, RUN on 30, GP26 and GP27 on 31 and 32, AGND on 33, GP28 on 34, ADC_VREF on 35, 3V3(OUT) on 36, 3V3_EN on 37, GND on 38, VSYS on 39 and VBUS on 40.",
+    "The same section's list of the seven positions that are neither GPIO nor ground -- PIN40 VBUS, PIN39 VSYS, PIN37 3V3_EN, PIN36 3V3, PIN35 ADC_VREF, PIN33 AGND and PIN30 RUN -- and what each is for, which the descriptions below restate.",
+    "Raspberry Pi Pico Datasheet (build d4e0f1799616) section 2.1, Raspberry Pi Pico W Datasheet (build eec2b0c) section 2.1 and Raspberry Pi Pico 2 W Datasheet (build 63766c4) section 2.1: the same seven positions at the same numbers, and a Figure 2 pinout carrying the same forty labels in the same places. Four boards on two chips share it, which is what makes it a standard rather than one board's connector.",
+    "Pimoroni Pico Plus 2 and Pico Plus 2 W pinout diagrams: the same forty positions in the same order, labeled by GPIO number alone -- 0 to 22, then 26 / A0, 27 / A1 and 28 / A2 -- with 3V3 EN and ADC VREF for 3V3_EN and ADC_VREF, and with GND on the position the Pico labels AGND.",
+    "Raspberry Pi Pico 2 Datasheet Figure 1 (both sides of the board): the underside silkscreen spells the three analog positions GP26_A0, GP27_A1 and GP28_A2, which is the spelling each row's `aka` records.",
+]
+notes = [
+    "A power budget is a real constraint this connector carries and no row here expresses it: the Pico 2 datasheet recommends keeping the load on 3V3 below 300 mA, and an extension that powers itself from 3V3 is inside that budget while one that takes VSYS or VBUS is not. Nothing joins an extension's draw to a board's regulator yet, and a file that implied it did would be worse than one that does not.",
+    "The eight ground positions are named by pin number, because a row is keyed by signal and two rows may not share one. Position 33 keeps the Pico's own name, AGND: it is the ground reference the analog positions are routed against, and the Pico datasheet says it may be tied to digital ground where the converter is not used, which is what a board that labels it GND has done.",
+]
+
+[[pins]]
+number = 1
+signal = "gp0"
+routable = true
+description = "General-purpose I/O, labeled GP0."
+
+[[pins]]
+number = 2
+signal = "gp1"
+routable = true
+description = "General-purpose I/O, labeled GP1."
+
+[[pins]]
+number = 3
+signal = "gnd3"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 4
+signal = "gp2"
+routable = true
+description = "General-purpose I/O, labeled GP2."
+
+[[pins]]
+number = 5
+signal = "gp3"
+routable = true
+description = "General-purpose I/O, labeled GP3."
+
+[[pins]]
+number = 6
+signal = "gp4"
+routable = true
+description = "General-purpose I/O, labeled GP4."
+
+[[pins]]
+number = 7
+signal = "gp5"
+routable = true
+description = "General-purpose I/O, labeled GP5."
+
+[[pins]]
+number = 8
+signal = "gnd8"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 9
+signal = "gp6"
+routable = true
+description = "General-purpose I/O, labeled GP6."
+
+[[pins]]
+number = 10
+signal = "gp7"
+routable = true
+description = "General-purpose I/O, labeled GP7."
+
+[[pins]]
+number = 11
+signal = "gp8"
+routable = true
+description = "General-purpose I/O, labeled GP8."
+
+[[pins]]
+number = 12
+signal = "gp9"
+routable = true
+description = "General-purpose I/O, labeled GP9."
+
+[[pins]]
+number = 13
+signal = "gnd13"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 14
+signal = "gp10"
+routable = true
+description = "General-purpose I/O, labeled GP10."
+
+[[pins]]
+number = 15
+signal = "gp11"
+routable = true
+description = "General-purpose I/O, labeled GP11."
+
+[[pins]]
+number = 16
+signal = "gp12"
+routable = true
+description = "General-purpose I/O, labeled GP12."
+
+[[pins]]
+number = 17
+signal = "gp13"
+routable = true
+description = "General-purpose I/O, labeled GP13."
+
+[[pins]]
+number = 18
+signal = "gnd18"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 19
+signal = "gp14"
+routable = true
+description = "General-purpose I/O, labeled GP14."
+
+[[pins]]
+number = 20
+signal = "gp15"
+routable = true
+description = "General-purpose I/O, labeled GP15."
+
+[[pins]]
+number = 21
+signal = "gp16"
+routable = true
+description = "General-purpose I/O, labeled GP16."
+
+[[pins]]
+number = 22
+signal = "gp17"
+routable = true
+description = "General-purpose I/O, labeled GP17."
+
+[[pins]]
+number = 23
+signal = "gnd23"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 24
+signal = "gp18"
+routable = true
+description = "General-purpose I/O, labeled GP18."
+
+[[pins]]
+number = 25
+signal = "gp19"
+routable = true
+description = "General-purpose I/O, labeled GP19."
+
+[[pins]]
+number = 26
+signal = "gp20"
+routable = true
+description = "General-purpose I/O, labeled GP20."
+
+[[pins]]
+number = 27
+signal = "gp21"
+routable = true
+description = "General-purpose I/O, labeled GP21."
+
+[[pins]]
+number = 28
+signal = "gnd28"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 29
+signal = "gp22"
+routable = true
+description = "General-purpose I/O, labeled GP22."
+
+[[pins]]
+number = 30
+signal = "run"
+routable = false
+description = "The chip's enable input, pulled up on the chip: shorting it low resets the chip. It is not a GPIO, and no binding reaches it."
+
+# Positions 31, 32 and 34 are the header's three analog inputs. Which converter channel each reaches,
+# and through which pad, is the board's fact -- see this file's header.
+
+[[pins]]
+number = 31
+signal = "gp26"
+aka = "gp26_a0"
+routable = true
+description = "General-purpose I/O, labeled GP26, and the header's first analog input."
+
+[[pins]]
+number = 32
+signal = "gp27"
+aka = "gp27_a1"
+routable = true
+description = "General-purpose I/O, labeled GP27, and the header's second analog input."
+
+[[pins]]
+number = 33
+signal = "agnd"
+routable = false
+description = "Analog ground: the ground reference the analog positions are routed against, and a ground position like any other where the converter is not used."
+
+[[pins]]
+number = 34
+signal = "gp28"
+aka = "gp28_a2"
+routable = true
+description = "General-purpose I/O, labeled GP28, and the header's third analog input."
+
+[[pins]]
+number = 35
+signal = "adc_vref"
+routable = false
+description = "The analog-to-digital converter's supply and reference voltage, filtered from the board's 3.3 V supply; an external reference may be fitted here for better converter performance."
+
+[[pins]]
+number = 36
+signal = "3v3"
+aka = "3v3(out)"
+routable = false
+description = "The board's regulated 3.3 V supply, which also powers the chip and its I/O. It can power external circuitry."
+
+[[pins]]
+number = 37
+signal = "3v3_en"
+routable = false
+description = "The enable input of the board's 3.3 V regulator, pulled high: shorting it low turns the 3.3 V supply off, and the chip with it."
+
+[[pins]]
+number = 38
+signal = "gnd38"
+routable = false
+description = "Ground."
+
+[[pins]]
+number = 39
+signal = "vsys"
+routable = false
+description = "The main system input voltage, which the board's regulator makes 3.3 V from."
+
+[[pins]]
+number = 40
+signal = "vbus"
+routable = false
+description = "The board's USB input voltage, nominally 5 V, or 0 V when no powered USB is connected."

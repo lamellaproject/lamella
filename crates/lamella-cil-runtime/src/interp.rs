@@ -164,13 +164,21 @@ pub struct Vm {
     /// rather than freezing at the set instant. `None` until set -> the epoch (a defined value,
     /// not garbage), so an unconfigured build is unchanged.
     wall_anchor: Option<(u64, i64)>,
-    /// The embedder's observer for wall-clock SETS ([`Vm::set_wall_clock_sink`]): called with the
-    /// new anchor ticks on every [`Vm::set_now_ticks`] -- an RTC load, a managed `Seed`, a
-    /// completed SNTP/NTS sync -- so a device embedder can MIRROR the one managed wall clock into
-    /// an engine that reads time through its own registered source (the device TLS engine's
-    /// `set_time_source`). A plain fn pointer, like the clock seam, so a bare-metal boot path can
-    /// register it. `None` = no observer (the default; nothing extra happens on a set).
-    wall_sink: Option<fn(i64)>,
+    /// The embedder's observer for wall-clock SETS ([`Vm::set_wall_clock_sink`]): called on every
+    /// set of the managed wall clock -- through [`set_wall_clock`], an RTC load, a managed `Seed`,
+    /// a completed SNTP or NTS sync -- with `Some(ticks)`, or with `None` when the clock returns to
+    /// never-set. So a device embedder can MIRROR the one managed wall clock into an engine that
+    /// reads time through its own registered source (the device TLS engine's `set_time_source`). A
+    /// plain fn pointer, like the clock seam, so a bare-metal boot path can register it. `None` = no
+    /// observer (the default; nothing extra happens on a set).
+    wall_sink: Option<fn(Option<i64>)>,
+    /// The last state the sink was told, anchored like `wall_anchor`:
+    /// `(monotonic_ms_when_told, ticks)`, or `None` for never-set. It is what a sink registered
+    /// AFTER a set is handed, advanced by the time since, so wiring order never loses a set.
+    wall_told: Option<(u64, i64)>,
+    /// How many times the sink has been told anything. [`set_wall_clock`] compares it across the
+    /// managed setter to tell a corlib that notifies from one that predates the notification.
+    wall_tellings: u32,
     /// The embedder's pin-change event queue ([`Vm::set_pin_event_source`]), drained between
     /// scheduler quanta. `None` = no queue, and the drain is then not attempted at all -- which is
     /// every host build and every board that arms no interrupt.
@@ -672,6 +680,12 @@ impl Vm {
     /// other threads run meanwhile, and the scheduler idle-sleeps the OS thread to the nearest deadline.
     pub fn request_sleep(&mut self, millis: u64) {
         self.thread_op = Some(ThreadOp::SleepFor(millis));
+    }
+
+    /// Requests that the scheduler park the running thread for good (`Thread.Sleep(Timeout.Infinite)`):
+    /// nothing wakes it, and the program keeps running its other threads, timers and pin events.
+    pub fn request_sleep_forever(&mut self) {
+        self.thread_op = Some(ThreadOp::SleepForever);
     }
 
     /// Sets the host clock seam: a monotonic-millisecond reader and an OS-thread sleep, used by the
@@ -1385,31 +1399,40 @@ impl Vm {
     /// own corlib.
     pub fn set_now_ticks(&mut self, ticks: i64) {
         self.wall_anchor = Some((self.now_millis().unwrap_or(0), ticks));
+        self.notify_wall_clock_sink(Some(ticks));
+    }
+
+    /// Tells the embedder's wall-clock sink what the wall clock was just set to: `Some(ticks)`, or
+    /// `None` when it returned to never-set.
+    ///
+    /// The managed clock's `WallClockChanged` seam calls this on every set, whoever made it, and
+    /// [`set_wall_clock`] calls it on behalf of a corlib that predates that seam. The state is
+    /// recorded even when no sink is registered, so one registered later is handed it.
+    pub fn notify_wall_clock_sink(&mut self, state: Option<i64>) {
+        self.wall_told = state.map(|ticks| (self.now_millis().unwrap_or(0), ticks));
+        self.wall_tellings = self.wall_tellings.wrapping_add(1);
         if let Some(sink) = self.wall_sink {
-            sink(ticks);
+            sink(state);
         }
     }
 
-    /// Registers the embedder's wall-clock sink: `sink` is called with the new anchor ticks on
-    /// every [`Vm::set_now_ticks`], and IMMEDIATELY with the current wall reading when the clock
+    /// Registers the embedder's wall-clock sink: `sink` is told every set of the wall clock
+    /// ([`Vm::notify_wall_clock_sink`]), and IMMEDIATELY the current wall reading when the clock
     /// is already set at registration -- so wiring order (seed the clock, then install the TLS
     /// backend, or the reverse) never loses a set. The device TLS bridge is the customer: the
     /// sink mirrors the managed clock into the statics the engine's time source reads, which is
     /// how "point the TLS time source at the clock `SystemClock` manages" is satisfied on a
     /// board whose only wall clock IS the managed one (adaptive TLS then full-validates
-    /// certificate dates from the first session after a sync).
-    /// Fires the embedder's wall-clock sink with `ticks`, if one is registered. Used by
-    /// [`set_wall_clock`], which writes the managed clock and then tells the mirror.
-    pub fn notify_wall_clock_sink(&mut self, ticks: i64) {
-        if let Some(sink) = self.wall_sink {
-            sink(ticks);
-        }
-    }
-
-    pub fn set_wall_clock_sink(&mut self, sink: fn(i64)) {
+    /// certificate dates from the first session after a sync, and returns to its clockless
+    /// bootstrap when the clock is told `None`).
+    pub fn set_wall_clock_sink(&mut self, sink: fn(Option<i64>)) {
         self.wall_sink = Some(sink);
-        if self.wall_anchor.is_some() {
-            sink(self.now_ticks());
+        if let Some((told_at, ticks)) = self.wall_told {
+            let elapsed_millis = self.now_millis().unwrap_or(told_at).saturating_sub(told_at);
+            let elapsed_ticks = i64::try_from(elapsed_millis)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(10_000);
+            sink(Some(ticks.saturating_add(elapsed_ticks)));
         }
     }
 
@@ -2108,6 +2131,12 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
 /// 256-1024 range; 256 keeps switch latency well under a quantum.
 const TIME_SLICE_QUANTUM: u32 = 256;
 
+/// How long the scheduler idles between looks for pin events and carrier traffic when nothing can be
+/// waited on but a thread sleeps forever (`Thread.Sleep(Timeout.Infinite)`). 16 ms is the slice every
+/// board's own sleep already takes, so a program parked for good answers at the cadence a program in
+/// a long timed sleep does.
+const FOREVER_IDLE_SLICE_MS: u64 = 16;
+
 /// A scheduler request an intrinsic raises; the scheduler takes it once the running thread pauses.
 #[derive(Debug)]
 enum ThreadOp {
@@ -2134,6 +2163,8 @@ enum ThreadOp {
     WakeThread { id: u32 },
     /// Block the running thread until `now` + this many milliseconds (`Thread.Sleep`).
     SleepFor(u64),
+    /// Park the running thread for good (`Thread.Sleep(Timeout.Infinite)`).
+    SleepForever,
     /// Block the running thread on socket I/O: register `socket` for `interest` with the reactor and
     /// park until its `poll` reports the socket ready (a socket op that would block). A receive
     /// timeout, when installed for the socket, bounds the park with a wake `deadline` (monotonic ms).
@@ -2243,6 +2274,10 @@ enum ThreadState {
     /// Sleeping until this monotonic-millisecond deadline (`Thread.Sleep`); woken by the scheduler's
     /// `idle_wait` once the deadline passes.
     Sleeping(u64),
+    /// Asleep for good (`Thread.Sleep(Timeout.Infinite)`). It has no deadline, so the reactor never
+    /// sees it and nothing wakes it; while one exists the scheduler never reads "nothing left to wait
+    /// for" as the end of the program, and idles instead, still delivering pin events.
+    SleepingForever,
     /// Blocked on socket I/O -- parked until this socket handle becomes ready, or (when a receive
     /// timeout bounds the park) until the deadline passes. Set by a socket op that would block;
     /// woken in `idle_wait` when the reactor's poll reports the socket ready or the deadline hits
@@ -2379,10 +2414,13 @@ pub fn set_wall_clock(module: &Module, vm: &mut Vm, ticks: i64) -> bool {
     let Some(setter) = module.wall_clock_setter() else {
         return false;
     };
+    let tellings = vm.wall_tellings;
     if run(module, vm, setter, alloc::vec![Value::Int64(ticks)]).is_err() {
         return false;
     }
-    vm.notify_wall_clock_sink(ticks);
+    if vm.wall_tellings == tellings {
+        vm.notify_wall_clock_sink(Some(ticks));
+    }
     true
 }
 
@@ -2561,6 +2599,7 @@ pub fn take_pending_op(vm: &mut Vm) -> PendingOp {
             Some(now) => PendingOp::SleepUntil(now.saturating_add(millis)),
             None => PendingOp::Yield,
         },
+        ThreadOp::SleepForever => PendingOp::SleepUntil(u64::MAX),
         ThreadOp::Yield => PendingOp::Yield,
         ThreadOp::WakeThread { .. } => PendingOp::Yield,
         ThreadOp::Spawn { .. } => PendingOp::NeedsScheduler("Thread.Start"),
@@ -2634,6 +2673,10 @@ pub fn run_interruptible(
                 }
                 continue;
             }
+            if threads.iter().any(|slot| slot.state == ThreadState::SleepingForever) {
+                vm.sleep_millis(FOREVER_IDLE_SLICE_MS);
+                continue;
+            }
             break;
         };
         cursor = index;
@@ -2701,6 +2744,10 @@ pub fn run_interruptible(
                 Some(ThreadOp::SleepFor(millis)) => {
                     let deadline = vm.now_millis().map_or(0, |now| now.saturating_add(millis));
                     threads[index].state = ThreadState::Sleeping(deadline);
+                    cursor = index + 1;
+                }
+                Some(ThreadOp::SleepForever) => {
+                    threads[index].state = ThreadState::SleepingForever;
                     cursor = index + 1;
                 }
                 Some(ThreadOp::BlockOnIo { socket, interest, deadline }) => {
@@ -5456,13 +5503,7 @@ fn step(
                     }
                 }
             }
-            if module.method_declares_value_type(method) {
-                if let Some(&Value::Object(reference)) = args.first() {
-                    if vm.heap().boxed_type_token(reference).is_some() {
-                        args[0] = Value::ByRef(Location::Boxed { object: reference });
-                    }
-                }
-            }
+            value_type_receiver(module, vm, method, &mut args);
             return Ok(Flow::Call { method, args });
         }
 
@@ -7561,7 +7602,7 @@ fn function_pointer(value: Value) -> Result<MethodId, Trap> {
 ///
 /// `None` now means only that no loader recorded a type for this shape, which leaves the caller's
 /// static target in place rather than dispatching against something invented.
-fn receiver_type_id(module: &Module, vm: &Vm, this: ObjectRef) -> Option<u32> {
+pub(crate) fn receiver_type_id(module: &Module, vm: &Vm, this: ObjectRef) -> Option<u32> {
     vm.heap()
         .type_of(this)
         .or_else(|| vm.heap().delegate_type_id(this))
@@ -7583,7 +7624,7 @@ fn receiver_type_id(module: &Module, vm: &Vm, this: ObjectRef) -> Option<u32> {
 /// class virtual via the runtime type's vtable slot, then a target PROVEN non-virtual (which
 /// binds statically, III.4.2), else an interface/abstract method by signature key, else the
 /// static target (a string/array `this`, or a non-virtual target the maps could not prove).
-fn resolve_callvirt(
+pub(crate) fn resolve_callvirt(
     module: &Module,
     static_method: Option<MethodId>,
     sig_key: Option<u32>,
@@ -7630,6 +7671,24 @@ fn resolve_callvirt(
         }
     }
     static_method
+}
+
+/// Gives a value type's OWN instance method, dispatched on a boxed receiver, the `this` it takes:
+/// a managed pointer INTO the box (ECMA-335 III.4.2 -- the unbox the JIT inserts for a box
+/// dispatched to its value type's method), so the body reads the boxed value through `this`
+/// (`ldarg.0; ldind.*` / `ldfld`). Only a value-type target on an actual box changes;
+/// reference-type dispatch keeps its object `this`.
+///
+/// Both dispatchers apply it: `callvirt`, and `MethodInfo.Invoke`, which dispatches the way a
+/// `callvirt` naming its method would.
+pub(crate) fn value_type_receiver(module: &Module, vm: &Vm, method: MethodId, args: &mut [Value]) {
+    if module.method_declares_value_type(method) {
+        if let Some(&Value::Object(reference)) = args.first() {
+            if vm.heap().boxed_type_token(reference).is_some() {
+                args[0] = Value::ByRef(Location::Boxed { object: reference });
+            }
+        }
+    }
 }
 
 /// The zero of the type `type_id` names, whose asm-folded handle is `handle`: what `initobj` writes,
@@ -8515,8 +8574,8 @@ mod tests {
     fn wall_clock_sink_observes_every_set_and_a_late_registration() {
         use core::sync::atomic::{AtomicI64, Ordering};
         static SEEN: AtomicI64 = AtomicI64::new(0);
-        fn sink(ticks: i64) {
-            SEEN.store(ticks, Ordering::Relaxed);
+        fn sink(state: Option<i64>) {
+            SEEN.store(state.expect("only sets happen here"), Ordering::Relaxed);
         }
 
         let mut vm = Vm::default();

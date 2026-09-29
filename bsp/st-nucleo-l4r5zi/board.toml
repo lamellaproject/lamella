@@ -1,0 +1,90 @@
+# BOARD binding: the ST NUCLEO-L4R5ZI. Chip truth lives in csp/stm32l4r5/.
+#
+# ONE REFERENCE BOARD, SIX PRODUCTS. UM2179 covers MB1312 under six order codes -- NUCLEO-L496ZG,
+# -L496ZG-P, -L4A6ZG, -L4P5ZG, -L4R5ZI and -L4R5ZI-P -- with different parts on the same copper, and
+# its schematic is drawn for all of them. So the board id selects the part row here, and every fact
+# below was checked against this product's own column of the manual. The -P board is a different
+# product: its part has the external-SMPS pinout, and this file does not describe it.
+#
+# THE VIRTUAL COM PORT IS LPUART1 ON PG7 AND PG8, AND TWO PROPERTIES OF THAT PAIR DECIDE HOW IT IS
+# DRIVEN. LPUART1's divisor is 256 x fck / baud (RM0432 section 51.4.7), where a USART's is
+# fck / baud, and the manual forbids any divisor below 0x300. And both pads are on the VDDIO2 rail,
+# which is isolated at reset until IOSV in PWR_CR2 is set. So the order is PWREN, then IOSV, then
+# the pins, then LPUART1.
+#
+
+[table]
+kind = "board"
+board = "st-nucleo-l4r5zi"
+vendor = "st"
+family = "stm32l4r5"
+part = "stm32l4r5zit6"
+product_model = 63          # lamella_wire::product_model::NUCLEO_L4R5ZI
+sources = [
+    "STM32 Nucleo-144 boards (MB1312) user manual UM2179 Rev 10 (October 2025): the introduction and ordering table name NUCLEO-L4R5ZI with target STM32L4R5ZIT6U; section 7.6 for the user LEDs, 7.7 for the push-buttons, 7.11 and table 8 for LPUART1, 7.3 and 7.16 for the SWD signals and the ST morpho connector, and table 10 for the solder bridges",
+    "MB1312 schematic revision A-03 (07-NOV-19), project NUCLEO-L4XXZX. Sheet 3: PB7 through R30 680R into LD2's anode with its cathode at ground; PB14 through SB132 and R29 1K into LD3; PC13 through SB197 and R43 330R to the B1 USER switch, whose far side is VDD_MCU, with R42 220K to ground. Sheet 4 (STM32_microcontroller_power): the VDDIO_2 pins 95 and 131 on the VDD net, with the VDD_1 to VDD_10 pins on VDD_MCU. Sheet 5: PC7 through SB124 (closed), or PA5 through SB123 (open), into R37 10K with R36 200K to ground, feeding the non-inverting input of U8, a TSV631AILT off +3V3_PER wired as a unity-gain follower, whose output drives R31 510R into LD1's anode with the cathode at ground; and the morpho header CN11, with PA13 on pin 13, NRST on pin 14 and PA14 on pin 15",
+]
+notes = [
+    "EVERY FACT BELOW IS GATED BY A SOLDER BRIDGE, and UM2179 gives the default for each: SB124 ON and SB123 OFF put LD1 on PC7 rather than on PA5, SB197 ON and SB178 OFF put B1 on PC13 rather than on PA0, and SB130 and SB131 ON connect LPUART1 to the ST-LINK's virtual COM port. The file states the defaults; a unit reworked away from them is not what it describes.",
+    "LD1's OPTIONAL POSITION IS THE HEADER's SPI CLOCK. PA5 is ST Zio D13, which UM2179's connector table gives as SPI_A_SCK on SPI1. Moving LD1 there puts the user LED and SPI1's clock on one pad; this board ships with LD1 on PC7, clear of it.",
+    "THE THREE USER LEDS NEED VDD_MCU AT 3.3 V, WHICH IS THE DEFAULT. VDD_MCU can be set to 1.8 V by solder bridge (SB122 open, SB121 and SB127 closed), and UM2179's notes say LD1 then cannot be lit and LD2 and LD3 cannot work.",
+    "VDDIO2 IS POWERED WHENEVER THE BOARD IS. The schematic ties both VDDIO_2 pins to the board's VDD net, so PG2 to PG15 need only IOSV set to be usable; the voltage-monitor step RM0432 section 5.2.3 gives for a VDDIO2 independent of VDD has nothing to wait for here.",
+    "NO HSE CRYSTAL IS FITTED. UM2179 section 7.9.1 lists the X3 position as not provided and gives 'HSE not used' as the default, with PH0 and PH1 free as GPIOs; the ST-LINK's 8 MHz MCO can be routed to PH0 by solder bridge instead. The 32.768 kHz LSE crystal X2 IS fitted by default (section 7.10), so PC14 and PC15 are the crystal and not free pins.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge's VCP, on LPUART1 PG7/PG8.
+baud = 115200
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# ALL THREE LEDS ARE ACTIVE HIGH. UM2179 says so for the three at once, and the schematic shows two
+# different reasons for it. LD2 and LD3 are driven from their pins through a series resistor into
+# the LED's ANODE, with the cathode at ground. LD1 is driven through a unity-gain follower (U8),
+# which does not invert, so HIGH lights it too -- while PC7 itself sources only the follower's
+# input current.
+#
+# THE USER BUTTON IS ACTIVE HIGH AS WELL. R42, a 220K, holds PC13 DOWN, and the switch ties it UP
+# to VDD_MCU -- so the pin reads LOW at rest and HIGH while pressed. A driver that enables a
+# pull-up and waits for a low edge waits forever. The pull-down is on the board, so the pin needs
+# no internal one.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PC7"
+active = "high"
+source = "UM2179 Rev 10 section 7.6: user LD1, a green LED, is connected to the STM32 I/O PC7 with SB124 ON and SB123 OFF, or to PA5 with SB123 ON and SB124 OFF, corresponding to ST Zio D13; this row states the default. MB1312 rev A-03 sheet 5: PC7 through SB124 and R37 10K, with R36 200K to ground, into U8's non-inverting input; U8's output drives R31 510R into LD1's anode with the cathode at ground -- a unity-gain follower, so HIGH lights it."
+
+[[devices]]
+name = "led1"
+kind = "gpio-out"
+pin = "PB7"
+active = "high"
+source = "UM2179 Rev 10 section 7.6: user LD2, a blue LED, is connected to PB7, and the user LEDs are on when the I/O is HIGH. MB1312 rev A-03 sheet 3: PB7 through R30 680R into LD2's anode, cathode at ground -- so HIGH lights it."
+
+[[devices]]
+name = "led2"
+kind = "gpio-out"
+pin = "PB14"
+active = "high"
+source = "UM2179 Rev 10 section 7.6: user LD3, a red LED, is connected to PB14, and the user LEDs are on when the I/O is HIGH. MB1312 rev A-03 sheet 3: PB14 through SB132 (closed) and R29 1K into LD3's anode, cathode at ground -- so HIGH lights it."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PC13"
+active = "high"
+source = "UM2179 Rev 10 section 7.7: B1 USER is connected to the I/O PC13 by default, with SB197 ON and SB178 OFF; the alternative puts it on PA0 for wakeup. MB1312 rev A-03 sheet 3: PC13 through SB197 (closed) and R43 330R to the switch, whose far side is VDD_MCU, with R42 220K to ground -- so the pin rests LOW and reads HIGH while the button is held."
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "no"
+onboard = "st-link"
+recovery = "probe"
+source = "UM2179 Rev 10 section 7.3: the target part's SWD signals are available on the ST morpho connector, SWCLK on CN11 pin 15 and SWDIO on CN11 pin 13, with NRST on CN11 pin 14, and the MB1312 schematic's CN11 carries PA13, NRST and PA14 on those pins. Section 7.16 states that the ST morpho connector consists of male pin header footprints CN11 and CN12, not soldered by default, so the positions are documented and empty: an owner fits a header before a cable can land on them. Section 7.4: the embedded ST-LINK/V2-1 supports only SWD for STM32 devices. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."

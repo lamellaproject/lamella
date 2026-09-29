@@ -4,6 +4,7 @@ using System.Device.Adc;
 using System.Device.Analog;
 using System.Device.Gpio;
 using System.Device.I2c;
+using System.Device.Pwm;
 using System.Device.Spi;
 using Lamella.Generated;
 using Lamella.Hardware;
@@ -32,15 +33,24 @@ namespace Lamella.Boards.RaspberryPi
         /// instantiable and routinely constructed as a temporary. The language runs a type
         /// initializer once per program, so idempotence costs nothing and the table keeps its
         /// throw as a genuine-error detector.
-        /// The bound values are FACTORIES, not drivers: `Rp2350AdcDriver`'s constructor brings the
-        /// converter up and assumes PLL_USB is already running, so constructing every driver here
-        /// would spin up a temperature sensor for a program that only blinks an LED.</remarks>
+        /// The bound values are FACTORIES, not drivers, so a program that never touches a bus never
+        /// constructs its driver. A driver's constructor touches no hardware either:
+        /// `Rp2350AdcDriver` brings the converter up at the first channel opened or read.</remarks>
         static Pico2()
         {
             Buses.BindSpi(0, new SpiDriverFactory(MakeSpi0));
             Buses.BindI2c(0, new I2cDriverFactory(MakeI2c0));
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
             AdcControllers.Bind(new AdcDriverFactory(MakeAdc));
+#if LAMELLA_SURFACE_FLOAT
+            Buses.BindPwm(1, new PwmChannelFactory(OpenPwm1));
+            Buses.BindPwm(2, new PwmChannelFactory(OpenPwm2));
+            Buses.BindPwm(3, new PwmChannelFactory(OpenPwm3));
+            Buses.BindPwm(4, new PwmChannelFactory(OpenPwm4));
+            Buses.BindPwm(5, new PwmChannelFactory(OpenPwm5));
+            Buses.BindPwm(6, new PwmChannelFactory(OpenPwm6));
+            Buses.BindPwm(7, new PwmChannelFactory(OpenPwm7));
+#endif
         }
 
         private static SpiDriver MakeSpi0() { return new Rp2350SpiDriver(SpiBinding(0)); }
@@ -81,16 +91,23 @@ namespace Lamella.Boards.RaspberryPi
                 if ((Mmio.Read32(xoscStatus) & Rp2350XoscLayout.STATUS_STABLE) != 0u) break;
             }
 
-            Mmio.Write32(clkRefCtrl, Rp2350ClocksLayout.CLK_REF_SRC_XOSC);
+            Mmio.Write32(clkRefCtrl,
+                (Mmio.Read32(clkRefCtrl) & ~Rp2350ClocksLayout.CLK_REF_CTRL_SRC) | Rp2350ClocksLayout.CLK_REF_SRC_XOSC);
             for (int spin = 0; spin < 100000; spin++)
             {
                 if ((Mmio.Read32(clkRefSelected) & Rp2350ClocksLayout.CLK_REF_XOSC_SELECTED) != 0u) break;
             }
-            Mmio.Write32(clkSysCtrl, 0);
+            Mmio.Write32(clkSysCtrl, Mmio.Read32(clkSysCtrl) & ~Rp2350ClocksLayout.CLK_SYS_CTRL_SRC);
+            bool parked = false;
             for (int spin = 0; spin < 100000; spin++)
             {
-                if ((Mmio.Read32(clkSysSelected) & Rp2350ClocksLayout.CLK_SYS_REF_SELECTED) != 0u) break;
+                if ((Mmio.Read32(clkSysSelected) & Rp2350ClocksLayout.CLK_SYS_REF_SELECTED) != 0u)
+                {
+                    parked = true;
+                    break;
+                }
             }
+            if (!parked) return;
 
             InitPll(pllSysCs,
                 Rp2350Instances.PLL_SYS_BASE + Rp2350PllLayout.FBDIV_INT_OFF,
@@ -146,14 +163,14 @@ namespace Lamella.Boards.RaspberryPi
             }
         }
 
-        public static readonly int TemperatureSensorChannel = Rp2350AdcLayout.Channel_TemperatureSensor;
-        public static readonly int AdcChannelGp26 = Rp2350AdcLayout.Channel_GPIO26;
-        public static readonly int AdcChannelGp27 = Rp2350AdcLayout.Channel_GPIO27;
-        public static readonly int AdcChannelGp28 = Rp2350AdcLayout.Channel_GPIO28;
-        public static readonly int AdcChannelGp29 = Rp2350AdcLayout.Channel_GPIO29;
+        public static readonly int TemperatureSensorChannel = (int)RpiPico2Bindings.ADC_TEMPERATURE_CHANNEL;
+        public static readonly int AdcChannelGp26 = (int)RpiPico2Bindings.ADC_GPIO26_CHANNEL;
+        public static readonly int AdcChannelGp27 = (int)RpiPico2Bindings.ADC_GPIO27_CHANNEL;
+        public static readonly int AdcChannelGp28 = (int)RpiPico2Bindings.ADC_GPIO28_CHANNEL;
+        public static readonly int AdcChannelGp29 = (int)RpiPico2Bindings.ADC_GPIO29_CHANNEL;
         public static readonly int AdcReferenceMicrovolts = (int)RpiPico2Bindings.ADC_REFERENCE_UV;
 
-        /// <summary>The `adc` binding descriptor, lifted from the generated consts.</summary>
+        /// <summary>The `adc` binding descriptor, built from the generated constants.</summary>
         public Rp2350AdcBinding CreateAdcBinding() { return AdcBinding(); }
 
         private static Rp2350AdcBinding AdcBinding()
@@ -161,7 +178,16 @@ namespace Lamella.Boards.RaspberryPi
             return new Rp2350AdcBinding(
                 RpiPico2Bindings.ADC_BASE,
                 RpiPico2Bindings.ADC_RESET_MASK,
-                RpiPico2Bindings.ADC_REFERENCE_UV);
+                RpiPico2Bindings.ADC_REFERENCE_UV,
+                (int)RpiPico2Bindings.ADC_CHANNEL_COUNT,
+                (int)RpiPico2Bindings.ADC_TEMPERATURE_CHANNEL,
+                new int[] {
+                    (int)RpiPico2Bindings.ADC_CHANNEL0_PIN, (int)RpiPico2Bindings.ADC_CHANNEL1_PIN,
+                    (int)RpiPico2Bindings.ADC_CHANNEL2_PIN, (int)RpiPico2Bindings.ADC_CHANNEL3_PIN },
+                RpiPico2Bindings.ADC_RESERVED_CHANNELS,
+                new string[4],
+                new uint[4],
+                new uint[4]);
         }
 
         /// <summary>An ADC controller over the RP2350 SAR converter (the on-chip temperature
@@ -309,5 +335,74 @@ namespace Lamella.Boards.RaspberryPi
         {
             return raw * RpiPico2Bindings.ADC_REFERENCE_UV / fullScaleCounts;
         }
+
+#if LAMELLA_SURFACE_FLOAT
+        private static readonly Rp2350PwmSlice[] _pwmSlices = new Rp2350PwmSlice[8];
+
+        private static PwmChannel OpenPwm(int slice, int channel, int frequency, double dutyCyclePercentage)
+        {
+            if ((object)_pwmSlices[slice] == null)
+            {
+                _pwmSlices[slice] = new Rp2350PwmSlice(PwmBinding(slice));
+            }
+            return _pwmSlices[slice].Open(channel, frequency, dutyCyclePercentage);
+        }
+
+        private static PwmChannel OpenPwm1(int channel, int frequency, double duty) { return OpenPwm(1, channel, frequency, duty); }
+        private static PwmChannel OpenPwm2(int channel, int frequency, double duty) { return OpenPwm(2, channel, frequency, duty); }
+        private static PwmChannel OpenPwm3(int channel, int frequency, double duty) { return OpenPwm(3, channel, frequency, duty); }
+        private static PwmChannel OpenPwm4(int channel, int frequency, double duty) { return OpenPwm(4, channel, frequency, duty); }
+        private static PwmChannel OpenPwm5(int channel, int frequency, double duty) { return OpenPwm(5, channel, frequency, duty); }
+        private static PwmChannel OpenPwm6(int channel, int frequency, double duty) { return OpenPwm(6, channel, frequency, duty); }
+        private static PwmChannel OpenPwm7(int channel, int frequency, double duty) { return OpenPwm(7, channel, frequency, duty); }
+
+        /// <summary>The binding descriptor of the board's pwm binding for <paramref name="slice"/>, from
+        /// 1 to 7. The first slice is not bound, and any slice outside 1 to 7 refuses loudly.</summary>
+        public Rp2350PwmBinding CreatePwmBinding(int slice) { return PwmBinding(slice); }
+
+        private static Rp2350PwmBinding PwmBinding(int slice)
+        {
+            switch (slice)
+            {
+                case 1:
+                    return new Rp2350PwmBinding(RpiPico2Bindings.PWM1_BASE, RpiPico2Bindings.PWM1_RESET_MASK, RpiPico2Bindings.PWM1_SLICE, RpiPico2Bindings.PWM1_FUNCSEL,
+                        RpiPico2Bindings.PWM1_CLK_SYS_HZ, new Rp2350PwmOutput[] {
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM1_OUTPUT_A, RpiPico2Bindings.PWM1_IO_A_CTRL, RpiPico2Bindings.PWM1_PADS_A),
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM1_OUTPUT_B, RpiPico2Bindings.PWM1_IO_B_CTRL, RpiPico2Bindings.PWM1_PADS_B) });
+                case 2:
+                    return new Rp2350PwmBinding(RpiPico2Bindings.PWM2_BASE, RpiPico2Bindings.PWM2_RESET_MASK, RpiPico2Bindings.PWM2_SLICE, RpiPico2Bindings.PWM2_FUNCSEL,
+                        RpiPico2Bindings.PWM2_CLK_SYS_HZ, new Rp2350PwmOutput[] {
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM2_OUTPUT_A, RpiPico2Bindings.PWM2_IO_A_CTRL, RpiPico2Bindings.PWM2_PADS_A),
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM2_OUTPUT_B, RpiPico2Bindings.PWM2_IO_B_CTRL, RpiPico2Bindings.PWM2_PADS_B) });
+                case 3:
+                    return new Rp2350PwmBinding(RpiPico2Bindings.PWM3_BASE, RpiPico2Bindings.PWM3_RESET_MASK, RpiPico2Bindings.PWM3_SLICE, RpiPico2Bindings.PWM3_FUNCSEL,
+                        RpiPico2Bindings.PWM3_CLK_SYS_HZ, new Rp2350PwmOutput[] {
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM3_OUTPUT_A, RpiPico2Bindings.PWM3_IO_A_CTRL, RpiPico2Bindings.PWM3_PADS_A),
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM3_OUTPUT_B, RpiPico2Bindings.PWM3_IO_B_CTRL, RpiPico2Bindings.PWM3_PADS_B) });
+                case 4:
+                    return new Rp2350PwmBinding(RpiPico2Bindings.PWM4_BASE, RpiPico2Bindings.PWM4_RESET_MASK, RpiPico2Bindings.PWM4_SLICE, RpiPico2Bindings.PWM4_FUNCSEL,
+                        RpiPico2Bindings.PWM4_CLK_SYS_HZ, new Rp2350PwmOutput[] {
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM4_OUTPUT_A, RpiPico2Bindings.PWM4_IO_A_CTRL, RpiPico2Bindings.PWM4_PADS_A),
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM4_OUTPUT_B, RpiPico2Bindings.PWM4_IO_B_CTRL, RpiPico2Bindings.PWM4_PADS_B) });
+                case 5:
+                    return new Rp2350PwmBinding(RpiPico2Bindings.PWM5_BASE, RpiPico2Bindings.PWM5_RESET_MASK, RpiPico2Bindings.PWM5_SLICE, RpiPico2Bindings.PWM5_FUNCSEL,
+                        RpiPico2Bindings.PWM5_CLK_SYS_HZ, new Rp2350PwmOutput[] {
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM5_OUTPUT_A, RpiPico2Bindings.PWM5_IO_A_CTRL, RpiPico2Bindings.PWM5_PADS_A),
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM5_OUTPUT_B, RpiPico2Bindings.PWM5_IO_B_CTRL, RpiPico2Bindings.PWM5_PADS_B) });
+                case 6:
+                    return new Rp2350PwmBinding(RpiPico2Bindings.PWM6_BASE, RpiPico2Bindings.PWM6_RESET_MASK, RpiPico2Bindings.PWM6_SLICE, RpiPico2Bindings.PWM6_FUNCSEL,
+                        RpiPico2Bindings.PWM6_CLK_SYS_HZ, new Rp2350PwmOutput[] {
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM6_OUTPUT_A, RpiPico2Bindings.PWM6_IO_A_CTRL, RpiPico2Bindings.PWM6_PADS_A),
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM6_OUTPUT_B, RpiPico2Bindings.PWM6_IO_B_CTRL, RpiPico2Bindings.PWM6_PADS_B) });
+                case 7:
+                    return new Rp2350PwmBinding(RpiPico2Bindings.PWM7_BASE, RpiPico2Bindings.PWM7_RESET_MASK, RpiPico2Bindings.PWM7_SLICE, RpiPico2Bindings.PWM7_FUNCSEL,
+                        RpiPico2Bindings.PWM7_CLK_SYS_HZ, new Rp2350PwmOutput[] {
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM7_OUTPUT_A, RpiPico2Bindings.PWM7_IO_A_CTRL, RpiPico2Bindings.PWM7_PADS_A),
+                            new Rp2350PwmOutput(RpiPico2Bindings.PWM7_OUTPUT_B, RpiPico2Bindings.PWM7_IO_B_CTRL, RpiPico2Bindings.PWM7_PADS_B) });
+                default:
+                    throw new ArgumentOutOfRangeException("slice");
+            }
+        }
+#endif
     }
 }

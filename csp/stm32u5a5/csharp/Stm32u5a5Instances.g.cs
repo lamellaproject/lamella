@@ -54,5 +54,9 @@ namespace Lamella.Generated
         public const uint USART1_RCC_EN_BIT = 14;
         public const uint USART1_RCC_EN_MASK = 0x4000;
         public const uint RCC_BASE = 0x46020C00;
+        public const uint PWR_BASE = 0x46020800;
+        public const uint PWR_RCC_EN_OFF = 148;
+        public const uint PWR_RCC_EN_BIT = 2;
+        public const uint PWR_RCC_EN_MASK = 0x4;
     }
 }

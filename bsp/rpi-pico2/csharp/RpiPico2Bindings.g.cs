@@ -25,6 +25,13 @@ namespace Lamella.Generated
         public const string SPI0_DRIVER_FAMILY = "rp2350-spi";
         public const string I2C0_DRIVER_FAMILY = "rp2350-i2c";
         public const string ADC_DRIVER_FAMILY = "rp2350-adc";
+        public const string PWM1_DRIVER_FAMILY = "rp2350-pwm";
+        public const string PWM2_DRIVER_FAMILY = "rp2350-pwm";
+        public const string PWM3_DRIVER_FAMILY = "rp2350-pwm";
+        public const string PWM4_DRIVER_FAMILY = "rp2350-pwm";
+        public const string PWM5_DRIVER_FAMILY = "rp2350-pwm";
+        public const string PWM6_DRIVER_FAMILY = "rp2350-pwm";
+        public const string PWM7_DRIVER_FAMILY = "rp2350-pwm";
 
         // -- UART0: a pl011 uart binding descriptor --
         public const uint UART0_BASE = 0x40070000;
@@ -64,11 +71,130 @@ namespace Lamella.Generated
         public const uint I2C0_FUNCSEL = 3;
         public const uint I2C0_IC_CLK_HZ = 150000000;
 
-        // -- ADC: an rp-adc binding descriptor (the reference rail is BOARD truth;
-        // the channel map + calibration records are chip truth in the adc layout) --
+        // -- PWM1: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
+        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
+        // and its pad --
+        public const uint PWM1_BASE = 0x400A8000;
+        public const uint PWM1_RESET_MASK = 0x10240;
+        public const uint PWM1_SLICE = 1;
+        public const uint PWM1_FUNCSEL = 4;
+        public const uint PWM1_CLK_SYS_HZ = 150000000;
+        public const uint PWM1_OUTPUT_A = 0;
+        public const uint PWM1_IO_A_CTRL = 0x40028014;
+        public const uint PWM1_PADS_A = 0x4003800C;
+        public const uint PWM1_OUTPUT_B = 1;
+        public const uint PWM1_IO_B_CTRL = 0x4002801C;
+        public const uint PWM1_PADS_B = 0x40038010;
+
+        // -- PWM2: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
+        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
+        // and its pad --
+        public const uint PWM2_BASE = 0x400A8000;
+        public const uint PWM2_RESET_MASK = 0x10240;
+        public const uint PWM2_SLICE = 2;
+        public const uint PWM2_FUNCSEL = 4;
+        public const uint PWM2_CLK_SYS_HZ = 150000000;
+        public const uint PWM2_OUTPUT_A = 0;
+        public const uint PWM2_IO_A_CTRL = 0x400280A4;
+        public const uint PWM2_PADS_A = 0x40038054;
+        public const uint PWM2_OUTPUT_B = 1;
+        public const uint PWM2_IO_B_CTRL = 0x400280AC;
+        public const uint PWM2_PADS_B = 0x40038058;
+
+        // -- PWM3: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
+        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
+        // and its pad --
+        public const uint PWM3_BASE = 0x400A8000;
+        public const uint PWM3_RESET_MASK = 0x10240;
+        public const uint PWM3_SLICE = 3;
+        public const uint PWM3_FUNCSEL = 4;
+        public const uint PWM3_CLK_SYS_HZ = 150000000;
+        public const uint PWM3_OUTPUT_A = 0;
+        public const uint PWM3_IO_A_CTRL = 0x40028034;
+        public const uint PWM3_PADS_A = 0x4003801C;
+        public const uint PWM3_OUTPUT_B = 1;
+        public const uint PWM3_IO_B_CTRL = 0x4002803C;
+        public const uint PWM3_PADS_B = 0x40038020;
+
+        // -- PWM4: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
+        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
+        // and its pad --
+        public const uint PWM4_BASE = 0x400A8000;
+        public const uint PWM4_RESET_MASK = 0x10240;
+        public const uint PWM4_SLICE = 4;
+        public const uint PWM4_FUNCSEL = 4;
+        public const uint PWM4_CLK_SYS_HZ = 150000000;
+        public const uint PWM4_OUTPUT_A = 0;
+        public const uint PWM4_IO_A_CTRL = 0x40028044;
+        public const uint PWM4_PADS_A = 0x40038024;
+        public const uint PWM4_OUTPUT_B = 1;
+        public const uint PWM4_IO_B_CTRL = 0x4002804C;
+        public const uint PWM4_PADS_B = 0x40038028;
+
+        // -- PWM5: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
+        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
+        // and its pad --
+        public const uint PWM5_BASE = 0x400A8000;
+        public const uint PWM5_RESET_MASK = 0x10240;
+        public const uint PWM5_SLICE = 5;
+        public const uint PWM5_FUNCSEL = 4;
+        public const uint PWM5_CLK_SYS_HZ = 150000000;
+        public const uint PWM5_OUTPUT_A = 0;
+        public const uint PWM5_IO_A_CTRL = 0x40028054;
+        public const uint PWM5_PADS_A = 0x4003802C;
+        public const uint PWM5_OUTPUT_B = 1;
+        public const uint PWM5_IO_B_CTRL = 0x4002805C;
+        public const uint PWM5_PADS_B = 0x40038030;
+
+        // -- PWM6: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
+        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
+        // and its pad --
+        public const uint PWM6_BASE = 0x400A8000;
+        public const uint PWM6_RESET_MASK = 0x10240;
+        public const uint PWM6_SLICE = 6;
+        public const uint PWM6_FUNCSEL = 4;
+        public const uint PWM6_CLK_SYS_HZ = 150000000;
+        public const uint PWM6_OUTPUT_A = 0;
+        public const uint PWM6_IO_A_CTRL = 0x40028064;
+        public const uint PWM6_PADS_A = 0x40038034;
+        public const uint PWM6_OUTPUT_B = 1;
+        public const uint PWM6_IO_B_CTRL = 0x4002806C;
+        public const uint PWM6_PADS_B = 0x40038038;
+
+        // -- PWM7: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
+        // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
+        // and its pad --
+        public const uint PWM7_BASE = 0x400A8000;
+        public const uint PWM7_RESET_MASK = 0x10240;
+        public const uint PWM7_SLICE = 7;
+        public const uint PWM7_FUNCSEL = 4;
+        public const uint PWM7_CLK_SYS_HZ = 150000000;
+        public const uint PWM7_OUTPUT_A = 0;
+        public const uint PWM7_IO_A_CTRL = 0x40028074;
+        public const uint PWM7_PADS_A = 0x4003803C;
+        public const uint PWM7_OUTPUT_B = 1;
+        public const uint PWM7_IO_B_CTRL = 0x4002807C;
+        public const uint PWM7_PADS_B = 0x40038040;
+
+        // -- ADC: an rp-adc binding descriptor: the converter, the board's reference rail, and
+        // the channel map of this part's package -- each pin-fed channel's GPIO, the channels
+        // whose pad the board gives to another line or binding (RESERVED_CHANNELS, and what
+        // has each), and the twin: a second pad the board ties to a channel's own net. The
+        // calibration records are chip truth in the adc layout --
         public const uint ADC_BASE = 0x400A0000;
         public const uint ADC_RESET_MASK = 0x1;
         public const uint ADC_REFERENCE_UV = 3300000;
+        public const uint ADC_CHANNEL_COUNT = 5;
+        public const uint ADC_TEMPERATURE_CHANNEL = 4;
+        public const uint ADC_RESERVED_CHANNELS = 0x0;
+        public const uint ADC_CHANNEL0_PIN = 26;
+        public const uint ADC_GPIO26_CHANNEL = 0;
+        public const uint ADC_CHANNEL1_PIN = 27;
+        public const uint ADC_GPIO27_CHANNEL = 1;
+        public const uint ADC_CHANNEL2_PIN = 28;
+        public const uint ADC_GPIO28_CHANNEL = 2;
+        public const uint ADC_CHANNEL3_PIN = 29;
+        public const uint ADC_GPIO29_CHANNEL = 3;
 
         // -- the clock plan (state-and-verify: the plan states the chosen PLL
         // values AND the resulting rates; generation verified hz == xosc * fbdiv /
@@ -99,5 +225,119 @@ namespace Lamella.Generated
         public const string MEMORY_FLASH_KIND = "flash";
         public const uint MEMORY_FLASH_SIZE = 0x400000;
         public const uint MEMORY_FLASH_OPTIONAL = 0;
+
+        /// -- connectors: the sockets a removable module plugs into. The socket is board truth --
+        /// it is on the schematic and identical on every unit -- and what is plugged into it is not,
+        /// so no row here names a module. A socket brings out whole BUSES, each named by the binding
+        /// role that serves it, and single LINES, each named by the standard's own name for that
+        /// position and carrying the port wiring a driver needs to drive it. Which of a socket's
+        /// protocols an attached module speaks is a property of the module, so a board that offers
+        /// several states all of them and chooses none --
+        public const uint CONNECTOR_COUNT = 1;
+        public const string CONNECTOR_HEADER_STANDARD = "pico-header";
+        public const uint CONNECTOR_HEADER_GP0_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP0_PIN = 0;
+        public const uint CONNECTOR_HEADER_GP0_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP0_MASK = 0x1;
+        public const uint CONNECTOR_HEADER_GP1_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP1_PIN = 1;
+        public const uint CONNECTOR_HEADER_GP1_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP1_MASK = 0x2;
+        public const uint CONNECTOR_HEADER_GP2_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP2_PIN = 2;
+        public const uint CONNECTOR_HEADER_GP2_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP2_MASK = 0x4;
+        public const uint CONNECTOR_HEADER_GP3_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP3_PIN = 3;
+        public const uint CONNECTOR_HEADER_GP3_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP3_MASK = 0x8;
+        public const uint CONNECTOR_HEADER_GP4_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP4_PIN = 4;
+        public const uint CONNECTOR_HEADER_GP4_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP4_MASK = 0x10;
+        public const uint CONNECTOR_HEADER_GP5_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP5_PIN = 5;
+        public const uint CONNECTOR_HEADER_GP5_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP5_MASK = 0x20;
+        public const uint CONNECTOR_HEADER_GP6_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP6_PIN = 6;
+        public const uint CONNECTOR_HEADER_GP6_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP6_MASK = 0x40;
+        public const uint CONNECTOR_HEADER_GP7_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP7_PIN = 7;
+        public const uint CONNECTOR_HEADER_GP7_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP7_MASK = 0x80;
+        public const uint CONNECTOR_HEADER_GP8_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP8_PIN = 8;
+        public const uint CONNECTOR_HEADER_GP8_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP8_MASK = 0x100;
+        public const uint CONNECTOR_HEADER_GP9_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP9_PIN = 9;
+        public const uint CONNECTOR_HEADER_GP9_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP9_MASK = 0x200;
+        public const uint CONNECTOR_HEADER_GP10_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP10_PIN = 10;
+        public const uint CONNECTOR_HEADER_GP10_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP10_MASK = 0x400;
+        public const uint CONNECTOR_HEADER_GP11_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP11_PIN = 11;
+        public const uint CONNECTOR_HEADER_GP11_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP11_MASK = 0x800;
+        public const uint CONNECTOR_HEADER_GP12_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP12_PIN = 12;
+        public const uint CONNECTOR_HEADER_GP12_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP12_MASK = 0x1000;
+        public const uint CONNECTOR_HEADER_GP13_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP13_PIN = 13;
+        public const uint CONNECTOR_HEADER_GP13_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP13_MASK = 0x2000;
+        public const uint CONNECTOR_HEADER_GP14_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP14_PIN = 14;
+        public const uint CONNECTOR_HEADER_GP14_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP14_MASK = 0x4000;
+        public const uint CONNECTOR_HEADER_GP15_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP15_PIN = 15;
+        public const uint CONNECTOR_HEADER_GP15_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP15_MASK = 0x8000;
+        public const uint CONNECTOR_HEADER_GP16_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP16_PIN = 16;
+        public const uint CONNECTOR_HEADER_GP16_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP16_MASK = 0x10000;
+        public const uint CONNECTOR_HEADER_GP17_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP17_PIN = 17;
+        public const uint CONNECTOR_HEADER_GP17_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP17_MASK = 0x20000;
+        public const uint CONNECTOR_HEADER_GP18_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP18_PIN = 18;
+        public const uint CONNECTOR_HEADER_GP18_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP18_MASK = 0x40000;
+        public const uint CONNECTOR_HEADER_GP19_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP19_PIN = 19;
+        public const uint CONNECTOR_HEADER_GP19_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP19_MASK = 0x80000;
+        public const uint CONNECTOR_HEADER_GP20_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP20_PIN = 20;
+        public const uint CONNECTOR_HEADER_GP20_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP20_MASK = 0x100000;
+        public const uint CONNECTOR_HEADER_GP21_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP21_PIN = 21;
+        public const uint CONNECTOR_HEADER_GP21_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP21_MASK = 0x200000;
+        public const uint CONNECTOR_HEADER_GP22_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP22_PIN = 22;
+        public const uint CONNECTOR_HEADER_GP22_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP22_MASK = 0x400000;
+        public const uint CONNECTOR_HEADER_GP26_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP26_PIN = 26;
+        public const uint CONNECTOR_HEADER_GP26_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP26_MASK = 0x4000000;
+        public const uint CONNECTOR_HEADER_GP27_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP27_PIN = 27;
+        public const uint CONNECTOR_HEADER_GP27_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP27_MASK = 0x8000000;
+        public const uint CONNECTOR_HEADER_GP28_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_HEADER_GP28_PIN = 28;
+        public const uint CONNECTOR_HEADER_GP28_BANK = 0;
+        public const uint CONNECTOR_HEADER_GP28_MASK = 0x10000000;
     }
 }

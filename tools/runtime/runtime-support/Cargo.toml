@@ -33,6 +33,11 @@ lamella-runtime-support-net = { path = "../../../crates/lamella-runtime-support-
 # layer -- as a DEPENDENCY and never as a second staticlib, so the image keeps exactly one panic
 # handler and one set of lang items.
 lamella-runtime-support-debug = { path = "../../../crates/lamella-runtime-support-debug", optional = true }
+# The board's half of a deployed image (features `board-*`): the startup its clock plan names, the
+# console and the clock, as the lamella_board_* members `console-board` and `clock-board` call. Here
+# for the same reason as the net and Link layers -- as a DEPENDENCY and never as a second
+# staticlib, so the image keeps exactly one panic handler and one set of lang items.
+lamella-board-support = { path = "../../../crates/lamella-board-support", optional = true }
 
 [features]
 # The console_sink knob: where an AOT image's `Console.Write*` bytes GO. Every console entry point
@@ -65,6 +70,12 @@ console-none = []
 # Its ABSENCE is not an error, because a program that never sleeps needs no clock. What is an
 # error is selecting it and not providing the symbol.
 clock-board = []
+# A board build: the console and the clock come from that board's half, compiled in. One board per
+# archive, built in its own directory, never the default path the gates build into.
+board-rpi-pico2 = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2"]
+board-rpi-pico2-w = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2-w"]
+board-pimoroni-pico-plus-2 = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2"]
+board-pimoroni-pico-plus-2-w = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2-w"]
 net = ["dep:lamella-runtime-support-net"]
 # The image SPEAKS Lamella Link: carrier frame loop + codec. This is the knob that costs flash, and
 # it is a prerequisite for both of the others below. It supplies no board carrier of its own -- the

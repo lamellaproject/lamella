@@ -101,27 +101,80 @@ clk_adc_hz = 48000000
 enob = "Stated per the config-envelope discipline: electrical table 1438 gives ENOB min 9 / typical 9.5 bits (the ch 12.4 intro quotes 9.2); the bottom ~2.5 bits of any single sample are noise-grade."
 clk_adc_hz = "The datasheet-REQUIRED conversion clock ('could come from the USB PLL'); the board plan states what its operating point delivers and generation verifies agreement."
 
-# Channel map, QFN-60 / RP2350A (datasheet table 1118). QFN-80 /
-# RP2350B (table 1119): channels 0-7 = GPIO40-47, channel 8 = the temperature sensor.
+# The channel map, one per package (datasheet 12.4, "To select an ADC input"). The QFN-60 / RP2350A
+# (table 1118) reads GPIO26-GPIO29 on channels 0-3, with the temperature sensor on 4. The QFN-80 /
+# RP2350B (table 1119) reads GPIO40-GPIO47 on channels 0-7, with the temperature sensor on 8. Each row
+# names its package, so no layout states either map: each board's adc binding emits its own part's.
 
 [[channels]]
+package = "QFN-60"
 index = 0
 source = "GPIO26"
 
 [[channels]]
+package = "QFN-60"
 index = 1
 source = "GPIO27"
 
 [[channels]]
+package = "QFN-60"
 index = 2
 source = "GPIO28"
 
 [[channels]]
+package = "QFN-60"
 index = 3
 source = "GPIO29"
 
 [[channels]]
+package = "QFN-60"
 index = 4
+source = "temperature_sensor"
+enable = "CS.TS_EN (bit 1): the sensor's bias source, +~40 uA on ADC_AVDD, deliberately separate from CS.EN"
+
+[[channels]]
+package = "QFN-80"
+index = 0
+source = "GPIO40"
+
+[[channels]]
+package = "QFN-80"
+index = 1
+source = "GPIO41"
+
+[[channels]]
+package = "QFN-80"
+index = 2
+source = "GPIO42"
+
+[[channels]]
+package = "QFN-80"
+index = 3
+source = "GPIO43"
+
+[[channels]]
+package = "QFN-80"
+index = 4
+source = "GPIO44"
+
+[[channels]]
+package = "QFN-80"
+index = 5
+source = "GPIO45"
+
+[[channels]]
+package = "QFN-80"
+index = 6
+source = "GPIO46"
+
+[[channels]]
+package = "QFN-80"
+index = 7
+source = "GPIO47"
+
+[[channels]]
+package = "QFN-80"
+index = 8
 source = "temperature_sensor"
 enable = "CS.TS_EN (bit 1): the sensor's bias source, +~40 uA on ADC_AVDD, deliberately separate from CS.EN"
 
@@ -132,7 +185,6 @@ enable = "CS.TS_EN (bit 1): the sensor's bias source, +~40 uA on ADC_AVDD, delib
 # (slope is NEGATIVE, so rising voltage = falling temperature; truncating integer division, the family's pinned rounding.)
 
 [calibration.temperature_sensor]
-channel = 4
 form = "vbe-linear"
 t0_millicelsius = 27000
 vbe_at_t0_microvolts = 706000

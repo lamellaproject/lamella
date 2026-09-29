@@ -1,6 +1,7 @@
 //! Compiles the vendored mbedTLS (vendor/mbedtls, pinned -- see README.md) plus the C shim
 //! against csrc/lamella_mbedtls_config.h. On a bare-metal target the compiler is an ARM
-//! cross GCC: `LAMELLA_ARM_GCC` if set, else `arm-none-eabi-gcc` on PATH. Host builds use the
+//! cross GCC: `LAMELLA_ARM_GCC` if set, else `arm-none-eabi-gcc` on PATH, and the archiver its
+//! `-ar` sibling unless `LAMELLA_ARM_AR` names one. Host builds use the
 //! platform C compiler (the same one the
 //! workspace's other native deps already require).
 
@@ -19,6 +20,12 @@ fn arm_gcc() -> PathBuf {
         "no ARM cross C compiler found for a bare-metal target: set LAMELLA_ARM_GCC, or put \
          arm-none-eabi-gcc on PATH (msys2: pacman -S mingw-w64-ucrt-x86_64-arm-none-eabi-gcc)"
     );
+}
+
+/// The float ABI the Rust target uses, which the C objects must share: hard on an `eabihf` target,
+/// whose FPU the `cc` crate already names with `-mfpu`, and soft on every other.
+fn arm_float_abi(target: &str) -> &'static str {
+    if target.ends_with("eabihf") { "-mfloat-abi=hard" } else { "-mfloat-abi=soft" }
 }
 
 /// The -mcpu matching the Rust target's architecture floor.
@@ -70,12 +77,15 @@ fn main() {
                 std::env::set_var("PATH", joined)
             };
         }
-        let ar = gcc.with_file_name(
-            gcc.file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.replace("gcc", "ar"))
-                .unwrap_or_else(|| "arm-none-eabi-ar".into()),
-        );
+        println!("cargo:rerun-if-env-changed=LAMELLA_ARM_AR");
+        let ar = std::env::var_os("LAMELLA_ARM_AR").map(PathBuf::from).unwrap_or_else(|| {
+            gcc.with_file_name(
+                gcc.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.replace("gcc", "ar"))
+                    .unwrap_or_else(|| "arm-none-eabi-ar".into()),
+            )
+        });
         build
             .compiler(&gcc)
             .archiver(&ar)
@@ -83,7 +93,7 @@ fn main() {
             .flag("-fno-builtin")
             .flag(format!("-mcpu={}", arm_cpu(&target)))
             .flag("-mthumb")
-            .flag("-mfloat-abi=soft")
+            .flag(arm_float_abi(&target))
             .flag("-Os")
             .flag("-ffunction-sections")
             .flag("-fdata-sections")

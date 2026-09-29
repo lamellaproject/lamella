@@ -1,0 +1,15 @@
+[package]
+name = "lamella-serve-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared plumbing for the interpreter firmware crates: the bare-metal startup and the native-USB link that each chip family's firmware includes."
+
+# No dependencies: the files under src/ are #[path]-included by each firmware binary, so their
+# `use usb_device::...` etc. resolve against the including crate's dependency set, and their
+# feature cfgs against the including crate's features. See src/lib.rs for why these files are
+# included rather than compiled as a library.
+publish = false
+[dependencies]

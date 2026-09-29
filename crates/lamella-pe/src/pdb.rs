@@ -242,6 +242,7 @@ pub fn build_portable_pdb(
 
     let has_locals = methods.iter().any(|method| !method.locals.is_empty());
     if has_locals {
+        tables.set_external_row_count(METHOD_DEF, methods.len() as u32);
         tables.mark_sorted(LOCAL_SCOPE);
         tables.add_row(
             IMPORT_SCOPE,
@@ -277,16 +278,13 @@ pub fn build_portable_pdb(
         }
     }
 
-    let (referenced_tables, referenced_rows) = if has_locals {
-        (1u64 << METHOD_DEF, vec![methods.len() as u32])
-    } else {
-        (0, Vec::new())
-    };
+    let (referenced_tables, referenced_rows) = tables.external_tables();
 
-    let table_bytes = tables.serialize(HeapSizes::default());
     let string_bytes = strings.into_bytes();
     let guid_bytes = guids.into_bytes();
     let blob_bytes = blobs.into_bytes();
+    let heaps = HeapSizes::for_heaps(&string_bytes, &guid_bytes, &blob_bytes);
+    let table_bytes = tables.serialize(heaps);
     let pdb_stream = pdb_stream(pdb_id, entry_point, referenced_tables, &referenced_rows);
 
     let streams: Vec<(&str, &[u8])> = vec![
@@ -451,6 +449,73 @@ mod tests {
         );
         let digest = crate::sha256::sha256(b"class A{}");
         assert!(blobs.windows(32).any(|w| w == digest), "source hash missing");
+    }
+
+    #[test]
+    fn a_pdb_whose_heaps_pass_64_kib_reads_back_whole() {
+        const METHODS: u32 = 6_000;
+        let local_name =
+            |method: u32| alloc::format!("local_{method:05}_named_at_length_to_fill_the_heap");
+        let methods: Vec<MethodDebug> = (0..METHODS)
+            .map(|method| MethodDebug {
+                sequence_points: vec![
+                    point(0, 10 * method + 1, 5, 10 * method + 1, 20),
+                    point(6, 10 * method + 2, 5, 10 * method + 2, 30),
+                ],
+                local_signature: method + 1,
+                locals: vec![LocalVariable {
+                    index: 0,
+                    name: local_name(method).into(),
+                }],
+                scope_length: 8,
+                document: 1,
+            })
+            .collect();
+        let documents = [DebugDocument { path: "Large.cs", source: "class Large{}" }];
+        let pdb = build_portable_pdb(&documents, &methods, Token::new(0x06, 1), [0u8; 20]);
+        assert!(find_stream(&pdb, "#Blob").len() >= 0x1_0000, "#Blob stays under 64 KiB");
+        assert!(find_stream(&pdb, "#Strings").len() >= 0x1_0000, "#Strings stays under 64 KiB");
+
+        let reader = lamella_metadata::pdb::PortablePdb::read(&pdb).expect("the PDB parses");
+        assert_eq!(reader.method_count(), METHODS);
+        assert_eq!(reader.method_document(METHODS).as_deref(), Some("Large.cs"));
+        let last = METHODS - 1;
+        let lines: Vec<(u32, u32)> = reader
+            .sequence_points(METHODS)
+            .iter()
+            .map(|point| (point.il_offset, point.start_line))
+            .collect();
+        assert_eq!(lines, [(0, 10 * last + 1), (6, 10 * last + 2)]);
+        let locals = reader.local_variables(METHODS);
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0].name, local_name(last));
+    }
+
+    #[test]
+    fn a_local_scope_indexes_the_images_methods_at_their_own_width() {
+        const METHODS: usize = 0x1_0001;
+        let mut methods: Vec<MethodDebug> = (0..METHODS)
+            .map(|_| MethodDebug {
+                sequence_points: Vec::new(),
+                local_signature: 0,
+                locals: Vec::new(),
+                scope_length: 0,
+                document: 0,
+            })
+            .collect();
+        methods[METHODS - 1].locals.push(LocalVariable {
+            index: 0,
+            name: "last".into(),
+        });
+        methods[METHODS - 1].scope_length = 4;
+        let pdb = build_portable_pdb(&[], &methods, Token::new(0x06, 1), [0u8; 20]);
+
+        let reader = lamella_metadata::pdb::PortablePdb::read(&pdb).expect("the PDB parses");
+        assert_eq!(reader.method_count(), METHODS as u32);
+        let locals = reader.local_variables(METHODS as u32);
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0].name, "last");
+        assert!(reader.local_variables(1).is_empty());
     }
 
     #[test]

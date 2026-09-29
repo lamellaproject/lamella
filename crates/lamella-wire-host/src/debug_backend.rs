@@ -265,9 +265,9 @@ pub struct WireHostBackend {
     image: Vec<u8>,
     timeout: Duration,
     seq: Cell<u16>,
-    /// The product the target named in its HELLO, for a sentence that has to name the board.
-    /// `None` when it named none.
-    board: Option<&'static str>,
+    /// What the target said it is, in the one HELLO this backend opened with. A sentence that has to
+    /// name the board reads the name from it ([`Self::board`]), so the two cannot disagree.
+    identity: TargetIdentity,
     /// What the TARGET said it can do, from its HELLO.
     ///
     /// Kept because a capability is the difference between a target that cannot answer a question
@@ -419,7 +419,7 @@ impl WireHostBackend {
             timeout,
             seq: Cell::new(0),
             target_caps: session.caps,
-            board: crate::board_name(session.identity.product_model),
+            identity: session.identity,
             session_live: false,
             running: false,
             frames: Vec::new(),
@@ -444,6 +444,23 @@ impl WireHostBackend {
             self.srcmap = SrcMap::parse(&bytes);
         }
         self
+    }
+
+    /// What the target said it is, in the HELLO this backend opened with.
+    ///
+    /// It holds for the whole session. The backend HELLOs once and never reopens, and a board that
+    /// resets either answers on the same serial port (a UART behind a debug probe stays open) or
+    /// closes its carrier (a USB one goes away), so every image this backend launches reaches the
+    /// board that answered that HELLO.
+    #[must_use]
+    pub fn identity(&self) -> &TargetIdentity {
+        &self.identity
+    }
+
+    /// The product the target named in its HELLO, for a sentence that has to name the board.
+    /// `None` when it named none.
+    fn board(&self) -> Option<&'static str> {
+        crate::board_name(self.identity.product_model)
     }
 
     fn next_seq(&self) -> u16 {
@@ -1200,22 +1217,7 @@ impl DebugBackend for WireHostBackend {
         );
         match deployed {
             Ok(TransferAck::Accepted) => {}
-            Ok(TransferAck::Rejected { chunk }) => {
-                return Err(format!("the target refused chunk {chunk} of the image"));
-            }
-            Ok(TransferAck::Mismatched { chunk, .. }) => {
-                return Err(format!(
-                    "the target's flash does not hold the image that was sent, from chunk {chunk} on"
-                ));
-            }
-            Ok(TransferAck::TooLarge { image, window }) => {
-                return Err(crate::image_too_large(self.board, image, window));
-            }
-            Ok(TransferAck::OutOfRange { chunk }) => {
-                return Err(format!(
-                    "the target refused chunk {chunk} of the image as reaching past its deploy window"
-                ));
-            }
+            Ok(not_accepted) => return Err(not_accepted.describe(self.board())),
             Err(TransportError::Closed) => {
                 return Err("the target did not acknowledge the image as it was sent".to_string());
             }
@@ -1553,13 +1555,48 @@ impl DebugBackend for WireHostBackend {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capabilities, Cell, RefCell, SrcMap, WireHostBackend, WireTransport, debug, exec, pack,
-        reason,
+        Capabilities, Cell, RefCell, SrcMap, TargetIdentity, WireHostBackend, WireTransport, debug,
+        exec, pack, reason,
     };
     use lamella_debug_backend::{DebugBackend, Stop};
     use lamella_wire::{MemTransport, Transport};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    /// A backend keeps what the target said it is, from the one HELLO it opened with, and the board
+    /// name its sentences use is read from that same identity.
+    ///
+    /// A host that checks WHICH board an image is about to reach reads it from the backend, so the
+    /// model the board reported has to arrive unchanged.
+    #[test]
+    fn a_backend_keeps_the_identity_its_hello_was_answered_with() {
+        let ack = lamella_wire::HelloAck {
+            chosen: lamella_wire::PROTOCOL_VERSION,
+            caps: Capabilities(
+                Capabilities::DEBUG_BASIC | Capabilities::BREAKPOINTS | Capabilities::STEPPING,
+            ),
+            identity: TargetIdentity {
+                product_model: lamella_wire::product_model::MICROBIT_V2,
+                ..TargetIdentity::default()
+            },
+            max_inbound_payload: None,
+        };
+        let mut board = MemTransport::new();
+        board
+            .send(lamella_wire::msg::HELLO_ACK, 0, &ack.encode())
+            .expect("queue the board's HELLO_ACK");
+        let mut host = MemTransport::new();
+        host.feed(&board.take_sent());
+
+        let backend = WireHostBackend::from_transport(
+            WireTransport::Mem(Arc::new(Mutex::new(host))),
+            Vec::new(),
+            Duration::from_millis(200),
+        )
+        .expect("a target that can debug is accepted");
+        assert_eq!(backend.identity().product_model, lamella_wire::product_model::MICROBIT_V2);
+        assert_eq!(backend.board(), Some("BBC micro:bit v2"));
+    }
 
     /// A backend wired to an in-memory board, with a live session and one `DBG_ACK` already
     /// waiting -- so a detach completes instead of sitting out its timeout.
@@ -1590,7 +1627,7 @@ mod tests {
             timeout: Duration::from_millis(50),
             seq: Cell::new(0),
             target_caps: Capabilities(u64::MAX),
-            board: None,
+            identity: TargetIdentity::default(),
             session_live: true,
             running: false,
             frames: Vec::new(),
@@ -1880,7 +1917,7 @@ mod tests {
     fn a_launch_refuses_an_image_larger_than_the_window_naming_both_sizes_and_the_board() {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
-        backend.board = Some("BBC micro:bit v2");
+        backend.identity.product_model = lamella_wire::product_model::MICROBIT_V2;
         backend.image = image_with_checksum(0x1122_3344_5566_7788);
         let mut nothing_held = vec![lamella_runner::deploy::deploy_state::NONE, 0];
         nothing_held.extend_from_slice(&0u64.to_le_bytes());
@@ -2255,7 +2292,7 @@ mod tests {
 mod variables_tests {
     use super::{
         Capabilities, Cell, ChildReference, DebugBackend, RefCell, Scope, SrcMap, Stop,
-        WireHostBackend, WireTransport, WireValue, debug, reason, render,
+        TargetIdentity, WireHostBackend, WireTransport, WireValue, debug, reason, render,
     };
     use lamella_wire::{MemTransport, Transport};
     use std::sync::{Arc, Mutex};
@@ -2357,7 +2394,7 @@ mod variables_tests {
             timeout: Duration::from_millis(50),
             seq: Cell::new(0),
             target_caps: Capabilities(caps),
-            board: None,
+            identity: TargetIdentity::default(),
             session_live: true,
             running: false,
             frames,

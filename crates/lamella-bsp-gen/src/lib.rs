@@ -8,6 +8,7 @@
 pub mod fit;
 pub mod reconcile;
 pub mod strata;
+pub mod compose;
 
 /// An integer fact plus how the table spelled it (hex spelling is preserved in the emission,
 /// so a generated file reads like the table that produced it).
@@ -100,6 +101,9 @@ pub struct Channel {
     pub index: i64,
     /// The signal source (a pad name like `GPIO26`, or `temperature_sensor`).
     pub source: String,
+    /// The package the row belongs to, in a block whose channel map differs by package (empty on a
+    /// map that holds for every package).
+    pub package: String,
 }
 
 /// A declarative `[calibration.*]` record: named integer coefficients a conversion derives from
@@ -410,7 +414,7 @@ pub fn parse(text: &str) -> Result<Table, String> {
 
         if let Some(header) = line.strip_prefix("[[").and_then(|l| l.strip_suffix("]]")) {
             if header == "channels" {
-                table.channels.push(Channel { index: 0, source: String::new() });
+                table.channels.push(Channel { index: 0, source: String::new(), package: String::new() });
                 section = Section::Channel;
                 continue;
             }
@@ -504,6 +508,7 @@ pub fn parse(text: &str) -> Result<Table, String> {
                 match (key, value) {
                     ("index", RawValue::Int(int)) => channel.index = int.value,
                     ("source", RawValue::Str(s)) => channel.source = s,
+                    ("package", RawValue::Str(s)) => channel.package = s,
                     ("enable", RawValue::Str(_)) => {}
                     (other, _) => {
                         return Err(err(line_number, &format!("unexpected channel key '{other}'")));
@@ -601,6 +606,28 @@ pub fn parse(text: &str) -> Result<Table, String> {
         return Err("[table] must declare chip and peripheral".to_string());
     }
     Ok(table)
+}
+
+/// The rows of a channel map that a table's own layout states: every row, unless the map differs
+/// by package.
+///
+/// A MAP KEYED BY PACKAGE IS BOARD TRUTH. The RP2350's ADC reads GPIO26-29 on the QFN-60 and
+/// GPIO40-47 on the QFN-80, with the temperature sensor at 4 and at 8, so a layout holding either
+/// map would be wrong for the other package's boards. Each board's adc binding emits the map of its
+/// own part's package instead, and the layout states none of it. A map with a package on some rows
+/// and not on others says neither, and is refused. `table` names the table in that refusal.
+pub fn family_channels<'a>(table: &str, channels: &'a [Channel]) -> Result<&'a [Channel], String> {
+    let keyed = channels.iter().filter(|channel| !channel.package.is_empty()).count();
+    if keyed == 0 {
+        return Ok(channels);
+    }
+    if keyed != channels.len() {
+        return Err(format!(
+            "{table}: {keyed} of its {} channel rows name a package -- a channel map names one on every row or on none",
+            channels.len()
+        ));
+    }
+    Ok(&[])
 }
 
 
@@ -736,9 +763,10 @@ pub fn emit_csharp(table: &Table, source: &str) -> Result<String, String> {
         }
     }
 
-    if !table.channels.is_empty() {
+    let channels = family_channels(&class, &table.channels)?;
+    if !channels.is_empty() {
         out.push_str("\n        // -- channel map: Channel_<source> = the mux/AINSEL index --\n");
-        for channel in &table.channels {
+        for channel in channels {
             out.push_str(&format!(
                 "        public const int Channel_{} = {};\n",
                 pascal(&channel.source),
@@ -907,7 +935,6 @@ source = "temperature_sensor"
 enable = "CS.TS_EN"
 
 [calibration.temperature_sensor]
-channel = 4
 form = "vbe-linear"
 t0_millicelsius = 27000
 slope_microvolts_per_celsius = -1721
@@ -927,7 +954,6 @@ notes = "typical values"
         assert_eq!(table.channels.len(), 2);
         assert_eq!(table.channels[1].index, 4);
         assert_eq!(table.channels[1].source, "temperature_sensor");
-        assert_eq!(table.calibration_coefficient("temperature_sensor", "channel"), Some(4));
         assert_eq!(table.calibration_coefficient("temperature_sensor", "t0_millicelsius"), Some(27000));
         assert_eq!(
             table.calibration_coefficient("temperature_sensor", "slope_microvolts_per_celsius"),
@@ -946,6 +972,23 @@ notes = "typical values"
         assert!(out.contains("public const int Channel_TemperatureSensor = 4;"));
         assert!(out.contains("public const uint TemperatureSensor_T0Millicelsius = 27000;"));
         assert!(out.contains("public const int TemperatureSensor_SlopeMicrovoltsPerCelsius = -1721;"));
+    }
+
+    #[test]
+    fn a_package_keyed_channel_map_is_left_out_of_the_layout_and_a_partly_keyed_one_is_refused() {
+        let keyed = SAMPLE_ADC
+            .replace("source = \"GPIO26\"\n", "source = \"GPIO26\"\npackage = \"QFN-60\"\n")
+            .replace("source = \"temperature_sensor\"\n", "source = \"temperature_sensor\"\npackage = \"QFN-60\"\n");
+        let table = parse(&keyed).expect("parses");
+        assert_eq!(table.channels[0].package, "QFN-60");
+        assert_eq!(table.channels[1].package, "QFN-60");
+        let out = emit_csharp(&table, "adc-rp2350.toml").expect("emits");
+        assert!(!out.contains("Channel_"), "a package-keyed map emitted into the layout:\n{out}");
+        assert!(out.contains("public const uint TemperatureSensor_T0Millicelsius = 27000;"));
+
+        let partly = SAMPLE_ADC.replace("source = \"GPIO26\"\n", "source = \"GPIO26\"\npackage = \"QFN-60\"\n");
+        let refused = emit_csharp(&parse(&partly).expect("parses"), "adc-rp2350.toml").unwrap_err();
+        assert!(refused.contains("1 of its 2 channel rows name a package"), "{refused}");
     }
 
     #[test]

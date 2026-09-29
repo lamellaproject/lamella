@@ -700,16 +700,24 @@ namespace System.Collections.Generic
     {
         public bool Equals(HashSet<T> x, HashSet<T> y)
         {
-            if ((object)x == null) return (object)y == null;
-            if ((object)y == null) return false;
-            if (x.Count != y.Count) return false;
+            if ((object)x == (object)y) return true;
+            if ((object)x == null || (object)y == null) return false;
+            if (x.Comparer.Equals(y.Comparer))
+            {
+                if (x.Count != y.Count) return false;
+                foreach (T item in y)
+                {
+                    if (!x.Contains(item)) return false;
+                }
+                return true;
+            }
             EqualityComparer<T> elements = EqualityComparer<T>.Default;
             foreach (T item in y)
             {
                 bool present = false;
                 foreach (T mine in x)
                 {
-                    if (elements.Equals(mine, item))
+                    if (elements.Equals(item, mine))
                     {
                         present = true;
                         break;
@@ -722,12 +730,14 @@ namespace System.Collections.Generic
 
         public int GetHashCode(HashSet<T> set)
         {
-            if ((object)set == null) return 0;
-            EqualityComparer<T> elements = EqualityComparer<T>.Default;
             int hash = 0;
-            foreach (T item in set)
+            if ((object)set != null)
             {
-                hash = unchecked(hash + elements.GetHashCode(item));
+                foreach (T item in set)
+                {
+                    object boxed = item;
+                    if (boxed != null) hash = hash ^ boxed.GetHashCode();
+                }
             }
             return hash;
         }

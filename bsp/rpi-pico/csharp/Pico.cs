@@ -11,7 +11,7 @@ namespace Lamella.Boards.RaspberryPi
         public static readonly int BoardModel = RpiPicoBindings.BOARD_MODEL;
 
         /// <summary>The green user LED on GP25 -- the board's blink target, and the only indicator
-        /// it has. Lifted from the generated pin rather than written out, so a pin moved in
+        /// it has. Derived from the generated pin rather than written out, so a pin moved in
         /// board.toml moves here.</summary>
         public static readonly int LedPin = (int)RpiPicoBindings.LED_PIN;
 

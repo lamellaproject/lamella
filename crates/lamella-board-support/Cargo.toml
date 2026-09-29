@@ -1,0 +1,21 @@
+[package]
+name = "lamella-board-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The board's half of a deployed Lamella image: the startup its clock plan names, the console byte sink and the monotonic millisecond clock, for one board, from the generated board and chip facts. Compiled into the runtime-support archive's board build (tools/runtime/runtime-support), never linked as a second static archive."
+publish = false
+
+[features]
+# One board per build. On a bare-metal target exactly one must be selected, and the library then
+# defines the three symbols the runtime archive calls for that board. On the host every board's
+# descriptor is compiled, so the tests read each board's real facts.
+board-rpi-pico2 = []
+board-rpi-pico2-w = []
+board-pimoroni-pico-plus-2 = []
+board-pimoroni-pico-plus-2-w = []
+
+[lints]
+workspace = true

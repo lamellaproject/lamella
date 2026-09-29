@@ -59,7 +59,7 @@ namespace Lamella.Boards.AutomationDirect
         /// <summary>The microSD socket's chip select. The card rides SERCOM2; this is the one line
         /// of that group the board drives as a plain pin.</summary>
         /// <remarks>The board file records no asserted level for this line, so there is no
-        /// polarity constant to lift and none is invented here.</remarks>
+        /// polarity constant to read and none is invented here.</remarks>
         public static readonly int SdChipSelectPin =
             LogicalPin(AutomationdirectP1am100Bindings.SD_CS_PORT_BASE, AutomationdirectP1am100Bindings.SD_CS_PIN);
 

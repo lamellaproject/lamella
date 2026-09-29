@@ -100,7 +100,7 @@ namespace System
 
         public static double Round(double value, int digits)
         {
-            if (digits < 0 || digits > 15) throw new ArgumentOutOfRangeException("Rounding digits must be between 0 and 15, inclusive.");
+            if (digits < 0 || digits > 15) throw new ArgumentOutOfRangeException("digits", "Rounding digits must be between 0 and 15, inclusive.");
             if (Abs(value) >= RoundLimit) return value;
             double power = Power10(digits);
             return Round(value * power) / power;

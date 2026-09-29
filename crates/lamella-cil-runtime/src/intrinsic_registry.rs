@@ -76,6 +76,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(clock_is_set),
     entry!(clock_monotonic_millis),
     entry!(clock_set_ticks),
+    entry!(clock_wall_changed),
     #[cfg(feature = "collections")]
     entry!(collection_contains),
     #[cfg(feature = "collections")]
@@ -397,6 +398,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(socket_send),
     entry!(socket_set_recv_timeout),
     entry!(socket_udp_bind),
+    entry!(socket_udp_max_datagram),
     entry!(socket_udp_recv_from),
     entry!(socket_udp_send_to),
     #[cfg(feature = "collections")]
@@ -480,6 +482,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(tls_client_config_alpn),
     entry!(tls_client_new),
     entry!(tls_close),
+    entry!(tls_close_notify),
     entry!(tls_default_stack),
     entry!(tls_drop_key),
     entry!(tls_exporter_key),

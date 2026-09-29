@@ -562,11 +562,11 @@ pub struct Closure {
     pub strict: bool,
     /// Whether this function's own code ever names `arguments`.
     ///
-    /// **AN EAGER `arguments` WAS THE ENGINE'S LARGEST SINGLE RETENTION.** `js-bench --bin
-    /// region-ram` measured 501.4 B retained per FUNCTION call against 0.0 B per ARROW call, and an
-    /// arrow is exactly a call that does not build one -- so the whole difference was this array,
-    /// allocated on every call whether the body named it or not. ~160 calls exhausted the M33's
-    /// whole fixed realm again.
+    /// **An eager `arguments` would be the engine's largest single retention.** Built on every
+    /// call, it retains 501.4 B per FUNCTION call against 0.0 B per ARROW call under a counting
+    /// allocator, and an arrow is exactly a call that does not build one; about 160 such calls
+    /// exhaust the whole fixed realm of a Cortex-M33 target. So it is built only when the body
+    /// names it.
     ///
     /// Decided by the COMPILER, not by a check here: it is a static property of the body, and
     /// the encoder is the walk that can see it once instead of on every call.

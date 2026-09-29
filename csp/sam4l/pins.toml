@@ -1,8 +1,8 @@
-# PIN map for the SAM4L family: pin x function -> (instance, signal), or -> nothing. PARTIAL and
-# evidence-only -- a row joins when a binding needs it.
+# PIN map for the SAM4L family: pin x function -> (instance, signal), or -> nothing. It lists
+# only the cells a binding uses.
 #
-# EMPTY OF ROWS: the only pins placed are a board's LED and user button, and a control pin rides no
-# alternate function, so it needs no cell here.
+# IT HAS NO ROWS: the only pins this family's boards place are an LED and a user button, and a
+# control pin rides no alternate function, so neither needs a cell here.
 #
 # WHEN ROWS ARRIVE THEY WILL NOT LOOK LIKE THE OTHER SAM4 FAMILIES'. Those select a peripheral
 # through a PIO controller's ABCD selection registers; this series muxes through the GPIO

@@ -1297,10 +1297,12 @@ impl ImageBuilder {
         self.tables.sort_by_index_column(table::FIELD_LAYOUT, 1);
         self.tables.sort_by_coded_parent(table::FIELD_MARSHAL);
         self.tables.sort_by_index_column(table::GENERIC_PARAM_CONSTRAINT, 0);
-        let tables = self.tables.serialize(HeapSizes::default());
         let strings = self.strings.into_bytes();
         let guids = self.guids.into_bytes();
         let blobs = self.blobs.into_bytes();
+        let tables = self
+            .tables
+            .serialize(HeapSizes::for_heaps(&strings, &guids, &blobs));
         let user_strings = self.user_strings.into_bytes();
         let user_strings = (user_strings.len() > 1).then_some(user_strings.as_slice());
 
@@ -1416,6 +1418,50 @@ mod tests {
         let image = lamella_metadata::pe::PeImage::parse(&pe).expect("valid PE");
         assert_eq!(image.cli_header_rva(), TEXT_RVA);
         assert!(lamella_metadata::image::MetadataImage::read(&pe).is_ok());
+    }
+
+    #[test]
+    fn an_image_whose_heaps_pass_64_kib_reads_back_whole() {
+        const PUBLIC_STATIC_LITERAL: u16 = 0x0006 | 0x0010 | 0x0040;
+        const STRING_FIELD: [u8; 2] = [0x06, 0x0E];
+        const FIELDS: usize = 2_000;
+        let field_name =
+            |index: usize| alloc::format!("field_{index:04}_with_a_name_long_enough_to_fill");
+
+        let mut builder = ImageBuilder::new("large.dll", "large");
+        let object = builder.object_type();
+        builder.add_type("App", "Program", object, PUBLIC_CLASS);
+        let text: Vec<u16> = (0..40_000u32).map(|i| u16::from(b'a' + (i % 26) as u8)).collect();
+        let value: Vec<u8> = text.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        let big = builder.add_field("Big", &STRING_FIELD, PUBLIC_STATIC_LITERAL);
+        builder.add_constant(big, 0x0E, &value);
+        for index in 0..FIELDS {
+            builder.add_field(&field_name(index), &STRING_FIELD, PUBLIC_STATIC_LITERAL);
+        }
+        let after = builder.add_method(
+            "After",
+            &[0x00, 0x00, 0x08],
+            &[0x0A, 0x16, 0x2A],
+            PUBLIC_STATIC,
+            IL_MANAGED,
+            &[],
+        );
+        assert!(builder.blobs.len() >= 0x1_0000, "#Blob stays under 64 KiB");
+        assert!(builder.strings.len() >= 0x1_0000, "#Strings stays under 64 KiB");
+        let pe = builder.finish(after, false);
+
+        let assembly = lamella_metadata::reader::Assembly::read(&pe).expect("the image reads");
+        let program = assembly.find_type("App", "Program").expect("App.Program");
+        let method = program.methods().next().expect("one method");
+        assert_eq!(method.name(), Some("After"));
+        assert_eq!(method.signature_blob(), [0x00, 0x00, 0x08]);
+        let fields: Vec<_> = program.fields().collect();
+        assert_eq!(fields.len(), FIELDS + 1);
+        assert_eq!(fields[FIELDS].name(), Some(field_name(FIELDS - 1).as_str()));
+        assert_eq!(
+            assembly.constant(big),
+            Some(lamella_metadata::constant::ConstantValue::String(text))
+        );
     }
 
     #[test]

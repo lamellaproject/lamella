@@ -164,10 +164,6 @@ const CR_LOCK: u32 = 1 << 31;
 /// **NOT CMSIS-DAP-ONLY, whatever this crate is called.** The impl below is blanket over
 /// `TargetAccess`, so an ST-Link gets these methods too -- `lamella_stlink::StLink` implements that
 /// trait directly, and `lamella-stlink`'s `stlink-flash` example is the composition with no glue.
-/// This doc previously said "a CMSIS-DAP `TargetAccess` probe", which together with the crate's name
-/// read as a transport binding that does not exist, and cost a lane a bug report for a gap that was
-/// not there. **A name that under-claims fails in the direction where nobody files a bug**, because
-/// the reader assumes the limit is real and works around it.
 pub trait Stm32F4Flash {
     /// Unlocks `FLASH_CR` for erase/program. Idempotent, and checked: the two `FLASH_KEYR` keys are
     /// written only to a register whose `LOCK` bit is set, and a register still locked afterwards is

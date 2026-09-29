@@ -47,7 +47,7 @@ sources = [
 notes = [
     "The port bases step by 0x20, not by the 0x400 a port block is given on several other vendors' parts. Each port's four control registers occupy 16 bytes of that 32-byte stride.",
     "Every base here was read from the address list printed at the head of the register's own section rather than stepped from PORT0, and both were then checked against each other: the printed list and a 0x20 stride agree across all ten ports, which is a check rather than a derivation.",
-    "Two ports are placed rather than the ten the part carries, because an instance map here is evidence-only: a row is added when a board reaches the block.",
+    "Two ports are placed rather than the ten the part carries, because an instance map here places only the blocks a board uses. A port that is not listed is not described here, rather than absent from the part.",
 ]
 
 [[instances]]

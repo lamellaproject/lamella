@@ -1,0 +1,80 @@
+# BLOCK layout: the RP2350 true random number generator. A free-running ring oscillator, sampled
+# at a programmable period, fills six 32-bit result registers (192 bits) after three built-in
+# entropy checks pass. Only the registers a polling reader uses are laid out; the interrupt mask
+# and the test counters grow with their consumers.
+[table]
+kind = "block"
+family = "rp2350"
+block = "trng"
+# Rust only: the one reader is the firmware's entropy source, which a TLS stack polls.
+emit = ["rust"]
+sources = ["RP2350 datasheet ch 12.12 (TRNG): 12.12.2 configuration, 12.12.3 operation, 12.12.4 caveats, Table 1261 (register list)"]
+notes = [
+    "Generation starts when RND_SOURCE_ENABLE.RND_SRC_EN is set and runs until 192 bits are collected or an entropy check fails; RNG_ISR reports which. Clear RND_SRC_EN when not generating.",
+    "EHR_DATA0..5 read 0 until a generation succeeds, and a failed check presents no result. Reading EHR_DATA5, the last word, clears all six.",
+    "Generation time is not deterministic: the datasheet puts the average near 2 ms with a chain length of 0 or 1 and a sample count of 20-25, and a run can take more than 100 times the average. A reader bounds its wait and reports no entropy rather than blocking.",
+    "An autocorrelation failure (RNG_ISR.AUTOCORR_ERR) stops the generator until the block is reset; software cannot clear it through RNG_ICR.",
+    "SAMPLE_CNT1 resets to 0xFFFF, the slowest rate. With the von Neumann decorrelator bypassed it must not be below 17.",
+]
+
+[registers.RNG_ISR]
+offset = 0x104
+width = 32
+fields = { EHR_VALID = [0, 1], AUTOCORR_ERR = [1, 1], CRNGT_ERR = [2, 1], VN_ERR = [3, 1] }
+notes = "Read-only status. EHR_VALID: 192 bits are ready. AUTOCORR_ERR: the autocorrelation test failed four times in a row. CRNGT_ERR: two consecutive 16-bit blocks were equal. VN_ERR: 32 consecutive collected bits were identical."
+
+[registers.RNG_ICR]
+offset = 0x108
+width = 32
+fields = { EHR_VALID = [0, 1], AUTOCORR_ERR = [1, 1], CRNGT_ERR = [2, 1], VN_ERR = [3, 1] }
+notes = "Write 1 to clear the matching RNG_ISR bit, except AUTOCORR_ERR, which only a reset of the block clears."
+
+[registers.TRNG_CONFIG]
+offset = 0x10C
+width = 32
+fields = { RND_SRC_SEL = [0, 2] }
+notes = "The ring oscillator's inverter chain length, one of four; higher values select longer chains. Resets to 0."
+
+[registers.TRNG_VALID]
+offset = 0x110
+width = 32
+fields = { EHR_VALID = [0, 1] }
+notes = "1 when 192 bits are collected and EHR_DATA0..5 can be read."
+
+[registers.EHR_DATA0]
+offset = 0x114
+width = 32
+notes = "The first of six result words, EHR_DATA0..5, at EHR_STRIDE apart."
+
+[registers.RND_SOURCE_ENABLE]
+offset = 0x12C
+width = 32
+fields = { RND_SRC_EN = [0, 1] }
+notes = "1 enables the entropy source and starts a generation. Resets to 0."
+
+[registers.SAMPLE_CNT1]
+offset = 0x130
+width = 32
+notes = "The number of rng_clk cycles, which 12.12.2 counts as system clock ticks, between two ring oscillator samples. Resets to 0xFFFF."
+
+[registers.TRNG_DEBUG_CONTROL]
+offset = 0x138
+width = 32
+fields = { VNC_BYPASS = [1, 1], TRNG_CRNGT_BYPASS = [2, 1], AUTO_CORRELATE_BYPASS = [3, 1] }
+notes = "Each bit bypasses one built-in check: the von Neumann balancer (with its 32-identical-bits test), the CRNGT test, and the autocorrelation test. All reset to 0, so every check runs."
+
+[registers.TRNG_SW_RESET]
+offset = 0x140
+width = 32
+fields = { TRNG_SW_RESET = [0, 1] }
+notes = "Writing 1 resets the generator's internal state."
+
+[registers.TRNG_BUSY]
+offset = 0x1B8
+width = 32
+fields = { TRNG_BUSY = [0, 1] }
+notes = "Read-only: the generator is collecting."
+
+[constants]
+EHR_WORDS = 6
+EHR_STRIDE = 4

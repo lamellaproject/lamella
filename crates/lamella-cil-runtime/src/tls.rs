@@ -48,14 +48,14 @@ pub enum VerifyMode {
     /// Trust exactly the certificate(s) supplied as `roots_pem` (a pinned leaf or CA), plus hostname.
     PinnedCert,
     /// Accept ANY certificate -- TEST ONLY; must be impossible to select in a shipping profile. The
-    /// engine checks nothing (no parse, no chain walk -- the cheap bench arm); the managed side
-    /// reports the chain UNVERIFIED to its validation callback, which makes the trust decision.
+    /// engine checks nothing (no parse, no chain walk); the managed side reports the chain
+    /// UNVERIFIED to its validation callback, which makes the trust decision.
     AcceptAny,
     /// Verify chain + hostname like [`SystemRoots`](VerifyMode::SystemRoots) but COMPLETE the
     /// handshake regardless, REPORTING the findings as [`session_flag`] bits -- the
     /// `RemoteCertificateValidationCallback` contract: the callback receives the engine's REAL
     /// policy errors and decides trust. A missing trust source (no registered store) is itself a
-    /// finding ([`session_flag::CHAIN_ERRORS`]), never a configuration failure -- a bench peer
+    /// finding ([`session_flag::CHAIN_ERRORS`]), never a configuration failure -- a test peer
     /// with a self-signed certificate reaches the callback with the honest report. The handshake
     /// signature is still hard-verified (the peer proves key possession).
     Report,
@@ -244,6 +244,22 @@ impl TlsState {
     }
 }
 
+/// What a read of decrypted application data found ([`TlsBackend::read_plain`]).
+///
+/// **A close and a failure are different answers**, and a reader must be able to tell them apart:
+/// the first ends the data, the second means the data so far may be incomplete or forged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlainRead {
+    /// This many plaintext bytes were read. `0` means none are available yet: pump, and feed more
+    /// ciphertext.
+    Data(usize),
+    /// The peer ended the session with close-notify, so no more plaintext will come.
+    Closed,
+    /// The session failed -- a fatal alert, a record that did not authenticate, a protocol error.
+    /// Nothing more can be read.
+    Failed,
+}
+
 /// The TLS crypto seam. `Debug` is a supertrait so the [`crate::interp::Vm`] -- which holds an
 /// `Option<Box<dyn TlsBackend>>` -- still derives `Debug`. Every method is a pure buffer transform;
 /// none touches a socket or blocks.
@@ -297,14 +313,15 @@ pub trait TlsBackend: core::fmt::Debug {
     /// may buffer less than offered; the managed side re-offers the remainder).
     fn read_tls(&mut self, tls: TlsHandle, input: &[u8]) -> usize;
 
-    /// Reads decrypted application data into `out`. `Some(n)` read `n` plaintext bytes (`0` = none
-    /// available yet -- pump + feed more ciphertext); `None` = the peer closed (close-notify).
-    fn read_plain(&mut self, tls: TlsHandle, out: &mut [u8]) -> Option<usize>;
+    /// Reads decrypted application data into `out`: see [`PlainRead`]. A session that has failed
+    /// answers [`PlainRead::Failed`] from then on, never [`PlainRead::Closed`].
+    fn read_plain(&mut self, tls: TlsHandle, out: &mut [u8]) -> PlainRead;
 
-    /// Queues application data to encrypt, returning how many bytes were accepted. The managed side
+    /// Queues application data to encrypt, returning how many bytes were accepted (`0` when the
+    /// engine can take none right now), or `None` when the session has failed. The managed side
     /// then drains the resulting ciphertext via [`wants_write`](TlsBackend::wants_write) +
     /// [`write_tls`](TlsBackend::write_tls).
-    fn write_plain(&mut self, tls: TlsHandle, input: &[u8]) -> usize;
+    fn write_plain(&mut self, tls: TlsHandle, input: &[u8]) -> Option<usize>;
 
     /// Writes the peer's end-entity certificate (DER) into `out`, returning its full DER length. When
     /// the certificate does not fit, nothing is written and the caller re-calls with a larger buffer;
@@ -372,7 +389,14 @@ pub trait TlsBackend: core::fmt::Debug {
         false
     }
 
-    /// Closes a session and releases its handle (sending close-notify where the engine supports it).
+    /// Queues close-notify for the peer, without releasing the session, so the managed side can
+    /// drain it through [`write_tls`](TlsBackend::write_tls) before [`close`](TlsBackend::close).
+    /// Defaults to nothing, for an engine that cannot send one.
+    fn close_notify(&mut self, _tls: TlsHandle) {}
+
+    /// Closes a session and releases its handle. Ciphertext still queued is dropped with it, so a
+    /// close-notify the peer should see goes through [`close_notify`](TlsBackend::close_notify)
+    /// and is drained first.
     fn close(&mut self, tls: TlsHandle);
 }
 

@@ -21,9 +21,9 @@ notes = [
 # documents name the same one.
 #
 # The check is run on every kit because the SAM R21 Xplained Pro's guide FAILED it -- it puts one
-# UART's two pads on two different SERCOM instances. Two of the three Microchip kits read so far
-# agree with their datasheets and one does not, which is the ratio that makes the check worth
-# running rather than a formality.
+# UART's two pads on two different SERCOM instances. Kits of this vendor have disagreed
+# with their own datasheets on exactly this, which is what makes the check worth running rather
+# than a formality.
 
 [[pins]]
 pin = "PA22"

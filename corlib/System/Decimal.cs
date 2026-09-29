@@ -17,7 +17,7 @@ namespace System
 
         public Decimal(int lo, int mid, int hi, bool isNegative, byte scale)
         {
-            if (scale > 28) throw new ArgumentOutOfRangeException("Decimal's scale value must be between 0 and 28, inclusive.");
+            if (scale > 28) throw new ArgumentOutOfRangeException("scale", scale, "scale ('" + Int32.Decimal(scale) + "') must be less than or equal to '28'.");
             this.lo = lo;
             this.mid = mid;
             this.hi = hi;
@@ -254,7 +254,7 @@ namespace System
 
         public static Decimal Round(Decimal d, int decimals)
         {
-            if (decimals < 0 || decimals > 28) throw new ArgumentOutOfRangeException("Decimal can only round to between 0 and 28 digits of precision.");
+            if (decimals < 0 || decimals > 28) throw new ArgumentOutOfRangeException("decimals", "Decimal can only round to between 0 and 28 digits of precision.");
             int scale = d.Scale;
             if (scale <= decimals) return d;
             uint clo = (uint)d.lo, cmid = (uint)d.mid, chi = (uint)d.hi;

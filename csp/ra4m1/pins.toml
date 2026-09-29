@@ -1,5 +1,5 @@
 # PIN map: pin x function -> (instance, signal) for the RA4M1.
-# PARTIAL, evidence-only.
+# It lists only the cells a binding uses, not the datasheet's whole table.
 #
 # THIS MAP IS EMPTY, AND AN EMPTY MAP IS A STATEMENT. Every pin the family's boards drive is a
 # general-purpose output driven by the port block itself, and a pin driven by its own port has no

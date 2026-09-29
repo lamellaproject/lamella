@@ -754,10 +754,29 @@ pub enum Feature {
     /// nullable analysis has nothing for it to suppress, so parsing it and discarding it is the
     /// whole implementation -- and refusing it would refuse ordinary modern C#.
     ///
-    /// **A SEPARATE VARIANT FROM THE `T?` ANNOTATION HALF, WHICH IS NOT BUILT**, even though csc
-    /// gates both as one feature and prints one name for both. One variant would have to answer
-    /// [`Feature::is_implemented`] for the pair at once, and the honest answer differs.
+    /// **A SEPARATE VARIANT FROM THE `T?` ANNOTATION HALF**, [`Feature::NullableReferenceTypes`],
+    /// even though csc gates both as one feature and prints one name for both: the two are found
+    /// by different parts of the compiler, the operator by the parser and the annotation only once
+    /// the binder knows whether `T` is a reference type.
     NullForgivingOperator,
+    /// A nullable reference type annotation, `string?`, and the `#nullable` directive that sets
+    /// where annotations and nullable warnings apply. Introduced in **C# 8.0**.
+    ///
+    /// **THE ANNOTATION IS NOT A TYPE.** `string?` is the type `string`, with a note that `null`
+    /// is an expected value; it is not `System.Nullable<string>`, which is not a type at all
+    /// (CS0453). So `T?` means two different things by what `T` turns out to be: over a value type
+    /// it is `Nullable<T>` (C# 2.0), and over a reference type, or a type parameter not known to be
+    /// a value type (C# 9.0), it is `T` itself. The difference is decided where `T` is resolved.
+    NullableReferenceTypes,
+    /// `T?` over a type parameter that is not known to be a value type or a non-nullable
+    /// reference type, as an annotation. Introduced in **C# 9.0**, with `where T : default`, under
+    /// the one feature csc names "default type parameter constraints"; at C# 8.0 it is CS8627.
+    UnconstrainedTypeParameterAnnotation,
+    /// The `notnull` constraint, `where T : notnull`: the argument must be a non-nullable type,
+    /// value or reference. Introduced in **C# 8.0**. It writes no `GenericParamConstraint` row --
+    /// csc records it only in the nullable metadata this compiler does not produce -- so what it
+    /// constrains is checked by nullable analysis alone, which is not built either.
+    NotNullConstraint,
     /// A `using static` directive (`using static System.Math;`), importing a type's static
     /// members into scope. Introduced in C# 6.0.
     UsingStatic,
@@ -1124,6 +1143,9 @@ impl Feature {
             Feature::RequiredMembers | Feature::LeadingDigitSeparator => true,
             Feature::NullConditional => true,
             Feature::NullForgivingOperator => true,
+            Feature::NullableReferenceTypes => true,
+            Feature::UnconstrainedTypeParameterAnnotation => true,
+            Feature::NotNullConstraint => true,
             Feature::UsingStatic => true,
             Feature::DefaultParameterValues => true,
             Feature::AutoPropertyInitializer | Feature::ReadonlyAutoProperty => true,
@@ -1184,7 +1206,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 80] = [
+    pub const ALL: [Feature; 83] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -1216,6 +1238,9 @@ impl Feature {
         Feature::NamedArguments,
         Feature::NullConditional,
         Feature::NullForgivingOperator,
+        Feature::NullableReferenceTypes,
+        Feature::UnconstrainedTypeParameterAnnotation,
+        Feature::NotNullConstraint,
         Feature::ExpressionBodiedConstructor,
         Feature::ConstantPattern,
         Feature::OutVariableDeclaration,
@@ -1307,6 +1332,8 @@ impl Feature {
             | Feature::Discards
             | Feature::DeclarationPattern => LanguageVersion::CSharp7,
             Feature::NullForgivingOperator
+            | Feature::NullableReferenceTypes
+            | Feature::NotNullConstraint
             | Feature::UsingDeclaration
             | Feature::SwitchExpression => LanguageVersion::CSharp8,
             Feature::NullConditional
@@ -1319,6 +1346,7 @@ impl Feature {
             Feature::BinaryLiterals | Feature::DigitSeparators => LanguageVersion::CSharp7,
             Feature::LeadingDigitSeparator => LanguageVersion::CSharp7_2,
             Feature::TopLevelStatements | Feature::Records => LanguageVersion::CSharp9,
+            Feature::UnconstrainedTypeParameterAnnotation => LanguageVersion::CSharp9,
             Feature::RecordStructs => LanguageVersion::CSharp10,
             Feature::RecordInheritance => LanguageVersion::CSharp9,
             Feature::InitOnlySetters => LanguageVersion::CSharp9,
@@ -1412,7 +1440,9 @@ impl Feature {
             Feature::DefaultParameterValues => "optional parameter",
             Feature::NamedArguments => "named argument",
             Feature::NullConditional => "null propagating operator",
-            Feature::NullForgivingOperator => "nullable reference types",
+            Feature::NullForgivingOperator | Feature::NullableReferenceTypes => {
+                "nullable reference types"
+            }
             Feature::StaticClasses => "static classes",
             Feature::UsingStatic => "using static",
             Feature::AutoProperties => "automatically implemented properties",
@@ -1421,6 +1451,8 @@ impl Feature {
             Feature::DigitSeparators => "digit separators",
             Feature::LeadingDigitSeparator => "leading digit separator",
             Feature::TopLevelStatements => "top-level statements",
+            Feature::UnconstrainedTypeParameterAnnotation => "default type parameter constraints",
+            Feature::NotNullConstraint => "notnull generic type constraint",
             Feature::FileScopedNamespaces => "file-scoped namespace",
             Feature::RequiredMembers => "required members",
             Feature::Records => "records",
@@ -1728,6 +1760,9 @@ mod tests {
                 | Feature::NamedArguments
                 | Feature::NullConditional
                 | Feature::NullForgivingOperator
+                | Feature::NullableReferenceTypes
+                | Feature::UnconstrainedTypeParameterAnnotation
+                | Feature::NotNullConstraint
                 | Feature::ExpressionBodiedConstructor
                 | Feature::ConstantPattern
                 | Feature::OutVariableDeclaration
@@ -1781,7 +1816,7 @@ mod tests {
         }
         assert_eq!(
             Feature::ALL.len(),
-            80,
+            83,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }

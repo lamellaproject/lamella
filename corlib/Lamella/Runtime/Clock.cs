@@ -20,7 +20,12 @@ namespace Lamella.Runtime
             Clock.anchorMonotonicMillis = MonotonicMilliseconds();
             Clock.anchorTicks = utcTicks;
             Clock.source = (int)source;
+            WallClockChanged(utcTicks, source != ClockSource.Unset);
         }
+
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        private static void WallClockChanged(long utcTicks, bool isSet) { }
 
         public static bool IsSet()
         {

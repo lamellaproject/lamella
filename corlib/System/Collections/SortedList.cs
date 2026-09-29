@@ -8,6 +8,11 @@ namespace System.Collections
         private int size;
         private IComparer comparer;
 
+        internal int version;
+
+        private SortedListKeysOrValues keysView;
+        private SortedListKeysOrValues valuesView;
+
         public SortedList()
         {
             keys = new object[16];
@@ -126,6 +131,7 @@ namespace System.Collections
             keys[index] = key;
             values[index] = value;
             size = size + 1;
+            version = version + 1;
         }
 
         public void Add(object key, object value)
@@ -149,7 +155,12 @@ namespace System.Collections
             {
                 CheckKey(key);
                 int i = InternalIndexOfKey(key);
-                if (i >= 0) { values[i] = value; return; }
+                if (i >= 0)
+                {
+                    values[i] = value;
+                    version = version + 1;
+                    return;
+                }
                 InsertAt(~i, key, value);
             }
         }
@@ -170,6 +181,7 @@ namespace System.Collections
         {
             if (index < 0 || index >= size) throw new ArgumentOutOfRangeException("index");
             values[index] = value;
+            version = version + 1;
         }
 
         public void RemoveAt(int index)
@@ -183,6 +195,7 @@ namespace System.Collections
             size = size - 1;
             keys[size] = null;
             values[size] = null;
+            version = version + 1;
         }
 
         public void Remove(object key)
@@ -196,15 +209,15 @@ namespace System.Collections
         {
             for (int i = 0; i < size; i++) { keys[i] = null; values[i] = null; }
             size = 0;
+            version = version + 1;
         }
 
         public ICollection Keys
         {
             get
             {
-                object[] snapshot = new object[size];
-                for (int i = 0; i < size; i++) snapshot[i] = keys[i];
-                return new ObjectArrayCollection(snapshot, size, this);
+                if (keysView == null) keysView = new SortedListKeysOrValues(this, SortedListEnumerator.Keys);
+                return keysView;
             }
         }
 
@@ -212,23 +225,25 @@ namespace System.Collections
         {
             get
             {
-                object[] snapshot = new object[size];
-                for (int i = 0; i < size; i++) snapshot[i] = values[i];
-                return new ObjectArrayCollection(snapshot, size, this);
+                if (valuesView == null) valuesView = new SortedListKeysOrValues(this, SortedListEnumerator.Values);
+                return valuesView;
             }
         }
 
         public IDictionaryEnumerator GetEnumerator()
         {
-            object[] ks = new object[size];
-            object[] vs = new object[size];
-            for (int i = 0; i < size; i++) { ks[i] = keys[i]; vs[i] = values[i]; }
-            return new SortedListEnumerator(ks, vs, size);
+            return new SortedListEnumerator(this, SortedListEnumerator.Entries);
         }
 
         IEnumerator IEnumerable.GetEnumerator()
         {
             return GetEnumerator();
+        }
+
+        internal void CopyTo(System.Array array, int index, int kind)
+        {
+            if ((object)array != null && array.Rank != 1) throw new ArgumentException("array");
+            System.Array.Copy(kind == SortedListEnumerator.Keys ? keys : values, 0, array, index, size);
         }
 
         public void CopyTo(System.Array array, int index)

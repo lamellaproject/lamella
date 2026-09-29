@@ -1,5 +1,5 @@
-# PARTS table for the SAM4S family. The pin present-list is EMPTY: this family is
-# identity-first, and a pad row is added when a binding is written against a read pinout.
+# PARTS table for the SAM4S family. Its `pins` lists name no pads, so every pin of this family is
+# refused rather than assumed.
 #
 # flash = 0x200000 (2 MB): the ATSAM4SD32C is a DUAL-PLANE part -- 2 x 1 MB, one EEFC per
 # plane (eefc0/eefc1). The memory gate below holds the plane arithmetic together rather than
@@ -32,4 +32,4 @@ package = "LQFP100"
 flash = 0x100000
 ram = 0x20000
 pins = ["PA5", "PC10", "PC17"]
-source = "SAM4S Series datasheet (Atmel-11100) ordering information: ATSAM4S16CA-AU / ATSAM4S16CB-AU is 1024 KB flash, 128 KB SRAM, LQFP100. The C suffix is the 100-pin member; the same table's ATSAM4SA16C rows are a different part at 160 KB SRAM. The pin list is PARTIAL and evidence-only: PA5, PC10 and PC17 are here because a board's control lines place them, each cited on its own row in that board file."
+source = "SAM4S Series datasheet (Atmel-11100) ordering information: ATSAM4S16CA-AU / ATSAM4S16CB-AU is 1024 KB flash, 128 KB SRAM, LQFP100. The C suffix is the 100-pin member; the same table's ATSAM4SA16C rows are a different part at 160 KB SRAM. The pin list is partial: PA5, PC10 and PC17 are here because a board's control lines place them, each cited on its own row in that board file."

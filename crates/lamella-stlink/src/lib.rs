@@ -209,7 +209,7 @@ impl FlashVerdict {
         }
     }
 
-    /// The process exit code a bench tool should carry.
+    /// The process exit code a command-line tool should exit with.
     ///
     /// **FOUR OUTCOMES, THREE CODES, AND THE THIRD ONE EARNS ITS KEEP.** A script that treats every
     /// non-zero as "re-flash it" would otherwise re-flash a board that is already correct, which on

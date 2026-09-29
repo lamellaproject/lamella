@@ -61,6 +61,77 @@ instance = "adc"
 reference_uv = 3300000
 source = "ADC_VREF/ADC_AVDD ride the board's filtered 3V3 rail. The datasheet's sensitivity warning: 1% of reference moves a reading over 4 C; an external reference improves absolute accuracy."
 
+# --- PWM: slices 1 to 7, each on the pair of GPIOs no other line here claims ----------------------
+#
+# Each output of slices 0 to 7 appears on two GPIOs, GPn and GPn+16 (datasheet 12.5.2, Table 1130),
+# so which one a slice drives is a board's choice. Each pair below is clear of the uart0, spi0 and
+# i2c0 pins and of the board's own lines. PWM0 is not bound: both of its pairs, GP0/GP1 and
+# GP16/GP17, are taken. Slices 8 to 11 reach no pin on this package. The chip a program passes to
+# PwmChannel.Create is the slice.
+
+[[bindings]]
+role = "pwm1"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 1
+a = { pin = "GP2" }
+b = { pin = "GP3" }
+
+[[bindings]]
+role = "pwm2"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 2
+a = { pin = "GP20" }
+b = { pin = "GP21" }
+
+[[bindings]]
+role = "pwm3"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 3
+a = { pin = "GP6" }
+b = { pin = "GP7" }
+
+[[bindings]]
+role = "pwm4"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 4
+a = { pin = "GP8" }
+b = { pin = "GP9" }
+
+[[bindings]]
+role = "pwm5"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 5
+a = { pin = "GP10" }
+b = { pin = "GP11" }
+
+[[bindings]]
+role = "pwm6"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 6
+a = { pin = "GP12" }
+b = { pin = "GP13" }
+
+[[bindings]]
+role = "pwm7"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 7
+a = { pin = "GP14" }
+b = { pin = "GP15" }
+
 # --- the board's own control: one LED, and it is plain GPIO ------------------------------------
 #
 # NO ALTERNATE FUNCTION IS INVOLVED, so this row states a pin and a level and nothing else -- which
@@ -78,6 +149,123 @@ kind = "gpio-out"
 pin = "GP25"
 active = "high"
 source = "Raspberry Pi Pico 2 datasheet section 2.1 internal-function pin list: 'GPIO25  OP Connected to user LED'. The schematic appendix, Figure 11, (the Pico 2 board schematic) wires GPIO25 through R3 (470R, 1%, M0603, 50 mW) to D2's anode, a green LED whose cathode is at ground. The same document's test-point list gives 'TP5  GPIO25/LED (not recommended to be used)' and explains that TP5 taps the node between the resistor and the anode, which is why it 'will only swing from 0V to the LED forward voltage'."
+
+# --- the header: the forty-position Pico header, ext/standards/pico-header.toml ---------------
+#
+# Each of its twenty-six GPIO positions reaches the GPIO of its own number, as the pinout draws it.
+# The row still states them one by one, because it is this board's half of a join: an extension
+# plugged onto the header names positions, and this row is where each finds its pad. A pin brought
+# out here is exposed rather than owned, so the bindings above keep theirs -- the header's GP0 and
+# GP1 are uart0's transmit and receive.
+
+[[connectors]]
+name = "header"
+standard = "pico-header"
+source = "Raspberry Pi Pico 2 Datasheet section 3.1 and Figure 2 (The pinout of the Raspberry Pi Pico 2 board): GP0 to GP22 on header positions 1 to 29 and GP26 to GP28 on positions 31, 32 and 34, each the RP2350's GPIO of the same number. The same section lists the four GPIOs the header does not carry as the board's own: GPIO29 measures VSYS/3 on ADC3, GPIO25 drives the user LED, GPIO24 senses VBUS and GPIO23 controls the SMPS power-save pin."
+
+[[connectors.header.pins]]
+signal = "gp0"
+pin = "GP0"
+
+[[connectors.header.pins]]
+signal = "gp1"
+pin = "GP1"
+
+[[connectors.header.pins]]
+signal = "gp2"
+pin = "GP2"
+
+[[connectors.header.pins]]
+signal = "gp3"
+pin = "GP3"
+
+[[connectors.header.pins]]
+signal = "gp4"
+pin = "GP4"
+
+[[connectors.header.pins]]
+signal = "gp5"
+pin = "GP5"
+
+[[connectors.header.pins]]
+signal = "gp6"
+pin = "GP6"
+
+[[connectors.header.pins]]
+signal = "gp7"
+pin = "GP7"
+
+[[connectors.header.pins]]
+signal = "gp8"
+pin = "GP8"
+
+[[connectors.header.pins]]
+signal = "gp9"
+pin = "GP9"
+
+[[connectors.header.pins]]
+signal = "gp10"
+pin = "GP10"
+
+[[connectors.header.pins]]
+signal = "gp11"
+pin = "GP11"
+
+[[connectors.header.pins]]
+signal = "gp12"
+pin = "GP12"
+
+[[connectors.header.pins]]
+signal = "gp13"
+pin = "GP13"
+
+[[connectors.header.pins]]
+signal = "gp14"
+pin = "GP14"
+
+[[connectors.header.pins]]
+signal = "gp15"
+pin = "GP15"
+
+[[connectors.header.pins]]
+signal = "gp16"
+pin = "GP16"
+
+[[connectors.header.pins]]
+signal = "gp17"
+pin = "GP17"
+
+[[connectors.header.pins]]
+signal = "gp18"
+pin = "GP18"
+
+[[connectors.header.pins]]
+signal = "gp19"
+pin = "GP19"
+
+[[connectors.header.pins]]
+signal = "gp20"
+pin = "GP20"
+
+[[connectors.header.pins]]
+signal = "gp21"
+pin = "GP21"
+
+[[connectors.header.pins]]
+signal = "gp22"
+pin = "GP22"
+
+[[connectors.header.pins]]
+signal = "gp26"
+pin = "GP26"
+
+[[connectors.header.pins]]
+signal = "gp27"
+pin = "GP27"
+
+[[connectors.header.pins]]
+signal = "gp28"
+pin = "GP28"
 
 [[plans]]
 name = "pll-150-48"         # the operating point: clk_sys 150 MHz off

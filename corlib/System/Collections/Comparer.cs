@@ -13,8 +13,10 @@ namespace System.Collections
             if (x == null) return -1;
             if (y == null) return 1;
             IComparable comparable = x as IComparable;
-            if (comparable == null) throw new ArgumentException("At least one object must implement IComparable.");
-            return comparable.CompareTo(y);
+            if (comparable != null) return comparable.CompareTo(y);
+            comparable = y as IComparable;
+            if (comparable != null) return -comparable.CompareTo(x);
+            throw new ArgumentException("At least one object must implement IComparable.");
         }
     }
 }

@@ -182,6 +182,14 @@ pub enum CilError {
     /// correct and always was. Same reasoning [`CilError::UnsupportedControlFlow`] carries one
     /// variant up: a refusal that names the wrong instruction is worse than one that names none.
     UnmatchableCatchType,
+    /// An `ldind.ref` or `stind.ref` whose slot does not hold an object reference: the store's value
+    /// is a `long`, a `double`, a struct or a small integer, or the load's address is a `ref` to one.
+    ///
+    /// These opcodes move one reference, which is one word on both targets, so lowering them would
+    /// truncate a `long` or `double`, zero a `byte`'s neighbours, and read a word of a struct as an
+    /// object -- silently. Earlier lcsc builds emitted them for every read and write through a
+    /// `ref T` or `out T` (csc emits `ldobj`/`stobj !T`), so a stale assembly can still carry them.
+    NonReferenceIndirect(Opcode),
 }
 
 /// Which control-flow shape a [`CilError::UnsupportedControlFlow`] refused.
@@ -985,6 +993,50 @@ impl CallResolver for NoCalls {
     }
 }
 
+/// Refuses an `ldind.ref` whose address is pushed, directly before it, by `ldarg` of a byref whose
+/// declared pointee is not a reference, or by `ldloca`/`ldarga` of a slot that is not one.
+///
+/// A load that reads one word into an object reference is wrong for every other slot: it takes half
+/// a `long` or a `double`, and a word of a struct, as a pointer. An address that reaches the load
+/// any other way -- through a local, a `dup`, a field -- is not traced here; the store side
+/// ([`CilError::NonReferenceIndirect`] at `stind.ref`) reads the value's own type instead.
+fn refuse_non_reference_ldind(
+    code: &[lamella_cil::Instruction],
+    arg_types: &[MirType],
+    local_types: &[MirType],
+    pointees: &[Option<MirType>],
+) -> Result<(), CilError> {
+    let not_reference = |ty: Option<&MirType>| ty.is_some_and(|ty| *ty != MirType::ObjectRef);
+    let mut previous: Option<&lamella_cil::Instruction> = None;
+    for inst in code.iter().filter(|inst| inst.opcode != Opcode::Nop) {
+        if inst.opcode == Opcode::LdindRef
+            && let Some(address) = previous
+        {
+            let slot = match &address.operand {
+                Operand::Variable(slot) => Some(usize::from(*slot)),
+                _ => None,
+            };
+            let refused = match address.opcode {
+                Opcode::Ldarg0 => not_reference(pointees.first().and_then(Option::as_ref)),
+                Opcode::Ldarg1 => not_reference(pointees.get(1).and_then(Option::as_ref)),
+                Opcode::Ldarg2 => not_reference(pointees.get(2).and_then(Option::as_ref)),
+                Opcode::Ldarg3 => not_reference(pointees.get(3).and_then(Option::as_ref)),
+                Opcode::LdargS | Opcode::Ldarg => {
+                    not_reference(slot.and_then(|slot| pointees.get(slot)).and_then(Option::as_ref))
+                }
+                Opcode::LdlocaS | Opcode::Ldloca => not_reference(slot.and_then(|slot| local_types.get(slot))),
+                Opcode::LdargaS | Opcode::Ldarga => not_reference(slot.and_then(|slot| arg_types.get(slot))),
+                _ => false,
+            };
+            if refused {
+                return Err(CilError::NonReferenceIndirect(Opcode::LdindRef));
+            }
+        }
+        previous = Some(inst);
+    }
+    Ok(())
+}
+
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`] by abstract
 /// interpretation: the CIL is split into basic blocks, the evaluation stack and
 /// locals are tracked per block, and join points (merges) become block parameters.
@@ -996,6 +1048,7 @@ fn lower_with_source(
     narrowing: Narrowing<'_>,
 ) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
+    refuse_non_reference_ldind(code, arg_types, local_types, narrowing.pointees)?;
     let widths = eval_stack_widths(code, arg_types, local_types, resolver);
     let mut byte_offsets: Vec<u32> = Vec::with_capacity(code.len());
     let mut running = 0u32;
@@ -2219,6 +2272,11 @@ pub struct Narrowing<'a> {
     pub args: &'a [Option<ConvKind>],
     /// Per-local, indexed as `ldloc`/`stloc` index them.
     pub locals: &'a [Option<ConvKind>],
+    /// Per-argument, indexed as `ldarg` indexes them: the MIR type a BYREF argument points at, from
+    /// the signature (`ref long` is `I64`), for the same reason as the widths above -- a
+    /// `ManagedPtr` does not say what it addresses. `None` for an argument that is not a byref, and
+    /// empty where the caller does not supply them.
+    pub pointees: &'a [Option<MirType>],
 }
 
 /// Defines a fresh MIR value of `ty` and returns its id.
@@ -3439,7 +3497,14 @@ fn apply_value_op(
         Opcode::StindI8 => stind(value_types, stack, insts, 8)?,
         Opcode::StindR4 => stind(value_types, stack, insts, 4)?,
         Opcode::StindR8 => stind(value_types, stack, insts, 8)?,
-        Opcode::StindRef | Opcode::StindI => stind(value_types, stack, insts, 4)?,
+        Opcode::StindRef => {
+            let value = *stack.last().ok_or(CilError::StackUnderflow)?;
+            if value_types.get(value.index()) != Some(&MirType::ObjectRef) {
+                return Err(CilError::NonReferenceIndirect(Opcode::StindRef));
+            }
+            stind(value_types, stack, insts, 4)?
+        }
+        Opcode::StindI => stind(value_types, stack, insts, 4)?,
         Opcode::LdindI1 => ldind(value_types, stack, insts, 1, true)?,
         Opcode::LdindU1 => ldind(value_types, stack, insts, 1, false)?,
         Opcode::LdindI2 => ldind(value_types, stack, insts, 2, true)?,
@@ -9819,6 +9884,79 @@ mod tests {
         assert_eq!(func.value_type(cond), Some(MirType::ObjectRef));
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::I32));
+    }
+
+    fn set_through_ref_body() -> MethodBodyImage {
+        MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::simple(Opcode::StindRef),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn stind_ref_of_a_long_is_refused_and_of_a_reference_lowers() {
+        let body = set_through_ref_body();
+        let at_long =
+            lower_method_typed(&body, &NoCalls, &[MirType::ManagedPtr, MirType::I64], &[], Narrowing::default());
+        assert_eq!(at_long.err(), Some(CilError::NonReferenceIndirect(Opcode::StindRef)));
+        let at_string =
+            lower_method_typed(&body, &NoCalls, &[MirType::ManagedPtr, MirType::ObjectRef], &[], Narrowing::default());
+        assert!(at_string.is_ok());
+    }
+
+    #[test]
+    fn ldind_ref_through_a_ref_long_is_refused_and_through_a_ref_string_lowers() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::LdindRef),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let at = |pointee: MirType| {
+            let pointees = [Some(pointee)];
+            lower_method_typed(
+                &body,
+                &NoCalls,
+                &[MirType::ManagedPtr],
+                &[],
+                Narrowing { pointees: &pointees, ..Narrowing::default() },
+            )
+        };
+        assert_eq!(at(MirType::I64).err(), Some(CilError::NonReferenceIndirect(Opcode::LdindRef)));
+        assert!(at(MirType::ObjectRef).is_ok());
+    }
+
+    #[test]
+    fn ldind_ref_of_a_long_local_is_refused() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdindRef),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let refused = lower_method_typed(&body, &NoCalls, &[], &[MirType::I64], Narrowing::default());
+        assert_eq!(refused.err(), Some(CilError::NonReferenceIndirect(Opcode::LdindRef)));
     }
 
     #[test]

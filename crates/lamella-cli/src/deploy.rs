@@ -2,9 +2,7 @@
 
 use crate::args::{self, Spec};
 use lamella_wire::Capabilities;
-use lamella_wire_host::{
-    TransferAck, board_name, deploy_image_blocking, hello_blocking, image_too_large, open_target,
-};
+use lamella_wire_host::{TransferAck, board_name, deploy_image_blocking, hello_blocking, open_target};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -346,13 +344,12 @@ fn send_image(image: &[u8], target: &str, no_run: bool) -> ExitCode {
     };
     match deploy_image_blocking(&mut transport, 1, image, CHUNK, TIMEOUT, Capabilities(0)) {
         Ok(TransferAck::Accepted) => {}
-        Ok(TransferAck::TooLarge { image: size, window }) => {
-            let board = board_name(session.identity.product_model);
-            eprintln!("lamella deploy: {}.", image_too_large(board, size, window));
+        Ok(not_accepted) => {
+            eprintln!("lamella deploy: {}.", not_accepted.describe(board_name(session.identity.product_model)));
             return ExitCode::FAILURE;
         }
-        Ok(_) => {
-            eprintln!("lamella deploy: a chunk failed to verify on {target}; nothing was started.");
+        Err(lamella_wire::TransportError::Refused { reason, .. }) => {
+            eprintln!("lamella deploy: {target} refused the deploy: {}", refusal(reason));
             return ExitCode::FAILURE;
         }
         Err(error) => {

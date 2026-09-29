@@ -16,8 +16,8 @@ mbedTLS, for boards whose firmware runs TLS on the main MCU (the `managed` arm o
   (`Apache-2.0 OR GPL-2.0-or-later`; see `vendor/mbedtls/LICENSE`)
 
 The build profile lives in `csrc/lamella_mbedtls_config.h` (TLS 1.2 client, ECDHE/RSA +
-AES-GCM + SHA-2, P-256/P-384, no filesystem, no wall clock -- certificate validity
-windows are NOT checked on device until a wall-clock source lands). `csrc/lamella_tls_shim.c`
+AES-GCM + SHA-2, P-256/P-384, no filesystem). Certificate validity windows are checked against
+the wall clock the embedder registers with `set_time_source`. `csrc/lamella_tls_shim.c`
 wraps the library in a handle-based opaque-pointer API so the Rust side needs no bindgen.
 
 ## Toolchain
@@ -29,11 +29,15 @@ Host builds (the seam conformance tests) use the platform C compiler.
 
 ## Embedder contract
 
-Register hardware entropy BEFORE creating sessions, then install the backend:
+Register hardware entropy and the wall clock BEFORE creating sessions, then install the backend:
 
 ```rust,ignore
 lamella_tls_mbedtls::set_entropy_source(trng_fill);
+lamella_tls_mbedtls::set_time_source(unix_seconds);
 vm.set_tls_backend(Box::new(lamella_tls_mbedtls::MbedTlsDevice::new()));
 ```
 
-Without an entropy source every configuration fails (no handshake with weak keys).
+Without an entropy source every configuration fails (no handshake with weak keys). The time
+source is the current time in Unix seconds, from the same clock the managed `SystemClock`
+keeps. Without one the clock reads 0, and the session's clock policy decides what a certificate's
+dates then mean (see `set_time_source`).

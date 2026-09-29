@@ -32,6 +32,8 @@ public sealed class Rp2350SpiDriver : SpiDriver
     private bool _chipSelectActiveHigh;
     private int _actualHz;
 
+    const int BankLines = 32;
+
     /// <summary>Binds the driver to one PL022 wiring; no hardware is touched until
     /// <see cref="Configure"/>.</summary>
     public Rp2350SpiDriver(Rp2350SpiBinding binding)
@@ -59,8 +61,10 @@ public sealed class Rp2350SpiDriver : SpiDriver
 
     /// <summary>Executes the proven init for the requested settings: crystal-exact clk_peri
     /// (the UART's sequence), the reset release, pad de-isolation, pin routing, then the
-    /// even-prescaler divisor with the port disabled (SSE last). Envelope rejects are LOUD:
-    /// the PL022 is MSB-first only, and this driver speaks 8-bit frames.</summary>
+    /// even-prescaler divisor with the port disabled (SSE last). Envelope rejects are LOUD, and
+    /// come before any register is written: the PL022 is MSB-first only, this driver speaks
+    /// 8-bit frames, and a chip-select line is -1 for the hardware ss_n or one of GPIO0 to
+    /// GPIO31, the lines SIO's bank-0 registers drive.</summary>
     public override void Configure(SpiConnectionSettings settings)
     {
         if (settings.DataFlow != System.Device.Spi.DataFlow.MsbFirst)
@@ -70,6 +74,10 @@ public sealed class Rp2350SpiDriver : SpiDriver
         if (settings.DataBitLength != 8)
         {
             throw new ArgumentException("this driver speaks 8-bit frames");
+        }
+        if (settings.ChipSelectLine < -1 || settings.ChipSelectLine >= BankLines)
+        {
+            throw new ArgumentOutOfRangeException("settings");
         }
 
         Mmio.Write32(_xoscStartup, Rp2350XoscLayout.STARTUP_DELAY_1MS);
@@ -139,18 +147,30 @@ public sealed class Rp2350SpiDriver : SpiDriver
     }
 
     /// <summary>The whole-burst full-duplex primitive: each byte transmits (empty = zeros) while
-    /// its echo lands (empty = discarded). The PL022 reports no per-transfer errors; 0 = done.</summary>
+    /// its echo lands (empty = discarded). Answers 0 when every byte went out and came back, and
+    /// <c>3</c> (the seam's other-error status) when a FIFO wait ran out -- never zeros or a
+    /// previous transfer's bytes. The receive FIFO is drained first, so a reply that arrives after its
+    /// transfer failed is not read as the next transfer's.</summary>
     public override int TransferFullDuplex(System.ReadOnlySpan<byte> writeBuffer,
                                            System.Span<byte> readBuffer, int count)
     {
+        DrainReceive();
         for (int i = 0; i < count; i++)
         {
             int tx = !writeBuffer.IsEmpty ? writeBuffer[i] : 0;
             int rx = TransferByte(tx);
+            if (rx < 0)
+            {
+                DrainReceive();
+                return OtherError;
+            }
             if (!readBuffer.IsEmpty) readBuffer[i] = (byte)rx;
         }
-        return 0;
+        return Ok;
     }
+
+    const int Ok = 0;
+    const int OtherError = 3;
 
     /// <summary>Drives the managed chip-select line; a no-op on the raw bus. Deassertion
     /// waits for the shift register to go idle first, so CS never releases mid-frame.</summary>
@@ -176,19 +196,23 @@ public sealed class Rp2350SpiDriver : SpiDriver
     }
 
     /// <summary>One full-duplex 8-bit transfer: sends <paramref name="value"/>, returns the
-    /// byte clocked back in.</summary>
+    /// byte clocked back in, or -1 when the transmit FIFO never had room or the reply never
+    /// came.</summary>
     public int TransferByte(int value)
+    {
+        if (!WaitStatus(Rp2350SpiLayout.SSPSR_TNF)) return -1;
+        Mmio.Write32(_dr, (uint)(value & 0xFF));
+        if (!WaitStatus(Rp2350SpiLayout.SSPSR_RNE)) return -1;
+        return (int)(Mmio.Read32(_dr) & 0xFFu);
+    }
+
+    bool WaitStatus(uint flag)
     {
         for (int spin = 0; spin < 100000; spin++)
         {
-            if ((Mmio.Read32(_sr) & Rp2350SpiLayout.SSPSR_TNF) != 0u) break;
+            if ((Mmio.Read32(_sr) & flag) != 0u) return true;
         }
-        Mmio.Write32(_dr, (uint)(value & 0xFF));
-        for (int spin = 0; spin < 100000; spin++)
-        {
-            if ((Mmio.Read32(_sr) & Rp2350SpiLayout.SSPSR_RNE) != 0u) break;
-        }
-        return (int)(Mmio.Read32(_dr) & 0xFFu);
+        return false;
     }
 
     /// <summary>Waits until the shift register is idle (SSPSR.BSY covers the frame on the wire).</summary>

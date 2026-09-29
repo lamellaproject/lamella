@@ -1,6 +1,6 @@
-# INSTANCE map for the CH32V003 family -- identity-first: ONLY the blocks a binding or a board
-# control line places appear here. The full peripheral set arrives with the family's first
-# generated driver.
+# INSTANCE map for the CH32V003 family. It places only the blocks a binding or a board's control
+# line uses, so a block that is not listed is not described here, rather than absent from the
+# part.
 #
 # THIS PART HAS PORTS A, C AND D AND NO PORT B. That is not an omission here: the reference
 # manual's own GPIO register list (Table 7-15) has three columns, x = A/C/D, and the clock-enable

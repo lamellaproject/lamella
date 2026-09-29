@@ -1,5 +1,6 @@
 # PIN map: pin x function -> (instance, signal) for the RP2040.
-# PARTIAL, evidence-only, exactly the cells the board packages bind. Function ids are
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# Function ids are
 # the datasheet's GPIO-function columns (F1..F9); GP<n> is the bank-less rp-family spelling.
 
 [table]

@@ -1,0 +1,209 @@
+[package]
+name = "lamella-serve-rp2350"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Interpreter firmware for RP2350 boards (the Raspberry Pi Pico 2 and Pico 2 W, and the Pimoroni Pico Plus 2 and Plus 2 W): it runs the C# or Python interpreter, takes programs from the lamella CLI over USB, and brings up the board's flash, USB and Wi-Fi."
+publish = false
+
+[dependencies]
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+# The firmware's Lamella Link side: the framed protocol and the baked-image runner core.
+lamella-wire = { path = "../lamella-wire", optional = true }
+lamella-runner = { path = "../lamella-runner", optional = true, default-features = false, features = [
+    "baked-image",
+] }
+# The reclaiming O(1) segregated global allocator: deployed apps run unbounded, and the M33
+# has the atomic CAS its spin lock needs. Pulled by the `rp2350` part feature.
+lamella-heap = { path = "../lamella-heap", optional = true }
+# The native-USB (driverless WinUSB) carrier: the RP2350 USB device controller as a hand-rolled
+# `usb_device::bus::UsbBus` (rp2350_usb.rs) under the shared usb_transport carrier. usb-device and
+# a critical-section implementation only -- no vendor USB-core crate; the RP2350 bus driver is in
+# this crate. Optional, behind `usb`, so a firmware build without USB is unchanged.
+usb-device = { version = "0.3.2", optional = true }
+critical-section = { version = "1", optional = true, features = ["restore-state-bool"] }
+# The on-board CYW43439 wireless (pico_wifi.rs): the driver with its RP2350 PIO engine, the station
+# that makes it one smoltcp device, smoltcp, and the NetBackend mapping for evaluations. Optional,
+# behind `cyw43`.
+smoltcp = { version = "0.14", optional = true, default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-dns",
+    "socket-dhcpv4",
+    "alloc",
+] }
+lamella-net-smoltcp = { path = "../lamella-net-smoltcp", optional = true }
+lamella-wifi-cyw4343x = { path = "../lamella-wifi-cyw4343x", optional = true, features = ["rp2350-pio"] }
+lamella-wifi-cyw4343x-smoltcp = { path = "../lamella-wifi-cyw4343x-smoltcp", optional = true }
+# The language-neutral network seam itself. The C# evaluations reach it through
+# `lamella_cil_runtime::net`, which re-exports it; a Python firmware names it directly.
+lamella-net-core = { path = "../lamella-net-core", optional = true }
+# On-board TLS for a wireless firmware build: the vendored mbedTLS device backend, its entropy from
+# the RP2350's TRNG. Optional, behind `tls`, which needs an ARM cross C compiler (see that crate's
+# README).
+lamella-tls-mbedtls = { path = "../lamella-tls-mbedtls", optional = true }
+# The bundled Mozilla/curl CA store (the `system-roots` feature), about 130 KB of flash.
+lamella-tls-roots = { path = "../lamella-tls-roots", optional = true }
+# The Python bytecode interpreter (rp2350-python-interpreter). `default-features = false` so every capability this
+# image carries is named by a recipe rather than inherited -- see the `python-float` feature.
+lamella-py-runtime = { path = "../lamella-py-runtime", optional = true, default-features = false }
+# The WebAssembly bring-up image (the `rp2350-wasm-proof` example): the wasm engine plus the
+# interpreter bridge, which serves a guest's bus imports through the C# driver stack. It is a
+# part-gated bare-metal image for this family, so it lives with the family's firmware. Optional,
+# behind `wasm-proof`, so every other build of this crate is unchanged.
+lamella-wasm-interp = { path = "../lamella-wasm-interp", optional = true }
+lamella-wasm-bridge = { path = "../lamella-wasm-bridge", optional = true }
+# The volatile MMIO seam the interpreted I2C driver reaches its registers through; the image
+# installs it on the VM before the harness's Main runs.
+lamella-mmio = { path = "../lamella-mmio", optional = true }
+
+[features]
+# A debugging aid, off by default: mirror every console byte into a RAM buffer so a debug probe
+# can read what the board printed when the UART cannot be read. Costs a 4 KiB static and one call
+# per byte, so it is off in a release image.
+console-mirror = []
+# A debugging aid, off by default: after every line written to the console, print on the UART how
+# many bytes of the heap are carved, live and on free lists. It tells a leak (live bytes that keep
+# growing) from fragmentation (a heap carved to its end while its free bytes sit in other size
+# classes). It walks the free lists once per line, so it is off in a release image.
+arena-trace = []
+# The firmware that takes programs from the lamella CLI over UART and, with `usb`, over USB:
+# lamella-wire framing and the lamella-runner baked-image core. Combine with the part feature --
+# e.g. `serve,rp2350` (Pico 2), `serve,rp2350,usb,cyw43` (Pico 2 W),
+# `serve,rp2350,usb,pico-plus-2` (Pico Plus 2) or `serve,rp2350,usb,pico-plus-2-w` (Pico Plus 2 W).
+serve = ["dep:lamella-wire", "dep:lamella-runner"]
+# The RP2350 part (Cortex-M33 / ARMv8-M, 520 KB SRAM; 4 MB of XIP flash on the Pico 2 and
+# Pico 2 W, 16 MB on the Pimoroni Pico Plus 2 and Plus 2 W): a firmware build takes the runner's
+# full profile and the reclaiming heap.
+rp2350 = ["lamella-runner?/profile-full", "dep:lamella-heap"]
+# The native-USB carrier for a firmware build: the RP2350 device controller under the shared
+# usb_transport carrier; the board's own USB port then carries the Lamella Link (no probe,
+# no jumpers). Combine with `serve,rp2350` -- e.g. `serve,rp2350,usb`.
+usb = ["dep:usb-device", "dep:critical-section"]
+# The Pico 2 W's CYW43439 wireless (pico_wifi.rs, gSPI over PIO0): the board identity flips to
+# PICO2_W, the build downloads the radio's images and checks them against their pins, the
+# bring-up and the join (open, WPA2 or WPA3, named at build time) narrate into the first
+# evaluation's stdout, and evaluations get a smoltcp NetBackend over the chip's ethernet data
+# channel. Combine with `serve,rp2350,usb`.
+cyw43 = [
+    "dep:smoltcp",
+    "dep:lamella-net-smoltcp",
+    "dep:lamella-wifi-cyw4343x",
+    "dep:lamella-wifi-cyw4343x-smoltcp",
+    "dep:lamella-wifi-images",
+]
+# The Pimoroni Pico Plus 2 W: the same firmware and the same CYW43439 radio on the same four lines
+# (its RM2 module), with its own board file and its own identity (PICO_PLUS_2_W). Combine with
+# `serve,rp2350,usb` -- `serve,rp2350,usb,pico-plus-2-w`.
+pico-plus-2-w = ["cyw43"]
+# The Pimoroni Pico Plus 2: the Pico 2's firmware on an RP2350B with no radio, with its own board
+# file and its own identity (PICO_PLUS_2). Combine with `serve,rp2350,usb` --
+# `serve,rp2350,usb,pico-plus-2`. It cannot take `cyw43`: the board has no radio, and the build
+# refuses the combination.
+pico-plus-2 = []
+# TLS on the interpreter over the wireless network: mbedTLS behind the runtime's TLS seam, keyed by
+# the RP2350's TRNG. Combine with a cyw43 build -- e.g. `serve,rp2350,usb,cyw43,tls`.
+tls = ["cyw43", "dep:lamella-tls-mbedtls"]
+# The bundled CA store, so a TLS build validates the public web's chains against system roots
+# rather than only a pinned certificate. Combine with a tls build.
+system-roots = ["tls", "dep:lamella-tls-roots"]
+# Embed a flash-resident corlib -- `LAMELLA_CORLIB_IMAGE` names the image to embed -- so a
+# deployed artifact can be the program's PE alone instead of a baked image carrying its own copy
+# of the corlib. A 1.5 KB program bakes to hundreds of KB with the corlib in it, and every one of
+# those bytes is one the board already had. Off, the firmware takes baked images only, and a bare
+# PE is refused by name.
+#
+# It forwards `corlib-lazy`, and on this part that is structural rather than a tuning preference.
+# Eager resolution loads the whole corlib into RAM at about a megabyte; the RP2350's entire SRAM is
+# 520 KB and this firmware's arena is 256 KB of it. An eager resident-corlib build therefore cannot
+# run a deployed PE at all: the load exhausts the arena, the allocator panics, and the recovery
+# reset returns the board to waiting for the host -- a failure that costs a boot rather than
+# reporting a wrong feature combination. Tying the two features together here rules that
+# combination out in the feature graph, before it can reach the RAM budget.
+resident-corlib = ["lamella-runner?/corlib-lazy"]
+# The WebAssembly bring-up image (the `rp2350-wasm-proof` example): a rustc-compiled wasm guest
+# reads the I2C bus through the CIL interpreter running the C# I2C driver. Combine with the part --
+# `rp2350,wasm-proof`. It does not take `serve`: the image reports over UART rather than taking
+# programs from a host.
+wasm-proof = [
+    "dep:lamella-wasm-interp",
+    "dep:lamella-wasm-bridge",
+    "dep:lamella-mmio",
+    # The same execute-in-place level the interpreter firmware's profiles take, and for the same
+    # reason: the embedded assemblies already sit in flash as `include_bytes!` statics, so the
+    # loader borrows the method bodies instead of copying them into the arena.
+    "lamella-wasm-bridge/code-in-place",
+]
+# A diagnostic image (the `rp2350-i2c-scan` example) that walks I2C0 and reports which addresses
+# answer. Combine with the part -- `rp2350,i2c-scan`. It takes no dependency of its own: the whole
+# image is the generated chip and board facts plus raw MMIO, so it builds and flashes without the
+# interpreter, wasm or USB stacks.
+i2c-scan = []
+# The Python bytecode interpreter linked bare-metal (rp2350-python-interpreter): the board runs a
+# bundle the host compiled and prints what the program prints. Combine with the part --
+# `python,rp2350`.
+python = ["dep:lamella-py-runtime", "python-gc-engine", "dep:lamella-heap"]
+# Python over the Pico 2 W's wireless: `socket` on the CYW43439's ethernet data channel, through
+# the same `lamella-net-smoltcp` mapping of the same `lamella-net-core` seam that carries the C#
+# evaluations on this board and Python on the SAM E54's wired GMAC. Three consumers, one seam --
+# so what a socket does here cannot depend on which language asked or which medium carried it.
+# Combine with the part -- `python-net,rp2350`.
+python-net = ["python", "cyw43", "dep:lamella-net-core"]
+# The `float` type and everything that produces one. Off unless a recipe asks for it by name: this
+# crate takes lamella-py-runtime with default-features = false, so a recipe that omits this builds
+# the no-float tier and `1 / 3` refuses in it -- a legitimate tier, never something to arrive at by
+# leaving a word out.
+python-float = ["lamella-py-runtime?/float"]
+# The `complex` numeric type: a pair of f64, so it requires the float tier.
+python-complex = ["python-float", "lamella-py-runtime?/complex"]
+# `dir()` and the per-type name lists it reports from. A deployed program runs; it does not ask
+# what a list can do.
+python-reflection = ["lamella-py-runtime?/reflection"]
+# The pure-Python module sources carried in the image so an import can be resolved with no
+# filesystem. A device running a host-compiled bundle never resolves an import at run time -- the
+# bundle already carries every module the program reached -- so this is off here.
+python-stdlib = ["lamella-py-runtime?/bundled-stdlib"]
+# `asyncio`'s coordination layer -- Lock, Event, Semaphore, BoundedSemaphore, Queue, wait_for and
+# timeout. The loop, tasks, `sleep`, `gather` and `run` are asyncio itself and are not gated here.
+#
+# Off unless a board enables it. Importing a module builds every class in it on the object heap, so
+# this surface takes heap whether or not a program uses it, and a board that turns it on needs Python
+# heap to spare. On this family `LAMELLA_PY_HEAP_BYTES` sets that heap at build time (see this crate's
+# `build.rs`).
+python-asyncio-sync = ["python-stdlib", "lamella-py-runtime?/asyncio-sync"]
+python-asyncio-streams = ["python-stdlib", "lamella-py-runtime?/asyncio-streams"]
+# The moving mark-compact collector engine, and the firmware drives it: rp2350-python-interpreter selects
+# `set_collect_when_full(true)` and installs the arena probe under this feature.
+python-gc-engine = ["lamella-py-runtime?/gc-collect"]
+# The `_thread` seam the `threading` module is written over -- `Thread`, `Lock`, `RLock`, `Event`.
+#
+# A flash knob rather than a heap one, which is what makes it different from `python-asyncio-sync`:
+# the surface is native code in the interpreter, so an image carries it whether or not any program
+# imports anything. A board short of flash can leave it off.
+#
+# Off, `import _thread` is a ModuleNotFoundError and `threading` fails on its own first line, so a
+# program that wants threads is told at import time instead of being accepted and then hung. The
+# interpreter still preempts either way: the switch point is not this feature's.
+python-threading = ["lamella-py-runtime?/threading"]
+
+[build-dependencies]
+# The radio's images for a `cyw43` build: downloaded at a pinned commit and checked against pinned
+# hashes before the firmware carries them.
+lamella-wifi-images = { path = "../lamella-wifi-images", optional = true }
+
+# Declared explicitly so profile-only builds skip it: without the `serve` dependencies the modules
+# are cfg'd out and the bin cannot provide the vector-table symbols.
+[[bin]]
+name = "rp2350-csharp-interpreter"
+path = "src/bin/rp2350-csharp-interpreter.rs"
+required-features = ["serve"]
+
+[[bin]]
+name = "rp2350-python-interpreter"
+path = "src/bin/rp2350-python-interpreter.rs"
+required-features = ["rp2350", "python"]
+

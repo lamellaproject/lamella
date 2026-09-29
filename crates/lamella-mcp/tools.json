@@ -33,7 +33,7 @@
     {
       "name": "lamella_run",
       "title": "Run (host interpreter)",
-      "description": "Compile and RUN a Lamella program on the HOST interpreter (no device needed) and return stdout, exit code, and diagnostics. Use this to test logic quickly. C#: a full program with a Main; Python: define main() and its return value is printed.",
+      "description": "Compile and RUN a Lamella program on the HOST interpreter (no device needed) and return stdout, exit code, and diagnostics. Use this to test logic quickly. C#: a full program with a Main; Python: define main() and its return value is printed. A program that has not finished in 20 seconds (or the time the server was started with, --run-timeout) is stopped, and the answer says so.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -114,6 +114,7 @@
           },
           "image_bytes": {
             "type": "integer",
+            "minimum": 0,
             "description": "The image's size in bytes."
           }
         },
@@ -149,7 +150,7 @@
     {
       "name": "lamella_bake",
       "title": "Bake to flash image",
-      "description": "Compile + BAKE a C# program into a deployable '.lmli' flash image (corlib-baked, the on-device deploy format) and report its size + the baked profile. Optionally write the image to out_path for inspection. This is the artifact lamella_deploy sends to a board.",
+      "description": "Compile + BAKE a C# program into a deployable '.lmli' flash image (corlib-baked, the on-device deploy format) and report its size. This is the artifact lamella_deploy sends to a board. To keep the image, name a NEW file with out_name: it is written in the directory the server was started with --allow-write=<dir>, never over a file already there, and a server started without that flag writes no file at all.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -157,9 +158,9 @@
             "type": "string",
             "description": "The C# program source."
           },
-          "out_path": {
+          "out_name": {
             "type": "string",
-            "description": "Optional path to write the .lmli image to."
+            "description": "Optional: the name of a NEW file to write the image to, such as 'blink.lmli'. A plain name ending in .lmli, with no directory part. It is created in the server's --allow-write directory and never replaces a file already there."
           }
         },
         "required": [
@@ -289,7 +290,7 @@
     {
       "name": "lamella_flash",
       "title": "Flash a board's chip",
-      "description": "Write an image that ALREADY EXISTS to a board's chip, over a probe or its bootloader volume. ERASES the board's flash: whatever was on it is gone, including another program you did not put there. Takes a path to a built image (.bin/.hex/.elf/.s19, or .uf2 for a volume route), never source -- build one with lamella_bake or the `lamella build` verb. The board is NEVER inferred and an ambiguous bench is REFUSED rather than guessed at: if more than one candidate matches, this returns the candidates and writes nothing, and you must call again naming one. A write to the wrong board succeeds and reports success, which is why. If a sidecar sits beside the image (<image>.manifest.json), it is CHECKED: a board that disagrees with `board`, or bytes that do not hash to what it records, refuse the call before any probe is opened. It is never used to infer `board`. A sidecar that is present and will not parse also refuses -- a claim nobody can check is worse than no claim.",
+      "description": "Write an image that ALREADY EXISTS to a board's chip, over a probe or its bootloader volume. ERASES the board's flash: whatever was on it is gone, including another program you did not put there. Takes a path to a built image (.bin/.hex/.elf/.s19, or .uf2 for a volume route), never source -- build one with the `lamella build` verb. A .lmli from lamella_bake is not a chip image: it is what lamella_deploy sends to a board that is already running Lamella. The board is NEVER inferred and an ambiguous bench is REFUSED rather than guessed at: if more than one candidate matches, this returns the candidates and writes nothing, and you must call again naming one. A write to the wrong board succeeds and reports success, which is why. If a sidecar sits beside the image (<image>.manifest.json), it is CHECKED: a board that disagrees with `board`, or bytes that do not hash to what it records, refuse the call before any probe is opened. It is never used to infer `board`. A sidecar that is present and will not parse also refuses -- a claim nobody can check is worse than no claim.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -474,6 +475,7 @@
           },
           "frame": {
             "type": "integer",
+            "minimum": 0,
             "default": 0,
             "description": "Frame index (0 = innermost)."
           }

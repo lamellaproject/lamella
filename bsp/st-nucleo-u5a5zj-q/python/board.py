@@ -72,10 +72,17 @@ INSTANCES = {
     "gpioj": {"block": "gpio", "base": 0x42022400, "rcc_en_off": 0x8C, "rcc_en_bit": 0x9},
     "usart1": {"block": "usart", "base": 0x40013800, "rcc_en_off": 0xA4, "rcc_en_bit": 0xE},
     "rcc": {"block": "rcc", "base": 0x46020C00},
+    "pwr": {"block": "pwr", "base": 0x46020800, "rcc_en_off": 0x94, "rcc_en_bit": 0x2},
 }
 
 PLANS = {
     "msis-4mhz": {"default": True, "source": "msis", "msis_hz": 4000000, "pclk_hz": 4000000},
+}
+
+# Supply rails this board's pads ride, which the part isolates at reset. Before any of a
+# rail's pads is touched, set the gate's mask in its register, then the valid mask.
+SUPPLIES = {
+    "vddio2": {"pads": ["PG2"], "rcc_en_reg": 0x46020C94, "rcc_en_mask": 0x4, "valid_reg": 0x46020810, "valid_mask": 0x20000000},
 }
 
 # On-board devices + module control lines: PORT group base + pin index + mask + polarity.

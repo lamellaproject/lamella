@@ -1615,7 +1615,6 @@ pub(crate) fn build_bootstrap_delta(
     let emitted = emit_body(
         &[],
         &[],
-        &[],
         &empty,
         &tokens,
         1,
@@ -1710,7 +1709,6 @@ pub(crate) fn build_submission_delta(
     let parameter_names = [ParamRow::from("s")];
     let emitted = emit_body(
         &param_row_names(&parameter_names),
-        &[],
         &[],
         bound,
         &tokens,
@@ -2420,11 +2418,14 @@ fn emit_enum(
                         .constant
                         .as_ref()
                         .and_then(lamella_binder::literal_int_value)
-                        .unwrap_or(0);
-                    (field.name.clone(), value)
+                        .ok_or(crate::EmitError::Unsupported(
+                            "an enum member whose value the compiler did not fold",
+                        ))?;
+                    Ok((field.name.clone(), value))
                 })
-                .collect()
+                .collect::<Result<_, crate::EmitError>>()
         })
+        .transpose()?
         .unwrap_or_default();
     for (name, value) in members {
         let field = image.add_field(&name, &member_field_sig, ENUM_MEMBER_FIELD_FLAGS);
@@ -5743,7 +5744,6 @@ fn emit_bound_body_in_scope(
     } = emit_body(
         &param_row_names(&parameter_names),
         &param_pairs(&byref_params),
-        scope.declaring,
         bound,
         tokens,
         arg_base,
@@ -7462,6 +7462,11 @@ fn emit_field(
         }
         let is_const_decimal =
             is_const && matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal));
+        if is_const && !is_const_decimal && constant.is_none() {
+            return Err(crate::EmitError::Unsupported(
+                "a `const` field whose value the compiler did not fold",
+            ));
+        }
         if constant.is_some() {
             flags |= FIELD_LITERAL | FIELD_HAS_DEFAULT;
         } else if is_const_decimal {
@@ -10493,6 +10498,7 @@ fn collect_type_tokens(
                 modifiers,
                 name,
                 type_parameters,
+                constraints,
                 parameters,
                 is_vararg,
                 body,
@@ -10505,12 +10511,8 @@ fn collect_type_tokens(
                 || find_dll_import(name, attributes).is_some() =>
             {
                 *next_method += 1;
-                let method_type_parameter_names: Vec<Box<str>> = type_parameters
-                    .iter()
-                    .map(|parameter| parameter.name.clone())
-                    .collect();
                 let method_type_parameters =
-                    binder.enter_type_parameter_names(&method_type_parameter_names);
+                    binder.enter_type_parameters(type_parameters, constraints);
                 let mut params: Vec<TypeSymbol> = parameters
                     .iter()
                     .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
@@ -16027,6 +16029,42 @@ mod tests {
             (1..=4).any(|rid| pdb.sequence_points(rid).iter().any(|p| p.start_line == 3)),
             "the const-decimal declaration (line 3) is covered by its .cctor init"
         );
+    }
+
+    /// **A `const` IS WRITTEN WITH THE VALUE ITS BOUND INITIALIZER HAS, AT ITS OWN TYPE.** Each of
+    /// these was written wrong with no diagnostic: `Big`, `C` and `All` as fields with no `Constant`
+    /// row at all -- plain statics every use read as zero -- and `A` and `D` with the value a
+    /// signed 64-bit fold truncated. The values are csc's, measured on .NET 8.
+    #[test]
+    fn a_const_is_written_with_the_value_of_its_bound_initializer() {
+        use lamella_metadata::ConstantValue;
+        let source = "public class P { public const int Big = int.MaxValue; \
+                          public const char C = char.MaxValue; public const int A = 1 << 33; \
+                          public const ulong D = ~0u; } \
+                      public enum E : uint { None, All = uint.MaxValue, After = All - 1 } \
+                      public enum Huge : ulong { Hex = 0xFFFFFFFFFFFFFFF0, \
+                          Decimal = 18446744073709551600, Suffixed = 0xFFFFFFFFFFFFFFF0UL, \
+                          All = ulong.MaxValue }";
+        let unit = parse_compilation_unit(source).unit;
+        let image = compile_unit(&unit, "t.dll", "t").image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the image reads back");
+        let constant = |ty: &str, name: &str| {
+            assembly
+                .find_type("", ty)
+                .and_then(|ty| ty.fields().find(|field| field.name() == Some(name)))
+                .and_then(|field| field.constant())
+                .unwrap_or_else(|| panic!("{ty}.{name} has a Constant row"))
+        };
+        assert_eq!(constant("P", "Big"), ConstantValue::I4(i32::MAX));
+        assert_eq!(constant("P", "C"), ConstantValue::Char(u16::MAX));
+        assert_eq!(constant("P", "A"), ConstantValue::I4(2));
+        assert_eq!(constant("P", "D"), ConstantValue::U8(u64::from(u32::MAX)));
+        assert_eq!(constant("E", "All"), ConstantValue::U4(u32::MAX));
+        assert_eq!(constant("E", "After"), ConstantValue::U4(u32::MAX - 1));
+        for member in ["Hex", "Decimal", "Suffixed"] {
+            assert_eq!(constant("Huge", member), ConstantValue::U8(0xFFFF_FFFF_FFFF_FFF0));
+        }
+        assert_eq!(constant("Huge", "All"), ConstantValue::U8(u64::MAX));
     }
 
     #[test]

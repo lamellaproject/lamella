@@ -1,0 +1,26 @@
+# BLOCK layout: the RP2350 system timer. A 64-bit counter advances once per tick from its tick
+# generator (block `ticks`). TIMER0 and TIMER1 are two copies of this block. Only the raw read
+# pair is laid out; the alarms grow with their consumers.
+[table]
+kind = "block"
+family = "rp2350"
+block = "timer"
+# Rust only: the one reader is a board's native clock, which reads TIMER0 beneath every managed
+# clock read.
+emit = ["rust"]
+sources = ["RP2350 datasheet ch 12.8 (system timers)"]
+notes = [
+    "TIMERAWH and TIMERAWL read the count without the TIMELR latch, so two readers cannot corrupt each other. Read H, then L, then H again, and read L again while the two H reads differ.",
+    "The count advances only while the tick generator runs. At a 1 us tick its 64 bits do not wrap in any real lifetime.",
+    "Reset values: the count is 0, PAUSE is clear, SOURCE is 0 (count ticks, not clk_sys cycles) and LOCKED is clear. DBGPAUSE resets with DBG0 and DBG1 set, so the count stops while either core is halted by a debugger.",
+]
+
+[registers.TIMERAWH]
+offset = 0x24
+width = 32
+notes = "Bits 63:32 of the count. A read has no side effects."
+
+[registers.TIMERAWL]
+offset = 0x28
+width = 32
+notes = "Bits 31:0 of the count. A read has no side effects."

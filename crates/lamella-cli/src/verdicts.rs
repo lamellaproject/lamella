@@ -121,6 +121,11 @@ pub fn fit_command(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    if image_bytes < 0 {
+        eprintln!("lamella fit: --image-bytes {image_bytes} is not a size. A size is 0 bytes or more.");
+        return ExitCode::FAILURE;
+    }
+
     let (board, part) = match catalog::resolve(board_id) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -371,6 +376,21 @@ mod tests {
     }
 
     /// An image over the budget is a failure exit; one whose budget is unknown is not.
+    /// A negative `--image-bytes` is refused as not a size. The rule called one a fit with more
+    /// room than the board has, and overflowed at the most negative.
+    #[test]
+    fn a_negative_size_is_refused_rather_than_fitted() {
+        for size in ["-5", "-9223372036854775808"] {
+            let args: Vec<String> =
+                ["--board", "rpi-pico", "--image-bytes", size].iter().map(|word| (*word).to_owned()).collect();
+            assert_eq!(
+                format!("{:?}", fit_command(&args)),
+                format!("{:?}", ExitCode::FAILURE),
+                "--image-bytes {size} must be refused"
+            );
+        }
+    }
+
     #[test]
     fn only_exceeding_the_budget_is_a_failure_exit() {
         let (board, part) = catalog::resolve("rpi-pico").expect("the pico board and its part");

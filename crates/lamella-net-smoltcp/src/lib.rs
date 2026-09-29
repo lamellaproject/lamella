@@ -661,6 +661,12 @@ impl<D: Device> NetBackend for SmoltcpNet<D> {
         outcome.unwrap_or(NetResult::WouldBlock)
     }
 
+    /// The UDP receive buffer's size: a datagram larger than the socket's payload buffer is
+    /// dropped on arrival rather than stored, so none larger is ever delivered.
+    fn udp_max_datagram(&mut self, _socket: SocketHandle) -> usize {
+        self.config.udp_buffer
+    }
+
     fn local_port(&mut self, socket: SocketHandle) -> Option<u16> {
         match self.table.get(&socket)? {
             Entry::Tcp(smol) => {

@@ -121,6 +121,8 @@ impl ReplLink for SerialLink {
 pub struct BakedSerialLink {
     transport: crate::SerialTransport,
     timeout: core::time::Duration,
+    /// What the target said it is, in the one HELLO this link opened with.
+    identity: lamella_wire::TargetIdentity,
 }
 
 #[cfg(all(feature = "serial", feature = "baked"))]
@@ -135,19 +137,44 @@ impl BakedSerialLink {
         baud: u32,
         timeout: core::time::Duration,
     ) -> Result<Self, TransportError> {
-        use lamella_wire::Capabilities;
         let mut transport = crate::SerialTransport::open(path, baud)?;
-        let session = crate::hello_blocking(
-            &mut transport,
-            0,
-            Capabilities(Capabilities::BAKED_IMAGE),
-            timeout,
-        )?;
-        if !session.caps.has(Capabilities::BAKED_IMAGE) {
-            return Err(TransportError::Closed);
-        }
-        Ok(Self { transport, timeout })
+        let identity = baked_hello(&mut transport, timeout)?;
+        Ok(Self { transport, timeout, identity })
     }
+
+    /// What the target said it is, in the HELLO this link opened with.
+    ///
+    /// It holds for as long as the link is open. A link HELLOs once and never reopens, and a board
+    /// that resets either answers on the same port (a UART behind a debug probe stays open) or
+    /// closes it (a board's own USB serial port goes away), so every program this link runs reaches
+    /// the board that answered that HELLO.
+    #[must_use]
+    pub fn identity(&self) -> &lamella_wire::TargetIdentity {
+        &self.identity
+    }
+}
+
+/// HELLO `transport` for a baked-image session, require the capability, and return what the target
+/// said it is.
+///
+/// # Errors
+/// [`TransportError::Closed`] if the handshake times out or the target does not run baked images.
+#[cfg(all(feature = "serial", feature = "baked"))]
+fn baked_hello(
+    transport: &mut impl lamella_wire::Transport,
+    timeout: core::time::Duration,
+) -> Result<lamella_wire::TargetIdentity, TransportError> {
+    use lamella_wire::Capabilities;
+    let session = crate::hello_blocking(
+        transport,
+        0,
+        Capabilities(Capabilities::BAKED_IMAGE),
+        timeout,
+    )?;
+    if !session.caps.has(Capabilities::BAKED_IMAGE) {
+        return Err(TransportError::Closed);
+    }
+    Ok(session.identity)
 }
 
 #[cfg(all(feature = "serial", feature = "baked"))]
@@ -828,6 +855,44 @@ fn ends_with_dangling_operator(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A baked-image link keeps what the target said it is, from the one HELLO it opened with.
+    ///
+    /// A host that checks WHICH board a program is about to run on reads it from the link, so the
+    /// model the board reported has to arrive unchanged. A target that does not run baked images is
+    /// still refused, rather than handing back an identity for a session that can run nothing.
+    #[cfg(all(feature = "serial", feature = "baked"))]
+    #[test]
+    fn a_baked_link_keeps_the_identity_its_hello_was_answered_with() {
+        let answered_with = |caps: u64| {
+            let ack = lamella_wire::HelloAck {
+                chosen: lamella_wire::PROTOCOL_VERSION,
+                caps: lamella_wire::Capabilities(caps),
+                identity: lamella_wire::TargetIdentity {
+                    product_model: lamella_wire::product_model::MICROBIT_V2,
+                    ..lamella_wire::TargetIdentity::default()
+                },
+                max_inbound_payload: None,
+            };
+            let mut board = MemTransport::new();
+            lamella_wire::Transport::send(&mut board, lamella_wire::msg::HELLO_ACK, 0, &ack.encode())
+                .expect("queue the board's HELLO_ACK");
+            let mut host = MemTransport::new();
+            host.feed(&board.take_sent());
+            host
+        };
+        let patience = core::time::Duration::from_millis(200);
+
+        let mut host = answered_with(lamella_wire::Capabilities::BAKED_IMAGE);
+        let identity = baked_hello(&mut host, patience).expect("a target that runs baked images");
+        assert_eq!(identity.product_model, lamella_wire::product_model::MICROBIT_V2);
+
+        let mut host = answered_with(0);
+        assert!(
+            matches!(baked_hello(&mut host, patience), Err(TransportError::Closed)),
+            "a target that does not run baked images is refused"
+        );
+    }
 
     /// A rendered diagnostic names its own namespace and its own location.
     ///

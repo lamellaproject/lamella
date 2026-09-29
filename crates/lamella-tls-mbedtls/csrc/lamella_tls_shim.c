@@ -371,12 +371,18 @@ int lam_tls_handshake(lam_tls *session)
 
 int lam_tls_read(lam_tls *session, unsigned char *buf, size_t len)
 {
-    int rc = mbedtls_ssl_read(&session->ssl, buf, len);
-    if (rc >= 0) {
-        /* A zero read from mbedTLS means the peer ended the connection. */
-        return rc == 0 ? LAM_TLS_CLOSED : rc;
+    /* A zero-length application record reads as 0 bytes, and a record behind it may already be
+     * buffered, so read past empty ones: mbedTLS itself fails the fourth in a row. A 0 is never
+     * the transport ending, because this BIO answers WANT_READ when it holds nothing. */
+    int empty = 0;
+    int rc;
+    do {
+        rc = mbedtls_ssl_read(&session->ssl, buf, len);
+    } while (rc == 0 && ++empty < 4);
+    if (rc > 0) {
+        return rc;
     }
-    if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    if (rc == 0 || rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
         return LAM_TLS_WANT;
     }
     if (rc == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
@@ -444,8 +450,15 @@ int lam_tls_report_flags(lam_tls *session)
     return flags;
 }
 
-/* Queues close-notify (best effort -- it lands in the Rust outgoing queue for the managed
- * side to flush) and releases the whole session. */
+/* Queues close-notify through the BIO, into the Rust outgoing queue, and keeps the session: the
+ * managed side sends the alert and then closes. */
+void lam_tls_close_notify(lam_tls *session)
+{
+    (void)mbedtls_ssl_close_notify(&session->ssl);
+}
+
+/* Queues close-notify (best effort -- a caller that wants the peer to see it calls
+ * lam_tls_close_notify and drains the queue first) and releases the whole session. */
 void lam_tls_close(lam_tls *session)
 {
     (void)mbedtls_ssl_close_notify(&session->ssl);

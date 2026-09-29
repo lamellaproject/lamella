@@ -1,9 +1,9 @@
-# BOARD binding: the SAM4L8 Xplained Pro -- identity-first. No peripheral bindings yet, because the
-# SAM4L family has no generated driver; what this file states beyond identity is the board's two
-# control lines, which need no driver -- a control pin rides no alternate function.
+# BOARD binding: the SAM4L8 Xplained Pro. It states the board's identity, its part and its two
+# control lines, and binds no peripheral. A control pin rides no alternate function, so the LED
+# and the button need no driver.
 #
-# BOTH CONTROL LINES ARE ON THE SAME PORT, which is a first here and worth knowing before reading
-# the rows: PC07 and PC24 are both port 2 of the one GPIO controller this part has, so both resolve
+# BOTH CONTROL LINES ARE ON THE SAME PORT, which is worth knowing before reading the rows:
+# PC07 and PC24 are both port 2 of the one GPIO controller this part has, so both resolve
 # to the same bank base and differ only in bit position.
 
 [table]
@@ -46,7 +46,7 @@ default = true              # this board states no [[plans]] row, so the carrier
 # connected I/O line to GND".
 #
 # THE PIN NAMES CARRY THE DATASHEET'S LEADING ZERO. PC07 is how the document spells it, and the
-# part's present-list spells it the same way, so the two are one string. PC7 would name the same
+# part's `pins` list spells it the same way, so the two are one string. PC7 would name the same
 # physical pin and match nothing.
 
 [[devices]]

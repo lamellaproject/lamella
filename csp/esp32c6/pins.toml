@@ -1,5 +1,6 @@
 # PIN map: pin x function -> (instance, signal) for the ESP32-C6.
-# PARTIAL, evidence-only. Function ids are IO_MUX MCU_SEL values (F0..F4);
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# Function ids are IO_MUX MCU_SEL values (F0..F4);
 # F0 is each pin's NATIVE function. GPIO<n> is the bank-less spelling.
 
 [table]

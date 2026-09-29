@@ -1,8 +1,7 @@
-# INSTANCE map for the nRF51 family -- identity-first: ONLY the blocks a binding
-# places appear here. nRF peripherals need no clock-gate or
-# reset records (each block owns an ENABLE register), so the record is bases-only, exactly
-# the nrf52833 shape. The full instance set + block layouts arrive with the family's first
-# generated driver.
+# INSTANCE map for the nRF51 family. It places only the blocks a binding uses, so a block that is
+# not listed is not described here, rather than absent from the part. nRF peripherals need no
+# clock-gate or reset records (each block owns an ENABLE register), so the record is bases-only,
+# exactly the nrf52833 shape.
 
 [table]
 kind = "instances"
@@ -23,8 +22,7 @@ base = 0x40003000   # TWI0, nRF51 Series RM v3.0 Table 259. Peripheral ID follow
                     # (10.1.1: ID = (base - 0x40000000) >> 12), so this is ID 3 -- shared with
                     # the serial-peripheral personality at the same address, which is why a
                     # bring-up disables the block before selecting TWI. TWI1 at 0x40004000 is
-                    # not placed here: this file is identity-first, so an instance joins when a
-                    # binding uses it.
+                    # not placed here, because no binding uses it.
 
 [[instances]]
 name = "uart0"

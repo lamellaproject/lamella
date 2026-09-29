@@ -661,6 +661,25 @@ pub extern "C" fn lamella_console_newline() {
     console_put(b'\n');
 }
 
+/// Name resolution in this archive, which has no net layer, in a module of its own so that it does
+/// not share a codegen unit with symbols every image links.
+mod no_resolver {
+    /// There is no resolver, so every name fails and `Dns` throws `SocketException`, as it does
+    /// wherever nothing answers. Not a mock -- an honest answer. It exists so a program whose `Dns`
+    /// call only ever sees IP literals (which never reach the resolver) still links.
+    #[no_mangle]
+    pub extern "C" fn lamella_net_resolve_host(
+        _host: *const u16,
+        _host_len: u32,
+        _buffer: *mut u8,
+        _buffer_len: u32,
+        _lengths: *mut i32,
+        _lengths_len: u32,
+    ) -> i32 {
+        -1
+    }
+}
+
 /// Park the current thread on `reason`: clear its runnable bit, record the reason, and run others
 /// through the shared re-entry loop. The thread resumes here once woken and rescheduled -- by the
 /// block point's wake pass (its `reason` came due) or, single-threaded, by its own wait completing.

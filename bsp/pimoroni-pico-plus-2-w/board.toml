@@ -101,6 +101,77 @@ instance = "adc"
 reference_uv = 3300000
 source = "Schematic sheet 1: the 3V3 rail reaches the RP2350B's ADC supply pin (labelled ADC_IOVDD, pin 59) through R3 (220R), with C9 (2.2uF) to ground -- the net ADC_VREF, which the pinout diagram brings out at the header's ADC VREF position. The part symbol's own note reads USB&ADC: 3.3V."
 
+# --- PWM: slices 1 to 7, each on the pair of GPIOs no other line here claims ----------------------
+#
+# Each output of slices 0 to 7 appears on two GPIOs, GPn and GPn+16 (datasheet 12.5.2, Table 1130),
+# so which one a slice drives is a board's choice. Each pair below is clear of the uart0, spi0 and
+# i2c0 pins and of the board's own lines. PWM0 is not bound: both of its pairs, GP0/GP1 and
+# GP16/GP17, are taken. Slices 8 to 11, on GP32 to GP47, are not bound. The chip a program passes
+# to PwmChannel.Create is the slice.
+
+[[bindings]]
+role = "pwm1"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 1
+a = { pin = "GP2" }
+b = { pin = "GP3" }
+
+[[bindings]]
+role = "pwm2"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 2
+a = { pin = "GP20" }
+b = { pin = "GP21" }
+
+[[bindings]]
+role = "pwm3"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 3
+a = { pin = "GP6" }
+b = { pin = "GP7" }
+
+[[bindings]]
+role = "pwm4"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 4
+a = { pin = "GP8" }
+b = { pin = "GP9" }
+
+[[bindings]]
+role = "pwm5"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 5
+a = { pin = "GP10" }
+b = { pin = "GP11" }
+
+[[bindings]]
+role = "pwm6"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 6
+a = { pin = "GP12" }
+b = { pin = "GP13" }
+
+[[bindings]]
+role = "pwm7"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 7
+a = { pin = "GP14" }
+b = { pin = "GP15" }
+
 # --- the RM2 module's control lines. The DATA line is a SHARED half-duplex DI/DO/IRQ line and CLK
 #     is a clock: neither has an asserted level, so neither states one (the Pico 2 W's rows take the
 #     same shape for the same reason). ---
@@ -151,6 +222,7 @@ source = "Schematic sheet 1: the net PSRAM_CS lands on GPIO47/ADC7 (ball 58); sh
 name = "adc0-header-26"
 kind = "gpio-in"
 pin = "GP40"
+twin = { pin = "GP26" }
 active = "none"
 source = "Schematic sheet 1: the header net GP26 reaches GPIO40/ADC0 (ball 49)  as well as GPIO26 (ball 27) directly. This row names the ANALOGUE half of a header position that also lands on a low-numbered GPIO, so it is a sampled input rather than a logic line and asserts no level: `none` here states that, where `unknown` would say nobody had looked."
 
@@ -158,6 +230,7 @@ source = "Schematic sheet 1: the header net GP26 reaches GPIO40/ADC0 (ball 49)  
 name = "adc1-header-27"
 kind = "gpio-in"
 pin = "GP41"
+twin = { pin = "GP27" }
 active = "none"
 source = "Schematic sheet 1: the header net GP27 reaches GPIO41/ADC1 (ball 52)  as well as GPIO27 (ball 28) directly. This row names the ANALOGUE half of a header position that also lands on a low-numbered GPIO, so it is a sampled input rather than a logic line and asserts no level: `none` here states that, where `unknown` would say nobody had looked."
 
@@ -165,8 +238,129 @@ source = "Schematic sheet 1: the header net GP27 reaches GPIO41/ADC1 (ball 52)  
 name = "adc2-header-28"
 kind = "gpio-in"
 pin = "GP42"
+twin = { pin = "GP28" }
 active = "none"
 source = "Schematic sheet 1: the header net GP28 reaches GPIO42/ADC2 (ball 53)  as well as GPIO28 (ball 36) directly. This row names the ANALOGUE half of a header position that also lands on a low-numbered GPIO, so it is a sampled input rather than a logic line and asserts no level: `none` here states that, where `unknown` would say nobody had looked."
+
+# --- the header: the forty-position Pico header, ext/standards/pico-header.toml ---------------
+#
+# Each of its twenty-six GPIO positions reaches the GPIO of its own number, as the pinout draws it.
+# The row still states them one by one, because it is this board's half of a join: an extension
+# plugged onto the header names positions, and this row is where each finds its pad. A pin brought
+# out here is exposed rather than owned, so the bindings above keep theirs -- the header's GP0 and
+# GP1 are uart0's transmit and receive.
+#
+# Positions GP26 to GP28 also reach GPIO40 to GPIO42 through 1k. Those are the converter's pads,
+# and the analog device rows above state them; this row states the header's own pads.
+
+[[connectors]]
+name = "header"
+standard = "pico-header"
+source = "Pimoroni Pico Plus 2 W pinout diagram: the forty header positions in the Pico's order, labeled by GPIO number alone -- 0 to 22, then 26 / A0, 27 / A1 and 28 / A2 -- each the RP2350B's GPIO of the same number. The same diagram draws the three analog positions' second connection, to GPIO40, GPIO41 and GPIO42, and labels it 1kOhms Internal."
+
+[[connectors.header.pins]]
+signal = "gp0"
+pin = "GP0"
+
+[[connectors.header.pins]]
+signal = "gp1"
+pin = "GP1"
+
+[[connectors.header.pins]]
+signal = "gp2"
+pin = "GP2"
+
+[[connectors.header.pins]]
+signal = "gp3"
+pin = "GP3"
+
+[[connectors.header.pins]]
+signal = "gp4"
+pin = "GP4"
+
+[[connectors.header.pins]]
+signal = "gp5"
+pin = "GP5"
+
+[[connectors.header.pins]]
+signal = "gp6"
+pin = "GP6"
+
+[[connectors.header.pins]]
+signal = "gp7"
+pin = "GP7"
+
+[[connectors.header.pins]]
+signal = "gp8"
+pin = "GP8"
+
+[[connectors.header.pins]]
+signal = "gp9"
+pin = "GP9"
+
+[[connectors.header.pins]]
+signal = "gp10"
+pin = "GP10"
+
+[[connectors.header.pins]]
+signal = "gp11"
+pin = "GP11"
+
+[[connectors.header.pins]]
+signal = "gp12"
+pin = "GP12"
+
+[[connectors.header.pins]]
+signal = "gp13"
+pin = "GP13"
+
+[[connectors.header.pins]]
+signal = "gp14"
+pin = "GP14"
+
+[[connectors.header.pins]]
+signal = "gp15"
+pin = "GP15"
+
+[[connectors.header.pins]]
+signal = "gp16"
+pin = "GP16"
+
+[[connectors.header.pins]]
+signal = "gp17"
+pin = "GP17"
+
+[[connectors.header.pins]]
+signal = "gp18"
+pin = "GP18"
+
+[[connectors.header.pins]]
+signal = "gp19"
+pin = "GP19"
+
+[[connectors.header.pins]]
+signal = "gp20"
+pin = "GP20"
+
+[[connectors.header.pins]]
+signal = "gp21"
+pin = "GP21"
+
+[[connectors.header.pins]]
+signal = "gp22"
+pin = "GP22"
+
+[[connectors.header.pins]]
+signal = "gp26"
+pin = "GP26"
+
+[[connectors.header.pins]]
+signal = "gp27"
+pin = "GP27"
+
+[[connectors.header.pins]]
+signal = "gp28"
+pin = "GP28"
 
 # --- the clock plan. X1 is a 12 MHz crystal: no document for this board states its frequency, so
 #     the figure is a measurement, and this file's notes say how it was taken. ---

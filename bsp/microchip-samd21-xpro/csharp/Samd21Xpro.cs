@@ -51,15 +51,15 @@ namespace Lamella.Boards.Microchip
         public const int PwmChipExt3 = 2;
 
         /// <summary>The `ext1-pwm` binding descriptor -- TC6 and the EXT1 header's two PWM pins --
-        /// lifted from the generated constants.</summary>
+        /// built from the generated constants.</summary>
         public Samd21PwmBinding CreateExt1PwmBinding() { return Ext1PwmBinding(); }
 
         /// <summary>The `ext2-pwm` binding descriptor -- TC4 and the EXT2 header's two PWM pins --
-        /// lifted from the generated constants.</summary>
+        /// built from the generated constants.</summary>
         public Samd21PwmBinding CreateExt2PwmBinding() { return Ext2PwmBinding(); }
 
         /// <summary>The `ext3-pwm` binding descriptor -- TCC2 and the EXT3 header's PWM pin --
-        /// lifted from the generated constants.</summary>
+        /// built from the generated constants.</summary>
         public Samd21PwmBinding CreateExt3PwmBinding() { return Ext3PwmBinding(); }
 
         private static Samd21PwmBinding Ext1PwmBinding()
@@ -161,7 +161,7 @@ namespace Lamella.Boards.Microchip
 
         private static I2cDriver MakeExtTwi() { return new Samd21I2cDriver(ExtTwiBinding()); }
 
-        /// <summary>The `ext-twi` binding descriptor -- the extension headers' shared TWI -- lifted
+        /// <summary>The `ext-twi` binding descriptor -- the extension headers' shared TWI -- built
         /// from the generated constants. The bus speed is not in it: that is a runtime
         /// <c>Configure</c> choice, derived from the core-clock rate.</summary>
         public Samd21SercomI2cBinding CreateExtTwiBinding() { return ExtTwiBinding(); }
@@ -216,7 +216,7 @@ namespace Lamella.Boards.Microchip
         public static readonly int AdcReferenceMicrovolts = (int)MicrochipSamd21XproBindings.ADC_REFERENCE_UV;
 
         /// <summary>The `adc` binding descriptor -- the converter and the six analog pads of the
-        /// extension headers -- lifted from the generated constants.</summary>
+        /// extension headers -- built from the generated constants.</summary>
         public Samd21AdcBinding CreateAdcBinding() { return AdcBinding(); }
 
         private static Samd21AdcBinding AdcBinding()
@@ -285,7 +285,7 @@ namespace Lamella.Boards.Microchip
 
         private static SpiDriver MakeExt1Spi() { return new Samd21SpiDriver(Ext1SpiBinding()); }
 
-        /// <summary>The `ext1-spi` binding descriptor -- the EXT1 header's SPI -- lifted from the
+        /// <summary>The `ext1-spi` binding descriptor -- the EXT1 header's SPI -- built from the
         /// generated constants.</summary>
         public Samd21SercomSpiBinding CreateExt1SpiBinding() { return Ext1SpiBinding(); }
 

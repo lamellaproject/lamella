@@ -3,7 +3,7 @@
 
 use crate::bind::bind_type;
 use crate::conversion::{can_cast, converts, no_conversion_operator_can_exist};
-use crate::diagnostic::{Diagnostic, DiagnosticKind, GenericMember};
+use crate::diagnostic::{Diagnostic, DiagnosticKind, GenericMember, NonGenericName};
 use crate::infer::{infer_expanded_type_arguments, infer_method_type_arguments};
 use crate::resolve::{Shadowed, TypeTable, resolve_type};
 use crate::special::SpecialType;
@@ -1238,6 +1238,11 @@ pub struct Binder {
     /// line -- a test, an in-process compile -- has no such policy to apply. The driver sets it,
     /// and `unsafe` written under it is `CS0227`.
     unsafe_option_missing: bool,
+    /// The nullable context of the file being bound (C# 8.0): whether a `?` over a reference type
+    /// is an annotation, a CS8632 warning or, before C# 8.0, a CS8370 error depends on where it is
+    /// written. Set per unit by [`Binder::set_nullable_context`]; the default, a disabled context
+    /// with no directives, is csc's without `/nullable`.
+    nullable_context: lamella_syntax::lexer::NullableContext,
     /// How many enclosing `catch` clauses the binder is inside, so a bare `throw;` outside one
     /// is `CS0156` -- there is no exception in flight to re-throw. Reset per method.
     catch_depth: u32,
@@ -1588,10 +1593,57 @@ impl Binder {
                 (parameter.name.clone(), displaced)
             })
             .collect();
+        let first = self.type_parameters_in_scope.len();
         for (name, constraint) in names.into_iter().zip(constraints) {
             self.type_parameters_in_scope.push((name, constraint));
         }
+        for clause in clauses {
+            let Some(offset) = parameters
+                .iter()
+                .position(|parameter| *parameter.name == *clause.parameter)
+            else {
+                continue;
+            };
+            if clause
+                .constraints
+                .iter()
+                .any(|constraint| self.is_non_nullable_reference_constraint(constraint))
+            {
+                self.type_parameters_in_scope[first + offset].1.known_non_nullable_reference = true;
+            }
+        }
         entered
+    }
+
+    /// Whether one written constraint makes its parameter KNOWN to be a non-nullable reference type
+    /// (C# 8.0): `class`, or a class type, written without `?` where annotations are enabled.
+    ///
+    /// **WHERE IT IS WRITTEN IS HALF OF THE ANSWER.** A `class` constraint in a disabled context is
+    /// OBLIVIOUS -- neither nullable nor not -- and at C# 8.0 `T?` over it is CS8627 exactly as over
+    /// an unconstrained `T`; so is `where T : U` with `U : class`, and `notnull` (all measured
+    /// against csc 10.0.301). `System.Enum` is a class that constrains to enums, so it does not
+    /// make a reference type either.
+    fn is_non_nullable_reference_constraint(
+        &mut self,
+        constraint: &lamella_syntax::ast::TypeParameterConstraint,
+    ) -> bool {
+        use lamella_syntax::ast::TypeParameterConstraint as SyntaxConstraint;
+        if !self.nullable_context.annotations_enabled_at(constraint.span().start) {
+            return false;
+        }
+        match constraint {
+            SyntaxConstraint::ReferenceType { question, .. } => question.is_none(),
+            SyntaxConstraint::Type(reference) => {
+                if matches!(reference.kind, TypeRefKind::Nullable(_)) {
+                    return false;
+                }
+                let resolved = self.resolve_named_type_quietly(&bind_type(reference), reference.span);
+                matches!(self.declared_kind(&resolved), Some(TypeKind::Class))
+                    && !is_reference_base_class(&resolved)
+                    && self.constraints_of_type_parameter(&resolved).is_none()
+            }
+            SyntaxConstraint::ValueType(_) | SyntaxConstraint::DefaultConstructor(_) => false,
+        }
     }
 
     /// The constraints written for the in-scope type parameter named `name`, innermost first, or
@@ -1730,6 +1782,19 @@ impl Binder {
     /// so a scoped lookup cannot capture a model type spelled like the parameter; exit through
     /// [`Binder::exit_type_parameters`].
     pub fn enter_type_parameter_names(&mut self, names: &[Box<str>]) -> Vec<(Box<str>, Shadowed)> {
+        self.enter_type_parameter_names_with(names, &[])
+    }
+
+    /// [`Self::enter_type_parameter_names`] with each parameter's constraints, where the model has
+    /// them, entered beside it -- `constraints` in the same order and at most as long (a missing
+    /// entry is "nothing known", as [`crate::symbols::MethodSymbol::type_parameter_constraints`]
+    /// allows). Signature qualification needs them: `T?` over a `struct` parameter is
+    /// `Nullable<T>`, and over any other an annotation.
+    pub fn enter_type_parameter_names_with(
+        &mut self,
+        names: &[Box<str>],
+        constraints: &[crate::symbols::TypeParameterConstraints],
+    ) -> Vec<(Box<str>, Shadowed)> {
         let entered: Vec<(Box<str>, Shadowed)> = names
             .iter()
             .map(|name| {
@@ -1737,9 +1802,9 @@ impl Binder {
                 (name.clone(), displaced)
             })
             .collect();
-        for name in names {
-            self.type_parameters_in_scope
-                .push((name.clone(), crate::symbols::TypeParameterConstraints::default()));
+        for (index, name) in names.iter().enumerate() {
+            let constraint = constraints.get(index).cloned().unwrap_or_default();
+            self.type_parameters_in_scope.push((name.clone(), constraint));
         }
         entered
     }
@@ -1839,6 +1904,11 @@ impl Binder {
     /// Whether `unsafe` may appear at all in this compilation.
     pub(crate) fn unsafe_option_missing(&self) -> bool {
         self.unsafe_option_missing
+    }
+
+    /// Binds what follows under `context`, the nullable context of the file it comes from.
+    pub fn set_nullable_context(&mut self, context: lamella_syntax::lexer::NullableContext) {
+        self.nullable_context = context;
     }
 
     /// The binder's type model, for the assembling step (base classes, member kinds).
@@ -2113,7 +2183,8 @@ impl Binder {
     pub(crate) fn resolve_type_ref(&mut self, ty: &TypeRef) -> TypeSymbol {
         let bare = matches!(&ty.kind, TypeRefKind::Name(parts) if parts.len() == 1);
         if !(ty.verbatim_name && bare) {
-            return self.resolve_named_type(&bind_type(ty), ty.span);
+            let symbol = self.bind_annotated_type(ty, true);
+            return self.resolve_named_type(&symbol, ty.span);
         }
         let symbol = bind_type(ty);
         let resolved = self.resolve_named_type_quietly(&symbol, ty.span);
@@ -2126,6 +2197,153 @@ impl Binder {
             ));
         }
         resolved
+    }
+
+    /// Binds a syntactic type with every `?` in it decided against what its underlying type
+    /// resolves to (C# 2.0's nullable value types and C# 8.0's nullable reference types): over a
+    /// value type `T?` is `System.Nullable<T>`; over a reference type, or a type parameter not known
+    /// to be a value type, it is an ANNOTATION and the type is `T` itself. With `report`, each
+    /// annotation's diagnostics are reported at its `?` ([`Self::report_nullable_annotation`]),
+    /// and CS8627 at C# 8.0 for a type parameter that cannot take one.
+    ///
+    /// **THE UNDERLYING TYPE IS RESOLVED QUIETLY TO BE CLASSIFIED**, because the whole type is
+    /// resolved afterwards by the reporting resolver, and a name that does not resolve is that
+    /// pass's CS0246 to report, once.
+    pub(crate) fn bind_annotated_type(&mut self, ty: &TypeRef, report: bool) -> TypeSymbol {
+        crate::bind::bind_type_with(ty, &mut |node, underlying| {
+            self.decide_nullable(node, underlying, report)
+        })
+    }
+
+    /// What one `T?` node denotes, `underlying` being its `T` as bound; see
+    /// [`Self::bind_annotated_type`].
+    fn decide_nullable(&mut self, node: &TypeRef, underlying: TypeSymbol, report: bool) -> TypeSymbol {
+        let resolved = self.resolve_named_type_quietly(&underlying, node.span);
+        match self.nullable_underlying(&resolved) {
+            NullableUnderlying::ValueType | NullableUnderlying::Unknown => {
+                crate::bind::nullable_of(underlying)
+            }
+            NullableUnderlying::ReferenceType => {
+                if report {
+                    self.report_nullable_annotation(question_of(node));
+                }
+                underlying
+            }
+            NullableUnderlying::TypeParameter {
+                known_non_nullable_reference,
+            } => {
+                if report {
+                    self.report_nullable_annotation(question_of(node));
+                    if !self.language_version.supports(Feature::UnconstrainedTypeParameterAnnotation)
+                        && !known_non_nullable_reference
+                    {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::NullableUnconstrainedTypeParameter,
+                            Span::empty_at(node.span.start),
+                        ));
+                    }
+                }
+                underlying
+            }
+        }
+    }
+
+    /// Reports what a nullable ANNOTATION at `question` (its `?`) draws: nothing where annotations
+    /// are enabled; where they are not, CS8632 -- a warning -- from C# 8.0, and before it the
+    /// feature's version error (CS8370 at C# 7.3). Measured against csc 10.0.301: under a
+    /// `#nullable enable` that is itself refused at C# 7.3, the annotations after it draw nothing.
+    pub(crate) fn report_nullable_annotation(&mut self, question: Span) {
+        if self.nullable_context.annotations_enabled_at(question.start) {
+            return;
+        }
+        if self.language_version.supports(Feature::NullableReferenceTypes) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::NullableAnnotationOutsideContext,
+                question,
+            ));
+        } else {
+            self.gate_feature(Feature::NullableReferenceTypes, question);
+        }
+    }
+
+    /// Whether `ty` is, at its top level, a nullable ANNOTATION -- a `?` over a reference type or
+    /// a type parameter not known to be a value type -- rather than a `System.Nullable<T>`. Asked
+    /// by the positions where an annotation is an error of its own: `typeof` (CS8639), `as`
+    /// (CS8651), object creation (CS8628) and a base list (CS1521). Reports nothing.
+    pub(crate) fn is_top_level_annotation(&mut self, ty: &TypeRef) -> bool {
+        let TypeRefKind::Nullable(underlying) = &ty.kind else {
+            return false;
+        };
+        let symbol = self.bind_annotated_type(underlying, false);
+        let resolved = self.resolve_named_type_quietly(&symbol, underlying.span);
+        matches!(
+            self.nullable_underlying(&resolved),
+            NullableUnderlying::ReferenceType | NullableUnderlying::TypeParameter { .. }
+        )
+    }
+
+    /// What a `?` over `underlying` means, `underlying` RESOLVED -- as a signature holds it, or as
+    /// the resolver answers it. The one classification both [`Self::canonicalize`] and
+    /// [`Self::bind_annotated_type`] take their decision from.
+    pub(crate) fn nullable_underlying(&self, underlying: &TypeSymbol) -> NullableUnderlying {
+        self.nullable_underlying_within(underlying, self.type_parameters_in_scope.len())
+    }
+
+    /// [`Self::nullable_underlying`] with only the first `visible` in-scope type parameters in view,
+    /// so a type-parameter constraint is followed only to a parameter entered before its own, and
+    /// a cycle (`where T : U where U : T`, CS0454) cannot loop.
+    fn nullable_underlying_within(&self, underlying: &TypeSymbol, visible: usize) -> NullableUnderlying {
+        match underlying {
+            TypeSymbol::Special(SpecialType::Object | SpecialType::String)
+            | TypeSymbol::Array { .. } => NullableUnderlying::ReferenceType,
+            TypeSymbol::Special(SpecialType::Void | SpecialType::Null) => NullableUnderlying::Unknown,
+            TypeSymbol::Special(_) => NullableUnderlying::ValueType,
+            TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => {
+                NullableUnderlying::Unknown
+            }
+            TypeSymbol::Named(parts) if parts.len() == 1 => {
+                let found = self.type_parameters_in_scope[..visible]
+                    .iter()
+                    .rposition(|(parameter, _)| *parameter == parts[0]);
+                match found {
+                    Some(index) => self.type_parameter_nullable_underlying(index),
+                    None => self.declared_nullable_underlying(underlying),
+                }
+            }
+            TypeSymbol::Named(_) | TypeSymbol::Instantiation { .. } => {
+                self.declared_nullable_underlying(underlying)
+            }
+        }
+    }
+
+    /// [`Self::nullable_underlying`] for the in-scope type parameter at `index`: a value type when
+    /// it carries `struct` or `unmanaged`, or a constraint that is a type parameter known to be
+    /// one; otherwise a type parameter the `?` annotates.
+    fn type_parameter_nullable_underlying(&self, index: usize) -> NullableUnderlying {
+        let constraints = &self.type_parameters_in_scope[index].1;
+        let value_type = constraints.value_type
+            || constraints.types.iter().any(|constraint| {
+                matches!(constraint, TypeSymbol::Named(parts) if parts.len() == 1 && &*parts[0] == "unmanaged")
+                    || self.nullable_underlying_within(constraint, index)
+                        == NullableUnderlying::ValueType
+            });
+        if value_type {
+            return NullableUnderlying::ValueType;
+        }
+        NullableUnderlying::TypeParameter {
+            known_non_nullable_reference: constraints.known_non_nullable_reference,
+        }
+    }
+
+    /// [`Self::nullable_underlying`] for a named or constructed type, by its declared kind.
+    fn declared_nullable_underlying(&self, ty: &TypeSymbol) -> NullableUnderlying {
+        match self.declared_kind(ty) {
+            Some(TypeKind::Struct | TypeKind::Enum) if !is_reference_base_class(ty) => {
+                NullableUnderlying::ValueType
+            }
+            Some(_) => NullableUnderlying::ReferenceType,
+            None => NullableUnderlying::Unknown,
+        }
     }
 
     /// Resolves a type against the reference world, reporting `CS0246` if unknown.
@@ -2152,7 +2370,27 @@ impl Binder {
         if !self.check_type_is_accessible(&resolved, span) {
             return TypeSymbol::Error;
         }
-        resolved
+        self.without_nullable_annotation(resolved)
+    }
+
+    /// `ty`, with a top-level `System.Nullable<T>` over a type that `?` ANNOTATES replaced by `T`
+    /// (C# 8.0) -- see [`Self::nullable_underlying`]. Any other type is returned as it is.
+    fn without_nullable_annotation(&self, ty: TypeSymbol) -> TypeSymbol {
+        if let TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } = &ty
+        {
+            if crate::types::is_nullable(definition, arguments)
+                && matches!(
+                    self.nullable_underlying(&arguments[0]),
+                    NullableUnderlying::ReferenceType | NullableUnderlying::TypeParameter { .. }
+                )
+            {
+                return arguments[0].clone();
+            }
+        }
+        ty
     }
 
     /// Whether a resolved type NAME is reachable from the site currently being bound (10.5.4).
@@ -2825,6 +3063,21 @@ impl Binder {
     /// with the use-site resolver, so declaration and use positions answer alike by
     /// construction.
     pub fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
+        if let TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } = ty
+        {
+            if crate::types::is_nullable(definition, arguments) {
+                let underlying = self.canonicalize(&arguments[0]);
+                if matches!(
+                    self.nullable_underlying(&underlying),
+                    NullableUnderlying::ReferenceType | NullableUnderlying::TypeParameter { .. }
+                ) {
+                    return underlying;
+                }
+            }
+        }
         match ty {
             TypeSymbol::Named(parts) if parts.len() == 1 => {
                 let name: &str = &parts[0];
@@ -4547,18 +4800,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         constant_required: bool,
         is_const: bool,
     ) {
-        self.current_type = Some(enclosing.clone());
-        self.enter_scope();
-        let was_in_initializer = self.in_field_initializer;
-        self.in_field_initializer = true;
         let diagnostics_before = self.diagnostics.len();
-        let value = match self.bind_target_typed(initializer, field_type) {
-            Some(bound) => bound,
-            None => self.bind_expression(initializer),
-        };
+        let value = self.bind_initializer_value(&enclosing, field_type, initializer);
+        self.current_type = Some(enclosing.clone());
         self.check_assignable(&value, field_type, initializer.span);
-        self.in_field_initializer = was_in_initializer;
-        self.exit_scope();
         self.current_type = None;
         if !is_const {
             self.mark_body_phase(diagnostics_before);
@@ -4596,6 +4841,30 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             }
         }
         crate::flow::collect_field_uses(&value, &mut self.field_reads, &mut self.field_writes);
+    }
+
+    /// Binds a field's initializer as its declaration sees it: in `enclosing`'s context, under the
+    /// field-initializer rules (no `this`, no instance member of the type), and target-typed by
+    /// `field_type`. The initializer's validation and the pass that folds each `const` field's
+    /// value both bind through here, so the value a field carries is the value of the expression
+    /// its validation checked.
+    pub(crate) fn bind_initializer_value(
+        &mut self,
+        enclosing: &TypeSymbol,
+        field_type: &TypeSymbol,
+        initializer: &Expr,
+    ) -> BoundExpr {
+        let previous_type = self.current_type.replace(enclosing.clone());
+        self.enter_scope();
+        let was_in_initializer = core::mem::replace(&mut self.in_field_initializer, true);
+        let value = match self.bind_target_typed(initializer, field_type) {
+            Some(bound) => bound,
+            None => self.bind_expression(initializer),
+        };
+        self.in_field_initializer = was_in_initializer;
+        self.exit_scope();
+        self.current_type = previous_type;
+        value
     }
 
     /// Binds an `enum` member's initializer in the enum's own scope, so a sibling member resolves
@@ -4647,7 +4916,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 Span::empty_at(syntax.span.start),
             );
         }
-        constant_literal_value(bound)
+        self.constant_value(bound)
     }
 
     /// Checks a `return` statement against the enclosing method's return type
@@ -5638,7 +5907,18 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 };
                 let span = target.span;
                 let operand = self.bind_expression(operand);
+                let annotated_as = matches!(operation, TypeTestOperation::As)
+                    && self.is_top_level_annotation(target);
                 let resolved = self.resolve_type_ref(target);
+                if annotated_as {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::AsNullableReferenceType {
+                            underlying: resolved.to_string().into(),
+                        },
+                        Span::empty_at(span.start),
+                    ));
+                    return error_expr();
+                }
                 let (resolved, declared) = match (&declared, crate::conversion::nullable_underlying(&resolved)) {
                     (Some((name, at, false)), Some(underlying)) => {
                         let underlying = underlying.clone();
@@ -5718,7 +5998,16 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 let target_ty = if matches!(target.kind, TypeRefKind::Unbound { .. }) {
                     self.resolve_unbound_generic_type(&bind_type(target), target.span)
                 } else {
-                    self.resolve_type_ref(target)
+                    let annotated = self.is_top_level_annotation(target);
+                    let resolved = self.resolve_type_ref(target);
+                    if annotated {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::TypeofNullableReferenceType,
+                            Span::empty_at(expr.span.start),
+                        ));
+                        return error_expr();
+                    }
+                    resolved
                 };
                 BoundExpr {
                     kind: BoundExprKind::TypeOf(target_ty),
@@ -5903,8 +6192,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         ty: TypeSymbol::Error,
                     };
                 };
-                let arguments: Vec<TypeSymbol> =
-                    type_arguments.iter().map(|arg| bind_type(arg)).collect();
+                let arguments: Vec<TypeSymbol> = type_arguments
+                    .iter()
+                    .map(|argument| self.bind_annotated_type(argument, true))
+                    .collect();
                 let constructed = TypeSymbol::Instantiation {
                     definition: parts.into(),
                     arguments: arguments.into(),
@@ -6018,7 +6309,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         };
         if matches!(
             operator,
-            BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply
+            BinaryOperator::Add
+                | BinaryOperator::Subtract
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
         ) {
             let fold = |operand: &BoundExpr| {
                 constant_literal_value(operand).and_then(|literal| literal_int_value(&literal))
@@ -6026,12 +6320,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             if let (Some(left_value), Some(right_value)) = (fold(&left), fold(&right)) {
                 let (left_value, right_value) = (i128::from(left_value), i128::from(right_value));
                 let value = match operator {
-                    BinaryOperator::Add => left_value + right_value,
-                    BinaryOperator::Subtract => left_value - right_value,
-                    BinaryOperator::Multiply => left_value * right_value,
+                    BinaryOperator::Add => Some(left_value + right_value),
+                    BinaryOperator::Subtract => Some(left_value - right_value),
+                    BinaryOperator::Multiply => Some(left_value * right_value),
+                    BinaryOperator::Divide => left_value.checked_div(right_value),
                     _ => unreachable!(),
                 };
-                self.report_constant_overflow(value, &ty, span);
+                if let Some(value) = value {
+                    self.report_constant_overflow(value, &ty, span);
+                }
             }
         }
         let (left, right) = if matches!(operator, BinaryOperator::Add)
@@ -6060,7 +6357,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// stays unsigned rather than promoting `uint op <signed>` to `long` (14.2.6.2). `uint` is the
     /// only case that diverges -- every other unsigned type already promotes to itself or to `int`.
     /// Any other operand pair is returned unchanged, so numeric promotion proceeds as before.
-    /// Reports CS0220 when a constant integer `+`/`-`/`*` (or unary `-`) overflows its result
+    /// Reports CS0220 when a constant integer `+`/`-`/`*`/`/` (or unary `-`) overflows its result
     /// type in a checked context. Constant expressions are checked by DEFAULT (14.16), so this
     /// fires unless an explicit `unchecked` context suppresses it. `ty` is the operation's own
     /// result type (the binder's numeric promotion), and `value` its true mathematical result in
@@ -6307,17 +6604,39 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
-    /// The underlying integral type of an enum -- its `value__` field's type, defaulting to `int`
-    /// (21.4) -- or `None` if `ty` is not an enum.
+    /// The underlying integral type of an enum (21.1) -- the one a source declaration names, or a
+    /// referenced enum's `value__` field's type, defaulting to `int` -- or `None` if `ty` is not an
+    /// enum.
     fn enum_underlying_type(&self, ty: &TypeSymbol) -> Option<TypeSymbol> {
         let info = self.type_info_of(ty)?;
         if info.kind != TypeKind::Enum {
             return None;
         }
+        if let Some(special) = info.enum_underlying {
+            return Some(TypeSymbol::Special(special));
+        }
         Some(match info.find_field("value__").map(|field| &field.ty) {
             Some(TypeSymbol::Special(special)) => TypeSymbol::Special(*special),
             _ => TypeSymbol::Special(SpecialType::Int32),
         })
+    }
+
+    /// The integral type a constant of type `ty` is held at: `ty` itself for an integral type or
+    /// `char`, and an enum's underlying type for an enum. `None` for every other type.
+    pub(crate) fn integral_constant_type(&self, ty: &TypeSymbol) -> Option<SpecialType> {
+        match ty {
+            TypeSymbol::Special(_) => special_integral_type(ty),
+            _ => match self.enum_underlying_type(ty)? {
+                underlying @ TypeSymbol::Special(_) => special_integral_type(&underlying),
+                _ => None,
+            },
+        }
+    }
+
+    /// The compile-time value of `expr` (14.15), as [`constant_literal_value`] computes it, with
+    /// every enum's operations computed at its underlying type.
+    pub(crate) fn constant_value(&self, expr: &BoundExpr) -> Option<Literal> {
+        constant_value_in(expr, &|ty| self.integral_constant_type(ty))
     }
 
     /// Whether `ty` is an enum type declared in the model.
@@ -9159,7 +9478,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             is_readonly: false,
                             is_volatile: false,
                             accessibility: Accessibility::Public,
-                            constant: Some(integer_literal(constant)),
+                            constant: crate::integral_constant::literal(
+                                i128::from(constant),
+                                special,
+                            ),
                             declaring_instantiation: None,
                         }),
                     },
@@ -9817,14 +10139,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         });
         let type_arguments: Vec<TypeSymbol> = type_argument_refs
             .iter()
-            .map(|argument| {
-                let symbol = bind_type(argument);
-                self.resolve_named_type(&symbol, argument.span)
-            })
+            .map(|argument| self.resolve_type_ref(argument))
             .collect();
         let argument_types: Vec<TypeSymbol> = arguments.iter().map(argument_type).collect();
         let names: Vec<Option<(&str, Span)>> = argument_names(argument_exprs);
-        let mut resolved = match group {
+        let resolved = match group {
             Some((receiver_ty, name)) if !real_error => {
                 let gather_constants: Vec<Option<i64>> =
                     arguments.iter().map(constant_int_value).collect();
@@ -9945,27 +10264,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             }
             _ => None,
         };
-        if resolved.is_none() && !arguments.iter().any(|argument| argument.ty.is_error()) {
-            if let Some(invoke) = self
-                .type_info_of(&callee.ty)
-                .filter(|info| info.kind == TypeKind::Delegate)
-                .and_then(|info| info.methods.iter().find(|m| &*m.name == "Invoke").cloned())
-            {
-                resolved = Some(MethodReference {
-                    declaring_instantiation: self.declaring_instantiation_of(
-                        &callee.ty,
-                        "Invoke",
-                        &invoke.parameters,
-                    ),
-                    declaring_type: callee.ty.clone(),
-                    name: "Invoke".into(),
-                    parameters: invoke.parameters,
-                    return_type: invoke.return_type,
-                    is_static: false,
-                    is_vararg: false,
-                    instantiation: None,
-                });
-            }
+        if !matches!(callee.kind, BoundExprKind::MethodGroup { .. }) {
+            self.report_not_invocable(receiver_expr, &callee, !type_argument_refs.is_empty());
         }
         if let (Some(kind), Some(method)) = (receiver_kind, &resolved) {
             if matches!(kind, Receiver::ImplicitThis) && !method.is_static {
@@ -10071,6 +10371,171 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         };
         let call = Self::spilling(call, spilled);
         Self::deref_ref_return(call, &declared)
+    }
+
+    /// Reports why `target(...)` cannot be called, when `target` bound to something that is
+    /// neither a method group nor a delegate value -- with csc's code and words, at csc's position:
+    ///
+    /// | `target` is | called | called with type arguments |
+    /// |---|---|---|
+    /// | a namespace | CS0118 `'N' is a namespace but is used like a variable` | CS0307 |
+    /// | a type | CS1955 `Non-invocable member 'T' cannot be used like a method.` | CS0308 |
+    /// | a field, property or enum member | CS1955, quoting `'T.m'` | CS0307 `The field 'T.m' ...` |
+    /// | a local or a parameter | CS0149 `Method name expected` | CS0307 `The variable 'x' ...` |
+    /// | any other value | CS0149 | CS0149 |
+    ///
+    /// A member, a type, and a namespace given type arguments are reported at the last name
+    /// written, and anything else at the start of `target`. A target that failed to bind has
+    /// already said why, so nothing is added to it -- nor to a local whose type failed to bind:
+    /// `var x = missing; x();` is CS0103 alone, as csc reports it.
+    fn report_not_invocable(
+        &mut self,
+        target: &Expr,
+        callee: &BoundExpr,
+        with_type_arguments: bool,
+    ) {
+        let name_span = match &target.kind {
+            ExprKind::MemberAccess { name, .. } => member_name_span(target.span, name),
+            _ => target.span,
+        };
+        let (kind, span) = match &callee.kind {
+            BoundExprKind::NamespaceReference(namespace) if with_type_arguments => (
+                DiagnosticKind::TypeArgumentsOnNonGenericName {
+                    kind: NonGenericName::Namespace,
+                    name: namespace.clone(),
+                },
+                name_span,
+            ),
+            BoundExprKind::NamespaceReference(namespace) => (
+                DiagnosticKind::NamespaceUsedLikeVariable {
+                    namespace: namespace.clone(),
+                },
+                target.span,
+            ),
+            BoundExprKind::Error => return,
+            _ if callee.ty.is_error() => return,
+            BoundExprKind::TypeReference(ty) => {
+                let name = self.short_type_display(ty);
+                let kind = if with_type_arguments {
+                    DiagnosticKind::NonGenericTypeWithTypeArguments {
+                        name,
+                        member: GenericMember::Type,
+                    }
+                } else {
+                    DiagnosticKind::NonInvocableMember { member: name }
+                };
+                (kind, name_span)
+            }
+            BoundExprKind::FieldAccess { name, field, .. } => {
+                let member = self.member_display(field.as_ref().map(|f| &f.declaring_type), name);
+                (
+                    non_invocable_member(member, NonGenericName::Field, with_type_arguments),
+                    name_span,
+                )
+            }
+            BoundExprKind::PropertyAccess {
+                name,
+                declaring_type,
+                ..
+            } => {
+                let member = self.member_display(Some(declaring_type), name);
+                (
+                    non_invocable_member(member, NonGenericName::Property, with_type_arguments),
+                    name_span,
+                )
+            }
+            _ if with_type_arguments => match self.variable_display(target, callee) {
+                Some(name) => (
+                    DiagnosticKind::TypeArgumentsOnNonGenericName {
+                        kind: NonGenericName::Variable,
+                        name,
+                    },
+                    target.span,
+                ),
+                None => (DiagnosticKind::MethodNameExpected, target.span),
+            },
+            _ => (DiagnosticKind::MethodNameExpected, target.span),
+        };
+        self.report(Diagnostic::new(kind, span));
+    }
+
+    /// A member as csc quotes it in CS1955 and CS0307: the type that declares it, in its short
+    /// form, then the member's name -- `P.F`, `string.Length`, `List<int>.Count`.
+    fn member_display(&self, declaring_type: Option<&TypeSymbol>, name: &str) -> Box<str> {
+        match declaring_type {
+            Some(declaring_type) => {
+                alloc::format!("{}.{name}", self.short_type_display(declaring_type)).into()
+            }
+            None => name.into(),
+        }
+    }
+
+    /// A local or a parameter as csc quotes it in CS0307 -- a local by its name, a parameter after
+    /// its type (`int p`) -- or `None` when `target` names neither.
+    fn variable_display(&self, target: &Expr, callee: &BoundExpr) -> Option<Box<str>> {
+        let ExprKind::Name { name, .. } = &target.kind else {
+            return None;
+        };
+        let is_local = matches!(&callee.kind, BoundExprKind::Local(local) if local == name)
+            || self.const_locals.contains_key(&**name);
+        if !is_local {
+            return None;
+        }
+        let is_parameter = self
+            .current_method
+            .as_ref()
+            .is_some_and(|method| method.parameter_names.iter().any(|p| p == name));
+        Some(if is_parameter {
+            alloc::format!("{} {name}", self.short_type_display(&callee.ty)).into()
+        } else {
+            name.clone()
+        })
+    }
+
+    /// `ty` as csc quotes it in a member lookup's diagnostics (CS1955, CS0307, CS0117, CS1061):
+    /// without its namespace, but with every type it is nested in, and its type arguments written
+    /// the same way -- `List<int>`, `Outer.Inner`, `StringBuilder`. A conversion's diagnostics
+    /// (CS0029, CS1503) keep the namespace, which is [`type_display`].
+    fn short_type_display(&self, ty: &TypeSymbol) -> Box<str> {
+        let ty = ty.clone().fold_builtin();
+        let mut out = String::new();
+        let _ = crate::types::write_type(&mut out, &ty, &|named| self.namespace_part_count(named));
+        out.into()
+    }
+
+    /// How many leading parts of a named or constructed type's dotted name are its namespace. A
+    /// nested type is recorded under the full name of the type it is nested in, so the namespace
+    /// is the one the OUTERMOST enclosing type declares. 0 for a type the model does not hold,
+    /// which then keeps its whole name rather than losing a part that might not be a namespace.
+    fn namespace_part_count(&self, ty: &TypeSymbol) -> usize {
+        let (definition, depth) = match ty {
+            TypeSymbol::Named(parts) => (ty.clone(), parts.len()),
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => (
+                crate::symbols::definition_symbol(definition, arguments.len()),
+                definition.len(),
+            ),
+            _ => return 0,
+        };
+        let Some(mut info) = self.type_info_of(&definition) else {
+            return 0;
+        };
+        for _ in 0..depth {
+            let Some(enclosing) = info.enclosing.clone() else {
+                break;
+            };
+            match self.type_info_of(&named_symbol_from_dotted(&enclosing)) {
+                Some(outer) => info = outer,
+                None => return 0,
+            }
+        }
+        if info.namespace.is_empty() {
+            0
+        } else {
+            info.namespace.split('.').count()
+        }
     }
 
     /// The three things that can be wrong with a call's NAMES, checked against one method.
@@ -11913,7 +12378,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         initializer: Option<&Initializer>,
         span: Span,
     ) -> BoundExpr {
+        let annotated = self.is_top_level_annotation(target);
         let target_ty = self.resolve_type_ref(target);
+        if annotated {
+            self.report(Diagnostic::new(
+                DiagnosticKind::NullableReferenceTypeInObjectCreation,
+                Span::empty_at(span.start),
+            ));
+            return error_expr();
+        }
         self.bind_object_creation_of(target_ty, argument_exprs, initializer, span)
     }
 
@@ -16547,19 +17020,60 @@ pub(crate) fn coerce_constant(value: i64, target: SpecialType) -> Option<Literal
 
 /// The compile-time constant value of a bound expression as a [`Literal`] (14.15), the full
 /// evaluator: a literal, a folded `const`/enum member access, an implicit conversion of a
-/// constant, a unary or binary operation, a numeric/char cast, or a conditional whose
-/// condition folds to a `bool`. `None` for anything not a constant expression. Unlike
-/// [`constant_int_value`] this keeps the value's kind (so a `bool`, `char`, or `string`
-/// constant round-trips), for a local constant's stored value.
+/// constant, a unary or binary operation, a numeric/char cast, a `checked` or `unchecked`
+/// expression, or a conditional whose condition folds to a `bool`. `None` for anything not a
+/// constant expression. Unlike [`constant_int_value`] this keeps the value's kind (so a `bool`,
+/// `char`, or `string` constant round-trips), for a local constant's stored value.
+///
+/// An integral operation is computed at its operands' own types. Without a model this cannot know
+/// an enum's underlying type, so an operation on enum operands is computed at 64 bits here; every
+/// position whose constant a program reads asks [`Binder::constant_value`], which knows it.
 pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
+    constant_value_in(expr, &special_integral_type)
+}
+
+/// `ty` itself when it is one of the integral types or `char`, else `None`.
+fn special_integral_type(ty: &TypeSymbol) -> Option<SpecialType> {
+    match ty {
+        TypeSymbol::Special(special) if crate::integral_constant::layout(*special).is_some() => {
+            Some(*special)
+        }
+        _ => None,
+    }
+}
+
+/// [`constant_literal_value`] with `integral` naming the integral type a constant of a given type
+/// is held at.
+fn constant_value_in(
+    expr: &BoundExpr,
+    integral: &dyn Fn(&TypeSymbol) -> Option<SpecialType>,
+) -> Option<Literal> {
     use crate::declaration::{fold_const_binary, fold_const_unary};
+    use crate::integral_constant;
+    let integral_value = |literal: &Literal, ty: &TypeSymbol| {
+        integral(ty).and_then(|ty| integral_constant::value(literal, ty))
+    };
     match &expr.kind {
         BoundExprKind::Literal(literal) => Some(literal.clone()),
         BoundExprKind::FieldAccess {
             field: Some(field), ..
         } => field.constant.clone(),
+        BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
+            constant_value_in(inner, integral)
+        }
         BoundExprKind::Conversion { operand, .. } => {
-            let inner = constant_literal_value(operand)?;
+            let inner = constant_value_in(operand, integral)?;
+            if let Some(value) = integral_value(&inner, &operand.ty) {
+                if let Some(target) = integral(&expr.ty) {
+                    return integral_constant::literal(value, target);
+                }
+                if let TypeSymbol::Special(
+                    target @ (SpecialType::Single | SpecialType::Double | SpecialType::Decimal),
+                ) = &expr.ty
+                {
+                    return widen_integer_constant(value, *target);
+                }
+            }
             match (&expr.ty, &inner) {
                 (
                     TypeSymbol::Special(
@@ -16571,20 +17085,53 @@ pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
             }
         }
         BoundExprKind::Unary { operator, operand, .. } => {
-            fold_const_unary(*operator, &constant_literal_value(operand)?)
+            let inner = constant_value_in(operand, integral)?;
+            if let (Some(value), Some(result)) = (integral_value(&inner, &operand.ty), integral(&expr.ty))
+            {
+                return integral_constant::unary(*operator, value, result);
+            }
+            fold_const_unary(*operator, &inner)
         }
         BoundExprKind::Binary {
             operator,
             left,
             right,
             ..
-        } => fold_const_binary(
-            *operator,
-            &constant_literal_value(left)?,
-            &constant_literal_value(right)?,
-        ),
+        } => {
+            let (left_constant, right_constant) = (
+                constant_value_in(left, integral)?,
+                constant_value_in(right, integral)?,
+            );
+            if let (Some(left_value), Some(right_value)) = (
+                integral_value(&left_constant, &left.ty),
+                integral_value(&right_constant, &right.ty),
+            ) {
+                return integral_constant::binary(
+                    *operator,
+                    left_value,
+                    right_value,
+                    integral(&expr.ty),
+                );
+            }
+            fold_const_binary(*operator, &left_constant, &right_constant)
+        }
         BoundExprKind::Cast { operand, .. } => {
-            let inner = constant_literal_value(operand)?;
+            let inner = constant_value_in(operand, integral)?;
+            if let Some(target) = integral(&expr.ty) {
+                if let Some(value) = integral_value(&inner, &operand.ty) {
+                    return integral_constant::literal(value, target);
+                }
+                if let Literal::Real { bits, .. } = inner {
+                    return integral_constant::literal(f64::from_bits(bits) as i128, target);
+                }
+            }
+            if let (Some(value), TypeSymbol::Special(target)) =
+                (integral_value(&inner, &operand.ty), &expr.ty)
+            {
+                if matches!(target, SpecialType::Single | SpecialType::Double | SpecialType::Decimal) {
+                    return widen_integer_constant(value, *target);
+                }
+            }
             match &expr.ty {
                 TypeSymbol::Special(target) => cast_constant(&inner, *target),
                 TypeSymbol::Named(_) => match inner {
@@ -16598,9 +17145,9 @@ pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
             condition,
             when_true,
             when_false,
-        } => match constant_literal_value(condition)? {
-            Literal::Boolean(true) => constant_literal_value(when_true),
-            Literal::Boolean(false) => constant_literal_value(when_false),
+        } => match constant_value_in(condition, integral)? {
+            Literal::Boolean(true) => constant_value_in(when_true, integral),
+            Literal::Boolean(false) => constant_value_in(when_false, integral),
             _ => None,
         },
         BoundExprKind::Call {
@@ -16612,10 +17159,11 @@ pub fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
             && is_decimal(&method.declaring_type)
             && is_decimal(&expr.ty) =>
         {
-            let inner = constant_literal_value(&arguments[0])?;
+            let inner = constant_value_in(&arguments[0], integral)?;
             match inner {
                 Literal::Integer { .. } | Literal::Character(_) => decimal_constant(
-                    exact_integer_constant(&inner, &arguments[0].ty)?,
+                    integral_value(&inner, &arguments[0].ty)
+                        .or_else(|| exact_integer_constant(&inner, &arguments[0].ty))?,
                 ),
                 Literal::Decimal { .. } => Some(inner),
                 _ => None,
@@ -17020,6 +17568,27 @@ pub(crate) fn tuple_arity(ty: &TypeSymbol) -> Option<usize> {
 /// A type as a diagnostic names it.
 pub(crate) fn type_display(ty: &TypeSymbol) -> alloc::boxed::Box<str> {
     alloc::format!("{ty}").into()
+}
+
+/// CS1955 for a member called as though it were a method, or CS0307 when type arguments follow it.
+fn non_invocable_member(
+    member: Box<str>,
+    kind: NonGenericName,
+    with_type_arguments: bool,
+) -> DiagnosticKind {
+    if with_type_arguments {
+        DiagnosticKind::TypeArgumentsOnNonGenericName { kind, name: member }
+    } else {
+        DiagnosticKind::NonInvocableMember { member }
+    }
+}
+
+/// Where the member named by a member access `E.name` is written: the access's last `name.len()`
+/// bytes. The name is the access's final token -- a call's type arguments belong to the invocation
+/// around it -- so its span ends where the access ends. A verbatim `@` before it is not included.
+fn member_name_span(access: Span, name: &str) -> Span {
+    let length = u32::try_from(name.len()).unwrap_or(u32::MAX);
+    Span::new(access.end.saturating_sub(length).max(access.start), access.end)
 }
 
 /// The zero-based element `Item<n>` names, or `None` when the name is not one.
@@ -17872,6 +18441,31 @@ fn binary_numeric_promotion(left: SpecialType, right: SpecialType) -> Option<Spe
 /// System.Enum and System.ValueType extend System.ValueType in metadata but are themselves
 /// REFERENCE types (a value of that static type is a boxed object), so a concrete value type boxes
 /// when converted to one -- they are never value types despite the model marking their kind.
+/// What a `?` written over a type means, by what the type is -- see
+/// [`Binder::nullable_underlying`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NullableUnderlying {
+    /// A value type, or a type parameter known to be one: `T?` is `System.Nullable<T>` (11.4).
+    ValueType,
+    /// A reference type: the `?` annotates it (C# 8.0), and the type is `T` itself.
+    ReferenceType,
+    /// A type parameter not known to be a value type: annotated like a reference type from C# 9.0,
+    /// and at C# 8.0 only when known to be a NON-NULLABLE reference type (CS8627 otherwise).
+    TypeParameter {
+        /// Whether it carries a `class` or class-type constraint written without `?` where
+        /// annotations are enabled.
+        known_non_nullable_reference: bool,
+    },
+    /// Nothing can be said -- an error type, or a name that resolves to nothing -- and the `?` is
+    /// left as `System.Nullable<T>`, so the name's own diagnostic is the one reported.
+    Unknown,
+}
+
+/// The `?` that ends a `T?` node, where an annotation's diagnostics point (csc's position).
+fn question_of(node: &TypeRef) -> Span {
+    Span::new(node.span.end.saturating_sub(1), node.span.end)
+}
+
 fn is_reference_base_class(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Named(parts)
         if matches!(&**parts, [ns, name] if &**ns == "System" && (&**name == "Enum" || &**name == "ValueType")))

@@ -268,6 +268,33 @@ impl GenericMember {
     }
 }
 
+/// Which noun CS0307 names: *"The **{0}** '{1}' cannot be used with type arguments"*. csc says
+/// "variable" for a local and for a parameter alike, and names a member or a namespace by its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonGenericName {
+    /// A local or a parameter.
+    Variable,
+    /// A namespace.
+    Namespace,
+    /// A field, an enum member or a constant included.
+    Field,
+    /// A property.
+    Property,
+}
+
+impl NonGenericName {
+    /// The word csc puts in the message.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NonGenericName::Variable => "variable",
+            NonGenericName::Namespace => "namespace",
+            NonGenericName::Field => "field",
+            NonGenericName::Property => "property",
+        }
+    }
+}
+
 /// What a binder diagnostic IS, one variant per rule the binder enforces.
 ///
 /// Each variant carries the parts its message needs rather than a formatted string, so the code
@@ -1387,6 +1414,32 @@ pub enum DiagnosticKind {
         /// Its underlying type -- what the message tells the reader to write instead.
         underlying: Box<str>,
     },
+    /// `CS8632`, a WARNING: a `?` annotates a reference type where nullable annotations are
+    /// disabled -- with no `/nullable`, after `#nullable disable`, or under `#nullable enable
+    /// warnings`. The type is the annotated one either way; what is missing is the context the
+    /// annotation belongs in. Reported at the `?`.
+    NullableAnnotationOutsideContext,
+    /// `CS8627`: at C# 8.0, `T?` over a type parameter not known to be a value type or a
+    /// NON-NULLABLE reference type. C# 9.0 admits it as an annotation. Reported at the type's start.
+    ///
+    /// Known means a `struct` constraint, or a `class` or class-type constraint written without `?`
+    /// where annotations are enabled -- a `class` written where they are disabled is oblivious and
+    /// does not count, and neither does `notnull`, an interface, or another type parameter
+    /// (measured against csc 10.0.301).
+    NullableUnconstrainedTypeParameter,
+    /// `CS8639`: `typeof` of a nullable reference type, `typeof(string?)`. The annotation is not
+    /// part of the type, so there is no `Type` object for it. Reported at `typeof`.
+    TypeofNullableReferenceType,
+    /// `CS8651`: `as` with a nullable reference type as its target, `o as string?`. Reported at
+    /// the target type.
+    AsNullableReferenceType {
+        /// The target's underlying type, which the message tells the reader to write instead.
+        underlying: Box<str>,
+    },
+    /// `CS8628`: an object creation of a nullable reference type, `new C?()`. Reported at `new`.
+    NullableReferenceTypeInObjectCreation,
+    /// `CS1521`: a base class or interface written with `?`, `class X : B?`. Reported at the base.
+    InvalidBaseType,
     /// `CS8703`: an interface member declares an access modifier. Every interface member is
     /// implicitly public in C# 1.0 (13.2), so the modifier is not merely redundant -- it is a
     /// later-version form, and csc gives it its own code because the repair is to delete it.
@@ -1859,9 +1912,31 @@ pub enum DiagnosticKind {
         /// The number of arguments supplied.
         count: u32,
     },
-    /// `CS0149`: a delegate-creation argument is not a method group or a compatible delegate
-    /// value (or extra arguments follow it).
+    /// `CS0149`: an invocation's target is a value that cannot be called -- a local, a parameter, a
+    /// literal, an array element, another call's result -- or a delegate-creation argument is not a
+    /// method group or a compatible delegate value (or extra arguments follow it).
     MethodNameExpected,
+    /// `CS1955`: an invocation's target names a member that is not a method -- a field, a property,
+    /// an enum member -- or names a type.
+    NonInvocableMember {
+        /// The member as csc quotes it, with the type that declares it (`P.F`, `string.Length`),
+        /// or the type alone.
+        member: Box<str>,
+    },
+    /// `CS0307`: type arguments follow a name that is not a generic method -- a local, a
+    /// parameter, a field, a property or a namespace.
+    TypeArgumentsOnNonGenericName {
+        /// Which noun csc puts in the message. See [`NonGenericName`].
+        kind: NonGenericName,
+        /// The name as csc quotes it: a local as written, a parameter after its type (`int p`), a
+        /// member with the type that declares it (`P.F`).
+        name: Box<str>,
+    },
+    /// `CS0118`: a namespace is named where a value is required -- here, as a call's target.
+    NamespaceUsedLikeVariable {
+        /// The namespace, dotted as written.
+        namespace: Box<str>,
+    },
     /// `CS0123`: the named method (or a delegate value's `Invoke`) matches no overload with the
     /// delegate's signature.
     NoOverloadMatchesDelegate {
@@ -2323,6 +2398,12 @@ impl DiagnosticKind {
             DiagnosticKind::AbstractPropertyHasPrivateAccessor { .. } => 442,
             DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
             DiagnosticKind::NullableTypeInPattern { .. } => 8116,
+            DiagnosticKind::NullableAnnotationOutsideContext => 8632,
+            DiagnosticKind::NullableUnconstrainedTypeParameter => 8627,
+            DiagnosticKind::TypeofNullableReferenceType => 8639,
+            DiagnosticKind::AsNullableReferenceType { .. } => 8651,
+            DiagnosticKind::NullableReferenceTypeInObjectCreation => 8628,
+            DiagnosticKind::InvalidBaseType => 1521,
             DiagnosticKind::InterfaceMemberModifier { .. } => 8703,
             DiagnosticKind::AbstractMemberInNonAbstractType { .. } => 513,
             DiagnosticKind::VirtualOrAbstractMemberIsPrivate { .. } => 621,
@@ -2397,6 +2478,9 @@ impl DiagnosticKind {
             DiagnosticKind::CannotIndex { .. } => 21,
             DiagnosticKind::NoConstructor { .. } => 1729,
             DiagnosticKind::MethodNameExpected => 149,
+            DiagnosticKind::NonInvocableMember { .. } => 1955,
+            DiagnosticKind::TypeArgumentsOnNonGenericName { .. } => 307,
+            DiagnosticKind::NamespaceUsedLikeVariable { .. } => 118,
             DiagnosticKind::NoOverloadMatchesDelegate { .. } => 123,
             DiagnosticKind::ReturnValueInVoidMethod { .. } => 127,
             DiagnosticKind::ReturnValueRequired { .. } => 126,
@@ -2470,7 +2554,8 @@ impl DiagnosticKind {
             | DiagnosticKind::UnreferencedLabel
             | DiagnosticKind::SwitchExpressionNotExhaustive
             | DiagnosticKind::ExternMemberHasNoAttributes { .. }
-            | DiagnosticKind::ExternConstructor { .. } => Severity::Warning,
+            | DiagnosticKind::ExternConstructor { .. }
+            | DiagnosticKind::NullableAnnotationOutsideContext => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -3128,6 +3213,29 @@ impl fmt::Display for DiagnosticKind {
                 f,
  "It is not legal to use nullable type '{nullable}' in a pattern; use the underlying type '{underlying}' instead."
             ),
+            DiagnosticKind::NullableAnnotationOutsideContext => write!(
+                f,
+                "The annotation for nullable reference types should only be used in code within a \
+                 '#nullable' annotations context."
+            ),
+            DiagnosticKind::NullableUnconstrainedTypeParameter => write!(
+                f,
+                "A nullable type parameter must be known to be a value type or non-nullable \
+                 reference type unless language version '9.0' or greater is used. Consider \
+                 changing the language version or adding a 'class', 'struct', or type constraint."
+            ),
+            DiagnosticKind::TypeofNullableReferenceType => {
+                write!(f, "The typeof operator cannot be used on a nullable reference type")
+            }
+            DiagnosticKind::AsNullableReferenceType { underlying } => write!(
+                f,
+                "It is not legal to use nullable reference type '{underlying}?' in an as \
+                 expression; use the underlying type '{underlying}' instead."
+            ),
+            DiagnosticKind::NullableReferenceTypeInObjectCreation => {
+                write!(f, "Cannot use a nullable reference type in object creation.")
+            }
+            DiagnosticKind::InvalidBaseType => write!(f, "Invalid base type"),
             DiagnosticKind::InterfaceMemberModifier { modifier } => write!(
                 f,
                 "The modifier '{modifier}' is not valid for this item in C# 1.0; \
@@ -3462,6 +3570,17 @@ impl fmt::Display for DiagnosticKind {
                 "'{type_name}' does not contain a constructor that takes {count} arguments"
             ),
             DiagnosticKind::MethodNameExpected => write!(f, "Method name expected"),
+            DiagnosticKind::NonInvocableMember { member } => {
+                write!(f, "Non-invocable member '{member}' cannot be used like a method.")
+            }
+            DiagnosticKind::TypeArgumentsOnNonGenericName { kind, name } => write!(
+                f,
+                "The {} '{name}' cannot be used with type arguments",
+                kind.as_str()
+            ),
+            DiagnosticKind::NamespaceUsedLikeVariable { namespace } => {
+                write!(f, "'{namespace}' is a namespace but is used like a variable")
+            }
             DiagnosticKind::NoOverloadMatchesDelegate { method, delegate } => {
                 write!(f, "No overload for '{method}' matches delegate '{delegate}'")
             }

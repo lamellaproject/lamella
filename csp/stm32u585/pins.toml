@@ -1,5 +1,6 @@
 # PIN map: pin x function -> (instance, signal) for the STM32U585.
-# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers (AF0..AF15) that the
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# Function ids are the ST alternate-function numbers (AF0..AF15) that the
 # AFRL/AFRH nibbles select.
 #
 # THE ALTERNATE-FUNCTION TABLE IS SPLIT ACROSS TWO TABLES AND READING ONE ALONE GIVES A FALSE
@@ -32,7 +33,7 @@ notes = [
     "The six RGB LED legs this family's board drives are general-purpose outputs on PH10 to PH15, and a pin driven by its own port has no peripheral function to select. They carry no row here, and the absence is deliberate rather than pending.",
     "A PIN COMES OUT OF RESET IN ANALOG MODE ON THIS PART, so selecting an alternate function is TWO writes and not one: MODER must be set to 10 (alternate-function mode) as well as the AFR nibble being set to the number below. Setting the nibble alone leaves the pin's input buffer off and drives nothing.",
     "WHICH AFR REGISTER HOLDS THE NIBBLE IS DECIDED BY THE PIN NUMBER AND NOT BY THE FUNCTION. AFRL covers pins 0..7 and AFRH covers pins 8..15, each counting from its own base -- so PG5's nibble is at bit 20 of AFRL while PG9's is at bit 4 of AFRH. The rows below span that boundary: the LPUART1 group sits in AFRL for PG5 to PG7 and in AFRH for PG8, and the SPI3 group is entirely in AFRH.",
-    "PG11's AF6 is SPI3_MOSI and it carries no row, because a pin map here is evidence-only and no board reaches that pin. That is not a statement that the part lacks the function -- Table 28 gives it plainly. A board wanting SPI3's MOSI on port G would add the row; a board wanting the SYSTEM BOOTLOADER's SPI3 must not, because AN2606 Rev 70 Table 217 places that one on PB5 instead.",
+    "PG11's AF6 is SPI3_MOSI and it carries no row, because a pin map here lists only the cells a binding uses and no binding uses that pin. That is not a statement that the part lacks the function -- Table 28 gives it plainly. A board wanting SPI3's MOSI on port G would add the row; a board wanting the SYSTEM BOOTLOADER's SPI3 must not, because AN2606 Rev 70 Table 217 places that one on PB5 instead.",
     "SPI3_RDY IS A REAL SIGNAL OF THIS PART, WHICH IS WORTH SAYING BECAUSE IT LOOKS LIKE A CONVENTION. A board carrying a 'ready' line beside an SPI bus is usually implementing a software handshake on a spare GPIO; here Table 28 gives PG13 the alternate function SPI3_RDY under the SPI3 header, so the line is part of the peripheral rather than beside it.",
 ]
 

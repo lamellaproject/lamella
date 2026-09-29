@@ -92,31 +92,7 @@ public enum Rp2350AdcLayout {
     public static let ConversionClkAdcCycles: UInt32 = 96
     public static let ClkAdcHz: UInt32 = 48000000
 
-    // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the
-    // GPIO index a pin-fed channel taps; ChannelCount = how many rows the map has;
-    // isChannel = whether an index is one of them --
-    public static let Channel_GPIO26: Int32 = 0
-    public static let Channel_GPIO27: Int32 = 1
-    public static let Channel_GPIO28: Int32 = 2
-    public static let Channel_GPIO29: Int32 = 3
-    public static let Channel_TemperatureSensor: Int32 = 4
-    public static let Channel0_Pin: Int32 = 26
-    public static let Channel1_Pin: Int32 = 27
-    public static let Channel2_Pin: Int32 = 28
-    public static let Channel3_Pin: Int32 = 29
-    public static let ChannelCount: Int32 = 5
-
-    /// Whether `channel` is the index of a row in the channel map above. The indexes need
-    /// not run without gaps, so `ChannelCount` alone does not answer this.
-    public static func isChannel(_ channel: Int32) -> Bool {
-        switch channel {
-        case 0, 1, 2, 3, 4: return true
-        default: return false
-        }
-    }
-
     // -- calibration 'temperature_sensor' (form: vbe-linear); integer coefficients, no hardcoding downstream --
-    public static let TemperatureSensor_Channel: UInt32 = 4
     public static let TemperatureSensor_T0Millicelsius: UInt32 = 27000
     public static let TemperatureSensor_VbeAtT0Microvolts: UInt32 = 706000
     public static let TemperatureSensor_SlopeMicrovoltsPerCelsius: Int32 = -1721

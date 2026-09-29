@@ -4567,8 +4567,29 @@ impl Module {
         keep_type: &[bool],
         strings: &BTreeSet<u64>,
     ) {
-        let kept_method =
-            |handle_map: &BTreeMap<u64, MethodId>, handle: u64| handle_map.contains_key(&handle);
+        let type_kept = |type_id: &TypeId| keep_type.get(*type_id as usize).copied().unwrap_or(false);
+        let handle_of_kept_type: BTreeSet<u64> = self
+            .type_handles
+            .iter()
+            .filter(|(type_id, _)| type_kept(type_id))
+            .map(|(_, handle)| *handle)
+            .collect();
+        let bodyless_of_kept_type: BTreeSet<u64> = self
+            .type_methods
+            .iter()
+            .filter(|(type_handle, _)| handle_of_kept_type.contains(*type_handle))
+            .flat_map(|(_, methods)| methods.iter().map(|method| method.handle))
+            .chain(
+                self.type_methods_by_name
+                    .iter()
+                    .filter(|((type_handle, _), _)| handle_of_kept_type.contains(type_handle))
+                    .map(|(_, member)| *member),
+            )
+            .filter(|member| self.resolve_by_handle(*member).is_none())
+            .collect();
+        let kept_method = |handle_map: &BTreeMap<u64, MethodId>, handle: u64| {
+            handle_map.contains_key(&handle) || bodyless_of_kept_type.contains(&handle)
+        };
         let empty_raw: RawCil = RawCil::Flash(&[]);
         for (id, method) in self.methods.iter_mut().enumerate() {
             if keep_method.get(id).copied().unwrap_or(false) {
@@ -4601,13 +4622,6 @@ impl Module {
                 info.sig_methods_nonvirtual.retain(|_, id| method_keep(id));
             }
         }
-        let type_kept = |type_id: &TypeId| keep_type.get(*type_id as usize).copied().unwrap_or(false);
-        let handle_of_kept_type: BTreeSet<u64> = self
-            .type_handles
-            .iter()
-            .filter(|(type_id, _)| type_kept(type_id))
-            .map(|(_, handle)| *handle)
-            .collect();
         self.type_tokens.retain(|_, id| type_kept(id));
         self.type_full_names.retain(|id, _| type_kept(id));
         self.vtable_slot_keys.retain(|id, _| type_kept(id));

@@ -154,7 +154,7 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
 
 /// Lists the devices registered under a caller-supplied WinUSB device-interface GUID (a
 /// `"{...}"` string) -- e.g. every attached Lamella Link board -- with product and serial
-/// strings where the OS can report them. Windows-only for now ([`Error::Unsupported`]
+/// strings where the OS can report them. Windows only ([`Error::Unsupported`]
 /// elsewhere): macOS and Linux have no interface-GUID registry, and their backends match by
 /// VID/PID at open time instead.
 pub fn enumerate_interface(interface_guid: &str) -> Result<Vec<DeviceInfo>> {

@@ -1,0 +1,184 @@
+# EXTENSION binding: MikroE's Click Shield for Pi Pico, an ADAPTER. It plugs onto a Pico's
+# forty-position header and carries two mikroBUS sockets, so it is an extension on one side and a
+# host on the other. Its header side names positions of ../standards/pico-header.toml and never a
+# pad; its sockets name positions of ../standards/mikrobus.toml, each wired to a header position.
+# A module in a socket therefore reaches a board's pad in two joins -- socket position to header
+# position here, header position to pad in the board's own `header` row -- and neither file names
+# the other's half.
+#
+# THE TWO SOCKETS SHARE THEIR BUSES AND NOTHING ELSE. SPI's clock and data lines and I2C's two lines
+# reach both sockets from one set of header positions; each socket has its own UART, chip select,
+# reset, interrupt, PWM and analog line. A module that uses a shared line uses it for both sockets.
+#
+# THE TWO REVISIONS DIFFER IN ONE PLACE, AND IT IS NOT COSMETIC. v101 wires the sockets' MOSI to
+# header position GP19 and MISO to GP16; v100 wires them the other way round, in both sockets.
+# Every other line, the power circuit and the parts list are the same in both drawings. So which
+# revision a unit is decides where SPI data lands, and the file states both: the unit's revision is
+# a fact about the physical shield, stated where the unit is described, not here.
+#
+# THE SOCKETS ARE NAMED socket-1 AND socket-2. The drawings designate them MIKROBUS0 and MIKROBUS1;
+# the mikroBUS standard numbers a board's sockets from 1, and socket-1 is the drawings' MIKROBUS0.
+
+[table]
+kind = "extension"
+extension = "click-shield-for-pi-pico"
+vendor = "mikroe"
+standard = "pico-header"
+sources = [
+    "Click Shield for Pi Pico schematic v101 (MikroE), the header symbol U7, labeled Raspberry Pi PICO: header pin 1 carries net TX0, 2 RX0, 4 PWM0, 5 INT0, 6 SDA, 7 SCL, 9 RST0, 10 PWM1, 11 TX1, 12 RX1, 17 CS1, 21 MISO, 22 CS0, 24 SCK, 25 MOSI, 26 RST1, 27 INT1, 31 AN0 and 32 AN1. Pins 14, 15, 16, 19, 20, 29, 30, 34, 35, 36 and 37 are drawn as bare stubs, and 39 and 40 are joined as one net, A5V. The pinout of ../standards/pico-header.toml turns each header pin into its position.",
+    "The same drawing's four TXS0108E level translators, U3 to U6, carry each header net to its socket net -- TX0 to MB_TX0, RX0 to MB_RX0, PWM0 to MB_PWM0, INT0 to MB_INT0, RST0 to MB_RST0 and CS0 to MB_CS0 for MIKROBUS0; TX1, RX1, PWM1, INT1, RST1 and CS1 likewise for MIKROBUS1; and the shared SCK, MOSI, MISO, SDA and SCL to both sockets' MB_ nets. AN0 and AN1 reach MB_AN0 and MB_AN1 through the AN0 and AN1 switches, with no translator. The socket symbols MIKROBUS0 and MIKROBUS1 put each MB_ net on the mikroBUS position of its name.",
+    "Click Shield for Pi Pico schematic v100 (MikroE): the same drawing, except that header pin 21 carries net MOSI and pin 25 carries MISO, the reverse of v101, while the translators still carry MOSI and MISO to the sockets' MB_MOSI and MB_MISO nets. Its title, footer, layout and line-crossing style differ; no other net does.",
+]
+notes = [
+    "THE SHIELD'S 3.3 V IS ITS OWN. The sockets' 3.3 V positions ride the shield's step-down regulator, fed from its 5 V rail, and the header's 3V3 and 3V3_EN positions are left unconnected -- so a module draws nothing from the host board's 3.3 V regulator.",
+    "WITH THE SHIELD FITTED, THE HOST'S VSYS AND VBUS POSITIONS ARE ONE NET. The drawing joins header pins 39 and 40 as A5V, so a supply fed into VSYS also appears on VBUS, and on the host's USB connector; a program that senses VBUS reads it as present whenever the board is powered at all.",
+    "EACH ANALOG LINE HAS A SWITCH, AND THE WRONG POSITION PUTS 5 V ON AN ANALOG PAD. The AN0 and AN1 switches each have two positions: MB_AN-3V3 joins the socket's AN straight to the header's analog position, and MB_AN-5V puts a 100k resistor in series, over the 200k that loads the position in both, so the host reads two-thirds of the module's voltage. A module whose analog output swings to 5 V needs the MB_AN-5V position. The drawing encodes no factory position, so read each switch off the unit.",
+    "Two more switches, VLS0 and VLS1, set each socket's logic level to 3.3 V or 5 V at its translators' socket side; the host side stays at the shield's 3.3 V either way.",
+]
+
+# --- the two revisions ---------------------------------------------------------------------------
+
+[[revisions]]
+name = "v101"
+source = "Click Shield for Pi Pico schematic v101: header pin 25 (GP19) carries net MOSI and pin 21 (GP16) carries MISO."
+
+[[revisions]]
+name = "v100"
+source = "Click Shield for Pi Pico schematic v100: header pin 21 (GP16) carries net MOSI and pin 25 (GP19) carries MISO."
+
+# --- socket 1, the drawings' MIKROBUS0 ----------------------------------------------------------
+#
+# Its UART is the header's GP0 and GP1: a board whose serial console rides those two positions
+# cannot also give them to a module here.
+
+[[connectors]]
+name = "socket-1"
+standard = "mikrobus"
+source = "Click Shield for Pi Pico schematics v100 and v101: socket MIKROBUS0, its nets MB_AN0, MB_RST0, MB_CS0, MB_SCK0, MB_MISO0, MB_MOSI0, MB_PWM0, MB_INT0, MB_RX0, MB_TX0, MB_SCL0 and MB_SDA0, each reaching the header net the sources above name."
+
+[[connectors.socket-1.pins]]
+signal = "an"
+host = "gp26"
+
+[[connectors.socket-1.pins]]
+signal = "rst"
+host = "gp6"
+
+[[connectors.socket-1.pins]]
+signal = "cs"
+host = "gp17"
+
+[[connectors.socket-1.pins]]
+signal = "sck"
+host = "gp18"
+
+[[connectors.socket-1.pins]]
+signal = "miso"
+host = "gp16"
+revision = "v101"
+
+[[connectors.socket-1.pins]]
+signal = "miso"
+host = "gp19"
+revision = "v100"
+
+[[connectors.socket-1.pins]]
+signal = "mosi"
+host = "gp19"
+revision = "v101"
+
+[[connectors.socket-1.pins]]
+signal = "mosi"
+host = "gp16"
+revision = "v100"
+
+[[connectors.socket-1.pins]]
+signal = "pwm"
+host = "gp2"
+
+[[connectors.socket-1.pins]]
+signal = "int"
+host = "gp3"
+
+[[connectors.socket-1.pins]]
+signal = "rx"
+host = "gp1"
+
+[[connectors.socket-1.pins]]
+signal = "tx"
+host = "gp0"
+
+[[connectors.socket-1.pins]]
+signal = "scl"
+host = "gp5"
+
+[[connectors.socket-1.pins]]
+signal = "sda"
+host = "gp4"
+
+# --- socket 2, the drawings' MIKROBUS1 ----------------------------------------------------------
+
+[[connectors]]
+name = "socket-2"
+standard = "mikrobus"
+source = "Click Shield for Pi Pico schematics v100 and v101: socket MIKROBUS1, its nets MB_AN1, MB_RST1, MB_CS1, MB_SCK1, MB_MISO1, MB_MOSI1, MB_PWM1, MB_INT1, MB_RX1, MB_TX1, MB_SCL1 and MB_SDA1, each reaching the header net the sources above name."
+
+[[connectors.socket-2.pins]]
+signal = "an"
+host = "gp27"
+
+[[connectors.socket-2.pins]]
+signal = "rst"
+host = "gp20"
+
+[[connectors.socket-2.pins]]
+signal = "cs"
+host = "gp13"
+
+[[connectors.socket-2.pins]]
+signal = "sck"
+host = "gp18"
+
+[[connectors.socket-2.pins]]
+signal = "miso"
+host = "gp16"
+revision = "v101"
+
+[[connectors.socket-2.pins]]
+signal = "miso"
+host = "gp19"
+revision = "v100"
+
+[[connectors.socket-2.pins]]
+signal = "mosi"
+host = "gp19"
+revision = "v101"
+
+[[connectors.socket-2.pins]]
+signal = "mosi"
+host = "gp16"
+revision = "v100"
+
+[[connectors.socket-2.pins]]
+signal = "pwm"
+host = "gp7"
+
+[[connectors.socket-2.pins]]
+signal = "int"
+host = "gp21"
+
+[[connectors.socket-2.pins]]
+signal = "rx"
+host = "gp9"
+
+[[connectors.socket-2.pins]]
+signal = "tx"
+host = "gp8"
+
+[[connectors.socket-2.pins]]
+signal = "scl"
+host = "gp5"
+
+[[connectors.socket-2.pins]]
+signal = "sda"
+host = "gp4"

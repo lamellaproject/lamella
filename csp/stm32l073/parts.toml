@@ -17,7 +17,7 @@
 # turns on GPIOE existing. Figure 5 of the datasheet gives all 64 pins, and the GPIO pads among them
 # are PA0-PA15, PB0-PB15, PC0-PC15, PD2 and PH0-PH1 -- 51 pads, the same EXTENT as the category 3
 # part in the same package. So the die difference this family exists for is invisible on this
-# package, and a reader comparing present-lists would conclude the two parts are the same. They are
+# package, and a reader comparing `pins` lists would conclude the two parts are the same. They are
 # not: GPIOE is on the die and reachable on the 100-pin packages, which is why the instance map
 # names it and this row does not.
 

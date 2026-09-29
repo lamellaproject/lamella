@@ -12,16 +12,18 @@ use lamella_wire_host::engine::{
 use lamella_wire_host::engine::BakedSerialLink;
 use lamella_wire_host::{deployed_status_blocking, hello_blocking, list_serial, SerialTransport, UsbTransport};
 #[cfg(feature = "bake")]
-use lamella_wire_host::deploy_chunked_blocking;
+use lamella_wire_host::{TransferAck, board_name, deploy_image_blocking};
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
-use std::time::Duration;
+use std::io::{BufRead, Read, Write};
+use std::time::{Duration, Instant};
 
 /// The default serial baud for a Lamella Link carrier (USB-CDC ignores it; a real UART wants it).
 const BAUD: u32 = 115_200;
 
 #[cfg(feature = "bake")]
 mod debug;
+
+mod schema;
 
 /// The shared, canonical tool contract (name / description / inputSchema / annotations). Embedded so the binary
 /// is self-contained; the browser host vendors a byte-identical copy. `tools/list` serves the `tools` array.
@@ -43,12 +45,121 @@ fn corlib_bytes() -> Result<Vec<u8>, String> {
     std::fs::read(&fixture).map_err(|error| format!("corlib fixture {}: {error}", fixture.display()))
 }
 
-/// The tool-list payload: the `tools` array from the embedded contract, verbatim.
+/// Every tool the contract declares, whatever this build routes, parsed once.
+fn contract_tools() -> &'static [Value] {
+    static TOOLS: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
+    TOOLS.get_or_init(|| {
+        serde_json::from_str::<Value>(CONTRACT)
+            .ok()
+            .and_then(|contract| contract.get("tools").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+    })
+}
+
+/// The tools only a build with the `bake` feature routes. A build without it serves none of them.
+const BAKE_ONLY: [&str; 12] = [
+    "lamella_size",
+    "lamella_bake",
+    "lamella_run_on_device",
+    "lamella_deploy",
+    "lamella_debug_launch",
+    "lamella_debug_set_breakpoints",
+    "lamella_debug_continue",
+    "lamella_debug_step",
+    "lamella_debug_stack",
+    "lamella_debug_locals",
+    "lamella_debug_eval",
+    "lamella_debug_disconnect",
+];
+
+/// Whether this build serves the tool `name` declares.
+fn served(name: &str) -> bool {
+    cfg!(feature = "bake") || !BAKE_ONLY.contains(&name)
+}
+
+/// The contract's entry for `name`, if this build serves it.
+fn served_tool(name: &str) -> Option<&'static Value> {
+    contract_tools()
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .filter(|_| served(name))
+}
+
+/// The tool-list payload: the contract's tools this build serves, in the contract's order.
+///
+/// **A LISTED TOOL IS ONE A CALL CAN REACH.** A build without `bake` listed all of them and then
+/// refused every one it cannot run, so a client offered the model tools that only ever answered
+/// that they were not built.
 fn tools() -> Value {
-    serde_json::from_str::<Value>(CONTRACT)
-        .ok()
-        .and_then(|c| c.get("tools").cloned())
-        .unwrap_or_else(|| json!([]))
+    let served: Vec<Value> = contract_tools()
+        .iter()
+        .filter(|tool| tool.get("name").and_then(Value::as_str).is_some_and(served))
+        .cloned()
+        .collect();
+    json!(served)
+}
+
+/// JSON-RPC's code for a line that is not JSON.
+const PARSE_ERROR: i64 = -32700;
+/// JSON-RPC's code for JSON that is not a request.
+const INVALID_REQUEST: i64 = -32600;
+/// JSON-RPC's code for a method this server does not have.
+const METHOD_NOT_FOUND: i64 = -32601;
+/// JSON-RPC's code for a request whose parameters are wrong, which is also how the specification
+/// has a server answer a call to a tool it does not have.
+const INVALID_PARAMS: i64 = -32602;
+
+/// Why a `tools/call` is answered without running its tool.
+enum CallRefused {
+    /// A malformed request, or a tool this server does not serve: a JSON-RPC error.
+    Protocol(i64, String),
+    /// Arguments the tool's `inputSchema` rules out: a tool result with `isError`, which is the
+    /// answer a client hands the model so it can correct the call.
+    Tool(Value),
+}
+
+/// The tool a `tools/call` names and the arguments to call it with, once both are checked.
+///
+/// **TWO KINDS OF WRONG, ANSWERED TWO WAYS, AS THE SPECIFICATION DIVIDES THEM.** A request that names
+/// no tool, names one this server does not serve, or carries `arguments` that is not an object, is a
+/// malformed request and gets a JSON-RPC error. Arguments that do not satisfy the tool's own
+/// `inputSchema` are an input the caller can correct, and get a tool result with `isError`.
+fn checked_call(params: Option<&Value>) -> Result<(&'static str, Value), CallRefused> {
+    let Some(name) = params.and_then(|params| params.get("name")).and_then(Value::as_str) else {
+        return Err(CallRefused::Protocol(
+            INVALID_PARAMS,
+            "tools/call needs the name of a tool, in params.name".to_owned(),
+        ));
+    };
+    let Some(tool) = served_tool(name) else {
+        let why = if BAKE_ONLY.contains(&name) {
+            format!(
+                "Unknown tool: {name}. This server was built without the `bake` feature, which it \
+                 needs: `cargo build -p lamella-mcp --features bake` builds one with it."
+            )
+        } else {
+            format!("Unknown tool: {name}")
+        };
+        return Err(CallRefused::Protocol(INVALID_PARAMS, why));
+    };
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+    let arguments = match params.and_then(|params| params.get("arguments")) {
+        None => json!({}),
+        Some(object @ Value::Object(_)) => object.clone(),
+        Some(_) => {
+            return Err(CallRefused::Protocol(
+                INVALID_PARAMS,
+                format!("tools/call {name}: arguments must be an object"),
+            ));
+        }
+    };
+    if let Err(why) = schema::check(&arguments, &tool["inputSchema"]) {
+        return Err(CallRefused::Tool(text_result(
+            format!("{name} was not run: {why}. Its inputSchema says what it takes."),
+            true,
+        )));
+    }
+    Ok((name, arguments))
 }
 
 /// The resource metadata for `resources/list` (uri/name/description/mimeType; the text is served by read).
@@ -143,7 +254,8 @@ fn host_caps() -> Capabilities {
             | Capabilities::STEPPING
             | Capabilities::REPL_RUN
             | Capabilities::BAKED_IMAGE
-            | Capabilities::DEBUG_BOOT_DEPLOYED,
+            | Capabilities::DEBUG_BOOT_DEPLOYED
+            | Capabilities::DEPLOY_PREFIX_CRC,
     )
 }
 
@@ -390,7 +502,7 @@ fn compile_and_bake(compiler: &LcscCompiler, code: &str) -> Result<Vec<u8>, Stri
 /// Compile a submission and run it ON the device over Lamella Link (BakedSerialLink: bake host-side, the image
 /// crosses the wire, the device interprets it and returns output). Serial targets only.
 #[cfg(feature = "bake")]
-fn tool_run_on_device(target: &str, code: &str) -> Value {
+fn tool_run_on_device(scope: &DeviceScope, target: &str, code: &str) -> Value {
     if target.starts_with("usb") {
         return text_result("run_on_device supports serial targets today (BakedSerialLink); usb Lamella Link run is a follow-up.".to_owned(), true);
     }
@@ -402,6 +514,9 @@ fn tool_run_on_device(target: &str, code: &str) -> Value {
         Ok(l) => l,
         Err(e) => return text_result(format!("cannot open {target} as a baked-image target (needs serve + BAKED_IMAGE): {e:?}"), true),
     };
+    if let Err(why) = scope.permits_link_board(link.identity().product_model) {
+        return text_result(why, true);
+    }
     let mut repl = Repl::new(Box::new(compiler), Box::new(link));
     match repl.eval_program(code) {
         Ok(Outcome::Ran { output, exit, .. }) => {
@@ -431,29 +546,103 @@ fn tool_deploy_status(target: &str) -> Value {
     }
 }
 
+/// Every tool that touches a board. Each is refused when the server was started without
+/// `--allow-device`.
+const DEVICE_TOOLS: [&str; 14] = [
+    "lamella_list_devices",
+    "lamella_identify_device",
+    "lamella_run_on_device",
+    "lamella_deploy",
+    "lamella_deploy_status",
+    "lamella_flash",
+    "lamella_debug_launch",
+    "lamella_debug_set_breakpoints",
+    "lamella_debug_continue",
+    "lamella_debug_step",
+    "lamella_debug_stack",
+    "lamella_debug_locals",
+    "lamella_debug_eval",
+    "lamella_debug_disconnect",
+];
+
+/// The tools that write a board over the Lamella Link: each changes what the board runs, or runs
+/// code on it.
+///
+/// `--allow-device`'s scope binds each of them twice: before anything is opened
+/// ([`DeviceScope::permits_link_request`]), and after the board answers its HELLO and before anything
+/// is written ([`DeviceScope::permits_link_board`]). The debug tools that take a `session` act on a
+/// board `lamella_debug_launch` already checked.
+const LINK_WRITES: [&str; 3] = ["lamella_deploy", "lamella_run_on_device", "lamella_debug_launch"];
+
+/// The refusal `lamella_flash` gives an `image` that is not a chip image, or `None` when it is one.
+///
+/// Decided by the file's KIND, before any file is read, as `lamella flash` decides it. Source or a
+/// `.lmli` would otherwise reach the image reader and be called "not a format this can write", which
+/// names no way forward.
+fn refusal_unless_a_chip_image(image: &str) -> Option<Value> {
+    use lamella_flash_routes::artifact::{Kind, classify};
+    let why = match classify(std::path::Path::new(image)) {
+        Kind::ChipImage => return None,
+        Kind::Source => format!(
+            "{image} is source, and lamella_flash writes an image that is already built. lamella_deploy \
+             compiles a program and puts it on a board running Lamella; the `lamella build` verb \
+             builds a chip image."
+        ),
+        Kind::WirePayload => format!(
+            "{image} is loaded by a board that is already running Lamella, not written to a chip, so \
+             lamella_flash cannot write it. `lamella deploy {image} --target <t>` sends it to such a \
+             board, and lamella_deploy compiles a program from its source and sends that."
+        ),
+    };
+    Some(text_result(why, true))
+}
+
+/// The refusal a tool call gets before it is dispatched, or `None`: a device tool when the server was
+/// started without `--allow-device`, and a Lamella Link write whose scope cannot hold for it.
+fn refusal_before_dispatch(scope: &DeviceScope, name: &str) -> Option<Value> {
+    if DEVICE_TOOLS.contains(&name) && !scope.allowed {
+        return Some(text_result(
+            "This tool touches a hardware board; the server was started without --allow-device.".to_owned(),
+            true,
+        ));
+    }
+    if cfg!(feature = "bake")
+        && LINK_WRITES.contains(&name)
+        && let Err(why) = scope.permits_link_request()
+    {
+        return Some(text_result(why, true));
+    }
+    None
+}
+
 /// Server state: the host compile/run engine (+ a check-only compiler), and (added with the debug tools) the
 /// live debug sessions. `allow_device` gates every tool that touches a board.
 struct Server {
     check: LcscCompiler,
-    repl: Repl,
+    /// How long a `lamella_run` program may run before its process is stopped ([`run_in_child`]).
+    run_timeout: Duration,
     scope: DeviceScope,
+    /// The one directory a tool may create a file in, from `--allow-write`. `None`: no tool writes a
+    /// file.
+    #[cfg_attr(not(feature = "bake"), allow(dead_code))]
+    write_dir: Option<std::path::PathBuf>,
     #[cfg(feature = "bake")]
     debug: debug::Sessions,
 }
 
 impl Server {
-    fn new(scope: DeviceScope) -> Result<Self, String> {
-        let corlib = corlib_bytes()?;
+    fn new(
+        scope: DeviceScope,
+        write_dir: Option<std::path::PathBuf>,
+        run_timeout: Duration,
+    ) -> Result<Self, String> {
+        corlib_bytes()?;
         let check = LcscCompiler::discover().map_err(|e| e.to_string())?;
-        let run_compiler = LcscCompiler::discover().map_err(|e| e.to_string())?;
-        let repl = Repl::new(
-            Box::new(run_compiler),
-            Box::new(LoopbackLink::new(corlib, install_host_clock)),
-        );
         Ok(Self {
             check,
-            repl,
+            run_timeout,
             scope,
+            write_dir,
             #[cfg(feature = "bake")]
             debug: debug::Sessions::new(),
         })
@@ -471,28 +660,8 @@ impl Server {
         let kind = args.get("kind").and_then(Value::as_str).unwrap_or("over");
         #[cfg(feature = "bake")]
         let expression = args.get("expression").and_then(Value::as_str).unwrap_or_default();
-        let device_tool = matches!(
-            name,
-            "lamella_list_devices"
-                | "lamella_identify_device"
-                | "lamella_run_on_device"
-                | "lamella_deploy"
-                | "lamella_deploy_status"
-                | "lamella_flash"
-                | "lamella_debug_launch"
-                | "lamella_debug_set_breakpoints"
-                | "lamella_debug_continue"
-                | "lamella_debug_step"
-                | "lamella_debug_stack"
-                | "lamella_debug_locals"
-                | "lamella_debug_eval"
-                | "lamella_debug_disconnect"
-        );
-        if device_tool && !self.scope.allowed {
-            return text_result(
-                "This tool touches a hardware board; the server was started without --allow-device.".to_owned(),
-                true,
-            );
+        if let Some(refusal) = refusal_before_dispatch(&self.scope, name) {
+            return refusal;
         }
         match name {
             "lamella_flash" => self.tool_flash(&args),
@@ -514,13 +683,13 @@ impl Server {
             #[cfg(feature = "bake")]
             "lamella_size" => self.tool_size(code),
             #[cfg(feature = "bake")]
-            "lamella_bake" => self.tool_bake(code, args.get("out_path").and_then(Value::as_str)),
+            "lamella_bake" => self.tool_bake(code, args),
             #[cfg(feature = "bake")]
-            "lamella_run_on_device" => tool_run_on_device(target, code),
+            "lamella_run_on_device" => tool_run_on_device(&self.scope, target, code),
             #[cfg(feature = "bake")]
             "lamella_deploy" => self.tool_deploy(target, code, args.get("run").and_then(Value::as_bool).unwrap_or(true)),
             #[cfg(feature = "bake")]
-            "lamella_debug_launch" => self.debug.launch(target, code),
+            "lamella_debug_launch" => self.debug.launch(&self.scope, target, code),
             #[cfg(feature = "bake")]
             "lamella_debug_set_breakpoints" => {
                 let lines: Vec<i64> = args
@@ -542,14 +711,6 @@ impl Server {
             "lamella_debug_eval" => self.debug.eval(session, expression),
             #[cfg(feature = "bake")]
             "lamella_debug_disconnect" => self.debug.disconnect(session),
-            #[cfg(not(feature = "bake"))]
-            "lamella_size" | "lamella_bake" | "lamella_run_on_device" | "lamella_deploy"
-            | "lamella_debug_launch" | "lamella_debug_set_breakpoints" | "lamella_debug_continue"
-            | "lamella_debug_step" | "lamella_debug_stack" | "lamella_debug_locals" | "lamella_debug_eval"
-            | "lamella_debug_disconnect" => text_result(
-                format!("{name}: this server was built WITHOUT the `bake` feature (compile / run / enumerate / identify only). Rebuild with `cargo build -p lamella-mcp --features bake` for on-device bake / deploy / debug."),
-                true,
-            ),
             other => text_result(format!("unknown tool: {other}"), true),
         }
     }
@@ -588,6 +749,10 @@ That is set when the server starts.",
                 ),
                 true,
             );
+        }
+
+        if let Some(refusal) = refusal_unless_a_chip_image(image) {
+            return refusal;
         }
 
         let path = std::path::Path::new(image);
@@ -690,30 +855,36 @@ Verification: {}.",
         }
     }
 
-    fn tool_run(&mut self, lang: &str, code: &str) -> Value {
+    fn tool_run(&self, lang: &str, code: &str) -> Value {
         if lang == "python" {
             return text_result("Python run is on the browser host; not wired into the native server yet.".to_owned(), false);
         }
-        match self.repl.eval_program(code) {
-            Ok(Outcome::Ran { output, exit, .. }) => {
-                let body = if output.is_empty() { "(empty)".to_owned() } else { output };
-                text_result(format!("exit code: {exit}\nstdout:\n{body}"), false)
-            }
-            Ok(Outcome::CompileError(text)) => text_result(format!("Compile failed:\n{text}"), true),
-            Ok(Outcome::Empty) => text_result("(empty submission)".to_owned(), false),
-            Err(error) => text_result(format!("error: {error}"), true),
-        }
+        run_in_child(code, self.run_timeout)
     }
 
     #[cfg(feature = "bake")]
-    fn tool_bake(&self, code: &str, out_path: Option<&str>) -> Value {
+    fn tool_bake(&self, code: &str, args: &Value) -> Value {
+        if args.get("out_path").is_some() {
+            return text_result(
+                "lamella_bake takes no out_path. Name a new file with out_name: it is written in the \
+                 directory the server was started with --allow-write=<dir>."
+                    .to_owned(),
+                true,
+            );
+        }
+        let out_name = args.get("out_name").and_then(Value::as_str);
+        if let Some(name) = out_name
+            && let Err(why) = writable(self.write_dir.as_deref(), name)
+        {
+            return text_result(format!("Nothing was baked or written: {why}."), true);
+        }
         match compile_and_bake(&self.check, code) {
             Ok(image) => {
                 let mut msg = format!("baked OK: {} bytes (.lmli flash image).", image.len());
-                if let Some(path) = out_path {
-                    match std::fs::write(path, &image) {
-                        Ok(()) => msg.push_str(&format!("\nWrote {path}.")),
-                        Err(e) => msg.push_str(&format!("\n(could not write {path}: {e})")),
+                if let Some(name) = out_name {
+                    match write_new_file(self.write_dir.as_deref(), name, &image) {
+                        Ok(path) => msg.push_str(&format!("\nWrote {}, a new file.", path.display())),
+                        Err(why) => return text_result(format!("{msg}\nNothing was written: {why}."), true),
                     }
                 }
                 text_result(msg, false)
@@ -746,24 +917,220 @@ Verification: {}.",
             Ok(t) => t,
             Err(e) => return text_result(format!("cannot open {target}: {e:?}"), true),
         };
-        let timeout = Duration::from_secs(20);
-        if let Err(e) = hello_blocking(&mut t, 0, host_caps(), timeout) {
-            return text_result(format!("no HELLO_ACK from {target}: {e:?}"), true);
+        deploy_over(&self.scope, &mut t, target, &image, run, Duration::from_secs(20))
+    }
+}
+
+/// The argument the server starts itself with to run one `lamella_run` program ([`run_child`]).
+const RUN_CHILD: &str = "--run-child";
+
+/// How long a `lamella_run` program may run when the server was started without `--run-timeout`.
+const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The most objects a `lamella_run` program may hold live at once. Past it an allocation raises
+/// `OutOfMemoryException`, which the program can catch, rather than taking this machine's memory.
+const RUN_OBJECT_BUDGET: usize = 1_000_000;
+
+/// The most console output, in UTF-16 units, a `lamella_run` program's run keeps.
+const RUN_OUTPUT_CAP: usize = 1_000_000;
+
+/// How much longer than its deadline the process a run is done in lets itself live: its own stop,
+/// for when the server that started it is gone ([`run_child`]).
+const RUN_CHILD_GRACE: Duration = Duration::from_secs(5);
+
+/// How long `--run-timeout=<seconds>` lets a `lamella_run` program run, or [`DEFAULT_RUN_TIMEOUT`].
+fn parse_run_timeout(args: impl Iterator<Item = String>) -> Result<Duration, String> {
+    let mut timeout = None;
+    for arg in args {
+        let Some(rest) = arg.strip_prefix("--run-timeout") else { continue };
+        let seconds = rest
+            .strip_prefix('=')
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .filter(|seconds| (1..=3600).contains(seconds))
+            .ok_or_else(|| format!("{arg}: give whole seconds from 1 to 3600, as --run-timeout=<seconds>"))?;
+        if timeout.replace(Duration::from_secs(seconds)).is_some() {
+            return Err("--run-timeout was given more than once".to_owned());
         }
-        match deploy_chunked_blocking(&mut t, 1, &image, 8 * 1024, timeout) {
-            Ok(true) => {
-                let mut msg = format!("deployed {} bytes to {target}.", image.len());
-                let mut failed = false;
-                if run {
-                    let (said, is_error) = start_deployed(&mut t, START_ACK_PATIENCE);
-                    msg.push_str(&said);
-                    failed = is_error;
-                }
-                text_result(msg, failed)
+    }
+    Ok(timeout.unwrap_or(DEFAULT_RUN_TIMEOUT))
+}
+
+/// Run `code` for `lamella_run` in a process of its own, and stop that process at `timeout`.
+///
+/// **THE ONLY STOP THAT ALWAYS WORKS IS ONE OUTSIDE THE PROGRAM.** The interpreter has no step
+/// budget, and a thread cannot be stopped from outside, so a program that never ended held the
+/// server's one request loop for good. In a child process it holds only that process, which is
+/// stopped at the deadline, and the server answers the next request. A program that crashes the
+/// interpreter, or fills memory, takes only the child with it.
+fn run_in_child(code: &str, timeout: Duration) -> Value {
+    let started = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .arg(RUN_CHILD)
+            .arg(timeout.as_millis().to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    });
+    let mut child = match started {
+        Ok(child) => child,
+        Err(error) => {
+            return text_result(format!("error: could not start a process to run the program in: {error}"), true);
+        }
+    };
+    let source = code.as_bytes().to_vec();
+    let feeding = child.stdin.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&source);
+        })
+    });
+    let reading = child.stdout.take().map(drain);
+    let erring = child.stderr.take().map(drain);
+
+    let deadline = Instant::now() + timeout;
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
             }
-            Ok(false) => text_result(format!("deploy to {target} was not fully acked (a chunk failed to verify)."), true),
-            Err(e) => text_result(format!("deploy to {target} failed: {e:?}"), true),
         }
+    };
+    if let Some(feeding) = feeding {
+        let _ = feeding.join();
+    }
+    let answer = reading.and_then(|reading| reading.join().ok()).unwrap_or_default();
+    let complaint = erring.and_then(|erring| erring.join().ok()).unwrap_or_default();
+    if !finished {
+        return text_result(
+            format!(
+                "The program was stopped after {} seconds without finishing. One that loops forever, or \
+                 waits for something this machine does not have, never finishes here.",
+                timeout.as_secs()
+            ),
+            true,
+        );
+    }
+    let answer = String::from_utf8_lossy(&answer)
+        .lines()
+        .last()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .unwrap_or_default();
+    let text = answer["text"].as_str().unwrap_or_default();
+    match answer["outcome"].as_str() {
+        Some("ran") => {
+            let output = answer["output"].as_str().unwrap_or_default();
+            let body = if output.is_empty() { "(empty)" } else { output };
+            text_result(format!("exit code: {}\nstdout:\n{body}", answer["exit"]), false)
+        }
+        Some("compile_error") => text_result(format!("Compile failed:\n{text}"), true),
+        Some("empty") => text_result("(empty submission)".to_owned(), false),
+        Some("error") => text_result(format!("error: {text}"), true),
+        _ => {
+            let said = String::from_utf8_lossy(&complaint);
+            let said = said.trim();
+            let tail = said.char_indices().rev().nth(1999).map_or(said, |(at, _)| &said[at..]);
+            text_result(format!("error: the run ended without an answer. It said:\n{tail}"), true)
+        }
+    }
+}
+
+/// Read a child's pipe to its end, on a thread of its own.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+/// `lamella-mcp --run-child <milliseconds>`: read one program from stdin, run it on this machine's
+/// interpreter, and print one JSON line saying how it went. The server starts itself this way for
+/// every `lamella_run` ([`run_in_child`]), passing the run's deadline.
+///
+/// **IT CARRIES A STOP OF ITS OWN.** The server stops it at the deadline; if the server is gone
+/// first, nothing else would stop a program that never ends, so this process ends itself
+/// [`RUN_CHILD_GRACE`] after the deadline, whatever the program is doing.
+fn run_child() -> ! {
+    let deadline = std::env::args()
+        .nth(2)
+        .and_then(|milliseconds| milliseconds.parse::<u64>().ok())
+        .map_or(DEFAULT_RUN_TIMEOUT, Duration::from_millis);
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline + RUN_CHILD_GRACE);
+        std::process::exit(3);
+    });
+    let mut source = String::new();
+    let answer = match std::io::stdin().read_to_string(&mut source) {
+        Err(error) => json!({ "outcome": "error", "text": format!("the program could not be read: {error}") }),
+        Ok(_) => match child_repl() {
+            Err(error) => json!({ "outcome": "error", "text": error }),
+            Ok(mut repl) => match repl.eval_program(&source) {
+                Ok(Outcome::Ran { output, exit, .. }) => json!({ "outcome": "ran", "exit": exit, "output": output }),
+                Ok(Outcome::CompileError(text)) => json!({ "outcome": "compile_error", "text": text }),
+                Ok(Outcome::Empty) => json!({ "outcome": "empty" }),
+                Err(error) => json!({ "outcome": "error", "text": error.to_string() }),
+            },
+        },
+    };
+    println!("{answer}");
+    let _ = std::io::stdout().flush();
+    std::process::exit(0)
+}
+
+/// The engine a `lamella_run` program runs on: this build's compiler, and the interpreter over the
+/// corlib, set up by [`configure_run`].
+fn child_repl() -> Result<Repl, String> {
+    let corlib = corlib_bytes()?;
+    let compiler = LcscCompiler::discover().map_err(|error| error.to_string())?;
+    Ok(Repl::new(Box::new(compiler), Box::new(LoopbackLink::new(corlib, configure_run))))
+}
+
+/// The machine a `lamella_run` program runs on: this machine's clock, and bounds on what the
+/// program may hold.
+fn configure_run(vm: &mut lamella_cil_runtime::Vm) {
+    install_host_clock(vm);
+    vm.set_object_budget(Some(RUN_OBJECT_BUDGET));
+    vm.set_output_cap(Some(RUN_OUTPUT_CAP));
+}
+
+/// `lamella_deploy` on an open carrier: HELLO the board, refuse it unless the scope names it, then
+/// deploy `image` and, if `run`, start it.
+#[cfg(feature = "bake")]
+fn deploy_over(
+    scope: &DeviceScope,
+    t: &mut impl lamella_wire::Transport,
+    target: &str,
+    image: &[u8],
+    run: bool,
+    timeout: Duration,
+) -> Value {
+    let session = match hello_blocking(&mut *t, 0, host_caps(), timeout) {
+        Ok(session) => session,
+        Err(e) => return text_result(format!("no HELLO_ACK from {target}: {e:?}"), true),
+    };
+    if let Err(why) = scope.permits_link_board(session.identity.product_model) {
+        return text_result(why, true);
+    }
+    match deploy_image_blocking(&mut *t, 1, image, 8 * 1024, timeout, session.caps) {
+        Ok(TransferAck::Accepted) => {
+            let mut msg = format!("deployed {} bytes to {target}.", image.len());
+            let mut failed = false;
+            if run {
+                let (said, is_error) = start_deployed(&mut *t, START_ACK_PATIENCE);
+                msg.push_str(&said);
+                failed = is_error;
+            }
+            text_result(msg, failed)
+        }
+        Ok(not_accepted) => text_result(
+            format!("deploy to {target} failed: {}.", not_accepted.describe(board_name(session.identity.product_model))),
+            true,
+        ),
+        Err(e) => text_result(format!("deploy to {target} failed: {e:?}"), true),
     }
 }
 
@@ -820,6 +1187,51 @@ fn requested_protocol(msg: &Value) -> Option<&str> {
     msg.get("params")?.get("_meta")?.get(META_PROTOCOL_VERSION)?.as_str()
 }
 
+/// The next request or notification on `input`, or `None` at its end.
+///
+/// **A LINE THAT IS NOT A MESSAGE IS ANSWERED AND PASSED OVER, NEVER THE END OF THE SERVER.** A line
+/// that is not UTF-8, or not JSON, is a parse error; JSON that is not a request object is an invalid
+/// request. Each is answered with `id: null`, as JSON-RPC requires when the id cannot be read. A
+/// response (an object with no method) needs no answer, since this server sends no requests.
+fn next_message(input: &mut impl BufRead, out: &mut impl Write) -> Option<Value> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match input.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            respond_error(out, &Value::Null, PARSE_ERROR, "Parse error: the line is not UTF-8");
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let message = match serde_json::from_str::<Value>(text) {
+            Ok(message) => message,
+            Err(error) => {
+                respond_error(out, &Value::Null, PARSE_ERROR, &format!("Parse error: {error}"));
+                continue;
+            }
+        };
+        if message.get("method").is_some_and(Value::is_string) {
+            return Some(message);
+        }
+        let response = message.get("result").is_some() || message.get("error").is_some();
+        if !response {
+            let id = message.get("id").filter(|id| id.is_string() || id.is_number()).cloned();
+            respond_error(
+                out,
+                &id.unwrap_or(Value::Null),
+                INVALID_REQUEST,
+                "Invalid Request: a request is a JSON object with a method",
+            );
+        }
+    }
+}
+
 fn respond(out: &mut impl Write, id: &Value, result: Value) {
     let _ = writeln!(
         out,
@@ -860,13 +1272,22 @@ fn respond_error(out: &mut impl Write, id: &Value, code: i64, message: &str) {
 
 /// What the server was permitted to touch, parsed from `--allow-device`.
 ///
+/// **IT BINDS EVERY TOOL THAT WRITES A BOARD:** `lamella_flash`, which writes a chip through a probe
+/// or a bootloader drive, and the [`LINK_WRITES`], which write a board over the Lamella Link. The
+/// tools that list and identify boards need only `--allow-device`, because identifying a board is
+/// how a caller finds the one in scope.
+///
 /// **A SCOPE ON A REQUEST AND A SCOPE ON A DEVICE ARE DIFFERENT PROTECTIONS**, and only one of them
 /// survives a cable being moved:
 ///
-/// - `board:` and `probe:` narrow what may be ASKED FOR. They are checked here, before any
+/// - `board:` and `probe:` narrow what a flash may ASK FOR. They are checked here, before any
 ///   hardware is touched, and they are cheap.
-/// - `chip:` narrows what may be WRITTEN. It is checked by the flashing contract itself, between
+/// - `chip:` narrows what a flash may WRITE. It is checked by the flashing contract itself, between
 ///   the part identifying itself and anything being erased, against the reading the part gave.
+/// - A Link write can satisfy only `board:`, and there it is checked against the board itself: the
+///   model it reports in its HELLO, on the connection the write then crosses
+///   ([`permits_link_board`](Self::permits_link_board)). A `probe:` or `chip:` term refuses every
+///   Link write ([`permits_link_request`](Self::permits_link_request)).
 ///
 /// **`chip:` IS ONLY AS NARROW AS THE READING THE PART CAN GIVE, AND THAT VARIES BY PART.** An
 /// RP2350 publishes a 64-bit OTP chip id unique to the die, so a `chip:` scope there really does
@@ -930,6 +1351,12 @@ chip:<hex>. Bare --allow-device permits any board this build can write."
                     )
                 })?;
                 match key {
+                    "board" if lamella_catalog::load_board(value).is_none() => {
+                        return Err(format!(
+                            "--allow-device=board:{value}: this build knows no board {value:?}. \
+                             `lamella boards` lists the ids it knows."
+                        ));
+                    }
                     "board" => scope.boards.push(value.to_owned()),
                     "probe" => scope.probes.push(value.to_owned()),
                     "chip" => {
@@ -971,6 +1398,72 @@ prints it after every write."
         true
     }
 
+    /// Whether a write over the Lamella Link may be asked for at all. Checked before anything is
+    /// opened.
+    ///
+    /// **A LINK WRITE CAN SATISFY ONLY A `board:` TERM.** It reaches the board's own firmware over the
+    /// board's serial or USB carrier, so it goes through no probe, and a `probe:` term cannot hold for
+    /// it, just as it cannot for a flash that names no probe. And the chip id a board reports over
+    /// the Link is not the reading a `chip:` term is checked against. That reading is the id the
+    /// flashing contract takes from the part, a different register on each family: an RP2350's OTP
+    /// chip id, an STM32's DEV_ID. A term that cannot be checked does not hold, so either kind refuses
+    /// every Link write.
+    fn permits_link_request(&self) -> Result<(), String> {
+        let mut unchecked = Vec::new();
+        if !self.probes.is_empty() {
+            unchecked.push("probe:");
+        }
+        if !self.chips.is_empty() {
+            unchecked.push("chip:");
+        }
+        if unchecked.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "This server may not write a board over the Lamella Link. It was started with: {}.\n\n\
+A Lamella Link write goes through no probe, and the chip id a board reports over the Link is not \
+the reading a chip: scope is checked against. So a {} scope cannot be checked for it, and nothing \
+was opened. A board: scope is what narrows a Link write. That is set when the server starts.",
+            self.describe(),
+            unchecked.join(" or ")
+        ))
+    }
+
+    /// Whether the board that answered a HELLO is one a `board:` term names.
+    ///
+    /// Checked after the HELLO and before anything is written, on the connection the write then
+    /// crosses, so it is the board the write reaches. It compares the MODEL the board reports with
+    /// the model each named board's own table declares. So a `board:` term names a model, and two
+    /// boards of one model are both inside it. A board reporting model 0 is inside no `board:` term:
+    /// 0 is what a firmware with no model to report sends.
+    #[cfg_attr(not(feature = "bake"), allow(dead_code))]
+    fn permits_link_board(&self, product_model: u16) -> Result<(), String> {
+        if self.boards.is_empty() {
+            return Ok(());
+        }
+        let named = product_model != lamella_wire::product_model::UNKNOWN
+            && self.boards.iter().any(|id| {
+                lamella_catalog::load_board(id)
+                    .is_some_and(|board| board.product_model == i64::from(product_model))
+            });
+        if named {
+            return Ok(());
+        }
+        let answered = if product_model == lamella_wire::product_model::UNKNOWN {
+            "a board that reports no model".to_owned()
+        } else {
+            match product_model_name(product_model) {
+                Some(name) => format!("{name} (product_model {product_model})"),
+                None => format!("product_model {product_model}, which this build does not know"),
+            }
+        };
+        Err(format!(
+            "This server may not write this board: it answered as {answered}. It was started with: \
+{}.\n\nNothing was written. That is set when the server starts.",
+            self.describe()
+        ))
+    }
+
     /// The permission the flashing contract enforces against the part itself.
     fn identities(&self) -> lamella_flash_backend::Allow {
         if self.chips.is_empty() {
@@ -999,6 +1492,95 @@ prints it after every write."
             parts.join("; ")
         }
     }
+}
+
+/// The directory `--allow-write=<dir>` grants, or `None` when the server was started without it.
+///
+/// **A FILE A TOOL WRITES GOES ONLY HERE, AND ONLY AS A NEW FILE** ([`write_new_file`]). Without the
+/// flag no tool writes a file at all, which is the default a server somebody found in a repository
+/// should have. The directory must exist when the server starts, and is made absolute then, so a
+/// later write cannot land somewhere the grant did not name.
+fn parse_write_dir(args: impl Iterator<Item = String>) -> Result<Option<std::path::PathBuf>, String> {
+    let mut granted = None;
+    for arg in args {
+        let Some(rest) = arg.strip_prefix("--allow-write") else { continue };
+        let Some(dir) = rest.strip_prefix('=').filter(|dir| !dir.is_empty()) else {
+            return Err(format!("{arg}: name the directory, as --allow-write=<dir>"));
+        };
+        if granted.is_some() {
+            return Err("--allow-write names one directory, and it was given more than once".to_owned());
+        }
+        let path = std::path::Path::new(dir);
+        if !path.is_dir() {
+            return Err(format!("--allow-write={dir}: there is no directory there"));
+        }
+        let absolute = std::path::absolute(path).map_err(|error| format!("--allow-write={dir}: {error}"))?;
+        granted = Some(absolute);
+    }
+    Ok(granted)
+}
+
+/// Why a file called `name` may not be created in `dir`, or the directory it may be created in.
+///
+/// `name` is a plain file name ending in `.lmli`: letters, digits, `-`, `_` and `.`, not starting
+/// with a dot. That leaves out every directory part, `..`, a drive (`C:x`), an NTFS stream (`a:b`,
+/// which writes beside a file already there), and control characters. A name Windows opens as a
+/// device in every directory (`CON`, `NUL`, `COM1` and the rest, whatever follows the first dot) is
+/// refused too.
+#[cfg_attr(not(feature = "bake"), allow(dead_code))]
+fn writable<'a>(dir: Option<&'a std::path::Path>, name: &str) -> Result<&'a std::path::Path, String> {
+    let Some(dir) = dir else {
+        return Err("this server writes no files: it was started without --allow-write=<dir>".to_owned());
+    };
+    let Some(stem) = name.strip_suffix(".lmli") else {
+        return Err(format!("out_name {name:?} does not end in .lmli"));
+    };
+    let plain = !stem.is_empty()
+        && name.len() <= 128
+        && !stem.starts_with('.')
+        && stem.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !plain {
+        return Err(format!(
+            "out_name {name:?} is not a plain file name: use letters, digits, '-', '_' and '.', with no \
+             directory part"
+        ));
+    }
+    let device = stem.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let numbered = (device.starts_with("COM") || device.starts_with("LPT"))
+        && device.len() == 4
+        && device.as_bytes()[3].is_ascii_digit();
+    if numbered || matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return Err(format!("out_name {name:?} is a name Windows reserves for a device"));
+    }
+    Ok(dir)
+}
+
+/// Write `bytes` as a NEW file called `name` in the `--allow-write` directory, and return its path.
+///
+/// **IT NEVER WRITES THROUGH ANYTHING ALREADY AT THAT NAME.** The file is created only if nothing is
+/// there, so an existing file, and a link at the name, both refuse rather than being replaced or
+/// followed. A write that fails part way removes the file it created.
+#[cfg_attr(not(feature = "bake"), allow(dead_code))]
+fn write_new_file(
+    dir: Option<&std::path::Path>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    let dir = writable(dir, name)?;
+    let path = dir.join(name);
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{name} is already in {}, and a new file never replaces one", dir.display())
+        } else {
+            format!("could not create {}: {error}", path.display())
+        }
+    })?;
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("could not write {}: {error}", path.display()));
+    }
+    Ok(path)
 }
 
 /// The protocol revisions this server speaks, newest first.
@@ -1062,7 +1644,8 @@ fn negotiate_protocol(requested: Option<&str>) -> &'static str {
 }
 
 const USAGE: &str = r#"
-usage: lamella-mcp [--allow-device[=<scope>[,<scope>]]]
+usage: lamella-mcp [--allow-device[=<scope>[,<scope>]]] [--allow-write=<dir>]
+                   [--run-timeout=<seconds>]
 
 An MCP server over stdio. It is started BY an MCP client, not by hand -- the client reads its
 configuration and launches this process, so these arguments are written where that configuration
@@ -1083,12 +1666,20 @@ the useful default for a server somebody discovered in a repository and has not 
 
 WITH bare --allow-device, any board this build can write is writable.
 
-The scopes narrow that, and they are two different kinds of protection:
+The scopes narrow that. They bind every tool that writes a board: lamella_flash, which writes a
+chip through a probe or a bootloader drive, and the three that write a board over the Lamella
+Link, lamella_deploy, lamella_run_on_device and lamella_debug_launch. The tools that list and
+identify boards need only --allow-device, because identifying a board is how a caller finds the
+one in scope. The other debug tools act on a session lamella_debug_launch opened.
 
-  board:<id>       narrows what may be ASKED FOR -- checked before any hardware is opened
-  probe:<serial>   the same, for the probe a write goes through
-  chip:<hex>       narrows what may be WRITTEN -- checked against the reading the PART gave,
-                   after it identifies itself and before anything is erased
+  board:<id>       a flash: narrows what may be ASKED FOR -- checked before any hardware is
+                   opened. A Link write: the model the board reports when it answers, checked
+                   before anything is written, so two boards of one model are both inside it
+  probe:<serial>   a flash: the same, for the probe the write goes through. A Link write goes
+                   through no probe, so a probe: scope refuses every one
+  chip:<hex>       a flash: narrows what may be WRITTEN -- checked against the reading the PART
+                   gave, after it identifies itself and before anything is erased. A board does
+                   not report that reading over the Link, so a chip: scope refuses every Link write
 
 chip: is only as narrow as the reading the part can give, and that varies by part. An RP2350
 publishes a die-unique 64-bit OTP chip id, and there chip: is the only scope that survives somebody
@@ -1103,9 +1694,22 @@ flag accumulates.
 THIS IS A GUARD AGAINST MISTAKES AND NOT AN ACCESS CONTROL. Whoever can start this server can
 start it with a wider scope, and can usually run the `lamella` CLI instead, which asks nobody.
 It narrows what this surface will do; it does not narrow what the process can reach.
+
+WITHOUT --allow-write, no tool writes a file. WITH --allow-write=<dir>, lamella_bake may keep the
+image it builds as a NEW file in <dir>, named by its out_name: a plain name ending in .lmli. No
+file already there is replaced, and a name with a directory part is refused. The directory must
+exist when the server starts.
+
+lamella_run runs each program in a process of its own and stops it after 20 seconds, or after
+--run-timeout=<seconds> (1 to 3600). A program that never ends costs that process, not the
+server. It may hold at most a million objects live at once; past that, an allocation raises
+OutOfMemoryException.
 "#;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some(RUN_CHILD) {
+        run_child();
+    }
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
         return;
@@ -1114,21 +1718,24 @@ fn main() {
         eprintln!("lamella-mcp: {error}");
         std::process::exit(2)
     });
-    let mut server = Server::new(scope).unwrap_or_else(|error| {
+    let write_dir = parse_write_dir(std::env::args()).unwrap_or_else(|error| {
+        eprintln!("lamella-mcp: {error}");
+        std::process::exit(2)
+    });
+    let run_timeout = parse_run_timeout(std::env::args()).unwrap_or_else(|error| {
+        eprintln!("lamella-mcp: {error}");
+        std::process::exit(2)
+    });
+    let mut server = Server::new(scope, write_dir, run_timeout).unwrap_or_else(|error| {
         eprintln!("lamella-mcp: {error}");
         std::process::exit(1)
     });
 
     let stdin = std::io::stdin();
+    let mut input = stdin.lock();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(trimmed) else { continue };
+    while let Some(msg) = next_message(&mut input, &mut out) {
         let id = msg.get("id").cloned();
         let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
 
@@ -1197,11 +1804,11 @@ fn main() {
             }
             "tools/call" => {
                 if let Some(id) = &id {
-                    let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
-                    let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
-                    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    let result = server.call_tool(name, &args);
-                    respond(&mut out, id, result);
+                    match checked_call(msg.get("params")) {
+                        Ok((name, arguments)) => respond(&mut out, id, server.call_tool(name, &arguments)),
+                        Err(CallRefused::Tool(result)) => respond(&mut out, id, result),
+                        Err(CallRefused::Protocol(code, message)) => respond_error(&mut out, id, code, &message),
+                    }
                 }
             }
             "resources/list" => {
@@ -1214,13 +1821,13 @@ fn main() {
                     let uri = msg.get("params").and_then(|p| p.get("uri")).and_then(Value::as_str).unwrap_or_default();
                     match read_resource(uri) {
                         Some(r) => respond(&mut out, id, with_cache_hints(r)),
-                        None => respond_error(&mut out, id, -32602, &format!("no such resource: {uri}")),
+                        None => respond_error(&mut out, id, INVALID_PARAMS, &format!("no such resource: {uri}")),
                     }
                 }
             }
             _ => {
                 if let Some(id) = &id {
-                    respond_error(&mut out, id, -32601, "method not found");
+                    respond_error(&mut out, id, METHOD_NOT_FOUND, "method not found");
                 }
             }
         }
@@ -1286,6 +1893,142 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bake")]
+    mod a_deploy_outside_the_scope {
+        use super::super::{DeviceScope, deploy_over};
+        use lamella_wire::{MemTransport, Transport, TransportError, msg};
+        use serde_json::{Value, json};
+        use std::time::Duration;
+
+        /// A board that answers its first frame with a HELLO_ACK naming `model`, and keeps the type
+        /// of every frame it is sent.
+        struct Board {
+            inbox: MemTransport,
+            hello_ack: Option<Vec<u8>>,
+            sent: Vec<u8>,
+        }
+
+        impl Board {
+            fn answering_as(model: u16) -> Self {
+                let ack = lamella_wire::HelloAck {
+                    chosen: lamella_wire::PROTOCOL_VERSION,
+                    caps: lamella_wire::Capabilities(lamella_wire::Capabilities::BAKED_IMAGE),
+                    identity: lamella_wire::TargetIdentity {
+                        product_model: model,
+                        ..lamella_wire::TargetIdentity::default()
+                    },
+                    max_inbound_payload: None,
+                };
+                let mut peer = MemTransport::new();
+                peer.send(msg::HELLO_ACK, 0, &ack.encode()).expect("queue the HELLO_ACK");
+                Board { inbox: MemTransport::new(), hello_ack: Some(peer.take_sent()), sent: Vec::new() }
+            }
+        }
+
+        impl Transport for Board {
+            fn send(&mut self, msg_type: u8, _seq: u16, _payload: &[u8]) -> Result<(), TransportError> {
+                self.sent.push(msg_type);
+                if let Some(answer) = self.hello_ack.take() {
+                    self.inbox.feed(&answer);
+                }
+                Ok(())
+            }
+
+            fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+                self.inbox.poll()
+            }
+        }
+
+        fn text(answer: &Value) -> &str {
+            answer["content"][0]["text"].as_str().expect("the answer is text")
+        }
+
+        fn scoped(term: &str) -> DeviceScope {
+            DeviceScope::parse([format!("--allow-device={term}")].into_iter()).expect("the term parses")
+        }
+
+        /// **A DEPLOY TO A BOARD OUTSIDE THE SCOPE STOPS AT ITS HELLO**: nothing but the HELLO reaches
+        /// the board, and the refusal names the board that answered.
+        #[test]
+        fn a_deploy_to_a_board_the_scope_does_not_name_stops_at_its_hello() {
+            let v2 = lamella_wire::product_model::MICROBIT_V2;
+            let quick = Duration::from_millis(50);
+
+            let mut board = Board::answering_as(v2);
+            let answer = deploy_over(&scoped("board:rpi-pico2"), &mut board, "COM0", &[0; 16], true, quick);
+            assert_eq!(answer["isError"], json!(true));
+            assert!(text(&answer).contains("may not write this board"), "{}", text(&answer));
+            assert!(text(&answer).contains("BBC micro:bit v2"), "it names the board: {}", text(&answer));
+            assert!(board.sent.iter().all(|sent| *sent == msg::HELLO), "only a HELLO was sent: {:?}", board.sent);
+
+            let mut board = Board::answering_as(v2);
+            let answer = deploy_over(&scoped("board:bbc-micro-bit-v2"), &mut board, "COM0", &[0; 16], true, quick);
+            assert!(!text(&answer).contains("may not write"), "{}", text(&answer));
+            assert!(board.sent.iter().any(|sent| *sent != msg::HELLO), "the deploy began: {:?}", board.sent);
+        }
+
+        /// A board that HELLOs with the prefix CRC, has room for any image, stores every chunk with
+        /// its first byte wrong, and says so honestly: each acknowledgement carries the CRC of what it
+        /// holds.
+        #[derive(Default)]
+        struct Miswriting {
+            flash: Vec<u8>,
+            replies: MemTransport,
+        }
+
+        impl Transport for Miswriting {
+            fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+                use lamella_wire_host::deploy;
+                let reply = match msg_type {
+                    msg::HELLO => {
+                        let ack = lamella_wire::HelloAck {
+                            chosen: lamella_wire::PROTOCOL_VERSION,
+                            caps: lamella_wire::Capabilities(
+                                lamella_wire::Capabilities::BAKED_IMAGE | lamella_wire::Capabilities::DEPLOY_PREFIX_CRC,
+                            ),
+                            identity: lamella_wire::TargetIdentity::default(),
+                            max_inbound_payload: None,
+                        };
+                        (msg::HELLO_ACK, ack.encode())
+                    }
+                    deploy::DEPLOY_STATUS => {
+                        let mut status = vec![deploy::deploy_state::NONE, 0];
+                        status.extend_from_slice(&0u64.to_le_bytes());
+                        status.extend_from_slice(&65_536u32.to_le_bytes());
+                        (deploy::DEPLOY_STATUS_RESULT, status)
+                    }
+                    _ => {
+                        let offset = u32::from_le_bytes(payload[0..4].try_into().expect("an offset")) as usize;
+                        let bytes = &payload[8..];
+                        let end = offset + bytes.len();
+                        self.flash.resize(self.flash.len().max(end), 0xFF);
+                        self.flash[offset..end].copy_from_slice(bytes);
+                        self.flash[offset] ^= 0x01;
+                        let mut reply = vec![msg::xfer::MATCHED];
+                        reply.extend_from_slice(&lamella_wire::crc32::of(&self.flash[..end]).to_le_bytes());
+                        (deploy::XFER_RESULT, reply)
+                    }
+                };
+                self.replies.feed(&lamella_wire::encode_frame(reply.0, seq, &reply.1).expect("a frame"));
+                Ok(())
+            }
+
+            fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+                self.replies.poll()
+            }
+        }
+
+        /// **A DEPLOY COMPARES THE CRC EACH CHUNK'S ACKNOWLEDGEMENT CARRIES**, so a board that stored
+        /// the image wrong is refused at that chunk, with both CRCs, rather than reported deployed.
+        #[test]
+        fn a_deploy_to_a_board_that_stored_it_wrong_is_refused_at_the_chunk() {
+            let bare = DeviceScope::parse(["--allow-device".to_owned()].into_iter()).expect("parses");
+            let answer = deploy_over(&bare, &mut Miswriting::default(), "COM0", &[0x5A; 1000], false, Duration::from_millis(200));
+            assert_eq!(answer["isError"], json!(true), "{}", text(&answer));
+            assert!(text(&answer).contains("does not hold the image that was sent"), "{}", text(&answer));
+        }
+    }
+
     use super::*;
 
     /// The boards resource must be COMPUTED from the wire's board table, not stored beside it.
@@ -1338,9 +2081,7 @@ mod tests {
             found
         }
 
-        let declared: Vec<String> = tools()
-            .as_array()
-            .expect("the contract has a tools array")
+        let declared: Vec<String> = contract_tools()
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
@@ -1401,9 +2142,7 @@ mod tests {
             "lamella_debug_eval",
             "lamella_debug_disconnect",
         ];
-        let declared: Vec<String> = tools()
-            .as_array()
-            .expect("the contract has a tools array")
+        let declared: Vec<String> = contract_tools()
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
@@ -1562,6 +2301,315 @@ mod tests {
         assert!(DeviceScope::parse(["--allow-device=rpi-pico2".to_owned()].into_iter()).is_err());
         assert!(DeviceScope::parse(["--allow-device=chip:zzz".to_owned()].into_iter()).is_err());
         assert!(DeviceScope::parse(["--allow-device=colour:red".to_owned()].into_iter()).is_err());
+        assert!(DeviceScope::parse(["--allow-device=board:rpi-pico-typo".to_owned()].into_iter()).is_err());
+    }
+
+    /// The scope a single `--allow-device=<term>` sets.
+    fn scoped(term: &str) -> DeviceScope {
+        DeviceScope::parse([format!("--allow-device={term}")].into_iter()).expect("the term parses")
+    }
+
+    /// **A LINK WRITE IS BOUND BY THE SCOPE, NOT ONLY A FLASH.** Under a `probe:` or a `chip:` term
+    /// each of the three is refused before anything is opened, because neither term can be checked
+    /// over the Link. Under a `board:` term, or bare `--allow-device`, each goes on to the board's
+    /// HELLO, where the board term is checked.
+    #[test]
+    fn a_probe_or_chip_scope_refuses_every_link_write_before_anything_opens() {
+        for tool in LINK_WRITES {
+            for term in ["probe:SERIAL0000000005", "chip:1234ABCD5678EF01"] {
+                let refusal = refusal_before_dispatch(&scoped(term), tool);
+                if cfg!(feature = "bake") {
+                    let refusal = refusal.unwrap_or_else(|| panic!("{tool} under {term} was not refused"));
+                    assert_eq!(refusal["isError"], json!(true));
+                    let text = refusal["content"][0]["text"].as_str().expect("the refusal is text");
+                    assert!(text.contains("nothing was opened"), "{tool} under {term}: {text}");
+                } else {
+                    assert!(refusal.is_none(), "without bake {tool} is not built, and its dispatch says so");
+                }
+            }
+            assert!(refusal_before_dispatch(&scoped("board:rpi-pico2"), tool).is_none(), "{tool}");
+            let bare = DeviceScope::parse(["--allow-device".to_owned()].into_iter()).expect("parses");
+            assert!(refusal_before_dispatch(&bare, tool).is_none(), "{tool}");
+        }
+        assert!(refusal_before_dispatch(&scoped("probe:SERIAL0000000005"), "lamella_flash").is_none());
+    }
+
+    /// A `board:` term binds a Link write to the MODEL the board reports in its HELLO, compared with
+    /// the model the named board's own table declares.
+    #[test]
+    fn a_board_scope_binds_a_link_write_to_the_model_the_board_reports() {
+        let model = |id: &str| {
+            let declared = lamella_catalog::load_board(id).expect("a known board").product_model;
+            u16::try_from(declared).expect("a wire model")
+        };
+        let (pico2, v2) = (model("rpi-pico2"), model("bbc-micro-bit-v2"));
+        assert_ne!(pico2, v2, "the control needs two different models");
+
+        let scope = scoped("board:rpi-pico2");
+        assert!(scope.permits_link_board(pico2).is_ok());
+        let refusal = scope.permits_link_board(v2).expect_err("another model is outside it");
+        assert!(refusal.contains("BBC micro:bit v2"), "the refusal names the board that answered: {refusal}");
+        assert!(
+            scope.permits_link_board(lamella_wire::product_model::UNKNOWN).is_err(),
+            "a board that reports no model is inside no board: term"
+        );
+
+        let bare = DeviceScope::parse(["--allow-device".to_owned()].into_iter()).expect("parses");
+        assert!(bare.permits_link_board(v2).is_ok());
+        assert!(bare.permits_link_board(lamella_wire::product_model::UNKNOWN).is_ok());
+    }
+
+    /// **EVERY DEVICE TOOL THE CONTRACT DOES NOT CALL READ-ONLY IS BOUND BY THE SCOPE.**
+    ///
+    /// Derived from the contract rather than from a list kept beside this one, so a tool that is
+    /// added later is checked without anybody remembering this test. Bound means one of three: it is
+    /// `lamella_flash`, with its own check; it is a [`LINK_WRITES`] tool; or it takes a `session`,
+    /// which only `lamella_debug_launch` opens, inside the scope.
+    #[test]
+    fn every_device_tool_that_can_change_a_board_is_bound_by_the_scope() {
+        let declared = contract_tools();
+        for name in DEVICE_TOOLS {
+            assert!(declared.iter().any(|tool| tool["name"] == name), "`{name}` is not in the contract");
+        }
+        let mut writable = 0;
+        for tool in declared {
+            let name = tool["name"].as_str().expect("a tool has a name");
+            if !DEVICE_TOOLS.contains(&name) || tool["annotations"]["readOnlyHint"] == json!(true) {
+                continue;
+            }
+            writable += 1;
+            let takes_a_session = tool["inputSchema"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "session"));
+            assert!(
+                name == "lamella_flash" || LINK_WRITES.contains(&name) || takes_a_session,
+                "`{name}` can change a board and nothing binds it to --allow-device's scope"
+            );
+        }
+        assert!(writable > LINK_WRITES.len(), "the contract marks only {writable} device tools writable");
+    }
+
+    /// A directory of its own for one test, under the system's temporary directory.
+    fn scratch_dir(test: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let dir = std::env::temp_dir().join(format!("lamella-mcp-{test}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test's directory");
+        dir
+    }
+
+    /// `--run-timeout` is whole seconds from 1 to 3600, given once, and 20 without it.
+    #[test]
+    fn the_run_timeout_is_whole_seconds_given_once() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>().into_iter();
+        assert_eq!(parse_run_timeout(args(&["--allow-device"])), Ok(DEFAULT_RUN_TIMEOUT));
+        assert_eq!(parse_run_timeout(args(&["--run-timeout=5"])), Ok(Duration::from_secs(5)));
+        for refused in ["--run-timeout", "--run-timeout=", "--run-timeout=0", "--run-timeout=3601", "--run-timeout=1.5"] {
+            assert!(parse_run_timeout(args(&[refused])).is_err(), "{refused} must be refused");
+        }
+        assert!(parse_run_timeout(args(&["--run-timeout=5", "--run-timeout=9"])).is_err(), "given once");
+    }
+
+    /// `--allow-write` grants ONE directory, which must exist when the server starts.
+    #[test]
+    fn the_write_grant_is_one_directory_that_exists() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>().into_iter();
+        assert_eq!(parse_write_dir(args(&["--allow-device"])).expect("no grant is fine"), None);
+
+        let dir = scratch_dir("grant");
+        let flag = format!("--allow-write={}", dir.display());
+        let granted = parse_write_dir(args(&[flag.as_str()])).expect("an existing directory");
+        assert!(granted.is_some_and(|granted| granted.is_absolute()), "the grant is held absolute");
+
+        assert!(parse_write_dir(args(&["--allow-write"])).is_err(), "a grant names its directory");
+        assert!(parse_write_dir(args(&["--allow-write="])).is_err());
+        assert!(parse_write_dir(args(&[flag.as_str(), flag.as_str()])).is_err(), "one directory");
+        let absent = format!("--allow-write={}", dir.join("absent").display());
+        assert!(parse_write_dir(args(&[absent.as_str()])).is_err(), "a directory that is not there");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A FILE IS WRITTEN ONLY IN THE GRANTED DIRECTORY, ONLY AS A NEW FILE, AND ONLY UNDER A PLAIN
+    /// `.lmli` NAME.** Every other name is refused before anything is opened.
+    ///
+    #[test]
+    fn a_new_file_goes_only_in_the_granted_directory_and_never_over_one_already_there() {
+        let dir = scratch_dir("write");
+        assert!(write_new_file(None, "blink.lmli", b"x").is_err(), "no grant, no file");
+        assert!(!dir.join("blink.lmli").exists());
+
+        let written = write_new_file(Some(&dir), "blink.lmli", b"first").expect("a plain new name");
+        assert_eq!(written, dir.join("blink.lmli"));
+        assert_eq!(std::fs::read(&written).expect("it was written"), b"first");
+
+        let again = write_new_file(Some(&dir), "blink.lmli", b"second").expect_err("the name is taken");
+        assert!(again.contains("never replaces"), "{again}");
+        assert_eq!(std::fs::read(&written).expect("it is still there"), b"first", "and unchanged");
+
+        for name in [
+            "../blink.lmli", "sub/blink.lmli", "sub\\blink.lmli", "C:blink.lmli", "C:\\blink.lmli",
+            "/blink.lmli", "blink:stream.lmli", ".blink.lmli", ".lmli", "blink.txt", "blink", "",
+            "bl ink.lmli", "CON.lmli", "nul.tar.lmli", "com1.lmli", "LPT9.lmli",
+        ] {
+            assert!(write_new_file(Some(&dir), name, b"x").is_err(), "{name:?} must be refused");
+        }
+        assert!(write_new_file(Some(&dir), "console.lmli", b"x").is_ok());
+        assert!(write_new_file(Some(&dir), "com10.lmli", b"x").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `lamella_flash` refuses a `.lmli` and source by kind, naming what to use instead, and hands
+    /// a chip image on to its route.
+    #[test]
+    fn the_flash_tool_refuses_a_link_payload_and_source_naming_what_to_use_instead() {
+        let refusal = |image: &str| {
+            refusal_unless_a_chip_image(image)
+                .map(|refused| refused["content"][0]["text"].as_str().unwrap_or_default().to_owned())
+        };
+        let payload = refusal("blink.lmli").expect("a .lmli is not a chip image");
+        assert!(payload.contains("lamella deploy") && payload.contains("lamella_deploy"), "{payload}");
+        let source = refusal("Program.cs").expect("source is not a chip image");
+        assert!(source.contains("lamella_deploy"), "{source}");
+        assert!(refusal("serve.uf2").is_none() && refusal("image.bin").is_none(), "chip images pass");
+    }
+
+    /// **`tools/list` SERVES EXACTLY THE TOOLS THIS BUILD ROUTES**: the whole contract with `bake`,
+    /// and the contract less the bake-only tools without it.
+    #[test]
+    fn the_tool_list_serves_exactly_the_tools_this_build_routes() {
+        let names = |tools: &[Value]| -> Vec<String> {
+            tools.iter().filter_map(|tool| tool["name"].as_str().map(str::to_owned)).collect()
+        };
+        let contract = names(contract_tools());
+        for name in BAKE_ONLY {
+            assert!(contract.iter().any(|declared| declared == name), "`{name}` is not in the contract");
+        }
+        let listed = tools();
+        let listed = names(listed.as_array().expect("the list is an array"));
+        let expected: Vec<String> = contract
+            .iter()
+            .filter(|name| cfg!(feature = "bake") || !BAKE_ONLY.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(listed, expected);
+        assert!(listed.len() < contract.len() || cfg!(feature = "bake"), "without bake, fewer are served");
+    }
+
+    /// **A CALL IS CHECKED AGAINST THE TOOL IT NAMES BEFORE IT RUNS.** A malformed request, or a tool
+    /// this build does not serve, is a JSON-RPC error; arguments the tool's schema rules out are a
+    /// tool result with `isError`, which the model can correct.
+    #[test]
+    fn a_call_is_checked_against_the_tool_it_names_before_it_runs() {
+        let protocol = |params: Value| match checked_call(Some(&params)) {
+            Err(CallRefused::Protocol(code, message)) => (code, message),
+            Err(CallRefused::Tool(result)) => panic!("{params} was answered as a tool result: {result}"),
+            Ok((name, _)) => panic!("{params} reached {name}"),
+        };
+        let refused = |params: Value| match checked_call(Some(&params)) {
+            Err(CallRefused::Tool(result)) => {
+                assert_eq!(result["isError"], json!(true));
+                result["content"][0]["text"].as_str().unwrap_or_default().to_owned()
+            }
+            Err(CallRefused::Protocol(code, message)) => panic!("{params} was a protocol error {code}: {message}"),
+            Ok((name, _)) => panic!("{params} reached {name}"),
+        };
+
+        assert_eq!(protocol(json!({})).0, INVALID_PARAMS, "a call names its tool");
+        assert_eq!(protocol(json!({ "name": "no_such_tool" })), (INVALID_PARAMS, "Unknown tool: no_such_tool".to_owned()));
+        let (_, why) = protocol(json!({ "name": "lamella_check", "arguments": [] }));
+        assert!(why.contains("arguments must be an object"), "{why}");
+        if !cfg!(feature = "bake") {
+            let (_, why) = protocol(json!({ "name": "lamella_deploy", "arguments": {} }));
+            assert!(why.starts_with("Unknown tool: lamella_deploy") && why.contains("--features bake"), "{why}");
+        }
+
+        let why = refused(json!({ "name": "lamella_fit", "arguments": { "board": "rpi-pico2", "image_bytes": -5 } }));
+        assert!(why.contains("arguments.image_bytes must be 0 or more"), "{why}");
+        let why = refused(json!({ "name": "lamella_check", "arguments": {} }));
+        assert!(why.contains("arguments.code is required"), "{why}");
+
+        let fit = json!({ "name": "lamella_fit", "arguments": { "board": "rpi-pico2", "image_bytes": 100 } });
+        assert!(matches!(checked_call(Some(&fit)), Ok(("lamella_fit", _))));
+        assert!(matches!(checked_call(Some(&json!({ "name": "lamella_version" }))), Ok(("lamella_version", _))));
+    }
+
+    /// **EVERY KEYWORD AND TYPE THE CONTRACT'S SCHEMAS USE IS ONE THE CHECKER ENFORCES OR IGNORES ON
+    /// PURPOSE.** A keyword it did not know would be a constraint the contract promises and nothing
+    /// checks.
+    #[test]
+    fn every_keyword_the_contract_uses_is_one_the_checker_knows() {
+        fn walk(schema: &Value, keywords: &mut Vec<String>, types: &mut Vec<String>) {
+            let Some(object) = schema.as_object() else { return };
+            for (keyword, value) in object {
+                keywords.push(keyword.clone());
+                if keyword == "type" {
+                    types.push(value.as_str().unwrap_or("(not a string)").to_owned());
+                }
+            }
+            for property in object.get("properties").and_then(Value::as_object).into_iter().flat_map(|p| p.values()) {
+                walk(property, keywords, types);
+            }
+            for nested in ["items", "additionalProperties"] {
+                if let Some(inner) = object.get(nested) {
+                    walk(inner, keywords, types);
+                }
+            }
+        }
+        let (mut keywords, mut types) = (Vec::new(), Vec::new());
+        for tool in contract_tools() {
+            walk(&tool["inputSchema"], &mut keywords, &mut types);
+        }
+        assert!(keywords.iter().any(|keyword| keyword == "minimum"), "the scan did not reach the properties");
+        for keyword in &keywords {
+            assert!(
+                schema::CHECKED.contains(&keyword.as_str()) || schema::ANNOTATIONS.contains(&keyword.as_str()),
+                "the contract uses `{keyword}`, which the argument checker does not enforce"
+            );
+        }
+        for kind in &types {
+            assert!(schema::TYPES.contains(&kind.as_str()), "the contract uses type `{kind}`, which the checker does not know");
+        }
+    }
+
+    /// **A LINE THAT IS NOT A MESSAGE IS ANSWERED, AND THE SERVER GOES ON.** One that is not UTF-8
+    /// ended the server, and one that was not JSON went unanswered.
+    #[test]
+    fn a_line_that_is_not_a_message_is_answered_and_the_server_goes_on() {
+        let mut input = std::io::Cursor::new(
+            b"\xff\xfe not text\n\
+              not json\n\
+              [1, 2]\n\
+              {\"jsonrpc\":\"2.0\",\"id\":7}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n\
+              \n\
+              {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let message = next_message(&mut input, &mut out).expect("the ping after them is read");
+        assert_eq!(message["method"], "ping");
+        assert!(next_message(&mut input, &mut out).is_none(), "and then the input has ended");
+
+        let answers: Vec<Value> = String::from_utf8(out)
+            .expect("the answers are text")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each answer is JSON"))
+            .collect();
+        let codes: Vec<(Value, i64)> = answers
+            .iter()
+            .map(|answer| (answer["id"].clone(), answer["error"]["code"].as_i64().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                (Value::Null, PARSE_ERROR),
+                (Value::Null, PARSE_ERROR),
+                (Value::Null, INVALID_REQUEST),
+                (json!(7), INVALID_REQUEST),
+            ],
+            "a response needs no answer, and a blank line is not a message"
+        );
     }
 
     /// **THE MODERN REVISION IS IN THE SUPPORTED LIST AND IS FIRST**, because a client with no
@@ -1645,11 +2693,10 @@ mod tests {
 
     /// **THE TOOL SURFACE IS STATELESS, AND THIS IS THE ASSERTION THAT KEEPS IT SO.**
     ///
-    /// A `Repl` is held across calls to reuse the compiler and corlib, not to carry state, and
-    /// measurement says nothing crosses between calls in either direction: a type declared by one
-    /// call is `CS0103` in the next, and a static field starts at zero every time. What this guards
-    /// is the reason -- an accumulating REPL would make a tool call's answer depend on which calls
-    /// came before it, which no caller can see and no schema can describe.
+    /// Each `lamella_run` program runs in a process of its own ([`run_in_child`]), so nothing one
+    /// program declares or stores can reach the next call. What this guards is the reason: state
+    /// that accumulated across tool calls would make a call's answer depend on which calls came
+    /// before it, which no caller can see and no schema can describe.
     #[test]
     fn the_server_holds_no_state_a_caller_would_have_to_reason_about() {
         let source = include_str!("main.rs");

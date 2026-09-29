@@ -43,6 +43,11 @@ namespace Lamella.Hardware
         private static readonly SpiDriver[] _spiDrivers = new SpiDriver[BusCount];
         private static readonly I2cDriverFactory[] _i2cFactories = new I2cDriverFactory[BusCount];
         private static readonly I2cDriver[] _i2cDrivers = new I2cDriver[BusCount];
+        private static readonly int[] _i2cRates = new int[BusCount];
+
+        /// <summary>The rate an I2C bus runs at unless its board binds another: 100 kHz, the
+        /// standard-mode rate every I2C device supports.</summary>
+        public const int DefaultI2cBusHz = 100000;
         private static GpioDriverFactory _gpioFactory;
         private static GpioDriver _gpioDriver;
 #if LAMELLA_SURFACE_FLOAT
@@ -60,13 +65,26 @@ namespace Lamella.Hardware
             _spiFactories[busId] = factory;
         }
 
-        /// <summary>Binds the factory that creates I2C bus <paramref name="busId"/>'s driver.</summary>
+        /// <summary>Binds the factory that creates I2C bus <paramref name="busId"/>'s driver, which
+        /// runs at <see cref="DefaultI2cBusHz"/>.</summary>
         public static void BindI2c(int busId, I2cDriverFactory factory)
+        {
+            BindI2c(busId, factory, DefaultI2cBusHz);
+        }
+
+        /// <summary>Binds the factory that creates I2C bus <paramref name="busId"/>'s driver, which
+        /// runs at <paramref name="busHz"/>. The first use of the bus creates the driver and
+        /// configures it at that rate, once, before any device sees it.</summary>
+        /// <exception cref="System.ArgumentOutOfRangeException"><paramref name="busHz"/> is not
+        /// positive.</exception>
+        public static void BindI2c(int busId, I2cDriverFactory factory, int busHz)
         {
             CheckBusId(busId);
             if ((object)factory == null) throw new System.ArgumentNullException("factory");
+            if (busHz <= 0) throw new System.ArgumentOutOfRangeException("busHz");
             if ((object)_i2cFactories[busId] != null) throw AlreadyBound("I2C", "bus", busId);
             _i2cFactories[busId] = factory;
+            _i2cRates[busId] = busHz;
         }
 
         /// <summary>Binds the factory that creates the GPIO driver. There is one GPIO controller
@@ -154,8 +172,8 @@ namespace Lamella.Hardware
             return created;
         }
 
-        /// <summary>The I2C driver bound to bus <paramref name="busId"/>, creating it on first
-        /// use.</summary>
+        /// <summary>The I2C driver bound to bus <paramref name="busId"/>, creating it on first use
+        /// and configuring it, once, at the rate its board bound.</summary>
         /// <remarks>The same instance the standard factories use; see
         /// <see cref="ResolveSpi"/> for why that guarantee is what makes this worth exposing.</remarks>
         /// <exception cref="System.ArgumentOutOfRangeException">The bus id is out of range.</exception>
@@ -168,6 +186,7 @@ namespace Lamella.Hardware
             if ((object)factory == null) throw NotBound("I2C", "bus", busId);
             I2cDriver created = factory();
             if ((object)created == null) throw FactoryReturnedNull("I2C", "bus", busId);
+            created.Configure(_i2cRates[busId]);
             _i2cDrivers[busId] = created;
             return created;
         }

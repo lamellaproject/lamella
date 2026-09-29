@@ -34,6 +34,10 @@ pub struct Tokenized {
     /// warning back for everything below it. So the directives ride out to the compilation, which
     /// is the one place that has both the regions and the diagnostics.
     pub pragma_warnings: Vec<PragmaWarning>,
+    /// Every `#nullable` directive in an included region of this file, in source order. They
+    /// travel to the compilation for the reason pragmas do: the warning they govern, CS8632 for
+    /// an annotation outside an annotations context, is the binder's and is decided by position.
+    pub nullable_directives: Vec<NullableDirective>,
 }
 
 /// One `#:` file-based-app directive: its name and everything after it on the line.
@@ -69,6 +73,96 @@ pub struct PragmaWarning {
     /// The warning numbers named, or EMPTY for the bare form that means every warning -- which is
     /// what `#pragma warning disable` with no list does, measured against csc.
     pub codes: Vec<u16>,
+}
+
+/// One `#nullable` directive (C# 8.0), and the position it takes effect from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NullableDirective {
+    /// The offset of the `#`; the directive governs everything from here to the next one.
+    pub position: u32,
+    /// What it does to the contexts it names.
+    pub setting: NullableSetting,
+    /// Which contexts it names.
+    pub target: NullableTarget,
+}
+
+/// A `#nullable` directive's setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullableSetting {
+    /// `enable`.
+    Enable,
+    /// `disable`.
+    Disable,
+    /// `restore`: back to the compilation's own setting, [`LexOptions::nullable`].
+    Restore,
+}
+
+/// The contexts a `#nullable` directive sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullableTarget {
+    /// Neither word was written: both contexts.
+    Both,
+    /// `annotations`: whether `T?` over a reference type is an annotation or a CS8632 warning.
+    Annotations,
+    /// `warnings`: whether nullable warnings are reported.
+    Warnings,
+}
+
+/// A compilation's own nullable context -- csc's `/nullable` -- which each file starts in and
+/// which `#nullable restore` returns to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NullableOption {
+    /// Neither annotations nor warnings: csc's default.
+    #[default]
+    Disable,
+    /// Annotations and warnings.
+    Enable,
+    /// Annotations only.
+    Annotations,
+    /// Warnings only.
+    Warnings,
+}
+
+impl NullableOption {
+    /// Whether this setting enables annotations.
+    #[must_use]
+    pub fn annotations(self) -> bool {
+        matches!(self, NullableOption::Enable | NullableOption::Annotations)
+    }
+}
+
+/// One file's nullable context (C# 8.0): the compilation's own setting and the file's `#nullable`
+/// directives, which between them say whether annotations are enabled at each position.
+///
+/// It rides the [`CompilationUnit`](crate::ast::CompilationUnit), as the `#define` set does,
+/// because what it governs is decided by the binder: whether a `?` over a reference type is an
+/// annotation, a CS8632 warning, or (before C# 8.0) a CS8370 error depends on where the `?` is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NullableContext {
+    /// The compilation's setting, csc's `/nullable`: the file starts in it, and `#nullable
+    /// restore` returns to it.
+    pub option: NullableOption,
+    /// The file's `#nullable` directives in its included regions, in source order.
+    pub directives: Vec<NullableDirective>,
+}
+
+impl NullableContext {
+    /// Whether nullable annotations are enabled at `position`: the compilation's option, changed
+    /// by each directive that starts at or before `position`, in order.
+    #[must_use]
+    pub fn annotations_enabled_at(&self, position: u32) -> bool {
+        let mut annotations = self.option.annotations();
+        for directive in self.directives.iter().take_while(|directive| directive.position <= position) {
+            if matches!(directive.target, NullableTarget::Both | NullableTarget::Annotations) {
+                annotations = match directive.setting {
+                    NullableSetting::Enable => true,
+                    NullableSetting::Disable => false,
+                    NullableSetting::Restore => self.option.annotations(),
+                };
+            }
+        }
+        annotations
+    }
 }
 
 /// Scans `source` into a complete [`Tokenized`] stream.
@@ -181,6 +275,9 @@ pub struct LexOptions {
     /// emit-time option -- it touches neither lexing nor binding -- threaded here for want of a
     /// separate emit-options bag, alongside `native_interop`. Off by default (standalone `.pdb`).
     pub embed_pdb: bool,
+    /// The compilation's nullable context -- csc's `/nullable`. Each file starts in it, and
+    /// `#nullable restore` returns to it. Disabled by default, as csc's is.
+    pub nullable: NullableOption,
 }
 
 impl LexOptions {
@@ -222,11 +319,13 @@ pub fn tokenize_with(source: &str, options: LexOptions) -> Tokenized {
     }
     let defined_symbols = core::mem::take(&mut lexer.defined_symbols);
     let pragma_warnings = core::mem::take(&mut lexer.pragma_warnings);
+    let nullable_directives = core::mem::take(&mut lexer.nullable_directives);
     let file_directives = core::mem::take(&mut lexer.file_directives);
     Tokenized {
         tokens,
         defined_symbols,
         pragma_warnings,
+        nullable_directives,
         file_directives,
         diagnostics: lexer.into_diagnostics(),
     }
@@ -255,6 +354,8 @@ pub struct Lexer<'a> {
     /// Every `#pragma warning disable|restore` seen in an INCLUDED region, in source order --
     /// one inside a skipped `#if` never happened, exactly as a `#define` there never happened.
     pragma_warnings: Vec<PragmaWarning>,
+    /// Every `#nullable` seen in an INCLUDED region, in source order.
+    nullable_directives: Vec<NullableDirective>,
     /// Every `#:` directive seen in an INCLUDED region, in source order.
     file_directives: Vec<FileDirective>,
     /// The stack of open `#if`/`#region` constructs, innermost last (9.5.4). Its
@@ -300,6 +401,7 @@ enum DirectiveKind {
     Region,
     EndRegion,
     Pragma,
+    Nullable,
 }
 
 impl DirectiveKind {
@@ -318,6 +420,7 @@ impl DirectiveKind {
             "region" => DirectiveKind::Region,
             "endregion" => DirectiveKind::EndRegion,
             "pragma" => DirectiveKind::Pragma,
+            "nullable" => DirectiveKind::Nullable,
             _ => return None,
         })
     }
@@ -356,6 +459,7 @@ impl<'a> Lexer<'a> {
             seen_token: false,
             defined_symbols: BTreeSet::new(),
             pragma_warnings: Vec::new(),
+            nullable_directives: Vec::new(),
             file_directives: Vec::new(),
             conditionals: Vec::new(),
             options: LexOptions::default(),
@@ -476,6 +580,7 @@ impl<'a> Lexer<'a> {
             _ => {}
         }
         self.skip_inline_whitespace();
+        let name_start = self.position;
         match DirectiveKind::from_text(self.read_directive_name()) {
             Some(DirectiveKind::Define) => self.scan_define_or_undef(start, active, true),
             Some(DirectiveKind::Undef) => self.scan_define_or_undef(start, active, false),
@@ -489,6 +594,7 @@ impl<'a> Lexer<'a> {
             Some(DirectiveKind::Warning) => self.scan_error_or_warning(start, active, false),
             Some(DirectiveKind::Line) => self.scan_line(start),
             Some(DirectiveKind::Pragma) => self.scan_pragma(start, active),
+            Some(DirectiveKind::Nullable) => self.scan_nullable(start, name_start, active),
             None => {
                 self.report(DiagnosticKind::PreprocessorDirectiveExpected, start);
                 self.consume_to_line_end();
@@ -750,6 +856,58 @@ impl<'a> Lexer<'a> {
                 self.consume_to_line_end();
             }
         }
+    }
+
+    /// Processes a `#nullable` directive (C# 8.0): `enable`, `disable` or `restore`, then optionally
+    /// `warnings` or `annotations` to set one of the two contexts rather than both.
+    ///
+    /// The words are case-sensitive, as csc's are. A missing or unknown setting is CS8637 where the
+    /// setting should be; a word after it that is not a target is CS8668; anything after a valid
+    /// target is the ordinary CS1025. In a skipped `#if` region nothing is checked or recorded, and
+    /// under C# 7.3 or earlier the directive is gated at its name but still checked, as csc does.
+    fn scan_nullable(&mut self, start: usize, name_start: usize, active: bool) {
+        if !active {
+            self.consume_to_line_end();
+            return;
+        }
+        self.gate_feature(Feature::NullableReferenceTypes, name_start);
+        self.skip_inline_whitespace();
+        let setting_start = self.position;
+        let setting = match self.read_pp_symbol().as_str() {
+            "enable" => NullableSetting::Enable,
+            "disable" => NullableSetting::Disable,
+            "restore" => NullableSetting::Restore,
+            _ => {
+                self.report(DiagnosticKind::NullableSettingExpected, setting_start);
+                self.consume_to_line_end();
+                return;
+            }
+        };
+        self.skip_inline_whitespace();
+        let target_start = self.position;
+        let at_line_end = self.peek().is_none_or(is_new_line)
+            || (self.peek() == Some('/') && self.peek_second() == Some('/'));
+        let target = if at_line_end {
+            NullableTarget::Both
+        } else {
+            match self.read_pp_symbol().as_str() {
+                "warnings" => NullableTarget::Warnings,
+                "annotations" => NullableTarget::Annotations,
+                _ => {
+                    self.report(DiagnosticKind::NullableTargetExpected, target_start);
+                    self.consume_to_line_end();
+                    return;
+                }
+            }
+        };
+        self.skip_inline_whitespace();
+        let rest = self.position;
+        self.expect_directive_line_end(rest);
+        self.nullable_directives.push(NullableDirective {
+            position: start as u32,
+            setting,
+            target,
+        });
     }
 
     /// The warning numbers on a `#pragma warning` line: decimal, or csc's `CS0649` spelling, comma
@@ -2592,6 +2750,128 @@ mod tests {
         );
         assert_eq!(kinds("Hello"), vec![ident("Hello"), TokenKind::EndOfFile]);
         assert_eq!(kinds("_x1"), vec![ident("_x1"), TokenKind::EndOfFile]);
+    }
+
+    /// `#nullable` is collected like a pragma: what it governs (CS8632) is the binder's, decided by
+    /// position. Every row is a spelling csc accepts.
+    #[test]
+    fn nullable_directives_are_collected_with_their_setting_and_target() {
+        let eight = LexOptions {
+            version: LanguageVersion::CSharp8,
+            ..LexOptions::default()
+        };
+        let source = "#nullable enable\nclass C { }\n#nullable disable annotations\n\
+                      #  nullable restore warnings // back\n#nullable enable // on\n";
+        let scanned = tokenize_with(source, eight);
+        assert!(scanned.diagnostics.is_empty(), "{:?}", scanned.diagnostics);
+        let read: Vec<(u32, NullableSetting, NullableTarget)> = scanned
+            .nullable_directives
+            .iter()
+            .map(|directive| (directive.position, directive.setting, directive.target))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (0, NullableSetting::Enable, NullableTarget::Both),
+                (29, NullableSetting::Disable, NullableTarget::Annotations),
+                (59, NullableSetting::Restore, NullableTarget::Warnings),
+                (96, NullableSetting::Enable, NullableTarget::Both),
+            ]
+        );
+    }
+
+    /// Each malformed spelling, with the code and the column csc gives it: CS8637 where the setting
+    /// should be (the words are case-sensitive, and a bare `#nullable` has none), CS8668 where a
+    /// target should be, and CS1025 for anything after a valid target.
+    #[test]
+    fn a_malformed_nullable_directive_is_reported_where_csc_reports_it() {
+        let at = |source: &str| -> Vec<(u16, u32)> {
+            let options = LexOptions {
+                version: LanguageVersion::CSharp8,
+                ..LexOptions::default()
+            };
+            tokenize_with(source, options)
+                .diagnostics
+                .iter()
+                .map(|d| (d.kind.code(), d.span.start))
+                .collect()
+        };
+        assert_eq!(at("#nullable\n"), [(8637, 9)]);
+        assert_eq!(at("#nullable maybe\n"), [(8637, 10)]);
+        assert_eq!(at("#nullable ENABLE\n"), [(8637, 10)]);
+        assert_eq!(at("#nullable enable junk\n"), [(8668, 17)]);
+        assert_eq!(at("#nullable enable /* x */\n"), [(8668, 17)]);
+        assert_eq!(at("#nullable enable warnings junk\n"), [(1025, 26)]);
+        let options = LexOptions {
+            version: LanguageVersion::CSharp8,
+            ..LexOptions::default()
+        };
+        assert!(tokenize_with("#nullable maybe\n", options).nullable_directives.is_empty());
+    }
+
+    /// Before C# 8.0 the directive is gated at its NAME -- column 4 when spaces follow the `#` --
+    /// and still checked, so csc's two errors both appear.
+    #[test]
+    fn a_nullable_directive_before_csharp_8_is_gated_at_its_name() {
+        let at = |source: &str| -> Vec<(u16, u32)> {
+            let options = LexOptions {
+                version: LanguageVersion::CSharp7_3,
+                ..LexOptions::default()
+            };
+            tokenize_with(source, options)
+                .diagnostics
+                .iter()
+                .map(|d| (d.kind.code(), d.span.start))
+                .collect()
+        };
+        assert_eq!(at("#nullable enable\n"), [(8370, 1)]);
+        assert_eq!(at("#  nullable enable\n"), [(8370, 3)]);
+        assert_eq!(at("#nullable maybe\n"), [(8370, 1), (8637, 10)]);
+    }
+
+    /// In a skipped `#if` region a `#nullable` is not read at all -- not gated, not checked, not
+    /// recorded -- as csc treats it.
+    #[test]
+    fn a_nullable_directive_in_a_skipped_region_is_not_read() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp7_3,
+            ..LexOptions::default()
+        };
+        let scanned = tokenize_with("#if false\n#nullable maybe\n#nullable enable\n#endif\n", options);
+        assert!(scanned.diagnostics.is_empty(), "{:?}", scanned.diagnostics);
+        assert!(scanned.nullable_directives.is_empty());
+    }
+
+    /// Annotations follow the compilation's setting, then each directive at or before the position:
+    /// `restore` returns to the setting, and a `warnings` directive leaves annotations alone.
+    #[test]
+    fn annotations_follow_the_option_and_the_directives_before_a_position() {
+        let directive = |position, setting, target| NullableDirective {
+            position,
+            setting,
+            target,
+        };
+        let directives = [
+            directive(10, NullableSetting::Enable, NullableTarget::Both),
+            directive(20, NullableSetting::Disable, NullableTarget::Warnings),
+            directive(30, NullableSetting::Disable, NullableTarget::Annotations),
+            directive(40, NullableSetting::Restore, NullableTarget::Both),
+        ];
+        let enabled = |option, position| {
+            NullableContext {
+                option,
+                directives: directives.to_vec(),
+            }
+            .annotations_enabled_at(position)
+        };
+        assert!(!enabled(NullableOption::Disable, 5));
+        assert!(enabled(NullableOption::Disable, 10));
+        assert!(enabled(NullableOption::Disable, 25));
+        assert!(!enabled(NullableOption::Disable, 35));
+        assert!(!enabled(NullableOption::Disable, 45));
+        assert!(enabled(NullableOption::Enable, 5));
+        assert!(enabled(NullableOption::Annotations, 45));
+        assert!(!enabled(NullableOption::Warnings, 45));
     }
 
     /// `#pragma warning` is COLLECTED rather than applied here: the warnings it silences are the

@@ -9,9 +9,8 @@
 # sections state overlapping register names at overlapping offsets, so reading the wrong one
 # produces a table that looks entirely plausible and gates the wrong peripherals.
 #
-# ALL ELEVEN GPIO PORTS ARE PLACED, WHICH IS A DELIBERATE EXCEPTION TO THE EVIDENCE-ONLY RULE THIS
-# FILE OTHERWISE FOLLOWS. A port normally joins when something reaches it, and on that rule GPIOH
-# through GPIOK would be absent because no binding here touches one. A GPIO DRIVER is a different
+# ALL ELEVEN GPIO PORTS ARE PLACED, THOUGH THIS FILE OTHERWISE PLACES ONLY THE BLOCKS A BINDING
+# USES. On that rule GPIOH through GPIOK would be absent, because no binding here touches one. A GPIO DRIVER is a different
 # kind of consumer from a binding: it presents a pin count and answers for every pin inside it, so
 # a map with holes hands a caller a pin number whose port has no base -- and the hole sits wherever
 # nothing happened to be bound rather than anywhere a reader would predict. The four joined with
@@ -23,7 +22,7 @@
 # whole plus PK0-PK7 -- so PORT K IS EIGHT PADS WIDE ON THE DIE ITSELF, and its register still
 # carries sixteen fields. The LQFP144 bonds 114: that datasheet's figure 13 shows ports A to G
 # whole, PH0 and PH1, and no PI, PJ or PK pad at all. What a part BONDS is that part's `pins`
-# present-list in parts.toml, and nothing in this file.
+# list in parts.toml, and nothing in this file.
 #
 # RM0090's TABLE 1 PRINTS IN DESCENDING ADDRESS ORDER, so a reader walking DOWN that page is
 # walking UP the port letters, and GPIOK is the first GPIO row rather than the last. The eleven

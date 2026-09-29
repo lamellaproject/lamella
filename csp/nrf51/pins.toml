@@ -1,5 +1,6 @@
 # PIN map for the nRF51 family: pin x function -> (instance, signal).
-# PARTIAL, evidence-only. This part has NO mux-table functions: a peripheral claims a GPIO
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# This part has NO mux-table functions: a peripheral claims a GPIO
 # through its own PSEL register, so any pin can carry any block's signal and the "function" id
 # here is the claiming block ("twi") while the signal names the PSEL register the pin routes
 # through. A row therefore records which signal a pin is USED for, plus the electrical fact

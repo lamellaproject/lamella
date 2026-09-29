@@ -32,6 +32,10 @@ namespace System.Net
             long want = count;
             if (want > _remaining) want = _remaining;
             int n = _conn.ReadRaw(buffer, offset, (int)want);
+            if (n <= 0)
+            {
+                throw new IOException("The response ended prematurely, with at least " + _remaining + " additional bytes expected.");
+            }
             _remaining -= n;
             return n;
         }

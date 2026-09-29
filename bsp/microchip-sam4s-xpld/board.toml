@@ -16,9 +16,9 @@
 # THE TWO USB CONNECTORS BELONG TO DIFFERENT CHIPS, WHICH IS WHAT MAKES BOTH HALVES WORK AT ONCE:
 # the part's own port carries the deploy, and the bridge's virtual COM port carries the console the
 # interpreter talks over. Nothing about the console requires speaking the debugger's protocol -- a
-# CDC virtual COM port is an ordinary serial port whatever else the chip presenting it does. Identity-first, like its sibling: no peripheral bindings yet, because the
-# SAM4S family has no generated driver. What this file adds beyond identity is the board's control
-# lines, which need no driver -- a control pin rides no alternate function.
+# CDC virtual COM port is an ordinary serial port whatever else the chip presenting it does. It binds no peripheral; what this file
+# states beyond identity is the board's control lines, which need no driver -- a control pin rides
+# no alternate function.
 #
 # THE PART IS NOT THE SIBLING'S, AND THAT IS THE POINT OF HAVING BOTH. The Pro carries an
 # ATSAM4SD32C: dual-plane, 2 MB of flash, 160 KB of SRAM. This carries an ATSAM4S16C: single

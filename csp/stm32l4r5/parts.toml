@@ -1,0 +1,42 @@
+# PARTS table for the stm32l4r5 family: the STM32L4R5 in its 144-pin LQFP package.
+#
+# THIS IS ITS OWN FAMILY AND NOT A ROW IN csp/stm32l476, THOUGH BOTH ARE STM32L4 PARTS. A family here
+# is one reference manual and one pin-function table. The STM32L476 is described by RM0351 and its
+# own datasheet; this part is described by RM0432, the STM32L4+ Series manual, and by DS12023. The
+# two lines agree on much of their register layout, but each fact below was read from this part's
+# documents.
+#
+# RAM IS ONE CONTIGUOUS 640-KBYTE SPAN. SRAM1 (192 Kbytes at 0x20000000), SRAM2 (64 Kbytes at
+# 0x20030000) and SRAM3 (384 Kbytes at 0x20040000) sit back to back, so a linker can treat the whole
+# of it as one region. SRAM2 is also aliased at 0x10000000, which is the same memory seen twice, not
+# more of it.
+#
+# EACH `pins` LIST NAMES A PACKAGE's PADS. A pin that is not listed is refused rather than assumed.
+
+[table]
+kind = "parts"
+family = "stm32l4r5"
+sources = [
+    "STM32L4+ Series reference manual RM0432 Rev 9 (June 2021), section 2.4 Embedded SRAM: the STM32L4Rxxx and STM32L4Sxxx devices feature up to 640 Kbytes of SRAM, 192 Kbytes SRAM1, 64 Kbytes SRAM2 and 384 Kbytes SRAM3, with SRAM2 aliased at 0x2003 0000 on these devices",
+    "RM0432 Rev 9 figure 3, the memory map for STM32L4Rxxx and STM32L4Sxxx: SRAM1 from 0x2000 0000, SRAM2 from 0x2003 0000, SRAM3 from 0x2004 0000, and reserved from 0x200A 0000; flash memory from 0x0800 0000 to 0x0820 0000",
+    "STM32L4R5xx STM32L4R7xx STM32L4R9xx datasheet DS12023 Rev 5 (January 2020): table 137 (ordering information scheme), figure 12 (STM32L4R5xx and STM32L4R7xx LQFP144 pinout) and table 2 (features and peripheral counts)",
+]
+notes = [
+    "THE P VARIANT IS A DIFFERENT PAD SET AND IS NOT THIS ROW. DS12023 decodes a trailing P as a dedicated pinout supporting an external SMPS, and prints its LQFP144 as a separate figure, 14. Its table 2 footnote says the SMPS package replaces two GPIOs with VDD12 supply pins, so an STM32L4R5ZIT6P has pads this row does not list in their place.",
+    "UM2179's ordering table writes this board's part as STM32L4R5ZIT6U. DS12023 Rev 5 table 137 decodes every letter of STM32L4R5ZIT6 and defines no U in any position, so the row is named for the letters the datasheet decodes.",
+    "PG2 TO PG15 ARE POWERED FROM A SEPARATE RAIL AND ARE ISOLATED AT RESET. RM0432 section 5.1.2: fourteen Port G pins, PG[15:2], are supplied through the VDDIO2 pin, and after reset they are logically and electrically isolated. The isolation is removed by setting IOSV, bit 9 of PWR_CR2, which the manual calls mandatory to use PG[15:2]. Until then a pin in that range neither drives nor reads, and a peripheral muxed onto it stays silent. DS12023 table 2 counts the same fourteen as the I/Os that run down to 1.08 V.",
+    "THE DIE HAS NINE GPIO PORTS AND THIS PACKAGE BONDS OUT SEVEN OF THEM WHOLE. ../instances.toml places GPIOA through GPIOI because RM0432 table 1 places all nine on this line; figure 12 bonds out ports A to G whole, PH0, PH1 and PH3, and nothing of port I. The instance list is a fact about the die and the pad list is a fact about the package.",
+    "Five of the pads double as something else. PC14 and PC15 are also the LSE crystal pins, PH0 and PH1 the HSE crystal pins, and PH3 is BOOT0 unless the nSWBOOT0 option bit hands it to GPIO (RM0432 section 8.3.15). Each is listed because each can be a GPIO; whether a board leaves it free is a fact about that board.",
+    "DBGMCU_IDCODE at 0xE004 2000 holds DEV_ID in bits 11:0, and RM0432 section 57.6.1 gives 0x470 for every STM32L4Rxxx and STM32L4Sxxx device. It names that class of dies, not this order code: an L4R7, an L4R9 and the L4S parts answer the same value.",
+]
+
+
+[[parts]]
+part = "stm32l4r5zit6"
+package = "144-pin LQFP"
+flash = 0x200000
+ram = 0xA0000
+pins = ["PA0-PA15", "PB0-PB15", "PC0-PC15", "PD0-PD15", "PE0-PE15", "PF0-PF15", "PG0-PG15", "PH0-PH1", "PH3"]
+rails = { vddio2 = ["PG2-PG15"] }
+rail_valid = { vddio2 = "pwr.CR2.IOSV" }
+source = "DS12023 Rev 5 table 137 decodes STM32L4R5ZIT6 as 4R5 = STM32L4R5xx, Z = 144 pins, I = 2 Mbytes of flash, T = LQFP and 6 = industrial, -40 to 85 C; with no P, it is the standard pinout of figure 12 rather than the external-SMPS pinout of figure 14. The pad set above is the complete general-purpose I/O set of figure 12: 115 pads, which is the GPIO count DS12023 table 2 gives the R5ZI column. flash 0x200000 is the 2 Mbytes of the I in the order code, and matches RM0432 figure 3's flash from 0x0800 0000 to 0x0820 0000. ram 0xA0000 is the 640 Kbytes of RM0432 section 2.4, contiguous from 0x2000 0000. The core is an Arm Cortex-M4 with an FPU, per DS12023's feature list."

@@ -1,7 +1,7 @@
-# INSTANCE map for the SAM4N family -- identity-first: ONLY the placed block copies a current
-# binding or control line references, with the SAM4-shaped record: the peripheral id is one number
-# serving as both the PMC clock-gate bit and the NVIC line. Block layouts arrive with the family's
-# first generated driver, and the rest of the instance map arrives with its first binding.
+# INSTANCE map for the SAM4N family. It places only the block copies a binding or a board's LED or
+# button uses, so a block that is not listed is not described here, rather than absent from the
+# part. The record is SAM4-shaped: the peripheral id is one number serving as both the PMC
+# clock-gate bit and the NVIC line.
 #
 # THE PORT ROWS SAY WHICH GROUP THEY ARE, RATHER THAN LEAVING IT TO THEIR NAMES. A pin named PB14
 # has to resolve to the base address of the port group that backs it, and this vendor calls that

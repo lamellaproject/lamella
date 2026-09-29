@@ -1,0 +1,26 @@
+[package]
+name = "lamella-wifi-cyw4343x-smoltcp"
+version.workspace = true
+edition.workspace = true
+# The driver this crate binds declares 1.96, so this crate cannot build on the workspace's older floor.
+rust-version = "1.96"
+license.workspace = true
+authors.workspace = true
+description = "The CYW43439 / CYW4343W Wi-Fi driver as an owning smoltcp network device: a station that owns the driver, its bus and its clock, and pumps the driver inside the stack's own receive and transmit calls."
+publish = false
+
+[dependencies]
+# The driver alone: this crate drives its public pump and data plane, not its borrowing adapter,
+# so the driver's own `smoltcp` feature stays off. A board selects the driver's bus engine.
+lamella-wifi-cyw4343x = { path = "../lamella-wifi-cyw4343x" }
+# The device trait and its tokens. `socket-raw` is here because the Ethernet medium turns on the
+# socket layer, which does not build without at least one socket kind; a consumer's own kinds
+# (a TCP/IP backend's) union with it.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-raw",
+] }
+
+[lints]
+workspace = true

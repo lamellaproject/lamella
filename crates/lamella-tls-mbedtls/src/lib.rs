@@ -22,7 +22,7 @@ use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use lamella_cil_runtime::tls::{
-    ClockPolicy, TlsBackend, TlsConfigHandle, TlsHandle, TlsStack, TlsState, TlsVersion,
+    ClockPolicy, PlainRead, TlsBackend, TlsConfigHandle, TlsHandle, TlsStack, TlsState, TlsVersion,
     TlsVersionRange, VerifyMode, session_flag,
 };
 
@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn lam_tls_peer_cert(session: *mut c_void, out: *mut u8, out_len: usize) -> c_int;
     fn lam_tls_dates_skipped(session: *mut c_void) -> c_int;
     fn lam_tls_report_flags(session: *mut c_void) -> c_int;
+    fn lam_tls_close_notify(session: *mut c_void);
     fn lam_tls_close(session: *mut c_void);
 }
 
@@ -72,7 +73,7 @@ static TIME_SOURCE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 /// window is tolerated and RECORDED (the clockless leap-of-faith rung); under a forced
 /// [`ClockPolicy::Require`] every real certificate pre-dates "now", so a REQUIRED
 /// (pinned-cert / system-root) verify fails "not yet valid" LOUDLY -- fail closed. The
-/// accept-any bench path (VERIFY_NONE) never consults it.
+/// accept-any test path (VERIFY_NONE) never consults it.
 pub fn set_time_source(source: fn() -> u64) {
     TIME_SOURCE.store(source as *mut (), Ordering::Release);
 }
@@ -164,9 +165,9 @@ extern "C" fn lamella_entropy_poll(output: *mut u8, len: usize) -> c_int {
 /// The pool size. On a device: one session's record buffers (16 KiB in + 4 KiB out) +
 /// ssl/x509 state + bignum churn peak, with working headroom for a FULL chain
 /// verification -- parsing the peer's chain and the matching root plus the ECDSA/RSA
-/// verify bignums peaks well past the AcceptAny bench's footprint (32 KiB served
-/// AcceptAny but starved SystemRoots/Report verification into alloc-fail handshake
-/// aborts on the E54). An embedder wanting concurrent sessions grows this and its RAM
+/// verify bignums peaks well past what an AcceptAny session needs (32 KiB serves
+/// AcceptAny but starves SystemRoots/Report verification into alloc-fail handshake
+/// aborts). An embedder wanting concurrent sessions grows this and its RAM
 /// budget together. On a HOST the pool is roomier: the conformance tests run sessions in
 /// parallel test threads, and host RAM is not the scarce resource the pool exists to
 /// discipline.
@@ -352,6 +353,7 @@ extern "C" fn lamella_bio_recv(user: *mut c_void, buf: *mut u8, len: usize) -> c
 
 /// A prepared client configuration: the trust decision plus (for pinned mode) the root
 /// bundle, applied when a session is created.
+#[derive(PartialEq)]
 struct StoredConfig {
     verify: VerifyMode,
     /// PEM roots, NUL-terminated the way mbedTLS's PEM parser expects.
@@ -370,8 +372,12 @@ struct Session {
     report: bool,
 }
 
-/// The device TLS engine. `configs`/`sessions` are append-only tables; a handle is an
-/// index -- the same shape as the host backend, so the managed pump cannot tell them apart.
+/// The device TLS engine. A handle is an index into `configs` or `sessions`, the same shape as
+/// the host backend, so the managed pump cannot tell them apart.
+///
+/// Neither table grows with the number of handshakes. A configuration is stored once however
+/// often it is asked for, and a closed session's slot is reused, so a program that makes a request
+/// every minute runs in the memory its first request took.
 #[derive(Default)]
 pub struct MbedTlsDevice {
     configs: Vec<StoredConfig>,
@@ -475,7 +481,11 @@ impl TlsBackend for MbedTlsDevice {
                 bundle
             }),
         };
-        self.configs.push(StoredConfig { verify, roots });
+        let stored = StoredConfig { verify, roots };
+        if let Some(index) = self.configs.iter().position(|existing| *existing == stored) {
+            return Some(index as TlsConfigHandle);
+        }
+        self.configs.push(stored);
         Some((self.configs.len() - 1) as TlsConfigHandle)
     }
 
@@ -536,15 +546,25 @@ impl TlsBackend for MbedTlsDevice {
             drop(unsafe { Box::from_raw(bio) });
             return None;
         }
-        self.sessions.push(Some(Session {
+        let session = Session {
             shim,
             bio,
             established: false,
             closed: false,
             failed: false,
             report: stored_verify == VerifyMode::Report,
-        }));
-        Some((self.sessions.len() - 1) as TlsHandle)
+        };
+        let index = match self.sessions.iter().position(Option::is_none) {
+            Some(free) => {
+                self.sessions[free] = Some(session);
+                free
+            }
+            None => {
+                self.sessions.push(Some(session));
+                self.sessions.len() - 1
+            }
+        };
+        Some(index as TlsHandle)
     }
 
     fn server_new(&mut self, _config: TlsConfigHandle) -> Option<TlsHandle> {
@@ -603,22 +623,46 @@ impl TlsBackend for MbedTlsDevice {
         input.len()
     }
 
-    fn read_plain(&mut self, tls: TlsHandle, out: &mut [u8]) -> Option<usize> {
-        let session = self.session_mut(tls)?;
-        if session.failed || session.closed {
-            return None;
+    fn read_plain(&mut self, tls: TlsHandle, out: &mut [u8]) -> PlainRead {
+        let Some(session) = self.session_mut(tls) else {
+            return PlainRead::Failed;
+        };
+        if session.failed {
+            return PlainRead::Failed;
+        }
+        if session.closed {
+            return PlainRead::Closed;
         }
         if out.is_empty() {
-            return Some(0);
+            return PlainRead::Data(0);
         }
         let rc = unsafe { lam_tls_read(session.shim, out.as_mut_ptr(), out.len()) };
         match rc {
-            n if n >= 0 => Some(n as usize),
-            SHIM_WANT => Some(0),
+            n if n >= 0 => PlainRead::Data(n as usize),
+            SHIM_WANT => PlainRead::Data(0),
             SHIM_CLOSED => {
                 session.closed = true;
-                None
+                PlainRead::Closed
             }
+            _ => {
+                session.failed = true;
+                PlainRead::Failed
+            }
+        }
+    }
+
+    fn write_plain(&mut self, tls: TlsHandle, input: &[u8]) -> Option<usize> {
+        let session = self.session_mut(tls)?;
+        if session.failed {
+            return None;
+        }
+        if input.is_empty() {
+            return Some(0);
+        }
+        let rc = unsafe { lam_tls_write(session.shim, input.as_ptr(), input.len()) };
+        match rc {
+            n if n >= 0 => Some(n as usize),
+            SHIM_WANT => Some(0),
             _ => {
                 session.failed = true;
                 None
@@ -626,22 +670,14 @@ impl TlsBackend for MbedTlsDevice {
         }
     }
 
-    fn write_plain(&mut self, tls: TlsHandle, input: &[u8]) -> usize {
+    fn close_notify(&mut self, tls: TlsHandle) {
         let Some(session) = self.session_mut(tls) else {
-            return 0;
+            return;
         };
-        if session.failed || input.is_empty() {
-            return 0;
+        if session.failed {
+            return;
         }
-        let rc = unsafe { lam_tls_write(session.shim, input.as_ptr(), input.len()) };
-        match rc {
-            n if n >= 0 => n as usize,
-            SHIM_WANT => 0,
-            _ => {
-                session.failed = true;
-                0
-            }
-        }
+        unsafe { lam_tls_close_notify(session.shim) };
     }
 
     fn peer_cert(&mut self, tls: TlsHandle, out: &mut [u8]) -> usize {

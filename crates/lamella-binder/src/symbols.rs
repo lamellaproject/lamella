@@ -651,6 +651,11 @@ pub struct TypeInfo {
     /// In metadata the mark is `IsByRefLikeAttribute` (II.23.2) -- there is no `TypeAttributes`
     /// bit for it -- so it is decoded from that attribute or not at all.
     pub is_by_ref_like: bool,
+    /// For an enum declared in source, the integral type its `: T` names (21.1), once
+    /// [`crate::declaration::resolve_constants`] has resolved that name in its declaration's scope;
+    /// `None` until then and for every other type. An enum read from metadata states the same fact
+    /// as the type of its `value__` field instead.
+    pub enum_underlying: Option<SpecialType>,
 }
 
 /// The resolved constraints on ONE type parameter (ECMA-334 4th ed 25.7).
@@ -677,6 +682,12 @@ pub struct TypeParameterConstraints {
     /// The named class, interface and type-parameter constraints, in source order. Each becomes one
     /// `GenericParamConstraint` row.
     pub types: Vec<TypeSymbol>,
+    /// Whether the parameter is KNOWN to be a non-nullable reference type (C# 8.0): it carries a
+    /// `class` or class-type constraint written without `?` where nullable annotations are enabled.
+    /// The one rule that asks is CS8627, `T?` at C# 8.0, so only the binder's own scope entry
+    /// ([`crate::Binder::enter_type_parameters`], which knows the file's context) fills it; `false`
+    /// elsewhere, which no position that reads it ever sees.
+    pub known_non_nullable_reference: bool,
 }
 
 impl TypeParameterConstraints {
@@ -875,6 +886,7 @@ impl TypeInfo {
             is_partial: false,
             synthesized_constructor: false,
             is_by_ref_like: false,
+            enum_underlying: None,
         }
     }
 

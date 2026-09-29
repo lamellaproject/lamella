@@ -10,8 +10,8 @@ use lamella_py_runtime::{run, run_bundle, Bundle, ObjectModel, Trap};
 /// whose total allocation this must still hold.
 ///
 /// The figure is HEADROOM, and it is worth saying what it is not: it is not what the interpreter
-/// needs. The runtime lane's measured floors (`device_footprint.rs`) are small -- every ordinary
-/// program inside 16 KiB, the two heaviest (`re`, `json`) at 8. The one expensive case is `random`,
+/// needs. The interpreter's measured heap floors are small -- every ordinary program inside
+/// 16 KiB, the two heaviest (`re`, `json`) at 8. The one expensive case is `random`,
 /// whose MT19937 seeding needs **256 KiB**: 624 state words, every one past the 31-bit fixnum, and
 /// all of them minted inside `random.py`, so the collection that would reclaim them cannot run until
 /// the call returns. That is the managed-module exception above, and it is why a collector did not

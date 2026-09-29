@@ -1,4 +1,5 @@
-//! A reclaiming O(1) segregated-fit allocator for the constrained serve tiers.
+//! A reclaiming segregated-fit allocator for the constrained serve tiers: O(1) for every size
+//! class, and a short best-fit list for the blocks beyond them.
 
 #![no_std]
 #![allow(unsafe_code)]
@@ -84,17 +85,22 @@ const fn class_for(size: usize) -> Option<usize> {
 struct Request {
     /// The class whose free list may satisfy this request, and to which its block returns.
     ///
-    /// `None` covers BOTH cases the allocator serves by an unreclaimed carve: a request beyond
-    /// every class, and an over-aligned one. Class blocks are only [`MIN_BLOCK`]-aligned, so for an
-    /// over-aligned request neither the pop nor the push is sound -- and collapsing the two into one
-    /// field is what makes `alloc` and `dealloc` agree about which blocks recycle by construction
-    /// rather than by two predicates that must be kept in step.
+    /// `None` covers BOTH cases no class serves: a request beyond every class, which the large free
+    /// list serves ([`Request::large`]), and an over-aligned one, which an unreclaimed carve serves.
+    /// Class blocks are only [`MIN_BLOCK`]-aligned, so for an over-aligned request neither the pop
+    /// nor the push is sound -- and collapsing the two into one field is what makes `alloc` and
+    /// `dealloc` agree about which blocks recycle by construction rather than by two predicates
+    /// that must be kept in step.
     class: Option<usize>,
-    /// The bytes to carve when the free list cannot serve it: the class's fixed size, or the
-    /// request's own size when it is beyond every class.
+    /// The bytes to carve when no free list can serve it: the class's fixed size, or, beyond every
+    /// class, the request's own size.
     carve_size: usize,
     /// The alignment the carve must honor.
     align: usize,
+    /// Whether this is a LARGE block: beyond every class, at no more than the minimum alignment. A
+    /// freed large block joins the large free list, where a later large request of its size or
+    /// smaller takes it ([`Heap::take_large`]).
+    large: bool,
 }
 
 impl Request {
@@ -103,15 +109,40 @@ impl Request {
         let need = layout.size().max(MIN_BLOCK).max(layout.align());
         let align = layout.align().max(MIN_BLOCK);
         let sized = class_for(need);
+        let large = sized.is_none() && align <= MIN_BLOCK;
         Request {
             class: if align <= MIN_BLOCK { sized } else { None },
             carve_size: match sized {
                 Some(class) => class_size(class),
+                None if large => need.next_multiple_of(MIN_BLOCK),
                 None => need,
             },
             align,
+            large,
         }
     }
+}
+
+/// The largest class's block size: a request beyond it is a large block (see [`Request::large`]).
+const LARGEST_CLASS: usize = class_size(CLASS_COUNT - 1);
+
+/// The largest class whose blocks fit in `size` bytes, or `None` below the smallest class.
+const fn class_at_most(size: usize) -> Option<usize> {
+    if size < MIN_BLOCK {
+        return None;
+    }
+    match class_for(size) {
+        Some(class) if class_size(class) == size => Some(class),
+        Some(class) => Some(class - 1),
+        None => Some(CLASS_COUNT - 1),
+    }
+}
+
+/// A free LARGE block's header: its size and the next free large block (null at the tail). Written
+/// into the block's own bytes while it is free; every large block is far bigger than this.
+struct LargeNode {
+    next: *mut LargeNode,
+    size: usize,
 }
 
 /// A free block's intrusive header: the next free block in its class (null at the tail).
@@ -131,6 +162,8 @@ pub struct Heap {
     frontier: *mut u8,
     /// Per-class free-list heads (null when the class has no reusable block).
     classes: [*mut FreeNode; CLASS_COUNT],
+    /// The free LARGE blocks, taken best fit (null when there are none) -- see [`Request::large`].
+    large: *mut LargeNode,
     /// Bytes the region has handed out and not taken back -- see [`Heap::live`].
     ///
     /// Maintained HERE rather than by a counting wrapper around the allocator, and on a CAS-less
@@ -148,6 +181,7 @@ impl Heap {
             end: core::ptr::null_mut(),
             frontier: core::ptr::null_mut(),
             classes: [core::ptr::null_mut(); CLASS_COUNT],
+            large: core::ptr::null_mut(),
             live: 0,
         }
     }
@@ -163,6 +197,7 @@ impl Heap {
         self.end = unsafe { base.add(size) };
         self.frontier = base;
         self.classes = [core::ptr::null_mut(); CLASS_COUNT];
+        self.large = core::ptr::null_mut();
         self.live = 0;
     }
 
@@ -180,6 +215,13 @@ impl Heap {
                 self.classes[class] = unsafe { (*head).next };
                 self.live += request.carve_size;
                 return head.cast();
+            }
+        }
+        if request.large {
+            let reused = self.take_large(request.carve_size);
+            if !reused.is_null() {
+                self.live += request.carve_size;
+                return reused;
             }
         }
         let carved = self.carve(request.carve_size, request.align);
@@ -202,9 +244,69 @@ impl Heap {
         aligned as *mut u8
     }
 
-    /// Returns a block to its size class's free list (O(1)). A block with no class -- one
-    /// beyond every class, or an over-aligned carve -- is dropped: it is never reused,
-    /// matching the bump behavior for those rare cases.
+    /// Takes the free large block that fits `size` bytes most closely, handing what it does not
+    /// need to [`Heap::release`], or null when no free large block is big enough.
+    ///
+    /// BEST fit rather than first. First fit split a big free block for a smaller request, so a
+    /// table growing from 24 to 40 KiB found no 40 KiB block on its second cycle; best fit gives
+    /// each size its own block back.
+    ///
+    /// A walk inside the lock, and a bounded one: every node is a free block bigger than every
+    /// class, so the list cannot hold more than the region's size over [`LARGEST_CLASS`] of them --
+    /// twelve in a 256 KiB arena, each a load and a compare.
+    fn take_large(&mut self, size: usize) -> *mut u8 {
+        let mut best: *mut *mut LargeNode = core::ptr::null_mut();
+        let mut best_size = usize::MAX;
+        let mut link: *mut *mut LargeNode = &raw mut self.large;
+        unsafe {
+            while !(*link).is_null() {
+                let node = *link;
+                let node_size = (*node).size;
+                if node_size >= size && node_size < best_size {
+                    best = link;
+                    best_size = node_size;
+                    if node_size == size {
+                        break;
+                    }
+                }
+                link = &raw mut (*node).next;
+            }
+            if best.is_null() {
+                return core::ptr::null_mut();
+            }
+            let node = *best;
+            *best = (*node).next;
+            if best_size > size {
+                self.release(node.cast::<u8>().add(size), best_size - size);
+            }
+            node.cast()
+        }
+    }
+
+    /// Makes the `size` free bytes at `ptr` reusable. Beyond every class they join the large free
+    /// list; otherwise they become a block of the largest class they hold.
+    ///
+    /// The bytes past that class's size are LOST for good: the block is used and freed at its
+    /// class's size from then on, and nothing tracks its tail again, because blocks never coalesce.
+    /// The loss is bounded per split, by the step between two classes -- under 4 KiB at the top
+    /// classes -- where dropping the whole remainder, as before, lost all of it.
+    ///
+    /// `ptr` is aligned to, and `size` is a multiple of, [`MIN_BLOCK`].
+    fn release(&mut self, ptr: *mut u8, size: usize) {
+        if size > LARGEST_CLASS {
+            let node = ptr.cast::<LargeNode>();
+            unsafe { node.write(LargeNode { next: self.large, size }) };
+            self.large = node;
+        } else if let Some(class) = class_at_most(size) {
+            let node = ptr.cast::<FreeNode>();
+            unsafe { (*node).next = self.classes[class] };
+            self.classes[class] = node;
+        }
+    }
+
+    /// Returns a block to a free list: a class block to its class's list (O(1)), a large block to
+    /// the large free list ([`Request::large`]). An over-aligned carve is dropped: it is never
+    /// reused, matching the bump behavior for that rare case.
     ///
     /// Takes a [`Request`] for the same reason [`Heap::alloc`] does: the class arithmetic is
     /// the caller's, computed before the lock.
@@ -217,6 +319,9 @@ impl Heap {
             let node = ptr.cast::<FreeNode>();
             unsafe { (*node).next = self.classes[class] };
             self.classes[class] = node;
+            self.live = self.live.saturating_sub(request.carve_size);
+        } else if request.large {
+            self.release(ptr, request.carve_size);
             self.live = self.live.saturating_sub(request.carve_size);
         }
     }
@@ -263,15 +368,23 @@ impl Heap {
     /// only the frontier concludes the heap is permanently full while the whole of a dropped
     /// REPL session sits reusable on these lists.
     ///
-    /// Reusability is per CLASS, not global: this allocator never splits or coalesces, so these
-    /// bytes satisfy a request only in their own class. Treat the total as an upper bound on what
-    /// is actually available to any particular allocation pattern.
+    /// Reusability is per CLASS, not global: a class block serves only its own class, and a free
+    /// large block serves only a large request of its size or smaller -- blocks never coalesce.
+    /// Treat the total as an upper bound on what is actually available to any particular
+    /// allocation pattern.
     ///
-    /// O(free blocks) -- it walks every class list. Intended for a between-submissions probe or a
+    /// O(free blocks) -- it walks every free list. Intended for a between-submissions probe or a
     /// diagnostic, never a hot path.
     #[must_use]
     pub fn free_list_bytes(&self) -> usize {
         let mut total = 0;
+        let mut large = self.large;
+        while !large.is_null() {
+            unsafe {
+                total += (*large).size;
+                large = (*large).next;
+            }
+        }
         let mut index = 0;
         while index < CLASS_COUNT {
             let size = class_size(index);
@@ -688,7 +801,7 @@ mod tests {
     #[test]
     fn live_does_not_fall_for_a_block_the_allocator_cannot_reclaim() {
         let (h, region, layout) = heap(256 * 1024);
-        let huge = Layout::from_size_align(64 * 1024, 8).unwrap();
+        let huge = Layout::from_size_align(64 * 1024, 64).unwrap();
         let p = unsafe { h.alloc(huge) };
         assert!(!p.is_null());
         assert_eq!(h.live_lockfree(), 64 * 1024);
@@ -714,6 +827,149 @@ mod tests {
             unsafe { h.dealloc(p, l) };
         }
         assert_eq!(h.live_lockfree(), live_with_one, "churn leaves one block live");
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn a_freed_large_block_serves_a_same_size_or_smaller_request_without_carving() {
+        let (h, region, layout) = heap(256 * 1024);
+        let big = Layout::from_size_align(64 * 1024, 8).unwrap();
+        let first = unsafe { h.alloc(big) };
+        assert!(!first.is_null());
+        let watermark = h.carved_lockfree();
+        unsafe { h.dealloc(first, big) };
+        assert_eq!(h.live_lockfree(), 0, "a freed large block is not live");
+        assert_eq!(h.free_list_bytes(), 64 * 1024, "it waits on the large free list");
+
+        let again = unsafe { h.alloc(big) };
+        assert_eq!(again, first, "the same size gets the same block back");
+        assert_eq!(h.carved_lockfree(), watermark, "and the region is not carved again");
+        unsafe { h.dealloc(again, big) };
+
+        let smaller = Layout::from_size_align(40 * 1024, 8).unwrap();
+        let front = unsafe { h.alloc(smaller) };
+        assert_eq!(front, first, "a smaller large request takes the block's front");
+        assert_eq!(h.carved_lockfree(), watermark);
+        assert_eq!(h.free_list_bytes(), 24 * 1024, "and the rest stays free");
+        let rest = Layout::from_size_align(24 * 1024, 8).unwrap();
+        let tail = unsafe { h.alloc(rest) };
+        assert_eq!(tail as usize, first as usize + 40 * 1024, "the rest serves the next that fits");
+        assert_eq!(h.carved_lockfree(), watermark);
+        assert_eq!(h.free_list_bytes(), 0);
+        unsafe { h.dealloc(front, smaller) };
+        unsafe { h.dealloc(tail, rest) };
+        assert_eq!(h.live_lockfree(), 0);
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn a_remainder_below_the_top_class_becomes_a_block_of_the_largest_class_it_holds() {
+        let (h, region, layout) = heap(256 * 1024);
+        let big = Layout::from_size_align(64 * 1024, 8).unwrap();
+        let block = unsafe { h.alloc(big) };
+        unsafe { h.dealloc(block, big) };
+        let most = Layout::from_size_align(60 * 1024, 8).unwrap();
+        let front = unsafe { h.alloc(most) };
+        assert_eq!(front, block);
+        let watermark = h.carved_lockfree();
+        let small = Layout::from_size_align(4000, 8).unwrap();
+        let from_the_rest = unsafe { h.alloc(small) };
+        assert_eq!(
+            from_the_rest as usize,
+            block as usize + 60 * 1024,
+            "a request of that class takes the remainder rather than carving"
+        );
+        assert_eq!(h.carved_lockfree(), watermark);
+        unsafe { h.dealloc(front, most) };
+        unsafe { h.dealloc(from_the_rest, small) };
+        assert_eq!(h.live_lockfree(), 0);
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn a_table_that_grows_past_the_classes_survives_a_thousand_collections_on_a_96k_arena() {
+        let (h, region, layout) = heap(96 * 1024);
+        let table = Layout::from_size_align(24 * 1024, 8).unwrap();
+        let grown = Layout::from_size_align(40 * 1024, 8).unwrap();
+        let mut watermark = None;
+        for cycle in 0..1_000 {
+            let small = unsafe { h.alloc(table) };
+            assert!(!small.is_null(), "cycle {cycle}: the table");
+            let bigger = unsafe { h.alloc(grown) };
+            assert!(!bigger.is_null(), "cycle {cycle}: the table, grown");
+            unsafe { h.dealloc(small, table) };
+            unsafe { h.dealloc(bigger, grown) };
+            assert_eq!(h.live_lockfree(), 0, "cycle {cycle}: live returns to its steady value");
+            let carved = h.carved_lockfree();
+            assert_eq!(*watermark.get_or_insert(carved), carved, "cycle {cycle}: nothing more carved");
+        }
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn a_seeded_mix_either_side_of_the_classes_never_overlaps_or_corrupts_a_block() {
+        let (h, region, layout) = heap(512 * 1024);
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pattern = |tag: u32, offset: usize| (tag as usize).wrapping_mul(31).wrapping_add(offset) as u8;
+        let checked = |size: usize| {
+            (0..size).filter(move |offset| *offset < 64 || *offset + 64 >= size || offset % 61 == 0)
+        };
+        let mut live: Vec<(*mut u8, Layout, u32)> = Vec::new();
+        let mut large_reused = 0usize;
+        for step in 0..20_000u32 {
+            let roll = next();
+            if !live.is_empty() && (roll % 3 == 0 || live.len() > 40) {
+                let index = (next() as usize) % live.len();
+                let (ptr, block, tag) = live.swap_remove(index);
+                for offset in checked(block.size()) {
+                    let byte = unsafe { *ptr.add(offset) };
+                    assert_eq!(byte, pattern(tag, offset), "step {step}: a live block was overwritten");
+                }
+                unsafe { h.dealloc(ptr, block) };
+                continue;
+            }
+            let size = match roll % 4 {
+                0 | 1 => 16 + (roll >> 8) as usize % 2_032,
+                2 => 2_048 + (roll >> 8) as usize % 18_432,
+                _ => 20_481 + (roll >> 8) as usize % 45_056,
+            };
+            let block = Layout::from_size_align(size, 8).unwrap();
+            let carved_before = h.carved_lockfree();
+            let ptr = unsafe { h.alloc(block) };
+            if ptr.is_null() {
+                continue;
+            }
+            if size > 20_480 && h.carved_lockfree() == carved_before {
+                large_reused += 1;
+            }
+            let (start, end) = (ptr as usize, ptr as usize + size);
+            for &(other, other_block, _) in &live {
+                let (other_start, other_end) = (other as usize, other as usize + other_block.size());
+                assert!(
+                    end <= other_start || other_end <= start,
+                    "step {step}: a new block overlaps a live one"
+                );
+            }
+            for offset in 0..size {
+                unsafe { *ptr.add(offset) = pattern(step, offset) };
+            }
+            live.push((ptr, block, step));
+        }
+        assert!(large_reused > 0, "the run reused freed large blocks, so it tested that path");
+        for (ptr, block, tag) in live.drain(..) {
+            for offset in checked(block.size()) {
+                let byte = unsafe { *ptr.add(offset) };
+                assert_eq!(byte, pattern(tag, offset), "at the end: a live block was overwritten");
+            }
+            unsafe { h.dealloc(ptr, block) };
+        }
+        assert_eq!(h.live_lockfree(), 0, "everything freed, nothing counted live");
         free_region(region, layout);
     }
 }

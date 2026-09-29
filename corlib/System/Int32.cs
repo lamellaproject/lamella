@@ -32,7 +32,11 @@ namespace System
 
         public override string ToString()
         {
-            int value = this;
+            return Decimal(this);
+        }
+
+        internal static string Decimal(int value)
+        {
             if (value == 0) return "0";
             bool negative = value < 0;
             int n = negative ? value : -value;
@@ -45,10 +49,12 @@ namespace System
                 buffer[pos] = (char)('0' + digit);
                 n = n / 10;
             }
-            System.Text.StringBuilder result = new System.Text.StringBuilder();
-            if (negative) result.Append('-');
-            for (int i = pos; i < buffer.Length; i++) result.Append(buffer[i]);
-            return result.ToString();
+            if (negative)
+            {
+                pos = pos - 1;
+                buffer[pos] = '-';
+            }
+            return new string(buffer, pos, buffer.Length - pos);
         }
 
         public string ToString(string format)

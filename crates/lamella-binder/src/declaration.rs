@@ -2,7 +2,7 @@
 //! clauses 16-18).
 
 use crate::bind::{bind_type, parameter_symbol, tuple_element_names};
-use crate::bound::{cast_constant, coerce_constant, integer_literal, literal_int_value};
+use crate::bound::{Binder, cast_constant, coerce_constant, integer_literal, literal_int_value};
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
@@ -16,10 +16,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    AttributeArgument, AttributeSection, BinaryOperator, CompilationUnit, Expr, ExprKind, Literal,
-    Member, Modifier, NamespaceMember, QualifiedName, TypeDecl, TypeKind as SyntaxTypeKind,
-    TypeParameterConstraint as SyntaxConstraint, UnaryOperator, auto_property_backing_field_name,
-    explicit_interface_member_name, is_auto_property,
+    AttributeArgument, AttributeSection, BinaryOperator, CompilationUnit, EnumDecl, Expr,
+    ExprKind, Literal, Member, Modifier, NamespaceMember, QualifiedName, TypeDecl,
+    TypeKind as SyntaxTypeKind, TypeParameterConstraint as SyntaxConstraint, UnaryOperator,
+    UsingDirective, auto_property_backing_field_name, explicit_interface_member_name,
+    is_auto_property,
 };
 
 /// Builds the [`Model`] of every type and member declared in `unit`.
@@ -78,7 +79,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             info.bases.push(enum_base.clone());
             info.base = Some(enum_base);
             let enum_ty = named_symbol(namespace, &declaration.name);
-            let numbering = enum_member_numbering(&declaration.members, &|_| None);
+            let numbering = enum_member_numbering(&declaration.members);
             for (member, (_, value)) in declaration.members.iter().zip(numbering) {
                 info.fields.push(FieldSymbol {
                     tuple_names: Vec::new(),
@@ -214,10 +215,10 @@ pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::string:
     }
 }
 
-/// A `const` field's folded value (14.15): its constant-expression initializer, with a reference
-/// to a `prior` const field (declared earlier in the same type) resolved to that field's value --
-/// so `const B = A;` and `const C = A + 1;` fold, not just literal arithmetic. `None` when it is
-/// not a compile-time constant, so the field stays a runtime field at the use site.
+/// A `const` field's provisional value (14.15), folded without a model: its initializer, with a
+/// reference to a `prior` const field (declared earlier in the same type) resolved to that field's
+/// value. [`resolve_constants`] clears it and folds the field from its bound initializer; only a
+/// model built without that pass -- an editor's hover or completion -- reads this one.
 fn const_field_literal(expr: &Expr, prior: &BTreeMap<Box<str>, Literal>) -> Option<Literal> {
     fold_const(expr, &|name| prior.get(name).cloned())
 }
@@ -240,18 +241,10 @@ fn eval_enum_member(expr: &Expr, prior: &BTreeMap<Box<str>, i64>) -> Option<i64>
 /// An IMPLICIT member is its predecessor plus one, so it waits for that predecessor to resolve
 /// rather than for the walk to reach it: `enum E { A = C, B, C = 5 }` gives B = 6.
 ///
-/// `extra` resolves an initializer the enum's own members cannot -- a constant declared elsewhere.
-/// It is tried only after them, so a same-named constant outside the enum cannot capture a
-/// same-enum reference.
-///
-/// A member left unresolved is unresolvable: a circular initializer (CS0110), a name that does not
-/// resolve, or a non-constant. Each is diagnosed in `validate_enum_members`, and the value falls
-/// back to the implicit sequence so that an enum which is already an error keeps the numbering it
-/// had rather than becoming a second, different failure.
-fn enum_member_numbering(
-    members: &[lamella_syntax::ast::EnumMember],
-    extra: &dyn Fn(&Expr) -> Option<i64>,
-) -> Vec<(Box<str>, i64)> {
+/// These values are provisional. A member this walk cannot resolve -- one naming a constant outside
+/// its enum, which needs the model -- takes the implicit sequence value, and [`resolve_constants`]
+/// replaces every value here with the one folded from the member's bound initializer.
+fn enum_member_numbering(members: &[lamella_syntax::ast::EnumMember]) -> Vec<(Box<str>, i64)> {
     let mut resolved: BTreeMap<Box<str>, i64> = BTreeMap::new();
     loop {
         let mut progressed = false;
@@ -260,7 +253,7 @@ fn enum_member_numbering(
                 continue;
             }
             let value = match &member.value {
-                Some(expr) => eval_enum_member(expr, &resolved).or_else(|| extra(expr)),
+                Some(expr) => eval_enum_member(expr, &resolved),
                 None => match index.checked_sub(1) {
                     None => Some(0),
                     Some(previous) => resolved.get(&members[previous].name).map(|v| v.wrapping_add(1)),
@@ -665,14 +658,6 @@ pub(crate) fn fold_const_binary(
     Some(integer_literal(value))
 }
 
-/// A `const` field awaiting model-aware resolution: its containing type's full name, its own name,
-/// and its initializer expression (borrowed from the AST).
-struct ConstDecl<'a> {
-    type_full: String,
-    name: &'a str,
-    init: &'a Expr,
-}
-
 /// One parameter's DEFAULT ARGUMENT, keyed well enough to find its method again in the model.
 ///
 /// **NAME PLUS PARAMETER COUNT IS THE KEY, and it is sufficient rather than merely convenient**:
@@ -687,140 +672,282 @@ struct ParamDefaultDecl<'a> {
     init: &'a Expr,
 }
 
-/// Model-aware, dependency-ordered constant resolution (14.15). A second pass that folds the
-/// `const` fields the declaration-order pass in [`type_info`] left unresolved -- a FORWARD reference
-/// (`const A = B; const B = 42;`) or a QUALIFIED reference (`const A = Other.Value;`), each of which
-/// needs the whole model rather than only the earlier same-type consts that pass can see. It is
-/// STRICTLY ADDITIVE: it fills a field only when its constant is still `None` and its initializer
-/// folds to a value against the fully collected model -- so it can neither change a value the first
-/// pass already resolved nor fold a non-constant initializer. A reference cycle simply never makes
-/// progress, so those fields stay `None` (a runtime field, as today) and the loop terminates. Enum
-/// members are excluded: their unresolved case is auto-numbering, a separate concern.
+/// Gives every `const` field and enum member that `units` declare its value (14.15, 17.3, 21.3),
+/// folded once, from its BOUND initializer, and held at the type the member declares.
+///
+/// Binding is what makes the value the language's. A name resolves through the scope its
+/// declaration sees -- `int.MaxValue`, `nameof(Main)`, a `using` alias, an enclosing type's
+/// constant, a constant declared later or in another file -- and every operation is computed at
+/// its operands' own types, so `1 << 33` held at `int` is 2 and `~0u` held at `ulong` is
+/// 4294967295. A `const` field's initializer is bound through the same entry point its validation
+/// uses ([`Binder::bind_initializer_value`]) and read by the same evaluator
+/// ([`Binder::constant_value`]), so a constant validation accepts is one this pass folds.
+///
+/// The values the declaration walk folded without a model are cleared first, so no constant is
+/// folded against a value this pass did not compute. Constants then fold in rounds until a round
+/// folds nothing new. A round folds every constant whose initializer names only constants already
+/// folded, so the rounds follow the dependencies whatever order the declarations are in; an
+/// implicit enum member is its predecessor plus one (21.3), so it follows its predecessor.
+///
+/// A constant left without a value has an initializer that is not a constant: a cycle (CS0110), a
+/// name that does not resolve, or an expression that is not constant (CS0133). Validation reports
+/// each of those, and emission refuses a `const` without a value.
 pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
-    let mut pending: Vec<ConstDecl> = Vec::new();
+    let mut binder = Binder::with_model(core::mem::take(model));
     for unit in units {
-        for member in &unit.members {
-            collect_const_field_decls(member, "", &mut pending);
-        }
-    }
-    let mut values = model_const_values(model);
-    // THE ENUM RENUMBERING RUNS EVEN WHEN NO `const` FIELD IS PENDING, AND IT SITS ABOVE THE EARLY
-    // RETURN FOR EXACTLY THE REASON THE PARAMETER-DEFAULT FILL DOES.
-    //
-    // That return fires for any compilation declaring no const field, and this pass has to run
-    // anyway: an enum member initialized from a constant the FIRST pass cannot resolve -- one in a
-    // REFERENCED ASSEMBLY, which that pass never sees -- would otherwise keep its implicit sequence
-    // value. `enum E { X = Imported.C }` must read the 41 the library declares.
-    //
-    // THERE IS A SECOND CALL AFTER THE FOLD LOOP AND BOTH ARE NEEDED, because the two kinds of
-    // constant name each other in both directions: an enum member may be initialized from a const
-    // field (`FromConstant = Constants.C`) and a const field from an enum member
-    // (`const Choice X = Choice.FromConstant`). This call settles every member whose initializer is
-    // already resolvable; the later one settles those that needed a field folded in the loop.
-    resolve_enum_members(model, units, &values);
-    values = model_const_values(model);
-    if pending.is_empty() {
-        resolve_parameter_defaults(model, units, &values);
-        return;
+        constant_namespace(&mut binder, &unit.usings, &unit.members, "", ConstantStep::Prepare);
     }
     loop {
-        let mut progress = false;
-        for decl in &pending {
-            let key = (decl.type_full.clone(), decl.name.to_string());
-            if values.contains_key(&key) {
-                continue;
-            }
-            if let Some(literal) = resolve_const_expr(decl.init, &decl.type_full, &values) {
-                values.insert(key, literal);
-                progress = true;
-            }
+        let mut folded = false;
+        for unit in units {
+            folded |=
+                constant_namespace(&mut binder, &unit.usings, &unit.members, "", ConstantStep::Fold);
         }
-        if !progress {
+        if !folded {
             break;
         }
     }
-    resolve_enum_members(model, units, &values);
-    for decl in &pending {
-        let Some(literal) = values.get(&(decl.type_full.clone(), decl.name.to_string())) else {
-            continue;
-        };
-        let (namespace, name) = split_type_full(&decl.type_full);
-        if let Some(info) = model.get_mut(&namespace, name) {
-            if let Some(field) = info.fields.iter_mut().find(|field| &*field.name == decl.name) {
-                if field.constant.is_none() {
-                    field.constant = Some(literal.clone());
-                }
-            }
-        }
-    }
-    normalize_constant_types(model);
+    *model = binder.into_model();
+    let values = model_const_values(model);
     resolve_parameter_defaults(model, units, &values);
 }
 
-/// Retypes every folded `const` value to the type its field DECLARES, for the types whose constant
-/// form is not an integer.
-///
-/// The folds above answer with the literal the INITIALIZER spells, which for `const decimal x = 11`
-/// is the integer 11. Nothing then converted it, and the mismatch was silent rather than loud: a
-/// `decimal` const is emitted as a `newobj System.Decimal(...)` chosen by the literal's KIND, so an
-/// integer sitting in a decimal field took the other branch and every use of it read 0.
-///
-/// One pass over the model rather than a conversion at each fold, because there are three folds
-/// that reach this field -- the declaration walk, the model-wide fill, and the enum numbering --
-/// and a rule with several implementations gains a new case in none of them.
-///
-/// An enum member is deliberately untouched: its field type is the enum, its constant is the
-/// underlying integer, and that pairing is correct.
-fn normalize_constant_types(model: &mut Model) {
-    for info in model.types_mut() {
-        for field in &mut info.fields {
-            let TypeSymbol::Special(target) = &field.ty else {
-                continue;
-            };
-            let Some(literal) = field.constant.clone() else {
-                continue;
-            };
-            let target = *target;
-            if !matches!(
-                target,
-                SpecialType::Decimal | SpecialType::Single | SpecialType::Double
-            ) {
-                continue;
-            }
-            let value = match &literal {
-                Literal::Integer { .. } | Literal::Character(_) => {
-                    match literal_int_value(&literal) {
-                        Some(value) => value,
-                        None => continue,
-                    }
-                }
-                _ => continue,
-            };
-            field.constant = Some(match target {
-                SpecialType::Decimal => decimal_constant_from_i64(value),
-                SpecialType::Single => Literal::Real {
-                    bits: f64::from(value as f32).to_bits(),
-                    suffix: lamella_syntax::token::RealSuffix::Float,
-                },
-                _ => Literal::Real {
-                    bits: (value as f64).to_bits(),
-                    suffix: lamella_syntax::token::RealSuffix::Double,
-                },
-            });
+/// What one walk over the declarations does in [`resolve_constants`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstantStep {
+    /// Records each enum's underlying type and clears every constant the declaration walk folded.
+    Prepare,
+    /// Folds each constant that has no value yet. The walk answers whether it folded any.
+    Fold,
+}
+
+/// One namespace body for [`resolve_constants`], under the imports its declarations see: its
+/// `using` directives and every enclosing namespace (10.8), as body binding applies them.
+fn constant_namespace(
+    binder: &mut Binder,
+    usings: &[UsingDirective],
+    members: &[NamespaceMember],
+    namespace: &str,
+    step: ConstantStep,
+) -> bool {
+    let scope = binder.import_scope();
+    for using in usings {
+        binder.import_using(&using.kind);
+    }
+    let mut prefix = String::new();
+    for part in namespace.split('.').filter(|part| !part.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('.');
         }
+        prefix.push_str(part);
+        binder.import_namespace(&prefix);
+    }
+    let mut folded = false;
+    for member in members {
+        folded |= match member {
+            NamespaceMember::Namespace(declaration) => {
+                let inner = join_namespace(namespace, &declaration.name);
+                constant_namespace(binder, &declaration.usings, &declaration.members, &inner, step)
+            }
+            _ => constant_member(binder, member, namespace, step),
+        };
+    }
+    binder.restore_import_scope(scope);
+    folded
+}
+
+/// One type or enum for [`resolve_constants`]. A nested type is walked under its enclosing type's
+/// full name, which is what the model keys it by, and inside its enclosing type's type parameters.
+fn constant_member(
+    binder: &mut Binder,
+    member: &NamespaceMember,
+    namespace: &str,
+    step: ConstantStep,
+) -> bool {
+    match member {
+        NamespaceMember::Type(declaration) => {
+            let type_name = declared_type_name(declaration);
+            let enclosing = named_symbol(namespace, &type_name);
+            let full = qualified_type_name(namespace, &type_name);
+            let type_parameters =
+                binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+            let mut folded = false;
+            for member in &declaration.members {
+                match member {
+                    Member::Field {
+                        modifiers,
+                        declarators,
+                        ..
+                    } if modifiers.contains(&Modifier::Const) => {
+                        for declarator in declarators {
+                            let field = ConstantField {
+                                namespace,
+                                type_name: &type_name,
+                                enclosing: &enclosing,
+                                name: &declarator.name,
+                            };
+                            folded |= constant_field(binder, &field, declarator.initializer.as_ref(), step);
+                        }
+                    }
+                    Member::NestedType(nested) => {
+                        folded |= constant_member(binder, nested, &full, step);
+                    }
+                    _ => {}
+                }
+            }
+            binder.exit_type_parameters(type_parameters);
+            folded
+        }
+        NamespaceMember::Enum(declaration) => constant_enum(binder, namespace, declaration, step),
+        NamespaceMember::Delegate(_) | NamespaceMember::Namespace(_) => false,
     }
 }
 
-/// An `i64` as a `decimal` constant: the 96-bit mantissa with a scale of zero.
-fn decimal_constant_from_i64(value: i64) -> Literal {
-    let magnitude = u128::from(value.unsigned_abs());
-    Literal::Decimal {
-        lo: magnitude as u32,
-        mid: (magnitude >> 32) as u32,
-        hi: (magnitude >> 64) as u32,
-        scale: 0,
-        negative: value < 0,
+/// Where a `const` field lives: the model key of its type, that type's symbol, and its own name.
+struct ConstantField<'a> {
+    namespace: &'a str,
+    type_name: &'a str,
+    enclosing: &'a TypeSymbol,
+    name: &'a str,
+}
+
+/// A `const` field for [`resolve_constants`]: [`ConstantStep::Prepare`] clears it, and
+/// [`ConstantStep::Fold`] gives it the value of its initializer converted to the field's type, as
+/// an assignment converts it (13.1), once that value is known.
+fn constant_field(
+    binder: &mut Binder,
+    field: &ConstantField<'_>,
+    initializer: Option<&Expr>,
+    step: ConstantStep,
+) -> bool {
+    let Some(declared) = binder
+        .model()
+        .get(field.namespace, field.type_name)
+        .filter(|info| info.kind != TypeKind::Enum)
+        .and_then(|info| info.find_field(field.name))
+    else {
+        return false;
+    };
+    if step == ConstantStep::Prepare {
+        set_constant(binder.model_mut(), field.namespace, field.type_name, field.name, None);
+        return false;
     }
+    let (Some(initializer), None) = (initializer, &declared.constant) else {
+        return false;
+    };
+    let field_type = declared.ty.clone();
+    let bound = binder.bind_initializer_value(field.enclosing, &field_type, initializer);
+    let Some(value) = binder.constant_value(&binder.convert(bound, &field_type)) else {
+        return false;
+    };
+    set_constant(binder.model_mut(), field.namespace, field.type_name, field.name, Some(value))
+}
+
+/// An enum for [`resolve_constants`]. [`ConstantStep::Prepare`] records the underlying type its
+/// `: T` names (21.1) and clears its members. [`ConstantStep::Fold`] gives each member whose value
+/// is known its value held at that type: an explicit member the value of its bound initializer, an
+/// implicit one its predecessor's plus one (21.3).
+fn constant_enum(
+    binder: &mut Binder,
+    namespace: &str,
+    declaration: &EnumDecl,
+    step: ConstantStep,
+) -> bool {
+    use crate::integral_constant;
+    let name = &*declaration.name;
+    if binder
+        .model()
+        .get(namespace, name)
+        .is_none_or(|info| info.kind != TypeKind::Enum)
+    {
+        return false;
+    }
+    if step == ConstantStep::Prepare {
+        let underlying = match &declaration.base {
+            None => Some(SpecialType::Int32),
+            Some(base) => match binder.canonicalize(&bind_type(base)) {
+                TypeSymbol::Special(special)
+                    if special != SpecialType::Char
+                        && integral_constant::layout(special).is_some() =>
+                {
+                    Some(special)
+                }
+                _ => None,
+            },
+        };
+        if let Some(info) = binder.model_mut().get_mut(namespace, name) {
+            info.enum_underlying = underlying;
+        }
+        for member in &declaration.members {
+            set_constant(binder.model_mut(), namespace, name, &member.name, None);
+        }
+        return false;
+    }
+    let underlying = binder
+        .model()
+        .get(namespace, name)
+        .and_then(|info| info.enum_underlying)
+        .unwrap_or(SpecialType::Int32);
+    let enum_symbol = TypeSymbol::Named(
+        qualified_type_name(namespace, name)
+            .split('.')
+            .map(Box::from)
+            .collect(),
+    );
+    let member_value = |binder: &Binder, member: &str| {
+        binder
+            .model()
+            .get(namespace, name)
+            .and_then(|info| info.find_field(member))
+            .and_then(|field| field.constant.as_ref())
+            .and_then(|literal| integral_constant::value(literal, underlying))
+    };
+    let mut folded = false;
+    for (index, member) in declaration.members.iter().enumerate() {
+        if member_value(binder, &member.name).is_some() {
+            continue;
+        }
+        let value = match &member.value {
+            Some(initializer) => {
+                let (bound, _) = binder.bind_enum_member_value(&enum_symbol, initializer);
+                binder
+                    .constant_value(&bound)
+                    .zip(binder.integral_constant_type(&bound.ty))
+                    .and_then(|(literal, ty)| integral_constant::value(&literal, ty))
+            }
+            None => match index.checked_sub(1) {
+                None => Some(0),
+                Some(previous) => {
+                    member_value(binder, &declaration.members[previous].name).map(|value| value + 1)
+                }
+            },
+        };
+        let Some(literal) = value.and_then(|value| integral_constant::literal(value, underlying))
+        else {
+            continue;
+        };
+        folded |= set_constant(binder.model_mut(), namespace, name, &member.name, Some(literal));
+    }
+    folded
+}
+
+/// Sets the constant of the field `name` of the type keyed (`namespace`, `type_name`), answering
+/// whether there was such a field to set.
+fn set_constant(
+    model: &mut Model,
+    namespace: &str,
+    type_name: &str,
+    name: &str,
+    constant: Option<Literal>,
+) -> bool {
+    let Some(field) = model
+        .get_mut(namespace, type_name)
+        .and_then(|info| info.fields.iter_mut().find(|field| &*field.name == name))
+    else {
+        return false;
+    };
+    field.constant = constant;
+    true
 }
 
 /// Fills the DEFAULT ARGUMENTS the declaration-order pass could not fold, against the whole model.
@@ -830,8 +957,8 @@ fn decimal_constant_from_i64(value: i64) -> Literal {
 /// another type, which is exactly the shape [`resolve_const_expr`] exists for and exactly the shape
 /// the first pass cannot see.
 ///
-/// STRICTLY ADDITIVE, like the field fill it follows: a slot the first pass already resolved is
-/// left alone, and an initializer that does not fold leaves the slot `None`. **A parameter whose
+/// STRICTLY ADDITIVE: a slot the first pass already resolved is left alone, and an initializer
+/// that does not fold leaves the slot `None`. **A parameter whose
 /// default never folds is REQUIRED as far as the rest of the compiler is concerned**, which is the
 /// safe direction -- a caller is asked for an argument it could have omitted, rather than being
 /// allowed to omit one this compiler cannot supply a value for. `CS1736` reports it separately.
@@ -876,125 +1003,6 @@ fn resolve_parameter_defaults(
 /// A type's dotted full name as the [`TypeSymbol`] the model is keyed by.
 fn type_symbol_of(type_full: &str) -> TypeSymbol {
     TypeSymbol::Named(type_full.split('.').map(Box::<str>::from).collect())
-}
-
-/// Re-numbers every enum against the WHOLE model, which the first pass could not do.
-///
-/// THE FAILURE THIS FIXES IS SILENT BY CONSTRUCTION. The first pass evaluates a member's
-/// initializer against `prior` -- the enum's own earlier members -- and falls back to auto-numbering
-/// when that fails. So `Normal = (int)Facts.MODE_NORMAL` does not resolve, takes the auto value, and
-/// the enum compiles and runs with the WRONG constant: an unresolvable initializer is
-/// indistinguishable from an absent one, because both end at the same `unwrap_or`.
-///
-/// AND IT HAS NO WORKAROUND, which is why it is worth a second pass of its own. A const FIELD that
-/// mis-folds can be spelled `static readonly` and computed at run time; an enum member must be a
-/// compile-time constant, so a driver naming a generated device code had to transcribe it by hand --
-/// the exact duplication the generated facts tables exist to remove.
-///
-/// The whole enum is re-numbered rather than patched member-by-member, because a late-resolving
-/// member moves every auto-numbered member after it (`enum E { A = Facts.X, B }` -- B is X+1). Same
-/// order of precedence as the first pass: the enum's own members win over the model, so a same-enum
-/// reference cannot be captured by a same-named constant elsewhere.
-///
-/// Members are resolved BY DEPENDENCY rather than in declaration order, because an initializer may
-/// name a member declared later in the same enum (21.3).
-fn resolve_enum_members(
-    model: &mut Model,
-    units: &[CompilationUnit],
-    values: &BTreeMap<(String, String), Literal>,
-) {
-    let mut enums: Vec<(String, &str, &[lamella_syntax::ast::EnumMember])> = Vec::new();
-    for unit in units {
-        for member in &unit.members {
-            collect_enum_decls(member, "", &mut enums);
-        }
-    }
-    for (namespace, name, members) in enums {
-        let full = qualified_type_name(&namespace, name);
-        let renumbered = enum_member_numbering(members, &|expr| {
-            resolve_const_expr(expr, &full, values).as_ref().and_then(literal_int_value)
-        });
-        let (namespace, name) = split_type_full(&full);
-        let Some(info) = model.get_mut(&namespace, name) else {
-            continue;
-        };
-        for (member_name, value) in renumbered {
-            if let Some(field) = info.fields.iter_mut().find(|f| f.name == member_name) {
-                field.constant = Some(integer_literal(value));
-            }
-        }
-    }
-}
-
-/// Collects every enum declaration, descending namespaces and nested types, with its containing
-/// namespace (or enclosing type's full name, for a nested enum).
-fn collect_enum_decls<'a>(
-    member: &'a NamespaceMember,
-    namespace: &str,
-    out: &mut Vec<(String, &'a str, &'a [lamella_syntax::ast::EnumMember])>,
-) {
-    match member {
-        NamespaceMember::Namespace(declaration) => {
-            let inner = join_namespace(namespace, &declaration.name);
-            for nested in &declaration.members {
-                collect_enum_decls(nested, &inner, out);
-            }
-        }
-        NamespaceMember::Enum(declaration) => {
-            out.push((namespace.to_string(), &declaration.name, &declaration.members));
-        }
-        NamespaceMember::Type(declaration) => {
-            let full = declared_full_name(namespace, declaration);
-            for member in &declaration.members {
-                if let Member::NestedType(nested) = member {
-                    collect_enum_decls(nested, &full, out);
-                }
-            }
-        }
-        NamespaceMember::Delegate(_) => {}
-    }
-}
-
-/// Collects the `const` fields (with initializers) declared in `member`, descending namespaces and
-/// nested types, each keyed by its containing type's full name.
-fn collect_const_field_decls<'a>(
-    member: &'a NamespaceMember,
-    namespace: &str,
-    out: &mut Vec<ConstDecl<'a>>,
-) {
-    match member {
-        NamespaceMember::Namespace(declaration) => {
-            let inner = join_namespace(namespace, &declaration.name);
-            for nested in &declaration.members {
-                collect_const_field_decls(nested, &inner, out);
-            }
-        }
-        NamespaceMember::Type(declaration) => {
-            let full = declared_full_name(namespace, declaration);
-            for member in &declaration.members {
-                match member {
-                    Member::Field {
-                        modifiers,
-                        declarators,
-                        ..
-                    } if modifiers.iter().any(|m| matches!(m, Modifier::Const)) => {
-                        for declarator in declarators {
-                            if let Some(init) = &declarator.initializer {
-                                out.push(ConstDecl {
-                                    type_full: full.clone(),
-                                    name: &declarator.name,
-                                    init,
-                                });
-                            }
-                        }
-                    }
-                    Member::NestedType(nested) => collect_const_field_decls(nested, &full, out),
-                    _ => {}
-                }
-            }
-        }
-        NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
-    }
 }
 
 /// Collects every DEFAULT ARGUMENT written in `member`, descending namespaces and nested types.
@@ -1120,7 +1128,7 @@ fn split_type_full(full: &str) -> (String, &str) {
 }
 
 /// Every folded constant in the model, keyed by (containing type's full name, member name) -- const
-/// fields AND enum members. The lookup table the model-aware constant folder resolves names against.
+/// fields AND enum members. The table a default argument's initializer is folded against by name.
 pub(crate) fn model_const_values(model: &Model) -> BTreeMap<(String, String), Literal> {
     let mut values: BTreeMap<(String, String), Literal> = BTreeMap::new();
     let keys: Vec<(String, String)> = model
@@ -1145,7 +1153,7 @@ pub(crate) fn model_const_values(model: &Model) -> BTreeMap<(String, String), Li
 /// Also registers each constant under the SHORTER type spellings a source file may legitimately
 /// write -- `Facts.X` for `G.Facts.X` under a `using G;`, `Outer.Inner.X` for `Ns.Outer.Inner.X`.
 ///
-/// WHY THIS IS NEEDED AT ALL: a constant initializer is folded against this map by NAME, using the
+/// WHY THIS IS NEEDED AT ALL: a default argument is folded against this map by NAME, using the
 /// receiver exactly as the source wrote it. A `using`-shortened receiver therefore matched nothing,
 /// and the fold quietly produced no value -- which downstream is indistinguishable from zero. That
 /// is the const-of-const mis-fold: `const byte X = (byte)Facts.IDENTITY_REG;` read back as 0 while
@@ -1279,14 +1287,31 @@ pub fn constraints_by_parameter(
         let slot = &mut result[index];
         for constraint in &clause.constraints {
             match constraint {
-                SyntaxConstraint::ReferenceType(_) => slot.reference_type = true,
+                SyntaxConstraint::ReferenceType { .. } => slot.reference_type = true,
                 SyntaxConstraint::ValueType(_) => slot.value_type = true,
                 SyntaxConstraint::DefaultConstructor(_) => slot.default_constructor = true,
-                SyntaxConstraint::Type(reference) => slot.types.push(bind_type(reference)),
+                SyntaxConstraint::Type(reference) if is_notnull_constraint(reference) => {}
+                SyntaxConstraint::Type(reference) => slot.types.push(bind_type(
+                    match &reference.kind {
+                        lamella_syntax::ast::TypeRefKind::Nullable(underlying) => underlying,
+                        _ => reference,
+                    },
+                )),
             }
         }
     }
     result
+}
+
+/// Whether a written type constraint is the `notnull` constraint (C# 8.0): the bare name, not
+/// verbatim. It is a contextual keyword there, so a program that declares a TYPE called
+/// `notnull` and constrains to it is read as the keyword -- the one reading this compiler does
+/// not share with csc, which binds the name first.
+#[must_use]
+pub fn is_notnull_constraint(reference: &lamella_syntax::ast::TypeRef) -> bool {
+    !reference.verbatim_name
+        && matches!(&reference.kind, lamella_syntax::ast::TypeRefKind::Name(parts)
+            if parts.len() == 1 && &*parts[0] == "notnull")
 }
 
 /// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
@@ -2138,6 +2163,96 @@ mod tests {
         assert_eq!(value("Normal"), 3, "folded from the cross-class const");
         assert_eq!(value("Next"), 4, "auto-numbered from the resolved member");
         assert_eq!(value("Forced"), 1, "a later explicit member re-anchors");
+    }
+
+    /// **A CONSTANT IS THE VALUE OF ITS BOUND INITIALIZER, HELD AT ITS OWN TYPE.** Each row read a
+    /// wrong value, with no diagnostic, while constants were folded from the SYNTAX as signed 64-bit
+    /// values: a member access through a keyword type and `nameof` did not fold at all, so the field
+    /// was written as a plain static reading 0, and an operation was computed at 64 bits and
+    /// truncated where it was stored. Every expected value is csc's, measured on .NET 8.
+    #[test]
+    fn a_const_takes_the_value_its_bound_initializer_has_at_its_own_type() {
+        let unit = parse_compilation_unit(
+            "class P { const int Big = int.MaxValue; const long Widened = int.MinValue; \
+                 const uint UBig = uint.MaxValue; const char CBig = char.MaxValue; \
+                 const string Name = nameof(Main); const int Forward = Later.Value * 2; \
+                 const int A = 1 << 33; const long B = 1 << 31; const long H = 1L << 64; \
+                 const ulong T = 0x8000000000000000; const ulong C = T >> 1; \
+                 const ulong D = ~0u; const long J = 0x80000000 << 1; \
+                 const bool F = 0xFFFFFFFFFFFFFFFF > 1; const double R = uint.MaxValue; \
+                 static void Main() { } } \
+             class Later { public const int Value = int.MaxValue / 1000; }",
+        )
+        .unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        model.link_bases();
+        resolve_constants(&mut model, core::slice::from_ref(&unit));
+
+        let constant = |field: &str| {
+            model
+                .get("", "P")
+                .and_then(|info| info.find_field(field))
+                .and_then(|field| field.constant.clone())
+                .unwrap_or_else(|| panic!("P.{field} has a value"))
+        };
+        let int = |value: i64| integer_literal(value);
+        assert_eq!(constant("Big"), int(i64::from(i32::MAX)));
+        assert_eq!(constant("Widened"), int(i64::from(i32::MIN)));
+        assert_eq!(constant("UBig"), int(i64::from(u32::MAX)));
+        assert_eq!(constant("CBig"), Literal::Character(u16::MAX));
+        assert_eq!(constant("Name"), Literal::String("Main".encode_utf16().collect()));
+        assert_eq!(constant("Forward"), int(4_294_966));
+        assert_eq!(constant("A"), int(2));
+        assert_eq!(constant("B"), int(i64::from(i32::MIN)));
+        assert_eq!(constant("H"), int(1));
+        assert_eq!(constant("C"), int(4_611_686_018_427_387_904));
+        assert_eq!(constant("D"), int(i64::from(u32::MAX)));
+        assert_eq!(constant("J"), int(0));
+        assert_eq!(constant("F"), Literal::Boolean(true));
+        assert_eq!(
+            constant("R"),
+            Literal::Real {
+                bits: 4_294_967_295f64.to_bits(),
+                suffix: RealSuffix::Double,
+            }
+        );
+    }
+
+    /// **AN ENUM MEMBER IS THE VALUE ITS INITIALIZER BINDS TO, AT THE UNDERLYING TYPE.** An
+    /// initializer the syntactic fold could not read used to fall back to the implicit sequence:
+    /// `All = uint.MaxValue` became 1, and `Next` after it 2. Inside its enum a member is read at the
+    /// underlying type (21.3), so `~A` in a `uint` enum is a `uint` complement.
+    #[test]
+    fn an_enum_member_takes_its_bound_value_at_the_underlying_type() {
+        let unit = parse_compilation_unit(
+            "enum E : uint { None, All = uint.MaxValue } \
+             enum S : sbyte { Min = sbyte.MinValue, Next } \
+             enum U : uint { A = 1, NotA = ~A } \
+             enum L : long { Low = long.MinValue, AfterLow } \
+             enum M : ulong { High = 0x8000000000000000, AfterHigh, All = ulong.MaxValue }",
+        )
+        .unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        model.link_bases();
+        resolve_constants(&mut model, core::slice::from_ref(&unit));
+
+        let value = |ty: &str, member: &str| {
+            model
+                .get("", ty)
+                .and_then(|info| info.find_field(member))
+                .and_then(|field| field.constant.as_ref())
+                .and_then(literal_int_value)
+                .unwrap_or_else(|| panic!("{ty}.{member} has a value"))
+        };
+        assert_eq!(value("E", "All"), i64::from(u32::MAX));
+        assert_eq!(value("S", "Min"), -128);
+        assert_eq!(value("S", "Next"), -127);
+        assert_eq!(value("U", "NotA"), 4_294_967_294);
+        assert_eq!(value("L", "AfterLow"), i64::MIN + 1);
+        assert_eq!(value("M", "AfterHigh") as u64, 0x8000_0000_0000_0001);
+        assert_eq!(value("M", "All") as u64, u64::MAX);
     }
 
     #[test]

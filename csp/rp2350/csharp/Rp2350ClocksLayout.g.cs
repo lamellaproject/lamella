@@ -12,10 +12,14 @@ namespace Lamella.Generated
         // -- register offsets (block-relative) + access widths --
         public const uint CLK_REF_CTRL_OFF = 0x30;
         public const int CLK_REF_CTRL_WIDTH = 32;
+        public const uint CLK_REF_DIV_OFF = 0x34;
+        public const int CLK_REF_DIV_WIDTH = 32;
         public const uint CLK_REF_SELECTED_OFF = 0x38;
         public const int CLK_REF_SELECTED_WIDTH = 32;
         public const uint CLK_SYS_CTRL_OFF = 0x3C;
         public const int CLK_SYS_CTRL_WIDTH = 32;
+        public const uint CLK_SYS_DIV_OFF = 0x40;
+        public const int CLK_SYS_DIV_WIDTH = 32;
         public const uint CLK_SYS_SELECTED_OFF = 0x44;
         public const int CLK_SYS_SELECTED_WIDTH = 32;
         public const uint CLK_PERI_CTRL_OFF = 0x48;
@@ -24,6 +28,8 @@ namespace Lamella.Generated
         public const int CLK_PERI_DIV_WIDTH = 32;
         public const uint CLK_USB_CTRL_OFF = 0x60;
         public const int CLK_USB_CTRL_WIDTH = 32;
+        public const uint CLK_USB_DIV_OFF = 0x64;
+        public const int CLK_USB_DIV_WIDTH = 32;
         public const uint CLK_ADC_CTRL_OFF = 0x6C;
         public const int CLK_ADC_CTRL_WIDTH = 32;
         public const uint CLK_ADC_DIV_OFF = 0x70;
@@ -32,10 +38,16 @@ namespace Lamella.Generated
         // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
         public const uint CLK_REF_CTRL_SRC = 0x3;
         public const uint CLK_REF_CTRL_SRC_LSB = 0;
+        public const uint CLK_REF_DIV_INT = 0xFF0000;
+        public const uint CLK_REF_DIV_INT_LSB = 16;
         public const uint CLK_SYS_CTRL_SRC = 0x1;
         public const uint CLK_SYS_CTRL_SRC_LSB = 0;
         public const uint CLK_SYS_CTRL_AUXSRC = 0xE0;
         public const uint CLK_SYS_CTRL_AUXSRC_LSB = 5;
+        public const uint CLK_SYS_DIV_FRAC = 0xFFFF;
+        public const uint CLK_SYS_DIV_FRAC_LSB = 0;
+        public const uint CLK_SYS_DIV_INT = 0xFFFF0000;
+        public const uint CLK_SYS_DIV_INT_LSB = 16;
         public const uint CLK_PERI_CTRL_AUXSRC = 0xE0;
         public const uint CLK_PERI_CTRL_AUXSRC_LSB = 5;
         public const uint CLK_PERI_CTRL_ENABLE = 0x800;
@@ -46,6 +58,8 @@ namespace Lamella.Generated
         public const uint CLK_USB_CTRL_AUXSRC_LSB = 5;
         public const uint CLK_USB_CTRL_ENABLE = 0x800;
         public const uint CLK_USB_CTRL_ENABLE_LSB = 11;
+        public const uint CLK_USB_DIV_INT = 0xF0000;
+        public const uint CLK_USB_DIV_INT_LSB = 16;
         public const uint CLK_ADC_CTRL_AUXSRC = 0xE0;
         public const uint CLK_ADC_CTRL_AUXSRC_LSB = 5;
         public const uint CLK_ADC_CTRL_KILL = 0x400;

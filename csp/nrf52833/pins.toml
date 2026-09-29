@@ -1,5 +1,6 @@
 # PIN map: pin x function -> (instance, signal) for the nRF52833.
-# PARTIAL, evidence-only. The nRF has no mux-table functions: a peripheral's
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# The nRF has no mux-table functions: a peripheral's
 # PSEL registers claim any GPIO, so the function id here is the claiming block ("twi") and
 # the signal is the PSEL register the pin routes through.
 

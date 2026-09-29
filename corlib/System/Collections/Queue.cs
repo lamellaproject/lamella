@@ -5,6 +5,9 @@ namespace System.Collections
     {
         private object[] items;
         private int size;
+
+        internal int version;
+
         public Queue() { items = new object[4]; size = 0; }
         public int Count { get { return size; } }
 
@@ -20,6 +23,7 @@ namespace System.Collections
             }
             items[size] = value;
             size = size + 1;
+            version = version + 1;
         }
         public object Dequeue()
         {
@@ -28,6 +32,7 @@ namespace System.Collections
             for (int i = 1; i < size; i++) items[i - 1] = items[i];
             size = size - 1;
             items[size] = null;
+            version = version + 1;
             return value;
         }
 
@@ -41,6 +46,7 @@ namespace System.Collections
         {
             for (int i = 0; i < size; i++) items[i] = null;
             size = 0;
+            version = version + 1;
         }
 
         public object[] ToArray()

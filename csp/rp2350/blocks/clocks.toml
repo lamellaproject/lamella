@@ -19,6 +19,12 @@ offset = 0x30
 width = 32
 fields = { SRC = [0, 2] }
 
+[registers.CLK_REF_DIV]
+offset = 0x34
+width = 32
+fields = { INT = [16, 8] }
+notes = "Integer divisor; 0 divides by 256. Resets to 1."
+
 [registers.CLK_REF_SELECTED]
 offset = 0x38
 width = 32
@@ -29,6 +35,12 @@ offset = 0x3C
 width = 32
 fields = { SRC = [0, 1], AUXSRC = [5, 3] }
 notes = "SRC 0 = clk_ref, 1 = the aux mux. AUXSRC 0 = PLL_SYS."
+
+[registers.CLK_SYS_DIV]
+offset = 0x40
+width = 32
+fields = { FRAC = [0, 16], INT = [16, 16] }
+notes = "Divisor INT + FRAC/65536; INT 0 divides by 65536. Resets to INT 1, FRAC 0."
 
 [registers.CLK_SYS_SELECTED]
 offset = 0x44
@@ -51,6 +63,12 @@ notes = "New on the RP2350; resets to divide-by-1 (INT = 1). Written explicitly 
 offset = 0x60
 width = 32
 fields = { AUXSRC = [5, 3], ENABLE = [11, 1] }
+
+[registers.CLK_USB_DIV]
+offset = 0x64
+width = 32
+fields = { INT = [16, 4] }
+notes = "Integer divisor; 0 divides by 16. Resets to 1."
 
 [registers.CLK_ADC_CTRL]
 offset = 0x6C

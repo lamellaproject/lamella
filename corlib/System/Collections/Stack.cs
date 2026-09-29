@@ -5,6 +5,9 @@ namespace System.Collections
     {
         private object[] items;
         private int size;
+
+        internal int version;
+
         public Stack() { items = new object[4]; size = 0; }
         public int Count { get { return size; } }
 
@@ -20,6 +23,7 @@ namespace System.Collections
             }
             items[size] = value;
             size = size + 1;
+            version = version + 1;
         }
         public object Pop()
         {
@@ -27,6 +31,7 @@ namespace System.Collections
             size = size - 1;
             object value = items[size];
             items[size] = null;
+            version = version + 1;
             return value;
         }
 
@@ -40,6 +45,7 @@ namespace System.Collections
         {
             for (int i = 0; i < size; i++) items[i] = null;
             size = 0;
+            version = version + 1;
         }
 
         public object[] ToArray()

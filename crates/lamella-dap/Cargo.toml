@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "A Debug Adapter Protocol server over the Lamella interpreter (host-side)."
 
-# Host-side debugger; std and external deps are allowed here (User-approved), unlike
+# Host-side debugger; std and external deps are allowed here, unlike
 # the no_std libraries. serde_json carries the DAP JSON wire format.
 publish = false
 [dependencies]

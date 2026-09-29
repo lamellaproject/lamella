@@ -1,0 +1,112 @@
+# INSTANCE map for the STM32L4R5: where each block copy sits, plus its RCC clock-enable routing.
+# `-1` = the row gates nothing (the RCC itself).
+#
+# THREE DIFFERENT ENABLE REGISTERS GATE THE ROWS BELOW, AND THEY SIT FOUR BYTES APART. The GPIO
+# ports are gated in RCC_AHB2ENR at 0x4C, PWR in RCC_APB1ENR1 at 0x58, and LPUART1 in RCC_APB1ENR2
+# at 0x5C. A transposed offset lands on a real neighboring register and enables something else, so
+# each gate below is stated as the pair [offset, bit] and read from that register's own section.
+#
+# THE PWR ROW IS HERE FOR PORT G. PG2 to PG15 are isolated at reset until IOSV in PWR_CR2 is set
+# (see ../parts.toml), and PWR_CR2 cannot be written until PWR's own clock is enabled. So a board
+# that uses a pin in that range needs this gate before it needs the pin's port.
+
+
+[table]
+kind = "instances"
+family = "stm32l4r5"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32L4+ Series reference manual RM0432 Rev 9, table 1 (STM32L4Rxxx and STM32L4Sxxx memory map and peripheral register boundary addresses): GPIOA to GPIOI on AHB2 from 0x4800 0000 in 1-Kbyte steps to 0x4800 2000; RCC at 0x4002 1000 on AHB1; PWR at 0x4000 7000 and LPUART1 at 0x4000 8000 on APB1",
+    "RM0432 Rev 9 section 6.4.17, AHB2 peripheral clock enable register (RCC_AHB2ENR), address offset 0x4C, per-bit descriptions: GPIOAEN bit 0 through GPIOIEN bit 8, one bit per port in order",
+    "RM0432 Rev 9 section 6.4.19, APB1 peripheral clock enable register 1 (RCC_APB1ENR1), address 0x58: bit 28 PWREN, power interface clock enable",
+    "RM0432 Rev 9 section 6.4.20, APB1 peripheral clock enable register 2 (RCC_APB1ENR2), address offset 0x5C: bit 0 LPUART1EN, low-power UART 1 clock enable",
+]
+notes = [
+    "NO BLOCK LAYOUT FILE ACCOMPANIES THE LPUART1, PWR OR RCC ROWS. An instance row states where a block sits and how it is gated; what is inside it is a separate reading, and a consumer needing those offsets takes them from RM0432 rather than from another family's block file.",
+    "LPUART1's kernel clock is selected by LPUART1SEL, bits 11:10 of RCC_CCIPR at 0x88, whose reset value 00 selects PCLK (RM0432 section 6.4.28). So at reset LPUART1 runs from PCLK1, the APB1 clock.",
+]
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x48000000
+rcc_en_off = 0x4C   # RCC_AHB2ENR
+rcc_en_bit = 0      # GPIOAEN
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x48000400
+rcc_en_off = 0x4C
+rcc_en_bit = 1
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x48000800
+rcc_en_off = 0x4C
+rcc_en_bit = 2
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x48000C00
+rcc_en_off = 0x4C
+rcc_en_bit = 3
+
+[[instances]]
+name = "gpioe"
+block = "gpio"
+base = 0x48001000
+rcc_en_off = 0x4C
+rcc_en_bit = 4
+
+[[instances]]
+name = "gpiof"
+block = "gpio"
+base = 0x48001400
+rcc_en_off = 0x4C
+rcc_en_bit = 5
+
+[[instances]]
+name = "gpiog"
+block = "gpio"
+base = 0x48001800
+rcc_en_off = 0x4C
+rcc_en_bit = 6
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x48001C00
+rcc_en_off = 0x4C
+rcc_en_bit = 7
+
+# Port I is on the die and on no pad of the LQFP144. See ../parts.toml.
+[[instances]]
+name = "gpioi"
+block = "gpio"
+base = 0x48002000
+rcc_en_off = 0x4C
+rcc_en_bit = 8
+
+[[instances]]
+name = "lpuart1"
+block = "lpuart"
+base = 0x40008000
+rcc_en_off = 0x5C   # RCC_APB1ENR2
+rcc_en_bit = 0      # LPUART1EN
+
+[[instances]]
+name = "pwr"
+block = "pwr"
+base = 0x40007000
+rcc_en_off = 0x58   # RCC_APB1ENR1
+rcc_en_bit = 28     # PWREN
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x40021000
+rcc_en_off = -1
+rcc_en_bit = -1

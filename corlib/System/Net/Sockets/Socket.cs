@@ -173,6 +173,15 @@ namespace System.Net.Sockets
         [Lamella.Runtime.RuntimeProvided] private static int UdpBind(byte[] addr, int port) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static int UdpSendTo(int handle, byte[] buffer, int offset, int count, byte[] addr, int port) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static int UdpReceiveFrom(int handle, byte[] buffer, int offset, int count, byte[] senderAddr, int[] senderMeta) { return 0; }
+
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        private static int UdpMaxDatagram(int handle) { return 65536; }
+
+        internal int MaxDatagram
+        {
+            get { return UdpMaxDatagram(_handle); }
+        }
     }
 }
 #endif

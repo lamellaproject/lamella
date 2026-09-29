@@ -18,6 +18,7 @@ public enum Rp2350IoBank0Layout {
     public static let FUNCSEL_SPI: UInt32 = 1
     public static let FUNCSEL_UART: UInt32 = 2
     public static let FUNCSEL_I2C: UInt32 = 3
+    public static let FUNCSEL_PWM: UInt32 = 4
     public static let FUNCSEL_SIO: UInt32 = 5
     public static let FUNCSEL_NULL: UInt32 = 0x1F
 }

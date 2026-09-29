@@ -13,6 +13,7 @@ use lamella_binder::{
 };
 use lamella_cil::{Instruction, Opcode, Operand};
 use lamella_syntax::ast::{BinaryOperator, Literal, PostfixOperator, UnaryOperator};
+use lamella_token::Token;
 
 /// Why an expression could not be lowered to CIL yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,14 +298,7 @@ pub fn emit_expression(
         BoundExprKind::This | BoundExprKind::Base => {
             out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
             if is_value_type(&expr.ty, tokens) {
-                if tokens.is_struct(&expr.ty) || tokens.is_enum(&expr.ty) {
-                    let token = tokens
-                        .instruction_type_token(&expr.ty)
-                        .ok_or(EmitError::Unsupported("a value-type `this` with no token"))?;
-                    out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
-                } else {
-                    emit_load_indirect(&expr.ty, tokens, out)?;
-                }
+                emit_load_indirect(&expr.ty, tokens, out)?;
             }
             Ok(())
         }
@@ -466,6 +460,8 @@ pub fn emit_expression(
             if matches!(operation, lamella_syntax::ast::TypeTestOperation::Is) {
                 out.push(Instruction::simple(Opcode::Ldnull));
                 out.push(Instruction::simple(Opcode::CgtUn));
+            } else if is_value_type(target, tokens) {
+                out.push(Instruction::new(Opcode::UnboxAny, Operand::Token(token)));
             }
             Ok(())
         }
@@ -485,7 +481,7 @@ pub fn emit_expression(
                 out.push(slot.load());
                 emit_expression(value, frame, tokens, out)?;
                 let kept = keep_assigned(true, &value.ty, frame, out);
-                emit_byref_store(&element, tokens, out)?;
+                emit_store_indirect(&element, tokens, out)?;
                 load_kept(kept, out);
                 Ok(())
             }
@@ -2439,15 +2435,7 @@ pub(crate) fn emit_local(
 ) -> Result<(), EmitError> {
     if let Some((slot, element)) = frame.byref(name) {
         out.push(slot.load());
-        if tokens.is_struct(&element) || tokens.is_enum(&element) {
-            let token = tokens
-                .instruction_type_token(&element)
-                .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
-            out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
-        } else {
-            emit_load_indirect(&element, tokens, out)?;
-        }
-        return Ok(());
+        return emit_load_indirect(&element, tokens, out);
     }
     match frame.slot(name) {
         Some(Slot::Argument(slot)) => {
@@ -2583,27 +2571,16 @@ pub(crate) fn emit_step(
     Ok(())
 }
 
-/// The `ldind.*` opcode that loads a value of `ty` through a managed pointer (the
-/// signed/unsigned width follows the type, as csc emits for a byref read).
 /// Loads the value a managed or unmanaged pointer points AT, choosing the instruction by what the
-/// referent IS.
-///
-/// **A STRUCT OR AN ENUM IS NOT A WIDTH, AND `ldind` ONLY KNOWS WIDTHS.** `ldind.*` covers the
-/// primitives and `ldind.ref` covers an object reference; a value type is loaded whole with
-/// `ldobj <token>`. Falling off the end of the width table into `ldind.ref` produces IL the
-/// runtime refuses -- `decimal* p; *p` compiled clean and threw `InvalidProgramException` on entry,
-/// and so did a pointer to any user struct or enum, while `float*` and `double*` were right because
-/// they have widths.
+/// referent IS: the width `ldind.*` for a primitive, `ldind.ref` for an object reference, and
+/// `ldobj <token>` for everything [`whole_referent_token`] names.
 ///
 pub(crate) fn emit_load_indirect(
     ty: &TypeSymbol,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
-    if is_value_type(ty, tokens) && matches!(ldind_opcode(ty), Opcode::LdindRef) {
-        let token = tokens
-            .instruction_type_token(ty)
-            .ok_or(EmitError::Unsupported("dereferenced value type has no token"))?;
+    if let Some(token) = whole_referent_token(ty, tokens)? {
         out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
         return Ok(());
     }
@@ -2618,15 +2595,42 @@ pub(crate) fn emit_store_indirect(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
-    if is_value_type(ty, tokens) && matches!(stind_opcode(ty), Opcode::StindRef) {
-        let token = tokens
-            .instruction_type_token(ty)
-            .ok_or(EmitError::Unsupported("stored-through value type has no token"))?;
+    if let Some(token) = whole_referent_token(ty, tokens)? {
         out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
         return Ok(());
     }
     out.push(Instruction::simple(stind_opcode(ty)));
     Ok(())
+}
+
+/// The token naming a referent that no `ldind`/`stind` moves, which is then moved whole with
+/// `ldobj`/`stobj`; `None` when the width table's instruction is the right one.
+///
+/// **A STRUCT OR AN ENUM IS NOT A WIDTH, AND `ldind` ONLY KNOWS WIDTHS.** `ldind.*` covers the
+/// primitives and `ldind.ref` covers an object reference, so a value type the table does not
+/// cover is named by its token. The test is exactly that, rather than `is_struct`, which knows only
+/// the types THIS MODULE declares: `decimal*` and a pointer to any imported struct reached
+/// `ldind.ref` that way, and the runtime refused the method on entry.
+///
+/// **A TYPE PARAMETER HAS NO WIDTH EITHER, AND IT IS TESTED FIRST.** It is a reference in some
+/// instantiations and a value in others, so `ldind.ref` is right only in the first kind: at
+/// `T = long` on a 32-bit target it moves four of the eight bytes, and at `T = byte` it overwrites
+/// the three that follow. `ldobj !T` is right for every instantiation -- over a reference type it
+/// moves the reference (III.4.13) -- and it is what csc emits whatever `T`'s constraints are. It
+/// goes first because a parameter shadows a real type of the same name, as it does at
+/// [`Tokens::instruction_type_token`].
+fn whole_referent_token(ty: &TypeSymbol, tokens: &Tokens) -> Result<Option<Token>, EmitError> {
+    if tokens.body_type_parameter(ty).is_some() {
+        return tokens.type_parameter_spec(ty).map(Some).ok_or(EmitError::Unsupported(
+            "a type parameter reached through a reference with no TypeSpec minted for its position",
+        ));
+    }
+    if is_value_type(ty, tokens) && matches!(ldind_opcode(ty), Opcode::LdindRef) {
+        return tokens.instruction_type_token(ty).map(Some).ok_or(EmitError::Unsupported(
+            "a value type reached through a reference with no metadata token",
+        ));
+    }
+    Ok(None)
 }
 
 pub(crate) fn ldind_opcode(ty: &TypeSymbol) -> Opcode {
@@ -2660,44 +2664,6 @@ pub(crate) fn stind_opcode(ty: &TypeSymbol) -> Opcode {
         TypeSymbol::Special(SpecialType::Double) => Opcode::StindR8,
         _ => Opcode::StindRef,
     }
-}
-
-/// Emits the load-through-a-byref instruction for a referent of type `element` (the managed
-/// pointer is already on the stack): `ldobj <token>` for a value type (struct/enum -- there is
-/// no `ldind` for one), else the width-appropriate `ldind`. The mirror of [`emit_byref_store`].
-pub(crate) fn emit_byref_load(
-    element: &TypeSymbol,
-    tokens: &Tokens,
-    out: &mut Vec<Instruction>,
-) -> Result<(), EmitError> {
-    if tokens.is_struct(element) || tokens.is_enum(element) {
-        let token = tokens
-            .instruction_type_token(element)
-            .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
-        out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
-    } else {
-        emit_load_indirect(element, tokens, out)?;
-    }
-    Ok(())
-}
-
-/// Emits the store-through-a-byref instruction for a referent of type `element` (the
-/// address and value are already on the stack): `stobj <token>` for a value type
-/// (struct/enum -- there is no `stind` for one), else the width-appropriate `stind`.
-pub(crate) fn emit_byref_store(
-    element: &TypeSymbol,
-    tokens: &Tokens,
-    out: &mut Vec<Instruction>,
-) -> Result<(), EmitError> {
-    if tokens.is_struct(element) || tokens.is_enum(element) {
-        let token = tokens
-            .instruction_type_token(element)
-            .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
-        out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
-    } else {
-        emit_store_indirect(element, tokens, out)?;
-    }
-    Ok(())
 }
 
 fn emit_literal(
@@ -2822,19 +2788,22 @@ fn emit_typeof(
 ///
 /// **A BARE `T` HAS NO ORDINARY TOKEN, DELIBERATELY** -- minting one would invent a `TypeRef` to
 /// a type called `T` that no assembly declares, which is a defect this compiler had and removed. It
-/// is named instead by a `TypeSpec` whose blob is `ELEMENT_TYPE_VAR n`, pre-minted per POSITION
-/// (see `Tokens::var_spec`) because emission cannot mint.
+/// is named instead by a `TypeSpec` whose blob is `ELEMENT_TYPE_VAR n` for the declaring type's
+/// parameter and `ELEMENT_TYPE_MVAR n` for the method's own, pre-minted per POSITION (see
+/// `Tokens::var_spec`) because emission cannot mint.
+///
+/// **THE BODY'S SCOPE ANSWERS WHICH ONE, AND IT IS THE ONLY LIST THAT KNOWS BOTH.** Asked of the
+/// declaring type's list alone, a method's `T` was not a parameter at all: it fell through to the
+/// reference-type arm, so `default(T)` in `M<T>()` was `ldnull`, and at `M<int>` a null stood where
+/// 0 belongs.
 fn emit_default_value(
     target: &TypeSymbol,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
-    if let TypeSymbol::Named(parts) = target
-        && let [only] = &parts[..]
-        && let Some(index) = frame.type_parameter_index(only)
-    {
-        let spec = tokens.var_spec(index).ok_or(EmitError::Unsupported(
+    if tokens.body_type_parameter(target).is_some() {
+        let spec = tokens.type_parameter_spec(target).ok_or(EmitError::Unsupported(
             "default of a type parameter with no TypeSpec minted for its position",
         ))?;
         let slot = frame.reserve_local(target);
@@ -2981,7 +2950,7 @@ fn emit_refvalue(
         .instruction_type_token(target)
         .ok_or(EmitError::Unsupported("__refvalue type has no token"))?;
     out.push(Instruction::new(Opcode::Refanyval, Operand::Token(token)));
-    emit_byref_load(target, tokens, out)
+    emit_load_indirect(target, tokens, out)
 }
 
 /// Lowers `__reftype(reference)`: `refanytype` recovers the referent's type as a

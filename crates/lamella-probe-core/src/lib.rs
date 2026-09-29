@@ -1363,11 +1363,10 @@ mod tests {
 
     /// ADIv5 answers exactly one transaction after the switch, and it must be the `DPIDR` read.
     ///
-    /// The defect this pins was silent for as long as it existed: every bench tool called
-    /// `read_idcode` between `connect` and `init_mem` out of habit, so only the two probe ROUTES --
-    /// which did not -- were wrong, and they failed with `NoAck`, the same answer a board with
-    /// nothing wired to it gives. Asserting the ORDER is the only way to catch it, because both
-    /// spellings of the sequence return `Ok` against a fake that does not care.
+    /// A caller that invokes `read_idcode` between `connect` and `init_mem` hides a `connect` that
+    /// skips this read; one that goes straight to `init_mem` fails with `NoAck`, the same answer a
+    /// board with nothing wired to it gives. Asserting the ORDER is the only way to catch it,
+    /// because both spellings of the sequence return `Ok` against a fake that does not care.
     #[test]
     fn connect_reads_dpidr_first_because_the_port_answers_nothing_else() {
         #[derive(PartialEq, Debug)]

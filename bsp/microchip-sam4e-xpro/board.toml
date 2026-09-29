@@ -1,6 +1,6 @@
-# BOARD binding: the SAM4E Xplained Pro -- identity-first. No peripheral bindings yet, because the
-# SAM4E family has no generated driver; what this file states beyond identity is the board's two
-# control lines, which need no driver -- a control pin rides no alternate function.
+# BOARD binding: the SAM4E Xplained Pro. It states the board's identity, its part and its two
+# control lines, and binds no peripheral. A control pin rides no alternate function, so the LED
+# and the button need no driver.
 
 [table]
 kind = "board"

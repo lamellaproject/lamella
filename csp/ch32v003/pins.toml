@@ -1,6 +1,5 @@
-# PIN map for the CH32V003 family: pin x function -> (instance, signal), or -> nothing. PARTIAL
-# and evidence-only -- a row joins when a binding needs it, and a row naming a pin outside every
-# part's present-list is refused.
+# PIN map for the CH32V003 family: pin x function -> (instance, signal), or -> nothing. It lists
+# only the cells a board uses, and a row naming a pin outside every part's `pins` list is refused.
 #
 # THE ROW BELOW IS THE UNROUTED SHAPE, AND THIS PART IS THE PLAIN CASE FOR IT. The only pin a
 # carrier of this family places is PD6, and what it places there is a plain output -- because PD6's

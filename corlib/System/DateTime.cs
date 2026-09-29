@@ -34,7 +34,7 @@ namespace System
         {
             if (ticks < MinTicks || ticks > MaxTicks)
             {
-                throw new ArgumentOutOfRangeException("Ticks must be between DateTime.MinValue.Ticks and DateTime.MaxValue.Ticks.");
+                throw new ArgumentOutOfRangeException("ticks", "Ticks must be between DateTime.MinValue.Ticks and DateTime.MaxValue.Ticks.");
             }
             return ticks;
         }

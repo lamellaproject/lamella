@@ -10,7 +10,7 @@
 #
 # Pin lists here are COMPLETE GPIO SETS for their package, read off the ch 4 package drawings and
 # cross-checked against the GPIO counts in table 1-1 -- unlike `csp/samd21/parts.toml`, whose lists
-# are partial present-lists. A consumer must still not read a complete GPIO set as a PAD SPACE:
+# are partial. A consumer must still not read a complete GPIO set as a PAD SPACE:
 # it omits VDD, GND and any pad that is not general-purpose I/O.
 
 [table]

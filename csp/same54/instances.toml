@@ -1,4 +1,5 @@
-# INSTANCE map for the SAM E54 family -- identity-first: only the placed block copies appear.
+# INSTANCE map for the SAM E54 family. It places only the block copies a binding or a board uses,
+# so a block that is not listed is not described here, rather than absent from the part.
 #
 # THE RECORD SHAPE IS SETTLED HERE, alongside the family's first clocked peripheral, which is what
 # the bases-only version of this file said it was waiting for. Four fields beyond the base, and

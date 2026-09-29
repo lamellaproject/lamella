@@ -20,8 +20,10 @@ namespace Lamella.Hardware
 
         /// <summary>Claims the bus's pins and runs the chip's initialization sequence at
         /// <paramref name="busHz"/>. A rate outside the chip's envelope is rejected loudly.
-        /// The bus rate is bus-level state the board/driver owner configures ONCE (the
-        /// official device settings carry no frequency), before facades are created.</summary>
+        /// The bus rate is bus-level state, configured ONCE (the official device settings carry
+        /// no frequency): <see cref="Lamella.Hardware.Buses"/> does it at the rate a board bound,
+        /// before any device sees the driver, and a driver made outside the table is configured
+        /// by whoever made it.</summary>
         public abstract void Configure(int busHz);
 
         /// <summary>One write transaction: START, address+W, <paramref name="count"/> bytes

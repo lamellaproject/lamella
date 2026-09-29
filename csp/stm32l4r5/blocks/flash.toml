@@ -1,0 +1,31 @@
+# BLOCK: the STM32L4R5 embedded flash controller, stated only as far as the facts consumers outside
+# the controller need. Its unlock sequence and its command bits are not described here.
+#
+# Two facts, and each `sources` entry names the one it backs.
+#
+# THE WRITE UNIT IS A 64-BIT DOUBLE WORD AND IT IS NOT A CHOICE. The controller programs 72 bits at a
+# time -- 64 of data and 8 of ECC -- and RM0432 refuses anything narrower: a byte or half-word write
+# sets SIZERR, and a double word at an address that is not double-word aligned sets PGAERR. Software
+# that wants to write a single 32-bit word completes the double word with the erase value.
+#
+# A UNIT IS ALSO WRITE-ONCE BETWEEN ERASES, AND THE CONTROLLER ENFORCES IT. The ECC is computed over
+# the double word being programmed, and a second program of an already-programmed address sets
+# PROGERR unless the data is all zero.
+
+[table]
+kind = "block"
+family = "stm32l4r5"
+block = "flash"
+erased_value = 0xffffffff
+write_unit = 8
+sources = [
+    "erased_value: STM32L4+ Series reference manual RM0432 Rev 9 section 3.3.7 `Flash main memory programming sequences`: `If the user needs to program only one word, double word must be completed with the erase value 0xFFFF FFFF to launch automatically the programming` -- the manual naming 0xFFFFFFFF as the erase value",
+    "write_unit: RM0432 Rev 9 section 3.3.7: `The Flash memory is programmed 72 bits at a time (64 bits + 8 bits ECC)` and `It is only possible to program double word (2 x 32-bit data)`",
+    "write_unit: RM0432 Rev 9 section 3.3.7: `Any attempt to write byte or half-word will set SIZERR flag` and `Any attempt to write a double word which is not aligned with a double word address will set PGAERR flag`",
+]
+notes = [
+    "RM0432 section 3.3.7: `Programming in a previously programmed address is not allowed except if the data to write is full zero`, and an attempt sets PROGERR.",
+    "THE PAGE SIZE DEPENDS ON AN OPTION BIT, SO A FLASH WRITER READS IT RATHER THAN ASSUMING IT. RM0432 section 3.3.1: on the 2-Mbyte STM32L4Rxxx parts the DBANK option bit selects dual-bank mode, two banks of 256 pages of 4 Kbytes, or single-bank mode, 256 pages of 8 Kbytes. DBANK is bit 22 of the user option bytes, whose ST production value is 0xFFEF F8AA (section 3.4.1), so a part as shipped is in dual-bank mode with 4-Kbyte pages. The write unit above is the same in both modes.",
+    "RM0432 also offers FAST PROGRAMMING, 64 double words in one high-voltage cycle. That is a throughput mode with conditions -- the bank, or in single-bank mode the whole memory, must have been mass-erased, and HCLK must be at least 8 MHz -- so it is not the granularity a placement rule can rely on.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

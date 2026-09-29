@@ -121,7 +121,7 @@ pub(crate) fn is_ref_cell(ty: MirType) -> bool {
 /// an exception cell's is empty.
 pub(crate) fn slot_roots(ty: MirType, pinned: bool) -> impl Iterator<Item = (u32, u16)> {
     let scalar = match ty {
-        MirType::ObjectRef if pinned => Some(STACKMAP_KIND_PINNED),
+        MirType::ObjectRef | MirType::ManagedPtr if pinned => Some(STACKMAP_KIND_PINNED),
         MirType::ObjectRef => Some(STACKMAP_KIND_OBJECT_REF),
         MirType::ManagedPtr => Some(STACKMAP_KIND_MANAGED_PTR),
         MirType::PyValue => Some(STACKMAP_KIND_TAGGED),
@@ -228,12 +228,30 @@ pub(crate) fn encode_stackmap_record(
     }
 }
 
-/// The values whose slots must be emitted [`STACKMAP_KIND_PINNED`]: ObjectRefs a `RefToInt` derives
-/// a raw pointer from, in a function that `CallNative`s an anchor seam (see
-/// [`ANCHOR_SEAM_EXTERNS`]). Anywhere else a raw derived pointer cannot outlive a collection --
-/// on the cooperative tier a collection only runs inside those seams.
+/// The values whose slots must be emitted [`STACKMAP_KIND_PINNED`], because a raw pointer derived from
+/// them must stay valid across a collection:
+///
+/// * an object reference or managed pointer converted to a NATIVE INT (`ToNativeInt`), which is what
+///   a `fixed` statement does. Any allocation can collect, so the object must not move while the
+///   pointer is in use;
+/// * an ObjectRef a `RefToInt` derives a raw pointer from, in a function that `CallNative`s an anchor
+///   seam (see [`ANCHOR_SEAM_EXTERNS`]). Elsewhere a `RefToInt` feeds bitmask arithmetic, which ends
+///   before the next safepoint.
 pub(crate) fn pinned_values(func: &Function, externs: &[alloc::string::String]) -> Vec<bool> {
     let mut pinned = alloc::vec![false; func.value_types.len()];
+    for block in &func.blocks {
+        for (_, inst) in &block.insts {
+            if let Inst::Convert {
+                value,
+                kind: lamella_ir::ConvKind::ToNativeInt,
+            } = inst
+            {
+                if matches!(func.value_type(*value), Some(MirType::ObjectRef | MirType::ManagedPtr)) {
+                    pinned[value.index()] = true;
+                }
+            }
+        }
+    }
     let parks_or_allocates = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(_, i)| {
             matches!(i, Inst::CallNative { symbol, .. }

@@ -4,8 +4,8 @@
 # alias of `resets` (base + 0x3000); the SET view rides the resets block's RESET_SET offset.
 # `sio` is the single-cycle IO block (the CPU-direct GPIO drive; processor-attached, never
 # through RESETS). -1 = not applicable.
-# Rows are added evidence-first, uart1 (0x40078000), spi1 (0x40088000), i2c1
-# (0x40098000) join when a binding first needs them, verified against the RP2350 datasheet.
+# Rows are added evidence-first: spi1 (0x40088000) and i2c1 (0x40098000) join when a binding or a
+# pin-map cell first needs them, verified against the RP2350 datasheet, as uart1 did.
 
 [table]
 kind = "instances"
@@ -73,6 +73,14 @@ block = "uart"
 base = 0x40070000
 reset_bit = 26
 
+# UART1 carries a module plugged into a board's header on GP8 and GP9 (function F2). RP2350
+# datasheet 2.2 address map: UART1_BASE 0x40078000; 7.5 Table 535 (RESETS: RESET): bit 27 UART1.
+[[instances]]
+name = "uart1"
+block = "uart"
+base = 0x40078000
+reset_bit = 27
+
 [[instances]]
 name = "spi0"
 block = "spi"
@@ -90,3 +98,29 @@ name = "adc"
 block = "adc"
 base = 0x400a0000
 reset_bit = 0
+
+[[instances]]
+name = "timer0"
+block = "timer"
+base = 0x400b0000
+reset_bit = 23
+
+[[instances]]
+name = "ticks"
+block = "ticks"
+base = 0x40108000
+reset_bit = -1
+
+[[instances]]
+name = "trng"
+block = "trng"
+base = 0x400f0000
+reset_bit = 25
+
+# The PWM block's registers start at 0x400a8000 (datasheet 12.5.3); RESETS bit 16 releases it
+# (Table 535).
+[[instances]]
+name = "pwm"
+block = "pwm"
+base = 0x400a8000
+reset_bit = 16

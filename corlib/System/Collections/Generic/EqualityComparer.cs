@@ -42,15 +42,7 @@ namespace System.Collections.Generic
     {
         public override bool Equals(T x, T y)
         {
-            if ((object)x != null)
-            {
-                if ((object)y != null)
-                {
-                    return x.Equals(y);
-                }
-                return false;
-            }
-            return (object)y == null;
+            return DefaultEquality<T>.AreEqual(x, y);
         }
 
         public override int GetHashCode(T obj)

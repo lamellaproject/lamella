@@ -1,0 +1,7 @@
+# The toolchain this crate is built and tested on, with the three targets
+# its battery builds for: the Cortex-M0+ of the RP2040 (the Pico W), the
+# Cortex-M7 of the STM32H747 (the GIGA R1 WiFi and the Portenta H7) and the
+# Cortex-M33 of the RP2350 (the Pico 2 W and the Pico Plus 2 W).
+[toolchain]
+channel = "1.96.0"
+targets = ["thumbv6m-none-eabi", "thumbv7em-none-eabihf", "thumbv8m.main-none-eabihf"]

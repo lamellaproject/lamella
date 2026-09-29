@@ -113,8 +113,8 @@ mod tests {
     ///
     /// REPORTED AND NOT RATCHETED, deliberately. A row states an identity when a probe has READ one
     /// from that part -- not when a sibling in the same family answered, and not when a core class
-    /// makes a value predictable. So the count moves with bench work rather than with edits here,
-    /// and a ratchet over it would be a ratchet over how much silicon somebody reached this month.
+    /// makes a value predictable. So the count moves as probes read more parts rather than with
+    /// edits here, and a ratchet over it would gate on hardware access rather than on the code.
     /// `cargo test -p lamella-catalog -- --nocapture` shows it.
     #[test]
     fn the_identity_coverage_is_reported() {

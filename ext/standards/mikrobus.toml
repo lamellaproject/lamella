@@ -1,0 +1,134 @@
+# The mikroBUS SOCKET: a pair of 1x8 female headers, 0.1 inch pitch, with a fixed meaning per
+# position -- the SPI, UART and I2C groups, five single lines (PWM, interrupt, analog input, reset
+# and chip select), and two power groups. This file is the JOIN VOCABULARY between an add-on board
+# and whatever carries the socket, the way xplained-pro.toml is for that connector.
+#
+# THE NAMES ARE THE SOCKET'S, AND THE SOCKET IS THE HOST. The standard marks a socket and a board
+# differently on purpose: its UART markings are criss-crossed, so the position a socket prints TX is
+# the one an add-on board prints RX, because a receiver is matched to a transmitter. So `tx` below is
+# the line the HOST transmits on, and `miso` the line the host receives SPI data on, whatever an
+# add-on board's own silkscreen calls the same pin. A board file that copied its pin names off an
+# add-on board's silkscreen would join its transmit line to the host's.
+#
+# THE STANDARD NUMBERS NO PIN, SO `number` HERE IS ITS OWN LISTING ORDER. The pinout page draws the
+# socket as two 1x8 headers and lists the left one top to bottom -- AN, RST, CS, SCK, MISO, MOSI,
+# +3.3V, GND -- then the right one top to bottom -- PWM, INT, RX, TX, SCL, SDA, +5V, GND. The numbers
+# 1 to 16 are that order, so each position can be found on the page. They are not printed on any
+# socket, and a document that numbers the pins some other way is not contradicting this file.
+#
+# A SOCKET IS NUMBERED WHEN A BOARD CARRIES MORE THAN ONE. The standard's silkscreen rules ask for a
+# socket number only then, and number sockets from 1. That number names a socket on its board; it is
+# the board's fact, not a position here.
+
+[table]
+kind = "header-standard"
+standard = "mikrobus"
+sources = [
+    "mikroBUS standard specifications v2.00 (MikroElektronika), page 6 (mikroBUS socket standard, Pinout specification): the socket comprises a pair of 1x8 female headers with a proprietary pin configuration and silkscreen markings, always laid out in the same order -- three groups of communication pins (SPI, UART and I2C), six additional pins (PWM, Interrupt, Analog input, Reset and Chip select), and two power groups, +3.3V and GND on the left 1x8 header and 5V and GND on the right. Its pinout figure lists the left header AN, RST, CS, SCK, MISO, MOSI, +3.3V, GND and the right header PWM, INT, RX, TX, SCL, SDA, +5V, GND, each top to bottom, with the name and function of each position.",
+    "The same document, page 7 (Silkscreen markings): the full socket markings include the pin names corresponding to the mikroBUS standard, a line enclosing the socket, a diagonal notch below the right-hand pinout that guides an add-on board's insertion, and a socket number, 'necessary only when multiple sockets are on the same board'. Page 9 (Placement requirements) numbers in-line sockets 1, 2 and onward, and asks that multiple sockets in two rows be enumerated in clockwise direction.",
+    "The same document, page 11 (mikroBUS add-on board standard, Pinout specification): the UART markings are criss-crossed because receivers are matched to transmitters, and the SPI markings are abbreviated -- the socket's RX, TX, MISO and MOSI are shown against the board's TX, RX, SDO and SDI. Page 8 adds that a socket whose pin names are printed vertically turns MOSI into SDO and MISO into SDI.",
+]
+notes = [
+    "The two power positions carry two different supplies, and an add-on board may use either or both. Which of them a given board draws on, and how much, is that board's fact, and no row here joins it to the carrier's regulators.",
+    "The two ground positions are one net. The second name exists because a row is keyed by signal and two rows may not share one.",
+]
+
+# --- the left header, top to bottom --------------------------------------------------------------
+
+[[pins]]
+number = 1
+signal = "an"
+routable = true
+description = "Analog input to the host."
+
+[[pins]]
+number = 2
+signal = "rst"
+routable = true
+description = "Reset, driven by the host."
+
+[[pins]]
+number = 3
+signal = "cs"
+routable = true
+description = "SPI chip select, driven by the host."
+
+[[pins]]
+number = 4
+signal = "sck"
+routable = true
+description = "SPI clock, driven by the host."
+
+[[pins]]
+number = 5
+signal = "miso"
+routable = true
+description = "SPI master input, slave output: the line the host receives SPI data on. An add-on board marks this pin SDO, its own output; a socket printed vertically marks it SDI."
+
+[[pins]]
+number = 6
+signal = "mosi"
+routable = true
+description = "SPI master output, slave input: the line the host sends SPI data on. An add-on board marks this pin SDI, its own input; a socket printed vertically marks it SDO."
+
+[[pins]]
+number = 7
+signal = "3v3"
+routable = false
+description = "The 3.3 V supply to the add-on board."
+
+[[pins]]
+number = 8
+signal = "gnd"
+routable = false
+description = "Ground."
+
+# --- the right header, top to bottom -------------------------------------------------------------
+
+[[pins]]
+number = 9
+signal = "pwm"
+routable = true
+description = "PWM output from the host."
+
+[[pins]]
+number = 10
+signal = "int"
+routable = true
+description = "Hardware interrupt, an input to the host."
+
+[[pins]]
+number = 11
+signal = "rx"
+routable = true
+description = "UART receive: the line the host receives on. An add-on board marks this pin TX, because its transmitter drives it."
+
+[[pins]]
+number = 12
+signal = "tx"
+routable = true
+description = "UART transmit: the line the host transmits on. An add-on board marks this pin RX, because its receiver listens on it."
+
+[[pins]]
+number = 13
+signal = "scl"
+routable = true
+description = "I2C clock."
+
+[[pins]]
+number = 14
+signal = "sda"
+routable = true
+description = "I2C data."
+
+[[pins]]
+number = 15
+signal = "5v"
+routable = false
+description = "The 5 V supply to the add-on board."
+
+[[pins]]
+number = 16
+signal = "gnd2"
+routable = false
+description = "Ground. The socket carries two ground positions and they are one net."

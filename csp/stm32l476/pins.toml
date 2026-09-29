@@ -1,5 +1,6 @@
 # PIN map: pin x function -> (instance, signal) for the STM32L476.
-# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers
+# It lists only the cells a binding uses, not the datasheet's whole table.
+# Function ids are the ST alternate-function numbers
 # (AF0..AF15) the AFRL/AFRH nibbles select.
 
 [table]

@@ -1,6 +1,6 @@
-# The SAM3X parts table. Pin lists are PARTIAL present-lists: they carry the pins boards
-# bind today, so a consumer must not read one as the package. Validation covers every current
-# binding, and a pin-map row naming a pin outside every present-list is refused rather than assumed.
+# The SAM3X parts table. Its `pins` lists are partial: each names the pins checked against the
+# datasheet's pinout, not the whole package, so a consumer must not read one as the package. A pin
+# that is not listed is refused rather than assumed.
 
 [table]
 kind = "parts"
@@ -15,4 +15,4 @@ package = "144-pin"
 flash = 0x80000
 ram = 0x18000
 pins = ["PA8-PA9"]
-source = "Atmel-11057 Table 1-1: SAM3X8E = LQFP144, 512 KB flash (2 x 256 KB planes), 96 KB SRAM, 103 PIOs; CHIPID_CIDR 0x285E0A60 -- PARTIAL pin list: PA8/PA9 are the UART pins; complete from ch 4 before further bindings"
+source = "Atmel-11057 Table 1-1: SAM3X8E = LQFP144, 512 KB flash (2 x 256 KB planes), 96 KB SRAM, 103 PIOs; CHIPID_CIDR 0x285E0A60 -- a partial pin list: PA8/PA9 are the UART pins"

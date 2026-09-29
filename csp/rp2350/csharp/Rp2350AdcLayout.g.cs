@@ -96,39 +96,7 @@ namespace Lamella.Generated
         public const uint ConversionClkAdcCycles = 96;
         public const uint ClkAdcHz = 48000000;
 
-        // -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the
-        // GPIO index a pin-fed channel taps (the inverse, so no driver carries a pin
-        // literal); ChannelCount = how many rows the map has; IsChannel = whether an
-        // index is one of them --
-        public const int Channel_GPIO26 = 0;
-        public const int Channel_GPIO27 = 1;
-        public const int Channel_GPIO28 = 2;
-        public const int Channel_GPIO29 = 3;
-        public const int Channel_TemperatureSensor = 4;
-        public const int Channel0_Pin = 26;
-        public const int Channel1_Pin = 27;
-        public const int Channel2_Pin = 28;
-        public const int Channel3_Pin = 29;
-        public const int ChannelCount = 5;
-
-        /// <summary>Whether <paramref name="channel"/> is the index of a row in the
-        /// channel map above. The indexes need not run without gaps, so ChannelCount alone
-        /// does not answer this.</summary>
-        public static bool IsChannel(int channel)
-        {
-            switch (channel)
-            {
-                case 0: return true;
-                case 1: return true;
-                case 2: return true;
-                case 3: return true;
-                case 4: return true;
-            }
-            return false;
-        }
-
         // -- calibration 'temperature_sensor' (form: vbe-linear); integer coefficients, no hardcoding downstream --
-        public const uint TemperatureSensor_Channel = 4;
         public const uint TemperatureSensor_T0Millicelsius = 27000;
         public const uint TemperatureSensor_VbeAtT0Microvolts = 706000;
         public const int TemperatureSensor_SlopeMicrovoltsPerCelsius = -1721;

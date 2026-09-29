@@ -14,6 +14,7 @@ pub mod deconstruct;
 pub mod diagnostic;
 pub mod flow;
 mod infer;
+mod integral_constant;
 pub mod program;
 pub mod reference;
 pub mod resolve;
