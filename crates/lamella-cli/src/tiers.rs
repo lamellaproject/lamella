@@ -138,13 +138,13 @@ fn no_archive_refusal(aot_target: &str, triple: &str, looked: &[PathBuf]) -> Str
         "no runtime support archive for {aot_target} ({triple}).\n\n\
          The class-library tier links your program against this archive, so it cannot be built \
          without one.\nLooked in:\n{}\n\n\
-         Name one with {ARCHIVE_ENV}, or build this target without {}.",
+         Name one with {ARCHIVE_ENV}, or build this target with {} for the flat tier.",
         looked
             .iter()
             .map(|path| format!("    {}", path.display()))
             .collect::<Vec<_>>()
             .join("\n"),
-        crate::flash::CLASS_LIBRARY_FLAG
+        crate::flash::FLAT_FLAG
     )
 }
 
@@ -327,8 +327,8 @@ mod tests {
             "and lists a place it looked, as a path: {error}"
         );
         assert!(
-            error.contains(crate::flash::CLASS_LIBRARY_FLAG),
-            "and the flag: {error}"
+            error.contains(crate::flash::FLAT_FLAG),
+            "and the option that builds without it: {error}"
         );
     }
 

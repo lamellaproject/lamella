@@ -54,12 +54,14 @@ done
 # directory must not also be listed here on its own, or the same type lands in two assemblies and a
 # reference resolves it from whichever is found first.
 assemblies=(
-    "Lamella.Hardware|"
-    "System.Device.Gpio||System.Device.Pwm"
-    "System.Device.Model|"
-    # Its own assembly rather than folded, unlike System.Device.Pwm above. See build-managed.ps1's
+    # Its own assembly rather than folded, unlike System.Device.Pwm below. See build-managed.ps1's
     # entry for the upstream measurement the distinction rests on. References only corlib.
     "System.Device.Analog|"
+    # It references System.Device.Analog and not the other way round: the analog controller it offers
+    # over the ADC seam is a System.Device.Analog.AnalogController.
+    "Lamella.Hardware|System.Device.Analog"
+    "System.Device.Gpio||System.Device.Pwm"
+    "System.Device.Model|"
     "System.Net.NetworkInformation|"
     # Bare, unprefixed: full .NET's own assembly name for full .NET's types. See build-managed.ps1's
     # entry for the three-way argument. References only corlib.

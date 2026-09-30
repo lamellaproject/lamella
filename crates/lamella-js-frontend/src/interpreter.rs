@@ -823,7 +823,7 @@ pub type NativeFn = fn(&mut Interpreter, JsValue, &[JsValue]) -> Completion;
 /// The seed a realm starts with when the embedder installs none.
 ///
 /// ITS VALUE IS ARBITRARY AND ITS FIXEDNESS IS NOT. Any constant makes an unseeded realm repeat
-/// itself across boots, which is the deviation `published_list` records; a constant that looked
+/// itself across boots, which `Interpreter::set_host_entropy` removes; a constant that looked
 /// meaningful would invite a reader to think it was chosen for a property it does not have.
 const DEFAULT_ENTROPY_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 

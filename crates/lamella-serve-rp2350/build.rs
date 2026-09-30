@@ -58,10 +58,13 @@ fn main() {
             text.replace("@LAMELLA_FLASH_LENGTH@", &format!("{length:#x}")),
         )
         .unwrap_or_else(|e| panic!("cannot write {}: {e}", script.display()));
-        // The examples are the bring-up proofs: bare-metal images like the firmware, so they take
-        // the same memory map.
+        // Every bare-metal image this package links takes this memory map: the firmware binaries,
+        // and the examples when the package has an `examples/` directory. Cargo refuses an examples
+        // instruction from a package with no example target, so it is emitted only then.
         println!("cargo:rustc-link-arg-bins=-T{}", script.display());
-        println!("cargo:rustc-link-arg-examples=-T{}", script.display());
+        if std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").is_dir() {
+            println!("cargo:rustc-link-arg-examples=-T{}", script.display());
+        }
     }
     // A `resident-corlib` build embeds a corlib through include_bytes!(env!("LAMELLA_CORLIB_IMAGE")).
     // The `rp2350` part feature builds the full runtime, so the default is the every-feature corlib.

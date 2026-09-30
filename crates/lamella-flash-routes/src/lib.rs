@@ -1150,12 +1150,16 @@ pub fn prepare_image(
     let artifact = crate::artifact::read(path)?;
     check_base(&artifact, placement)?;
     check_rp2350_stamp(&artifact.bytes, row.aot_target)?;
-    refuse_unless_it_fits(
-        row.board,
-        &artifact,
-        placement,
-        extension.as_deref() == Some("elf"),
-    )?;
+    refuse_unless_it_fits(row.board, &artifact.bytes, placement).map_err(|mut message| {
+        if extension.as_deref() == Some("elf") {
+            message.push_str(
+                "\nA linked ELF is written from its lowest loadable address to its highest, so a \
+                 segment placed outside\nflash -- initialized data given a load address in RAM, \
+                 most often -- stretches the image across the gap.",
+            );
+        }
+        message
+    })?;
     let read = format!("{} B of {}", artifact.bytes.len(), artifact.format);
     Ok(match wrap_for_route(route, &artifact.bytes) {
         Some((bytes, line)) => Prepared { bytes, read, wrapped: Some(line) },
@@ -1185,18 +1189,24 @@ pub fn wrap_for_route(route: Programmer, image: &[u8]) -> Option<(Vec<u8>, Strin
 }
 
 /// Refuse a flat image larger than the flash `board`'s facts state, less any bootloader
-/// `placement` keeps in front of it. A board that states no flash size is not refused, because
-/// there is nothing to compare against.
+/// `placement` keeps in front of it, naming both sizes. A board that states no flash size is not
+/// refused, because there is nothing to compare against.
 ///
-fn refuse_unless_it_fits(
+/// **EVERY VERB THAT PRODUCES OR WRITES AN IMAGE FOR A BOARD ASKS THIS**, so an image `build`
+/// writes to a file, `deploy` writes to a chip and `flash` writes from a file fits or does not by
+/// one rule.
+///
+/// # Errors
+/// An image that does not fit, or a board the catalog does not know.
+///
+pub fn refuse_unless_it_fits(
     board: &str,
-    artifact: &crate::artifact::Artifact,
+    image: &[u8],
     placement: &placement::Placement,
-    from_elf: bool,
 ) -> Result<(), String> {
     let (table, part) = catalog::resolve(board)?;
     let kept = usize::try_from(placement.kept_bytes()).unwrap_or(usize::MAX);
-    let length = i64::try_from(artifact.bytes.len().saturating_add(kept)).unwrap_or(i64::MAX);
+    let length = i64::try_from(image.len().saturating_add(kept)).unwrap_or(i64::MAX);
     let verdict = lamella_bsp_gen::fit::fit(&table, &part, length);
     let lamella_bsp_gen::fit::Fit::Exceeds { over } = verdict.flash_fit else {
         return Ok(());
@@ -1206,25 +1216,17 @@ fn refuse_unless_it_fits(
         lamella_bsp_gen::fit::BudgetSource::Part => format!("part {}", verdict.part),
     };
     let base = placement.base();
-    let end = u64::from(base).saturating_add(u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX));
+    let end = u64::from(base).saturating_add(u64::try_from(image.len()).unwrap_or(u64::MAX));
     let kept_by = match placement.kept() {
         Some(bootloader) => format!(", {} B of it kept for the {}", bootloader.size, bootloader.name),
         None => String::new(),
     };
-    let mut message = format!(
+    Err(format!(
         "this image is {} B, from {base:#010x} to {end:#010x}, and {board} has {} B of flash \
          ({source}){kept_by} -- {over} B too many.",
-        artifact.bytes.len(),
+        image.len(),
         verdict.flash.bytes
-    );
-    if from_elf {
-        message.push_str(
-            "\nA linked ELF is written from its lowest loadable address to its highest, so a segment \
-             placed outside\nflash -- initialized data given a load address in RAM, most often -- \
-             stretches the image across the gap.",
-        );
-    }
-    Err(message)
+    ))
 }
 /// Write `image` through `programmer`, at the address `placement` gives, with no restriction on
 /// which part.

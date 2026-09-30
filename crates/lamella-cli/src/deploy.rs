@@ -62,7 +62,12 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
         verb: "deploy",
         usage: Some(USAGE),
         values: &["--target", "--board", "--probe", "--volume", "--device", "--via"],
-        flags: &["--no-run", "--unsafe", crate::flash::CLASS_LIBRARY_FLAG],
+        flags: &[
+            "--no-run",
+            "--unsafe",
+            crate::flash::CLASS_LIBRARY_FLAG,
+            crate::flash::FLAT_FLAG,
+        ],
     };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
@@ -87,14 +92,23 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let tier = crate::flash::Tier::from_options(&parsed);
-    if tier == crate::flash::Tier::ClassLibrary && parsed.value("--target").is_some() {
+    let tier = match crate::flash::Tier::from_options(&parsed, "deploy") {
+        Ok(tier) => tier,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(flag) = crate::flash::Tier::typed(&parsed)
+        && parsed.value("--target").is_some()
+    {
         eprintln!(
             "{}",
             crate::flash::tier_flag_where_nothing_links(
                 "deploy",
-                "--target hands the program to firmware that is already running, which resolves \
-                 what it needs\non the board itself.",
+                flag,
+                "--target sends firmware that is already running an image baked with the corlib \
+                 the program\nwas compiled against, and nothing is linked on the way.",
                 "Use --board <id> to compile and write the chip, which is the route that links.",
                 "Nothing was sent.",
             )
@@ -187,7 +201,7 @@ const USAGE: &str = "\
 usage: lamella deploy <file.cs|file.csproj> --target <t> [--no-run]    into firmware on the board
        lamella deploy <file.cs|file.csproj> --board <id> [--via probe|volume]   onto the bare chip
                                [--probe <serial>] [--volume <name>] [--device <serial>]
-                               [--class-library]
+                               [--nostdlib]
 
 --target is a live connection (what `lamella devices` prints); --board is a board model (what
 `lamella boards` lists). The first keeps the board's firmware and takes about a second; the second
@@ -205,17 +219,21 @@ A .csproj builds every .cs beside it as ONE program and links the assemblies its
 elements name, each by a <HintPath>. Nothing is available to a build that its project does not
 name. A single .cs file names no references and binds against the class library alone.
 
---class-library links the program with the class library and the runtime support archive, so it may
+--target sends an image baked with the corlib the program was compiled against, so the program may
+call into System.* as it does under `lamella run`. A call into another library is refused by name,
+because the image carries no library but the corlib.
+
+--board links the program with the class library and the runtime support archive, so it may
 allocate, use floating point and call into System.*. That tier's collector reclaims an object
-without finalizing it, so a finalizer (a class's ~destructor) never runs there. Without it the flat
-tier is used, which is linker-free and resolves no call outside the program. Every build says which
-tier produced it. The class-library tier covers fewer boards; asking for it where there is no plan
-names the ones there are.
+without finalizing it, so a finalizer (a class's ~destructor) never runs there. It covers fewer
+boards than the flat tier, and a board it has no plan for is refused, naming the ones there are.
+--nostdlib builds the flat tier instead, which is linker-free and resolves no call outside the
+program. Every build says which tier produced it.
 
 A class-library image is compiled as a debug build is, with the debug information set aside, so
-`lamella build <file> --board <id> --class-library --format elf` for the same program describes
-exactly the image deployed, and a debugger can attach to the board with it. The flat tier is
-compiled without debug information.
+`lamella build <file> --board <id> --format elf` for the same program describes exactly the image
+deployed, and a debugger can attach to the board with it. The flat tier is compiled without debug
+information.
 ";
 
 /// Send a payload that is ALREADY built to firmware running at `target`.

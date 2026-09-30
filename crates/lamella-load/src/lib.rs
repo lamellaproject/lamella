@@ -1534,6 +1534,22 @@ pub fn load_program_lazy_corlib<'c, 'p>(
     corlib: &SourceAssembly<'c>,
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LazyLoadError> {
+    let mut loaded = load_program_lazy_corlib_unfrozen(corlib, program)?;
+    loaded.module.freeze();
+    Ok(loaded)
+}
+
+/// [`load_program_lazy_corlib`] WITHOUT the final freeze -- the lazy tier's bake entry, as
+/// [`load_unfrozen`] is the single-assembly one: the reachability trim must scrub the still-mutable
+/// builders, and [`Module::write_baked`] freezes afterwards. A module this returns is NOT ready to
+/// run.
+///
+/// # Errors
+/// As [`load_program_lazy_corlib`].
+pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
+    corlib: &SourceAssembly<'c>,
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LazyLoadError> {
     if program.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint.into());
     }
@@ -1628,7 +1644,6 @@ pub fn load_program_lazy_corlib<'c, 'p>(
     if let Some(name) = first_unresolved_call(&module, program, LAZY_PROGRAM_ASM, corlib) {
         return Err(LazyLoadError::UnresolvedMember(name));
     }
-    module.freeze();
     Ok(Program { module, entry })
 }
 

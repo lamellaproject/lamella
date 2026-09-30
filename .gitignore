@@ -1,6 +1,11 @@
 # Build output
 /target/
 
+/tools/**/target/
+
+/managed/
+
+
 # Reference specifications
 /reference/*.pdf
 /reference/*.txt

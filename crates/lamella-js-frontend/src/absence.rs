@@ -1,21 +1,30 @@
 //! What this profile does not implement, as a closed set rather than a habit.
 
-use crate::{format, String};
-
 /// A feature this profile does not implement at RUN time.
 ///
-/// Every variant is a DELIBERATE gap with a reason, not a to-do. The order here is the order the
-/// published list uses, grouped by what a reader would look for.
+/// A program that reaches one is refused with an `InternalError` whose message is
+/// [`Absence::message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Absence {
+    /// `await`, which suspends an async function until a promise settles.
     Await,
+
+    /// `eval(...)`, which compiles source in the caller's scope.
+    ///
+    /// Present only in a build with the `eval` feature, which links the parser.
     Eval,
+    /// `new Function(...)`, which compiles source in the global scope.
     FunctionConstructor,
+
+    /// `"a".normalize()`.
+    ///
+    /// Its Unicode data costs more flash than one string method justifies, and returning the string
+    /// unchanged would be wrong for the very inputs a program normalizes.
     StringNormalize,
 }
 
 impl Absence {
-    /// The stable identifier the published list uses. Never a sentence, so it can be searched for.
+    /// The stable identifier for this absence. Never a sentence, so it can be searched for.
     #[must_use]
     pub fn id(self) -> &'static str {
         match self {
@@ -41,11 +50,8 @@ impl Absence {
 
     /// The cargo feature that FILLS this gap, for the gaps a build can choose to fill.
     ///
-    /// THIS IS DELIBERATELY NOT `cfg`-AWARE. It answers "is this entry knob-controlled at all",
-    /// which is a property of the engine and the same in every build -- so the published absence
-    /// list beside this crate is ONE document rather than one per feature combination, and a reader
-    /// building the engine themselves can see which entries they are able to make go away.
-    /// [`Absence::refusable`] is the half that knows about the build you are running.
+    /// The answer is the same in every build; [`Absence::refusable`] answers for the build you are
+    /// running.
     #[must_use]
     pub fn knob(self) -> Option<&'static str> {
         match self {
@@ -56,12 +62,8 @@ impl Absence {
 
     /// Whether this gap exists in **the binary you are running**.
     ///
-    /// A TEST THAT DEMANDS A REFUSAL MUST ASK THIS FIRST. "Every listed absence actually
-    /// refuses" stopped being true the day a feature could fill one, and the failure looked like
-    /// three unrelated broken tests rather than like a list that had become configuration-dependent.
-    ///
-    /// The default for a new variant is `true`, which is the safe direction: a gap nobody has
-    /// wired a knob to is a gap in every build.
+    /// It is `false` only where a feature enabled in this build fills the gap, so a caller that
+    /// expects a refusal asks this first.
     #[must_use]
     pub fn refusable(self) -> bool {
         match self {
@@ -70,12 +72,9 @@ impl Absence {
         }
     }
 
-    /// Every absence, in published order. The generator walks this; nothing greps.
+    /// Every absence, whatever features this build has.
     ///
-    /// THIS STAYS THE COMPLETE SET OF VARIANTS AND IS NEVER FILTERED BY BUILD. It is what the
-    /// count assertion in `the_published_absences` checks against the enum, and a `cfg`-shortened
-    /// array would weaken the one guard standing between a new variant and a list that omits it.
-    /// Filter with [`Absence::refusable`] at the point of use instead.
+    /// Filter with [`Absence::refusable`] for the gaps in the binary you are running.
     #[must_use]
     pub fn all() -> &'static [Absence] {
         &[
@@ -88,40 +87,12 @@ impl Absence {
 }
 
 /// A feature this profile does not implement at PARSE time, refused with a diagnostic.
-///
-/// These are a different mechanism from [`Absence`] and belong on the same published list: a
-/// reader asking "what does this engine not do?" does not care which phase said no. Keeping them in
-/// two places is how one of them goes stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxAbsence {
     Class(&'static str),
     /// A `yield` in a position the state-machine transform cannot cut the body at.
     ///
-    /// **SUSPENSION IS PRESENT.** `function* g() { a; yield x; b; }` is rewritten into a state
-    /// machine and runs one step per `next()`, and the generator object, its protocol and all four
-    /// states behave as the standard says. So do `while`, `do`, `for`, `if`, `break`, `continue`,
-    /// `for`-`of`, `try`/`catch`, and `try`/`finally` -- including a finalizer that itself suspends,
-    /// and one run because the consumer called `return()` -- and a `yield` standing as the value of an
-    /// assignment, a declarator or a `return`.
-    ///
-    /// **A `yield*` RUNS IN THOSE SAME FOUR POSITIONS.** It delegates to the inner iterator as
-    /// 15.5.5 specifies: `throw()` and `return()` are handed to the delegate's own methods rather
-    /// than acted on in the outer body, a delegate with no `throw` method is closed before the
-    /// protocol violation is reported, a delegate may decline to finish, and the result object the
-    /// delegate answers is forwarded to the consumer unchanged rather than rebuilt.
-    ///
-    /// **AND A SUSPENSION NESTED INSIDE A LARGER EXPRESSION RUNS.** `f(yield x)`, `a + (yield b)`,
-    /// `yield yield 1`, `yield [...yield]` and `{ [yield k]: v }` are linearized: the operands
-    /// evaluated before the suspension are parked in frame slots and the expression is rebuilt from
-    /// them afterwards, so `a` in `a + (yield b)` keeps the value it had when it was read.
-    ///
-    /// Each is refused where it is written rather than mis-executed, and by the transform itself:
-    /// a shape is supported exactly when the transform rewrites it, so this list cannot drift from
-    /// what the engine does.
-    ///
-    /// A refusal names the ONE position it found, in these same words. Naming every position at
-    /// once told a user nothing about which one they had written, and left the compiler unable to
-    /// count them.
+    /// [`SyntaxAbsence::reason`] lists those positions, and a refusal names the one it found.
     Yield,
     AsyncFunctions,
     BigIntLiterals,
@@ -196,79 +167,11 @@ impl SyntaxAbsence {
     }
 }
 
-/// The published absence list, generated from the same types the engine refuses with.
-///
-/// **A HAND-WRITTEN LIST IS A CLAIM, AND A CLAIM ABOUT WHAT AN ENGINE DOES NOT DO GOES STALE THE
-/// FIRST TIME SOMEBODY IMPLEMENTS AN ENTRY AND FORGETS.** This walks [`Absence`] and
-/// [`SyntaxAbsence`] -- the very types a refusal must go through -- so the list cannot disagree with
-/// the code. The profile's own exclusions are named here too but generated by the harness, because
-/// they are selection rules rather than engine behaviour, and a reader asking "what does this engine
-/// not do?" should not have to know which mechanism said no.
-#[must_use]
-pub fn published_list() -> String {
-    let mut out = String::new();
-    out.push_str("# What this ECMAScript profile does not implement\n\n");
-    out.push_str(
-        "GENERATED by `cargo run --example publish-absences`. Do not edit: a test regenerates this\n\
-         and compares, so an edit here fails the gate rather than misinforming a reader.\n\n\
-         The rule this list exists to keep honest: **a feature is either absent AND LISTED, or it is\n\
-         correct.** There is no third category. Anything not named here and not working is a defect,\n\
-         not a gap -- which is the whole point of writing it down.\n\n",
-    );
-
-    out.push_str("## Refused when the program RUNS\n\n");
-    out.push_str(
-        "Each throws an error whose kind no `negative.type` in Test262 names, so a run stopped by\n\
-         one is attributable and can never be scored as a pass.\n\n\
-         An entry marked **build knob** is absent in the DEFAULT build and present in one built\n\
-         with the named cargo feature. This document describes the default; it is generated the\n\
-         same way whichever features are on, so it never quietly changes underneath a reader.\n\n",
-    );
-    for absence in Absence::all() {
-        match absence.knob() {
-            None => out.push_str(&format!("- `{}` -- {}\n", absence.id(), absence.message())),
-            Some(knob) => out.push_str(&format!(
-                "- `{}` -- {} **(build knob: `--features {}` fills this gap.)**\n",
-                absence.id(),
-                absence.message(),
-                knob
-            )),
-        }
-    }
-
-    out.push_str("\n## Refused when the program is PARSED\n\n");
-    out.push_str(
-        "Each is reported as a `NotInProfile` diagnostic that CONSUMES its construct, so one\n\
-         absence produces one message rather than a trail of unrelated complaints.\n\n",
-    );
-    for absence in SyntaxAbsence::all() {
-        out.push_str(&format!("- `{}` -- {}\n", absence.id(), absence.reason()));
-    }
-
-    out.push_str("\n## Refused when a REGULAR EXPRESSION is compiled\n\n");
-    for absent in lamella_regexp::js::ErrorKind::absences() {
-        out.push_str(&format!("- `{}` -- {}\n", absent.id, absent.reason));
-    }
-
-    out.push_str("\n## Excluded from the corpus before a test is RUN\n\n");
-
-    out.push_str("\n## DEVIATIONS: answered, but not the way the standard says\n\n");
-
-    out.push_str("## What is NOT on this list, on purpose\n\n");
-    out.push_str(
-        "An engine INVARIANT -- a condition meaning this engine is broken -- is not an absence and\n\
-         is thrown under a different kind. Five of them were being reported as absences before this\n\
-         list existed, which would have published our own defect as a gap we had chosen.\n",
-    );
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// THE IDS ARE SEARCH KEYS AND MUST BE UNIQUE, or the published list has two rows a reader
-    /// cannot tell apart and a grep for one finds the other.
+    /// THE IDS ARE SEARCH KEYS AND MUST BE UNIQUE, or a search for one finds another.
     #[test]
     fn every_absence_has_a_distinct_searchable_id() {
         let mut ids: Vec<&str> = Absence::all().iter().map(|a| a.id()).collect();
@@ -289,12 +192,10 @@ mod tests {
     /// THE TWO HALVES OF A KNOB ARE SEPARATE `match`ES AND NOTHING MAKES THEM AGREE.
     /// `cfg!` needs a literal feature name, so [`Absence::refusable`] cannot be derived from
     /// [`Absence::knob`]; they can only be checked against each other. An absence with no knob must
-    /// be refusable in every build -- if one is not, somebody added a `cfg` arm and did not name
-    /// the feature, and the published list is silently describing a build nobody asked for.
+    /// be refusable in every build.
     ///
     /// This has teeth only where a feature is ON: in the default build every `refusable()` is
-    /// true and the assertion is vacuous, which is exactly the shape that fails both ways. The
-    /// `--features eval` suite is therefore part of the gate, not an extra.
+    /// true and the assertion is vacuous.
     #[test]
     fn a_knob_is_named_wherever_it_is_honored() {
         for absence in Absence::all() {

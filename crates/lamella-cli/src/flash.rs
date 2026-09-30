@@ -521,6 +521,10 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
+    if let Err(refusal) = image_fits("deploy", board_id, &image, &placement) {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
     let selector = match selector_for(chosen, probe, volume, device) {
         Ok(selector) => selector,
         Err(error) => {
@@ -586,7 +590,30 @@ pub fn image_for_board(
     } else {
         build_image(path, source, aot_target, unsafe_code, tier, libraries, "build")?
     };
+    refuse_unless_it_fits("build", board_id, &image)?;
     Ok((image, row.programmer.flash_base()))
+}
+
+/// Refuse `image` for `board_id` when it is larger than the board's flash, naming both sizes --
+/// asked of a build before its file is written, as `lamella flash` asks it of a file before any
+/// write.
+///
+/// **THE SIZE IS THE BOARD'S, READ BY THE ONE RULE `flash` READS IT BY**, through the route the
+/// board is written by when nothing chooses another, so a bootloader that route keeps is counted
+/// against the image as it would be at the write.
+///
+/// # Errors
+/// An image that does not fit, or a board with no route to place it by.
+pub fn refuse_unless_it_fits(verb: &str, board_id: &str, image: &[u8]) -> Result<(), String> {
+    let row = programmer_for(board_id)?;
+    let placement = placement_for(row, row.programmer, BootloaderChoice::Keep)?;
+    image_fits(verb, board_id, image, &placement)
+}
+
+/// [`refuse_unless_it_fits`] for an image placed by `placement`, worded for `verb`.
+fn image_fits(verb: &str, board_id: &str, image: &[u8], placement: &Placement) -> Result<(), String> {
+    lamella_flash_routes::refuse_unless_it_fits(board_id, image, placement)
+        .map_err(|why| format!("lamella {verb}: {why}\n\nNothing was written."))
 }
 
 /// The ahead-of-time target `build` compiles for `board_id`, or the refusal worded for `build`.
@@ -743,42 +770,74 @@ fn generators_in_this_build() -> String {
     }
 }
 
-/// Which ahead-of-time tier a build asks for.
+/// Which ahead-of-time tier a build uses.
 ///
-/// **THE TIER IS ASKED FOR, NEVER INFERRED, AND NEVER FALLEN BACK FROM.** The two tiers differ in
-/// what a program may contain and in how much flash the result needs, so choosing between them on
-/// the program's behalf would mean a build that quietly changes shape when an edit adds a call --
-/// and an image that fits one board and not the next. A person who asks for one and cannot have it
-/// is told; they are not handed the other.
+/// **THE CLASS LIBRARY UNLESS THE FLAT TIER IS ASKED FOR, AND NEVER INFERRED OR FALLEN BACK FROM.**
+/// A C# program is written against the class library, so a build for a board links it by default,
+/// as `csc` references the standard library unless it is told not to. The two tiers differ in what
+/// a program may contain and in how much flash the result needs, so choosing between them on the
+/// program's behalf would mean a build that quietly changes shape when an edit adds a call -- and an
+/// image that fits one board and not the next. A build that cannot have its tier is told so; it is
+/// not handed the other.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
     /// The flat, linker-free path: nothing outside the program resolves, and the image needs
-    /// nothing on the board.
+    /// nothing on the board. [`FLAT_FLAG`] asks for it.
     Flat,
-    /// Linked against the class library and the runtime-support archive, which is what
-    /// `--class-library` asks for.
+    /// Linked against the class library and the runtime-support archive: the default.
     ClassLibrary,
 }
 
-/// The option that asks for the class-library tier, spelled once.
+/// The option that names the class-library tier, spelled once.
 ///
-/// **.NET's OWN WORD FOR WHAT IT ADDS.** The flag names what the reader gains rather than the
-/// mechanism that delivers it: `--linked` describes a link step to somebody who never asked for
-/// one, and the sentence the flat tier's refusal already prints is about the class library.
+/// **.NET's OWN WORD FOR WHAT IT ADDS.** The tier is the default, so the option changes nothing, and
+/// it is taken rather than refused: a command line that names the class library asks for what it
+/// gets.
 pub const CLASS_LIBRARY_FLAG: &str = "--class-library";
 
+/// The option that asks for the flat tier, spelled once.
+///
+/// **THE WORD `csc` AND THE C LINKERS ALREADY USE FOR WHAT IT TAKES AWAY.** `csc -nostdlib` builds
+/// without the standard library and a linker's `-nostdlib` links without it; the flat tier links the
+/// program with nothing outside it, so it takes the name a reader of either toolchain knows.
+pub const FLAT_FLAG: &str = "--nostdlib";
+
 impl Tier {
-    /// The tier a parsed command line asks for.
+    /// The tier a parsed command line uses: the class library, or the flat tier where
+    /// [`FLAT_FLAG`] asks for it.
     ///
-    /// **ONE MAPPING, READ BY EVERY VERB THAT TAKES THE FLAG.** `build`, `deploy` and the debug
-    /// server all offer it, and a flag that meant the flat tier at one verb and the linked one at
-    /// another would be discovered as an image that does not match the command that produced it.
+    /// **ONE MAPPING, READ BY EVERY VERB THAT TAKES THE OPTIONS.** `build` and `deploy` both offer
+    /// them, and an option that meant one tier at one verb and the other at the next would be
+    /// discovered as an image that does not match the command that produced it.
+    ///
+    /// # Errors
+    /// Both options at once, which ask for different tiers.
+    pub fn from_options(parsed: &crate::args::Options, verb: &str) -> Result<Self, String> {
+        match (parsed.flag(CLASS_LIBRARY_FLAG), parsed.flag(FLAT_FLAG)) {
+            (true, true) => Err(format!(
+                "lamella {verb}: {CLASS_LIBRARY_FLAG} and {FLAT_FLAG} ask for different tiers, so \
+                 give one.\n\n\
+                 The class library is linked by default; {FLAT_FLAG} builds the program on the \
+                 flat tier instead.\n\n\
+                 Nothing was built."
+            )),
+            (false, true) => Ok(Self::Flat),
+            _ => Ok(Self::ClassLibrary),
+        }
+    }
+
+    /// The tier option typed on a command line, if any.
+    ///
+    /// For a route that links nothing, where either option would be taken and have no effect --
+    /// the defect an option dropped in silence always is.
     #[must_use]
-    pub fn from_options(parsed: &crate::args::Options) -> Self {
-        if parsed.flag(CLASS_LIBRARY_FLAG) {
-            Self::ClassLibrary
+    pub fn typed(parsed: &crate::args::Options) -> Option<&'static str> {
+        if parsed.flag(FLAT_FLAG) {
+            Some(FLAT_FLAG)
+        } else if parsed.flag(CLASS_LIBRARY_FLAG) {
+            Some(CLASS_LIBRARY_FLAG)
         } else {
-            Self::Flat
+            None
         }
     }
 
@@ -878,12 +937,12 @@ fn reference_without_the_tier(verb: &str, named: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "lamella {verb}: this project declares a reference, and {CLASS_LIBRARY_FLAG} was not \
-         asked for.\n\n\
+        "lamella {verb}: this project declares a reference, and {FLAT_FLAG} builds on a tier \
+         that links none.\n\n\
          Declared:\n{listed}\n\n\
          The flat tier is linker-free and resolves no call outside the program, so it cannot \
-         link a class\nlibrary and these would have no effect. Add {CLASS_LIBRARY_FLAG} to link \
-         them, or drop them to\nbuild the program on its own.\n\n\
+         link a class\nlibrary and these would have no effect. Drop {FLAT_FLAG} to link them, \
+         or drop them to build the\nprogram on its own.\n\n\
          Nothing was built."
     )
 }
@@ -1211,9 +1270,9 @@ fn flat_refusal(verb: &str, aot_target: &str, error: &lamella_aot::build::BuildE
     }
     format!(
         "{limits}\n\n\
-         That is a limit of the tier and not of the board. To build this program against the class \
-         library,\nwhich links it with corlib and the runtime support archive, add \
-         {CLASS_LIBRARY_FLAG}."
+         That is a limit of the tier and not of the board. Without {FLAT_FLAG} this program is \
+         built against\nthe class library, which links it with corlib and the runtime support \
+         archive."
     )
 }
 
@@ -1262,8 +1321,8 @@ fn is_unresolvable_call(_error: &lamella_aot::build::BuildError) -> bool {
     false
 }
 
-/// Why `--class-library` cannot be honored, naming what is missing rather than building something
-/// else.
+/// Why the class-library tier cannot be built, naming what is missing rather than building
+/// something else.
 ///
 /// **IT NEVER FALLS BACK TO THE FLAT TIER.** The two tiers accept different programs and produce
 /// images of very different sizes, so a silent downgrade would answer a request for the class
@@ -1272,22 +1331,23 @@ fn is_unresolvable_call(_error: &lamella_aot::build::BuildError) -> bool {
 fn class_library_refusal(verb: &str, aot_target: &str) -> String {
     if !crate::tiers::covers(aot_target) {
         return format!(
-            "lamella {verb}: --class-library has no image plan for {aot_target}.\n\n\
+            "lamella {verb}: the class library has no image plan for {aot_target} yet.\n\n\
              The class-library tier lays out a part's RAM explicitly -- where the statics window \
              sits, where the\nheap starts and where it must stop -- so it covers a part only once \
              those addresses are stated.\n\n\
              Boards it covers today:\n{}\n\n\
-             Build this target without --class-library to use the flat tier, whose limits are \
-             stated when a\nprogram exceeds them.",
+             {FLAT_FLAG} builds this target on the flat tier instead, whose limits are stated \
+             when a program\nexceeds them.",
             class_library_boards()
         );
     }
     format!(
-        "lamella {verb}: --class-library was asked for and this build cannot supply it.\n\n\
+        "lamella {verb}: the class library is linked by default, and this build cannot supply \
+         it.\n\n\
          The class-library tier links your program against corlib and the runtime support archive, \
          and this\nbinary was compiled without it.\n\n\
-         Nothing was built. The flat tier would accept a narrower program and produce a \
-         different\nimage, so it is not substituted for what you asked for."
+         Nothing was built. {FLAT_FLAG} asks for the flat tier, which accepts a narrower program \
+         and\nproduces a different image, so it is not substituted without being asked for."
     )
 }
 
@@ -1295,21 +1355,22 @@ fn class_library_refusal(verb: &str, aot_target: &str) -> String {
 /// Why the tier flag cannot be honored on a route that builds no image.
 ///
 /// **AN OPTION ACCEPTED AND THEN DROPPED IS THIS CRATE'S OLDEST DEFECT SHAPE.** Its own parser says
-/// so: a `--target` quietly ignored looks exactly like a board that did not respond. This flag
-/// chooses what a program is LINKED against, and two of the routes that take it link nothing -- so
-/// somebody passing it there believes they have the class-library tier and does not have it.
+/// so: a `--target` quietly ignored looks exactly like a board that did not respond. `flag` chooses
+/// what a program is LINKED against, and two of the routes that take it link nothing -- so
+/// somebody passing it there believes they chose a tier and did not.
 ///
 /// **IT NAMES THE ROUTE THAT WORKS.** A refusal that only declines reproduces the defect one level
 /// up: the reader still does not learn where the flag applies.
 pub fn tier_flag_where_nothing_links(
     verb: &str,
+    flag: &str,
     route: &str,
     instead: &str,
     outcome: &str,
 ) -> String {
     format!(
-        "lamella {verb}: {CLASS_LIBRARY_FLAG} chooses what a program is LINKED against, and \
-         nothing is linked\non this route.\n\n{route}\n\n{instead}\n\n{outcome}"
+        "lamella {verb}: {flag} chooses what a program is LINKED against, and nothing is \
+         linked\non this route.\n\n{route}\n\n{instead}\n\n{outcome}"
     )
 }
 
@@ -1834,7 +1895,7 @@ class Program
         )
         .expect_err("the flat tier resolves no call outside the program");
         assert!(
-            error.contains(CLASS_LIBRARY_FLAG),
+            error.contains(&format!("Without {FLAT_FLAG} this program is built against")),
             "it names the way out: {error}"
         );
         assert!(
@@ -1864,8 +1925,8 @@ class Program
             return;
         };
         assert!(
-            !error.contains(CLASS_LIBRARY_FLAG),
-            "ch32v003 has no linked plan, so the refusal must not name the flag: {error}"
+            !error.contains(CLASS_LIBRARY_FLAG) && !error.contains(FLAT_FLAG),
+            "ch32v003 has no linked plan, so the refusal must not name a way out: {error}"
         );
     }
 
@@ -1904,7 +1965,7 @@ class Program
         ) {
             Err(error) => {
                 assert!(
-                    error.contains(CLASS_LIBRARY_FLAG),
+                    error.contains("class-library tier") || error.contains("class library"),
                     "it names what was asked for: {error}"
                 );
                 assert!(
@@ -2000,6 +2061,73 @@ class Program
                 );
             }
         }
+    }
+
+    /// A command line parsed as `build` parses one, with both tier options known.
+    fn tier_of(args: &[&str]) -> Result<Tier, String> {
+        let spec = Spec {
+            verb: "build",
+            usage: None,
+            values: &["--board", "--format"],
+            flags: &[CLASS_LIBRARY_FLAG, FLAT_FLAG],
+        };
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let parsed = args::parse(&args, &spec).expect("the command line parses");
+        Tier::from_options(&parsed, "build")
+    }
+
+    /// **THE CLASS LIBRARY IS WHAT A BUILD LINKS UNLESS THE FLAT TIER IS ASKED FOR.** A C# program
+    /// is written against the class library, so a build for a board links it unless the program's
+    /// author names the tier that leaves it out.
+    #[test]
+    fn the_class_library_is_the_default_and_the_flat_tier_is_asked_for() {
+        assert_eq!(tier_of(&["P.cs"]), Ok(Tier::ClassLibrary), "nothing typed");
+        assert_eq!(
+            tier_of(&["P.cs", CLASS_LIBRARY_FLAG]),
+            Ok(Tier::ClassLibrary),
+            "the default, asked for by name, is still taken"
+        );
+        assert_eq!(tier_of(&["P.cs", FLAT_FLAG]), Ok(Tier::Flat));
+        let both = tier_of(&["P.cs", CLASS_LIBRARY_FLAG, FLAT_FLAG])
+            .expect_err("two tiers cannot both be built");
+        assert!(
+            both.contains(CLASS_LIBRARY_FLAG) && both.contains(FLAT_FLAG),
+            "it names both: {both}"
+        );
+        crate::rendered::assert_renders_cleanly(&both, crate::rendered::four_space_sample);
+    }
+
+    /// **A BOARD THE CLASS LIBRARY HAS NO PLAN FOR IS REFUSED, NAMING THE OPTION THAT BUILDS IT
+    /// FLAT.** With the class library the default, a board it does not cover would otherwise have
+    /// no build at all, and the reader has to be told the one that remains.
+    #[test]
+    fn a_board_with_no_class_library_plan_names_the_option_that_builds_it_flat() {
+        let refusal = class_library_refusal("build", "rp2350");
+        assert!(
+            refusal.starts_with("lamella build: the class library has no image plan for rp2350 yet."),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("{FLAT_FLAG} builds this target on the flat tier")),
+            "it names the way to build the board: {refusal}"
+        );
+    }
+
+    /// **AN IMAGE LARGER THAN ITS PART IS REFUSED, NAMING BOTH SIZES**, before anything is written.
+    /// A 256 KB part was handed 271,320 B and 344,626 B images without a word, and found out only
+    /// when nothing could load them.
+    #[test]
+    fn an_image_larger_than_the_part_is_refused_naming_both_sizes() {
+        let refusal = refuse_unless_it_fits("build", "bbc-micro-bit-v1", &vec![0; 300_000])
+            .expect_err("300,000 B is more than the micro:bit v1's 256 KB");
+        assert!(refusal.starts_with("lamella build: "), "{refusal}");
+        assert!(
+            refusal.contains("this image is 300000 B") && refusal.contains("262144 B of flash"),
+            "it names both sizes: {refusal}"
+        );
+        assert!(refusal.contains("Nothing was written."), "{refusal}");
+        refuse_unless_it_fits("build", "bbc-micro-bit-v1", &vec![0; 262_144])
+            .expect("an image exactly the part's size fits");
     }
 
     /// Every build states its tier, and the two never read the same.
@@ -2105,7 +2233,7 @@ class Program
     fn a_reference_without_the_tier_is_refused_and_names_both() {
         let error = libraries_from(&["Gpio.dll"], Tier::Flat, "deploy")
             .expect_err("the flat tier links nothing");
-        assert!(error.contains(CLASS_LIBRARY_FLAG), "names the flag: {error}");
+        assert!(error.contains(FLAT_FLAG), "names the flag: {error}");
         assert!(error.contains("Gpio.dll"), "and the library: {error}");
         assert!(
             error.contains("Nothing was built"),

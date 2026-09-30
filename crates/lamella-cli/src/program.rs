@@ -68,12 +68,13 @@ find out whether a program compiles and does what you meant.
 
 A .csproj compiles every .cs beside it as one program, as `lamella build` compiles it. This
 machine and firmware on a board both run a program against the class library alone, so a project
-that references libraries of its own is built with `lamella build --class-library`, which links
-them.
+that references libraries of its own is built with `lamella build --board <id> --format <f>`,
+which links them.
 
 --target <t> runs a C# program -- a .cs or a .csproj -- ON a board that already has firmware, with
-the output still appearing here. `lamella devices` prints the word to pass. A cycle is about a
-second, and the board keeps its firmware. A Python program and a JavaScript program run on this
+the output still appearing here. `lamella devices` prints the word to pass. The program is baked
+with the corlib it was compiled against, so it may call into System.* as it does here; a call into
+another library is refused by name. A cycle is about a second, and the board keeps its firmware. A Python program and a JavaScript program run on this
 machine.
 
 Two questions this verb does not answer: whether a program FITS a board is `build --board <id>`,
@@ -284,10 +285,7 @@ fn project_outcome(path: &Path) -> Result<Result<Outcome, ReplError>, String> {
         path,
         "run",
         "This verb runs a program on this machine",
-        &format!(
-            "lamella build {} --board <id> --format <f> --class-library",
-            path.display()
-        ),
+        &format!("lamella build {} --board <id> --format <f>", path.display()),
     )?;
     let (assembly, corlib) = compile_project_assembly(&project, &[], "run")?;
     let mut link = LoopbackLink::new(corlib, install_host_clock);
@@ -570,7 +568,7 @@ pub fn build_command(args: &[String]) -> ExitCode {
         verb: "build",
         usage: Some(&usage),
         values: &["--board", "--out", "--format"],
-        flags: &["--unsafe", crate::flash::CLASS_LIBRARY_FLAG],
+        flags: &["--unsafe", crate::flash::CLASS_LIBRARY_FLAG, crate::flash::FLAT_FLAG],
     };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
@@ -591,7 +589,13 @@ pub fn build_command(args: &[String]) -> ExitCode {
         }
     };
 
-    let tier = crate::flash::Tier::from_options(&parsed);
+    let tier = match crate::flash::Tier::from_options(&parsed, "build") {
+        Ok(tier) => tier,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let libraries: Vec<crate::flash::Library> = Vec::new();
 
     if let Some(name) = parsed.value("--format") {
@@ -608,16 +612,18 @@ pub fn build_command(args: &[String]) -> ExitCode {
         );
     }
 
-    if tier == crate::flash::Tier::ClassLibrary {
+    if let Some(flag) = crate::flash::Tier::typed(&parsed) {
         eprintln!(
             "{}",
             crate::flash::tier_flag_where_nothing_links(
                 "build",
+                flag,
                 "Without --format this builds the ordinary artifact -- an assembly, a baked image \
                  or a\nPython bundle -- and none of those has a link step.",
-                "--format <f> asks for the image a chip takes, which is the build that \
-                 links:\n\n\x20   lamella build <file> --board <id> --format bin \
-                 --class-library",
+                &format!(
+                    "--format <f> asks for the image a chip takes, which is the build that \
+                     links:\n\n\x20   lamella build <file> --board <id> --format bin {flag}"
+                ),
                 "Nothing was built.",
             )
         );
@@ -689,7 +695,7 @@ fn usage() -> String {
     format!(
         "\
 usage: lamella build <file.cs|file.csproj|file.py> [--board <id>] [--format <f>] [--out <path>]
-                                      [--class-library]
+                                      [--nostdlib]
 
 With --format, it builds the BARE-METAL IMAGE for --board and writes it in that format -- which is
 exactly what `lamella flash` takes, so `build` produces what `flash` consumes and neither has to
@@ -697,21 +703,22 @@ touch hardware. The formats:
 {formats}
 
 Without --format it builds the ordinary artifact -- an assembly, a baked image, or a Python bundle
--- and with --board it also answers whether that fits.
+-- and with --board it also answers whether that fits. A baked image carries the corlib the program
+was compiled against, so the program may call into System.* on the board as it does here.
 
 A .csproj builds every .cs beside it as ONE program and links the assemblies its <Reference>
 elements name, each by a <HintPath>. It goes with --format, which is the build that links.
 
---class-library links the program with the class library and the runtime support archive, so it may
+The image links the program with the class library and the runtime support archive, so it may
 allocate, use floating point and call into System.*. That tier's collector reclaims an object
-without finalizing it, so a finalizer (a class's ~destructor) never runs there. Without it the flat
-tier is used, which is linker-free and resolves no call outside the program. Every build says which
-tier produced it. The class-library tier covers fewer boards; asking for it where there is no plan
-names the ones there are.
+without finalizing it, so a finalizer (a class's ~destructor) never runs there. It covers fewer
+boards than the flat tier, and a board it has no plan for is refused, naming the ones there are.
+--nostdlib builds the flat tier instead, which is linker-free and resolves no call outside the
+program. Every build says which tier produced it.
 
 --format elf writes the image as a linked ELF that also carries the program's debug information,
-which is the file a debugger takes as the program. It goes with --class-library, the one tier
-that carries debug information into an image.
+which is the file a debugger takes as the program. The class-library tier is the one that carries
+debug information into an image, so --format elf does not go with --nostdlib.
 
 A class-library image is always compiled as a debug build is, whatever format it is written in:
 --format elf writes the debug information beside it and every other format sets it aside. So the
@@ -847,6 +854,10 @@ fn build_debug_elf(
             return ExitCode::FAILURE;
         }
     };
+    if let Err(refusal) = crate::flash::refuse_unless_it_fits("build", board_id, &loaded.bytes) {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
     let out = match out {
         Some(given) => Path::new(given).to_path_buf(),
         None => path.with_extension(lamella_flash_routes::artifact::Output::Elf.extension()),
@@ -870,18 +881,18 @@ fn build_debug_elf(
 /// Why `--format elf` cannot be written on `tier`, or `None` where it can.
 ///
 /// **ONLY THE CLASS-LIBRARY TIER CARRIES DEBUG INFORMATION INTO AN IMAGE**, so on the flat tier the
-/// refusal names the flag that makes the ELF work, and the formats the flat tier's image can be
-/// written in instead.
+/// refusal names the option to drop, and the formats the flat tier's image can be written in
+/// instead.
 fn elf_refusal(tier: crate::flash::Tier) -> Option<String> {
     if tier == crate::flash::Tier::ClassLibrary {
         return None;
     }
     Some(format!(
         "lamella build: --format elf writes the image with the program's debug information, and \
-         only the\nclass-library tier carries debug information into an image. Add {}, or write \
-         the flat\ntier's image in a format that carries none:\n\n\x20   {}\n\n\
+         only the\nclass-library tier carries debug information into an image. Drop {}, or \
+         write the flat\ntier's image in a format that carries none:\n\n\x20   {}\n\n\
          Nothing was built.",
-        crate::flash::CLASS_LIBRARY_FLAG,
+        crate::flash::FLAT_FLAG,
         lamella_flash_routes::artifact::Format::listing()
     ))
 }
@@ -942,10 +953,13 @@ struct Built {
 /// assembly is as far as this verb goes. See the crate documentation for why that feature is not
 /// on by default.
 fn build_csharp(path: &Path, source: &str, unsafe_code: bool) -> Result<Built, String> {
-    let assembly = compile_csharp_assembly(path, source, unsafe_code, "build")?;
+    let (assembly, corlib) =
+        compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], "build")?;
+    #[cfg(not(feature = "bake"))]
+    let _ = corlib;
     #[cfg(feature = "bake")]
     {
-        let image = crate::bake::bake(assembly)?;
+        let image = crate::bake::bake(assembly, &corlib)?;
         return Ok(Built {
             bytes: image,
             extension: "lmli",
@@ -968,29 +982,15 @@ fn build_csharp(path: &Path, source: &str, unsafe_code: bool) -> Result<Built, S
     })
 }
 
-/// Compile a C# file to a .NET assembly named after it.
+/// Compile a C# file to a .NET assembly named after it, and the corlib the program was BOUND
+/// against.
 ///
 /// The one place a source FILE becomes an assembly, so `build` and `flash` cannot disagree about
 /// what compiling one means -- which reference assemblies it binds against, what the assembly is
 /// called, and what its debug info says the source path is.
 ///
-/// # Errors
-/// The compiler's diagnostics, rendered as `CSnnnn` lines, or the emit error when binding was
-/// clean and a construct is not lowered.
-pub fn compile_csharp_assembly(
-    path: &Path,
-    source: &str,
-    unsafe_code: bool,
-    verb: &str,
-) -> Result<Vec<u8>, String> {
-    compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], verb)
-        .map(|(assembly, _)| assembly)
-}
-
-/// As [`compile_csharp_assembly`], and also the corlib the program was BOUND against.
-///
-/// **THE LINKED TIER LINKS THE SAME CORLIB THE PROGRAM WAS BOUND AGAINST, AND THAT IS WHY IT COMES
-/// BACK FROM HERE RATHER THAN FROM A SECOND LOOKUP.** Discovery walks an environment variable, then
+/// **A BAKED IMAGE CARRIES, AND THE LINKED TIER LINKS, THE SAME CORLIB THE PROGRAM WAS BOUND
+/// AGAINST, AND THAT IS WHY IT COMES BACK FROM HERE RATHER THAN FROM A SECOND LOOKUP.** Discovery walks an environment variable, then
 /// beside the executable, then the development tree, and a second walk can answer differently from
 /// the first -- a variable set between them, a file appearing beside the binary. A program bound
 /// against one corlib and linked against another would produce an image whose method tokens resolve
@@ -1001,8 +1001,9 @@ pub fn compile_csharp_assembly(
 /// the same order or the build would resolve a name at compile time that the link cannot find.
 ///
 /// # Errors
-/// As [`compile_csharp_assembly`], plus a reference set carrying no corlib to hand back, or a named
-/// library that is not a readable assembly.
+/// The compiler's diagnostics, rendered as `CSnnnn` lines, or the emit error when binding was
+/// clean and a construct is not lowered; a reference set carrying no corlib to hand back; or a
+/// named library that is not a readable assembly.
 pub fn compile_csharp_assembly_with_corlib(
     path: &Path,
     source: &str,
@@ -1630,7 +1631,8 @@ mod tests {
         assert!(
             refusal.contains("references libraries of its own")
                 && refusal.contains("System.Device.Gpio.dll")
-                && refusal.contains("--class-library"),
+                && refusal.contains("--board <id> --format <f>")
+                && !refusal.contains("--class-library"),
             "{refusal}"
         );
         crate::rendered::assert_renders_cleanly(&refusal, crate::rendered::four_space_sample);
@@ -2199,8 +2201,8 @@ mod tests {
         let message =
             elf_refusal(crate::flash::Tier::Flat).expect("the flat tier refuses an ELF");
         assert!(
-            message.contains(&format!("Add {},", crate::flash::CLASS_LIBRARY_FLAG)),
-            "the refusal must name the flag that makes the ELF work:\n{message}"
+            message.contains(&format!("Drop {},", crate::flash::FLAT_FLAG)),
+            "the refusal must name the option that keeps the ELF from working:\n{message}"
         );
         let listing = format!("    {}", lamella_flash_routes::artifact::Format::listing());
         assert!(
