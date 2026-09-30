@@ -656,6 +656,12 @@ pub struct TypeInfo {
     /// `None` until then and for every other type. An enum read from metadata states the same fact
     /// as the type of its `value__` field instead.
     pub enum_underlying: Option<SpecialType>,
+    /// For a value type read from metadata, the types of the instance fields the import left out
+    /// of [`Self::fields`] -- the private and compiler-controlled ones. This compilation can name
+    /// none of them, but each is part of the value, so a question about the value's SHAPE asks
+    /// them too: a struct is unmanaged only when every instance field is, private ones included,
+    /// which is why a reference assembly keeps its structs' private fields at all.
+    pub hidden_instance_field_types: Vec<TypeSymbol>,
 }
 
 /// The resolved constraints on ONE type parameter (ECMA-334 4th ed 25.7).
@@ -887,6 +893,7 @@ impl TypeInfo {
             synthesized_constructor: false,
             is_by_ref_like: false,
             enum_underlying: None,
+            hidden_instance_field_types: Vec::new(),
         }
     }
 
@@ -1016,6 +1023,9 @@ impl TypeInfo {
         closed.type_parameters = Vec::new();
         for field in &mut closed.fields {
             field.ty = substitute(&field.ty, &bindings);
+        }
+        for ty in &mut closed.hidden_instance_field_types {
+            *ty = substitute(ty, &bindings);
         }
         for property in &mut closed.properties {
             property.ty = substitute(&property.ty, &bindings);

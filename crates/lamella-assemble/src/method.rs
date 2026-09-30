@@ -299,6 +299,8 @@ pub fn emit_body(
     method_name: &str,
     declaring_type: Option<&TypeSymbol>,
 ) -> Result<EmittedBody, EmitError> {
+    let spilled = crate::stackallocspill::spill_stackallocs(body, tokens)?;
+    let body = spilled.as_ref().unwrap_or(body);
     let mut frame = Frame::build(parameters, byref_params, body, arg_base);
     frame.set_constructor_of(match (method_name, declaring_type) {
         (".ctor" | ".cctor", Some(owner)) => Some(owner.clone()),

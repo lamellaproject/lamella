@@ -953,12 +953,21 @@ pub enum BoundExprKind {
     /// `ObjectCreation` argument list; emission pushes each element and encodes its type
     /// after the sentinel in the call-site signature. Never a value by itself (CS0226).
     ArgListLiteral(Vec<BoundExpr>),
-    /// A `stackalloc T[count]` (unsafe): a `T*` to `count * sizeof(T)` stack bytes.
+    /// A `stackalloc T[count]`: `count * sizeof(T)` zeroed bytes of the frame's local memory pool
+    /// (`localloc`). Without a span constructor it is the unsafe form, a `T*` to the block. With
+    /// one it is C# 7.2's safe form, a `Span<T>` over the block, which that constructor builds.
     StackAlloc {
         /// The element type.
         element: TypeSymbol,
-        /// The element count.
+        /// The element count, an `int`.
         count: Box<BoundExpr>,
+        /// The constructor that makes the block a span (C# 7.2), when it becomes one: `Span<T>(void*,
+        /// int)` over the `localloc`'d block where the referenced span declares it, else the span
+        /// type's `(T[])` over a new array. The node's type is that span.
+        span_constructor: Option<MethodReference>,
+        /// The initializer's elements (C# 7.3), converted to the element type, stored into the
+        /// block in order; empty without one.
+        initializer: Vec<BoundExpr>,
     },
     /// A pointer indirection `*operand` (unsafe): reads/writes the element the pointer
     /// addresses. An lvalue when it is an assignment target.
@@ -1054,6 +1063,24 @@ pub struct DeclaredField {
     pub stable: Box<str>,
     /// The field's type.
     pub ty: TypeSymbol,
+}
+
+/// What makes a value refer to stack memory -- see [`Binder::stack_bound_culprit`].
+enum StackBound {
+    /// A `stackalloc` into a span, of this span type.
+    StackAlloc(TypeSymbol),
+    /// A local that holds one.
+    Local(Box<str>),
+}
+
+/// The handler and `lock` nesting of the function being bound, set aside while a nested
+/// function's body binds -- see [`Binder::enter_function_body`].
+struct HandlerNesting {
+    catch_depth: u32,
+    filter_depth: u32,
+    finally_depth: u32,
+    lock_depth: u32,
+    finally_floor: Vec<u32>,
 }
 
 /// One lambda being bound: where its own scopes start, and what it has captured so far.
@@ -1243,6 +1270,21 @@ pub struct Binder {
     /// written. Set per unit by [`Binder::set_nullable_context`]; the default, a disabled context
     /// with no directives, is csc's without `/nullable`.
     nullable_context: lamella_syntax::lexer::NullableContext,
+    /// The byte ranges of the file being bound that are unsafe contexts (18.1), set per unit by
+    /// [`Binder::set_unsafe_regions`]. `None` where no unit set them -- a REPL submission -- and
+    /// then nothing is reported for want of one: an unknown context is not a safe one.
+    unsafe_regions: Option<Vec<Span>>,
+    /// Whether the expression being bound is a local's initializer -- the one position where a
+    /// `stackalloc` converts to a span by its TARGET (C# 7.2), and an arm of a conditional there.
+    /// Set by the local declaration around its target-typed binding; anywhere else a `stackalloc`
+    /// is a `Span<T>` of its own (`bind_stackalloc_nested`).
+    local_initializer_target: bool,
+    /// The `stackalloc`s of the statement being bound that C# 7.3 admits without being a local's
+    /// initializer itself. csc's rule is syntactic: through any casts written over one and then
+    /// one conditional, a `stackalloc` may be a declarator's initializer or the value of a simple
+    /// assignment that is a statement (`command = stackalloc byte[2];`). Anywhere else it is
+    /// C# 8.0's nested `stackalloc`. Set per statement by [`Binder::with_csharp73_stackallocs`].
+    stackalloc_csharp73_positions: Vec<Span>,
     /// How many enclosing `catch` clauses the binder is inside, so a bare `throw;` outside one
     /// is `CS0156` -- there is no exception in flight to re-throw. Reset per method.
     catch_depth: u32,
@@ -1283,6 +1325,11 @@ pub struct Binder {
     /// absent for all but a handful of locals in any program, so widening the entry every lookup
     /// walks would pay for the common case to describe the rare one.
     local_tuple_names: BTreeMap<String, (Vec<Option<Box<str>>>, usize)>,
+    /// The ref struct LOCALS in scope that hold stack memory -- initialized from a `stackalloc`
+    /// into a span, or from another such local -- each with the scope depth it was declared at
+    /// (evicted by `exit_scope`). A local's escape scope is its initializer's, so one of these may
+    /// never be returned or stored anywhere that outlives the method (`CS8352`).
+    stack_bound_locals: BTreeMap<String, usize>,
     /// The `ref` LOCALS in scope, each with what its declaration decided about it and the scope
     /// depth it was declared at (evicted by `exit_scope`, exactly as `const_locals` is).
     ///
@@ -1909,6 +1956,43 @@ impl Binder {
     /// Binds what follows under `context`, the nullable context of the file it comes from.
     pub fn set_nullable_context(&mut self, context: lamella_syntax::lexer::NullableContext) {
         self.nullable_context = context;
+    }
+
+    /// Binds what follows knowing which of its file's byte ranges are unsafe contexts.
+    pub(crate) fn set_unsafe_regions(&mut self, regions: Vec<Span>) {
+        self.unsafe_regions = Some(regions);
+    }
+
+    /// Whether `span` is in an unsafe context -- true where the regions are not known.
+    fn in_unsafe_context(&self, span: Span) -> bool {
+        self.unsafe_regions.as_ref().is_none_or(|regions| {
+            regions
+                .iter()
+                .any(|region| region.start <= span.start && span.end <= region.end)
+        })
+    }
+
+    /// Marks whether what binds next is a local's initializer; see the field.
+    pub(crate) fn set_local_initializer_target(&mut self, is_initializer: bool) -> bool {
+        core::mem::replace(&mut self.local_initializer_target, is_initializer)
+    }
+
+    /// Runs `bind` with the C# 7.3 `stackalloc` positions under `values` marked (see the field),
+    /// then restores the marks it replaced, so a statement nested in one (a lambda's) keeps its
+    /// own.
+    pub(crate) fn with_csharp73_stackallocs<'e, R>(
+        &mut self,
+        values: impl IntoIterator<Item = &'e Expr>,
+        bind: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let mut positions = Vec::new();
+        for value in values {
+            csharp73_stackalloc_positions(value, &mut positions);
+        }
+        let outer = core::mem::replace(&mut self.stackalloc_csharp73_positions, positions);
+        let bound = bind(self);
+        self.stackalloc_csharp73_positions = outer;
+        bound
     }
 
     /// The binder's type model, for the assembling step (base classes, member kinds).
@@ -3539,6 +3623,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         expr: &Expr,
         target: &TypeSymbol,
     ) -> Option<BoundExpr> {
+        let at_initializer = core::mem::replace(&mut self.local_initializer_target, false);
+        let bound = self.bind_target_typed_at(expr, target, at_initializer);
+        self.local_initializer_target = at_initializer;
+        bound
+    }
+
+    /// [`Self::bind_target_typed`], with whether `expr` is a local's initializer (or an arm of a
+    /// conditional that is one) passed in rather than read from the binder.
+    fn bind_target_typed_at(
+        &mut self,
+        expr: &Expr,
+        target: &TypeSymbol,
+        at_initializer: bool,
+    ) -> Option<BoundExpr> {
         match &expr.kind {
             ExprKind::Lambda {
                 parameters,
@@ -3558,18 +3656,32 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 initializer.as_ref(),
                 expr.span,
             )),
+            ExprKind::StackAlloc { .. } if at_initializer => {
+                if span_element_type(target).is_some() {
+                    self.bind_stackalloc_into_span_gated(expr, target, Feature::RefStruct)
+                } else if matches!(target, TypeSymbol::Pointer(_)) || target.is_error() {
+                    None
+                } else {
+                    Some(self.bind_stackalloc_to_non_span(expr, target))
+                }
+            }
             ExprKind::Conditional {
                 condition,
                 when_true,
                 when_false,
-            } if self.target_typed_arm(when_true) || self.target_typed_arm(when_false) => {
+            } if target_typed_arm(when_true, at_initializer)
+                || target_typed_arm(when_false, at_initializer) =>
+            {
                 let condition = self.bind_condition(condition);
-                let when_true = self
-                    .bind_target_typed(when_true, target)
-                    .unwrap_or_else(|| self.bind_expression(when_true));
-                let when_false = self
-                    .bind_target_typed(when_false, target)
-                    .unwrap_or_else(|| self.bind_expression(when_false));
+                let when_true = match self.bind_target_typed_at(when_true, target, at_initializer) {
+                    Some(bound) => bound,
+                    None => self.bind_arm_toward(when_true, target),
+                };
+                let when_false = match self.bind_target_typed_at(when_false, target, at_initializer)
+                {
+                    Some(bound) => bound,
+                    None => self.bind_arm_toward(when_false, target),
+                };
                 Some(BoundExpr {
                     ty: target.clone(),
                     kind: BoundExprKind::Conditional {
@@ -3583,18 +3695,472 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
-    /// Whether an arm of a conditional is one of the forms that has no type without a target.
+    /// An arm of a target-typed conditional that is not target-typed itself, converted to the
+    /// target where it converts and left as it binds where it does not (so the conditional's own
+    /// checks report).
+    fn bind_arm_toward(&mut self, arm: &Expr, target: &TypeSymbol) -> BoundExpr {
+        let bound = self.bind_expression(arm);
+        if bound.ty != *target && !bound.ty.is_error() && self.converts(&bound.ty, target) {
+            self.convert(bound, target)
+        } else {
+            bound
+        }
+    }
+
+    /// `stackalloc T[count]` converted to `target`, a `Span<T>` or `ReadOnlySpan<T>` (C# 7.2).
+    /// `None` leaves the pointer reading to bind it, for an element this build cannot resolve
+    /// quietly: that reading reports the name.
     ///
-    /// **THE GUARD EXISTS SO THE ORDINARY CONDITIONAL PATH IS UNTOUCHED.** Every rule that binder
-    /// applies -- the better-conversion choice between the two arms, `CS0173` when neither
-    /// converts to the other, the constant folding -- stays where it is for every conditional that
-    /// does not contain one of these. Routing ALL conditionals through the target-typed path would
-    /// replace a body of measured behaviour with a shortcut, to serve one syntax.
-    fn target_typed_arm(&self, expr: &Expr) -> bool {
-        matches!(
-            &expr.kind,
-            ExprKind::ObjectCreation { target: None, .. }
-        )
+    /// Where the referenced `Span<T>` declares a `Span<T>(void*, int)` constructor, the block is
+    /// `localloc`'d and that constructor lays the span over it, as csc does; a `ReadOnlySpan<T>` is
+    /// then the span's implicit conversion. Where it declares none, the span is built over
+    /// `new T[count]`: the same values (zeroed, the same `Length`), from a heap allocation.
+    fn bind_stackalloc_into_span_gated(
+        &mut self,
+        expr: &Expr,
+        target: &TypeSymbol,
+        gate: Feature,
+    ) -> Option<BoundExpr> {
+        let span = expr.span;
+        let span_element = span_element_type(target)?;
+        let before = self.diagnostics.len();
+        let Some((element_ty, count, initializer)) = self.bind_stackalloc_parts(expr) else {
+            return Some(error_expr());
+        };
+        if self.errors_since(before) {
+            return Some(error_expr());
+        }
+        if element_ty != span_element {
+            self.report(Diagnostic::new(
+                DiagnosticKind::StackAllocConversion {
+                    element: element_ty.short_name().into(),
+                    target: target.short_name().into(),
+                },
+                span,
+            ));
+            return Some(error_expr());
+        }
+        self.gate_feature(gate, Span::empty_at(span.start));
+        Some(self.span_over_stackalloc(element_ty, count, initializer, target, span))
+    }
+
+    /// The span a bound `stackalloc` makes, of type `target` (a `Span<T>` or `ReadOnlySpan<T>`
+    /// over `element_ty`): csc's lowering where the referenced `Span<T>` declares `(void*, int)`,
+    /// the array one where it does not.
+    fn span_over_stackalloc(
+        &mut self,
+        element_ty: TypeSymbol,
+        count: BoundExpr,
+        initializer: Vec<BoundExpr>,
+        target: &TypeSymbol,
+        span: Span,
+    ) -> BoundExpr {
+        let count = match constant_int_value(&count) {
+            Some(value) => BoundExpr {
+                ty: TypeSymbol::Special(SpecialType::Int32),
+                kind: BoundExprKind::Literal(integer_literal(value)),
+            },
+            None => count,
+        };
+        let span_type = TypeSymbol::Instantiation {
+            definition: [Box::from("System"), Box::from("Span")].into(),
+            arguments: [element_ty.clone()].into(),
+        };
+        if let Some(constructor) = self.span_pointer_constructor(&span_type) {
+            let block = BoundExpr {
+                ty: span_type.clone(),
+                kind: BoundExprKind::StackAlloc {
+                    element: element_ty,
+                    count: Box::new(count),
+                    span_constructor: Some(constructor),
+                    initializer,
+                },
+            };
+            return if span_type == *target {
+                block
+            } else {
+                self.convert(block, target)
+            };
+        }
+        let array_ty = TypeSymbol::Array {
+            element: Box::new(element_ty.clone()),
+            rank: 1,
+        };
+        let Some(constructor) = self.constructor_taking(target, core::slice::from_ref(&array_ty))
+        else {
+            self.report(Diagnostic::new(
+                DiagnosticKind::FeatureNotInThisBuild {
+                    feature: "a `stackalloc` into a span type that declares neither a \
+                              (void*, int) nor a (T[]) constructor"
+                        .into(),
+                    permitted_by: self.language_version,
+                    instead: None,
+                },
+                span,
+            ));
+            return error_expr();
+        };
+        BoundExpr {
+            ty: target.clone(),
+            kind: BoundExprKind::StackAlloc {
+                element: element_ty,
+                count: Box::new(count),
+                span_constructor: Some(constructor),
+                initializer,
+            },
+        }
+    }
+
+    /// The element type, count and initializer of a `stackalloc`, each bound and checked (see
+    /// [`Self::bind_stackalloc_operands`]); `None` when the element type is unknown, reported.
+    /// `stackalloc[] { ... }` takes the best common type of its elements (csc's rule for an
+    /// implicitly typed array), `CS0826` where there is none.
+    fn bind_stackalloc_parts(
+        &mut self,
+        expr: &Expr,
+    ) -> Option<(TypeSymbol, BoundExpr, Vec<BoundExpr>)> {
+        let ExprKind::StackAlloc {
+            element,
+            count,
+            initializer,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        if initializer.is_some() {
+            self.gate_feature(
+                Feature::StackAllocInitializer,
+                Span::empty_at(expr.span.start),
+            );
+        }
+        let bound_elements: Option<Vec<BoundExpr>> = initializer
+            .as_ref()
+            .map(|elements| elements.iter().map(|e| self.bind_expression(e)).collect());
+        let (element_ty, element_span) = match element {
+            Some(written) => (self.resolve_type_ref(written), written.span),
+            None => {
+                let inferred = self.best_common_type(bound_elements.as_deref().unwrap_or(&[]));
+                if inferred.is_none() {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::NoBestTypeForImplicitArray,
+                        Span::empty_at(expr.span.start),
+                    ));
+                }
+                (inferred.unwrap_or(TypeSymbol::Error), expr.span)
+            }
+        };
+        if element_ty.is_error() {
+            if let Some(count) = count {
+                let _ = self.bind_expression(count);
+            }
+            return None;
+        }
+        let initializer = initializer.as_deref().zip(bound_elements);
+        let (count, elements) = self.bind_stackalloc_operands(
+            &element_ty,
+            element_span,
+            count.as_deref(),
+            initializer,
+            expr.span,
+        );
+        Some((element_ty, count, elements))
+    }
+
+    /// The best common type of `elements` (csc's rule for an implicitly typed array): the one
+    /// element type every element converts to, when exactly one does.
+    fn best_common_type(&self, elements: &[BoundExpr]) -> Option<TypeSymbol> {
+        let mut candidates: Vec<&TypeSymbol> = Vec::new();
+        for element in elements {
+            let ty = &element.ty;
+            if !ty.is_error()
+                && !matches!(ty, TypeSymbol::Special(SpecialType::Null))
+                && !candidates.contains(&ty)
+            {
+                candidates.push(ty);
+            }
+        }
+        let fits: Vec<&TypeSymbol> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                elements
+                    .iter()
+                    .all(|element| element.ty.is_error() || self.converts(&element.ty, candidate))
+            })
+            .collect();
+        match fits[..] {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// A local's initializer, bound as an expression: a `stackalloc` there is the pointer reading
+    /// (C# 1.0's), where anywhere else it is a span.
+    pub(crate) fn bind_initializer_expression(&mut self, expr: &Expr) -> BoundExpr {
+        match &expr.kind {
+            ExprKind::StackAlloc { .. } => self.bind_stackalloc_pointer(expr),
+            _ => self.bind_expression(expr),
+        }
+    }
+
+    /// `stackalloc T[count]` as a `T*` to the block: C# 1.0's reading, admitted only as a local's
+    /// initializer and only in an unsafe context (`CS0214`, at the `stackalloc`).
+    fn bind_stackalloc_pointer(&mut self, expr: &Expr) -> BoundExpr {
+        let parts = self.bind_stackalloc_parts(expr);
+        if !self.in_unsafe_context(expr.span) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::PointerInSafeContext,
+                Span::empty_at(expr.span.start),
+            ));
+        }
+        let Some((element, count, initializer)) = parts else {
+            return error_expr();
+        };
+        BoundExpr {
+            ty: TypeSymbol::Pointer(Box::new(element.clone())),
+            kind: BoundExprKind::StackAlloc {
+                element,
+                count: Box::new(count),
+                span_constructor: None,
+                initializer,
+            },
+        }
+    }
+
+    /// A `stackalloc` anywhere but a local's initializer: a `Span<T>` over its own element type,
+    /// lowered as a local's is. C# 8.0 admits it in any expression. Before that it is admitted
+    /// only in the positions csc's syntactic rule names (`stackalloc_csharp73_positions`), and
+    /// there it is gated as the ref struct it makes (C# 7.2), as csc gates it.
+    fn bind_stackalloc_nested(&mut self, expr: &Expr) -> BoundExpr {
+        let admitted_at_csharp73 = self.stackalloc_csharp73_positions.contains(&expr.span);
+        let gate = if admitted_at_csharp73 {
+            Feature::RefStruct
+        } else {
+            Feature::StackAllocNestedExpressions
+        };
+        self.gate_feature(gate, Span::empty_at(expr.span.start));
+        let misplaced =
+            !admitted_at_csharp73 && gate.gate_against(self.language_version).is_some();
+        let before = self.diagnostics.len();
+        let Some((element, count, initializer)) = self.bind_stackalloc_parts(expr) else {
+            return error_expr();
+        };
+        if misplaced || self.errors_since(before) {
+            return error_expr();
+        }
+        let span_type = TypeSymbol::Instantiation {
+            definition: [Box::from("System"), Box::from("Span")].into(),
+            arguments: [element.clone()].into(),
+        };
+        self.span_over_stackalloc(element, count, initializer, &span_type, expr.span)
+    }
+
+    /// A `stackalloc` whose target is neither a span nor a pointer: `CS8346` once the `stackalloc`
+    /// binds without errors of its own, since it converts to nothing else at any rung.
+    fn bind_stackalloc_to_non_span(&mut self, expr: &Expr, target: &TypeSymbol) -> BoundExpr {
+        let before = self.diagnostics.len();
+        let parts = self.bind_stackalloc_parts(expr);
+        if let Some((element, _, _)) = parts
+            && !self.errors_since(before)
+        {
+            let element = element.short_name();
+            self.report(Diagnostic::new(
+                DiagnosticKind::StackAllocConversion {
+                    element: element.into(),
+                    target: target.short_name().into(),
+                },
+                expr.span,
+            ));
+        }
+        error_expr()
+    }
+
+    /// The rules every `stackalloc T[count]` keeps, pointer or span: it may not appear in a
+    /// `catch` or `finally` block (`CS0255`), its element must be an unmanaged type (`CS0208`),
+    /// and its count converts implicitly to `int` (`CS0266`, `CS0029`) and is not a negative
+    /// constant (`CS0247`). Each rule reports on its own, all of them in csc's order; the count
+    /// comes back converted to `int`.
+    fn bind_stackalloc_operands(
+        &mut self,
+        element: &TypeSymbol,
+        element_span: Span,
+        count: Option<&Expr>,
+        initializer: Option<(&[Expr], Vec<BoundExpr>)>,
+        span: Span,
+    ) -> (BoundExpr, Vec<BoundExpr>) {
+        if self.catch_depth > 0 || self.finally_depth > 0 {
+            self.report(Diagnostic::new(
+                DiagnosticKind::StackAllocInHandler,
+                Span::empty_at(span.start),
+            ));
+        }
+        if !element.is_error() && !self.is_unmanaged_type(element) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::ManagedTypeAddress {
+                    type_name: element.short_name().into(),
+                },
+                element_span,
+            ));
+        }
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        let has_initializer = initializer.is_some();
+        let elements: Vec<BoundExpr> = match initializer {
+            Some((written, bound)) => written
+                .iter()
+                .zip(bound)
+                .map(|(written, bound)| {
+                    self.check_assignable(&bound, element, written.span);
+                    if bound.ty.is_error() || !self.assignable(&bound, element) {
+                        bound
+                    } else {
+                        self.convert(bound, element)
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let written_length = || BoundExpr {
+            ty: TypeSymbol::Special(SpecialType::Int32),
+            kind: BoundExprKind::Literal(integer_literal(elements.len() as i64)),
+        };
+        let Some(count) = count else {
+            if !has_initializer {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::ArrayCreationNeedsSize,
+                    Span::empty_at(span.start),
+                ));
+            }
+            let length = written_length();
+            return (length, elements);
+        };
+        let count_bound = self.bind_expression(count);
+        self.check_assignable(&count_bound, &int, count.span);
+        let constant = constant_int_value(&count_bound);
+        if constant.is_some_and(|value| value < 0) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::StackAllocNegativeSize,
+                count.span,
+            ));
+        }
+        if has_initializer && !count_bound.ty.is_error() {
+            match constant {
+                None => self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, count.span)),
+                Some(value) if value >= 0 && value as usize != elements.len() => {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ArrayInitializerLength {
+                            length: value as u64,
+                        },
+                        Span::empty_at(span.start),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if count_bound.ty.is_error() || !self.assignable(&count_bound, &int) {
+            return (count_bound, elements);
+        }
+        (self.convert(count_bound, &int), elements)
+    }
+
+    /// Whether an ERROR was reported after the diagnostics list held `before` entries, other than
+    /// a language version's gate: as in csc, a construct gated by its rung is not otherwise in
+    /// error, and what follows it is still checked.
+    fn errors_since(&self, before: usize) -> bool {
+        self.diagnostics[before..].iter().any(|diagnostic| {
+            diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+                && !matches!(diagnostic.kind, DiagnosticKind::FeatureRequiresLaterVersion { .. })
+        })
+    }
+
+    /// `Span<T>(void*, int)` on `span_type` (a `System.Span<T>`), when the referenced span declares
+    /// it: the constructor csc lays a `stackalloc`'d block under a span with.
+    fn span_pointer_constructor(&self, span_type: &TypeSymbol) -> Option<MethodReference> {
+        let parameters = [
+            TypeSymbol::Pointer(Box::new(TypeSymbol::Special(SpecialType::Void))),
+            TypeSymbol::Special(SpecialType::Int32),
+        ];
+        self.constructor_taking(span_type, &parameters)
+    }
+
+    /// The accessible instance constructor of `ty` whose parameters are exactly `parameters`, as
+    /// a reference to call -- for a lowering that names one constructor rather than resolving an
+    /// overload.
+    fn constructor_taking(
+        &self,
+        ty: &TypeSymbol,
+        parameters: &[TypeSymbol],
+    ) -> Option<MethodReference> {
+        let info = self.type_info_of(ty)?;
+        let chosen = info.constructors.iter().find(|constructor| {
+            constructor.parameters[..] == *parameters
+                && self.constructor_is_accessible(ty, constructor.accessibility)
+        })?;
+        Some(MethodReference {
+            declaring_instantiation: self.declaring_instantiation_of(ty, ".ctor", parameters),
+            declaring_type: ty.clone(),
+            name: ".ctor".into(),
+            parameters: chosen.parameters.clone(),
+            return_type: TypeSymbol::Special(SpecialType::Void),
+            is_static: false,
+            is_vararg: false,
+            instantiation: None,
+        })
+    }
+
+    /// Whether `ty` is an unmanaged type (C# 7.3's `unmanaged` constraint names the same set): a
+    /// primitive value type, an enum, a pointer, a type parameter constrained `unmanaged`, or a
+    /// struct whose every instance field is unmanaged, at any depth. Only an unmanaged element
+    /// can be `stackalloc`'d: the block is raw memory, and a reference in it is one the collector
+    /// never sees.
+    fn is_unmanaged_type(&self, ty: &TypeSymbol) -> bool {
+        self.is_unmanaged_within(ty, &mut Vec::new())
+    }
+
+    fn is_unmanaged_within(&self, ty: &TypeSymbol, open: &mut Vec<TypeSymbol>) -> bool {
+        match ty {
+            TypeSymbol::Special(special) => !matches!(
+                special,
+                SpecialType::Object | SpecialType::String | SpecialType::Void | SpecialType::Null
+            ),
+            TypeSymbol::Pointer(_) | TypeSymbol::Error => true,
+            TypeSymbol::Array { .. } | TypeSymbol::ByRef(_) => false,
+            TypeSymbol::Named(parts)
+                if matches!(&parts[..], [name] if self.type_parameter_in_scope(name).is_some()) =>
+            {
+                let [name] = &parts[..] else {
+                    return false;
+                };
+                self.type_parameter_in_scope(name).is_some_and(|constraints| {
+                    constraints.types.iter().any(|constraint| {
+                        matches!(constraint, TypeSymbol::Named(parts)
+                            if matches!(&parts[..], [only] if &**only == "unmanaged"))
+                    })
+                })
+            }
+            _ => {
+                let Some(info) = self.type_info_of(ty) else {
+                    return false;
+                };
+                match info.kind {
+                    TypeKind::Enum => true,
+                    TypeKind::Struct => {
+                        if open.contains(ty) {
+                            return true;
+                        }
+                        open.push(ty.clone());
+                        let unmanaged = info
+                            .fields
+                            .iter()
+                            .filter(|field| !field.is_static)
+                            .map(|field| &field.ty)
+                            .chain(info.hidden_instance_field_types.iter())
+                            .all(|field| self.is_unmanaged_within(field, open));
+                        open.pop();
+                        unmanaged
+                    }
+                    _ => false,
+                }
+            }
+        }
     }
 
     /// Binds a LAMBDA against the delegate type it is being converted to (14.5.11).
@@ -3680,6 +4246,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         for (name, ty) in &bound_parameters {
             self.declare_local(name, ty.clone());
         }
+        let handlers = self.enter_function_body();
         let bound_body = match body {
             lamella_syntax::ast::LambdaBody::Expression(expression) => {
                 let value = if invoke.return_type.is_void() {
@@ -3715,6 +4282,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 BoundLambdaBody::Block(bound)
             }
         };
+        self.exit_function_body(handlers);
         let frame = self.lambda_frames.pop().unwrap_or_default();
         self.exit_scope();
         let (captures, captures_this) = (frame.captures, frame.captures_this);
@@ -4456,6 +5024,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.case_label_uses.clear();
         self.const_locals.clear();
         self.local_tuple_names.clear();
+        self.stack_bound_locals.clear();
         self.loop_depth = 0;
         self.switch_depth = 0;
         self.catch_depth = 0;
@@ -4561,6 +5130,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.case_label_uses.clear();
         self.const_locals.clear();
         self.local_tuple_names.clear();
+        self.stack_bound_locals.clear();
         self.loop_depth = 0;
         self.switch_depth = 0;
         self.catch_depth = 0;
@@ -5347,6 +5917,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.ref_locals.retain(|_, (_, declared_at)| *declared_at <= depth);
         self.local_tuple_names
             .retain(|_, (_, declared_at)| *declared_at <= depth);
+        self.stack_bound_locals
+            .retain(|_, declared_at| *declared_at <= depth);
     }
 
     /// Enters / leaves a loop body, so `break`/`continue` know they have an enclosing loop.
@@ -5385,6 +5957,27 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     pub(crate) fn exit_catch_filter(&mut self) {
         self.filter_depth = self.filter_depth.saturating_sub(1);
+    }
+
+    /// Enters the body of a function nested in the one being bound -- a lambda's -- which no
+    /// `catch`, filter, `finally` or `lock` of the outer one encloses. Returns what
+    /// [`Self::exit_function_body`] restores.
+    fn enter_function_body(&mut self) -> HandlerNesting {
+        HandlerNesting {
+            catch_depth: core::mem::take(&mut self.catch_depth),
+            filter_depth: core::mem::take(&mut self.filter_depth),
+            finally_depth: core::mem::take(&mut self.finally_depth),
+            lock_depth: core::mem::take(&mut self.lock_depth),
+            finally_floor: core::mem::take(&mut self.finally_floor),
+        }
+    }
+
+    fn exit_function_body(&mut self, outer: HandlerNesting) {
+        self.catch_depth = outer.catch_depth;
+        self.filter_depth = outer.filter_depth;
+        self.finally_depth = outer.finally_depth;
+        self.lock_depth = outer.lock_depth;
+        self.finally_floor = outer.finally_floor;
     }
 
     pub(crate) fn enter_catch(&mut self) {
@@ -5473,6 +6066,121 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     pub fn declare_local(&mut self, name: &str, ty: TypeSymbol) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.into(), ty);
+        }
+    }
+
+    /// Marks the local just declared as `name` stack-bound when `initializer` refers to stack
+    /// memory: its escape scope is its initializer's, for the rest of its life.
+    pub(crate) fn note_stack_bound_local(&mut self, name: &str, initializer: Option<&BoundExpr>) {
+        if initializer.is_some_and(|value| self.stack_bound_culprit(value).is_some()) {
+            self.stack_bound_locals.insert(name.into(), self.scopes.len());
+        }
+    }
+
+    /// Whether `name` resolves to a local [`Self::note_stack_bound_local`] marked.
+    fn is_stack_bound_local(&self, name: &str) -> bool {
+        self.lookup_local_depth(name).is_some_and(|(index, _)| {
+            self.stack_bound_locals.get(name) == Some(&(index + 1))
+        })
+    }
+
+    /// What makes `value` refer to stack memory that dies with the method, when anything does: a
+    /// `stackalloc` into a span, or a local holding one. Only a value of a ref struct type can
+    /// carry either. A call, property or indexer returning one carries whatever its receiver and
+    /// ref struct arguments carry (csc's rule for a method invocation), and a conversion or a
+    /// conditional whatever its operands do.
+    fn stack_bound_culprit(&self, value: &BoundExpr) -> Option<StackBound> {
+        if !self.type_is_by_ref_like(&value.ty) {
+            return None;
+        }
+        match &value.kind {
+            BoundExprKind::StackAlloc {
+                span_constructor: Some(_),
+                ..
+            } => Some(StackBound::StackAlloc(value.ty.clone())),
+            BoundExprKind::Local(name) => self
+                .is_stack_bound_local(name)
+                .then(|| StackBound::Local(name.clone())),
+            BoundExprKind::Conversion { operand, .. } | BoundExprKind::Cast { operand, .. } => {
+                self.stack_bound_culprit(operand)
+            }
+            BoundExprKind::Conditional {
+                when_true,
+                when_false,
+                ..
+            } => self
+                .stack_bound_culprit(when_true)
+                .or_else(|| self.stack_bound_culprit(when_false)),
+            BoundExprKind::Call {
+                callee, arguments, ..
+            } => {
+                let receiver = match &callee.kind {
+                    BoundExprKind::MethodGroup { receiver, .. } => Some(&**receiver),
+                    _ => None,
+                };
+                receiver
+                    .and_then(|receiver| self.stack_bound_culprit(receiver))
+                    .or_else(|| arguments.iter().find_map(|a| self.stack_bound_culprit(a)))
+            }
+            BoundExprKind::PropertyAccess { receiver, .. } => self.stack_bound_culprit(receiver),
+            BoundExprKind::IndexerAccess {
+                receiver, indices, ..
+            } => self
+                .stack_bound_culprit(receiver)
+                .or_else(|| indices.iter().find_map(|index| self.stack_bound_culprit(index))),
+            BoundExprKind::ObjectCreation { arguments, .. } => {
+                arguments.iter().find_map(|argument| self.stack_bound_culprit(argument))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reports `value` reaching a place that outlives the method -- a `return`, or a store into
+    /// anything but a local that already holds stack memory -- when it refers to stack memory:
+    /// `CS8353` naming the `stackalloc`'s span type, or `CS8352` naming the local, at `written`,
+    /// or at the arm of a conditional there that holds it.
+    pub(crate) fn check_stack_escape(&mut self, value: &BoundExpr, written: &Expr) {
+        let span = self.escape_position(value, written);
+        let kind = match self.stack_bound_culprit(value) {
+            None => return,
+            Some(StackBound::StackAlloc(ty)) => DiagnosticKind::StackAllocEscapes {
+                type_name: ty.short_name().into(),
+            },
+            Some(StackBound::Local(name)) => DiagnosticKind::StackBoundLocalEscapes { name },
+        };
+        self.report(Diagnostic::new(kind, span));
+    }
+
+    /// Where an escaping `value` written as `written` is reported: at the arm of a conditional
+    /// that holds the stack memory, as csc reports it, else at the expression.
+    fn escape_position(&self, value: &BoundExpr, written: &Expr) -> Span {
+        let value = match &value.kind {
+            BoundExprKind::Conversion { operand, .. } | BoundExprKind::Cast { operand, .. } => {
+                &**operand
+            }
+            _ => value,
+        };
+        match (&written.kind, &value.kind) {
+            (ExprKind::Parenthesized(inner), _) => self.escape_position(value, inner),
+            (
+                ExprKind::Conditional {
+                    when_true,
+                    when_false,
+                    ..
+                },
+                BoundExprKind::Conditional {
+                    when_true: bound_true,
+                    when_false: bound_false,
+                    ..
+                },
+            ) => {
+                if self.stack_bound_culprit(bound_true).is_some() {
+                    self.escape_position(bound_true, when_true)
+                } else {
+                    self.escape_position(bound_false, when_false)
+                }
+            }
+            _ => written.span,
         }
     }
 
@@ -6085,17 +6793,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     ty: arglist_marker(),
                 }
             }
-            ExprKind::StackAlloc { element, count } => {
-                let element_ty = self.resolve_type_ref(element);
-                let count = self.bind_expression(count);
-                BoundExpr {
-                    ty: TypeSymbol::Pointer(Box::new(element_ty.clone())),
-                    kind: BoundExprKind::StackAlloc {
-                        element: element_ty,
-                        count: Box::new(count),
-                    },
-                }
-            }
+            ExprKind::StackAlloc { .. } => self.bind_stackalloc_nested(expr),
             ExprKind::Dereference(operand) => {
                 let pointer = self.bind_expression(operand);
                 let ty = match &pointer.ty {
@@ -8679,6 +9377,16 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let target_span = target_expr.span;
         let checkpoint = self.diagnostics.len();
         let bound = self.bind_assignment_inner(operator, target_expr, value_expr, span);
+        if let BoundExprKind::Assignment {
+            operator: AssignmentOperator::Assign,
+            target,
+            value,
+            ..
+        } = &bound.kind
+            && !matches!(&target.kind, BoundExprKind::Local(name) if self.is_stack_bound_local(name))
+        {
+            self.check_stack_escape(value, value_expr);
+        }
         let BoundExprKind::Assignment { target, .. } = &bound.kind else {
             return bound;
         };
@@ -18464,6 +19172,63 @@ pub(crate) enum NullableUnderlying {
 /// The `?` that ends a `T?` node, where an annotation's diagnostics point (csc's position).
 fn question_of(node: &TypeRef) -> Span {
     Span::new(node.span.end.saturating_sub(1), node.span.end)
+}
+
+/// Whether an arm of a conditional is one of the forms that has no type without a target -- a
+/// target-typed `new()`, and a `stackalloc` where the conditional is a local's initializer.
+///
+/// **THE GUARD EXISTS SO THE ORDINARY CONDITIONAL PATH IS UNTOUCHED.** Every rule that binder
+/// applies -- the better-conversion choice between the two arms, `CS0173` when neither converts to
+/// the other, the constant folding -- stays where it is for every conditional that does not
+/// contain one of these. Routing ALL conditionals through the target-typed path would replace a
+/// body of measured behaviour with a shortcut, to serve one syntax.
+fn target_typed_arm(expr: &Expr, at_initializer: bool) -> bool {
+    match &expr.kind {
+        ExprKind::ObjectCreation { target: None, .. } => true,
+        ExprKind::StackAlloc { .. } => at_initializer,
+        _ => false,
+    }
+}
+
+/// The `T` of `System.Span<T>` or `System.ReadOnlySpan<T>`, the two types `stackalloc` converts to
+/// in safe code (C# 7.2); `None` for any other type.
+fn span_element_type(ty: &TypeSymbol) -> Option<TypeSymbol> {
+    let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = ty
+    else {
+        return None;
+    };
+    let is_span = matches!(&definition[..], [namespace, name]
+        if &**namespace == "System" && (&**name == "Span" || &**name == "ReadOnlySpan"));
+    match &arguments[..] {
+        [element] if is_span => Some(element.clone()),
+        _ => None,
+    }
+}
+
+/// Collects the `stackalloc`s C# 7.3 admits under `value`, a declarator's initializer or the value
+/// of a simple assignment that is a statement: `value` itself, or a part of a conditional that is
+/// `value`, each through any casts written directly over the `stackalloc`. csc's rule, and as in
+/// csc a parenthesized `stackalloc` is not among them.
+fn csharp73_stackalloc_positions(value: &Expr, positions: &mut Vec<Span>) {
+    let parts: [Option<&Expr>; 3] = match &value.kind {
+        ExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => [Some(&**condition), Some(&**when_true), Some(&**when_false)],
+        _ => [Some(value), None, None],
+    };
+    for mut part in parts.into_iter().flatten() {
+        while let ExprKind::Cast { operand, .. } = &part.kind {
+            part = operand;
+        }
+        if matches!(part.kind, ExprKind::StackAlloc { .. }) {
+            positions.push(part.span);
+        }
+    }
 }
 
 fn is_reference_base_class(ty: &TypeSymbol) -> bool {

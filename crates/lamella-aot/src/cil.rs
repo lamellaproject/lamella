@@ -2835,6 +2835,19 @@ fn materialize_pending(
     Ok(addr)
 }
 
+/// Whether a recorded address is the RECEIVER of a call that takes `operands` values, its receiver
+/// included: whether it sits at the bottom of the call's operand window.
+///
+/// Pushed, the address would occupy slot `pending.depth` of a stack one value taller than
+/// `stack_len`, and the call takes the top `operands` slots of that stack. A recorded address
+/// anywhere else is an ordinary operand. Above the bottom it is an explicit argument: `obj.M(out s)`
+/// is `ldloc obj; ldloca s; callvirt`, with `&s` above `obj`. Below it, it belongs to a later
+/// instruction: `p.X = obj.Get()` is `ldloca p; ldloc obj; callvirt; stfld`, and `&p` is the
+/// `stfld`'s. Either way it is materialized at its depth ([`materialize_pending`]).
+fn pending_is_receiver(pending: &PendingAddr, stack_len: usize, operands: usize) -> bool {
+    (stack_len + 1).checked_sub(operands) == Some(pending.depth)
+}
+
 /// Records a `ldloca`/`ldarga` address, materializing whatever was already pending.
 ///
 /// TWO ADDRESSES CAN BE LIVE AT ONCE, AND THE OLDER ONE IS DEEPER. A user-defined operator is the
@@ -3806,7 +3819,25 @@ fn apply_value_op(
                     .ok_or(CilError::UnresolvedCall)?,
             };
             if matches!(info.target, CallTarget::Intrinsic(Intrinsic::IntToString)) {
-                let value = match last_local_addr.take() {
+                let receiver = match last_local_addr.take() {
+                    Some(pending) if pending_is_receiver(&pending, stack.len(), info.args) => {
+                        Some(pending)
+                    }
+                    Some(operand) => {
+                        materialize_pending(
+                            operand,
+                            stack,
+                            locals,
+                            local_types,
+                            args,
+                            value_types,
+                            insts,
+                        )?;
+                        None
+                    }
+                    None => None,
+                };
+                let value = match receiver {
                     Some(PendingAddr { source, .. }) => {
                         addr_base(source, locals, local_types, args, value_types, insts)?
                     }
@@ -3830,10 +3861,13 @@ fn apply_value_op(
                 return Ok(());
             }
             let mut pending = last_local_addr.take();
-            if constrained.is_none() && !info.has_this {
-                if let Some(argument) = pending.take() {
+            let receiver_pending = pending.is_some_and(|address| {
+                info.has_this && pending_is_receiver(&address, stack.len(), info.args)
+            });
+            if !receiver_pending {
+                if let Some(operand) = pending.take() {
                     materialize_pending(
-                        argument,
+                        operand,
                         stack,
                         locals,
                         local_types,
@@ -9582,6 +9616,234 @@ mod tests {
         });
         assert_eq!(call, Some((1, 3)));
         assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    /// A `ref`/`out` local passed to an INSTANCE method is an argument, never the receiver.
+    ///
+    /// `obj.M(out s, 5)` is `ldarg.0; ldloca s; ldc.i4.5; callvirt`, and `obj.M(5, out s)` puts the
+    /// `ldloca` last. A struct local's address is recorded rather than pushed, and here it sits above
+    /// the receiver, so the call's arguments are the receiver and then the two operands in stack
+    /// order. Asserted for each way an instance call lowers (a direct call, a vtable slot, an itable
+    /// tag, another assembly's method, and a `constrained.` call on a type that declares the method),
+    /// with the address before and after the scalar, below a value left on the stack.
+    #[test]
+    fn a_ref_local_passed_to_an_instance_method_is_an_argument_not_the_receiver() {
+        use lamella_token::Token;
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Dispatch {
+            Direct,
+            Virtual,
+            Interface,
+            External,
+            Constrained,
+        }
+        struct Instance(Dispatch);
+        impl CallResolver for Instance {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 3,
+                    has_result: false,
+                    result_type: None,
+                    has_this: true,
+                    target: match self.0 {
+                        Dispatch::External => CallTarget::External("Sensors.Sensor.Read".into()),
+                        _ => CallTarget::Internal(5),
+                    },
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                (self.0 == Dispatch::Virtual).then_some(4)
+            }
+            fn interface_call_tag(&self, _: &Operand) -> Option<u32> {
+                (self.0 == Dispatch::Interface).then_some(0x51)
+            }
+            fn constrained_call(&self, _: &Operand, method: &Operand) -> Option<CallInfo> {
+                (self.0 == Dispatch::Constrained).then(|| self.resolve(method)).flatten()
+            }
+        }
+        let reading = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(3),
+            size: 8,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        for dispatch in [
+            Dispatch::Direct,
+            Dispatch::Virtual,
+            Dispatch::Interface,
+            Dispatch::External,
+            Dispatch::Constrained,
+        ] {
+            for address_first in [true, false] {
+                let address = Instruction::new(Opcode::LdlocaS, Operand::Variable(0));
+                let scalar = Instruction::new(Opcode::LdcI4S, Operand::Int8(5));
+                let mut code = alloc::vec![
+                    Instruction::simple(Opcode::LdcI41),
+                    Instruction::simple(Opcode::Ldarg0),
+                ];
+                code.extend(if address_first { [address, scalar] } else { [scalar, address] });
+                if dispatch == Dispatch::Constrained {
+                    code.push(Instruction::new(Opcode::Constrained, Operand::Token(Token::new(0x02, 1))));
+                }
+                let call = if dispatch == Dispatch::Direct { Opcode::Call } else { Opcode::Callvirt };
+                code.push(Instruction::new(call, Operand::Token(Token::new(0x0A, 2))));
+                code.push(Instruction::simple(Opcode::Ret));
+                let body = MethodBodyImage {
+                    max_stack: 4,
+                    init_locals: true,
+                    local_var_sig: None,
+                    code: code.into_boxed_slice(),
+                    handlers: Vec::new().into_boxed_slice(),
+                };
+                let receiver_type = match dispatch {
+                    Dispatch::Constrained => MirType::ManagedPtr,
+                    _ => MirType::ObjectRef,
+                };
+                let case = alloc::format!("{dispatch:?}, address first: {address_first}");
+                let (func, _) = lower_method_typed(
+                    &body,
+                    &Instance(dispatch),
+                    &[receiver_type],
+                    &[reading],
+                    Narrowing::default(),
+                )
+                .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                assert!(lamella_ir::verify(&func).is_ok(), "{case}");
+                let receiver = func.blocks[func.entry.index()].params[0];
+                let insts: Vec<&(ValueId, Inst)> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+                let address = insts
+                    .iter()
+                    .find_map(|(id, i)| matches!(i, Inst::FieldAddr { offset: 0, .. }).then_some(*id))
+                    .unwrap_or_else(|| panic!("{case}: the local's address is materialized"));
+                let five = insts
+                    .iter()
+                    .find_map(|(id, i)| matches!(i, Inst::ConstInt { value: 5, .. }).then_some(*id))
+                    .unwrap_or_else(|| panic!("{case}: the scalar is a constant"));
+                let call_args = insts
+                    .iter()
+                    .find_map(|(_, i)| match (dispatch, i) {
+                        (Dispatch::Direct | Dispatch::Constrained, Inst::Call { callee: 5, args })
+                        | (Dispatch::Virtual, Inst::CallVirtual { slot: 4, args, .. })
+                        | (Dispatch::Interface, Inst::CallInterface { tag: 0x51, args, .. })
+                        | (Dispatch::External, Inst::PInvoke { args, .. }) => Some(args.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{case}: the call lowers as its dispatch says"));
+                let expected = if address_first {
+                    alloc::vec![receiver, address, five]
+                } else {
+                    alloc::vec![receiver, five, address]
+                };
+                assert_eq!(call_args, expected, "{case}: the receiver, then the stack's order");
+            }
+        }
+    }
+
+    /// A struct local's address recorded BELOW a call belongs to the instruction after the call.
+    ///
+    /// `p.X = obj.Get()` is `ldloca p; ldarg.0; callvirt Get; stfld X`, and `p.S = n.ToString()` is
+    /// `ldloca p; ldloca n; call Int32::ToString; stfld S`, where `n` is an int local whose own
+    /// address is pushed as a real pointer. In both, the call's receiver is on the stack, and `&p` is
+    /// the `stfld`'s base.
+    #[test]
+    fn a_struct_local_s_address_below_a_call_is_the_next_store_s_base() {
+        use lamella_token::Token;
+        struct Get(bool);
+        impl CallResolver for Get {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(if self.0 { MirType::ObjectRef } else { MirType::I32 }),
+                    has_this: true,
+                    target: match self.0 {
+                        true => CallTarget::Intrinsic(Intrinsic::IntToString),
+                        false => CallTarget::Internal(6),
+                    },
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                Some(5)
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(4)
+            }
+        }
+        let label = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(3),
+            size: 8,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        for int_to_string in [false, true] {
+            let case = if int_to_string { "p.S = n.ToString()" } else { "p.X = obj.Get()" };
+            let (receiver, call) = match int_to_string {
+                true => (
+                    Instruction::new(Opcode::LdlocaS, Operand::Variable(1)),
+                    Instruction::new(Opcode::Call, Operand::Token(Token::new(0x0A, 3))),
+                ),
+                false => (
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::new(Opcode::Callvirt, Operand::Token(Token::new(0x0A, 3))),
+                ),
+            };
+            let body = MethodBodyImage {
+                max_stack: 3,
+                init_locals: true,
+                local_var_sig: None,
+                code: alloc::vec![
+                    Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                    receiver,
+                    call,
+                    Instruction::new(Opcode::Stfld, Operand::Token(Token::new(0x04, 1))),
+                    Instruction::simple(Opcode::Ret),
+                ]
+                .into_boxed_slice(),
+                handlers: Vec::new().into_boxed_slice(),
+            };
+            let (func, _) = lower_method_typed(
+                &body,
+                &Get(int_to_string),
+                &[MirType::ObjectRef],
+                &[label, MirType::I32],
+                Narrowing::default(),
+            )
+            .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert!(lamella_ir::verify(&func).is_ok(), "{case}");
+            let insts: Vec<&(ValueId, Inst)> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+            let defined_by = |value: ValueId| insts.iter().find(|(id, _)| *id == value).map(|(_, i)| i);
+            let (store_base, stored) = insts
+                .iter()
+                .find_map(|(_, i)| match i {
+                    Inst::FieldStore { base, offset: 4, value } => Some((*base, *value)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{case}: the store is emitted"));
+            let Some(Inst::FieldAddr { base: slot, offset: 0 }) = defined_by(store_base) else {
+                panic!("{case}: the store's base is `&p`, got {:?}", defined_by(store_base));
+            };
+            let result = if int_to_string {
+                let Some(Inst::IntToString { value }) = defined_by(stored) else {
+                    panic!("{case}: the stored value is the string");
+                };
+                let Some(Inst::Load { address, .. }) = defined_by(*value) else {
+                    panic!("{case}: the int is loaded through its pointer, got {:?}", defined_by(*value));
+                };
+                assert_ne!(*address, store_base, "{case}: the int is not read through `&p`");
+                stored
+            } else {
+                let receiver = func.blocks[func.entry.index()].params[0];
+                let call_args = insts
+                    .iter()
+                    .find_map(|(id, i)| match i {
+                        Inst::CallVirtual { slot: 5, args, .. } => Some((*id, args.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{case}: the call dispatches through its slot"));
+                assert_eq!(call_args.1, alloc::vec![receiver], "{case}: the receiver is `obj`");
+                call_args.0
+            };
+            assert_eq!(stored, result, "{case}: the call's result is what is stored");
+            assert_ne!(*slot, func.blocks[func.entry.index()].params[0], "{case}: `&p` is not `obj`");
+        }
     }
 
     #[test]

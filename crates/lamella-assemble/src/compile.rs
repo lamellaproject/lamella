@@ -7857,6 +7857,34 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 }
             }
         }
+        BoundExprKind::StackAlloc {
+            element,
+            count,
+            span_constructor,
+            initializer,
+        } => {
+            mint_in_expr(count, image, tokens);
+            for value in initializer {
+                mint_in_expr(value, image, tokens);
+            }
+            let array_lowering = span_constructor
+                .as_ref()
+                .is_some_and(|ctor| !matches!(ctor.parameters.first(), Some(TypeSymbol::Pointer(_))));
+            if array_lowering || (!initializer.is_empty() && !matches!(element, TypeSymbol::Special(_))) {
+                mint_type_token(image, tokens, element);
+            }
+            if let Some(constructor) = span_constructor
+                && tokens
+                    .method(
+                        &constructor.declaring_type,
+                        &constructor.name,
+                        &constructor.parameters,
+                    )
+                    .is_none()
+            {
+                mint_member_ref(constructor, image, tokens);
+            }
+        }
         BoundExprKind::ObjectCreation {
             arguments,
             constructor,

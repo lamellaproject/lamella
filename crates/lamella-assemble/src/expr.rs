@@ -388,13 +388,24 @@ pub fn emit_expression(
         BoundExprKind::RefValue { reference, target } => {
             emit_refvalue(reference, target, frame, tokens, out)
         }
-        BoundExprKind::StackAlloc { element, count } => {
+        BoundExprKind::StackAlloc {
+            element,
+            count,
+            span_constructor: None,
+            initializer,
+        } => {
             emit_expression(count, frame, tokens, out)?;
             emit_sizeof(element, tokens, out)?;
             out.push(Instruction::simple(Opcode::Mul));
             out.push(Instruction::simple(Opcode::Localloc));
-            Ok(())
+            emit_stackalloc_elements(element, initializer, frame, tokens, out)
         }
+        BoundExprKind::StackAlloc {
+            element,
+            count,
+            span_constructor: Some(constructor),
+            initializer,
+        } => emit_stackalloc_span(element, count, initializer, constructor, frame, tokens, out),
         BoundExprKind::Dereference { operand } => {
             emit_expression(operand, frame, tokens, out)?;
             let (TypeSymbol::Pointer(element) | TypeSymbol::ByRef(element)) = &operand.ty else {
@@ -908,6 +919,159 @@ fn row_major_indices(position: usize, dimensions: &[i32]) -> Vec<i32> {
         remainder /= size;
     }
     indices
+}
+
+/// Lowers `stackalloc T[count]` into a `Span<T>` as csc does: the block's byte size, `localloc`,
+/// then `newobj Span<T>(void*, int)` over the block and the count.
+///
+/// The size is the count widened with `conv.u` and multiplied by `sizeof(T)` with `mul.ovf.un`, so
+/// a count too large for the frame overflows rather than wrapping to a small block; a one-byte
+/// element needs no multiply. The count is read twice, so one that is not a constant goes through
+/// a temporary. A constant one is folded, byte size and all, when `T`'s size is a constant.
+fn emit_stackalloc_span(
+    element: &TypeSymbol,
+    count: &BoundExpr,
+    initializer: &[BoundExpr],
+    constructor: &lamella_binder::MethodReference,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let ctor = tokens
+        .method(
+            &constructor.declaring_type,
+            &constructor.name,
+            &constructor.parameters,
+        )
+        .ok_or(EmitError::Unsupported("a span constructor that was not minted"))?;
+    if !matches!(constructor.parameters.first(), Some(TypeSymbol::Pointer(_))) {
+        let array = BoundExpr {
+            ty: TypeSymbol::Array {
+                element: alloc::boxed::Box::new(element.clone()),
+                rank: 1,
+            },
+            kind: BoundExprKind::ArrayCreation {
+                lengths: alloc::vec![count.clone()],
+                elements: initializer.to_vec(),
+            },
+        };
+        emit_expression(&array, frame, tokens, out)?;
+        out.push(Instruction::new(Opcode::Newobj, Operand::Token(ctor)));
+        return Ok(());
+    }
+    let size = constant_size_of(element, tokens);
+    let ldc = |value: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(value));
+    let count_slot = match constant_length(count) {
+        Some(value) => {
+            let folded = u64::from(value as u32) * u64::from(size.unwrap_or(0) as u32);
+            match size {
+                Some(_) if folded < u64::from(u32::MAX) => {
+                    out.push(ldc(folded as u32 as i32));
+                    out.push(Instruction::simple(Opcode::ConvU));
+                }
+                _ => {
+                    out.push(ldc(value));
+                    out.push(Instruction::simple(Opcode::ConvU));
+                    emit_element_size(element, size, tokens, out)?;
+                    out.push(Instruction::simple(Opcode::MulOvfUn));
+                }
+            }
+            None
+        }
+        None => {
+            emit_expression(count, frame, tokens, out)?;
+            let slot = frame.reserve_local(&TypeSymbol::Special(SpecialType::Int32));
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+            out.push(Instruction::simple(Opcode::ConvU));
+            if size != Some(1) {
+                emit_element_size(element, size, tokens, out)?;
+                out.push(Instruction::simple(Opcode::MulOvfUn));
+            }
+            Some(slot)
+        }
+    };
+    out.push(Instruction::simple(Opcode::Localloc));
+    emit_stackalloc_elements(element, initializer, frame, tokens, out)?;
+    match (count_slot, constant_length(count)) {
+        (Some(slot), _) => out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot))),
+        (None, Some(value)) => out.push(ldc(value)),
+        (None, None) => return Err(EmitError::Unsupported("a stackalloc count with no value")),
+    }
+    out.push(Instruction::new(Opcode::Newobj, Operand::Token(ctor)));
+    Ok(())
+}
+
+/// Stores a `stackalloc` initializer's elements into the block whose address is on the stack,
+/// leaving the address there: for each, `dup`, the element's byte offset added (none for the
+/// first), the value, and the indirect store its type takes.
+fn emit_stackalloc_elements(
+    element: &TypeSymbol,
+    initializer: &[BoundExpr],
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let size = constant_size_of(element, tokens);
+    for (index, value) in initializer.iter().enumerate() {
+        let mut nested = false;
+        crate::awaitlower::visit_expr(value, &mut |node| {
+            nested |= matches!(node.kind, BoundExprKind::StackAlloc { .. });
+        });
+        if nested {
+            return Err(EmitError::Unsupported(
+                "a stackalloc inside a stackalloc's initializer",
+            ));
+        }
+        out.push(Instruction::simple(Opcode::Dup));
+        if index > 0 {
+            match size {
+                Some(size) => out.push(Instruction::new(
+                    Opcode::LdcI4,
+                    Operand::Int32(index as i32 * size),
+                )),
+                None => {
+                    out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(index as i32)));
+                    emit_sizeof(element, tokens, out)?;
+                    out.push(Instruction::simple(Opcode::Mul));
+                }
+            }
+            out.push(Instruction::simple(Opcode::Add));
+        }
+        emit_expression(value, frame, tokens, out)?;
+        emit_store_indirect(element, tokens, out)?;
+    }
+    Ok(())
+}
+
+/// `sizeof(element)` for a `stackalloc`'s multiply: the constant where there is one, else the
+/// `sizeof` opcode naming the type.
+fn emit_element_size(
+    element: &TypeSymbol,
+    size: Option<i32>,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match size {
+        Some(size) => {
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(size)));
+            Ok(())
+        }
+        None => emit_sizeof(element, tokens, out),
+    }
+}
+
+/// The byte size of `ty` when C# makes it a constant: a fixed-width primitive, `decimal`, or an
+/// enum (its underlying type's). `None` for a struct, whose size only the runtime knows.
+fn constant_size_of(ty: &TypeSymbol, tokens: &Tokens) -> Option<i32> {
+    match ty {
+        TypeSymbol::Special(SpecialType::Decimal) => Some(16),
+        TypeSymbol::Special(special) => primitive_byte_size(*special),
+        _ if tokens.is_enum(ty) => {
+            primitive_byte_size(tokens.enum_underlying(ty).unwrap_or(SpecialType::Int32))
+        }
+        _ => None,
+    }
 }
 
 /// The constant `int32` value of an array-dimension length, when it is an integer literal

@@ -1121,6 +1121,47 @@ pub enum DiagnosticKind {
     /// language supports unsafe code in full; a compilation opts IN to containing it, exactly as
     /// csc requires.
     UnsafeCodeRequiresOption,
+    /// `CS0214`: a `stackalloc`'s pointer reading outside an unsafe context -- a type or member
+    /// declared `unsafe`, or an `unsafe` block. Only the `stackalloc` is checked; a pointer TYPE
+    /// written in a safe context is not yet.
+    PointerInSafeContext,
+    /// `CS0208`: a `stackalloc` of a managed type. The block is raw memory the collector never
+    /// scans, so an element that holds a reference, at any depth, cannot live in it.
+    ManagedTypeAddress {
+        /// The element type, as csc names it.
+        type_name: Box<str>,
+    },
+    /// `CS0255`: a `stackalloc` in a `catch` or `finally` block, where the CLI does not allow
+    /// `localloc` (ECMA-335 III.3.47). A lambda's body is a function of its own, so one written
+    /// in such a block is not inside it.
+    StackAllocInHandler,
+    /// `CS0247`: a `stackalloc` whose count is a negative constant.
+    StackAllocNegativeSize,
+    /// `CS0826`: an implicitly typed array or `stackalloc[] { ... }` whose elements share no
+    /// best common type -- none at all when the initializer is empty.
+    NoBestTypeForImplicitArray,
+    /// `CS1586`: a `stackalloc` whose brackets are empty with no initializer to count.
+    ArrayCreationNeedsSize,
+    /// `CS8346`: a `stackalloc` converted to a type it does not convert to -- anything but a
+    /// pointer, or a `Span<T>`/`ReadOnlySpan<T>` over its own element type.
+    StackAllocConversion {
+        /// The element type the `stackalloc` names.
+        element: Box<str>,
+        /// The type it was converted to.
+        target: Box<str>,
+    },
+    /// `CS8353`: a `stackalloc` into a span reaching a place that outlives the method -- a
+    /// `return`, or a store into anything but a local that already holds stack memory.
+    StackAllocEscapes {
+        /// The span type, as csc names it.
+        type_name: Box<str>,
+    },
+    /// `CS8352`: a local that holds stack memory (a `stackalloc`'s span, or another such local's)
+    /// reaching a place that outlives the method.
+    StackBoundLocalEscapes {
+        /// The local.
+        name: Box<str>,
+    },
     /// `CS0133`: a `const` field's initializer is not a constant expression. Its value is baked
     /// into every use site (17.4.2), so nothing evaluated at run time can supply it.
     NonConstantFieldInitializer {
@@ -2364,6 +2405,15 @@ impl DiagnosticKind {
             DiagnosticKind::ByRefLikeFieldType { .. } => 8345,
             DiagnosticKind::ByRefLikeTypeArgument { .. } => 9244,
             DiagnosticKind::UnsafeCodeRequiresOption => 227,
+            DiagnosticKind::PointerInSafeContext => 214,
+            DiagnosticKind::ManagedTypeAddress { .. } => 208,
+            DiagnosticKind::StackAllocInHandler => 255,
+            DiagnosticKind::StackAllocNegativeSize => 247,
+            DiagnosticKind::NoBestTypeForImplicitArray => 826,
+            DiagnosticKind::ArrayCreationNeedsSize => 1586,
+            DiagnosticKind::StackAllocConversion { .. } => 8346,
+            DiagnosticKind::StackAllocEscapes { .. } => 8353,
+            DiagnosticKind::StackBoundLocalEscapes { .. } => 8352,
             DiagnosticKind::NonConstantFieldInitializer { .. } => 133,
             DiagnosticKind::OverloadableUnaryOperatorExpected => 1019,
             DiagnosticKind::CatchAfterGeneralCatch => 1017,
@@ -3090,6 +3140,42 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UnsafeCodeRequiresOption => {
                 write!(f, "Unsafe code may only appear if compiling with /unsafe")
             }
+            DiagnosticKind::PointerInSafeContext => write!(
+                f,
+                "Pointers and fixed size buffers may only be used in an unsafe context"
+            ),
+            DiagnosticKind::ManagedTypeAddress { type_name } => write!(
+                f,
+                "Cannot take the address of, get the size of, or declare a pointer to a managed \
+                 type ('{type_name}')"
+            ),
+            DiagnosticKind::StackAllocInHandler => {
+                write!(f, "stackalloc may not be used in a catch or finally block")
+            }
+            DiagnosticKind::StackAllocNegativeSize => {
+                write!(f, "Cannot use a negative size with stackalloc")
+            }
+            DiagnosticKind::NoBestTypeForImplicitArray => {
+                write!(f, "No best type found for implicitly-typed array")
+            }
+            DiagnosticKind::ArrayCreationNeedsSize => {
+                write!(f, "Array creation must have array size or array initializer")
+            }
+            DiagnosticKind::StackAllocEscapes { type_name } => write!(
+                f,
+                "A result of a stackalloc expression of type '{type_name}' cannot be used in this \
+                 context because it may be exposed outside of the containing method"
+            ),
+            DiagnosticKind::StackBoundLocalEscapes { name } => write!(
+                f,
+                "Cannot use variable '{name}' in this context because it may expose referenced \
+                 variables outside of their declaration scope"
+            ),
+            DiagnosticKind::StackAllocConversion { element, target } => write!(
+                f,
+                "Conversion of a stackalloc expression of type '{element}' to type '{target}' is \
+                 not possible."
+            ),
             DiagnosticKind::NonConstantFieldInitializer { field } => {
                 write!(f, "The expression being assigned to '{field}' must be constant")
             }

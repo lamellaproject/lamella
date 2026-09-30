@@ -31,6 +31,7 @@ pub(crate) mod interop;
 pub(crate) mod lambdalower;
 pub mod method;
 pub mod session;
+pub(crate) mod stackallocspill;
 pub mod tokens;
 
 pub use compile::{

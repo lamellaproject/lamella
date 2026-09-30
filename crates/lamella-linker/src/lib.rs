@@ -366,7 +366,21 @@ pub fn check_instantiation_cap(objects: &[Object], cap: usize) -> Result<(), Lin
 /// and all other data, then rebuilds each object re-laid-out with its symbols and relocations remapped, so
 /// unused functions/descriptors and the undefined externs only they referenced drop out.
 pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
-    trim_all(objects, &reachable_from(objects, entry, &[]))
+    trim_all(objects, &reachable_from(objects, entry, &[], true))
+}
+
+/// The names [`garbage_collect`] keeps for a reason other than a vtable or itable slot: the same
+/// walk from the same roots, except that it never follows a type descriptor's reference to a
+/// function. A descriptor carries no other function pointer, so each such reference is one of its
+/// vtable or itable slots.
+///
+/// A method that only a slot keeps is absent here, and so is everything reached only through it:
+/// the methods it calls, and theirs. A kept type keeps its whole table, called or not, so the
+/// dead-strip cannot say whether the program ever dispatches to such a method. A name in this set
+/// is reached some other way: by a call, by code that takes its address (a delegate's target), or
+/// by data kept whole.
+pub fn reachable_without_table_slots(objects: &[Object], entry: &str) -> BTreeSet<String> {
+    reachable_from(objects, entry, &[], false)
 }
 
 /// Rebuilds every object against `keep`, EXCEPT the ones [`resolves_against_its_own_layout`] refuses
@@ -417,7 +431,9 @@ fn resolves_against_its_own_layout(obj: &Object) -> bool {
 
 /// The names [`garbage_collect`] keeps: everything the cross-object reference graph reaches from
 /// `entry` and from each of `optional_roots`, plus everything [`kept_regardless`] keeps without
-/// being reached. An optional root that no object defines reaches nothing.
+/// being reached. An optional root that no object defines reaches nothing. Without
+/// `through_table_slots`, the walk does not follow a type descriptor's references to functions,
+/// which is [`reachable_without_table_slots`].
 ///
 /// **EXTRACTED SO THE FOLD PATH ASKS THE SAME QUESTION RATHER THAN ANSWERING IT AGAIN.**
 /// [`link_gc_inner`] needs the reachable set MINUS the functions ICF folds away, which it cannot get
@@ -425,7 +441,12 @@ fn resolves_against_its_own_layout(obj: &Object) -> bool {
 /// its own that followed a function's calls and NOTHING a data symbol references, so every
 /// descriptor, string blob and statics record fell out of the image and the link died on the first
 /// reference to one.
-fn reachable_from(objects: &[Object], entry: &str, optional_roots: &[&str]) -> BTreeSet<String> {
+fn reachable_from(
+    objects: &[Object],
+    entry: &str,
+    optional_roots: &[&str],
+    through_table_slots: bool,
+) -> BTreeSet<String> {
     let mut defs: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, s) in obj.symbols.iter().enumerate() {
@@ -434,6 +455,11 @@ fn reachable_from(objects: &[Object], entry: &str, optional_roots: &[&str]) -> B
             }
         }
     }
+    let is_function = |name: &str| {
+        defs.get(name).is_some_and(|sites| {
+            sites.iter().any(|&(oi, si)| objects[oi].symbols[si].kind == SymbolType::Func)
+        })
+    };
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
     stack.push(String::from(entry));
@@ -464,9 +490,13 @@ fn reachable_from(objects: &[Object], entry: &str, optional_roots: &[&str]) -> B
             let sym = &obj.symbols[si];
             let start = sym.value & !1;
             let end = start + sym.size;
+            let skips_slots = !through_table_slots && sym.name.starts_with(TYPE_DESC_PREFIX);
             for r in &obj.relocations {
                 if r.offset >= start && r.offset < end {
                     if let Some(target) = obj.symbols.get(r.symbol as usize) {
+                        if skips_slots && is_function(&target.name) {
+                            continue;
+                        }
                         stack.push(target.name.clone());
                     }
                 }
@@ -1739,7 +1769,7 @@ fn link_gc_inner(
     ram: Option<(u32, u32)>,
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
-    let mut keep = reachable_from(objects, entry, optional_roots);
+    let mut keep = reachable_from(objects, entry, optional_roots, true);
     let folds = match fold {
         true => plan_folds(objects, machine, &keep, entry),
         false => Vec::new(),
@@ -2943,6 +2973,62 @@ mod tests {
         assert!(defined.contains(&"m"), "a method reached only through a descriptor's reloc is kept");
         assert!(!defined.contains(&"__lamella_typedesc_2"), "an unreached descriptor is dropped");
         assert!(!defined.contains(&"dead"), "a method only an unreached descriptor referenced drops out");
+    }
+
+    /// A METHOD ONLY A TABLE SLOT KEEPS, AND WHAT IT CALLS, ARE NOT REACHED WITHOUT TABLE SLOTS.
+    ///
+    /// `f0` calls `direct` and references `__lamella_typedesc_1`, whose slots name `slot` (defined
+    /// beside it) and `lib_slot` (another object's, so undefined here), and whose base word names
+    /// `__lamella_typedesc_2`, whose own slot names `base_slot`. `slot` calls `helper`. The
+    /// dead-strip keeps all of them. Without table slots the walk still reaches both descriptors,
+    /// but none of the four methods that only a slot keeps.
+    #[test]
+    fn a_method_only_a_table_slot_keeps_is_not_reached_without_table_slots() {
+        let program = obj_arm(
+            &[0u8; 24],
+            &[
+                func("f0", 1, 4),
+                func("direct", 5, 2),
+                func("slot", 7, 2),
+                func("helper", 9, 2),
+                data("__lamella_typedesc_1", 12, 12),
+                undef("lib_slot"),
+                undef("__lamella_typedesc_2"),
+            ],
+            &[
+                Relocation { offset: 0, symbol: 4, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 2, symbol: 1, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 6, symbol: 3, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 12, symbol: 2, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 16, symbol: 5, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 20, symbol: 6, kind: arm::R_ARM_ABS32, addend: 0 },
+            ],
+        );
+        let library = obj_arm(
+            &[0u8; 8],
+            &[
+                func("lib_slot", 1, 2),
+                func("base_slot", 3, 2),
+                data("__lamella_typedesc_2", 4, 4),
+            ],
+            &[Relocation { offset: 4, symbol: 1, kind: arm::R_ARM_ABS32, addend: 0 }],
+        );
+        let objects = [program, library];
+        let kept: Vec<String> = garbage_collect(&objects, "f0")
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.clone())
+            .collect();
+        let reached = reachable_without_table_slots(&objects, "f0");
+        for name in ["f0", "direct", "__lamella_typedesc_1", "__lamella_typedesc_2"] {
+            assert!(kept.iter().any(|k| k == name), "the dead-strip keeps {name}");
+            assert!(reached.contains(name), "{name} is reached without table slots");
+        }
+        for name in ["slot", "helper", "lib_slot", "base_slot"] {
+            assert!(kept.iter().any(|k| k == name), "the dead-strip keeps {name}");
+            assert!(!reached.contains(name), "{name} is kept only through a table slot");
+        }
     }
 
     #[test]

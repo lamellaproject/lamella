@@ -476,7 +476,7 @@ fn stmt_contains_await(statement: &BoundStmt) -> bool {
 }
 
 /// Depth-first over an expression and every child expression.
-fn visit_expr(expr: &BoundExpr, f: &mut dyn FnMut(&BoundExpr)) {
+pub(crate) fn visit_expr(expr: &BoundExpr, f: &mut dyn FnMut(&BoundExpr)) {
     f(expr);
     match &expr.kind {
         BoundExprKind::SwitchExpression {
@@ -546,6 +546,14 @@ fn visit_expr(expr: &BoundExpr, f: &mut dyn FnMut(&BoundExpr)) {
                 visit_expr(element, f);
             }
         }
+        BoundExprKind::StackAlloc {
+            count, initializer, ..
+        } => {
+            visit_expr(count, f);
+            for value in initializer {
+                visit_expr(value, f);
+            }
+        }
         BoundExprKind::ObjectCreation { arguments, .. } => {
             for argument in arguments {
                 visit_expr(argument, f);
@@ -588,7 +596,7 @@ fn visit_expr(expr: &BoundExpr, f: &mut dyn FnMut(&BoundExpr)) {
 }
 
 /// Every expression a statement holds, statements recursed.
-fn visit_stmt_exprs(statement: &BoundStmt, f: &mut dyn FnMut(&BoundExpr)) {
+pub(crate) fn visit_stmt_exprs(statement: &BoundStmt, f: &mut dyn FnMut(&BoundExpr)) {
     match &statement.kind {
         BoundStmtKind::Block(statements) => {
             for inner in statements {
@@ -1985,6 +1993,17 @@ pub(crate) fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> 
                 .iter()
                 .map(|element| map_expr(element, replace))
                 .collect(),
+        },
+        BoundExprKind::StackAlloc {
+            element,
+            count,
+            span_constructor,
+            initializer,
+        } => BoundExprKind::StackAlloc {
+            element: element.clone(),
+            count: Box::new(map_expr(count, replace)),
+            span_constructor: span_constructor.clone(),
+            initializer: initializer.iter().map(|value| map_expr(value, replace)).collect(),
         },
         BoundExprKind::ObjectCreation {
             arguments,

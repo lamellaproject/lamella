@@ -1022,7 +1022,57 @@ fn qualify_model_info(binder: &mut Binder, namespace: &str, name: &str) {
 /// path that binds a unit comes through here, so none of them can bind one under its neighbor's.
 fn bind_unit_body(binder: &mut Binder, unit: &CompilationUnit) {
     binder.set_nullable_context(unit.nullable.clone());
+    binder.set_unsafe_regions(unsafe_regions(unit));
     bind_namespace_body(binder, &unit.usings, &unit.members, "");
+}
+
+/// The byte ranges of one unit that are unsafe contexts (18.1): each type and member declared
+/// `unsafe`, and each `unsafe` block. The context is lexical, so a lambda written in one is in it
+/// and a nested type inherits its container's.
+fn unsafe_regions(unit: &CompilationUnit) -> Vec<Span> {
+    let mut regions = unit.unsafe_blocks.clone();
+    for member in &unit.members {
+        collect_unsafe_regions(member, &mut regions);
+    }
+    regions
+}
+
+fn collect_unsafe_regions(member: &NamespaceMember, regions: &mut Vec<Span>) {
+    let is_unsafe =
+        |modifiers: &[Modifier]| modifiers.iter().any(|m| matches!(m, Modifier::Unsafe));
+    match member {
+        NamespaceMember::Namespace(namespace) => {
+            for inner in &namespace.members {
+                collect_unsafe_regions(inner, regions);
+            }
+        }
+        NamespaceMember::Type(declaration) => {
+            if is_unsafe(&declaration.modifiers) {
+                regions.push(declaration.span);
+            }
+            for member in &declaration.members {
+                match member {
+                    Member::NestedType(nested) => collect_unsafe_regions(nested, regions),
+                    Member::Method { modifiers, span, .. }
+                    | Member::Field { modifiers, span, .. }
+                    | Member::Property { modifiers, span, .. }
+                    | Member::Indexer { modifiers, span, .. }
+                    | Member::Constructor { modifiers, span, .. }
+                    | Member::Destructor { modifiers, span, .. }
+                    | Member::Operator { modifiers, span, .. }
+                    | Member::ConversionOperator { modifiers, span, .. }
+                    | Member::EventField { modifiers, span, .. }
+                    | Member::Event { modifiers, span, .. } => {
+                        if is_unsafe(modifiers) {
+                            regions.push(*span);
+                        }
+                    }
+                    Member::Error => {}
+                }
+            }
+        }
+        NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
+    }
 }
 
 fn bind_namespace_body(

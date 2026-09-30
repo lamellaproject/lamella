@@ -1178,37 +1178,37 @@ fn reachable_objects(
     }
     let trimmed = lamella_linker::garbage_collect(&objects, LINKED_ENTRY_SYMBOL);
     refuse_reached_deferred_bodies(&trimmed, &deferred)?;
-    refuse_reached_silent_seam_edges(&trimmed, &seam_edges)?;
+    let untabled = lamella_linker::reachable_without_table_slots(&objects, LINKED_ENTRY_SYMBOL);
+    refuse_reached_silent_seam_edges(&untabled, &seam_edges)?;
     Ok(trimmed)
 }
 
-/// Refuses a dead-stripped link that still defines the caller of a library's own call into one of
-/// its silent seams, naming the first such caller and seam and counting them: the program reaches a
+/// Refuses a link whose program reaches the caller of a library's own call into one of its silent
+/// seams, naming the first such caller and seam and counting them: the program reaches a
 /// placeholder that answers a constant through the library's own code, which no single assembly's
 /// build can see, because a library is built before the program that decides what it reaches.
+/// `reached` is [`lamella_linker::reachable_without_table_slots`] of the same objects and entry
+/// as the dead-strip.
 ///
-/// A seam kept only by a vtable or itable slot is not refused here: a kept table keeps every slot,
-/// called or not, so the dead-strip cannot say whether the program dispatches to it.
+/// Neither a seam nor a caller kept only by a vtable or itable slot is refused here. A kept table
+/// keeps every slot, called or not, so the dead-strip cannot say whether the program dispatches to
+/// it, and that holds for the slot's method and for everything that method calls. Every kept
+/// exception type's vtable keeps `Exception.ToString`, which calls the `GetType` seam, so counting a
+/// caller the dead-strip merely kept refused every program that keeps an exception type.
 #[cfg(feature = "linked")]
 fn refuse_reached_silent_seam_edges(
-    trimmed: &[lamella_elf::Object],
+    reached: &alloc::collections::BTreeSet<alloc::string::String>,
     edges: &[LibrarySeamEdge],
 ) -> Result<(), BuildError> {
-    let kept: alloc::collections::BTreeSet<&str> = trimmed
+    let callers: Vec<&LibrarySeamEdge> = edges
         .iter()
-        .flat_map(|object| &object.symbols)
-        .filter(|symbol| symbol.defined)
-        .map(|symbol| symbol.name.as_str())
+        .filter(|edge| reached.contains(edge.symbol.as_str()))
         .collect();
-    let reached: Vec<&LibrarySeamEdge> = edges
-        .iter()
-        .filter(|edge| kept.contains(edge.symbol.as_str()))
-        .collect();
-    match reached.first() {
+    match callers.first() {
         Some(first) => Err(BuildError::SilentSeamCallEdge {
             caller: first.caller.clone(),
             seam: first.seam.clone(),
-            total: reached.len(),
+            total: callers.len(),
         }),
         None => Ok(()),
     }
@@ -4560,7 +4560,7 @@ fn build_library_object_inner(
 /// answering a constant; here a program that reaches one is refused instead.
 ///
 /// Returned beside them, the library's own calls into its silent seams, keyed by the caller's
-/// symbol, for [`refuse_reached_silent_seam_edges`] to ask of the same dead-strip.
+/// symbol, for [`refuse_reached_silent_seam_edges`] to ask of the same link.
 #[cfg(feature = "linked")]
 fn build_library_object_deferring(
     cil: &[u8],
@@ -12790,6 +12790,83 @@ mod tests {
         }
         linked_objects(&around, &corlib, &library)
             .expect("a program that does not reach the library's call into its seam links");
+    }
+
+    /// A CALLER KEPT ONLY THROUGH A TABLE SLOT IS NOT REFUSED.
+    ///
+    /// `seamreachprog-tabled` keeps an `Api` and calls nothing on it. `Api`'s vtable keeps
+    /// `seamreachlib`'s virtual `Tabled`, and `Tabled` keeps `Relay`. Both call the silent seam and
+    /// the dead-strip keeps both, yet the link is not refused: the dead-strip cannot say whether the
+    /// program ever dispatches to `Tabled`. That is the shape of `Exception.ToString`, which every
+    /// kept exception type's vtable keeps. The test asserts first that the dead-strip keeps both
+    /// callers, so it cannot pass on a program that no longer keeps them.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_caller_kept_only_through_a_table_slot_is_not_refused() {
+        let (Some(corlib), Some(library), Some(tabled)) = (
+            fixture("../lamella-load/tests/fixtures/corlib.dll"),
+            fixture("tests/fixtures/seamreachlib.dll"),
+            fixture("tests/fixtures/seamreachprog-tabled.dll"),
+        ) else {
+            return;
+        };
+        let (_, _, edges) = build_library_object_deferring(&library, &[corlib.as_slice()], false)
+            .expect("the library builds deferring");
+        let slot_callers: Vec<&LibrarySeamEdge> = edges
+            .iter()
+            .filter(|edge| edge.caller.contains("Tabled") || edge.caller.contains("Relay"))
+            .collect();
+        assert_eq!(slot_callers.len(), 2, "`Tabled` and `Relay` each call the seam");
+        let objects = linked_objects(&tabled, &corlib, &library)
+            .expect("a program that keeps a seam's callers only through a table slot links");
+        let kept: alloc::collections::BTreeSet<&str> = objects
+            .iter()
+            .flat_map(|object| &object.symbols)
+            .filter(|symbol| symbol.defined)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        for edge in slot_callers {
+            assert!(kept.contains(edge.symbol.as_str()), "the dead-strip keeps `{}`", edge.caller);
+        }
+    }
+
+    /// A PROGRAM THAT KEEPS AN EXCEPTION TYPE LINKS, WHETHER OR NOT IT CALLS `ToString`.
+    ///
+    /// Every kept exception type's vtable keeps corlib's `Exception.ToString`, which calls the
+    /// `GetType` seam, so counting every caller the dead-strip keeps refused both programs. The
+    /// first reads only `Message`. The second calls `ToString` through its slot, and refusing that
+    /// needs the link to know which slots a program calls. The test asserts first that corlib's
+    /// `ToString` calls the seam and that the dead-strip keeps it, so it cannot pass on a corlib or
+    /// a program that has lost the shape.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_program_that_keeps_an_exception_type_links() {
+        let (Some(corlib), Some(held), Some(called)) = (
+            fixture("../lamella-load/tests/fixtures/corlib.dll"),
+            fixture("tests/fixtures/seamreachprog-exception-held.dll"),
+            fixture("tests/fixtures/seamreachprog-exception-called.dll"),
+        ) else {
+            return;
+        };
+        let (_, _, edges) = build_library_object_deferring(&corlib, &[], false)
+            .expect("corlib builds deferring");
+        let to_string: Vec<&LibrarySeamEdge> = edges
+            .iter()
+            .filter(|edge| edge.caller == "System.Exception::ToString")
+            .collect();
+        let seams: Vec<&str> = to_string.iter().map(|edge| edge.seam.as_str()).collect();
+        assert!(seams.contains(&"System.Object::GetType"), "`ToString` calls `GetType`, got {seams:?}");
+        for (name, program) in [("held", &held), ("called", &called)] {
+            let (object, deferred) = build_linked_program_object(program, &corlib, &[], None, false)
+                .unwrap_or_else(|e| panic!("{name}: the program builds: {e:?}"));
+            let objects = reachable_objects(&object, deferred, &corlib, &[], false)
+                .unwrap_or_else(|e| panic!("{name}: a program that keeps an exception type links: {e:?}"));
+            let kept = objects
+                .iter()
+                .flat_map(|object| &object.symbols)
+                .any(|symbol| symbol.defined && symbol.name == to_string[0].symbol);
+            assert!(kept, "{name}: the dead-strip keeps `Exception.ToString`");
+        }
     }
 
     /// A METHOD THIS BUILD CANNOT LOWER REFUSES A PROGRAM THAT REACHES IT, AND NO OTHER.

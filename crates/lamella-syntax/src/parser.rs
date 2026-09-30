@@ -273,6 +273,8 @@ struct Parser {
     /// context, `await` refusing there (CS4004, measured), must be raised while the block is
     /// still visible. Tracked only inside async methods, where the operator exists.
     in_unsafe_block: bool,
+    /// The ranges of the `unsafe` blocks parsed so far, for the unit's `unsafe_blocks`.
+    unsafe_blocks: Vec<Span>,
 }
 
 /// Which token, after the closing bracket, settles a bracketed list as a deconstruction: `=` in
@@ -317,6 +319,7 @@ impl Parser {
             in_async_method: false,
             in_ref_returning_member: false,
             in_unsafe_block: false,
+            unsafe_blocks: Vec::new(),
         }
     }
 
@@ -491,6 +494,7 @@ impl Parser {
                     self.in_unsafe_block = true;
                     let block = self.parse_block();
                     self.in_unsafe_block = was_unsafe;
+                    self.unsafe_blocks.push(block.span);
                     return block;
                 }
                 _ => {}
@@ -1863,6 +1867,7 @@ impl Parser {
             span: Span::new(start, end),
             defined_symbols: core::mem::take(&mut self.defined_symbols),
             nullable: crate::lexer::NullableContext::default(),
+            unsafe_blocks: core::mem::take(&mut self.unsafe_blocks),
         }
     }
 
@@ -4799,6 +4804,7 @@ impl Parser {
             in_async_method: self.in_async_method,
             in_ref_returning_member: self.in_ref_returning_member,
             in_unsafe_block: self.in_unsafe_block,
+            unsafe_blocks: Vec::new(),
         };
         let expression = inner.parse_expression();
         if !matches!(inner.current().kind, TokenKind::EndOfFile) {
@@ -4908,20 +4914,39 @@ impl Parser {
             }
             TokenKind::Keyword(Keyword::Stackalloc) => {
                 self.bump();
-                let element = self.parse_non_array_type();
+                let element = if self.current_punctuator() == Some(Punctuator::OpenBracket) {
+                    None
+                } else {
+                    Some(self.parse_non_array_type())
+                };
                 self.expect(
                     Punctuator::OpenBracket,
                     DiagnosticKind::TokenExpected { expected: "[" },
                 );
-                let count = self.parse_expression();
-                let end = self.expect(
+                let count = if self.current_punctuator() == Some(Punctuator::CloseBracket) {
+                    None
+                } else {
+                    Some(Box::new(self.parse_expression()))
+                };
+                let mut end = self.expect(
                     Punctuator::CloseBracket,
                     DiagnosticKind::TokenExpected { expected: "]" },
                 );
+                let initializer = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                    let initializer = self.parse_array_initializer();
+                    end = initializer.span.end;
+                    match initializer.kind {
+                        ExprKind::ArrayInitializer(elements) => Some(elements),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 Expr::new(
                     ExprKind::StackAlloc {
                         element,
-                        count: Box::new(count),
+                        count,
+                        initializer,
                     },
                     Span::new(span.start, end),
                 )
@@ -7537,8 +7562,20 @@ mod tests {
             ExprKind::TypeOf(target) => format!("(typeof {})", dump_type(target)),
             ExprKind::SizeOf(target) => format!("(sizeof {})", dump_type(target)),
             ExprKind::DefaultValue(target) => format!("(default {})", dump_type(target)),
-            ExprKind::StackAlloc { element, count } => {
-                format!("(stackalloc {} {})", dump_type(element), dump(count))
+            ExprKind::StackAlloc {
+                element,
+                count,
+                initializer,
+            } => {
+                let element = element.as_ref().map_or_else(|| "?".into(), dump_type);
+                let count = count.as_ref().map_or_else(|| "?".into(), |count| dump(count));
+                match initializer {
+                    Some(elements) => format!(
+                        "(stackalloc {element} {count} {{{}}})",
+                        elements.iter().map(dump).collect::<Vec<_>>().join(" ")
+                    ),
+                    None => format!("(stackalloc {element} {count})"),
+                }
             }
             ExprKind::Dereference(operand) => format!("(deref {})", dump(operand)),
             ExprKind::AddressOf(operand) => format!("(addressof {})", dump(operand)),

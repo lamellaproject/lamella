@@ -375,10 +375,13 @@ pub enum ExprKind {
     /// A `stackalloc` expression (unsafe): `stackalloc T [ count ]`. Allocates
     /// `count * sizeof(T)` bytes on the call stack and yields a `T*` to the start.
     StackAlloc {
-        /// The element type.
-        element: TypeRef,
-        /// The element count.
-        count: Box<Expr>,
+        /// The element type; `None` for `stackalloc[] { ... }` (C# 7.3), which infers it from the
+        /// initializer.
+        element: Option<TypeRef>,
+        /// The element count; `None` when the brackets are empty and the initializer counts.
+        count: Option<Box<Expr>>,
+        /// The `{ ... }` initializer (C# 7.3), when one is written.
+        initializer: Option<Vec<Expr>>,
     },
     /// A pointer indirection (unsafe): the prefix `* operand`, reading or writing the value
     /// the pointer addresses (its element type). An lvalue when assigned.
@@ -1087,6 +1090,9 @@ pub struct CompilationUnit {
     /// `#nullable` directives, which decide at each `?` over a reference type whether it is an
     /// annotation or a diagnostic.
     pub nullable: crate::lexer::NullableContext,
+    /// The byte ranges of the file's `unsafe { ... }` blocks (18.1). The parser lowers each to a
+    /// plain block, so this is what is left of the fact that the block is an unsafe context.
+    pub unsafe_blocks: Vec<Span>,
 }
 
 /// A dotted name such as `System.Collections` (10.8).

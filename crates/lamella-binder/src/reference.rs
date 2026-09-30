@@ -207,6 +207,13 @@ fn type_info(
     }
     for field in type_def.fields() {
         if !member_is_imported(field.flags(), internals_visible) {
+            if info.kind == TypeKind::Struct
+                && field.flags() & 0x0010 == 0
+                && let Some(signature) = field.signature()
+            {
+                info.hidden_instance_field_types
+                    .push(sigtype_to_symbol(assembly, &signature, &[], own_parameters));
+            }
             continue;
         }
         if let (Some(field_name), Some(signature)) = (field.name(), field.signature()) {

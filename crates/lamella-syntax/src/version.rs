@@ -650,6 +650,13 @@ pub enum Feature {
     /// **THE RESTRICTIONS ARE THE FEATURE.** Declaring one is a parser change of a few lines;
     /// what makes it correct is refusing every position that would put it on the heap.
     RefStruct,
+    /// A `stackalloc` anywhere but a local's initializer, where C# 7.2 admits it: as an argument,
+    /// an operand, a parenthesized expression, a receiver. There its type is `Span<T>`, and it
+    /// converts as any span does. Introduced in C# 8.0.
+    StackAllocNestedExpressions,
+    /// A `stackalloc` with an initializer -- `stackalloc T[] { ... }`, `stackalloc T[n] { ... }`
+    /// and `stackalloc[] { ... }`, which infers its element type. Introduced in C# 7.3.
+    StackAllocInitializer,
     /// A by-reference local or return: `ref T M()`, `ref T this[int i]`, `ref T P { get; }` and
     /// `ref T r = ref x;`. Introduced in C# 7.0.
     ///
@@ -1139,7 +1146,9 @@ impl Feature {
             | Feature::UsingDeclaration
             | Feature::SwitchExpression
             | Feature::ThrowExpression
-            | Feature::RefStruct => true,
+            | Feature::RefStruct
+            | Feature::StackAllocNestedExpressions
+            | Feature::StackAllocInitializer => true,
             Feature::RequiredMembers | Feature::LeadingDigitSeparator => true,
             Feature::NullConditional => true,
             Feature::NullForgivingOperator => true,
@@ -1206,7 +1215,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 83] = [
+    pub const ALL: [Feature; 85] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -1226,6 +1235,8 @@ impl Feature {
         Feature::ExpressionBodiedAccessor,
         Feature::ThrowExpression,
         Feature::RefStruct,
+        Feature::StackAllocNestedExpressions,
+        Feature::StackAllocInitializer,
         Feature::ByRefLocalsAndReturns,
         Feature::RefReassignment,
         Feature::ReadOnlyReferences,
@@ -1320,6 +1331,8 @@ impl Feature {
             Feature::ExpressionBodiedAccessor => LanguageVersion::CSharp7,
             Feature::ThrowExpression => LanguageVersion::CSharp7,
             Feature::RefStruct => LanguageVersion::CSharp7_2,
+            Feature::StackAllocNestedExpressions => LanguageVersion::CSharp8,
+            Feature::StackAllocInitializer => LanguageVersion::CSharp7_3,
             Feature::AutoPropertyInitializer => LanguageVersion::CSharp6,
             Feature::ByRefLocalsAndReturns => LanguageVersion::CSharp7,
             Feature::RefReassignment => LanguageVersion::CSharp7_3,
@@ -1426,6 +1439,8 @@ impl Feature {
             Feature::DeclarationPattern => "pattern matching",
             Feature::ThrowExpression => "throw expression",
             Feature::RefStruct => "ref structs",
+            Feature::StackAllocNestedExpressions => "stackalloc in nested expressions",
+            Feature::StackAllocInitializer => "stackalloc initializer",
             Feature::UsingDeclaration => "using declarations",
             Feature::SwitchExpression => "recursive patterns",
             Feature::AutoPropertyInitializer => "auto property initializer",
@@ -1746,6 +1761,8 @@ mod tests {
                 | Feature::ExpressionBodiedAccessor
                 | Feature::ThrowExpression
                 | Feature::RefStruct
+                | Feature::StackAllocNestedExpressions
+                | Feature::StackAllocInitializer
                 | Feature::ByRefLocalsAndReturns
                 | Feature::RefReassignment
                 | Feature::AutoPropertyInitializer
@@ -1816,7 +1833,7 @@ mod tests {
         }
         assert_eq!(
             Feature::ALL.len(),
-            83,
+            85,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }

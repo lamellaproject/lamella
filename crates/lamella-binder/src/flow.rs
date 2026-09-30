@@ -496,7 +496,14 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
                 visit_local_uses(argument, f);
             }
         }
-        BoundExprKind::StackAlloc { count, .. } => visit_local_uses(count, f),
+        BoundExprKind::StackAlloc {
+            count, initializer, ..
+        } => {
+            visit_local_uses(count, f);
+            for element in initializer {
+                visit_local_uses(element, f);
+            }
+        }
         BoundExprKind::Call {
             callee, arguments, ..
         } => {
@@ -958,7 +965,14 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
                 collect_field_uses(argument, reads, writes);
             }
         }
-        BoundExprKind::StackAlloc { count, .. } => collect_field_uses(count, reads, writes),
+        BoundExprKind::StackAlloc {
+            count, initializer, ..
+        } => {
+            collect_field_uses(count, reads, writes);
+            for element in initializer {
+                collect_field_uses(element, reads, writes);
+            }
+        }
         BoundExprKind::Call {
             callee, arguments, ..
         } => {
@@ -2005,8 +2019,13 @@ impl Analyzer<'_> {
                     self.expression(operand, assigned, span);
                 }
             }
-            BoundExprKind::StackAlloc { count, .. } => {
+            BoundExprKind::StackAlloc {
+                count, initializer, ..
+            } => {
                 self.expression(count, assigned, span);
+                for element in initializer {
+                    self.expression(element, assigned, span);
+                }
             }
             BoundExprKind::Call {
                 callee, arguments, ..

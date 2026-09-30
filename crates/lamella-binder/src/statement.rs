@@ -11,8 +11,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind, SwitchLabel,
-    SwitchSection, TypeRef, TypeRefKind, UnaryOperator, UsingResource, VariableDeclarator,
+    AssignmentOperator, CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind,
+    SwitchLabel, SwitchSection, TypeRef, TypeRefKind, UnaryOperator, UsingResource,
+    VariableDeclarator,
 };
 use lamella_syntax::span::Span;
 
@@ -298,7 +299,16 @@ impl Binder {
                 if let Some(kind) = self.bind_conditional_access_statement(expr) {
                     return BoundStmt { kind, span: stmt.span };
                 }
-                let bound = self.bind_expression(expr);
+                let assigned = match &expr.kind {
+                    ExprKind::Assignment {
+                        operator: AssignmentOperator::Assign,
+                        value,
+                        ..
+                    } => Some(&**value),
+                    _ => None,
+                };
+                let bound =
+                    self.with_csharp73_stackallocs(assigned, |binder| binder.bind_expression(expr));
                 if !is_statement_expression(&bound.kind) {
                     self.report(Diagnostic::new(
                         DiagnosticKind::IllegalStatementExpression,
@@ -352,6 +362,7 @@ impl Binder {
                 BoundStmtKind::While { condition, body }
             }
             StmtKind::Return(value) => {
+                let value_syntax = value.as_ref();
                 let expected = self.current_return_type();
                 let value = value.as_ref().map(|expr| {
                     match expected
@@ -370,6 +381,9 @@ impl Binder {
                 }
                 self.check_return(value.as_ref(), stmt.span);
                 let value = value.map(|v| self.convert_to_return_type(v));
+                if let (Some(bound), Some(written)) = (&value, value_syntax) {
+                    self.check_stack_escape(bound, written);
+                }
                 BoundStmtKind::Return(value)
             }
             StmtKind::DoWhile { body, condition } => {
@@ -1466,6 +1480,19 @@ impl Binder {
     }
 
     fn bind_local(&mut self, ty: &TypeRef, declarators: &[VariableDeclarator]) -> BoundStmtKind {
+        let initializers = declarators
+            .iter()
+            .filter_map(|declarator| declarator.initializer.as_ref());
+        self.with_csharp73_stackallocs(initializers, |binder| {
+            binder.bind_local_declarators(ty, declarators)
+        })
+    }
+
+    fn bind_local_declarators(
+        &mut self,
+        ty: &TypeRef,
+        declarators: &[VariableDeclarator],
+    ) -> BoundStmtKind {
         if let TypeRefKind::ByRef {
             referent,
             is_readonly,
@@ -1484,7 +1511,10 @@ impl Binder {
         for declarator in declarators {
             self.check_local_name_available(declarator);
             let initializer = declarator.initializer.as_ref().map(|expr| {
-                if let Some(bound) = self.bind_target_typed(expr, &declared) {
+                let outer = self.set_local_initializer_target(true);
+                let target_typed = self.bind_target_typed(expr, &declared);
+                self.set_local_initializer_target(outer);
+                if let Some(bound) = target_typed {
                     return bound;
                 }
                 if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
@@ -1503,7 +1533,7 @@ impl Binder {
                         expr.span,
                     ));
                 }
-                let value = self.bind_expression(expr);
+                let value = self.bind_initializer_expression(expr);
                 if value.ty.is_error() || !self.assignable(&value, &declared) {
                     self.exempt_local_from_unused(&declarator.name);
                 }
@@ -1511,6 +1541,7 @@ impl Binder {
                 self.convert(value, &declared)
             });
             self.declare_local(&declarator.name, declared.clone());
+            self.note_stack_bound_local(&declarator.name, initializer.as_ref());
             self.record_local_tuple_names(&declarator.name, crate::bind::tuple_element_names(ty));
             bound.push(BoundDeclarator {
                 name: declarator.name.clone(),
@@ -1773,6 +1804,7 @@ impl Binder {
                     .map_or(TypeSymbol::Error, |value| value.ty.clone());
             }
             self.declare_local(&declarator.name, declared.clone());
+            self.note_stack_bound_local(&declarator.name, initializer.as_ref());
             let mut names = declarator
                 .initializer
                 .as_ref()
@@ -1830,7 +1862,7 @@ impl Binder {
             ));
             return unusable();
         }
-        let value = self.bind_expression(expr);
+        let value = self.bind_initializer_expression(expr);
         if value.ty.is_error() {
             return Some(value);
         }
