@@ -19,17 +19,63 @@ namespace System.Text
             return bytes;
         }
 
-        public override string GetString(byte[] bytes)
+        /// <summary>Decodes a range of UTF-16 little-endian bytes into a string. A lone surrogate, and a
+        /// final byte with no partner, decode to U+FFFD.</summary>
+        /// <param name="bytes">The array holding the bytes to decode.</param>
+        /// <param name="index">The position of the first byte to decode.</param>
+        /// <param name="count">How many bytes to decode.</param>
+        /// <returns>The decoded text.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="bytes"/> is null.</exception>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> or
+        /// <paramref name="count"/> is negative, or the range does not lie within
+        /// <paramref name="bytes"/>.</exception>
+        public override string GetString(byte[] bytes, int index, int count)
         {
-            StringBuilder result = new StringBuilder();
-            int i = 0;
-            while (i + 1 < bytes.Length)
+            if (bytes == null) throw new ArgumentNullException("bytes");
+            if (index < 0)
             {
-                int lo = bytes[i];
-                int hi = bytes[i + 1];
-                result.Append((char)(lo | (hi << 8)));
-                i = i + 2;
+                string text = Int32.Decimal(index);
+                throw new ArgumentOutOfRangeException("index", text, "index ('" + text + "') must be a non-negative value.");
             }
+            if (count < 0)
+            {
+                string text = Int32.Decimal(count);
+                throw new ArgumentOutOfRangeException("count", text, "count ('" + text + "') must be a non-negative value.");
+            }
+            RequireRangeWithin(bytes, index, count);
+
+            StringBuilder result = new StringBuilder(count / 2 + 1);
+            int end = index + count;
+            int i = index;
+            while (i + 1 < end)
+            {
+                int unit = bytes[i] | (bytes[i + 1] << 8);
+                i = i + 2;
+                if (unit >= 0xD800 && unit <= 0xDBFF)
+                {
+                    if (i + 1 < end)
+                    {
+                        int next = bytes[i] | (bytes[i + 1] << 8);
+                        if (next >= 0xDC00 && next <= 0xDFFF)
+                        {
+                            result.Append((char)unit);
+                            result.Append((char)next);
+                            i = i + 2;
+                            continue;
+                        }
+                    }
+                    result.Append(ReplacementCharacter);
+                }
+                else if (unit >= 0xDC00 && unit <= 0xDFFF)
+                {
+                    result.Append(ReplacementCharacter);
+                }
+                else
+                {
+                    result.Append((char)unit);
+                }
+            }
+            if (i < end) result.Append(ReplacementCharacter);
             return result.ToString();
         }
     }

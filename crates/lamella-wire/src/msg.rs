@@ -195,15 +195,16 @@ pub const LOAD_BUNDLE: u8 = 0x32;
 /// while it was free, which is the whole point of reallocating the space once.
 pub const LOAD_JS: u8 = 0x33;
 /// Target -> host: the result of one chunk, of a LOAD or a DEPLOY alike. Payload = `status(u8)`
-/// (see [`xfer`]), `crc32(u32 LE)`.
+/// (see [`xfer`]), then a `u32` LE.
 ///
 /// ONE reply for both halves, because a reply carries its request's `seq` and the host therefore
 /// already knows what it sent -- the type byte was redundant for attribution. That holds whether or
 /// not a load and a deploy can be in flight at once, which is why it is the reason to prefer over an
 /// argument from exclusivity.
 ///
-/// The CRC's MEANING is keyed on the REQUEST, not on this reply: over the RAM as assembled for a
-/// load, over the flash as read back for a deploy.
+/// The `u32`'s MEANING is keyed on the REQUEST, not on this reply: a CRC-32 over the RAM as assembled
+/// for a load chunk, or over the flash as read back for a deploy chunk. For [`LOAD_CLEAR`] it is 0,
+/// and for [`DEPLOY_CLEAR`] the bytes of flash erased, 0 from a target that does not report them.
 ///
 /// # The deploy CRC under [`crate::Capabilities::DEPLOY_PREFIX_CRC`]
 ///
@@ -239,7 +240,9 @@ pub const DEPLOY_BUNDLE: u8 = 0x42;
 /// Host -> target: persist ECMAScript bytecode so it boots on reset. Chunked. `LOAD_JS + 0x10`.
 /// RESERVED alongside [`LOAD_JS`].
 pub const DEPLOY_JS: u8 = 0x43;
-/// Host -> target: erase the persisted artifact. Empty payload. Answered by [`XFER_RESULT`].
+/// Host -> target: erase the persisted artifact. Empty payload. Answered by [`XFER_RESULT`], whose
+/// `u32` -- where a deploy chunk's answer carries its prefix CRC -- is the number of bytes of flash
+/// the target erased, or 0 from a target that does not report it.
 ///
 /// The mirror of [`LOAD_CLEAR`], and the reason that op sits where it does: `DEPLOY_CLEAR - 0x10`.
 pub const DEPLOY_CLEAR: u8 = 0x49;

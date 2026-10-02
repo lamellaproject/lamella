@@ -9,6 +9,14 @@ struct LinkedTarget {
     aot_target: &'static str,
     /// The triple the archive beside it was compiled for.
     triple: &'static str,
+    /// Whether the archive carries the board's own half -- the startup its clock plan names, its
+    /// console and its millisecond clock -- so that each board needs an archive of its own.
+    ///
+    /// **A BOARD BUILD IS FOUND BY THE BOARD, NEVER BY THE TRIPLE ALONE.** An archive built for
+    /// the triple without a board starts no clock and writes its console through a debugger, so on
+    /// a board with nothing attached the image runs at the clock it was reset into and faults at
+    /// its first `Console.Write` -- an image that links, writes and says nothing about why.
+    per_board: bool,
 }
 
 /// Every target the class-library tier has a plan for, with the archive each one needs.
@@ -20,10 +28,17 @@ const LINKED_TARGETS: &[LinkedTarget] = &[
     LinkedTarget {
         aot_target: "microbit",
         triple: "thumbv6m-none-eabi",
+        per_board: false,
     },
     LinkedTarget {
         aot_target: "nrf52833",
         triple: "thumbv6m-none-eabi",
+        per_board: false,
+    },
+    LinkedTarget {
+        aot_target: "rp2350",
+        triple: "thumbv8m.main-none-eabi",
+        per_board: true,
     },
 ];
 
@@ -51,11 +66,24 @@ pub fn targets() -> impl Iterator<Item = &'static str> {
 }
 
 /// The triple whose archive `aot_target` links against.
+#[cfg(test)]
 fn triple_for(aot_target: &str) -> Option<&'static str> {
+    row_for(aot_target).map(|row| row.triple)
+}
+
+/// The table's row for `aot_target`.
+fn row_for(aot_target: &str) -> Option<&'static LinkedTarget> {
     LINKED_TARGETS
         .iter()
         .find(|row| row.aot_target == aot_target)
-        .map(|row| row.triple)
+}
+
+/// The runtime-support feature that compiles `board`'s half into an archive.
+///
+/// The feature is named after the board id, as `lamella boards` lists it, so the name a reader
+/// typed after `--board` is the name they pass to cargo.
+fn board_feature(board: &str) -> String {
+    format!("board-{board}")
 }
 
 /// The machine an archive for `aot_target` must have been built for.
@@ -77,11 +105,14 @@ fn machine_for(triple: &str) -> Option<lamella_elf::Machine> {
 /// [`ARCHIVE_ENV`] set, the named file is the answer or there is no answer, so a typo in it is
 /// reported rather than quietly replaced by a different archive that happens to be installed.
 ///
+/// `board` is the `--board` id the image is for. It decides which archive is looked for only on a
+/// target whose archive carries the board's own half; elsewhere one archive serves every board.
+///
 /// # Errors
 /// No archive found, a file that is not an `ar` archive, or one built for another instruction set.
 /// Each names the path it is talking about.
-pub fn runtime_archive(aot_target: &str) -> Result<(PathBuf, Vec<u8>), String> {
-    named_runtime_archive(aot_target, std::env::var_os(ARCHIVE_ENV).map(PathBuf::from))
+pub fn runtime_archive(board: &str, aot_target: &str) -> Result<(PathBuf, Vec<u8>), String> {
+    named_runtime_archive(board, aot_target, std::env::var_os(ARCHIVE_ENV).map(PathBuf::from))
 }
 
 /// [`runtime_archive`] with the override handed in rather than read from the environment.
@@ -93,15 +124,17 @@ pub fn runtime_archive(aot_target: &str) -> Result<(PathBuf, Vec<u8>), String> {
 /// # Errors
 /// As [`runtime_archive`].
 fn named_runtime_archive(
+    board: &str,
     aot_target: &str,
     named: Option<PathBuf>,
 ) -> Result<(PathBuf, Vec<u8>), String> {
-    let Some(triple) = triple_for(aot_target) else {
+    let Some(row) = row_for(aot_target) else {
         return Err(format!(
             "{aot_target} has no runtime support archive because the class-library tier has no \
              plan for it"
         ));
     };
+    let triple = row.triple;
     if let Some(path) = named {
         let bytes = std::fs::read(&path).map_err(|error| {
             format!(
@@ -113,8 +146,10 @@ fn named_runtime_archive(
         })?;
         return check(path, bytes, triple);
     }
+    let board = row.per_board.then_some(board);
     let looked: Vec<PathBuf> = candidates(
         triple,
+        board,
         std::env::var_os(CARGO_TARGET_DIR_ENV)
             .map(PathBuf::from)
             .as_deref(),
@@ -124,7 +159,7 @@ fn named_runtime_archive(
             return check(path.clone(), bytes, triple);
         }
     }
-    Err(no_archive_refusal(aot_target, triple, &looked))
+    Err(no_archive_refusal(aot_target, triple, board, &looked))
 }
 
 /// The refusal when no candidate held an archive, naming every place that was looked in.
@@ -133,36 +168,125 @@ fn named_runtime_archive(
 /// machine has a discoverable archive decides whether the search can fail at all, and the wording
 /// here is what a person with no archive has to act on -- so it must not be verifiable only on
 /// machines that cannot build.
-fn no_archive_refusal(aot_target: &str, triple: &str, looked: &[PathBuf]) -> String {
+///
+/// **A BOARD BUILD IS GIVEN AS THE COMMAND THAT MAKES IT.** Its feature, its triple and the
+/// directory it must be written to are three facts nobody can guess, and the directory is one this
+/// search reads -- so the command below produces exactly the file the next build finds.
+///
+/// **AND THE CHECKOUT'S DIRECTORY IS REMAPPED AWAY IN IT.** The crates the archive takes from this
+/// checkout reach the compiler by absolute path, so without the remap every panic location in the
+/// archive names the directory the checkout sits in, and every image linked against it carries
+/// that directory onto the board.
+fn no_archive_refusal(
+    aot_target: &str,
+    triple: &str,
+    board: Option<&str>,
+    looked: &[PathBuf],
+) -> String {
+    let places = looked
+        .iter()
+        .map(|path| format!("    {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(board) = board else {
+        return format!(
+            "no runtime support archive for {aot_target} ({triple}).\n\n\
+             The class-library tier links your program against this archive, so it cannot be built \
+             without one.\nLooked in:\n{places}\n\n\
+             Name one with {ARCHIVE_ENV}, or build this target with {} for the flat tier.",
+            crate::flash::FLAT_FLAG
+        );
+    };
     format!(
-        "no runtime support archive for {aot_target} ({triple}).\n\n\
+        "no runtime support archive for {board} ({aot_target}, {triple}).\n\n\
          The class-library tier links your program against this archive, so it cannot be built \
-         without one.\nLooked in:\n{}\n\n\
-         Name one with {ARCHIVE_ENV}, or build this target with {} for the flat tier.",
-        looked
-            .iter()
-            .map(|path| format!("    {}", path.display()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        crate::flash::FLAT_FLAG
+         without one.\nOn this target the archive also carries the board's own startup, console \
+         and clock, so each\nboard has an archive of its own. Looked in:\n{places}\n\n\
+         Build it from this checkout with:\n\
+         \x20   cargo build --release --manifest-path {} --target {triple} --no-default-features \
+         --features {}{} --target-dir {}\n\n\
+         or name one with {ARCHIVE_ENV}.",
+        development_manifest().display(),
+        board_feature(board),
+        remap_option(triple),
+        development_board_dir(board).display()
     )
 }
 
-/// Where an archive for `triple` is looked for, in order.
+/// The cargo option that maps the checkout's directory to nothing in what `triple`'s build
+/// compiles, with a space in front of it -- the remap the tree's own archive builder passes.
+///
+/// Empty for a checkout whose path holds a quote, which the option's TOML string and the shell's
+/// quoting could not both carry; the build then works and keeps the directory.
+fn remap_option(triple: &str) -> String {
+    let root = checkout();
+    let root = root.display().to_string();
+    if root.contains('\'') || root.contains('"') {
+        return String::new();
+    }
+    format!(" --config \"target.{triple}.rustflags=['--remap-path-prefix={root}=']\"")
+}
+
+/// The checkout this crate sits in: two directories above it.
+fn checkout() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest.ancestors().nth(2).unwrap_or(manifest).to_path_buf()
+}
+
+/// The development tree's runtime-support crate: where its sources live, relative to this crate.
+///
+/// Joined a component at a time from the checkout, two directories above this crate, so the path a
+/// refusal prints is one a reader can paste into a shell on any system.
+fn development_crate() -> PathBuf {
+    checkout().join("tools").join("runtime").join("runtime-support")
+}
+
+/// The manifest the board build in [`no_archive_refusal`] names.
+fn development_manifest() -> PathBuf {
+    development_crate().join("Cargo.toml")
+}
+
+/// The directory a board's archive is built into in the development tree: one per board, under the
+/// crate's own `target`, so one board's archive never overwrites another's.
+fn development_board_dir(board: &str) -> PathBuf {
+    development_crate().join("target").join(board)
+}
+
+/// Where an archive for `triple` is looked for, in order. `board` is set for a target whose archive
+/// carries the board's own half, and then names the board whose archive is wanted.
 ///
 /// Beside the executable first, because that is where a published toolchain puts it and where a
 /// person who installed one can be told to look; the development tree last, so a checkout that has
 /// built the staticlib works without any setting at all.
-fn candidates(triple: &str, cargo_target_dir: Option<&Path>) -> Vec<PathBuf> {
+fn candidates(triple: &str, board: Option<&str>, cargo_target_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    if let Some(board) = board {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            paths.push(
+                dir.join("runtime-support")
+                    .join(triple)
+                    .join(board)
+                    .join(ARCHIVE_NAME),
+            );
+        }
+        paths.push(
+            development_board_dir(board)
+                .join(triple)
+                .join("release")
+                .join(ARCHIVE_NAME),
+        );
+        return paths;
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         paths.push(dir.join("runtime-support").join(triple).join(ARCHIVE_NAME));
     }
     paths.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/runtime/runtime-support/target")
+        development_crate()
+            .join("target")
             .join(triple)
             .join("release")
             .join(ARCHIVE_NAME),
@@ -283,7 +407,7 @@ mod tests {
     #[test]
     fn the_archive_is_looked_for_where_a_redirected_build_writes_it() {
         let redirected = Path::new("F:/build/lamella/target-devtools");
-        let looked = candidates("thumbv6m-none-eabi", Some(redirected));
+        let looked = candidates("thumbv6m-none-eabi", None, Some(redirected));
         assert!(
             looked.contains(
                 &redirected
@@ -302,8 +426,8 @@ mod tests {
     #[test]
     fn a_tree_that_redirects_nothing_gains_no_candidate() {
         assert_eq!(
-            candidates("thumbv6m-none-eabi", None).len(),
-            candidates("thumbv6m-none-eabi", Some(Path::new("F:/x"))).len() - 1,
+            candidates("thumbv6m-none-eabi", None, None).len(),
+            candidates("thumbv6m-none-eabi", None, Some(Path::new("F:/x"))).len() - 1,
             "the redirected path is the only difference"
         );
     }
@@ -314,7 +438,8 @@ mod tests {
         let error = no_archive_refusal(
             "microbit",
             "thumbv6m-none-eabi",
-            &candidates("thumbv6m-none-eabi", None),
+            None,
+            &candidates("thumbv6m-none-eabi", None, None),
         );
         assert!(
             error.contains("microbit (thumbv6m-none-eabi)"),
@@ -339,7 +464,7 @@ mod tests {
     fn a_named_archive_that_cannot_be_read_refuses_rather_than_falling_through() {
         let missing = std::env::temp_dir().join("lamella-tiers-does-not-exist.a");
         let _ = std::fs::remove_file(&missing);
-        let error = named_runtime_archive("microbit", Some(missing))
+        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(missing))
             .expect_err("a named archive that is absent is an error, not a hint");
         assert!(
             error.contains(ARCHIVE_ENV),
@@ -354,7 +479,7 @@ mod tests {
     #[test]
     fn a_file_that_is_not_an_archive_is_refused_by_name() {
         let path = write_temp("not-an-archive.a", b"MZ this is a dll, not a staticlib");
-        let error = named_runtime_archive("microbit", Some(path))
+        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path))
             .expect_err("a file that is not an archive cannot be linked");
         assert!(error.contains("not a runtime support archive"), "{error}");
         assert!(
@@ -369,7 +494,7 @@ mod tests {
     #[test]
     fn an_archive_for_another_machine_is_refused_naming_both() {
         let path = write_temp("riscv.a", &archive_of(lamella_elf::Machine::RiscV));
-        let error = named_runtime_archive("microbit", Some(path))
+        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path))
             .expect_err("a RISC-V archive cannot serve a Thumb target");
         assert!(
             error.contains("RiscV"),
@@ -385,7 +510,7 @@ mod tests {
     #[test]
     fn a_matching_archive_is_accepted_and_reports_where_it_came_from() {
         let path = write_temp("arm.a", &archive_of(lamella_elf::Machine::Arm));
-        let (found, bytes) = named_runtime_archive("microbit", Some(path.clone()))
+        let (found, bytes) = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path.clone()))
             .expect("an ARM archive serves a Thumb target");
         assert_eq!(found, path, "it reports the file it used");
         assert!(!bytes.is_empty());
@@ -393,8 +518,123 @@ mod tests {
 
     #[test]
     fn a_target_with_no_plan_has_no_archive_to_look_for() {
-        let error = named_runtime_archive("ch32v003", None).expect_err("no plan, no archive");
+        let error = named_runtime_archive("bbc-micro-bit-v1", "ch32v003", None).expect_err("no plan, no archive");
         assert!(error.contains("no plan for it"), "{error}");
+    }
+
+    /// **A BOARD BUILD IS LOOKED FOR UNDER ITS BOARD, AND NOWHERE A TRIPLE'S OWN ARCHIVE LIVES.**
+    /// The archive at the triple's path is built with no board in it, so finding it would link an
+    /// image that starts no clock and faults at its first console write.
+    #[test]
+    fn a_board_build_is_looked_for_under_its_board_and_never_by_the_triple_alone() {
+        let redirected = Path::new("F:/build/lamella/target-devtools");
+        let looked = candidates("thumbv8m.main-none-eabi", Some("rpi-pico2"), Some(redirected));
+        assert!(!looked.is_empty());
+        for path in &looked {
+            assert!(
+                path.components().any(|part| part.as_os_str() == "rpi-pico2"),
+                "every place is the board's own: {}",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(redirected),
+                "the redirected output holds the triple's archive, not the board's: {}",
+                path.display()
+            );
+        }
+        let other = candidates("thumbv8m.main-none-eabi", Some("rpi-pico2-w"), None);
+        assert!(
+            looked.iter().all(|path| !other.contains(path)),
+            "two boards never share a place: {looked:?} and {other:?}"
+        );
+    }
+
+    /// **THE COMMAND A BOARD's REFUSAL GIVES WRITES THE FILE THE NEXT BUILD FINDS.** The feature,
+    /// the triple and the directory are the three facts nobody can guess, and a directory that is
+    /// not one of the places looked in would send the reader round the same refusal again.
+    #[test]
+    fn a_missing_board_archive_is_refused_with_the_command_that_builds_it() {
+        let triple = "thumbv8m.main-none-eabi";
+        let looked = candidates(triple, Some("pimoroni-pico-plus-2-w"), None);
+        let error = no_archive_refusal("rp2350", triple, Some("pimoroni-pico-plus-2-w"), &looked);
+        assert!(
+            error.contains("pimoroni-pico-plus-2-w (rp2350, thumbv8m.main-none-eabi)"),
+            "it names the board, the target and the triple: {error}"
+        );
+        let command = error
+            .lines()
+            .find(|line| line.trim_start().starts_with("cargo build"))
+            .expect("the refusal gives the command");
+        for part in [
+            "--release",
+            "--target thumbv8m.main-none-eabi",
+            "--no-default-features",
+            "--features board-pimoroni-pico-plus-2-w",
+        ] {
+            assert!(command.contains(part), "the command passes {part}: {command}");
+        }
+        assert!(
+            command.contains(&format!(
+                "--config \"target.thumbv8m.main-none-eabi.rustflags=['--remap-path-prefix={}=']\"",
+                checkout().display()
+            )),
+            "and keeps the checkout's directory out of the archive: {command}"
+        );
+        let manifest = development_manifest();
+        assert!(
+            command.contains(&format!("--manifest-path {}", manifest.display())),
+            "and the crate's own manifest: {command}"
+        );
+        let out = development_board_dir("pimoroni-pico-plus-2-w");
+        assert!(
+            command.ends_with(&format!("--target-dir {}", out.display())),
+            "and the directory: {command}"
+        );
+        assert!(
+            looked.contains(&out.join(triple).join("release").join(ARCHIVE_NAME)),
+            "cargo writes the archive where the lookup reads it: {looked:?}"
+        );
+        assert!(error.contains(ARCHIVE_ENV), "the override is still offered: {error}");
+    }
+
+    /// **EVERY BOARD WHOSE TARGET TAKES A BOARD BUILD HAS A FEATURE TO BUILD IT WITH.** The refusal
+    /// above names `board-<id>`, a claim about another crate's manifest that would otherwise be
+    /// tested only by somebody running the command it prints.
+    #[test]
+    fn every_board_on_a_per_board_target_has_a_feature_in_the_runtime_archive() {
+        let manifest = include_str!("../../../tools/runtime/runtime-support/Cargo.toml");
+        let boards: Vec<&str> = lamella_flash_routes::PROGRAMMING
+            .iter()
+            .filter(|route| {
+                route
+                    .aot_target
+                    .and_then(row_for)
+                    .is_some_and(|row| row.per_board)
+            })
+            .map(|route| route.board)
+            .collect();
+        assert_eq!(
+            boards.len(),
+            4,
+            "the four RP2350 boards take a board build: {boards:?}"
+        );
+        for board in boards {
+            let feature = board_feature(board);
+            assert!(
+                manifest
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{feature} = ["))),
+                "the runtime-support manifest declares {feature}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_board_archive_for_the_right_machine_is_accepted() {
+        let path = write_temp("arm-board.a", &archive_of(lamella_elf::Machine::Arm));
+        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", Some(path.clone()))
+            .expect("an ARM archive serves the Cortex-M33");
+        assert_eq!(found, path, "it reports the file it used");
     }
 
     /// **THE TABLE IS A CLAIM ABOUT ANOTHER CRATE, AND THIS IS THE ONLY PLACE IT IS CHECKED.**

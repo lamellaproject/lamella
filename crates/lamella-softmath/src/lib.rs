@@ -33,13 +33,23 @@ pub fn already_integral(value: f64) -> bool {
     !(abs(value) < NO_FRACTION_ABOVE)
 }
 
-/// The integer part of `value`, toward zero -- `System.Math.Truncate`.
+/// `magnitude` with the sign of `sign_source`.
+///
+/// A rounding of a negative value that lands on zero must answer negative zero, as IEEE-754's
+/// round-to-integral operations and .NET do. The arithmetic that does the rounding here cannot
+/// produce one, so every rounding that can land on zero passes its result through this.
+fn copy_sign(magnitude: f64, sign_source: f64) -> f64 {
+    f64::from_bits((magnitude.to_bits() & !SIGN_BIT) | (sign_source.to_bits() & SIGN_BIT))
+}
+
+/// The integer part of `value`, toward zero -- `System.Math.Truncate`. A negative value above -1
+/// truncates to negative zero.
 #[must_use]
 pub fn truncate(value: f64) -> f64 {
     if already_integral(value) {
         return value;
     }
-    (value as i64) as f64
+    copy_sign((value as i64) as f64, value)
 }
 
 /// The largest integer not greater than `value` -- `System.Math.Floor`.
@@ -57,7 +67,8 @@ pub fn floor(value: f64) -> f64 {
     }
 }
 
-/// The smallest integer not less than `value` -- `System.Math.Ceiling`. The mirror of [`floor`].
+/// The smallest integer not less than `value` -- `System.Math.Ceiling`. The mirror of [`floor`]. A
+/// negative value above -1 rounds up to negative zero.
 #[must_use]
 pub fn ceiling(value: f64) -> f64 {
     let truncated = truncate(value);
@@ -76,14 +87,15 @@ pub fn ceiling(value: f64) -> f64 {
 /// spare, so the addition itself must round, and IEEE-754's default mode is round-to-nearest-EVEN --
 /// the rule this function wants. Subtracting the same constant then returns the value to its own
 /// magnitude. The constant carries `value`'s sign so negatives round symmetrically rather than
-/// toward zero.
+/// toward zero. A negative value that rounds to zero answers negative zero, which the subtraction
+/// alone would not: it cancels to positive zero.
 #[must_use]
 pub fn round_half_to_even(value: f64) -> f64 {
     if already_integral(value) {
         return value;
     }
     let magic = f64::from_bits(NO_FRACTION_ABOVE.to_bits() | (value.to_bits() & SIGN_BIT));
-    (value + magic) - magic
+    copy_sign((value + magic) - magic, value)
 }
 
 /// The larger of two doubles, or NaN when either is NaN -- `System.Math.Max(double, double)`.
@@ -163,11 +175,36 @@ mod tests {
     }
 
     #[test]
-    fn a_result_of_zero_loses_its_sign_and_that_is_the_recorded_deviation() {
-        assert_eq!(truncate(-0.5).to_bits(), 0.0f64.to_bits());
-        assert_eq!(ceiling(-0.5).to_bits(), 0.0f64.to_bits());
-        assert_eq!(round_half_to_even(-0.4).to_bits(), 0.0f64.to_bits());
+    fn a_negative_value_that_rounds_to_zero_answers_negative_zero() {
+        let negative_zero = (-0.0f64).to_bits();
+        assert_eq!(truncate(-0.5).to_bits(), negative_zero);
+        assert_eq!(truncate(-0.0).to_bits(), negative_zero);
+        assert_eq!(ceiling(-0.5).to_bits(), negative_zero);
+        assert_eq!(ceiling(-0.0).to_bits(), negative_zero);
+        assert_eq!(floor(-0.0).to_bits(), negative_zero);
+        assert_eq!(round_half_to_even(-0.4).to_bits(), negative_zero);
+        assert_eq!(
+            round_half_to_even(-0.5).to_bits(),
+            negative_zero,
+            "a tie goes to the even zero"
+        );
+        assert_eq!(round_half_to_even(-0.0).to_bits(), negative_zero);
         assert_eq!(floor(-0.5), -1.0);
+    }
+
+    #[test]
+    fn a_positive_value_that_rounds_to_zero_answers_positive_zero() {
+        let positive_zero = 0.0f64.to_bits();
+        assert_eq!(truncate(0.5).to_bits(), positive_zero);
+        assert_eq!(floor(0.5).to_bits(), positive_zero);
+        assert_eq!(floor(0.0).to_bits(), positive_zero);
+        assert_eq!(round_half_to_even(0.4).to_bits(), positive_zero);
+        assert_eq!(round_half_to_even(0.5).to_bits(), positive_zero);
+        assert_eq!(
+            ceiling(-1.5),
+            -1.0,
+            "a nonzero result is unchanged by the sign rule"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub mod dispatch;
 pub mod ehabi;
 pub mod symbols;
 
@@ -1249,6 +1250,36 @@ pub struct Object {
     /// The alignment the object's `.bss` extent needs -- the largest `sh_addralign` among the
     /// sections merged into it, or 1 when there are none.
     pub bss_align: u32,
+    /// The allocated read-only input sections merged into [`Self::text`], in file order. Empty for
+    /// an object built in memory rather than read from a file, which a linker then trims as one
+    /// whose section boundaries are unknown.
+    pub input_sections: Vec<InputSection>,
+}
+
+/// One allocated, read-only input section of an [`Object`], where it lies in [`Object::text`].
+///
+/// A reader merges every such section into one text, and a symbol's position in it no longer says
+/// which section it came from. A linker that trims the object needs the boundaries back: a
+/// reference to a section's own symbol, with the offset into the section in its addend, or to a
+/// label of size zero, addresses the section as a whole, so the section has to be kept whole
+/// rather than symbol by symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputSection {
+    /// The section's name, for diagnostics.
+    pub name: String,
+    /// Where the section starts in [`Object::text`].
+    pub offset: u32,
+    /// Its length in bytes, not counting the padding in front of the next section.
+    pub size: u32,
+    /// Whether it holds code (`SHF_EXECINSTR`) rather than read-only data.
+    pub executable: bool,
+    /// Its `sh_addralign`, 1 at least: a copy of any part of it keeps its offset's residue modulo
+    /// this, so what was aligned inside it stays aligned.
+    pub align: u32,
+    /// The indices, into [`Object::symbols`], of the symbols defined in it. Explicit, so a label of
+    /// size zero at its very end, or a section with no bytes, belongs to it without a guess from
+    /// offsets.
+    pub symbols: Vec<u32>,
 }
 
 fn rd_u16(bytes: &[u8], o: usize) -> Result<u16, ElfError> {
@@ -1284,6 +1315,7 @@ const SH_INFO: usize = 28;
 const SH_ADDRALIGN: usize = 32;
 const SHF_WRITE: u32 = 0x1;
 const SHF_ALLOC: u32 = 0x2;
+const SHF_EXECINSTR: u32 = 0x4;
 
 /// Parses an ELF32 little-endian relocatable object (as written by [`write_relocatable_object`],
 /// and, later, a C toolchain): the `.text` bytes, the symbol table (names resolved), and the
@@ -1315,6 +1347,8 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     let mut symtab_i = None;
     let mut section_base: Vec<Option<u32>> = Vec::new();
     section_base.resize(e_shnum, None);
+    let mut input_sections: Vec<InputSection> = Vec::new();
+    let mut input_section_of: Vec<Option<usize>> = alloc::vec![None; e_shnum];
     let mut text: Vec<u8> = Vec::new();
     let mut text_align = 1u32;
     #[allow(clippy::needless_range_loop)]
@@ -1338,6 +1372,15 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         section_base[i] = Some(text.len() as u32);
         let off = sh(i, SH_OFFSET)? as usize;
         let size = sh(i, SH_SIZE)? as usize;
+        input_section_of[i] = Some(input_sections.len());
+        input_sections.push(InputSection {
+            name: String::from(sec_name(i)?),
+            offset: text.len() as u32,
+            size: size as u32,
+            executable: flags & SHF_EXECINSTR != 0,
+            align,
+            symbols: Vec::new(),
+        });
         text.extend_from_slice(bytes.get(off..off + size).ok_or(ElfError::Truncated)?);
     }
     let symtab_i = symtab_i.ok_or(ElfError::MissingSymbolTable)?;
@@ -1400,6 +1443,9 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         let st_size = rd_u32(bytes, base + 8)?;
         let st_info = *bytes.get(base + 12).ok_or(ElfError::Truncated)?;
         let st_shndx = rd_u16(bytes, base + 14)?;
+        if let Some(&Some(section)) = input_section_of.get(st_shndx as usize) {
+            input_sections[section].symbols.push(s as u32);
+        }
         let binding = match st_info >> 4 {
             1 => Binding::Global,
             2 => Binding::Weak,
@@ -1485,6 +1531,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         sections,
         bss_len,
         bss_align,
+        input_sections,
     })
 }
 
@@ -2322,6 +2369,85 @@ mod tests {
         assert!(
             ranges.is_empty() || ranges.iter().all(|&(start, end)| start < end),
             "either it has no opinion, or every range it gives is well formed: {ranges:?}"
+        );
+    }
+
+    /// The reader records each merged read-only section: where it lies in the merged text, its
+    /// size, whether it holds code, its alignment, and which symbols it defines -- a nameless section
+    /// symbol and a label of size zero included.
+    #[test]
+    fn each_merged_section_is_recorded_with_its_bounds_alignment_and_members() {
+        let symbols = [
+            Symbol {
+                name: "main",
+                value: 1,
+                size: 2,
+                binding: Binding::Global,
+                kind: SymbolType::Func,
+                section: SymbolSection::Text,
+            },
+            Symbol {
+                name: "",
+                value: 0,
+                size: 0,
+                binding: Binding::Local,
+                kind: SymbolType::Section,
+                section: SymbolSection::InSection(0),
+            },
+            Symbol {
+                name: "end_of_table",
+                value: 3,
+                size: 0,
+                binding: Binding::Local,
+                kind: SymbolType::NoType,
+                section: SymbolSection::InSection(0),
+            },
+        ];
+        let sections = [Section {
+            name: ".rodata.table",
+            flags: 0x2,
+            addralign: 8,
+            data: &[1, 2, 3],
+            relocations: &[],
+        }];
+        let object = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0x70, 0x47],
+            &symbols,
+            &[],
+            &sections,
+        ))
+        .unwrap();
+        let index_of = |name: &str, kind: SymbolType| {
+            object
+                .symbols
+                .iter()
+                .position(|s| s.name == name && s.kind == kind)
+                .unwrap() as u32
+        };
+        assert_eq!(
+            object.input_sections,
+            [
+                InputSection {
+                    name: String::from(".text"),
+                    offset: 0,
+                    size: 2,
+                    executable: true,
+                    align: 4,
+                    symbols: alloc::vec![index_of("main", SymbolType::Func)],
+                },
+                InputSection {
+                    name: String::from(".rodata.table"),
+                    offset: 8,
+                    size: 3,
+                    executable: false,
+                    align: 8,
+                    symbols: alloc::vec![
+                        index_of("", SymbolType::Section),
+                        index_of("end_of_table", SymbolType::NoType),
+                    ],
+                },
+            ]
         );
     }
 }

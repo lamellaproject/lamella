@@ -2,7 +2,7 @@
 //! clauses 16-18).
 
 use crate::bind::{bind_type, parameter_symbol, tuple_element_names};
-use crate::bound::{Binder, cast_constant, coerce_constant, integer_literal, literal_int_value};
+use crate::bound::{Binder, cast_constant, integer_literal, literal_int_value};
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
@@ -17,8 +17,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
     AttributeArgument, AttributeSection, BinaryOperator, CompilationUnit, EnumDecl, Expr,
-    ExprKind, Literal, Member, Modifier, NamespaceMember, QualifiedName, TypeDecl,
-    TypeKind as SyntaxTypeKind, TypeParameterConstraint as SyntaxConstraint, UnaryOperator,
+    ExprKind, Literal, Member, Modifier, NamespaceMember, Parameter, QualifiedName, TypeDecl,
+    TypeKind as SyntaxTypeKind, TypeParameterConstraint as SyntaxConstraint, TypeRef, UnaryOperator,
     UsingDirective, auto_property_backing_field_name, explicit_interface_member_name,
     is_auto_property,
 };
@@ -206,6 +206,31 @@ pub fn declared_full_name(namespace: &str, declaration: &TypeDecl) -> alloc::str
     qualified_type_name(namespace, &declared_type_name(declaration))
 }
 
+/// The name the declaration pass stores a member under: an explicit interface implementation's
+/// qualified `I.M`, so that simple-name lookup of `M` does not find it, and the plain name
+/// otherwise.
+///
+/// One function for every reader of the model that has to find a member AGAIN from its
+/// declaration -- the pass that folds its default arguments, and the emitter that writes them.
+#[must_use]
+pub fn declared_member_name(name: &str, explicit_interface: Option<&TypeRef>) -> Box<str> {
+    match explicit_interface {
+        Some(interface) => explicit_interface_member_name(interface, name).into(),
+        None => name.into(),
+    }
+}
+
+/// The name the declaration pass stores an indexer's accessor under: `get_Item` or `set_Item`
+/// WHATEVER `[IndexerName]` says -- the emitter bridges the two spellings -- qualified as
+/// [`declared_member_name`] qualifies any member.
+#[must_use]
+pub fn declared_indexer_accessor_name(
+    prefix: &str,
+    explicit_interface: Option<&TypeRef>,
+) -> Box<str> {
+    declared_member_name(&alloc::format!("{prefix}Item"), explicit_interface)
+}
+
 /// Joins a namespace (possibly empty) and a simple name into a dotted full name.
 pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
     if namespace.is_empty() {
@@ -345,7 +370,7 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
 /// constant for it regardless -- so any predefined value type folds to its zero and everything
 /// else, struct or not, folds to null.
 pub fn fold_parameter_default(expr: &Expr) -> Option<Literal> {
-    if let ExprKind::DefaultValue(target) = &expr.kind {
+    if let ExprKind::DefaultValue(Some(target)) = &expr.kind {
         return Some(default_value_literal(target));
     }
     fold_const(expr, &|_| None)
@@ -386,80 +411,6 @@ pub(crate) fn default_value_literal(target: &lamella_syntax::ast::TypeRef) -> Li
         | PredefinedType::Long
         | PredefinedType::Ulong => integer_literal(0),
         _ => Literal::Null,
-    }
-}
-
-/// A DEFAULT ARGUMENT's constant value against the WHOLE model (15.6.2.13) -- the form every
-/// consumer asks once the model is complete.
-///
-/// [`fold_parameter_default`] answers what the expression alone can settle; this adds the three
-/// shapes that need to look something up, and between them they cover every default form in the
-/// 34-row control table this was measured against:
-///
-/// ```text
-///     E.B          an enum member of another type   -- by far the commonest in driver code
-///     K            a `const` of the ENCLOSING type
-///     (E)7         a cast to a named type, which neither const folder will coerce to
-/// ```
-///
-/// **The `(E)7` arm is guarded on the target really being an enum.** An enum's constant IS its
-/// underlying integer and the width comes from the PARAMETER's type, so the value is all that is
-/// needed -- but a cast to some other named type has to fold to nothing rather than to a
-/// plausible wrong number.
-#[must_use]
-pub fn parameter_default_in_model(
-    model: &Model,
-    containing: &TypeSymbol,
-    expr: &Expr,
-) -> Option<Literal> {
-    if let Some(literal) = fold_parameter_default(expr) {
-        return Some(literal);
-    }
-    match &expr.kind {
-        ExprKind::Parenthesized(inner) => parameter_default_in_model(model, containing, inner),
-        ExprKind::MemberAccess { receiver, name } => {
-            let ExprKind::Name { name: type_name, .. } = &receiver.kind else {
-                return None;
-            };
-            let owner = TypeSymbol::Named([type_name.clone()].into());
-            model.get_by_symbol(&owner)?.find_field(name)?.constant.clone()
-        }
-        ExprKind::Name { name, .. } => model
-            .get_by_symbol(containing)?
-            .find_field(name)?
-            .constant
-            .clone(),
-        ExprKind::Cast { target, operand } => {
-            let target_ty = bind_type(target);
-            if model.get_by_symbol(&target_ty)?.kind != crate::symbols::TypeKind::Enum {
-                return None;
-            }
-            let inner = parameter_default_in_model(model, containing, operand)?;
-            Some(integer_literal(literal_int_value(&inner)?))
-        }
-        ExprKind::Binary {
-            operator,
-            left,
-            right,
-        } => fold_const_binary(
-            *operator,
-            &parameter_default_in_model(model, containing, left)?,
-            &parameter_default_in_model(model, containing, right)?,
-        ),
-        ExprKind::Unary { operator, operand } => fold_const_unary(
-            *operator,
-            &parameter_default_in_model(model, containing, operand)?,
-        ),
-        ExprKind::Conditional {
-            condition,
-            when_true,
-            when_false,
-        } => match parameter_default_in_model(model, containing, condition)? {
-            Literal::Boolean(true) => parameter_default_in_model(model, containing, when_true),
-            Literal::Boolean(false) => parameter_default_in_model(model, containing, when_false),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -658,20 +609,6 @@ pub(crate) fn fold_const_binary(
     Some(integer_literal(value))
 }
 
-/// One parameter's DEFAULT ARGUMENT, keyed well enough to find its method again in the model.
-///
-/// **NAME PLUS PARAMETER COUNT IS THE KEY, and it is sufficient rather than merely convenient**:
-/// two methods of one type cannot share a name and an arity unless they differ by `ref`/`out`
-/// alone, and this pass is STRICTLY ADDITIVE -- it fills a slot only where the slot is still
-/// empty and the fold succeeds -- so even that collision can at worst write the same value twice.
-struct ParamDefaultDecl<'a> {
-    type_full: String,
-    method: &'a str,
-    arity: usize,
-    index: usize,
-    init: &'a Expr,
-}
-
 /// Gives every `const` field and enum member that `units` declare its value (14.15, 17.3, 21.3),
 /// folded once, from its BOUND initializer, and held at the type the member declares.
 ///
@@ -707,9 +644,10 @@ pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
             break;
         }
     }
+    for unit in units {
+        constant_namespace(&mut binder, &unit.usings, &unit.members, "", ConstantStep::Defaults);
+    }
     *model = binder.into_model();
-    let values = model_const_values(model);
-    resolve_parameter_defaults(model, units, &values);
 }
 
 /// What one walk over the declarations does in [`resolve_constants`].
@@ -719,6 +657,9 @@ enum ConstantStep {
     Prepare,
     /// Folds each constant that has no value yet. The walk answers whether it folded any.
     Fold,
+    /// Gives every parameter that declares a DEFAULT ARGUMENT (15.6.2) the value the argument
+    /// supplies, bound in the declaration's scope. Once, after the rounds.
+    Defaults,
 }
 
 /// One namespace body for [`resolve_constants`], under the imports its declarations see: its
@@ -778,7 +719,7 @@ fn constant_member(
                         modifiers,
                         declarators,
                         ..
-                    } if modifiers.contains(&Modifier::Const) => {
+                    } if modifiers.contains(&Modifier::Const) && step != ConstantStep::Defaults => {
                         for declarator in declarators {
                             let field = ConstantField {
                                 namespace,
@@ -792,15 +733,184 @@ fn constant_member(
                     Member::NestedType(nested) => {
                         folded |= constant_member(binder, nested, &full, step);
                     }
+                    _ if step == ConstantStep::Defaults => {
+                        let owner = DefaultsOwner {
+                            namespace,
+                            type_name: &type_name,
+                            enclosing: &enclosing,
+                        };
+                        member_defaults(binder, &owner, member);
+                    }
                     _ => {}
                 }
             }
             binder.exit_type_parameters(type_parameters);
             folded
         }
+        NamespaceMember::Enum(_) if step == ConstantStep::Defaults => false,
         NamespaceMember::Enum(declaration) => constant_enum(binder, namespace, declaration, step),
+        NamespaceMember::Delegate(declaration) if step == ConstantStep::Defaults => {
+            delegate_defaults(binder, namespace, declaration);
+            false
+        }
         NamespaceMember::Delegate(_) | NamespaceMember::Namespace(_) => false,
     }
+}
+
+/// The type whose members' DEFAULT ARGUMENTS [`ConstantStep::Defaults`] is storing: its model key,
+/// and its symbol, which a default's simple names resolve against.
+struct DefaultsOwner<'a> {
+    namespace: &'a str,
+    type_name: &'a str,
+    enclosing: &'a TypeSymbol,
+}
+
+/// One type member's DEFAULT ARGUMENTS for [`ConstantStep::Defaults`], stored on the model entry
+/// the declaration pass made for it -- found under the name that pass gave it: a constructor as
+/// `.ctor`, an indexer as its `get_Item` and `set_Item` accessors, an operator as its `op_` method
+/// and an explicit implementation under its qualified name.
+///
+/// **EVERY KIND THAT CAN DECLARE A DEFAULT, BECAUSE EVERY ONE OF THEM IS CALLED.**
+fn member_defaults(binder: &mut Binder, owner: &DefaultsOwner<'_>, member: &Member) {
+    match member {
+        Member::Method {
+            name,
+            type_parameters,
+            constraints,
+            parameters,
+            explicit_interface,
+            ..
+        } => {
+            let name = declared_member_name(name, explicit_interface.as_ref());
+            let scope = binder.enter_type_parameters(type_parameters, constraints);
+            store_member_defaults(binder, owner, &name, type_parameters.len(), parameters, None);
+            binder.exit_type_parameters(scope);
+        }
+        Member::Constructor {
+            modifiers,
+            parameters,
+            ..
+        } if !is_static(modifiers) => {
+            store_member_defaults(binder, owner, ".ctor", 0, parameters, None);
+        }
+        Member::Indexer {
+            ty,
+            parameters,
+            getter,
+            setter,
+            explicit_interface,
+            ..
+        } => {
+            let accessor = |prefix: &str| {
+                declared_indexer_accessor_name(prefix, explicit_interface.as_ref())
+            };
+            if getter.is_some() {
+                store_member_defaults(binder, owner, &accessor("get_"), 0, parameters, None);
+            }
+            if setter.is_some() {
+                store_member_defaults(binder, owner, &accessor("set_"), 0, parameters, Some(ty));
+            }
+        }
+        Member::Operator {
+            operator,
+            parameters,
+            ..
+        } => {
+            let name = operator.method_name(parameters.len());
+            store_member_defaults(binder, owner, name, 0, parameters, None);
+        }
+        Member::ConversionOperator {
+            direction,
+            parameters,
+            ..
+        } => {
+            store_member_defaults(binder, owner, direction.method_name(), 0, parameters, None);
+        }
+        _ => {}
+    }
+}
+
+/// Binds each default argument `parameters` declares and stores the value it gives its parameter
+/// on the model entry [`TypeInfo::declared_method_mut`] finds for `name`. `trailing` is a
+/// signature's synthesized last parameter, which the declaration does not list: an indexer
+/// setter's `value`, of the element type.
+///
+/// **THE ENTRY IS FOUND BY ITS WHOLE SIGNATURE**, each parameter's type qualified here exactly as
+/// signature qualification qualified the entry's -- in the type's scope, with the member's own type
+/// parameters entered by the caller.
+fn store_member_defaults(
+    binder: &mut Binder,
+    owner: &DefaultsOwner<'_>,
+    name: &str,
+    type_parameter_count: usize,
+    parameters: &[Parameter],
+    trailing: Option<&TypeRef>,
+) {
+    if parameters.iter().all(|parameter| parameter.default_value.is_none()) {
+        return;
+    }
+    let outer = binder.replace_current_type(Some(owner.enclosing.clone()));
+    let mut signature: Vec<TypeSymbol> = parameters
+        .iter()
+        .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+        .collect();
+    signature.extend(trailing.map(|ty| binder.canonicalize(&bind_type(ty))));
+    let values = bound_defaults(binder, owner.enclosing, parameters);
+    binder.replace_current_type(outer);
+    let Some(method) = binder
+        .model_mut()
+        .get_mut(owner.namespace, owner.type_name)
+        .and_then(|info| info.declared_method_mut(name, type_parameter_count, &signature))
+    else {
+        return;
+    };
+    for (index, value) in values {
+        if let Some(slot) = method.parameter_info.get_mut(index) {
+            slot.default = Some(value);
+        }
+    }
+}
+
+/// A delegate's DEFAULT ARGUMENTS for [`ConstantStep::Defaults`]. They belong to its `Invoke`,
+/// which is the method a call through the delegate binds against.
+fn delegate_defaults(
+    binder: &mut Binder,
+    namespace: &str,
+    declaration: &lamella_syntax::ast::DelegateDecl,
+) {
+    let type_name = declared_delegate_name(declaration);
+    let enclosing = named_symbol(namespace, &type_name);
+    let owner = DefaultsOwner {
+        namespace,
+        type_name: &type_name,
+        enclosing: &enclosing,
+    };
+    let scope =
+        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    store_member_defaults(binder, &owner, "Invoke", 0, &declaration.parameters, None);
+    binder.exit_type_parameters(scope);
+}
+
+/// The value each default argument in `parameters` gives its parameter, bound through
+/// [`Binder::bind_parameter_default`] in `enclosing`'s context and read by
+/// [`Binder::parameter_default_value`]: by parameter index, for the defaults that HAVE a value.
+/// One that does not -- not constant, or not bound -- is left out, and its parameter stays as the
+/// declaration pass left it.
+fn bound_defaults(
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    parameters: &[Parameter],
+) -> Vec<(usize, Literal)> {
+    parameters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, parameter)| {
+            let value = parameter.default_value.as_ref()?;
+            let parameter_type = binder.canonicalize(&bind_type(&parameter.ty));
+            let (bound, _) = binder.bind_parameter_default(enclosing, &parameter_type, value);
+            Some((index, binder.parameter_default_value(&bound, &parameter_type)?))
+        })
+        .collect()
 }
 
 /// Where a `const` field lives: the model key of its type, that type's symbol, and its own name.
@@ -948,269 +1058,6 @@ fn set_constant(
     };
     field.constant = constant;
     true
-}
-
-/// Fills the DEFAULT ARGUMENTS the declaration-order pass could not fold, against the whole model.
-///
-/// Runs AFTER the const fields and enum members above are in `values`, because that is what it
-/// folds against: `void M(PinMode mode = PinMode.Input)` is a qualified reference to a member of
-/// another type, which is exactly the shape [`resolve_const_expr`] exists for and exactly the shape
-/// the first pass cannot see.
-///
-/// STRICTLY ADDITIVE: a slot the first pass already resolved is left alone, and an initializer
-/// that does not fold leaves the slot `None`. **A parameter whose
-/// default never folds is REQUIRED as far as the rest of the compiler is concerned**, which is the
-/// safe direction -- a caller is asked for an argument it could have omitted, rather than being
-/// allowed to omit one this compiler cannot supply a value for. `CS1736` reports it separately.
-fn resolve_parameter_defaults(
-    model: &mut Model,
-    units: &[CompilationUnit],
-    values: &BTreeMap<(String, String), Literal>,
-) {
-    let mut pending: Vec<ParamDefaultDecl> = Vec::new();
-    for unit in units {
-        for member in &unit.members {
-            collect_param_default_decls(member, "", &mut pending);
-        }
-    }
-    let folded: Vec<(&ParamDefaultDecl, Literal)> = pending
-        .iter()
-        .filter_map(|decl| {
-            let containing = type_symbol_of(&decl.type_full);
-            let literal = parameter_default_in_model(model, &containing, decl.init)
-                .or_else(|| resolve_const_expr(decl.init, &decl.type_full, values))?;
-            Some((decl, literal))
-        })
-        .collect();
-    for (decl, literal) in folded {
-        let (namespace, name) = split_type_full(&decl.type_full);
-        let Some(info) = model.get_mut(&namespace, name) else {
-            continue;
-        };
-        for method in info.methods.iter_mut() {
-            if &*method.name != decl.method || method.parameters.len() != decl.arity {
-                continue;
-            }
-            if let Some(slot) = method.parameter_info.get_mut(decl.index)
-                && slot.default.is_none()
-            {
-                slot.default = Some(literal.clone());
-            }
-        }
-    }
-}
-
-/// A type's dotted full name as the [`TypeSymbol`] the model is keyed by.
-fn type_symbol_of(type_full: &str) -> TypeSymbol {
-    TypeSymbol::Named(type_full.split('.').map(Box::<str>::from).collect())
-}
-
-/// Collects every DEFAULT ARGUMENT written in `member`, descending namespaces and nested types.
-///
-/// A constructor is keyed under `.ctor`, which is the name it carries in the model, so the two
-/// member kinds need no separate handling downstream. Accessors are not collected: a property or
-/// an indexer accessor's parameters are synthesized, and the one an indexer CAN declare a default
-/// on reaches the model through `get_Item`/`set_Item` rather than through this walk.
-fn collect_param_default_decls<'a>(
-    member: &'a NamespaceMember,
-    namespace: &str,
-    out: &mut Vec<ParamDefaultDecl<'a>>,
-) {
-    match member {
-        NamespaceMember::Namespace(declaration) => {
-            let inner = join_namespace(namespace, &declaration.name);
-            for nested in &declaration.members {
-                collect_param_default_decls(nested, &inner, out);
-            }
-        }
-        NamespaceMember::Type(declaration) => {
-            let full = declared_full_name(namespace, declaration);
-            for member in &declaration.members {
-                let (name, parameters) = match member {
-                    Member::Method {
-                        name, parameters, ..
-                    } => (&**name, parameters),
-                    Member::Constructor { parameters, .. } => (".ctor", parameters),
-                    Member::NestedType(nested) => {
-                        collect_param_default_decls(nested, &full, out);
-                        continue;
-                    }
-                    _ => continue,
-                };
-                for (index, parameter) in parameters.iter().enumerate() {
-                    if let Some(init) = &parameter.default_value {
-                        out.push(ParamDefaultDecl {
-                            type_full: full.clone(),
-                            method: name,
-                            arity: parameters.len(),
-                            index,
-                            init,
-                        });
-                    }
-                }
-            }
-        }
-        NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
-    }
-}
-
-/// Folds a constant expression against `values` -- the constants collected across the whole model --
-/// so a simple name resolves to a `const`/enum member of `containing`, and a qualified `Type.Member`
-/// resolves against the named type. Mirrors [`fold_const`]'s operator/cast/conditional handling.
-pub(crate) fn resolve_const_expr(
-    expr: &Expr,
-    containing: &str,
-    values: &BTreeMap<(String, String), Literal>,
-) -> Option<Literal> {
-    match &expr.kind {
-        ExprKind::Literal(literal) => Some(literal.clone()),
-        ExprKind::Parenthesized(inner) => resolve_const_expr(inner, containing, values),
-        ExprKind::Name { name, .. } => values
-            .get(&(containing.to_string(), name.to_string()))
-            .cloned(),
-        ExprKind::MemberAccess { receiver, name } => {
-            let type_full = dotted_name(receiver)?;
-            values.get(&(type_full, name.to_string())).cloned()
-        }
-        ExprKind::Unary { operator, operand } => {
-            fold_const_unary(*operator, &resolve_const_expr(operand, containing, values)?)
-        }
-        ExprKind::Binary {
-            operator,
-            left,
-            right,
-        } => fold_const_binary(
-            *operator,
-            &resolve_const_expr(left, containing, values)?,
-            &resolve_const_expr(right, containing, values)?,
-        ),
-        ExprKind::Cast { target, operand } => {
-            let operand = resolve_const_expr(operand, containing, values)?;
-            match bind_type(target) {
-                TypeSymbol::Special(special) => {
-                    coerce_constant(literal_int_value(&operand)?, special)
-                }
-                _ => None,
-            }
-        }
-        ExprKind::Conditional {
-            condition,
-            when_true,
-            when_false,
-        } => match resolve_const_expr(condition, containing, values)? {
-            Literal::Boolean(true) => resolve_const_expr(when_true, containing, values),
-            Literal::Boolean(false) => resolve_const_expr(when_false, containing, values),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// The dotted name of a chain of simple-name/member-access expressions (`A`, `A.B`, `A.B.C`), or
-/// `None` for anything else -- used to read the type name out of a qualified constant reference.
-fn dotted_name(expr: &Expr) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Name { name, .. } => Some(name.to_string()),
-        ExprKind::MemberAccess { receiver, name } => {
-            Some(alloc::format!("{}.{}", dotted_name(receiver)?, name))
-        }
-        _ => None,
-    }
-}
-
-/// Splits a type's full name into its model key: the namespace-or-enclosing-type prefix and the
-/// simple name (`Ns.Sub.T` -> (`Ns.Sub`, `T`); `T` -> (``, `T`)).
-fn split_type_full(full: &str) -> (String, &str) {
-    match full.rsplit_once('.') {
-        Some((prefix, name)) => (String::from(prefix), name),
-        None => (String::new(), full),
-    }
-}
-
-/// Every folded constant in the model, keyed by (containing type's full name, member name) -- const
-/// fields AND enum members. The table a default argument's initializer is folded against by name.
-pub(crate) fn model_const_values(model: &Model) -> BTreeMap<(String, String), Literal> {
-    let mut values: BTreeMap<(String, String), Literal> = BTreeMap::new();
-    let keys: Vec<(String, String)> = model
-        .type_keys()
-        .map(|(namespace, name)| (String::from(namespace), String::from(name)))
-        .collect();
-    for (namespace, name) in &keys {
-        let Some(info) = model.get(namespace, name) else {
-            continue;
-        };
-        let full = qualified_type_name(namespace, name);
-        for field in &info.fields {
-            if let Some(literal) = &field.constant {
-                values.insert((full.clone(), field.name.to_string()), literal.clone());
-            }
-        }
-    }
-    register_unambiguous_short_spellings(&keys, &mut values);
-    values
-}
-
-/// Also registers each constant under the SHORTER type spellings a source file may legitimately
-/// write -- `Facts.X` for `G.Facts.X` under a `using G;`, `Outer.Inner.X` for `Ns.Outer.Inner.X`.
-///
-/// WHY THIS IS NEEDED AT ALL: a default argument is folded against this map by NAME, using the
-/// receiver exactly as the source wrote it. A `using`-shortened receiver therefore matched nothing,
-/// and the fold quietly produced no value -- which downstream is indistinguishable from zero. That
-/// is the const-of-const mis-fold: `const byte X = (byte)Facts.IDENTITY_REG;` read back as 0 while
-/// the identical expression written INLINE folded correctly, because the inline path resolves names
-/// through scope and this one did not.
-///
-/// ONLY UNAMBIGUOUS SUFFIXES ARE REGISTERED, and that is the whole safety argument. This is not
-/// scope resolution -- it does not know which namespaces a file imported -- so it earns the right
-/// to answer only where every candidate agrees. A suffix owned by two types resolves to NOTHING,
-/// which leaves the fold unresolved exactly as it is today: a gap, never a wrong value. A file that
-/// writes `Facts.X` while two `Facts` types exist gets no fold rather than the wrong one.
-///
-/// A full name already inserted above is never displaced -- aliases fill empty slots only.
-fn register_unambiguous_short_spellings(
-    keys: &[(String, String)],
-    values: &mut BTreeMap<(String, String), Literal>,
-) {
-    let full_names: Vec<String> = keys
-        .iter()
-        .map(|(namespace, name)| qualified_type_name(namespace, name))
-        .collect();
-    let mut owners: BTreeMap<String, usize> = BTreeMap::new();
-    for full in &full_names {
-        for suffix in dotted_suffixes(full) {
-            *owners.entry(suffix).or_insert(0) += 1;
-        }
-    }
-    let constants: Vec<((String, String), Literal)> = values
-        .iter()
-        .map(|(key, literal)| (key.clone(), literal.clone()))
-        .collect();
-    for full in &full_names {
-        for suffix in dotted_suffixes(full) {
-            if owners.get(&suffix).copied() != Some(1) {
-                continue;
-            }
-            for ((owner, field), literal) in &constants {
-                if owner == full {
-                    values
-                        .entry((suffix.clone(), field.clone()))
-                        .or_insert_with(|| literal.clone());
-                }
-            }
-        }
-    }
-}
-
-/// The proper dotted suffixes of a type's full name -- `A.B.C` yields `B.C` and `C`. The full name
-/// itself is excluded: it is already a key.
-fn dotted_suffixes(full: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = full;
-    while let Some((_, tail)) = rest.split_once('.') {
-        out.push(tail.to_string());
-        rest = tail;
-    }
-    out
 }
 
 /// Whether `expr` is a constant-expression FORM (14.15): built only from literals, names, member
@@ -1456,10 +1303,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 explicit_interface,
                 ..
             } => info.events.push(EventSymbol {
-                name: match explicit_interface {
-                    Some(interface) => explicit_interface_member_name(interface, name).into(),
-                    None => name.clone(),
-                },
+                name: declared_member_name(name, explicit_interface.as_ref()),
                 explicit_interface: explicit_interface.as_ref().map(bind_type),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
@@ -1486,10 +1330,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             } => info.methods.push(MethodSymbol {
                 return_tuple_names: tuple_element_names(return_type),
                 return_required_modifiers: Vec::new(),
-                name: match explicit_interface {
-                    Some(interface) => explicit_interface_member_name(interface, name).into(),
-                    None => name.clone(),
-                },
+                name: declared_member_name(name, explicit_interface.as_ref()),
                 explicit_interface: explicit_interface.as_ref().map(bind_type),
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(parameter_symbol).collect(),
@@ -1630,14 +1471,8 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let element_tuple_names = tuple_element_names(ty);
                 let indices: Vec<TypeSymbol> = parameters.iter().map(parameter_symbol).collect();
                 let interface_symbol = explicit_interface.as_ref().map(bind_type);
-                let accessor = |prefix: &str| -> Box<str> {
-                    let plain = alloc::format!("{prefix}Item");
-                    match explicit_interface {
-                        Some(interface) => {
-                            explicit_interface_member_name(interface, &plain).into()
-                        }
-                        None => plain.into(),
-                    }
+                let accessor = |prefix: &str| {
+                    declared_indexer_accessor_name(prefix, explicit_interface.as_ref())
                 };
                 let accessibility = match explicit_interface {
                     Some(_) => Accessibility::Private,
@@ -2299,5 +2134,76 @@ mod tests {
         let area = widget.methods_named("Area").next().expect("Area");
         assert!(!area.is_static);
         assert!(area.return_type.to_string() == "double");
+    }
+
+    /// The model after [`resolve_constants`], for the default-argument rows below -- built by the
+    /// pipeline the emitter uses, signature qualification included, because a default is stored
+    /// on the member whose QUALIFIED signature its declaration names.
+    fn resolved(source: &str) -> Model {
+        let unit = parse_compilation_unit(source).unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        let mut binder = Binder::with_model(model);
+        crate::program::qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
+        let mut model = binder.into_model();
+        model.link_bases();
+        resolve_constants(&mut model, core::slice::from_ref(&unit));
+        model
+    }
+
+    /// The integer each default of the members `members` picks out holds, in parameter order.
+    fn default_values<'a>(
+        members: impl Iterator<Item = &'a MethodSymbol>,
+    ) -> Vec<Vec<Option<u64>>> {
+        members
+            .map(|method| {
+                method
+                    .parameter_info
+                    .iter()
+                    .map(|info| match &info.default {
+                        Some(Literal::Integer { value, .. }) => Some(*value),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// TWO OVERLOADS OF ONE ARITY KEEP THEIR OWN DEFAULTS.
+    #[test]
+    fn a_default_is_stored_on_the_overload_that_declares_it() {
+        let model = resolved(
+            "namespace N { public enum E1 { A, B, C } public enum E2 { X, Y, Z } \
+             public class P { \
+             public static void F(int i, E1 e = E1.C) { } \
+             public static void F(string s, E2 e = E2.Y) { } } }",
+        );
+        let p = model.get("N", "P").expect("P");
+        assert_eq!(
+            default_values(p.methods_named("F")),
+            [[None, Some(2)], [None, Some(1)]]
+        );
+    }
+
+    /// A constructor, a delegate's `Invoke` and both accessors of an indexer take a default that
+    /// names an enum member, in a namespace -- three member kinds the pass this replaced did not
+    /// reach.
+    #[test]
+    fn every_member_kind_that_is_called_has_its_default_folded() {
+        let model = resolved(
+            "namespace N { public enum E { A, B, C } \
+             public delegate void D(E e = E.C); \
+             public class P { \
+             public P(int n, E e = E.B) { } \
+             public int this[int i, E e = E.B] { get { return i; } set { } } } }",
+        );
+        let p = model.get("N", "P").expect("P");
+        assert_eq!(default_values(p.constructors.iter()), [[None, Some(1)]]);
+        assert_eq!(
+            default_values(p.methods_named("get_Item").chain(p.methods_named("set_Item"))),
+            [vec![None, Some(1)], vec![None, Some(1), None]]
+        );
+        let d = model.get("N", "D").expect("D");
+        assert_eq!(default_values(d.methods_named("Invoke")), [[Some(2)]]);
     }
 }

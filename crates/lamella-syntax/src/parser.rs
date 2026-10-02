@@ -1691,14 +1691,22 @@ impl Parser {
                 if self.case_declaration_pattern_here() {
                     self.gate_feature(Feature::PatternCaseLabel, case_at);
                     let ty = self.parse_type();
+                    let name_span = self.current().span;
+                    let name: Box<str> = match &self.current().kind {
+                        TokenKind::Identifier(name) => name.clone(),
+                        _ => Box::from("when"),
+                    };
                     self.bump();
-                    let span = Span::new(ty.span.start, self.current().span.start);
-                    self.skip_case_guard();
-                    self.expect(
-                        Punctuator::Colon,
-                        DiagnosticKind::TokenExpected { expected: ":" },
-                    );
-                    return Some(SwitchLabel::Case(Expr::new(ExprKind::Error, span)));
+                    let pattern = match &*name {
+                        "_" if is_var_type(&ty) => Pattern::Discard(name_span),
+                        "_" => Pattern::Type(ty),
+                        _ => Pattern::Declaration {
+                            ty,
+                            name,
+                            span: name_span,
+                        },
+                    };
+                    return Some(self.finish_pattern_case_label(pattern, case_at));
                 }
                 let value = self.parse_expression();
                 if matches!(value.kind, ExprKind::PredefinedType(_)) {
@@ -1706,7 +1714,8 @@ impl Parser {
                 }
                 if self.current_contextual_keyword() == Some("when") {
                     self.gate_feature(Feature::PatternCaseLabel, case_at);
-                    self.skip_case_guard();
+                    let constant = Pattern::Constant(Box::new(value));
+                    return Some(self.finish_pattern_case_label(constant, case_at));
                 }
                 self.expect(
                     Punctuator::Colon,
@@ -1746,11 +1755,24 @@ impl Parser {
         designator
     }
 
-    /// Consumes a case label's `when` guard, if one is here, stopping at the label's `:`.
-    fn skip_case_guard(&mut self) {
-        if self.current_contextual_keyword() == Some("when") {
+    /// The rest of a pattern label after its pattern: the `when` guard, if one is here, and the
+    /// `:`. The guard is parsed above the conditional operator, whose `:` would take the label's.
+    fn finish_pattern_case_label(&mut self, pattern: Pattern, case_at: Span) -> SwitchLabel {
+        let guard = if self.current_contextual_keyword() == Some("when") {
             self.bump();
-            let _ = self.parse_null_coalescing();
+            Some(self.parse_null_coalescing())
+        } else {
+            None
+        };
+        let end = self.current().span.start;
+        self.expect(
+            Punctuator::Colon,
+            DiagnosticKind::TokenExpected { expected: ":" },
+        );
+        SwitchLabel::Pattern {
+            pattern,
+            guard,
+            span: Span::new(case_at.start, end),
         }
     }
 
@@ -1961,7 +1983,7 @@ impl Parser {
             self.bump();
         }
         let kind = if is_static {
-            UsingKind::Static(self.parse_qualified_name())
+            UsingKind::Static(self.parse_aliased_qualified_name())
         } else if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::Equals)
         {
@@ -1969,16 +1991,35 @@ impl Parser {
             self.bump();
             UsingKind::Alias {
                 name,
-                target: self.parse_qualified_name(),
+                target: self.parse_aliased_qualified_name(),
             }
         } else {
-            UsingKind::Namespace(self.parse_qualified_name())
+            UsingKind::Namespace(self.parse_aliased_qualified_name())
         };
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         UsingDirective {
             kind,
             span: Span::new(start, end),
         }
+    }
+
+    /// Parses a dotted name that may begin with a namespace alias qualifier (C# 2.0) --
+    /// `global::a.b.c`, `alias::a.b` -- as a `using` directive or an attribute names it. The alias
+    /// is the name's first part, an [`alias_qualifier_part`](crate::ast::alias_qualifier_part).
+    fn parse_aliased_qualified_name(&mut self) -> QualifiedName {
+        let start = self.current().span.start;
+        if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::ColonColon)
+        {
+            let (alias, _) = self.expect_identifier();
+            self.bump();
+            let mut name = self.parse_qualified_name();
+            name.parts
+                .insert(0, crate::ast::alias_qualifier_part(&alias));
+            name.span = Span::new(start, name.span.end);
+            return name;
+        }
+        self.parse_qualified_name()
     }
 
     /// Parses a dotted name `a.b.c` (10.8).
@@ -2051,7 +2092,7 @@ impl Parser {
     /// Parses one attribute: a type name and an optional argument list (24.2).
     fn parse_attribute(&mut self) -> Attribute {
         let start = self.current().span.start;
-        let name = self.parse_qualified_name();
+        let name = self.parse_aliased_qualified_name();
         let mut end = name.span.end;
         let arguments = if self.current_punctuator() == Some(Punctuator::OpenParen) {
             let (arguments, close) = self.parse_attribute_arguments();
@@ -4904,13 +4945,14 @@ impl Parser {
             }
             TokenKind::Keyword(Keyword::Default) => {
                 self.bump();
-                self.expect(
-                    Punctuator::OpenParen,
-                    DiagnosticKind::TokenExpected { expected: "(" },
-                );
+                if self.current_punctuator() != Some(Punctuator::OpenParen) {
+                    self.gate_feature(Feature::DefaultLiteral, span);
+                    return Expr::new(ExprKind::DefaultValue(None), span);
+                }
+                self.bump();
                 let target = self.parse_type();
                 let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-                Expr::new(ExprKind::DefaultValue(target), Span::new(span.start, end))
+                Expr::new(ExprKind::DefaultValue(Some(target)), Span::new(span.start, end))
             }
             TokenKind::Keyword(Keyword::Stackalloc) => {
                 self.bump();
@@ -5020,7 +5062,29 @@ impl Parser {
             TokenKind::Identifier(name) => {
                 let verbatim = self.current().verbatim;
                 self.bump();
-                Expr::new(ExprKind::Name { name, verbatim }, span)
+                // `global::System.Console` (C# 2.0): `alias::name` is the member `name` of what the
+                // alias denotes -- the global namespace for `global`, the namespace a `using`
+                // alias names otherwise -- so it is a member access whose receiver is the alias.
+                if self.current_punctuator() == Some(Punctuator::ColonColon) {
+                    self.bump();
+                    let alias = Expr::new(
+                        ExprKind::Name {
+                            name: crate::ast::alias_qualifier_part(&name),
+                            verbatim: false,
+                        },
+                        span,
+                    );
+                    let (member, member_end) = self.expect_identifier();
+                    Expr::new(
+                        ExprKind::MemberAccess {
+                            receiver: Box::new(alias),
+                            name: member,
+                        },
+                        Span::new(span.start, member_end),
+                    )
+                } else {
+                    Expr::new(ExprKind::Name { name, verbatim }, span)
+                }
             }
             TokenKind::Punctuator(Punctuator::OpenParen) => {
                 self.bump();
@@ -5855,6 +5919,18 @@ impl Parser {
         let verbatim = self.current().verbatim;
         let (mut name, mut end) = self.expect_identifier();
         let mut parts: Vec<TypeNamePart> = Vec::new();
+        // `global::System.String` and `IO::File` (C# 2.0): the identifier before `::` is an alias,
+        // recorded as the name's first part, and the name proper starts after it.
+        if self.current_punctuator() == Some(Punctuator::ColonColon) {
+            self.bump();
+            parts.push(TypeNamePart {
+                name: crate::ast::alias_qualifier_part(&name),
+                arguments: Vec::new(),
+            });
+            let (first, first_end) = self.expect_identifier();
+            name = first;
+            end = first_end;
+        }
         let mut constructed = false;
         let mut credit = AngleCredit::default();
         loop {
@@ -6473,6 +6549,12 @@ fn modifier_of(keyword: Keyword) -> Option<Modifier> {
 }
 
 /// A type named by its dotted parts, for a synthesized signature.
+/// Whether `ty` is the contextual `var`, written plainly: a one-part name `var`, not `@var`.
+fn is_var_type(ty: &TypeRef) -> bool {
+    !ty.verbatim_name
+        && matches!(&ty.kind, TypeRefKind::Name(parts) if parts.len() == 1 && &*parts[0] == "var")
+}
+
 fn synth_type(parts: &[&str], span: Span) -> TypeRef {
     TypeRef {
         kind: TypeRefKind::Name(parts.iter().map(|part| Box::from(*part)).collect()),
@@ -7561,7 +7643,8 @@ mod tests {
             ),
             ExprKind::TypeOf(target) => format!("(typeof {})", dump_type(target)),
             ExprKind::SizeOf(target) => format!("(sizeof {})", dump_type(target)),
-            ExprKind::DefaultValue(target) => format!("(default {})", dump_type(target)),
+            ExprKind::DefaultValue(Some(target)) => format!("(default {})", dump_type(target)),
+            ExprKind::DefaultValue(None) => String::from("default"),
             ExprKind::StackAlloc {
                 element,
                 count,
@@ -8171,6 +8254,23 @@ mod tests {
                         match label {
                             SwitchLabel::Case(value) => {
                                 text.push_str(&format!(" (case {})", dump(value)));
+                            }
+                            SwitchLabel::Pattern { pattern, guard, .. } => {
+                                let pattern = match pattern {
+                                    Pattern::Type(ty) => format!("{} _", dump_type(ty)),
+                                    Pattern::Constant(value) => dump(value),
+                                    Pattern::Discard(_) => String::from("var _"),
+                                    Pattern::Declaration { ty, name, .. } => {
+                                        format!("{} {name}", dump_type(ty))
+                                    }
+                                };
+                                match guard {
+                                    Some(guard) => text.push_str(&format!(
+                                        " (case {pattern} when {})",
+                                        dump(guard)
+                                    )),
+                                    None => text.push_str(&format!(" (case {pattern})")),
+                                }
                             }
                             SwitchLabel::Default => text.push_str(" (default)"),
                         }
@@ -10490,7 +10590,7 @@ mod tests {
             [8022]
         );
         assert_eq!(unit_codes("class C { object M(object a) { return a ?? a; } }"), [8022]);
-        assert_eq!(unit_codes("class C { void M() { int x = A::B; } }"), [8022]);
+        assert_eq!(unit_codes("class C { void M() { int x = A::B; } }"), []);
         assert_eq!(unit_codes("class C { void M(string a) { a?.ToString(); } }"), [8022]);
         assert_eq!(unit_codes("class C { int P; int Q => 5; }"), [8022]);
         assert!(unit_codes("class C { void M() { System.Func<int,int> f = x => x; } }").contains(&8022));
@@ -11302,21 +11402,6 @@ mod tests {
                 "System.Console.WriteLine(1);\nSystem.Console.WriteLine(2);\nclass C { }",
                 "System",
                 "top-level statements",
-            ),
-            (
-                "class P { void M(object o) { switch (o) { case int n when n > 0: break; } } }",
-                "case",
-                "patterns in case labels",
-            ),
-            (
-                "class P { void M(int i, bool b) { switch (i) { case 1 when b: break; } } }",
-                "case",
-                "patterns in case labels",
-            ),
-            (
-                "class P { void M(object o) { switch (o) { case var x: break; } } }",
-                "case",
-                "patterns in case labels",
             ),
             (
                 "record R(int X); class P { void M(R r) { var s = r with { X = 2 }; } }",

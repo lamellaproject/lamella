@@ -371,7 +371,13 @@ pub enum ExprKind {
     /// spellable otherwise: `T` may be closed over a reference type (where the answer is `null`)
     /// or a value type (where it is not), so no literal covers both and the choice has to be made
     /// where `T` is known.
-    DefaultValue(TypeRef),
+    ///
+    /// `None` is the `default` LITERAL (C# 7.1), which names no type and takes the one its context
+    /// converts it to: `x = default;`, `return default;`. An `Option` rather than a second
+    /// `ExprKind`, for the reason [`ExprKind::ObjectCreation`]'s `target` is one: every reader of
+    /// this variant is a compile error until it says what the literal means there, where a new
+    /// variant would fall silently into each pass's `_ =>` arm.
+    DefaultValue(Option<TypeRef>),
     /// A `stackalloc` expression (unsafe): `stackalloc T [ count ]`. Allocates
     /// `count * sizeof(T)` bytes on the call stack and yields a `T*` to the start.
     StackAlloc {
@@ -648,6 +654,28 @@ impl TypeRef {
         self.verbatim_name = verbatim;
         self
     }
+}
+
+/// The name part that stands for a NAMESPACE ALIAS QUALIFIER (C# 2.0): `alias::` before the first
+/// real part of `alias::N.T`. `global::System.String` is the parts `global::`, `System`,
+/// `String`; `IO::File` is `IO::`, `File`.
+///
+/// **IT IS A PART OF THE NAME, SO IT TRAVELS WITH THE NAME.** A qualified name reaches a type
+/// argument, an attribute, a `using` directive and a member access, and in each the qualifier has
+/// to arrive where the name is resolved. No identifier can contain `::`, so the part cannot be
+/// mistaken for one the source wrote; [`alias_qualifier`] reads it back.
+#[must_use]
+pub fn alias_qualifier_part(alias: &str) -> Box<str> {
+    let mut part = String::from(alias);
+    part.push_str("::");
+    part.into()
+}
+
+/// The alias a name part qualifies by, when the part is an [`alias_qualifier_part`]: `global` for
+/// `global::`.
+#[must_use]
+pub fn alias_qualifier(part: &str) -> Option<&str> {
+    part.strip_suffix("::")
 }
 
 /// The kind of a [`TypeRef`].
@@ -1018,6 +1046,20 @@ pub struct SwitchSection {
 pub enum SwitchLabel {
     /// `case constant-expression :`.
     Case(Expr),
+    /// `case pattern when guard :` (C# 7.0) -- a TYPE or DECLARATION pattern (`case Bme280 _:`,
+    /// `case int n:`, `case var x:`), or a constant with a `when` guard (`case 1 when ready:`).
+    ///
+    /// **A SEPARATE VARIANT FROM `Case`, SO A SWITCH OF CONSTANTS IS UNTOUCHED.** A label written
+    /// as a constant with no guard stays [`SwitchLabel::Case`]; only a switch that holds one of
+    /// these becomes a sequence of tests.
+    Pattern {
+        /// The pattern the governing value is tested against.
+        pattern: Pattern,
+        /// The `when` guard, if written. A guarded label is never a catch-all.
+        guard: Option<Expr>,
+        /// The label from its `case` to its `:`.
+        span: Span,
+    },
     /// `default :`.
     Default,
 }

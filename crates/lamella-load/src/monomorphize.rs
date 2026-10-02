@@ -70,23 +70,65 @@ fn definition_key(_assembly: &Assembly<'_>, _token: Token) -> Option<String> {
     None
 }
 
-/// The closed instantiation set `program` requires, collected and spelled by the SHARED collector
-/// both tiers consume.
+/// The closed instantiation set `program` reaches, collected and spelled by the SHARED collector
+/// both tiers consume: what the program's own rows name, and what the generic definitions it
+/// instantiates name in turn under its arguments.
 ///
 /// **THIS FUNCTION IS A BRIDGE, NOT A COLLECTOR.** Membership comes from
-/// `lamella_generics::Program::instantiations` -- the closure walk that carries the
-/// growth-on-a-cycle refusal -- and every name comes from that crate's canonical spelling. All this
-/// does is read the decoded ARGUMENTS back off the `TypeSpec` row the walk's name identifies,
+/// `lamella_generics::Program::instantiations_from_program_deriving` -- the closure walk that carries
+/// the growth-on-a-cycle refusal -- and every name comes from that crate's canonical spelling. All
+/// this does is read the decoded ARGUMENTS back off the `TypeSpec` row the walk's name identifies,
 /// because the walk's own arguments are name-keyed (deliberately: a token means nothing outside its
 /// assembly) while substitution here needs the assembly-local signatures the row carries.
 ///
 /// An instantiation the walk found that the program names through no `TypeSpec` row is SKIPPED
 /// rather than guessed at, and the caller sees it as a call site that stays marked. Silently
 /// inventing a signature for it is the one thing that would put a wrong type in the image.
+///
+/// **WHAT A REFERENCE'S OWN CODE NAMES IS NOT HERE.** A corlib method that takes a
+/// `ReadOnlySpan<byte>` names that instantiation for itself; a program that never calls it does not
+/// reach it, and its set does not hold it. The loader still lowers it, because the module holds the
+/// corlib's code -- as that reference's PLAN, [`collect_reference_plans`], beside this set and
+/// reported apart from it.
 #[cfg(feature = "generics")]
 pub fn collect_instantiations<'pe>(
     program: &Assembly<'pe>,
     references: &[Assembly<'pe>],
+) -> Vec<Instantiation> {
+    collect(program, references, Roots::Program)
+}
+
+/// The PLAN `references` bring with their code: every closed instantiation their own rows name,
+/// closed and spelled as [`collect_instantiations`] closes and spells the program's set, with the
+/// signatures expressed against `program` -- the assembly the module is lowered for.
+///
+/// A loader that holds a reference's code beside the program's lowers this set too, because any
+/// of those methods can run: a library method that builds a `Span<byte>` internally is called by
+/// programs that never spell `Span<byte>`. It is not the PROGRAM's set, and the two are kept apart
+/// so that the program's set answers what the program reaches.
+#[cfg(feature = "generics")]
+pub fn collect_reference_plans<'pe>(
+    program: &Assembly<'pe>,
+    references: &[Assembly<'pe>],
+) -> Vec<Instantiation> {
+    collect(program, references, Roots::References)
+}
+
+/// Which rows a collection roots in: the program's, or its references'.
+#[cfg(feature = "generics")]
+#[derive(Clone, Copy)]
+enum Roots {
+    Program,
+    References,
+}
+
+/// The one body behind [`collect_instantiations`] and [`collect_reference_plans`], which differ
+/// only in where the walk's roots come from.
+#[cfg(feature = "generics")]
+fn collect<'pe>(
+    program: &Assembly<'pe>,
+    references: &[Assembly<'pe>],
+    roots: Roots,
 ) -> Vec<Instantiation> {
     let mut assemblies = Vec::with_capacity(1 + references.len());
     assemblies.push(program.clone());
@@ -95,7 +137,7 @@ pub fn collect_instantiations<'pe>(
     let servers: Vec<(&str, &str)> = VECTOR_INTERFACES
         .iter()
         .copied()
-        .filter(|&(_, server)| references_define(references, server))
+        .filter(|&(_, server)| references_define(&assemblies, server))
         .collect();
     let derive = |found: &lamella_generics::Instantiation| -> Vec<lamella_generics::TypeArg> {
         servers
@@ -108,7 +150,11 @@ pub fn collect_instantiations<'pe>(
             })
             .collect()
     };
-    let Ok(closed) = walk.instantiations_deriving(&derive) else {
+    let walked = match roots {
+        Roots::Program => walk.instantiations_from_program_deriving(&derive),
+        Roots::References => walk.instantiations_from_references_deriving(&derive),
+    };
+    let Ok(closed) = walked else {
         return Vec::new();
     };
 
@@ -674,8 +720,14 @@ impl fmt::Display for Refusal {
 
 /// What one run of the pass produced.
 pub struct Lowering {
-    /// Each instantiation that was lowered, and the type identity it was lowered to.
+    /// Each instantiation that was lowered, and the type identity it was lowered to. A loader that
+    /// lowers its references' plans beside the set it was handed reports this for that set alone;
+    /// the plans' identities are in [`reference_types`](Self::reference_types).
     pub types: Vec<(String, TypeId)>,
+    /// Each instantiation lowered for a REFERENCE's own plan ([`collect_reference_plans`]) rather
+    /// than for the set the caller handed in, and its type identity. An instantiation in both is
+    /// lowered once and listed under [`types`](Self::types).
+    pub reference_types: Vec<(String, TypeId)>,
     /// Everything it refused. Empty means every instantiation in the set now has a type identity
     /// and every call site that reaches one is bound.
     pub refusals: Vec<Refusal>,
@@ -684,6 +736,66 @@ pub struct Lowering {
     /// on that token already being bound, so a caller that resolved the DEFINING assembly lazily has
     /// to materialize what those bodies reach itself.
     pub copied_definitions: Vec<(u8, u32)>,
+}
+
+impl Lowering {
+    /// The type identity the instantiation spelled `name` was lowered to, from either list.
+    #[must_use]
+    pub fn type_named(&self, name: &str) -> Option<TypeId> {
+        self.types
+            .iter()
+            .chain(self.reference_types.iter())
+            .find(|(lowered, _)| lowered == name)
+            .map(|(_, type_id)| *type_id)
+    }
+
+    /// Moves each identity that `requested` does not name from [`types`](Self::types) to
+    /// [`reference_types`](Self::reference_types).
+    fn set_apart_reference_plans(&mut self, requested: &[Instantiation]) {
+        let (requested_types, plan_types) = core::mem::take(&mut self.types)
+            .into_iter()
+            .partition(|(name, _)| requested.iter().any(|want| want.name == *name));
+        self.types = requested_types;
+        self.reference_types = plan_types;
+    }
+}
+
+/// Lowers `requested` and, beside it, every instantiation of `plans` it does not already hold --
+/// the references' own plans, which a loader that holds their code has to lower too -- and reports
+/// the two apart (see [`Lowering::reference_types`]).
+///
+/// `requested` goes first, so each of its instantiations keeps the place it would have had alone,
+/// and the plans follow in their own discovery order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn monomorphize_with_reference_plans<'pe>(
+    module: &mut Module,
+    program: &Assembly<'pe>,
+    program_asm: u8,
+    sources: &[DefinitionSource<'pe>],
+    type_index: &TypeNameIndex,
+    field_index: &FieldNameIndex,
+    materialize: super::CilMaterializer<'pe>,
+    requested: &[Instantiation],
+    plans: Vec<Instantiation>,
+) -> Lowering {
+    let mut lowered = requested.to_vec();
+    for plan in plans {
+        if !lowered.iter().any(|want| want.name == plan.name) {
+            lowered.push(plan);
+        }
+    }
+    let mut lowering = monomorphize(
+        module,
+        program,
+        program_asm,
+        sources,
+        type_index,
+        field_index,
+        materialize,
+        &lowered,
+    );
+    lowering.set_apart_reference_plans(requested);
+    lowering
 }
 
 /// One instantiation, after its type identity exists but before its bodies do.
@@ -750,6 +862,7 @@ pub(crate) fn monomorphize<'pe>(
 ) -> Lowering {
     let mut lowering = Lowering {
         types: Vec::new(),
+        reference_types: Vec::new(),
         refusals: Vec::new(),
         copied_definitions: Vec::new(),
     };

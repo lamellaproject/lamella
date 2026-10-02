@@ -10,6 +10,7 @@ use lamella_ir::{
 };
 
 use crate::cil::{CheckStubs, InlineCheck};
+use crate::parallel_moves::SlotWord;
 use crate::target::{falls_through, TargetLowering};
 
 /// Why a [`Function`] could not be lowered by this first ARMv6-M tracer.
@@ -623,18 +624,38 @@ fn branch_on_nonzero(
     }
 }
 
-/// Walks `addr` forward until `offset` fits the narrow load/store's imm5 reach (31 bytes for a
-/// byte access, 62 for a halfword), returning the residual offset. `addr` is a scratch COPY of
-/// the base (the narrow arms load/derive it fresh), so advancing it in place is free.
-fn narrow_reach(enc: &mut Encoder, addr: Reg, offset: u32, reach: u32) -> Result<u8, LowerError> {
+/// The farthest byte offset a Thumb-1 `LDR`/`STR Rt, [Rn, #imm5*4]` reaches.
+const WORD_REACH: u32 = 124;
+/// The farthest byte offset a Thumb-1 `LDRH`/`STRH Rt, [Rn, #imm5*2]` reaches.
+const HALFWORD_REACH: u32 = 62;
+/// The farthest byte offset a Thumb-1 `LDRB`/`STRB Rt, [Rn, #imm5]` reaches.
+const BYTE_REACH: u32 = 31;
+
+/// Advances `addr` until `offset` is within `reach`, an access's immediate reach, and returns what
+/// is left of the offset to encode in the access.
+///
+/// Every field access through a pointer, and every word of a struct copied through one, takes its
+/// offset from here, because a field's offset is bounded only by its object's size and Thumb-1's
+/// immediate forms reach 124 bytes for a word, 62 for a halfword and 31 for a byte. The address moves in `ADDS Rd, #imm8` steps of at most 255 bytes,
+/// and the last step lands exactly on `reach`, so an offset that is a multiple of the access width
+/// stays one. A `reach` of zero adds the whole offset, which is how a field's address is formed.
+///
+/// `addr` must be a scratch copy of the base address: every pointer-base access loads or derives it
+/// fresh, so advancing it in place needs no second register.
+fn advance_to_reach(
+    enc: &mut Encoder,
+    addr: Reg,
+    offset: u32,
+    reach: u32,
+) -> Result<u8, LowerError> {
     let mut off = offset;
     while off > reach {
-        let step = off.saturating_sub(reach).min(255) as u8;
+        let step = (off - reach).min(255) as u8;
         enc.adds_imm8(addr, step)
             .map_err(|_| LowerError::TooManyValues)?;
         off -= u32::from(step);
     }
-    Ok(off as u8)
+    u8::try_from(off).map_err(|_| LowerError::TooManyValues)
 }
 
 /// Loads the `size`-byte (1 or 2) field at `addr + offset` into `rt`, zero- or sign-extended to
@@ -652,14 +673,14 @@ fn narrow_load_at(
     let e = |_| LowerError::TooManyValues;
     match size {
         1 => {
-            let off = narrow_reach(enc, addr, offset, 31)?;
+            let off = advance_to_reach(enc, addr, offset, BYTE_REACH)?;
             enc.ldrb_imm(rt, addr, off).map_err(e)?;
             if signed {
                 enc.sxtb(rt, rt).map_err(e)?;
             }
         }
         2 => {
-            let off = narrow_reach(enc, addr, offset, 62)?;
+            let off = advance_to_reach(enc, addr, offset, HALFWORD_REACH)?;
             enc.ldrh_imm(rt, addr, off).map_err(e)?;
             if signed {
                 enc.sxth(rt, rt).map_err(e)?;
@@ -682,11 +703,11 @@ fn narrow_store_at(
     let e = |_| LowerError::TooManyValues;
     match size {
         1 => {
-            let off = narrow_reach(enc, addr, offset, 31)?;
+            let off = advance_to_reach(enc, addr, offset, BYTE_REACH)?;
             enc.strb_imm(rt, addr, off).map_err(e)
         }
         2 => {
-            let off = narrow_reach(enc, addr, offset, 62)?;
+            let off = advance_to_reach(enc, addr, offset, HALFWORD_REACH)?;
             enc.strh_imm(rt, addr, off).map_err(e)
         }
         _ => Err(LowerError::CallUnsupported),
@@ -866,6 +887,28 @@ fn emit_reference_null_test(
     let stub = stubs.entry(InlineCheck::NullReference, || enc.new_label());
     enc.cmp_imm(reg, 0).map_err(|_| LowerError::TooManyValues)?;
     enc.b_cond(Cond::Eq, stub);
+    Ok(())
+}
+
+/// Faults unless the ARRAY descriptor in `descriptor` is a vector's, rank 1; `scratch` is clobbered.
+///
+/// Only a vector's descriptor carries `System.Array`'s interface table. A rectangular array's lays
+/// the same header with an EMPTY table, which would answer every interface query "not
+/// implemented" -- a false answer, since `int[,]` implements every interface `System.Array` does --
+/// so a query on one faults rather than answer it.
+fn fault_unless_vector(enc: &mut Encoder, descriptor: Reg, scratch: Reg) -> Result<(), LowerError> {
+    let vector = enc.new_label();
+    enc.ldr_imm(scratch, descriptor, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.lsls_imm(scratch, scratch, 8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.lsrs_imm(scratch, scratch, 8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.cmp_imm(scratch, 1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Eq, vector);
+    enc.udf(0);
+    enc.bind_label(vector);
     Ok(())
 }
 
@@ -1056,7 +1099,11 @@ fn lower_spilled_inst(
             enc.ldr_literal(Reg::R0, label)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::VirtualFuncAddr { object, slot: vslot } => {
+        Inst::VirtualFuncAddr {
+            object,
+            slot: vslot,
+            ..
+        } => {
             let entry_offset = vslot
                 .checked_mul(4)
                 .and_then(|x| x.checked_add(4))
@@ -1236,6 +1283,7 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.b(have_itable);
             enc.bind_label(array_form);
+            fault_unless_vector(enc, Reg::R0, Reg::R1)?;
             enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.bind_label(have_itable);
@@ -1383,6 +1431,7 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.b(have_itable);
             enc.bind_label(array_form);
+            fault_unless_vector(enc, Reg::R0, Reg::R1)?;
             enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.bind_label(have_itable);
@@ -1495,10 +1544,16 @@ fn lower_spilled_inst(
             if is_pointer_base(value_types, *base) {
                 slot_load(enc, Reg::R2, slot(*base))?;
                 emit_null_test(enc, value_types, *base, Reg::R2, stubs)?;
-                enc.ldr_imm(Reg::R0, Reg::R2, *offset as u16)
+                let reach = if two_words {
+                    WORD_REACH - 4
+                } else {
+                    WORD_REACH
+                };
+                let at = u16::from(advance_to_reach(enc, Reg::R2, *offset, reach)?);
+                enc.ldr_imm(Reg::R0, Reg::R2, at)
                     .map_err(|_| LowerError::TooManyValues)?;
                 if two_words {
-                    enc.ldr_imm(Reg::R1, Reg::R2, *offset as u16 + 4)
+                    enc.ldr_imm(Reg::R1, Reg::R2, at + 4)
                         .map_err(|_| LowerError::TooManyValues)?;
                 }
             } else {
@@ -1518,13 +1573,20 @@ fn lower_spilled_inst(
                 Some(MirType::I64 | MirType::F64)
             );
             let base_ptr = is_pointer_base(value_types, *base);
+            let mut at = 0;
             if base_ptr {
                 slot_load(enc, Reg::R1, slot(*base))?;
                 emit_null_test(enc, value_types, *base, Reg::R1, stubs)?;
+                let reach = if two_words {
+                    WORD_REACH - 4
+                } else {
+                    WORD_REACH
+                };
+                at = u16::from(advance_to_reach(enc, Reg::R1, *offset, reach)?);
             }
             slot_load(enc, Reg::R0, slot(*value))?;
             if base_ptr {
-                enc.str_imm(Reg::R0, Reg::R1, *offset as u16)
+                enc.str_imm(Reg::R0, Reg::R1, at)
                     .map_err(|_| LowerError::TooManyValues)?;
             } else {
                 slot_store(enc, Reg::R0, slot(*base) + *offset as u16, Reg::R2)?;
@@ -1532,7 +1594,7 @@ fn lower_spilled_inst(
             if two_words {
                 slot_load(enc, Reg::R0, slot(*value) + 4)?;
                 if base_ptr {
-                    enc.str_imm(Reg::R0, Reg::R1, *offset as u16 + 4)
+                    enc.str_imm(Reg::R0, Reg::R1, at + 4)
                         .map_err(|_| LowerError::TooManyValues)?;
                 } else {
                     slot_store(enc, Reg::R0, slot(*base) + *offset as u16 + 4, Reg::R2)?;
@@ -1572,10 +1634,7 @@ fn lower_spilled_inst(
             if is_pointer_base(value_types, *base) {
                 slot_load(enc, Reg::R0, slot(*base))?;
                 emit_null_test(enc, value_types, *base, Reg::R0, stubs)?;
-                if *offset != 0 {
-                    enc.adds_imm8(Reg::R0, *offset as u8)
-                        .map_err(|_| LowerError::TooManyValues)?;
-                }
+                advance_to_reach(enc, Reg::R0, *offset, 0)?;
             } else {
                 slot_addr(enc, Reg::R0, slot(*base) + *offset as u16)?;
             }
@@ -3105,10 +3164,14 @@ fn lower_spilled_into(
                         slot_load(enc, Reg::R1, slot(*base))?;
                         emit_null_test(enc, &func.value_types, *base, Reg::R1, &mut stubs)?;
                     }
+                    let mut advanced = 0;
                     for w in 0..full_words {
                         slot_load(enc, Reg::R0, slot(*value) + w * 4)?;
                         if ptr {
-                            enc.str_imm(Reg::R0, Reg::R1, *offset as u16 + w * 4)
+                            let word = *offset + u32::from(w) * 4;
+                            let at = advance_to_reach(enc, Reg::R1, word - advanced, WORD_REACH)?;
+                            advanced = word - u32::from(at);
+                            enc.str_imm(Reg::R0, Reg::R1, u16::from(at))
                                 .map_err(|_| LowerError::TooManyValues)?;
                         } else {
                             slot_store(enc, Reg::R0, slot(*base) + *offset as u16 + w * 4, Reg::R2)?;
@@ -3137,9 +3200,13 @@ fn lower_spilled_into(
                         slot_load(enc, Reg::R1, slot(*base))?;
                         emit_null_test(enc, &func.value_types, *base, Reg::R1, &mut stubs)?;
                     }
+                    let mut advanced = 0;
                     for w in 0..full_words {
                         if ptr {
-                            enc.ldr_imm(Reg::R0, Reg::R1, *offset as u16 + w * 4)
+                            let word = *offset + u32::from(w) * 4;
+                            let at = advance_to_reach(enc, Reg::R1, word - advanced, WORD_REACH)?;
+                            advanced = word - u32::from(at);
+                            enc.ldr_imm(Reg::R0, Reg::R1, u16::from(at))
                                 .map_err(|_| LowerError::TooManyValues)?;
                         } else {
                             slot_load(enc, Reg::R0, slot(*base) + *offset as u16 + w * 4)?;
@@ -3166,7 +3233,8 @@ fn lower_spilled_into(
                     let rem = (size % 4) as u16;
                     for w in 0..full_words {
                         static_slot_addr(enc, &mut pool, &mut sym_pool, relocate, *owner, *offset)?;
-                        enc.ldr_imm(Reg::R0, Reg::R0, w * 4)
+                        let at = advance_to_reach(enc, Reg::R0, u32::from(w) * 4, WORD_REACH)?;
+                        enc.ldr_imm(Reg::R0, Reg::R0, u16::from(at))
                             .map_err(|_| LowerError::TooManyValues)?;
                         slot_store(enc, Reg::R0, slot(*result) + w * 4, Reg::R2)?;
                     }
@@ -3193,7 +3261,8 @@ fn lower_spilled_into(
                     for w in 0..full_words {
                         static_slot_addr(enc, &mut pool, &mut sym_pool, relocate, *owner, *offset)?;
                         slot_load(enc, Reg::R1, slot(*value) + w * 4)?;
-                        enc.str_imm(Reg::R1, Reg::R0, w * 4)
+                        let at = advance_to_reach(enc, Reg::R0, u32::from(w) * 4, WORD_REACH)?;
+                        enc.str_imm(Reg::R1, Reg::R0, u16::from(at))
                             .map_err(|_| LowerError::TooManyValues)?;
                     }
                     for k in 0..rem {
@@ -3465,7 +3534,8 @@ fn lower_spilled_into(
                         let label = enc.new_label();
                         type_descs.push((
                             label,
-                            alloc::vec![ARRAY_DESC_MARK | 2, *element_kind, 0u32].into_boxed_slice(),
+                            alloc::vec![ARRAY_DESC_MARK | 2, *element_kind, 0u32, 0u32]
+                                .into_boxed_slice(),
                         ));
                         type_desc_labels.push((*handle, label));
                         label
@@ -3524,6 +3594,7 @@ fn lower_spilled_into(
                             alloc::vec![
                                 ARRAY_DESC_MARK | u32::try_from(dims.len()).unwrap_or(1),
                                 *element_kind,
+                                0u32,
                                 0u32
                             ]
                             .into_boxed_slice(),
@@ -3637,13 +3708,24 @@ fn lower_spilled_into(
                 if args.len() != params.len() {
                     return Err(LowerError::ControlFlowUnsupported);
                 }
+                let mut moves = Vec::new();
                 for (p, a) in params.iter().zip(args) {
                     let bytes = func.value_type(*a).map_or(4, |t| t.stack_slot_bytes() as u16);
-                    let mut off = 0u16;
-                    while off < bytes {
-                        slot_load(enc, Reg::R0, slot(*a) + off)?;
-                        slot_store(enc, Reg::R0, slot(*p) + off, Reg::R2)?;
-                        off += 4;
+                    for off in (0..bytes).step_by(4) {
+                        moves.push((SlotWord::At(slot(*p) + off), SlotWord::At(slot(*a) + off)));
+                    }
+                }
+                for (dst, src) in crate::parallel_moves::schedule(&moves, SlotWord::Saved) {
+                    match (dst, src) {
+                        (SlotWord::At(d), SlotWord::At(s)) => {
+                            slot_load(enc, Reg::R0, s)?;
+                            slot_store(enc, Reg::R0, d, Reg::R2)?;
+                        }
+                        (SlotWord::Saved, SlotWord::At(s)) => slot_load(enc, Reg::R1, s)?,
+                        (SlotWord::At(d), SlotWord::Saved) => slot_store(enc, Reg::R1, d, Reg::R2)?,
+                        (SlotWord::Saved, SlotWord::Saved) => {
+                            unreachable!("the schedule never moves its scratch into itself")
+                        }
                     }
                 }
                 let label = *block_labels
@@ -3858,7 +3940,7 @@ fn lower_spilled_into(
 /// the supported slice.
 /// Where a value lives in a register/spill mix: a machine register, or a spill slot at
 /// a byte offset from the stack pointer.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Home {
     Reg(Reg),
     Spill(u16),
@@ -4545,56 +4627,62 @@ fn load_home(enc: &mut Encoder, home: Home, dst: Reg) -> Result<(), LowerError> 
 }
 
 /// Emits a set of moves between value homes so they take effect as if simultaneous, the
-/// general form of [`emit_parallel_move`] over registers and spill slots. Distinct values
-/// have distinct slots, so the only cross-move register hazards are register-to-register
-/// (handled by the cycle-safe register move); the phases below order the rest so every
-/// source is read in its original location. `mem_scratch` (r0/r1, never a value home)
-/// shuttles a slot-to-slot move.
+/// general form of [`emit_parallel_move`] over registers and spill slots, in the order
+/// [`crate::parallel_moves::schedule`] gives.
+///
+/// On a loop's back edge one home can be a destination and another move's source in the same
+/// assignment: `last = counter` before `counter--` moves the counter's slot into `last`'s register
+/// and the decremented counter into that slot, so the slot must be read before it is written. A
+/// cycle's saved value goes in r12, which is never a value home and is the scratch the register
+/// path's cycles use too.
+///
+/// `mem_scratch` is a low register that is never a value home on the mixed path. It shuttles a
+/// slot-to-slot copy, and a copy between a slot and r12, because Thumb-1's SP-relative `LDR` and
+/// `STR` take only low registers. Entry and call moves name argument registers, which may include
+/// it, but an entry move's source and a call move's destination are registers, so neither needs
+/// the shuttle and neither can lose a value to it.
 fn emit_home_moves(
     enc: &mut Encoder,
     moves: &[(Home, Home)],
     mem_scratch: Reg,
 ) -> Result<(), LowerError> {
-    let oops = |_| LowerError::TooManyValues;
-    let active: Vec<(Home, Home)> = moves
-        .iter()
-        .copied()
-        .filter(|(d, s)| !same_home(*d, *s))
-        .collect();
-    for &(d, s) in &active {
-        if let (Home::Spill(off), Home::Reg(r)) = (d, s) {
-            enc.str_sp(r, off).map_err(oops)?;
-        }
-    }
-    let reg_moves: Vec<(Reg, Reg)> = active
-        .iter()
-        .filter_map(|&(d, s)| match (d, s) {
-            (Home::Reg(d), Home::Reg(s)) => Some((d, s)),
-            _ => None,
-        })
-        .collect();
-    emit_parallel_move(enc, &reg_moves);
-    for &(d, s) in &active {
-        if let (Home::Reg(r), Home::Spill(off)) = (d, s) {
-            enc.ldr_sp(r, off).map_err(oops)?;
-        }
-    }
-    for &(d, s) in &active {
-        if let (Home::Spill(doff), Home::Spill(soff)) = (d, s) {
-            enc.ldr_sp(mem_scratch, soff).map_err(oops)?;
-            enc.str_sp(mem_scratch, doff).map_err(oops)?;
-        }
+    for (dst, src) in crate::parallel_moves::schedule(moves, Home::Reg(Reg::R12)) {
+        emit_home_move(enc, dst, src, mem_scratch)?;
     }
     Ok(())
 }
 
-/// Whether two homes are the same place (so a move between them is a no-op).
-fn same_home(a: Home, b: Home) -> bool {
-    match (a, b) {
-        (Home::Reg(x), Home::Reg(y)) => x == y,
-        (Home::Spill(x), Home::Spill(y)) => x == y,
-        _ => false,
+/// Emits one move between value homes. Thumb-1's SP-relative `LDR` and `STR` take only low
+/// registers, so r12 reaches a slot through `mem_scratch`, as a slot-to-slot copy does.
+fn emit_home_move(
+    enc: &mut Encoder,
+    dst: Home,
+    src: Home,
+    mem_scratch: Reg,
+) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    match (dst, src) {
+        (Home::Reg(d), Home::Reg(s)) => enc.mov_reg(d, s),
+        (Home::Reg(d), Home::Spill(off)) => {
+            let low = if d.is_low() { d } else { mem_scratch };
+            enc.ldr_sp(low, off).map_err(oops)?;
+            if low != d {
+                enc.mov_reg(d, low);
+            }
+        }
+        (Home::Spill(off), Home::Reg(s)) => {
+            let low = if s.is_low() { s } else { mem_scratch };
+            if low != s {
+                enc.mov_reg(low, s);
+            }
+            enc.str_sp(low, off).map_err(oops)?;
+        }
+        (Home::Spill(d), Home::Spill(s)) => {
+            enc.ldr_sp(mem_scratch, s).map_err(oops)?;
+            enc.str_sp(mem_scratch, d).map_err(oops)?;
+        }
     }
+    Ok(())
 }
 
 /// Maps native code offsets to CIL byte offsets, ascending by offset, so a
@@ -5261,6 +5349,8 @@ fn rewrite_md_alloc(
                 crate::resolver::ARRAY_DESC_MARK | rank,
                 element_kind,
                 type_tag,
+                0,
+                0,
                 0
             ]
             .into_boxed_slice(),
@@ -6869,6 +6959,12 @@ fn emit_object_pass(
             addend: 0,
         });
     }
+    let dispatch_records = crate::dispatch::record_names(funcs, names, descriptors, qualifiers);
+    symbols.extend(
+        dispatch_records
+            .iter()
+            .map(|name| crate::dispatch::record_symbol(name)),
+    );
     let object = match debug {
         Some(dbg) => {
             let described: Vec<(usize, Vec<crate::debugmap::SourceLine>)> = line_tables
@@ -9406,6 +9502,129 @@ mod tests {
         assert!(!enc.finish().unwrap().bytes.is_empty());
     }
 
+    /// The registers and the two spill-slot words after running what [`emit_home_moves`] emits for
+    /// `moves`, with `r0` as the shuttle, from distinct values: register `n` starts at `100 + n` and
+    /// slot word `k` at `200 + k`. The moves emit only `MOV` and `LDR`/`STR` to the stack, and
+    /// those are all this runs.
+    fn after_home_moves(moves: &[(Home, Home)]) -> ([u32; 16], [u32; 2]) {
+        let mut regs: [u32; 16] = core::array::from_fn(|n| 100 + n as u32);
+        let mut slots = [200u32, 201];
+        let mut enc = Encoder::new();
+        emit_home_moves(&mut enc, moves, Reg::R0).unwrap();
+        let bytes = enc.finish().unwrap().bytes;
+        for h in bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        {
+            let low = usize::from((h >> 8) & 7);
+            let word = usize::from(h & 0xFF);
+            if h & 0xFF00 == 0x4600 {
+                let to = usize::from((h & 7) | ((h >> 4) & 8));
+                regs[to] = regs[usize::from((h >> 3) & 15)];
+            } else if h & 0xF800 == 0x9800 {
+                regs[low] = slots[word];
+            } else if h & 0xF800 == 0x9000 {
+                slots[word] = regs[low];
+            } else {
+                panic!("a home move emitted {h:#06x}, which is not a MOV or a stack LDR/STR");
+            }
+        }
+        (regs, slots)
+    }
+
+    /// Asserts that `moves` take effect as if simultaneous: each destination ends holding what its
+    /// source held before any move ran, and nothing else changes but the shuttle and r12.
+    fn assert_simultaneous(moves: &[(Home, Home)]) {
+        let before = |home: Home| match home {
+            Home::Reg(r) => 100 + u32::from(r.number()),
+            Home::Spill(off) => 200 + u32::from(off) / 4,
+        };
+        let (regs, slots) = after_home_moves(moves);
+        let after = |home: Home| match home {
+            Home::Reg(r) => regs[usize::from(r.number())],
+            Home::Spill(off) => slots[usize::from(off) / 4],
+        };
+        for &(dst, src) in moves {
+            assert_eq!(
+                after(dst),
+                before(src),
+                "{dst:?} must receive what {src:?} held before the moves {moves:?}"
+            );
+        }
+        let untouched = (1..12)
+            .filter_map(|n| Reg::new(n).map(Home::Reg))
+            .chain([Home::Spill(0), Home::Spill(4)])
+            .filter(|home| !moves.iter().any(|(dst, _)| dst == home));
+        for home in untouched {
+            assert_eq!(
+                after(home),
+                before(home),
+                "{home:?} is no destination of {moves:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_back_edge_reads_a_slot_before_the_move_that_writes_it() {
+        let lost_copy = [
+            (Home::Reg(Reg::R7), Home::Spill(4)),
+            (Home::Spill(4), Home::Reg(Reg::R5)),
+        ];
+        assert_simultaneous(&lost_copy);
+        assert_simultaneous(&[lost_copy[1], lost_copy[0]]);
+    }
+
+    #[test]
+    fn a_cycle_through_registers_and_slots_keeps_every_old_value() {
+        assert_simultaneous(&[
+            (Home::Reg(Reg::R2), Home::Spill(0)),
+            (Home::Spill(0), Home::Reg(Reg::R2)),
+        ]);
+        assert_simultaneous(&[
+            (Home::Spill(0), Home::Spill(4)),
+            (Home::Spill(4), Home::Reg(Reg::R3)),
+            (Home::Reg(Reg::R3), Home::Spill(0)),
+        ]);
+    }
+
+    #[test]
+    fn every_assignment_over_registers_and_slots_is_simultaneous() {
+        let homes = [
+            Home::Reg(Reg::R2),
+            Home::Reg(Reg::R3),
+            Home::Reg(Reg::R7),
+            Home::Spill(0),
+            Home::Spill(4),
+        ];
+        for choice in 0..homes.len().pow(homes.len() as u32) {
+            let mut rest = choice;
+            let moves: Vec<_> = homes
+                .iter()
+                .map(|&dst| {
+                    let src = homes[rest % homes.len()];
+                    rest /= homes.len();
+                    (dst, src)
+                })
+                .collect();
+            assert_simultaneous(&moves);
+        }
+    }
+
+    #[test]
+    fn entry_and_call_moves_that_name_the_shuttle_are_simultaneous() {
+        assert_simultaneous(&[
+            (Home::Reg(Reg::R2), Home::Reg(Reg::R0)),
+            (Home::Reg(Reg::R0), Home::Spill(0)),
+            (Home::Reg(Reg::R1), Home::Reg(Reg::R3)),
+            (Home::Reg(Reg::R3), Home::Reg(Reg::R2)),
+        ]);
+        assert_simultaneous(&[
+            (Home::Spill(0), Home::Reg(Reg::R0)),
+            (Home::Reg(Reg::R2), Home::Reg(Reg::R3)),
+            (Home::Reg(Reg::R3), Home::Reg(Reg::R2)),
+        ]);
+    }
+
     #[test]
     fn lowers_a_reference_type_allocation() {
         let func = Function {
@@ -10427,6 +10646,7 @@ mod tests {
                     Inst::VirtualFuncAddr {
                         object: ValueId(0),
                         slot: 2,
+                        declaring_type: None,
                     },
                 )],
                 terminator: Some(Terminator::Return(Some(ValueId(1)))),
@@ -12700,6 +12920,328 @@ mod tests {
             halfwords.iter().any(|&h| h & 0xFFC0 == 0xB240),
             "the signed byte load sign-extends (SXTB)"
         );
+    }
+
+    /// Where a register's address came from, for [`reached_offsets`].
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Origin {
+        /// The function's one parameter, the object its fields are reached through.
+        This,
+        /// The start of the statics region.
+        Statics,
+    }
+
+    /// Where each access through an address derived from `this` or from the statics region reaches
+    /// memory, in emission order, as `(access, origin, byte offset from the origin)`: `"ldr"`,
+    /// `"str"`, `"ldrb"` and so on, and `"addr"` for a derived address stored to a stack slot.
+    ///
+    /// `this` arrives in `r0` and the entry stores it to its slot, so a later load of that slot
+    /// hands it to another register; a literal relocated against the statics region holds an
+    /// address in it. `ADDS Rd, #imm8` moves a register forward and `MOV` copies one; any other
+    /// write forgets where a register came from. That covers every instruction a field access or a
+    /// struct copy emits.
+    fn reached_offsets(object: &lamella_elf::Object) -> Vec<(&'static str, Origin, u32)> {
+        let statics_at = |pool_word: u32| {
+            object.relocations.iter().find_map(|r| {
+                let name = &object.symbols[r.symbol as usize].name;
+                (r.offset == pool_word && name.starts_with("__lamella_statics_"))
+                    .then_some(r.addend as u32)
+            })
+        };
+        let mut at: [Option<(Origin, u32)>; 8] = [None; 8];
+        at[0] = Some((Origin::This, 0));
+        let mut this_slot = None;
+        let mut reached = Vec::new();
+        let halfwords = object
+            .text
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]));
+        for (index, h) in (0u32..).zip(halfwords) {
+            let (rd, imm8) = (usize::from((h >> 8) & 7), u32::from(h & 0xFF));
+            let (rt, rn, imm5) = (
+                usize::from(h & 7),
+                usize::from((h >> 3) & 7),
+                u32::from((h >> 6) & 31),
+            );
+            let access = match h & 0xF800 {
+                0x6800 => Some(("ldr", 4, true)),
+                0x6000 => Some(("str", 4, false)),
+                0x8800 => Some(("ldrh", 2, true)),
+                0x8000 => Some(("strh", 2, false)),
+                0x7800 => Some(("ldrb", 1, true)),
+                0x7000 => Some(("strb", 1, false)),
+                _ => None,
+            };
+            if let Some((name, scale, loads)) = access {
+                if let Some((origin, base)) = at[rn] {
+                    reached.push((name, origin, base + imm5 * scale));
+                }
+                if loads {
+                    at[rt] = None;
+                }
+                continue;
+            }
+            match h & 0xF800 {
+                0x9800 => at[rd] = (this_slot == Some(imm8)).then_some((Origin::This, 0)),
+                0x4800 => {
+                    let pool_word = ((index * 2 + 4) & !3) + imm8 * 4;
+                    at[rd] = statics_at(pool_word).map(|addend| (Origin::Statics, addend));
+                }
+                0x3000 => at[rd] = at[rd].map(|(origin, base)| (origin, base + imm8)),
+                0x9000 => match at[rd] {
+                    Some((Origin::This, 0)) if this_slot.is_none() => this_slot = Some(imm8),
+                    Some((origin, address)) => reached.push(("addr", origin, address)),
+                    None => {}
+                },
+                0x4000 if h & 0xFF00 == 0x4600 => {
+                    let to = usize::from((h & 7) | ((h >> 4) & 8));
+                    let from = usize::from((h >> 3) & 15);
+                    if to < 8 {
+                        at[to] = at.get(from).copied().flatten();
+                    }
+                }
+                0x0000..=0x1800 | 0x4000 | 0x5000 | 0x5800 => at[rt] = None,
+                0x2000 | 0x3800 | 0xA000 | 0xA800 => at[rd] = None,
+                0xF000 => at[..4].fill(None),
+                _ => {}
+            }
+        }
+        reached
+    }
+
+    /// A one-block function of `this` running `insts`, with `value_types` after `this`, lowered to
+    /// an object with a statics region, and where its accesses from `origin` reach.
+    fn reached_by(
+        origin: Origin,
+        value_types: &[MirType],
+        insts: Vec<(ValueId, Inst)>,
+    ) -> Vec<(&'static str, u32)> {
+        let mut types = vec![MirType::ObjectRef];
+        types.extend_from_slice(value_types);
+        let f = Function {
+            params: vec![MirType::ObjectRef],
+            ret: None,
+            value_types: types,
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts,
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("11223344"),
+            region_bytes: 256,
+            roots: Vec::new(),
+        };
+        let object = lower_object_vtables_statics(
+            &[f],
+            &["main"],
+            &[],
+            &[],
+            &statics,
+            &DescQualifiers::default(),
+        )
+        .expect("the function lowers");
+        reached_offsets(&lamella_elf::read_object(&object).unwrap())
+            .into_iter()
+            .filter(|(_, from, _)| *from == origin)
+            .map(|(access, _, offset)| (access, offset))
+            .collect()
+    }
+
+    #[test]
+    fn a_word_field_past_the_immediate_reach_is_loaded_and_stored_at_its_offset() {
+        let reached = reached_by(
+            Origin::This,
+            &[
+                MirType::I32,
+                MirType::I32,
+                MirType::I64,
+                MirType::I32,
+                MirType::I32,
+            ],
+            vec![
+                (
+                    ValueId(1),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 124,
+                    },
+                ),
+                (
+                    ValueId(2),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 128,
+                    },
+                ),
+                (
+                    ValueId(3),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 1024,
+                    },
+                ),
+                (
+                    ValueId(4),
+                    Inst::FieldStore {
+                        base: ValueId(0),
+                        offset: 128,
+                        value: ValueId(2),
+                    },
+                ),
+                (
+                    ValueId(5),
+                    Inst::FieldStore {
+                        base: ValueId(0),
+                        offset: 1024,
+                        value: ValueId(3),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            reached,
+            [
+                ("ldr", 124),
+                ("ldr", 128),
+                ("ldr", 1024),
+                ("ldr", 1028),
+                ("str", 128),
+                ("str", 1024),
+                ("str", 1028),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_field_s_address_adds_its_whole_offset() {
+        let reached = reached_by(
+            Origin::This,
+            &[MirType::ManagedPtr; 4],
+            [252, 256, 300, 1024]
+                .into_iter()
+                .zip(1..)
+                .map(|(offset, id)| {
+                    (
+                        ValueId(id),
+                        Inst::FieldAddr {
+                            base: ValueId(0),
+                            offset,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(
+            reached,
+            [("addr", 252), ("addr", 256), ("addr", 300), ("addr", 1024)]
+        );
+    }
+
+    #[test]
+    fn a_struct_copied_past_the_immediate_reach_reaches_every_word() {
+        let record = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0x0200_0001),
+            size: 136,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let reached = reached_by(
+            Origin::This,
+            &[record, MirType::I32],
+            vec![
+                (
+                    ValueId(1),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 8,
+                    },
+                ),
+                (
+                    ValueId(2),
+                    Inst::FieldStore {
+                        base: ValueId(0),
+                        offset: 200,
+                        value: ValueId(1),
+                    },
+                ),
+            ],
+        );
+        let loads = (0..34).map(|w| ("ldr", 8 + w * 4));
+        let stores = (0..34).map(|w| ("str", 200 + w * 4));
+        assert_eq!(reached, loads.chain(stores).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_struct_static_past_the_immediate_reach_is_copied_word_for_word() {
+        let record = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0x0200_0001),
+            size: 136,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let reached = reached_by(
+            Origin::Statics,
+            &[record, MirType::I32],
+            vec![
+                (
+                    ValueId(1),
+                    Inst::StaticLoad {
+                        owner: StaticOwner::Own,
+                        offset: 16,
+                    },
+                ),
+                (
+                    ValueId(2),
+                    Inst::StaticStore {
+                        owner: StaticOwner::Own,
+                        offset: 16,
+                        value: ValueId(1),
+                    },
+                ),
+            ],
+        );
+        let loads = (0..34).map(|w| ("ldr", 16 + w * 4));
+        let stores = (0..34).map(|w| ("str", 16 + w * 4));
+        assert_eq!(reached, loads.chain(stores).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_narrow_field_past_its_reach_is_still_reached_exactly() {
+        let reached = reached_by(
+            Origin::This,
+            &[MirType::I32; 4],
+            vec![
+                (
+                    ValueId(1),
+                    Inst::FieldLoadNarrow {
+                        base: ValueId(0),
+                        offset: 300,
+                        size: 1,
+                        signed: false,
+                    },
+                ),
+                (
+                    ValueId(2),
+                    Inst::FieldLoadNarrow {
+                        base: ValueId(0),
+                        offset: 1026,
+                        size: 2,
+                        signed: true,
+                    },
+                ),
+                (
+                    ValueId(3),
+                    Inst::FieldStoreNarrow {
+                        base: ValueId(0),
+                        offset: 1026,
+                        value: ValueId(2),
+                        size: 2,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(reached, [("ldrb", 300), ("ldrh", 1026), ("strh", 1026)]);
     }
 
     #[test]

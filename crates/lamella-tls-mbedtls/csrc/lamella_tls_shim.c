@@ -9,6 +9,7 @@
  *   lam_tls_read:       >=0 plaintext bytes, LAM_TLS_WANT none yet, LAM_TLS_CLOSED
  *                       close-notify, LAM_TLS_ERR fatal.
  *   lam_tls_write:      >=0 bytes accepted, LAM_TLS_WANT try again, LAM_TLS_ERR fatal.
+ *   lam_tls_identity_check: 0 usable, else the LAM_ID_* naming what was not.
  */
 #include <stddef.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
+#include <mbedtls/pk.h>
 #include <mbedtls/platform.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
@@ -25,6 +27,12 @@
 #define LAM_TLS_WANT (-1)
 #define LAM_TLS_CLOSED (-2)
 #define LAM_TLS_ERR (-3)
+
+/* Why a client identity could not be used (mirrored by src/lib.rs). */
+#define LAM_ID_CERTIFICATE (-1) /* the chain did not parse */
+#define LAM_ID_KEY (-2)         /* the key did not parse */
+#define LAM_ID_MISMATCH (-3)    /* the key is not the leaf's */
+#define LAM_ID_RESOURCES (-4)   /* the pool could not hold the check */
 
 #if defined(LAMELLA_FREESTANDING_LIBC)
 /* The string.h functions this build of mbedTLS needs (PEM delimiter search + name
@@ -177,13 +185,32 @@ typedef struct lam_tls {
     mbedtls_ctr_drbg_context drbg;
     mbedtls_entropy_context entropy;
     mbedtls_x509_crt ca;
+    /* The client's own certificate chain and the leaf's private key, which the session presents
+     * when the server asks for a certificate. Empty (initialized, never parsed) without one. */
+    mbedtls_x509_crt own_chain;
+    mbedtls_pk_context own_key;
     void *user;
     int have_ca;
     /* Set to 1 by the skip-with-warning verify callback when it cleared a date-window error
      * (expired / not-yet-valid) the clockless board could not check. Read post-handshake via
      * lam_tls_dates_skipped so the managed side surfaces it as a policy-error warning. */
     int dates_skipped;
+    /* The description byte of the fatal alert the peer sent that ended the session, or -1. A
+     * server refuses a client certificate this way (unknown_ca, certificate_required), so it is
+     * what names the refusal. */
+    int peer_alert;
 } lam_tls;
+
+/* Records the fatal alert behind `rc`, the return of an mbedTLS record read. mbedTLS 3.6 has no
+ * getter for a received alert: it returns MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE and leaves the alert
+ * in the input buffer, as its own debug message reads it (ssl_msg.c), so the description is
+ * in_msg[1] -- a private field, read here against the pinned vendored version. */
+static void lam_note_alert(lam_tls *session, int rc)
+{
+    if (rc == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
+        session->peer_alert = session->ssl.MBEDTLS_PRIVATE(in_msg)[1];
+    }
+}
 
 /* The verify callback for the surface.net.tls.clock=skip-with-warning policy: clears ONLY the
  * date-window failures (expired / not yet valid) while leaving every other flag (bad chain
@@ -223,7 +250,78 @@ static void lam_tls_destroy(lam_tls *session)
     mbedtls_ctr_drbg_free(&session->drbg);
     mbedtls_entropy_free(&session->entropy);
     mbedtls_x509_crt_free(&session->ca);
+    mbedtls_x509_crt_free(&session->own_chain);
+    /* Frees the key's numbers zeroized, so the private key does not outlive the session in the
+     * pool. */
+    mbedtls_pk_free(&session->own_key);
     mbedtls_free(session);
+}
+
+/* Parses a client identity: `chain` (PEM text counted with its NUL, or one DER certificate) into
+ * `crt`, and `key` (PEM likewise, or DER: PKCS#8, PKCS#1 or SEC1) into `pk`. With `check`, also
+ * proves the key is the private half of the leaf's public key -- an EC point multiplication or an
+ * RSA key check, so it runs once per configuration rather than once per session. Returns 0, or the
+ * LAM_ID_* naming what could not be used. */
+static int lam_identity_load(
+    mbedtls_x509_crt *crt,
+    mbedtls_pk_context *pk,
+    const unsigned char *chain,
+    size_t chain_len,
+    const unsigned char *key,
+    size_t key_len,
+    int check,
+    mbedtls_ctr_drbg_context *drbg)
+{
+    if (chain == NULL || chain_len == 0 || mbedtls_x509_crt_parse(crt, chain, chain_len) != 0) {
+        return LAM_ID_CERTIFICATE;
+    }
+    if (key == NULL || key_len == 0
+        || mbedtls_pk_parse_key(pk, key, key_len, NULL, 0, mbedtls_ctr_drbg_random, drbg) != 0) {
+        return LAM_ID_KEY;
+    }
+    if (check && mbedtls_pk_check_pair(&crt->pk, pk, mbedtls_ctr_drbg_random, drbg) != 0) {
+        return LAM_ID_MISMATCH;
+    }
+    return 0;
+}
+
+/* Whether a client identity could be presented: the chain and the key both parse, and the key is
+ * the leaf's. Nothing is kept; every allocation goes back to the pool. Returns 0, or the LAM_ID_*
+ * naming what could not be used. */
+int lam_tls_identity_check(
+    const unsigned char *chain, size_t chain_len, const unsigned char *key, size_t key_len)
+{
+    /* The key parse and the pair check both draw randomness (blinding), so the check seeds its own
+     * generator, from the pool rather than the stack: the contexts are about a kilobyte. */
+    typedef struct {
+        mbedtls_ctr_drbg_context drbg;
+        mbedtls_entropy_context entropy;
+        mbedtls_x509_crt crt;
+        mbedtls_pk_context pk;
+    } lam_identity_check_state;
+    lam_identity_check_state *state =
+        (lam_identity_check_state *)mbedtls_calloc(1, sizeof(lam_identity_check_state));
+    if (state == NULL) {
+        return LAM_ID_RESOURCES;
+    }
+    mbedtls_ctr_drbg_init(&state->drbg);
+    mbedtls_entropy_init(&state->entropy);
+    mbedtls_x509_crt_init(&state->crt);
+    mbedtls_pk_init(&state->pk);
+    int result = LAM_ID_RESOURCES;
+    if (mbedtls_ctr_drbg_seed(
+            &state->drbg, mbedtls_entropy_func, &state->entropy,
+            (const unsigned char *)"lamella-tls-id", 14)
+        == 0) {
+        result = lam_identity_load(
+            &state->crt, &state->pk, chain, chain_len, key, key_len, 1, &state->drbg);
+    }
+    mbedtls_pk_free(&state->pk);
+    mbedtls_x509_crt_free(&state->crt);
+    mbedtls_entropy_free(&state->entropy);
+    mbedtls_ctr_drbg_free(&state->drbg);
+    mbedtls_free(state);
+    return result;
 }
 
 /* The lazy trusted-certificate callback (mbedtls_ssl_conf_ca_cb) for system-root trust: given
@@ -264,10 +362,17 @@ static int lam_ca_cb(void *ctx, const mbedtls_x509_crt *child, mbedtls_x509_crt 
  * validation callback receives them and decides trust). `skip_dates` (meaningful with
  * verify_mode 0, 2 or 3) installs the clock-skip verify callback: the chain + hostname are
  * still checked, only the validity WINDOW is tolerated (the surface.net.tls.clock policy).
- * `hostname` drives SNI + name verification. Returns NULL on any setup failure. */
+ * `own_chain` + `own_key`, when given, are the client's identity (lam_identity_load's formats),
+ * presented if the server asks for a certificate; the configuration already checked the pair, so a
+ * session only parses it. `hostname` drives SNI + name verification. Returns NULL on any setup
+ * failure. */
 lam_tls *lam_tls_client_new(
     const unsigned char *ca_pem,
     size_t ca_len,
+    const unsigned char *own_chain,
+    size_t own_chain_len,
+    const unsigned char *own_key,
+    size_t own_key_len,
     const char *hostname,
     int verify_mode,
     int skip_dates,
@@ -282,9 +387,12 @@ lam_tls *lam_tls_client_new(
     mbedtls_ctr_drbg_init(&session->drbg);
     mbedtls_entropy_init(&session->entropy);
     mbedtls_x509_crt_init(&session->ca);
+    mbedtls_x509_crt_init(&session->own_chain);
+    mbedtls_pk_init(&session->own_key);
     session->user = user;
     session->have_ca = 0;
     session->dates_skipped = 0;
+    session->peer_alert = -1;
 
     if (mbedtls_ctr_drbg_seed(
             &session->drbg, mbedtls_entropy_func, &session->entropy,
@@ -348,6 +456,18 @@ lam_tls *lam_tls_client_new(
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_NONE);
     }
 
+    if (own_chain != NULL) {
+        if (lam_identity_load(
+                &session->own_chain, &session->own_key, own_chain, own_chain_len, own_key,
+                own_key_len, 0, &session->drbg)
+                != 0
+            || mbedtls_ssl_conf_own_cert(&session->conf, &session->own_chain, &session->own_key)
+                != 0) {
+            lam_tls_destroy(session);
+            return NULL;
+        }
+    }
+
     if (mbedtls_ssl_setup(&session->ssl, &session->conf) != 0
         || mbedtls_ssl_set_hostname(&session->ssl, hostname) != 0) {
         lam_tls_destroy(session);
@@ -366,6 +486,7 @@ int lam_tls_handshake(lam_tls *session)
     if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
         return 0;
     }
+    lam_note_alert(session, rc);
     return LAM_TLS_ERR;
 }
 
@@ -388,6 +509,7 @@ int lam_tls_read(lam_tls *session, unsigned char *buf, size_t len)
     if (rc == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
         return LAM_TLS_CLOSED;
     }
+    lam_note_alert(session, rc);
     return LAM_TLS_ERR;
 }
 
@@ -400,7 +522,14 @@ int lam_tls_write(lam_tls *session, const unsigned char *buf, size_t len)
     if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
         return LAM_TLS_WANT;
     }
+    lam_note_alert(session, rc);
     return LAM_TLS_ERR;
+}
+
+/* The description byte of the fatal alert the peer sent that ended the session, or -1. */
+int lam_tls_peer_alert(lam_tls *session)
+{
+    return session->peer_alert;
 }
 
 /* Writes the peer's end-entity certificate (DER) into `out` when it fits; always returns

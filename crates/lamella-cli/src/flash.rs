@@ -491,8 +491,8 @@ pub fn deploy_to_chip(
         return ExitCode::FAILURE;
     };
     let built = match &project {
-        Some(project) => build_project_image(project, aot_target, tier, "deploy", path),
-        None => build_image(path, &source, aot_target, unsafe_code, tier, libraries, "deploy"),
+        Some(project) => build_project_image(project, board_id, aot_target, tier, "deploy", path),
+        None => build_image(path, &source, board_id, aot_target, unsafe_code, tier, libraries, "deploy"),
     };
     let image = match built {
         Ok(image) => image,
@@ -586,9 +586,9 @@ pub fn image_for_board(
     let row = programmer_for(board_id)?;
     let image = if is_project(path) {
         let project = crate::project::Project::read_file(path, "build")?;
-        build_project_image(&project, aot_target, tier, "build", path)?
+        build_project_image(&project, board_id, aot_target, tier, "build", path)?
     } else {
-        build_image(path, source, aot_target, unsafe_code, tier, libraries, "build")?
+        build_image(path, source, board_id, aot_target, unsafe_code, tier, libraries, "build")?
     };
     refuse_unless_it_fits("build", board_id, &image)?;
     Ok((image, row.programmer.flash_base()))
@@ -650,7 +650,7 @@ pub fn debug_elf_for_board(
         let libraries = project_libraries(&project, Tier::ClassLibrary, "build")?;
         let debuggable =
             crate::program::compile_project_for_debugging(&project, &libraries, "build")?;
-        debug_elf_from(&debuggable, &libraries, aot_target, "build", path)
+        debug_elf_from(&debuggable, &libraries, board_id, aot_target, "build", path)
     } else {
         let debuggable = crate::program::compile_csharp_for_debugging(
             path,
@@ -659,7 +659,7 @@ pub fn debug_elf_for_board(
             libraries,
             "build",
         )?;
-        debug_elf_from(&debuggable, libraries, aot_target, "build", path)
+        debug_elf_from(&debuggable, libraries, board_id, aot_target, "build", path)
     }
 }
 
@@ -669,12 +669,13 @@ pub fn debug_elf_for_board(
 fn debug_elf_from(
     debuggable: &crate::program::Debuggable,
     libraries: &[Library],
+    board_id: &str,
     aot_target: &str,
     verb: &str,
     path: &Path,
 ) -> Result<Vec<u8>, String> {
     require_static_main(&debuggable.assembly, verb, path)?;
-    class_library_build(aot_target, verb, |archive| {
+    class_library_build(board_id, aot_target, verb, |archive| {
         linked_debug_build(
             &debuggable.assembly,
             &debuggable.pdb,
@@ -957,6 +958,7 @@ fn reference_without_the_tier(verb: &str, named: &[&str]) -> String {
 fn build_image(
     path: &Path,
     source: &str,
+    board_id: &str,
     aot_target: &str,
     unsafe_code: bool,
     tier: Tier,
@@ -981,7 +983,7 @@ fn build_image(
             verb,
         )?
     };
-    image_from_assembly(&assembly, &corlib, aot_target, tier, libraries, verb, path)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, libraries, verb, path)
 }
 
 /// Whether a program built on `tier` is compiled as a debug build is, even for an image that is
@@ -1008,6 +1010,7 @@ fn compiles_as_debug_build(tier: Tier) -> bool {
 /// As the single-file path, plus anything wrong with the project itself.
 fn build_project_image(
     project: &crate::project::Project,
+    board_id: &str,
     aot_target: &str,
     tier: Tier,
     verb: &str,
@@ -1021,7 +1024,7 @@ fn build_project_image(
     } else {
         crate::program::compile_project_assembly(project, &libraries, verb)?
     };
-    image_from_assembly(&assembly, &corlib, aot_target, tier, &libraries, verb, path)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &libraries, verb, path)
 }
 
 /// The class libraries `project` references, read and in the order it declares them.
@@ -1048,6 +1051,7 @@ fn project_libraries(
 fn image_from_assembly(
     assembly: &[u8],
     corlib: &[u8],
+    board_id: &str,
     aot_target: &str,
     tier: Tier,
     libraries: &[Library],
@@ -1056,7 +1060,7 @@ fn image_from_assembly(
 ) -> Result<Vec<u8>, String> {
     require_static_main(assembly, verb, path)?;
     if tier == Tier::ClassLibrary {
-        return class_library_build(aot_target, verb, |archive| {
+        return class_library_build(board_id, aot_target, verb, |archive| {
             linked_build(assembly, corlib, libraries, archive, aot_target)
         });
     }
@@ -1096,6 +1100,7 @@ fn require_static_main(assembly: &[u8], verb: &str, path: &Path) -> Result<(), S
 /// looking for in a binary that could not link it -- so sending somebody to hunt for a file when
 /// the answer is neither would waste their afternoon.
 fn class_library_build<T>(
+    board_id: &str,
     aot_target: &str,
     verb: &str,
     link: impl FnOnce(&[u8]) -> Result<T, String>,
@@ -1103,7 +1108,7 @@ fn class_library_build<T>(
     if !crate::tiers::covers(aot_target) || !linked_tier_compiled_in() {
         return Err(class_library_refusal(verb, aot_target));
     }
-    let (archive_path, archive) = crate::tiers::runtime_archive(aot_target)
+    let (archive_path, archive) = crate::tiers::runtime_archive(board_id, aot_target)
         .map_err(|reason| format!("lamella {verb}: {reason}"))?;
     link(&archive).map_err(|error| {
         let head =
@@ -1779,7 +1784,7 @@ class Program
                 continue;
             };
             built += 1;
-            let image = build_image(path, BLINK, target, true, Tier::Flat, &[], "deploy")
+            let image = build_image(path, BLINK, row.board, target, true, Tier::Flat, &[], "deploy")
                 .unwrap_or_else(|error| panic!("{}: {error}", row.board));
             assert!(
                 image.len() > 64,
@@ -1852,8 +1857,8 @@ class Program
             return;
         }
         let path = Path::new("Blink.cs");
-        for target in ["microbit", "ch32v003"] {
-            let image = build_image(path, BLINK, target, true, Tier::Flat, &[], "deploy")
+        for (board, target) in [("bbc-micro-bit-v1", "microbit"), ("muselab-nano-ch32v003", "ch32v003")] {
+            let image = build_image(path, BLINK, board, target, true, Tier::Flat, &[], "deploy")
                 .unwrap_or_else(|error| {
                     panic!("{target}: this build cannot compile for it: {error}")
                 });
@@ -1887,6 +1892,7 @@ class Program
         let error = build_image(
             Path::new("Hello.cs"),
             CONSOLE,
+            "bbc-micro-bit-v1",
             "microbit",
             false,
             Tier::Flat,
@@ -1916,6 +1922,7 @@ class Program
         let Err(error) = build_image(
             Path::new("Hello.cs"),
             CONSOLE,
+            "muselab-nano-ch32v003",
             "ch32v003",
             false,
             Tier::Flat,
@@ -1947,6 +1954,7 @@ class Program
         let flat = build_image(
             Path::new("Blink.cs"),
             BLINK,
+            "bbc-micro-bit-v1",
             "microbit",
             true,
             Tier::Flat,
@@ -1957,6 +1965,7 @@ class Program
         match build_image(
             Path::new("Blink.cs"),
             BLINK,
+            "bbc-micro-bit-v1",
             "microbit",
             true,
             Tier::ClassLibrary,
@@ -2014,6 +2023,7 @@ class Program
         let error = build_image(
             Path::new("Blink.cs"),
             library,
+            "bbc-micro-bit-v1",
             "microbit",
             true,
             Tier::Flat,
@@ -2042,6 +2052,7 @@ class Program
                 build_image(
                     Path::new("Hello.cs"),
                     CONSOLE,
+                    "bbc-micro-bit-v1",
                     "microbit",
                     false,
                     Tier::Flat,
@@ -2102,9 +2113,9 @@ class Program
     /// no build at all, and the reader has to be told the one that remains.
     #[test]
     fn a_board_with_no_class_library_plan_names_the_option_that_builds_it_flat() {
-        let refusal = class_library_refusal("build", "rp2350");
+        let refusal = class_library_refusal("build", "rp2040");
         assert!(
-            refusal.starts_with("lamella build: the class library has no image plan for rp2350 yet."),
+            refusal.starts_with("lamella build: the class library has no image plan for rp2040 yet."),
             "{refusal}"
         );
         assert!(
@@ -2149,6 +2160,7 @@ class Program
         let error = build_image(
             Path::new("Blink.cs"),
             library,
+            "bbc-micro-bit-v1",
             "microbit",
             true,
             Tier::Flat,

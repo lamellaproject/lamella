@@ -321,11 +321,7 @@ impl Binder {
                 self.lookup_local_type(name)
             }
             DeconstructionTarget::Expression(expr) => {
-                if let ExprKind::Name { name, verbatim } = &expr.kind
-                    && &**name == "_"
-                    && !verbatim
-                    && !self.local_is_visible("_")
-                {
+                if self.names_a_discard(expr) {
                     return self.speculative_type(&element);
                 }
                 let ty = self.speculative_type(expr);

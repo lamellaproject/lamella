@@ -143,12 +143,31 @@ mod serve {
     #[cfg(feature = "usb")]
     use crate::usb_transport::{self, UsbCarrier};
 
-    /// A reclaiming heap over half the 512 KB SRAM (lamella-heap, the O(1) segregated
-    /// allocator): dropped interpreter allocations return to the heap, so a deployed infinite
-    /// blink loop runs unbounded where a grow-only bump arena would exhaust. The M33 has the
-    /// CAS the lock needs.
-    const ARENA_BYTES: usize = 256 * 1024;
-    static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
+    unsafe extern "C" {
+        /// The first byte past the statics (`memory-rp2350.x`), where the heap starts.
+        static mut _sheap: u8;
+        /// The stack's floor (`memory-rp2350.x`): where the heap ends, and the lowest address the
+        /// stack may reach.
+        static _stack_floor: u8;
+    }
+
+    /// The heap: every byte of RAM between the statics and the stack's floor, as the link laid it
+    /// out. The firmware and the program share it. A reclaiming heap (lamella-heap, the O(1)
+    /// segregated allocator), so dropped interpreter allocations return to it and a deployed
+    /// infinite blink loop runs unbounded where a grow-only bump allocator would exhaust. The M33
+    /// has the CAS the lock needs.
+    fn heap() -> (*mut u8, usize) {
+        let start = core::ptr::addr_of_mut!(_sheap);
+        let end = core::ptr::addr_of!(_stack_floor) as usize;
+        (start, end - start as usize)
+    }
+
+    /// Hands the core the stack's floor (ARMv8-M `MSPLIM`), so a stack that outgrows its share
+    /// faults instead of writing into the heap below it.
+    fn guard_stack() {
+        let floor = core::ptr::addr_of!(_stack_floor) as u32;
+        unsafe { core::arch::asm!("msr MSPLIM, {0}", in(reg) floor, options(nomem, nostack, preserves_flags)) };
+    }
 
     #[global_allocator]
     static ALLOCATOR: lamella_heap::LockedHeap = lamella_heap::LockedHeap::empty();
@@ -162,8 +181,9 @@ mod serve {
         let _ = core::fmt::Write::write_fmt(
             &mut UartWriter,
             format_args!(
-                "[lamella] FIRMWARE ABORT: {info}\r\n[lamella] arena: {} of {ARENA_BYTES} bytes carved, {} live\r\n",
+                "[lamella] FIRMWARE ABORT: {info}\r\n[lamella] heap: {} of {} bytes carved, {} live\r\n",
                 ALLOCATOR.carved_lockfree(),
+                heap().1,
                 ALLOCATOR.live_lockfree()
             ),
         );
@@ -465,8 +485,22 @@ mod serve {
     }
 
     /// Any exception or fault vector lands here: the next boot comes back up waiting for the host.
+    ///
+    /// It lifts the stack's limit before anything pushes. A fault the limit raised leaves the stack
+    /// at its floor, so a handler whose first push went below it would fault again inside the fault
+    /// and lock the core up instead of resetting it.
     #[unsafe(no_mangle)]
+    #[unsafe(naked)]
     pub extern "C" fn fault() -> ! {
+        core::arch::naked_asm!(
+            "movs r0, #0",
+            "msr MSPLIM, r0",
+            "b {recover}",
+            recover = sym recover_from_fault,
+        )
+    }
+
+    extern "C" fn recover_from_fault() -> ! {
         reset_to_serve()
     }
 
@@ -540,6 +574,18 @@ mod serve {
 
     pub(crate) use crate::systick_clock as clock;
 
+    /// The full name of this board's C# class, in `bsp/<board>/csharp`, which the runtime
+    /// initializes before a program's entry point when the program carries it. One bin serves four
+    /// boards, so it follows the same feature switch as the board identity in `lamella_main`.
+    #[cfg(all(feature = "cyw43", not(feature = "pico-plus-2-w")))]
+    const BOARD_CLASS: &str = "Lamella.Boards.RaspberryPi.Pico2W";
+    #[cfg(feature = "pico-plus-2-w")]
+    const BOARD_CLASS: &str = "Lamella.Boards.Pimoroni.PicoPlus2W";
+    #[cfg(feature = "pico-plus-2")]
+    const BOARD_CLASS: &str = "Lamella.Boards.Pimoroni.PicoPlus2";
+    #[cfg(not(any(feature = "cyw43", feature = "pico-plus-2")))]
+    const BOARD_CLASS: &str = "Lamella.Boards.RaspberryPi.Pico2";
+
     /// Installs the board seams on a fresh evaluation `Vm` (the runner's `_with` hook). Every
     /// build gets the board's clock. A cyw43 build also brings the radio up and joins on the first
     /// evaluation, streams that narration into the run's stdout and -- once the join has
@@ -547,6 +593,7 @@ mod serve {
     /// engine in a `tls` build.
     fn configure_vm(vm: &mut lamella_cil_runtime::Vm) {
         vm.set_clock(clock::now_ms, clock::sleep_ms);
+        vm.set_board_class(BOARD_CLASS);
         #[cfg(feature = "arena-trace")]
         vm.set_console_tap(arena_trace);
         #[cfg(feature = "cyw43")]
@@ -676,8 +723,10 @@ mod serve {
     #[unsafe(no_mangle)]
     pub extern "C" fn lamella_main() -> ! {
         write_register(SCB_VTOR, 0x1000_0000);
+        guard_stack();
+        let (start, bytes) = heap();
         unsafe {
-            ALLOCATOR.init(core::ptr::addr_of_mut!(ARENA).cast::<u8>(), ARENA_BYTES);
+            ALLOCATOR.init(start, bytes);
         }
         clocks_uart_init();
 

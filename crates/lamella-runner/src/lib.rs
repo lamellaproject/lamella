@@ -458,8 +458,24 @@ pub trait FlashSink {
     /// image; `from_baked` reads the true length from the image header.
     fn image_slice(&self) -> &'static [u8];
     /// Erase enough of the region to invalidate any stored image (its fingerprint), so a
-    /// subsequent boot finds none.
+    /// subsequent boot finds none. A sink that implements [`erase_range`](Self::erase_range) is
+    /// cleared through that instead, of everything the region holds.
     fn erase(&mut self);
+    /// The unit [`erase_range`](Self::erase_range) erases, in bytes: the part's erase granularity
+    /// over the region. `None`, the default, is a sink that cannot erase part of its region on
+    /// request, so a clear erases what [`erase`](Self::erase) does and a deploy erases only what
+    /// its chunks reach.
+    fn erase_unit(&self) -> Option<usize> {
+        None
+    }
+    /// Erase `len` bytes of the region starting at `offset`, both multiples of
+    /// [`erase_unit`](Self::erase_unit) and within [`window_len`](Self::window_len). Returns
+    /// whether the range now reads erased. A sink implementing it must answer the whole region
+    /// from [`image_slice`](Self::image_slice), which is what is read to find what to erase.
+    fn erase_range(&mut self, offset: usize, len: usize) -> bool {
+        let _ = (offset, len);
+        false
+    }
     /// Erase, then program `image` into the region. Returns whether a readback verified.
     fn program(&mut self, image: &[u8]) -> bool;
     /// Program one CHUNK of a larger image: write `chunk` at `offset` within the region, having
@@ -2707,6 +2723,58 @@ fn serve_frame_baked(
     Ok(())
 }
 
+/// What [`scrub_window`] did.
+#[cfg(feature = "baked-image")]
+enum Scrubbed {
+    /// Every unit that held anything was erased: this many bytes.
+    Erased(usize),
+    /// An erase did not complete, so the window may still hold old bytes.
+    Failed,
+    /// The sink cannot erase part of its region, so only [`FlashSink::erase`] ran.
+    Unsupported,
+}
+
+/// Erases every unit of the deploy window that holds anything: the stored program, whatever its
+/// format, and whatever an earlier clear or an abandoned deploy left behind. So nothing of a
+/// previous program survives in flash -- not its code, and not the strings compiled into it, keys
+/// and connection strings among them. A unit that already reads erased is skipped, so a clean
+/// window costs one read of it and no erase.
+///
+/// Each run of units that hold something is one [`FlashSink::erase_range`], so a part that erases
+/// a larger block uses it across the run.
+#[cfg(feature = "baked-image")]
+fn scrub_window(flash: &mut impl FlashSink) -> Scrubbed {
+    let Some(unit) = flash.erase_unit().filter(|&unit| unit > 0) else {
+        flash.erase();
+        return Scrubbed::Unsupported;
+    };
+    let region = flash.image_slice();
+    let units = flash.window_len().min(region.len()) / unit;
+    let holds_data = |index: usize| {
+        region
+            .get(index * unit..(index + 1) * unit)
+            .is_some_and(|bytes| bytes.iter().any(|&byte| byte != 0xFF))
+    };
+    let mut erased = 0;
+    let mut index = 0;
+    while index < units {
+        if !holds_data(index) {
+            index += 1;
+            continue;
+        }
+        let first = index;
+        while index < units && holds_data(index) {
+            index += 1;
+        }
+        let len = (index - first) * unit;
+        if !flash.erase_range(first * unit, len) {
+            return Scrubbed::Failed;
+        }
+        erased += len;
+    }
+    Scrubbed::Erased(erased)
+}
+
 /// Serve one pending request on a DEPLOY-capable baked-image target: `DEPLOY_IMAGE`
 /// programs the image into `flash` and keeps it (boots on reset); `DEPLOY_CLEAR` erases
 /// it; every other frame is delegated to [`serve_frame_baked`]. A device firmware's serve
@@ -2778,6 +2846,9 @@ fn serve_deploy_frame(
                     if total > window || offset.saturating_add(chunk.len()) > window {
                         load.forget_deployed_prefix();
                         (xfer::RANGE_REJECTED, 0)
+                    } else if offset == 0 && matches!(scrub_window(flash), Scrubbed::Failed) {
+                        load.forget_deployed_prefix();
+                        (xfer::WRITE_FAILED, 0)
                     } else if flash.program_chunk(offset, chunk, total) {
                         let read_back = flash.image_slice();
                         (xfer::MATCHED, load.deployed_prefix_crc(read_back, offset, chunk.len()))
@@ -2791,9 +2862,13 @@ fn serve_deploy_frame(
             send_xfer_result(transport, frame.seq, status, crc)?;
         }
         deploy::DEPLOY_CLEAR => {
-            flash.erase();
+            let (status, erased) = match scrub_window(flash) {
+                Scrubbed::Erased(bytes) => (xfer::MATCHED, u32::try_from(bytes).unwrap_or(u32::MAX)),
+                Scrubbed::Unsupported => (xfer::MATCHED, 0),
+                Scrubbed::Failed => (xfer::WRITE_FAILED, 0),
+            };
             load.forget_deployed_prefix();
-            send_xfer_result(transport, frame.seq, xfer::MATCHED, 0)?;
+            send_xfer_result(transport, frame.seq, status, erased)?;
         }
         deploy::DEPLOY_STATUS => {
             let (state, checksum) =
@@ -5620,6 +5695,128 @@ mod tests {
             seq += 1;
         }
         assert_eq!(sink.data, image, "the reassembled image matches the original");
+    }
+
+    /// A deploy window of `unit`-byte erase units over RAM, recording each erase it is asked for.
+    /// Like NOR flash it refuses to program a byte that is not erased, so a deploy that writes over
+    /// a previous program's bytes fails here as it would corrupt them on a part.
+    #[cfg(feature = "baked-image")]
+    struct Window {
+        data: Vec<u8>,
+        unit: usize,
+        erases: Vec<(usize, usize)>,
+    }
+
+    #[cfg(feature = "baked-image")]
+    impl Window {
+        /// A `len`-byte window holding `old` from its start, and erased after it.
+        fn holding(len: usize, old: &[u8]) -> Self {
+            let mut data = vec![0xFF; len];
+            data[..old.len()].copy_from_slice(old);
+            Window { data, unit: 4096, erases: Vec::new() }
+        }
+    }
+
+    #[cfg(feature = "baked-image")]
+    impl FlashSink for Window {
+        fn image_slice(&self) -> &'static [u8] {
+            Box::leak(self.data.clone().into_boxed_slice())
+        }
+        fn erase(&mut self) {
+            panic!("a sink that erases ranges is cleared through them");
+        }
+        fn erase_unit(&self) -> Option<usize> {
+            Some(self.unit)
+        }
+        fn erase_range(&mut self, offset: usize, len: usize) -> bool {
+            if offset % self.unit != 0 || len % self.unit != 0 || offset + len > self.data.len() {
+                return false;
+            }
+            self.data[offset..offset + len].fill(0xFF);
+            self.erases.push((offset, len));
+            true
+        }
+        fn program(&mut self, _image: &[u8]) -> bool {
+            false
+        }
+        fn program_chunk(&mut self, offset: usize, chunk: &[u8], _total: usize) -> bool {
+            let Some(target) = self.data.get_mut(offset..offset + chunk.len()) else {
+                return false;
+            };
+            if target.iter().any(|&byte| byte != 0xFF) {
+                return false;
+            }
+            target.copy_from_slice(chunk);
+            true
+        }
+    }
+
+    /// Sends `DEPLOY_CLEAR` to `flash` and answers the reply's status and its second field.
+    #[cfg(feature = "baked-image")]
+    fn clear(flash: &mut impl FlashSink) -> (u8, u32) {
+        use lamella_wire::MemTransport;
+
+        let mut arena = ArtifactLoad::new();
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        driver.send(deploy::DEPLOY_CLEAR, 9, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert_eq!(serve_one_deploy(&mut runner, flash, &mut arena).unwrap(), Served::Handled);
+        driver.feed(&runner.take_sent());
+        let reply = driver.poll().unwrap().expect("a clear acknowledgement");
+        assert_eq!(reply.msg_type, deploy::XFER_RESULT);
+        let second = u32::from_le_bytes([reply.payload[1], reply.payload[2], reply.payload[3], reply.payload[4]]);
+        (reply.payload[0], second)
+    }
+
+    /// **A clear erases everything the window holds**, not only the first unit, so none of a stored
+    /// program's bytes -- the strings compiled into it included -- survive it. The reply says how many
+    /// bytes it erased, and units that already read erased are not erased again.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_clear_erases_everything_the_window_holds_and_says_how_much() {
+        let mut flash = Window::holding(65_536, &[0xA5; 10_000]);
+        flash.data[40_000..41_000].fill(0x5A);
+        assert_eq!(clear(&mut flash), (deploy::xfer::MATCHED, 20_480));
+        assert!(flash.data.iter().all(|&byte| byte == 0xFF), "the window reads erased");
+        assert_eq!(
+            flash.erases,
+            [(0, 12_288), (36_864, 8_192)],
+            "one erase per run of units that held anything, and none for a unit already erased"
+        );
+        assert_eq!(clear(&mut flash), (deploy::xfer::MATCHED, 0), "a clean window erases nothing");
+    }
+
+    /// **A re-deploy leaves none of the previous program past its own end**: a smaller program
+    /// deployed over a larger one used to leave the larger one's tail, its strings included, in
+    /// flash for anyone with a probe to read.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_redeploy_leaves_none_of_the_previous_program_past_its_own_end() {
+        let mut flash = Window::holding(65_536, &[0xA5; 30_000]);
+        let image: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<(usize, &[u8])> =
+            image.chunks(2_048).enumerate().map(|(index, chunk)| (index * 2_048, chunk)).collect();
+        let acks = deploy_chunks(&mut flash, image.len(), &chunks);
+        assert!(acks.iter().all(|&(status, _)| status == deploy::xfer::MATCHED), "{acks:?}");
+        assert_eq!(&flash.data[..image.len()], &image[..], "the new program is stored");
+        assert!(
+            flash.data[image.len()..].iter().all(|&byte| byte == 0xFF),
+            "nothing of the previous program follows it"
+        );
+    }
+
+    /// **A deploy abandoned after its first chunk leaves none of the previous program either.** The
+    /// first chunk clears the window, so the chunks never sent leave erased flash rather than the
+    /// old program's bytes.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_deploy_abandoned_after_its_first_chunk_leaves_none_of_the_previous_program() {
+        let mut flash = Window::holding(65_536, &[0xA5; 30_000]);
+        let first = [0x3Cu8; 2_048];
+        let acks = deploy_chunks(&mut flash, 20_000, &[(0, &first)]);
+        assert_eq!(acks[0].0, deploy::xfer::MATCHED);
+        assert!(flash.data[2_048..].iter().all(|&byte| byte == 0xFF));
     }
 
     #[cfg(feature = "baked-image")]

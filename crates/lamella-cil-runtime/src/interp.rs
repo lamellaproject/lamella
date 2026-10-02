@@ -191,6 +191,10 @@ pub struct Vm {
     /// each event nests inside the one before it and the innermost finishes first. It also costs a
     /// call frame per event, so a full queue arrives as a stack as deep as its capacity.
     pin_events_draining: bool,
+    /// The full name of the board class this machine is ([`Vm::set_board_class`]), whose type
+    /// initializer [`boot_baked`] runs before the entry point when the program carries the class.
+    /// `None` = no board: every host run, and every firmware that names none.
+    board_class: Option<&'static str>,
     /// Native KEY material the managed tier references only by HANDLE (a TLS exporter output,
     /// an AEAD key): the bytes live here, runtime-side, and never appear in managed values.
     /// Append-only like the TLS handle tables; a released slot is ZEROIZED before it is
@@ -686,6 +690,22 @@ impl Vm {
     /// nothing wakes it, and the program keeps running its other threads, timers and pin events.
     pub fn request_sleep_forever(&mut self) {
         self.thread_op = Some(ThreadOp::SleepForever);
+    }
+
+    /// Names the board this machine is, by the full name of its board class
+    /// (`Lamella.Boards.RaspberryPi.Pico2`). [`boot_baked`] runs that class's type initializer
+    /// before the entry point when the program carries the class, so the buses it binds are bound
+    /// before `Main` -- as an operating system has its devices set up before a program starts -- and
+    /// code written against the standard factories (`I2cDevice.Create`, `new GpioController()`)
+    /// needs no line that touches the board first.
+    pub fn set_board_class(&mut self, full_name: &'static str) {
+        self.board_class = Some(full_name);
+    }
+
+    /// The board class [`Vm::set_board_class`] named, if any.
+    #[must_use]
+    pub fn board_class(&self) -> Option<&'static str> {
+        self.board_class
     }
 
     /// Sets the host clock seam: a monotonic-millisecond reader and an OS-thread sleep, used by the
@@ -1342,8 +1362,8 @@ impl Vm {
             .map(|&(type_id, _)| type_id)
     }
 
-    /// Marks every type's `.cctor` as already run -- the EAGER embedder's escape hatch
-    /// (a baked device image boots its cctors up front, before serving).
+    /// Marks every type's `.cctor` as already run -- the EAGER embedder's escape hatch, for an
+    /// image baked before the trigger tables, whose cctors must run up front.
     pub fn mark_all_cctors_run(&mut self, module: &Module) {
         for &cctor in module.static_ctors() {
             if let Some(type_id) = module.method_type(cctor) {
@@ -1571,19 +1591,22 @@ impl Vm {
     /// handle (what `GetType()` answers), which is `None` when that type is not among the loaded
     /// types -- a program running without the managed corlib names `System.DivideByZeroException`
     /// nowhere, so there is no handle to record and `GetType()` keeps its previous answer rather
-    /// than inventing one.
+    /// than inventing one. See [`FaultIdentity`] for the rest.
     #[cfg(feature = "exceptions")]
-    fn set_exception_identity(
-        &mut self,
-        exception: ObjectRef,
-        chain: Vec<u32>,
-        type_handle: Option<u64>,
-    ) {
-        let identity = FaultIdentity { chain, type_handle };
+    fn set_exception_identity(&mut self, exception: ObjectRef, identity: FaultIdentity) {
         match self.exception_faults.iter_mut().find(|(key, _)| *key == exception) {
             Some(slot) => slot.1 = identity,
             None => self.exception_faults.push((exception, identity)),
         }
+    }
+
+    /// The recorded identity of a runtime-fault `exception`, if the VES minted it.
+    #[cfg(feature = "exceptions")]
+    fn exception_fault(&self, exception: ObjectRef) -> Option<&FaultIdentity> {
+        self.exception_faults
+            .iter()
+            .find(|(key, _)| *key == exception)
+            .map(|(_, fault)| fault)
     }
 
     /// The recorded base-chain tag vector of a runtime-fault `exception`, if one was set.
@@ -1647,25 +1670,64 @@ impl Vm {
         #[cfg(not(feature = "exceptions"))]
         {
             let _ = module;
-            return UnhandledException { tag: 0, type_name: None, message: None };
+            return UnhandledException {
+                tag: 0,
+                type_name: None,
+                message: None,
+                raised_in: None,
+                inner: None,
+            };
         }
         #[cfg(feature = "exceptions")]
         {
-        let escaped = self.unhandled;
+        self.describe_exception(module, self.unhandled, 0)
+        }
+    }
+
+    /// What the report can say about `escaped`: its type, its message, the method the VES raised
+    /// it in, and the exception it wraps, described the same way. `None` describes nothing.
+    #[cfg(feature = "exceptions")]
+    fn describe_exception(
+        &self,
+        module: &Module,
+        escaped: Option<ObjectRef>,
+        depth: usize,
+    ) -> UnhandledException {
         let type_id = escaped.and_then(|exception| match self.heap().type_of(exception) {
             Some(EXTERNAL_TYPE_ID) | None => self.raised_exception_type(module, exception),
             Some(type_id) => Some(type_id),
         });
-        let type_name = type_id.and_then(|id| module.type_full_name(id).map(String::from));
-        let tag = type_id.and_then(|id| module.exception_tag_of(id)).unwrap_or(0);
+        let fault = escaped.and_then(|exception| self.exception_fault(exception));
+        let type_name = type_id
+            .and_then(|id| module.type_full_name(id).map(String::from))
+            .or_else(|| {
+                fault
+                    .map(|fault| fault.type_name)
+                    .filter(|name| !name.is_empty())
+                    .map(String::from)
+            });
+        let tag = type_id
+            .and_then(|id| module.exception_tag_of(id))
+            .or_else(|| fault.and_then(|fault| fault.chain.first().copied()))
+            .unwrap_or(0);
         let message = escaped
             .and_then(|exception| {
                 self.exception_message(exception)
                     .or_else(|| self.message_field_of(module, exception))
             })
             .and_then(|text| self.heap().as_string(text).map(|units| String::from_utf16_lossy(&units)));
-        UnhandledException { tag, type_name, message }
-        }
+        let raised_in = fault
+            .and_then(|fault| fault.raised_in)
+            .and_then(|method| module.method_type(method))
+            .and_then(|type_id| module.type_full_name(type_id))
+            .map(String::from);
+        let inner = escaped
+            .filter(|_| depth < MAX_REPORTED_INNER_EXCEPTIONS)
+            .and_then(|exception| self.exception_inner(exception))
+            .map(|inner| {
+                alloc::boxed::Box::new(self.describe_exception(module, Some(inner), depth + 1))
+            });
+        UnhandledException { tag, type_name, message, raised_in, inner }
     }
 
     /// The message string a MANAGED constructor stored in an exception's own field, read from the
@@ -2507,29 +2569,55 @@ pub fn run(
     run_serviced(module, vm, entry, args, &mut |_vm| {})
 }
 
-/// Boots a BAKED module ([`Module::from_baked`]): runs its static constructors in order,
-/// marks them run, and hands `entry` back so the entry point a caller runs is the one that
-/// came out of the boot.
+/// Prepares a module's type initialization before its entry point runs, and hands `entry` back
+/// so the entry point a caller runs is the one that came out of the boot.
 ///
-/// A baked image restores the ordered `.cctor` list but not the lazy-trigger map, so the
-/// II.10.5.3 first-access initialization cannot fire on it. Without this call no static ever
-/// initializes and every `static readonly` reads its zero value -- so [`run`] refuses such a
-/// module instead of running it that way, and this is the call that satisfies it.
+/// A module that fires each static constructor at its type's first access
+/// ([`Module::initializes_types_on_first_access`]) needs nothing here, and nothing runs: every
+/// loaded module, and every image baked since the trigger tables were added. A constructor then
+/// runs where ECMA-335 II.10.5.3 puts it, so its output follows `Main`'s and one that throws
+/// raises `TypeInitializationException` at the access, where the program can catch it.
+///
+/// An image baked before those tables has no trigger to fire, so its static constructors run
+/// here, in declaration order, before the entry point. Without that no static would ever
+/// initialize -- so [`run`] refuses such a module unless this has run.
+///
+/// Then the board: when the [`Vm`] names a board class ([`Vm::set_board_class`]) and the program
+/// carries it, that class is initialized here, before the entry point, exactly as its first access
+/// would initialize it -- so it runs once, and touching the board later runs nothing more.
 ///
 /// Configure the [`Vm`] FIRST -- board seams, console, heap. A static constructor observes
-/// the VM it is booted on, so a seam installed afterwards is not there when it runs.
-///
-/// Harmless on a loaded (non-baked) module, whose cctors would otherwise fire lazily; it
-/// makes their order deterministic rather than first-touch.
+/// the VM it runs on, so a seam installed afterwards is not there when it runs.
 ///
 /// # Errors
-/// Propagates a [`Trap`] from any static constructor.
+/// Propagates a [`Trap`] from a static constructor run here, the board class's included.
 pub fn boot_baked(module: &Module, vm: &mut Vm, entry: MethodId) -> Result<MethodId, Trap> {
-    vm.mark_all_cctors_run(module);
-    for &cctor in module.static_ctors() {
+    if !module.initializes_types_on_first_access() {
+        vm.mark_all_cctors_run(module);
+        for &cctor in module.static_ctors() {
+            run(module, vm, cctor, Vec::new())?;
+        }
+    }
+    arm_board(module, vm)?;
+    Ok(entry)
+}
+
+/// Initializes the board class the [`Vm`] names, if the program carries it: its type initializer
+/// binds the board's buses, which the standard factories then resolve through.
+///
+/// A program without the class is not refused here. It has bound nothing, and the first factory
+/// it calls says so, naming what to add.
+fn arm_board(module: &Module, vm: &mut Vm) -> Result<(), Trap> {
+    let Some(type_id) = vm.board_class().and_then(|name| module.type_id_by_full_name(name)) else {
+        return Ok(());
+    };
+    if let Some(cctor) = vm
+        .take_pending_cctor(module, type_id)
+        .map_err(Trap::TypeInitializationFailed)?
+    {
         run(module, vm, cctor, Vec::new())?;
     }
-    Ok(entry)
+    Ok(())
 }
 
 /// [`run`] plus a `service` callback fired at EVERY scheduler quantum boundary (every
@@ -2643,7 +2731,11 @@ pub fn run_interruptible(
     args: Vec<Value>,
     service: &mut dyn FnMut(&mut Vm) -> bool,
 ) -> Result<Ran, Trap> {
-    if module.is_baked() && !vm.all_cctors_run(module) && !module.static_ctors().contains(&entry) {
+    if module.is_baked()
+        && !module.initializes_types_on_first_access()
+        && !vm.all_cctors_run(module)
+        && !module.static_ctors().contains(&entry)
+    {
         return Err(Trap::StaticCtorsNotRun);
     }
     let mut threads = alloc::vec![ThreadSlot {
@@ -3408,7 +3500,7 @@ impl Session {
         let flow = match step(top, current, code.len(), Some(module), vm, instruction) {
             Ok(flow) => flow,
             #[cfg(feature = "exceptions")]
-            Err(trap) => match catchable_fault(&trap, module, vm) {
+            Err(trap) => match catchable_fault(&trap, module, vm, Some(top.method)) {
                 Some(exception) => Flow::Throw(exception),
                 None => return Err(trap),
             },
@@ -3512,7 +3604,12 @@ impl Session {
                             Ok(Status::Running)
                         }
                         #[cfg(feature = "exceptions")]
-                        Err(trap) => match catchable_fault(&trap, module, vm) {
+                        Err(trap) => match catchable_fault(
+                            &trap,
+                            module,
+                            vm,
+                            frames.last().map(|frame| frame.method),
+                        ) {
                             Some(exception) => {
                                 vm.note_unhandled(exception);
                                 raise(frames, module, vm, exception)
@@ -3629,7 +3726,12 @@ impl Session {
                     Ok(Status::Running)
                 }
                 #[cfg(feature = "exceptions")]
-                Err(trap) => match catchable_fault(&trap, module, vm) {
+                Err(trap) => match catchable_fault(
+                    &trap,
+                    module,
+                    vm,
+                    frames.last().map(|frame| frame.method),
+                ) {
                     Some(exception) => {
                         vm.note_unhandled(exception);
                         raise(frames, module, vm, exception)
@@ -4598,10 +4700,14 @@ fn eh_clause_count(module: &Module, id: MethodId) -> usize {
 ///
 const EXTERNAL_TYPE_ID: u32 = u32::MAX;
 
+/// How many wrapped exceptions an unhandled-exception report follows below the one that escaped.
+#[cfg(feature = "exceptions")]
+const MAX_REPORTED_INNER_EXCEPTIONS: usize = 8;
+
 /// What the VES knows about one runtime-raised exception, whose managed type is external to the
 /// loaded module and so carries neither a base chain to walk nor a type handle to read.
 ///
-/// Both facts are recorded at the moment the object is minted and are relocated together by the
+/// Every fact is recorded at the moment the object is minted and is relocated together by the
 /// collector, which is why they share one entry rather than one table each.
 #[cfg(feature = "exceptions")]
 #[derive(Debug)]
@@ -4611,6 +4717,12 @@ struct FaultIdentity {
     chain: Vec<u32>,
     /// The leaf type's asm-folded `Type` handle, or `None` when that type is not loaded.
     type_handle: Option<u64>,
+    /// The leaf type's full name, which an unhandled-exception report prints when the image does
+    /// not carry the type: an image trimmed to what `Main` reaches often does not.
+    type_name: &'static str,
+    /// The method that was executing when the VES raised it, which the report names. `None` for
+    /// one raised at a type's first access, which is a wrapper and points at its inner exception.
+    raised_in: Option<MethodId>,
 }
 
 /// The .NET exception type a catchable runtime fault surfaces as: a default message and the
@@ -4801,7 +4913,8 @@ fn poison_failed_type(
         .map(crate::exception::exception_tag)
         .collect();
     let type_handle = TYPE_INIT.first().and_then(|leaf| module.type_handle_by_name(leaf));
-    vm.set_exception_identity(wrapper, chain, type_handle);
+    let type_name = TYPE_INIT.first().copied().unwrap_or_default();
+    vm.set_exception_identity(wrapper, FaultIdentity { chain, type_handle, type_name, raised_in: None });
     vm.set_exception_inner(wrapper, exception);
     vm.note_cctor_failed(type_id, wrapper);
     wrapper
@@ -4810,9 +4923,15 @@ fn poison_failed_type(
 /// Converts a catchable runtime fault into a thrown exception object (carrying a default
 /// message and its base-chain tag vector so `catch` matches it by type), or returns `None`
 /// for traps that should still abort execution (a stack overflow, an unresolved token,
-/// malformed CIL, ...).
+/// malformed CIL, ...). `raised_in` is the method that was executing, which an
+/// unhandled-exception report names.
 #[cfg(feature = "exceptions")]
-fn catchable_fault(trap: &Trap, module: &Module, vm: &mut Vm) -> Option<ObjectRef> {
+fn catchable_fault(
+    trap: &Trap,
+    module: &Module,
+    vm: &mut Vm,
+    raised_in: Option<MethodId>,
+) -> Option<ObjectRef> {
     if let Trap::TypeInitializationFailed(type_id) = *trap {
         return vm.cctor_failure(type_id);
     }
@@ -4826,7 +4945,8 @@ fn catchable_fault(trap: &Trap, module: &Module, vm: &mut Vm) -> Option<ObjectRe
     let message = vm.heap_mut().alloc_text(&text);
     vm.set_exception_message(exception, message);
     let type_handle = chain_names.first().and_then(|leaf| module.type_handle_by_name(leaf));
-    vm.set_exception_identity(exception, chain, type_handle);
+    let type_name = chain_names.first().copied().unwrap_or_default();
+    vm.set_exception_identity(exception, FaultIdentity { chain, type_handle, type_name, raised_in });
     Some(exception)
 }
 
@@ -4963,7 +5083,13 @@ fn complete_finally(
         AfterFinally::Unwind(exception) => {
             #[cfg(feature = "exceptions")]
             let exception = match frames.last() {
-                Some(frame) => poison_failed_type(module, vm, frame.method, exception),
+                Some(frame) => {
+                    let raised = poison_failed_type(module, vm, frame.method, exception);
+                    if raised != exception {
+                        vm.note_unhandled(raised);
+                    }
+                    raised
+                }
                 None => exception,
             };
             if let Some(unwound) = frames.pop() {
@@ -9903,8 +10029,8 @@ mod tests {
         (module, main)
     }
 
-    /// The eager boot and the lazy trigger are two routes to one initialization, and a module
-    /// must not take both: II.10.5.3 runs a type's constructor ONCE. A constructor with a side
+    /// `boot_baked` and the lazy trigger are two routes to one initialization, and a module must
+    /// not take both: II.10.5.3 runs a type's constructor ONCE. A constructor with a side
     /// effect -- a counter, a device register write, a queued allocation -- is where a second
     /// run stops being invisible.
     #[test]
@@ -9932,15 +10058,13 @@ mod tests {
         );
     }
 
-    /// THE DEFECT, STATED AS A TEST. A baked image restores the ordered `.cctor` list but NOT
-    /// the lazy-trigger map, so on a baked module the trigger above can never fire: without an
-    /// eager boot the entry reads 0 and reports success. No other test in the tree can express
-    /// this -- every one either boots eagerly or runs unbaked, so all of them return the right
-    /// answer for a program that fails on a device.
+    /// A baked image carries the lazy trigger -- each type's `.cctor` and the owner of each static
+    /// slot -- so its first static access runs the constructor, exactly once, as on a loaded
+    /// module, and `boot_baked` has nothing to run before the entry point.
     #[cfg(feature = "code-in-place")]
     #[test]
-    fn a_baked_image_refuses_to_run_before_its_static_constructors() {
-        let (mut module, main) = static_readonly_program();
+    fn a_baked_image_initializes_each_type_at_its_first_access() {
+        let (mut module, main) = counting_cctor_program();
         let image = module.write_baked(Some(main)).expect("bake");
         let image: &'static [u8] = Box::leak(image.into_boxed_slice());
         let (baked, entry) = Module::from_baked(image).expect("boot");
@@ -9948,14 +10072,49 @@ mod tests {
 
         assert!(baked.is_baked(), "a module out of from_baked is baked");
         assert!(
-            baked.cctor_of_type(0).is_none(),
-            "the lazy trigger map is NOT restored -- the mechanism the refusal exists for"
+            baked.initializes_types_on_first_access(),
+            "the image carries a trigger for every type initializer it lists"
+        );
+        assert_eq!(
+            super::run(&baked, &mut Vm::new(), entry, Vec::new()),
+            Ok(Some(Value::Int32(1))),
+            "the entry's first static access runs the cctor, with no boot: 0 means it never ran"
         );
 
+        let mut vm = Vm::new();
+        let entry = super::boot_baked(&baked, &mut vm, entry).expect("nothing to boot");
+        assert!(
+            !vm.all_cctors_run(&baked),
+            "boot_baked ran or marked a constructor ahead of the type's first access"
+        );
+        assert_eq!(
+            super::run(&baked, &mut vm, entry, Vec::new()),
+            Ok(Some(Value::Int32(1))),
+            "2 means the constructor ran at boot AND at the access"
+        );
+    }
+
+    /// AN IMAGE BAKED BEFORE THE TRIGGER TABLES has the ordered `.cctor` list and nothing to fire
+    /// it with, so its entry point is refused until `boot_baked` runs the list. Without the refusal
+    /// the entry reads 0 and reports success, which is what such an image did before it existed.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn an_image_baked_before_the_trigger_tables_is_refused_until_booted() {
+        let (mut module, main) = static_readonly_program();
+        let image = module.write_baked(Some(main)).expect("bake");
+        let older = crate::module::image_without_trailing_tables(&image, 2);
+        let image: &'static [u8] = Box::leak(older.into_boxed_slice());
+        let (baked, entry) = Module::from_baked(image).expect("an older image still reads");
+        let entry = entry.expect("the image records its entry point");
+
+        assert!(
+            !baked.initializes_types_on_first_access(),
+            "an image with a cctor and no trigger table must not claim the lazy path"
+        );
         assert_eq!(
             super::run(&baked, &mut Vm::new(), entry, Vec::new()),
             Err(Trap::StaticCtorsNotRun),
-            "a baked module refuses its entry point until its cctors have run"
+            "an older image refuses its entry point until its cctors have run"
         );
 
         let mut vm = Vm::new();
@@ -9965,6 +10124,115 @@ mod tests {
             Ok(Some(Value::Int32(7))),
             "after boot_baked the static holds what its constructor wrote"
         );
+    }
+
+    /// dotnet/iot code on a board, reduced to its shape: `Test.Buses` holds a static the board
+    /// binds (slot 0), `Test.Board`'s type initializer ADDS 1 to it, so running it twice shows, and
+    /// the entry reads that static -- calling `Board.Touch` first only when `touch_board`, as a
+    /// program written to construct its board does.
+    fn board_program(touch_board: bool) -> (Module, MethodId) {
+        let bound = Token(0x0400_0021);
+        let touch_token = Token(0x0600_0041);
+        let mut module = Module::new();
+        let buses = module.add_type(Vec::new());
+        let board = module.add_type(Vec::new());
+        module.bind_type_full_name(buses, String::from("Test.Buses"));
+        module.bind_type_full_name(board, String::from("Test.Board"));
+        module.bind_static_field(0, bound, Value::Int32(0));
+        module.bind_static_slot_range(0, 1, buses);
+
+        let cctor = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Ldsfld, Operand::Token(bound)),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Add),
+                Instruction::new(Opcode::Stsfld, Operand::Token(bound)),
+                ret(),
+            ]),
+            0,
+        );
+        module.set_method_type(cctor, board);
+        module.add_static_ctor(cctor);
+        let touch = module.add_method_image(0, method(vec![ret()]), 0);
+        module.set_method_type(touch, board);
+        module.bind_token(0, touch_token, touch);
+
+        let mut body = Vec::new();
+        if touch_board {
+            body.push(Instruction::new(Opcode::Call, Operand::Token(touch_token)));
+        }
+        body.push(Instruction::new(Opcode::Ldsfld, Operand::Token(bound)));
+        body.push(ret());
+        let main = module.add_method_image(0, method(body), 0);
+        (module, main)
+    }
+
+    /// The board class the `Vm` names is initialized before the entry point, so a program that
+    /// never touches its board finds what the board's initializer bound -- the dotnet/iot shape,
+    /// where `I2cDevice.Create` opens a bus and no line names the board.
+    #[test]
+    fn the_named_board_class_is_initialized_before_the_entry_point() {
+        let (module, main) = board_program(false);
+        let mut vm = Vm::new();
+        let unarmed = super::boot_baked(&module, &mut vm, main).expect("nothing runs at boot");
+        assert_eq!(
+            super::run(&module, &mut vm, unarmed, Vec::new()),
+            Ok(Some(Value::Int32(0))),
+            "with no board named, nothing binds the buses"
+        );
+
+        let mut vm = Vm::new();
+        vm.set_board_class("Test.Board");
+        let armed = super::boot_baked(&module, &mut vm, main).expect("the board arms");
+        assert_eq!(
+            super::run(&module, &mut vm, armed, Vec::new()),
+            Ok(Some(Value::Int32(1))),
+            "the named board's initializer ran before the entry point"
+        );
+    }
+
+    /// Arming IS the type's first access, so touching the board afterwards runs nothing: a program
+    /// written to construct its board first must not bind the buses a second time, which the bus
+    /// table refuses.
+    #[test]
+    fn an_armed_board_is_not_initialized_again_when_the_program_touches_it() {
+        let (module, main) = board_program(true);
+        let mut vm = Vm::new();
+        vm.set_board_class("Test.Board");
+        let main = super::boot_baked(&module, &mut vm, main).expect("the board arms");
+        assert_eq!(
+            super::run(&module, &mut vm, main, Vec::new()),
+            Ok(Some(Value::Int32(1))),
+            "2 means touching the board ran its initializer a second time"
+        );
+    }
+
+    /// A program that does not carry the named class is not refused at boot. It has bound
+    /// nothing, and the first bus it opens says so.
+    #[test]
+    fn a_named_board_class_the_program_does_not_carry_arms_nothing() {
+        let (module, main) = board_program(false);
+        let mut vm = Vm::new();
+        vm.set_board_class("Test.SomeOtherBoard");
+        let main = super::boot_baked(&module, &mut vm, main).expect("nothing to arm");
+        assert_eq!(super::run(&module, &mut vm, main, Vec::new()), Ok(Some(Value::Int32(0))));
+    }
+
+    /// The same arming on a baked image, which finds the class by the type names every image
+    /// carries.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_baked_image_arms_the_named_board_class() {
+        let (mut module, main) = board_program(false);
+        let image = module.write_baked(Some(main)).expect("bake");
+        let image: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, entry) = Module::from_baked(image).expect("boot");
+        let entry = entry.expect("the image records its entry point");
+        let mut vm = Vm::new();
+        vm.set_board_class("Test.Board");
+        let entry = super::boot_baked(&baked, &mut vm, entry).expect("the board arms");
+        assert_eq!(super::run(&baked, &mut vm, entry, Vec::new()), Ok(Some(Value::Int32(1))));
     }
 
     /// A module holding `System.Nullable<T>` over one value type, wired exactly as the loader

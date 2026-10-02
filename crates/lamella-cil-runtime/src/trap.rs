@@ -28,16 +28,41 @@ pub struct UnhandledException {
     /// The exception's message, when this tier has an object to read one from.
     ///
     pub message: Option<String>,
+    /// The type whose method was executing when the runtime raised this exception. `None` for an
+    /// exception the program threw itself, and on a tier that does not record it.
+    pub raised_in: Option<String>,
+    /// The exception this one wraps, as its `InnerException` holds it: what a static constructor
+    /// threw, inside the `TypeInitializationException` raised at its type's first access.
+    pub inner: Option<alloc::boxed::Box<UnhandledException>>,
 }
 
 impl fmt::Display for UnhandledException {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("unhandled exception")?;
+        f.write_str(if self.type_name.is_none() && self.message.is_none() { " " } else { ": " })?;
+        self.write_described(f)
+    }
+}
+
+impl UnhandledException {
+    /// This exception's type and message, where it was raised, and then each exception it wraps,
+    /// after .NET's ` ---> `.
+    fn write_described(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.type_name, &self.message) {
-            (Some(name), Some(message)) => write!(f, ": {name}: {message}"),
-            (Some(name), None) => write!(f, ": {name}"),
-            (None, Some(message)) => write!(f, ": {message}"),
-            (None, None) => write!(f, " (type tag {:#010x})", self.tag),
+            (Some(name), Some(message)) => write!(f, "{name}: {message}")?,
+            (Some(name), None) => f.write_str(name)?,
+            (None, Some(message)) => f.write_str(message)?,
+            (None, None) => write!(f, "(type tag {:#010x})", self.tag)?,
+        }
+        if let Some(method) = &self.raised_in {
+            write!(f, " (raised in {method})")?;
+        }
+        match &self.inner {
+            Some(inner) => {
+                f.write_str(" ---> ")?;
+                inner.write_described(f)
+            }
+            None => Ok(()),
         }
     }
 }
@@ -154,10 +179,11 @@ pub enum Trap {
     /// An exception propagated out of the entry method with no matching handler, and what the
     /// running tier could say about it.
     UnhandledException(UnhandledException),
-    /// A BAKED module's entry point was run before its static constructors. A baked image
-    /// carries the ordered `.cctor` list but not the lazy-trigger map a loaded module uses,
-    /// so no static would ever initialize on first access and every `static readonly` would
-    /// read its zero value. Boot the module with [`crate::boot_baked`] first.
+    /// A BAKED module's entry point was run before its static constructors. An image baked
+    /// before the trigger tables carries the ordered `.cctor` list but not the lazy-trigger map
+    /// a loaded module uses, so no static would ever initialize on first access and every
+    /// `static readonly` would read its zero value. Boot the module with [`crate::boot_baked`]
+    /// first.
     StaticCtorsNotRun,
     /// A `System.String` could not be constructed because the build's string storage cannot
     /// hold one of its code units -- a lone surrogate on the well-formed UTF-8 tier (the

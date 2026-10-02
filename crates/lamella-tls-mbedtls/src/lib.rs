@@ -22,23 +22,34 @@ use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use lamella_cil_runtime::tls::{
-    ClockPolicy, PlainRead, TlsBackend, TlsConfigHandle, TlsHandle, TlsStack, TlsState, TlsVersion,
-    TlsVersionRange, VerifyMode, session_flag,
+    ClientIdentity, ClockPolicy, IdentityError, PlainRead, TlsBackend, TlsConfigHandle, TlsHandle,
+    TlsStack, TlsState, TlsVersion, TlsVersionRange, VerifyMode, session_flag,
 };
 
 unsafe extern "C" {
     fn lam_tls_client_new(
         ca_pem: *const u8,
         ca_len: usize,
+        own_chain: *const u8,
+        own_chain_len: usize,
+        own_key: *const u8,
+        own_key_len: usize,
         hostname: *const c_char,
         verify_mode: c_int,
         skip_dates: c_int,
         user: *mut c_void,
     ) -> *mut c_void;
+    fn lam_tls_identity_check(
+        chain: *const u8,
+        chain_len: usize,
+        key: *const u8,
+        key_len: usize,
+    ) -> c_int;
     fn lam_tls_handshake(session: *mut c_void) -> c_int;
     fn lam_tls_read(session: *mut c_void, buf: *mut u8, len: usize) -> c_int;
     fn lam_tls_write(session: *mut c_void, buf: *const u8, len: usize) -> c_int;
     fn lam_tls_peer_cert(session: *mut c_void, out: *mut u8, out_len: usize) -> c_int;
+    fn lam_tls_peer_alert(session: *mut c_void) -> c_int;
     fn lam_tls_dates_skipped(session: *mut c_void) -> c_int;
     fn lam_tls_report_flags(session: *mut c_void) -> c_int;
     fn lam_tls_close_notify(session: *mut c_void);
@@ -47,6 +58,11 @@ unsafe extern "C" {
 
 const SHIM_WANT: c_int = -1;
 const SHIM_CLOSED: c_int = -2;
+
+/// `lam_tls_identity_check`'s answers (the shim's `LAM_ID_*`).
+const SHIM_ID_CERTIFICATE: c_int = -1;
+const SHIM_ID_KEY: c_int = -2;
+const SHIM_ID_MISMATCH: c_int = -3;
 
 /// The registered hardware entropy source (`None` until the embedder provides one).
 /// Stored as a raw fn pointer so registration works from a bare-metal boot path.
@@ -171,7 +187,7 @@ extern "C" fn lamella_entropy_poll(output: *mut u8, len: usize) -> c_int {
 /// budget together. On a HOST the pool is roomier: the conformance tests run sessions in
 /// parallel test threads, and host RAM is not the scarce resource the pool exists to
 /// discipline.
-const POOL_BYTES: usize = if cfg!(target_os = "none") { 48 * 1024 } else { 128 * 1024 };
+const POOL_BYTES: usize = if cfg!(target_os = "none") { DEVICE_POOL_BYTES } else { 128 * 1024 };
 
 /// Block granularity and payload alignment: every block size is a multiple of this, and
 /// headers are one unit so payloads stay aligned.
@@ -201,6 +217,29 @@ static mut FREE_INIT: bool = false;
 /// costs one uncontended CAS per call); the HOST conformance tests run in cargo's
 /// parallel test threads and genuinely contend.
 static POOL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Bytes the pool has handed out and not had back, headers and rounding included, and the most it
+/// has held at once since [`reset_pool_peak`]. Both change only under [`POOL_LOCK`].
+static mut POOL_IN_USE: usize = 0;
+static mut POOL_PEAK: usize = 0;
+
+/// The most the mbedTLS pool has held at once since the last [`reset_pool_peak`], in bytes,
+/// headers and rounding included. A host test reads it to show that a handshake fits a device's
+/// pool, which is smaller than a host's ([`POOL_BYTES`]): a host pool that big would never refuse
+/// an allocation the device's would.
+#[must_use]
+pub fn pool_peak_bytes() -> usize {
+    with_pool(|| unsafe { *core::ptr::addr_of!(POOL_PEAK) })
+}
+
+/// Starts a new high-water mark at what the pool holds now.
+pub fn reset_pool_peak() {
+    with_pool(|| unsafe { *core::ptr::addr_of_mut!(POOL_PEAK) = *core::ptr::addr_of!(POOL_IN_USE) });
+}
+
+/// The pool's size on a device, in bytes: what [`pool_peak_bytes`] must stay under for a session
+/// to run on a board.
+pub const DEVICE_POOL_BYTES: usize = 48 * 1024;
 
 /// Runs `body` holding the pool lock.
 fn with_pool<T>(body: impl FnOnce() -> T) -> T {
@@ -267,6 +306,10 @@ extern "C" fn lamella_mbedtls_calloc(count: usize, size: usize) -> *mut c_void {
                     (*prev).next = successor;
                 }
                 let block = current.cast::<u8>();
+                *core::ptr::addr_of_mut!(POOL_IN_USE) += (*current).size;
+                if *core::ptr::addr_of!(POOL_IN_USE) > *core::ptr::addr_of!(POOL_PEAK) {
+                    *core::ptr::addr_of_mut!(POOL_PEAK) = *core::ptr::addr_of!(POOL_IN_USE);
+                }
                 block.cast::<usize>().write((*current).size);
                 let user = block.add(ALLOC_UNIT);
                 core::ptr::write_bytes(user, 0, payload);
@@ -292,6 +335,7 @@ extern "C" fn lamella_mbedtls_free(pointer: *mut c_void) {
         let block = pointer.cast::<u8>().sub(ALLOC_UNIT).cast::<FreeBlock>();
         let size = block.cast::<usize>().read();
         (*block).size = size;
+        *core::ptr::addr_of_mut!(POOL_IN_USE) -= size;
         let mut prev: *mut FreeBlock = core::ptr::null_mut();
         let mut current = *core::ptr::addr_of!(FREE_HEAD);
         while !current.is_null() && current < block {
@@ -352,12 +396,62 @@ extern "C" fn lamella_bio_recv(user: *mut c_void, buf: *mut u8, len: usize) -> c
 }
 
 /// A prepared client configuration: the trust decision plus (for pinned mode) the root
-/// bundle, applied when a session is created.
+/// bundle, and the client's own identity when it has one, applied when a session is created.
 #[derive(PartialEq)]
 struct StoredConfig {
     verify: VerifyMode,
     /// PEM roots, NUL-terminated the way mbedTLS's PEM parser expects.
     roots: Option<Vec<u8>>,
+    identity: Option<StoredIdentity>,
+}
+
+/// A client identity as a configuration keeps it: each part as given, with the NUL mbedTLS's PEM
+/// parser expects after PEM text (see [`for_mbedtls`]).
+#[derive(PartialEq)]
+struct StoredIdentity {
+    chain: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl Drop for StoredIdentity {
+    /// The private key is overwritten before its memory goes back to the allocator. `fill` alone
+    /// may be dropped as a write nothing reads; the fence keeps it.
+    fn drop(&mut self) {
+        self.key.fill(0);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// `bytes` as mbedTLS's parsers read them: PEM text gains the NUL that tells them it is PEM (and
+/// that its length counts), and DER stays exact, because a trailing byte is not part of the
+/// encoding.
+fn for_mbedtls(bytes: &[u8]) -> Vec<u8> {
+    let mut copy = Vec::with_capacity(bytes.len() + 1);
+    copy.extend_from_slice(bytes);
+    if bytes.windows(10).any(|window| window == b"-----BEGIN") && bytes.last() != Some(&0) {
+        copy.push(0);
+    }
+    copy
+}
+
+/// Checks `identity` in the shim: both parts parse and the key is the leaf's. The check draws on
+/// the entropy source, which the caller has confirmed is registered.
+fn check_in_shim(identity: &StoredIdentity) -> Result<(), IdentityError> {
+    let answer = unsafe {
+        lam_tls_identity_check(
+            identity.chain.as_ptr(),
+            identity.chain.len(),
+            identity.key.as_ptr(),
+            identity.key.len(),
+        )
+    };
+    match answer {
+        0 => Ok(()),
+        SHIM_ID_CERTIFICATE => Err(IdentityError::Certificate),
+        SHIM_ID_KEY => Err(IdentityError::Key),
+        SHIM_ID_MISMATCH => Err(IdentityError::Mismatch),
+        _ => Err(IdentityError::Configuration),
+    }
 }
 
 /// A live session: the C-side handle plus the shared BIO queues and the seam state.
@@ -430,6 +524,55 @@ impl MbedTlsDevice {
     fn session_mut(&mut self, tls: TlsHandle) -> Option<&mut Session> {
         self.sessions.get_mut(tls as usize).and_then(Option::as_mut)
     }
+
+    /// [`TlsBackend::client_config`], with or without a client identity. The identity is checked
+    /// before anything is stored, so a stored configuration's pair is known good and a session only
+    /// parses it.
+    fn configure_client(
+        &mut self,
+        verify: VerifyMode,
+        roots_pem: Option<&[u8]>,
+        identity: Option<StoredIdentity>,
+    ) -> Result<TlsConfigHandle, IdentityError> {
+        if ENTROPY_SOURCE.load(Ordering::Acquire).is_null() {
+            return Err(IdentityError::Configuration);
+        }
+        if !self.version_range.is_valid() || !self.version_range.admits(TlsVersion::Tls12) {
+            return Err(IdentityError::Configuration);
+        }
+        if let Some(identity) = &identity {
+            check_in_shim(identity)?;
+        }
+        let roots = match verify {
+            VerifyMode::SystemRoots => {
+                if !system_roots_available() {
+                    return Err(IdentityError::Configuration);
+                }
+                None
+            }
+            VerifyMode::PinnedCert => {
+                let pem = roots_pem.ok_or(IdentityError::Configuration)?;
+                if pem.is_empty() {
+                    return Err(IdentityError::Configuration);
+                }
+                let mut bundle = pem.to_vec();
+                bundle.push(0);
+                Some(bundle)
+            }
+            VerifyMode::AcceptAny => None,
+            VerifyMode::Report => roots_pem.filter(|pem| !pem.is_empty()).map(|pem| {
+                let mut bundle = pem.to_vec();
+                bundle.push(0);
+                bundle
+            }),
+        };
+        let stored = StoredConfig { verify, roots, identity };
+        if let Some(index) = self.configs.iter().position(|existing| *existing == stored) {
+            return Ok(index as TlsConfigHandle);
+        }
+        self.configs.push(stored);
+        Ok((self.configs.len() - 1) as TlsConfigHandle)
+    }
 }
 
 impl Drop for MbedTlsDevice {
@@ -452,41 +595,36 @@ impl TlsBackend for MbedTlsDevice {
         verify: VerifyMode,
         roots_pem: Option<&[u8]>,
     ) -> Option<TlsConfigHandle> {
-        if ENTROPY_SOURCE.load(Ordering::Acquire).is_null() {
-            return None;
-        }
-        if !self.version_range.is_valid() || !self.version_range.admits(TlsVersion::Tls12) {
-            return None;
-        }
-        let roots = match verify {
-            VerifyMode::SystemRoots => {
-                if !system_roots_available() {
-                    return None;
-                }
-                None
-            }
-            VerifyMode::PinnedCert => {
-                let pem = roots_pem?;
-                if pem.is_empty() {
-                    return None;
-                }
-                let mut bundle = pem.to_vec();
-                bundle.push(0);
-                Some(bundle)
-            }
-            VerifyMode::AcceptAny => None,
-            VerifyMode::Report => roots_pem.filter(|pem| !pem.is_empty()).map(|pem| {
-                let mut bundle = pem.to_vec();
-                bundle.push(0);
-                bundle
-            }),
+        self.configure_client(verify, roots_pem, None).ok()
+    }
+
+    fn client_config_identity(
+        &mut self,
+        _stack: TlsStack,
+        verify: VerifyMode,
+        roots_pem: Option<&[u8]>,
+        identity: ClientIdentity<'_>,
+    ) -> Result<TlsConfigHandle, IdentityError> {
+        let identity = StoredIdentity {
+            chain: for_mbedtls(identity.chain),
+            key: for_mbedtls(identity.key),
         };
-        let stored = StoredConfig { verify, roots };
-        if let Some(index) = self.configs.iter().position(|existing| *existing == stored) {
-            return Some(index as TlsConfigHandle);
+        self.configure_client(verify, roots_pem, Some(identity))
+    }
+
+    fn check_identity(&mut self, identity: ClientIdentity<'_>) -> Result<(), IdentityError> {
+        if ENTROPY_SOURCE.load(Ordering::Acquire).is_null() {
+            return Err(IdentityError::Configuration);
         }
-        self.configs.push(stored);
-        Some((self.configs.len() - 1) as TlsConfigHandle)
+        check_in_shim(&StoredIdentity {
+            chain: for_mbedtls(identity.chain),
+            key: for_mbedtls(identity.key),
+        })
+    }
+
+    fn peer_alert(&mut self, tls: TlsHandle) -> Option<u8> {
+        let session = self.session_mut(tls)?;
+        u8::try_from(unsafe { lam_tls_peer_alert(session.shim) }).ok()
     }
 
     /// The device rung is client-only (the NETMF-parity direction); serving TLS from the
@@ -527,6 +665,15 @@ impl TlsBackend for MbedTlsDevice {
             Some(bundle) => (bundle.as_ptr(), bundle.len()),
             None => (core::ptr::null(), 0),
         };
+        let (chain_ptr, chain_len, key_ptr, key_len) = match &stored.identity {
+            Some(identity) => (
+                identity.chain.as_ptr(),
+                identity.chain.len(),
+                identity.key.as_ptr(),
+                identity.key.len(),
+            ),
+            None => (core::ptr::null(), 0, core::ptr::null(), 0),
+        };
 
         let bio = Box::into_raw(Box::new(BioState {
             incoming: VecDeque::new(),
@@ -536,6 +683,10 @@ impl TlsBackend for MbedTlsDevice {
             lam_tls_client_new(
                 ca_ptr,
                 ca_len,
+                chain_ptr,
+                chain_len,
+                key_ptr,
+                key_len,
                 hostname_z.as_ptr().cast::<c_char>(),
                 verify_mode,
                 skip_dates,

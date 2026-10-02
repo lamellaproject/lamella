@@ -155,6 +155,7 @@ spelled_enum! {
         "." => Dot,
         "," => Comma,
         ":" => Colon,
+        "::" => ColonColon,
         ";" => Semicolon,
         "+" => Plus,
         "-" => Minus,
@@ -479,10 +480,11 @@ mod tests {
 
     /// The table's size, pinned so a stray addition or a lost row is loud. It is NOT the C# 1.0
     /// operator set alone: `??` is C# 2.0's and the LEXER is what keeps it out of a C# 1 dialect
-    /// (`try_gate_post_1_0_operator`), not its absence from this table. 45 -> 46 when `??` landed.
+    /// (`try_gate_post_1_0_operator`), not its absence from this table, and `::` is C# 2.0's and
+    /// the BINDER gates it. 45 -> 46 when `??` landed, 47 with `=>`, 48 with `::`.
     #[test]
-    fn there_are_forty_six_operators_and_punctuators() {
-        assert_eq!(Punctuator::all().len(), 47);
+    fn there_are_forty_eight_operators_and_punctuators() {
+        assert_eq!(Punctuator::all().len(), 48);
     }
 
     #[test]

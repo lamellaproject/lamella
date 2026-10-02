@@ -64,6 +64,7 @@ usage:
   lamella run <file> [--target <t>]                  run it here, or ON a board with output here
   lamella build <file> [--board <id>] [--format f]   make an artifact; nothing is written
   lamella deploy <file> --target <t> | --board <id>  compile it and put it on a board
+  lamella deploy --erase --target <t>                stop and erase the program a board stores
   lamella flash <image> --board <id> [--probe <s>]   write bytes that are ALREADY an image
   lamella boards                                     every board this build knows
   lamella fit --board <id> --image-bytes <n>         does an image of <n> bytes fit?

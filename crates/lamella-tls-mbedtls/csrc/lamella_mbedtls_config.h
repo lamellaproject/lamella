@@ -17,6 +17,10 @@
  * - Trust: a pinned certificate (a static ca_chain) OR the bundled Mozilla/curl system-root
  *   store, reached through the lazy trusted-cert callback so only the root(s) matching a peer
  *   chain's issuer are parsed per handshake (the whole ~120-root store never enters the pool).
+ * - Client identity (mutual TLS): the client may present its own certificate chain and prove it
+ *   holds the leaf's key, signing CertificateVerify with ECDSA (P-256/P-384) or RSA. The modules
+ *   below already carry it: PK_PARSE + PEM_PARSE read the key, X509_CRT_PARSE the chain. An
+ *   encrypted key is not read (no PKCS5/PKCS12 here); nothing takes a password.
  * - No filesystem, no built-in networking, no printf-family dependency beyond what the
  *   modules below need: the library runs as a pure byte transform behind the Rust seam.
  * - Memory: every allocation routes through lamella_mbedtls_calloc/free (provided in

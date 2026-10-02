@@ -75,7 +75,16 @@ SECTIONS
   /* Retained across a warm reset and not zeroed by startup (it sits past _ebss): the fault /
      panic handler stamps a magic here and resets, and the next boot reads it to come back up
      waiting for the host instead of re-running a crashing deployed app. */
-  .noinit (NOLOAD) : ALIGN(4) { *(.noinit .noinit.*) } > RAM
+  .noinit (NOLOAD) : ALIGN(4) { *(.noinit .noinit.*) _enoinit = .; } > RAM
+
+  /* What the statics leave of RAM. The stack keeps the top @LAMELLA_STACK_BYTES@ bytes, below the
+     initial SP, and the C# firmware's heap is everything between the statics and the stack's floor:
+     sized here, at link time, rather than fixed in the firmware. That firmware also hands the floor
+     to the core's stack-limit register, so a stack that outgrows its share faults rather than
+     writing into the heap. build.rs sizes the stack from the build's features. */
+  _sheap = ALIGN(_enoinit, 8);
+  _stack_floor = ORIGIN(RAM) + LENGTH(RAM) - @LAMELLA_STACK_BYTES@;
+  ASSERT(_stack_floor > _sheap, "the statics reach into the stack's share of RAM")
 
   /DISCARD/ : { *(.ARM.exidx .ARM.exidx.*) *(.ARM.attributes) }
 }

@@ -653,9 +653,15 @@ pub(crate) fn visit_stmt_exprs(statement: &BoundStmt, f: &mut dyn FnMut(&BoundEx
         BoundStmtKind::Switch {
             expression,
             sections,
+            ..
         } => {
             visit_expr(expression, f);
             for section in sections {
+                for label in &section.labels {
+                    if let lamella_binder::BoundSwitchLabel::Pattern { test, guard, .. } = label {
+                        test.iter().chain(guard).for_each(|part| visit_expr(part, f));
+                    }
+                }
                 for inner in &section.statements {
                     visit_stmt_exprs(inner, f);
                 }
@@ -1203,7 +1209,15 @@ impl Rewriter {
             BoundStmtKind::Switch {
                 expression,
                 sections,
+                subject,
             } => {
+                let label_awaits = sections.iter().flat_map(|section| &section.labels).any(|label| {
+                    matches!(label, lamella_binder::BoundSwitchLabel::Pattern { test, guard, .. }
+                        if test.iter().chain(guard).any(expr_contains_await))
+                });
+                if label_awaits {
+                    return Err(EmitError::Unsupported("an await in a case label's guard"));
+                }
                 let expression =
                     self.expression(expression, &mut out.statements, &mut out.routes)?;
                 let mut rewritten_sections = Vec::new();
@@ -1223,6 +1237,7 @@ impl Rewriter {
                     BoundStmtKind::Switch {
                         expression,
                         sections: rewritten_sections,
+                        subject: subject.clone(),
                     },
                     span,
                 ));

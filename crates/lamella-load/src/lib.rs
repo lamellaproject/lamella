@@ -736,12 +736,20 @@ pub fn load_unfrozen<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, Loa
 /// types + methods exactly as [`load`] does but WITHOUT requiring -- or running -- an entry point.
 /// The REPL emits a `/target:library` session class and invokes a named method by id (never an
 /// entry), so this lets it load that image directly instead of carrying an unused dummy `Main`.
+///
+/// A library loaded alone is lowered for what its own code names: every closed generic
+/// instantiation it spells whose definition it declares -- a method taking a `Span<byte>`, where the
+/// library is the corlib that declares `Span<T>` -- gets its own type identity, as it would beside a
+/// program. One whose definition lives in an assembly this load was not given stays unlowered, and
+/// its call sites keep the mark `Module::validate_profile` refuses by name.
 pub fn load_library<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Module, LoadError> {
     let mut module = Module::new();
     let mut index = NameIndex::new();
     let mut type_index = TypeNameIndex::new();
     let mut field_index = FieldNameIndex::new();
-    let _ = load_assembly(
+    let mut heirs: Vec<GenericBaseHeir<'_>> = Vec::new();
+    let type_offset = module.type_count();
+    let _ = load_assembly_collecting(
         &mut module,
         assembly,
         flash_cil,
@@ -750,7 +758,32 @@ pub fn load_library<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Module, LoadE
         &mut type_index,
         &mut field_index,
         false,
+        &mut heirs,
     );
+    #[cfg(feature = "generics")]
+    {
+        let plan = monomorphize::collect_instantiations(assembly, &[]);
+        if !plan.is_empty() {
+            let sources = [monomorphize::DefinitionSource {
+                assembly: assembly.clone(),
+                asm: 0,
+                type_offset: Some(type_offset),
+            }];
+            let lowering = monomorphize::monomorphize(
+                &mut module,
+                assembly,
+                0,
+                &sources,
+                &type_index,
+                &field_index,
+                flash_cil,
+                &plan,
+            );
+            relink_generic_base_heirs(&mut module, &heirs, &lowering);
+        }
+    }
+    #[cfg(not(feature = "generics"))]
+    let _ = (&heirs, type_offset);
     module.freeze();
     Ok(module)
 }
@@ -1556,12 +1589,18 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
     let mut module = Module::new();
     let mut resolution = CorlibResolution::new();
     #[cfg(feature = "generics")]
-    let instantiations =
-        monomorphize::collect_instantiations(program, core::slice::from_ref(&corlib.clone()));
+    let (instantiations, plans) = {
+        let references = [corlib.clone()];
+        (
+            monomorphize::collect_instantiations(program, &references),
+            monomorphize::collect_reference_plans(program, &references),
+        )
+    };
     #[cfg(feature = "generics")]
     let generic_definitions: Vec<String> = {
         let mut names: Vec<String> = instantiations
             .iter()
+            .chain(plans.iter())
             .map(|want| want.definition.clone())
             .collect();
         names.sort_unstable();
@@ -1574,6 +1613,7 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
     let boxed_type_arguments: Vec<String> = {
         let mut names: Vec<String> = instantiations
             .iter()
+            .chain(plans.iter())
             .flat_map(|want| want.arguments.iter())
             .map(monomorphize::primitive_display_name)
             .filter(|name| !name.is_empty())
@@ -1620,7 +1660,7 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
                 type_offset: None,
             },
         ];
-        let lowering = monomorphize::monomorphize(
+        let lowering = monomorphize::monomorphize_with_reference_plans(
             &mut module,
             program,
             LAZY_PROGRAM_ASM,
@@ -1629,6 +1669,7 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
             &resolution.field_index,
             flash_cil,
             &instantiations,
+            plans,
         );
         materialize_copied_corlib_definitions(
             &mut module,
@@ -3087,15 +3128,21 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
         .map(|(program, _)| program)
 }
 
-/// [`load_with_corlib_unfrozen`] with the program's closed generic instantiations MONOMORPHIZED:
-/// each one becomes its own type identity, and the call sites that reach it bind to members of that
-/// identity instead of leaving the `UnloweredGeneric` mark the bake refuses on.
+/// [`load_with_corlib_unfrozen`] with a GIVEN set of the program's closed generic instantiations
+/// MONOMORPHIZED: each one becomes its own type identity, and the call sites that reach it bind to
+/// members of that identity instead of leaving the `UnloweredGeneric` mark the bake refuses on.
 ///
 /// **THE SET IS A PARAMETER, AND SO IS EACH INSTANTIATION'S CANONICAL NAME.** This crate
 /// collects nothing and spells nothing: both already exist in the AOT tier, and a second collector
 /// or a second spelling would be a source of drift rather than a second opinion. See
-/// [`monomorphize`] for the whole argument. Passing an EMPTY set is exactly what every other
-/// `load_with_corlib*` entry point does, which is why they still refuse a generic program.
+/// [`monomorphize`] for the whole argument. The other `load_with_corlib*` entry points pass the set
+/// [`monomorphize::collect_instantiations`] answers; an EMPTY set here leaves every call site that
+/// reaches one of the program's instantiations marked, which is the state the bake refuses by name.
+///
+/// The corlib's own PLAN -- what its code names for itself, [`monomorphize::collect_reference_plans`]
+/// -- is lowered beside the set whatever the set is, because the module holds that code.
+/// [`monomorphize::Lowering::types`] answers for the given set alone and
+/// [`monomorphize::Lowering::reference_types`] for the plan.
 ///
 /// Returns the loaded program together with what the pass lowered and REFUSED. A refusal leaves its
 /// call sites marked, so `Module::validate_profile` still reports them and the bake still stops.
@@ -3167,8 +3214,9 @@ fn library_load_order(libraries: &[SourceAssembly<'_>]) -> Result<Vec<usize>, Lo
     Ok(order)
 }
 
-/// The one loading core. `instantiations` are the PROGRAM's closed generic instantiations; an empty
-/// slice is the ordinary (non-monomorphizing) load.
+/// The one loading core. `instantiations` are the PROGRAM's closed generic instantiations; the
+/// references' own plans are collected and lowered beside them here, so an empty slice still lowers
+/// what the corlib and the libraries name for themselves.
 ///
 /// # Errors
 /// As [`load_with_corlib_and_libraries`].
@@ -3270,7 +3318,16 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
             type_offset: Some(program_type_offset),
         }]
     };
-    let lowering = monomorphize::monomorphize(
+    #[cfg(feature = "generics")]
+    let plans = {
+        let mut references: Vec<Assembly<'_>> = Vec::with_capacity(1 + libraries.len());
+        references.push(corlib.clone());
+        references.extend(libraries.iter().cloned());
+        monomorphize::collect_reference_plans(program, &references)
+    };
+    #[cfg(not(feature = "generics"))]
+    let plans: Vec<monomorphize::Instantiation> = Vec::new();
+    let lowering = monomorphize::monomorphize_with_reference_plans(
         &mut module,
         program,
         program_asm,
@@ -3279,6 +3336,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         &field_index,
         flash_cil,
         instantiations,
+        plans,
     );
     relink_generic_base_heirs(&mut module, &heirs, &lowering);
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
@@ -6636,11 +6694,7 @@ fn generic_base_of(
 ) -> Option<TypeId> {
     let signature = heir.assembly.type_spec_signature(extends)?;
     let name = lamella_generics::spell_sig(&heir.assembly, &signature)?;
-    lowering
-        .types
-        .iter()
-        .find(|(emitted, _)| *emitted == name)
-        .map(|(_, type_id)| *type_id)
+    lowering.type_named(&name)
 }
 
 /// The capability-off answer: nothing was monomorphized, so no `TypeSpec` base has an identity to

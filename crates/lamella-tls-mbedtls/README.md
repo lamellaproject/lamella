@@ -20,11 +20,28 @@ AES-GCM + SHA-2, P-256/P-384, no filesystem). Certificate validity windows are c
 the wall clock the embedder registers with `set_time_source`. `csrc/lamella_tls_shim.c`
 wraps the library in a handle-based opaque-pointer API so the Rust side needs no bindgen.
 
+## Client certificates
+
+A client configuration can carry an identity (`client_config_identity`): a certificate chain, leaf
+first, and the leaf's private key, each as PEM or DER, with the key in PKCS#8, PKCS#1 or SEC1. The
+client presents it when a server asks for a certificate, which is how cloud IoT services
+authenticate their X.509 devices. The engine checks that the key belongs to the leaf before it
+stores the configuration, so a mismatched pair is refused by name rather than at the server. An
+encrypted key is not read.
+
+The mbedTLS pool is 48 KiB on a device (`DEVICE_POOL_BYTES`). `pool_peak_bytes` reports the most it
+has held since `reset_pool_peak`. On a host build of this engine, the heaviest mutual handshake
+measured, an RSA-2048 client certificate to a server with an RSA chain, peaks at about 40 KiB. That
+figure is from a host, whose 64-bit pointers and sizes make mbedTLS's structures larger than a
+board's.
+
 ## Toolchain
 
 Bare-metal targets need an ARM cross C compiler: `LAMELLA_ARM_GCC`, else
-`arm-none-eabi-gcc` on PATH, else the MSYS2 default location
-(`pacman -S mingw-w64-ucrt-x86_64-arm-none-eabi-gcc mingw-w64-ucrt-x86_64-arm-none-eabi-newlib`).
+`arm-none-eabi-gcc` on PATH. MSYS2 packages one
+(`pacman -S mingw-w64-ucrt-x86_64-arm-none-eabi-gcc mingw-w64-ucrt-x86_64-arm-none-eabi-newlib`),
+but the build does not look in MSYS2's directory itself: point `LAMELLA_ARM_GCC` at it, or put its
+`bin` directory on PATH.
 Host builds (the seam conformance tests) use the platform C compiler.
 
 ## Embedder contract

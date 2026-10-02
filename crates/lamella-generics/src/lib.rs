@@ -749,10 +749,14 @@ pub enum Refusal {
 
 /// A program and the assemblies its definitions live in.
 ///
-/// Index 0 is the program: it is where roots come from. Every assembly in the slice, the program
-/// included, supplies DEFINITIONS the closure walks into. A definition in an assembly outside the
-/// slice is still named -- a `TypeRef` carries its own name, so the spelling never needs the
-/// defining assembly -- but its own instantiations are not discovered.
+/// Index 0 is the program; the rest are its references. Every assembly in the slice, the program
+/// included, supplies DEFINITIONS the closure walks into. Where the walk's ROOTS come from depends
+/// on what the caller is asking for: [`Self::instantiations`] roots in every assembly at once,
+/// [`Self::instantiations_from_program`] in the program alone -- what the program reaches -- and
+/// [`Self::instantiations_from_references_deriving`] in the references alone -- the plan their own
+/// code brings. A definition in an assembly outside the slice is still named -- a `TypeRef` carries
+/// its own name, so the spelling never needs the defining assembly -- but its own instantiations
+/// are not discovered.
 pub struct Program<'a> {
     assemblies: &'a [Assembly<'a>],
     /// Full name -> (assembly index, TypeDef row). Built once; a definition is looked up by NAME
@@ -812,9 +816,65 @@ impl<'a> Program<'a> {
         Some(self.assemblies[index].type_def(row)?.is_interface())
     }
 
-    /// The closed instantiation set, in discovery order, or the refusal that stopped it.
+    /// The closed instantiation set, in discovery order, or the refusal that stopped it. It is
+    /// rooted in the rows of EVERY assembly in the set, so it includes what a reference's own code
+    /// names.
     pub fn instantiations(&self) -> Result<Vec<Instantiation>, Refusal> {
         self.instantiations_deriving(&|_| Vec::new())
+    }
+
+    /// The closed instantiation set the PROGRAM reaches, in discovery order, or the refusal that
+    /// stopped it. It is rooted in the program's own rows alone, and closed through the
+    /// definitions of every assembly in the set.
+    ///
+    /// It is for a tier that builds each assembly on its own. A reference's own methods are built
+    /// with that reference, whose build plans what they name, so an instantiation that only a
+    /// reference's own code names is not the program's to build. [`Self::instantiations`] would
+    /// hand every program each closed instantiation its class library names anywhere, whether the
+    /// program reaches it or not.
+    ///
+    /// What the program reaches THROUGH a reference is still here: a generic definition declared
+    /// there is walked under the program's arguments, so an instantiation its body names joins the
+    /// set. A program that writes `List<int>` also gets the enumerator `List<int>.GetEnumerator`
+    /// creates, though no row of the program spells it.
+    pub fn instantiations_from_program(&self) -> Result<Vec<Instantiation>, Refusal> {
+        self.instantiations_from_program_deriving(&|_| Vec::new())
+    }
+
+    /// [`Self::instantiations_from_program`], widened by what a consumer DERIVES from it, as
+    /// [`Self::instantiations_deriving`] widens [`Self::instantiations`].
+    ///
+    /// It is the program's own set for a tier that runs the references' code in the program's
+    /// module. What that code names is lowered there too, but as each reference's own PLAN
+    /// ([`Self::instantiations_from_references_deriving`]), so this set holds what the program
+    /// reaches and nothing a reference's methods name for themselves.
+    pub fn instantiations_from_program_deriving(
+        &self,
+        derive: &dyn Fn(&Instantiation) -> Vec<TypeArg>,
+    ) -> Result<Vec<Instantiation>, Refusal> {
+        let program = self.assemblies.get(..1).unwrap_or_default();
+        self.close(self.roots_in(program)?, derive)
+    }
+
+    /// The closed instantiation set the REFERENCES' own rows reach, in discovery order, widened by
+    /// `derive`, or the refusal that stopped it: the PLAN each reference brings with its code.
+    ///
+    /// It is for a tier that holds a reference's code beside the program's. Every method the
+    /// module holds can run, so every instantiation its body names has to exist there, whether or
+    /// not the program names it: a library method that builds a `Span<byte>` internally is called
+    /// by a program whose own rows never spell `Span<byte>`. That set belongs to the reference --
+    /// it is what a tier that builds each assembly on its own plans with that assembly -- so it is
+    /// kept apart from the program's.
+    ///
+    /// Its union with [`Self::instantiations_from_program_deriving`] is the set
+    /// [`Self::instantiations_deriving`] answers for the same deriver: the two root sets split that
+    /// walk's roots between them. Each is closed, and checked for handle collisions, on its own.
+    pub fn instantiations_from_references_deriving(
+        &self,
+        derive: &dyn Fn(&Instantiation) -> Vec<TypeArg>,
+    ) -> Result<Vec<Instantiation>, Refusal> {
+        let references = self.assemblies.get(1..).unwrap_or_default();
+        self.close(self.roots_in(references)?, derive)
     }
 
     /// [`Self::instantiations`], widened by what a consumer DERIVES from it: every instantiation the
@@ -831,13 +891,23 @@ impl<'a> Program<'a> {
     /// ONE WALK, NOT TWO: the derived roots are visited by the same [`Walk`] after the named ones, as
     /// a worklist over what it has found so far, so a derived root's own finds are offered to
     /// `derive` in turn, and a rule the walk learns reaches both. With a deriver that answers
-    /// nothing, the loop below visits nothing, and this is exactly [`Self::instantiations`], which
-    /// is how it is called.
+    /// nothing, the derived-root loop visits nothing, and this is exactly [`Self::instantiations`],
+    /// which is how it is called.
     ///
     /// `derive` answers CLOSED types. The walk passes over an open one without a word, which for a
     /// derived root would be the very miss this exists to remove, so a debug build asserts it.
     pub fn instantiations_deriving(
         &self,
+        derive: &dyn Fn(&Instantiation) -> Vec<TypeArg>,
+    ) -> Result<Vec<Instantiation>, Refusal> {
+        self.close(self.roots_in(self.assemblies)?, derive)
+    }
+
+    /// The closure of `roots`, widened by `derive`, with its handle-collision check: the one walk
+    /// behind both root sets.
+    fn close(
+        &self,
+        roots: Vec<TypeArg>,
         derive: &dyn Fn(&Instantiation) -> Vec<TypeArg>,
     ) -> Result<Vec<Instantiation>, Refusal> {
         let mut walk = Walk {
@@ -846,7 +916,7 @@ impl<'a> Program<'a> {
             found: Vec::new(),
         };
         let mut path = Vec::new();
-        for root in self.roots()? {
+        for root in roots {
             walk.visit(&root, &mut path)?;
         }
         let mut next = 0;
@@ -872,17 +942,17 @@ impl<'a> Program<'a> {
         Ok(walk.found)
     }
 
-    /// Every closed instantiation ANY assembly in the set names directly: its `TypeSpec` rows, the
-    /// type arguments of its `MethodSpec` rows, and the field and method signatures of its own
-    /// types.
+    /// Every closed instantiation the given assemblies name directly: their `TypeSpec` rows, the
+    /// type arguments of their `MethodSpec` rows, the field and method signatures of their own
+    /// types, their `MemberRef` signatures and their local-variable signatures.
     ///
     /// Open ones are skipped here rather than refused: `List<!0>` inside a generic definition is
     /// not a root, it is an EDGE from that definition's own instantiations, and the closure walk is
     /// what closes it.
     ///
-    fn roots(&self) -> Result<Vec<TypeArg>, Refusal> {
+    fn roots_in(&self, assemblies: &[Assembly<'a>]) -> Result<Vec<TypeArg>, Refusal> {
         let mut roots = Vec::new();
-        for assembly in self.assemblies {
+        for assembly in assemblies {
             let tables = assembly.tables();
             for index in 1..=tables.row_count(table::TYPE_SPEC) {
                 let token = Token::new(table::TYPE_SPEC, index);
@@ -1808,22 +1878,18 @@ impl MonoPlan {
         Self::for_assembly_with_references(assembly, &[], first_index)
     }
 
-    /// [`for_assembly`](Self::for_assembly), with the REFERENCES available so an instantiation of a
-    /// definition declared next door can be planned too.
-    ///
-    /// **AN EMPTY REFERENCE LIST REPRODUCES `for_assembly` EXACTLY, AND THAT IS THE SAFETY
-    /// PROPERTY.** A `TypeRef` definition cannot resolve against no references, so every
-    /// instantiation whose definition is imported is declined by the same path as before -- which
-    /// is why the existing callers can keep calling `for_assembly` and emit byte-identical images
-    /// while this grows underneath them.
-    ///
-    /// **PLANNING A CROSS-ASSEMBLY BODY IS NOT THE SAME AS BEING ABLE TO EMIT ONE.** The
-    /// definition's CIL is in the OWNER's token space: every field, call and string literal in it
-    /// is an owner token, while the emitted body lands in the CALLER's function table. A consumer
-    /// that lowers one of these bodies with a resolver over the CALLER produces a body that links,
-    /// boots and answers wrong. [`MonoBody::owner`] is what a consumer must read before it lowers,
+    /// A full dotted name split the way [`Assembly::find_type`] wants it -- everything before the
+    /// last `.` is the namespace, the remainder is the simple name, and a name with no `.` is in the
+    /// global namespace. The inverse of the join `type_def_full_name` performs.
+    fn split_full_name(full: &str) -> (&str, &str) {
+        full.rsplit_once('.').unwrap_or(("", full))
+    }
+
     /// Plans the instantiations the CLOSURE finds that this module's own `TypeSpec` table does not
     /// name -- the transitive half of the type axis.
+    ///
+    /// The closure is rooted in this module alone ([`Program::instantiations_from_program`]): the
+    /// references supply the definitions it walks into, never roots of their own.
     ///
     /// The arguments are carried on the body rather than decoded from a row, because there is no row:
     /// the walk resolves them by NAME and [`type_arg_to_sig`] turns that back into a signature the
@@ -1832,13 +1898,6 @@ impl MonoPlan {
     /// **AN INSTANTIATION WHOSE ARGUMENTS CANNOT BE EXPRESSED IS SKIPPED, NOT GUESSED AT.** The call
     /// site then stays exactly as refused as it is today, which is the direction that cannot put a
     /// wrong type in an image.
-    /// A full dotted name split the way [`Assembly::find_type`] wants it -- everything before the
-    /// last `.` is the namespace, the remainder is the simple name, and a name with no `.` is in the
-    /// global namespace. The inverse of the join `type_def_full_name` performs.
-    fn split_full_name(full: &str) -> (&str, &str) {
-        full.rsplit_once('.').unwrap_or(("", full))
-    }
-
     fn extend_with_closure<'a>(
         assembly: &Assembly<'a>,
         references: &[&Assembly<'a>],
@@ -1850,7 +1909,7 @@ impl MonoPlan {
         assemblies.push(*assembly);
         assemblies.extend(references.iter().map(|reference| **reference));
         let walk = Program::new(&assemblies);
-        let Ok(closed) = walk.instantiations() else {
+        let Ok(closed) = walk.instantiations_from_program() else {
             return Ok(());
         };
         let mut tokens: BTreeMap<String, Token> = BTreeMap::new();
@@ -1921,7 +1980,25 @@ impl MonoPlan {
         Ok(())
     }
 
-    /// and no shipping build path passes references here yet.
+    /// [`for_assembly`](Self::for_assembly), with the REFERENCES available so an instantiation of a
+    /// definition declared next door can be planned too.
+    ///
+    /// **AN EMPTY REFERENCE LIST REPRODUCES `for_assembly` EXACTLY, AND THAT IS THE SAFETY
+    /// PROPERTY.** A `TypeRef` definition cannot resolve against no references, so every
+    /// instantiation whose definition is imported is declined by the same path as before -- which
+    /// is why the existing callers can keep calling `for_assembly` and emit byte-identical images
+    /// while this grows underneath them.
+    ///
+    /// **PLANNING A CROSS-ASSEMBLY BODY IS NOT THE SAME AS BEING ABLE TO EMIT ONE.** The
+    /// definition's CIL is in the OWNER's token space: every field, call and string literal in it
+    /// is an owner token, while the emitted body lands in the CALLER's function table. A consumer
+    /// that lowers one of these bodies with a resolver over the CALLER produces a body that links,
+    /// boots and answers wrong. [`MonoBody::owner`] is what a consumer must read before it lowers.
+    ///
+    /// **THE REFERENCES SUPPLY DEFINITIONS, NOT ROOTS.** Every instantiation planned is one the
+    /// assembly being built reaches: one its own rows name, or one named, under its arguments, by
+    /// the body of a definition it instantiates. A reference's own methods are built with that
+    /// reference, so an instantiation only they name is that build's to plan, not this one's.
     pub fn for_assembly_with_references<'a>(
         assembly: &Assembly<'a>,
         references: &[&Assembly<'a>],

@@ -94,7 +94,8 @@ namespace Lamella.Hardware
             if ((object)factory == null) throw new System.ArgumentNullException("factory");
             if ((object)_gpioFactory != null)
             {
-                throw new System.InvalidOperationException("a GPIO driver is already bound");
+                throw new System.InvalidOperationException(
+                    "a GPIO driver is already bound, by the board's class or an earlier bind");
             }
             _gpioFactory = factory;
         }
@@ -165,7 +166,7 @@ namespace Lamella.Hardware
             CheckBusId(busId);
             if ((object)_spiDrivers[busId] != null) return _spiDrivers[busId];
             SpiDriverFactory factory = _spiFactories[busId];
-            if ((object)factory == null) throw NotBound("SPI", "bus", busId);
+            if ((object)factory == null) throw NotBound("SPI", "bus", "buses", busId, _spiFactories);
             SpiDriver created = factory();
             if ((object)created == null) throw FactoryReturnedNull("SPI", "bus", busId);
             _spiDrivers[busId] = created;
@@ -183,7 +184,7 @@ namespace Lamella.Hardware
             CheckBusId(busId);
             if ((object)_i2cDrivers[busId] != null) return _i2cDrivers[busId];
             I2cDriverFactory factory = _i2cFactories[busId];
-            if ((object)factory == null) throw NotBound("I2C", "bus", busId);
+            if ((object)factory == null) throw NotBound("I2C", "bus", "buses", busId, _i2cFactories);
             I2cDriver created = factory();
             if ((object)created == null) throw FactoryReturnedNull("I2C", "bus", busId);
             created.Configure(_i2cRates[busId]);
@@ -201,7 +202,9 @@ namespace Lamella.Hardware
             if ((object)_gpioFactory == null)
             {
                 throw new System.InvalidOperationException(
-                    "no GPIO driver is bound; the board must call Lamella.Hardware.Buses.BindGpio at startup");
+                    "no GPIO driver is bound" + (AnythingBound()
+                        ? "; this board binds no GPIO controller"
+                        : NothingBound));
             }
             GpioDriver created = _gpioFactory();
             if ((object)created == null)
@@ -220,7 +223,7 @@ namespace Lamella.Hardware
         {
             CheckChip(chip);
             PwmChannelFactory factory = _pwmFactories[chip];
-            if ((object)factory == null) throw NotBound("PWM", "chip", chip);
+            if ((object)factory == null) throw NotBound("PWM", "chip", "chips", chip, _pwmFactories);
             System.Device.Pwm.PwmChannel created = factory(channel, frequency, dutyCyclePercentage);
             if ((object)created == null) throw FactoryReturnedNull("PWM", "chip", chip);
             return created;
@@ -243,11 +246,58 @@ namespace Lamella.Hardware
             }
         }
 
-        private static System.Exception NotBound(string kind, string unit, int id)
+        private static System.Exception NotBound(string kind, string unit, string units, int id, object[] table)
         {
-            return new System.InvalidOperationException(
-                "no " + kind + " driver is bound for " + unit + " " + id.ToString()
-                + "; the board must bind it at startup");
+            string message = "no " + kind + " driver is bound for " + unit + " " + id.ToString();
+            string listed = null;
+            int count = 0;
+            for (int candidate = 0; candidate < table.Length; candidate++)
+            {
+                if (table[candidate] == null) continue;
+                listed = count == 0 ? candidate.ToString() : listed + ", " + candidate.ToString();
+                count++;
+            }
+            if (count == 1)
+            {
+                message += "; this board binds " + kind + " " + unit + " " + listed;
+                if (kind == "I2C" && id == 1)
+                {
+                    message += ", and a Raspberry Pi's header bus 1 is bus " + listed + " here";
+                }
+            }
+            else if (count > 1)
+            {
+                message += "; this board binds " + kind + " " + units + " " + listed;
+            }
+            else if (AnythingBound())
+            {
+                message += "; this board binds no " + kind + " " + unit;
+            }
+            else
+            {
+                message += NothingBound;
+            }
+            return new System.InvalidOperationException(message);
+        }
+
+        private const string NothingBound =
+            ", and no bus is bound at all: add your board's class to the program"
+            + " (Lamella.Boards.RaspberryPi.Pico2 for a Raspberry Pi Pico 2). Where the firmware"
+            + " does not initialize it before Main, construct it before opening a bus";
+
+        /// <summary>Whether anything at all is bound, which separates a board that has no bus of
+        /// one kind from a program that no board has armed.</summary>
+        private static bool AnythingBound()
+        {
+            if ((object)_gpioFactory != null) return true;
+            for (int index = 0; index < BusCount; index++)
+            {
+                if ((object)_spiFactories[index] != null || (object)_i2cFactories[index] != null) return true;
+#if LAMELLA_SURFACE_FLOAT
+                if ((object)_pwmFactories[index] != null) return true;
+#endif
+            }
+            return false;
         }
 
         private static System.Exception FactoryReturnedNull(string kind, string unit, int id)
@@ -259,7 +309,8 @@ namespace Lamella.Hardware
         private static System.Exception AlreadyBound(string kind, string unit, int id)
         {
             return new System.InvalidOperationException(
-                "a " + kind + " driver is already bound for " + unit + " " + id.ToString());
+                kind + " " + unit + " " + id.ToString() + " is already bound, by the board's class or"
+                + " an earlier bind");
         }
     }
 }

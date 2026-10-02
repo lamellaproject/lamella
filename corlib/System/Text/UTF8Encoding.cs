@@ -16,25 +16,26 @@ namespace System.Text
             return 4;
         }
 
+        private static int ScalarAt(string s, int i)
+        {
+            int c = s[i];
+            if (IsHighSurrogate(c) && i + 1 < s.Length && IsLowSurrogate(s[i + 1]))
+            {
+                return 0x10000 + ((c - 0xD800) << 10) + (s[i + 1] - 0xDC00);
+            }
+            if (IsHighSurrogate(c) || IsLowSurrogate(c)) return 0xFFFD;
+            return c;
+        }
+
         public override int GetByteCount(string s)
         {
             int count = 0;
             int i = 0;
-            int n = s.Length;
-            while (i < n)
+            while (i < s.Length)
             {
-                int c = s[i];
-                if (IsHighSurrogate(c) && i + 1 < n && IsLowSurrogate(s[i + 1]))
-                {
-                    int cp = 0x10000 + ((c - 0xD800) << 10) + (s[i + 1] - 0xDC00);
-                    count = count + BytesForScalar(cp);
-                    i = i + 2;
-                }
-                else
-                {
-                    count = count + BytesForScalar(c);
-                    i = i + 1;
-                }
+                int scalar = ScalarAt(s, i);
+                count = count + BytesForScalar(scalar);
+                i = i + (scalar >= 0x10000 ? 2 : 1);
             }
             return count;
         }
@@ -44,21 +45,10 @@ namespace System.Text
             byte[] bytes = new byte[GetByteCount(s)];
             int pos = 0;
             int i = 0;
-            int n = s.Length;
-            while (i < n)
+            while (i < s.Length)
             {
-                int cp;
-                int c = s[i];
-                if (IsHighSurrogate(c) && i + 1 < n && IsLowSurrogate(s[i + 1]))
-                {
-                    cp = 0x10000 + ((c - 0xD800) << 10) + (s[i + 1] - 0xDC00);
-                    i = i + 2;
-                }
-                else
-                {
-                    cp = c;
-                    i = i + 1;
-                }
+                int cp = ScalarAt(s, i);
+                i = i + (cp >= 0x10000 ? 2 : 1);
                 if (cp < 0x80)
                 {
                     bytes[pos] = (byte)cp;
@@ -89,51 +79,94 @@ namespace System.Text
             return bytes;
         }
 
-        public override string GetString(byte[] bytes)
+        /// <summary>Decodes a range of UTF-8 bytes into a string. A byte sequence that is not well-formed
+        /// UTF-8 decodes to U+FFFD, one for each maximal ill-formed subpart.</summary>
+        /// <param name="bytes">The array holding the bytes to decode.</param>
+        /// <param name="index">The position of the first byte to decode.</param>
+        /// <param name="count">How many bytes to decode.</param>
+        /// <returns>The decoded text.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="bytes"/> is null.</exception>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> or
+        /// <paramref name="count"/> is negative, or the range does not lie within
+        /// <paramref name="bytes"/>.</exception>
+        public override string GetString(byte[] bytes, int index, int count)
         {
-            StringBuilder result = new StringBuilder();
-            int i = 0;
-            int n = bytes.Length;
-            while (i < n)
+            if (bytes == null) throw new ArgumentNullException("bytes", "Array cannot be null.");
+            if (index < 0) throw new ArgumentOutOfRangeException("index", "Non-negative number required.");
+            if (count < 0) throw new ArgumentOutOfRangeException("count", "Non-negative number required.");
+            RequireRangeWithin(bytes, index, count);
+
+            StringBuilder result = new StringBuilder(count);
+            int end = index + count;
+            int i = index;
+            while (i < end)
             {
-                int b0 = bytes[i];
-                int cp;
-                if (b0 < 0x80)
+                int lead = bytes[i];
+                if (lead < 0x80)
                 {
-                    cp = b0;
+                    result.Append((char)lead);
                     i = i + 1;
+                    continue;
                 }
-                else if (b0 < 0xE0)
+
+                int length;
+                int scalar;
+                int low = 0x80;
+                int high = 0xBF;
+                if (lead >= 0xC2 && lead <= 0xDF)
                 {
-                    cp = ((b0 & 0x1F) << 6) | (bytes[i + 1] & 0x3F);
-                    i = i + 2;
+                    length = 2;
+                    scalar = lead & 0x1F;
                 }
-                else if (b0 < 0xF0)
+                else if (lead >= 0xE0 && lead <= 0xEF)
                 {
-                    cp = ((b0 & 0x0F) << 12) | ((bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F);
-                    i = i + 3;
+                    length = 3;
+                    scalar = lead & 0x0F;
+                    if (lead == 0xE0) low = 0xA0;
+                    else if (lead == 0xED) high = 0x9F;
+                }
+                else if (lead >= 0xF0 && lead <= 0xF4)
+                {
+                    length = 4;
+                    scalar = lead & 0x07;
+                    if (lead == 0xF0) low = 0x90;
+                    else if (lead == 0xF4) high = 0x8F;
                 }
                 else
                 {
-                    cp = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3F) << 12)
-                        | ((bytes[i + 2] & 0x3F) << 6) | (bytes[i + 3] & 0x3F);
-                    i = i + 4;
+                    result.Append(ReplacementCharacter);
+                    i = i + 1;
+                    continue;
                 }
-                if (cp >= 0x10000)
+
+                int taken = 1;
+                while (taken < length && i + taken < end)
                 {
-                    int v = cp - 0x10000;
-                    char high = (char)(0xD800 + (v >> 10));
-                    char low = (char)(0xDC00 + (v & 0x3FF));
-                    result.Append(high);
-                    result.Append(low);
+                    int next = bytes[i + taken];
+                    if (next < low || next > high) break;
+                    scalar = (scalar << 6) | (next & 0x3F);
+                    taken = taken + 1;
+                    low = 0x80;
+                    high = 0xBF;
+                }
+                i = i + taken;
+                if (taken < length)
+                {
+                    result.Append(ReplacementCharacter);
+                }
+                else if (scalar >= 0x10000)
+                {
+                    int offset = scalar - 0x10000;
+                    result.Append((char)(0xD800 + (offset >> 10)));
+                    result.Append((char)(0xDC00 + (offset & 0x3FF)));
                 }
                 else
                 {
-                    char ch = (char)cp;
-                    result.Append(ch);
+                    result.Append((char)scalar);
                 }
             }
             return result.ToString();
         }
+
     }
 }

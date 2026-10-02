@@ -11,9 +11,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    AssignmentOperator, CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind,
-    SwitchLabel, SwitchSection, TypeRef, TypeRefKind, UnaryOperator, UsingResource,
-    VariableDeclarator,
+    AssignmentOperator, CatchClause, Expr, ExprKind, ForInitializer, Literal, Pattern, Stmt,
+    StmtKind, SwitchLabel, SwitchSection, TypeRef, TypeRefKind, TypeTestOperation, UnaryOperator,
+    UsingResource, VariableDeclarator,
 };
 use lamella_syntax::span::Span;
 
@@ -105,6 +105,10 @@ pub enum BoundStmtKind {
         expression: BoundExpr,
         /// The sections, in order.
         sections: Vec<BoundSwitchSection>,
+        /// For a switch holding a PATTERN label (C# 7.0), the unspeakable local the governing
+        /// value is spilled into, which every label's test reads by this name; `None` for a switch
+        /// of constants, whose labels compare against a temporary the emitter reserves.
+        subject: Option<Box<str>>,
     },
     /// A `try` statement (15.10).
     Try {
@@ -184,6 +188,21 @@ pub enum BoundSwitchLabel {
     CaseString(Box<[u16]>),
     /// `case null:` -- the null reference, matched against a `string` governing value.
     CaseNull,
+    /// A label of a PATTERN switch (C# 7.0): the governing value's `test` -- `None` for a pattern
+    /// that matches everything -- and the `when` guard, each a `bool`, run in that order. A
+    /// constant label in such a switch is one of these too, a constant pattern.
+    Pattern {
+        /// The pattern's test of the switch's subject.
+        test: Option<BoundExpr>,
+        /// The `when` guard.
+        guard: Option<BoundExpr>,
+        /// The label as a fall-through diagnostic quotes it.
+        text: Box<str>,
+        /// Whether the label matches EVERY value the switch can have -- unguarded `var x`, `var _`,
+        /// or a type pattern a value-type governing value always passes -- so that, like
+        /// `default`, it leaves no way past the switch.
+        catch_all: bool,
+    },
     /// `default:`.
     Default,
 }
@@ -202,6 +221,7 @@ fn switch_label_text(label: &BoundSwitchLabel) -> Box<str> {
             format!("case \"{}\":", String::from_utf16_lossy(text)).into()
         }
         BoundSwitchLabel::CaseNull => Box::from("case null:"),
+        BoundSwitchLabel::Pattern { text, .. } => text.clone(),
         BoundSwitchLabel::Default => Box::from("default:"),
     }
 }
@@ -309,7 +329,9 @@ impl Binder {
                 };
                 let bound =
                     self.with_csharp73_stackallocs(assigned, |binder| binder.bind_expression(expr));
-                if !is_statement_expression(&bound.kind) {
+                if !is_statement_expression(&bound.kind)
+                    && !matches!(expr.kind, ExprKind::Assignment { .. })
+                {
                     self.report(Diagnostic::new(
                         DiagnosticKind::IllegalStatementExpression,
                         expr.span,
@@ -478,7 +500,7 @@ impl Binder {
                 BoundStmtKind::Continue
             }
             StmtKind::Throw(value) => {
-                let bound = value.as_ref().map(|expr| self.bind_expression(expr));
+                let bound = value.as_ref().map(|expr| self.bind_thrown_value(expr));
                 if value.is_none() && !self.in_catch() {
                     self.report(Diagnostic::new(
                         DiagnosticKind::RethrowOutsideCatch,
@@ -489,6 +511,15 @@ impl Binder {
                     self.check_thrown_operand(operand, expr.span);
                 }
                 BoundStmtKind::Throw(bound)
+            }
+            StmtKind::Switch {
+                expression,
+                sections,
+            } if sections
+                .iter()
+                .any(|section| section.labels.iter().any(|label| matches!(label, SwitchLabel::Pattern { .. }))) =>
+            {
+                self.bind_pattern_switch(stmt.span, expression, sections)
             }
             StmtKind::Switch {
                 expression,
@@ -540,6 +571,7 @@ impl Binder {
                                 seen_null = true;
                                 None
                             }
+                            BoundSwitchLabel::Pattern { .. } => None,
                             BoundSwitchLabel::Default if seen_default => {
                                 Some(Box::<str>::from("default"))
                             }
@@ -551,6 +583,7 @@ impl Binder {
                         if let Some(text) = duplicate {
                             let span = match label {
                                 SwitchLabel::Case(expr) => expr.span,
+                                SwitchLabel::Pattern { span, .. } => *span,
                                 SwitchLabel::Default => section_anchor(section, switch_span),
                             };
                             self.report(Diagnostic::new(
@@ -584,6 +617,7 @@ impl Binder {
                 BoundStmtKind::Switch {
                     expression,
                     sections: bound_sections,
+                    subject: None,
                 }
             }
             StmtKind::Try {
@@ -685,6 +719,11 @@ impl Binder {
     fn bind_switch_label(&mut self, label: &SwitchLabel, governing: &TypeSymbol) -> BoundSwitchLabel {
         match label {
             SwitchLabel::Default => BoundSwitchLabel::Default,
+            SwitchLabel::Pattern { .. } => BoundSwitchLabel::Case(0),
+            SwitchLabel::Case(expr) if crate::bound::is_default_literal(expr) => {
+                self.report(Diagnostic::new(DiagnosticKind::DefaultLiteralPattern, expr.span));
+                BoundSwitchLabel::Case(0)
+            }
             SwitchLabel::Case(expr) => {
                 let bound = self.bind_expression(expr);
                 self.record_case_label_uses(&bound);
@@ -1515,6 +1554,9 @@ impl Binder {
                 let target_typed = self.bind_target_typed(expr, &declared);
                 self.set_local_initializer_target(outer);
                 if let Some(bound) = target_typed {
+                    if bound.ty.is_error() || !self.assignable(&bound, &declared) {
+                        self.exempt_local_from_unused(&declarator.name);
+                    }
                     return bound;
                 }
                 if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
@@ -1981,6 +2023,308 @@ impl Binder {
         bound
     }
 
+    /// A switch whose labels include a PATTERN (C# 7.0) -- `case Bme280 _:`, `case int n when n >
+    /// 0:`, `case 1 when ready:`. Every label is a TEST of the governing value, tried in source
+    /// order, with `default` taken only when none matches, wherever it is written. The governing
+    /// value may have any type, which is the point of the form: it is spilled into an unspeakable
+    /// local that each label's test reads, as a switch expression's is, and each section is its
+    /// own scope, where its labels' pattern variables live.
+    ///
+    /// A constant label of such a switch is a constant pattern, so `case 1:` beside `case int n:`
+    /// is the test `subject is 1`. A label an earlier UNGUARDED one already covers is csc's
+    /// CS8120.
+    fn bind_pattern_switch(
+        &mut self,
+        span: Span,
+        expression: &Expr,
+        sections: &[SwitchSection],
+    ) -> BoundStmtKind {
+        let switch_span = expression.span;
+        let governing = self.bind_expression(expression);
+        if !self.language_version().supports(Feature::PatternCaseLabel)
+            && !governing.ty.is_error()
+            && !self.is_switch_governing_type(&governing.ty)
+        {
+            self.report(Diagnostic::new(DiagnosticKind::SwitchGoverningType, switch_span));
+        }
+        let subject: Box<str> = format!("<switch>{}", span.start).into();
+        self.enter_scope_at(span);
+        self.declare_local(&subject, governing.ty.clone());
+        let subject_expr = Expr::new(
+            ExprKind::Name {
+                name: subject.clone(),
+                verbatim: false,
+            },
+            switch_span,
+        );
+        self.enter_switch();
+        let mut covered = PatternCoverage::default();
+        let mut seen_default = false;
+        let mut declared: Vec<(Box<str>, TypeSymbol)> = Vec::new();
+        let mut bound_sections = Vec::with_capacity(sections.len());
+        for (index, section) in sections.iter().enumerate() {
+            self.enter_scope();
+            let mut labels = Vec::with_capacity(section.labels.len());
+            for label in &section.labels {
+                let bound = match label {
+                    SwitchLabel::Default => {
+                        if seen_default {
+                            self.report(Diagnostic::new(
+                                DiagnosticKind::DuplicateCaseLabel {
+                                    label: Box::from("default"),
+                                },
+                                section_anchor(section, switch_span),
+                            ));
+                        }
+                        seen_default = true;
+                        BoundSwitchLabel::Default
+                    }
+                    SwitchLabel::Case(value) if crate::bound::is_default_literal(value) => {
+                        self.report(Diagnostic::new(DiagnosticKind::DefaultLiteralPattern, value.span));
+                        BoundSwitchLabel::Pattern {
+                            test: None,
+                            guard: None,
+                            text: Box::from("case default:"),
+                            catch_all: false,
+                        }
+                    }
+                    SwitchLabel::Case(value) => {
+                        let pattern = Pattern::Constant(Box::new(value.clone()));
+                        self.bind_pattern_label(&subject_expr, &governing.ty, &pattern, None, value.span, &mut covered, &mut declared)
+                    }
+                    SwitchLabel::Pattern {
+                        pattern,
+                        guard,
+                        span,
+                    } => self.bind_pattern_label(
+                        &subject_expr,
+                        &governing.ty,
+                        pattern,
+                        guard.as_ref(),
+                        *span,
+                        &mut covered,
+                        &mut declared,
+                    ),
+                };
+                labels.push(bound);
+            }
+            let statements: Vec<BoundStmt> = section
+                .statements
+                .iter()
+                .map(|statement| self.bind_statement(statement))
+                .collect();
+            if !statements.is_empty() && crate::flow::switch_section_completes(&statements) {
+                let label = labels
+                    .last()
+                    .map(switch_label_text)
+                    .unwrap_or_else(|| Box::from("default:"));
+                let kind = if index + 1 == sections.len() {
+                    DiagnosticKind::SwitchFallOutFinal { label }
+                } else {
+                    DiagnosticKind::SwitchFallThrough { label }
+                };
+                self.report(Diagnostic::new(kind, section_anchor(section, switch_span)));
+            }
+            self.exit_scope();
+            bound_sections.push(BoundSwitchSection { labels, statements });
+        }
+        self.exit_switch();
+        self.exit_scope();
+        BoundStmtKind::Switch {
+            expression: governing,
+            sections: bound_sections,
+            subject: Some(subject),
+        }
+    }
+
+    /// One label of a pattern switch: its test of the subject, bound as `subject is pattern` so it
+    /// is the `is` operator's own test, and its guard in the scope the test declared into.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_pattern_label(
+        &mut self,
+        subject: &Expr,
+        governing: &TypeSymbol,
+        pattern: &Pattern,
+        guard: Option<&Expr>,
+        span: Span,
+        covered: &mut PatternCoverage,
+        declared: &mut Vec<(Box<str>, TypeSymbol)>,
+    ) -> BoundSwitchLabel {
+        let unguarded = guard.is_none();
+        let (test, text, coverage) = match pattern {
+            Pattern::Discard(_) => (None, Box::from("case var _:"), Coverage::Everything),
+            Pattern::Declaration { ty, name, span: at } if self.is_implicitly_typed(ty) => {
+                self.declare_expression_variable(name, governing.clone(), *at);
+                self.report(Diagnostic::new(
+                    DiagnosticKind::FeatureNotInThisBuild {
+                        feature: "a var pattern that declares a variable".into(),
+                        permitted_by: self.language_version(),
+                        instead: Some(
+                            "Match everything with 'case var _:' and read the switch's value.".into(),
+                        ),
+                    },
+                    *at,
+                ));
+                let declares = BoundExpr {
+                    kind: BoundExprKind::TypeTest {
+                        operation: TypeTestOperation::Is,
+                        operand: Box::new(self.bind_expression(subject)),
+                        target: TypeSymbol::Error,
+                        declares: Some(name.clone()),
+                    },
+                    ty: TypeSymbol::Special(SpecialType::Boolean),
+                };
+                (Some(declares), format!("case var {name}:").into(), Coverage::Everything)
+            }
+            _ => {
+                let test = self.bind_expression(&Expr::new(
+                    ExprKind::TypeTest {
+                        operation: TypeTestOperation::Is,
+                        operand: Box::new(subject.clone()),
+                        target: pattern.clone(),
+                    },
+                    span,
+                ));
+                let coverage = match (&test.kind, pattern) {
+                    (BoundExprKind::TypeTest { target, .. }, _) if !target.is_error() => {
+                        Coverage::Type(target.clone())
+                    }
+                    (BoundExprKind::Binary { right, .. }, Pattern::Constant(_))
+                        if !right.ty.is_error() =>
+                    {
+                        Coverage::Constant(right.ty.clone(), self.constant_value(right))
+                    }
+                    _ => Coverage::Nothing,
+                };
+                let text: Box<str> = match (pattern, &coverage) {
+                    (Pattern::Type(_), Coverage::Type(ty)) => format!("case {ty} _:").into(),
+                    (Pattern::Declaration { name, span: at, .. }, Coverage::Type(ty)) => {
+                        let ty = ty.clone();
+                        self.check_pattern_variable(name, &ty, *at, declared);
+                        format!("case {ty} {name}:").into()
+                    }
+                    (_, Coverage::Constant(_, Some(Literal::Integer { value, .. }))) => {
+                        format!("case {value}:").into()
+                    }
+                    (_, Coverage::Constant(_, Some(Literal::String(units)))) => {
+                        format!("case \"{}\":", String::from_utf16_lossy(units)).into()
+                    }
+                    _ => Box::from("case:"),
+                };
+                (Some(test), text, coverage)
+            }
+        };
+        let coverage = match coverage {
+            Coverage::Type(tested)
+                if self.is_value_type(governing) && self.pattern_type_covers(&tested, governing) =>
+            {
+                Coverage::Everything
+            }
+            other => other,
+        };
+        if covered.covers(self, &coverage) {
+            self.report(Diagnostic::new(DiagnosticKind::SwitchCaseSubsumed, span));
+        }
+        let catch_all = unguarded && matches!(coverage, Coverage::Everything);
+        if unguarded {
+            covered.add(coverage);
+        }
+        let guard = guard.map(|guard| self.bind_condition(guard));
+        BoundSwitchLabel::Pattern {
+            test,
+            guard,
+            text,
+            catch_all,
+        }
+    }
+
+    /// Records a pattern variable's type for the reuse refusal [`Self::bind_pattern_switch`]
+    /// describes, and reports one declared again at a different type.
+    fn check_pattern_variable(
+        &mut self,
+        name: &str,
+        ty: &TypeSymbol,
+        span: Span,
+        declared: &mut Vec<(Box<str>, TypeSymbol)>,
+    ) {
+        match declared.iter().find(|(seen, _)| &**seen == name) {
+            Some((_, seen)) if seen != ty => {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::FeatureNotInThisBuild {
+                        feature: "a pattern variable named again at another type in one switch".into(),
+                        permitted_by: self.language_version(),
+                        instead: Some("Give the variable a different name in each section.".into()),
+                    },
+                    span,
+                ));
+            }
+            Some(_) => {}
+            None => declared.push((name.into(), ty.clone())),
+        }
+    }
+
+    /// Whether a value of type `tested` always matches a type pattern of type `covering`: the same
+    /// type, or one it reaches by a reference or a boxing conversion -- the conversions a run-time
+    /// type test performs. A numeric conversion does not count: an `int` is never a `long`.
+    pub(crate) fn pattern_type_covers(&self, covering: &TypeSymbol, tested: &TypeSymbol) -> bool {
+        if covering == tested {
+            return true;
+        }
+        if self.is_value_type(covering) {
+            return false;
+        }
+        crate::conversion::converts(self.model(), tested, covering)
+    }
+}
+
+/// What a pattern switch's label MATCHES, for csc's CS8120: every value, the non-null values of a
+/// type, one constant, or -- for a null test, or a test that did not bind -- nothing it can tell.
+enum Coverage {
+    Everything,
+    Type(TypeSymbol),
+    Constant(TypeSymbol, Option<Literal>),
+    Nothing,
+}
+
+/// What the UNGUARDED labels of a pattern switch have matched so far: a label they already cover
+/// can never run, which csc reports as CS8120.
+#[derive(Default)]
+struct PatternCoverage {
+    everything: bool,
+    types: Vec<TypeSymbol>,
+    constants: Vec<Literal>,
+}
+
+impl PatternCoverage {
+    fn covers(&self, binder: &Binder, coverage: &Coverage) -> bool {
+        if self.everything {
+            return true;
+        }
+        match coverage {
+            Coverage::Everything | Coverage::Nothing => false,
+            Coverage::Type(tested) => self
+                .types
+                .iter()
+                .any(|covering| binder.pattern_type_covers(covering, tested)),
+            Coverage::Constant(ty, constant) => {
+                !matches!(constant, Some(Literal::Null))
+                    && (self
+                        .types
+                        .iter()
+                        .any(|covering| binder.pattern_type_covers(covering, ty))
+                        || constant.as_ref().is_some_and(|value| self.constants.contains(value)))
+            }
+        }
+    }
+
+    fn add(&mut self, coverage: Coverage) {
+        match coverage {
+            Coverage::Everything => self.everything = true,
+            Coverage::Type(ty) => self.types.push(ty),
+            Coverage::Constant(_, Some(value)) => self.constants.push(value),
+            Coverage::Constant(_, None) | Coverage::Nothing => {}
+        }
+    }
 }
 
 /// A span to anchor a section-level diagnostic on: its first `case` constant, else
@@ -1991,6 +2335,7 @@ fn section_anchor(section: &SwitchSection, fallback: Span) -> Span {
         .iter()
         .find_map(|label| match label {
             SwitchLabel::Case(expr) => Some(expr.span),
+            SwitchLabel::Pattern { span, .. } => Some(*span),
             SwitchLabel::Default => None,
         })
         .or_else(|| section.statements.first().map(|statement| statement.span))

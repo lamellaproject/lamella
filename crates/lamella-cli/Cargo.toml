@@ -115,6 +115,13 @@ lamella-token = { path = "../lamella-token", optional = true }
 # which rides the debug session.
 lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 
+[dev-dependencies]
+# The deploy serve a board's firmware runs, driven in-process by the erase tests, so the exchange
+# is proven against the firmware's own code rather than against scripted answers. It is already a
+# dependency through lamella-wire-host, with the same features; under `bake` it carries
+# `baked-image`, which those tests need.
+lamella-runner = { path = "../lamella-runner" }
+
 [features]
 # Every code generator this tool carries, on by default.
 #

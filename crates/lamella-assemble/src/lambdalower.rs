@@ -942,12 +942,31 @@ impl Lowering<'_> {
             BoundStmtKind::Switch {
                 expression,
                 sections,
+                subject,
             } => BoundStmtKind::Switch {
                 expression: self.expression(expression),
+                subject: subject.clone(),
                 sections: sections
                     .iter()
                     .map(|section| lamella_binder::BoundSwitchSection {
-                        labels: section.labels.clone(),
+                        labels: section
+                            .labels
+                            .iter()
+                            .map(|label| match label {
+                                lamella_binder::BoundSwitchLabel::Pattern {
+                                    test,
+                                    guard,
+                                    text,
+                                    catch_all,
+                                } => lamella_binder::BoundSwitchLabel::Pattern {
+                                    test: test.as_ref().map(|test| self.expression(test)),
+                                    guard: guard.as_ref().map(|guard| self.expression(guard)),
+                                    text: text.clone(),
+                                    catch_all: *catch_all,
+                                },
+                                other => other.clone(),
+                            })
+                            .collect(),
                         statements: section
                             .statements
                             .iter()

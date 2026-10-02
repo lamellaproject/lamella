@@ -8,7 +8,11 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use lamella_elf::dispatch::{UNUSED_SLOT_TRAP, is_record};
 use lamella_elf::{Archive, Binding, Machine, Object, ParsedRelocation, SymbolType, arm, riscv};
+
+mod slots;
+use slots::{Slots, TableEntry};
 
 /// A reason linking failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,12 +365,27 @@ pub fn check_instantiation_cap(objects: &[Object], cap: usize) -> Result<(), Lin
 }
 
 /// Function-level `--gc-sections`: builds the cross-object reference graph from `entry` -- following each
-/// reached symbol's relocations, a function's calls AND a data symbol's references (e.g. a type
-/// descriptor's vtable entries and base pointer) -- keeps the reachable functions, reachable descriptors,
-/// and all other data, then rebuilds each object re-laid-out with its symbols and relocations remapped, so
-/// unused functions/descriptors and the undefined externs only they referenced drop out.
+/// reached symbol's relocations, a function's calls AND a data symbol's references (a type descriptor's
+/// base pointer, and the table entries a kept function dispatches through) -- keeps the reachable
+/// functions, reachable descriptors, and all other data, then rebuilds each object re-laid-out with its
+/// symbols and relocations remapped, so unused functions/descriptors and the undefined externs only they
+/// referenced drop out.
+///
+/// A kept descriptor keeps its layout whole. A table entry whose method no kept function dispatches
+/// through is pointed at [`UNUSED_SLOT_TRAP`], one shared function that faults, and the method it named
+/// drops with everything only it reached.
 pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
-    trim_all(objects, &reachable_from(objects, entry, &[], true))
+    trim_all(
+        objects,
+        &reachable_from(objects, entry, &[], TableEntries::Called),
+    )
+}
+
+/// The names [`garbage_collect`] keeps from `entry`: a method a kept function dispatches to through
+/// a table entry is in it, with everything that method calls, and a method a kept type merely lists
+/// in its tables is not.
+pub fn kept_names(objects: &[Object], entry: &str) -> BTreeSet<String> {
+    reachable_from(objects, entry, &[], TableEntries::Called)
 }
 
 /// The names [`garbage_collect`] keeps for a reason other than a vtable or itable slot: the same
@@ -375,33 +394,177 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
 /// vtable or itable slots.
 ///
 /// A method that only a slot keeps is absent here, and so is everything reached only through it:
-/// the methods it calls, and theirs. A kept type keeps its whole table, called or not, so the
-/// dead-strip cannot say whether the program ever dispatches to such a method. A name in this set
-/// is reached some other way: by a call, by code that takes its address (a delegate's target), or
-/// by data kept whole.
+/// the methods it calls, and theirs. A name in this set is reached some other way: by a call, by
+/// code that takes its address (a delegate's target), or by data kept whole.
 pub fn reachable_without_table_slots(objects: &[Object], entry: &str) -> BTreeSet<String> {
-    reachable_from(objects, entry, &[], false)
+    reachable_from(objects, entry, &[], TableEntries::Ignored)
+}
+
+/// Which of a kept descriptor's table entries a walk follows to the methods they name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableEntries {
+    /// The entries a kept function dispatches through (the `slots` module): the dead-strip's rule.
+    Called,
+    /// None of them.
+    Ignored,
 }
 
 /// Rebuilds every object against `keep`, EXCEPT the ones [`resolves_against_its_own_layout`] refuses
 /// to move, which are passed through whole.
+///
+/// Before the rebuild, a kept descriptor's table entry whose method no kept function dispatches
+/// through is pointed at [`UNUSED_SLOT_TRAP`]. The entry stays, so the table keeps its numbering, and
+/// the method drops unless something else keeps it. The trap's definition is added the first time an
+/// entry needs it, and a later trim keeps it through the entries that name it.
 fn trim_all(objects: &[Object], keep: &BTreeSet<String>) -> Vec<Object> {
+    let mut slots = Slots::new(objects);
+    for name in keep {
+        slots.keep_caller(name);
+    }
+    let functions = defined_functions(objects);
+    let mut needs_trap = false;
+    let mut trimmed: Vec<Object> = objects
+        .iter()
+        .map(|obj| {
+            let obj = retarget_unused_entries(obj, keep, &slots, &functions, &mut needs_trap);
+            match resolves_against_its_own_layout(&obj) {
+                true => obj,
+                false => trim_object(&obj, keep),
+            }
+        })
+        .collect();
+    if needs_trap
+        && !trimmed.iter().any(|obj| defines(obj, UNUSED_SLOT_TRAP))
+        && let Some(first) = objects.first()
+    {
+        trimmed.push(unused_slot_trap(first.machine));
+    }
+    trimmed
+}
+
+/// Every name some object defines as a function. A table entry is told apart from a descriptor's
+/// other words by its target being a function, and that is asked of the DEFINITION: a program's copy
+/// of a referenced type's descriptor names the owner's methods as undefined symbols, which carry no
+/// type.
+fn defined_functions(objects: &[Object]) -> BTreeSet<&str> {
     objects
         .iter()
-        .map(|obj| match resolves_against_its_own_layout(obj) {
-            true => obj.clone(),
-            false => trim_object(obj, keep),
-        })
+        .flat_map(|obj| &obj.symbols)
+        .filter(|s| s.defined && s.kind == SymbolType::Func && !s.name.is_empty())
+        .map(|s| s.name.as_str())
         .collect()
 }
 
-/// Whether any of `obj`'s code relocations names a target the trim CANNOT PUT BACK: one that is
-/// defined here and either has no name at all (a section symbol) or has no `st_size`.
+/// Whether `obj` defines `name`.
+fn defines(obj: &Object, name: &str) -> bool {
+    obj.symbols.iter().any(|s| s.defined && s.name == name)
+}
+
+/// `obj` with each table entry of a kept descriptor that no kept function dispatches through
+/// pointed at [`UNUSED_SLOT_TRAP`], setting `needs_trap` when it pointed one. An object that does
+/// not record its dispatches, or a link the analysis is off for, comes back unchanged.
+fn retarget_unused_entries(
+    obj: &Object,
+    keep: &BTreeSet<String>,
+    slots: &Slots<'_>,
+    functions: &BTreeSet<&str>,
+    needs_trap: &mut bool,
+) -> Object {
+    let mut rewritten = obj.clone();
+    if !slots.active() || !slots::records_dispatches(obj) {
+        return rewritten;
+    }
+    let mut trap_index = None;
+    for descriptor in obj
+        .symbols
+        .iter()
+        .filter(|s| s.defined && s.name.starts_with(TYPE_DESC_PREFIX) && keep.contains(&s.name))
+    {
+        let start = descriptor.value & !1;
+        let end = start + descriptor.size;
+        for r in rewritten
+            .relocations
+            .iter_mut()
+            .filter(|r| r.offset >= start && r.offset < end)
+        {
+            let Some(target) = obj.symbols.get(r.symbol as usize) else {
+                continue;
+            };
+            if !functions.contains(target.name.as_str())
+                || slots
+                    .follows(obj, &descriptor.name, r, &target.name)
+                    .is_ok()
+            {
+                continue;
+            }
+            r.symbol = *trap_index.get_or_insert_with(|| {
+                rewritten.symbols.push(lamella_elf::ParsedSymbol {
+                    name: String::from(UNUSED_SLOT_TRAP),
+                    value: 0,
+                    size: 0,
+                    binding: Binding::Global,
+                    kind: SymbolType::Func,
+                    defined: false,
+                    section: None,
+                    bss: false,
+                });
+                rewritten.symbols.len() as u32 - 1
+            });
+            *needs_trap = true;
+        }
+    }
+    rewritten
+}
+
+/// The object that defines [`UNUSED_SLOT_TRAP`] for `machine`: one instruction that faults with no
+/// debugger attached -- Thumb's `udf #0` on ARM, `ebreak` on RISC-V.
+fn unused_slot_trap(machine: Machine) -> Object {
+    let (text, value) = match machine {
+        Machine::Arm => (alloc::vec![0x00, 0xde], 1),
+        Machine::RiscV => (alloc::vec![0x73, 0x00, 0x10, 0x00], 0),
+    };
+    let size = text.len() as u32;
+    Object {
+        machine,
+        text,
+        text_align: 4,
+        symbols: alloc::vec![
+            lamella_elf::ParsedSymbol {
+                name: String::new(),
+                value: 0,
+                size: 0,
+                binding: Binding::Local,
+                kind: SymbolType::NoType,
+                defined: false,
+                section: None,
+                bss: false,
+            },
+            lamella_elf::ParsedSymbol {
+                name: String::from(UNUSED_SLOT_TRAP),
+                value,
+                size,
+                binding: Binding::Global,
+                kind: SymbolType::Func,
+                defined: true,
+                section: None,
+                bss: false,
+            },
+        ],
+        relocations: Vec::new(),
+        sections: Vec::new(),
+        bss_len: 0,
+        bss_align: 1,
+        input_sections: Vec::new(),
+    }
+}
+
+/// Whether any of `obj`'s code relocations names a target the trim CANNOT PUT BACK: one that
+/// addresses its section ([`needs_section`]) in a section this object does not record.
 ///
 /// **SUCH AN OBJECT IS KEPT WHOLE, BECAUSE A SYMBOL-GRANULARITY TRIM CANNOT RE-ADDRESS IT.**
-/// [`trim_object`] rebuilds an object by copying each kept symbol's `[st_value, st_value + st_size)`
-/// and re-pointing relocations AT THE SYMBOL BY NAME, so a target survives the move when it has a
-/// name to be found by and a size to be copied. Neither of these has both:
+/// [`trim_object`] rebuilds an object by copying spans and re-pointing relocations at the symbols
+/// they named, so a target survives the move when it has a size to be copied or a recorded section
+/// to be kept whole with. One with neither cannot move:
 ///
 ///   * a SECTION symbol carries no name, and its relocation's offset into the section rides in the
 ///     ADDEND -- which on ARM is IMPLICIT, i.e. the instruction's own immediate field, so there is
@@ -410,30 +573,149 @@ fn trim_all(objects: &[Object], keep: &BTreeSet<String>) -> Vec<Object> {
 ///   * a size-0 definition is dropped by the trim whatever reaches it (see [`trim_object`]).
 ///
 /// A real linker has the same limit and answers it the same way: `--gc-sections` works at SECTION
-/// granularity and never splits a section it cannot re-address.
+/// granularity and never splits a section it cannot re-address. [`retained_sections`] is that rule
+/// for an object whose sections are recorded -- every object read from a file -- so this whole-object
+/// fallback is left to one built in memory without them.
 ///
 /// **A NAMED, SIZED LOCAL IS NOT HERE, AND THE OMISSION IS DELIBERATE.** It moves correctly: the
 /// walk roots it (a relocation target's name is pushed whatever its binding), the trim keeps it, and
 /// the relocation is re-pointed at its new position with the addend still measured from the symbol's
-/// own base. Including it would keep whole every archive member carrying an internal label, for no
-/// gain.
-///
-/// The objects this selects are compiled ones that address their own literal pools this way; a
-/// symbol table the backend writes itself names and sizes every relocation target, so a program
-/// object and a corlib object are both unaffected.
+/// own base.
 fn resolves_against_its_own_layout(obj: &Object) -> bool {
+    let sections = sections_of_symbols(obj);
     obj.relocations.iter().any(|r| {
         obj.symbols
             .get(r.symbol as usize)
-            .is_some_and(|s| s.defined && (s.name.is_empty() || s.size == 0))
+            .is_some_and(needs_section)
+            && sections.get(r.symbol as usize).copied().flatten().is_none()
     })
+}
+
+/// Each symbol's input section in `obj`, by symbol index: `None` for a symbol in no merged
+/// read-only section -- undefined, `.bss`, a carried section's -- and for every symbol of an object
+/// built in memory, which records no sections.
+fn sections_of_symbols(obj: &Object) -> Vec<Option<usize>> {
+    let mut of = alloc::vec![None; obj.symbols.len()];
+    for (i, section) in obj.input_sections.iter().enumerate() {
+        for &symbol in &section.symbols {
+            if let Some(slot) = of.get_mut(symbol as usize) {
+                *slot = Some(i);
+            }
+        }
+    }
+    of
+}
+
+/// Where `s` starts in its object's text. An ARM function's value carries the Thumb bit, which
+/// names the instruction set rather than a byte; a data symbol's value is its byte, odd or not.
+fn symbol_offset(obj: &Object, s: &lamella_elf::ParsedSymbol) -> u32 {
+    match obj.machine == Machine::Arm && s.kind == SymbolType::Func {
+        true => s.value & !1,
+        false => s.value,
+    }
+}
+
+/// Whether a reference to `s` addresses its SECTION rather than a span the symbol owns: a symbol
+/// with no name (a section symbol, its offset into the section carried in the addend) or with no
+/// size (a label). A symbol-by-symbol trim cannot move either alone -- see [`retained_sections`].
+fn needs_section(s: &lamella_elf::ParsedSymbol) -> bool {
+    s.defined && !s.bss && s.section.is_none() && (s.name.is_empty() || s.size == 0)
+}
+
+/// The input sections of `obj` the trim keeps WHOLE, given the names `keep` holds.
+///
+/// A section is kept whole when something kept refers into it through a symbol that cannot be moved
+/// alone ([`needs_section`]): a kept span's relocation to a section symbol or to a label, or a kept
+/// global label inside it. A real linker's `--gc-sections` keeps the same unit. A section kept whole
+/// carries all of its relocations, so one of them can reach a further section the same way, and
+/// the set grows until nothing new is reached. A reference from code nothing keeps keeps nothing.
+///
+/// **A LOCAL LABEL KEEPS NOTHING BY ITS NAME.** `keep` holds names, and a local's name belongs to its
+/// own object alone: every ARM object marks its code and data with `$t` and `$d` mapping symbols, so
+/// one such name kept would keep every section, in every object, that carries one. A local can only
+/// be referred to from its own object, by a relocation, and the first rule follows that.
+fn retained_sections(
+    obj: &Object,
+    sections: &[Option<usize>],
+    keep: &BTreeSet<String>,
+) -> BTreeSet<usize> {
+    let mut retained: BTreeSet<usize> = BTreeSet::new();
+    let addresses_sections = obj.relocations.iter().any(|r| {
+        obj.symbols
+            .get(r.symbol as usize)
+            .is_some_and(needs_section)
+    });
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    for (i, s) in obj.symbols.iter().enumerate() {
+        if !s.defined || s.bss || s.section.is_some() || s.name.is_empty() {
+            continue;
+        }
+        match s.size {
+            0 => {
+                if s.binding != Binding::Local && keep.contains(&s.name) {
+                    retained.extend(sections[i]);
+                }
+            }
+            size => {
+                if addresses_sections
+                    && (keep.contains(&s.name) || kept_regardless(obj, sections, i))
+                {
+                    let start = symbol_offset(obj, s);
+                    spans.push((start, start + size));
+                }
+            }
+        }
+    }
+    if !addresses_sections {
+        return retained;
+    }
+    let spans = merged_spans(spans);
+    let in_span = |offset: u32| {
+        let after = spans.partition_point(|&(start, _)| start <= offset);
+        after > 0 && offset < spans[after - 1].1
+    };
+    loop {
+        let before = retained.len();
+        for r in &obj.relocations {
+            let from_kept = in_span(r.offset)
+                || retained.iter().any(|&i| {
+                    let section = &obj.input_sections[i];
+                    r.offset >= section.offset && r.offset < section.offset + section.size
+                });
+            if from_kept
+                && obj
+                    .symbols
+                    .get(r.symbol as usize)
+                    .is_some_and(needs_section)
+            {
+                retained.extend(sections.get(r.symbol as usize).copied().flatten());
+            }
+        }
+        if retained.len() == before {
+            return retained;
+        }
+    }
+}
+
+/// `spans` sorted and with every overlap merged, so no two returned spans share a byte.
+fn merged_spans(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    spans.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 /// The names [`garbage_collect`] keeps: everything the cross-object reference graph reaches from
 /// `entry` and from each of `optional_roots`, plus everything [`kept_regardless`] keeps without
-/// being reached. An optional root that no object defines reaches nothing. Without
-/// `through_table_slots`, the walk does not follow a type descriptor's references to functions,
-/// which is [`reachable_without_table_slots`].
+/// being reached. An optional root that no object defines reaches nothing. With
+/// [`TableEntries::Called`] a kept descriptor's table entry is followed only once a kept function
+/// dispatches through it (the `slots` module), and until then the walk sets it aside under its slot
+/// or tag for a caller kept later to bring in; with [`TableEntries::Ignored`] none is followed.
 ///
 /// **EXTRACTED SO THE FOLD PATH ASKS THE SAME QUESTION RATHER THAN ANSWERING IT AGAIN.**
 /// [`link_gc_inner`] needs the reachable set MINUS the functions ICF folds away, which it cannot get
@@ -445,7 +727,7 @@ fn reachable_from(
     objects: &[Object],
     entry: &str,
     optional_roots: &[&str],
-    through_table_slots: bool,
+    entries: TableEntries,
 ) -> BTreeSet<String> {
     let mut defs: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     for (oi, obj) in objects.iter().enumerate() {
@@ -464,9 +746,14 @@ fn reachable_from(
     let mut stack: Vec<String> = Vec::new();
     stack.push(String::from(entry));
     stack.extend(optional_roots.iter().map(|root| String::from(*root)));
-    for obj in objects {
-        for s in &obj.symbols {
-            if s.defined && s.size > 0 && !s.name.is_empty() && kept_regardless(s) {
+    let section_maps: Vec<Vec<Option<usize>>> = objects.iter().map(sections_of_symbols).collect();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, s) in obj.symbols.iter().enumerate() {
+            if s.defined
+                && s.size > 0
+                && !s.name.is_empty()
+                && kept_regardless(obj, &section_maps[oi], si)
+            {
                 stack.push(s.name.clone());
             }
         }
@@ -478,9 +765,24 @@ fn reachable_from(
             }
         }
     }
-    while let Some(name) = stack.pop() {
+    let mut slots = Slots::new(objects);
+    let mut set_aside: BTreeMap<TableEntry, Vec<(String, String)>> = BTreeMap::new();
+    let mut rooted: BTreeSet<(usize, usize)> = BTreeSet::new();
+    while let Some(name) = stack.pop().or_else(|| {
+        root_retained_sections(objects, &section_maps, &reachable, &mut rooted, &mut stack);
+        stack.pop()
+    }) {
         if !reachable.insert(name.clone()) {
             continue;
+        }
+        for key in slots.keep_caller(&name) {
+            for (descriptor, method) in set_aside.remove(&key).unwrap_or_default() {
+                if slots.live(&descriptor, key) {
+                    stack.push(method);
+                } else {
+                    set_aside.entry(key).or_default().push((descriptor, method));
+                }
+            }
         }
         let Some(sites) = defs.get(name.as_str()) else {
             continue;
@@ -488,14 +790,26 @@ fn reachable_from(
         for &(oi, si) in sites {
             let obj = &objects[oi];
             let sym = &obj.symbols[si];
-            let start = sym.value & !1;
+            if sym.bss || sym.section.is_some() {
+                continue;
+            }
+            let start = symbol_offset(obj, sym);
             let end = start + sym.size;
-            let skips_slots = !through_table_slots && sym.name.starts_with(TYPE_DESC_PREFIX);
+            let descriptor = sym.name.starts_with(TYPE_DESC_PREFIX);
             for r in &obj.relocations {
                 if r.offset >= start && r.offset < end {
                     if let Some(target) = obj.symbols.get(r.symbol as usize) {
-                        if skips_slots && is_function(&target.name) {
-                            continue;
+                        if descriptor && is_function(&target.name) {
+                            if entries == TableEntries::Ignored {
+                                continue;
+                            }
+                            if let Err(key) = slots.follows(obj, &sym.name, r, &target.name) {
+                                set_aside
+                                    .entry(key)
+                                    .or_default()
+                                    .push((sym.name.clone(), target.name.clone()));
+                                continue;
+                            }
                         }
                         stack.push(target.name.clone());
                     }
@@ -504,6 +818,54 @@ fn reachable_from(
         }
     }
     reachable
+}
+
+/// Pushes onto `stack` every name a section newly kept whole carries -- each global symbol in it, and
+/// each named target of a relocation in it, including those of the nameless pool entries between its
+/// symbols -- and records each such section in `rooted`, so it is rooted once. A section kept whole
+/// carries all of that into the image, so the walk has to follow it: the "keep and root are one set"
+/// rule [`kept_regardless`] states, at section granularity.
+///
+/// The section's own locals are not pushed. The trim keeps them with the section, every relocation
+/// in their bytes is followed here, and their names would only reach the locals of other objects that
+/// share them (see [`retained_sections`]).
+fn root_retained_sections(
+    objects: &[Object],
+    section_maps: &[Vec<Option<usize>>],
+    reachable: &BTreeSet<String>,
+    rooted: &mut BTreeSet<(usize, usize)>,
+    stack: &mut Vec<String>,
+) {
+    for (oi, obj) in objects.iter().enumerate() {
+        for section in retained_sections(obj, &section_maps[oi], reachable) {
+            if !rooted.insert((oi, section)) {
+                continue;
+            }
+            let span = &obj.input_sections[section];
+            for &si in &span.symbols {
+                let s = &obj.symbols[si as usize];
+                if s.defined
+                    && s.binding != Binding::Local
+                    && !s.name.is_empty()
+                    && !reachable.contains(&s.name)
+                {
+                    stack.push(s.name.clone());
+                }
+            }
+            for r in obj
+                .relocations
+                .iter()
+                .filter(|r| r.offset >= span.offset && r.offset < span.offset + span.size)
+            {
+                if let Some(target) = obj.symbols.get(r.symbol as usize)
+                    && !target.name.is_empty()
+                    && !reachable.contains(&target.name)
+                {
+                    stack.push(target.name.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Whether [`trim_object`] keeps this symbol WITHOUT asking whether anything reaches it.
@@ -520,8 +882,18 @@ fn reachable_from(
 /// was never followed because the blob was KEPT without ever being REACHED. The first two were fixed
 /// by narrowing what is kept. The general statement is the other way round: **keep and root are the
 /// same set**, so [`garbage_collect`] seeds the walk from this predicate instead of restating it.
-fn kept_regardless(s: &lamella_elf::ParsedSymbol) -> bool {
+fn kept_regardless(obj: &Object, sections: &[Option<usize>], i: usize) -> bool {
+    let s = &obj.symbols[i];
     if s.name.starts_with(STACKMAP_RECORD_PREFIX) {
+        return false;
+    }
+    if !s.bss
+        && sections
+            .get(i)
+            .copied()
+            .flatten()
+            .is_some_and(|section| !obj.input_sections[section].executable)
+    {
         return false;
     }
     s.kind != SymbolType::Func && !s.name.starts_with(TYPE_DESC_PREFIX)
@@ -546,26 +918,97 @@ fn carried_tombstone(section: &str) -> u32 {
     }
 }
 
-/// Rebuilds `obj` keeping only reachable functions and reachable descriptors (plus all other data),
-/// re-laid-out. A referenced symbol not among the kept ones stays an undefined extern (the linker resolves
-/// it, or errors if genuinely missing).
+/// Rebuilds `obj` keeping the symbols the walk reached, the data kept regardless of reachability, and
+/// every input section kept whole, re-laid-out. A referenced symbol not among the kept ones stays an
+/// undefined extern (the linker resolves it, or errors if genuinely missing).
+///
+/// **A SECTION KEPT WHOLE IS COPIED AS ONE SPAN** ([`retained_sections`]): every byte of it, every
+/// symbol in it -- a nameless section symbol and a label of size zero included -- and every
+/// relocation in it, so an offset into it carried in an addend, implicit or explicit, still lands on
+/// the same byte. Each copied span keeps its start's residue modulo its section's alignment, a word
+/// at least, so an aligned constant inside it stays aligned. A relocation's target is found by its
+/// INDEX in the original table, never by name: several nameless section symbols share the empty
+/// name.
 fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
-    let mut kept: Vec<usize> = (0..obj.symbols.len())
+    let sections = sections_of_symbols(obj);
+    let retained = retained_sections(obj, &sections, reachable);
+    let in_retained = |i: usize| sections[i].is_some_and(|section| retained.contains(&section));
+    let kept: Vec<usize> = (0..obj.symbols.len())
         .filter(|&i| {
             let s = &obj.symbols[i];
-            if !s.defined || s.size == 0 || s.name.is_empty() {
+            if !s.defined || s.section.is_some() {
+                return false;
+            }
+            if s.bss || in_retained(i) {
+                return true;
+            }
+            if s.size == 0 || s.name.is_empty() {
                 return false;
             }
             if let Some(func) = s.name.strip_prefix(STACKMAP_RECORD_PREFIX) {
                 return reachable.contains(func);
             }
-            reachable.contains(&s.name) || kept_regardless(s)
+            reachable.contains(&s.name) || kept_regardless(obj, &sections, i)
         })
         .collect();
-    kept.sort_by_key(|&i| obj.symbols[i].value & !1);
 
+    let align_of = |section: Option<usize>| {
+        section.map_or(4, |section| obj.input_sections[section].align.max(4))
+    };
+    let mut spans: Vec<(u32, u32, u32)> = retained
+        .iter()
+        .filter(|&&i| obj.input_sections[i].size > 0)
+        .map(|&i| {
+            let section = &obj.input_sections[i];
+            (
+                section.offset,
+                section.offset + section.size,
+                align_of(Some(i)),
+            )
+        })
+        .collect();
+    for &i in &kept {
+        let s = &obj.symbols[i];
+        if !s.bss && !in_retained(i) {
+            let start = symbol_offset(obj, s);
+            spans.push((start, start + s.size, align_of(sections[i])));
+        }
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(u32, u32, u32)> = Vec::new();
+    for (start, end, align) in spans {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => {
+                last.1 = last.1.max(end);
+                last.2 = last.2.max(align);
+            }
+            _ => merged.push((start, end, align)),
+        }
+    }
     let mut text: Vec<u8> = Vec::new();
     let mut ranges: Vec<(u32, u32, u32)> = Vec::new();
+    for (start, end, align) in merged {
+        let Some(bytes) = obj.text.get(start as usize..end as usize) else {
+            continue;
+        };
+        while text.len() as u32 % align != start % align {
+            text.push(0);
+        }
+        ranges.push((start, end, text.len() as u32));
+        text.extend_from_slice(bytes);
+    }
+    let mut empty: BTreeMap<usize, u32> = BTreeMap::new();
+    for &i in &retained {
+        let section = &obj.input_sections[i];
+        if section.size == 0 {
+            let align = align_of(Some(i));
+            while text.len() as u32 % align != section.offset % align {
+                text.push(0);
+            }
+            empty.insert(i, text.len() as u32);
+        }
+    }
+
     let mut symbols: Vec<lamella_elf::ParsedSymbol> = Vec::new();
     symbols.push(lamella_elf::ParsedSymbol {
         name: String::new(),
@@ -577,63 +1020,51 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         section: None,
         bss: false,
     });
-    let mut index_of: BTreeMap<String, u32> = BTreeMap::new();
-    let mut debug_index_of: BTreeMap<(String, u32), u32> = BTreeMap::new();
+    let mut mapped: Vec<Option<u32>> = alloc::vec![None; obj.symbols.len()];
     for &i in &kept {
         let s = &obj.symbols[i];
-        let start = s.value & !1;
-        let end = start + s.size;
-        while text.len() % 4 != 0 {
-            text.push(0);
-        }
-        if s.bss {
-            index_of.insert(s.name.clone(), symbols.len() as u32);
-            symbols.push(lamella_elf::ParsedSymbol {
-                name: s.name.clone(),
-                value: s.value,
-                size: s.size,
-                binding: s.binding,
-                kind: s.kind,
-                defined: true,
-                section: None,
-                bss: true,
-            });
+        let value = if s.bss {
+            Some(s.value)
+        } else {
+            let old = symbol_offset(obj, s);
+            let moved = sections[i]
+                .and_then(|section| {
+                    empty
+                        .get(&section)
+                        .map(|&at| at + old - obj.input_sections[section].offset)
+                })
+                .or_else(|| remap_text_offset(&ranges, old))
+                .or_else(|| {
+                    let section = &obj.input_sections[sections[i]?];
+                    let end = section.offset + section.size;
+                    (old == end && end > section.offset)
+                        .then(|| remap_text_offset(&ranges, end - 1).map(|at| at + 1))
+                        .flatten()
+                });
+            moved.map(|at| at | (s.value - old))
+        };
+        let Some(value) = value else {
             continue;
-        }
-        let new_start = text.len() as u32;
-        if let Some(slice) = obj.text.get(start as usize..end as usize) {
-            text.extend_from_slice(slice);
-        }
-        ranges.push((start, end, new_start));
-        index_of.insert(s.name.clone(), symbols.len() as u32);
+        };
+        mapped[i] = Some(symbols.len() as u32);
         symbols.push(lamella_elf::ParsedSymbol {
-            name: s.name.clone(),
-            value: new_start | (s.value & 1),
-            size: s.size,
-            binding: s.binding,
-            kind: s.kind,
-            defined: true,
-            section: None,
-            bss: false,
+            value,
+            ..s.clone()
         });
     }
 
+    let mut externs: BTreeMap<String, u32> = BTreeMap::new();
     let mut relocations: Vec<ParsedRelocation> = Vec::new();
     for r in &obj.relocations {
-        let Some(&(old_start, _, new_start)) = ranges
-            .iter()
-            .filter(|(a, b, _)| r.offset >= *a && r.offset < *b)
-            .min_by_key(|(a, b, _)| b - a)
-        else {
+        let Some(offset) = remap_text_offset(&ranges, r.offset) else {
             continue;
         };
         let Some(target) = obj.symbols.get(r.symbol as usize) else {
             continue;
         };
-        let idx = match index_of.get(target.name.as_str()) {
-            Some(&i) => i,
-            None => {
-                let i = symbols.len() as u32;
+        let symbol = match mapped[r.symbol as usize] {
+            Some(index) => index,
+            None => *externs.entry(target.name.clone()).or_insert_with(|| {
                 symbols.push(lamella_elf::ParsedSymbol {
                     name: target.name.clone(),
                     value: 0,
@@ -644,21 +1075,19 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                     section: None,
                     bss: false,
                 });
-                index_of.insert(target.name.clone(), i);
-                i
-            }
+                symbols.len() as u32 - 1
+            }),
         };
         relocations.push(ParsedRelocation {
-            offset: new_start + (r.offset - old_start),
-            symbol: idx,
-            kind: r.kind,
-            addend: r.addend,
-            implicit_addend: r.implicit_addend,
+            offset,
+            symbol,
+            ..*r
         });
     }
 
-    let mut sections = obj.sections.clone();
-    for sec in &mut sections {
+    let mut debug_index_of: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut sections_out = obj.sections.clone();
+    for sec in &mut sections_out {
         let mut kept_relocs: Vec<ParsedRelocation> = Vec::new();
         for r in &sec.relocations {
             let Some(target) = obj.symbols.get(r.symbol as usize) else {
@@ -666,8 +1095,10 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
             };
             let remapped = match target.section {
                 Some(_) => Some((target.value, target.section)),
-                None if target.defined => remap_text_offset(&ranges, target.value & !1)
-                    .map(|v| (v | (target.value & 1), None)),
+                None if target.defined && !target.bss => {
+                    let old = symbol_offset(obj, target);
+                    remap_text_offset(&ranges, old).map(|v| (v | (target.value - old), None))
+                }
                 None => Some((target.value, None)),
             };
             let Some((value, section)) = remapped else {
@@ -679,37 +1110,82 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                 }
                 continue;
             };
-            let key = (target.name.clone(), r.symbol);
-            let idx = match debug_index_of.get(&key) {
-                Some(&i) => i,
-                None => {
-                    let i = symbols.len() as u32;
-                    symbols.push(lamella_elf::ParsedSymbol {
-                        name: target.name.clone(),
-                        value,
-                        size: if target.defined { 0 } else { target.size },
-                        binding: match target.defined {
-                            true => Binding::Local,
-                            false => Binding::Global,
-                        },
-                        kind: target.kind,
-                        defined: target.defined,
-                        section,
-                        bss: target.bss,
-                    });
-                    debug_index_of.insert(key, i);
-                    i
-                }
-            };
+            let idx = *debug_index_of.entry(r.symbol).or_insert_with(|| {
+                symbols.push(lamella_elf::ParsedSymbol {
+                    name: target.name.clone(),
+                    value,
+                    size: if target.defined { 0 } else { target.size },
+                    binding: match target.defined {
+                        true => Binding::Local,
+                        false => Binding::Global,
+                    },
+                    kind: target.kind,
+                    defined: target.defined,
+                    section,
+                    bss: target.bss,
+                });
+                symbols.len() as u32 - 1
+            });
             kept_relocs.push(ParsedRelocation {
-                offset: r.offset,
                 symbol: idx,
-                kind: r.kind,
-                addend: r.addend,
-                implicit_addend: r.implicit_addend,
+                ..*r
             });
         }
         sec.relocations = kept_relocs;
+    }
+
+    for s in obj.symbols.iter().filter(|s| is_record(&s.name)) {
+        let caller_kept = lamella_elf::dispatch::dispatch_record(&s.name)
+            .is_none_or(|(_, caller)| reachable.contains(caller));
+        if caller_kept {
+            symbols.push(lamella_elf::ParsedSymbol {
+                value: 0,
+                ..s.clone()
+            });
+        }
+    }
+
+    let mut input_sections: Vec<lamella_elf::InputSection> = Vec::new();
+    for (i, section) in obj.input_sections.iter().enumerate() {
+        let members = |lo: u32, hi: u32, at_end: bool| -> Vec<u32> {
+            section
+                .symbols
+                .iter()
+                .filter_map(|&si| {
+                    let s = &obj.symbols[si as usize];
+                    let old = symbol_offset(obj, s);
+                    let inside = (old >= lo && old < hi) || (at_end && old == hi);
+                    inside.then(|| mapped[si as usize]).flatten()
+                })
+                .collect()
+        };
+        if let Some(&at) = empty.get(&i) {
+            input_sections.push(lamella_elf::InputSection {
+                offset: at,
+                symbols: members(section.offset, section.offset, true),
+                ..section.clone()
+            });
+            continue;
+        }
+        for &(start, end, new_start) in &ranges {
+            let lo = start.max(section.offset);
+            let hi = end.min(section.offset + section.size);
+            if lo >= hi {
+                continue;
+            }
+            input_sections.push(lamella_elf::InputSection {
+                name: section.name.clone(),
+                offset: new_start + (lo - start),
+                size: hi - lo,
+                executable: section.executable,
+                align: section.align,
+                symbols: members(
+                    lo,
+                    hi,
+                    retained.contains(&i) && hi == section.offset + section.size,
+                ),
+            });
+        }
     }
 
     Object {
@@ -718,21 +1194,20 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         text_align: obj.text_align.max(4),
         symbols,
         relocations,
-        sections,
+        sections: sections_out,
         bss_len: obj.bss_len,
         bss_align: obj.bss_align,
+        input_sections,
     }
 }
 
 /// Maps a pre-trim `.text` offset to its post-trim one, or `None` if the byte was dropped. `ranges`
-/// holds `(old_start, old_end, new_start)` per kept symbol; the SMALLEST covering range wins, for
-/// the same reason it does when relocations are remapped -- an enclosing symbol must not capture an
-/// offset that belongs to an inner one.
+/// holds `(old_start, old_end, new_start)` for each span [`trim_object`] copied; the spans are
+/// disjoint, so at most one holds the offset.
 fn remap_text_offset(ranges: &[(u32, u32, u32)], old: u32) -> Option<u32> {
     ranges
         .iter()
-        .filter(|(a, b, _)| old >= *a && old < *b)
-        .min_by_key(|(a, b, _)| b - a)
+        .find(|(a, b, _)| old >= *a && old < *b)
         .map(|(a, _, new_start)| new_start + (old - a))
 }
 
@@ -872,6 +1347,7 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
         text_align: 4,
         bss_len: 0,
         bss_align: 1,
+        input_sections: Vec::new(),
         symbols: alloc::vec![
             lamella_elf::ParsedSymbol {
                 name: String::new(),
@@ -1024,6 +1500,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         sections: Vec::new(),
         bss_len: 0,
         bss_align: 1,
+        input_sections: Vec::new(),
     })
 }
 
@@ -1769,7 +2246,7 @@ fn link_gc_inner(
     ram: Option<(u32, u32)>,
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
-    let mut keep = reachable_from(objects, entry, optional_roots, true);
+    let mut keep = reachable_from(objects, entry, optional_roots, TableEntries::Called);
     let folds = match fold {
         true => plan_folds(objects, machine, &keep, entry),
         false => Vec::new(),
@@ -1816,8 +2293,11 @@ fn plan_folds(
         if resolves_against_its_own_layout(obj) {
             continue;
         }
-        for s in &obj.symbols {
+        let sections = sections_of_symbols(obj);
+        let whole = retained_sections(obj, &sections, keep);
+        for (si, s) in obj.symbols.iter().enumerate() {
             if !s.defined
+                || sections[si].is_some_and(|section| whole.contains(&section))
                 || s.size == 0
                 || s.name.is_empty()
                 || s.binding == Binding::Local
@@ -1870,9 +2350,10 @@ fn define_fold_aliases(objects: &mut [Object], folds: &[(String, String)]) {
 type Func = (usize, String, u32, u32);
 
 /// A function's identity for ICF: its code bytes plus its relocations as `(offset-within-function,
-/// kind, addend, target name)`, sorted. Two functions with equal fingerprints are interchangeable --
-/// the relocation targets (by name) must match, so two functions calling different symbols never
-/// fold even with identical placeholder bytes; a `SHT_REL` implicit addend rides in the code bytes.
+/// kind, addend, target)`, sorted. Two functions with equal fingerprints are interchangeable -- the
+/// relocation targets must match, so two functions calling different symbols never fold even with
+/// identical placeholder bytes; a `SHT_REL` implicit addend rides in the code bytes. A target is its
+/// name, except a nameless or local one, which is its place in its own object.
 type Fingerprint = (Vec<u8>, Vec<(u32, u32, i32, String)>);
 
 fn function_fingerprint(func: &Func, objects: &[Object]) -> Fingerprint {
@@ -1886,7 +2367,12 @@ fn function_fingerprint(func: &Func, objects: &[Object]) -> Fingerprint {
             let target = objects[*oi]
                 .symbols
                 .get(r.symbol as usize)
-                .map_or(String::new(), |s| s.name.clone());
+                .map_or(String::new(), |s| {
+                    match s.defined && (s.name.is_empty() || s.binding == Binding::Local) {
+                        true => alloc::format!("@local:{oi}:{}", r.symbol),
+                        false => s.name.clone(),
+                    }
+                });
             (r.offset - start, r.kind, r.addend, target)
         })
         .collect();
@@ -2173,7 +2659,7 @@ mod tests {
     use alloc::vec;
     use lamella_elf::{
         ArchiveMember, Binding, Machine, Relocation, Section, Symbol, SymbolSection, SymbolType,
-        arm, read_object, write_relocatable_object, write_relocatable_object_with_sections,
+        arm, read_object, riscv, write_relocatable_object, write_relocatable_object_with_sections,
     };
 
     /// Every name family the backend emits, classified. Written from the shapes actually observed
@@ -2973,6 +3459,537 @@ mod tests {
         assert!(defined.contains(&"m"), "a method reached only through a descriptor's reloc is kept");
         assert!(!defined.contains(&"__lamella_typedesc_2"), "an unreached descriptor is dropped");
         assert!(!defined.contains(&"dead"), "a method only an unreached descriptor referenced drops out");
+    }
+
+    /// A managed object for the called-slot rows, written as named parts -- functions with the
+    /// functions they call, descriptors with the method each table entry names, and the dispatch
+    /// records -- so a row says which method a slot names rather than which offset or index it is.
+    /// The builder lays the parts out as the backend does: a descriptor's vtable slots in front of
+    /// its words, slot `k` at `-(4 + 4k)`, and each interface entry after the words with its tag in
+    /// the word before it.
+    struct Managed {
+        machine: Machine,
+        functions: Vec<(&'static str, Vec<&'static str>)>,
+        descriptors: Vec<Descriptor>,
+        records: Vec<String>,
+        marked: bool,
+    }
+
+    /// One descriptor of a [`Managed`] object.
+    struct Descriptor {
+        name: &'static str,
+        slots: Vec<&'static str>,
+        interface: Vec<(u32, &'static str)>,
+    }
+
+    impl Managed {
+        fn new(machine: Machine) -> Managed {
+            Managed {
+                machine,
+                functions: Vec::new(),
+                descriptors: Vec::new(),
+                records: Vec::new(),
+                marked: true,
+            }
+        }
+
+        fn function(mut self, name: &'static str, calls: &[&'static str]) -> Managed {
+            self.functions.push((name, calls.to_vec()));
+            self
+        }
+
+        fn descriptor(
+            mut self,
+            name: &'static str,
+            slots: &[&'static str],
+            interface: &[(u32, &'static str)],
+        ) -> Managed {
+            self.descriptors.push(Descriptor {
+                name,
+                slots: slots.to_vec(),
+                interface: interface.to_vec(),
+            });
+            self
+        }
+
+        fn calls_slot(mut self, caller: &str, slot: u32, declaring: &str) -> Managed {
+            let slot = lamella_elf::dispatch::DispatchSlot::Virtual {
+                slot,
+                declaring: String::from(declaring),
+            };
+            self.records
+                .push(lamella_elf::dispatch::dispatch_record_name(&slot, caller));
+            self
+        }
+
+        fn calls_tag(mut self, caller: &str, tag: u32) -> Managed {
+            let tag = lamella_elf::dispatch::DispatchSlot::Interface(tag);
+            self.records
+                .push(lamella_elf::dispatch::dispatch_record_name(&tag, caller));
+            self
+        }
+
+        fn derives(mut self, descriptor: &str, base: Option<&str>) -> Managed {
+            self.records
+                .push(lamella_elf::dispatch::hierarchy_record_name(
+                    descriptor, base,
+                ));
+            self
+        }
+
+        fn unmarked(mut self) -> Managed {
+            self.marked = false;
+            self
+        }
+
+        fn build(self) -> Object {
+            let thumb = u32::from(self.machine == Machine::Arm);
+            let (absolute, relative) = match self.machine {
+                Machine::Arm => (arm::R_ARM_ABS32, arm::R_LAMELLA_REL_DESC),
+                Machine::RiscV => (riscv::R_RISCV_32, riscv::R_LAMELLA_REL_DESC),
+            };
+            let mut names: Vec<String> = self
+                .functions
+                .iter()
+                .map(|(name, _)| String::from(*name))
+                .chain(self.descriptors.iter().map(|d| String::from(d.name)))
+                .collect();
+            let mut text: Vec<u8> = Vec::new();
+            let mut spans: Vec<(u32, u32)> = Vec::new();
+            let mut references: Vec<(u32, &'static str, u32, i32)> = Vec::new();
+            for (_, calls) in &self.functions {
+                let start = text.len() as u32;
+                text.extend_from_slice(&[0; 4]);
+                for callee in calls {
+                    references.push((text.len() as u32, *callee, absolute, 0));
+                    text.extend_from_slice(&[0; 4]);
+                }
+                spans.push((start, text.len() as u32 - start));
+            }
+            for d in &self.descriptors {
+                let start = text.len() as u32;
+                for (k, method) in d.slots.iter().enumerate().rev() {
+                    let addend = -(4 + 4 * k as i32);
+                    references.push((text.len() as u32, *method, relative, addend));
+                    text.extend_from_slice(&[0; 4]);
+                }
+                text.extend_from_slice(&[0; 4]);
+                for (tag, method) in &d.interface {
+                    text.extend_from_slice(&tag.to_le_bytes());
+                    references.push((text.len() as u32, *method, relative, 8));
+                    text.extend_from_slice(&[0; 4]);
+                }
+                spans.push((start, text.len() as u32 - start));
+            }
+            for (_, target, ..) in &references {
+                if !names.iter().any(|n| n == target) {
+                    names.push(String::from(*target));
+                }
+            }
+            let functions = self.functions.len();
+            let mut symbols: Vec<Symbol> = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| match spans.get(i) {
+                    Some(&(value, size)) => Symbol {
+                        name,
+                        value: if i < functions { value | thumb } else { value },
+                        size,
+                        binding: Binding::Global,
+                        kind: if i < functions {
+                            SymbolType::Func
+                        } else {
+                            SymbolType::NoType
+                        },
+                        section: SymbolSection::Text,
+                    },
+                    None => Symbol {
+                        name,
+                        value: 0,
+                        size: 0,
+                        binding: Binding::Global,
+                        kind: SymbolType::NoType,
+                        section: SymbolSection::Undefined,
+                    },
+                })
+                .collect();
+            let mut records = self.records.clone();
+            if self.marked {
+                records.push(String::from(lamella_elf::dispatch::DISPATCH_RECORDS));
+            }
+            symbols.extend(records.iter().map(|name| Symbol {
+                name,
+                value: 0,
+                size: 0,
+                binding: Binding::Local,
+                kind: SymbolType::NoType,
+                section: SymbolSection::Text,
+            }));
+            let relocations: Vec<Relocation> = references
+                .iter()
+                .map(|&(offset, target, kind, addend)| Relocation {
+                    offset,
+                    symbol: names.iter().position(|n| n == target).unwrap() as u32,
+                    kind,
+                    addend,
+                })
+                .collect();
+            read_object(&write_relocatable_object(
+                self.machine,
+                &text,
+                &symbols,
+                &relocations,
+            ))
+            .unwrap()
+        }
+    }
+
+    /// The names an object list defines.
+    fn names_defined_by(objects: &[Object]) -> Vec<String> {
+        objects
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    /// The symbols a kept descriptor's table entries name: its vtable slots from slot 0, then its
+    /// interface entries in the order it lays them.
+    fn entries_of(objects: &[Object], descriptor: &str) -> Vec<String> {
+        let object = objects
+            .iter()
+            .find(|o| o.symbols.iter().any(|s| s.defined && s.name == descriptor))
+            .expect("the descriptor is kept");
+        let d = object
+            .symbols
+            .iter()
+            .find(|s| s.defined && s.name == descriptor)
+            .unwrap();
+        let mut entries: Vec<(u8, i64, String)> = object
+            .relocations
+            .iter()
+            .filter(|r| r.offset >= d.value && r.offset < d.value + d.size)
+            .filter(|r| slots::table_entry(object, r).is_some())
+            .map(|r| {
+                let (order, key) = match r.addend < 0 {
+                    true => (0, -i64::from(r.addend)),
+                    false => (1, i64::from(r.offset)),
+                };
+                (order, key, object.symbols[r.symbol as usize].name.clone())
+            })
+            .collect();
+        entries.sort();
+        entries.into_iter().map(|(_, _, name)| name).collect()
+    }
+
+    /// `Shape` lays two vtable slots, `Shape.ToText` at slot 0 and `Shape.Area` at slot 1, and
+    /// `Shape.Area` calls `helper`. The entry `f0` refers to the descriptor, as an allocation does,
+    /// and dispatches through each slot of `calls`, declared on `Shape`.
+    fn one_shape(machine: Machine, calls: &[u32]) -> Object {
+        let mut object = Managed::new(machine)
+            .function("f0", &["__lamella_typedesc_shape"])
+            .function("Shape.ToText", &[])
+            .function("Shape.Area", &["helper"])
+            .function("helper", &[])
+            .descriptor(
+                "__lamella_typedesc_shape",
+                &["Shape.ToText", "Shape.Area"],
+                &[],
+            )
+            .derives("__lamella_typedesc_shape", None);
+        for &slot in calls {
+            object = object.calls_slot("f0", slot, "__lamella_typedesc_shape");
+        }
+        object.build()
+    }
+
+    /// A SLOT NO KEPT FUNCTION CALLS NAMES THE TRAP, AND ITS METHOD DROPS WITH WHAT ONLY IT CALLED.
+    ///
+    /// The descriptor keeps both entries, so its layout is the one every call was computed against,
+    /// and one shared function that faults stands where `Shape.Area` was.
+    #[test]
+    fn a_slot_no_kept_function_calls_names_the_trap_and_its_method_drops() {
+        for machine in [Machine::Arm, Machine::RiscV] {
+            let trimmed = garbage_collect(&[one_shape(machine, &[0])], "f0");
+            let kept = names_defined_by(&trimmed);
+            assert!(
+                kept.iter().any(|n| n == "Shape.ToText"),
+                "{machine:?}: slot 0 is called"
+            );
+            for gone in ["Shape.Area", "helper"] {
+                assert!(
+                    !kept.iter().any(|n| n == gone),
+                    "{machine:?}: {gone} must drop"
+                );
+            }
+            assert_eq!(
+                entries_of(&trimmed, "__lamella_typedesc_shape"),
+                ["Shape.ToText", UNUSED_SLOT_TRAP],
+                "{machine:?}: the descriptor keeps both entries, the uncalled one naming the trap"
+            );
+            assert_eq!(
+                kept.iter().filter(|n| *n == UNUSED_SLOT_TRAP).count(),
+                1,
+                "{machine:?}: one trap stands in for every uncalled entry"
+            );
+        }
+    }
+
+    /// A CALLED SLOT KEEPS ITS METHOD AND EVERYTHING THAT METHOD CALLS.
+    #[test]
+    fn a_called_slot_keeps_its_method_and_everything_it_calls() {
+        let kept = names_defined_by(&garbage_collect(&[one_shape(Machine::Arm, &[1])], "f0"));
+        for name in ["Shape.Area", "helper"] {
+            assert!(
+                kept.iter().any(|n| n == name),
+                "{name} is reached through the called slot"
+            );
+        }
+        assert!(
+            !kept.iter().any(|n| n == "Shape.ToText"),
+            "slot 0 is not called"
+        );
+    }
+
+    /// A CALL KEEPS ITS SLOT IN THE DECLARING TYPE AND IN EVERY TYPE DERIVING FROM IT, AND IN NO
+    /// OTHER.
+    ///
+    /// `Circle` derives from `Shape`; `Gadget` derives from neither and happens to number a method at
+    /// the same slot. A call through slot 1 declared on `Shape` can reach a `Shape` or a `Circle`,
+    /// never a `Gadget`.
+    #[test]
+    fn a_call_keeps_its_slot_in_the_declaring_type_and_its_derived_types_and_no_other() {
+        let object = Managed::new(Machine::Arm)
+            .function(
+                "f0",
+                &[
+                    "__lamella_typedesc_shape",
+                    "__lamella_typedesc_circle",
+                    "__lamella_typedesc_gadget",
+                ],
+            )
+            .function("Shape.ToText", &[])
+            .function("Shape.Area", &[])
+            .function("Circle.Area", &[])
+            .function("Gadget.ToText", &[])
+            .function("Gadget.Blink", &[])
+            .descriptor(
+                "__lamella_typedesc_shape",
+                &["Shape.ToText", "Shape.Area"],
+                &[],
+            )
+            .descriptor(
+                "__lamella_typedesc_circle",
+                &["Shape.ToText", "Circle.Area"],
+                &[],
+            )
+            .descriptor(
+                "__lamella_typedesc_gadget",
+                &["Gadget.ToText", "Gadget.Blink"],
+                &[],
+            )
+            .derives("__lamella_typedesc_shape", None)
+            .derives(
+                "__lamella_typedesc_circle",
+                Some("__lamella_typedesc_shape"),
+            )
+            .derives("__lamella_typedesc_gadget", None)
+            .calls_slot("f0", 1, "__lamella_typedesc_shape")
+            .build();
+        let kept = names_defined_by(&garbage_collect(&[object], "f0"));
+        for name in ["Shape.Area", "Circle.Area"] {
+            assert!(kept.iter().any(|n| n == name), "{name} can answer the call");
+        }
+        for name in ["Gadget.Blink", "Gadget.ToText", "Shape.ToText"] {
+            assert!(!kept.iter().any(|n| n == name), "{name} cannot answer it");
+        }
+    }
+
+    /// A DESCRIPTOR WHOSE CHAIN IS NOT KNOWN KEEPS EVERY SLOT A KEPT FUNCTION CALLS, AND NO OTHER.
+    ///
+    /// `Circle` records no base, so it could derive from `Shape`, and a call through slot 1 declared
+    /// on `Shape` keeps its override. Nothing calls slot 0, so that entry still names the trap.
+    #[test]
+    fn a_descriptor_whose_chain_is_unknown_keeps_every_called_slot_and_no_other() {
+        let object = Managed::new(Machine::Arm)
+            .function("f0", &["__lamella_typedesc_circle"])
+            .function("Circle.ToText", &[])
+            .function("Circle.Area", &[])
+            .descriptor(
+                "__lamella_typedesc_circle",
+                &["Circle.ToText", "Circle.Area"],
+                &[],
+            )
+            .derives("__lamella_typedesc_shape", None)
+            .calls_slot("f0", 1, "__lamella_typedesc_shape")
+            .build();
+        let trimmed = garbage_collect(&[object], "f0");
+        assert_eq!(
+            entries_of(&trimmed, "__lamella_typedesc_circle"),
+            [UNUSED_SLOT_TRAP, "Circle.Area"]
+        );
+    }
+
+    /// AN INTERFACE CALL KEEPS THE ENTRY WITH ITS OWN TAG AND NOT THE ONE BESIDE IT.
+    #[test]
+    fn an_interface_call_keeps_the_entry_with_its_own_tag_and_not_the_next() {
+        let object = Managed::new(Machine::Arm)
+            .function("f0", &["__lamella_typedesc_sensor"])
+            .function("Sensor.Read", &[])
+            .function("Sensor.Reset", &[])
+            .descriptor(
+                "__lamella_typedesc_sensor",
+                &[],
+                &[(123, "Sensor.Read"), (456, "Sensor.Reset")],
+            )
+            .derives("__lamella_typedesc_sensor", None)
+            .calls_tag("f0", 123)
+            .build();
+        let trimmed = garbage_collect(&[object], "f0");
+        assert_eq!(
+            entries_of(&trimmed, "__lamella_typedesc_sensor"),
+            ["Sensor.Read", UNUSED_SLOT_TRAP]
+        );
+    }
+
+    /// A METHOD KEPT ONLY THROUGH A SLOT MAKES THE SLOTS IT CALLS LIVE IN TURN.
+    ///
+    /// `f0` calls slot 0, and `Shape.ToText`, which answers it, calls slot 1 -- so `Shape.Area` is
+    /// kept by a caller the walk reaches only after it has set the descriptor's entries aside.
+    #[test]
+    fn a_method_kept_only_through_a_slot_makes_the_slots_it_calls_live_in_turn() {
+        let object = Managed::new(Machine::Arm)
+            .function("f0", &["__lamella_typedesc_shape"])
+            .function("Shape.ToText", &[])
+            .function("Shape.Area", &["helper"])
+            .function("helper", &[])
+            .descriptor(
+                "__lamella_typedesc_shape",
+                &["Shape.ToText", "Shape.Area"],
+                &[],
+            )
+            .derives("__lamella_typedesc_shape", None)
+            .calls_slot("f0", 0, "__lamella_typedesc_shape")
+            .calls_slot("Shape.ToText", 1, "__lamella_typedesc_shape")
+            .build();
+        let kept = names_defined_by(&garbage_collect(&[object], "f0"));
+        for name in ["Shape.ToText", "Shape.Area", "helper"] {
+            assert!(kept.iter().any(|n| n == name), "{name} is kept");
+        }
+    }
+
+    /// AN OBJECT THAT DOES NOT RECORD ITS DISPATCHES KEEPS EVERY ENTRY OF ITS TABLES.
+    #[test]
+    fn an_object_that_records_no_dispatches_keeps_every_entry() {
+        let object = Managed::new(Machine::Arm)
+            .function("f0", &["__lamella_typedesc_shape"])
+            .function("Shape.ToText", &[])
+            .function("Shape.Area", &[])
+            .descriptor(
+                "__lamella_typedesc_shape",
+                &["Shape.ToText", "Shape.Area"],
+                &[],
+            )
+            .unmarked()
+            .build();
+        let trimmed = garbage_collect(&[object], "f0");
+        assert_eq!(
+            entries_of(&trimmed, "__lamella_typedesc_shape"),
+            ["Shape.ToText", "Shape.Area"]
+        );
+    }
+
+    /// ONE MANAGED OBJECT THAT DOES NOT RECORD ITS DISPATCHES TURNS THE ANALYSIS OFF FOR THE WHOLE
+    /// LINK, because a function no record describes may dispatch through any entry.
+    #[test]
+    fn a_managed_object_without_records_keeps_every_entry_of_every_object() {
+        let recorded = one_shape(Machine::Arm, &[0]);
+        let unrecorded = Managed::new(Machine::Arm)
+            .function("elsewhere", &[])
+            .descriptor("__lamella_typedesc_other", &["elsewhere"], &[])
+            .unmarked()
+            .build();
+        let trimmed = garbage_collect(&[recorded, unrecorded], "f0");
+        assert_eq!(
+            entries_of(&trimmed, "__lamella_typedesc_shape"),
+            ["Shape.ToText", "Shape.Area"],
+            "a function the records do not describe could call slot 1"
+        );
+    }
+
+    /// THE TRAP SURVIVES A SECOND TRIM AND THE IMAGE LINKS, AND THE TRAP IS ONE FAULTING
+    /// INSTRUCTION: Thumb's `udf #0` on ARM, `ebreak` on RISC-V.
+    #[test]
+    fn the_trap_survives_a_second_trim_and_faults_when_reached() {
+        for (machine, fault) in [
+            (Machine::Arm, alloc::vec![0x00, 0xde]),
+            (Machine::RiscV, alloc::vec![0x73, 0x00, 0x10, 0x00]),
+        ] {
+            let once = garbage_collect(&[one_shape(machine, &[0])], "f0");
+            let twice = garbage_collect(&once, "f0");
+            assert_eq!(
+                entries_of(&twice, "__lamella_typedesc_shape"),
+                ["Shape.ToText", UNUSED_SLOT_TRAP],
+                "{machine:?}"
+            );
+            let image = link_at_base(&twice, "f0", 0x100).expect("the twice-trimmed objects link");
+            let (_, trap) = image
+                .symbols
+                .iter()
+                .find(|(name, _)| name == UNUSED_SLOT_TRAP)
+                .expect("the image defines the trap");
+            let at = (*trap & !1) as usize;
+            assert_eq!(
+                &image.text[at..at + fault.len()],
+                fault.as_slice(),
+                "{machine:?}"
+            );
+        }
+    }
+
+    /// THE NAMES A LINK REPORTS AS KEPT ARE THE NAMES THE DEAD-STRIP KEEPS, so a check that reads
+    /// them sees what the image carries.
+    #[test]
+    fn the_kept_names_are_the_names_the_dead_strip_keeps() {
+        let object = one_shape(Machine::Arm, &[1]);
+        let kept = kept_names(core::slice::from_ref(&object), "f0");
+        let stripped = names_defined_by(&garbage_collect(&[object], "f0"));
+        for name in ["f0", "Shape.Area", "helper", "__lamella_typedesc_shape"] {
+            assert!(
+                kept.contains(name) && stripped.iter().any(|n| n == name),
+                "{name}"
+            );
+        }
+        assert!(!kept.contains("Shape.ToText"));
+        assert!(!stripped.iter().any(|n| n == "Shape.ToText"));
+    }
+
+    /// A DESCRIPTOR TWO OBJECTS LAY IS ONE TYPE: ONE COPY NAMING ITS BASE IS ENOUGH, and a copy
+    /// that names no base does not cut the chain short.
+    #[test]
+    fn copies_of_one_descriptor_unite_their_bases() {
+        let program = Managed::new(Machine::Arm)
+            .function("f0", &["__lamella_typedesc_circle"])
+            .function("Circle.ToText", &[])
+            .descriptor("__lamella_typedesc_circle", &["Circle.ToText"], &[])
+            .derives("__lamella_typedesc_circle", None)
+            .calls_slot("f0", 0, "__lamella_typedesc_object")
+            .build();
+        let library = Managed::new(Machine::Arm)
+            .function("Object.ToText", &[])
+            .descriptor("__lamella_typedesc_object", &["Object.ToText"], &[])
+            .derives("__lamella_typedesc_object", None)
+            .derives(
+                "__lamella_typedesc_circle",
+                Some("__lamella_typedesc_object"),
+            )
+            .build();
+        let kept = names_defined_by(&garbage_collect(&[program, library], "f0"));
+        assert!(
+            kept.iter().any(|n| n == "Circle.ToText"),
+            "a call declared on the base reaches the override"
+        );
     }
 
     /// A METHOD ONLY A TABLE SLOT KEEPS, AND WHAT IT CALLS, ARE NOT REACHED WITHOUT TABLE SLOTS.
@@ -3797,18 +4814,16 @@ mod tests {
         );
     }
 
-    /// AND THE DEAD-STRIP MUST NOT MOVE THAT OBJECT'S BYTES. The section symbol's value plus the
-    /// relocation's addend is an offset into the section as it was LAID OUT; a symbol-granularity
-    /// re-layout invalidates it and there is no name to re-resolve through, so `trim_all` passes
-    /// such an object through whole. Before that rule, `trim_object` turned the unnamed target into
-    /// an undefined extern and 51 corpus programs failed the gc link on `UndefinedSymbol("")` --
-    /// the empty string being what an unnamed target becomes when it is looked up by name.
+    /// AND THE DEAD-STRIP MUST NOT MOVE THE BYTES OF THE SECTION IT ADDRESSES. The nameless symbol's
+    /// value plus the relocation's addend is an offset into the section as it was LAID OUT; a
+    /// symbol-granularity re-layout invalidates it and there is no name to re-resolve through, so
+    /// the trim keeps that input section whole.
     ///
-    /// The `dead` function is the control in the other direction: the object is kept whole, so a
-    /// body nothing calls survives HERE, where it would be stripped from any other object. That is
+    /// The `dead` function is the control in the other direction: it shares the section, so a body
+    /// nothing calls survives HERE, where it would be stripped from a section of its own. That is
     /// the cost of the rule and it is asserted rather than left as a claim.
     #[test]
-    fn an_object_that_resolves_against_its_own_layout_is_kept_whole() {
+    fn a_section_addressed_through_a_nameless_symbol_is_kept_whole() {
         let section = Symbol {
             name: "",
             value: 4,
@@ -3840,7 +4855,7 @@ mod tests {
         );
         assert!(
             img.symbols.iter().any(|(n, _)| n == "dead"),
-            "the object is kept WHOLE, so even its unreached body survives -- the cost of the rule"
+            "the section is kept WHOLE, so even its unreached body survives -- the cost of the rule"
         );
     }
 
@@ -4031,17 +5046,16 @@ mod tests {
         }
     }
 
-    /// A DEFINED SYMBOL WITH NO `st_size` IS DROPPED BY THE DEAD-STRIP, AND THE LINK THEN NAMES IT
-    /// AS UNDEFINED. This is `trim_object`'s copy rule showing through: it copies
-    /// `[st_value, st_value + st_size)`, so a size-less symbol contributes no bytes and cannot be
-    /// kept over somebody else's code.
+    /// A DEFINED SYMBOL WITH NO `st_size` SURVIVES THE DEAD-STRIP WITH ITS SECTION, OR NOT AT ALL.
+    /// A size-less symbol owns no bytes of its own, so the trim keeps it only by keeping its whole
+    /// input section; in an object that records no sections it is dropped, and the link then names it
+    /// as undefined.
     ///
-    /// It is pinned because the failure READS LIKE A MISSING DEFINITION and is not one -- fifteen
-    /// `global_asm!` shims in the runtime-support archive were exactly this, and the fix is a
-    /// `.size` directive in the assembly, not a change here. The `link_at_base` control links the
-    /// same objects, so the row is about the dead-strip and not about the fixture.
+    /// The second half is pinned because that failure READS LIKE A MISSING DEFINITION and is not
+    /// one. The `link_at_base` control links the same objects, so the row is about the dead-strip and
+    /// not about the fixture.
     #[test]
-    fn a_defined_symbol_with_no_size_does_not_survive_the_dead_strip() {
+    fn a_symbol_with_no_size_is_kept_with_its_section_or_not_at_all() {
         let main = obj_arm(
             &[0x00, 0xB5, 0x00, 0xF0, 0x00, 0xD0, 0x00, 0xBD],
             &[func("main", 1, 8), undef("shim")],
@@ -4058,14 +5072,29 @@ mod tests {
             link_at_base(&[main.clone(), unsized_shim.clone()], "main", 0x8000).is_ok(),
             "the control must link the size-less symbol -- the ordinary link never trims"
         );
-        let refused = link_gc(&[main.clone(), unsized_shim], "main");
+        let kept = link_gc(&[main.clone(), unsized_shim.clone()], "main")
+            .expect("a size-less definition read from a file survives with its section");
+        let shim = kept
+            .symbols
+            .iter()
+            .find(|(n, _)| n == "shim")
+            .expect("`shim` is kept")
+            .1;
+        assert_eq!(
+            kept.text[(shim & !1) as usize..(shim & !1) as usize + 2],
+            [0x70, 0x47],
+            "the section's bytes come with it"
+        );
+        let mut sectionless = unsized_shim;
+        sectionless.input_sections.clear();
+        let refused = link_gc(&[main.clone(), sectionless], "main");
         assert!(
             matches!(&refused, Err(LinkError::UndefinedSymbol(n)) if n == "shim"),
-            "a size-less definition must not survive the trim; got {refused:?}"
+            "without a recorded section, a size-less definition does not survive; got {refused:?}"
         );
         assert!(
             link_gc(&[main, sized_shim], "main").is_ok(),
-            "and the SIZE is the whole difference -- the same shim with st_size links"
+            "the same shim with st_size links"
         );
     }
 
@@ -4318,5 +5347,617 @@ mod tests {
         let image = link_at_base_gc(&objects, "_start", 0x2000).unwrap();
         assert_eq!(debug_word(&image, ".debug_info", 0), 0x2000, "entry first");
         assert_eq!(debug_word(&image, ".debug_info", 4), 0x2004);
+    }
+
+    /// An object laid out as a compiled archive member lays one: `main` in `.text`, two constants
+    /// it addresses through their nameless section symbols -- `.rodata.first`, aligned to 8, whose
+    /// first word holds `helper`'s address, and `.rodata.second`, aligned to 16 -- and two things
+    /// nothing reaches, `dead_native` in `.text.dead` and `unused_float_table` in `.rodata.float`.
+    /// Each of `main`'s two words addresses byte 4 of its constant: in the word itself with
+    /// `implicit`, as an ARM toolchain's `SHT_REL` lays it, and otherwise in the addend.
+    fn native_member(machine: Machine, implicit: bool) -> Object {
+        let (absolute, thumb) = match machine {
+            Machine::Arm => (arm::R_ARM_ABS32, 1),
+            Machine::RiscV => (riscv::R_RISCV_32, 0),
+        };
+        let section_symbol = |section| Symbol {
+            name: "",
+            value: 0,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::Section,
+            section: SymbolSection::InSection(section),
+        };
+        let mut dead = func("dead_native", thumb, 4);
+        dead.section = SymbolSection::InSection(2);
+        let mut table = data("unused_float_table", 0, 16);
+        table.section = SymbolSection::InSection(3);
+        let symbols = [
+            func("main", thumb, 8),
+            section_symbol(0),
+            section_symbol(1),
+            undef("helper"),
+            dead,
+            table,
+        ];
+        let (word, addend) = match implicit {
+            true => (4u32.to_le_bytes(), 0),
+            false => ([0; 4], 4),
+        };
+        let helper_word = [Relocation {
+            offset: 0,
+            symbol: 3,
+            kind: absolute,
+            addend: 0,
+        }];
+        let sections = [
+            Section {
+                name: ".rodata.first",
+                flags: 2,
+                addralign: 8,
+                data: &[0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44],
+                relocations: &helper_word,
+            },
+            Section {
+                name: ".rodata.second",
+                flags: 2,
+                addralign: 16,
+                data: &[0, 0, 0, 0, 0x55, 0x66, 0x77, 0x88],
+                relocations: &[],
+            },
+            Section {
+                name: ".text.dead",
+                flags: 6,
+                addralign: 4,
+                data: &[0; 4],
+                relocations: &[],
+            },
+            Section {
+                name: ".rodata.float",
+                flags: 2,
+                addralign: 4,
+                data: &[0; 16],
+                relocations: &[],
+            },
+        ];
+        let words = [
+            Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: absolute,
+                addend,
+            },
+            Relocation {
+                offset: 4,
+                symbol: 2,
+                kind: absolute,
+                addend,
+            },
+        ];
+        let code = [word, word].concat();
+        let mut member = read_object(&write_relocatable_object_with_sections(
+            machine, &code, &symbols, &words, &sections,
+        ))
+        .unwrap();
+        for r in &mut member.relocations {
+            r.implicit_addend = implicit;
+        }
+        member
+    }
+
+    /// `helper`, alone in an object of its own.
+    fn helper_for(machine: Machine) -> Object {
+        match machine {
+            Machine::Arm => obj_arm(&[0x70, 0x47], &[func("helper", 1, 2)], &[]),
+            Machine::RiscV => obj(&[0x67, 0x80, 0, 0], &[func("helper", 0, 4)], &[]),
+        }
+    }
+
+    /// The 32-bit little-endian word at `offset` within `image`'s text.
+    fn image_word(image: &LinkedImage, offset: u32) -> u32 {
+        let at = offset as usize;
+        u32::from_le_bytes(image.text[at..at + 4].try_into().unwrap())
+    }
+
+    /// Where `name` lies within `image`'s text.
+    fn image_offset(image: &LinkedImage, name: &str) -> u32 {
+        image
+            .symbols
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("the image defines `{name}`"))
+            .1
+    }
+
+    /// The word `main` holds at `word`, linked at `base`, as an offset within the image's text.
+    fn main_word_target(image: &LinkedImage, word: u32, base: u32) -> u32 {
+        image_word(image, image_offset(image, "main") + word) - base
+    }
+
+    /// The names of the input sections `object` still records.
+    fn section_names(object: &Object) -> Vec<&str> {
+        object
+            .input_sections
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect()
+    }
+
+    /// A CONSTANT ADDRESSED THROUGH ITS SECTION KEEPS THAT SECTION, AND NOTHING ELSE OF ITS OBJECT.
+    #[test]
+    fn a_constant_addressed_through_its_section_keeps_that_section_and_not_its_object() {
+        let member = native_member(Machine::Arm, false);
+        assert!(
+            !resolves_against_its_own_layout(&member),
+            "the member records its sections"
+        );
+        let trimmed = garbage_collect(&[member, helper_for(Machine::Arm)], "main");
+        assert_eq!(
+            section_names(&trimmed[0]),
+            [".text", ".rodata.first", ".rodata.second"],
+            "the two constants `main` addresses are kept, `.text.dead` and `.rodata.float` are not"
+        );
+        assert!(
+            !defines(&trimmed[0], "dead_native"),
+            "a function nothing calls drops"
+        );
+    }
+
+    /// AN OFFSET INTO A KEPT SECTION STILL LANDS ON ITS BYTE, WHETHER IT RIDES IN THE INSTRUCTION
+    /// (ARM's implicit addend) OR IN THE RELOCATION (ARM's and RISC-V's explicit one).
+    #[test]
+    fn an_offset_into_a_kept_section_lands_on_the_same_byte_implicit_or_explicit() {
+        for (machine, implicit) in [
+            (Machine::Arm, true),
+            (Machine::Arm, false),
+            (Machine::RiscV, false),
+        ] {
+            let trimmed = garbage_collect(
+                &[native_member(machine, implicit), helper_for(machine)],
+                "main",
+            );
+            let image = link_with_archives(&trimmed, &[], "main", Some(0x1000)).unwrap();
+            let target = main_word_target(&image, 0, 0x1000);
+            assert_eq!(
+                image_word(&image, target),
+                0x4433_2211,
+                "{machine:?}, implicit {implicit}: the word addresses byte 4 of `.rodata.first`"
+            );
+        }
+    }
+
+    /// TWO NAMELESS SECTION SYMBOLS ARE TWO TARGETS. They share the empty name, so a trim that
+    /// re-found a target by name would point both words at one constant.
+    #[test]
+    fn two_anonymous_constants_stay_distinct() {
+        let trimmed = garbage_collect(
+            &[native_member(Machine::Arm, false), helper_for(Machine::Arm)],
+            "main",
+        );
+        let image = link_with_archives(&trimmed, &[], "main", Some(0x1000)).unwrap();
+        assert_eq!(
+            image_word(&image, main_word_target(&image, 0, 0x1000)),
+            0x4433_2211
+        );
+        assert_eq!(
+            image_word(&image, main_word_target(&image, 4, 0x1000)),
+            0x8877_6655
+        );
+    }
+
+    /// A KEPT SECTION KEEPS ITS ALIGNMENT, in the trimmed object and in the image.
+    #[test]
+    fn a_kept_section_keeps_its_alignment() {
+        let trimmed = garbage_collect(
+            &[native_member(Machine::Arm, false), helper_for(Machine::Arm)],
+            "main",
+        );
+        for (name, align) in [(".rodata.first", 8), (".rodata.second", 16)] {
+            let section = trimmed[0]
+                .input_sections
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap();
+            assert_eq!(section.offset % align, 0, "{name} in the trimmed object");
+        }
+        let image = link_with_archives(&trimmed, &[], "main", Some(0x1000)).unwrap();
+        assert_eq!(
+            (main_word_target(&image, 0, 0x1000) - 4) % 8,
+            0,
+            "`.rodata.first` in the image"
+        );
+        assert_eq!(
+            (main_word_target(&image, 4, 0x1000) - 4) % 16,
+            0,
+            "`.rodata.second` in the image"
+        );
+    }
+
+    /// A KEPT SECTION'S OWN REFERENCES ARE FOLLOWED: `helper` is named only by a word inside
+    /// `.rodata.first`, and survives, and the word holds its address.
+    #[test]
+    fn a_section_kept_whole_keeps_what_it_refers_to() {
+        let trimmed = garbage_collect(
+            &[native_member(Machine::Arm, false), helper_for(Machine::Arm)],
+            "main",
+        );
+        assert!(
+            defines(&trimmed[1], "helper"),
+            "the constant's reference keeps `helper`"
+        );
+        let image = link_with_archives(&trimmed, &[], "main", Some(0x1000)).unwrap();
+        let first = main_word_target(&image, 0, 0x1000) - 4;
+        assert_eq!(
+            image_word(&image, first),
+            0x1000 + image_offset(&image, "helper") + 1,
+            "the constant holds `helper`'s Thumb address"
+        );
+    }
+
+    /// AN UNREFERENCED NATIVE CONSTANT DROPS. A managed object's data, which the backend lays in
+    /// its executable text, is still kept regardless, as before.
+    #[test]
+    fn an_unreferenced_native_constant_drops_and_managed_data_stays() {
+        let managed = obj_arm(
+            &[0x70, 0x47, 0, 0, 1, 2, 3, 4],
+            &[func("other", 1, 2), data("managed_blob", 4, 4)],
+            &[],
+        );
+        let trimmed = garbage_collect(
+            &[
+                native_member(Machine::Arm, false),
+                helper_for(Machine::Arm),
+                managed,
+            ],
+            "main",
+        );
+        assert!(
+            !defines(&trimmed[0], "unused_float_table"),
+            "native read-only data is kept by reference"
+        );
+        assert!(
+            defines(&trimmed[2], "managed_blob"),
+            "data in executable text is kept regardless"
+        );
+    }
+
+    /// A SECOND TRIM KEEPS WHAT THE FIRST KEPT. The product link trims twice, so the first trim's
+    /// output has to record its sections as the reader did.
+    #[test]
+    fn a_second_trim_keeps_what_the_first_kept() {
+        let once = garbage_collect(
+            &[native_member(Machine::Arm, true), helper_for(Machine::Arm)],
+            "main",
+        );
+        let twice = garbage_collect(&once, "main");
+        assert_eq!(twice[0].text, once[0].text, "the same bytes");
+        assert_eq!(
+            twice[0].input_sections, once[0].input_sections,
+            "the same sections"
+        );
+        let image = link_with_archives(&twice, &[], "main", Some(0x1000)).unwrap();
+        assert_eq!(
+            image_word(&image, main_word_target(&image, 0, 0x1000)),
+            0x4433_2211
+        );
+    }
+
+    /// A REFERENCE FROM CODE NOTHING KEEPS KEEPS NO SECTION.
+    #[test]
+    fn a_section_referenced_only_from_dropped_code_drops() {
+        let mut member = native_member(Machine::Arm, false);
+        member
+            .symbols
+            .iter_mut()
+            .find(|s| s.name == "main")
+            .unwrap()
+            .size = 4;
+        let trimmed = garbage_collect(&[member, helper_for(Machine::Arm)], "main");
+        assert_eq!(section_names(&trimmed[0]), [".text", ".rodata.first"]);
+    }
+
+    /// AN EMPTY SECTION A RELOCATION ADDRESSES KEEPS AN ADDRESS, THROUGH BOTH TRIMS.
+    #[test]
+    fn an_empty_section_keeps_its_address_through_both_trims() {
+        let empty = Symbol {
+            name: "",
+            value: 0,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::Section,
+            section: SymbolSection::InSection(0),
+        };
+        let member = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0; 4],
+            &[func("main", 1, 4), empty],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+            &[Section {
+                name: ".rodata.empty",
+                flags: 2,
+                addralign: 4,
+                data: &[],
+                relocations: &[],
+            }],
+        ))
+        .unwrap();
+        let once = garbage_collect(&[member], "main");
+        let twice = garbage_collect(&once, "main");
+        for objects in [&once, &twice] {
+            let section = objects[0]
+                .input_sections
+                .iter()
+                .find(|s| s.name == ".rodata.empty")
+                .unwrap();
+            let image = link_with_archives(objects, &[], "main", Some(0x1000)).unwrap();
+            assert_eq!(image_word(&image, 0), 0x1000 + section.offset);
+        }
+    }
+
+    /// A `.bss` SYMBOL OWNS NO TEXT RELOCATION. Its value is an offset into the RAM extent, so the
+    /// text relocations that happen to lie at the same number belong to someone else.
+    #[test]
+    fn a_bss_symbol_does_not_keep_the_text_relocations_at_its_offset() {
+        let mut member = obj_arm(
+            &[0; 12],
+            &[
+                func("main", 1, 4),
+                func("unused_caller", 5, 4),
+                func("unused_callee", 9, 4),
+                data("zero_state", 0, 8),
+            ],
+            &[
+                Relocation {
+                    offset: 0,
+                    symbol: 3,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                },
+                Relocation {
+                    offset: 4,
+                    symbol: 2,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                },
+            ],
+        );
+        let state = member
+            .symbols
+            .iter()
+            .position(|s| s.name == "zero_state")
+            .unwrap();
+        member.symbols[state].bss = true;
+        member.input_sections[0]
+            .symbols
+            .retain(|&i| i as usize != state);
+        member.bss_len = 8;
+        member.bss_align = 4;
+        let trimmed = garbage_collect(&[member], "main");
+        assert!(defines(&trimmed[0], "zero_state"), "the extent survives");
+        assert!(!defines(&trimmed[0], "unused_caller"));
+        assert!(
+            !defines(&trimmed[0], "unused_callee"),
+            "nothing kept calls it"
+        );
+    }
+
+    /// A MAPPING SYMBOL IN A KEPT SECTION IS NOT A NAME THE LINK KEEPS. Every ARM object marks its
+    /// code and data with `$t` and `$d`; were the mark of one kept section a kept name, every section
+    /// of every object that carries the same mark would follow it.
+    #[test]
+    fn a_mapping_symbol_in_a_kept_section_is_not_a_name_the_link_keeps() {
+        let mapping = |section| Symbol {
+            name: "$d",
+            value: 0,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::NoType,
+            section: SymbolSection::InSection(section),
+        };
+        let mut marked = native_member(Machine::Arm, false);
+        let first = marked
+            .input_sections
+            .iter()
+            .position(|s| s.name == ".rodata.first")
+            .unwrap();
+        let index = marked.symbols.len() as u32;
+        marked.symbols.push(lamella_elf::ParsedSymbol {
+            name: String::from("$d"),
+            value: marked.input_sections[first].offset,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::NoType,
+            defined: true,
+            section: None,
+            bss: false,
+        });
+        marked.input_sections[first].symbols.push(index);
+        let helper = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0x70, 0x47],
+            &[func("helper", 1, 2), mapping(0)],
+            &[],
+            &[Section {
+                name: ".rodata.unused",
+                flags: 2,
+                addralign: 4,
+                data: &[0; 8],
+                relocations: &[],
+            }],
+        ))
+        .unwrap();
+        let objects = [marked, helper];
+        assert!(!kept_names(&objects, "main").contains("$d"));
+        let trimmed = garbage_collect(&objects, "main");
+        assert!(section_names(&trimmed[0]).contains(&".rodata.first"));
+        assert_eq!(
+            section_names(&trimmed[1]),
+            [".text"],
+            "the other object's `$d` section is not kept for the first one's"
+        );
+    }
+
+    /// A LOCAL LABEL A RELOCATION NAMES KEEPS ITS OWN SECTION AND NO OTHER: a local of the same name
+    /// in another object is a different label.
+    #[test]
+    fn a_local_label_a_relocation_names_keeps_only_its_own_section() {
+        let pool = |section| Symbol {
+            name: "pool",
+            value: 0,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::NoType,
+            section: SymbolSection::InSection(section),
+        };
+        let rodata = |name| Section {
+            name,
+            flags: 2,
+            addralign: 4,
+            data: &[7, 0, 0, 0],
+            relocations: &[],
+        };
+        let addressing = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0; 4],
+            &[func("main", 1, 4), pool(0)],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+            &[rodata(".rodata.pool")],
+        ))
+        .unwrap();
+        let other = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0x70, 0x47],
+            &[func("unused", 1, 2), pool(0)],
+            &[],
+            &[rodata(".rodata.other")],
+        ))
+        .unwrap();
+        let trimmed = garbage_collect(&[addressing, other], "main");
+        assert_eq!(section_names(&trimmed[0]), [".text", ".rodata.pool"]);
+        assert!(
+            section_names(&trimmed[1]).is_empty(),
+            "nothing of the other object is kept, its `pool` included"
+        );
+    }
+
+    /// A DATA SYMBOL AT AN ODD OFFSET IS COPIED FROM ITS OWN FIRST BYTE. Only an ARM function's
+    /// value carries the Thumb bit; clearing bit 0 of every value copied an odd data symbol from the
+    /// byte before it, and lost its last byte.
+    #[test]
+    fn a_data_symbol_at_an_odd_offset_is_copied_from_its_own_first_byte() {
+        let member = obj_arm(
+            &[0, 0, 0, 0, 0xA4, 0xA5, 0xA6, 0xA7],
+            &[func("main", 1, 4), data("odd", 5, 3)],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+        );
+        let trimmed = garbage_collect(&[member], "main");
+        let image = link_with_archives(&trimmed, &[], "main", Some(0x1000)).unwrap();
+        let odd = image_offset(&image, "odd") as usize;
+        assert_eq!(image.text[odd..odd + 3], [0xA5, 0xA6, 0xA7]);
+    }
+
+    /// AN OBJECT WITHOUT SECTION RECORDS IS KEPT WHOLE, AS BEFORE: one built in memory cannot say
+    /// where a nameless target's section begins and ends.
+    #[test]
+    fn an_object_without_section_records_is_kept_whole() {
+        let mut member = native_member(Machine::Arm, false);
+        member.input_sections.clear();
+        assert!(resolves_against_its_own_layout(&member));
+        let trimmed = garbage_collect(core::slice::from_ref(&member), "main");
+        assert_eq!(trimmed[0].text, member.text);
+        assert!(defines(&trimmed[0], "dead_native"));
+    }
+
+    /// IDENTICAL CODE REACHING DIFFERENT NAMELESS CONSTANTS NEVER FOLDS. Both targets have the
+    /// empty name, so a fingerprint by name would call `a` and `b` interchangeable.
+    #[test]
+    fn identical_code_reaching_different_anonymous_constants_never_folds() {
+        let section_symbol = |section| Symbol {
+            name: "",
+            value: 0,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::Section,
+            section: SymbolSection::InSection(section),
+        };
+        let constants = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0; 8],
+            &[
+                func("a", 1, 4),
+                func("b", 5, 4),
+                section_symbol(0),
+                section_symbol(1),
+            ],
+            &[
+                Relocation {
+                    offset: 0,
+                    symbol: 2,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                },
+                Relocation {
+                    offset: 4,
+                    symbol: 3,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                },
+            ],
+            &[
+                Section {
+                    name: ".rodata.a",
+                    flags: 2,
+                    addralign: 4,
+                    data: &[1, 0, 0, 0],
+                    relocations: &[],
+                },
+                Section {
+                    name: ".rodata.b",
+                    flags: 2,
+                    addralign: 4,
+                    data: &[2, 0, 0, 0],
+                    relocations: &[],
+                },
+            ],
+        ))
+        .unwrap();
+        let main = obj_arm(
+            &[0x00, 0xF0, 0x00, 0xD0, 0x00, 0xF0, 0x00, 0xD0],
+            &[func("main", 1, 8), undef("a"), undef("b")],
+            &[
+                Relocation {
+                    offset: 0,
+                    symbol: 1,
+                    kind: arm::R_ARM_THM_CALL,
+                    addend: -4,
+                },
+                Relocation {
+                    offset: 4,
+                    symbol: 2,
+                    kind: arm::R_ARM_THM_CALL,
+                    addend: -4,
+                },
+            ],
+        );
+        let image = link_icf_with_archives(&[main, constants], &[], "main", Some(0x1000)).unwrap();
+        let (a, b) = (image_offset(&image, "a"), image_offset(&image, "b"));
+        assert_ne!(a, b, "`a` and `b` keep their own bodies");
+        assert_eq!(image_word(&image, image_word(&image, a) - 0x1000), 1);
+        assert_eq!(image_word(&image, image_word(&image, b) - 0x1000), 2);
     }
 }

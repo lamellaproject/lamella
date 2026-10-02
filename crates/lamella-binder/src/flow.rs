@@ -100,7 +100,7 @@ fn exits(stmt: &BoundStmt, undefined_labels: &BTreeSet<Box<str>>) -> bool {
         Kind::Switch { sections, .. } => {
             let has_default = sections
                 .iter()
-                .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
+                .any(|section| section.labels.iter().any(matches_every_value));
             has_default
                 && sections.iter().all(|section| {
                     section
@@ -396,10 +396,14 @@ impl UnusedScan {
             BoundStmtKind::Switch {
                 expression,
                 sections,
+                ..
             } => {
                 self.uses(expression);
                 self.scopes.push(BTreeMap::new());
                 for section in sections {
+                    for (test, guard) in section.labels.iter().filter_map(pattern_label_parts) {
+                        test.into_iter().chain(guard).for_each(|part| self.uses(part));
+                    }
                     for statement in &section.statements {
                         self.statement(statement);
                     }
@@ -750,9 +754,15 @@ pub(crate) fn collect_field_accesses(stmt: &BoundStmt, reads: &mut FieldSet, wri
         BoundStmtKind::Switch {
             expression,
             sections,
+            ..
         } => {
             collect_field_uses(expression, reads, writes);
             for section in sections {
+                for (test, guard) in section.labels.iter().filter_map(pattern_label_parts) {
+                    for part in test.into_iter().chain(guard) {
+                        collect_field_uses(part, reads, writes);
+                    }
+                }
                 for statement in &section.statements {
                     collect_field_accesses(statement, reads, writes);
                 }
@@ -1455,6 +1465,26 @@ fn switch_jump_targets(sections: &[BoundSwitchSection]) -> BTreeSet<usize> {
     targets
 }
 
+/// Whether a switch label is taken for every value the switch can have: `default`, or a pattern
+/// label the binder found matching everything. A switch with one leaves no way past itself.
+fn matches_every_value(label: &BoundSwitchLabel) -> bool {
+    matches!(
+        label,
+        BoundSwitchLabel::Default | BoundSwitchLabel::Pattern { catch_all: true, .. }
+    )
+}
+
+/// A pattern switch's label as its TEST and GUARD -- `None` for a label of a switch of constants,
+/// which tests nothing a flow analysis has to walk.
+fn pattern_label_parts(
+    label: &BoundSwitchLabel,
+) -> Option<(Option<&BoundExpr>, Option<&BoundExpr>)> {
+    match label {
+        BoundSwitchLabel::Pattern { test, guard, .. } => Some((test.as_ref(), guard.as_ref())),
+        _ => None,
+    }
+}
+
 /// Which `switch` sections are statically reachable when the governing value is a compile-time
 /// constant (clause 12, 15.7): the section the constant selects (its `case`, else the `default`),
 /// plus every section a `goto case`/`goto default` targets. `None` means the value is not a
@@ -1468,6 +1498,12 @@ pub fn switch_section_reachability(
     expression: &BoundExpr,
     sections: &[BoundSwitchSection],
 ) -> Option<Vec<bool>> {
+    if sections
+        .iter()
+        .any(|section| section.labels.iter().any(|label| pattern_label_parts(label).is_some()))
+    {
+        return None;
+    }
     let value = constant_int_value(expression)?;
     let has_default = sections
         .iter()
@@ -1711,6 +1747,60 @@ impl Analyzer<'_> {
             BoundStmtKind::Switch {
                 expression,
                 sections,
+                subject: Some(subject),
+            } => {
+                let mut assigned = assigned;
+                self.expression(expression, &mut assigned, span);
+                assigned.insert(subject.clone());
+                self.break_frames.push(Vec::new());
+                let mut after = Flow::Exits;
+                let mut catch_all = false;
+                for section in sections {
+                    let mut entry: Option<Assigned> = None;
+                    for label in &section.labels {
+                        catch_all |= matches_every_value(label);
+                        let state = match pattern_label_parts(label) {
+                            None => assigned.clone(),
+                            Some((test, guard)) => {
+                                let state = match test {
+                                    Some(test) => self
+                                        .condition(test, assigned.clone(), span)
+                                        .when_true
+                                        .unwrap_or_else(|| assigned.clone()),
+                                    None => assigned.clone(),
+                                };
+                                match guard {
+                                    Some(guard) => {
+                                        let guarded = self.condition(guard, state.clone(), span);
+                                        guarded.when_true.unwrap_or(state)
+                                    }
+                                    None => state,
+                                }
+                            }
+                        };
+                        entry = Some(match entry {
+                            None => state,
+                            Some(previous) => previous.intersection(&state).cloned().collect(),
+                        });
+                    }
+                    let entry = entry.unwrap_or_else(|| assigned.clone());
+                    if let Flow::Reaches(set) = self.block(&section.statements, entry) {
+                        after = merge(after, Flow::Reaches(set));
+                    }
+                }
+                for set in self.break_frames.pop().unwrap_or_default() {
+                    after = merge(after, Flow::Reaches(set));
+                }
+                if catch_all {
+                    after
+                } else {
+                    merge(after, Flow::Reaches(assigned))
+                }
+            }
+            BoundStmtKind::Switch {
+                expression,
+                sections,
+                subject: None,
             } => {
                 let mut assigned = assigned;
                 self.expression(expression, &mut assigned, span);

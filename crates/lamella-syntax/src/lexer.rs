@@ -2062,7 +2062,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Recognizes a post-1.0 operator at the current position that the target version does not
-    /// support (`??` and `::`, both from C# 2.0), reports a `CS8022`
+    /// support (`??`, from C# 2.0), reports a `CS8022`
     /// feature diagnostic, consumes it as one token, and returns `Unknown`. Without this, maximal
     /// munch over the 1.0 operator set would split it (`=` then `>`, two `?`, ...) and the error
     /// would name those, not the feature. `?.` is NOT gated when a digit follows -- it is then a
@@ -2073,7 +2073,6 @@ impl<'a> Lexer<'a> {
     fn try_gate_post_1_0_operator(&mut self, start: usize) -> Option<TokenKind> {
         const GATED: &[(&str, Feature)] = &[
             ("??", Feature::NullCoalescing),
-            ("::", Feature::NamespaceAlias),
         ];
         let rest = self.remaining();
         for &(spelling, feature) in GATED {
@@ -2957,13 +2956,19 @@ class C { }
     #[test]
     fn post_1_0_operators_report_cs8022_under_csharp1() {
         let iso1 = LexOptions { version: LanguageVersion::CSharp1, ..LexOptions::default() };
-        for src in ["a ?? b", "global::System"] {
+        for src in ["a ?? b"] {
             let diagnostics = tokenize_with(src, iso1.clone()).diagnostics;
             assert!(
                 diagnostics.iter().any(|d| d.code() == 8022),
                 "{src:?} should report CS8022, got {diagnostics:?}"
             );
         }
+        let qualified = tokenize_with("global::System", iso1.clone());
+        assert!(qualified.diagnostics.is_empty(), "{:?}", qualified.diagnostics);
+        assert!(qualified
+            .tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::Punctuator(Punctuator::ColonColon)));
         assert!(
             tokenize("c?.5:.3").diagnostics.is_empty(),
             "c?.5:.3 is a valid 1.0 conditional: {:?}",

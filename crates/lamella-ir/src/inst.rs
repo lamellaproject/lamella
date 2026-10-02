@@ -375,6 +375,11 @@ pub enum Inst {
     CallVirtual {
         /// The called method's vtable slot.
         slot: u32,
+        /// The type that declares the called method, when the call site names it. A link keeps the
+        /// slot's method only in descriptors of that type and of the types deriving from it, since
+        /// no other receiver can reach this call. `None` when the site cannot name the type; the
+        /// slot is then kept in every descriptor that has it.
+        declaring_type: Option<TypeHandle>,
         /// The argument values, in order; `args[0]` is the receiver (`this`).
         args: Vec<ValueId>,
         /// Whether the callee returns a value (false for a `void` method). A signature-checked
@@ -410,6 +415,8 @@ pub enum Inst {
         object: ValueId,
         /// The method's vtable slot.
         slot: u32,
+        /// The type that declares the method; see [`Inst::CallVirtual`].
+        declaring_type: Option<TypeHandle>,
     },
     /// An INDIRECT call through a code pointer in `target` (the CIL `calli`, and the engine of a
     /// delegate's `Invoke`): passes `args` in the ABI's argument registers and calls `target`.

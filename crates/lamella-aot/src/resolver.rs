@@ -43,7 +43,7 @@ pub fn reference_handle_parts(handle: TypeHandle) -> Option<(usize, u32)> {
 
 /// The qualified handle for `ordinal`'s type at `type_def_token` (see
 /// [`REFERENCE_HANDLE_TABLE`]). Panics past the encoding's capacity rather than aliasing.
-fn reference_handle(ordinal: usize, type_def_token: u32) -> TypeHandle {
+pub(crate) fn reference_handle(ordinal: usize, type_def_token: u32) -> TypeHandle {
     let row = type_def_token & 0x00ff_ffff;
     assert!(
         ordinal < 16 && row <= REFERENCE_ROW_MASK,
@@ -833,44 +833,52 @@ impl<'a> MetadataResolver<'a> {
     /// bound to the OPEN definition's rid, and refused as `UnresolvedCall`.
     ///
     /// The key is built the way the `TypeSpec` path builds its own, through the SAME speller, so the
-    /// two cannot disagree about the string the plan is holding: the declaring type instantiated over
-    /// its own parameters (`` List`1<!0> ``), spelled with the arguments in force.
-    ///
-    /// **THE ARITY GUARD IS WHAT KEEPS THIS FROM ANSWERING FOR A TYPE IT IS NOT ABOUT.** A bare
-    /// `MethodDef` naming a non-generic type's method, or a generic type of a different arity, spells
-    /// a key the plan does not hold and misses -- but requiring the counts to match refuses it before
-    /// the lookup rather than relying on a string not to collide.
+    /// two cannot disagree about the string the plan is holding: [`Self::instantiation_in_force`].
     fn monomorphized_self_call(&self, token: Token, signature: &MethodSig) -> Option<CallInfo> {
-        if self.mono.is_empty()
-            || token.table() != table::METHOD_DEF
-            || self.type_arguments.is_empty()
-        {
+        if self.mono.is_empty() || token.table() != table::METHOD_DEF {
             return None;
         }
         let declaring = self.type_token_of(token)?;
-        let arity = self
-            .assembly
-            .generic_params()
-            .filter(|&(_, _, owner, _)| owner & 1 == 0 && (owner >> 1) == declaring.row())
-            .count();
-        if arity != self.type_arguments.len() {
+        let name = self.instantiation_in_force(declaring)?;
+        let method = self.assembly.resolve_method(token)?;
+        let index = self
+            .mono
+            .index_of(&name, method.name?, &signature.parameters)?;
+        self.monomorphized_call_info(index, signature, &self.type_arguments)
+    }
+
+    /// The canonical spelling of the generic type `declaring` instantiated over the type arguments
+    /// in force: the instantiation a body lowered under those arguments belongs to, when the body
+    /// names its own type by a bare `TypeDef` -- the declaring type over its own parameters
+    /// (`` List`1<!0> ``), spelled with the arguments in force. `None` with no arguments in force.
+    ///
+    /// **THE ARITY GUARD IS WHAT KEEPS THIS FROM ANSWERING FOR A TYPE IT IS NOT ABOUT.** A
+    /// non-generic type, or a generic type of a different arity, would spell a name no
+    /// instantiation in force has -- but requiring the counts to match refuses it before a lookup
+    /// rather than relying on a string not to collide.
+    fn instantiation_in_force(&self, declaring: Token) -> Option<String> {
+        if self.type_arguments.is_empty() || self.type_arity(declaring) != self.type_arguments.len()
+        {
             return None;
         }
         let open = SigType::GenericInst {
             definition: alloc::boxed::Box::new(SigType::Class(declaring)),
             arguments: (0..self.type_arguments.len() as u32).map(SigType::Var).collect(),
         };
-        let name = crate::generics::spell_sig_across(
+        crate::generics::spell_sig_across(
             self.assembly,
             self.argument_world(),
             &open,
             &self.type_arguments,
-        )?;
-        let method = self.assembly.resolve_method(token)?;
-        let index = self
-            .mono
-            .index_of(&name, method.name?, &signature.parameters)?;
-        self.monomorphized_call_info(index, signature, &self.type_arguments)
+        )
+    }
+
+    /// How many generic parameters this assembly's `TypeDef` declares; 0 for a non-generic type.
+    fn type_arity(&self, type_def: Token) -> usize {
+        self.assembly
+            .generic_params()
+            .filter(|&(_, _, owner, _)| owner & 1 == 0 && (owner >> 1) == type_def.row())
+            .count()
     }
 
     /// A `callvirt` on a GENERIC INTERFACE instantiation -- `` IBox`1<int32>::Get() `` -- typed for
@@ -4525,6 +4533,36 @@ impl<'a> MetadataResolver<'a> {
         }
     }
 
+    /// The signature of the field a `Field` or field `MemberRef` token names, closed over the
+    /// instantiation in force, in its LAYOUT reading: the one type the field's value type and its
+    /// access width are both read from.
+    ///
+    /// **THE TWO MUST COME FROM ONE READING, OR AN ACCESS DISAGREES WITH THE LAYOUT IT ADDRESSES.**
+    /// The layout sizes a field by the type it resolves to: an enum at its underlying width, a `T` at
+    /// its argument's. The DECLARED signature names a `ValueType` token for the enum and `!0` for the
+    /// `T`, and neither is a short integer, so an access sized from it read a `byte`-backed enum field
+    /// as a whole word, three neighbors included, and a store to it overwrote them.
+    fn closed_field_sig(&self, token: Token) -> Option<SigType> {
+        match token.table() {
+            table::MEMBER_REF => {
+                let member = self.assembly.member_ref(token.row())?;
+                let declared = member.field_type()?;
+                if member.parent().table() == table::TYPE_SPEC {
+                    let (_, _, arguments) = self.instantiated_parent(member.parent())?;
+                    let arguments = caller_resolved_arguments(
+                        &arguments,
+                        self.argument_world(),
+                        &self.references,
+                    )?;
+                    crate::generics::substitute_sig(&declared, &arguments)
+                } else {
+                    Some(declared)
+                }
+            }
+            _ => self.apply_instantiation(&self.assembly.field_signature(token)?),
+        }
+    }
+
     /// The layout of one INSTANTIATION of a generic definition: the definition's own instance
     /// fields with `!n` replaced by the instantiation's arguments, then laid out.
     ///
@@ -5111,27 +5149,8 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let signature = match token.table() {
-            table::MEMBER_REF => {
-                let member = self.assembly.member_ref(token.row())?;
-                let declared = member.field_type()?;
-                if member.parent().table() == table::TYPE_SPEC {
-                    let (_, _, arguments) = self.instantiated_parent(member.parent())?;
-                    let arguments = caller_resolved_arguments(
-                        &arguments,
-                        self.argument_world(),
-                        &self.references,
-                    )?;
-                    crate::generics::substitute_sig(&declared, &arguments)?
-                } else {
-                    declared
-                }
-            }
-            _ => self
-                .apply_instantiation(&self.assembly.field_signature(*token)?)?,
-        };
         mir_type_across(
-            &signature,
+            &self.closed_field_sig(*token)?,
             self.assembly,
             self.argument_assembly,
             &self.references,
@@ -5139,21 +5158,15 @@ impl CallResolver for MetadataResolver<'_> {
         )
     }
 
-    fn field_narrow(&self, operand: &Operand) -> Option<(u8, bool)> {
+    fn field_narrow(&self, operand: &Operand) -> Option<lamella_ir::ConvKind> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let signature = match token.table() {
-            table::MEMBER_REF => self.assembly.member_ref(token.row())?.field_type()?,
-            _ => self.assembly.field_signature(*token)?,
-        };
-        match signature {
-            SigType::Boolean | SigType::U1 => Some((1, false)),
-            SigType::I1 => Some((1, true)),
-            SigType::Char | SigType::U2 => Some((2, false)),
-            SigType::I2 => Some((2, true)),
-            _ => None,
-        }
+        declared_narrow(
+            &self.closed_field_sig(*token)?,
+            self.assembly,
+            self.references(),
+        )
     }
 
     fn array_cast_test(&self, operand: &Operand) -> Option<ArrayCastTest> {
@@ -6292,6 +6305,39 @@ impl CallResolver for MetadataResolver<'_> {
                 GenericDispatch::Slot(slot) => Some(slot),
                 GenericDispatch::Tag(_) => None,
             },
+            _ => None,
+        }
+    }
+
+    /// The declaring type of the method a `callvirt` or `ldvirtftn` names, as the handle its
+    /// descriptor symbol is spelled from: an instantiation by its canonical spelling, closed under
+    /// the arguments in force; this assembly's type by its token; a referenced type by the
+    /// reference-owned handle. A type this resolver cannot name in any of those ways answers
+    /// `None`, which keeps the slot in every descriptor -- never a guess at a name.
+    fn virtual_declaring_type(&self, operand: &Operand) -> Option<TypeHandle> {
+        let Operand::Token(token) = *operand else {
+            return None;
+        };
+        let method = if token.table() == table::METHOD_SPEC {
+            self.assembly.method_spec_method(token)?
+        } else {
+            token
+        };
+        let declaring = self.type_token_of(method)?;
+        match declaring.table() {
+            table::TYPE_SPEC => Some(crate::generics::instantiation_handle(
+                &self.spelled_spec(declaring)?,
+            )),
+            table::TYPE_DEF if self.type_arity(declaring) == 0 => {
+                Some(self.qualified_type_handle(declaring))
+            }
+            table::TYPE_DEF => self
+                .instantiation_in_force(declaring)
+                .map(|name| crate::generics::instantiation_handle(&name)),
+            table::TYPE_REF => {
+                let handle = self.qualified_type_handle(declaring);
+                reference_handle_parts(handle).is_some().then_some(handle)
+            }
             _ => None,
         }
     }

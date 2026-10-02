@@ -670,8 +670,27 @@ pub enum DiagnosticKind {
         /// The operand's type.
         operand: Box<str>,
     },
-    /// `CS0173`: a conditional expression's two branches have no common type.
+    /// `CS0173`: a conditional expression's two branches have no common type, and nothing
+    /// converts the conditional to one.
     ConditionalTypeMismatch {
+        /// The `true` branch's type.
+        left: Box<str>,
+        /// The `false` branch's type.
+        right: Box<str>,
+    },
+    /// `CS0172`: a conditional expression's two branches each convert to the other's type, so
+    /// neither is its type, and nothing converts the conditional to one.
+    ConditionalTypeAmbiguous {
+        /// The `true` branch's type.
+        left: Box<str>,
+        /// The `false` branch's type.
+        right: Box<str>,
+    },
+    /// `CS8957`: a conditional expression whose branches have no common type takes the type it is
+    /// converted to only from C# 9.0, and this program is compiled at an earlier version.
+    ConditionalNeedsTargetTyping {
+        /// The version being compiled.
+        current: LanguageVersion,
         /// The `true` branch's type.
         left: Box<str>,
         /// The `false` branch's type.
@@ -1427,14 +1446,13 @@ pub enum DiagnosticKind {
     /// `bool b switch { true => .., false => .. }` draws it. The program compiles and runs
     /// correctly either way; only the warning is spurious.
     SwitchExpressionNotExhaustive,
-    /// `CS8506`: a switch expression's arms have no type in common.
+    /// `CS8506`: a switch expression's arms have no type in common, and nothing converts the
+    /// expression to one.
     ///
-    /// **REPORTED WHEREVER THE ARMS HAVE NO TYPE IN COMMON, EVEN WHERE THE CONTEXT WOULD SUPPLY
-    /// ONE.** A switch expression is target-typed in the standard, so
-    /// `object M(int x) => x switch { 1 => "s", _ => 2 };` is a legal program: each arm converts
-    /// to `object` and no common type is needed. This build does not implement target typing, so
-    /// it asks for a common type in every position and refuses that program. Writing the
-    /// conversion on each arm is the repair.
+    /// **A CONTEXT THAT CONVERTS THE EXPRESSION SUPPLIES THE TYPE INSTEAD.** A switch expression
+    /// is target-typed, so `object M(int x) => x switch { 1 => "s", _ => 2 };` is a legal program:
+    /// each arm converts to `object` and no common type is needed. `var v = x switch { 1 => "s",
+    /// _ => 2 };` has no target, and that is this diagnostic.
     SwitchExpressionNoBestType,
     /// The type a non-exhaustive switch expression must throw is not in scope.
     ///
@@ -1573,6 +1591,41 @@ pub enum DiagnosticKind {
         from: Box<str>,
         /// The parameter's declared type.
         to: Box<str>,
+    },
+    /// `CS8183`: `_ = null;` -- a discard takes the type of what is assigned to it, and `null` has
+    /// none.
+    DiscardWithoutType,
+    /// `CS8209`: `_ = M();` where `M` returns nothing -- there is no value to discard.
+    VoidAssignedToDiscard,
+    /// `CS8120`: a switch label an earlier unguarded one already covers -- after `case Bme280 b:`,
+    /// a `case Bme280 c:` can never run.
+    SwitchCaseSubsumed,
+    /// `CS8716`: a `default` literal stands where nothing gives it a type -- `var x = default;`,
+    /// `default.ToString()`.
+    DefaultLiteralNoTarget,
+    /// `CS8315`: both operands of an operator are `default` literals, so neither types the other.
+    DefaultLiteralAmbiguousOperator {
+        /// The operator as written.
+        operator: Box<str>,
+    },
+    /// `CS8505`: a `default` literal written as a pattern -- `x is default`, `case default:`.
+    DefaultLiteralPattern,
+    /// `CS1763`: a parameter of a reference type has a default other than `null` -- a boxed
+    /// value (`object o = 5`), or a string given to an `object`. A `string` parameter is the
+    /// exception the message names.
+    DefaultValueReferenceNotNull {
+        /// The parameter's declared name.
+        parameter: Box<str>,
+        /// The parameter's declared type.
+        ty: Box<str>,
+    },
+    /// `CS1770`: a NULLABLE parameter's default converts from a type with no constants
+    /// (`S? s = default(S)`), so its `Constant` row has nothing to hold.
+    DefaultValueNullableNotSimple {
+        /// The default's own type, which the message names twice.
+        from: Box<str>,
+        /// The parameter's declared name.
+        parameter: Box<str>,
     },
     /// `CS0231`: a `params` parameter is not the last parameter in the list.
     ParamsNotLast,
@@ -2133,6 +2186,22 @@ pub enum DiagnosticKind {
         /// The name that was not found in it.
         name: Box<str>,
     },
+    /// `CS0400`: a name qualified by `global::` is not in the global namespace.
+    GlobalNamespaceMemberNotFound {
+        /// The name that was not found.
+        name: Box<str>,
+    },
+    /// `CS0432`: a namespace alias qualifier `alias::` names no alias in scope.
+    AliasNotFound {
+        /// The alias as written.
+        alias: Box<str>,
+    },
+    /// `CS0431`: a namespace alias qualifier names an alias of a TYPE, and `::` qualifies only by a
+    /// namespace: `L::Item` for `using L = System.Text.StringBuilder;` is `L.Item`.
+    AliasQualifierNamesType {
+        /// The alias as written.
+        alias: Box<str>,
+    },
     /// `CS0104`: a simple name is ambiguous between two imported namespaces.
     AmbiguousReference {
         /// The ambiguous simple name.
@@ -2342,6 +2411,8 @@ impl DiagnosticKind {
             DiagnosticKind::OperatorNotApplicable { .. } => 19,
             DiagnosticKind::UnaryOperatorNotApplicable { .. } => 23,
             DiagnosticKind::ConditionalTypeMismatch { .. } => 173,
+            DiagnosticKind::ConditionalTypeAmbiguous { .. } => 172,
+            DiagnosticKind::ConditionalNeedsTargetTyping { .. } => 8957,
             DiagnosticKind::NotAssignable => 131,
             DiagnosticKind::CannotAssignToMethodGroup { .. } => 1656,
             DiagnosticKind::CannotAssignToReadonlyLocal { .. } => 1656,
@@ -2479,6 +2550,14 @@ impl DiagnosticKind {
             DiagnosticKind::ParamsParameterWithDefault => 1751,
             DiagnosticKind::DefaultValueNotConstant { .. } => 1736,
             DiagnosticKind::DefaultValueWrongType { .. } => 1750,
+            DiagnosticKind::DefaultValueReferenceNotNull { .. } => 1763,
+            DiagnosticKind::DefaultLiteralNoTarget => 8716,
+            DiagnosticKind::SwitchCaseSubsumed => 8120,
+            DiagnosticKind::DiscardWithoutType => 8183,
+            DiagnosticKind::VoidAssignedToDiscard => 8209,
+            DiagnosticKind::DefaultLiteralAmbiguousOperator { .. } => 8315,
+            DiagnosticKind::DefaultLiteralPattern => 8505,
+            DiagnosticKind::DefaultValueNullableNotSimple { .. } => 1770,
             DiagnosticKind::ParamsNotLast => 231,
             DiagnosticKind::ParamsNotArray => 225,
             DiagnosticKind::InconsistentAccessibility { position, .. } => position.code(),
@@ -2557,6 +2636,9 @@ impl DiagnosticKind {
             DiagnosticKind::UseOfUnassignedLocal { .. } => 165,
             DiagnosticKind::OutParameterNotAssigned { .. } => 177,
             DiagnosticKind::NamespaceMemberNotFound { .. } => 234,
+            DiagnosticKind::GlobalNamespaceMemberNotFound { .. } => 400,
+            DiagnosticKind::AliasNotFound { .. } => 432,
+            DiagnosticKind::AliasQualifierNamesType { .. } => 431,
             DiagnosticKind::AmbiguousReference { .. } => 104,
             DiagnosticKind::AsyncReturnType => 1983,
             DiagnosticKind::AsyncByRefParameter => 1988,
@@ -2863,6 +2945,22 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "Type of conditional expression cannot be determined because there is no \
                  implicit conversion between '{left}' and '{right}'"
+            ),
+            DiagnosticKind::ConditionalTypeAmbiguous { left, right } => write!(
+                f,
+                "Type of conditional expression cannot be determined because '{left}' and \
+                 '{right}' implicitly convert to one another"
+            ),
+            DiagnosticKind::ConditionalNeedsTargetTyping {
+                current,
+                left,
+                right,
+            } => write!(
+                f,
+                "Conditional expression is not valid in language version {} because a common \
+                 type was not found between '{left}' and '{right}'. To use a target-typed \
+                 conversion, upgrade to language version 9.0 or greater.",
+                current.message_name()
             ),
             DiagnosticKind::NotAssignable => write!(
                 f,
@@ -3438,6 +3536,33 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "A value of type '{from}' cannot be used as a default parameter because there are no standard conversions to type '{to}'"
             ),
+            DiagnosticKind::DefaultLiteralNoTarget => {
+                f.write_str("There is no target type for the default literal.")
+            }
+            DiagnosticKind::SwitchCaseSubsumed => f.write_str(
+                "The switch case is unreachable. It has already been handled by a previous case or it is impossible to match."
+            ),
+            DiagnosticKind::DiscardWithoutType => {
+                f.write_str("Cannot infer the type of implicitly-typed discard.")
+            }
+            DiagnosticKind::VoidAssignedToDiscard => {
+                f.write_str("A value of type 'void' may not be assigned.")
+            }
+            DiagnosticKind::DefaultLiteralAmbiguousOperator { operator } => write!(
+                f,
+                "Operator '{operator}' is ambiguous on operands 'default' and 'default'"
+            ),
+            DiagnosticKind::DefaultLiteralPattern => f.write_str(
+                "A default literal 'default' is not valid as a pattern. Use another literal (e.g. '0' or 'null') as appropriate. To match everything, use a discard pattern '_'."
+            ),
+            DiagnosticKind::DefaultValueReferenceNotNull { parameter, ty } => write!(
+                f,
+                "'{parameter}' is of type '{ty}'. A default parameter value of a reference type other than string can only be initialized with null"
+            ),
+            DiagnosticKind::DefaultValueNullableNotSimple { from, parameter } => write!(
+                f,
+                "A value of type '{from}' cannot be used as default parameter for nullable parameter '{parameter}' because '{from}' is not a simple type"
+            ),
             DiagnosticKind::ParamsNotLast => write!(
                 f,
                 "A params parameter must be the last parameter in a parameter list"
@@ -3764,6 +3889,17 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NamespaceMemberNotFound { namespace, name } => write!(
                 f,
                 "The type or namespace name '{name}' does not exist in the namespace '{namespace}'"
+            ),
+            DiagnosticKind::GlobalNamespaceMemberNotFound { name } => write!(
+                f,
+                "The type or namespace name '{name}' could not be found in the global namespace \
+                 (are you missing an assembly reference?)"
+            ),
+            DiagnosticKind::AliasNotFound { alias } => write!(f, "Alias '{alias}' not found"),
+            DiagnosticKind::AliasQualifierNamesType { alias } => write!(
+                f,
+                "Cannot use alias '{alias}' with '::' since the alias references a type. Use '.' \
+                 instead."
             ),
             DiagnosticKind::AmbiguousReference {
                 name,

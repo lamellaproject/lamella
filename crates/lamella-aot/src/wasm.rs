@@ -1771,7 +1771,7 @@ fn lower_inst(
             body.i32_const((ctx.import_count + *func) as i32);
             body.local_set(local(result));
         }
-        Inst::VirtualFuncAddr { object, slot } => {
+        Inst::VirtualFuncAddr { object, slot, .. } => {
             let offset = i32::try_from(4 + slot * 4).map_err(|_| LowerError::Unsupported)?;
             body.local_get(local(*object));
             body.i32_const(4);
@@ -1786,6 +1786,7 @@ fn lower_inst(
             slot,
             args,
             returns_value,
+            ..
         } => {
             let receiver = *args.first().ok_or(LowerError::Unsupported)?;
             let offset = i32::try_from(4 + slot * 4).map_err(|_| LowerError::Unsupported)?;
@@ -3225,6 +3226,7 @@ mod tests {
                         ValueId(1),
                         Inst::CallVirtual {
                             slot: 0,
+                            declaring_type: None,
                             args: alloc::vec![ValueId(0)],
                             returns_value: true,
                         },
@@ -3435,6 +3437,7 @@ mod tests {
                         ValueId(1),
                         Inst::CallVirtual {
                             slot: 0,
+                            declaring_type: None,
                             args: alloc::vec![ValueId(0)],
                             returns_value: false,
                         },

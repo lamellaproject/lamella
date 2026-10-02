@@ -1085,9 +1085,21 @@ fn bind_namespace_body(
     let mut aliases: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
     for using in usings {
         match &using.kind {
-            UsingKind::Namespace(_) => {}
+            // `using global::System;` (C# 2.0) is gated at the `global`, where csc reports it.
+            UsingKind::Namespace(name) => {
+                if name
+                    .parts
+                    .first()
+                    .is_some_and(|part| lamella_syntax::ast::alias_qualifier(part).is_some())
+                {
+                    binder.gate_feature(
+                        lamella_syntax::version::Feature::NamespaceAlias,
+                        Span::empty_at(name.span.start),
+                    );
+                }
+            }
             UsingKind::Static(target) => {
-                let imported = TypeSymbol::Named(target.parts.iter().cloned().collect());
+                let imported = TypeSymbol::Named(qualified_parts(target));
                 if binder.resolve_named_type_quietly(&imported, target.span).is_error()
                     && binder.names_a_namespace(&dotted(target))
                 {
@@ -1108,10 +1120,10 @@ fn bind_namespace_body(
                         using.span,
                     ));
                 }
-                binder.resolve_named_type(
-                    &TypeSymbol::Named(target.parts.iter().cloned().collect()),
-                    target.span,
-                );
+                let named = TypeSymbol::Named(qualified_parts(target));
+                if binder.aliased_namespace(&named).is_none() {
+                    binder.resolve_named_type(&named, target.span);
+                }
             }
         }
         binder.import_using(&using.kind);
@@ -1154,6 +1166,16 @@ fn bind_namespace_member(binder: &mut Binder, namespace: &str, member: &Namespac
         NamespaceMember::Type(declaration) => bind_type_bodies(binder, namespace, declaration),
         NamespaceMember::Delegate(declaration) => {
             check_delegate_accessibility(binder, namespace, declaration);
+            let enclosing = named_symbol(
+                namespace,
+                &crate::declaration::declared_delegate_name(declaration),
+            );
+            let scope = binder
+                .enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+            let outer = binder.replace_current_type(Some(enclosing.clone()));
+            check_optional_parameters(binder, &enclosing, &declaration.parameters);
+            binder.replace_current_type(outer);
+            binder.exit_type_parameters(scope);
         }
         NamespaceMember::Enum(declaration) => {
             validate_enum_members(binder, namespace, declaration);
@@ -2112,6 +2134,19 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
     let mut seen: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
     for section in attributes {
         for attribute in &section.attributes {
+            // `[global::System.Obsolete]` (C# 2.0) is gated at the `global`, where csc reports it;
+            // the name itself is resolved quietly below, so the gate is raised here.
+            if attribute
+                .name
+                .parts
+                .first()
+                .is_some_and(|part| lamella_syntax::ast::alias_qualifier(part).is_some())
+            {
+                binder.gate_feature(
+                    lamella_syntax::version::Feature::NamespaceAlias,
+                    Span::empty_at(attribute.name.span.start),
+                );
+            }
             let name = dotted(&attribute.name);
             let written = TypeSymbol::Named(attribute.name.parts.iter().cloned().collect());
             let resolved = binder.resolve_named_type_quietly(&written, attribute.span);
@@ -4099,7 +4134,18 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             _ => continue,
         };
         check_params_usage(binder, parameters);
+        let method_type_parameters = match member {
+            Member::Method {
+                type_parameters,
+                constraints,
+                ..
+            } => binder.enter_type_parameters(type_parameters, constraints),
+            _ => Vec::new(),
+        };
+        let outer = binder.replace_current_type(Some(enclosing.clone()));
         check_optional_parameters(binder, &enclosing, parameters);
+        binder.replace_current_type(outer);
+        binder.exit_type_parameters(method_type_parameters);
     }
     binder.enter_type(enclosing.clone());
     let container_mask = {
@@ -5111,23 +5157,25 @@ fn check_params_usage(binder: &mut Binder, parameters: &[Parameter]) {
     }
 }
 
-/// The four declaration rules a DEFAULT ARGUMENT has to obey (15.6.2.13), each measured against
-/// csc. **Every one of them fails as an ACCEPTS-INVALID rather than a wrong diagnostic**, which is
-/// the direction that compiles clean and is discovered by the reader.
+/// The declaration rules a DEFAULT ARGUMENT has to obey (15.6.2.13), each measured against csc.
+/// **Every one of them fails as an ACCEPTS-INVALID rather than a wrong diagnostic**, which is the
+/// direction that compiles clean and is discovered by the reader.
 ///
 /// ```text
 ///     CS1737  int a = 1, int b        a required parameter after an optional one
 ///     CS1741  ref int a = 1           a byref parameter with a default
 ///     CS1751  params int[] a = null   a parameter collection with a default
-///     CS1736  int a = F()             a default that is not a compile-time constant
-///     CS1750  int a = "s"             a constant that does not convert to the parameter's type
 /// ```
+///
+/// and then the rules about the VALUE, which [`Binder::parameter_default_problem`] asks of the
+/// default as [`Binder::bind_parameter_default`] binds it -- the binding the pass that folds the
+/// value uses too.
 ///
 /// **CS1737 EXEMPTS A `params` ARRAY**: `M(int a = 1, params int[] rest)` is legal, because the
 /// trailing array is not a parameter a call has to supply.
 ///
-/// **CS1736 AND CS1750 ARE DIFFERENT QUESTIONS.** Not-a-constant is CS1736; a constant of the
-/// wrong type is CS1750, whose message names both types.
+/// The caller has entered the declaration's scope: the type, and a generic method's own type
+/// parameters.
 fn check_optional_parameters(
     binder: &mut Binder,
     enclosing: &TypeSymbol,
@@ -5164,61 +5212,18 @@ fn check_optional_parameters(
             continue;
         }
         let declared = binder.canonicalize(&bind_type(&parameter.ty));
-        let Some(literal) =
-            crate::declaration::parameter_default_in_model(binder.model(), enclosing, expr)
-        else {
-            binder.report(Diagnostic::new(
-                DiagnosticKind::DefaultValueNotConstant {
-                    parameter: parameter.name.clone(),
-                },
-                parameter.span,
-            ));
+        let (bound, failed) = binder.bind_parameter_default(enclosing, &declared, expr);
+        if failed {
             continue;
-        };
-        let signed = literal_int_value(&literal);
-        let value_ty = match signed {
-            Some(value) if i32::try_from(value).is_ok() && matches!(literal, lamella_syntax::ast::Literal::Integer { .. }) => {
-                TypeSymbol::Special(crate::special::SpecialType::Int32)
-            }
-            _ => crate::bound::literal_type(&literal),
-        };
-        let converts = match &expr.kind {
-            lamella_syntax::ast::ExprKind::DefaultValue(target) => {
-                let target_ty = binder.canonicalize(&bind_type(target));
-                target_ty == declared || binder.converts(&target_ty, &declared)
-            }
-            _ if binder.is_enum_type(&declared) => {
-                !matches!(literal, lamella_syntax::ast::Literal::Null)
-            }
-            _ if matches!(literal, lamella_syntax::ast::Literal::Null) => {
-                !binder.is_value_type(&declared) || lamella_binder_nullable(&declared)
-            }
-            _ => binder.constant_assignable(&value_ty, signed, &declared),
-        };
-        if !converts {
-            binder.report(Diagnostic::new(
-                DiagnosticKind::DefaultValueWrongType {
-                    from: default_value_type_name(&literal, &value_ty).into(),
-                    to: declared.to_string().into(),
-                },
-                parameter.span,
-            ));
+        }
+        if let Some(kind) = binder.parameter_default_problem(&bound, &parameter.name, &declared) {
+            let span = match kind {
+                DiagnosticKind::DefaultValueNotConstant { .. } => expr.span,
+                _ => parameter.span,
+            };
+            binder.report(Diagnostic::new(kind, span));
         }
     }
-}
-
-/// Whether `ty` is `System.Nullable<T>`, for the `= null` admissibility test above.
-fn lamella_binder_nullable(ty: &TypeSymbol) -> bool {
-    crate::conversion::nullable_underlying(ty).is_some()
-}
-
-/// How csc names a default's own type in CS1750: `<null>` for the null literal, and the type's
-/// ordinary rendering otherwise. Measured -- `int a = null` reports *a value of type '<null>'*.
-fn default_value_type_name(literal: &lamella_syntax::ast::Literal, value_ty: &TypeSymbol) -> alloc::string::String {
-    if matches!(literal, lamella_syntax::ast::Literal::Null) {
-        return "<null>".into();
-    }
-    value_ty.to_string()
 }
 
 /// Reports CS0542 when a member's name repeats its enclosing type's -- illegal for every member
@@ -5492,9 +5497,26 @@ fn join_namespace(outer: &str, name: &QualifiedName) -> String {
 }
 
 /// A qualified name as one dotted string (`A.B.C`).
+/// The parts of a `using` directive's name, less a leading `global::`: the directive's name is
+/// resolved from the global namespace already, so the qualifier changes nothing it names.
+pub(crate) fn qualified_parts(name: &QualifiedName) -> Box<[Box<str>]> {
+    match name.parts.split_first() {
+        Some((first, rest)) if lamella_syntax::ast::alias_qualifier(first) == Some("global") => {
+            rest.into()
+        }
+        _ => name.parts.iter().cloned().collect(),
+    }
+}
+
 pub(crate) fn dotted(name: &QualifiedName) -> String {
     let mut text = String::new();
-    for part in &name.parts {
+    let parts = match name.parts.split_first() {
+        Some((first, rest)) if lamella_syntax::ast::alias_qualifier(first) == Some("global") => {
+            rest
+        }
+        _ => &name.parts[..],
+    };
+    for part in parts {
         if !text.is_empty() {
             text.push('.');
         }

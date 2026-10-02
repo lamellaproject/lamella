@@ -1487,11 +1487,14 @@ fn is_reference_base_class(ty: &TypeSymbol) -> bool {
 
 /// An enum's underlying integral type (from its `value__` field), defaulting to `int`.
 fn enum_underlying(model: &Model, enum_ty: &TypeSymbol) -> SpecialType {
-    match model
-        .get_by_symbol(enum_ty)
-        .and_then(|info| info.find_field("value__").map(|field| field.ty.clone()))
-    {
-        Some(TypeSymbol::Special(special)) => special,
+    let Some(info) = model.get_by_symbol(enum_ty) else {
+        return SpecialType::Int32;
+    };
+    if let Some(special) = info.enum_underlying {
+        return special;
+    }
+    match info.find_field("value__").map(|field| &field.ty) {
+        Some(TypeSymbol::Special(special)) => *special,
         _ => SpecialType::Int32,
     }
 }
@@ -2113,7 +2116,15 @@ fn emit_interface(
             if is_readonly_ref(return_type) {
                 mark_readonly_return(image, tokens, method);
             }
-            emit_declared_parameter_metadata(image, binder, tokens, &enclosing, method, parameters);
+            emit_declared_parameter_metadata(
+                image,
+                binder,
+                tokens,
+                &enclosing,
+                method,
+                DeclaredMember::plain(name),
+                parameters,
+            );
         }
     }
     let mut first_property = None;
@@ -2360,6 +2371,7 @@ fn emit_delegate(
         tokens,
         &delegate_ty,
         invoke,
+        DeclaredMember::plain("Invoke"),
         &declaration.parameters,
     );
     Ok(())
@@ -3940,7 +3952,15 @@ fn emit_bodyless_method(
     if is_readonly_ref(return_type) {
         mark_readonly_return(image, tokens, method);
     }
-    emit_declared_parameter_metadata(image, binder, tokens, enclosing, method, parameters);
+    emit_declared_parameter_metadata(
+        image,
+        binder,
+        tokens,
+        enclosing,
+        method,
+        DeclaredMember::plain(name),
+        parameters,
+    );
     Ok(method)
 }
 
@@ -4091,7 +4111,19 @@ fn emit_one_method_in_scope(
             &return_symbol,
             body_token,
         )?;
-        emit_declared_parameter_metadata(image, binder, tokens, enclosing, body_token, parameters);
+        emit_declared_parameter_metadata(
+            image,
+            binder,
+            tokens,
+            enclosing,
+            body_token,
+            DeclaredMember {
+                name: &lamella_binder::declared_member_name(name, explicit_interface),
+                type_parameter_count: type_parameters.len(),
+                trailing: None,
+            },
+            parameters,
+        );
         return Ok(body_token);
     }
     let is_static = modifiers.contains(&Modifier::Static);
@@ -4127,7 +4159,19 @@ fn emit_one_method_in_scope(
         None,
         debug,
     )?;
-    emit_declared_parameter_metadata(image, binder, tokens, enclosing, method, parameters);
+    emit_declared_parameter_metadata(
+        image,
+        binder,
+        tokens,
+        enclosing,
+        method,
+        DeclaredMember {
+            name: &lamella_binder::declared_member_name(name, explicit_interface),
+            type_parameter_count: type_parameters.len(),
+            trailing: None,
+        },
+        parameters,
+    );
     Ok(method)
 }
 
@@ -4273,9 +4317,7 @@ fn constructed_interface_member_ref(
         .iter()
         .chain(core::iter::once(&declared.return_type))
     {
-        if !mentions_type_parameter(ty, &type_parameters) {
-            mint_named_type_token(ty, image, tokens);
-        }
+        mint_open_signature_type(ty, &type_parameters, image, tokens);
     }
     let scope = GenericScope {
         method: &[],
@@ -4533,12 +4575,16 @@ fn ends_in_params_array(parameters: &[Parameter]) -> bool {
 ///
 /// Silently skipped if `System.ParamArrayAttribute` does not resolve -- a corlib being compiled
 /// before that type exists, which is the same lenient posture the other synthesized markers take.
+///
+/// `member` names the model entry the parameters belong to, which is where their folded default
+/// values are read from.
 fn emit_declared_parameter_metadata(
     image: &mut ImageBuilder,
     binder: &Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     method: Token,
+    member: DeclaredMember<'_>,
     parameters: &[Parameter],
 ) {
     let rows = image.method_parameters(method);
@@ -4589,6 +4635,21 @@ fn emit_declared_parameter_metadata(
         }
         emit_attributes(image, binder, tokens, enclosing, param, &sections);
     }
+    let signature: Vec<TypeSymbol> = parameters
+        .iter()
+        .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+        .collect();
+    let mut entry_signature = signature.clone();
+    entry_signature.extend(member.trailing.cloned());
+    let folded: Vec<Option<Literal>> = binder
+        .model()
+        .get_by_symbol(enclosing)
+        .and_then(|info| {
+            let declared =
+                info.declared_method(member.name, member.type_parameter_count, &entry_signature)?;
+            Some(declared.parameter_info.iter().map(|info| info.default.clone()).collect())
+        })
+        .unwrap_or_default();
     for (index, parameter) in parameters.iter().enumerate() {
         let Some(expr) = &parameter.default_value else {
             continue;
@@ -4597,9 +4658,14 @@ fn emit_declared_parameter_metadata(
             continue;
         };
         let mut flags = image.param_flags(param) | PARAM_OPTIONAL;
-        let ty = binder.canonicalize(&parameter_symbol(parameter));
-        if let Some(literal) = lamella_binder::parameter_default_in_model(binder.model(), enclosing, expr) {
-            if let Some((element, value)) = constant_row(binder.model(), &ty, &literal) {
+        let ty = &signature[index];
+        let value = folded
+            .get(index)
+            .cloned()
+            .flatten()
+            .or_else(|| lamella_binder::fold_parameter_default(expr));
+        if let Some(literal) = value {
+            if let Some((element, value)) = constant_row(binder.model(), ty, &literal) {
                 flags |= PARAM_HAS_DEFAULT;
                 image.add_constant(param, element, &value);
             } else if matches!(ty, TypeSymbol::Special(SpecialType::Decimal)) {
@@ -4620,6 +4686,29 @@ fn emit_declared_parameter_metadata(
         return;
     };
     image.add_custom_attribute(param, constructor, &[0x01, 0x00, 0x00, 0x00]);
+}
+
+/// The model entry a declared parameter list belongs to, as the declaration pass stored it: its
+/// name ([`lamella_binder::declared_member_name`], `.ctor`, `Invoke`, or an indexer accessor's
+/// [`lamella_binder::declared_indexer_accessor_name`]), its own type-parameter count, and the
+/// synthesized parameter its signature ends in that the declaration does not list -- an indexer
+/// setter's `value`.
+#[derive(Clone, Copy)]
+struct DeclaredMember<'a> {
+    name: &'a str,
+    type_parameter_count: usize,
+    trailing: Option<&'a TypeSymbol>,
+}
+
+impl<'a> DeclaredMember<'a> {
+    /// A member declaring no type parameters of its own, whose signature is its declared list.
+    fn plain(name: &'a str) -> DeclaredMember<'a> {
+        DeclaredMember {
+            name,
+            type_parameter_count: 0,
+            trailing: None,
+        }
+    }
 }
 
 /// The `ref`/`out` (byref) flag of each parameter, in order -- parallel to the bound
@@ -4811,7 +4900,15 @@ fn emit_pinvoke_method(
     let flags =
         member_visibility(modifiers) | METHOD_STATIC | METHOD_HIDEBYSIG | METHOD_PINVOKE_IMPL;
     let method = image.add_pinvoke_method(name, &signature, flags, &parameter_names(parameters));
-    emit_declared_parameter_metadata(image, binder, tokens, enclosing, method, parameters);
+    emit_declared_parameter_metadata(
+        image,
+        binder,
+        tokens,
+        enclosing,
+        method,
+        DeclaredMember::plain(name),
+        parameters,
+    );
     let module_ref = image.add_module_ref(&dll_import.library);
     image.add_impl_map(method, dll_import.mapping_flags, &dll_import.entry_point, module_ref);
     Ok(())
@@ -4902,7 +4999,15 @@ fn emit_constructor(
             Some(&prologue),
             debug,
         )?;
-        emit_declared_parameter_metadata(image, binder, tokens, enclosing, ctor, parameters);
+        emit_declared_parameter_metadata(
+            image,
+            binder,
+            tokens,
+            enclosing,
+            ctor,
+            DeclaredMember::plain(".ctor"),
+            parameters,
+        );
         return Ok(ctor);
     }
     let mut prologue = match initializer {
@@ -4980,7 +5085,15 @@ fn emit_constructor(
         prologue.as_ref(),
         debug,
     )?;
-    emit_declared_parameter_metadata(image, binder, tokens, enclosing, ctor, parameters);
+    emit_declared_parameter_metadata(
+        image,
+        binder,
+        tokens,
+        enclosing,
+        ctor,
+        DeclaredMember::plain(".ctor"),
+        parameters,
+    );
     Ok(ctor)
 }
 
@@ -6992,7 +7105,18 @@ fn emit_indexer(
                 )?;
             }
             emit_attributes(image, binder, tokens, enclosing, token, &getter.attributes);
-            emit_declared_parameter_metadata(image, binder, tokens, enclosing, token, parameters);
+            emit_declared_parameter_metadata(
+                image,
+                binder,
+                tokens,
+                enclosing,
+                token,
+                DeclaredMember::plain(&lamella_binder::declared_indexer_accessor_name(
+                    "get_",
+                    explicit_interface,
+                )),
+                parameters,
+            );
             image.add_method_semantics(SEMANTICS_GETTER, token, property);
         }
     }
@@ -7034,7 +7158,22 @@ fn emit_indexer(
                 )?;
             }
             emit_attributes(image, binder, tokens, enclosing, token, &setter.attributes);
-            emit_declared_parameter_metadata(image, binder, tokens, enclosing, token, parameters);
+            emit_declared_parameter_metadata(
+                image,
+                binder,
+                tokens,
+                enclosing,
+                token,
+                DeclaredMember {
+                    name: &lamella_binder::declared_indexer_accessor_name(
+                        "set_",
+                        explicit_interface,
+                    ),
+                    type_parameter_count: 0,
+                    trailing: Some(&element_ty),
+                },
+                parameters,
+            );
             image.add_method_semantics(SEMANTICS_SETTER, token, property);
         }
     }
@@ -7516,6 +7655,7 @@ fn constant_row(
     if matches!(literal, Literal::Null) {
         return Some((0x12, alloc::vec![0u8; 4]));
     }
+    let field_ty = lamella_binder::nullable_underlying(field_ty).unwrap_or(field_ty);
     if model
         .get_by_symbol(field_ty)
         .is_some_and(|info| info.kind == lamella_binder::TypeKind::Enum)
@@ -7525,7 +7665,6 @@ fn constant_row(
         let value = lamella_binder::literal_int_value(&literal)?;
         return Some((element, value.to_le_bytes()[..width].to_vec()));
     }
-    let field_ty = lamella_binder::nullable_underlying(field_ty).unwrap_or(field_ty);
     let TypeSymbol::Special(special) = field_ty else {
         return None;
     };
@@ -7630,8 +7769,16 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
         BoundStmtKind::Switch {
             expression,
             sections,
+            ..
         } => {
             mint_in_expr(expression, image, tokens);
+            for label in sections.iter().flat_map(|section| &section.labels) {
+                if let lamella_binder::BoundSwitchLabel::Pattern { test, guard, .. } = label {
+                    for part in test.iter().chain(guard) {
+                        mint_in_expr(part, image, tokens);
+                    }
+                }
+            }
             let mut has_string_case = false;
             for section in sections {
                 for label in &section.labels {
@@ -8422,9 +8569,7 @@ fn mint_instantiated_member_ref(
         .iter()
         .chain(core::iter::once(&declaring.return_type))
     {
-        if !mentions_type_parameter(ty, &declaring.type_parameters) {
-            mint_named_type_token(ty, image, tokens);
-        }
+        mint_open_signature_type(ty, &declaring.type_parameters, image, tokens);
     }
     let scope = GenericScope {
         method: &[],
@@ -8934,9 +9079,7 @@ fn mint_instantiated_field_ref(
     else {
         return;
     };
-    if !mentions_type_parameter(&declaring.ty, &declaring.type_parameters) {
-        mint_named_type_token(&declaring.ty, image, tokens);
-    }
+    mint_open_signature_type(&declaring.ty, &declaring.type_parameters, image, tokens);
     let scope = GenericScope {
         method: &[],
         declaring: &declaring.type_parameters,
@@ -10237,6 +10380,44 @@ fn mentions_type_parameter(ty: &TypeSymbol, type_parameters: &[Box<str>]) -> boo
             .iter()
             .any(|argument| mentions_type_parameter(argument, type_parameters)),
         _ => false,
+    }
+}
+
+/// Mints every token an OPEN signature type over `type_parameters` names -- each generic
+/// definition it instantiates and each closed type among its leaves, which is everything
+/// [`open_type_sig`] looks up -- and none for a mention of one of `type_parameters`, which is a
+/// position (`!n`) and not a type.
+///
+/// **THE LEAF, NOT THE COMPOSITE**, the rule [`is_type_parameter`] states for a declaration's own
+/// signatures. `ReadOnlySpan<T>` MENTIONS `T` and is not itself a parameter: its definition is an
+/// ordinary imported type that needs a `TypeRef` like any other, and only the argument is a
+/// position.
+fn mint_open_signature_type(
+    ty: &TypeSymbol,
+    type_parameters: &[Box<str>],
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    if !mentions_type_parameter(ty, type_parameters) {
+        mint_named_type_token(ty, image, tokens);
+        return;
+    }
+    match ty {
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => {
+            mint_named_type_token(&definition_symbol(definition, arguments.len()), image, tokens);
+            for argument in arguments {
+                mint_open_signature_type(argument, type_parameters, image, tokens);
+            }
+        }
+        TypeSymbol::Array { element, .. }
+        | TypeSymbol::Pointer(element)
+        | TypeSymbol::ByRef(element) => {
+            mint_open_signature_type(element, type_parameters, image, tokens);
+        }
+        _ => {}
     }
 }
 
@@ -11919,7 +12100,9 @@ mod tests {
     /// Only the shapes those tests use; anything else is a test bug rather than a compiler one.
     fn constant_tag(value: &lamella_metadata::ConstantValue) -> u8 {
         match value {
+            lamella_metadata::ConstantValue::U1(_) => 0x05,
             lamella_metadata::ConstantValue::I4(_) => 0x08,
+            lamella_metadata::ConstantValue::R8(_) => 0x0d,
             lamella_metadata::ConstantValue::String(_) => 0x0e,
             lamella_metadata::ConstantValue::Null => 0x12,
             other => panic!("unexpected constant shape in this test: {other:?}"),
@@ -11928,7 +12111,9 @@ mod tests {
 
     fn constant_blob(value: &lamella_metadata::ConstantValue) -> Vec<u8> {
         match value {
+            lamella_metadata::ConstantValue::U1(n) => alloc::vec![*n],
             lamella_metadata::ConstantValue::I4(n) => n.to_le_bytes().to_vec(),
+            lamella_metadata::ConstantValue::R8(n) => n.to_le_bytes().to_vec(),
             lamella_metadata::ConstantValue::String(units) => {
                 units.iter().flat_map(|u| u.to_le_bytes()).collect()
             }
@@ -12018,12 +12203,12 @@ mod tests {
         }
     }
 
-    /// AN ENUM DEFAULT IS ITS UNDERLYING INTEGER'S CONSTANT, not the enum's -- and the value has
-    /// to survive the model-aware fold that resolves `E.B` against another type.
+    /// AN ENUM DEFAULT IS ITS UNDERLYING INTEGER'S CONSTANT, not the enum's -- and the value is the
+    /// one the binder folded for the member, read back from the model.
     ///
-    /// **RED-PROOF: remove the `MemberAccess` arm from `parameter_default_in_model` and the
-    /// constant goes to `None` while the flags keep `Optional` -- exactly the half-emitted shape
-    /// that would let a caller omit an argument this compiler cannot supply.**
+    /// **RED-PROOF: read the default from `fold_parameter_default` instead of the member's model
+    /// entry and the constant goes to `None` while the flags keep `Optional` -- exactly the
+    /// half-emitted shape that would let a caller omit an argument this compiler cannot supply.**
     #[test]
     fn an_enum_member_default_folds_to_its_underlying_integer() {
         let image = image_of_csharp4_source(
@@ -12033,6 +12218,34 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, 0x1010);
         assert_eq!(rows[0].2, Some((0x08, alloc::vec![2, 0, 0, 0])));
+    }
+
+    /// AN ENUM DECLARED IN A NAMESPACE WRITES THE SAME ROW, and a byte-based one its own width.
+    #[test]
+    fn an_enum_default_declared_in_a_namespace_writes_its_constant_row() {
+        let image = image_of_csharp4_source(
+            "namespace N { public enum E { A, B, C } public enum Small : byte { X = 7 } \
+             public class P { public void M(E e = E.C, Small s = Small.X) { } } }",
+        );
+        let rows = param_rows_of(&image, "M");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, 0x1010);
+        assert_eq!(rows[0].2, Some((0x08, alloc::vec![2, 0, 0, 0])));
+        assert_eq!(rows[1].1, 0x1010);
+        assert_eq!(rows[1].2, Some((0x05, alloc::vec![7])));
+    }
+
+    /// A DEFAULT IS CONVERTED TO ITS PARAMETER'S TYPE BEFORE IT IS WRITTEN, as csc writes it:
+    /// `double d = 1` is the R8 `1.0`, not the integer `1` -- which no R8 row can hold, so the row
+    /// went missing and a consumer passed `0.0`.
+    #[test]
+    fn an_integer_default_for_a_double_writes_an_r8_row() {
+        let image =
+            image_of_csharp4_source("public class P { public void M(double d = 1) { } }");
+        let rows = param_rows_of(&image, "M");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, 0x1010);
+        assert_eq!(rows[0].2, Some((0x0d, 1.0f64.to_le_bytes().to_vec())));
     }
 
     fn image_of_gated_source(source: &str) -> Vec<u8> {

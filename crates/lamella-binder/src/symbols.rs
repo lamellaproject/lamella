@@ -1078,6 +1078,79 @@ impl TypeInfo {
             .iter()
             .filter(move |method| &*method.name == name)
     }
+
+    /// The method or constructor this type DECLARES as `name`, with `type_parameter_count` type
+    /// parameters of its own and the parameter list `parameters` -- each parameter's type as
+    /// signature qualification left it. A constructor is `.ctor`, the name the declaration pass
+    /// gives it.
+    ///
+    /// The member with that name, type-parameter count and parameter COUNT, when there is one; the
+    /// types are compared only to tell OVERLOADS of one count apart. A delegate's `Invoke` and
+    /// most members are found by the count alone, so a caller that qualified a parameter type in
+    /// a slightly different scope still finds them.
+    ///
+    /// **`None` WHEN TWO MATCH, NOT THE FIRST.** Two members cannot share a whole signature in a
+    /// valid program (CS0111), except the conversion operators, which C# overloads on their RETURN
+    /// type; for those this declines rather than answer for the wrong one.
+    ///
+    /// What a member DECLARES is asked of it in two places -- the pass that folds its default
+    /// arguments writes them here, and the emitter reads them back for the `Param` rows -- and both
+    /// ask through this, so the two cannot disagree about which member they mean.
+    #[must_use]
+    pub fn declared_method(
+        &self,
+        name: &str,
+        type_parameter_count: usize,
+        parameters: &[TypeSymbol],
+    ) -> Option<&MethodSymbol> {
+        let index = self.declared_method_index(name, type_parameter_count, parameters)?;
+        let members = if name == ".ctor" { &self.constructors } else { &self.methods };
+        members.get(index)
+    }
+
+    /// [`Self::declared_method`], for the pass that writes what it declares.
+    pub fn declared_method_mut(
+        &mut self,
+        name: &str,
+        type_parameter_count: usize,
+        parameters: &[TypeSymbol],
+    ) -> Option<&mut MethodSymbol> {
+        let index = self.declared_method_index(name, type_parameter_count, parameters)?;
+        let members = if name == ".ctor" { &mut self.constructors } else { &mut self.methods };
+        members.get_mut(index)
+    }
+
+    fn declared_method_index(
+        &self,
+        name: &str,
+        type_parameter_count: usize,
+        parameters: &[TypeSymbol],
+    ) -> Option<usize> {
+        let members = if name == ".ctor" { &self.constructors } else { &self.methods };
+        let unique = |candidates: Vec<usize>| match candidates.as_slice() {
+            [index] => Some(*index),
+            _ => None,
+        };
+        let same_shape: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter(|(_, method)| {
+                &*method.name == name
+                    && method.type_parameters.len() == type_parameter_count
+                    && method.parameters.len() == parameters.len()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if same_shape.len() == 1 {
+            return unique(same_shape);
+        }
+        unique(
+            same_shape
+                .into_iter()
+                .filter(|index| members[*index].parameters == parameters)
+                .collect(),
+        )
+    }
 }
 
 /// Every type in scope, keyed by namespace and name. The binder's reference world

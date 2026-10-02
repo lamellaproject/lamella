@@ -51,11 +51,18 @@ fn main() {
              not be applied; restore it rather than hard-coding a length",
             template.display()
         );
+        assert!(
+            text.contains("@LAMELLA_STACK_BYTES@"),
+            "{} no longer carries the @LAMELLA_STACK_BYTES@ token, so the stack's share of RAM \
+             would not be set; restore it rather than hard-coding one",
+            template.display()
+        );
         let script = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR"))
             .join("memory-rp2350.x");
         std::fs::write(
             &script,
-            text.replace("@LAMELLA_FLASH_LENGTH@", &format!("{length:#x}")),
+            text.replace("@LAMELLA_FLASH_LENGTH@", &format!("{length:#x}"))
+                .replace("@LAMELLA_STACK_BYTES@", &format!("{:#x}", stack_bytes())),
         )
         .unwrap_or_else(|e| panic!("cannot write {}: {e}", script.display()));
         // Every bare-metal image this package links takes this memory map: the firmware binaries,
@@ -137,6 +144,16 @@ fn embed_python_heap_size() {
     let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("py_heap.rs");
     std::fs::write(&out, format!("const PY_HEAP_BYTES: usize = {bytes};\n"))
         .expect("write the heap-size constant");
+}
+
+/// The stack's share of RAM, at its top. The C# firmware's heap takes what the statics leave below
+/// it, and the core's stack-limit register guards the line between the two.
+fn stack_bytes() -> usize {
+    if std::env::var_os("CARGO_FEATURE_RESIDENT_CORLIB").is_some() {
+        96 * 1024
+    } else {
+        64 * 1024
+    }
 }
 
 /// Reads `IMAGE_BASE` out of the flash-region module, so the firmware's link ceiling and the

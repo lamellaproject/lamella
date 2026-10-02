@@ -1436,28 +1436,6 @@ mod extended {
     }
 
 
-    /// Truncates `value` toward zero (no libm): an already-integral magnitude (>= 2^52, where
-    /// a double has no fractional bits) is returned as-is, else round-tripped through `i64`.
-    #[cfg(feature = "float")]
-    fn trunc_f64(value: f64) -> f64 {
-        if value.is_finite() && value.abs() < 4_503_599_627_370_496.0 {
-            (value as i64) as f64
-        } else {
-            value
-        }
-    }
-
-    /// The largest integer not greater than `value` (no libm).
-    #[cfg(feature = "float")]
-    fn floor_f64(value: f64) -> f64 {
-        let truncated = trunc_f64(value);
-        if truncated > value {
-            truncated - 1.0
-        } else {
-            truncated
-        }
-    }
-
     /// `System.Math.Truncate(double)`: the integer part, toward zero.
     ///
     /// # Errors
@@ -1468,7 +1446,8 @@ mod extended {
         _module: &Module,
         args: &[Value],
     ) -> Result<Option<Value>, Trap> {
-        Ok(Some(Value::Float(trunc_f64(arg_f64(args)?))))
+        let truncated = lamella_softmath::truncate(arg_f64(args)?);
+        Ok(Some(Value::Float(truncated)))
     }
 
     /// `System.Math.Floor(double)`: the largest integer not greater than the argument.
@@ -1481,7 +1460,8 @@ mod extended {
         _module: &Module,
         args: &[Value],
     ) -> Result<Option<Value>, Trap> {
-        Ok(Some(Value::Float(floor_f64(arg_f64(args)?))))
+        let floor = lamella_softmath::floor(arg_f64(args)?);
+        Ok(Some(Value::Float(floor)))
     }
 
     /// `System.Math.Ceiling(double)`: the smallest integer not less than the argument.
@@ -1494,13 +1474,7 @@ mod extended {
         _module: &Module,
         args: &[Value],
     ) -> Result<Option<Value>, Trap> {
-        let value = arg_f64(args)?;
-        let truncated = trunc_f64(value);
-        let ceiling = if truncated < value {
-            truncated + 1.0
-        } else {
-            truncated
-        };
+        let ceiling = lamella_softmath::ceiling(arg_f64(args)?);
         Ok(Some(Value::Float(ceiling)))
     }
 
@@ -1515,23 +1489,8 @@ mod extended {
         _module: &Module,
         args: &[Value],
     ) -> Result<Option<Value>, Trap> {
-        let value = arg_f64(args)?;
-        let result = if !value.is_finite() || value.abs() >= 4_503_599_627_370_496.0 {
-            value
-        } else {
-            let floor = floor_f64(value);
-            let fraction = value - floor;
-            if fraction < 0.5 {
-                floor
-            } else if fraction > 0.5 {
-                floor + 1.0
-            } else if (floor as i64) % 2 == 0 {
-                floor
-            } else {
-                floor + 1.0
-            }
-        };
-        Ok(Some(Value::Float(result)))
+        let rounded = lamella_softmath::round_half_to_even(arg_f64(args)?);
+        Ok(Some(Value::Float(rounded)))
     }
 
     /// `System.Convert.ToInt32(double)`: the nearest integer (round half to even, like .NET).
@@ -1548,17 +1507,7 @@ mod extended {
         if !value.is_finite() {
             return Err(Trap::Overflow);
         }
-        let floor = floor_f64(value);
-        let fraction = value - floor;
-        let rounded = if fraction < 0.5 {
-            floor
-        } else if fraction > 0.5 {
-            floor + 1.0
-        } else if (floor as i64) % 2 == 0 {
-            floor
-        } else {
-            floor + 1.0
-        };
+        let rounded = lamella_softmath::round_half_to_even(value);
         if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
             return Err(Trap::Overflow);
         }

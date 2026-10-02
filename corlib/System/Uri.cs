@@ -90,5 +90,19 @@ namespace System
         public bool IsDefaultPort { get { return _port == DefaultPort(_scheme); } }
 
         public override string ToString() { return _original; }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        /// <summary>Escapes text for use as one component of a URI, such as a path segment or a query
+        /// value: letters, digits and - . _ ~ are left as they are, and every other character is written
+        /// as the %XX of each of its UTF-8 bytes, in uppercase hex.</summary>
+        /// <param name="stringToEscape">The text to escape.</param>
+        /// <returns>The escaped text, or the same instance when nothing needed escaping.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="stringToEscape"/> is null.</exception>
+        public static string EscapeDataString(string stringToEscape)
+        {
+            if ((object)stringToEscape == null) throw new ArgumentNullException("stringToEscape");
+            return PercentEncoding.EscapeDataString(stringToEscape);
+        }
+#endif
     }
 }

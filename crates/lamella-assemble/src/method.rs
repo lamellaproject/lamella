@@ -830,10 +830,27 @@ fn emit_statement(
         BoundStmtKind::Switch {
             expression,
             sections,
+            subject,
         } => {
-            let temp = frame.reserve_local(&expression.ty);
-            emit_expression(expression, frame, tokens, out)?;
-            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(temp)));
+            let temp = match subject {
+                Some(name) => {
+                    let slot = match frame.slot(name) {
+                        Some(slot) => slot,
+                        None => frame.declare_expression_local(name, &expression.ty),
+                    };
+                    emit_expression(expression, frame, tokens, out)?;
+                    out.push(slot.store());
+                    None
+                }
+                None => {
+                    let temp = frame.reserve_local(&expression.ty);
+                    emit_expression(expression, frame, tokens, out)?;
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(temp)));
+                    Some(temp)
+                }
+            };
+            let constant_temp =
+                || temp.ok_or(EmitError::Unsupported("a constant case label in a pattern switch"));
 
             let long = matches!(
                 expression.ty,
@@ -847,6 +864,7 @@ fn emit_statement(
                 for label in &section.labels {
                     match label {
                         BoundSwitchLabel::Case(value) => {
+                            let temp = constant_temp()?;
                             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
                             let constant = if long {
                                 Instruction::new(Opcode::LdcI8, Operand::Int64(*value))
@@ -858,6 +876,7 @@ fn emit_statement(
                             labels.branch(Opcode::Brtrue, section_labels[index], out);
                         }
                         BoundSwitchLabel::CaseString(text) => {
+                            let temp = constant_temp()?;
                             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
                             let token = tokens.string(text).ok_or(EmitError::Unsupported(
                                 "a switch case string was not minted",
@@ -867,8 +886,18 @@ fn emit_statement(
                             labels.branch(Opcode::Brtrue, section_labels[index], out);
                         }
                         BoundSwitchLabel::CaseNull => {
+                            let temp = constant_temp()?;
                             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
                             labels.branch(Opcode::Brfalse, section_labels[index], out);
+                        }
+                        BoundSwitchLabel::Pattern { test, guard, .. } => {
+                            let next = labels.label();
+                            for part in test.iter().chain(guard) {
+                                emit_expression(part, frame, tokens, out)?;
+                                labels.branch(Opcode::Brfalse, next, out);
+                            }
+                            labels.branch(Opcode::Br, section_labels[index], out);
+                            labels.place(next, out);
                         }
                         BoundSwitchLabel::Default => default_label = Some(section_labels[index]),
                     }
@@ -887,8 +916,9 @@ fn emit_statement(
                         BoundSwitchLabel::CaseString(text) => {
                             switch_string_cases.push((text.clone(), section_labels[index]));
                         }
-                        BoundSwitchLabel::CaseNull => {}
-                        BoundSwitchLabel::Default => {}
+                        BoundSwitchLabel::CaseNull
+                        | BoundSwitchLabel::Pattern { .. }
+                        | BoundSwitchLabel::Default => {}
                     }
                 }
             }

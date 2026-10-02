@@ -9,6 +9,7 @@ use lamella_ir::{
 };
 
 use crate::cil::{CheckStubs, InlineCheck};
+use crate::parallel_moves::SlotWord;
 use crate::resolver::{
     ARRAY_DESC_MARK, STRING_ALLOCATING_SEAMS, STRING_TYPEDESC_SYMBOL, TypeMeta, VtableEntry,
     descriptor_symbol,
@@ -1796,6 +1797,12 @@ fn lower_object_relocatable(
             addend: 0,
         });
     }
+    let dispatch_records = crate::dispatch::record_names(&program, names, descriptors, qualifiers);
+    symbols.extend(
+        dispatch_records
+            .iter()
+            .map(|name| crate::dispatch::record_symbol(name)),
+    );
     let line_tables: MethodLineTables = method_lines
         .iter()
         .enumerate()
@@ -2106,10 +2113,13 @@ fn lower_function(
                 if args.len() != params.len() {
                     return Err(LowerError::ControlFlowUnsupported);
                 }
-                for (p, a) in params.iter().zip(args) {
-                    if reg(*p) != reg(*a) {
-                        enc.mv(reg(*p), reg(*a));
-                    }
+                let moves: Vec<(Reg, Reg)> = params
+                    .iter()
+                    .zip(args)
+                    .map(|(p, a)| (reg(*p), reg(*a)))
+                    .collect();
+                for (dst, src) in crate::parallel_moves::schedule(&moves, Reg::T0) {
+                    enc.mv(dst, src);
                 }
                 if !falls_through(index, *target) {
                     enc.j(block_labels[target.index()]);
@@ -2768,10 +2778,26 @@ fn lower_function_spilled(
                 if args.len() != params.len() {
                     return Err(LowerError::ControlFlowUnsupported);
                 }
+                let mut moves = Vec::new();
                 for (p, a) in params.iter().zip(args) {
                     for w in 0..slot_words(&func.value_types, *p) as i32 {
-                        slot_load(enc, Reg::T0, slot(*a) + w * 4);
-                        slot_store(enc, Reg::T0, slot(*p) + w * 4);
+                        moves.push((
+                            SlotWord::At(slot(*p) + w * 4),
+                            SlotWord::At(slot(*a) + w * 4),
+                        ));
+                    }
+                }
+                for (dst, src) in crate::parallel_moves::schedule(&moves, SlotWord::Saved) {
+                    match (dst, src) {
+                        (SlotWord::At(d), SlotWord::At(s)) => {
+                            slot_load(enc, Reg::T0, s);
+                            slot_store(enc, Reg::T0, d);
+                        }
+                        (SlotWord::Saved, SlotWord::At(s)) => slot_load(enc, Reg::T1, s),
+                        (SlotWord::At(d), SlotWord::Saved) => slot_store(enc, Reg::T1, d),
+                        (SlotWord::Saved, SlotWord::Saved) => {
+                            unreachable!("the schedule never moves its scratch into itself")
+                        }
                     }
                 }
                 if !falls_through(index, *target) {
@@ -2884,6 +2910,21 @@ fn lower_function_spilled(
         }
     }
     Ok(method_record)
+}
+
+/// Faults unless the ARRAY descriptor in `descriptor` is a vector's, rank 1; `scratch` and `one`
+/// are clobbered. The ARM twin's reason: a rectangular array's descriptor carries an EMPTY interface
+/// table, which would answer every interface query "not implemented" where `int[,]` implements every
+/// interface `System.Array` does.
+fn fault_unless_vector(enc: &mut Encoder, descriptor: Reg, scratch: Reg, one: Reg) {
+    let vector = enc.new_label();
+    enc.lw(scratch, descriptor, 0);
+    enc.slli(scratch, scratch, 8);
+    enc.srli(scratch, scratch, 8);
+    enc.li(one, 1);
+    enc.branch(BranchCond::Eq, scratch, one, vector);
+    enc.ebreak();
+    enc.bind_label(vector);
 }
 
 /// Lowers one instruction in the all-spilled frame: load operands from their slots into `t0`-`t2`,
@@ -3174,7 +3215,14 @@ fn lower_inst_spilled(
                     type_descs.push(DescEmit {
                         label: l,
                         vtable: Vec::new(),
-                        words: alloc::vec![crate::resolver::ARRAY_DESC_MARK | 2, *element_kind, 0],
+                        words: alloc::vec![
+                            crate::resolver::ARRAY_DESC_MARK | 2,
+                            *element_kind,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
                         itable: Vec::new(),
                         base: None,
                         element: None,
@@ -3302,6 +3350,9 @@ fn lower_inst_spilled(
                         words: alloc::vec![
                             crate::resolver::ARRAY_DESC_MARK | u32::try_from(dims.len()).unwrap_or(1),
                             *element_kind,
+                            0,
+                            0,
+                            0,
                             0
                         ],
                         itable: Vec::new(),
@@ -3964,6 +4015,7 @@ fn lower_inst_spilled(
             enc.addi(t1, t1, (DESC_HEADER_WORDS * 4) as i32);
             enc.j(have_itable);
             enc.bind_label(array_form);
+            fault_unless_vector(enc, t0, t1, t2);
             enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
             enc.bind_label(have_itable);
             enc.add(t1, t0, t1);
@@ -3991,6 +4043,7 @@ fn lower_inst_spilled(
         Inst::VirtualFuncAddr {
             object,
             slot: vslot,
+            ..
         } => {
             let entry_off = vslot
                 .checked_mul(4)
@@ -4092,6 +4145,7 @@ fn lower_inst_spilled(
             enc.addi(t1, t1, 16);
             enc.j(have_itable);
             enc.bind_label(array_form);
+            fault_unless_vector(enc, t0, t1, t2);
             enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
             enc.bind_label(have_itable);
             enc.add(t1, t0, t1);
@@ -7366,6 +7420,7 @@ mod tests {
         let words = |inst: &Inst, profile| call_stack_words(inst, n(9), &types, profile);
         let virtual_call = Inst::CallVirtual {
             slot: 0,
+            declaring_type: None,
             args: args.clone(),
             returns_value: true,
         };
@@ -7451,6 +7506,7 @@ mod tests {
                         n(1),
                         Inst::CallVirtual {
                             slot: 0,
+                            declaring_type: None,
                             args: vec![n(0)],
                             returns_value: true,
                         },
@@ -8472,6 +8528,7 @@ mod tests {
                         Inst::VirtualFuncAddr {
                             object: n(0),
                             slot: 0,
+                            declaring_type: None,
                         },
                     ),
                 ],

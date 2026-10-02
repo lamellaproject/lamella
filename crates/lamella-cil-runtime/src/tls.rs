@@ -217,6 +217,38 @@ pub mod session_flag {
     pub const REPORT_PRESENT: i32 = 1 << 3;
 }
 
+/// A client's own identity for mutual TLS: the certificate chain it presents when a server asks for
+/// one, and the private key that proves it holds the leaf. A server that authenticates its clients
+/// by certificate, as cloud IoT services do for their X.509 devices, refuses a client without one.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientIdentity<'a> {
+    /// The certificate chain, leaf first: PEM text holding one or more `CERTIFICATE` blocks, or one
+    /// DER certificate.
+    pub chain: &'a [u8],
+    /// The leaf's private key: PEM text (a `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`
+    /// block), or DER in one of those three encodings (PKCS#8, PKCS#1, SEC1). An encrypted key is
+    /// not read: nothing here takes a password.
+    pub key: &'a [u8],
+}
+
+/// Why a [`ClientIdentity`] could not be used. Each case is a different thing for the program to
+/// fix, so each is reported by name rather than folded into one failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IdentityError {
+    /// This engine cannot present a client certificate at all.
+    Unsupported,
+    /// The certificate chain could not be read.
+    Certificate,
+    /// The private key could not be read.
+    Key,
+    /// The private key is not the one whose public half the leaf certificate carries.
+    Mismatch,
+    /// The identity was usable, and the rest of the configuration failed, for a reason
+    /// [`TlsBackend::client_config`] refuses too (no entropy source, an unusable root, a version
+    /// pin the engine cannot meet).
+    Configuration,
+}
+
 /// The state of a TLS session as the pump advances it. The managed side maps these to the integers
 /// `0..=3` so the seam crosses as a plain `int`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -338,6 +370,41 @@ pub trait TlsBackend: core::fmt::Debug {
     /// Defaults to a clean report for a backend with no such tolerances.
     fn session_flags(&mut self, _tls: TlsHandle) -> i32 {
         session_flag::REPORT_PRESENT
+    }
+
+    /// Like [`TlsBackend::client_config`], but the client PRESENTS `identity` when the server asks
+    /// for a certificate. The engine checks that the key belongs to the leaf before it stores
+    /// anything, so a mismatched pair is refused here rather than at the server.
+    ///
+    /// The default is [`IdentityError::Unsupported`]: an engine that cannot present a client
+    /// certificate says so at configuration, rather than handshaking without one and leaving the
+    /// server to refuse.
+    fn client_config_identity(
+        &mut self,
+        _stack: TlsStack,
+        _verify: VerifyMode,
+        _roots_pem: Option<&[u8]>,
+        _identity: ClientIdentity<'_>,
+    ) -> Result<TlsConfigHandle, IdentityError> {
+        Err(IdentityError::Unsupported)
+    }
+
+    /// Whether `identity` could be presented: the chain and the key both read, and the key is the
+    /// leaf's. Nothing is stored. This answers `X509Certificate2.CreateFromPem`, which refuses a
+    /// mismatched pair when the certificate is made, as .NET does.
+    ///
+    /// The default is [`IdentityError::Unsupported`], which the managed caller reads as "not
+    /// checked here" rather than as a verdict on the pair.
+    fn check_identity(&mut self, _identity: ClientIdentity<'_>) -> Result<(), IdentityError> {
+        Err(IdentityError::Unsupported)
+    }
+
+    /// The description byte of the fatal alert the peer sent that ended the session (RFC 5246 7.2:
+    /// `48` is unknown_ca, `116` certificate_required), or `None` when the peer sent none -- the
+    /// session failed on this side, or has not failed. A server refuses a client certificate this
+    /// way, so the alert is what names the refusal.
+    fn peer_alert(&mut self, _tls: TlsHandle) -> Option<u8> {
+        None
     }
 
     /// Like [`TlsBackend::client_config`] but the configuration OFFERS `alpn` (each entry one

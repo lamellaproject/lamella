@@ -871,6 +871,12 @@ pub struct Module {
     /// (loader-built) module, which uses `methods`.
     #[cfg(feature = "code-in-place")]
     baked: Option<BakedMethods>,
+    /// Whether a baked module carries the lazy initialization trigger for every type initializer
+    /// it lists. Decided once by [`Module::from_baked`]: an image baked before the trigger tables
+    /// existed has `.cctor`s and no trigger for them. See
+    /// [`Module::initializes_types_on_first_access`].
+    #[cfg(feature = "code-in-place")]
+    baked_first_access_init: bool,
     /// The signature interner: every distinct "name + parameter types" dispatch key maps to one
     /// stable 1-based `u32` id (0 reserved), so dispatch compares integers and the tables store
     /// ids. `sig_pool` owns the text (indexed by `id - 1`) for the load-time consumers that still
@@ -908,11 +914,13 @@ pub struct Module {
     static_fields: BTreeMap<u64, usize>,
     /// The zero value of each static field, indexed by storage slot.
     static_defaults: Vec<Value>,
-    /// The static constructors (`.cctor`), to run before the entry point.
+    /// The static constructors (`.cctor`), in declaration order. The bake-time trim keeps each one
+    /// as a root, and an image baked before the trigger tables existed runs them in this order
+    /// before its entry point.
     static_ctors: Vec<MethodId>,
     /// A type's `.cctor`, for the LAZY trigger (II.10.5.3): the interpreter runs it on the
-    /// type's first static-field access / method entry, marking it run in the `Vm`. Runtime-
-    /// side only (not baked): a baked image boots its cctors eagerly.
+    /// type's first static-field access / method entry, marking it run in the `Vm`. Frozen into
+    /// a trailing table, so a baked image initializes on first access as a loaded module does.
     cctor_types: BTreeMap<TypeId, MethodId>,
     /// A bodyless PinvokeImpl method's `[DllImport]` target, keyed by the method token's
     /// asm-folded handle -- consulted where an unresolvable `call` would otherwise trap.
@@ -920,7 +928,7 @@ pub struct Module {
     pinvoke_targets: BTreeMap<u64, PInvokeTarget>,
     /// The [`TypeId`] owning each contiguous run of static storage slots
     /// (`start, end, type`), so a static-field access can find the type whose cctor it
-    /// triggers. Loader-recorded, runtime-side only.
+    /// triggers. Loader-recorded, and frozen into a dense column indexed by slot.
     static_slot_types: Vec<(u32, u32, TypeId)>,
     /// A `TypeDef` token mapped to its [`TypeId`] (for `castclass` / `isinst`).
     type_tokens: BTreeMap<u64, TypeId>,
@@ -1544,6 +1552,15 @@ struct FrozenTables {
     /// the same reason: an image baked before it existed matches every cast test leniently, as it
     /// always did.
     cast_elems: SortedWideTable,
+    /// The frozen `cctor_types` ([`TypeId`] -> its `.cctor`), the lazy initialization trigger.
+    /// Trailing, for the same reason: an image baked before it existed has none, and
+    /// [`crate::boot_baked`] then runs its type initializers before the entry point, as it always
+    /// did.
+    cctor_types: SortedTokenTable,
+    /// The frozen `static_slot_types`: the [`TypeId`] owning each static storage slot, a dense
+    /// column indexed by slot, so a static access on a baked image finds the type whose `.cctor`
+    /// it triggers. Trailing, for the same reason.
+    static_slot_types: DenseIdColumn,
     /// The frozen `enum_wide` (enum handles with a 64-bit underlying type).
     enum_wide: SortedTokenSet,
     /// The frozen `enum_flags` (enum handles carrying `[Flags]`).
@@ -2026,6 +2043,32 @@ fn image_checksum(directory: &[u8], arena: &[u8]) -> u64 {
     crc64_update(crc64_update(0, directory), arena)
 }
 
+/// `image` as a writer from before its directory's last `pairs` trailing tables would have
+/// written it: the same bytes without those pairs, and the header's directory length and checksum
+/// recomputed to match. A test's way to hold an older image without committing one per table.
+#[cfg(all(test, feature = "code-in-place"))]
+pub(crate) fn image_without_trailing_tables(image: &[u8], pairs: usize) -> Vec<u8> {
+    let words = &image[8..];
+    let header_words = image_word(words, HEADER_WORD_COUNT_INDEX).expect("a header");
+    let directory_start = baked_directory_start(header_words).expect("a whole header");
+    let directory_len = image_word(words, HEADER_DIRECTORY_LEN_INDEX).expect("a directory length");
+    let arena_start = directory_start + directory_len as usize;
+    let shorter = directory_len as usize - pairs * 16;
+    let directory = &image[directory_start..directory_start + shorter];
+    let arena = &image[arena_start..];
+    let mut older = image[..directory_start].to_vec();
+    for (index, value) in [
+        (HEADER_DIRECTORY_LEN_INDEX, shorter as u64),
+        (HEADER_CHECKSUM_INDEX, image_checksum(directory, arena)),
+    ] {
+        let at = 8 + index * 8;
+        older[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    older.extend_from_slice(directory);
+    older.extend_from_slice(arena);
+    older
+}
+
 /// The content checksum recorded in a baked image's header (word 18), or `None` if the bytes are not
 /// a current-version Lamella image. Reads ONLY the fixed header -- for a deploy-skip check (does a
 /// device already hold this exact image?) without parsing or hashing the whole image. Not gated on
@@ -2349,6 +2392,8 @@ impl FrozenTables {
         pair(out, self.runtime_methods.offset, self.runtime_methods.entries);
         pair(out, self.enum_unsigned.offset, self.enum_unsigned.entries);
         pair(out, self.cast_elems.offset, self.cast_elems.entries);
+        pair(out, self.cctor_types.offset, self.cctor_types.entries);
+        pair(out, self.static_slot_types.offset, self.static_slot_types.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
@@ -2459,6 +2504,8 @@ impl FrozenTables {
         trailing!(runtime_methods, SortedTokenTable);
         trailing!(enum_unsigned, SortedTokenSet);
         trailing!(cast_elems, SortedWideTable);
+        trailing!(cctor_types, SortedTokenTable);
+        trailing!(static_slot_types, DenseIdColumn);
         Some((frozen, cursor))
     }
 }
@@ -2728,6 +2775,7 @@ impl Module {
             entries,
         );
         self.freeze_token_tables();
+        self.freeze_static_slot_types();
         self.freeze_token_sets();
         self.freeze_type_handles();
         self.freeze_rva_blobs();
@@ -3463,6 +3511,15 @@ impl Module {
             );
             frozen.finalizers = SortedTokenTable::write(arena, entries);
         }
+        if !self.cctor_types.is_empty() {
+            let mut entries = frozen.cctor_types.entries_of(arena);
+            entries.extend(
+                core::mem::take(&mut self.cctor_types)
+                    .into_iter()
+                    .map(|(type_id, cctor)| (u64::from(type_id), cctor)),
+            );
+            frozen.cctor_types = SortedTokenTable::write(arena, entries);
+        }
         if !self.explicit_overrides.is_empty() {
             let mut entries = frozen.explicit_overrides.entries_of(arena);
             let unpacked = core::mem::take(&mut self.explicit_overrides);
@@ -3575,6 +3632,34 @@ impl Module {
             arena.push_u64(*value);
         }
         DenseU64Column { offset, entries }
+    }
+
+    /// Drains `static_slot_types` into a dense column indexed by static slot, carrying an earlier
+    /// column forward on a re-freeze. A run reaching past the slots this freeze covers stays in the
+    /// builder, which [`Module::type_of_static_slot`] consults after the column.
+    fn freeze_static_slot_types(&mut self) {
+        if self.static_slot_types.is_empty() {
+            return;
+        }
+        let old = self.frozen.static_slot_types;
+        let entries = self.static_defaults.len().max(old.entries);
+        let mut owners = alloc::vec![0u32; entries];
+        for (slot, owner) in owners.iter_mut().enumerate().take(old.entries) {
+            *owner = self.arena.read_u32(old.offset + slot * 4).unwrap_or(0);
+        }
+        let mut beyond = Vec::new();
+        for (start, end, type_id) in core::mem::take(&mut self.static_slot_types) {
+            match owners.get_mut(start as usize..end as usize) {
+                Some(run) => run.fill(type_id + 1),
+                None => beyond.push((start, end, type_id)),
+            }
+        }
+        self.static_slot_types = beyond;
+        let offset = self.arena.bytes.len();
+        for owner in &owners {
+            self.arena.push_u32(*owner);
+        }
+        self.frozen.static_slot_types = DenseIdColumn { offset, entries };
     }
 
     /// Drains a dense-id-keyed builder map into a fresh arena column of `entries` values,
@@ -4226,6 +4311,9 @@ impl Module {
             let asm = module.method_asm(entry);
             module.bind_entry_assembly(asm);
         }
+        module.baked_first_access_init = module.static_ctors.iter().all(|&cctor| {
+            module.method_type(cctor).and_then(|type_id| module.cctor_of_type(type_id)) == Some(cctor)
+        });
         Ok((module, entry))
     }
 
@@ -4758,6 +4846,8 @@ impl Module {
             + self.explicit_overrides.len()
             + self.delegate_invokes.len()
             + self.finalizers.len()
+            + self.cctor_types.len()
+            + self.static_slot_types.len()
             + self.enum_widths.len()
             + self.md_array_ctors.len()
             + self.delegate_ctor_types.len()
@@ -4836,6 +4926,10 @@ impl Module {
             ("explicit_overrides", self.explicit_overrides.len()),
             ("delegate_invokes", self.delegate_invokes.len()),
             ("finalizers", self.finalizers.len()),
+            ("cctor_types", self.cctor_types.len()),
+            ("cctor_types (frozen)", self.frozen.cctor_types.entries),
+            ("static_slot_types", self.static_slot_types.len()),
+            ("static slot owner column entries (frozen)", self.frozen.static_slot_types.entries),
             ("enum_widths", self.enum_widths.len()),
             ("md_array_ctors", self.md_array_ctors.len()),
             ("delegate_ctor_types", self.delegate_ctor_types.len()),
@@ -4896,6 +4990,16 @@ impl Module {
                 self.enum_constants.values().map(BTreeMap::len).sum(),
             ),
         ])
+    }
+
+    /// The type whose full name (`Namespace.Name`) is `full_name`, found by scanning each type's
+    /// recorded name. Those names are in every image, where the reflection index is only in a
+    /// build with `reflection`; the scan is for a lookup made once, at boot.
+    #[must_use]
+    pub fn type_id_by_full_name(&self, full_name: &str) -> Option<TypeId> {
+        (0..self.type_count())
+            .filter_map(|index| TypeId::try_from(index).ok())
+            .find(|&type_id| self.type_full_name(type_id) == Some(full_name))
     }
 
     /// The number of declared reference types in the module -- the global [`TypeId`]
@@ -5321,8 +5425,8 @@ impl Module {
         &self.static_defaults
     }
 
-    /// Records a static constructor (`.cctor`) to run before the entry point. The declaring
-    /// type (already bound via [`Module::set_method_type`]) keys the lazy-trigger map.
+    /// Records a static constructor (`.cctor`), which runs at its type's first access. The
+    /// declaring type (already bound via [`Module::set_method_type`]) keys the lazy-trigger map.
     pub fn add_static_ctor(&mut self, method: MethodId) {
         if let Some(type_id) = self.method_type(method) {
             self.cctor_types.insert(type_id, method);
@@ -5333,7 +5437,10 @@ impl Module {
     /// The `.cctor` of `type_id`, if it declares one -- the lazy-initialization trigger map.
     #[must_use]
     pub fn cctor_of_type(&self, type_id: TypeId) -> Option<MethodId> {
-        self.cctor_types.get(&type_id).copied()
+        self.frozen
+            .cctor_types
+            .get(&self.arena, u64::from(type_id))
+            .or_else(|| self.cctor_types.get(&type_id).copied())
     }
 
     /// Records the `[DllImport]` target of the bodyless PinvokeImpl method `token`.
@@ -5358,11 +5465,16 @@ impl Module {
     /// The type owning static storage slot `slot`, if recorded.
     #[must_use]
     pub fn type_of_static_slot(&self, slot: usize) -> Option<TypeId> {
-        let slot = slot as u32;
-        self.static_slot_types
-            .iter()
-            .find(|&&(start, end, _)| slot >= start && slot < end)
-            .map(|&(_, _, type_id)| type_id)
+        let slot = u32::try_from(slot).ok()?;
+        self.frozen
+            .static_slot_types
+            .get(&self.arena, slot)
+            .or_else(|| {
+                self.static_slot_types
+                    .iter()
+                    .find(|&&(start, end, _)| slot >= start && slot < end)
+                    .map(|&(_, _, type_id)| type_id)
+            })
     }
 
     /// Records `type_id`'s `Finalize` method (its destructor), so allocating an instance
@@ -5771,13 +5883,26 @@ impl Module {
         &self.static_ctors
     }
 
+    /// Whether this module fires each type initializer at its type's first access, the lazy
+    /// initialization of ECMA-335 II.10.5.3.
+    ///
+    /// A loaded module always does. A baked image does when it carries the trigger tables, which
+    /// every image baked since they were added does. An image baked before them does not: its
+    /// static constructors must run before its entry point, which [`crate::boot_baked`] does.
+    #[must_use]
+    pub fn initializes_types_on_first_access(&self) -> bool {
+        #[cfg(feature = "code-in-place")]
+        {
+            self.baked.is_none() || self.baked_first_access_init
+        }
+        #[cfg(not(feature = "code-in-place"))]
+        {
+            true
+        }
+    }
+
     /// Whether this module BOOTED from a baked image ([`Module::from_baked`]) rather than
     /// being built by the loader.
-    ///
-    /// The distinction is not cosmetic: a baked module restores the ordered `static_ctors`
-    /// list but NOT the `cctor_types` trigger map, so the lazy initialization of II.10.5.3
-    /// cannot fire on it and its static constructors must be run eagerly before its entry
-    /// point ([`crate::boot_baked`]).
     #[must_use]
     pub fn is_baked(&self) -> bool {
         #[cfg(feature = "code-in-place")]

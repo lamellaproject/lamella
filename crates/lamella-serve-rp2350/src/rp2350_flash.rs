@@ -5,7 +5,7 @@
 //! - The bootrom publishes its functions through a lookup helper whose 16-bit pointer sits at
 //!   `0x16` (behind the `'M','u',0x02` magic at `0x10`); Secure Arm entries are selected with the
 //!   `RT_FLAG_FUNC_ARM_SEC` mask. Codes used here: `IF` connect_internal_flash, `EX`
-//!   flash_exit_xip, `FO` flash_op, `FC` flash_flush_cache.
+//!   flash_exit_xip, `FO` flash_op, `RE` flash_range_erase, `FC` flash_flush_cache.
 //! - `flash_op(flags, addr, size, buf)` (5.4.8.9) is the checked high-level erase/program/read:
 //!   erases are 4096-byte-sector granular, programs 256-byte-page granular, `addr` is an XIP
 //!   window address, and the flags select the operation (bits 17:16), the security level
@@ -60,6 +60,17 @@ pub const IMAGE_LEN: usize = FLASH_END - IMAGE_BASE;
 pub const SECTOR_BYTES: usize = 4096;
 pub const PAGE_BYTES: usize = 256;
 
+/// Where the flash's first byte appears in the XIP window. `flash_range_erase` takes a flash
+/// OFFSET, where `flash_op` takes an XIP address (5.4.8.9, 5.4.8.10).
+const XIP_BASE: usize = 0x1000_0000;
+
+/// Block-erase parameters for `flash_range_erase` (5.4.8.10): the 64 KB block-erase command, D8h,
+/// which it uses over 64 KB-aligned spans with 4 KB sector erases at the edges. `flash_op` uses
+/// D8h only where the runtime `FLASH_DEVINFO` declares it supported (5.4.8.9); this is told to, so
+/// clearing a large stored program does not depend on that setting.
+const BLOCK_BYTES: u32 = 1 << 16;
+const BLOCK_ERASE_CMD: u8 = 0xD8;
+
 // Bootrom well-known layout (5.4.1, table 453) and ROM-table lookup flags.
 const BOOTROM_MAGIC_ADDR: usize = 0x10;
 const BOOTROM_MAGIC: u32 = 0x02_75_4d; // 'M', 'u', 0x02 (little-endian low 24 bits)
@@ -79,6 +90,7 @@ const CFLASH_OP_PROGRAM: u32 = 0x1 << 16;
 type RomTableLookup = unsafe extern "C" fn(u32, u32) -> u32;
 type RomFnVoid = extern "C" fn();
 type RomFlashOp = extern "C" fn(u32, u32, u32, u32) -> i32;
+type RomRangeErase = extern "C" fn(u32, u32, u32, u8);
 
 /// The resolved bootrom flash entry points. Resolution happens once, at construction; a ROM
 /// whose magic or table entries are missing yields an unavailable sink whose programs fail
@@ -87,6 +99,7 @@ pub struct Rp2350Flash {
     connect_internal_flash: Option<RomFnVoid>,
     flash_exit_xip: Option<RomFnVoid>,
     flash_op: Option<RomFlashOp>,
+    flash_range_erase: Option<RomRangeErase>,
     flash_flush_cache: Option<RomFnVoid>,
 }
 
@@ -113,12 +126,33 @@ impl Rp2350Flash {
             let addr = rom_lookup(rom_code(b'F', b'O'));
             if addr == 0 { None } else { Some(unsafe { core::mem::transmute::<usize, RomFlashOp>(addr as usize) }) }
         };
+        let flash_range_erase = {
+            let addr = rom_lookup(rom_code(b'R', b'E'));
+            if addr == 0 { None } else { Some(unsafe { core::mem::transmute::<usize, RomRangeErase>(addr as usize) }) }
+        };
         Self {
             connect_internal_flash: fetch_void(b'I', b'F'),
             flash_exit_xip: fetch_void(b'E', b'X'),
             flash_op,
+            flash_range_erase,
             flash_flush_cache: fetch_void(b'F', b'C'),
         }
+    }
+
+    /// Erase `len` bytes at flash offset `offset` with `flash_range_erase`'s 64 KB block erase,
+    /// then restore the fast XIP mode. Returns whether the bootrom provided every entry point.
+    fn range_erase(&self, offset: u32, len: u32) -> bool {
+        let (Some(cif), Some(cex), Some(cre), Some(cfc)) = (
+            self.connect_internal_flash,
+            self.flash_exit_xip,
+            self.flash_range_erase,
+            self.flash_flush_cache,
+        ) else {
+            return false;
+        };
+        range_erase_in_ram(cif, cex, cre, cfc, offset, len);
+        restore_xip_mode();
+        true
     }
 
     /// Run an erase and/or program batch through the bootrom, then restore the fast XIP mode.
@@ -173,6 +207,30 @@ extern "C" fn flash_ops_in_ram(
     status
 }
 
+/// The block erase, executing from RAM for the reason [`flash_ops_in_ram`] does: while
+/// `flash_range_erase` runs the QMI is in direct mode, and an XIP fetch would bus-error (5.4.8.10).
+#[unsafe(link_section = ".data.rp2350_flash_ops")]
+#[inline(never)]
+extern "C" fn range_erase_in_ram(
+    connect_internal_flash: RomFnVoid,
+    flash_exit_xip: RomFnVoid,
+    flash_range_erase: RomRangeErase,
+    flash_flush_cache: RomFnVoid,
+    offset: u32,
+    len: u32,
+) {
+    connect_internal_flash();
+    flash_exit_xip();
+    flash_range_erase(offset, len, BLOCK_BYTES, BLOCK_ERASE_CMD);
+    flash_flush_cache();
+}
+
+/// Whether the `len` bytes of the region at `offset` all read erased (`0xFF`).
+fn reads_erased(offset: usize, len: usize) -> bool {
+    let bytes = unsafe { core::slice::from_raw_parts((IMAGE_BASE + offset) as *const u8, len) };
+    bytes.iter().all(|&byte| byte == 0xFF)
+}
+
 /// Restore the XIP mode the bootrom discovered at flash scan: copy its saved setup function
 /// (the first 64 words of boot RAM, per the SDK's documented convention for this chip) into RAM
 /// and execute it. Between `flash_op`s the QMI is already in a working basic serial XIP mode, so
@@ -223,6 +281,19 @@ impl lamella_runner::FlashSink for Rp2350Flash {
         let _ = self.run_ops(IMAGE_BASE as u32, SECTOR_BYTES as u32, 0, 0, 0);
     }
 
+    fn erase_unit(&self) -> Option<usize> {
+        Some(SECTOR_BYTES)
+    }
+
+    fn erase_range(&mut self, offset: usize, len: usize) -> bool {
+        let in_window = offset.checked_add(len).is_some_and(|end| end <= IMAGE_LEN);
+        if !in_window || offset % SECTOR_BYTES != 0 || len % SECTOR_BYTES != 0 {
+            return false;
+        }
+        let flash_offset = (IMAGE_BASE - XIP_BASE + offset) as u32;
+        self.range_erase(flash_offset, len as u32) && reads_erased(offset, len)
+    }
+
     fn program(&mut self, image: &[u8]) -> bool {
         if image.is_empty() || image.len() > IMAGE_LEN {
             return false;
@@ -252,9 +323,14 @@ impl lamella_runner::FlashSink for Rp2350Flash {
         // was erased by the chunk before it.
         let erase_from = round_up(offset, SECTOR_BYTES);
         let erase_to = round_up(offset + chunk.len(), SECTOR_BYTES);
+        let erase_len = if reads_erased(erase_from, erase_to - erase_from) {
+            0
+        } else {
+            erase_to - erase_from
+        };
         let status = self.run_ops(
             (IMAGE_BASE + erase_from) as u32,
-            (erase_to - erase_from) as u32,
+            erase_len as u32,
             (IMAGE_BASE + offset) as u32,
             staged.as_ptr() as u32,
             staged.len() as u32,

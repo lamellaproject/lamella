@@ -487,12 +487,14 @@ pub trait CallResolver {
         None
     }
 
-    /// `(size, signed)` when the field is SUB-WORD -- `bool`/`byte` (1, false), `sbyte`
-    /// (1, true), `char`/`ushort` (2, false), `short` (2, true) -- so `ldfld`/`stfld` lower to
-    /// the width-exact [`Inst::FieldLoadNarrow`]/[`Inst::FieldStoreNarrow`]: such fields sit at
+    /// How a FIELD is stored when it is narrower than a word, as the extension a load of it applies:
+    /// [`Self::sub_word_scalar`]'s question, asked of the field a `ldfld`/`stfld` token names. A
+    /// `bool`, `byte`, `sbyte`, `char`, `short` or `ushort` field, an enum field over one of those,
+    /// and a `T` field whose argument is one of those all answer, so `ldfld`/`stfld` lower to the
+    /// width-exact [`Inst::FieldLoadNarrow`]/[`Inst::FieldStoreNarrow`]: such fields sit at
     /// unaligned offsets in the natural layout, and a word-wide store would stomp the neighbors.
     /// `None` for a word-or-wider field. Defaults to `None`.
-    fn field_narrow(&self, _operand: &Operand) -> Option<(u8, bool)> {
+    fn field_narrow(&self, _operand: &Operand) -> Option<ConvKind> {
         None
     }
 
@@ -671,6 +673,15 @@ pub trait CallResolver {
     /// cannot place (an interface/abstract method, or a cross-module ref) -- dispatched directly.
     /// Defaults to None (direct dispatch everywhere).
     fn virtual_slot(&self, _operand: &Operand) -> Option<usize> {
+        None
+    }
+
+    /// The type that declares a virtual `callvirt` or `ldvirtftn` target, as the handle its
+    /// descriptor is named by: only a receiver of that type, or of a type deriving from it, can
+    /// reach the call, so a link keeps the slot's method in those descriptors alone. `None` when
+    /// this resolver cannot name the type, and the slot is then kept in every descriptor that has
+    /// it. Defaults to `None`.
+    fn virtual_declaring_type(&self, _operand: &Operand) -> Option<TypeHandle> {
         None
     }
 
@@ -2537,16 +2548,26 @@ fn stind(
     Ok(())
 }
 
-/// The width and extension a token-form access (`ldobj`, `stobj`, `cpobj`) of `operand` must use,
-/// when [`CallResolver::sub_word_scalar`] says the type is narrower than a word; `None` otherwise.
-fn sub_word_access(resolver: &dyn CallResolver, operand: &Operand) -> Option<(u32, bool)> {
-    match resolver.sub_word_scalar(operand)? {
+/// The width in bytes and the signedness of an access to a value stored narrower than a word, from
+/// the extension a load of it applies; `None` for any other conversion.
+///
+/// A field access and a token-form access (`ldobj`, `stobj`, `cpobj`) both take their width from
+/// here, so the two cannot disagree about how many bytes one type occupies.
+fn narrow_access(kind: ConvKind) -> Option<(u8, bool)> {
+    match kind {
         ConvKind::SignExtend8 => Some((1, true)),
         ConvKind::ZeroExtend8 => Some((1, false)),
         ConvKind::SignExtend16 => Some((2, true)),
         ConvKind::ZeroExtend16 => Some((2, false)),
         _ => None,
     }
+}
+
+/// The width and extension a token-form access (`ldobj`, `stobj`, `cpobj`) of `operand` must use,
+/// when [`CallResolver::sub_word_scalar`] says the type is narrower than a word; `None` otherwise.
+fn sub_word_access(resolver: &dyn CallResolver, operand: &Operand) -> Option<(u32, bool)> {
+    let (width, signed) = narrow_access(resolver.sub_word_scalar(operand)?)?;
+    Some((u32::from(width), signed))
 }
 
 /// Lowers a `ldind.{i,u}{1,2,4}`: `value = *(addr)`, a `width`-byte load sign- or zero-extended to
@@ -3215,6 +3236,7 @@ fn apply_value_op(
                     Inst::VirtualFuncAddr {
                         object,
                         slot: slot as u32,
+                        declaring_type: resolver.virtual_declaring_type(&inst.operand),
                     },
                 ));
             } else {
@@ -3942,6 +3964,7 @@ fn apply_value_op(
                         },
                         (_, Some(slot)) => Inst::CallVirtual {
                             slot: slot as u32,
+                            declaring_type: resolver.virtual_declaring_type(&inst.operand),
                             args: call_args,
                             returns_value: info.has_result,
                         },
@@ -3972,6 +3995,7 @@ fn apply_value_op(
                         },
                         (_, Some(slot)) => Inst::CallVirtual {
                             slot: slot as u32,
+                            declaring_type: resolver.virtual_declaring_type(&inst.operand),
                             args: call_args,
                             returns_value: info.has_result,
                         },
@@ -4217,7 +4241,7 @@ fn apply_value_op(
                     .ok_or(CilError::BadOperand)?;
             let field_ty = resolver.field_type(&inst.operand).unwrap_or(MirType::I32);
             let result = new_value(value_types, field_ty);
-            match resolver.field_narrow(&inst.operand) {
+            match resolver.field_narrow(&inst.operand).and_then(narrow_access) {
                 Some((size, signed)) => insts.push((
                     result,
                     Inst::FieldLoadNarrow {
@@ -4245,7 +4269,7 @@ fn apply_value_op(
                     .field_offset(&inst.operand)
                     .ok_or(CilError::BadOperand)?;
             let placeholder = new_value(value_types, MirType::I32);
-            match resolver.field_narrow(&inst.operand) {
+            match resolver.field_narrow(&inst.operand).and_then(narrow_access) {
                 Some((size, _)) => insts.push((
                     placeholder,
                     Inst::FieldStoreNarrow {

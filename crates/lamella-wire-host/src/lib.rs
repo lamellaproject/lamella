@@ -1170,11 +1170,18 @@ fn deploy_chunk_outcome(
     let (Some(sent), Some(&xfer::MATCHED)) = (expected, reply.first()) else {
         return Ok(TransferAck::Accepted);
     };
-    let Some(crc) = reply.get(1..5) else {
+    let Some(reported) = transfer_word(reply) else {
         return Err(TransportError::MalformedReply { msg_type: deploy::XFER_RESULT });
     };
-    let reported = u32::from_le_bytes([crc[0], crc[1], crc[2], crc[3]]);
     Ok(if reported == sent { TransferAck::Accepted } else { TransferAck::Mismatched { chunk, sent, reported } })
+}
+
+/// The `u32` an `XFER_RESULT` carries after its status byte, or `None` when the reply is too short
+/// to hold one. What it means depends on the request it answers -- a prefix CRC for a deploy chunk,
+/// the bytes erased for a clear -- so each reader decides, and this only decodes.
+fn transfer_word(reply: &[u8]) -> Option<u32> {
+    let bytes = reply.get(1..5)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// Host driver, blocking: persist `image` to the target's flash (it boots on reset), or
@@ -1200,8 +1207,40 @@ pub fn deploy_blocking(
     if !image.is_empty() {
         return deploy_image_blocking(transport, seq, image, CHUNK_DATA_CAP, timeout, lamella_wire::Capabilities(0));
     }
+    clear_deployed_blocking(transport, seq, timeout).map(|cleared| cleared.ack)
+}
+
+/// What a target answered when it was told to clear its deployed image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cleared {
+    /// The answer itself: [`TransferAck::Accepted`] when the target cleared, and a refusal of
+    /// chunk 0 when it did not finish.
+    pub ack: TransferAck,
+    /// How many bytes of flash the target erased, from a target that says. `None` is a target that
+    /// does not report it, never one that erased nothing.
+    pub erased: Option<u32>,
+}
+
+/// Host driver, blocking: clear the deployed image (un-deploy), and say what the target answered,
+/// with how many bytes it erased where it reports that.
+///
+/// The count travels in the acknowledgement's `u32`, where a deploy chunk's carries its prefix CRC,
+/// and a target that does not report it sends 0 there -- so 0 is read as "not said".
+///
+/// # Errors
+/// [`TransportError::Refused`] at once when the target answers `ERROR`, [`TransportError::Closed`]
+/// on timeout; otherwise a carrier [`TransportError`].
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn clear_deployed_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    timeout: Duration,
+) -> Result<Cleared, TransportError> {
     transport.send(deploy::DEPLOY_CLEAR, seq, &[])?;
-    await_transfer_ack(transport, seq, 0, None, timeout)
+    let reply = await_transfer_reply(transport, seq, timeout)?;
+    let ack = deploy_chunk_outcome(&reply, 0, None)?;
+    let erased = transfer_word(&reply).filter(|&count| ack == TransferAck::Accepted && count != 0);
+    Ok(Cleared { ack, erased })
 }
 
 /// The largest image slice one `DEPLOY_IMAGE` frame can carry: the frame's `u16` LEN cap, less the
@@ -1413,11 +1452,7 @@ pub fn run_bundle_blocking(
     Ok(RunOutcome::Ran(await_result(transport, seq, timeout)?))
 }
 
-/// Wait for one chunk's transfer ack: [`try_recv_deploy_ack`] until it answers or `timeout` passes.
-///
-/// Every transfer acknowledged by `XFER_RESULT` waits here -- an image, a clear, and a bundle
-/// deployed or loaded -- so a target that answers `ERROR` is a refusal on all of them rather than a
-/// wait on some.
+/// Wait for one chunk's transfer ack: [`await_transfer_reply`], read by the deploy rule.
 fn await_transfer_ack(
     transport: &mut impl Transport,
     seq: u16,
@@ -1425,10 +1460,24 @@ fn await_transfer_ack(
     expected: Option<u32>,
     timeout: Duration,
 ) -> Result<TransferAck, TransportError> {
+    deploy_chunk_outcome(&await_transfer_reply(transport, seq, timeout)?, chunk, expected)
+}
+
+/// Wait for the `XFER_RESULT` answering `seq`: [`try_recv_transfer_reply`] until it answers or
+/// `timeout` passes, then the reply's payload.
+///
+/// Every transfer acknowledged by `XFER_RESULT` waits here -- an image, a clear, and a bundle
+/// deployed or loaded -- so a target that answers `ERROR` is a refusal on all of them rather than a
+/// wait on some.
+fn await_transfer_reply(
+    transport: &mut impl Transport,
+    seq: u16,
+    timeout: Duration,
+) -> Result<Vec<u8>, TransportError> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(ack) = try_recv_deploy_ack(transport, seq, chunk, expected)? {
-            return Ok(ack);
+        if let Some(reply) = try_recv_transfer_reply(transport, seq)? {
+            return Ok(reply);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1565,13 +1614,25 @@ pub fn try_recv_deploy_ack(
     chunk: usize,
     expected: Option<u32>,
 ) -> Result<Option<TransferAck>, TransportError> {
+    try_recv_transfer_reply(transport, seq)?
+        .map(|reply| deploy_chunk_outcome(&reply, chunk, expected))
+        .transpose()
+}
+
+/// The payload of the `XFER_RESULT` answering `seq` once it has arrived, or `Ok(None)` while
+/// nothing has. A frame for another sequence number is passed over.
+///
+/// # Errors
+/// [`TransportError::Refused`] when the target answered `ERROR` for this sequence; otherwise a
+/// carrier [`TransportError`].
+fn try_recv_transfer_reply(transport: &mut impl Transport, seq: u16) -> Result<Option<Vec<u8>>, TransportError> {
     use lamella_wire::{Frame, msg};
     while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
         if reply_seq != seq {
             continue;
         }
         if msg_type == deploy::XFER_RESULT {
-            return deploy_chunk_outcome(&payload, chunk, expected).map(Some);
+            return Ok(Some(payload));
         }
         if msg_type == msg::ERROR {
             return Err(lamella_wire::error::refusal(&payload));
@@ -2588,6 +2649,42 @@ mod tests {
         let error = deploy_blocking(&mut transport, 5, &[], patience).expect_err("a refused clear is an error");
         assert!(matches!(error, TransportError::Refused { .. }), "expected Refused, got {error:?}");
         assert!(started.elapsed() < patience, "the clear waited its refusal out");
+    }
+
+    /// **A CLEAR SAYS HOW MUCH IT ERASED WHERE THE TARGET REPORTS IT**, in the `u32` a deploy chunk's
+    /// answer gives its prefix CRC, and 0 there is a target that does not say -- never a clear that
+    /// erased nothing. A clear that did not finish is a refusal, and reports no count.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn a_clear_reports_the_bytes_the_target_says_it_erased() {
+        use lamella_wire::msg::xfer;
+        let patience = Duration::from_secs(2);
+        let answering = |status: u8, count: u32| {
+            let mut payload = vec![status];
+            payload.extend_from_slice(&count.to_le_bytes());
+            let mut transport = MemTransport::new();
+            transport.feed(&encode_frame(deploy::XFER_RESULT, 7, &payload).expect("a 5-byte answer frames"));
+            transport
+        };
+        assert_eq!(
+            clear_deployed_blocking(&mut answering(xfer::MATCHED, 331_776), 7, patience),
+            Ok(Cleared { ack: TransferAck::Accepted, erased: Some(331_776) })
+        );
+        assert_eq!(
+            clear_deployed_blocking(&mut answering(xfer::MATCHED, 0), 7, patience),
+            Ok(Cleared { ack: TransferAck::Accepted, erased: None }),
+            "a target that does not report the count"
+        );
+        assert_eq!(
+            clear_deployed_blocking(&mut answering(xfer::WRITE_FAILED, 4096), 7, patience),
+            Ok(Cleared { ack: TransferAck::Rejected { chunk: 0 }, erased: None }),
+            "an erase that did not finish"
+        );
+        assert_eq!(
+            deploy_blocking(&mut answering(xfer::MATCHED, 331_776), 7, &[], patience),
+            Ok(TransferAck::Accepted),
+            "and the older call answers the same clear as it always did"
+        );
     }
 
     /// A bundle deploy compares each acknowledgement with the prefix CRC of what was planned, as an

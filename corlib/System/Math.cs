@@ -100,10 +100,15 @@ namespace System
 
         public static double Round(double value, int digits)
         {
-            if (digits < 0 || digits > 15) throw new ArgumentOutOfRangeException("digits", "Rounding digits must be between 0 and 15, inclusive.");
-            if (Abs(value) >= RoundLimit) return value;
+            RequireRoundingDigits(digits);
+            if (!(Abs(value) < RoundLimit)) return value;
             double power = Power10(digits);
             return Round(value * power) / power;
+        }
+
+        private static void RequireRoundingDigits(int digits)
+        {
+            if (digits < 0 || digits > 15) throw new ArgumentOutOfRangeException("digits", "Rounding digits must be between 0 and 15, inclusive.");
         }
 
         private static double Power10(int digits)
@@ -130,6 +135,56 @@ namespace System
         }
 #if LAMELLA_SURFACE_NETFX_2_0
         [Lamella.Runtime.RuntimeProvided] public static double Truncate(double d) { return 0; }
+
+        /// <summary>Rounds a value to a whole number, settling a value halfway between two whole
+        /// numbers as <paramref name="mode"/> says.</summary>
+        /// <param name="value">The value to round.</param>
+        /// <param name="mode">How to round a value halfway between two whole numbers.</param>
+        /// <returns>The whole number <paramref name="value"/> rounds to. NaN and the infinities come
+        /// back unchanged, and a value that rounds to zero keeps its sign.</returns>
+        /// <exception cref="ArgumentException"><paramref name="mode"/> is not a
+        /// <see cref="MidpointRounding"/> value.</exception>
+        public static double Round(double value, MidpointRounding mode)
+        {
+            return Round(value, 0, mode);
+        }
+
+        /// <summary>Rounds a value to a number of decimal places, settling a value halfway between two
+        /// candidates as <paramref name="mode"/> says.</summary>
+        /// <param name="value">The value to round.</param>
+        /// <param name="digits">How many decimal places to keep, from 0 to 15.</param>
+        /// <param name="mode">How to round a value halfway between two candidates.</param>
+        /// <returns>The value with <paramref name="digits"/> decimal places that
+        /// <paramref name="value"/> rounds to. NaN, the infinities and any value of magnitude 1e16 or
+        /// more come back unchanged, and a value that rounds to zero keeps its sign.</returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="digits"/> is less than 0 or
+        /// greater than 15.</exception>
+        /// <exception cref="ArgumentException"><paramref name="mode"/> is not a
+        /// <see cref="MidpointRounding"/> value.</exception>
+        public static double Round(double value, int digits, MidpointRounding mode)
+        {
+            RequireRoundingDigits(digits);
+            RequireMidpointRounding(mode);
+            if (!(Abs(value) < RoundLimit)) return value;
+            double power = Power10(digits);
+            return RoundToWhole(value * power, mode) / power;
+        }
+
+        private static void RequireMidpointRounding(MidpointRounding mode)
+        {
+            if (mode != MidpointRounding.ToEven && mode != MidpointRounding.AwayFromZero)
+            {
+                throw new ArgumentException("The value '" + Int32.Decimal((int)mode) + "' is not valid for this usage of the type MidpointRounding.", "mode");
+            }
+        }
+
+        private static double RoundToWhole(double value, MidpointRounding mode)
+        {
+            if (mode == MidpointRounding.ToEven) return Round(value);
+            double whole = Truncate(value);
+            if (Abs(value - whole) >= 0.5) whole += value < 0 ? -1.0 : 1.0;
+            return whole;
+        }
 #endif
 #endif
 

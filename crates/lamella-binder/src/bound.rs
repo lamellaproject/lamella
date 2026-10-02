@@ -2671,6 +2671,227 @@ impl Binder {
         Some(arguments)
     }
 
+    /// Resolves a type name written with a namespace alias qualifier (C# 2.0) --
+    /// `global::System.String`, `IO::File` -- or answers `None` for a name without one.
+    ///
+    /// **THE ALIAS FIXES WHERE THE LOOKUP STARTS, AND NOTHING ELSE IS CONSULTED.** `global::` is the
+    /// global namespace and `alias::` the namespace a `using` alias names; no enclosing namespace,
+    /// `using` directive or type member is searched, which is what the qualifier is for:
+    /// `global::System` is the root `System` even inside a namespace that declares its own. After
+    /// the alias the parts are namespaces while they name one, then a type, then types nested in
+    /// it. A first part that is neither is `CS0400` in the global namespace and `CS0234` in an
+    /// alias's.
+    fn resolve_alias_qualified(&mut self, ty: &TypeSymbol, span: Span) -> Option<TypeSymbol> {
+        let (parts, arguments) = match ty {
+            TypeSymbol::Named(parts) => (parts, None),
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => (definition, Some(arguments)),
+            _ => return None,
+        };
+        let alias = lamella_syntax::ast::alias_qualifier(parts.first()?)?;
+        let Some(root) = self.alias_namespace(alias, span) else {
+            return Some(TypeSymbol::Error);
+        };
+        let rest = &parts[1..];
+        let Some(first) = rest.first() else {
+            return Some(TypeSymbol::Error);
+        };
+        if !self.type_named_in(&root, first)
+            && !self.model.is_namespace(&namespace_member(&root, first))
+        {
+            let kind = if root.is_empty() {
+                DiagnosticKind::GlobalNamespaceMemberNotFound {
+                    name: first.clone(),
+                }
+            } else {
+                DiagnosticKind::NamespaceMemberNotFound {
+                    namespace: root.as_str().into(),
+                    name: first.clone(),
+                }
+            };
+            self.report(Diagnostic::new(kind, span));
+            return Some(TypeSymbol::Error);
+        }
+        let mut namespace = root.clone();
+        let mut index = 0;
+        while index + 1 < rest.len()
+            && !self.type_named_in(&namespace, &rest[index])
+            && self
+                .model
+                .is_namespace(&namespace_member(&namespace, &rest[index]))
+        {
+            namespace = namespace_member(&namespace, &rest[index]);
+            index += 1;
+        }
+        if index > 0 && !self.type_named_in(&namespace, &rest[index]) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::NamespaceMemberNotFound {
+                    namespace: namespace.as_str().into(),
+                    name: rest[index].clone(),
+                },
+                span,
+            ));
+            return Some(TypeSymbol::Error);
+        }
+        let mut qualified: Vec<Box<str>> = root
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .map(Box::from)
+            .collect();
+        qualified.extend(rest.iter().cloned());
+        let qualified = match arguments {
+            None => TypeSymbol::Named(qualified.into()),
+            Some(arguments) => TypeSymbol::Instantiation {
+                definition: qualified.into(),
+                arguments: arguments.clone(),
+            },
+        };
+        Some(
+            match resolve_type(&self.world, &qualified, &mut self.diagnostics, span).fold_builtin()
+            {
+                TypeSymbol::Special(special) => self.resolve_special_type(special, span),
+                resolved => resolved,
+            },
+        )
+    }
+
+    /// The namespace a `using` alias's target names, when it names one rather than a type:
+    /// `using IO = System.IO;` names `System.IO`, and a target written `global::N` names `N`.
+    ///
+    /// **A TYPE WITH NESTED TYPES IS NOT A NAMESPACE, THOUGH THE MODEL FILES ITS NESTED TYPES UNDER
+    /// ITS NAME.** `System.Text.StringBuilder` holds nested types, so a namespace test alone answers
+    /// yes for it; the alias `using L = System.Text.StringBuilder;` names the type.
+    pub(crate) fn aliased_namespace(&self, target: &TypeSymbol) -> Option<String> {
+        let TypeSymbol::Named(parts) = target else {
+            return None;
+        };
+        let parts = match parts.split_first() {
+            Some((first, rest))
+                if lamella_syntax::ast::alias_qualifier(first) == Some("global") =>
+            {
+                rest
+            }
+            _ => &parts[..],
+        };
+        let [leading @ .., last] = parts else {
+            return None;
+        };
+        let namespace = parts.join(".");
+        (self.model.is_namespace(&namespace) && self.model.get(&leading.join("."), last).is_none())
+            .then_some(namespace)
+    }
+
+    /// `ty` with a leading `using` alias of a NAMESPACE replaced by that namespace (16.3.1):
+    /// `T.StringBuilder` for `using T = System.Text;` is `System.Text.StringBuilder`. `None` when
+    /// the first part is no such alias, or is a type or namespace in scope, which an alias does not
+    /// hide.
+    fn expand_namespace_alias(&self, ty: &TypeSymbol) -> Option<TypeSymbol> {
+        let (parts, arguments) = match ty {
+            TypeSymbol::Named(parts) => (parts, None),
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => (definition, Some(arguments)),
+            _ => return None,
+        };
+        let [first, rest @ ..] = &parts[..] else {
+            return None;
+        };
+        if rest.is_empty() || lamella_syntax::ast::alias_qualifier(first).is_some() {
+            return None;
+        }
+        let namespace = self.aliased_namespace(&self.alias_target(first)?)?;
+        if self.named_type_in_scope(first).is_some() || self.model.is_namespace(first) {
+            return None;
+        }
+        let mut expanded: Vec<Box<str>> = namespace.split('.').map(Box::from).collect();
+        expanded.extend(rest.iter().cloned());
+        Some(match arguments {
+            None => TypeSymbol::Named(expanded.into()),
+            Some(arguments) => TypeSymbol::Instantiation {
+                definition: expanded.into(),
+                arguments: arguments.clone(),
+            },
+        })
+    }
+
+    /// `ty` with the namespace alias qualifier on its name replaced by the namespace it denotes --
+    /// `global::System.String` is `System.String`, `IO::File` is `System.IO.File` -- without
+    /// reporting anything; `None` for a name with no qualifier or one that denotes no namespace,
+    /// which [`Self::resolve_alias_qualified`] reports.
+    fn without_alias_qualifier(&self, ty: &TypeSymbol) -> Option<TypeSymbol> {
+        let (parts, arguments) = match ty {
+            TypeSymbol::Named(parts) => (parts, None),
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => (definition, Some(arguments)),
+            _ => return None,
+        };
+        let alias = lamella_syntax::ast::alias_qualifier(parts.first()?)?;
+        let root = if alias == "global" {
+            String::new()
+        } else {
+            self.aliased_namespace(&self.alias_target(alias)?)?
+        };
+        let mut qualified: Vec<Box<str>> = root
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .map(Box::from)
+            .collect();
+        qualified.extend(parts[1..].iter().cloned());
+        Some(match arguments {
+            None => TypeSymbol::Named(qualified.into()),
+            Some(arguments) => TypeSymbol::Instantiation {
+                definition: qualified.into(),
+                arguments: arguments.clone(),
+            },
+        })
+    }
+
+    /// The namespace a namespace alias qualifier starts its lookup in -- `""`, the global
+    /// namespace, for `global`, and the namespace a `using` alias names for any other -- or `None`
+    /// once the qualifier is reported: `CS0432` where no alias of that name is in scope, `CS0431`
+    /// where the alias names a type. Below C# 2.0 the qualifier is the feature diagnostic as well,
+    /// at the alias, which is where and when csc reports it.
+    fn alias_namespace(&mut self, alias: &str, span: Span) -> Option<String> {
+        self.gate_feature(Feature::NamespaceAlias, Span::empty_at(span.start));
+        if alias == "global" {
+            return Some(String::new());
+        }
+        let Some(target) = self.alias_target(alias) else {
+            self.report(Diagnostic::new(
+                DiagnosticKind::AliasNotFound {
+                    alias: alias.into(),
+                },
+                span,
+            ));
+            return None;
+        };
+        if let Some(namespace) = self.aliased_namespace(&target) {
+            return Some(namespace);
+        }
+        self.report(Diagnostic::new(
+            DiagnosticKind::AliasQualifierNamesType {
+                alias: alias.into(),
+            },
+            span,
+        ));
+        None
+    }
+
+    /// Whether `namespace` (`""` for the global one) declares a type named `name`, at any arity.
+    fn type_named_in(&self, namespace: &str, name: &str) -> bool {
+        self.model.get(namespace, name).is_some()
+            || (1..=MAX_GENERIC_ARITY_PROBED).any(|arity| {
+                self.model
+                    .get(namespace, &alloc::format!("{name}`{arity}"))
+                    .is_some()
+            })
+    }
+
     fn resolve_named_type_unchecked(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
         let instantiated;
         let ty = match ty {
@@ -2689,6 +2910,12 @@ impl Binder {
             }
             other => other,
         };
+        if let Some(qualified) = self.resolve_alias_qualified(ty, span) {
+            return qualified;
+        }
+        if let Some(expanded) = self.expand_namespace_alias(ty) {
+            return self.resolve_named_type_unchecked(&expanded, span);
+        }
         self.gate_generic_use(ty, span);
         if let TypeSymbol::Special(special) = ty {
             return self.resolve_special_type(*special, span);
@@ -3147,6 +3374,21 @@ impl Binder {
     /// with the use-site resolver, so declaration and use positions answer alike by
     /// construction.
     pub fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
+        // A name qualified by `global::` or an alias is fully qualified once the qualifier is
+        // replaced by the namespace it denotes, and no scope is consulted for it.
+        if let Some(expanded) = self.expand_namespace_alias(ty) {
+            return self.canonicalize(&expanded.fold_builtin());
+        }
+        if let Some(qualified) = self.without_alias_qualifier(ty) {
+            let qualified = qualified.fold_builtin();
+            if let TypeSymbol::Named(parts) = &qualified
+                && let [only] = &parts[..]
+                && self.model.get("", only).is_some()
+            {
+                return qualified;
+            }
+            return self.canonicalize(&qualified);
+        }
         if let TypeSymbol::Instantiation {
             definition,
             arguments,
@@ -3320,7 +3562,19 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// constant whose value fits a narrower integral `target` (13.1.7), or it is the constant
     /// `0` assigned to an enum (13.1.3). Use this at an assignment context that has the value
     /// expression, not just its type.
+    ///
+    /// An expression with no type of its own converts by its own rule: a throw expression or a
+    /// `default` literal to every type that holds a value, and a conditional or switch expression
+    /// whose arms have no type in common to every type each of its arms converts to.
     pub(crate) fn assignable(&self, value: &BoundExpr, target: &TypeSymbol) -> bool {
+        if is_throw_marker(&value.ty) || is_default_literal_marker(&value.ty) {
+            return !target.is_void();
+        }
+        if typeless_kind(&value.ty).is_some() {
+            return typeless_arms(value)
+                .iter()
+                .all(|arm| self.assignable(arm, target));
+        }
         self.converts(&value.ty, target)
             || implicit_constant_conversion(value, target)
             || self.enum_from_zero(value, target)
@@ -3474,6 +3728,26 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// boxes, or upcasts as needed (13.1). Returns `expr` unchanged when the types
     /// match or no implicit conversion applies (the site reports any error).
     pub(crate) fn convert(&self, expr: BoundExpr, target: &TypeSymbol) -> BoundExpr {
+        if is_default_literal_marker(&expr.ty) && !target.is_error() {
+            return BoundExpr {
+                kind: BoundExprKind::DefaultValue(target.clone()),
+                ty: target.clone(),
+            };
+        }
+        // A throw expression produces no value, so converting one only gives it the type its
+        // context has; the paths that use the value never come through it.
+        if is_throw_marker(&expr.ty) && !target.is_error() {
+            return BoundExpr {
+                kind: expr.kind,
+                ty: target.clone(),
+            };
+        }
+        // A conditional or switch expression with no type of its own converts by converting each
+        // arm, and then has the type it was converted to. Every arm converts: whoever chose
+        // `target` asked that first.
+        if typeless_kind(&expr.ty).is_some() && !target.is_error() {
+            return self.convert_arms(expr, target);
+        }
         if matches!(expr.kind, BoundExprKind::MethodGroup { .. })
             && self
                 .type_info_of(target)
@@ -3643,6 +3917,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 body,
                 parenthesized,
             } => Some(self.bind_lambda(expr, parameters, body, *parenthesized, target)),
+            ExprKind::DefaultValue(None) => Some(self.default_literal(target, expr.span)),
             ExprKind::Tuple { elements } => {
                 Some(self.bind_tuple(elements, Some(target), expr.span))
             }
@@ -3691,6 +3966,29 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     },
                 })
             }
+            // Any other conditional takes its natural type where its arms have one, and the
+            // target's where they have none (C# 9.0): `int? x = c ? 1 : null;`.
+            ExprKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let value = self.bind_conditional_value(condition, when_true, when_false);
+                Some(self.convert_at(value, expr, target))
+            }
+            ExprKind::SwitchExpression {
+                governing,
+                keyword,
+                arms,
+            } => Some(self.bind_switch_toward(governing, arms, *keyword, expr, target)),
+            ExprKind::Parenthesized(inner)
+                if matches!(
+                    without_parentheses(inner).kind,
+                    ExprKind::Conditional { .. } | ExprKind::SwitchExpression { .. }
+                ) =>
+            {
+                self.bind_target_typed_at(inner, target, at_initializer)
+            }
             _ => None,
         }
     }
@@ -3699,6 +3997,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// target where it converts and left as it binds where it does not (so the conditional's own
     /// checks report).
     fn bind_arm_toward(&mut self, arm: &Expr, target: &TypeSymbol) -> BoundExpr {
+        if let ExprKind::Throw(operand) = &arm.kind {
+            return self.bind_throw_expression(operand, target.clone());
+        }
         let bound = self.bind_expression(arm);
         if bound.ty != *target && !bound.ty.is_error() && self.converts(&bound.ty, target) {
             self.convert(bound, target)
@@ -4360,7 +4661,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         elements
             .iter()
             .map(|element| {
-                let bound = self.bind_expression(element);
+                // An element is converted to the element type, so a conditional or switch
+                // expression with no type of its own takes that type: `int?[] a = { c ? 1 : null };`.
+                let bound = self.bind_convertible(element);
+                if typeless_kind(&bound.ty).is_some() {
+                    return self.finish_typeless(bound, element, &element_ty);
+                }
                 self.check_assignable(&bound, &element_ty, element.span);
                 self.convert(bound, &element_ty)
             })
@@ -4695,10 +5001,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         match kind {
             UsingKind::Namespace(name) => self.import_namespace(&crate::program::dotted(name)),
             UsingKind::Static(name) => {
-                self.import_static_type(TypeSymbol::Named(name.parts.iter().cloned().collect()));
+                self.import_static_type(TypeSymbol::Named(crate::program::qualified_parts(name)));
             }
             UsingKind::Alias { name, target } => {
-                self.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
+                self.import_alias(
+                    name,
+                    TypeSymbol::Named(crate::program::qualified_parts(target)),
+                );
             }
         }
     }
@@ -5279,7 +5588,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let arguments: Vec<BoundExpr> = initializer
             .arguments
             .iter()
-            .map(|argument| self.bind_expression(&argument.value))
+            .map(|argument| self.bind_argument_expression(&argument.value))
             .collect();
         self.exit_scope();
         self.current_type = None;
@@ -5308,6 +5617,29 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             _ => return None,
         };
         let mut arguments = arguments;
+        let filled = names
+            .iter()
+            .any(Option::is_some)
+            .then(|| map_arguments(&chosen, &names))
+            .flatten();
+        // An argument with no type of its own -- a `default` literal, or a conditional or switch
+        // expression whose arms have no type in common -- is converted here to the chosen
+        // constructor's parameter type, which is the only type it can have.
+        for (index, argument) in arguments.iter_mut().enumerate() {
+            if !is_default_literal_marker(&argument.ty) && typeless_kind(&argument.ty).is_none() {
+                continue;
+            }
+            let parameter = match &filled {
+                Some(filled) => filled.iter().position(|slot| *slot == Some(index)),
+                None => Some(index),
+            };
+            if let Some(parameter) =
+                parameter.and_then(|position| chosen.parameters.get(position))
+            {
+                let typeless = core::mem::replace(argument, error_expr());
+                *argument = self.convert(typeless, parameter);
+            }
+        }
         let mut chain_named = false;
         if names.iter().any(Option::is_some)
             && let Some(fill) = named_slots(&chosen, &names)
@@ -5464,6 +5796,187 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
         });
         (value, failed)
+    }
+
+    /// The `default` literal at a position that gives it `target` as its type: `default(target)`,
+    /// which is what it means (C# 7.1). A position whose type is unknown already reported why, and
+    /// one that has no type to give -- the `null` type, `void` -- is `CS8716`, as csc reports it.
+    pub(crate) fn default_literal(&mut self, target: &TypeSymbol, span: Span) -> BoundExpr {
+        if target.is_error() {
+            return error_expr();
+        }
+        if target.is_void() || *target == TypeSymbol::Special(SpecialType::Null) {
+            self.report(Diagnostic::new(DiagnosticKind::DefaultLiteralNoTarget, span));
+            return error_expr();
+        }
+        BoundExpr {
+            kind: BoundExprKind::DefaultValue(target.clone()),
+            ty: target.clone(),
+        }
+    }
+
+    /// The operand of a `throw`, statement or expression. From C# 8.0 a thrown value is converted
+    /// to `Exception`, so a `default` literal there is `default(Exception)` -- a null reference,
+    /// which throws `NullReferenceException` as csc's build does. Below 8.0 nothing converts it,
+    /// so the literal has no target type: it binds as one standing alone, and that is `CS8716` at
+    /// the literal, inside any parentheses, as csc reports it at 7.1, 7.2 and 7.3.
+    pub(crate) fn bind_thrown_value(&mut self, operand: &Expr) -> BoundExpr {
+        if is_default_literal(operand) && self.language_version() >= LanguageVersion::CSharp8 {
+            let exception = TypeSymbol::Named(["System".into(), "Exception".into()].into());
+            let exception = self.canonicalize(&exception);
+            return self.default_literal(&exception, operand.span);
+        }
+        self.bind_expression(operand)
+    }
+
+    /// Binds a parameter's DEFAULT ARGUMENT (15.6.2) as its declaration sees it: in `enclosing`'s
+    /// context, under the scope the caller has entered -- the declaration's imports, its type's
+    /// type parameters and the member's own -- and target-typed by the parameter's type. Returns
+    /// the bound expression and whether binding drew an error, as
+    /// [`Self::bind_enum_member_value`] does and for its reason.
+    ///
+    /// Validation and the pass that folds every default
+    /// ([`crate::declaration::resolve_constants`]) both bind through here, so the value a call
+    /// site supplies is the value of the expression validation checked -- the treatment a `const`
+    /// field's initializer gets from [`Self::bind_initializer_value`].
+    ///
+    /// **NOT UNDER THE FIELD-INITIALIZER RULES.** csc binds a default where an instance member can
+    /// be named, and refuses it afterwards as not constant: `int a = x` and `int a = this.x` over
+    /// an instance field are both CS1736, measured, where those rules would say CS0236 and CS0027.
+    pub(crate) fn bind_parameter_default(
+        &mut self,
+        enclosing: &TypeSymbol,
+        parameter_type: &TypeSymbol,
+        value: &Expr,
+    ) -> (BoundExpr, bool) {
+        let previous_type = self.current_type.replace(enclosing.clone());
+        self.enter_scope();
+        let diagnostics_before = self.diagnostics.len();
+        let bound = match self.bind_target_typed(value, parameter_type) {
+            Some(bound) => bound,
+            None => self.bind_expression(value),
+        };
+        self.exit_scope();
+        self.current_type = previous_type;
+        let failed = self.diagnostics[diagnostics_before..].iter().any(|diagnostic| {
+            diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+        });
+        (bound, failed)
+    }
+
+    /// The value a bound default argument gives its parameter: what every call that omits the
+    /// argument supplies, and what the parameter's `Constant` row holds. Computed as csc computes
+    /// it (Roslyn's `MakeDefaultExpression`), because the row is read by a consumer csc built:
+    ///
+    /// ```text
+    ///     E e = E.B          the constant converted to the parameter's type: E.B's integer
+    ///     double d = 1       1.0 -- converted first, so the row is an R8 and not an integer
+    ///     E? e = E.B         a NULLABLE parameter takes its UNDERLYING type's constant
+    ///     E? e = default(E)  0, for the same reason -- `default(E)` is a constant
+    ///     S s = default(S)   no constant, and csc writes a null reference for it
+    ///     S s = new S()      the same
+    /// ```
+    ///
+    /// `None` for an expression that is no default at all -- not a constant, and not `default(T)`
+    /// or a struct's `new S()` -- which validation reports as CS1736, and which leaves the
+    /// parameter required rather than optional with a value nobody computed.
+    pub(crate) fn parameter_default_value(
+        &self,
+        bound: &BoundExpr,
+        parameter_type: &TypeSymbol,
+    ) -> Option<Literal> {
+        if bound.ty.is_error() {
+            return None;
+        }
+        let value = bound.clone();
+        let underlying = crate::conversion::nullable_underlying(parameter_type);
+        for target in underlying.into_iter().chain(core::iter::once(parameter_type)) {
+            if let Some(constant) = self.constant_value(&self.convert(value.clone(), target)) {
+                return Some(constant);
+            }
+        }
+        self.is_zero_initialization(bound).then_some(Literal::Null)
+    }
+
+    /// Whether a bound default is one of the two forms 15.6.2 admits beside a constant:
+    /// `default(T)` and a value type's parameterless `new S()`, with no initializer.
+    ///
+    /// **`default(T)` IS ADMITTED WHATEVER `T` IS**, as csc admits it -- a class, a type parameter
+    /// and a struct alike -- although the clause names value types only.
+    fn is_zero_initialization(&self, bound: &BoundExpr) -> bool {
+        match &bound.kind {
+            BoundExprKind::DefaultValue(_) => true,
+            BoundExprKind::ObjectCreation {
+                arguments,
+                initializer: None,
+                ..
+            } => arguments.is_empty() && self.is_value_type(&bound.ty),
+            _ => false,
+        }
+    }
+
+    /// What is wrong with a bound default argument for a parameter of type `parameter_type`, in
+    /// csc's order (Roslyn's `ReportDefaultParameterErrors`); `None` when it is a default csc
+    /// admits. Ask it only of a default whose binding drew no error.
+    ///
+    /// ```text
+    ///     CS1736  int a = F()          not a constant, not default(T), not a struct's new S()
+    ///     CS1750  int a = 1L           no implicit conversion, or only a user-defined one
+    ///     CS1763  object o = 5         a boxing, or a string given to an object
+    ///     CS1770  S? s = default(S)    a nullable parameter of a type with no constants
+    /// ```
+    ///
+    /// **THE CONVERSION IS ASKED OF THE EXPRESSION, NOT OF ITS FOLDED VALUE.** An enum constant
+    /// folds to its integer, so a test of the value admits `E e = 1` -- which csc refuses, because
+    /// only the literal `0` converts to an enum -- and refuses `E? e = E.B`, which it admits.
+    pub(crate) fn parameter_default_problem(
+        &self,
+        bound: &BoundExpr,
+        parameter: &str,
+        parameter_type: &TypeSymbol,
+    ) -> Option<DiagnosticKind> {
+        if self.constant_value(bound).is_none() && !self.is_zero_initialization(bound) {
+            return Some(DiagnosticKind::DefaultValueNotConstant {
+                parameter: parameter.into(),
+            });
+        }
+        let from = &bound.ty;
+        let standard = crate::conversion::converts(&self.model, from, parameter_type)
+            || implicit_constant_conversion(bound, parameter_type)
+            || self.enum_from_zero(bound, parameter_type);
+        if !standard {
+            return Some(DiagnosticKind::DefaultValueWrongType {
+                from: default_value_type_display(from),
+                to: parameter_type.to_string().into(),
+            });
+        }
+        let object = TypeSymbol::Special(SpecialType::Object);
+        let string = TypeSymbol::Special(SpecialType::String);
+        let boxing = self.is_value_type(from) && !self.is_value_type(parameter_type);
+        if boxing || (*from == string && *parameter_type == object) {
+            return Some(DiagnosticKind::DefaultValueReferenceNotNull {
+                parameter: parameter.into(),
+                ty: parameter_type.to_string().into(),
+            });
+        }
+        if let Some(underlying) = crate::conversion::nullable_underlying(parameter_type)
+            && *from != TypeSymbol::Special(SpecialType::Null)
+            && crate::conversion::nullable_underlying(from).is_none()
+            && !self.is_enum_type(underlying)
+            && !matches!(
+                underlying,
+                TypeSymbol::Special(special) if !matches!(
+                    special,
+                    SpecialType::Object | SpecialType::Void | SpecialType::Null
+                )
+            )
+        {
+            return Some(DiagnosticKind::DefaultValueNullableNotSimple {
+                from: from.to_string().into(),
+                parameter: parameter.into(),
+            });
+        }
+        None
     }
 
     /// The constant value of an initializer WHERE THE LANGUAGE REQUIRES ONE, with the version
@@ -6374,6 +6887,81 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.scopes.iter().any(|scope| scope.contains_key(name))
     }
 
+    /// Whether `expr` is a DISCARD (C# 7.0): a bare `_`, written without `@`, where no local of
+    /// that name is in scope. `int _ = 0;` makes every later `_` in its scope that local -- csc
+    /// assigns to it, measured -- so the question is what is in scope, never only the spelling.
+    ///
+    /// One rule for every position a discard can stand in: a deconstruction's target, an `out`
+    /// argument, the left of `=`.
+    pub(crate) fn names_a_discard(&self, expr: &Expr) -> bool {
+        matches!(&expr.kind, ExprKind::Name { name, verbatim: false } if &**name == "_")
+            && !self.local_is_visible("_")
+    }
+
+    /// The argument list with each DISCARD `out` argument -- `out _`, `out var _`, `out T _` --
+    /// rewritten as an `out` variable no source can name; `None` when the list has none, so an
+    /// ordinary call is not copied.
+    ///
+    /// csc passes a discard the address of a temporary of the parameter's type, and an `out var`
+    /// under an unspeakable name is exactly that: typed by the overload resolution chooses, as
+    /// `out var a` is, and declared where nothing can read it or collide with it -- so two discards
+    /// in one scope stay two.
+    fn rewrite_out_discards(&mut self, arguments: &[Argument]) -> Option<Vec<Argument>> {
+        let mut rewritten: Option<Vec<Argument>> = None;
+        for (index, argument) in arguments.iter().enumerate() {
+            let ExprKind::RefArgument {
+                out: true,
+                position,
+                operand,
+            } = &argument.value.kind
+            else {
+                continue;
+            };
+            let ty = match &operand.kind {
+                ExprKind::DeclarationExpression { ty, name } if &**name == "_" => ty.clone(),
+                _ if self.names_a_discard(operand) => {
+                    self.gate_feature(Feature::Discards, operand.span);
+                    TypeRef::new(TypeRefKind::Name(alloc::vec!["var".into()]), operand.span)
+                }
+                _ => continue,
+            };
+            let discard = Expr::new(
+                ExprKind::DeclarationExpression {
+                    ty,
+                    name: alloc::format!("<discard>{}", operand.span.start).into(),
+                },
+                operand.span,
+            );
+            let list = rewritten.get_or_insert_with(|| arguments.to_vec());
+            list[index].value = Expr::new(
+                ExprKind::RefArgument {
+                    out: true,
+                    position: *position,
+                    operand: Box::new(discard),
+                },
+                argument.value.span,
+            );
+        }
+        rewritten
+    }
+
+    /// `_ = value;` -- the value evaluated and its result DISCARDED (C# 7.0), so the expression is
+    /// the value itself, of its own type. A value with no type to give the discard is refused as
+    /// csc refuses it: `null` (CS8183) and a call that returns nothing (CS8209).
+    fn bind_discard_assignment(&mut self, target: &Expr, value: &Expr) -> BoundExpr {
+        self.gate_feature(Feature::Discards, target.span);
+        if matches!(value.kind, ExprKind::Literal(Literal::Null)) || is_default_literal(value) {
+            self.report(Diagnostic::new(DiagnosticKind::DiscardWithoutType, target.span));
+            return error_expr();
+        }
+        let bound = self.bind_expression(value);
+        if bound.ty.is_void() {
+            self.report(Diagnostic::new(DiagnosticKind::VoidAssignedToDiscard, value.span));
+            return error_expr();
+        }
+        bound
+    }
+
     /// The type an expression has, WITHOUT reporting anything about it.
     ///
     /// **A SPECULATIVE BIND, AND THE ROLLBACK IS THE POINT.** Several places need a type before
@@ -6573,9 +7161,19 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             ExprKind::PostfixUnary { operator, operand } => {
                 self.bind_postfix(*operator, operand, expr.span)
             }
-            ExprKind::Cast { target, operand } => {
-                let operand = self.bind_expression(operand);
+            ExprKind::Cast { target, operand } if is_default_literal(operand) => {
                 let ty = self.resolve_type_ref(target);
+                self.default_literal(&ty, operand.span)
+            }
+            ExprKind::Cast { target, operand } => {
+                let operand_syntax = operand;
+                let operand = self.bind_convertible(operand);
+                let ty = self.resolve_type_ref(target);
+                // A cast gives a conditional or switch expression with no type of its own the type
+                // it names: `(int?)(c ? 1 : null)` converts each arm to `int?`.
+                if typeless_kind(&operand.ty).is_some() {
+                    return self.finish_typeless(operand, operand_syntax, &ty);
+                }
                 if !self.unchecked_context {
                     if let Some(value_text) = constant_out_of_range(&operand, &ty) {
                         self.report(Diagnostic::new(
@@ -6701,7 +7299,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 governing,
                 keyword,
                 arms,
-            } => self.bind_switch_expression(governing, arms, *keyword),
+            } => self.bind_switch_expression(governing, arms, *keyword, expr),
             ExprKind::TypeOf(target) => {
                 let target_ty = if matches!(target.kind, TypeRefKind::Unbound { .. }) {
                     self.resolve_unbound_generic_type(&bind_type(target), target.span)
@@ -6729,7 +7327,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     ty: TypeSymbol::Special(SpecialType::Int32),
                 }
             }
-            ExprKind::DefaultValue(target) => {
+            ExprKind::DefaultValue(None) => {
+                self.report(Diagnostic::new(DiagnosticKind::DefaultLiteralNoTarget, expr.span));
+                error_expr()
+            }
+            ExprKind::DefaultValue(Some(target)) => {
                 self.gate_feature(Feature::DefaultOperator, expr.span);
                 let target_ty = self.resolve_type_ref(target);
                 BoundExpr {
@@ -6864,7 +7466,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 condition,
                 when_true,
                 when_false,
-            } => self.bind_conditional(condition, when_true, when_false),
+            } => self.bind_conditional(condition, when_true, when_false, expr),
             ExprKind::NullCoalescing { left, right } => {
                 self.bind_null_coalescing(left, right, expr.span)
             }
@@ -6926,8 +7528,27 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         right_expr: &Expr,
         span: Span,
     ) -> BoundExpr {
-        let left = self.bind_expression(left_expr);
-        let right = self.bind_expression(right_expr);
+        let (left, right) = match (is_default_literal(left_expr), is_default_literal(right_expr)) {
+            (true, true) => {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::DefaultLiteralAmbiguousOperator {
+                        operator: operator_symbol(operator).into(),
+                    },
+                    span,
+                ));
+                return error_expr();
+            }
+            (true, false) => {
+                let right = self.bind_expression(right_expr);
+                (self.default_literal(&right.ty, left_expr.span), right)
+            }
+            (false, true) => {
+                let left = self.bind_expression(left_expr);
+                let right = self.default_literal(&left.ty, right_expr.span);
+                (left, right)
+            }
+            (false, false) => (self.bind_expression(left_expr), self.bind_expression(right_expr)),
+        };
         if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo)
             && matches!(
                 right.kind,
@@ -7661,16 +8282,16 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Binds a THROW EXPRESSION (C# 7.0) that stands in a context admitting one, giving it the
     /// type that context needs.
     ///
-    /// **ONE FUNCTION FOR EVERY PERMITTED POSITION**, and there are only two -- the right operand
-    /// of `??` and either arm of `?:`. Each recognizes the syntax itself and calls this; the
-    /// generic expression binder refuses everything else as `CS8115`, so a position that forgets
-    /// to call this REFUSES rather than silently accepting, which is the safe direction for a
-    /// rule whose whole content is where it may appear.
+    /// **ONE FUNCTION FOR EVERY PERMITTED POSITION**, and there are three: the right operand of
+    /// `??`, either arm of `?:`, and the value of a switch expression's arm. Each recognizes the
+    /// syntax itself and calls this; the generic expression binder refuses everything else as
+    /// `CS8115`, so a position that forgets to call this REFUSES rather than silently accepting,
+    /// which is the safe direction for a rule whose whole content is where it may appear.
     ///
     /// The operand is checked by [`Binder::check_thrown_operand`], the same function the throw
     /// STATEMENT uses, so the two spellings cannot drift into two answers about what may be thrown.
     pub(crate) fn bind_throw_expression(&mut self, operand: &Expr, ty: TypeSymbol) -> BoundExpr {
-        let bound = self.bind_expression(operand);
+        let bound = self.bind_thrown_value(operand);
         self.check_thrown_operand(&bound, operand.span);
         BoundExpr {
             kind: BoundExprKind::Throw(Box::new(bound)),
@@ -7678,131 +8299,398 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
-    /// The `?:` arm of [`Binder::bind_conditional`] where at least one arm is a THROW EXPRESSION.
-    ///
-    /// The result type is the arm that is NOT a throw; the throwing arm takes the same type, so
-    /// the conditional is uniform to the emitter and to definite assignment. With both arms
-    /// throwing there is no type at all and csc reports `CS0173` naming `<throw expression>` on
-    /// both sides -- a spelling with no type behind it, which is why it is written rather than
-    /// rendered from a `TypeSymbol`.
-    #[allow(clippy::too_many_arguments)]
-    fn bind_conditional_with_throw(
-        &mut self,
-        condition: BoundExpr,
-        when_true: &Expr,
-        when_false: &Expr,
-        true_throws: bool,
-        false_throws: bool,
-    ) -> BoundExpr {
-        let (when_true, when_false, ty) = match (true_throws, false_throws) {
-            (true, true) => {
-                let error = TypeSymbol::Error;
-                (
-                    self.throw_arm(when_true, error.clone()),
-                    self.throw_arm(when_false, error.clone()),
-                    error,
-                )
-            }
-            (true, false) => {
-                let value = self.bind_expression(when_false);
-                let ty = value.ty.clone();
-                (self.throw_arm(when_true, ty.clone()), value, ty)
-            }
-            (false, true) => {
-                let value = self.bind_expression(when_true);
-                let ty = value.ty.clone();
-                (value, self.throw_arm(when_false, ty.clone()), ty)
-            }
-            (false, false) => unreachable!("the caller checked that one arm throws"),
-        };
-        BoundExpr {
-            kind: BoundExprKind::Conditional {
-                condition: Box::new(condition),
-                when_true: Box::new(when_true),
-                when_false: Box::new(when_false),
-            },
-            ty,
-        }
-    }
-
-    /// Binds an arm already known to be a throw expression, at the type the conditional settled on.
-    fn throw_arm(&mut self, arm: &Expr, ty: TypeSymbol) -> BoundExpr {
-        let ExprKind::Throw(operand) = &arm.kind else {
-            unreachable!("the caller matched the syntax")
-        };
-        self.bind_throw_expression(operand, ty)
-    }
-
+    /// Binds a conditional `condition ? when_true : when_false` that nothing converts: to its
+    /// NATURAL type, or, where it has none, to the refusal [`Binder::require_type`] gives.
     fn bind_conditional(
         &mut self,
         condition: &Expr,
         when_true: &Expr,
         when_false: &Expr,
+        syntax: &Expr,
     ) -> BoundExpr {
-        let condition_span = condition.span;
-        let condition = self.bind_expression(condition);
-        let boolean = TypeSymbol::Special(SpecialType::Boolean);
-        let condition = if condition.ty.is_error() || self.converts(&condition.ty, &boolean) {
-            condition
-        } else if let Some(tested) = self.bind_operator_true(&condition) {
-            tested
-        } else {
-            self.diagnostics.push(Diagnostic::new(
-                DiagnosticKind::NoImplicitConversion {
-                    from: condition.ty.to_string().into(),
-                    to: "bool".into(),
+        let value = self.bind_conditional_value(condition, when_true, when_false);
+        self.require_type(value, syntax)
+    }
+
+    /// A value bound by [`Binder::bind_convertible`] where NOTHING converts it. A conditional or
+    /// switch expression with no type of its own is an error here, with csc's code for it:
+    /// `CS0173` for a conditional, at the conditional; `CS0172` where each arm converts to the
+    /// other's type, which is the case the language calls ambiguous; and `CS8506` for a switch
+    /// expression, at its `switch` keyword. Anything else is returned as it is.
+    fn require_type(&mut self, value: BoundExpr, syntax: &Expr) -> BoundExpr {
+        let syntax = without_parentheses(syntax);
+        let (kind, at) = match (typeless_kind(&value.ty), &value.kind, &syntax.kind) {
+            (
+                Some(Typeless::Conditional),
+                BoundExprKind::Conditional {
+                    when_true,
+                    when_false,
+                    ..
                 },
-                condition_span,
-            ));
-            condition
+                _,
+            ) => {
+                let left = argument_display(&when_true.ty);
+                let right = argument_display(&when_false.ty);
+                let kind = if self.conditional_candidates(when_true, when_false).len() > 1 {
+                    DiagnosticKind::ConditionalTypeAmbiguous { left, right }
+                } else {
+                    DiagnosticKind::ConditionalTypeMismatch { left, right }
+                };
+                (kind, syntax.span)
+            }
+            (Some(Typeless::Switch), _, ExprKind::SwitchExpression { keyword, .. }) => {
+                (DiagnosticKind::SwitchExpressionNoBestType, *keyword)
+            }
+            _ => return value,
         };
-        let span = when_false.span;
-        let true_throws = matches!(when_true.kind, ExprKind::Throw(_));
-        let false_throws = matches!(when_false.kind, ExprKind::Throw(_));
-        if true_throws || false_throws {
-            return self.bind_conditional_with_throw(
-                condition,
-                when_true,
-                when_false,
-                true_throws,
-                false_throws,
-            );
+        self.report(Diagnostic::new(kind, at));
+        BoundExpr {
+            kind: value.kind,
+            ty: TypeSymbol::Error,
         }
-        let when_true = self.bind_expression(when_true);
-        let when_false = self.bind_expression(when_false);
-        let ty = if when_true.ty.is_error() || when_false.ty.is_error() {
-            TypeSymbol::Error
-        } else if let Some(common) =
-            conditional_result_type(&self.model, &when_true.ty, &when_false.ty)
-        {
-            common
-        } else if self.assignable(&when_true, &when_false.ty) {
-            when_false.ty.clone()
-        } else if self.assignable(&when_false, &when_true.ty) {
-            when_true.ty.clone()
-        } else {
-            self.diagnostics.push(Diagnostic::new(
-                DiagnosticKind::ConditionalTypeMismatch {
-                    left: when_true.ty.to_string().into(),
-                    right: when_false.ty.to_string().into(),
-                },
-                span,
-            ));
-            TypeSymbol::Error
-        };
-        let (when_true, when_false) = if ty.is_error() {
-            (when_true, when_false)
-        } else {
-            (self.convert(when_true, &ty), self.convert(when_false, &ty))
+    }
+
+    /// Binds a conditional as far as it binds WITHOUT a target: to its natural type, each arm
+    /// converted to it, where the arms have one; and otherwise to a value with no type of its
+    /// own, its arms left as they bound, for the context that converts it to finish
+    /// ([`Binder::finish_typeless`]).
+    ///
+    /// **THE NATURAL TYPE IS ONE OF THE ARMS' OWN TYPES, AND ONLY ONE THE OTHER ARM CONVERTS TO.**
+    /// An arm that has no type -- `null`, `default`, a throw expression, a nested conditional with
+    /// none -- offers none, so `c ? 1 : null` has no natural type and `c ? s : null` is a
+    /// `string`. Where both arms offer one, the one the other converts to wins
+    /// ([`Binder::best_type`]); `b ? 1 : 2L` is a `long`, and two types that convert to each other
+    /// have no natural type at all.
+    fn bind_conditional_value(
+        &mut self,
+        condition: &Expr,
+        when_true: &Expr,
+        when_false: &Expr,
+    ) -> BoundExpr {
+        let condition = self.bind_condition(condition);
+        let true_arm = self.bind_arm(when_true);
+        let false_arm = self.bind_arm(when_false);
+        let (true_arm, false_arm, ty) = match self.conditional_natural_type(&true_arm, &false_arm) {
+            Some(ty) => (
+                self.finish_arm(true_arm, when_true, &ty),
+                self.finish_arm(false_arm, when_false, &ty),
+                ty,
+            ),
+            None => {
+                let marker = typeless_marker(Typeless::Conditional, &[&true_arm, &false_arm]);
+                (true_arm, false_arm, marker)
+            }
         };
         BoundExpr {
             kind: BoundExprKind::Conditional {
                 condition: Box::new(condition),
-                when_true: Box::new(when_true),
-                when_false: Box::new(when_false),
+                when_true: Box::new(true_arm),
+                when_false: Box::new(false_arm),
             },
             ty,
         }
+    }
+
+    /// Binds one ARM of a conditional or of a switch expression as far as it binds without the
+    /// type the whole expression will have: a throw expression or a `default` literal waits for
+    /// that type, and a nested conditional or switch expression may have no type of its own.
+    fn bind_arm(&mut self, arm: &Expr) -> BoundExpr {
+        if let ExprKind::Throw(operand) = &arm.kind {
+            return self.bind_throw_expression(operand, throw_marker());
+        }
+        if is_default_literal(arm) {
+            let marker = default_literal_marker();
+            return BoundExpr {
+                kind: BoundExprKind::DefaultValue(marker.clone()),
+                ty: marker,
+            };
+        }
+        self.bind_convertible(arm)
+    }
+
+    /// Binds `expr` as a value its context is about to CONVERT -- the one kind of position where a
+    /// conditional or switch expression whose arms have no type in common is not yet an error. It
+    /// binds to a value with no type of its own, which the context then finishes with
+    /// [`Binder::finish_typeless`] or, for an argument, by converting it to the parameter overload
+    /// resolution chose. Anything else binds as it always does.
+    fn bind_convertible(&mut self, expr: &Expr) -> BoundExpr {
+        match &expr.kind {
+            ExprKind::Parenthesized(inner) => self.bind_convertible(inner),
+            ExprKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => self.bind_conditional_value(condition, when_true, when_false),
+            ExprKind::SwitchExpression {
+                governing,
+                keyword,
+                arms,
+            } => self.bind_switch_value(governing, arms, *keyword),
+            _ => self.bind_expression(expr),
+        }
+    }
+
+    /// The types a conditional's natural type is chosen from: each arm's own type, where the other
+    /// arm converts to it.
+    fn conditional_candidates(
+        &self,
+        when_true: &BoundExpr,
+        when_false: &BoundExpr,
+    ) -> Vec<TypeSymbol> {
+        let mut candidates: Vec<TypeSymbol> = Vec::with_capacity(2);
+        for (typed, other) in [(when_true, when_false), (when_false, when_true)] {
+            if supplies_natural_type(&typed.ty)
+                && !candidates.contains(&typed.ty)
+                && self.assignable(other, &typed.ty)
+            {
+                candidates.push(typed.ty.clone());
+            }
+        }
+        candidates
+    }
+
+    /// A conditional's NATURAL type (14.13), from its arms as they bound alone; `None` when it has
+    /// none. An arm in error makes the whole an error, so nothing further is reported about it.
+    fn conditional_natural_type(
+        &self,
+        when_true: &BoundExpr,
+        when_false: &BoundExpr,
+    ) -> Option<TypeSymbol> {
+        if when_true.ty.is_error() || when_false.ty.is_error() {
+            return Some(TypeSymbol::Error);
+        }
+        self.best_type(&self.conditional_candidates(when_true, when_false))
+    }
+
+    /// The BEST of several candidate types: the one every other candidate converts to. `None`
+    /// when no single candidate is that -- two types that convert to each other, or two that are
+    /// unrelated.
+    ///
+    /// This is the pairwise walk the C# specification calls inferring a best common type, and it
+    /// asks about TYPES only: `1` and `2u` have no best type even though the constant `1` converts
+    /// to `uint`, which is why `x switch { 1 => 1, _ => 2u }` has no natural type.
+    fn best_type(&self, candidates: &[TypeSymbol]) -> Option<TypeSymbol> {
+        let mut best: Option<&TypeSymbol> = None;
+        let mut best_index = 0;
+        for (index, candidate) in candidates.iter().enumerate() {
+            best = match best {
+                None => Some(candidate),
+                Some(current) => self.better_type(current, candidate),
+            };
+            best_index = index;
+        }
+        let best = best?;
+        candidates[..best_index]
+            .iter()
+            .all(|candidate| self.better_type(best, candidate) == Some(best))
+            .then(|| best.clone())
+    }
+
+    /// Of two candidate types, the one the other converts to; `None` when each converts to the
+    /// other or neither does.
+    fn better_type<'a>(&self, a: &'a TypeSymbol, b: &'a TypeSymbol) -> Option<&'a TypeSymbol> {
+        if a == b {
+            return Some(a);
+        }
+        match (self.converts(a, b), self.converts(b, a)) {
+            (true, false) => Some(b),
+            (false, true) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Converts one arm of a conditional or switch expression to `ty`, the type the whole
+    /// expression settled on. An arm with no type of its own takes `ty` by its own rule, and a
+    /// nested conditional or switch expression with none is finished here, where its syntax is in
+    /// hand for the diagnostics that belong to it.
+    fn finish_arm(&mut self, arm: BoundExpr, syntax: &Expr, ty: &TypeSymbol) -> BoundExpr {
+        if typeless_kind(&arm.ty).is_some() {
+            return self.finish_typeless(arm, syntax, ty);
+        }
+        self.convert(arm, ty)
+    }
+
+    /// Converts a value with NO TYPE OF ITS OWN -- a conditional or switch expression whose arms
+    /// have no type in common -- to `target`, the type its context gives it.
+    ///
+    /// Where every arm converts to `target`, that is the conversion: the target-typed conditional
+    /// of C# 9.0 and the switch expression conversion of C# 8.0. Below C# 9.0 a conditional that
+    /// needed it is `CS8957`, as csc reports it. Where some arm does not convert, each such arm
+    /// reports its own failure where it is written -- `int x = c ? 1 : null;` is `CS0037` at the
+    /// `null` -- and the value is an error.
+    fn finish_typeless(
+        &mut self,
+        value: BoundExpr,
+        syntax: &Expr,
+        target: &TypeSymbol,
+    ) -> BoundExpr {
+        if target.is_error() {
+            return BoundExpr {
+                kind: value.kind,
+                ty: TypeSymbol::Error,
+            };
+        }
+        if self.assignable(&value, target) {
+            self.report_target_typed_conditionals(&value, syntax);
+            return self.convert(value, target);
+        }
+        self.report_unconverted_arms(&value, syntax, target);
+        BoundExpr {
+            kind: value.kind,
+            ty: TypeSymbol::Error,
+        }
+    }
+
+    /// `CS8957` below C# 9.0 for each conditional under `value` that only a target typed --
+    /// `value` itself and every nested one -- innermost first, which is csc's order.
+    fn report_target_typed_conditionals(&mut self, value: &BoundExpr, syntax: &Expr) {
+        let syntax = without_parentheses(syntax);
+        match (&value.kind, &syntax.kind, typeless_kind(&value.ty)) {
+            (
+                BoundExprKind::Conditional {
+                    when_true,
+                    when_false,
+                    ..
+                },
+                ExprKind::Conditional {
+                    when_true: true_syntax,
+                    when_false: false_syntax,
+                    ..
+                },
+                Some(Typeless::Conditional),
+            ) => {
+                self.report_target_typed_conditionals(when_true, true_syntax);
+                self.report_target_typed_conditionals(when_false, false_syntax);
+                let current = self.language_version();
+                if current < LanguageVersion::CSharp9 {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ConditionalNeedsTargetTyping {
+                            current,
+                            left: argument_display(&when_true.ty),
+                            right: argument_display(&when_false.ty),
+                        },
+                        syntax.span,
+                    ));
+                }
+            }
+            (
+                BoundExprKind::SwitchExpression { arms, .. },
+                ExprKind::SwitchExpression {
+                    arms: arm_syntax, ..
+                },
+                Some(Typeless::Switch),
+            ) => {
+                for (arm, written) in arms.iter().zip(arm_syntax) {
+                    self.report_target_typed_conditionals(&arm.value, &written.value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `CS8957` below C# 9.0 for each argument the chosen parameter typed -- a conditional whose
+    /// arms have no type in common -- reported once overload resolution has chosen, which is when
+    /// csc reports it. A call that no candidate fits reports such an argument as `CS1503` instead.
+    fn report_target_typed_arguments(&mut self, syntax: &[Argument], bound: &[BoundExpr]) {
+        for (written, value) in syntax.iter().zip(bound) {
+            if typeless_kind(&value.ty).is_some() {
+                self.report_target_typed_conditionals(value, &written.value);
+            }
+        }
+    }
+
+    /// For a typeless `value` that does not convert to `target`: each arm that does not, reported
+    /// where it is written with the code its own conversion has (`CS0029`, `CS0037`, `CS0266`,
+    /// `CS0031`), as csc reports it. A nested typeless arm reports its own arms.
+    fn report_unconverted_arms(&mut self, value: &BoundExpr, syntax: &Expr, target: &TypeSymbol) {
+        let syntax = without_parentheses(syntax);
+        let arms: Vec<(&BoundExpr, &Expr)> = match (&value.kind, &syntax.kind) {
+            (
+                BoundExprKind::Conditional {
+                    when_true,
+                    when_false,
+                    ..
+                },
+                ExprKind::Conditional {
+                    when_true: true_syntax,
+                    when_false: false_syntax,
+                    ..
+                },
+            ) => alloc::vec![
+                (&**when_true, &**true_syntax),
+                (&**when_false, &**false_syntax)
+            ],
+            (
+                BoundExprKind::SwitchExpression { arms, .. },
+                ExprKind::SwitchExpression {
+                    arms: arm_syntax, ..
+                },
+            ) => arms
+                .iter()
+                .zip(arm_syntax)
+                .map(|(arm, written)| (&arm.value, &written.value))
+                .collect(),
+            _ => return,
+        };
+        for (arm, written) in arms {
+            if self.assignable(arm, target) {
+                continue;
+            }
+            if typeless_kind(&arm.ty).is_some() {
+                self.report_unconverted_arms(arm, written, target);
+            } else {
+                self.check_assignable(arm, target, without_parentheses(written).span);
+            }
+        }
+    }
+
+    /// Converts each arm of a typeless conditional or switch expression to `target`, and gives the
+    /// whole that type. The caller has established that every arm converts.
+    fn convert_arms(&self, expr: BoundExpr, target: &TypeSymbol) -> BoundExpr {
+        let kind = match expr.kind {
+            BoundExprKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => BoundExprKind::Conditional {
+                condition,
+                when_true: Box::new(self.convert(*when_true, target)),
+                when_false: Box::new(self.convert(*when_false, target)),
+            },
+            BoundExprKind::SwitchExpression {
+                governing,
+                subject,
+                arms,
+                fallback,
+            } => BoundExprKind::SwitchExpression {
+                governing,
+                subject,
+                arms: arms
+                    .into_iter()
+                    .map(|arm| BoundSwitchArm {
+                        value: self.convert(arm.value, target),
+                        ..arm
+                    })
+                    .collect(),
+                fallback,
+            },
+            other => other,
+        };
+        BoundExpr {
+            kind,
+            ty: target.clone(),
+        }
+    }
+
+    /// Converts `value`, bound by [`Binder::bind_convertible`], to `target` at an ASSIGNMENT
+    /// context -- a declaration's initializer, an assignment, a `return`, a cast's operand -- and
+    /// reports what does not convert at the expression itself, which is where csc reports it.
+    fn convert_at(&mut self, value: BoundExpr, syntax: &Expr, target: &TypeSymbol) -> BoundExpr {
+        if typeless_kind(&value.ty).is_some() {
+            return self.finish_typeless(value, syntax, target);
+        }
+        self.check_assignable(&value, target, without_parentheses(syntax).span);
+        self.convert(value, target)
     }
 
     /// `n == null` and `n != null` where `n` is a NULLABLE VALUE TYPE, and their mirrors with the
@@ -7830,7 +8718,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// A nullable value type tests `HasValue`, which is the same lowering `n == null` needs and is
     /// already factored out. A NON-nullable value type can never be null and is `CS0037` -- at
     /// every language version, measured, so it is not a rung question.
-    /// Binds a SWITCH EXPRESSION, `governing switch { pattern => value, ... }` (C# 8.0).
+    /// Binds a SWITCH EXPRESSION, `governing switch { pattern => value, ... }` (C# 8.0), that
+    /// nothing converts: to its natural type, or, where it has none, to `CS8506` at the `switch`
+    /// keyword.
     ///
     /// **EVERY ARM'S PATTERN IS BOUND AS AN `is`, BY SYNTHESIZING THAT SYNTAX AND BINDING IT.**
     /// A pattern must mean the same thing in an arm as it does after an `is`, and the way to
@@ -7843,15 +8733,113 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// C# (`<subject>N`, N being its span) and each arm's test names that local. Without it,
     /// `M() switch { 1 => .., 2 => .., _ => .. }` would call `M` once per arm.
     ///
-    /// **THE ARMS' TYPES ARE UNIFIED PAIRWISE, LEFT TO RIGHT**, by the same rules `?:` uses
-    /// (13.1.7 / 14.13) -- and every arm is then CONVERTED to the result, so each leaves the same
-    /// type on the stack. An arm left unconverted is unverifiable CIL that the lenient JIT runs.
+    /// **EVERY ARM IS CONVERTED TO THE RESULT**, so each leaves the same type on the stack. An arm
+    /// left unconverted is unverifiable CIL that the lenient JIT runs.
     fn bind_switch_expression(
         &mut self,
         governing: &Expr,
         arms: &[SwitchArm],
         keyword: Span,
+        syntax: &Expr,
     ) -> BoundExpr {
+        let value = self.bind_switch_value(governing, arms, keyword);
+        self.require_type(value, syntax)
+    }
+
+    /// Binds a switch expression as far as it binds WITHOUT a target: to its natural type, each
+    /// arm converted to it, where its arms have one; and otherwise to a value with no type of its
+    /// own, its arms left as they bound, for the context that converts it to finish.
+    fn bind_switch_value(
+        &mut self,
+        governing: &Expr,
+        arms: &[SwitchArm],
+        keyword: Span,
+    ) -> BoundExpr {
+        let (value, natural) = self.bind_switch_parts(governing, arms, keyword);
+        match natural {
+            Some(ty) => self.switch_arms_to(value, arms, &ty),
+            None => value,
+        }
+    }
+
+    /// Binds a switch expression that its context converts to `target`: the switch expression
+    /// conversion of C# 8.0.
+    ///
+    /// **WHERE EVERY ARM CONVERTS TO `target`, EACH ARM IS CONVERTED -- EVEN WHEN THE ARMS HAVE A
+    /// NATURAL TYPE.** That is csc's order, and it is visible: `byte b = x switch { 1 => 1, _ => 2
+    /// };` converts each constant to `byte`, where converting the natural `int` would be
+    /// `CS0266`. Otherwise the natural type is converted to `target`; with neither, each arm that
+    /// does not convert reports its own failure.
+    fn bind_switch_toward(
+        &mut self,
+        governing: &Expr,
+        arms: &[SwitchArm],
+        keyword: Span,
+        syntax: &Expr,
+        target: &TypeSymbol,
+    ) -> BoundExpr {
+        let (value, natural) = self.bind_switch_parts(governing, arms, keyword);
+        if target.is_error() || typeless_kind(&value.ty).is_none() {
+            return value;
+        }
+        if self.assignable(&value, target) {
+            return self.switch_arms_to(value, arms, target);
+        }
+        match natural {
+            Some(ty) => {
+                let value = self.switch_arms_to(value, arms, &ty);
+                self.convert_at(value, syntax, target)
+            }
+            None => self.finish_typeless(value, syntax, target),
+        }
+    }
+
+    /// Converts each arm of a switch expression bound by [`Binder::bind_switch_parts`] to `ty`,
+    /// and gives the whole that type. A nested arm with no type of its own is finished here, with
+    /// its syntax in hand for the diagnostics that belong to it.
+    fn switch_arms_to(
+        &mut self,
+        value: BoundExpr,
+        arm_syntax: &[SwitchArm],
+        ty: &TypeSymbol,
+    ) -> BoundExpr {
+        let BoundExprKind::SwitchExpression {
+            governing,
+            subject,
+            arms,
+            fallback,
+        } = value.kind
+        else {
+            return value;
+        };
+        let arms = arms
+            .into_iter()
+            .zip(arm_syntax)
+            .map(|(arm, written)| BoundSwitchArm {
+                value: self.finish_arm(arm.value, &written.value, ty),
+                ..arm
+            })
+            .collect();
+        BoundExpr {
+            kind: BoundExprKind::SwitchExpression {
+                governing,
+                subject,
+                arms,
+                fallback,
+            },
+            ty: ty.clone(),
+        }
+    }
+
+    /// Binds a switch expression's governing value, its arms' tests and guards, and its arms'
+    /// values -- each value as it binds without the type the whole will have -- and answers the
+    /// expression with no type of its own yet, beside its natural type if it has one.
+    fn bind_switch_parts(
+        &mut self,
+        governing: &Expr,
+        arms: &[SwitchArm],
+        keyword: Span,
+    ) -> (BoundExpr, Option<TypeSymbol>) {
         let span = keyword;
         let governing_span = governing.span;
         let governing = self.bind_expression(governing);
@@ -7862,7 +8850,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 },
                 governing_span,
             ));
-            return error_expr();
+            return (error_expr(), Some(TypeSymbol::Error));
         }
         let subject: Box<str> = alloc::format!("<subject>{}", span.start).into();
         self.declare_local(&subject, governing.ty.clone());
@@ -7904,20 +8892,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 .map(|guard| self.bind_condition(guard));
             tests.push(test);
             guards.push(guard);
-            values.push(self.bind_expression(&arm.value));
+            values.push(self.bind_arm(&arm.value));
         }
-
-        let ty = self.unify_switch_arm_types(&values, span);
-        let values: Vec<BoundExpr> = values
-            .into_iter()
-            .map(|value| {
-                if ty.is_error() {
-                    value
-                } else {
-                    self.convert(value, &ty)
-                }
-            })
-            .collect();
+        let natural = self.switch_natural_type(&values);
+        let marker = typeless_marker(Typeless::Switch, &values.iter().collect::<Vec<_>>());
 
         let fallback = if has_catch_all {
             None
@@ -7935,15 +8913,16 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .zip(values)
             .map(|((test, guard), value)| BoundSwitchArm { test, guard, value })
             .collect();
-        BoundExpr {
+        let value = BoundExpr {
             kind: BoundExprKind::SwitchExpression {
                 governing: Box::new(governing),
                 subject,
                 arms: bound_arms,
                 fallback,
             },
-            ty,
-        }
+            ty: marker,
+        };
+        (value, natural)
     }
 
     /// The `throw new SwitchExpressionException()` a non-exhaustive switch expression falls into.
@@ -7985,35 +8964,27 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         })
     }
 
-    /// The type of a switch expression: its arms' types unified pairwise, left to right, by the
-    /// rules `?:` uses for its two (13.1.7 / 14.13).
+    /// A switch expression's NATURAL type: the best of its arms' own types ([`Binder::best_type`]),
+    /// provided every arm converts to it -- the arms with no type of their own included. `None`
+    /// when it has none, and an arm in error makes the whole an error.
     ///
-    /// **LEFT TO RIGHT AND PAIRWISE IS NOT THE SPEC'S BEST-COMMON-TYPE ALGORITHM**, which
-    /// considers every candidate at once. They differ only where an arm converts to a LATER arm's
-    /// type but not to the running result -- and the running result is always a type some earlier
-    /// arm had, so the difference needs three arms with a type each. Recorded rather than claimed
-    /// equal.
-    fn unify_switch_arm_types(&mut self, values: &[BoundExpr], span: Span) -> TypeSymbol {
-        let Some(first) = values.first() else {
-            return TypeSymbol::Error;
-        };
-        let mut result = first.ty.clone();
-        for value in &values[1..] {
-            if result.is_error() || value.ty.is_error() {
-                return TypeSymbol::Error;
-            }
-            if let Some(common) = conditional_result_type(&self.model, &result, &value.ty) {
-                result = common;
-            } else if self.assignable(value, &result) {
-            } else if self.assignable(first, &value.ty) {
-                result = value.ty.clone();
-            } else {
-                self.diagnostics
-                    .push(Diagnostic::new(DiagnosticKind::SwitchExpressionNoBestType, span));
-                return TypeSymbol::Error;
+    /// `x switch { }` has no arm to offer a type, so it has none, and only a context can give it
+    /// one.
+    fn switch_natural_type(&self, values: &[BoundExpr]) -> Option<TypeSymbol> {
+        if values.iter().any(|value| value.ty.is_error()) {
+            return Some(TypeSymbol::Error);
+        }
+        let mut types: Vec<TypeSymbol> = Vec::new();
+        for value in values {
+            if supplies_natural_type(&value.ty) && !types.contains(&value.ty) {
+                types.push(value.ty.clone());
             }
         }
-        result
+        let best = self.best_type(&types)?;
+        values
+            .iter()
+            .all(|value| self.assignable(value, &best))
+            .then_some(best)
     }
 
     /// `CS8121` for a declaration pattern whose type no run-time test could reach from the
@@ -8087,6 +9058,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// any comparison. Handing either one back would put a non-`bool` where a pattern's `bool` is
     /// owed, which is a wrong answer no diagnostic reports.
     fn bind_constant_pattern(&mut self, operand: &Expr, value: &Expr) -> BoundExpr {
+        if is_default_literal(value) {
+            self.bind_expression(operand);
+            self.report(Diagnostic::new(DiagnosticKind::DefaultLiteralPattern, value.span));
+            return error_expr();
+        }
         if matches!(value.kind, ExprKind::Literal(Literal::Null)) {
             let operand = self.bind_expression(operand);
             return self.bind_null_pattern(operand, value.span);
@@ -9123,11 +10099,33 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// and answer `int?`. A NON-nullable value type on the left remains CS0019, measured on
     /// `int a; a ?? 2`.
     fn bind_null_coalescing(&mut self, left: &Expr, right: &Expr, span: Span) -> BoundExpr {
+        let right_syntax = right;
         let left = self.bind_expression(left);
         if let Some(underlying) = crate::conversion::nullable_underlying(&left.ty).cloned() {
             return self.bind_nullable_coalescing(left, &underlying, right, span);
         }
         if let ExprKind::Throw(operand) = &right.kind {
+            // A left operand of a value type that is not nullable is never null, so `??` does not
+            // apply to it: `i ?? throw e` on an `int` is `CS0019`, naming the throw expression
+            // the way csc names it.
+            if !left.ty.is_error() && self.is_value_type(&left.ty) {
+                let right = self.bind_throw_expression(operand, throw_marker());
+                self.report(Diagnostic::new(
+                    DiagnosticKind::OperatorNotApplicable {
+                        operator: "??".into(),
+                        left: left.ty.to_string().into(),
+                        right: argument_display(&right.ty),
+                    },
+                    span,
+                ));
+                return BoundExpr {
+                    kind: BoundExprKind::NullCoalescing {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    ty: TypeSymbol::Error,
+                };
+            }
             let ty = left.ty.clone();
             let right = self.bind_throw_expression(operand, ty.clone());
             return BoundExpr {
@@ -9138,7 +10136,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty,
             };
         }
-        let right = self.bind_expression(right);
+        let right = self.bind_convertible(right);
         if left.ty.is_error() || right.ty.is_error() {
             return BoundExpr {
                 kind: BoundExprKind::NullCoalescing {
@@ -9153,7 +10151,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 DiagnosticKind::OperatorNotApplicable {
                     operator: "??".into(),
                     left: left.ty.to_string().into(),
-                    right: right.ty.to_string().into(),
+                    right: argument_display(&right.ty),
                 },
                 span,
             ));
@@ -9163,7 +10161,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             TypeSymbol::Error
         } else if self.assignable(&right, &left.ty) {
             left.ty.clone()
-        } else if self.assignable(&left, &right.ty) {
+        } else if supplies_natural_type(&right.ty) && self.assignable(&left, &right.ty) {
             right.ty.clone()
         } else {
             mismatch(self, &left, &right);
@@ -9172,6 +10170,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let (left, right) = if ty.is_error() {
             (left, right)
         } else {
+            if typeless_kind(&right.ty).is_some() {
+                self.report_target_typed_conditionals(&right, right_syntax);
+            }
             (self.convert(left, &ty), self.convert(right, &ty))
         };
         BoundExpr {
@@ -9214,7 +10215,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             let bound = self.bind_throw_expression(operand, underlying.clone());
             (bound, underlying.clone())
         } else {
-            let bound = self.bind_expression(right);
+            let bound = self.bind_convertible(right);
             if bound.ty.is_error() {
                 return BoundExpr {
                     kind: BoundExprKind::NullCoalescing {
@@ -9228,19 +10229,24 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 underlying.clone()
             } else if self.assignable(&bound, &left_ty) {
                 left_ty.clone()
-            } else if crate::conversion::converts(&self.model, underlying, &bound.ty) {
+            } else if supplies_natural_type(&bound.ty)
+                && crate::conversion::converts(&self.model, underlying, &bound.ty)
+            {
                 bound.ty.clone()
             } else {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::OperatorNotApplicable {
                         operator: "??".into(),
                         left: left_ty.to_string().into(),
-                        right: bound.ty.to_string().into(),
+                        right: argument_display(&bound.ty),
                     },
                     span,
                 ));
                 TypeSymbol::Error
             };
+            if !ty.is_error() && typeless_kind(&bound.ty).is_some() {
+                self.report_target_typed_conditionals(&bound, right);
+            }
             (bound, ty)
         };
         if ty.is_error() {
@@ -9374,6 +10380,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         value_expr: &Expr,
         span: Span,
     ) -> BoundExpr {
+        if operator == AssignmentOperator::Assign && self.names_a_discard(target_expr) {
+            return self.bind_discard_assignment(target_expr, value_expr);
+        }
         let target_span = target_expr.span;
         let checkpoint = self.diagnostics.len();
         let bound = self.bind_assignment_inner(operator, target_expr, value_expr, span);
@@ -9547,7 +10556,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 if let Some(setter) = setter {
                     let mut args: Vec<BoundExpr> = arguments
                         .iter()
-                        .map(|argument| self.bind_expression(&argument.value))
+                        .map(|argument| self.bind_argument_expression(&argument.value))
                         .collect();
                     args.push(self.bind_expression(value_expr));
                     let setter_names = argument_names(arguments);
@@ -10521,7 +11530,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     format,
                 } => {
                     let (expression, alignment, format) = (&expression, &alignment, &format);
-                    let value = self.bind_expression(expression);
+                    // A hole is formatted as an `object`, so a conditional or switch expression
+                    // with no type of its own takes that type there.
+                    let value = self.bind_convertible(expression);
+                    let value = if typeless_kind(&value.ty).is_some() {
+                        self.finish_typeless(value, expression, &object)
+                    } else {
+                        value
+                    };
                     if matches!(value.ty, TypeSymbol::Special(SpecialType::Void)) {
                         let position = u32::try_from(pieces.len() + 1).unwrap_or(1);
                         self.report(Diagnostic::new(
@@ -10777,7 +11793,27 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             self.gate_feature(Feature::LambdaArgument, lambda.span);
             return error_expr();
         }
-        self.bind_expression(value)
+        self.bind_argument_expression(value)
+    }
+
+    /// An ARGUMENT's value as overload resolution sees it: a `default` literal as the
+    /// [`default_literal_marker`], which every by-value parameter admits and the conversion to the
+    /// chosen one turns into `default(parameter type)`; anything else as itself.
+    ///
+    /// Every argument list binds through here -- a call, a `new`, a `: this(...)` chain, an
+    /// indexer -- so the literal is an argument in all of them, as it is in csc.
+    fn bind_argument_expression(&mut self, value: &Expr) -> BoundExpr {
+        if is_default_literal(value) {
+            let marker = default_literal_marker();
+            return BoundExpr {
+                kind: BoundExprKind::DefaultValue(marker.clone()),
+                ty: marker,
+            };
+        }
+        // A conditional or switch expression whose arms have no type in common is an argument
+        // too: it converts to whichever parameter every one of its arms converts to, and takes
+        // that parameter's type once overload resolution has chosen it.
+        self.bind_convertible(value)
     }
 
     fn bind_invocation(
@@ -10787,6 +11823,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         argument_exprs: &[Argument],
         span: Span,
     ) -> BoundExpr {
+        let rewritten = self.rewrite_out_discards(argument_exprs);
+        let argument_exprs = rewritten.as_deref().unwrap_or(argument_exprs);
         let callee = self.bind_call_target(receiver_expr);
         let callee = if self.is_delegate_value(&callee) {
             BoundExpr {
@@ -11000,6 +12038,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 &method.name,
                 span,
             );
+        }
+        if resolved.is_some() {
+            self.report_target_typed_arguments(argument_exprs, &arguments);
         }
         let mut arguments = arguments;
         let mut spilled: Vec<BoundExpr> = Vec::new();
@@ -11341,7 +12382,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let mut spilled: Vec<BoundExpr> = Vec::new();
         let mut slots: Vec<Option<u32>> = Vec::with_capacity(source.len());
         for argument in &mut source {
-            if matches!(argument.kind, BoundExprKind::Ref { .. }) {
+            if matches!(argument.kind, BoundExprKind::Ref { .. })
+                || is_default_literal_marker(&argument.ty)
+            {
                 slots.push(None);
                 continue;
             }
@@ -11435,9 +12478,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty: parameter_ty.clone(),
             };
         }
+        let value_ty = crate::conversion::nullable_underlying(parameter_ty).unwrap_or(parameter_ty);
+        let ty = if self.is_enum_type(value_ty) {
+            value_ty.clone()
+        } else {
+            literal_type(literal)
+        };
         let bound = BoundExpr {
             kind: BoundExprKind::Literal(literal.clone()),
-            ty: literal_type(literal),
+            ty,
         };
         self.convert(bound, parameter_ty)
     }
@@ -12129,7 +13178,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::ArgumentConversion {
                         index: index as u32 + 1,
-                        from: from.to_string().into(),
+                        from: argument_display(&from),
                         to: to.to_string().into(),
                     },
                     span,
@@ -12233,7 +13282,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let receiver = self.bind_expression(receiver_expr);
         let indices: Vec<BoundExpr> = argument_exprs
             .iter()
-            .map(|argument| self.bind_expression(&argument.value))
+            .map(|argument| self.bind_argument_expression(&argument.value))
             .collect();
         let element = match &receiver.ty {
             TypeSymbol::Array { element, .. } => Some((**element).clone()),
@@ -12254,6 +13303,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 .into_iter()
                 .zip(argument_exprs)
                 .map(|(index, argument)| {
+                    let index = self.require_type(index, &argument.value);
                     self.coerce_index_or_length(index, accepted, argument.value.span)
                 })
                 .collect();
@@ -12277,8 +13327,21 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             ));
             return error_expr();
         };
-        self.bind_indexer_call(receiver, &getter, indices, &argument_names(argument_exprs), span)
-            .unwrap_or_else(error_expr)
+        let typeless_indices = indices
+            .iter()
+            .any(|index| typeless_kind(&index.ty).is_some())
+            .then(|| indices.clone());
+        let bound = self.bind_indexer_call(
+            receiver,
+            &getter,
+            indices,
+            &argument_names(argument_exprs),
+            span,
+        );
+        if let (Some(_), Some(indices)) = (&bound, typeless_indices) {
+            self.report_target_typed_arguments(argument_exprs, &indices);
+        }
+        bound.unwrap_or_else(error_expr)
     }
 
     /// Resolves an indexer accessor overload (`get_`/`set_`) on `receiver_ty` and converts the
@@ -12478,7 +13541,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let getter = self.indexer_accessor(&read_receiver.ty, "get_", arguments.len())?;
         let indices: Vec<BoundExpr> = arguments
             .iter()
-            .map(|argument| self.bind_expression(&argument.value))
+            .map(|argument| self.bind_argument_expression(&argument.value))
             .collect();
         let store_receiver = read_receiver.clone();
         let store_indices = indices.clone();
@@ -12579,13 +13642,23 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     elements
                         .iter()
                         .map(|element| {
+                            // Each element is an argument to `Add`, and binds as one: a `default`
+                            // literal or a conditional with no type of its own takes the type of
+                            // the parameter the chosen `Add` declares.
                             let mut arguments: Vec<BoundExpr> = element
                                 .arguments
                                 .iter()
-                                .map(|argument| self.bind_expression(argument))
+                                .map(|argument| self.bind_argument_expression(argument))
                                 .collect();
                             let add =
                                 self.resolve_collection_add(target_ty, &arguments, element.span);
+                            if add.is_some() {
+                                for (written, value) in element.arguments.iter().zip(&arguments) {
+                                    if typeless_kind(&value.ty).is_some() {
+                                        self.report_target_typed_conditionals(value, written);
+                                    }
+                                }
+                            }
                             if let Some(method) = &add {
                                 let parameters = method.parameters.clone();
                                 for (argument, parameter) in
@@ -12750,10 +13823,24 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let value = match &member.value {
             MemberInitializerValue::Expression(expression) => {
-                let bound = self.bind_expression(expression);
-                if let Some(ty) = &expected {
-                    self.check_assignable(&bound, ty, member.span);
-                }
+                let bound = self.bind_convertible(expression);
+                let bound = match &expected {
+                    Some(ty) if typeless_kind(&bound.ty).is_some() => {
+                        self.finish_typeless(bound, expression, ty)
+                    }
+                    // The value is CONVERTED to the member's type, as an assignment's is: the
+                    // store takes exactly that type, so `new C { P = 5 }` wraps the `5` for an
+                    // `int?` property and boxes it for an `object` one.
+                    Some(ty) => {
+                        self.check_assignable(&bound, ty, member.span);
+                        self.convert(bound, ty)
+                    }
+                    None if typeless_kind(&bound.ty).is_some() => BoundExpr {
+                        kind: bound.kind,
+                        ty: TypeSymbol::Error,
+                    },
+                    None => bound,
+                };
                 BoundMemberInitializerValue::Expression(bound)
             }
             MemberInitializerValue::Nested(nested) => {
@@ -13114,6 +14201,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         initializer: Option<&Initializer>,
         span: Span,
     ) -> BoundExpr {
+        let rewritten = self.rewrite_out_discards(argument_exprs);
+        let argument_exprs = rewritten.as_deref().unwrap_or(argument_exprs);
         if let [argument] = argument_exprs
             && initializer.is_none()
             && let Some(lambda) = lambda_through_parentheses(&argument.value)
@@ -13226,6 +14315,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     };
                     if let Some(chosen) = chosen {
                         ctor_sets_required_members = chosen.sets_required_members;
+                        self.report_target_typed_arguments(argument_exprs, &arguments);
                         if names.iter().any(Option::is_some)
                             && let Some(fill) = named_slots(&chosen, &names)
                         {
@@ -13604,7 +14694,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::ArgumentConversion {
                         index: index as u32 + 1,
-                        from: from.to_string().into(),
+                        from: argument_display(&from),
                         to: to.to_string().into(),
                     },
                     span,
@@ -16667,6 +17757,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// variable or parameter; anything else is `CS0103` (field, type, and
     /// namespace lookup arrive with the declaration model).
     fn bind_name(&mut self, name: &str, span: Span) -> BoundExpr {
+        // The `alias::` of `global::System.Console` -- the receiver the parser gives `System` -- is
+        // the namespace the alias denotes, and no variable, type or namespace in scope is asked.
+        if let Some(alias) = lamella_syntax::ast::alias_qualifier(name) {
+            return match self.alias_namespace(alias, span) {
+                Some(namespace) => BoundExpr {
+                    kind: BoundExprKind::NamespaceReference(namespace.into()),
+                    ty: TypeSymbol::Error,
+                },
+                None => error_expr(),
+            };
+        }
         if let Some((value, ty, _)) = self.const_locals.get(name) {
             return BoundExpr {
                 kind: BoundExprKind::Literal(value.clone()),
@@ -16789,6 +17890,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             }
         }
         if let Some(target) = self.alias_target(name) {
+            if let Some(namespace) = self.aliased_namespace(&target) {
+                return BoundExpr {
+                    kind: BoundExprKind::NamespaceReference(namespace.into()),
+                    ty: TypeSymbol::Error,
+                };
+            }
             return BoundExpr {
                 kind: BoundExprKind::TypeReference(target.clone()),
                 ty: target,
@@ -16837,31 +17944,32 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         error_expr()
     }
 
-    /// Resolves `namespace.name`: a nested namespace, a type, or `CS0234`.
+    /// Resolves `namespace.name`: a nested namespace, a type, or `CS0234` -- `CS0400` where
+    /// `namespace` is the global one, `""`, which only `global::` names.
     fn bind_qualified_name(&mut self, namespace: &str, name: &str, span: Span) -> BoundExpr {
         if self.model.get(namespace, name).is_some() {
-            let ty = qualified_type_symbol(namespace, name);
+            let ty = type_symbol_in(namespace, name);
             return BoundExpr {
                 kind: BoundExprKind::TypeReference(ty.clone()),
                 ty,
             };
         }
-        let mut nested = String::from(namespace);
-        nested.push('.');
-        nested.push_str(name);
+        let nested = namespace_member(namespace, name);
         if self.model.is_namespace(&nested) {
             return BoundExpr {
                 kind: BoundExprKind::NamespaceReference(nested.into()),
                 ty: TypeSymbol::Error,
             };
         }
-        self.diagnostics.push(Diagnostic::new(
+        let kind = if namespace.is_empty() {
+            DiagnosticKind::GlobalNamespaceMemberNotFound { name: name.into() }
+        } else {
             DiagnosticKind::NamespaceMemberNotFound {
                 namespace: namespace.into(),
                 name: name.into(),
-            },
-            span,
-        ));
+            }
+        };
+        self.diagnostics.push(Diagnostic::new(kind, span));
         error_expr()
     }
 
@@ -17517,6 +18625,82 @@ fn predefined_constant(special: SpecialType, member: &str) -> Option<i64> {
     }
 }
 
+/// The constant `default(ty)` is, for a type whose default is one (14.16): the zero of an integral
+/// type, `char` or an enum at the type it is held at (`integral`), `false`, a floating zero, `0m`,
+/// and `null` for `string` and `object`. `None` for every other type.
+fn default_constant(
+    ty: &TypeSymbol,
+    integral: &dyn Fn(&TypeSymbol) -> Option<SpecialType>,
+) -> Option<Literal> {
+    if let Some(integral) = integral(ty) {
+        return crate::integral_constant::literal(0, integral);
+    }
+    let TypeSymbol::Special(special) = ty else {
+        return None;
+    };
+    let suffix = match special {
+        SpecialType::Boolean => return Some(Literal::Boolean(false)),
+        SpecialType::String | SpecialType::Object => return Some(Literal::Null),
+        SpecialType::Decimal => {
+            return Some(Literal::Decimal {
+                lo: 0,
+                mid: 0,
+                hi: 0,
+                scale: 0,
+                negative: false,
+            });
+        }
+        SpecialType::Single => lamella_syntax::token::RealSuffix::Float,
+        SpecialType::Double => lamella_syntax::token::RealSuffix::Double,
+        _ => return None,
+    };
+    Some(Literal::Real {
+        bits: 0.0f64.to_bits(),
+        suffix,
+    })
+}
+
+/// The full name of `name` inside `namespace`, where `""` is the global namespace.
+fn namespace_member(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        String::from(name)
+    } else {
+        alloc::format!("{namespace}.{name}")
+    }
+}
+
+/// The highest generic arity [`Binder::type_named_in`] asks a namespace about. A type of more
+/// parameters than this is not found through a namespace alias qualifier.
+const MAX_GENERIC_ARITY_PROBED: usize = 16;
+
+/// `expr` with any parentheses around it taken off: a diagnostic about a parenthesized expression
+/// is reported at the expression the parentheses hold, which is where csc reports it.
+fn without_parentheses(expr: &Expr) -> &Expr {
+    match &expr.kind {
+        ExprKind::Parenthesized(inner) => without_parentheses(inner),
+        _ => expr,
+    }
+}
+
+/// Whether `expr` is the `default` literal (C# 7.1), parenthesized or not.
+pub(crate) fn is_default_literal(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::DefaultValue(None) => true,
+        ExprKind::Parenthesized(inner) => is_default_literal(inner),
+        _ => false,
+    }
+}
+
+/// How csc names a default argument's own type in CS1750: `<null>` for the null literal, and the
+/// type's ordinary rendering otherwise. Measured -- `int a = null` reports *a value of type
+/// '<null>'*.
+fn default_value_type_display(ty: &TypeSymbol) -> Box<str> {
+    if *ty == TypeSymbol::Special(SpecialType::Null) {
+        return "<null>".into();
+    }
+    ty.to_string().into()
+}
+
 /// Whether `expr` is a constant of type `int`/`long` whose value fits the integral
 /// `target` -- the implicit constant expression conversion (13.1.7), which lets
 /// `byte b = 10` and `b[0] = 10` compile without a cast.
@@ -17763,6 +18947,7 @@ fn constant_value_in(
     };
     match &expr.kind {
         BoundExprKind::Literal(literal) => Some(literal.clone()),
+        BoundExprKind::DefaultValue(ty) => default_constant(ty, integral),
         BoundExprKind::FieldAccess {
             field: Some(field), ..
         } => field.constant.clone(),
@@ -17974,35 +19159,30 @@ fn arg_applicable(
     if is_arglist_marker(arg_ty) {
         return false;
     }
+    if is_default_literal_marker(arg_ty) || is_throw_marker(arg_ty) {
+        return !matches!(param, TypeSymbol::ByRef(_));
+    }
+    // A conditional or switch expression with no type of its own converts to a parameter exactly
+    // when every arm does, each arm by its own type and, where it is a constant, its value.
+    if let Some(arms) = typeless_arm_types(arg_ty) {
+        return !matches!(param, TypeSymbol::ByRef(_))
+            && arms
+                .iter()
+                .all(|(arm, constant)| arg_applicable(model, arm, *constant, param));
+    }
     if matches!(arg_ty, TypeSymbol::ByRef(_)) || matches!(param, TypeSymbol::ByRef(_)) {
         return arg_ty == param;
     }
     if converts(model, arg_ty, param) || user_implicit_converts(model, arg_ty, param) {
         return true;
     }
+    let target = crate::conversion::nullable_underlying(param).unwrap_or(param);
     matches!(
         arg_ty,
         TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64)
-    ) && match param {
+    ) && match target {
         TypeSymbol::Special(target) => arg_const.is_some_and(|value| constant_fits(value, *target)),
         _ => false,
-    }
-}
-
-impl Binder {
-    /// Whether a CONSTANT of type `from` and value `value` is assignable to `to` -- the ordinary
-    /// conversions plus 13.2.4's implicit constant-expression conversion, which admits an
-    /// in-range `int` constant to `byte`, `sbyte`, `short`, `ushort`, `uint` and `ulong`.
-    ///
-    /// The same question overload resolution asks of an argument, exposed for the declaration
-    /// check on a DEFAULT ARGUMENT -- which is an argument written at the declaration.
-    pub(crate) fn constant_assignable(
-        &self,
-        from: &TypeSymbol,
-        value: Option<i64>,
-        to: &TypeSymbol,
-    ) -> bool {
-        arg_applicable(self.model(), from, value, to)
     }
 }
 
@@ -18572,7 +19752,13 @@ fn is_better(
             continue;
         }
         let arg = &arguments[index];
-        let (std1, std2) = (converts(model, arg, p1), converts(model, arg, p2));
+        // A conditional or switch expression with no type of its own converts to both the same
+        // way, by converting each arm, so for it too only the two parameter types decide.
+        let (std1, std2) = if is_default_literal_marker(arg) || typeless_kind(arg).is_some() {
+            (true, true)
+        } else {
+            (converts(model, arg, p1), converts(model, arg, p2))
+        };
         if std1 != std2 {
             if std1 {
                 strictly_better_somewhere = true;
@@ -18580,13 +19766,27 @@ fn is_better(
             }
             return false;
         }
-        if converts(model, p1, p2) || signed_preferred(p1, p2) {
+        if converts(model, p1, p2) || lifted_converts(model, p1, p2) || signed_preferred(p1, p2) {
             strictly_better_somewhere = true;
         } else {
             return false;
         }
     }
     strictly_better_somewhere
+}
+
+/// Whether `from` converts to `to` as two NULLABLE types whose underlying types convert: the
+/// lifted conversion `S? -> T?` (13.7.2), by which `int?` is a better parameter type than `long?`.
+///
+/// Asked only to RANK two parameter types against each other; nothing is converted by it.
+fn lifted_converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    match (
+        crate::conversion::nullable_underlying(from),
+        crate::conversion::nullable_underlying(to),
+    ) {
+        (Some(from), Some(to)) => from == to || converts(model, from, to),
+        _ => false,
+    }
 }
 
 /// The signed/unsigned better-conversion special cases (14.4.2.3): a signed integral
@@ -18801,9 +20001,149 @@ fn arglist_marker() -> TypeSymbol {
     TypeSymbol::Named([Box::from("__arglist")].into())
 }
 
+/// The pseudo-type a `default` literal ARGUMENT carries into overload resolution (C# 7.1): it has
+/// no type of its own and takes the chosen parameter's, which [`Binder::convert`] gives it. Spelled
+/// `default`, a keyword no declared type can be named, and how csc renders it.
+fn default_literal_marker() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("default")].into())
+}
+
+/// Whether `ty` is the [`default_literal_marker`].
+fn is_default_literal_marker(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts) if parts.len() == 1 && &*parts[0] == "default")
+}
+
 /// Whether `ty` is the [`arglist_marker`] pseudo-type (an `__arglist(...)` argument pack).
 fn is_arglist_marker(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Named(parts) if parts.len() == 1 && &*parts[0] == "__arglist")
+}
+
+/// The pseudo-type of a THROW EXPRESSION that is an arm of a conditional or a switch expression,
+/// while the whole expression's type is not yet settled. It converts to every type, and the arm
+/// takes the type the expression settles on. Spelled `<throw expression>`, which is how csc names
+/// it in a diagnostic.
+fn throw_marker() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("<throw expression>")].into())
+}
+
+/// Whether `ty` is the [`throw_marker`].
+fn is_throw_marker(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts) if parts.len() == 1 && &*parts[0] == "<throw expression>")
+}
+
+/// The two expressions that can have NO TYPE OF THEIR OWN and still be valid: a conditional whose
+/// arms have no type in common (C# 9.0) and a switch expression whose arms have none (C# 8.0).
+/// Each takes the type its context converts it to, which only the context knows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Typeless {
+    Conditional,
+    Switch,
+}
+
+impl Typeless {
+    /// How csc names the expression where a type would go, in `CS1503`'s "cannot convert from".
+    fn display(self) -> &'static str {
+        match self {
+            Typeless::Conditional => "target-typed conditional expression",
+            Typeless::Switch => "<switch expression>",
+        }
+    }
+}
+
+/// The pseudo-type a [`Typeless`] expression carries until its context converts it.
+///
+/// **IT CARRIES ITS ARMS, BECAUSE AN ARGUMENT IS JUDGED BEFORE IT IS CONVERTED.** A typeless
+/// expression converts to a type exactly when every one of its arms does, and overload resolution
+/// asks that of each candidate's parameter while it sees only a type per argument. So the marker
+/// holds what that question needs about each arm: its own type, and its value when it is an
+/// integral constant -- `c ? 1 : null` reaches `byte?` only because `1` is a constant.
+fn typeless_marker(kind: Typeless, arms: &[&BoundExpr]) -> TypeSymbol {
+    TypeSymbol::Instantiation {
+        definition: [Box::from(kind.display())].into(),
+        arguments: arms.iter().map(|arm| arm_descriptor(arm)).collect(),
+    }
+}
+
+/// Which [`Typeless`] expression `ty` is the [`typeless_marker`] of, if it is one.
+fn typeless_kind(ty: &TypeSymbol) -> Option<Typeless> {
+    let TypeSymbol::Instantiation { definition, .. } = ty else {
+        return None;
+    };
+    match &definition[..] {
+        [name] if &**name == Typeless::Conditional.display() => Some(Typeless::Conditional),
+        [name] if &**name == Typeless::Switch.display() => Some(Typeless::Switch),
+        _ => None,
+    }
+}
+
+/// The arms of a conditional or switch expression with no type of its own, as they bound.
+fn typeless_arms(value: &BoundExpr) -> Vec<&BoundExpr> {
+    match &value.kind {
+        BoundExprKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => alloc::vec![&**when_true, &**when_false],
+        BoundExprKind::SwitchExpression { arms, .. } => arms.iter().map(|arm| &arm.value).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One arm as a [`typeless_marker`] records it: its type, wrapped with its value when it is an
+/// `int` or `long` constant.
+fn arm_descriptor(arm: &BoundExpr) -> TypeSymbol {
+    let integral = matches!(
+        arm.ty,
+        TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64)
+    );
+    match constant_int_value(arm) {
+        Some(value) if integral => TypeSymbol::Instantiation {
+            definition: [Box::from("<constant>"), value.to_string().into()].into(),
+            arguments: [arm.ty.clone()].into(),
+        },
+        _ => arm.ty.clone(),
+    }
+}
+
+/// The arms a [`typeless_marker`] carries, each as its type and its constant value.
+fn typeless_arm_types(ty: &TypeSymbol) -> Option<Vec<(TypeSymbol, Option<i64>)>> {
+    typeless_kind(ty)?;
+    let TypeSymbol::Instantiation { arguments, .. } = ty else {
+        return None;
+    };
+    let decode = |descriptor: &TypeSymbol| match descriptor {
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } if definition.len() == 2 && &*definition[0] == "<constant>" => {
+            (arguments[0].clone(), definition[1].parse::<i64>().ok())
+        }
+        other => (other.clone(), None),
+    };
+    Some(arguments.iter().map(decode).collect())
+}
+
+/// Whether `ty` is one of the pseudo-types an expression with NO TYPE OF ITS OWN carries: a
+/// `default` literal, a throw expression whose arm is not settled, or a [`Typeless`] expression.
+/// Type inference infers nothing from such an argument, as it infers nothing from `null`.
+pub(crate) fn has_no_type_of_its_own(ty: &TypeSymbol) -> bool {
+    is_default_literal_marker(ty) || is_throw_marker(ty) || typeless_kind(ty).is_some()
+}
+
+/// Whether an expression of type `ty` can supply a conditional's or a switch expression's NATURAL
+/// type: it has a type of its own. `null` has none in this sense -- `c ? 1 : null` has no natural
+/// type -- and neither do the pseudo-types of [`has_no_type_of_its_own`].
+fn supplies_natural_type(ty: &TypeSymbol) -> bool {
+    !matches!(ty, TypeSymbol::Special(SpecialType::Null)) && !has_no_type_of_its_own(ty)
+}
+
+/// How an argument's type is named in `CS1503`: a [`Typeless`] expression by csc's name for it, and
+/// anything else as itself.
+fn argument_display(ty: &TypeSymbol) -> Box<str> {
+    match typeless_kind(ty) {
+        Some(kind) => kind.display().into(),
+        None => ty.to_string().into(),
+    }
 }
 
 /// csc's member display in CS7036 for a vararg member: `P.M(int, __arglist)`, with a
@@ -18881,27 +20221,6 @@ fn member_lookup_type(ty: &TypeSymbol) -> TypeSymbol {
         system_array()
     } else {
         ty.clone()
-    }
-}
-
-/// The type of a conditional expression from its branch types (14.13): the branch
-/// type the other implicitly converts to, or `None` (`CS0173`) when there is no
-/// one-way conversion between them.
-fn conditional_result_type(
-    model: &Model,
-    when_true: &TypeSymbol,
-    when_false: &TypeSymbol,
-) -> Option<TypeSymbol> {
-    if when_true == when_false {
-        return Some(when_true.clone());
-    }
-    match (
-        converts(model, when_true, when_false),
-        converts(model, when_false, when_true),
-    ) {
-        (true, false) => Some(when_false.clone()),
-        (false, true) => Some(when_true.clone()),
-        _ => None,
     }
 }
 
@@ -21817,6 +23136,59 @@ mod tests {
         assert_eq!(codes("throw new object();", LanguageVersion::CSharp7_3), [155]);
         assert_eq!(codes("throw K;", LanguageVersion::CSharp7_3), [119, 155]);
         assert_eq!(codes("throw M;", LanguageVersion::CSharp7_3), [155]);
+    }
+
+    /// The `default` literal is thrown as `default(Exception)` only where a thrown value is
+    /// converted to `Exception`, which is from C# 8.0. At 7.1, 7.2 and 7.3 it has no target type
+    /// and csc reports `CS8716` at the literal -- in a `throw` statement, in each position a throw
+    /// expression can stand, and inside parentheses. Every row is csc's, measured at each rung.
+    #[test]
+    fn below_csharp_8_a_thrown_default_literal_has_no_target_type() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        use lamella_syntax::version::LanguageVersion;
+        let diagnostics = |body: &str, version: LanguageVersion| {
+            let source = alloc::format!(
+                "namespace System {{ public class Exception {{ }} }} \
+                 class C {{ static int F(string a, bool b) {{ {body} }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            crate::bind_compilation_unit_with_dialect(&unit, &[], false, version)
+                .iter()
+                .map(|diagnostic| {
+                    let span = diagnostic.span;
+                    let text = &source[span.start as usize..span.end as usize];
+                    (diagnostic.code(), String::from(text))
+                })
+                .collect::<Vec<_>>()
+        };
+        let bodies = [
+            "throw default;",
+            "throw (default);",
+            "return a == null ? 1 : throw ((default));",
+            "return b ? 1 : throw default;",
+            "return F(a ?? throw default, b);",
+        ];
+        for version in [
+            LanguageVersion::CSharp7_1,
+            LanguageVersion::CSharp7_2,
+            LanguageVersion::CSharp7_3,
+        ] {
+            for body in bodies {
+                assert_eq!(
+                    diagnostics(body, version),
+                    [(8716, String::from("default"))],
+                    "at {version:?}: {body}"
+                );
+            }
+            let named = diagnostics("throw default(System.Exception);", version);
+            assert!(named.is_empty(), "at {version:?}: {named:?}");
+        }
+        for version in [LanguageVersion::CSharp8, LanguageVersion::SELECTABLE_MAX] {
+            for body in bodies {
+                let accepted = diagnostics(body, version);
+                assert!(accepted.is_empty(), "at {version:?}: {body}: {accepted:?}");
+            }
+        }
     }
 
     #[test]

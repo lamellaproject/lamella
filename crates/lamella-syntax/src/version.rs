@@ -905,6 +905,10 @@ pub enum Feature {
     /// `await` is reserved only inside a method whose modifiers include `async`, and the verbatim
     /// `@await` is an ordinary identifier even there (12.8.8.1).
     AsyncFunction,
+    /// The `default` LITERAL (C# 7.1): `default` with no type, which takes the type its context
+    /// converts it to -- `x = default;`, `return default;`, `CancellationToken token = default`.
+    /// `default(T)` is [`Feature::DefaultOperator`], six releases earlier.
+    DefaultLiteral,
     /// An async entry point -- `static async Task Main()`. Introduced in **C# 7.1**, two rungs
     /// after async functions themselves, and gated separately by csc under its own name --
     /// measured: at `/langversion:5` an async `Task Main` reports `Feature 'async main' is not
@@ -1161,8 +1165,8 @@ impl Feature {
             Feature::ExceptionFilter => true,
             Feature::LambdaExpression => true,
             Feature::NamedArguments => true,
+            Feature::NamespaceAlias => true,
             Feature::AnonymousMethods
-            | Feature::NamespaceAlias
             | Feature::AnonymousObjectCreation
             | Feature::SwitchOnBool
             | Feature::TopLevelStatements
@@ -1179,6 +1183,7 @@ impl Feature {
             Feature::AsyncFunction => true,
             Feature::PartialTypes => true,
             Feature::AsyncMain => false,
+            Feature::DefaultLiteral => true,
             Feature::AsyncTaskOfT
             | Feature::AsyncGenericMethod
             | Feature::AwaitInCatchOrFinally
@@ -1190,12 +1195,12 @@ impl Feature {
             Feature::InterpolatedStrings => true,
             Feature::ConstantInterpolatedStrings => true,
             Feature::RecordClass => true,
+            Feature::PatternCaseLabel => true,
             Feature::ImplicitlyTypedArray
             | Feature::ExtensionMethod
             | Feature::Iterators
             | Feature::LocalFunctions
             | Feature::StaticLocalFunctions
-            | Feature::PatternCaseLabel
             | Feature::TypePattern
             | Feature::WithExpression
             | Feature::LambdaArgument
@@ -1215,7 +1220,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 85] = [
+    pub const ALL: [Feature; 86] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -1278,6 +1283,7 @@ impl Feature {
         Feature::ParameterlessStructConstructor,
         Feature::AsyncFunction,
         Feature::AsyncMain,
+        Feature::DefaultLiteral,
         Feature::AsyncTaskOfT,
         Feature::AsyncGenericMethod,
         Feature::LambdaCapturingThis,
@@ -1369,7 +1375,7 @@ impl Feature {
             Feature::DefaultInterfaceImplementation => LanguageVersion::CSharp8,
             Feature::ParameterlessStructConstructor => LanguageVersion::CSharp10,
             Feature::AsyncFunction => LanguageVersion::CSharp5,
-            Feature::AsyncMain => LanguageVersion::CSharp7_1,
+            Feature::AsyncMain | Feature::DefaultLiteral => LanguageVersion::CSharp7_1,
             Feature::AsyncTaskOfT | Feature::AsyncGenericMethod => LanguageVersion::CSharp5,
             Feature::LambdaCapturingThis
             | Feature::LambdaCapturingLocals
@@ -1480,6 +1486,7 @@ impl Feature {
             Feature::AsyncFunction => "async function",
             Feature::PartialTypes => "partial types",
             Feature::AsyncMain => "async main",
+            Feature::DefaultLiteral => "default literal",
             Feature::LambdaCapturingThis => "lambda capturing the enclosing instance",
             Feature::LambdaCapturingLocals => "lambda capturing a local variable",
             Feature::LambdaCapturingNestedScope => {
@@ -1806,6 +1813,7 @@ mod tests {
                 | Feature::ParameterlessStructConstructor
                 | Feature::AsyncFunction
                 | Feature::AsyncMain
+                | Feature::DefaultLiteral
                 | Feature::AsyncTaskOfT
                 | Feature::AsyncGenericMethod
                 | Feature::LambdaCapturingThis
@@ -1833,7 +1841,7 @@ mod tests {
         }
         assert_eq!(
             Feature::ALL.len(),
-            85,
+            86,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }
@@ -2118,13 +2126,7 @@ mod tests {
                 required: "7.0"
             })
         );
-        assert!(matches!(
-            Feature::PatternCaseLabel.gate_against(LanguageVersion::CSharp7),
-            Some(FeatureGate::NotInThisBuild {
-                feature: "patterns in case labels",
-                instead: Some(_)
-            })
-        ));
+        assert_eq!(Feature::PatternCaseLabel.gate_against(LanguageVersion::CSharp7), None);
         assert!(matches!(
             Feature::RecordInheritance.gate_against(LanguageVersion::CSharp9),
             Some(FeatureGate::NotInThisBuild {

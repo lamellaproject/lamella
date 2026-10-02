@@ -38,7 +38,7 @@ pub use bound::{
 pub use conversion::{has_implicit_conversion, nullable_underlying};
 pub use declaration::{
     collect_into, collect_model, collect_types, constraints_by_parameter, declared_full_name,
-    fold_parameter_default, parameter_default_in_model, resolve_constants,
+    declared_indexer_accessor_name, declared_member_name, fold_parameter_default, resolve_constants,
 };
 pub use diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment, switch_section_reachability};

@@ -159,7 +159,14 @@ fn relate(model: &Model, a: &TypeSymbol, p: &TypeSymbol, pool: &mut Pool<'_>) ->
         if !involves(p, pool.names) {
             return true;
         }
-        if matches!(a, TypeSymbol::Special(SpecialType::Null)) || a.is_error() {
+        // An argument with NO TYPE OF ITS OWN -- a `default` literal, or a conditional or switch
+        // expression whose arms have no type in common -- is passed over as `null` is: it takes
+        // the type of the parameter it is passed to, so it has none to offer while that type is
+        // being inferred.
+        if matches!(a, TypeSymbol::Special(SpecialType::Null))
+            || a.is_error()
+            || crate::bound::has_no_type_of_its_own(a)
+        {
             return true;
         }
         match p {
