@@ -162,6 +162,13 @@ pub enum Trap {
         /// The slot it resolved to, which the storage does not have.
         slot: u32,
     },
+    /// Pointer arithmetic on the address of a field reached a byte this interpreter cannot
+    /// address, or started from a field address it cannot walk at all. The message says which.
+    ///
+    /// An object's fields are typed slots, so a pointer walked from one field reaches another only
+    /// where that field starts. Not catchable: like [`Unsupported`](Self::Unsupported), it names
+    /// something the interpreter does not do, not an exception .NET would raise.
+    FieldPointerWalk(Cow<'static, str>),
     /// Integer division or remainder by zero (`div`, `rem`, and unsigned forms).
     DivideByZero,
     /// A `call` token resolved to no method in the module.
@@ -247,6 +254,7 @@ impl fmt::Display for Trap {
                  (the field is fine; the object was allocated with a different layout)",
                 field.0
             ),
+            Trap::FieldPointerWalk(message) => f.write_str(message),
             Trap::DivideByZero => f.write_str("integer divide by zero"),
             Trap::UnresolvedCall(token) => {
                 write!(f, "call token 0x{:08X} resolved to no method", token.0)

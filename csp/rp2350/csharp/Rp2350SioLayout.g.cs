@@ -12,6 +12,8 @@ namespace Lamella.Generated
         // -- register offsets (block-relative) + access widths --
         public const uint GPIO_IN_OFF = 0x4;
         public const int GPIO_IN_WIDTH = 32;
+        public const uint GPIO_HI_IN_OFF = 0x8;
+        public const int GPIO_HI_IN_WIDTH = 32;
         public const uint GPIO_OUT_SET_OFF = 0x18;
         public const int GPIO_OUT_SET_WIDTH = 32;
         public const uint GPIO_OUT_CLR_OFF = 0x20;

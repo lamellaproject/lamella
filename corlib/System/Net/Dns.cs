@@ -15,6 +15,15 @@ namespace System.Net
         public static IPAddress[] GetHostAddresses(string hostNameOrAddress)
         {
             if ((object)hostNameOrAddress == null) throw new ArgumentNullException("hostNameOrAddress");
+            IPAddress[] addresses = TryGetHostAddresses(hostNameOrAddress);
+            if (addresses == null) throw new SocketException(HostNotFound);
+            return addresses;
+        }
+
+        internal const string HostNotFound = "No such host is known.";
+
+        internal static IPAddress[] TryGetHostAddresses(string hostNameOrAddress)
+        {
             IPAddress literal;
             if (IPAddress.TryParseInternal(hostNameOrAddress, out literal))
             {
@@ -25,7 +34,7 @@ namespace System.Net
             byte[] buffer = new byte[16 * MaxAddresses];
             int[] lengths = new int[MaxAddresses];
             int count = ResolveHost(hostNameOrAddress, buffer, lengths);
-            if (count <= 0) throw new SocketException();
+            if (count <= 0) return null;
             IPAddress[] result = new IPAddress[count];
             for (int i = 0; i < count; i++)
             {

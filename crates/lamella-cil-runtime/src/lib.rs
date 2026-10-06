@@ -53,8 +53,8 @@ pub use interp::{
 /// second dependency for one two-field struct.
 pub use lamella_pin_events::PinEvent;
 pub use module::{
-    CastElem, CastPrim, IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn,
-    PInvokeTarget, TypeId, asm_key, baked_image_checksum,
+    CastElem, CastPrim, FieldOffsets, IntrinsicFn, Method, MethodId, Module, PInvokeParam,
+    PInvokeReturn, PInvokeTarget, TypeId, asm_key, baked_image_checksum,
 };
 #[cfg(feature = "code-in-place")]
 pub use module::verified_image_checksum;

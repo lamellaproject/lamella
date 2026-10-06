@@ -31,6 +31,14 @@ namespace Lamella.Generated
         public const string EXT2_PWM_DRIVER_FAMILY = "samd21-tc";
         public const string EXT3_PWM_DRIVER_FAMILY = "samd21-tcc";
 
+        /// chip selects: `SpiConnectionSettings.ChipSelectLine` is an index into a bus's chip
+        /// selects, as dotnet/iot means it on Linux. Line n selects the pin in the bus's
+        /// `_CHIP_SELECTn` constant, numbered as this family's GPIO driver numbers its pins; -1
+        /// selects none; and a line at or past the bus's `_CHIP_SELECT_COUNT` names no select. Entry
+        /// 0 is the chip select the binding names, and a binding that names none has no entries.
+        public const uint EXT1_SPI_CHIP_SELECT_COUNT = 1;
+        public const uint EXT1_SPI_CHIP_SELECT0 = 5;
+
         // -- VCP: a sercom-usart binding descriptor --
         public const uint VCP_SERCOM_BASE = 0x42001400;
         public const uint VCP_IRQ = 12;

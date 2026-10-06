@@ -8,14 +8,23 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
 #[cfg(test)]
 extern crate std;
+
+/// The network stored on the board, in two slots that each erase on their own.
+pub mod record;
+
+/// The station as the Wi-Fi seam a language runtime reaches.
+pub mod controller;
 
 use lamella_wifi_cyw4343x::control::SERVICE_POLL_US;
 use lamella_wifi_cyw4343x::data::ETHERNET_MAX;
 use lamella_wifi_cyw4343x::gspi::{Gspi, GspiWire};
+use lamella_wifi_cyw4343x::scan::SSID_MAX;
 use lamella_wifi_cyw4343x::{
-    Clock, Credential, Driver, JoinFailure, LinkState, Micros, Outcome, Refusal, Transport, Wake,
+    Advertised, Capabilities, Clock, Credential, Driver, JoinFailure, LinkState, Micros, Outcome,
+    Refusal, ScanRecord, Security, Transport, Wake,
 };
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
@@ -76,6 +85,12 @@ pub trait Control<'b>: Radio {
 
     /// Drop the network.
     fn disconnect(&mut self) -> bool;
+
+    /// List the networks in range, one record per outcome, then the scan's end.
+    fn scan(&mut self) -> bool;
+
+    /// Ask the firmware which features it has, among them whether it runs WPA3's SAE exchange.
+    fn capabilities(&mut self) -> bool;
 }
 
 /// A bus that can read the chip's interrupt without a transfer.
@@ -173,6 +188,14 @@ impl<'b, T: Transport + Interrupt> Control<'b> for Chip<'b, T> {
     fn disconnect(&mut self) -> bool {
         self.driver.disconnect()
     }
+
+    fn scan(&mut self) -> bool {
+        self.driver.scan()
+    }
+
+    fn capabilities(&mut self) -> bool {
+        self.driver.capabilities()
+    }
 }
 
 /// The images the chip runs, and the version string the firmware's reply must contain. The station
@@ -218,6 +241,52 @@ pub struct Counters {
     pub link_losses: u32,
 }
 
+/// What one scan saw of the network it was asked to look for: the strongest of its access points,
+/// and what any of them advertised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sighting {
+    /// The record of the access point heard most strongly.
+    pub strongest: ScanRecord,
+    /// Whether any access point of the network may take a WPA2 join.
+    pub wpa2: bool,
+    /// Whether any access point of the network may take a WPA3 join.
+    pub wpa3: bool,
+    /// Whether any access point of the network is open.
+    pub open: bool,
+    /// Whether any access point of the network names SAE among its suites. A network whose records
+    /// carry no readable suites may take either secured join; this says one was named.
+    pub sae: bool,
+    /// What the strongest access point advertised.
+    pub advertised: Advertised,
+}
+
+/// What the station has seen of the driver's requests, kept so that a caller can follow a join, a
+/// scan or a disconnect it started without pumping the driver itself: the stack's own calls pump
+/// it, and each outcome passing through is recorded here. Every count only grows, so a caller tells
+/// a new outcome from an old one by the count it read before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Journal {
+    /// The last failed join attempt.
+    pub failure: Option<JoinFailure>,
+    /// The link's state just after that failure: [`LinkState::Detached`] when the driver let the
+    /// network go, so it will not try again.
+    pub failure_link: Option<LinkState>,
+    /// Failed join attempts.
+    pub failures: u32,
+    /// The access point of the last join that completed.
+    pub joined: Option<[u8; 6]>,
+    /// Joins completed, the driver's own re-joins after a lost link among them.
+    pub joins: u32,
+    /// Disconnects completed.
+    pub disconnects: u32,
+    /// Scans ended.
+    pub scans: u32,
+    /// What the last scan saw of the network it looked for; `None` when it saw none of it.
+    pub sighting: Option<Sighting>,
+    /// The firmware's answer to the capability query, once it has given one.
+    pub capabilities: Option<Capabilities>,
+}
+
 /// The radio and its clock as one `smoltcp` device: the driver pumped inside the stack's receive
 /// and transmit calls, each received frame copied out of the driver and handed to the stack with a
 /// token for its reply, the stack's frames staged in the driver and written under the chip's credit
@@ -237,6 +306,10 @@ pub struct Station<R, C> {
     address: Option<[u8; 6]>,
     refusal: Option<Refusal>,
     counters: Counters,
+    journal: Journal,
+    /// The name of the network the running scan looks for, and its length; 0 when it looks for none.
+    target: [u8; SSID_MAX],
+    target_len: usize,
 }
 
 impl<R, C> Station<R, C> {
@@ -252,7 +325,25 @@ impl<R, C> Station<R, C> {
             address: None,
             refusal: None,
             counters: Counters { received: 0, dropped: 0, sent: 0, link_losses: 0 },
+            journal: Journal {
+                failure: None,
+                failure_link: None,
+                failures: 0,
+                joined: None,
+                joins: 0,
+                disconnects: 0,
+                scans: 0,
+                sighting: None,
+                capabilities: None,
+            },
+            target: [0; SSID_MAX],
+            target_len: 0,
         }
+    }
+
+    /// What the station has seen of the driver's requests.
+    pub fn journal(&self) -> &Journal {
+        &self.journal
     }
 
     /// The radio.
@@ -339,9 +430,49 @@ impl<R: Radio, C: Clock> Station<R, C> {
             Outcome::Up { address } => self.address = Some(address),
             Outcome::LinkLost(_) => self.counters.link_losses = self.counters.link_losses.wrapping_add(1),
             Outcome::Refused(refusal) => self.refusal = Some(refusal),
+            Outcome::JoinFailed(failure) => {
+                self.journal.failure = Some(failure);
+                self.journal.failure_link = Some(self.radio.link());
+                self.journal.failures = self.journal.failures.wrapping_add(1);
+            }
+            Outcome::Joined { bssid } => {
+                self.journal.joined = Some(bssid);
+                self.journal.joins = self.journal.joins.wrapping_add(1);
+            }
+            Outcome::Disconnected => self.journal.disconnects = self.journal.disconnects.wrapping_add(1),
+            Outcome::ScanRecord(record) => self.sighted(record),
+            Outcome::ScanDone { .. } => {
+                self.target_len = 0;
+                self.journal.scans = self.journal.scans.wrapping_add(1);
+            }
+            Outcome::Capabilities(capabilities) => self.journal.capabilities = Some(capabilities),
             _ => {}
         }
         Some(outcome)
+    }
+
+    /// Takes a scan record into the sighting when it is a record of the network the scan looks for.
+    fn sighted(&mut self, record: ScanRecord) {
+        if self.target_len == 0 || record.ssid() != &self.target[..self.target_len] {
+            return;
+        }
+        let advertised = record.security;
+        let sighting = self.journal.sighting.get_or_insert(Sighting {
+            strongest: record,
+            wpa2: false,
+            wpa3: false,
+            open: false,
+            sae: false,
+            advertised,
+        });
+        if record.rssi > sighting.strongest.rssi {
+            sighting.strongest = record;
+            sighting.advertised = advertised;
+        }
+        sighting.wpa2 |= advertised.compatible(Security::Wpa2Psk);
+        sighting.wpa3 |= advertised.compatible(Security::Wpa3Sae);
+        sighting.open |= advertised.compatible(Security::Open);
+        sighting.sae |= advertised.rsne && advertised.sae;
     }
 
     /// Whether the driver could take a frame the stack stages now.
@@ -449,7 +580,41 @@ impl<'b, R: Control<'b>, C: Clock> Station<R, C> {
 
     /// Drop the network. The disassociation goes out on the polls that follow.
     pub fn disconnect(&mut self) -> bool {
+        self.due_now();
         self.radio.disconnect()
+    }
+
+    /// Start a join of the network named `ssid` with `credential` and return at once; the polls that
+    /// follow carry it, and the [`Journal`] records how each attempt ends. Returns whether the driver
+    /// took the request.
+    pub fn start_join(&mut self, ssid: &'b [u8], credential: Credential<'b>) -> bool {
+        self.due_now();
+        self.radio.join(ssid, credential)
+    }
+
+    /// Start a scan that looks for the network named `ssid`, and return at once; when the scan ends,
+    /// the [`Journal`]'s sighting holds what it saw of that network. Returns whether the driver took
+    /// the request.
+    pub fn start_scan(&mut self, ssid: &[u8]) -> bool {
+        let len = ssid.len().min(SSID_MAX);
+        self.target[..len].copy_from_slice(&ssid[..len]);
+        self.journal.sighting = None;
+        self.due_now();
+        let accepted = self.radio.scan();
+        self.target_len = if accepted { len } else { 0 };
+        accepted
+    }
+
+    /// Ask the firmware for its features and return at once; the [`Journal`] records the answer.
+    /// Returns whether the driver took the request.
+    pub fn start_capabilities(&mut self) -> bool {
+        self.due_now();
+        self.radio.capabilities()
+    }
+
+    /// Poll the driver at the next chance: a request just made has work for it.
+    fn due_now(&mut self) {
+        self.next_poll = self.clock.now_us();
     }
 }
 

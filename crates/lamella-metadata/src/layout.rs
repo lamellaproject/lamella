@@ -58,13 +58,19 @@ pub enum LayoutError {
     NotAFieldType(SigType),
     /// A nested value-type field's token could not be resolved to its layout.
     UnresolvedValueType(Token),
+    /// A field's type is an instantiation of a value type (`int?`, `KeyValuePair<int, string>`)
+    /// that the resolver could not lay out.
+    ///
+    /// Such a field's size and trace map are its definition's fields with the type arguments
+    /// substituted, which takes the definition's assembly and a substitution this crate does not
+    /// perform; the resolver passed to [`layout_value_type`] answers it, or this is the refusal.
+    UnresolvedInstantiation(SigType),
     /// A field's type still mentions a type parameter, so it has no layout yet.
     ///
-    /// **A REFUSAL, NOT A GAP.** `T` has no size until an instantiation supplies one, and
-    /// `Box<int>` has none until the definition is resolved -- so there is no correct number to
-    /// return and any guess would be a size the collector later walks. Under bake-time lowering
-    /// nothing generic should reach layout at all: the baker substitutes first. Reaching this means
-    /// the lowering did not run, and saying so loudly is the whole point.
+    /// **A REFUSAL, NOT A GAP.** `T` has no size until an instantiation supplies one, so there is
+    /// no correct number to return and any guess would be a size the collector later walks. Under
+    /// bake-time lowering nothing generic should reach layout at all: the baker substitutes first.
+    /// Reaching this means the lowering did not run, and saying so loudly is the whole point.
     GenericNotInstantiated(SigType),
 }
 
@@ -74,13 +80,18 @@ const fn align_up(offset: u32, align: u32) -> u32 {
 }
 
 /// Lays out a value type whose fields have the given signature types, in declaration
-/// order. `resolve` supplies the layout of a nested value type by its `ValueType`
-/// token (so the caller drives recursion with its assembly/model); it is only called
-/// for a `ValueType` field.
+/// order.
+///
+/// `resolve` supplies the layout of a nested value type, so the caller drives recursion with
+/// its own assembly or model. It is called with the field's signature, which is one of two
+/// shapes: a `ValueType` token, or a `GenericInst` whose definition is a `ValueType` (an
+/// instantiation such as `int?`). An instantiation whose definition is a `Class` is a managed
+/// reference whatever its arguments are, so it takes a pointer and one reference offset and is
+/// never passed to `resolve`.
 pub fn layout_value_type(
     fields: &[SigType],
     target: &TargetLayout,
-    resolve: &impl Fn(Token) -> Option<TypeLayout>,
+    resolve: &impl Fn(&SigType) -> Option<TypeLayout>,
 ) -> Result<TypeLayout, LayoutError> {
     let mut offset = 0u32;
     let mut alignment = 1u32;
@@ -113,7 +124,7 @@ pub fn layout_value_type(
 fn field_shape(
     field: &SigType,
     target: &TargetLayout,
-    resolve: &impl Fn(Token) -> Option<TypeLayout>,
+    resolve: &impl Fn(&SigType) -> Option<TypeLayout>,
 ) -> Result<(u32, u32, Vec<u32>), LayoutError> {
     let primitive = |size: u32| Ok((size, size, Vec::new()));
     let pointer = |is_reference: bool| {
@@ -136,7 +147,22 @@ fn field_shape(
         | SigType::SzArray(_)
         | SigType::Array { .. } => pointer(true),
         SigType::ValueType(token) => {
-            let nested = resolve(*token).ok_or(LayoutError::UnresolvedValueType(*token))?;
+            let nested = resolve(field).ok_or(LayoutError::UnresolvedValueType(*token))?;
+            Ok((nested.size, nested.alignment, nested.reference_offsets))
+        }
+        // An instantiation of a class (`List<int>`, `IEqualityComparer<TKey>`, `Func<T>`) is a
+        // managed reference whatever its arguments are, open ones included: one pointer, one
+        // reference offset, and no lookup.
+        SigType::GenericInst { definition, .. } if matches!(**definition, SigType::Class(_)) => {
+            pointer(true)
+        }
+        // An instantiation of a value type composes like a nested value type, from the layout
+        // the resolver substitutes for it.
+        SigType::GenericInst { definition, .. }
+            if matches!(**definition, SigType::ValueType(_)) =>
+        {
+            let nested = resolve(field)
+                .ok_or_else(|| LayoutError::UnresolvedInstantiation(field.clone()))?;
             Ok((nested.size, nested.alignment, nested.reference_offsets))
         }
         SigType::Var(_) | SigType::MVar(_) | SigType::GenericInst { .. } => {
@@ -226,7 +252,8 @@ mod tests {
             reference_offsets: alloc::vec![0],
         };
         let nested_token = Token::new(crate::tables::table::TYPE_DEF, 2);
-        let resolve = |token: Token| (token == nested_token).then(|| inner.clone());
+        let resolve =
+            |field: &SigType| (*field == SigType::ValueType(nested_token)).then(|| inner.clone());
         let layout = layout_value_type(
             &[SigType::I4, SigType::ValueType(nested_token)],
             &TargetLayout::ilp32(),
@@ -247,6 +274,76 @@ mod tests {
             &|_| None,
         );
         assert_eq!(result, Err(LayoutError::UnresolvedValueType(token)));
+    }
+
+    fn instantiation(definition: SigType, arguments: alloc::vec::Vec<SigType>) -> SigType {
+        SigType::GenericInst {
+            definition: alloc::boxed::Box::new(definition),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn a_class_instantiation_is_one_traced_pointer_without_a_lookup() {
+        let list = Token::new(crate::tables::table::TYPE_REF, 4);
+        let readings = instantiation(SigType::Class(list), alloc::vec![SigType::I4]);
+        let layout = layout_value_type(&[SigType::I4, readings], &TargetLayout::ilp32(), &|_| {
+            panic!("a class instantiation needs no resolver")
+        })
+        .unwrap();
+        assert_eq!(layout.field_offsets, [0, 4]);
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.reference_offsets, [4]);
+    }
+
+    #[test]
+    fn an_open_class_instantiation_is_a_reference_too() {
+        let cell = Token::new(crate::tables::table::TYPE_DEF, 3);
+        let field = instantiation(SigType::Class(cell), alloc::vec![SigType::Var(0)]);
+        let layout = layout_value_type(&[field], &TargetLayout::ilp32(), &|_| None).unwrap();
+        assert_eq!(layout.reference_offsets, [0]);
+        assert_eq!(layout.size, 4);
+    }
+
+    #[test]
+    fn a_value_type_instantiation_composes_the_layout_the_resolver_substitutes() {
+        let nullable = Token::new(crate::tables::table::TYPE_REF, 7);
+        let limit = instantiation(SigType::ValueType(nullable), alloc::vec![SigType::I4]);
+        let wanted = limit.clone();
+        let resolve = |field: &SigType| {
+            (*field == wanted).then(|| TypeLayout {
+                size: 8,
+                alignment: 4,
+                field_offsets: alloc::vec![0, 4],
+                reference_offsets: alloc::vec![],
+            })
+        };
+        let layout =
+            layout_value_type(&[SigType::U1, limit], &TargetLayout::ilp32(), &resolve).unwrap();
+        assert_eq!(layout.field_offsets, [0, 4]);
+        assert_eq!(layout.size, 12);
+        assert!(layout.reference_offsets.is_empty());
+    }
+
+    #[test]
+    fn a_value_type_instantiation_the_resolver_cannot_lay_out_is_named() {
+        let pair = Token::new(crate::tables::table::TYPE_DEF, 5);
+        let field = instantiation(SigType::ValueType(pair), alloc::vec![SigType::String]);
+        let result = layout_value_type(
+            core::slice::from_ref(&field),
+            &TargetLayout::ilp32(),
+            &|_| None,
+        );
+        assert_eq!(result, Err(LayoutError::UnresolvedInstantiation(field)));
+    }
+
+    #[test]
+    fn a_type_parameter_still_has_no_layout() {
+        let result = layout_value_type(&[SigType::Var(0)], &TargetLayout::ilp32(), &|_| None);
+        assert_eq!(
+            result,
+            Err(LayoutError::GenericNotInstantiated(SigType::Var(0)))
+        );
     }
 
     #[test]

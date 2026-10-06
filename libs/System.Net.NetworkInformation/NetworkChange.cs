@@ -56,6 +56,8 @@ namespace System.Net.NetworkInformation
         {
             bool lastAvail = NetworkInterface.GetIsNetworkAvailable();
             string lastSig = AddressSignature();
+            int lastAvailChanges = NetworkInterface.Changes(0);
+            int lastAddrChanges = NetworkInterface.Changes(1);
             while (true)
             {
                 bool reBaseline = false;
@@ -71,23 +73,61 @@ namespace System.Net.NetworkInformation
                 {
                     lastAvail = NetworkInterface.GetIsNetworkAvailable();
                     lastSig = AddressSignature();
+                    lastAvailChanges = NetworkInterface.Changes(0);
+                    lastAddrChanges = NetworkInterface.Changes(1);
                 }
 
                 Thread.Sleep(PollIntervalMs);
 
                 bool avail = NetworkInterface.GetIsNetworkAvailable();
-                if (avail != lastAvail)
+                int availChanges = NetworkInterface.Changes(0);
+                if (availChanges >= 0 && lastAvailChanges >= 0)
+                {
+                    int flips = availChanges - lastAvailChanges;
+                    lastAvailChanges = availChanges;
+                    lastAvail = avail;
+                    RaiseFlips(flips, avail);
+                }
+                else if (avail != lastAvail)
                 {
                     lastAvail = avail;
                     RaiseAvailability(avail);
                 }
 
                 string sig = AddressSignature();
-                if (sig != lastSig)
+                int addrChanges = NetworkInterface.Changes(1);
+                if (addrChanges >= 0 && lastAddrChanges >= 0)
+                {
+                    bool changed = addrChanges != lastAddrChanges;
+                    lastAddrChanges = addrChanges;
+                    lastSig = sig;
+                    if (changed)
+                    {
+                        RaiseAddress();
+                    }
+                }
+                else if (sig != lastSig)
                 {
                     lastSig = sig;
                     RaiseAddress();
                 }
+            }
+        }
+
+        private static void RaiseFlips(int flips, bool now)
+        {
+            if (flips <= 0)
+            {
+                return;
+            }
+            if (flips > 3)
+            {
+                flips = flips % 2 == 0 ? 2 : 3;
+            }
+            for (int i = 0; i < flips; i++)
+            {
+                bool value = (flips - 1 - i) % 2 == 0 ? now : !now;
+                RaiseAvailability(value);
             }
         }
 

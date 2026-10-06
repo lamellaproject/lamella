@@ -224,7 +224,7 @@ pub fn now_ms<R: Registers>(regs: &mut R, state: &State) -> u64 {
 
 /// Starts the crystal and waits, boundedly, for it to report stable.
 fn start_crystal<R: Registers>(regs: &mut R) -> bool {
-    regs.write(instances::XOSC_BASE + xosc::STARTUP_OFF, xosc::STARTUP_DELAY_1MS);
+    regs.write(instances::XOSC_BASE + xosc::STARTUP_OFF, xosc::STARTUP_DELAY_RESET);
     regs.write(
         instances::XOSC_BASE + xosc::CTRL_OFF,
         (xosc::CTRL_ENABLE_MAGIC << xosc::CTRL_ENABLE_LSB) | xosc::CTRL_FREQ_RANGE_1_15MHZ,

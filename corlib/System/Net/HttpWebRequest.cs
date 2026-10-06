@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Text;
 #if LAMELLA_SURFACE_NET_TLS
 using System.Net.Security;
+using System.Security.Authentication;
 #endif
 
 namespace System.Net
@@ -142,16 +143,29 @@ namespace System.Net
         private HttpWebResponse Execute(Uri uri, string method, byte[] body, string contentType)
         {
             string scheme = uri.Scheme;
-            IPAddress address = IPAddress.Parse(uri.Host);
-            TcpClient client = new TcpClient();
-            client.Connect(address, uri.Port);
+            TcpClient client = Connect(uri);
             Stream net = client.GetStream();
 
             if (scheme == "https")
             {
 #if LAMELLA_SURFACE_NET_TLS
                 SslStream ssl = new SslStream(net, false, ServicePointManager.ServerCertificateValidationCallback);
-                ssl.AuthenticateAsClient(uri.Host);
+                try
+                {
+                    ssl.AuthenticateAsClient(uri.Host);
+                }
+                catch (AuthenticationException e)
+                {
+                    throw Failed(client, TlsFailed, new AuthenticationException(e.Message));
+                }
+                catch (IOException e)
+                {
+                    throw Failed(client, TlsFailed, new IOException(e.Message));
+                }
+                catch (SocketException e)
+                {
+                    throw Failed(client, TlsFailed, new SocketException(e.Message));
+                }
                 net = ssl;
 #else
                 client.Close();
@@ -161,9 +175,58 @@ namespace System.Net
 #endif
             }
 
-            SendRequest(net, uri, method, body, contentType);
-            HttpConnection conn = new HttpConnection(net, client);
-            return HttpWebResponse.ReadFrom(conn, method, uri);
+            try
+            {
+                SendRequest(net, uri, method, body, contentType);
+                HttpConnection conn = new HttpConnection(net, client);
+                return HttpWebResponse.ReadFrom(conn, method, uri);
+            }
+            catch (IOException e)
+            {
+                throw Failed(client, ExchangeFailed, new IOException(e.Message));
+            }
+            catch (SocketException e)
+            {
+                throw Failed(client, ExchangeFailed, new SocketException(e.Message));
+            }
+        }
+
+        private const string TlsFailed = "The SSL connection could not be established, see inner exception.";
+        private const string ExchangeFailed = "An error occurred while sending the request.";
+
+        private static WebException Failed(TcpClient client, string message, Exception cause)
+        {
+            client.Close();
+            return new WebException(message, cause, WebExceptionStatus.UnknownError, null);
+        }
+
+        private static TcpClient Connect(Uri uri)
+        {
+            IPAddress[] addresses = Dns.TryGetHostAddresses(uri.Host);
+            if (addresses == null)
+            {
+                throw new WebException(
+                    Dns.HostNotFound + " (" + uri.Host + ":" + uri.Port.ToString() + ")",
+                    new SocketException(Dns.HostNotFound), WebExceptionStatus.NameResolutionFailure, null);
+            }
+            string refusal = null;
+            for (int i = 0; i < addresses.Length; i++)
+            {
+                TcpClient client = new TcpClient();
+                try
+                {
+                    client.Connect(addresses[i], uri.Port);
+                    return client;
+                }
+                catch (SocketException e)
+                {
+                    client.Close();
+                    refusal = e.Message;
+                }
+            }
+            throw new WebException(
+                refusal + " (" + uri.Host + ":" + uri.Port.ToString() + ")",
+                new SocketException(refusal), WebExceptionStatus.UnknownError, null);
         }
 
         private static bool IsRedirect(int status)

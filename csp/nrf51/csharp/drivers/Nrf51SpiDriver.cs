@@ -1,9 +1,12 @@
 // A Lamella.Hardware.SpiDriver for the nRF51 SPI master: 8-bit frames, SPI modes 0 to 3, either bit
 // order, and the rates its FREQUENCY register enumerates up to the part's 4 MHz limit, from 125 kHz.
 //
-// The pins arrive routed from a board's generated binding. The master drives no chip select, so a
-// non-negative SpiConnectionSettings.ChipSelectLine names the GPIO, P0.n as n, that this driver
-// asserts across each operation; -1 leaves selecting the device to the caller.
+// The pins arrive routed from a board's generated binding. The master drives no chip select of its
+// own, so the binding lists the bus's chip selects as GPIOs, P0.n as n, and
+// SpiConnectionSettings.ChipSelectLine is an index into that list, as dotnet/iot means it on
+// Linux: line n is entry n, which this driver asserts across each operation, and -1 leaves
+// selecting the device to the caller. SpiDevice refuses any other line, from the list this driver
+// states, before it configures the driver.
 using System.Device.Gpio;
 using System.Device.Spi;
 using Lamella.Boards;
@@ -24,7 +27,7 @@ public sealed class Nrf51SpiDriver : SpiDriver
     private readonly uint _config;
     private readonly Nrf51SpiBinding _binding;
 
-    private int _chipSelectLine;
+    private int _chipSelectPin;
     private bool _chipSelectActiveHigh;
     private int _actualHz;
 
@@ -49,7 +52,7 @@ public sealed class Nrf51SpiDriver : SpiDriver
         _txd = spi + Nrf51SpiLayout.TXD_OFF;
         _frequency = spi + Nrf51SpiLayout.FREQUENCY_OFF;
         _config = spi + Nrf51SpiLayout.CONFIG_OFF;
-        _chipSelectLine = -1;
+        _chipSelectPin = -1;
     }
 
     /// <summary>Brings the master up for <paramref name="settings"/>, with the pins configured as
@@ -57,18 +60,24 @@ public sealed class Nrf51SpiDriver : SpiDriver
     /// <remarks>The clock is the fastest rate the register enumerates at or below the request, and
     /// never above 4 MHz; <see cref="ActualClockFrequency"/> reports it.</remarks>
     /// <exception cref="System.ArgumentException">The frames are not 8 bits, the clock is below
-    /// 125 kHz, or the chip select line is past the part's one GPIO port.</exception>
+    /// 125 kHz, or the binding names a chip select past the part's one GPIO port.</exception>
     public override void Configure(SpiConnectionSettings settings)
     {
         if (settings.DataBitLength != 8)
         {
             Refuse("this SPI master's frames are 8 bits");
         }
-        // This part has one GPIO port of 32 pins; whether a pin is bonded out is the board's to know.
         int line = settings.ChipSelectLine;
-        if (line >= 32)
+        int pin = -1;
+        if (line >= 0)
         {
-            Refuse("the chip select line is past this part's one GPIO port");
+            // This part has one GPIO port of 32 pins; whether a pin is bonded out is the board's to
+            // know.
+            pin = _binding.ChipSelectPins[line];
+            if ((uint)pin >= 32u)
+            {
+                Refuse("the binding's chip select is past this part's one GPIO port");
+            }
         }
         uint frequency = FrequencyWord(settings.ClockFrequency);
 
@@ -111,13 +120,13 @@ public sealed class Nrf51SpiDriver : SpiDriver
         Mmio.Write32(_intenclr, Nrf51SpiLayout.INTENCLR_READY);
         Mmio.Write32(_eventsReady, 0);
 
-        _chipSelectLine = line;
+        _chipSelectPin = pin;
         _chipSelectActiveHigh = settings.ChipSelectLineActiveState == PinValue.High;
-        if (line >= 0)
+        if (pin >= 0)
         {
             // The select idles deasserted, and the level is written before the pin becomes an output.
             SetChipSelect(false);
-            Mmio.Write32(PinCnfAddress(line), Nrf51SpiLayout.PIN_CNF_SPI_OUTPUT);
+            Mmio.Write32(PinCnfAddress(pin), Nrf51SpiLayout.PIN_CNF_SPI_OUTPUT);
         }
         Mmio.Write32(_enable, Nrf51SpiLayout.ENABLE_SPI);
     }
@@ -148,13 +157,20 @@ public sealed class Nrf51SpiDriver : SpiDriver
         return Ok;
     }
 
-    /// <summary>Drives the chip select GPIO named by the settings; does nothing when none was
-    /// named.</summary>
+    /// <summary>Drives the chip select GPIO the settings' line selects; does nothing when the line
+    /// is -1.</summary>
     public override void SetChipSelect(bool asserted)
     {
-        if (_chipSelectLine < 0) return;
-        DrivePin((uint)_chipSelectLine, asserted == _chipSelectActiveHigh);
+        if (_chipSelectPin < 0) return;
+        DrivePin((uint)_chipSelectPin, asserted == _chipSelectActiveHigh);
     }
+
+    /// <summary>The number of chip selects the binding names for this bus.</summary>
+    public override int ChipSelectCount { get { return _binding.ChipSelectPins.Length; } }
+
+    /// <summary>The GPIO chip-select line <paramref name="line"/> drives: the binding's table entry,
+    /// P0.n as n.</summary>
+    public override int GetChipSelectPin(int line) { return _binding.ChipSelectPins[line]; }
 
     /// <summary>The bit rate the master runs at: the fastest enumerated rate at or below the
     /// request.</summary>

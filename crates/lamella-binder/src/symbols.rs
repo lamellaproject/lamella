@@ -462,26 +462,63 @@ impl MethodSymbol {
     /// **THE ARITY RULE, STATED ONCE** -- every site that asks whether a call has the right number
     /// of arguments asks it here, so a new admissible shape is added in one place.
     ///
-    /// Three admissible shapes, in the order 12.6.4.2 considers them:
-    ///
-    /// * exactly as many arguments as parameters;
-    /// * fewer, with every parameter left over carrying a default;
-    /// * a `params` tail absorbing any count from the fixed arity up (and it absorbs zero, which
-    ///   is why the comparison is against `len() - 1`).
+    /// The two forms 12.6.4.2 considers, each answered by its own function below: the NORMAL form
+    /// ([`MethodSymbol::accepts_normal_count`]) and, for a `params` method, the EXPANDED form
+    /// ([`MethodSymbol::accepts_expanded_count`]).
     ///
     /// This answers COUNT alone. Whether the argument types convert is a separate question with a
     /// separate diagnostic (`CS1503`), and answering it here would put a wrong code on a real
     /// error.
     #[must_use]
     pub fn accepts_argument_count(&self, argc: usize) -> bool {
+        self.accepts_normal_count(argc) || self.accepts_expanded_count(argc)
+    }
+
+    /// Whether `argc` positional arguments fit this method in its NORMAL form: one per parameter,
+    /// or fewer with every parameter left over optional.
+    ///
+    /// **A `params` ARRAY IS NOT OPTIONAL.** It is a parameter like any other in this form and
+    /// cannot have a default (CS1751), so a `params` method's normal form takes an argument for
+    /// every parameter, the array last. A call that gives the array nothing is in EXPANDED form.
+    #[must_use]
+    pub fn accepts_normal_count(&self, argc: usize) -> bool {
         let declared = self.parameters.len();
-        if argc == declared {
-            return true;
-        }
-        if argc < declared && argc >= self.required_parameter_count() {
-            return true;
-        }
-        self.is_params && declared > 0 && argc + 1 >= declared
+        argc == declared
+            || (!self.is_params && argc < declared && argc >= self.required_parameter_count())
+    }
+
+    /// Whether `argc` positional arguments fit this `params` method in its EXPANDED form: each
+    /// fixed parameter takes an argument or is optional, and the array takes the rest -- any
+    /// number, zero included.
+    ///
+    /// **OPTIONAL FIXED PARAMETERS MAY BE LEFT OUT, BUT ONLY WHEN THE ARRAY TAKES NOTHING**, since
+    /// arguments are positional: `S(1)` against `S(int a, int b = 10, params int[] r)` is `a = 1`,
+    /// `b = 10` and an empty array, which is csc's reading and returns 11. The words of 12.6.4.2
+    /// (*"if A has fewer arguments than the number of fixed parameters ... the expanded form ...
+    /// cannot be constructed"*) predate optional parameters; csc fills them, and so does this.
+    #[must_use]
+    pub fn accepts_expanded_count(&self, argc: usize) -> bool {
+        let Some(fixed) = self.parameters.len().checked_sub(1) else {
+            return false;
+        };
+        self.is_params && argc >= self.required_parameter_count().min(fixed)
+    }
+
+    /// The parameters a call supplying `supplied` positional arguments leaves to their defaults,
+    /// in order: every parameter past the last argument that has one, with that default.
+    ///
+    /// **THE DEFAULTS ARE FILLED FROM HERE AT EVERY POSITION A CALL CAN STAND** -- a method call, a
+    /// `new`, a constructor chain and an indexer -- because the rule is one rule. A `params` array
+    /// is never among them: it has no default, and a call that gives it no argument passes an
+    /// empty array, which `bind_params_arguments` builds.
+    #[must_use]
+    pub fn omitted_defaults(&self, supplied: usize) -> Vec<(TypeSymbol, Literal)> {
+        (supplied..self.parameters.len())
+            .filter_map(|index| {
+                let default = self.parameter_default(index)?.clone();
+                Some((self.parameters[index].clone(), default))
+            })
+            .collect()
     }
 
     /// This generic method DEFINITION closed over `arguments`: the same method with every mention

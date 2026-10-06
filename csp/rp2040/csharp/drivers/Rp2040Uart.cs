@@ -45,7 +45,7 @@ public sealed class Rp2040Uart
     /// then LCR_H -- the latching order).</summary>
     public void Init(int baud)
     {
-        Mmio.Write32(_xoscStartup, Rp2040XoscLayout.STARTUP_DELAY_1MS);
+        Mmio.Write32(_xoscStartup, Rp2040XoscLayout.STARTUP_DELAY_RESET);
         Mmio.Write32(_xoscCtrl,
             (Rp2040XoscLayout.CTRL_ENABLE_MAGIC << (int)Rp2040XoscLayout.CTRL_ENABLE_LSB)
             | Rp2040XoscLayout.CTRL_FREQ_RANGE_1_15MHZ);

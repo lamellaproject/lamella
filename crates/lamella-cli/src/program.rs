@@ -67,18 +67,22 @@ With neither option it runs on this machine, which needs no hardware and is the 
 find out whether a program compiles and does what you meant.
 
 A .csproj compiles every .cs beside it as one program, as `lamella build` compiles it. This
-machine and firmware on a board both run a program against the class library alone, so a project
-that references libraries of its own is built with `lamella build --board <id> --format <f>`,
-which links them.
+machine runs a program against the class library alone, so here a project that references
+libraries of its own is refused; with --target the board is sent them, and
+`lamella build --board <id> --format <f>` links them.
 
 --target <t> runs a C# program -- a .cs or a .csproj -- ON a board that already has firmware, with
-the output still appearing here. `lamella devices` prints the word to pass. The program is baked
-with the corlib it was compiled against, so it may call into System.* as it does here; a call into
-another library is refused by name. A cycle is about a second, and the board keeps its firmware. A Python program and a JavaScript program run on this
-machine.
+the output still appearing here. `lamella devices` prints the word to pass. The program is
+deployed as `lamella deploy` deploys it, so the board stores it and runs it again at every reset,
+and it then runs under the board's scheduler: threads, locks and blocking calls such as a socket's
+work as they do here. A board that already stores exactly this program is sent nothing; over a
+Pico 2 W's own USB a 326 KB program is written in about 2 seconds. The program is baked with the
+corlib and the libraries it was compiled against -- the class library's own, System.Device.Gpio
+among them, and the ones a project's <Reference> elements name -- keeping only what Main reaches.
+A Python program and a JavaScript program run on this machine.
 
 Two questions this verb does not answer: whether a program FITS a board is `build --board <id>`,
-and putting it on one is `deploy`.";
+and putting it on a board while returning you to your shell is `deploy`.";
 
 /// `lamella run <file> [--board <id>]`: compile and run on this machine.
 pub fn run_command(args: &[String]) -> ExitCode {
@@ -299,23 +303,12 @@ fn project_outcome(path: &Path) -> Result<Result<Outcome, ReplError>, String> {
         }))
 }
 
-/// The C# project at `path`, read as a program that runs against the class library alone, or why
-/// it is not one.
-///
-/// **ONE RULE FOR EVERY ROUTE THAT RUNS A PROJECT WITHOUT LINKING IT** -- this machine, and firmware
-/// already on a board. A class library has no entry point, and a project that names libraries of
-/// its own would run with none of their code, so both are refused. Only the words differ: `runs`
-/// says where the program would run, and `linked_build` is the command that builds it with its
-/// libraries linked.
+/// The C# project at `path`, read as a program, or why it is not one: a class library has no entry
+/// point. Firmware on a board takes it as it is, the libraries it references included.
 ///
 /// # Errors
-/// A project that cannot be read, a class library, or a project naming libraries of its own.
-pub(crate) fn program_project(
-    path: &Path,
-    verb: &str,
-    runs: &str,
-    linked_build: &str,
-) -> Result<crate::project::Project, String> {
+/// A project that cannot be read, or a class library.
+pub(crate) fn runnable_project(path: &Path, verb: &str) -> Result<crate::project::Project, String> {
     let project = crate::project::Project::read_file(path, verb)?;
     if project.output_type == crate::project::OutputType::Library {
         return Err(format!(
@@ -326,6 +319,25 @@ pub(crate) fn program_project(
             path.display()
         ));
     }
+    Ok(project)
+}
+
+/// The C# project at `path`, read as a program that runs against the class library alone, or why
+/// it is not one -- the rule for THIS machine, whose run loads the corlib and nothing else.
+///
+/// A class library has no entry point, and a project that names libraries of its own would run with
+/// none of their code, so both are refused. `runs` says where the program would run, and
+/// `linked_build` is a command that builds it with its libraries.
+///
+/// # Errors
+/// A project that cannot be read, a class library, or a project naming libraries of its own.
+pub(crate) fn program_project(
+    path: &Path,
+    verb: &str,
+    runs: &str,
+    linked_build: &str,
+) -> Result<crate::project::Project, String> {
+    let project = runnable_project(path, verb)?;
     if !project.references.is_empty() {
         let named: Vec<String> = project
             .references
@@ -703,8 +715,9 @@ touch hardware. The formats:
 {formats}
 
 Without --format it builds the ordinary artifact -- an assembly, a baked image, or a Python bundle
--- and with --board it also answers whether that fits. A baked image carries the corlib the program
-was compiled against, so the program may call into System.* on the board as it does here.
+-- and with --board it also answers whether that fits. A baked image carries the corlib and the
+libraries the program was compiled against, keeping only what Main reaches, so the program may
+call into System.* and System.Device.Gpio on the board.
 
 A .csproj builds every .cs beside it as ONE program and links the assemblies its <Reference>
 elements name, each by a <HintPath>. It goes with --format, which is the build that links.
@@ -953,13 +966,11 @@ struct Built {
 /// assembly is as far as this verb goes. See the crate documentation for why that feature is not
 /// on by default.
 fn build_csharp(path: &Path, source: &str, unsafe_code: bool) -> Result<Built, String> {
-    let (assembly, corlib) =
-        compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], "build")?;
-    #[cfg(not(feature = "bake"))]
-    let _ = corlib;
     #[cfg(feature = "bake")]
     {
-        let image = crate::bake::bake(assembly, &corlib)?;
+        let (assembly, references) =
+            compile_csharp_assembly_with_references(path, source, unsafe_code, &[], "build")?;
+        let image = crate::bake::bake(assembly, &references)?;
         return Ok(Built {
             bytes: image,
             extension: "lmli",
@@ -970,6 +981,9 @@ fn build_csharp(path: &Path, source: &str, unsafe_code: bool) -> Result<Built, S
             loaded_into_firmware: true,
         });
     }
+    #[cfg(not(feature = "bake"))]
+    let (assembly, _) =
+        compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], "build")?;
     #[cfg(not(feature = "bake"))]
     Ok(Built {
         bytes: assembly,
@@ -1015,6 +1029,33 @@ pub fn compile_csharp_assembly_with_corlib(
         .map(|compiled| (compiled.assembly, compiled.corlib))
 }
 
+/// As [`compile_csharp_assembly_with_corlib`], handing back the WHOLE set the program was bound
+/// against rather than its corlib alone -- the corlib first, then in the order the compiler searched
+/// them. A baked image takes the program's libraries from this set, for the reason it takes the
+/// corlib from it: a second lookup can answer differently from the one the compile made.
+///
+/// # Errors
+/// As [`compile_csharp_assembly_with_corlib`].
+#[cfg_attr(not(feature = "bake"), allow(dead_code))]
+pub fn compile_csharp_assembly_with_references(
+    path: &Path,
+    source: &str,
+    unsafe_code: bool,
+    libraries: &[crate::flash::Library],
+    verb: &str,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
+    compile_csharp_file(path, source, unsafe_code, libraries, verb, false)
+        .map(|compiled| (compiled.assembly, compiled.references))
+}
+
+/// The set a compile with `compiler`'s discovered references and `libraries` was bound against, in
+/// the order it searched them: the discovered set, corlib first, then the declared libraries.
+fn bound_against(compiler: &LcscCompiler, libraries: &[crate::flash::Library]) -> Vec<Vec<u8>> {
+    let mut bound: Vec<Vec<u8>> = compiler.references().to_vec();
+    bound.extend(libraries.iter().map(|library| library.bytes().to_vec()));
+    bound
+}
+
 /// As [`compile_csharp_assembly_with_corlib`], compiled for a debugger: the program, the corlib it
 /// was bound against, and the Portable PDB that maps its IL back to its source.
 ///
@@ -1045,21 +1086,76 @@ pub struct Debuggable {
     /// The standalone Portable PDB: each method's sequence points and local names, and each
     /// source by its absolute path.
     pub pdb: Vec<u8>,
+    /// The libraries the class-library tier links beside the corlib ([`link_libraries`]): the rest
+    /// of the set the program was bound against. The tier carries the ones the program references.
+    pub libraries: Vec<Vec<u8>>,
 }
 
-/// What one compilation produced: the assembly, its corlib, and the PDB when one was asked for.
+/// The name ECMA-335 gives the kernel library, which the compiler scopes its well-known types to.
+/// A reference by this name is a reference to the corlib, whatever the corlib calls itself.
+const KERNEL_LIBRARY: &str = "mscorlib";
+
+/// Whether an assembly reference by `name` means the corlib: the kernel library's name, or the
+/// corlib's own.
+///
+/// **ONE ANSWER FOR BOTH TIERS THAT CARRY LIBRARIES**: the bake's set and the class-library link's
+/// are cut from the same reference set by it.
+pub(crate) fn names_the_corlib(name: &str, corlib: &lamella_metadata::Assembly) -> bool {
+    name == KERNEL_LIBRARY || corlib.assembly_name() == Some(name)
+}
+
+/// The libraries a class-library image may link beside `corlib`: every assembly of `references`, the
+/// set the program was bound against, that parses and is not named as the corlib -- in the order the
+/// compiler searched them, which is first-declarer-wins.
+///
+/// **THE WHOLE SET, AND THE TIER TAKES WHAT THE PROGRAM REFERENCES**, as the bake does. A project
+/// names a board's assembly; the board's assembly names `Lamella.Hardware`; handed only the project's
+/// own references, the link met that library's types as nothing and refused the board's type
+/// initializer.
+pub(crate) fn link_libraries(references: &[Vec<u8>], corlib: &[u8]) -> Vec<Vec<u8>> {
+    let Ok(corlib) = lamella_metadata::Assembly::read(corlib) else {
+        return Vec::new();
+    };
+    references
+        .iter()
+        .filter(|bytes| {
+            lamella_metadata::Assembly::read(bytes).is_ok_and(|library| {
+                !library
+                    .assembly_name()
+                    .is_some_and(|name| names_the_corlib(name, &corlib))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// What one compilation produced: the assembly, its corlib, the whole reference set it was bound
+/// against, and the PDB when one was asked for.
 struct Compiled {
     assembly: Vec<u8>,
     corlib: Vec<u8>,
+    /// Every assembly the program was bound against, in the order the compiler searched them: the
+    /// discovered set, corlib first, then the libraries a project names.
+    references: Vec<Vec<u8>>,
     pdb: Option<Vec<u8>>,
 }
 
 impl Compiled {
     /// This compilation as a [`Debuggable`], or a refusal led by `subject` when it carries no PDB.
     fn debuggable(self, subject: impl FnOnce() -> String) -> Result<Debuggable, String> {
-        let Compiled { assembly, corlib, pdb } = self;
+        let Compiled {
+            assembly,
+            corlib,
+            references,
+            pdb,
+        } = self;
         match pdb {
-            Some(pdb) => Ok(Debuggable { assembly, corlib, pdb }),
+            Some(pdb) => Ok(Debuggable {
+                libraries: link_libraries(&references, &corlib),
+                assembly,
+                corlib,
+                pdb,
+            }),
             None => Err(format!(
                 "{}: the compiler was asked for debug information and wrote none.",
                 subject()
@@ -1161,6 +1257,7 @@ fn compile_csharp_file(
     Ok(Compiled {
         assembly: image,
         corlib,
+        references: bound_against(&compiler, libraries),
         pdb: compiled.pdb,
     })
 }
@@ -1200,6 +1297,21 @@ pub fn compile_project_assembly(
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     compile_project(project, libraries, verb, false)
         .map(|compiled| (compiled.assembly, compiled.corlib))
+}
+
+/// As [`compile_project_assembly`], handing back the whole set the program was bound against, as
+/// [`compile_csharp_assembly_with_references`] does for a file.
+///
+/// # Errors
+/// As [`compile_project_assembly`].
+#[cfg_attr(not(feature = "bake"), allow(dead_code))]
+pub fn compile_project_assembly_with_references(
+    project: &crate::project::Project,
+    libraries: &[crate::flash::Library],
+    verb: &str,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
+    compile_project(project, libraries, verb, false)
+        .map(|compiled| (compiled.assembly, compiled.references))
 }
 
 /// As [`compile_project_assembly`], compiled for a debugger: the program, its corlib, and the
@@ -1293,6 +1405,7 @@ fn compile_project(
     Ok(Compiled {
         assembly: image,
         corlib,
+        references: bound_against(&compiler, libraries),
         pdb: compiled.pdb,
     })
 }
@@ -1308,7 +1421,7 @@ fn render_multi_diagnostics(
     sources: &[(String, String)],
 ) -> String {
     if let Some(emit_error) = &compiled.emit_error {
-        return format!("error: this construct is not yet supported by lcsc: {emit_error}");
+        return format!("error: {}: {emit_error}", emit_error.headline());
     }
     let mut text = String::new();
     for (per_file, (file_text, path)) in compiled.diagnostics.iter().zip(sources) {
@@ -1343,7 +1456,7 @@ fn render_diagnostics(
     source: &str,
 ) -> String {
     if let Some(emit_error) = &compiled.emit_error {
-        return format!("{path}: error: this construct is not yet supported by lcsc: {emit_error}");
+        return format!("{path}: error: {}: {emit_error}", emit_error.headline());
     }
     let mut text = String::new();
     for diagnostic in &compiled.diagnostics {

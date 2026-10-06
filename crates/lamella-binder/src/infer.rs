@@ -28,7 +28,7 @@ pub(crate) fn infer_method_type_arguments(
     if method.type_parameters.is_empty() {
         return None;
     }
-    if arguments.len() != method.parameters.len() {
+    if !method.accepts_normal_count(arguments.len()) {
         return None;
     }
     let names: BTreeSet<&str> = method
@@ -66,13 +66,10 @@ pub(crate) fn infer_expanded_type_arguments(
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
 ) -> Option<Vec<TypeSymbol>> {
-    if method.type_parameters.is_empty() || !method.is_params {
+    if method.type_parameters.is_empty() || !method.accepts_expanded_count(arguments.len()) {
         return None;
     }
     let fixed = method.parameters.len().checked_sub(1)?;
-    if arguments.len() < fixed {
-        return None;
-    }
     let TypeSymbol::Array { element, rank: 1 } = &method.parameters[fixed] else {
         return None;
     };

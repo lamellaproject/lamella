@@ -647,10 +647,8 @@ impl ReplCompiler for LcscCompiler {
         }
         if let Some(emit_error) = compiled.emit_error {
             return Err(CompileFailure::Diagnostics(match self.source_path.as_deref() {
-                Some(path) => format!(
-                    "{path}: error: this construct is not yet supported by lcsc: {emit_error}"
-                ),
-                None => format!("error: this construct is not yet supported by lcsc: {emit_error}"),
+                Some(path) => format!("{path}: error: {}: {emit_error}", emit_error.headline()),
+                None => format!("error: {}: {emit_error}", emit_error.headline()),
             }));
         }
         Err(CompileFailure::Diagnostics(diagnostic_text(

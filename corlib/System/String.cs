@@ -231,6 +231,15 @@ namespace System
         }
         public static bool operator !=(string a, string b) { return !(a == b); }
 
+#if LAMELLA_SURFACE_NETCORE_2_1
+        /// <summary>A read-only span over the string's characters; an empty span for <see langword="null"/>.</summary>
+        public static implicit operator ReadOnlySpan<char>(String value)
+        {
+            if ((object)value == null) return new ReadOnlySpan<char>(new char[0]);
+            return new ReadOnlySpan<char>(value.ToCharArray());
+        }
+#endif
+
 #if LAMELLA_SURFACE_NETFX_2_0
         public static bool IsNullOrEmpty(string value)
         {
@@ -569,6 +578,30 @@ namespace System
                 result = String.Concat(result, TextOf(values[i]));
             }
             return result;
+        }
+
+        public static string Join(string separator, System.Collections.Generic.IEnumerable<string> values)
+        {
+            if ((object)values == null) throw new ArgumentNullException("values");
+            if ((object)separator == null) separator = "";
+            System.Collections.Generic.IEnumerator<string> e = values.GetEnumerator();
+            try
+            {
+                string result = "";
+                bool first = true;
+                while (e.MoveNext())
+                {
+                    if (!first) result = String.Concat(result, separator);
+                    string item = e.Current;
+                    if ((object)item != null) result = String.Concat(result, item);
+                    first = false;
+                }
+                return result;
+            }
+            finally
+            {
+                if (e != null) e.Dispose();
+            }
         }
 
         public static string Join<T>(string separator, System.Collections.Generic.IEnumerable<T> values)

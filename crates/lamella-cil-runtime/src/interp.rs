@@ -3,12 +3,12 @@
 #[cfg(feature = "bcl")]
 use crate::intrinsic_registry::intrinsic_id;
 use crate::module::{
-    CastElem, CastPrim, IntrinsicType, MethodId, MethodKind, Module, TypeId, asm_key,
+    CastElem, CastPrim, FieldOffsets, IntrinsicType, MethodId, MethodKind, Module, TypeId,
+    asm_key,
 };
 use crate::object::{Heap, ObjectRef};
 use crate::trap::{Trap, UnhandledException};
 use crate::value::{Location, Value};
-#[cfg(feature = "exceptions")]
 use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
@@ -722,8 +722,15 @@ impl Vm {
         self.now_millis_fn.map(|now| now())
     }
 
-    /// Blocks the OS thread for `millis` milliseconds (a no-op without a clock seam).
-    fn sleep_millis(&self, millis: u64) {
+    /// Blocks the OS thread for `millis` milliseconds (a no-op without a clock seam). A network
+    /// backend whose link needs the processor's time -- a radio it drives by polling -- spends the
+    /// wait servicing it instead ([`crate::net::NetBackend::idle`]).
+    fn sleep_millis(&mut self, millis: u64) {
+        if let Some(backend) = self.net_backend.as_deref_mut() {
+            if backend.idle(millis) {
+                return;
+            }
+        }
         if let Some(sleep) = self.sleep_millis_fn {
             sleep(millis);
         }
@@ -1784,8 +1791,13 @@ struct Frame {
     /// handler caught last. Sized when the frame is set up ([`Frame::prepare_for_handlers`]), so
     /// recording a catch never allocates.
     caught_exceptions: Vec<(usize, ObjectRef)>,
-    /// An in-progress `finally` chain (from a `leave` or an exception unwind).
-    pending: Option<PendingFinally>,
+    /// The in-progress `finally` chains (from a `leave` or an exception unwind), innermost last.
+    ///
+    /// One per `finally` or `fault` handler running, because a running handler can start a chain
+    /// of its own: a `leave` out of a `try` inside it, which a `try`/`finally`, `using`, `lock` or
+    /// `foreach` in a `finally` compiles to. That inner chain runs to its end first, and the
+    /// handler's own `endfinally` then resumes the chain beneath it.
+    pending: Vec<PendingFinally>,
     /// A `filter` expression being evaluated mid-unwind: the exception, the handler to
     /// enter if it accepts, and where to resume the search if it rejects.
     pending_filter: Option<PendingFilter>,
@@ -1871,7 +1883,7 @@ impl FramePool {
         frame.new_object = None;
         frame.new_value = None;
         frame.caught_exceptions.clear();
-        frame.pending = None;
+        frame.pending.clear();
         frame.pending_filter = None;
         frame.multicast = None;
         frame.pending_constraint = None;
@@ -1892,13 +1904,14 @@ impl core::fmt::Debug for FramePool {
 /// Activation frames PARKED on the [`Vm`] for the duration of a nested interpreter run.
 ///
 /// A [`Session`]'s root walk reaches that session's own frames and no others, so a collection
-/// triggered inside a NESTED session -- a reflective `Invoke`, an intrinsic's lazy cctor -- marks
-/// and remaps the nested frames while the caller's frames are left pointing at the objects' old
-/// addresses. The caller's frames sit on the Rust stack for the duration and no walk can reach
-/// them there, so the dispatch site hands them here first and takes them back after: parked frames
-/// are roots like any other, marked and remapped by the same pass.
+/// triggered inside a NESTED session -- a reflective `Invoke`, an intrinsic's lazy cctor, a
+/// pin-change callback -- marks and remaps the nested frames while the caller's frames are left
+/// pointing at the objects' old addresses. The caller's frames sit on the Rust stack for the
+/// duration and no walk can reach them there, so the dispatch site hands them here first and takes
+/// them back after: parked frames are roots like any other, marked and remapped by the same pass.
 ///
-/// A STACK, because nesting nests: an intrinsic's cctor may call an intrinsic of its own.
+/// A STACK, because nesting nests: an intrinsic's cctor may call an intrinsic of its own. The
+/// pin-event drain parks one entry per green thread, since every thread is suspended beneath it.
 ///
 /// The frames are MOVED in and back out rather than borrowed, which is what lets an intrinsic keep
 /// its `&mut Vm` -- the property the `Vm` doc calls out. The pool's shells are still not roots
@@ -2114,10 +2127,13 @@ enum AfterFinally {
     Unwind(ObjectRef),
 }
 
-/// A frame's in-progress `finally` chain: the remaining handler starts to run
-/// (innermost first, via `pop`) and what to do once they are all done.
+/// A frame's in-progress `finally` chain: the handler it is running, the handlers still to run
+/// (innermost first, via `pop`), and what to do once they are all done.
 struct PendingFinally {
-    finallys: Vec<usize>,
+    /// The `finally` or `fault` handler this chain is running. An exception caught outside it
+    /// leaves it for good, which is how [`abandon_finallys_for`] knows the chain is over.
+    running: InstructionRange,
+    finallys: Vec<InstructionRange>,
     then: AfterFinally,
 }
 
@@ -2500,18 +2516,35 @@ pub fn set_wall_clock(module: &Module, vm: &mut Vm, ticks: i64) -> bool {
 /// is exactly the program a pin-change handler is for. The drain has to happen while the program is
 /// RUNNING, which means it happens where the scheduler already decides what runs next.
 ///
+/// # The program's threads stay roots while a callback runs
+///
+/// A callback runs on a nested [`run`], and that run's root walk reaches its own frames, not those of
+/// the `threads` the scheduler is holding meanwhile. So each thread's frames are parked on the [`Vm`]
+/// for the length of the drain ([`ParkedFrames`]), and a collection that a callback triggers marks
+/// and relocates them with everything else, rather than reclaiming what only they reach.
+///
 /// # Errors
 /// Propagates a [`Trap`] from the dispatcher or from a handler it invokes. An exception a callback
 /// does not handle ends the program, which is what it does on .NET; swallowing it here would leave
 /// a program running with a handler that had silently stopped working.
-fn drain_pin_events(module: &Module, vm: &mut Vm) -> Result<(), Trap> {
+fn drain_pin_events(module: &Module, vm: &mut Vm, threads: &mut [ThreadSlot]) -> Result<(), Trap> {
     let Some(source) = vm.pin_events else { return Ok(()) };
     let Some(dispatch) = module.pin_event_dispatch() else { return Ok(()) };
     if vm.pin_events_draining {
         return Ok(());
     }
     vm.pin_events_draining = true;
+    #[cfg(feature = "gc")]
+    for slot in threads.iter_mut() {
+        vm.park_frames(core::mem::take(&mut slot.session.frames));
+    }
+    #[cfg(not(feature = "gc"))]
+    let _ = &threads;
     let outcome = dispatch_queued(module, vm, source, dispatch);
+    #[cfg(feature = "gc")]
+    for slot in threads.iter_mut().rev() {
+        slot.session.frames = vm.unpark_frames();
+    }
     vm.pin_events_draining = false;
     outcome
 }
@@ -2754,7 +2787,7 @@ pub fn run_interruptible(
         {
             break;
         }
-        drain_pin_events(module, vm)?;
+        drain_pin_events(module, vm, &mut threads)?;
         let Some(index) = next_ready_thread(&threads, cursor) else {
             if !service(vm) {
                 return Ok(Ran::Interrupted);
@@ -3773,9 +3806,9 @@ impl Session {
                     .last_mut()
                     .ok_or(Trap::StackUnderflow)?
                     .pending
-                    .take();
+                    .pop();
                 match pending {
-                    Some(PendingFinally { finallys, then }) => {
+                    Some(PendingFinally { finallys, then, .. }) => {
                         begin_finallys(frames, module, vm, finallys, then)
                     }
                     None => Err(Trap::Unsupported(Opcode::Endfinally)),
@@ -3791,6 +3824,10 @@ impl Session {
                     Some(filter) if accept => {
                         let method = frames.last().ok_or(Trap::StackUnderflow)?.method;
                         let handlers = method_handlers(module, method)?;
+                        abandon_finallys_for(
+                            frames.last_mut().ok_or(Trap::StackUnderflow)?,
+                            filter.handler,
+                        );
                         let finallys =
                             finallys_inside(&handlers, filter.fault_ip, filter.filter_try);
                         begin_finallys(
@@ -4514,6 +4551,27 @@ fn write_field_at(
     write_location_value(frames, vm, location, container)
 }
 
+/// The trap for a `call`, `callvirt`, `newobj`, `jmp`, `ldftn` or `ldvirtftn` whose token resolves
+/// to no method.
+///
+/// A token the loader marked as reaching a generic instantiation it did not lower raises a
+/// catchable `MissingMethodException` naming the instantiation, with why it was not lowered where
+/// the loader recorded that ([`Module::unlowered_generic_name`]), as .NET raises one for a call it
+/// cannot bind. Any other token traps [`Trap::UnresolvedCall`].
+fn unresolved_call(module: &Module, asm: u8, token: Token) -> Trap {
+    if !module.is_unlowered_generic(asm, token) {
+        return Trap::UnresolvedCall(token);
+    }
+    let message = match module.unlowered_generic_name(asm, token) {
+        Some(message) => String::from(message),
+        None => alloc::format!(
+            "Method not found: the generic instantiation at token 0x{:08X}. Lamella did not lower it.",
+            token.0
+        ),
+    };
+    Trap::Refused(crate::trap::RefusedWith::MissingMethod, Cow::Owned(message))
+}
+
 /// Dispatches a `call` of a bodyless `[DllImport]` method: takes the call's arguments
 /// off the evaluation stack, marshals them per the target's recorded signature shape
 /// (integers ride a 64-bit scalar slot; a managed string becomes a NUL-terminated byte
@@ -4997,7 +5055,12 @@ fn raise_from(
                     *type_token,
                     exception,
                 ) {
+                    let handler = clause.handler_range.start as usize;
                     let finallys = finallys_inside(&handlers, fault_ip, clause.try_range);
+                    abandon_finallys_for(
+                        frames.last_mut().ok_or(Trap::StackUnderflow)?,
+                        handler,
+                    );
                     return begin_finallys(
                         frames,
                         module,
@@ -5044,17 +5107,40 @@ fn begin_finallys(
     frames: &mut Vec<Frame>,
     module: &Module,
     vm: &mut Vm,
-    mut finallys: Vec<usize>,
+    mut finallys: Vec<InstructionRange>,
     then: AfterFinally,
 ) -> Result<Status, Trap> {
     match finallys.pop() {
         Some(next) => {
             let frame = frames.last_mut().ok_or(Trap::StackUnderflow)?;
-            frame.ip = next;
-            frame.pending = Some(PendingFinally { finallys, then });
+            frame.ip = next.start as usize;
+            frame.pending.push(PendingFinally {
+                running: next,
+                finallys,
+                then,
+            });
             Ok(Status::Running)
         }
         None => complete_finally(frames, module, vm, then),
+    }
+}
+
+/// Ends the frame's pending `finally` chains that an exception leaves by being caught at `handler`:
+/// those whose running handler does not hold it.
+///
+/// A handler that throws is not resumed: an exception that escapes a `finally` abandons the rest of
+/// it, and with it the chain that was running it -- a `leave`'s branch, or another exception's
+/// unwind, which the new exception replaces as on .NET. The chains nest as their handlers do, so the
+/// innermost is ended first and the first that holds `handler` holds every one beneath it. One
+/// caught inside the running handler leaves the chain alone, and the handler finishes as written.
+/// A chain the exception leaves by unwinding the frame needs nothing: it ends with the frame.
+fn abandon_finallys_for(frame: &mut Frame, handler: usize) {
+    while frame
+        .pending
+        .last()
+        .is_some_and(|chain| !covers(chain.running, handler))
+    {
+        frame.pending.pop();
     }
 }
 
@@ -5107,7 +5193,7 @@ fn covers(range: InstructionRange, ip: usize) -> bool {
 
 /// The finally handlers a `leave` from `from_ip` to `target` exits: those whose try
 /// covers `from_ip` but not `target`. Ordered so `pop` yields innermost first.
-fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<usize> {
+fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<InstructionRange> {
     finally_handlers(handlers, false, &|clause| {
         covers(clause.try_range, from_ip) && !covers(clause.try_range, target)
     })
@@ -5115,7 +5201,7 @@ fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<
 
 /// The finally handlers in this frame covering `fault_ip` (run as the frame unwinds
 /// when it has no matching catch).
-fn finallys_covering(handlers: &[EhClause], fault_ip: usize) -> Vec<usize> {
+fn finallys_covering(handlers: &[EhClause], fault_ip: usize) -> Vec<InstructionRange> {
     finally_handlers(handlers, true, &|clause| covers(clause.try_range, fault_ip))
 }
 
@@ -5125,7 +5211,7 @@ fn finallys_inside(
     handlers: &[EhClause],
     fault_ip: usize,
     catch_try: InstructionRange,
-) -> Vec<usize> {
+) -> Vec<InstructionRange> {
     finally_handlers(handlers, true, &|clause| {
         covers(clause.try_range, fault_ip)
             && clause.try_range.start >= catch_try.start
@@ -5133,7 +5219,7 @@ fn finallys_inside(
     })
 }
 
-/// The handler starts of the finally clauses -- and, when `include_fault` (an exception
+/// The handler ranges of the finally clauses -- and, when `include_fault` (an exception
 /// unwind, not a `leave`), the fault clauses -- kept by `keep`, ordered outermost-first so
 /// that `pop` runs them innermost-first. A fault handler runs like a finally during unwind
 /// and ends with `endfault` (the same opcode as `endfinally`).
@@ -5144,7 +5230,7 @@ fn finally_handlers(
     handlers: &[EhClause],
     include_fault: bool,
     keep: &dyn Fn(&EhClause) -> bool,
-) -> Vec<usize> {
+) -> Vec<InstructionRange> {
     let mut clauses: Vec<&EhClause> = handlers
         .iter()
         .filter(|clause| {
@@ -5156,7 +5242,7 @@ fn finally_handlers(
     clauses.sort_by_key(|clause| clause.try_range.start);
     clauses
         .into_iter()
-        .map(|clause| clause.handler_range.start as usize)
+        .map(|clause| clause.handler_range)
         .collect()
 }
 
@@ -5346,6 +5432,12 @@ fn step(
             let (a, b) = frame.pop2()?;
             let result = match stack_pointer_arithmetic(opcode, &a, &b)? {
                 Some(pointer) => pointer,
+                None if matches!(a, Value::ByRef(_)) || matches!(b, Value::ByRef(_)) => {
+                    match field_pointer_arithmetic(module, vm, opcode, &a, &b)? {
+                        Some(pointer) => pointer,
+                        None => binary_numeric(opcode, a, b)?,
+                    }
+                }
                 None => binary_numeric(opcode, a, b)?,
             };
             frame.stack.push(result);
@@ -5502,7 +5594,7 @@ fn step(
                 if let Some(target) = module.pinvoke_target(asm, token.0) {
                     return pinvoke_call(frame, vm, target, token);
                 }
-                return Err(Trap::UnresolvedCall(token));
+                return Err(unresolved_call(module, asm, token));
             };
             if let Some(site) = module.vararg_site(asm, token) {
                 let total = site.total_args;
@@ -5556,7 +5648,8 @@ fn step(
             let arg_count = match target_info {
                 Some((_, count)) => count,
                 None => {
-                    let method = static_method.ok_or(Trap::UnresolvedCall(token))?;
+                    let method =
+                        static_method.ok_or_else(|| unresolved_call(module, asm, token))?;
                     module
                         .method_arg_count(method)
                         .ok_or(Trap::NoSuchMethod(method))?
@@ -5577,7 +5670,7 @@ fn step(
                 runtime_type.and_then(|type_id| module.explicit_override(asm, type_id, token));
             let method =
                 resolve_callvirt(module, static_method, sig_key, runtime_type, explicit_override)
-                    .ok_or(Trap::UnresolvedCall(token))?;
+                    .ok_or_else(|| unresolved_call(module, asm, token))?;
             #[cfg(feature = "bcl")]
             if let Some(constraint) = constraint {
                 if is_object_to_string(module, method) {
@@ -5650,7 +5743,7 @@ fn step(
             let token = token_operand(instruction)?;
             let target = module
                 .resolve(asm, token)
-                .ok_or(Trap::UnresolvedCall(token))?;
+                .ok_or_else(|| unresolved_call(module, asm, token))?;
             return Ok(Flow::Jmp(target));
         }
         Opcode::Ldftn => {
@@ -5661,7 +5754,7 @@ fn step(
                 None if module.delegate_invoke(asm, token).is_some() => {
                     frame.stack.push(Value::NativeInt(i64::from(DELEGATE_INVOKE_FPTR)));
                 }
-                None => return Err(Trap::UnresolvedCall(token)),
+                None => return Err(unresolved_call(module, asm, token)),
             }
         }
         Opcode::Ldvirtftn => {
@@ -5684,7 +5777,7 @@ fn step(
                 None if module.delegate_invoke(asm, token).is_some() => {
                     frame.stack.push(Value::NativeInt(i64::from(DELEGATE_INVOKE_FPTR)));
                 }
-                None => return Err(Trap::UnresolvedCall(token)),
+                None => return Err(unresolved_call(module, asm, token)),
             }
         }
 
@@ -5765,7 +5858,7 @@ fn step(
             }
             let ctor = module
                 .resolve(asm, token)
-                .ok_or(Trap::UnresolvedCall(token))?;
+                .ok_or_else(|| unresolved_call(module, asm, token))?;
             if let Some(with_range) = string_pointer_ctor_form(module, ctor) {
                 let mut args = take_args_pooled(frame, vm, if with_range { 3 } else { 1 })?;
                 let (start, length) = if with_range {
@@ -6563,7 +6656,7 @@ impl Frame {
             new_object: None,
             new_value: None,
             caught_exceptions: Vec::new(),
-            pending: None,
+            pending: Vec::new(),
             pending_filter: None,
             multicast: None,
             pending_constraint: None,
@@ -7074,6 +7167,163 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         _ => return Ok(None),
     };
     Ok(Some(Value::ByRef(stepped)))
+}
+
+/// `add` / `sub` on the address of an object's field, which unsafe C# walks to reach the fields
+/// after it: `p[1]` after `fixed (int* p = &o.A)` is the field that starts four bytes past `A`.
+///
+/// An object's fields are typed slots here, not bytes, so the walk is resolved through the byte
+/// layout the loader recorded for the object's type ([`Module::type_field_offsets`]). The result
+/// is the address of the field that starts at the byte the arithmetic reaches, or the end of the
+/// fields, which C# may form without dereferencing (a loop's end pointer). `pointer - pointer`
+/// between two field addresses of one object is their distance in bytes. Any other byte -- inside
+/// a field, on a struct-typed field, outside the object -- is refused by name rather than
+/// addressed whole. The fields walked are a class instance's and a boxed struct's.
+fn field_pointer_arithmetic(
+    module: Option<&Module>,
+    vm: &Vm,
+    opcode: Opcode,
+    a: &Value,
+    b: &Value,
+) -> Result<Option<Value>, Trap> {
+    let add = matches!(opcode, Opcode::Add | Opcode::AddOvfUn);
+    let sub = matches!(opcode, Opcode::Sub | Opcode::SubOvfUn);
+    if !add && !sub {
+        return Ok(None);
+    }
+    if sub {
+        if let (Value::ByRef(la), Value::ByRef(lb)) = (a, b) {
+            if is_field_address(la) && is_field_address(lb) {
+                let module = module.ok_or(Trap::TypeMismatch(opcode))?;
+                let (container_a, at_a) = field_walk_start(module, vm, la)?;
+                let (container_b, at_b) = field_walk_start(module, vm, lb)?;
+                if container_a.object != container_b.object {
+                    return Err(Trap::TypeMismatch(opcode));
+                }
+                return Ok(Some(Value::NativeInt(i64::from(at_a) - i64::from(at_b))));
+            }
+        }
+    }
+    let (location, offset) = match (a, b) {
+        (Value::ByRef(location), other) if is_field_address(location) => (location, other),
+        (other, Value::ByRef(location)) if add && is_field_address(location) => (location, other),
+        _ => return Ok(None),
+    };
+    let Some(delta) = pointer_offset(offset) else {
+        return Ok(None);
+    };
+    let module = module.ok_or(Trap::TypeMismatch(opcode))?;
+    let (container, start) = field_walk_start(module, vm, location)?;
+    let signed = if sub { delta.wrapping_neg() } else { delta };
+    let name = || module.type_full_name(container.owner).unwrap_or("<unknown>");
+    let target = i64::from(start) + signed;
+    let layout = container.layout;
+    let slot = u32::try_from(target)
+        .ok()
+        .and_then(|byte| layout.slot_at(byte))
+        .ok_or_else(|| {
+            Trap::FieldPointerWalk(Cow::Owned(alloc::format!(
+                "pointer arithmetic moved the address of a field of `{}` to byte {target}, where none \
+                 of its fields starts (they span bytes 0 to {}); the interpreter addresses a field \
+                 only whole",
+                name(),
+                layout.end()
+            )))
+        })?;
+    if matches!(container.fields.get(slot), Some(Value::Struct(_))) {
+        return Err(Trap::FieldPointerWalk(Cow::Owned(alloc::format!(
+            "pointer arithmetic moved the address of a field of `{}` to the struct-typed field at \
+             byte {target}; the interpreter cannot reach the fields inside it through that pointer",
+            name()
+        ))));
+    }
+    let slot = slot as u32;
+    Ok(Some(Value::ByRef(match location {
+        Location::Field { object, .. } => Location::Field {
+            object: *object,
+            slot,
+        },
+        Location::Nested { base, .. } => Location::Nested {
+            base: base.clone(),
+            slot,
+        },
+        _ => return Ok(None),
+    })))
+}
+
+/// Whether `location` is the address of a field, the kind [`field_pointer_arithmetic`] walks.
+fn is_field_address(location: &Location) -> bool {
+    matches!(location, Location::Field { .. } | Location::Nested { .. })
+}
+
+/// The storage a field address points into, for [`field_pointer_arithmetic`].
+struct FieldContainer<'v, 'm> {
+    /// The object holding the fields: the instance, or the box.
+    object: ObjectRef,
+    /// The type whose layout numbers them.
+    owner: TypeId,
+    /// That layout.
+    layout: FieldOffsets<'m>,
+    /// The field slots themselves.
+    fields: &'v [Value],
+}
+
+/// The fields a field address points into and the byte its field starts at, or the refusal that
+/// says why that address cannot be walked.
+fn field_walk_start<'v, 'm>(
+    module: &'m Module,
+    vm: &'v Vm,
+    location: &Location,
+) -> Result<(FieldContainer<'v, 'm>, u32), Trap> {
+    let (object, slot) = match location {
+        Location::Field { object, slot } => (*object, *slot),
+        Location::Nested { base, slot } => match base.as_ref() {
+            Location::Boxed { object } => (*object, *slot),
+            _ => {
+                return Err(Trap::FieldPointerWalk(Cow::Borrowed(
+                    "pointer arithmetic on the address of a field of a struct held in a local, an \
+                     argument, a static, an array element or another object's field: the \
+                     interpreter walks the fields of a class instance or a boxed struct only",
+                )));
+            }
+        },
+        _ => return Err(Trap::TypeMismatch(Opcode::Add)),
+    };
+    let (owner, fields) = match vm.heap().get(object) {
+        Some(crate::object::Object::Instance { type_id, fields }) => (*type_id, &fields[..]),
+        Some(crate::object::Object::Boxed {
+            type_token,
+            value: Value::Struct(fields),
+        }) => (
+            module
+                .type_id_by_handle(*type_token)
+                .ok_or(Trap::TypeMismatch(Opcode::Add))?,
+            &fields[..],
+        ),
+        _ => return Err(Trap::TypeMismatch(Opcode::Add)),
+    };
+    let layout = module
+        .type_field_offsets(owner)
+        .filter(|layout| layout.slot_count() == fields.len())
+        .ok_or_else(|| {
+            Trap::FieldPointerWalk(Cow::Owned(alloc::format!(
+                "pointer arithmetic on the address of a field of `{}`: no byte layout of its \
+                 fields is recorded, so they cannot be walked by a pointer",
+                module.type_full_name(owner).unwrap_or("<unknown>")
+            )))
+        })?;
+    let start = layout
+        .offset_of(slot as usize)
+        .ok_or(Trap::TypeMismatch(Opcode::Add))?;
+    Ok((
+        FieldContainer {
+            object,
+            owner,
+            layout,
+            fields,
+        },
+        start,
+    ))
 }
 
 /// Whether a managed pointer is one of the byte-addressed kinds that pointer arithmetic
@@ -8281,14 +8531,15 @@ fn reference_equal(a: Value, b: Value) -> bool {
     }
 }
 
-/// The non-negative length operand of `newarr`, as a `usize`.
+/// The non-negative length operand of `newarr`, as a `usize`. A negative length is an
+/// OverflowException, as ECMA-335 III.4.20 and .NET raise it.
 fn array_length(value: Value) -> Result<usize, Trap> {
     let length = match value {
         Value::Int32(n) => i64::from(n),
         Value::Int64(n) | Value::NativeInt(n) => n,
         _ => return Err(Trap::TypeMismatch(Opcode::Newarr)),
     };
-    usize::try_from(length).map_err(|_| Trap::IndexOutOfRange(length as i32))
+    usize::try_from(length).map_err(|_| Trap::Overflow)
 }
 
 /// The index operand of an array access, kept signed so a negative index reports as
@@ -8362,7 +8613,7 @@ fn visit_frames(frames: &mut [Frame], visit: &mut dyn FnMut(&mut Value)) {
         for (_, exception) in &mut frame.caught_exceptions {
             visit_ref(exception, visit);
         }
-        if let Some(pending) = &mut frame.pending {
+        for pending in &mut frame.pending {
             match &mut pending.then {
                 AfterFinally::Catch { exception, .. } | AfterFinally::Unwind(exception) => {
                     visit_ref(exception, visit);
@@ -9039,6 +9290,124 @@ mod tests {
             ),
             Some(Value::Int32(0))
         );
+    }
+
+    /// A module holding `Pair`, a class whose two `int` fields the loader recorded at bytes 0 and 4,
+    /// and an instance of it holding 5 and 7.
+    fn walkable_pair() -> (Module, Vm, ObjectRef) {
+        let mut module = Module::new();
+        let pair = module.add_type(alloc::vec![Value::Int32(0), Value::Int32(0)]);
+        module.bind_type_full_name(pair, String::from("Pair"));
+        module.set_type_field_offsets(pair, 8, 4, &[0, 4]);
+        let mut vm = Vm::new();
+        let object = vm
+            .heap_mut()
+            .alloc_instance(pair, alloc::vec![Value::Int32(5), Value::Int32(7)]);
+        (module, vm, object)
+    }
+
+    /// The refusal a field-pointer walk raised, or a panic naming what it did instead.
+    fn walk_refusal(result: Result<Option<Value>, Trap>) -> String {
+        match result {
+            Err(Trap::FieldPointerWalk(message)) => message.into_owned(),
+            other => panic!("expected a refused walk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_field_address_walks_to_the_field_that_starts_at_the_byte_it_reaches() {
+        let (module, vm, object) = walkable_pair();
+        let field = |slot| Value::ByRef(Location::Field { object, slot });
+        let walk = |opcode, a: &Value, b: &Value| {
+            field_pointer_arithmetic(Some(&module), &vm, opcode, a, b)
+        };
+        assert_eq!(walk(Opcode::Add, &field(0), &Value::NativeInt(4)), Ok(Some(field(1))));
+        assert_eq!(walk(Opcode::Add, &Value::Int32(4), &field(0)), Ok(Some(field(1))));
+        assert_eq!(walk(Opcode::Sub, &field(1), &Value::Int32(4)), Ok(Some(field(0))));
+        assert_eq!(walk(Opcode::Add, &field(0), &Value::Int32(8)), Ok(Some(field(2))));
+        assert_eq!(walk(Opcode::Sub, &field(1), &field(0)), Ok(Some(Value::NativeInt(4))));
+        assert_eq!(walk(Opcode::Mul, &field(0), &Value::Int32(4)), Ok(None));
+    }
+
+    #[test]
+    fn a_walk_that_lands_inside_a_field_or_outside_the_object_is_refused_by_name() {
+        let (module, vm, object) = walkable_pair();
+        let field = Value::ByRef(Location::Field { object, slot: 0 });
+        for offset in [1, 6, 12, -4] {
+            let message = walk_refusal(field_pointer_arithmetic(
+                Some(&module),
+                &vm,
+                Opcode::Add,
+                &field,
+                &Value::NativeInt(offset),
+            ));
+            assert!(
+                message.contains("`Pair`") && message.contains("where none of its fields starts"),
+                "byte {offset}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_address_without_a_layout_that_numbers_its_slots_is_refused_by_name() {
+        let mut module = Module::new();
+        let unrecorded = module.add_type(alloc::vec![Value::Int32(0)]);
+        module.bind_type_full_name(unrecorded, String::from("Unrecorded"));
+        let grown = module.add_type(alloc::vec![Value::Int32(0), Value::Int32(0)]);
+        module.bind_type_full_name(grown, String::from("Grown"));
+        module.set_type_field_offsets(grown, 4, 4, &[0]);
+        let mut vm = Vm::new();
+        for (type_id, name, fields) in [(unrecorded, "`Unrecorded`", 1), (grown, "`Grown`", 2)] {
+            let object = vm
+                .heap_mut()
+                .alloc_instance(type_id, alloc::vec![Value::Int32(0); fields]);
+            let field = Value::ByRef(Location::Field { object, slot: 0 });
+            let message = walk_refusal(field_pointer_arithmetic(
+                Some(&module),
+                &vm,
+                Opcode::Add,
+                &field,
+                &Value::Int32(4),
+            ));
+            assert!(
+                message.contains(name) && message.contains("no byte layout"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_walk_onto_a_struct_field_or_from_a_struct_held_in_a_local_is_refused_by_name() {
+        let mut module = Module::new();
+        let point = || Value::Struct(alloc::vec![Value::Int32(0), Value::Int32(0)].into_boxed_slice());
+        let holder = module.add_type(alloc::vec![Value::Int32(0), point()]);
+        module.bind_type_full_name(holder, String::from("Holder"));
+        module.set_type_field_offsets(holder, 12, 4, &[0, 4]);
+        let mut vm = Vm::new();
+        let object = vm
+            .heap_mut()
+            .alloc_instance(holder, alloc::vec![Value::Int32(1), point()]);
+        let field = Value::ByRef(Location::Field { object, slot: 0 });
+        let message = walk_refusal(field_pointer_arithmetic(
+            Some(&module),
+            &vm,
+            Opcode::Add,
+            &field,
+            &Value::Int32(4),
+        ));
+        assert!(message.contains("struct-typed field"), "{message}");
+        let in_local = Value::ByRef(Location::Nested {
+            base: alloc::boxed::Box::new(Location::Local { frame: 0, slot: 0 }),
+            slot: 0,
+        });
+        let message = walk_refusal(field_pointer_arithmetic(
+            Some(&module),
+            &vm,
+            Opcode::Add,
+            &in_local,
+            &Value::Int32(4),
+        ));
+        assert!(message.contains("held in a local"), "{message}");
     }
 
     /// A `localloc` buffer pointer at `offset`, for the pointer-arithmetic tests.
@@ -10102,7 +10471,7 @@ mod tests {
     fn an_image_baked_before_the_trigger_tables_is_refused_until_booted() {
         let (mut module, main) = static_readonly_program();
         let image = module.write_baked(Some(main)).expect("bake");
-        let older = crate::module::image_without_trailing_tables(&image, 2);
+        let older = crate::module::image_without_trailing_tables(&image, 3);
         let image: &'static [u8] = Box::leak(older.into_boxed_slice());
         let (baked, entry) = Module::from_baked(image).expect("an older image still reads");
         let entry = entry.expect("the image records its entry point");

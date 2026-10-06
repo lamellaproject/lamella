@@ -33,6 +33,15 @@
 #if LAMELLA_SURFACE_NETCORE_2_0
 [assembly: Lamella.Runtime.SurfaceSymbol("LAMELLA_SURFACE_NETCORE_2_0")]
 #endif
+#if LAMELLA_SURFACE_NETCORE_2_1
+[assembly: Lamella.Runtime.SurfaceSymbol("LAMELLA_SURFACE_NETCORE_2_1")]
+#endif
+#if LAMELLA_SURFACE_NETCORE_3_0
+[assembly: Lamella.Runtime.SurfaceSymbol("LAMELLA_SURFACE_NETCORE_3_0")]
+#endif
+#if LAMELLA_SURFACE_NET_5_0
+[assembly: Lamella.Runtime.SurfaceSymbol("LAMELLA_SURFACE_NET_5_0")]
+#endif
 #if LAMELLA_SURFACE_FLOAT
 [assembly: Lamella.Runtime.SurfaceSymbol("LAMELLA_SURFACE_FLOAT")]
 #endif

@@ -7,12 +7,16 @@ use crate::uart::{PARITY_EVEN, PARITY_ODD};
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[path = "../../../../csp/rp2040/rust/rp2040_xosc_layout.rs"]
+#[allow(dead_code)]
+mod xosc;
+
 /// The crystal oscillator: enable (magic | range), stable flag, startup delay.
 const XOSC_STARTUP: u32 = 0x4002_400C;
 const XOSC_CTRL: u32 = 0x4002_4000;
 const XOSC_STATUS: u32 = 0x4002_4004;
 const XOSC_ENABLE_1_15MHZ: u32 = 0x00FA_BAA0;
-const XOSC_STARTUP_1MS: u32 = 0xC4;
+const XOSC_STARTUP_DELAY: u32 = xosc::STARTUP_DELAY_RESET;
 const XOSC_STABLE: u32 = 1 << 31;
 
 /// clk_peri: OFF at reset, non-glitchless aux mux -- disable, select the crystal, enable.
@@ -96,7 +100,7 @@ pub(crate) fn open_ops(config: &UartConfig) -> Result<Vec<UartOp>, UartConfigErr
     let (ibrd, fbrd) = divisor(config.baudrate).ok_or(UartConfigError::BaudOutOfRange)?;
     let lcr_h = lcr_h(config);
     Ok(vec![
-        UartOp::Write { reg: XOSC_STARTUP, value: XOSC_STARTUP_1MS },
+        UartOp::Write { reg: XOSC_STARTUP, value: XOSC_STARTUP_DELAY },
         UartOp::Write { reg: XOSC_CTRL, value: XOSC_ENABLE_1_15MHZ },
         UartOp::PollEq { reg: XOSC_STATUS, mask: XOSC_STABLE, want: XOSC_STABLE },
         UartOp::Write { reg: CLK_PERI_CTRL, value: 0 },

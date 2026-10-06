@@ -62,6 +62,11 @@ struct Script {
     link: LinkState,
     requests: Vec<&'static str>,
     accept: bool,
+    /// Whether a join and a disconnect move the link as the driver's do: a join to `Joining`, a
+    /// disconnect to `Detached`, and a join refused while a network is held.
+    driver_like: bool,
+    /// Each join's network name, credential kind and secret, as the driver was handed them.
+    joins: Vec<(Vec<u8>, &'static str, Vec<u8>)>,
 }
 
 impl Script {
@@ -78,6 +83,8 @@ impl Script {
             link: LinkState::Detached,
             requests: Vec::new(),
             accept: true,
+            driver_like: false,
+            joins: Vec::new(),
         }
     }
 
@@ -172,12 +179,40 @@ impl<'b> Control<'b> for Script {
         self.request("up")
     }
 
-    fn join(&mut self, _ssid: &'b [u8], _credential: Credential<'b>) -> bool {
-        self.request("join")
+    fn join(&mut self, ssid: &'b [u8], credential: Credential<'b>) -> bool {
+        if self.driver_like && self.link != LinkState::Detached {
+            return false;
+        }
+        let accepted = self.request("join");
+        if accepted && self.driver_like {
+            self.link = LinkState::Joining;
+            let (kind, secret): (&'static str, &[u8]) = match credential {
+                Credential::Open => ("open", &[]),
+                Credential::Passphrase(secret) => ("wpa2", secret),
+                Credential::SaePassword(secret) => ("wpa3", secret),
+            };
+            self.joins.push((ssid.to_vec(), kind, secret.to_vec()));
+        }
+        accepted
     }
 
     fn disconnect(&mut self) -> bool {
-        self.request("disconnect")
+        if self.driver_like && self.link == LinkState::Detached {
+            return false;
+        }
+        let accepted = self.request("disconnect");
+        if accepted && self.driver_like {
+            self.link = LinkState::Detached;
+        }
+        accepted
+    }
+
+    fn scan(&mut self) -> bool {
+        self.request("scan")
+    }
+
+    fn capabilities(&mut self) -> bool {
+        self.request("capabilities")
     }
 }
 
@@ -376,3 +411,6 @@ fn a_smoltcp_interface_answers_an_arp_request_through_the_station() {
     assert_eq!(&reply[20..22], &[0x00, 0x02], "a reply");
     assert_eq!(&reply[28..32], &[192, 168, 1, 2], "for our address");
 }
+
+/// The controller against the same scripted radio, run as the driver runs.
+mod controller;

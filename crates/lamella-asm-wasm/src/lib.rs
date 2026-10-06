@@ -151,6 +151,8 @@ pub struct Func {
     param_count: u32,
     locals: Vec<ValType>,
     code: Vec<u8>,
+    uses_memory: bool,
+    uses_globals: bool,
 }
 
 impl Func {
@@ -162,7 +164,24 @@ impl Func {
             param_count,
             locals: Vec::new(),
             code: Vec::new(),
+            uses_memory: false,
+            uses_globals: false,
         }
+    }
+
+    /// Whether the body reads or writes linear memory: a load, a store, or a `memory.*`
+    /// instruction. A module has to declare a memory for any body that does, or no engine
+    /// accepts it -- so this is read off what was emitted rather than predicted from the
+    /// instructions a lowering meant to emit.
+    #[must_use]
+    pub fn uses_memory(&self) -> bool {
+        self.uses_memory
+    }
+
+    /// Whether the body reads or writes a global, which its module has to declare.
+    #[must_use]
+    pub fn uses_globals(&self) -> bool {
+        self.uses_globals
     }
 
     /// Declares a new local of type `ty` and returns its index (which follows the parameters and
@@ -223,11 +242,13 @@ impl Func {
     }
     /// `global.get index`.
     pub fn global_get(&mut self, index: u32) {
+        self.uses_globals = true;
         self.op(0x23);
         write_var_u32(&mut self.code, index);
     }
     /// `global.set index`.
     pub fn global_set(&mut self, index: u32) {
+        self.uses_globals = true;
         self.op(0x24);
         write_var_u32(&mut self.code, index);
     }
@@ -408,11 +429,13 @@ impl Func {
     }
     /// `memory.size` -- the current size in 64 KiB pages.
     pub fn memory_size(&mut self) {
+        self.uses_memory = true;
         self.op(0x3F);
         self.code.push(0x00);
     }
     /// `memory.grow` -- grow by the popped page count, pushing the old size (or -1 on failure).
     pub fn memory_grow(&mut self) {
+        self.uses_memory = true;
         self.op(0x40);
         self.code.push(0x00);
     }
@@ -420,6 +443,7 @@ impl Func {
     /// `memory.copy` -- copy the popped `size` bytes from `src` to `dst` (bulk-memory proposal).
     /// Pops dst, src, size with size on top; both memory indices are the single memory 0.
     pub fn memory_copy(&mut self) {
+        self.uses_memory = true;
         self.op(0xFC);
         self.code.push(0x0A);
         self.code.push(0x00);
@@ -429,12 +453,14 @@ impl Func {
     /// `memory.fill` -- fill the popped `size` bytes at `dst` with the low byte of the popped `value`
     /// (bulk-memory proposal). Pops dst, value, size with size on top.
     pub fn memory_fill(&mut self) {
+        self.uses_memory = true;
         self.op(0xFC);
         self.code.push(0x0B);
         self.code.push(0x00);
     }
 
     fn mem(&mut self, opcode: u8, m: MemArg) {
+        self.uses_memory = true;
         self.op(opcode);
         m.write(&mut self.code);
     }
@@ -847,6 +873,37 @@ impl Func {
         self.op(0xBB);
     }
 
+
+    /// `i32.trunc_sat_f32_s` -- truncate an f32 to a signed i32, saturating.
+    pub fn i32_trunc_sat_f32_s(&mut self) {
+        self.sat(0x00);
+    }
+    /// `i32.trunc_sat_f64_s` -- truncate an f64 to a signed i32, saturating.
+    pub fn i32_trunc_sat_f64_s(&mut self) {
+        self.sat(0x02);
+    }
+    /// `i64.trunc_sat_f32_s` -- truncate an f32 to a signed i64, saturating.
+    pub fn i64_trunc_sat_f32_s(&mut self) {
+        self.sat(0x04);
+    }
+    /// `i64.trunc_sat_f32_u` -- truncate an f32 to an UNSIGNED i64, saturating.
+    pub fn i64_trunc_sat_f32_u(&mut self) {
+        self.sat(0x05);
+    }
+    /// `i64.trunc_sat_f64_s` -- truncate an f64 to a signed i64, saturating.
+    pub fn i64_trunc_sat_f64_s(&mut self) {
+        self.sat(0x06);
+    }
+    /// `i64.trunc_sat_f64_u` -- truncate an f64 to an UNSIGNED i64, saturating.
+    pub fn i64_trunc_sat_f64_u(&mut self) {
+        self.sat(0x07);
+    }
+
+    fn sat(&mut self, sub_opcode: u8) {
+        self.op(0xFC);
+        self.code.push(sub_opcode);
+    }
+
     /// Encodes this body as a code-section entry: `[size][locals vec][code]` (core spec 5.5.13).
     /// `code` must already be closed with a trailing [`Func::end`].
     fn encode_entry(&self, out: &mut Vec<u8>) {
@@ -1235,6 +1292,51 @@ mod tests {
         neighbours.i64_extend_i32_u();
         neighbours.f32_convert_i32_s();
         assert_eq!(neighbours.code, [0xAD, 0xB2]);
+    }
+
+    /// A body reports the memory and the globals it touched, read off what it emitted: nothing for
+    /// arithmetic alone, memory for any load, store or `memory.*`, and globals for `global.*`.
+    #[test]
+    fn a_body_reports_the_memory_and_globals_it_touches() {
+        let mut arithmetic = Func::new(0);
+        arithmetic.i32_const(40);
+        arithmetic.i32_const(2);
+        arithmetic.i32_add();
+        assert!(!arithmetic.uses_memory() && !arithmetic.uses_globals());
+
+        let mut load = Func::new(0);
+        load.i32_const(0);
+        load.i32_load(MemArg::new(4, 0));
+        assert!(load.uses_memory() && !load.uses_globals());
+
+        let mut size = Func::new(0);
+        size.memory_size();
+        assert!(size.uses_memory());
+
+        let mut global = Func::new(0);
+        global.global_get(0);
+        assert!(global.uses_globals() && !global.uses_memory());
+    }
+
+    /// The saturating truncations are `0xFC` then their index in the core spec's order (5.4.8):
+    /// `i32.trunc_sat_f32_s` 0, `_f32_u` 1, `_f64_s` 2, `_f64_u` 3, then the `i64` four at 4..7.
+    /// `lamella-wasm-interp`'s decoder reads the same eight in the same order (`TRUNC_SAT_OPS` in
+    /// its `decode.rs`), so an index off by one here would run as its unsigned or narrower neighbour.
+    #[test]
+    fn the_saturating_truncations_encode_as_the_fc_prefix_and_their_spec_index() {
+        let mut body = Func::new(0);
+        body.i32_trunc_sat_f32_s();
+        body.i32_trunc_sat_f64_s();
+        body.i64_trunc_sat_f32_s();
+        body.i64_trunc_sat_f32_u();
+        body.i64_trunc_sat_f64_s();
+        body.i64_trunc_sat_f64_u();
+        assert_eq!(
+            body.code,
+            [
+                0xFC, 0x00, 0xFC, 0x02, 0xFC, 0x04, 0xFC, 0x05, 0xFC, 0x06, 0xFC, 0x07
+            ]
+        );
     }
 
     /// The canonical first milestone: `fn main() -> i32 { 40 + 2 }`, exported as `main`. The

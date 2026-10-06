@@ -657,6 +657,14 @@ impl Capabilities {
     /// A target without it reports a CRC over something else, which a host must not compare. The
     /// rules are on [`msg::XFER_RESULT`].
     pub const DEPLOY_PREFIX_CRC: u64 = 1 << 31;
+    /// Start the PERSISTENTLY DEPLOYED artifact running without a reset
+    /// ([`msg::exec_flags::NO_RESET`]): under the scheduler, with its output going to the host that
+    /// started it and its stop reported at that request.
+    ///
+    /// A bit and not just the flag, because the flag's absence is not a refusal. A target that
+    /// predates it ignores the flag and resets, and a host on the board's own USB then loses the
+    /// carrier it was going to read the run on.
+    pub const EXEC_NO_RESET: u64 = 1 << 32;
 
 
     /// On-device telemetry: the host subscribes to device signals and the target streams samples
@@ -757,6 +765,7 @@ impl Capabilities {
         (Self::RESIDENT_CORLIB, "RESIDENT_CORLIB"),
         (Self::DEBUG_BOOT_DEPLOYED, "DEBUG_BOOT_DEPLOYED"),
         (Self::DEPLOY_PREFIX_CRC, "DEPLOY_PREFIX_CRC"),
+        (Self::EXEC_NO_RESET, "EXEC_NO_RESET"),
         (Self::TELEMETRY, "TELEMETRY"),
         (Self::LIVE_MEMORY, "LIVE_MEMORY"),
         (Self::HW_BOOTLOADER, "HW_BOOTLOADER"),
@@ -3215,6 +3224,45 @@ mod tests {
         assert_eq!(surface::missing(program, board), surface::NETCORE_2_0);
         assert_eq!(surface::bit_of("LAMELLA_SURFACE_NETCORE_2_0"), Some(surface::NETCORE_2_0));
         assert_eq!(surface::NETCORE_2_0 & surface::NETFX_MASK, 0, "the rung is not a NETFX era");
+    }
+
+    /// Each .NET Core rung is a bit of its own, so a board that stops at one rung refuses a program
+    /// built against the next by naming that rung alone, and no rung joins the era mask.
+    #[test]
+    fn a_program_past_the_boards_core_rung_is_refused_by_that_rung() {
+        let at_2_0 = surface::NETFX_MASK | surface::GENERICS | surface::SPAN | surface::NETCORE_2_0;
+        let at_2_1 = at_2_0 | surface::NETCORE_2_1;
+        let at_3_0 = at_2_1 | surface::NETCORE_3_0;
+        refused_by_the_rung(at_2_0, surface::NETCORE_2_1, "LAMELLA_SURFACE_NETCORE_2_1");
+        refused_by_the_rung(at_2_1, surface::NETCORE_3_0, "LAMELLA_SURFACE_NETCORE_3_0");
+        let both = surface::NETCORE_2_1 | surface::NETCORE_3_0;
+        assert_eq!(surface::missing(at_3_0, at_2_0), both);
+    }
+
+    /// A board carrying `board` refuses a program built one rung higher, naming that rung alone.
+    fn refused_by_the_rung(board: u64, rung: u64, symbol: &str) {
+        let program = board | rung;
+        assert!(!surface::accepts(program, board));
+        assert_eq!(surface::missing(program, board), rung);
+        assert_eq!(surface::bit_of(symbol), Some(rung));
+        assert_eq!(rung & surface::NETFX_MASK, 0, "{symbol} is not a NETFX era");
+    }
+
+    /// The .NET 5.0 rung is a bit of its own above .NET Core 3.0: a board that stops at 3.0 refuses
+    /// a program built against 5.0 (X509Certificate2.CreateFromPem is 5.0's) by naming 5.0 alone.
+    #[test]
+    fn a_program_past_the_boards_core_rung_is_refused_by_the_net_5_rung() {
+        let board = surface::NETFX_MASK
+            | surface::GENERICS
+            | surface::SPAN
+            | surface::NETCORE_2_0
+            | surface::NETCORE_2_1
+            | surface::NETCORE_3_0;
+        let program = board | surface::NET_5_0;
+        assert!(!surface::accepts(program, board));
+        assert_eq!(surface::missing(program, board), surface::NET_5_0);
+        assert_eq!(surface::bit_of("LAMELLA_SURFACE_NET_5_0"), Some(surface::NET_5_0));
+        assert_eq!(surface::NET_5_0 & surface::NETFX_MASK, 0, "the rung is not a NETFX era");
     }
 
     #[test]

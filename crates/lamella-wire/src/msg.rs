@@ -707,6 +707,22 @@ pub mod exec_flags {
     /// Start HALTED at the entry point rather than running. Refused unless the target advertises a
     /// debug capability, since nothing would be able to resume it.
     pub const START_HALTED: u8 = 1 << 0;
+    /// Start the DEPLOYED artifact without the reset its start otherwise takes.
+    ///
+    /// Without this flag a target starts its deployed artifact by resetting into its boot run, so
+    /// the run answers no request: its output goes out unprompted, a USB carrier leaves the bus and
+    /// comes back, and whatever the program printed before a host reattached is lost. With it, the
+    /// target runs the artifact at once, from where it is stored, under the same scheduler a boot
+    /// run has. Its output goes to the host that asked, and its [`super::EVT_STOPPED`] answers this
+    /// request's sequence number, as a run of a LOADED artifact does.
+    ///
+    /// The run then belongs to that host. A `HELLO` takes the board back from it, and an
+    /// [`super::ABORT`] ends it.
+    ///
+    /// A LOADED artifact always starts without a reset, so the flag changes nothing there. Send it
+    /// only to a target advertising [`crate::Capabilities::EXEC_NO_RESET`]: a target that predates
+    /// the flag ignores it and resets.
+    pub const NO_RESET: u8 = 1 << 1;
 }
 
 /// What an [`EXEC_ACK`] reports. Byte 0 of its payload.

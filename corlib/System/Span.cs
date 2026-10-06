@@ -275,6 +275,9 @@ namespace System
             }
             destination.CopyFrom(_items, _start, _length);
         }
+
+        internal T[] BackingArray { get { return _items; } }
+        internal int BackingStart { get { return _start; } }
     }
 }
 #endif

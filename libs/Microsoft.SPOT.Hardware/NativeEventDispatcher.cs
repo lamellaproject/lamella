@@ -9,9 +9,10 @@ namespace Microsoft.SPOT.Hardware
 
     /// <summary>Dispatches events raised by a native driver to managed handlers.</summary>
     /// <remarks>
-    /// IMPORTANT: this build delivers no hardware interrupts to managed code, so a handler added to
-    /// <see cref="OnInterrupt"/> is never invoked. Poll the port instead, or wait on
-    /// System.Device.Gpio's WaitForEvent, until the interrupt seam lands.
+    /// IMPORTANT: nothing raises <see cref="OnInterrupt"/> in this build, so a handler added to it is
+    /// never invoked. For pin-change interrupts, register a callback with System.Device.Gpio's
+    /// GpioController.RegisterCallbackForPinValueChangedEvent, which receives them on boards whose
+    /// firmware delivers them; or poll the port.
     /// </remarks>
     public class NativeEventDispatcher : System.IDisposable
     {

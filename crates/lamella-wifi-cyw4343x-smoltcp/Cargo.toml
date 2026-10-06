@@ -13,6 +13,8 @@ publish = false
 # The driver alone: this crate drives its public pump and data plane, not its borrowing adapter,
 # so the driver's own `smoltcp` feature stays off. A board selects the driver's bus engine.
 lamella-wifi-cyw4343x = { path = "../lamella-wifi-cyw4343x" }
+# The Wi-Fi seam the controller answers, and its plain values.
+lamella-net-core = { path = "../lamella-net-core" }
 # The device trait and its tokens. `socket-raw` is here because the Ethernet medium turns on the
 # socket layer, which does not build without at least one socket kind; a consumer's own kinds
 # (a TCP/IP backend's) union with it.

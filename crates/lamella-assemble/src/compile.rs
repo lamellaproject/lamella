@@ -770,9 +770,6 @@ fn build_image(
     target: OutputKind,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let units = program.units;
-    let references = program.references;
-    let model = reference_model(units, references, assembly_name);
-    let mut binder = Binder::with_model(model);
     let contexts: Vec<DebugContext> = debug
         .into_iter()
         .flatten()
@@ -784,7 +781,85 @@ fn build_image(
         })
         .collect();
     let partials = index_partial_types(units, &contexts);
-    let mut tokens = assign_tokens(units, &mut binder, &partials);
+    let mut source = emit_source_types(
+        program,
+        module_name,
+        assembly_name,
+        debug,
+        native_interop,
+        &contexts,
+        &partials,
+        crate::tokens::InstanceRows::new(),
+    )?;
+    if let Err(mismatch) = check_method_rows(&source.image, &source.tokens) {
+        let measured = source.tokens.take_instance_rows_written();
+        if measured.is_empty() {
+            return Err(mismatch);
+        }
+        source = emit_source_types(
+            program,
+            module_name,
+            assembly_name,
+            debug,
+            native_interop,
+            &contexts,
+            &partials,
+            measured,
+        )?;
+        check_method_rows(&source.image, &source.tokens)?;
+    }
+    let SourceTypes {
+        mut image,
+        mut binder,
+        mut tokens,
+        entry_point,
+    } = source;
+    let pending_lambdas = core::mem::take(&mut tokens.pending_lambdas);
+    if !pending_lambdas.is_empty() || !tokens.pending_instance_bodies.is_empty() {
+        emit_closure_types(&mut image, &mut binder, &mut tokens, pending_lambdas)?;
+    }
+    let pending_async = core::mem::take(&mut tokens.pending_async);
+    for pending in pending_async {
+        emit_async_machine(&mut image, &mut binder, &mut tokens, pending)?;
+    }
+    emit_is_readonly_attribute(&mut image, binder.model(), &mut tokens);
+    for unit in units {
+        emit_global_attributes(&mut image, &binder, &mut tokens, &unit.global_attributes);
+    }
+    emit_exception_base_chains(&mut image, binder.model(), &tokens);
+    finish_image(image, entry_point, debug, module_name, embed_pdb, target)
+}
+
+/// What one emission of the source types leaves for the rest of [`build_image`]: the image so far,
+/// and the binder, numbering and entry point it was written with.
+struct SourceTypes {
+    image: ImageBuilder,
+    binder: Binder,
+    tokens: Tokens,
+    entry_point: Option<Token>,
+}
+
+/// Numbers the program's members, then writes every source type -- from a model, a numbering and
+/// an image of its own, so a second call starts from nothing the first one left.
+///
+/// `synthesized` is the `this`-capturing lambda rows a previous call measured, which this
+/// numbering reserves; see [`build_image`].
+#[allow(clippy::too_many_arguments)]
+fn emit_source_types(
+    program: &ValidatedProgram,
+    module_name: &str,
+    assembly_name: &str,
+    debug: Option<&[(&str, &str)]>,
+    native_interop: bool,
+    contexts: &[DebugContext],
+    partials: &PartialIndex<'_>,
+    synthesized: crate::tokens::InstanceRows,
+) -> Result<SourceTypes, crate::EmitError> {
+    let units = program.units;
+    let references = program.references;
+    let model = reference_model(units, references, assembly_name);
+    let mut binder = Binder::with_model(model);
+    let mut tokens = assign_tokens(units, &mut binder, partials, synthesized);
     tokens.set_native_interop(native_interop);
     mark_external_value_types(binder.model(), &mut tokens);
     let mut image = ImageBuilder::new(module_name, assembly_name);
@@ -814,22 +889,26 @@ fn build_image(
             &unit.members,
             "",
             contexts.get(index),
-            &partials,
+            partials,
         )?;
     }
-    let pending_lambdas = core::mem::take(&mut tokens.pending_lambdas);
-    if !pending_lambdas.is_empty() || !tokens.pending_instance_bodies.is_empty() {
-        emit_closure_types(&mut image, &mut binder, &mut tokens, pending_lambdas)?;
-    }
-    let pending_async = core::mem::take(&mut tokens.pending_async);
-    for pending in pending_async {
-        emit_async_machine(&mut image, &mut binder, &mut tokens, pending)?;
-    }
-    emit_is_readonly_attribute(&mut image, binder.model(), &mut tokens);
-    for unit in units {
-        emit_global_attributes(&mut image, &binder, &mut tokens, &unit.global_attributes);
-    }
-    emit_exception_base_chains(&mut image, binder.model(), &tokens);
+    Ok(SourceTypes {
+        image,
+        binder,
+        tokens,
+        entry_point,
+    })
+}
+
+/// Writes the finished image -- and its PDB, standalone or embedded, when one was asked for.
+fn finish_image(
+    image: ImageBuilder,
+    entry_point: Option<Token>,
+    debug: Option<&[(&str, &str)]>,
+    module_name: &str,
+    embed_pdb: bool,
+    target: OutputKind,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let (is_dll, entry_point) = match target {
         OutputKind::Executable => (false, entry_point),
         OutputKind::Library => (true, None),
@@ -1093,11 +1172,13 @@ fn emit_one_attribute(
             AttributeArgument::Named { name, value } => named.push((name, value)),
         }
     }
-    let Some((attribute_ty, parameters, is_params)) =
+    let Some((attribute_ty, constructor)) =
         resolve_attribute(binder, &attribute.name, positional.len())
     else {
         return;
     };
+    let parameters = constructor.parameters.clone();
+    let is_params = constructor.is_params;
     let mut blob = alloc::vec![0x01u8, 0x00];
     for (index, parameter) in parameters.iter().enumerate() {
         if is_params && index + 1 == parameters.len() {
@@ -1128,7 +1209,13 @@ fn emit_one_attribute(
             break;
         }
         let Some(expr) = positional.get(index) else {
-            return;
+            let Some(default) = constructor.parameter_default(index) else {
+                return;
+            };
+            if encode_default(binder, tokens, default, parameter, &mut blob).is_none() {
+                return;
+            }
+            continue;
         };
         if encode_value(binder, tokens, enclosing, expr, parameter, &mut blob).is_none() {
             return;
@@ -1164,14 +1251,14 @@ fn emit_one_attribute(
     image.add_custom_attribute(parent, constructor, &blob);
 }
 
-/// Resolves an attribute name to its type and the parameter types of the constructor taking
-/// `arg_count` positional arguments, trying the name as written and with an `Attribute`
-/// suffix (24.2). `None` if neither resolves to a type with such a constructor.
+/// Resolves an attribute name to its type and the constructor taking `arg_count` positional
+/// arguments, trying the name as written and with an `Attribute` suffix (24.2). `None` if neither
+/// resolves to a type with such a constructor.
 fn resolve_attribute(
     binder: &Binder,
     name: &QualifiedName,
     arg_count: usize,
-) -> Option<(TypeSymbol, Vec<TypeSymbol>, bool)> {
+) -> Option<(TypeSymbol, lamella_binder::MethodSymbol)> {
     let model = binder.model();
     for candidate in attribute_candidates(name) {
         let resolved = binder.resolve_type(&candidate);
@@ -1182,13 +1269,11 @@ fn resolve_attribute(
                 .find(|constructor| constructor.parameters.len() == arg_count)
                 .or_else(|| {
                     info.constructors.iter().find(|constructor| {
-                        constructor.is_params
-                            && !constructor.parameters.is_empty()
-                            && arg_count + 1 >= constructor.parameters.len()
+                        !constructor.is_vararg && constructor.accepts_argument_count(arg_count)
                     })
                 });
             if let Some(constructor) = constructor {
-                return Some((resolved, constructor.parameters.clone(), constructor.is_params));
+                return Some((resolved, constructor.clone()));
             }
         }
     }
@@ -1328,10 +1413,37 @@ fn encode_literal(literal: &Literal, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Opt
         (SpecialType::String, Literal::String(units)) => {
             encode_ser_string_units(units, blob);
         }
+        (SpecialType::String, Literal::Null) => blob.push(0xFF),
         (_, Literal::Integer { value, .. }) => return encode_integer(*special, *value, blob),
         _ => return None,
     }
     Some(())
+}
+
+/// Encodes an omitted parameter's default value (`literal`) as the fixed argument for `parameter`:
+/// an enum's as its underlying integer, everything else as [`encode_literal`] writes the type.
+fn encode_default(
+    binder: &Binder,
+    tokens: &Tokens,
+    literal: &Literal,
+    parameter: &TypeSymbol,
+    blob: &mut Vec<u8>,
+) -> Option<()> {
+    let resolved = binder.resolve_type(parameter);
+    let is_enum = binder
+        .model()
+        .get_by_symbol(&resolved)
+        .is_some_and(|info| info.kind == lamella_binder::TypeKind::Enum);
+    if is_enum {
+        let Literal::Integer { value, .. } = literal else {
+            return None;
+        };
+        let underlying = tokens
+            .enum_underlying(&resolved)
+            .unwrap_or_else(|| enum_underlying(binder.model(), &resolved));
+        return encode_integer(underlying, *value, blob);
+    }
+    encode_literal(literal, &resolved, blob)
 }
 
 /// Encodes a named attribute argument (II.23.3): the FIELD (0x53) / PROPERTY (0x54) tag, the
@@ -1701,6 +1813,7 @@ pub(crate) fn build_submission_delta(
             None,
             &partials,
         )?;
+        check_method_rows(&image, &tokens)?;
     }
 
     mint_named_type_token(repl_type, &mut image, &mut tokens);
@@ -2654,10 +2767,24 @@ fn implicit_base_chain(
     let chosen = constructors
         .iter()
         .find(|c| c.accepts_argument_count(0) && !c.parameters.is_empty())?;
+    let array = chosen
+        .is_params
+        .then(|| chosen.parameters.len().checked_sub(1))
+        .flatten();
     let arguments: Vec<BoundExpr> = (0..chosen.parameters.len())
         .map(|index| {
+            let parameter = &chosen.parameters[index];
+            if Some(index) == array {
+                return Some(BoundExpr {
+                    kind: BoundExprKind::ArrayCreation {
+                        lengths: Vec::new(),
+                        elements: Vec::new(),
+                    },
+                    ty: parameter.clone(),
+                });
+            }
             let literal = chosen.parameter_default(index)?.clone();
-            Some(default_argument_expr(&chosen.parameters[index], &literal))
+            Some(default_argument_expr(parameter, &literal))
         })
         .collect::<Option<Vec<_>>>()?;
     let reference = lamella_binder::MethodReference {
@@ -3659,12 +3786,9 @@ fn emit_instance_lambda_rows(
             IL_MANAGED,
             &by_value_parameter_names(&site.parameters),
         );
-        tokens.insert_method(
-            enclosing,
-            &site.method_name,
-            &site.parameters.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
-            token,
-        );
+        let parameters: Vec<TypeSymbol> = site.parameters.iter().map(|(_, ty)| ty.clone()).collect();
+        tokens.insert_method(enclosing, &site.method_name, &parameters, token);
+        tokens.record_instance_row(enclosing, &site.method_name, &parameters);
         emit_compiler_generated_marker(image, tokens, token);
         tokens
             .pending_instance_bodies
@@ -5056,6 +5180,7 @@ fn emit_constructor(
             prologue.leading_body = initializers.len();
         }
     }
+    let initializer_count = initializers.len();
     let body = if initializers.is_empty() {
         body.clone()
     } else {
@@ -5065,6 +5190,13 @@ fn emit_constructor(
     };
     if !contexts.is_empty() {
         binder.set_next_method_statement_contexts(contexts);
+    }
+    let positional_record = declaration
+        .record
+        .as_ref()
+        .is_some_and(|record| record.parameters.is_some());
+    if !positional_record {
+        binder.set_next_method_initializer_statements(initializer_count);
     }
     let ctor = emit_method_body(
         image,
@@ -7797,9 +7929,17 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
             }
         }
         BoundStmtKind::ForEach {
-            collection, body, ..
+            element_type,
+            collection,
+            element_conversion,
+            body,
+            ..
         } => {
+            mint_named_type_token(element_type, image, tokens);
             mint_in_expr(collection, image, tokens);
+            if let Some(conversion) = element_conversion {
+                mint_in_expr(conversion, image, tokens);
+            }
             mint_references(body, image, tokens);
         }
         BoundStmtKind::Fixed {
@@ -10557,13 +10697,17 @@ fn is_later_partial_part(index: &PartialIndex<'_>, scope: &str, declaration: &Ty
         .is_some_and(|first| !core::ptr::eq(first.declaration, declaration))
 }
 
+/// Numbers every type, field and method the source types will write, in the order emission writes
+/// them -- the `this`-capturing lambda rows `synthesized` lists included.
 fn assign_tokens(
     units: &[CompilationUnit],
     binder: &mut Binder,
     partials: &PartialIndex<'_>,
+    synthesized: crate::tokens::InstanceRows,
 ) -> Tokens {
     let mut tokens = Tokens::new();
     tokens.set_canon(binder.model().signature_canon());
+    tokens.expect_instance_rows(synthesized);
     let mut next_type = 1u32;
     let mut next_field = 0u32;
     let mut next_method = 0u32;
@@ -10582,6 +10726,59 @@ fn assign_tokens(
         );
     }
     tokens
+}
+
+/// Reserves the next `MethodDef` row for a member of `owner` that emission will write as
+/// `row_name`, and records what the row is for.
+///
+/// **EVERY METHOD RESERVATION GOES THROUGH HERE**, and that is what makes [`check_method_rows`]
+/// complete: it holds each row of the image to the member reserved for it, so a counter bumped
+/// anywhere else would be a row the check cannot describe.
+fn reserve_method_row(
+    tokens: &mut Tokens,
+    next_method: &mut u32,
+    owner: &TypeSymbol,
+    row_name: &str,
+) -> Token {
+    *next_method += 1;
+    tokens.plan_method_row(*next_method, owner, row_name);
+    Token::new(METHOD_DEF, *next_method)
+}
+
+/// Proves that every `MethodDef` row the source types wrote is the row the pre-pass numbered for
+/// it, by reading the image back: row `n` must exist and carry the name of the member reserved as
+/// row `n`, and no row may follow the last one reserved.
+///
+/// **A CALL NAMES ITS TARGET BY THAT NUMBER**, fixed before any body was written, and nothing in
+/// a token says which method it was meant to be -- so a row written out of place is not an
+/// inconsistency anyone downstream can see. The runtime calls whatever sits there: a call to
+/// `Helper()` ran `Main`, and of two same-signature neighbours the wrong one ran without a trap.
+///
+/// **IT READS THE ARTIFACT RATHER THAN TRUSTING THE SITES THAT WROTE IT.** Every row the builder
+/// writes is checked, whichever path wrote it, so a member kind added later is held to its
+/// reservation without remembering to be. Run after the source types and before the closure types,
+/// async machines and attribute types, which are written past every reserved row and named only
+/// through the tokens their own emission hands out.
+///
+/// It compares names, so a run of same-named overloads swapped within one type would pass. Both
+/// walks visit a type's members in declaration order, so no such swap is known to arise.
+fn check_method_rows(image: &ImageBuilder, tokens: &Tokens) -> Result<(), crate::EmitError> {
+    let reserved = tokens.planned_method_rows();
+    for row in 1..=reserved.max(image.method_count()) {
+        let planned = tokens.planned_method_row(row);
+        let written = image.method_name(Token::new(METHOD_DEF, row));
+        if planned.map(|planned| &*planned.name) == written && written.is_some() {
+            continue;
+        }
+        return Err(crate::EmitError::MethodRowMismatch {
+            row,
+            numbered: planned.map_or_else(String::new, |planned| {
+                format!("{}.{}", planned.owner, planned.name)
+            }),
+            written: written.map_or_else(String::new, String::from),
+        });
+    }
+    Ok(())
 }
 
 /// Reserves the tokens ONE type's rows will take, in the order [`emit_type_inner`] writes them.
@@ -10684,22 +10881,12 @@ fn collect_type_tokens(
         && !any_part_declares_instance_constructor(declaration, later)
         && !any_part_is_static(declaration, later)
     {
-        *next_method += 1;
-        tokens.insert_method(
-            &declaring,
-            ".ctor",
-            &[],
-            Token::new(METHOD_DEF, *next_method),
-        );
+        let token = reserve_method_row(tokens, next_method, &declaring, ".ctor");
+        tokens.insert_method(&declaring, ".ctor", &[], token);
     }
     if emits_static_constructor(declaration, every_part(partials, namespace, declaration)) {
-        *next_method += 1;
-        tokens.insert_method(
-            &declaring,
-            ".cctor",
-            &[],
-            Token::new(METHOD_DEF, *next_method),
-        );
+        let token = reserve_method_row(tokens, next_method, &declaring, ".cctor");
+        tokens.insert_method(&declaring, ".cctor", &[], token);
     }
     for member in &declaration.members {
         match member {
@@ -10717,9 +10904,14 @@ fn collect_type_tokens(
             } if body.is_some()
                 || is_interface
                 || modifiers.contains(&Modifier::Abstract)
+                || modifiers.contains(&Modifier::Extern)
                 || find_dll_import(name, attributes).is_some() =>
             {
-                *next_method += 1;
+                let row_name = match explicit_interface {
+                    Some(interface) => explicit_interface_member_name(interface, name),
+                    None => String::from(&**name),
+                };
+                let token = reserve_method_row(tokens, next_method, &declaring, &row_name);
                 let method_type_parameters =
                     binder.enter_type_parameters(type_parameters, constraints);
                 let mut params: Vec<TypeSymbol> = parameters
@@ -10730,14 +10922,8 @@ fn collect_type_tokens(
                 if *is_vararg {
                     params.push(crate::expr::arglist_marker_symbol());
                 }
-                let token = Token::new(METHOD_DEF, *next_method);
                 match explicit_interface {
-                    Some(interface) => tokens.insert_method(
-                        &declaring,
-                        &explicit_interface_member_name(interface, name),
-                        &params,
-                        token,
-                    ),
+                    Some(_) => tokens.insert_method(&declaring, &row_name, &params, token),
                     None => {
                         tokens.insert_method(&declaring, name, &params, token);
                         if modifiers.contains(&Modifier::Virtual)
@@ -10754,17 +10940,13 @@ fn collect_type_tokens(
                 parameters,
                 ..
             } => {
-                *next_method += 1;
+                let row_name = operator.method_name(parameters.len());
+                let token = reserve_method_row(tokens, next_method, &declaring, row_name);
                 let params: Vec<TypeSymbol> = parameters
                     .iter()
                     .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
                     .collect();
-                tokens.insert_method(
-                    &declaring,
-                    operator.method_name(parameters.len()),
-                    &params,
-                    Token::new(METHOD_DEF, *next_method),
-                );
+                tokens.insert_method(&declaring, row_name, &params, token);
             }
             Member::ConversionOperator {
                 direction,
@@ -10772,12 +10954,12 @@ fn collect_type_tokens(
                 parameters,
                 ..
             } => {
-                *next_method += 1;
+                let token =
+                    reserve_method_row(tokens, next_method, &declaring, direction.method_name());
                 let params: Vec<TypeSymbol> = parameters
                     .iter()
                     .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
                     .collect();
-                let token = Token::new(METHOD_DEF, *next_method);
                 tokens.insert_method(&declaring, direction.method_name(), &params, token);
                 tokens.insert_method(
                     &declaring,
@@ -10795,7 +10977,7 @@ fn collect_type_tokens(
                 is_vararg,
                 ..
             } if !is_static_constructor(modifiers) => {
-                *next_method += 1;
+                let token = reserve_method_row(tokens, next_method, &declaring, ".ctor");
                 let mut params: Vec<TypeSymbol> = parameters
                     .iter()
                     .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
@@ -10803,21 +10985,11 @@ fn collect_type_tokens(
                 if *is_vararg {
                     params.push(crate::expr::arglist_marker_symbol());
                 }
-                tokens.insert_method(
-                    &declaring,
-                    ".ctor",
-                    &params,
-                    Token::new(METHOD_DEF, *next_method),
-                );
+                tokens.insert_method(&declaring, ".ctor", &params, token);
             }
             Member::Destructor { .. } => {
-                *next_method += 1;
-                tokens.insert_method(
-                    &declaring,
-                    "Finalize",
-                    &[],
-                    Token::new(METHOD_DEF, *next_method),
-                );
+                let token = reserve_method_row(tokens, next_method, &declaring, "Finalize");
+                tokens.insert_method(&declaring, "Finalize", &[], token);
             }
             _ => {}
         }
@@ -10840,45 +11012,26 @@ fn collect_type_tokens(
                 setter.as_ref(),
                 is_interface,
             );
-            if getter
-                .as_ref()
-                .is_some_and(|a| {
+            let emitted = |accessor: &Option<lamella_syntax::ast::Accessor>| {
+                accessor.as_ref().is_some_and(|a| {
                     a.body.is_some()
                         || is_interface
                         || is_auto
                         || modifiers.contains(&Modifier::Abstract)
+                        || modifiers.contains(&Modifier::Extern)
                 })
-            {
-                *next_method += 1;
-                tokens.insert_method(
-                    &declaring,
-                    &explicit_accessor_name(
-                        explicit_interface.as_ref(),
-                        &accessor_name("get_", name),
-                    ),
-                    &[],
-                    Token::new(METHOD_DEF, *next_method),
-                );
+            };
+            if emitted(getter) {
+                let row_name =
+                    explicit_accessor_name(explicit_interface.as_ref(), &accessor_name("get_", name));
+                let token = reserve_method_row(tokens, next_method, &declaring, &row_name);
+                tokens.insert_method(&declaring, &row_name, &[], token);
             }
-            if setter
-                .as_ref()
-                .is_some_and(|a| {
-                    a.body.is_some()
-                        || is_interface
-                        || is_auto
-                        || modifiers.contains(&Modifier::Abstract)
-                })
-            {
-                *next_method += 1;
-                tokens.insert_method(
-                    &declaring,
-                    &explicit_accessor_name(
-                        explicit_interface.as_ref(),
-                        &accessor_name("set_", name),
-                    ),
-                    &[property_ty],
-                    Token::new(METHOD_DEF, *next_method),
-                );
+            if emitted(setter) {
+                let row_name =
+                    explicit_accessor_name(explicit_interface.as_ref(), &accessor_name("set_", name));
+                let token = reserve_method_row(tokens, next_method, &declaring, &row_name);
+                tokens.insert_method(&declaring, &row_name, &[property_ty], token);
             }
         }
         if let Member::Indexer {
@@ -10897,6 +11050,7 @@ fn collect_type_tokens(
                     a.body.is_some()
                         || is_interface
                         || modifiers.contains(&Modifier::Abstract)
+                        || modifiers.contains(&Modifier::Extern)
                 })
             };
             let indices: Vec<TypeSymbol> = parameters
@@ -10907,17 +11061,18 @@ fn collect_type_tokens(
             let key = |prefix: &str| -> String {
                 explicit_accessor_name(explicit_interface.as_ref(), &accessor_name(prefix, "Item"))
             };
+            let row_name = |prefix: &str| -> String {
+                explicit_accessor_name(explicit_interface.as_ref(), &accessor_name(prefix, &accessor))
+            };
             if emitted(getter) {
-                *next_method += 1;
-                let token = Token::new(METHOD_DEF, *next_method);
+                let token = reserve_method_row(tokens, next_method, &declaring, &row_name("get_"));
                 tokens.insert_method(&declaring, &key("get_"), &indices, token);
                 if explicit_interface.is_none() {
                     alias_renamed_accessor(tokens, &declaring, "get_", &accessor, &indices, token);
                 }
             }
             if emitted(setter) {
-                *next_method += 1;
-                let token = Token::new(METHOD_DEF, *next_method);
+                let token = reserve_method_row(tokens, next_method, &declaring, &row_name("set_"));
                 let mut parameters = indices;
                 parameters.push(binder.canonicalize(&bind_type(ty)));
                 tokens.insert_method(&declaring, &key("set_"), &parameters, token);
@@ -10935,13 +11090,9 @@ fn collect_type_tokens(
             let event_ty = binder.canonicalize(&bind_type(ty));
             for declarator in declarators {
                 for prefix in ["add_", "remove_"] {
-                    *next_method += 1;
-                    tokens.insert_method(
-                        &declaring,
-                        &accessor_name(prefix, &declarator.name),
-                        &[event_ty.clone()],
-                        Token::new(METHOD_DEF, *next_method),
-                    );
+                    let row_name = accessor_name(prefix, &declarator.name);
+                    let token = reserve_method_row(tokens, next_method, &declaring, &row_name);
+                    tokens.insert_method(&declaring, &row_name, &[event_ty.clone()], token);
                 }
             }
         }
@@ -10957,16 +11108,10 @@ fn collect_type_tokens(
             let event_ty = binder.canonicalize(&bind_type(ty));
             for (prefix, present) in [("add_", adder.is_some()), ("remove_", remover.is_some())] {
                 if present {
-                    *next_method += 1;
-                    tokens.insert_method(
-                        &declaring,
-                        &explicit_accessor_name(
-                            explicit_interface.as_ref(),
-                            &accessor_name(prefix, name),
-                        ),
-                        &[event_ty.clone()],
-                        Token::new(METHOD_DEF, *next_method),
-                    );
+                    let row_name =
+                        explicit_accessor_name(explicit_interface.as_ref(), &accessor_name(prefix, name));
+                    let token = reserve_method_row(tokens, next_method, &declaring, &row_name);
+                    tokens.insert_method(&declaring, &row_name, &[event_ty.clone()], token);
                 }
             }
         }
@@ -10991,6 +11136,11 @@ fn collect_type_tokens(
     }
     if continuation {
         return;
+    }
+    let synthesized = tokens.expected_instance_rows(&declaring).to_vec();
+    for row in synthesized {
+        let token = reserve_method_row(tokens, next_method, &declaring, &row.name);
+        tokens.insert_method(&declaring, &row.name, &row.parameters, token);
     }
     let enclosing_full = lamella_binder::declared_full_name(namespace, declaration);
     for member in &declaration.members {
@@ -11142,25 +11292,15 @@ fn collect_tokens(
                     &declaring,
                     delegate_type_parameter_names(binder, &declaring, declaration),
                 );
-                *next_method += 1;
-                tokens.insert_method(
-                    &declaring,
-                    ".ctor",
-                    &[],
-                    Token::new(METHOD_DEF, *next_method),
-                );
-                *next_method += 1;
+                let constructor = reserve_method_row(tokens, next_method, &declaring, ".ctor");
+                tokens.insert_method(&declaring, ".ctor", &[], constructor);
+                let invoke = reserve_method_row(tokens, next_method, &declaring, "Invoke");
                 let params: Vec<TypeSymbol> = declaration
                     .parameters
                     .iter()
                     .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
                     .collect();
-                tokens.insert_method(
-                    &declaring,
-                    "Invoke",
-                    &params,
-                    Token::new(METHOD_DEF, *next_method),
-                );
+                tokens.insert_method(&declaring, "Invoke", &params, invoke);
             }
         }
     }
@@ -18426,4 +18566,124 @@ mod tests {
         assert_eq!(field_marshal_rows(&image).len(), 2);
     }
 
+    /// A numbering of `rows`, each `(owner, name)` reserved in order from row 1, as the pre-pass
+    /// records it.
+    fn numbered(rows: &[(&str, &str)]) -> Tokens {
+        let mut tokens = Tokens::new();
+        let mut next_method = 0;
+        for (owner, name) in rows {
+            reserve_method_row(&mut tokens, &mut next_method, &type_symbol_from_dotted(owner), name);
+        }
+        tokens
+    }
+
+    /// An image whose `MethodDef` rows carry `names`, in order.
+    fn written(names: &[&str]) -> ImageBuilder {
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let object = image.object_type();
+        image.add_type("", "K", object, 0x0000_0001);
+        let signature = [0x00u8, 0x00, 0x01];
+        for name in names {
+            image.add_method(name, &signature, &[0x06, 0x2A], 0x0006 | 0x0010, 0, &[]);
+        }
+        image
+    }
+
+    /// The row and both sides `check_method_rows` reports, or `None` when it passes.
+    fn refusal(image: &ImageBuilder, tokens: &Tokens) -> Option<(u32, String, String)> {
+        match check_method_rows(image, tokens) {
+            Ok(()) => None,
+            Err(crate::EmitError::MethodRowMismatch {
+                row,
+                numbered,
+                written,
+            }) => Some((row, numbered, written)),
+            Err(other) => panic!("not a row refusal: {other}"),
+        }
+    }
+
+    /// THE LAMBDA SHAPE: a row the numbering never counted, written at the end of `K`'s run, so
+    /// `Program`'s first method was numbered one row early -- a lambda reading only `this` in an
+    /// early class, as its first numbering left it.
+    #[test]
+    fn a_row_written_after_a_types_numbered_run_is_refused() {
+        let tokens = numbered(&[("K", ".ctor"), ("K", "Run"), ("Program", "Main"), ("Program", "Helper")]);
+        let image = written(&[".ctor", "Run", "<Run>b__1_0", "Main", "Helper"]);
+        assert_eq!(
+            refusal(&image, &tokens),
+            Some((3, String::from("Program.Main"), String::from("<Run>b__1_0")))
+        );
+    }
+
+    /// THE `extern` SHAPE: an uncounted row in the MIDDLE of a type's run, so the next method of
+    /// the same type was numbered one row early.
+    #[test]
+    fn a_row_written_inside_a_types_numbered_run_is_refused() {
+        let tokens = numbered(&[("E", ".ctor"), ("E", "After"), ("Program", "Main")]);
+        let image = written(&[".ctor", "Native", "After", "Main"]);
+        assert_eq!(
+            refusal(&image, &tokens),
+            Some((2, String::from("E.After"), String::from("Native")))
+        );
+    }
+
+    /// THE OPPOSITE DRIFT: a row numbered and never written moves every later row UP one, and the
+    /// last numbered row is left with nothing.
+    #[test]
+    fn a_numbered_row_never_written_is_refused() {
+        let tokens = numbered(&[("E", ".ctor"), ("E", "Gone"), ("E", "After")]);
+        assert_eq!(
+            refusal(&written(&[".ctor", "After"]), &tokens),
+            Some((2, String::from("E.Gone"), String::from("After")))
+        );
+        let tokens = numbered(&[("E", ".ctor"), ("E", "After")]);
+        assert_eq!(
+            refusal(&written(&[".ctor"]), &tokens),
+            Some((2, String::from("E.After"), String::new()))
+        );
+    }
+
+    /// THE CONTROL: an image written as numbered passes -- so each refusal above is about the
+    /// drift, not about a check that refuses everything.
+    #[test]
+    fn an_image_written_as_numbered_passes() {
+        let tokens = numbered(&[("K", ".ctor"), ("K", "Run"), ("K", "<Run>b__1_0"), ("Program", "Main")]);
+        assert_eq!(refusal(&written(&[".ctor", "Run", "<Run>b__1_0", "Main"]), &tokens), None);
+        assert_eq!(refusal(&written(&[]), &Tokens::new()), None);
+    }
+
+    /// Through the real emission: the FIRST numbering of a program whose early class holds a lambda
+    /// that reads only `this` is short, and the check sees it. That refusal is what sends
+    /// `build_image` to number the program again, and it is why a numbering that went on missing
+    /// such a row would stop the build rather than call the wrong method.
+    #[test]
+    fn the_first_numbering_of_a_this_only_lambda_is_refused_by_the_check() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
+        let Ok(bytes) = std::fs::read(fixture) else {
+            return;
+        };
+        let corlib = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
+        .expect("the corlib fixture reads");
+        let source = "using System;
+class K { int v = 3; public int Run() { Func<int> f = () => v; return f(); } }
+static class Program { static int Main() { return Helper(); } static int Helper() { return new K().Run(); } }";
+        let parsed = parse_compilation_unit_with(source, LexOptions::default());
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let units = [parsed.unit];
+        let references = [corlib];
+        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+            .expect("the bind is taken as clean");
+        let partials = index_partial_types(&units, &[]);
+        let emit = |measured| {
+            emit_source_types(&program, "App", "App", None, false, &[], &partials, measured)
+                .unwrap_or_else(|error| panic!("the source types emit: {error}"))
+        };
+        let mut first = emit(crate::tokens::InstanceRows::new());
+        assert_eq!(
+            refusal(&first.image, &first.tokens),
+            Some((3, String::from("Program.Main"), String::from("<Run>b__1_0")))
+        );
+        let second = emit(first.tokens.take_instance_rows_written());
+        assert_eq!(refusal(&second.image, &second.tokens), None);
+    }
 }

@@ -27,6 +27,66 @@ pub struct BoundStmt {
     pub span: Span,
 }
 
+impl BoundStmt {
+    /// The statements this one holds directly, in source order: a block's statements, both
+    /// branches of an `if`, the body of a loop, of a `lock`, `using` or `fixed`, of a label and of
+    /// a `checked` or `unchecked` block, a `for`'s initializers and a `using`'s resources, every
+    /// switch section's statements, and a `try`'s body, catch bodies and `finally`.
+    ///
+    /// The one list of which statements hold statements, so a walker over a bound body states only
+    /// its own question of each node. The match names every kind, so a new kind that holds a body
+    /// cannot compile until it is listed here.
+    #[must_use]
+    pub fn children(&self) -> Vec<&BoundStmt> {
+        use BoundStmtKind as Kind;
+        match &self.kind {
+            Kind::Block(statements) => statements.iter().collect(),
+            Kind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => core::iter::once(&**then_branch).chain(else_branch.as_deref()).collect(),
+            Kind::While { body, .. }
+            | Kind::DoWhile { body, .. }
+            | Kind::ForEach { body, .. }
+            | Kind::Lock { body, .. }
+            | Kind::Fixed { body, .. }
+            | Kind::Labeled { body, .. } => core::iter::once(&**body).collect(),
+            Kind::For {
+                initializer, body, ..
+            } => initializer.iter().chain(core::iter::once(&**body)).collect(),
+            Kind::Using { resource, body } => {
+                resource.iter().chain(core::iter::once(&**body)).collect()
+            }
+            Kind::Checked(inner) | Kind::Unchecked(inner) => core::iter::once(&**inner).collect(),
+            Kind::Switch { sections, .. } => sections
+                .iter()
+                .flat_map(|section| section.statements.iter())
+                .collect(),
+            Kind::Try {
+                body,
+                catches,
+                finally,
+            } => core::iter::once(&**body)
+                .chain(catches.iter().map(|catch| &*catch.body))
+                .chain(finally.as_deref())
+                .collect(),
+            Kind::Empty
+            | Kind::Local { .. }
+            | Kind::Expression(_)
+            | Kind::Return(_)
+            | Kind::Break
+            | Kind::Continue
+            | Kind::Throw(_)
+            | Kind::Goto(_)
+            | Kind::GotoCase(_)
+            | Kind::GotoCaseString(_)
+            | Kind::GotoDefault
+            | Kind::Error => Vec::new(),
+        }
+    }
+}
+
 /// The kind of a [`BoundStmt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundStmtKind {
@@ -80,8 +140,8 @@ pub enum BoundStmtKind {
         /// The loop body.
         body: Box<BoundStmt>,
     },
-    /// A `foreach` statement (15.8.4); the iteration variable is in the body's
-    /// scope. The element-type check against the collection is deferred.
+    /// A `foreach` statement over a single-dimension array (15.8.4); the iteration variable is in
+    /// the body's scope. Every other collection binds as the enumerator pattern instead.
     ForEach {
         /// The iteration variable's name.
         name: Box<str>,
@@ -89,6 +149,11 @@ pub enum BoundStmtKind {
         element_type: TypeSymbol,
         /// The collection iterated over.
         collection: BoundExpr,
+        /// The conversion from the array's element type to the iteration variable's type, written
+        /// over [`BoundExprKind::Temp`]`(0)` as the element just read; `None` when the two types are
+        /// the same. It is the explicit conversion 15.8.4 applies: a cast that can throw
+        /// `InvalidCastException`, a numeric conversion, or a user-defined operator.
+        element_conversion: Option<Box<BoundExpr>>,
         /// The loop body.
         body: Box<BoundStmt>,
     },
@@ -298,13 +363,21 @@ impl Binder {
             StmtKind::Block(statements) => {
                 self.enter_scope_at(stmt.span);
                 let contexts = self.take_body_statement_contexts();
+                let initializers = self.take_body_initializer_statements();
                 let bound = statements
                     .iter()
                     .enumerate()
                     .map(|(index, s)| {
-                        match contexts.iter().find(|context| context.statements.contains(&index)) {
-                            Some(context) => self.bind_statement_in_file_context(context, s),
-                            None => self.bind_statement(s),
+                        let context =
+                            contexts.iter().find(|context| context.statements.contains(&index));
+                        let bind = |binder: &mut Binder| match context {
+                            Some(context) => binder.bind_statement_in_file_context(context, s),
+                            None => binder.bind_statement(s),
+                        };
+                        if index < initializers {
+                            self.with_method_locals_hidden(bind)
+                        } else {
+                            bind(self)
                         }
                     })
                     .collect();
@@ -445,7 +518,14 @@ impl Binder {
                 let enumerable = if single_dimension_array {
                     None
                 } else {
-                    self.bind_for_each_enumerable(ty.span, &element_type, name, collection.clone(), body)
+                    self.bind_for_each_enumerable(
+                        ty.span,
+                        stmt.span,
+                        &element_type,
+                        name,
+                        collection.clone(),
+                        body,
+                    )
                 };
                 if let Some(desugared) = enumerable {
                     self.exit_readonly_local();
@@ -462,6 +542,20 @@ impl Binder {
                             stmt.span,
                         ));
                     }
+                    let element_conversion = match &collection.ty {
+                        TypeSymbol::Array { element, .. }
+                            if **element != element_type
+                                && !element.is_error()
+                                && !element_type.is_error() =>
+                        {
+                            let current = BoundExpr {
+                                kind: BoundExprKind::Temp(0),
+                                ty: (**element).clone(),
+                            };
+                            Some(Box::new(self.foreach_element_value(current, &element_type, stmt.span)))
+                        }
+                        _ => None,
+                    };
                     self.enter_scope_at(stmt.span);
                     self.declare_local(name, element_type.clone());
                     self.enter_loop();
@@ -473,6 +567,7 @@ impl Binder {
                         name: name.clone(),
                         element_type,
                         collection,
+                        element_conversion,
                         body,
                     }
                 }
@@ -941,14 +1036,38 @@ impl Binder {
         }
     }
 
+    /// The iteration variable's value from `current`, the collection's element: the EXPLICIT
+    /// conversion from the element's type to the variable's type `element_type` (15.8.4). An
+    /// implicit conversion is taken where one exists, so an upcast or a boxing conversion compiles
+    /// as it does in an assignment; otherwise the conversion is the cast `(V)current` -- a
+    /// user-defined operator, an unboxing, a numeric narrowing or a reference cast that throws
+    /// `InvalidCastException` -- and CS0030 when none exists.
+    ///
+    /// The one rule for both lowerings of `foreach`: an array's element read and an enumerator's
+    /// `Current`.
+    pub(crate) fn foreach_element_value(
+        &mut self,
+        current: BoundExpr,
+        element_type: &TypeSymbol,
+        span: Span,
+    ) -> BoundExpr {
+        if self.assignable(&current, element_type) {
+            return self.convert(current, element_type);
+        }
+        self.bind_cast(current, element_type.clone(), span)
+    }
+
     /// Desugars `foreach (V name in collection)` over a non-array collection into the
     /// enumerator pattern (15.8.4): a block that declares the enumerator, then
     /// `while (e.MoveNext())` whose body binds `name = (V)e.Current` ahead of the original
     /// body, the loop wrapped in `try { ... } finally { <e> as IDisposable, disposed if non-null }`.
     /// `None` when the collection has no `GetEnumerator` (the array/error path is kept).
+    /// `statement_span` is the whole statement's, where an element that does not convert is
+    /// reported (CS0030), as csc reports it.
     fn bind_for_each_enumerable(
         &mut self,
         span: Span,
+        statement_span: Span,
         element_type: &TypeSymbol,
         name: &str,
         collection: BoundExpr,
@@ -1011,37 +1130,7 @@ impl Binder {
         };
         let condition = call(enumerator_ref(), move_next);
         let current = call(enumerator_ref(), get_current);
-        let current_ty = current.ty.clone();
-        // THE ELEMENT CONVERSION IS A CONVERSION, NOT ALWAYS A CAST INSTRUCTION.
-        //
-        // 15.8.4 applies the EXPLICIT conversion from the enumerator's `Current` type to the loop
-        // variable's type, and an explicit conversion includes a user-defined `op_Explicit`. This
-        // built a `Cast` node directly, which the emitter turns into `castclass`/`unbox.any` -- so
-        // a `foreach (Target t in c)` over an enumerator yielding `Source`, with an
-        // `explicit operator Target(Source)` sitting right there, threw InvalidCastException at
-        // run time instead of calling the operator. The conversion existed; nothing asked for it.
-        //
-        // The reference cast stays the fallback, because it is right for every conversion that is
-        // not user-defined -- `object` -> V over a non-generic IEnumerable is exactly an unbox/cast,
-        // and that is the common case.
-        let element_value = self
-            .user_conversion(&current_ty, element_type, "op_Explicit")
-            .or_else(|| self.user_conversion(&current_ty, element_type, "op_Implicit"))
-            .map(|method| BoundExpr {
-                ty: element_type.clone(),
-                kind: BoundExprKind::Call {
-                    callee: Box::new(crate::bound::error_expr()),
-                    arguments: alloc::vec![current.clone()],
-                    method: Some(method),
-                },
-            })
-            .unwrap_or_else(|| BoundExpr {
-                kind: BoundExprKind::Cast {
-                    operand: Box::new(current),
-                    checked: false,
-                },
-                ty: element_type.clone(),
-            });
+        let element_value = self.foreach_element_value(current, element_type, statement_span);
 
         self.enter_scope_at(span);
         self.declare_local(name, element_type.clone());

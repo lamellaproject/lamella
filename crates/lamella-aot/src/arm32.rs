@@ -2914,7 +2914,15 @@ fn spilled_slot_offsets(func: &Function) -> (Vec<u16>, u16) {
     let sret_bytes: u16 =
         if matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4) { 4 } else { 0 };
     let mut used = out.saturating_add(sret_bytes);
-    for ty in &func.value_types {
+    let storage = crate::struct_storage::StorageClasses::of(func);
+    for (value, ty) in func.value_types.iter().enumerate() {
+        if let Some(owner) = storage
+            .slot_owner(ValueId(value as u32))
+            .filter(|owner| owner.index() < value)
+        {
+            offsets.push(offsets[owner.index()]);
+            continue;
+        }
         offsets.push(used);
         used = used.saturating_add(ty.stack_slot_bytes() as u16);
     }
@@ -2965,8 +2973,8 @@ fn lower_spilled_into(
             .any(|(_, i)| matches!(i, Inst::InvokeDelegate { .. }))
     });
     let saved_mask: u8 = if invokes_delegate { 0x70 } else { 0 };
-    let saved_bytes: u16 = (saved_mask.count_ones() as u16 + 1) * 4;
-    let lr_bytes = if has_calls { 4 } else { 0 };
+    let saved_bytes = prologue_bytes(saved_mask, true);
+    let pushed = if has_calls { saved_bytes } else { 0 };
     let returns_big_struct = matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4);
     let (offsets, mut used) = spilled_slot_offsets(func);
     let result_ptr_off = out_args_bytes(func);
@@ -2986,7 +2994,7 @@ fn lower_spilled_into(
         .unwrap_or(0);
     let argv_scratch_off = used;
     used = used.saturating_add((max_call_argc as u16) * 4);
-    let frame = ((used as usize + lr_bytes + 7) & !7usize) - lr_bytes;
+    let frame = ((used as usize + pushed as usize + 7) & !7usize) - pushed as usize;
     if frame > 65024 {
         return Err(LowerError::TooManyValues);
     }
@@ -3058,7 +3066,7 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 reg += 1;
             } else {
-                slot_load(enc, Reg::R0, frame + lr_bytes as u16 + stack_param_off)?;
+                slot_load(enc, Reg::R0, frame + pushed + stack_param_off)?;
                 enc.str_sp(Reg::R0, slot(param) + woff)
                     .map_err(|_| LowerError::TooManyValues)?;
                 stack_param_off += 4;
@@ -4133,8 +4141,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
             crate::regalloc::is_safepoint(i) || matches!(i, Inst::CastClassScan { .. })
         })
     });
-    let lr_bytes = if has_calls { 4 } else { 0 };
-    let pushed = saved.count_ones() as usize * 4 + lr_bytes;
+    let pushed = prologue_bytes(saved, has_calls) as usize;
     let frame = ((pushed + mixed.spill_count as usize * 4 + 7) & !7usize) - pushed;
     if frame > 1020 {
         return Ok(Assignment::Spilled);
@@ -4144,6 +4151,13 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
         saved,
         frame: frame as u16,
     })
+}
+
+/// The bytes a prologue pushes: four for each callee-saved register in `saved`, and four for LR
+/// when `with_lr`. A frame is sized so that it and these bytes keep SP 8-aligned, and a caller's
+/// stack arguments sit just above them, so every frame builder asks this one question here.
+fn prologue_bytes(saved: u8, with_lr: bool) -> u16 {
+    saved.count_ones() as u16 * 4 + if with_lr { 4 } else { 0 }
 }
 
 /// The callee-saved push mask (r4-r7) for a contiguous register assignment: every
@@ -4232,7 +4246,7 @@ fn lower_into(
         .blocks
         .iter()
         .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
-    let saved_bytes: u16 = (saved.count_ones() as u16 + 1) * 4;
+    let saved_bytes = prologue_bytes(saved, true);
 
     if has_calls || saved != 0 {
         enc.push_registers(saved, has_calls);
@@ -4363,7 +4377,7 @@ fn lower_mixed_into(
     stack_maps: &mut Vec<StackMapEntry>,
     relocate: bool,
 ) -> Result<(), LowerError> {
-    let saved_bytes: u16 = (saved.count_ones() as u16 + 1) * 4;
+    let saved_bytes = prologue_bytes(saved, true);
     let has_calls = func
         .blocks
         .iter()
@@ -4892,7 +4906,10 @@ fn method_record_roots(func: &Function, externs: &[alloc::string::String]) -> Ve
     let mut roots = Vec::new();
     for (v, ty) in func.value_types.iter().enumerate() {
         for (offset, kind) in crate::stackmaps::slot_roots(*ty, pinned[v]) {
-            roots.push(((u32::from(offsets[v]) + offset) / 4) | (u32::from(kind) << 14));
+            let root = ((u32::from(offsets[v]) + offset) / 4) | (u32::from(kind) << 14);
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
         }
     }
     roots.into_iter().map(|r| r as u16).collect()
@@ -8661,6 +8678,7 @@ mod tests {
             &NoCalls,
             &[MirType::I32, MirType::I32],
             &[MirType::I32, MirType::I32],
+            crate::cil::Returns::FromBody,
             crate::cil::Narrowing::default(),
         )
         .unwrap();
@@ -11697,6 +11715,61 @@ mod tests {
         );
     }
 
+    /// A DELEGATE-INVOKING FRAME KEEPS SP 8-ALIGNED AT EVERY CALL, whatever its values need: the
+    /// frame and the r4-r6 and LR its prologue pushes sum to a multiple of eight.
+    #[test]
+    fn a_delegate_invoking_frame_keeps_sp_8_aligned_at_every_call() {
+        for extra in 0..4u32 {
+            let values = 2 + extra;
+            let mut insts: Vec<(ValueId, Inst)> = (2..values)
+                .map(|v| {
+                    (
+                        ValueId(v),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: i64::from(v),
+                        },
+                    )
+                })
+                .collect();
+            insts.push((
+                ValueId(values),
+                Inst::InvokeDelegate {
+                    delegate: ValueId(0),
+                    args: vec![ValueId(1)],
+                    returns_value: true,
+                },
+            ));
+            let f = Function {
+                params: vec![MirType::ObjectRef, MirType::I32],
+                ret: Some(MirType::I32),
+                value_types: core::iter::once(MirType::ObjectRef)
+                    .chain(core::iter::repeat_n(MirType::I32, values as usize))
+                    .collect(),
+                entry: BlockId(0),
+                blocks: vec![BasicBlock {
+                    params: vec![ValueId(0), ValueId(1)],
+                    insts,
+                    terminator: Some(Terminator::Return(Some(ValueId(values)))),
+                }],
+            };
+            let (_, maps) = lower_module_gc_mapped(&[f], 0x1000).unwrap();
+            assert!(
+                !maps.0.is_empty(),
+                "the invoke is a call site with a frame-walk entry"
+            );
+            for entry in &maps.0 {
+                assert_eq!(entry.saved_bytes, 16, "r4-r6 and LR are pushed");
+                assert_eq!(
+                    (entry.frame_size + entry.saved_bytes) % 8,
+                    0,
+                    "{extra} extra values: a {} B frame under 16 pushed bytes leaves SP unaligned",
+                    entry.frame_size
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_four_argument_delegate_invoke_reserves_an_outgoing_stack_word() {
         let delegate_taking = |n: usize| Function {
@@ -14025,12 +14098,17 @@ mod tests {
                 unlowered += 1;
                 continue;
             };
+            let Ok(returns) = crate::resolver::declared_return(&assembly, method, &target) else {
+                unlowered += 1;
+                continue;
+            };
             let (arg_narrow, local_narrow) = crate::resolver::narrowing_of(&assembly, method, &[]);
             match crate::cil::lower_method_typed(
                 &body,
                 &resolver,
                 &arg_types,
                 &local_types,
+                returns,
                 crate::cil::Narrowing {
                     args: &arg_narrow,
                     locals: &local_narrow,

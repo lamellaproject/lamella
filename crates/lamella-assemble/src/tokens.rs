@@ -78,6 +78,33 @@ fn definition_of(ty: &TypeSymbol) -> TypeSymbol {
     lamella_binder::definition_symbol(definition, arguments.len())
 }
 
+/// What one reserved `MethodDef` row is for: the member's declaring type and the name its row
+/// will be written with.
+///
+/// **THE NAME IS THE METADATA NAME, NOT THE KEY.** The two differ for a renamed indexer -- keyed
+/// `get_Item`, written `get_Chars` -- and for a conversion operator, keyed with its return type.
+/// It is compared with what the image holds, so it has to be what the image will hold.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedRow {
+    /// The member's declaring type.
+    pub(crate) owner: TypeSymbol,
+    /// The name its `MethodDef` row is written with.
+    pub(crate) name: Box<str>,
+}
+
+/// A `MethodDef` row the compiler writes for a member no declaration spells -- a lambda that reads
+/// only `this`, lowered to a private instance method of its class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SynthesizedRow {
+    /// The method's name, `<M>b__N_M`.
+    pub(crate) name: Box<str>,
+    /// Its parameter types, which key it as any method is keyed.
+    pub(crate) parameters: Vec<TypeSymbol>,
+}
+
+/// [`SynthesizedRow`]s by the key of the type whose method run they end, in writing order.
+pub(crate) type InstanceRows = BTreeMap<String, Vec<SynthesizedRow>>;
+
 /// The metadata tokens of the module's members and the strings it loads, keyed by
 /// identity (member references are minted into the same table for external calls).
 ///
@@ -157,6 +184,18 @@ pub struct Tokens {
     /// and no closure type exists until every source type has been emitted.
     pub(crate) pending_instance_bodies:
         Vec<(TypeSymbol, Token, crate::lambdalower::LoweredLambda)>,
+    /// What each `MethodDef` row the pre-pass reserved is FOR, by row. Recorded beside every
+    /// reservation and read back against the image by `compile::check_method_rows`, which is what
+    /// makes a row written out of its numbered place a refusal rather than a call that runs the
+    /// wrong method.
+    planned_rows: BTreeMap<u32, PlannedRow>,
+    /// The `this`-capturing lambda rows each type's method run ended with, by type key, in the
+    /// order they were written -- MEASURED by this emission, so that a numbering which did not
+    /// count them can be done again with them counted.
+    instance_rows_written: InstanceRows,
+    /// The rows a PREVIOUS emission of the same program measured, which this numbering reserves at
+    /// the end of each type's run. Empty on a first numbering.
+    instance_rows_expected: InstanceRows,
     /// Each member's ORDINAL within its declaring type -- its position in a running count over the
     /// type's members in SOURCE order, which is what csc names a synthesized closure member after
     /// (`<M>b__N_M`). Keyed like `methods`, so an overload pair gets two ordinals rather than one.
@@ -426,6 +465,68 @@ impl Tokens {
         self.methods
             .get(&method_key(&self.canonical(declaring), name, &self.canonical_params(parameters)))
             .copied()
+    }
+
+    /// Records what reserved `MethodDef` row `row` is for: a member of `owner` whose row will be
+    /// written as `name`. The pre-pass calls this at every reservation, through
+    /// `compile::reserve_method_row`.
+    pub(crate) fn plan_method_row(&mut self, row: u32, owner: &TypeSymbol, name: &str) {
+        self.planned_rows.insert(
+            row,
+            PlannedRow {
+                owner: owner.clone(),
+                name: Box::from(name),
+            },
+        );
+    }
+
+    /// What reserved `MethodDef` row `row` is for, or `None` when the pre-pass reserved no such row.
+    #[must_use]
+    pub(crate) fn planned_method_row(&self, row: u32) -> Option<&PlannedRow> {
+        self.planned_rows.get(&row)
+    }
+
+    /// The highest `MethodDef` row the pre-pass reserved; 0 when it reserved none.
+    #[must_use]
+    pub(crate) fn planned_method_rows(&self) -> u32 {
+        self.planned_rows.keys().next_back().copied().unwrap_or(0)
+    }
+
+    /// Records that `owner`'s method run ended with a `this`-capturing lambda's row, `name` over
+    /// `parameters` -- what a second numbering reserves if this one did not.
+    pub(crate) fn record_instance_row(
+        &mut self,
+        owner: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) {
+        let key = type_key(&self.canonical(owner));
+        let row = SynthesizedRow {
+            name: Box::from(name),
+            parameters: self.canonical_params(parameters),
+        };
+        self.instance_rows_written.entry(key).or_default().push(row);
+    }
+
+    /// The `this`-capturing lambda rows this emission wrote, by type; taken, so they are handed on
+    /// once.
+    pub(crate) fn take_instance_rows_written(&mut self) -> InstanceRows {
+        core::mem::take(&mut self.instance_rows_written)
+    }
+
+    /// Installs the rows an earlier emission of the same program measured. Called on a fresh table
+    /// BEFORE the pre-pass, which reserves them.
+    pub(crate) fn expect_instance_rows(&mut self, rows: InstanceRows) {
+        self.instance_rows_expected = rows;
+    }
+
+    /// The `this`-capturing lambda rows the pre-pass reserves at the end of `owner`'s method run,
+    /// in the order they will be written. Empty on a first numbering.
+    #[must_use]
+    pub(crate) fn expected_instance_rows(&self, owner: &TypeSymbol) -> &[SynthesizedRow] {
+        self.instance_rows_expected
+            .get(&type_key(&self.canonical(owner)))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The `TypeSpec` row naming type parameter `index` -- the blob `ELEMENT_TYPE_VAR index`, which

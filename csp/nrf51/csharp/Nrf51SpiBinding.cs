@@ -22,9 +22,15 @@ namespace Lamella.Boards
         public readonly uint PinCnfMosiReg;
         /// <summary>The MISO pin's PIN_CNF register address.</summary>
         public readonly uint PinCnfMisoReg;
+        /// <summary>The bus's chip selects in line order, each a GPIO numbered P0.n as n: entry n is
+        /// the pin <c>SpiConnectionSettings.ChipSelectLine</c> n selects. Empty when the board names
+        /// none.</summary>
+        public readonly int[] ChipSelectPins;
 
+        /// <param name="chipSelectPins">The bus's chip selects in line order; never null, and empty
+        /// when the board names none.</param>
         public Nrf51SpiBinding(uint spiBase, uint pselSck, uint pselMosi, uint pselMiso,
-            uint pinCnfSckReg, uint pinCnfMosiReg, uint pinCnfMisoReg)
+            uint pinCnfSckReg, uint pinCnfMosiReg, uint pinCnfMisoReg, int[] chipSelectPins)
         {
             SpiBase = spiBase;
             PselSck = pselSck;
@@ -33,6 +39,7 @@ namespace Lamella.Boards
             PinCnfSckReg = pinCnfSckReg;
             PinCnfMosiReg = pinCnfMosiReg;
             PinCnfMisoReg = pinCnfMisoReg;
+            ChipSelectPins = chipSelectPins;
         }
     }
 }

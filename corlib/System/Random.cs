@@ -38,7 +38,36 @@ namespace System
             inextp = 21;
         }
 
-        public Random() : this(0) { }
+        public Random() : this(DefaultSeed()) { }
+
+        private static int defaultSeedCount;
+
+#if LAMELLA_SURFACE_THREADS
+        private static readonly object defaultSeedGate = new object();
+#endif
+
+        private static int DefaultSeed()
+        {
+            long now = Lamella.Runtime.Clock.NowTicks();
+            uint folded = unchecked((uint)now ^ (uint)(now >> 32));
+            return unchecked((int)(folded + (uint)NextDefaultSeedCount() * 2654435769u));
+        }
+
+        private static int NextDefaultSeedCount()
+        {
+            int count;
+#if LAMELLA_SURFACE_THREADS
+            lock (defaultSeedGate)
+            {
+                count = defaultSeedCount;
+                defaultSeedCount = count + 1;
+            }
+#else
+            count = defaultSeedCount;
+            defaultSeedCount = count + 1;
+#endif
+            return count;
+        }
 
         private int InternalSample()
         {

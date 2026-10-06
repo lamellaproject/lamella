@@ -929,11 +929,15 @@ impl Lowering<'_> {
                 name,
                 element_type,
                 collection,
+                element_conversion,
                 body,
             } => BoundStmtKind::ForEach {
                 name: name.clone(),
                 element_type: element_type.clone(),
                 collection: self.expression(collection),
+                element_conversion: element_conversion
+                    .as_ref()
+                    .map(|conversion| Box::new(self.expression(conversion))),
                 body: self.boxed(body),
             },
             BoundStmtKind::Break => BoundStmtKind::Break,

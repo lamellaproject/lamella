@@ -1203,6 +1203,13 @@ pub struct Binder {
     next_method_statement_contexts: Vec<StatementContext>,
     /// The statement contexts of the body being bound, which the body block takes.
     body_statement_contexts: Vec<StatementContext>,
+    /// How many of the NEXT [`Binder::bind_method`] body's leading top-level statements are
+    /// instance field initializers. Pre-set by the caller and consumed by `bind_method`, the same
+    /// self-clearing shape as the fields above.
+    next_method_initializer_statements: usize,
+    /// How many of the body being bound's leading statements are field initializers, which the
+    /// body block takes.
+    body_initializer_statements: usize,
     /// The imports every file context sits on: those in force when the caller began walking the
     /// compilation's files -- a session's own, or none. See [`Binder::set_file_context_base`].
     file_context_base: ImportScope,
@@ -5070,6 +5077,26 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         core::mem::take(&mut self.body_statement_contexts)
     }
 
+    /// How many of the body being bound's leading statements are field initializers, taken so that
+    /// only the body block sees the count.
+    pub(crate) fn take_body_initializer_statements(&mut self) -> usize {
+        core::mem::take(&mut self.body_initializer_statements)
+    }
+
+    /// Runs `bind` with every local and parameter of the enclosing method out of scope, then puts
+    /// them back. A field initializer binds this way: it names the members of its type, never a
+    /// constructor's parameters, and a variable it declares itself -- an `out var` -- leaves with
+    /// it rather than joining the constructor's body.
+    pub(crate) fn with_method_locals_hidden<T>(&mut self, bind: impl FnOnce(&mut Self) -> T) -> T {
+        let hidden: Vec<BTreeMap<String, TypeSymbol>> =
+            self.scopes.iter_mut().map(core::mem::take).collect();
+        let result = bind(self);
+        for (scope, names) in self.scopes.iter_mut().zip(hidden) {
+            *scope = names;
+        }
+        result
+    }
+
     /// Binds `stmt` under `context`'s imports and `#define` set, then puts the current ones back.
     pub(crate) fn bind_statement_in_file_context(
         &mut self,
@@ -5293,6 +5320,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.next_method_statement_contexts = contexts;
     }
 
+    /// Names how many of the NEXT [`Binder::bind_method`] body's leading top-level statements are
+    /// instance field initializers placed ahead of a constructor's own statements. They bind in
+    /// the type's scope rather than the constructor's: a constructor parameter's scope is the
+    /// constructor initializer and block alone (ECMA-334 10.7), so a parameter never hides a
+    /// member an initializer names. `bind_method` consumes the count.
+    pub fn set_next_method_initializer_statements(&mut self, count: usize) {
+        self.next_method_initializer_statements = count;
+    }
+
     /// Binds a method body end to end: the enclosing type is in scope for `this`
     /// and unqualified names, the parameters are declared as locals, and `return`
     /// statements are checked against `return_type` (15.9.4). Returns the bound
@@ -5351,8 +5387,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 .then_some(ScopeId(self.next_scope_id)),
         ];
         self.body_statement_contexts = core::mem::take(&mut self.next_method_statement_contexts);
+        self.body_initializer_statements =
+            core::mem::take(&mut self.next_method_initializer_statements);
         let bound = self.bind_statement(body);
         self.body_statement_contexts.clear();
+        self.body_initializer_statements = 0;
         self.exit_scope();
         if returns_value && !crate::flow::method_body_always_exits(&bound) {
             self.diagnostics.push(Diagnostic::new(
@@ -5650,34 +5689,38 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let omitted: Vec<(TypeSymbol, Literal)> = if chain_named {
             Vec::new()
         } else {
-            (arguments.len()..chosen.parameters.len())
-                .filter_map(|index| {
-                    let default = chosen.parameter_default(index)?.clone();
-                    Some((chosen.parameters[index].clone(), default))
-                })
-                .collect()
+            chosen.omitted_defaults(arguments.len())
         };
         for (parameter_ty, literal) in omitted {
             let filled = self.default_argument(&parameter_ty, &literal);
             arguments.push(filled);
         }
-        Some((
-            MethodReference {
-                declaring_instantiation: self.declaring_instantiation_of(
-                    &target,
-                    ".ctor",
-                    &chosen.parameters,
-                ),
-                declaring_type: target,
-                name: ".ctor".into(),
-                is_vararg: chosen.is_vararg,
-                parameters: chosen.parameters,
-                return_type: TypeSymbol::Special(SpecialType::Void),
-                is_static: false,
-                instantiation: None,
-            },
-            arguments,
-        ))
+        let reference = MethodReference {
+            declaring_instantiation: self.declaring_instantiation_of(
+                &target,
+                ".ctor",
+                &chosen.parameters,
+            ),
+            declaring_type: target,
+            name: ".ctor".into(),
+            is_vararg: chosen.is_vararg,
+            parameters: chosen.parameters.clone(),
+            return_type: TypeSymbol::Special(SpecialType::Void),
+            is_static: false,
+            instantiation: None,
+        };
+        let arguments = if chosen.is_params {
+            self.bind_params_arguments(&reference, arguments)
+        } else if !chosen.is_vararg && arguments.len() == chosen.parameters.len() {
+            arguments
+                .into_iter()
+                .zip(chosen.parameters.iter())
+                .map(|(argument, parameter)| self.convert(argument, parameter))
+                .collect()
+        } else {
+            arguments
+        };
+        Some((reference, arguments))
     }
 
     /// Binds a field initializer in `enclosing`'s context and checks it converts
@@ -9801,7 +9844,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Binds `(ty)operand` for an operand that is already bound -- the conversion half of a cast
     /// expression, separate from the syntax so that a conversion that is itself a composition can
     /// bind its second step with the same rules as the first.
-    fn bind_cast(&mut self, operand: BoundExpr, ty: TypeSymbol, span: Span) -> BoundExpr {
+    pub(crate) fn bind_cast(&mut self, operand: BoundExpr, ty: TypeSymbol, span: Span) -> BoundExpr {
         if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) && !ty.is_error() {
             let candidates: Vec<(Box<str>, MethodSymbol)> = self
                 .type_info_of(&ty)
@@ -10526,15 +10569,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 arguments,
             } = &target_expr.kind
             {
-                if is_repeatable(receiver) && arguments.iter().all(|a| is_repeatable(&a.value)) {
-                    let checkpoint = self.diagnostics.len();
-                    if let Some(result) =
-                        self.bind_indexer_compound(receiver, arguments, binary_op, value_expr, span)
-                    {
-                        return result;
-                    }
-                    self.diagnostics.truncate(checkpoint);
+                let checkpoint = self.diagnostics.len();
+                if let Some(result) =
+                    self.bind_indexer_compound(receiver, arguments, binary_op, value_expr, span)
+                {
+                    return result;
                 }
+                self.diagnostics.truncate(checkpoint);
             }
         }
         if operator == AssignmentOperator::Assign {
@@ -11946,14 +11987,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 };
                 chosen.map(|method| {
                     params_method = method.is_params;
-                    if !method.is_params && arguments.len() < method.parameters.len() {
-                        omitted = (arguments.len()..method.parameters.len())
-                            .filter_map(|index| {
-                                let default = method.parameter_default(index)?.clone();
-                                Some((method.parameters[index].clone(), default))
-                            })
-                            .collect();
-                    }
+                    omitted = method.omitted_defaults(arguments.len());
                     if names.iter().any(Option::is_some) {
                         named_fill = named_slots(&method, &names);
                     }
@@ -13434,12 +13468,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let declaring_instantiation =
             self.declaring_instantiation_of(&declaring_type, &declared.name, &declared.parameters);
         let params_accessor = method.is_params;
-        let omitted: Vec<(TypeSymbol, Literal)> = (arguments.len()..method.parameters.len())
-            .filter_map(|index| {
-                let default = method.parameter_default(index)?.clone();
-                Some((method.parameters[index].clone(), default))
-            })
-            .collect();
+        let omitted = method.omitted_defaults(arguments.len());
         let method_ref = MethodReference {
             declaring_type,
             is_vararg: method.is_vararg,
@@ -13512,14 +13541,16 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Binds a COMPOUND indexer assignment `receiver[indices] op= value` as the read-modify-write
     /// it is: `receiver[indices] = receiver[indices] op value`.
     ///
-    /// The receiver and indices are bound ONCE and the bound trees CLONED for the second use --
-    /// the same shape the pointer, enum and user-operator compound lowerings take. Binding the
-    /// syntax twice instead would report any error in it twice: `nope[0] += 1` gave CS0103 twice
-    /// where csc gives it once. The two accessor RESOLUTIONS are still independent, since each is
+    /// The receiver and indices are bound ONCE and evaluated once (14.13.2), although the lowering
+    /// names each of them twice: one whose second evaluation could be observed -- a call, or a
+    /// property read such as the `B` of `B[0] += 5` -- moves into a temporary that the get and the
+    /// set both name, by the rule every compound target's operands take
+    /// ([`spill_unless_repeatable`]). The two accessor RESOLUTIONS are independent, since each is
     /// resolved against its own argument list, so a `[IndexerName]`-renamed indexer still gets its
     /// matching pair.
     ///
-    /// `None` when either accessor does not resolve, leaving the caller's existing paths to report.
+    /// `None` when either accessor does not resolve, or when the receiver is a value-type
+    /// expression that is not reusable storage, leaving the caller's existing paths to report.
     fn bind_indexer_compound(
         &mut self,
         receiver: &lamella_syntax::ast::Expr,
@@ -13539,14 +13570,36 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let setter = self.indexer_accessor(&read_receiver.ty, "set_", arguments.len() + 1)?;
         let getter = self.indexer_accessor(&read_receiver.ty, "get_", arguments.len())?;
-        let indices: Vec<BoundExpr> = arguments
+        let mut spilled = Vec::new();
+        let receiver = if self.is_value_type(&read_receiver.ty) {
+            if !self.names_writable_storage(&read_receiver) {
+                return None;
+            }
+            let receiver = spill_target_operands(read_receiver, &mut spilled);
+            if !bound_is_repeatable(&receiver) || !self.names_writable_storage(&receiver) {
+                return None;
+            }
+            receiver
+        } else {
+            spill_unless_repeatable(read_receiver, &mut spilled)
+        };
+        let receiver_spilled = !spilled.is_empty();
+        let bound_indices: Vec<BoundExpr> = arguments
             .iter()
             .map(|argument| self.bind_argument_expression(&argument.value))
             .collect();
-        let store_receiver = read_receiver.clone();
+        let indices: Vec<BoundExpr> = bound_indices
+            .into_iter()
+            .map(|index| spill_unless_repeatable(index, &mut spilled))
+            .collect();
+        let reordered = |call: &BoundExpr| matches!(call.kind, BoundExprKind::Sequence { .. });
+        let store_receiver = receiver.clone();
         let store_indices = indices.clone();
         let current =
-            self.bind_indexer_call(read_receiver, &getter, indices, &argument_names(arguments), span)?;
+            self.bind_indexer_call(receiver, &getter, indices, &argument_names(arguments), span)?;
+        if receiver_spilled && reordered(&current) {
+            return None;
+        }
 
         let operand = self.bind_expression(value_expr);
         let result_ty = binary_result_type(self, binary_op, &current.ty, &operand.ty)?;
@@ -13555,7 +13608,43 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let mut store_args = store_indices;
         store_args.push(combined);
         let setter_names = argument_names(arguments);
-        self.bind_indexer_store(store_receiver, &setter, store_args, &setter_names, span)
+        let store =
+            self.bind_indexer_store(store_receiver, &setter, store_args, &setter_names, span)?;
+        if receiver_spilled && reordered(&store) {
+            return None;
+        }
+        Some(Self::spilling(store, spilled))
+    }
+
+    /// Whether `expr` denotes storage a write can reach in place: a local or parameter that is
+    /// not a `ref readonly` local, `this`, an array element, a dereference, or a field that is
+    /// writable here and whose container is itself such storage or a reference.
+    ///
+    /// A struct's members are called on its address. A value-type expression that is a value
+    /// rather than storage -- a call's or a property's result, a spilled temporary -- or a
+    /// `readonly` field outside a constructor is copied first, and a write through the copy is lost.
+    fn names_writable_storage(&self, expr: &BoundExpr) -> bool {
+        match &expr.kind {
+            BoundExprKind::Local(_) => !self.writes_through_readonly_ref(expr),
+            BoundExprKind::This
+            | BoundExprKind::ElementAccess { .. }
+            | BoundExprKind::Dereference { .. } => true,
+            BoundExprKind::FieldAccess {
+                receiver,
+                field: Some(field),
+                ..
+            } => {
+                let in_constructor = matches!(
+                    self.current_method.as_ref(),
+                    Some(context) if &*context.name == ".ctor" || &*context.name == ".cctor"
+                );
+                (in_constructor || !self.field_is_readonly(&field.declaring_type, &field.name))
+                    && (field.is_static
+                        || !self.is_value_type(&receiver.ty)
+                        || self.names_writable_storage(receiver))
+            }
+            _ => false,
+        }
     }
 
     /// Binds an indexer WRITE `obj[indices] = value` as an [`BoundExprKind::IndexerAccess`] store
@@ -14339,6 +14428,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             instantiation: None,
                         };
                         if chosen.is_params {
+                            for (parameter_ty, literal) in chosen.omitted_defaults(arguments.len()) {
+                                let filled = self.default_argument(&parameter_ty, &literal);
+                                arguments.push(filled);
+                            }
                             arguments =
                                 self.bind_params_arguments(&ctor_ref, core::mem::take(&mut arguments));
                         } else if chosen.is_vararg
@@ -14354,14 +14447,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             bound.extend(remaining);
                             arguments = bound;
                         } else if chosen.accepts_argument_count(arguments.len()) {
-                            let omitted: Vec<(TypeSymbol, Literal)> = (arguments.len()
-                                ..chosen.parameters.len())
-                                .filter_map(|index| {
-                                    let default = chosen.parameter_default(index)?.clone();
-                                    Some((chosen.parameters[index].clone(), default))
-                                })
-                                .collect();
-                            for (parameter_ty, literal) in omitted {
+                            for (parameter_ty, literal) in chosen.omitted_defaults(arguments.len()) {
                                 let filled = self.default_argument(&parameter_ty, &literal);
                                 arguments.push(filled);
                             }
@@ -19586,10 +19672,10 @@ fn first_bad_expanded(
     arguments: &[TypeSymbol],
     arg_constants: &[Option<i64>],
 ) -> Option<OverloadResult> {
-    let fixed = method.parameters.len().saturating_sub(1);
-    if arguments.len() < fixed {
+    if !method.accepts_expanded_count(arguments.len()) {
         return None;
     }
+    let fixed = method.parameters.len().saturating_sub(1);
     let TypeSymbol::Array { element, .. } = &method.parameters[fixed] else {
         return None;
     };
@@ -19656,9 +19742,7 @@ fn is_normal_applicable(
                     )
                 });
     }
-    if arguments.len() > method.parameters.len()
-        || arguments.len() < method.required_parameter_count()
-    {
+    if !method.accepts_normal_count(arguments.len()) {
         return false;
     }
     arguments
@@ -19678,13 +19762,14 @@ fn is_applicable_expanded(
     arguments: &[TypeSymbol],
     arg_constants: &[Option<i64>],
 ) -> bool {
-    let fixed = method.parameters.len().saturating_sub(1);
-    if arguments.len() < fixed {
+    if !method.accepts_expanded_count(arguments.len()) {
         return false;
     }
-    if !arguments[..fixed]
+    let fixed = method.parameters.len().saturating_sub(1);
+    let supplied = arguments.len().min(fixed);
+    if !arguments[..supplied]
         .iter()
-        .zip(&method.parameters[..fixed])
+        .zip(&method.parameters[..supplied])
         .enumerate()
         .all(|(i, (argument, parameter))| {
             arg_applicable(model, argument, arg_constants.get(i).copied().flatten(), parameter)
@@ -19695,7 +19780,7 @@ fn is_applicable_expanded(
     let TypeSymbol::Array { element, .. } = &method.parameters[fixed] else {
         return false;
     };
-    arguments[fixed..].iter().enumerate().all(|(offset, argument)| {
+    arguments.get(fixed..).unwrap_or(&[]).iter().enumerate().all(|(offset, argument)| {
         arg_applicable(
             model,
             argument,
@@ -20224,43 +20309,10 @@ fn member_lookup_type(ty: &TypeSymbol) -> TypeSymbol {
     }
 }
 
-/// Whether a bound expression denotes something assignable: a local or parameter,
-/// a field or (writable) property, or an array element. A read-only property's
-/// missing setter is a finer check left for later.
-/// Whether an expression can be evaluated TWICE with the same result and no extra effect.
-///
-/// A compound indexer assignment (`c[i] += v`) names its receiver and indices once in the source
-/// and twice in the lowering -- once for the `get_`, once for the `set_`. C# evaluates them once
-/// (14.14.2), so the lowering is only sound when re-evaluating is unobservable. This is the
-/// conservative test for that: a name, `this`, a literal, and reads THROUGH those. Anything that
-/// can run user code or write state -- a call, an assignment, `++`/`--`, `new` -- is refused, so
-/// `Next()[i] += 1` keeps its existing behavior rather than calling `Next()` twice.
-///
-/// Nothing writes between the get and the set in this lowering, so a repeated field or element
-/// READ observes the same value by construction; that is why those are permitted.
-fn is_repeatable(expr: &lamella_syntax::ast::Expr) -> bool {
-    use lamella_syntax::ast::ExprKind as K;
-    match &expr.kind {
-        K::Name { .. } | K::Literal(_) | K::This | K::Base => true,
-        K::Parenthesized(inner) | K::Checked(inner) | K::Unchecked(inner) => is_repeatable(inner),
-        K::Cast { operand, .. } => is_repeatable(operand),
-        K::Binary { left, right, .. } => is_repeatable(left) && is_repeatable(right),
-        K::Unary { operator, operand } => {
-            !matches!(
-                operator,
-                UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
-            ) && is_repeatable(operand)
-        }
-        _ => false,
-    }
-}
-
 /// Whether a BOUND expression can be evaluated twice with the same result and no extra effect.
 ///
-/// The sibling of [`is_repeatable`], asked of the bound tree rather than of the syntax -- which
-/// lets it answer for the two forms the syntactic test has to refuse. `c.P` is a getter CALL or a
-/// plain field load, and `a[i]` is an indexer call or an array element, depending on what the
-/// names resolved to; by here that is known.
+/// Asked of the BOUND tree, where the names have resolved: `c.P` is a getter CALL or a plain field
+/// load, and `a[i]` is an indexer call or an array element, and the syntax alone cannot tell which.
 ///
 /// Anything that can run user code or write storage -- a call, a property read, an assignment,
 /// `++`/`--`, `new` -- is not repeatable. A LOAD is, including a load reached through other loads:
@@ -20316,25 +20368,13 @@ fn bound_is_repeatable(expr: &BoundExpr) -> bool {
 /// order, receiver before indices, and the caller wraps the finished node with
 /// [`Binder::spilling`].
 fn spill_target_operands(target: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
-    fn once(operand: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
-        if bound_is_repeatable(&operand) {
-            return operand;
-        }
-        let ty = operand.ty.clone();
-        let index = spilled.len() as u32;
-        spilled.push(operand);
-        BoundExpr {
-            ty,
-            kind: BoundExprKind::Temp(index),
-        }
-    }
     let BoundExpr { kind, ty } = target;
     let kind = match kind {
         BoundExprKind::ElementAccess { receiver, indices } => BoundExprKind::ElementAccess {
-            receiver: Box::new(once(*receiver, spilled)),
+            receiver: Box::new(spill_unless_repeatable(*receiver, spilled)),
             indices: indices
                 .into_iter()
-                .map(|index| once(index, spilled))
+                .map(|index| spill_unless_repeatable(index, spilled))
                 .collect(),
         },
         BoundExprKind::FieldAccess {
@@ -20342,7 +20382,7 @@ fn spill_target_operands(target: BoundExpr, spilled: &mut Vec<BoundExpr>) -> Bou
             name,
             field,
         } => BoundExprKind::FieldAccess {
-            receiver: Box::new(once(*receiver, spilled)),
+            receiver: Box::new(spill_unless_repeatable(*receiver, spilled)),
             name,
             field,
         },
@@ -20354,7 +20394,7 @@ fn spill_target_operands(target: BoundExpr, spilled: &mut Vec<BoundExpr>) -> Bou
             setter_instantiation,
             name,
         } => BoundExprKind::PropertyAccess {
-            receiver: Box::new(once(*receiver, spilled)),
+            receiver: Box::new(spill_unless_repeatable(*receiver, spilled)),
             declaring_type,
             setter_declaring_type,
             getter_instantiation,
@@ -20362,11 +20402,31 @@ fn spill_target_operands(target: BoundExpr, spilled: &mut Vec<BoundExpr>) -> Bou
             name,
         },
         BoundExprKind::Dereference { operand } => BoundExprKind::Dereference {
-            operand: Box::new(once(*operand, spilled)),
+            operand: Box::new(spill_unless_repeatable(*operand, spilled)),
         },
         other => other,
     };
     BoundExpr { kind, ty }
+}
+
+/// `operand` itself when evaluating it twice is unobservable, and otherwise a [`BoundExprKind::Temp`]
+/// naming it, with the operand moved onto the end of `spilled` for the enclosing sequence to evaluate
+/// once.
+///
+/// The one rule for an operand a read-modify-write names twice, used for the operands of a compound
+/// assignment's target ([`spill_target_operands`]) and for an indexer's receiver and indices
+/// ([`Binder::bind_indexer_compound`]).
+fn spill_unless_repeatable(operand: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
+    if bound_is_repeatable(&operand) {
+        return operand;
+    }
+    let ty = operand.ty.clone();
+    let index = spilled.len() as u32;
+    spilled.push(operand);
+    BoundExpr {
+        ty,
+        kind: BoundExprKind::Temp(index),
+    }
 }
 
 /// What a `ref` local's DECLARATION decided, for the two rules that cannot be answered at the use.
@@ -20384,6 +20444,9 @@ pub(crate) struct RefLocal {
     is_readonly: bool,
 }
 
+/// Whether a bound expression denotes something assignable: a local or parameter, a field, a
+/// property, an array element, a dereference or a `__refvalue`. Whether a property has a setter
+/// is decided where the assignment binds (CS0200), not here.
 fn is_lvalue(expr: &BoundExpr) -> bool {
     matches!(
         expr.kind,

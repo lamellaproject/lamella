@@ -63,7 +63,9 @@ namespace Lamella.Boards.RaspberryPi
         /// guard is CONJUNCTIVE (clk_sys on PLL_SYS AND both PLLs locked), so a PARTIAL state (e.g.
         /// after a soft restart: clk_sys on PLL_SYS but a PLL unlocked) takes the FULL bring-up,
         /// which parks clk_sys on clk_ref FIRST so re-cycling PLL_SYS never kills the clock the core
-        /// is running on. Public so a boot stub or a test can call it explicitly.</summary>
+        /// is running on. Moving clk_ref onto the crystal starts TIMER0's tick again at a
+        /// microsecond of the clk_ref it then runs at, so TIMER0 keeps counting microseconds. Public
+        /// so a boot stub or a test can call it explicitly.</summary>
         public static void EnsureClocks()
         {
             uint xoscCtrl = Rp2350Instances.XOSC_BASE + Rp2350XoscLayout.CTRL_OFF;
@@ -82,7 +84,7 @@ namespace Lamella.Boards.RaspberryPi
             bool usbLocked = (Mmio.Read32(pllUsbCs) & Rp2350PllLayout.CS_LOCK) != 0u;
             if (sysOnPll && sysLocked && usbLocked) return;
 
-            Mmio.Write32(xoscStartup, Rp2350XoscLayout.STARTUP_DELAY_1MS);
+            Mmio.Write32(xoscStartup, Rp2350XoscLayout.STARTUP_DELAY_RESET);
             Mmio.Write32(xoscCtrl,
                 (Rp2350XoscLayout.CTRL_ENABLE_MAGIC << (int)Rp2350XoscLayout.CTRL_ENABLE_LSB)
                 | Rp2350XoscLayout.CTRL_FREQ_RANGE_1_15MHZ);
@@ -93,10 +95,16 @@ namespace Lamella.Boards.RaspberryPi
 
             Mmio.Write32(clkRefCtrl,
                 (Mmio.Read32(clkRefCtrl) & ~Rp2350ClocksLayout.CLK_REF_CTRL_SRC) | Rp2350ClocksLayout.CLK_REF_SRC_XOSC);
+            bool refOnCrystal = false;
             for (int spin = 0; spin < 100000; spin++)
             {
-                if ((Mmio.Read32(clkRefSelected) & Rp2350ClocksLayout.CLK_REF_XOSC_SELECTED) != 0u) break;
+                if ((Mmio.Read32(clkRefSelected) & Rp2350ClocksLayout.CLK_REF_XOSC_SELECTED) != 0u)
+                {
+                    refOnCrystal = true;
+                    break;
+                }
             }
+            if (refOnCrystal) StartMicrosecondTick();
             Mmio.Write32(clkSysCtrl, Mmio.Read32(clkSysCtrl) & ~Rp2350ClocksLayout.CLK_SYS_CTRL_SRC);
             bool parked = false;
             for (int spin = 0; spin < 100000; spin++)
@@ -130,6 +138,29 @@ namespace Lamella.Boards.RaspberryPi
                 RpiPico2Bindings.PLL_USB_FBDIV_PLL_150_48, RpiPico2Bindings.PLL_USB_PRIM_PLL_150_48);
             Mmio.Write32(clkUsbCtrl, 0);
             Mmio.Write32(clkUsbCtrl, Rp2350ClocksLayout.CLK_USB_CTRL_ENABLE);
+        }
+
+        static void StartMicrosecondTick()
+        {
+            uint divider = (Mmio.Read32(Rp2350Instances.CLOCKS_BASE + Rp2350ClocksLayout.CLK_REF_DIV_OFF)
+                & Rp2350ClocksLayout.CLK_REF_DIV_INT) >> (int)Rp2350ClocksLayout.CLK_REF_DIV_INT_LSB;
+            if (divider == 0u) divider = 256u;
+            uint crystal = RpiPico2Bindings.XOSC_HZ_PLL_150_48;
+            if (crystal % divider != 0u) return;
+            uint refHz = crystal / divider;
+            if (refHz % 1000000u != 0u) return;
+
+            uint resetsClr = Rp2350Instances.RESETS_CLR_BASE + Rp2350ResetsLayout.RESET_OFF;
+            uint resetsDone = Rp2350Instances.RESETS_BASE + Rp2350ResetsLayout.RESET_DONE_OFF;
+            Mmio.Write32(resetsClr, Rp2350Instances.TIMER0_RESET_MASK);
+            for (int spin = 0; spin < 100000; spin++)
+            {
+                if ((Mmio.Read32(resetsDone) & Rp2350Instances.TIMER0_RESET_MASK) != 0u) break;
+            }
+            uint ticksCtrl = Rp2350Instances.TICKS_BASE + Rp2350TicksLayout.TIMER0_CTRL_OFF;
+            Mmio.Write32(ticksCtrl, 0);
+            Mmio.Write32(Rp2350Instances.TICKS_BASE + Rp2350TicksLayout.TIMER0_CYCLES_OFF, refHz / 1000000u);
+            Mmio.Write32(ticksCtrl, Rp2350TicksLayout.TIMER0_CTRL_ENABLE);
         }
 
         static void InitPll(uint cs, uint fbdiv, uint prim, uint pwrClr, uint resetMask, uint fbdivValue, uint primValue)
@@ -235,8 +266,8 @@ namespace Lamella.Boards.RaspberryPi
         }
 
         /// <summary>The `spi0` binding descriptor for <paramref name="busId"/>
-        /// (bus 0 = SPI0 on GP16 MISO / GP17 CS / GP18 SCK / GP19 MOSI; unknown ids
-        /// refuse loudly).</summary>
+        /// (bus 0 = SPI0 on GP16 MISO / GP18 SCK / GP19 MOSI, whose chip select 0 is GP17;
+        /// unknown ids refuse loudly).</summary>
         public Rp2350SpiBinding CreateSpiBinding(int busId) { return SpiBinding(busId); }
 
         private static Rp2350SpiBinding SpiBinding(int busId)
@@ -250,26 +281,25 @@ namespace Lamella.Boards.RaspberryPi
                 RpiPico2Bindings.SPI0_RESET_MASK,
                 RpiPico2Bindings.SPI0_IO_MISO_CTRL,
                 RpiPico2Bindings.SPI0_PADS_MISO,
-                RpiPico2Bindings.SPI0_IO_CS_CTRL,
-                RpiPico2Bindings.SPI0_PADS_CS,
                 RpiPico2Bindings.SPI0_IO_SCK_CTRL,
                 RpiPico2Bindings.SPI0_PADS_SCK,
                 RpiPico2Bindings.SPI0_IO_MOSI_CTRL,
                 RpiPico2Bindings.SPI0_PADS_MOSI,
                 RpiPico2Bindings.SPI0_FUNCSEL,
-                RpiPico2Bindings.SPI0_SSPCLK_HZ);
+                RpiPico2Bindings.SPI0_SSPCLK_HZ,
+                new int[] { (int)RpiPico2Bindings.SPI0_CHIP_SELECT0 });
         }
 
         /// <summary>A SPI device per <paramref name="settings"/>: the settings' BusId picks
-        /// the descriptor. A negative ChipSelectLine routes the bus's hardware CS pin
-        /// as the PL022's ss_n; a non-negative line is driven as a managed SIO chip-select.</summary>
+        /// the descriptor. ChipSelectLine is an index into the bus's chip selects: 0 is GP17 on
+        /// bus 0, driven as the select around each operation, and -1 is no chip select.</summary>
         public SpiDevice CreateSpiDevice(SpiConnectionSettings settings)
         {
             return SpiDevice.Create(settings);
         }
 
-        /// <summary>A SPI device on bus 0 with <paramref name="chipSelectLine"/> (the
-        /// one-argument convenience the demos use).</summary>
+        /// <summary>A SPI device on bus 0 with <paramref name="chipSelectLine"/>: an index into the
+        /// bus's chip selects, or -1 for none.</summary>
         public SpiDevice CreateSpiDevice(int chipSelectLine)
         {
             return CreateSpiDevice(new SpiConnectionSettings(0, chipSelectLine));

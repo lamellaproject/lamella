@@ -470,3 +470,6 @@ fitted = "unknown"
 onboard = "st-link"
 recovery = "probe"
 source = "UM1907 documents SWD debugging support and an embedded ST-LINK/V2-1 reaching the part over SWD, with PA13 carrying SYS_JTMS-SWDIO. The manual does not place those signals on a connector for an external probe in anything read here, so the exposure is unknown. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."
+
+[csharp_interpreter]
+optimization = "speed"

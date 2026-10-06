@@ -14,6 +14,10 @@
 use crate::board_bindings as board;
 use crate::rp2350_instances as chip;
 
+#[path = "../../../csp/rp2350/rust/rp2350_xosc_layout.rs"]
+#[allow(dead_code)]
+mod xosc;
+
 fn write_register(address: usize, value: u32) {
     unsafe { core::ptr::write_volatile(address as *mut u32, value) };
 }
@@ -31,7 +35,7 @@ const XOSC_CTRL: usize = chip::XOSC_BASE as usize;
 const XOSC_STATUS: usize = chip::XOSC_BASE as usize + 0x4;
 const XOSC_STARTUP: usize = chip::XOSC_BASE as usize + 0xc;
 const XOSC_CTRL_ENABLE_1_15MHZ: u32 = 0x00fa_baa0;
-const XOSC_STARTUP_DELAY: u32 = 0x00c4;
+const XOSC_STARTUP_DELAY: u32 = xosc::STARTUP_DELAY_RESET;
 const XOSC_STABLE: u32 = 1 << 31;
 const CLK_PERI_CTRL: usize = chip::CLOCKS_BASE as usize + 0x48;
 const CLK_PERI_ENABLE: u32 = 1 << 11;

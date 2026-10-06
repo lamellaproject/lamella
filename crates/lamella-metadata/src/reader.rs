@@ -623,6 +623,54 @@ impl<'a> Assembly<'a> {
             })
     }
 
+    /// The positions in `available` of the assemblies `root` references, directly or through one
+    /// another, in `available`'s order.
+    ///
+    /// **A REFERENCE IS MATCHED BY NAME, TO THE FIRST OF `available` CARRYING IT.** A simple name is
+    /// the one identity an `AssemblyRef` (II.22.5) and the assembly it names (II.22.2) both carry.
+    /// Where two of `available` share a name the first is taken, because a reference set is
+    /// first-declarer-wins, so the first is the one a program was compiled against. Only that
+    /// first one's own references are followed in turn.
+    ///
+    /// **A NAME NOTHING ANSWERS ADDS NOTHING.** The corlib is not among `available`, and an
+    /// assembly built by .NET's compiler names `System.Runtime` or `netstandard`, whose types
+    /// resolve into the corlib by type name. Whether a member resolves is the build's question.
+    ///
+    /// An assembly carrying `root`'s own name is never in the answer, so the closure of a library
+    /// that is itself one of `available` does not contain it, however its references cycle back.
+    ///
+    /// The answer does not depend on the order `root` lists its references in, as .NET's own build
+    /// does not: MSBuild's `ResolveAssemblyReference` takes the transitive closure of a project's
+    /// references, whatever order they are written in.
+    #[must_use]
+    pub fn referenced_assemblies(root: &Assembly<'_>, available: &[Assembly<'_>]) -> Vec<usize> {
+        let names: Vec<Option<&str>> = available.iter().map(Assembly::assembly_name).collect();
+        let own = root.assembly_name();
+        let mut taken: Vec<usize> = Vec::new();
+        let take_references_of = |assembly: &Assembly<'_>, taken: &mut Vec<usize>| {
+            for reference in assembly.assembly_refs() {
+                let Some(wanted) = reference.name() else {
+                    continue;
+                };
+                if own == Some(wanted) {
+                    continue;
+                }
+                let first = names.iter().position(|name| *name == Some(wanted));
+                if let Some(position) = first.filter(|position| !taken.contains(position)) {
+                    taken.push(position);
+                }
+            }
+        };
+        take_references_of(root, &mut taken);
+        let mut cursor = 0;
+        while let Some(&position) = taken.get(cursor) {
+            cursor += 1;
+            take_references_of(&available[position], &mut taken);
+        }
+        taken.sort_unstable();
+        taken
+    }
+
     /// This assembly's own simple name (the `Assembly` row, II.22.2), if present.
     #[must_use]
     pub fn assembly_name(&self) -> Option<&'a str> {
@@ -1072,7 +1120,10 @@ impl<'a> Assembly<'a> {
     /// shared layout the backend (stack slots + GC stack maps) and the runtime (the
     /// flat heap + boxing) consume, so neither re-derives it. A field whose type is a
     /// value type in another assembly (a `TypeRef`) cannot be resolved here and is a
-    /// `LayoutError::UnresolvedValueType`.
+    /// `LayoutError::UnresolvedValueType`; a field whose type instantiates a generic value
+    /// type (`int?`) needs a substitution this crate does not perform and is a
+    /// `LayoutError::UnresolvedInstantiation`. A field instantiating a generic class is a
+    /// reference and lays out here like any other.
     pub fn value_type_layout(
         &self,
         token: Token,
@@ -1089,8 +1140,9 @@ impl<'a> Assembly<'a> {
                 .collect(),
             None => return Err(LayoutError::UnresolvedValueType(token)),
         };
-        layout_value_type(&fields, target, &|nested| {
-            self.value_type_layout(nested, target).ok()
+        layout_value_type(&fields, target, &|nested| match nested {
+            SigType::ValueType(token) => self.value_type_layout(*token, target).ok(),
+            _ => None,
         })
     }
 
@@ -1706,6 +1758,24 @@ impl<'a> TypeDef<'a> {
     #[must_use]
     pub fn is_abstract(&self) -> bool {
         flags::type_is_abstract(self.flags())
+    }
+
+    /// Whether the type has explicit layout, each field at the offset its `FieldLayout` row states
+    /// (`[StructLayout(LayoutKind.Explicit)]`).
+    #[must_use]
+    pub fn is_explicit_layout(&self) -> bool {
+        flags::type_is_explicit_layout(self.flags())
+    }
+
+    /// The type's `ClassLayout` row (II.22.8) as `(packing size, class size)`: what
+    /// `[StructLayout(Pack = n, Size = m)]` writes. `None` when the type has no row.
+    #[must_use]
+    pub fn class_layout(&self) -> Option<(u32, u32)> {
+        let tables = &self.assembly.tables;
+        (1..=tables.row_count(table::CLASS_LAYOUT))
+            .filter_map(|index| tables.row(table::CLASS_LAYOUT, index))
+            .find(|row| row.raw(2) == self.index)
+            .map(|row| (row.raw(0), row.raw(1)))
     }
 
     /// Whether the type is sealed.

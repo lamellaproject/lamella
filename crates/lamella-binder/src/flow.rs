@@ -16,12 +16,14 @@ use alloc::vec::Vec;
 use lamella_syntax::ast::{AssignmentOperator, BinaryOperator, Literal, UnaryOperator};
 use lamella_syntax::span::Span;
 
-/// Whether executing `stmt` always transfers control away rather than reaching its
-/// endpoint -- the structural, label-blind view (every `goto` is taken to exit). Codegen
-/// consumes this form; the `CS0161` test uses the label-aware [`method_body_always_exits`].
+/// Whether executing `stmt` always transfers control away rather than reaching its endpoint
+/// (ECMA-334 15.1), given that its start is reached. A labeled statement inside `stmt` that a
+/// reachable `goto` targets is reached through the jump, so `{ goto L; L: F(); }` reaches its end.
+/// Codegen consumes this form to decide whether a branch over an `else`, or a `leave` out of a
+/// protected region, is needed; the `CS0161` test uses [`method_body_always_exits`].
 #[must_use]
 pub fn always_exits(stmt: &BoundStmt) -> bool {
-    exits(stmt, &BTreeSet::new())
+    exits(stmt, &Jumps::reaching(stmt, BTreeSet::new()))
 }
 
 /// The `CS0161` endpoint test for a whole method body: like [`always_exits`], except a `goto`
@@ -32,7 +34,102 @@ pub fn always_exits(stmt: &BoundStmt) -> bool {
 /// turn a valid value-returning method into a false CS0161.
 #[must_use]
 pub fn method_body_always_exits(body: &BoundStmt) -> bool {
-    exits(body, &undefined_goto_labels(body))
+    exits(body, &Jumps::reaching(body, undefined_goto_labels(body)))
+}
+
+/// What the endpoint test knows about the `goto`s inside the statement it was asked about.
+struct Jumps {
+    /// The labels a `goto` names that no statement declares (`CS0159`): such a `goto` cannot jump.
+    undefined: BTreeSet<Box<str>>,
+    /// The labels a REACHABLE `goto` targets. A statement carrying one is reached through the jump
+    /// even when the statement before it never completes.
+    reached: BTreeSet<Box<str>>,
+}
+
+impl Jumps {
+    /// The jumps of `stmt`, its start taken as reached. A `goto` can leave a block but never enter
+    /// one (ECMA-334 15.9.3), so every `goto` that targets a label inside `stmt` lies inside it as
+    /// well, and `stmt` alone decides which of its labels are reached.
+    ///
+    /// Which labels are reached depends on which `goto`s are, and that depends on which labels
+    /// are: the set grows from empty, one walk at a time, until a walk adds nothing.
+    fn reaching(stmt: &BoundStmt, undefined: BTreeSet<Box<str>>) -> Jumps {
+        let mut jumps = Jumps {
+            undefined,
+            reached: BTreeSet::new(),
+        };
+        loop {
+            let mut found = BTreeSet::new();
+            jumps.reachable_gotos(stmt, &mut found);
+            let before = jumps.reached.len();
+            jumps.reached.extend(found);
+            if jumps.reached.len() == before {
+                return jumps;
+            }
+        }
+    }
+
+    /// Records in `found` the label of every `goto` that control reaches inside `stmt`, its start
+    /// taken as reached. A statement list is reached in order ([`Jumps::sequence_gotos`]); every
+    /// other statement's children are taken as reached when it is.
+    fn reachable_gotos(&self, stmt: &BoundStmt, found: &mut BTreeSet<Box<str>>) {
+        match &stmt.kind {
+            BoundStmtKind::Goto(label) => {
+                found.insert(label.clone());
+            }
+            BoundStmtKind::Block(statements) => self.sequence_gotos(statements, found),
+            BoundStmtKind::Switch { sections, .. } => {
+                for section in sections {
+                    self.sequence_gotos(&section.statements, found);
+                }
+            }
+            _ => {
+                for child in stmt.children() {
+                    self.reachable_gotos(child, found);
+                }
+            }
+        }
+    }
+
+    /// [`Jumps::reachable_gotos`] over a statement list run in order: a statement is reached when
+    /// the one before it completes, or when a reached label marks it.
+    fn sequence_gotos(&self, statements: &[BoundStmt], found: &mut BTreeSet<Box<str>>) {
+        let mut reachable = true;
+        for statement in statements {
+            reachable |= self.marks(statement);
+            if reachable {
+                self.reachable_gotos(statement, found);
+                reachable = !exits(statement, self);
+            }
+        }
+    }
+
+    /// Whether control reaches the end of `statements`, run in order from a reached start: the
+    /// end of the last statement is reachable, counting a statement that a reached label marks
+    /// as reached whatever precedes it.
+    fn sequence_completes(&self, statements: &[BoundStmt]) -> bool {
+        let mut reachable = true;
+        for statement in statements {
+            reachable |= self.marks(statement);
+            if reachable && exits(statement, self) {
+                reachable = false;
+            }
+        }
+        reachable
+    }
+
+    /// Whether `stmt` carries a label a reachable `goto` targets -- its own, or one on the labeled
+    /// statement it labels in turn (`A: B: F();`).
+    fn marks(&self, stmt: &BoundStmt) -> bool {
+        let mut current = stmt;
+        while let BoundStmtKind::Labeled { label, body } = &current.kind {
+            if self.reached.contains(label) {
+                return true;
+            }
+            current = body;
+        }
+        false
+    }
 }
 
 /// The `goto` targets in `body` that name no declared label -- exactly the labels [`check_labels`]
@@ -57,33 +154,33 @@ fn undefined_goto_labels(body: &BoundStmt) -> BTreeSet<Box<str>> {
     undefined
 }
 
-/// The core endpoint-reachability test, threading the set of undefined `goto` labels (empty for
-/// the structural [`always_exits`]): whether `stmt` always transfers control away rather than
-/// reaching its endpoint.
-fn exits(stmt: &BoundStmt, undefined_labels: &BTreeSet<Box<str>>) -> bool {
+/// The core endpoint-reachability test: whether `stmt` always transfers control away rather than
+/// reaching its endpoint, given the `goto`s [`Jumps`] found inside the statement the question was
+/// first asked about.
+fn exits(stmt: &BoundStmt, jumps: &Jumps) -> bool {
     use BoundStmtKind as Kind;
     match &stmt.kind {
         Kind::Return(_) | Kind::Throw(_) => true,
-        Kind::Goto(label) => !undefined_labels.contains(label),
+        Kind::Goto(label) => !jumps.undefined.contains(label),
         Kind::GotoCase(_) | Kind::GotoCaseString(_) | Kind::GotoDefault => true,
-        Kind::Block(statements) => statements.iter().any(|s| exits(s, undefined_labels)),
+        Kind::Block(statements) => !jumps.sequence_completes(statements),
         Kind::If {
             then_branch,
             else_branch: Some(else_branch),
             ..
-        } => exits(then_branch, undefined_labels) && exits(else_branch, undefined_labels),
+        } => exits(then_branch, jumps) && exits(else_branch, jumps),
         Kind::While { condition, body } => is_const_true(condition) && !loop_breaks(body),
         Kind::For {
             condition, body, ..
         } => condition.as_ref().is_none_or(is_const_true) && !loop_breaks(body),
         Kind::DoWhile { body, condition } => {
-            exits(body, undefined_labels) || (is_const_true(condition) && !loop_breaks(body))
+            exits(body, jumps) || (is_const_true(condition) && !loop_breaks(body))
         }
         Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
-            exits(body, undefined_labels)
+            exits(body, jumps)
         }
-        Kind::Checked(inner) | Kind::Unchecked(inner) => exits(inner, undefined_labels),
-        Kind::Labeled { body, .. } => exits(body, undefined_labels),
+        Kind::Checked(inner) | Kind::Unchecked(inner) => exits(inner, jumps),
+        Kind::Labeled { body, .. } => exits(body, jumps),
         Kind::Try {
             body,
             catches,
@@ -91,23 +188,20 @@ fn exits(stmt: &BoundStmt, undefined_labels: &BTreeSet<Box<str>>) -> bool {
         } => {
             finally
                 .as_ref()
-                .is_some_and(|block| exits(block, undefined_labels))
-                || (exits(body, undefined_labels)
+                .is_some_and(|block| exits(block, jumps))
+                || (exits(body, jumps)
                     && catches
                         .iter()
-                        .all(|catch| exits(&catch.body, undefined_labels)))
+                        .all(|catch| exits(&catch.body, jumps)))
         }
         Kind::Switch { sections, .. } => {
             let has_default = sections
                 .iter()
                 .any(|section| section.labels.iter().any(matches_every_value));
             has_default
-                && sections.iter().all(|section| {
-                    section
-                        .statements
-                        .iter()
-                        .any(|s| exits(s, undefined_labels))
-                })
+                && sections
+                    .iter()
+                    .all(|section| !jumps.sequence_completes(&section.statements))
         }
         _ => false,
     }

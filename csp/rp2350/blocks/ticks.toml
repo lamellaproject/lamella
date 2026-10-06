@@ -6,8 +6,9 @@
 kind = "block"
 family = "rp2350"
 block = "ticks"
-# Rust only: the one reader is a board's native clock, which starts TIMER0's tick at reset.
-emit = ["rust"]
+# C# and Rust: a native clock starts TIMER0's tick at reset, and a C# clock bring-up that moves
+# clk_ref starts it again.
+emit = ["csharp", "rust"]
 sources = ["RP2350 datasheet ch 8.5 (tick generators)"]
 notes = [
     "A tick is CYCLES periods of clk_ref. With clk_ref on a 12 MHz crystal, CYCLES = 12 gives the 1 us tick the system timers count, which is the rate the datasheet names for them.",

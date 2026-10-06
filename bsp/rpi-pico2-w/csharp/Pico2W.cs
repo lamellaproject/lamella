@@ -153,8 +153,8 @@ namespace Lamella.Boards.RaspberryPi
         }
 
         /// <summary>The `spi0` binding descriptor for <paramref name="busId"/>
-        /// (bus 0 = SPI0 on GP16 MISO / GP17 CS / GP18 SCK / GP19 MOSI; unknown ids
-        /// refuse loudly).</summary>
+        /// (bus 0 = SPI0 on GP16 MISO / GP18 SCK / GP19 MOSI, whose chip select 0 is GP17;
+        /// unknown ids refuse loudly).</summary>
         public Rp2350SpiBinding CreateSpiBinding(int busId) { return SpiBinding(busId); }
 
         private static Rp2350SpiBinding SpiBinding(int busId)
@@ -168,25 +168,25 @@ namespace Lamella.Boards.RaspberryPi
                 RpiPico2WBindings.SPI0_RESET_MASK,
                 RpiPico2WBindings.SPI0_IO_MISO_CTRL,
                 RpiPico2WBindings.SPI0_PADS_MISO,
-                RpiPico2WBindings.SPI0_IO_CS_CTRL,
-                RpiPico2WBindings.SPI0_PADS_CS,
                 RpiPico2WBindings.SPI0_IO_SCK_CTRL,
                 RpiPico2WBindings.SPI0_PADS_SCK,
                 RpiPico2WBindings.SPI0_IO_MOSI_CTRL,
                 RpiPico2WBindings.SPI0_PADS_MOSI,
                 RpiPico2WBindings.SPI0_FUNCSEL,
-                RpiPico2WBindings.SPI0_SSPCLK_HZ);
+                RpiPico2WBindings.SPI0_SSPCLK_HZ,
+                new int[] { (int)RpiPico2WBindings.SPI0_CHIP_SELECT0 });
         }
 
         /// <summary>A SPI device per <paramref name="settings"/>: the settings' BusId picks
-        /// the descriptor. A negative ChipSelectLine routes the bus's hardware CS pin
-        /// as the PL022's ss_n; a non-negative line is driven as a managed SIO chip-select.</summary>
+        /// the descriptor. ChipSelectLine is an index into the bus's chip selects: 0 is GP17 on
+        /// bus 0, driven as the select around each operation, and -1 is no chip select.</summary>
         public SpiDevice CreateSpiDevice(SpiConnectionSettings settings)
         {
             return SpiDevice.Create(settings);
         }
 
-        /// <summary>A SPI device on bus 0 with <paramref name="chipSelectLine"/>.</summary>
+        /// <summary>A SPI device on bus 0 with <paramref name="chipSelectLine"/>: an index into the
+        /// bus's chip selects, or -1 for none.</summary>
         public SpiDevice CreateSpiDevice(int chipSelectLine)
         {
             return CreateSpiDevice(new SpiConnectionSettings(0, chipSelectLine));

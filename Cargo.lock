@@ -949,6 +949,7 @@ dependencies = [
  "lamella-mmio",
  "lamella-net-core",
  "lamella-net-smoltcp",
+ "lamella-pin-events",
  "lamella-py-runtime",
  "lamella-runner",
  "lamella-tls-mbedtls",
@@ -1087,6 +1088,7 @@ version = "0.1.0"
 name = "lamella-wifi-cyw4343x-smoltcp"
 version = "0.0.0"
 dependencies = [
+ "lamella-net-core",
  "lamella-wifi-cyw4343x",
  "smoltcp",
 ]

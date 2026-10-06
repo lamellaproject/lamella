@@ -1,0 +1,26 @@
+Lamella
+Copyright (c) 2026 Lamella LLC
+
+This product is licensed under your choice of the MIT license (LICENSE-MIT) or
+the Apache License, Version 2.0 (LICENSE-APACHE).
+
+Notices for third-party components distributed with this product appear
+alongside those components and in this file.
+
+Third-party components:
+
+- crates/lamella-syntax/ -- data derived from the Unicode Character Database,
+  Copyright (c) Unicode, Inc., under the Unicode License V3. See LICENSE-UNICODE
+  in that directory.
+- crates/lamella-tls-mbedtls/vendor/mbedtls/ -- Mbed TLS,
+  Copyright The Mbed TLS Contributors, under your choice of the Apache License,
+  Version 2.0 or the GNU General Public License v2.0 or later. See that directory's
+  LICENSE.
+- The managed class libraries (corlib/ and libs/) -- the parts that compatibility
+  with .NET dictates: the public type and member names and shapes of the .NET class
+  libraries and of dotnet/iot that they implement, and the default exception messages
+  they reproduce (from the dotnet/runtime and dotnet/iot repositories),
+  Copyright (c) .NET Foundation and Contributors, MIT license.
+- The C# compiler's diagnostic codes and the text of the diagnostic messages
+  reproduce those of the Roslyn C# compiler (the dotnet/roslyn repository),
+  Copyright (c) .NET Foundation and Contributors, MIT license.

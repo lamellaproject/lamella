@@ -4,6 +4,9 @@
 //! peripheral is in use (erratum RP2350-E12), so this brings clk_sys to the rated 150 MHz. clk_peri
 //! is untouched: the UART bring-up has already put it on the crystal.
 //!
+//! Once clk_ref runs from the crystal, TIMER0 is started counting microseconds: the boot ROM leaves
+//! its tick generator stopped, and the I2C driver times its waits on the bus against that count.
+//!
 //! The sequence runs over [`Registers`] rather than over raw addresses, so a host test runs this
 //! same code over a model of the clock generators. What can go wrong here is the order of the
 //! writes, and no read of the finished registers shows an order.
@@ -22,6 +25,10 @@
 
 use crate::board_bindings as board;
 use crate::rp2350_instances as chip;
+
+#[path = "../../../csp/rp2350/rust/rp2350_xosc_layout.rs"]
+#[allow(dead_code)]
+mod xosc;
 
 /// The registers the clock sequence reads and writes: the chip's own on the board, a model in a
 /// host test.
@@ -47,7 +54,7 @@ pub(crate) const XOSC_CTRL: usize = chip::XOSC_BASE as usize;
 pub(crate) const XOSC_STATUS: usize = chip::XOSC_BASE as usize + 0x4;
 pub(crate) const XOSC_STARTUP: usize = chip::XOSC_BASE as usize + 0xc;
 const XOSC_CTRL_ENABLE_1_15MHZ: u32 = 0x00fa_baa0;
-const XOSC_STARTUP_DELAY: u32 = 0x00c4;
+const XOSC_STARTUP_DELAY: u32 = xosc::STARTUP_DELAY_RESET;
 pub(crate) const XOSC_STABLE: u32 = 1 << 31;
 
 // RESETS: set alias +0x2000 puts a peripheral into reset, the placed clear alias takes it
@@ -57,6 +64,13 @@ pub(crate) const RESETS_CLR: usize = chip::RESETS_CLR_BASE as usize;
 pub(crate) const RESETS_DONE: usize = chip::RESETS_BASE as usize + 0x8;
 pub(crate) const RESET_PLL_SYS: u32 = chip::PLL_SYS_RESET_MASK;
 pub(crate) const RESET_PLL_USB: u32 = chip::PLL_USB_RESET_MASK;
+const RESET_TIMER0: u32 = chip::TIMER0_RESET_MASK;
+
+// TICKS: the generator that clocks TIMER0 ticks once every TIMER0_CYCLES periods of clk_ref; it is
+// stopped while its count changes (datasheet 8.5).
+const TICKS_TIMER0_CTRL: usize = chip::TICKS_BASE as usize + 0x18;
+const TICKS_TIMER0_CYCLES: usize = chip::TICKS_BASE as usize + 0x1c;
+const TICKS_ENABLE: u32 = 1 << 0;
 
 // The two PLLs (8.6.5): CS (REFDIV[5:0], LOCK bit 31), PWR (PD bit 0, POSTDIVPD bit 3,
 // VCOPD bit 5), FBDIV_INT, PRIM (POSTDIV1[18:16], POSTDIV2[14:12]).
@@ -86,6 +100,9 @@ const ATOMIC_CLR: usize = 0x3000;
 // AUXSRC bits 7:5, and its SELECTED is bit 0 for clk_ref and bit 1 for the aux mux.
 pub(crate) const CLK_REF_CTRL: usize = chip::CLOCKS_BASE as usize + 0x30;
 pub(crate) const CLK_REF_SELECTED: usize = chip::CLOCKS_BASE as usize + 0x38;
+// clk_ref's divider: INT in bits 23:16, where 0 means 256.
+const CLK_REF_DIV: usize = chip::CLOCKS_BASE as usize + 0x34;
+const CLK_REF_DIV_INT_LSB: u32 = 16;
 pub(crate) const CLK_SYS_CTRL: usize = chip::CLOCKS_BASE as usize + 0x3c;
 pub(crate) const CLK_SYS_SELECTED: usize = chip::CLOCKS_BASE as usize + 0x44;
 pub(crate) const CLK_USB_CTRL: usize = chip::CLOCKS_BASE as usize + 0x60;
@@ -142,6 +159,29 @@ fn pll_init<R: Registers>(
     true
 }
 
+/// Start TIMER0 counting microseconds from clk_ref, which runs from the crystal: a tick is the
+/// crystal's rate over clk_ref's divider, in MHz, periods of clk_ref. The divider is read rather than
+/// set, because something else on this board may run from clk_ref; the boot ROM leaves it at 4 on a
+/// part booted from flash, so clk_ref is 3 MHz and a tick three of its periods. A divider that leaves
+/// no whole number of periods in a microsecond leaves the generator as found, and TIMER0 then reads
+/// as not counting to whatever times on it, where a tick of the wrong length would mismeasure every
+/// wait. TIMER0 is released from reset if it is held, and its count is not reset.
+fn start_microsecond_tick<R: Registers>(regs: &mut R) {
+    let divider = match (regs.read(CLK_REF_DIV) >> CLK_REF_DIV_INT_LSB) & 0xff {
+        0 => 256,
+        int => int,
+    };
+    let ref_hz = board::XOSC_HZ_PLL_150_48 / divider;
+    if board::XOSC_HZ_PLL_150_48 % divider != 0 || ref_hz % 1_000_000 != 0 || ref_hz == 0 {
+        return;
+    }
+    regs.write(RESETS_CLR, RESET_TIMER0);
+    let _ = wait_for(regs, RESETS_DONE, RESET_TIMER0);
+    regs.write(TICKS_TIMER0_CTRL, 0);
+    regs.write(TICKS_TIMER0_CYCLES, ref_hz / 1_000_000);
+    regs.write(TICKS_TIMER0_CTRL, TICKS_ENABLE);
+}
+
 /// Bring the USB clock tree up: XOSC -> PLL_SYS -> clk_sys at 150 MHz, XOSC -> PLL_USB ->
 /// clk_usb at 48 MHz. Returns `false` if the crystal, a glitchless switch or a PLL never comes
 /// ready, degrading to UART-only operation instead of bricking the board behind an infinite wait.
@@ -162,6 +202,7 @@ pub fn init<R: Registers>(regs: &mut R) -> bool {
     if !wait_for(regs, CLK_REF_SELECTED, 1 << CLK_REF_SRC_XOSC) {
         return false;
     }
+    start_microsecond_tick(regs);
     let sys_ctrl = regs.read(CLK_SYS_CTRL);
     regs.write(CLK_SYS_CTRL, sys_ctrl & !CLK_SYS_CTRL_SRC);
     if !wait_for(regs, CLK_SYS_SELECTED, CLK_SYS_SELECTED_REF) {

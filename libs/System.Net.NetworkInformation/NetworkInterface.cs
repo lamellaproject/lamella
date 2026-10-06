@@ -12,6 +12,12 @@ namespace System.Net.NetworkInformation
         [Lamella.Runtime.RuntimeProvided] private static int Ipv4Gateway(int index) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static int IfaceFlags(int index) { return 0; }
 
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        private static int ChangeCount(int which) { return -1; }
+
+        internal static int Changes(int which) { return ChangeCount(which); }
+
         private readonly int _index;
 
         private NetworkInterface(int index) { _index = index; }

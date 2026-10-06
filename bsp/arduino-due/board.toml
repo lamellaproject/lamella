@@ -59,3 +59,6 @@ fitted = "unknown"
 onboard = "none"
 recovery = "unknown"
 source = "The programming port is an externally bridged UART: an ATmega16U2 bridges the part's UART on PA8 and PA9, which is a serial bridge and not a debug probe. No document for this board is held, so neither where its debug signals reach nor what survives a write to flash is established. Both are recorded as unknown and both are document requests."
+
+[csharp_interpreter]
+optimization = "size"

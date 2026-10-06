@@ -1026,6 +1026,26 @@ pub struct BootloaderLayout {
     pub source: String,
 }
 
+/// The builds a board's C# interpreter firmware can take.
+///
+/// `speed` is the workspace's `flash-speed` profile: the interpreter's own crates are optimized for
+/// speed inside an image that is otherwise optimized for size. `size` is `flash`, which optimizes
+/// everything for size.
+pub const INTERPRETER_BUILDS: [&str; 2] = ["speed", "size"];
+
+/// How this board's C# interpreter firmware is built, and the measurement that chose it.
+///
+/// A CHOICE, AND A PER-BOARD ONE. The speed build executes markedly fewer instructions for the same
+/// program and costs a larger image. Whether that image fits the board's firmware region, and
+/// whether a larger image gives back some of the gain on a part that executes from cached flash,
+/// are facts about the board -- so each board that runs the interpreter states its own build, and a
+/// board added later is measured and chosen for rather than handed a default nobody tried on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InterpreterBuild {
+    /// How the board's C# interpreter firmware is optimized: one of [`INTERPRETER_BUILDS`].
+    pub optimization: String,
+}
+
 /// One position of a connector STANDARD: the join vocabulary two files meet in.
 ///
 /// A standard describes neither a chip nor a board, which is why it is neither. It exists
@@ -1283,6 +1303,8 @@ pub struct BoardTable {
     pub debug: Option<DebugAccess>,
     /// The bootloader the board's product ships in flash. `None` means the file states none.
     pub bootloader: Option<BootloaderLayout>,
+    /// How the board's C# interpreter firmware is built. `None` means the file states no choice.
+    pub interpreter: Option<InterpreterBuild>,
 }
 
 impl BoardTable {
@@ -3797,6 +3819,8 @@ fn build_board(
         Debug,
         /// The bootloader its product ships (`[bootloader]`).
         Bootloader,
+        /// How its C# interpreter firmware is built (`[csharp_interpreter]`).
+        Interpreter,
     }
     let mut at = At::None;
     let mut memory_source_cited = false;
@@ -3837,6 +3861,17 @@ fn build_board(
                 }
                 table.bootloader = Some(BootloaderLayout { base: -1, size: -1, ..BootloaderLayout::default() });
                 at = At::Bootloader;
+            }
+            Item::Section(name) if name == "csharp_interpreter" => {
+                if table.interpreter.is_some() {
+                    return Err(err(
+                        *line,
+                        "a board states [csharp_interpreter] once -- how its C# interpreter firmware is built \
+                         is one choice, and a second section would be a second answer to it",
+                    ));
+                }
+                table.interpreter = Some(InterpreterBuild::default());
+                at = At::Interpreter;
             }
             Item::ArraySection(name) if name == "bindings" => {
                 table.bindings.push(build_binding(*line));
@@ -4020,6 +4055,20 @@ fn build_board(
                                 *line,
                                 &format!(
                                     "unexpected bootloader key '{other}' -- a bootloader record takes name/base/size/reserved_ram/reset_wait_ms/interpreter/source"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                At::Interpreter => {
+                    let record = table.interpreter.as_mut().expect("open interpreter record");
+                    match (key.as_str(), value) {
+                        ("optimization", RawValue::Str(s)) => record.optimization = s.clone(),
+                        (other, _) => {
+                            return Err(err(
+                                *line,
+                                &format!(
+                                    "unexpected csharp_interpreter key '{other}' -- a csharp_interpreter record takes optimization"
                                 ),
                             ));
                         }
@@ -4289,6 +4338,23 @@ fn build_board(
         }
         if record.reset_wait_ms.is_some_and(|wait| wait < 0) {
             return Err(format!("board {}: a bootloader cannot wait a negative time", table.board));
+        }
+    }
+    if let Some(record) = &table.interpreter {
+        if record.optimization.is_empty() {
+            return Err(format!(
+                "board {}: a [csharp_interpreter] record states no optimization -- one of {}",
+                table.board,
+                INTERPRETER_BUILDS.join("/")
+            ));
+        }
+        if !INTERPRETER_BUILDS.contains(&record.optimization.as_str()) {
+            return Err(format!(
+                "board {}: csharp_interpreter optimization '{}' is not one of {}",
+                table.board,
+                record.optimization,
+                INTERPRETER_BUILDS.join("/")
+            ));
         }
     }
     for (at, region) in table.memory.iter().enumerate() {
@@ -6582,7 +6648,7 @@ fn resolve_spi_pl022(
             .ok_or_else(|| format!("{board}: spi binding '{}' needs a {signal} pin", binding.role))?;
         if pin.soft {
             return Err(format!(
-                "{board}: spi binding '{}' marks {signal} soft -- the pl022 arm emits the muxed wiring only (a managed CS is the driver's runtime choice, not a binding fact)",
+                "{board}: spi binding '{}' marks {signal} soft -- the pl022 arm states every signal on a pin with the block's own function, the chip select included, and checks each against its cell",
                 binding.role
             ));
         }
@@ -8820,10 +8886,11 @@ fn resolve_nrf_pin(
 /// each pin's PIN_CNF register address -- the nrf-twi shape with three signals, resolved by the
 /// same routing helper.
 ///
-/// It carries NO chip select, and that is the master's own shape rather than an omission: the
-/// part drives none, both manuals leave slave selection to a GPIO the program owns, and dotnet/iot's
-/// `SpiConnectionSettings.ChipSelectLine` names that GPIO at run time. A binding that names a `cs`
-/// is refused, because a select fixed by the board would be a second answer to one question.
+/// THE MASTER DRIVES NO CHIP SELECT: both manuals leave slave selection to a GPIO. So a binding's
+/// `cs`, when the board names one, must be soft -- a plain output the driver drives for
+/// `SpiConnectionSettings.ChipSelectLine` 0 -- and it reaches the driver through the binding's select
+/// table, not through a register here. A muxed one is refused, because there is no select function
+/// to mux it to.
 struct NrfSpiEmission {
     prefix: String,
     role: String,
@@ -8855,9 +8922,9 @@ fn resolve_spi_nrf(
         ));
     }
     let spi_base = set.instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
-    if binding.pins.iter().any(|(s, _)| s == "cs") {
+    if binding.pins.iter().any(|(s, pin)| s == "cs" && !pin.soft) {
         return Err(format!(
-            "{board}: spi binding '{}' names a chip select, and an nRF spi binding carries none: the master drives no chip select, and SpiConnectionSettings.ChipSelectLine names the GPIO that does at run time",
+            "{board}: spi binding '{}' names a muxed chip select, and the nRF spi master drives none: mark it `soft = true`, a plain output the driver drives for ChipSelectLine 0",
             binding.role
         ));
     }
@@ -9229,6 +9296,8 @@ struct BoardEmissions {
     supplies: Vec<SupplyEmission>,
     /// Per emitted role, `(role, driver family)` -- see [`driver_family`].
     driver_families: Vec<(String, String)>,
+    /// Every spi binding's select table, in binding order.
+    chip_selects: Vec<ChipSelectTable>,
     sercom_uarts: Vec<UartEmission>,
     rp_uarts: Vec<RpUartEmission>,
     esp_uarts: Vec<EspUartEmission>,
@@ -9292,11 +9361,90 @@ fn driver_family(set: &FamilySet, binding: &Binding) -> Result<String, String> {
     Ok(format!("{}-{}", set.family, instance.block))
 }
 
+/// The select table of one spi binding: the pins `SpiConnectionSettings.ChipSelectLine` indexes, in
+/// line order.
+///
+/// A LINE IS AN INDEX, AS DOTNET/IOT MEANS IT ON LINUX, where line n opens `/dev/spidev<bus>.<n>`:
+/// line 0 is the bus's first chip select, -1 is none, and a program never names the pin. So each
+/// entry is the pin a driver drives for its line, numbered as the family's GPIO driver numbers its
+/// pins -- the number `GpioController` takes for the same pin -- so that one number means one pin
+/// everywhere a program meets it.
+///
+/// Entry 0 is the chip select the binding names. A binding that names none has an empty table, and
+/// a driver refuses every line on that bus but -1: it is a bus whose select is the program's own GPIO.
+struct ChipSelectTable {
+    prefix: String,
+    pins: Vec<i64>,
+}
+
+fn resolve_chip_selects(set: &FamilySet, resolved: &ResolvedBoard, binding: &Binding) -> Result<ChipSelectTable, String> {
+    let board = &resolved.board.board;
+    let mut pins = Vec::new();
+    if let Some((_, pin)) = binding.pins.iter().find(|(signal, _)| signal == "cs") {
+        pins.push(logical_pin(&set.family, board, &pin.pin)?);
+    }
+    Ok(ChipSelectTable { prefix: upper_snake(&binding.role), pins })
+}
+
+/// The number a family's GPIO driver gives `pin` -- the logical numbering each driver's `LogicalPin`
+/// composes from a port base and an index: GPIO n on the RP2350; port * 32 + index on the nRF
+/// families, whose `P<port>.<index>` ports are 32 pins wide, and on the SAM D21, whose PORT groups
+/// are too; and port * 16 + index on the ST families, whose ports are 16 pins wide.
+///
+/// THE FAMILY DECIDES, NEVER THE SPELLING ALONE. `split_pin` reads the RP2350's `GP7` and an ST
+/// part's `PG7` as the same port and index, and they are pins 7 and 103. A family with no arm here
+/// is refused rather than guessed, because a wrong number is a wrong pin.
+fn logical_pin(family: &str, board: &str, pin: &str) -> Result<i64, String> {
+    let unknown = || format!("{board}: '{pin}' has no logical number this generator knows on the {family} family");
+    let (port, index) = split_pin(pin).ok_or_else(unknown)?;
+    let index = i64::from(index);
+    let group = |width: i64| {
+        port.is_ascii_lowercase().then(|| i64::from(u32::from(port) - u32::from('a')) * width + index)
+    };
+    let numbered = match family {
+        "rp2350" => (port == 'g').then_some(index),
+        "nrf51" | "nrf52833" => port.to_digit(10).map(|port| i64::from(port) * 32 + index),
+        "samd21" => group(32),
+        _ if family.starts_with("stm32") => group(16),
+        _ => None,
+    };
+    numbered.ok_or_else(unknown)
+}
+
+/// A select table as every language emits it, from ONE derivation: the count, then each entry under
+/// its line. The typed emitters render each row with their own types, and the Python dict takes each
+/// name without the binding's prefix, lowercased (`SPI0_CHIP_SELECT0` is "chip_select0").
+fn chip_select_rows(table: &ChipSelectTable) -> Vec<Row> {
+    let p = &table.prefix;
+    let mut rows = vec![Row::Uint(format!("{p}_CHIP_SELECT_COUNT"), table.pins.len().to_string())];
+    for (line, pin) in table.pins.iter().enumerate() {
+        rows.push(Row::Uint(format!("{p}_CHIP_SELECT{line}"), pin.to_string()));
+    }
+    rows
+}
+
+/// The comment the typed emitters put above the select tables.
+fn chip_select_note(indent: &str) -> String {
+    let lines = [
+        "chip selects: `SpiConnectionSettings.ChipSelectLine` is an index into a bus's chip",
+        "selects, as dotnet/iot means it on Linux. Line n selects the pin in the bus's",
+        "`_CHIP_SELECTn` constant, numbered as this family's GPIO driver numbers its pins; -1",
+        "selects none; and a line at or past the bus's `_CHIP_SELECT_COUNT` names no select. Entry",
+        "0 is the chip select the binding names, and a binding that names none has no entries.",
+    ];
+    let mut out = String::from("\n");
+    for line in lines {
+        out.push_str(&format!("{indent}/// {line}\n"));
+    }
+    out
+}
+
 fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<BoardEmissions, String> {
     let mut emissions = BoardEmissions {
         skipped: Vec::new(),
         supplies: Vec::new(),
         driver_families: Vec::new(),
+        chip_selects: Vec::new(),
         sercom_uarts: Vec::new(),
         rp_uarts: Vec::new(),
         esp_uarts: Vec::new(),
@@ -9346,20 +9494,23 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                     ));
                 }
             },
-            "spi" => match set.family.as_str() {
-                "samd21" => emissions.sercom_spis.push(resolve_spi(set, resolved, binding)?),
-                "rp2350" => emissions.pl022_spis.push(resolve_spi_pl022(set, resolved, binding)?),
-                "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" => {
-                    emissions.st_spis.push(resolve_spi_stm32(set, resolved, binding)?);
+            "spi" => {
+                match set.family.as_str() {
+                    "samd21" => emissions.sercom_spis.push(resolve_spi(set, resolved, binding)?),
+                    "rp2350" => emissions.pl022_spis.push(resolve_spi_pl022(set, resolved, binding)?),
+                    "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" => {
+                        emissions.st_spis.push(resolve_spi_stm32(set, resolved, binding)?);
+                    }
+                    "nrf52833" | "nrf51" => emissions.nrf_spis.push(resolve_spi_nrf(set, resolved, binding)?),
+                    other => {
+                        return Err(format!(
+                            "{}: no spi emission shape for family '{other}' -- add its derivation path first",
+                            resolved.board.board
+                        ));
+                    }
                 }
-                "nrf52833" | "nrf51" => emissions.nrf_spis.push(resolve_spi_nrf(set, resolved, binding)?),
-                other => {
-                    return Err(format!(
-                        "{}: no spi emission shape for family '{other}' -- add its derivation path first",
-                        resolved.board.board
-                    ));
-                }
-            },
+                emissions.chip_selects.push(resolve_chip_selects(set, resolved, binding)?);
+            }
             "i2c" => match set.family.as_str() {
                 "samd21" => emissions.sercom_i2cs.push(resolve_i2c_samd21(set, resolved, binding)?),
                 "same54" => emissions.same54_i2cs.push(resolve_i2c_same54(set, resolved, binding)?),
@@ -9479,6 +9630,7 @@ pub fn emit_board_csharp(
     let BoardEmissions {
         skipped,
         driver_families,
+        chip_selects,
         sercom_uarts: uarts,
         rp_uarts,
         esp_uarts,
@@ -9537,6 +9689,15 @@ pub fn emit_board_csharp(
                 &format!("{}_DRIVER_FAMILY", upper_snake(role)),
                 &format!("\"{family}\""),
             );
+        }
+    }
+    if !chip_selects.is_empty() {
+        out.push_str(&chip_select_note("        "));
+        for row in chip_selects.iter().flat_map(chip_select_rows) {
+            match row {
+                Row::Uint(name, value) => push_const(&mut out, "uint", &name, &value),
+                _ => unreachable!("a select table is integer rows"),
+            }
         }
     }
 
@@ -10945,6 +11106,7 @@ pub fn emit_board_rust(
     let BoardEmissions {
         skipped,
         driver_families,
+        chip_selects: _,
         sercom_uarts: uarts,
         rp_uarts,
         esp_uarts,
@@ -11754,6 +11916,7 @@ pub fn emit_board_swift(
     let BoardEmissions {
         skipped,
         driver_families,
+        chip_selects: _,
         sercom_uarts: uarts,
         rp_uarts,
         esp_uarts,
@@ -12356,6 +12519,7 @@ pub fn emit_board_python(
     let BoardEmissions {
         skipped,
         driver_families,
+        chip_selects: _,
         sercom_uarts,
         rp_uarts,
         esp_uarts,
@@ -14360,6 +14524,23 @@ reg = "CTRL"
 value = 0x2
 "#;
 
+    /// A chip select is numbered as its family's GPIO driver numbers the pin, and the family decides:
+    /// the RP2350's `GP7` and an ST part's `PG7` split to the same port and index, and are pins 7 and
+    /// 103. A family whose numbering the generator does not state is refused.
+    #[test]
+    fn a_chip_select_is_numbered_by_its_family() {
+        assert_eq!(logical_pin("rp2350", "b", "GP17"), Ok(17));
+        assert_eq!(logical_pin("rp2350", "b", "GP7"), Ok(7));
+        assert_eq!(logical_pin("stm32f42x", "b", "PG7"), Ok(6 * 16 + 7));
+        assert_eq!(logical_pin("stm32f42x", "b", "PC1"), Ok(2 * 16 + 1));
+        assert_eq!(logical_pin("samd21", "b", "PA05"), Ok(5));
+        assert_eq!(logical_pin("samd21", "b", "PB05"), Ok(32 + 5));
+        assert_eq!(logical_pin("nrf52833", "b", "P1.02"), Ok(32 + 2));
+        assert_eq!(logical_pin("nrf51", "b", "P0.16"), Ok(16));
+        assert!(logical_pin("rp2350", "b", "PA05").is_err(), "an RP2350 pin is spelled GP<n>");
+        assert!(logical_pin("ch32v003", "b", "PC1").is_err(), "a family with no stated numbering is refused");
+    }
+
     #[test]
     fn parses_a_block_and_emits_offsets_widths_masks() {
         let Strata::Block(block) = parse(BLOCK).expect("parses") else { panic!("kind") };
@@ -16045,7 +16226,8 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         }
     }
 
-    /// The Zero's file with `section` in place of its own `[bootloader]`, which is its last.
+    /// The Zero's file with `section` in place of its own `[bootloader]`, which only
+    /// `[csharp_interpreter]` follows.
     fn zero_with(section: &str) -> Result<BoardTable, String> {
         let (head, _) = ZERO
             .split_once("\n[bootloader]")
@@ -16092,6 +16274,41 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         ];
         for (section, expected) in cases {
             let error = zero_with(&section).expect_err(expected);
+            assert!(error.contains(expected), "{expected:?} in {error:?}");
+        }
+    }
+
+    const PICO2_W: &str = include_str!("../../../bsp/rpi-pico2-w/board.toml");
+
+    /// The Pico 2 W's file with `section` in place of its own `[csharp_interpreter]`, which is its last.
+    fn pico2_w_with(section: &str) -> Result<BoardTable, String> {
+        let (head, _) = PICO2_W
+            .split_once("\n[csharp_interpreter]")
+            .expect("the Pico 2 W states [csharp_interpreter], last in its file");
+        board_text(&format!("{head}\n{section}"))
+    }
+
+    const INTERPRETER: &str = "[csharp_interpreter]\noptimization = \"speed\"\n";
+
+    #[test]
+    fn the_pico_2_w_states_how_its_interpreter_firmware_is_built() {
+        let record = board_text(PICO2_W).unwrap().interpreter.expect("the Pico 2 W states [csharp_interpreter]");
+        assert_eq!(record.optimization, "speed");
+        assert_eq!(pico2_w_with("").unwrap().interpreter, None);
+        assert_eq!(pico2_w_with(&INTERPRETER.replace("speed", "size")).unwrap().interpreter.unwrap().optimization, "size");
+    }
+
+    #[test]
+    fn an_interpreter_record_that_cannot_be_checked_or_says_nothing_is_refused() {
+        let cases = [
+            (format!("{INTERPRETER}{INTERPRETER}"), "states [csharp_interpreter] once"),
+            (INTERPRETER.replace("optimization = \"speed\"\n", ""), "states no optimization"),
+            (INTERPRETER.replace("\"speed\"", "\"fast\""), "optimization 'fast'"),
+            (format!("{INTERPRETER}source = \"s\"\n"), "unexpected csharp_interpreter key 'source'"),
+            (format!("{INTERPRETER}python = \"size\"\n"), "unexpected csharp_interpreter key 'python'"),
+        ];
+        for (section, expected) in cases {
+            let error = pico2_w_with(&section).expect_err(expected);
             assert!(error.contains(expected), "{expected:?} in {error:?}");
         }
     }

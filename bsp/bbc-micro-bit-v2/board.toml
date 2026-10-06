@@ -36,9 +36,12 @@ sda = { pin = "P0.16" }
 
 # THE EDGE CONNECTOR'S SPI. Edge pins 13, 14 and 15 carry the SPI clock, MISO and MOSI. The binding
 # rides the legacy SPI master's instance SPI2, which shares its base only with the EasyDMA SPI
-# siblings and with neither TWI, so the internal I2C bus on TWI0 stays its own. The master drives no
-# chip select: the program names the GPIO that selects its device, as
-# SpiConnectionSettings.ChipSelectLine.
+# siblings and with neither TWI, so the internal I2C bus on TWI0 stays its own. It names no chip
+# select, because the board gives this bus none: the schematic's SPI_EXT nets are the clock and the
+# two data lines, and the edge connector's published pinout
+# (tech.microbit.org/hardware/edgeconnector) names no pin as a chip select. So the bus's select
+# table is empty, SpiConnectionSettings.ChipSelectLine -1 is its only line, and a device's select is
+# a pin the program drives itself.
 [[bindings]]
 role = "spi"
 kind = "spi"
@@ -219,3 +222,6 @@ fitted = "unknown"
 onboard = "cmsis-dap"
 recovery = "probe"
 source = "The board carries an interface processor running a CMSIS-DAP debugger, which this toolchain speaks over USB. Where the target part's SWD signals reach on the board is not established by a document held here. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."
+
+[csharp_interpreter]
+optimization = "size"

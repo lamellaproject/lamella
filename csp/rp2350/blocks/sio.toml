@@ -20,6 +20,11 @@ notes = [
 offset = 0x4
 width = 32
 
+[registers.GPIO_HI_IN]
+offset = 0x8
+width = 32
+notes = "GPIO32-47's input levels in bits 15:0, the QSPI and USB pins' above them (datasheet 3.1.11, Table 20). Read by the firmware's IO_IRQ_BANK0 handler for a high-bank pin's level."
+
 [registers.GPIO_OUT_SET]
 offset = 0x18
 width = 32

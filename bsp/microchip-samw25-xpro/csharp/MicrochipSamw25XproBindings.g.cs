@@ -26,6 +26,14 @@ namespace Lamella.Generated
         public const string WINC_SPI_DRIVER_FAMILY = "samd21-sercom";
         public const string VCP_DRIVER_FAMILY = "samd21-sercom";
 
+        /// chip selects: `SpiConnectionSettings.ChipSelectLine` is an index into a bus's chip
+        /// selects, as dotnet/iot means it on Linux. Line n selects the pin in the bus's
+        /// `_CHIP_SELECTn` constant, numbered as this family's GPIO driver numbers its pins; -1
+        /// selects none; and a line at or past the bus's `_CHIP_SELECT_COUNT` names no select. Entry
+        /// 0 is the chip select the binding names, and a binding that names none has no entries.
+        public const uint WINC_SPI_CHIP_SELECT_COUNT = 1;
+        public const uint WINC_SPI_CHIP_SELECT0 = 14;
+
         // -- VCP: a sercom-usart binding descriptor --
         public const uint VCP_SERCOM_BASE = 0x42001800;
         public const uint VCP_IRQ = 13;

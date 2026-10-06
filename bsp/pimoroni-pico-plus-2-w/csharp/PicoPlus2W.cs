@@ -54,7 +54,18 @@ namespace Lamella.Boards.Pimoroni
 
         private static SpiDriver MakeSpi0() { return new Rp2350SpiDriver(SpiBinding(0)); }
         private static I2cDriver MakeI2c0() { return new Rp2350I2cDriver(I2cBinding(0)); }
-        private static GpioDriver MakeGpio() { return new Rp2350GpioDriver(RadioPins); }
+        private static GpioDriver MakeGpio()
+        {
+            return new Rp2350GpioDriver(RadioPins,
+                new int[] {
+                    (int)PimoroniPicoPlus2WBindings.ADC_CHANNEL0_TWIN_PIN,
+                    (int)PimoroniPicoPlus2WBindings.ADC_CHANNEL1_TWIN_PIN,
+                    (int)PimoroniPicoPlus2WBindings.ADC_CHANNEL2_TWIN_PIN },
+                new int[] {
+                    (int)PimoroniPicoPlus2WBindings.ADC_CHANNEL0_PIN,
+                    (int)PimoroniPicoPlus2WBindings.ADC_CHANNEL1_PIN,
+                    (int)PimoroniPicoPlus2WBindings.ADC_CHANNEL2_PIN });
+        }
         private static AdcDriver MakeAdc() { return new Rp2350AdcDriver(AdcBinding()); }
 
         /// <summary>The family SIO/pad driver this board bound, over bank 0 less the four lines in
@@ -68,7 +79,9 @@ namespace Lamella.Boards.Pimoroni
         }
 
         /// <summary>A GPIO controller over the RP2350 SIO/pad block, bank 0 (GP0..GP31). The radio's
-        /// four lines refuse <c>SetPinMode</c>.</summary>
+        /// four lines refuse <c>SetPinMode</c>. A mode set on GP26, GP27 or GP28 leaves the
+        /// converter's pad on the same header position (GP40, GP41 or GP42) high-impedance, with no
+        /// pull.</summary>
         public GpioController CreateGpioController()
         {
             return new GpioController();
@@ -164,8 +177,8 @@ namespace Lamella.Boards.Pimoroni
         }
 
         /// <summary>The `spi0` binding descriptor for <paramref name="busId"/>
-        /// (bus 0 = SPI0 on GP16 MISO / GP17 CS / GP18 SCK / GP19 MOSI; unknown ids
-        /// refuse loudly).</summary>
+        /// (bus 0 = SPI0 on GP16 MISO / GP18 SCK / GP19 MOSI, whose chip select 0 is GP17;
+        /// unknown ids refuse loudly).</summary>
         public Rp2350SpiBinding CreateSpiBinding(int busId) { return SpiBinding(busId); }
 
         private static Rp2350SpiBinding SpiBinding(int busId)
@@ -179,25 +192,25 @@ namespace Lamella.Boards.Pimoroni
                 PimoroniPicoPlus2WBindings.SPI0_RESET_MASK,
                 PimoroniPicoPlus2WBindings.SPI0_IO_MISO_CTRL,
                 PimoroniPicoPlus2WBindings.SPI0_PADS_MISO,
-                PimoroniPicoPlus2WBindings.SPI0_IO_CS_CTRL,
-                PimoroniPicoPlus2WBindings.SPI0_PADS_CS,
                 PimoroniPicoPlus2WBindings.SPI0_IO_SCK_CTRL,
                 PimoroniPicoPlus2WBindings.SPI0_PADS_SCK,
                 PimoroniPicoPlus2WBindings.SPI0_IO_MOSI_CTRL,
                 PimoroniPicoPlus2WBindings.SPI0_PADS_MOSI,
                 PimoroniPicoPlus2WBindings.SPI0_FUNCSEL,
-                PimoroniPicoPlus2WBindings.SPI0_SSPCLK_HZ);
+                PimoroniPicoPlus2WBindings.SPI0_SSPCLK_HZ,
+                new int[] { (int)PimoroniPicoPlus2WBindings.SPI0_CHIP_SELECT0 });
         }
 
         /// <summary>A SPI device per <paramref name="settings"/>: the settings' BusId picks
-        /// the descriptor. A negative ChipSelectLine routes the bus's hardware CS pin
-        /// as the PL022's ss_n; a non-negative line is driven as a managed SIO chip-select.</summary>
+        /// the descriptor. ChipSelectLine is an index into the bus's chip selects: 0 is GP17 on
+        /// bus 0, driven as the select around each operation, and -1 is no chip select.</summary>
         public SpiDevice CreateSpiDevice(SpiConnectionSettings settings)
         {
             return SpiDevice.Create(settings);
         }
 
-        /// <summary>A SPI device on bus 0 with <paramref name="chipSelectLine"/>.</summary>
+        /// <summary>A SPI device on bus 0 with <paramref name="chipSelectLine"/>: an index into the
+        /// bus's chip selects, or -1 for none.</summary>
         public SpiDevice CreateSpiDevice(int chipSelectLine)
         {
             return CreateSpiDevice(new SpiConnectionSettings(0, chipSelectLine));

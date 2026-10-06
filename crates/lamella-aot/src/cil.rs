@@ -174,6 +174,17 @@ pub enum CilError {
     ///
     /// Carries the instantiation's canonical spelling so a failing build names what it refused.
     GenericValueTypeSlot(alloc::string::String),
+    /// A TYPE COULD NOT BE LAID OUT BECAUSE OF ONE OF ITS FIELDS, so an allocation of it or an access
+    /// to its fields has no size, offset or trace map to lower with.
+    ///
+    /// Carries the field (`Namespace.Type::field`) and its type, so a failing build names the
+    /// declaration to look at rather than the opcode that met it.
+    UnlaidField {
+        /// The field, as `Namespace.Type::field`.
+        field: alloc::string::String,
+        /// The field's type, in this tier's canonical spelling.
+        field_type: alloc::string::String,
+    },
     /// A `catch (T)` clause bound NO tag, so nothing in flight could ever match it and the handler
     /// would be silently dead.
     ///
@@ -347,6 +358,17 @@ pub trait CallResolver {
     /// while live on a mark-compact heap (measured; `tests/fixtures/structroot.cs`). Two calls are
     /// two chances to ask only the first.
     fn value_type_cell(&self, _operand: &Operand) -> Option<(u32, lamella_ir::RefWords)> {
+        None
+    }
+
+    /// The field that stops the layout of the type an operand allocates or reads -- a `newobj`
+    /// constructor, or an `ldfld`/`stfld`/`ldflda` field -- as `(Namespace.Type::field, the field's
+    /// type)`, so a refusal can name the declaration rather than the opcode. Defaults to `None`,
+    /// which leaves the refusal unnamed.
+    fn unlaid_field(
+        &self,
+        _operand: &Operand,
+    ) -> Option<(alloc::string::String, alloc::string::String)> {
         None
     }
 
@@ -1056,6 +1078,7 @@ fn lower_with_source(
     resolver: &dyn CallResolver,
     arg_types: &[MirType],
     local_types: &[MirType],
+    returns: Returns,
     narrowing: Narrowing<'_>,
 ) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
@@ -2070,10 +2093,14 @@ fn lower_with_source(
     let (rows, local_changes): (Vec<Vec<u32>>, Vec<Vec<(u32, u16, Option<ValueId>)>>) =
         source_map.into_iter().unzip();
 
-    let ret = mir_blocks.iter().find_map(|blk| match &blk.terminator {
-        Some(Terminator::Return(Some(v))) => value_types.get(v.index()).copied(),
-        _ => None,
-    });
+    let ret = match returns {
+        Returns::FromBody => mir_blocks.iter().find_map(|blk| match &blk.terminator {
+            Some(Terminator::Return(Some(v))) => value_types.get(v.index()).copied(),
+            _ => None,
+        }),
+        Returns::Void => None,
+        Returns::Value(ty) => Some(ty),
+    };
 
     if let Some(ret_ty) = ret {
         for &block_index in &propagate_fixups {
@@ -2233,13 +2260,14 @@ impl CilSourceMap {
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`]. See
 /// [`lower_method_debug`] for the accompanying [`CilSourceMap`].
 pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
-    lower_with_source(body, &NoCalls, &[], &[], Narrowing::default()).map(|(function, _)| function)
+    lower_with_source(body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default())
+        .map(|(function, _)| function)
 }
 
 /// Lowers a method body, also returning the [`CilSourceMap`] tying each MIR
 /// instruction back to the CIL instruction it came from.
 pub fn lower_method_debug(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, &NoCalls, &[], &[], Narrowing::default())
+    lower_with_source(body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default())
 }
 
 /// Lowers a method body that makes calls, using `resolver` to map each `call`'s token to
@@ -2249,21 +2277,56 @@ pub fn lower_method_debug_with(
     body: &MethodBodyImage,
     resolver: &dyn CallResolver,
 ) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, resolver, &[], &[], Narrowing::default())
+    lower_with_source(body, resolver, &[], &[], Returns::FromBody, Narrowing::default())
 }
 
 /// Lowers a method body with explicit parameter and local types (mapped from the method's
 /// signature and local-variable signature), so `int64`, value-type, and other non-`int32`
 /// slots type correctly instead of defaulting to `int32`. A slot with no supplied type
-/// defaults to `int32`.
+/// defaults to `int32`. The function's result type is `returns`, from the same signature.
 pub fn lower_method_typed(
     body: &MethodBodyImage,
     resolver: &dyn CallResolver,
     arg_types: &[MirType],
     local_types: &[MirType],
+    returns: Returns,
     narrowing: Narrowing<'_>,
 ) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, resolver, arg_types, local_types, narrowing)
+    lower_with_source(body, resolver, arg_types, local_types, returns, narrowing)
+}
+
+/// What a method's signature says it returns, which the lowering makes the function's result type.
+///
+/// **THE SIGNATURE, NOT THE BODY, BECAUSE A BODY CAN HAVE NO `return` TO READ.** A method whose
+/// every path throws reaches no `return`, and its callers bind its declared result all the same: a
+/// WebAssembly host binds the export's type, a virtual call checks the callee's signature, and on ARM
+/// and RISC-V a struct too wide for registers comes back through a pointer the caller passes ahead of
+/// the arguments. A REQUIRED PARAMETER of the typed entry, for the reason [`Narrowing`] is one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Returns {
+    /// No signature is known (the single-method entries above, which pass no slot types either):
+    /// the result type is the type of the body's first reachable `return`.
+    FromBody,
+    /// The signature returns `void`.
+    Void,
+    /// The signature returns a value of this type.
+    Value(MirType),
+}
+
+impl Returns {
+    /// What `signature` declares, typed by `typed` -- the rule the caller types the method's
+    /// parameters with, so a result and an argument of one type cannot disagree. No signature
+    /// leaves the result type to the body.
+    pub fn declared<E>(
+        signature: Option<&lamella_metadata::MethodSig>,
+        typed: impl Fn(&lamella_metadata::SigType) -> Result<MirType, E>,
+    ) -> Result<Self, E> {
+        Ok(match signature.map(|signature| &signature.return_type) {
+            None => Returns::FromBody,
+            Some(lamella_metadata::SigType::Void) => Returns::Void,
+            Some(declared) => Returns::Value(typed(declared)?),
+        })
+    }
 }
 
 /// The DECLARED short-integer width of each argument and local, as the conversion that realizes it,
@@ -2560,6 +2623,15 @@ fn narrow_access(kind: ConvKind) -> Option<(u8, bool)> {
         ConvKind::SignExtend16 => Some((2, true)),
         ConvKind::ZeroExtend16 => Some((2, false)),
         _ => None,
+    }
+}
+
+/// The refusal for an operand whose type does not lay out: the field that stops it, when the
+/// resolver can name one ([`CallResolver::unlaid_field`]), else the unnamed [`CilError::BadOperand`].
+fn unlaid(resolver: &dyn CallResolver, operand: &Operand) -> CilError {
+    match resolver.unlaid_field(operand) {
+        Some((field, field_type)) => CilError::UnlaidField { field, field_type },
+        None => CilError::BadOperand,
     }
 }
 
@@ -4153,7 +4225,7 @@ fn apply_value_op(
         Opcode::Ldflda => {
             let field = resolver
                 .field_offset(&inst.operand)
-                .ok_or(CilError::BadOperand)?;
+                .ok_or_else(|| unlaid(resolver, &inst.operand))?;
             match last_local_addr.take() {
                 Some(pending) => {
                     *last_local_addr = Some(PendingAddr {
@@ -4238,7 +4310,7 @@ fn apply_value_op(
             let offset = base_offset
                 + resolver
                     .field_offset(&inst.operand)
-                    .ok_or(CilError::BadOperand)?;
+                    .ok_or_else(|| unlaid(resolver, &inst.operand))?;
             let field_ty = resolver.field_type(&inst.operand).unwrap_or(MirType::I32);
             let result = new_value(value_types, field_ty);
             match resolver.field_narrow(&inst.operand).and_then(narrow_access) {
@@ -4267,7 +4339,7 @@ fn apply_value_op(
             let offset = base_offset
                 + resolver
                     .field_offset(&inst.operand)
-                    .ok_or(CilError::BadOperand)?;
+                    .ok_or_else(|| unlaid(resolver, &inst.operand))?;
             let placeholder = new_value(value_types, MirType::I32);
             match resolver.field_narrow(&inst.operand).and_then(narrow_access) {
                 Some((size, _)) => insts.push((
@@ -4294,6 +4366,7 @@ fn apply_value_op(
                 .array_element(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
             let length = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let length = sizable_length(length, element.element_size, value_types, insts);
             let array = new_value(value_types, MirType::ObjectRef);
             insts.push((
                 array,
@@ -4954,7 +5027,7 @@ fn apply_value_op(
                 None => {
                     let layout = resolver
                         .newobj_reference_layout(&inst.operand)
-                        .ok_or(CilError::BadOperand)?;
+                        .ok_or_else(|| unlaid(resolver, &inst.operand))?;
                     let obj = new_value(value_types, MirType::ObjectRef);
                     insts.push((
                         obj,
@@ -6202,7 +6275,7 @@ fn trap_kind_at(
     if let Some(kind) = overflow {
         return Some(TrapKind::Overflow(kind));
     }
-    if let Some((lo, hi, unsigned_source)) = control_flow::conv_overflow_range(opcode) {
+    if let Some((lo, hi, unsigned_source)) = control_flow::checked_range(opcode) {
         return Some(TrapKind::ConvOverflow {
             lo,
             hi,
@@ -6506,7 +6579,7 @@ fn trap_operand_types(
             return types;
         }
     }
-    if control_flow::conv_overflow_range(opcode).is_some() {
+    if control_flow::checked_range(opcode).is_some() {
         return vec![slot];
     }
     if matches!(
@@ -6768,6 +6841,61 @@ fn cmp_value(
     let v = new_value(value_types, MirType::I32);
     insts.push((v, Inst::Compare { op, lhs, rhs }));
     v
+}
+
+/// The most header any backend lays before an array's elements: the length word, and the type
+/// descriptor's word where the backend writes one itself.
+const ARRAY_HEADER_BYTES_MAX: u32 = 8;
+
+/// `length`, or the largest count whose byte size still fits 32 bits when `length` is larger --
+/// the count an `AllocArray` of `element_size`-byte elements is given.
+///
+/// **EVERY BACKEND SIZES AN ARRAY AS `length * element_size + header` IN 32 BITS**, and a count past
+/// this one wraps that product into a small request that fits. The allocator then hands back a few
+/// bytes under a header claiming the whole length, and the unsigned bounds check passes every index
+/// up to it, so safe code reads and writes outside the array. At or below this count no product
+/// wraps, so an impossible array asks for more memory than any part has and stops at the exhausted
+/// heap, as every other request that does not fit does.
+///
+/// Branch-free, because it sits on every `new T[n]`: `length - ((length - max) & mask)`, where `mask`
+/// is all ones exactly when `length` is above `max`. The compare is unsigned, so a negative count is
+/// clamped too should one ever arrive. One-byte elements need nothing: a count of at most
+/// `i32::MAX` plus any header stays below 2^32.
+fn sizable_length(
+    length: ValueId,
+    element_size: u32,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    if element_size <= 1 {
+        return length;
+    }
+    let max = new_value(value_types, MirType::I32);
+    insts.push((
+        max,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from((u32::MAX - ARRAY_HEADER_BYTES_MAX) / element_size),
+        },
+    ));
+    let zero = new_value(value_types, MirType::I32);
+    insts.push((
+        zero,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: 0,
+        },
+    ));
+    let above = cmp_value(CmpOp::UnsignedGt, length, max, value_types, insts);
+    let mut binary = |op: BinOp, lhs: ValueId, rhs: ValueId| {
+        let v = new_value(value_types, MirType::I32);
+        insts.push((v, Inst::Binary { op, lhs, rhs }));
+        v
+    };
+    let mask = binary(BinOp::Sub, zero, above);
+    let excess = binary(BinOp::Sub, length, max);
+    let cut = binary(BinOp::And, excess, mask);
+    binary(BinOp::Sub, length, cut)
 }
 
 /// Weakens a checked reference cast's failure predicate so that NULL PASSES: `mismatch = unmatched AND
@@ -9012,7 +9140,7 @@ mod control_flow {
             size: 8,
             refs: lamella_ir::RefWords::NONE,
         };
-        let (func, _) = lower_method_typed(&body, &Fields, &[], &[point], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &Fields, &[], &[point], Returns::FromBody, Narrowing::default()).unwrap();
         let insts: Vec<_> = func.blocks[0].insts.iter().map(|(_, i)| i).collect();
         assert!(insts.iter().any(|i| matches!(i, Inst::InitStruct)));
         assert!(insts.iter().any(|i| matches!(i, Inst::FieldStore { .. })));
@@ -9074,17 +9202,22 @@ mod control_flow {
         )
     }
 
-    /// The range a checked conversion (`conv.ovf.*`) tests, or `None` for an opcode that cannot
-    /// overflow: `(lo, hi, unsigned_source)`. `lo` is the target's inclusive minimum and `hi` its
-    /// inclusive maximum, or `None` for `u64`, whose maximum does not fit an `i64`. `unsigned_source`
-    /// marks the `.un` family, which reads its source unsigned, so it has no lower bound and compares its
-    /// upper one unsigned. The native `.un` forms target a 32-bit native int here, so they share the
-    /// `i4`/`u4` ranges; `conv.ovf.u8.un` holds any unsigned source, so it has none.
+    /// The range a checked opcode holds its one operand to, raising OverflowException outside it, or
+    /// `None` for an opcode that tests none: `(lo, hi, unsigned_source)`. For a checked conversion
+    /// (`conv.ovf.*`) `lo` is the target's inclusive minimum and `hi` its inclusive maximum, or `None`
+    /// for `u64`, whose maximum does not fit an `i64`. `unsigned_source` marks the `.un` family, which
+    /// reads its source unsigned, so it has no lower bound and compares its upper one unsigned. The
+    /// native `.un` forms target a 32-bit native int here, so they share the `i4`/`u4` ranges;
+    /// `conv.ovf.u8.un` holds any unsigned source, so it has none.
+    ///
+    /// `newarr` is the one opcode here that converts nothing: ECMA-335 III.4.20 raises
+    /// OverflowException when its element count is below 0, which is this test with no upper bound.
     ///
     /// Block discovery makes every opcode with a range a leader, and the trap lowering takes its bounds
     /// from the same answer, so an opcode cannot be one without the other.
-    pub fn conv_overflow_range(op: Opcode) -> Option<(i64, Option<i64>, bool)> {
+    pub fn checked_range(op: Opcode) -> Option<(i64, Option<i64>, bool)> {
         Some(match op {
+            Opcode::Newarr => (0, None, false),
             Opcode::ConvOvfI1 => (-128, Some(127), false),
             Opcode::ConvOvfU1 => (0, Some(255), false),
             Opcode::ConvOvfI2 => (-32768, Some(32767), false),
@@ -9311,7 +9444,7 @@ mod control_flow {
                     | Opcode::MulOvf
                     | Opcode::MulOvfUn
             );
-            let is_conv_ovf = conv_overflow_range(inst.opcode).is_some();
+            let is_range_checked = checked_range(inst.opcode).is_some();
             let in_protected_try = handlers.iter().any(|clause| {
                 matches!(clause.kind, EhKind::Catch(_) | EhKind::Finally)
                     && (clause.try_range.start as usize..clause.try_range.end as usize).contains(&i)
@@ -9325,7 +9458,7 @@ mod control_flow {
                 || is_rectangular)
                 && in_protected_try)
                 || is_cast
-                || is_conv_ovf
+                || is_range_checked
                 || is_overflow
                 || is_covariant
             {
@@ -9484,6 +9617,7 @@ mod tests {
         assert_eq!(range(Opcode::ConvOvfU4), Some((0, Some(4_294_967_295), false)));
         assert_eq!(range(Opcode::ConvOvfI8), Some((i64::MIN, Some(i64::MAX), false)));
         assert_eq!(range(Opcode::ConvOvfU8), Some((0, None, false)));
+        assert_eq!(range(Opcode::Newarr), Some((0, None, false)));
     }
 
     #[test]
@@ -9626,7 +9760,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &Ctor, &[], &[vec2], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &Ctor, &[], &[vec2], Returns::FromBody, Narrowing::default()).unwrap();
         let insts: Vec<_> = func.blocks[0].insts.iter().map(|(_, i)| i).collect();
         assert!(insts.iter().any(|i| matches!(i, Inst::InitStruct)));
         assert!(
@@ -9728,6 +9862,7 @@ mod tests {
                     &Instance(dispatch),
                     &[receiver_type],
                     &[reading],
+                    Returns::FromBody,
                     Narrowing::default(),
                 )
                 .unwrap_or_else(|e| panic!("{case}: {e:?}"));
@@ -9828,6 +9963,7 @@ mod tests {
                 &Get(int_to_string),
                 &[MirType::ObjectRef],
                 &[label, MirType::I32],
+                Returns::FromBody,
                 Narrowing::default(),
             )
             .unwrap_or_else(|e| panic!("{case}: {e:?}"));
@@ -10095,7 +10231,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &Fields, &[point], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &Fields, &[point], &[], Returns::FromBody, Narrowing::default()).unwrap();
         let arg0 = func.blocks[0].params[0];
         assert!(
             func.blocks[0]
@@ -10136,7 +10272,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &i64s, Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &i64s, Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::I64));
     }
@@ -10158,7 +10294,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::ObjectRef], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::ObjectRef], &[], Returns::FromBody, Narrowing::default()).unwrap();
         let cond = func
             .blocks
             .iter()
@@ -10192,10 +10328,10 @@ mod tests {
     fn stind_ref_of_a_long_is_refused_and_of_a_reference_lowers() {
         let body = set_through_ref_body();
         let at_long =
-            lower_method_typed(&body, &NoCalls, &[MirType::ManagedPtr, MirType::I64], &[], Narrowing::default());
+            lower_method_typed(&body, &NoCalls, &[MirType::ManagedPtr, MirType::I64], &[], Returns::FromBody, Narrowing::default());
         assert_eq!(at_long.err(), Some(CilError::NonReferenceIndirect(Opcode::StindRef)));
         let at_string =
-            lower_method_typed(&body, &NoCalls, &[MirType::ManagedPtr, MirType::ObjectRef], &[], Narrowing::default());
+            lower_method_typed(&body, &NoCalls, &[MirType::ManagedPtr, MirType::ObjectRef], &[], Returns::FromBody, Narrowing::default());
         assert!(at_string.is_ok());
     }
 
@@ -10220,6 +10356,7 @@ mod tests {
                 &NoCalls,
                 &[MirType::ManagedPtr],
                 &[],
+                Returns::FromBody,
                 Narrowing { pointees: &pointees, ..Narrowing::default() },
             )
         };
@@ -10241,7 +10378,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let refused = lower_method_typed(&body, &NoCalls, &[], &[MirType::I64], Narrowing::default());
+        let refused = lower_method_typed(&body, &NoCalls, &[], &[MirType::I64], Returns::FromBody, Narrowing::default());
         assert_eq!(refused.err(), Some(CilError::NonReferenceIndirect(Opcode::LdindRef)));
     }
 
@@ -10262,7 +10399,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default()).unwrap();
         let cond = func
             .blocks
             .iter()
@@ -10317,7 +10454,7 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         let (func, _) =
-            lower_method_typed(&body, &NativePrimitive, &[], &[MirType::NativeInt], Narrowing::default()).unwrap();
+            lower_method_typed(&body, &NativePrimitive, &[], &[MirType::NativeInt], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
             func.blocks
@@ -10354,7 +10491,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &FieldAt0, &[MirType::ObjectRef], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &FieldAt0, &[MirType::ObjectRef], &[], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
             func.blocks
@@ -10389,7 +10526,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &TypeHandleFor, &[], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &TypeHandleFor, &[], &[], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
             func.blocks.iter().flat_map(|b| &b.insts).any(|(_, i)| matches!(
@@ -10426,7 +10563,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &OneArgVoid, &[], &[MirType::ObjectRef], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &OneArgVoid, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
             func.blocks
@@ -10475,6 +10612,7 @@ mod tests {
             &TrapArray,
             &[MirType::ObjectRef, MirType::I32, MirType::I32],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .unwrap();
@@ -10506,7 +10644,7 @@ mod tests {
                 .into_boxed_slice(),
                 handlers: Vec::new().into_boxed_slice(),
             };
-            let (func, _) = lower_method_typed(&body, &TaggedOverflow, &[MirType::I64], &[], Narrowing::default())
+            let (func, _) = lower_method_typed(&body, &TaggedOverflow, &[MirType::I64], &[], Returns::FromBody, Narrowing::default())
                 .expect("a checked narrowing lowers with no enclosing try");
             assert!(lamella_ir::verify(&func).is_ok());
             func.blocks.iter().flat_map(|b| &b.insts).any(|(_, inst)| {
@@ -10542,7 +10680,7 @@ mod tests {
 
     /// Lowers `body` with two arguments of `arg` type and returns the function.
     fn lower_two_arg(body: MethodBodyImage, arg: MirType) -> Result<Function, CilError> {
-        lower_method_typed(&body, &TagsEveryException, &[arg, arg], &[], Narrowing::default()).map(|(f, _)| f)
+        lower_method_typed(&body, &TagsEveryException, &[arg, arg], &[], Returns::FromBody, Narrowing::default()).map(|(f, _)| f)
     }
 
     /// A two-argument body applying one binary opcode: `T M(T a, T b) { return a OP b; }`.
@@ -10749,6 +10887,7 @@ mod tests {
             &CatchAllWithMessage,
             &[MirType::ObjectRef, MirType::I32],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .expect("a rethrow after a branch in its handler lowers")
@@ -10798,7 +10937,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&folded, &NoCalls, &[], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&folded, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default())
             .expect("a stackalloc whose size is a constant EXPRESSION lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         let cell = func
@@ -10837,7 +10976,7 @@ mod tests {
         };
         assert!(
             matches!(
-                lower_method_typed(&runtime, &NoCalls, &[MirType::I32], &[], Narrowing::default()),
+                lower_method_typed(&runtime, &NoCalls, &[MirType::I32], &[], Returns::FromBody, Narrowing::default()),
                 Err(CilError::Unsupported(Opcode::Localloc))
             ),
             "a size multiplied by an ARGUMENT is a runtime size and stays refused"
@@ -10859,7 +10998,7 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         assert!(
-            lower_method_typed(&divided, &NoCalls, &[], &[], Narrowing::default()).is_err(),
+            lower_method_typed(&divided, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default()).is_err(),
             "a divided size is left to run rather than folded"
         );
     }
@@ -10900,7 +11039,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &A2D, &[], &[MirType::ObjectRef], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &A2D, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default())
             .expect("int[,]::Address lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         let addr = func
@@ -10961,7 +11100,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &AStaticAt12, &[], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &AStaticAt12, &[], &[], Returns::FromBody, Narrowing::default())
             .expect("ldsflda lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         let addr = func
@@ -11030,7 +11169,7 @@ mod tests {
                 .into_boxed_slice(),
                 handlers: Vec::new().into_boxed_slice(),
             };
-            let (func, _) = lower_method_typed(&body, &Primitives, &[], &[], Narrowing::default())
+            let (func, _) = lower_method_typed(&body, &Primitives, &[], &[], Returns::FromBody, Narrowing::default())
                 .expect("`sizeof` of a primitive lowers");
             assert!(lamella_ir::verify(&func).is_ok());
             func.blocks
@@ -11061,7 +11200,7 @@ mod tests {
         };
         assert!(
             matches!(
-                lower_method_typed(&body, &Primitives, &[], &[], Narrowing::default()),
+                lower_method_typed(&body, &Primitives, &[], &[], Returns::FromBody, Narrowing::default()),
                 Err(CilError::Unsupported(Opcode::Sizeof))
             ),
             "an unsizeable operand refuses rather than guessing a width"
@@ -11118,7 +11257,7 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         let (func, _) =
-            lower_method_typed(&body, &OneIntField, &[struct_ty, struct_ty], &[struct_ty], Narrowing::default())
+            lower_method_typed(&body, &OneIntField, &[struct_ty, struct_ty], &[struct_ty], Returns::FromBody, Narrowing::default())
                 .expect("two live deferred addresses lower");
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(
@@ -11175,7 +11314,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoFields, &[struct_ty, MirType::NativeInt], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &NoFields, &[struct_ty, MirType::NativeInt], &[], Returns::FromBody, Narrowing::default())
             .expect("an address stored into a pointer local lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
@@ -11229,7 +11368,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &OneIntField, &[struct_ty], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &OneIntField, &[struct_ty], &[], Returns::FromBody, Narrowing::default())
             .expect("a field store through a deferred address lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
@@ -11284,7 +11423,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &OneIntField, &[MirType::ManagedPtr], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &OneIntField, &[MirType::ManagedPtr], &[], Returns::FromBody, Narrowing::default())
             .expect("a compound assignment through a deferred field address lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         let insts: Vec<&Inst> = func
@@ -11337,7 +11476,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &OneIntField, &[MirType::ManagedPtr], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &OneIntField, &[MirType::ManagedPtr], &[], Returns::FromBody, Narrowing::default())
             .expect("the deferred chain lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
@@ -11440,7 +11579,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &TagsEveryException, &[source], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &TagsEveryException, &[source], &[], Returns::FromBody, Narrowing::default())
             .unwrap_or_else(|e| panic!("{op:?} from {source:?} lowers: {e:?}"));
         assert!(lamella_ir::verify(&func).is_ok(), "{op:?} from {source:?} verifies");
         func
@@ -11585,7 +11724,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &TagsEveryException, &[MirType::F64], &[], Narrowing::default())
+        let (func, _) = lower_method_typed(&body, &TagsEveryException, &[MirType::F64], &[], Returns::FromBody, Narrowing::default())
             .expect("a checked narrowing from a double lowers");
         assert!(
             lamella_ir::verify(&func).is_ok(),
@@ -11624,7 +11763,7 @@ mod tests {
                 .any(|i| matches!(i, Inst::Binary { op: BinOp::Or, .. })),
             "and NOT the out-of-range form, whose OR answers FALSE for NaN in both directions"
         );
-        let (int_func, _) = lower_method_typed(&body, &TagsEveryException, &[MirType::I64], &[], Narrowing::default())
+        let (int_func, _) = lower_method_typed(&body, &TagsEveryException, &[MirType::I64], &[], Returns::FromBody, Narrowing::default())
             .expect("a checked narrowing from a long lowers");
         assert!(lamella_ir::verify(&int_func).is_ok());
         assert!(
@@ -11663,7 +11802,7 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         let (func, _) =
-            lower_method_typed(&body, &TagsEveryException, &[MirType::ObjectRef], &[], Narrowing::default())
+            lower_method_typed(&body, &TagsEveryException, &[MirType::ObjectRef], &[], Returns::FromBody, Narrowing::default())
                 .expect("pointer arithmetic lowers");
         assert!(lamella_ir::verify(&func).is_ok());
         let returned = match func.blocks.last().and_then(|b| b.terminator.as_ref()) {
@@ -11722,6 +11861,7 @@ mod tests {
             &TaggedTraps,
             &[MirType::ObjectRef, MirType::ObjectRef],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .expect("a covariant store inside a try lowers");
@@ -11752,6 +11892,7 @@ mod tests {
             &TaggedTraps,
             &[MirType::ObjectRef, MirType::I32],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .expect("a primitive element store inside a try lowers");
@@ -11788,7 +11929,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let func = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Narrowing::default())
+        let func = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Returns::FromBody, Narrowing::default())
             .expect("a predecessorless trailing block lowers instead of UnsupportedControlFlow")
             .0;
         assert!(lamella_ir::verify(&func).is_ok());
@@ -11840,6 +11981,7 @@ mod tests {
             &NoCalls,
             &[MirType::I32, MirType::I32],
             &[MirType::I32],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .expect("dead code with a join of its own lowers")
@@ -11882,6 +12024,7 @@ mod tests {
             &CatchAllWithMessage,
             &[MirType::ObjectRef, MirType::I32],
             &[MirType::I32],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .expect("dead code falling into a catch handler lowers")
@@ -11906,7 +12049,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default()).unwrap();
         assert_eq!(func.ret, Some(MirType::I32));
         assert!(
             func.blocks
@@ -11987,6 +12130,7 @@ mod tests {
             &CatchAllCalls,
             &[],
             &[MirType::I32],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .expect("a call inside a try lowers")
@@ -12048,7 +12192,7 @@ mod tests {
             }]
             .into_boxed_slice(),
         };
-        let func = lower_method_typed(&body, &CatchAllCalls, &[], &[MirType::I32], Narrowing::default())
+        let func = lower_method_typed(&body, &CatchAllCalls, &[], &[MirType::I32], Returns::FromBody, Narrowing::default())
             .expect("a call inside a try/finally lowers")
             .0;
         assert!(lamella_ir::verify(&func).is_ok());
@@ -12095,7 +12239,7 @@ mod tests {
             }]
             .into_boxed_slice(),
         };
-        let func = lower_method_typed(&body, &NoCalls, &[], &[], Narrowing::default())
+        let func = lower_method_typed(&body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default())
             .expect("a finally handler with a branch in it lowers")
             .0;
         assert!(lamella_ir::verify(&func).is_ok());
@@ -12128,7 +12272,7 @@ mod tests {
             }]
             .into_boxed_slice(),
         };
-        let func = lower_method_typed(&body, &CatchAllCalls, &[], &[MirType::I32], Narrowing::default())
+        let func = lower_method_typed(&body, &CatchAllCalls, &[], &[MirType::I32], Returns::FromBody, Narrowing::default())
             .expect("a call immediately before a leave lowers")
             .0;
         assert!(lamella_ir::verify(&func).is_ok());
@@ -12198,6 +12342,7 @@ mod tests {
             &CatchAllCalls,
             &[],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
             .expect("a try/finally inside a try/catch lowers")
@@ -12228,6 +12373,7 @@ mod tests {
             &CatchAllCalls,
             &[],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
             .expect("a try/finally inside a try/catch lowers")
@@ -12273,6 +12419,7 @@ mod tests {
             &CatchAllCalls,
             &[],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
             .expect("a try/finally inside a try/catch lowers")
@@ -12355,7 +12502,7 @@ mod tests {
             }]
             .into_boxed_slice(),
         };
-        let func = lower_method_typed(&body, &NoCalls, &[], &[MirType::I32, MirType::I32], Narrowing::default())
+        let func = lower_method_typed(&body, &NoCalls, &[], &[MirType::I32, MirType::I32], Returns::FromBody, Narrowing::default())
             .expect("a try/finally lowers")
             .0;
         assert!(lamella_ir::verify(&func).is_ok());
@@ -12746,7 +12893,7 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         let (func, _) =
-            lower_method_typed(&body, &Poll, &[MirType::I32], &[MirType::I32], Narrowing::default()).unwrap();
+            lower_method_typed(&body, &Poll, &[MirType::I32], &[MirType::I32], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         let back_edges = func
             .blocks
@@ -12786,7 +12933,7 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         assert_eq!(
-            lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Narrowing::default()).err(),
+            lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Returns::FromBody, Narrowing::default()).err(),
             Some(CilError::UnsupportedControlFlow(
                 ControlFlowGap::EntryLoopArgs
             ))
@@ -13019,6 +13166,9 @@ mod tests {
                     element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
                     element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
                 })
+            }
+            fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+                Some(1)
             }
         }
         let body = MethodBodyImage {
@@ -13359,7 +13509,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[MirType::F64], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[MirType::F64], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::I32));
         assert!(
@@ -13412,7 +13562,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[MirType::F64], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[MirType::F64], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::F64));
         let load = func
@@ -13448,7 +13598,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::I32));
         assert!(
@@ -13502,7 +13652,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         let arg0 = func.blocks[0].params[0];
         assert!(
@@ -13550,6 +13700,7 @@ mod tests {
             &NoCalls,
             &[MirType::ObjectRef, MirType::ObjectRef],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .unwrap();
@@ -13599,6 +13750,7 @@ mod tests {
             &NoCalls,
             &[MirType::ObjectRef, MirType::ObjectRef, MirType::I32],
             &[],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .unwrap();
@@ -13639,7 +13791,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::F64], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::F64], &[], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::F64));
         assert!(
@@ -13684,7 +13836,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::I32));
         assert!(
@@ -13726,7 +13878,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let result = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Narrowing::default());
+        let result = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[], Returns::FromBody, Narrowing::default());
         assert!(matches!(
             result,
             Err(CilError::Unsupported(Opcode::Localloc))
@@ -13866,6 +14018,7 @@ mod tests {
             &FieldAt0,
             &[MirType::ObjectRef],
             &[MirType::NativeInt],
+            Returns::FromBody,
             Narrowing::default(),
         )
         .unwrap();
@@ -13914,7 +14067,7 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         let (func, _) =
-            lower_method_typed(&body, &NoCalls, &[], &[MirType::NativeInt], Narrowing::default()).unwrap();
+            lower_method_typed(&body, &NoCalls, &[], &[MirType::NativeInt], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
             func.blocks.iter().flat_map(|b| &b.insts).any(|(_, i)| matches!(
@@ -13968,7 +14121,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &Inherited, &[], &[MirType::I32], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &Inherited, &[], &[MirType::I32], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
         assert!(
@@ -14040,7 +14193,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let (func, _) = lower_method_typed(&body, &Declared, &[], &[MirType::I32], Narrowing::default()).unwrap();
+        let (func, _) = lower_method_typed(&body, &Declared, &[], &[MirType::I32], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
         assert!(
@@ -14144,7 +14297,7 @@ mod tests {
             layout: true,
         };
         let (func, _) =
-            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Narrowing::default()).unwrap();
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
             !is_materialized(&func),
@@ -14165,7 +14318,7 @@ mod tests {
             layout: true,
         };
         let (func, _) =
-            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Narrowing::default()).unwrap();
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(
             is_materialized(&func),
@@ -14206,7 +14359,7 @@ mod tests {
             layout: true,
         };
         assert_eq!(
-            lower_method_typed(&body, &escaping, &[], &[MirType::ObjectRef], Narrowing::default()).err(),
+            lower_method_typed(&body, &escaping, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default()).err(),
             Some(CilError::ExceptionBindingEscapes),
             "an escaping binding is refused at compile time, not compiled to a dangling pointer"
         );
@@ -14215,7 +14368,7 @@ mod tests {
             layout: true,
         };
         assert!(
-            lower_method_typed(&body, &receiver_only, &[], &[MirType::ObjectRef], Narrowing::default()).is_ok(),
+            lower_method_typed(&body, &receiver_only, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default()).is_ok(),
             "the refusal must come from the arity, not from the instruction pair"
         );
     }
@@ -14232,7 +14385,7 @@ mod tests {
             layout: true,
         };
         assert_eq!(
-            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Narrowing::default()).err(),
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default()).err(),
             Some(CilError::ExceptionBindingEscapes),
         );
     }
@@ -14250,7 +14403,7 @@ mod tests {
             layout: false,
         };
         let (func, _) =
-            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Narrowing::default()).unwrap();
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef], Returns::FromBody, Narrowing::default()).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(!is_materialized(&func));
     }

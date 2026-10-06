@@ -13,31 +13,32 @@
 //! resets into the command loop, so a crashing app cannot brick the board into a crash loop. Both
 //! carriers are polled -- the PL011's 32-byte RX FIFO covers the command and debug loops' poll
 //! cadence at 115200, and the USB device controller is serviced by the same polls -- so the vector
-//! table carries no IRQs.
+//! table carries one interrupt only: IO_IRQ_BANK0, whose handler queues the pin-change events a
+//! program's GPIO callbacks hear (rp2350_pin_events.rs).
 //!
 //! Boot: the RP2350 bootrom scans the first 4 KB for the PICOBIN IMAGE_DEF block (below) and
 //! boots the vector table at 0x10000000. Peripheral facts: RP2350 datasheet -- XOSC 12 MHz ->
 //! clk_peri; UART0 = PL011 @ 0x40070000, TX GP0 / RX GP1 (funcsel 2); the USB build raises
 //! clk_sys to 150 MHz + clk_usb to 48 MHz (rp2350_usb::clocks_init).
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,resident-corlib
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,cyw43
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,pico-plus-2-w
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,pico-plus-2
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,cyw43,tls,system-roots
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,pico-plus-2-w,tls,system-roots
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabihf --features serve,rp2350
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabihf --features serve,rp2350,usb,cyw43,tls,system-roots
-//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabihf --features serve,rp2350,usb,pico-plus-2-w,tls,system-roots
 //! The fourth is the Pimoroni Pico Plus 2 W: the third's radio and serve, with that board's own
 //! board file and identity. The fifth is the Pimoroni Pico Plus 2: the Pico 2's firmware, with no
@@ -99,9 +100,17 @@ mod board_bindings;
 #[allow(dead_code)]
 mod rp2350_instances;
 
-#[cfg(all(target_os = "none", feature = "usb"))]
+#[cfg(target_os = "none")]
 #[path = "../../../lamella-serve-core/src/bare_critical_section.rs"]
 mod bare_critical_section;
+
+#[cfg(target_os = "none")]
+#[path = "../../../lamella-serve-core/src/pin_events.rs"]
+mod pin_events;
+
+#[cfg(target_os = "none")]
+#[path = "../rp2350_pin_events.rs"]
+mod rp2350_pin_events;
 
 #[cfg(all(target_os = "none", feature = "usb"))]
 #[path = "../../../lamella-serve-core/src/usb_transport.rs"]
@@ -132,11 +141,16 @@ mod rp2350_trng;
 mod tls_clock;
 
 #[cfg(target_os = "none")]
+#[path = "../../../../csp/rp2350/rust/rp2350_xosc_layout.rs"]
+#[allow(dead_code)]
+mod rp2350_xosc_layout;
+
+#[cfg(target_os = "none")]
 mod serve {
     extern crate alloc;
     use crate::rp2350_flash::Rp2350Flash;
     use lamella_runner::carriers::{Carrier, CarrierSet, Windows};
-    use lamella_runner::{Served, run_deployed_with, serve_one_deploy_with};
+    use lamella_runner::{Served, run_deployed_with, serve_one_deploy_with_residence};
     use lamella_wire::{Frame, FrameReader, Transport, TransportError, encode_frame};
     #[cfg(feature = "usb")]
     use crate::rp2350_usb;
@@ -244,7 +258,7 @@ mod serve {
     const XOSC_STATUS: usize = chip::XOSC_BASE as usize + 0x4;
     const XOSC_STARTUP: usize = chip::XOSC_BASE as usize + 0xc;
     const XOSC_CTRL_ENABLE_1_15MHZ: u32 = 0x00fa_baa0;
-    const XOSC_STARTUP_DELAY: u32 = 0x00c4;
+    const XOSC_STARTUP_DELAY: u32 = crate::rp2350_xosc_layout::STARTUP_DELAY_RESET;
     const XOSC_STABLE: u32 = 1 << 31;
     const CLK_PERI_CTRL: usize = chip::CLOCKS_BASE as usize + 0x48;
     const CLK_PERI_ENABLE: u32 = 1 << 11;
@@ -588,19 +602,21 @@ mod serve {
 
     /// Installs the board seams on a fresh evaluation `Vm` (the runner's `_with` hook). Every
     /// build gets the board's clock. A cyw43 build also brings the radio up and joins on the first
-    /// evaluation, streams that narration into the run's stdout and -- once the join has
-    /// succeeded -- wires a smoltcp NetBackend over the chip's ethernet data channel, plus the TLS
-    /// engine in a `tls` build.
+    /// evaluation, streams that narration into the run's stdout and -- whenever the radio runs,
+    /// joined or not -- wires a smoltcp NetBackend over the chip's ethernet data channel that lends
+    /// the radio to the program's Wi-Fi classes, plus the TLS engine in a `tls` build.
     fn configure_vm(vm: &mut lamella_cil_runtime::Vm) {
         vm.set_clock(clock::now_ms, clock::sleep_ms);
         vm.set_board_class(BOARD_CLASS);
+        vm.set_pin_event_source(crate::rp2350_pin_events::source_for_a_new_program());
         #[cfg(feature = "arena-trace")]
         vm.set_console_tap(arena_trace);
         #[cfg(feature = "cyw43")]
         {
             use crate::pico_wifi;
             let ticks = TICKS_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-            pico_wifi::ensure_wifi(ticks.saturating_mul(1000), &mut |line: &str| {
+            let settings = alloc::boxed::Box::new(crate::rp2350_flash::SettingsStore::new());
+            pico_wifi::ensure_wifi(ticks.saturating_mul(1000), settings, &mut |line: &str| {
                 for byte in line.bytes() {
                     uart_tx(byte);
                 }
@@ -611,9 +627,9 @@ mod serve {
             let wifi_done = clock::now_ms();
             let units: alloc::vec::Vec<u16> = boot_log::get().encode_utf16().collect();
             vm.write(&units);
-            if !pico_wifi::wifi_up() {
+            if !pico_wifi::radio_up() {
                 let msg: alloc::vec::Vec<u16> =
-                    "[net] wifi is not up; evaluation runs without a backend\r\n"
+                    "[net] no radio is running; evaluation runs without a backend\r\n"
                         .encode_utf16()
                         .collect();
                 vm.write(&msg);
@@ -650,8 +666,10 @@ mod serve {
                 config,
                 clock::now_ms,
                 seed,
-            );
-            {
+            )
+            .with_wifi(pico_wifi::view);
+            let joined = pico_wifi::wifi_up();
+            if joined {
                 use lamella_cil_runtime::net::NetBackend;
                 let deadline = clock::now_ms().saturating_add(8_000);
                 while net.ipv4_addr().is_none() && clock::now_ms() < deadline {
@@ -662,6 +680,9 @@ mod serve {
             let to_dhcp_ms = dhcp_started.saturating_sub(wifi_done);
             let dhcp_ms = settled.saturating_sub(dhcp_started);
             let status: alloc::string::String = match net.ipv4_addr() {
+                None if !joined => alloc::string::String::from(
+                    "[net] the radio is up and no network is joined yet; the address follows the link\r\n",
+                ),
                 Some(ip) => alloc::format!(
                     "[net] up, address {}.{}.{}.{} from DHCP ({} ms from the wifi step to dhcp start, {} ms more to the lease)\r\n",
                     ip[0], ip[1], ip[2], ip[3], to_dhcp_ms, dhcp_ms
@@ -729,6 +750,7 @@ mod serve {
             ALLOCATOR.init(start, bytes);
         }
         clocks_uart_init();
+        crate::rp2350_pin_events::init();
 
         #[cfg(feature = "usb")]
         let clocked = rp2350_usb::clocks_init();
@@ -827,22 +849,65 @@ mod serve {
                     Ok((module, entry)) => {
                         narrate("[lamella] running the deployed artifact");
                         let _ = run_deployed_with(&mut transport, &module, entry, &mut configure_vm);
+                        crate::rp2350_pin_events::disarm_every_pin();
                     }
                     Err(reason) => report(&mut transport, &reason),
                 }
             }
         }
 
+        let mut load = lamella_runner::ArtifactLoad::new();
+        let mut loaded = OneLoadedImage::default();
         loop {
-            let mut load = lamella_runner::ArtifactLoad::new();
-            loop {
-                match serve_one_deploy_with(&mut transport, &mut flash, &mut configure_vm, None, &mut load) {
-                    Ok(Served::RunRequested) => reset_to_run(), // EXEC(deployed): boot the deployed image
-                    Ok(Served::ResetRequested) => reset_to_serve(),
-                    Ok(Served::Handled) => break,
-                    Ok(Served::Nothing) => {}
-                    Err(_) => break,
-                }
+            let served = serve_one_deploy_with_residence(
+                &mut transport,
+                &mut flash,
+                &mut configure_vm,
+                None,
+                &mut loaded,
+                &mut load,
+            );
+            if !matches!(served, Ok(Served::Nothing)) {
+                crate::rp2350_pin_events::disarm_every_pin();
+            }
+            match served {
+                Ok(Served::RunRequested) => reset_to_run(), // EXEC(deployed): boot the deployed image
+                Ok(Served::ResetRequested) => reset_to_serve(),
+                Ok(Served::Handled | Served::Nothing) | Err(_) => {}
+            }
+        }
+    }
+
+    /// Where a LOADED artifact lives while a plain run or a debug session borrows it: one heap
+    /// allocation, freed when the transfer arena lets go of it.
+    ///
+    /// The runner can only leak an image to give the loader the `'static` bytes it borrows, and with
+    /// the arena held across frames every LOAD completes, so leaking would keep one image per run
+    /// until the heap ran out. This keeps one at a time.
+    #[derive(Default)]
+    struct OneLoadedImage {
+        /// The image placed last: its pointer, length and capacity, as the `Vec` it arrived in.
+        held: Option<(*mut u8, usize, usize)>,
+    }
+
+    impl lamella_runner::ImageResidence for OneLoadedImage {
+        fn admit(&mut self, image: alloc::vec::Vec<u8>) -> Option<&'static [u8]> {
+            lamella_runner::ImageResidence::release(self);
+            let mut image = core::mem::ManuallyDrop::new(image);
+            let held = (image.as_mut_ptr(), image.len(), image.capacity());
+            self.held = Some(held);
+            // SAFETY: the allocation is live until `release` rebuilds the Vec it came from and drops
+            // it, and `release` runs only when the arena has let go of these bytes with nothing
+            // executing -- an execution refuses every transfer while it exists -- so no borrow of
+            // the slice outlives the allocation.
+            Some(unsafe { core::slice::from_raw_parts(held.0, held.1) })
+        }
+
+        fn release(&mut self) {
+            if let Some((pointer, len, capacity)) = self.held.take() {
+                // SAFETY: the three parts are exactly those of the Vec `admit` took apart, and it was
+                // never dropped; the arena has let go of the slice handed out (see `admit`).
+                drop(unsafe { alloc::vec::Vec::from_raw_parts(pointer, len, capacity) });
             }
         }
     }

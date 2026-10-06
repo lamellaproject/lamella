@@ -151,6 +151,10 @@ varargs = ["typed-references"]
 # rounding + arithmetic float ops stay). FUTURE (for discussion): a fast/approximate backend
 # (e.g. micromath) selectable against libm -- an accuracy-vs-size/speed knob.
 math-transcendental = ["NETMFv4_4", "float", "dep:libm"]
+# The Lamella.Net.WiFi class library's seam: the intrinsics a radio's joins, state and stored network
+# cross. Off by default, so a firmware with no radio carries none of their code; a build whose network
+# backend lends a radio turns it on.
+wifi = []
 
 [lints]
 workspace = true

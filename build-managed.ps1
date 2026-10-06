@@ -55,6 +55,14 @@ $DefaultSurface = @(
     # The rung above 4.5: members .NET Core 2.0 introduced, each gated where it was introduced, like
     # the four eras below it. It takes no language version of its own.
     'LAMELLA_SURFACE_NETCORE_2_0',
+    # The rung above it: what .NET Core 2.1 introduced, such as System.Buffers.Binary.BinaryPrimitives.
+    # Every .NET Core 2.1 shipped with spans, so it requires LAMELLA_SURFACE_SPAN as well.
+    'LAMELLA_SURFACE_NETCORE_2_1',
+    # And above that, what .NET Core 3.0 introduced, such as MidpointRounding's directed modes.
+    'LAMELLA_SURFACE_NETCORE_3_0',
+    # The rung above that: what .NET 5.0 introduced, such as X509Certificate2.CreateFromPem. It stands
+    # on .NET Core 3.0, the rung below it.
+    'LAMELLA_SURFACE_NET_5_0',
     'LAMELLA_SURFACE_FILE_IO',
     'LAMELLA_SURFACE_SERIAL',
     'LAMELLA_SURFACE_STRING_COMPARISON',
@@ -85,6 +93,11 @@ $SurfaceRequires = [ordered]@{
     # A rung stands on the one below it: .NET Core 2.0 members without the 4.5 surface describe no
     # .NET that ever shipped.
     'LAMELLA_SURFACE_NETCORE_2_0' = @('LAMELLA_SURFACE_NETFX_4_5')
+    # And .NET Core 2.1 without spans describes none either.
+    'LAMELLA_SURFACE_NETCORE_2_1' = @('LAMELLA_SURFACE_NETCORE_2_0', 'LAMELLA_SURFACE_SPAN')
+    'LAMELLA_SURFACE_NETCORE_3_0' = @('LAMELLA_SURFACE_NETCORE_2_1')
+    # And .NET 5.0 without the .NET Core rungs below it describes none.
+    'LAMELLA_SURFACE_NET_5_0' = @('LAMELLA_SURFACE_NETCORE_3_0')
 }
 foreach ($symbol in $SurfaceRequires.Keys) {
     if ($Define -notcontains $symbol) { continue }
@@ -121,6 +134,9 @@ $Assemblies = @(
     @{ name = 'System.IO.Ports';                       references = @() },
     @{ name = 'Lamella.Net.Time';                      references = @() },
     @{ name = 'Lamella.Net.Time.Nts';                  references = @('Lamella.Net.Time') },
+    # The board's Wi-Fi radio. It references System.Net.NetworkInformation because the addresses a
+    # board holds on the network are that assembly's report, which WiFiAdapter.WaitForAddress reads.
+    @{ name = 'Lamella.Net.WiFi';                      references = @('System.Net.NetworkInformation') },
     @{ name = 'Lamella.IO.Storage';                    references = @('System.Device.Gpio') },
     # The `nanoFramework.` prefix marks a compatibility surface: the types keep nanoFramework's
     # namespaces so unmodified nanoFramework source compiles, and the ASSEMBLY name is what says

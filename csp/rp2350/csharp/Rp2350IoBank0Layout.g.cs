@@ -10,12 +10,26 @@ namespace Lamella.Generated
         private Rp2350IoBank0Layout() { }
 
         // -- register offsets (block-relative) + access widths --
+        public const uint GPIO0_STATUS_OFF = 0x0;
+        public const int GPIO0_STATUS_WIDTH = 32;
         public const uint GPIO0_CTRL_OFF = 0x4;
         public const int GPIO0_CTRL_WIDTH = 32;
+        public const uint INTR0_OFF = 0x230;
+        public const int INTR0_WIDTH = 32;
+        public const uint PROC0_INTE0_OFF = 0x248;
+        public const int PROC0_INTE0_WIDTH = 32;
+        public const uint PROC0_INTS0_OFF = 0x278;
+        public const int PROC0_INTS0_WIDTH = 32;
 
         // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
+        public const uint GPIO0_STATUS_INFROMPAD = 0x20000;
+        public const uint GPIO0_STATUS_INFROMPAD_LSB = 17;
         public const uint GPIO0_CTRL_FUNCSEL = 0x1F;
         public const uint GPIO0_CTRL_FUNCSEL_LSB = 0;
+        public const uint GPIO0_CTRL_OUTOVER = 0x3000;
+        public const uint GPIO0_CTRL_OUTOVER_LSB = 12;
+        public const uint GPIO0_CTRL_OEOVER = 0xC000;
+        public const uint GPIO0_CTRL_OEOVER_LSB = 14;
 
         // -- block constants --
         public const uint GPIO_CTRL_STRIDE = 8;
@@ -25,5 +39,13 @@ namespace Lamella.Generated
         public const uint FUNCSEL_PWM = 4;
         public const uint FUNCSEL_SIO = 5;
         public const uint FUNCSEL_NULL = 0x1F;
+        public const uint OUTOVER_LOW = 2;
+        public const uint OEOVER_DISABLE = 2;
+        public const uint OEOVER_ENABLE = 3;
+        public const uint GPIO_INT_STRIDE = 4;
+        public const uint GPIO_INT_PINS = 8;
+        public const uint GPIO_INT_BITS = 4;
+        public const uint GPIO_INT_EDGE_LOW = 0x4;
+        public const uint GPIO_INT_EDGE_HIGH = 0x8;
     }
 }

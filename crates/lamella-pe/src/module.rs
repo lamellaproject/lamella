@@ -1002,6 +1002,26 @@ impl ImageBuilder {
         }
     }
 
+    /// How many `MethodDef` rows have been written so far.
+    #[must_use]
+    pub fn method_count(&self) -> u32 {
+        self.tables.row_count(table::METHOD_DEF)
+    }
+
+    /// The name `method`'s `MethodDef` row was written with, read back from the row, or `None`
+    /// when no such row exists yet. A compiler that numbers its methods before writing them reads
+    /// this to prove each row landed where the number says it did.
+    #[must_use]
+    pub fn method_name(&self, method: Token) -> Option<&str> {
+        if method.table() != table::METHOD_DEF {
+            return None;
+        }
+        match self.tables.cell(table::METHOD_DEF, method.row(), 3)? {
+            Column::StringRef(offset) => self.strings.get(*offset),
+            _ => None,
+        }
+    }
+
     /// The `Param` tokens (II.22.33) of `method`'s parameter list, in row order -- the
     /// `HasCustomAttribute` parents (II.22.10) a parameter-targeted attribute such as
     /// `[ParamArrayAttribute]` on a `params` array hangs off.
@@ -1418,6 +1438,25 @@ mod tests {
         let image = lamella_metadata::pe::PeImage::parse(&pe).expect("valid PE");
         assert_eq!(image.cli_header_rva(), TEXT_RVA);
         assert!(lamella_metadata::image::MetadataImage::read(&pe).is_ok());
+    }
+
+    #[test]
+    fn every_kind_of_method_row_reads_back_by_name() {
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        let object = builder.object_type();
+        builder.add_type("App", "Program", object, PUBLIC_CLASS);
+        let signature = [0x00u8, 0x00, 0x01];
+        assert_eq!(builder.method_count(), 0);
+        let bodied = builder.add_method("Main", &signature, &[0x06, 0x2A], PUBLIC_STATIC, IL_MANAGED, &[]);
+        let deferred =
+            builder.add_method_deferred_body("Later", &signature, PUBLIC_STATIC, IL_MANAGED, &[]);
+        let bodyless = builder.add_abstract_method("Native", &signature, PUBLIC_STATIC, &[]);
+        assert_eq!(builder.method_count(), 3);
+        assert_eq!(builder.method_name(bodied), Some("Main"));
+        assert_eq!(builder.method_name(deferred), Some("Later"));
+        assert_eq!(builder.method_name(bodyless), Some("Native"));
+        assert_eq!(builder.method_name(Token::new(table::METHOD_DEF, 4)), None);
+        assert_eq!(builder.method_name(Token::new(table::TYPE_DEF, 1)), None);
     }
 
     #[test]

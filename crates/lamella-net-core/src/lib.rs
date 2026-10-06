@@ -21,6 +21,9 @@ pub mod timeout;
 /// program and a debug session reaching the board over that network need it.
 pub mod shared;
 
+/// A board's radio, as a language runtime reaches it through the backend that carries its frames.
+pub mod wifi;
+
 /// A socket the backend hands out: an index into the backend's own table, opaque to the caller
 /// (which just passes the handle back to identify the socket). Kept distinct from a raw fd so the
 /// seam stays host-agnostic.
@@ -149,6 +152,33 @@ pub trait NetBackend: core::fmt::Debug {
     fn interface_info(&mut self, index: u32) -> Option<InterfaceInfo> {
         let _ = index;
         None
+    }
+
+    /// How many times, since the backend was made, the network has become available or stopped
+    /// being available, and how many times an interface's link state or IPv4 address has changed:
+    /// `(availability, addressing)`. A poller that compares these counts, rather than the states,
+    /// hears of a change that came and went between two of its reads. `None` (the default) for a
+    /// backend that does not count; its poller compares states.
+    fn change_counts(&mut self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// The board's Wi-Fi radio, when this backend carries its frames; `None` (the default) for a
+    /// backend with no radio under it. A backend that has one services it before lending it, so a
+    /// caller that only ever asks the radio still moves it forward.
+    fn wifi(&mut self) -> Option<&mut dyn wifi::WifiControl> {
+        None
+    }
+
+    /// Spends `millis` milliseconds servicing the network instead of sleeping, and returns `true`;
+    /// or returns `false` at once, and the caller sleeps as it would have. The default is `false`.
+    ///
+    /// A backend answers `true` when its link needs the processor's time to stay up -- a radio the
+    /// backend drives by polling, whose re-join after a lost link would otherwise wait until the
+    /// program next touched the network.
+    fn idle(&mut self, millis: u64) -> bool {
+        let _ = millis;
+        false
     }
 }
 

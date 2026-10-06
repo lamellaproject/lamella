@@ -70,6 +70,9 @@ namespace Lamella.Boards.Bbc
 
         /// <summary>The logical bus id of the edge connector's SPI (edge pins 13, 14 and 15: SCK,
         /// MISO, MOSI), as <c>SpiConnectionSettings</c> names it.</summary>
+        /// <remarks>The edge connector names no chip select for this bus, so its only line is -1:
+        /// a device on it is opened with <c>ChipSelectLine</c> -1 and selected through a pin the
+        /// program drives itself. Any other line is refused.</remarks>
         public const int EdgeSpiBusId = 0;
 
         private static SpiDriver MakeSpi() { return new Nrf52833SpiDriver(SpiBinding()); }
@@ -87,7 +90,8 @@ namespace Lamella.Boards.Bbc
                 BbcMicroBitV2Bindings.SPI_PSEL_MISO,
                 BbcMicroBitV2Bindings.SPI_PIN_CNF_SCK_REG,
                 BbcMicroBitV2Bindings.SPI_PIN_CNF_MOSI_REG,
-                BbcMicroBitV2Bindings.SPI_PIN_CNF_MISO_REG);
+                BbcMicroBitV2Bindings.SPI_PIN_CNF_MISO_REG,
+                new int[0]);
         }
 
         /// <summary>The edge connector's SPI as the layer-1 driver the board's table binds for

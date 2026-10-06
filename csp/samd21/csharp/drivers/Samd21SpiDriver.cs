@@ -3,9 +3,11 @@
 // binding's core clock -- half of it down to 1/512 of it.
 //
 // The pads arrive routed from a board's generated binding. The master drives no chip select of its
-// own, so a non-negative SpiConnectionSettings.ChipSelectLine names the PORT pin -- PA00 to PA31 as
-// 0 to 31, PB00 to PB31 as 32 to 63 -- that this driver asserts across each operation; -1 leaves
-// selecting the device to the caller.
+// own, so the binding lists the bus's chip selects as PORT pins -- PA00 to PA31 as 0 to 31, PB00 to
+// PB31 as 32 to 63 -- and SpiConnectionSettings.ChipSelectLine is an index into that list, as
+// dotnet/iot means it on Linux: line n is entry n, which this driver asserts across each operation,
+// and -1 leaves selecting the device to the caller. SpiDevice refuses any other line, from the list
+// this driver states, before it configures the driver.
 using System.Device.Gpio;
 using System.Device.Spi;
 using Lamella.Boards;
@@ -22,7 +24,7 @@ public sealed class Samd21SpiDriver : SpiDriver
     private readonly uint _data;
     private readonly Samd21SercomSpiBinding _binding;
 
-    private int _chipSelectLine;
+    private int _chipSelectPin;
     private bool _chipSelectActiveHigh;
     private int _actualHz;
 
@@ -43,7 +45,7 @@ public sealed class Samd21SpiDriver : SpiDriver
         _intflag = sercom + Samd21SercomSpiLayout.INTFLAG_OFF;
         _syncbusy = sercom + Samd21SercomSpiLayout.SYNCBUSY_OFF;
         _data = sercom + Samd21SercomSpiLayout.DATA_OFF;
-        _chipSelectLine = -1;
+        _chipSelectPin = -1;
     }
 
     /// <summary>Brings the master up for <paramref name="settings"/>: the SERCOM's bus and core
@@ -53,7 +55,8 @@ public sealed class Samd21SpiDriver : SpiDriver
     /// the binding's core clock divided by an even number from 2 to 512.
     /// <see cref="ActualClockFrequency"/> reports it.</remarks>
     /// <exception cref="System.ArgumentException">The frames are not 8 bits, the clock is below
-    /// the core clock / 512, or the chip select line is past this part's two PORT groups.</exception>
+    /// the core clock / 512, or the binding names a chip select past this part's two PORT
+    /// groups.</exception>
     /// <exception cref="System.InvalidOperationException">The SERCOM's core clock could not be
     /// routed from its generator, or the SERCOM did not finish its reset or its enable, which is what
     /// an instance without a running core clock does.</exception>
@@ -64,9 +67,14 @@ public sealed class Samd21SpiDriver : SpiDriver
             BadArgument("this SPI master's frames are 8 bits");
         }
         int line = settings.ChipSelectLine;
-        if (line >= 64)
+        int pin = -1;
+        if (line >= 0)
         {
-            BadArgument("the chip select line is past this part's two PORT groups");
+            pin = _binding.ChipSelectPins[line];
+            if ((uint)pin >= 64u)
+            {
+                BadArgument("the binding's chip select is past this part's two PORT groups");
+            }
         }
         uint baud = BaudFor(settings.ClockFrequency);
 
@@ -120,15 +128,15 @@ public sealed class Samd21SpiDriver : SpiDriver
         Mmio.Write8(_binding.PincfgMisoReg,
             (byte)(Samd21PortLayout.PINCFG0_PMUXEN | Samd21PortLayout.PINCFG0_INEN));
 
-        _chipSelectLine = line;
+        _chipSelectPin = pin;
         _chipSelectActiveHigh = settings.ChipSelectLineActiveState == PinValue.High;
-        if (line >= 0)
+        if (pin >= 0)
         {
             // The select idles deasserted: its level is written before the pin becomes an output,
             // and the pad is under plain PORT control, its input buffer on so its level can be read.
             SetChipSelect(false);
-            Mmio.Write8(PinCfgAddress(line), (byte)Samd21PortLayout.PINCFG0_INEN);
-            Mmio.Write32(GroupBase(line) + Samd21PortLayout.DIRSET_OFF, PinMask(line));
+            Mmio.Write8(PinCfgAddress(pin), (byte)Samd21PortLayout.PINCFG0_INEN);
+            Mmio.Write32(GroupBase(pin) + Samd21PortLayout.DIRSET_OFF, PinMask(pin));
         }
 
         Mmio.Write32(_ctrla, ctrla | Samd21SercomSpiLayout.CTRLA_ENABLE);
@@ -167,16 +175,23 @@ public sealed class Samd21SpiDriver : SpiDriver
         return Ok;
     }
 
-    /// <summary>Drives the chip select pin named by the settings; does nothing when none was
-    /// named.</summary>
+    /// <summary>Drives the chip select pin the settings' line selects; does nothing when the line
+    /// is -1.</summary>
     public override void SetChipSelect(bool asserted)
     {
-        if (_chipSelectLine < 0) return;
+        if (_chipSelectPin < 0) return;
         uint offset = asserted == _chipSelectActiveHigh
             ? Samd21PortLayout.OUTSET_OFF
             : Samd21PortLayout.OUTCLR_OFF;
-        Mmio.Write32(GroupBase(_chipSelectLine) + offset, PinMask(_chipSelectLine));
+        Mmio.Write32(GroupBase(_chipSelectPin) + offset, PinMask(_chipSelectPin));
     }
+
+    /// <summary>The number of chip selects the binding names for this bus.</summary>
+    public override int ChipSelectCount { get { return _binding.ChipSelectPins.Length; } }
+
+    /// <summary>The PORT pin chip-select line <paramref name="line"/> drives: the binding's table
+    /// entry, PA00 to PA31 as 0 to 31 and PB00 to PB31 as 32 to 63.</summary>
+    public override int GetChipSelectPin(int line) { return _binding.ChipSelectPins[line]; }
 
     /// <summary>The bit rate the master runs at: the fastest rate the baud generator reaches at or
     /// below the request.</summary>

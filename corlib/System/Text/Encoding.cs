@@ -44,6 +44,17 @@ namespace System.Text
         /// <paramref name="bytes"/>.</exception>
         public abstract string GetString(byte[] bytes, int index, int count);
 
+#if LAMELLA_SURFACE_NETCORE_2_1 && LAMELLA_SURFACE_SPAN
+        /// <summary>Decodes every byte of a span into a string.</summary>
+        /// <param name="bytes">The bytes to decode.</param>
+        /// <returns>The decoded text, which is empty when the span is.</returns>
+        public string GetString(ReadOnlySpan<byte> bytes)
+        {
+            if (bytes.Length == 0) return "";
+            return GetString(bytes.BackingArray, bytes.BackingStart, bytes.Length);
+        }
+#endif
+
         internal const char ReplacementCharacter = '\uFFFD';
 
         internal static void RequireRangeWithin(byte[] bytes, int index, int count)

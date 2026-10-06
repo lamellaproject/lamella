@@ -28,6 +28,18 @@ pub enum EmitError {
         /// The method whose body carries it.
         method: alloc::string::String,
     },
+    /// A `MethodDef` row was written somewhere other than the row its member was numbered for.
+    /// Every method is numbered before any body is written, and a call names its target by that
+    /// number, so an image built past this would run a different method from the one a call was
+    /// written against. A fault in the compiler, never in the program.
+    MethodRowMismatch {
+        /// The 1-based `MethodDef` row.
+        row: u32,
+        /// The member numbered for the row, as `Type.Name`, or empty when none was.
+        numbered: alloc::string::String,
+        /// The name the row was written with, or empty when none was written.
+        written: alloc::string::String,
+    },
 }
 
 impl core::fmt::Display for EmitError {
@@ -37,11 +49,44 @@ impl core::fmt::Display for EmitError {
             EmitError::UnsupportedIn { reason, method } => {
                 write!(f, "{reason} (in method '{method}')")
             }
+            EmitError::MethodRowMismatch {
+                row,
+                numbered,
+                written,
+            } => {
+                let either = |text: &str, absent: &'static str| -> alloc::string::String {
+                    if text.is_empty() {
+                        alloc::string::String::from(absent)
+                    } else {
+                        alloc::format!("'{text}'")
+                    }
+                };
+                write!(
+                    f,
+                    "method row {row} was numbered for {} but written for {}, so a call naming that \
+                     row would run another method",
+                    either(numbered, "no member"),
+                    either(written, "nothing"),
+                )
+            }
         }
     }
 }
 
 impl EmitError {
+    /// What a driver should say BEFORE the message: an unsupported construct is a gap in what the
+    /// compiler builds, and a row mismatch is a fault in the compiler, and the two read alike
+    /// without it.
+    #[must_use]
+    pub fn headline(&self) -> &'static str {
+        match self {
+            EmitError::Unsupported(_) | EmitError::UnsupportedIn { .. } => {
+                "this construct is not yet supported by lcsc"
+            }
+            EmitError::MethodRowMismatch { .. } => "internal compiler error in lcsc",
+        }
+    }
+
     /// This error carrying the containing method's name; an error already attributed
     /// to a method keeps its original site.
     #[must_use]
@@ -147,17 +192,7 @@ pub fn emit_expression(
         BoundExprKind::Literal(literal) => emit_literal(literal, &expr.ty, tokens, out),
         BoundExprKind::Local(name) => emit_local(name, frame, tokens, out),
         BoundExprKind::Sequence { spilled, value } => {
-            let mut slots = Vec::with_capacity(spilled.len());
-            for operand in spilled {
-                emit_expression(operand, frame, tokens, out)?;
-                let slot = frame.reserve_local(&operand.ty);
-                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
-                slots.push(slot);
-            }
-            frame.open_temp_scope();
-            for slot in slots {
-                frame.bind_temp(slot);
-            }
+            open_sequence(spilled, frame, tokens, out)?;
             let result = emit_expression(value, frame, tokens, out);
             frame.close_temp_scope();
             result
@@ -1748,6 +1783,25 @@ pub(crate) fn emit_field_store(
     Ok(())
 }
 
+/// The instruction that calls a property or indexer accessor on `receiver`: `call` for a static
+/// accessor, for a value-type receiver (whose accessor takes `this` by address) and for a `base`
+/// receiver, which names the base class's accessor and must not dispatch to an override of it
+/// (ECMA-334 14.5.8); `callvirt` for every other instance receiver.
+///
+/// One rule for every accessor call: a property read, a property write, an indexer write, and both
+/// calls of a compound assignment's read-modify-write.
+pub(crate) fn accessor_call_opcode(
+    is_static: bool,
+    value_type_receiver: bool,
+    receiver: &BoundExpr,
+) -> Opcode {
+    if is_static || value_type_receiver || matches!(receiver.kind, BoundExprKind::Base) {
+        Opcode::Call
+    } else {
+        Opcode::Callvirt
+    }
+}
+
 /// Lowers a property read: the receiver (for an instance property) then a call to
 /// the `get_Name` accessor. A static property is accessed through its type.
 fn emit_property_load(
@@ -1778,12 +1832,7 @@ fn emit_property_load(
         .ok_or(EmitError::Unsupported(
             "property getter outside this module",
         ))?;
-    let is_base = matches!(receiver.kind, BoundExprKind::Base);
-    let opcode = if is_static || value_type_receiver || is_base {
-        Opcode::Call
-    } else {
-        Opcode::Callvirt
-    };
+    let opcode = accessor_call_opcode(is_static, value_type_receiver, receiver);
     out.push(Instruction::new(opcode, Operand::Token(token)));
     Ok(())
 }
@@ -1821,12 +1870,7 @@ pub(crate) fn emit_property_store(
         .ok_or(EmitError::Unsupported(
             "property setter outside this module",
         ))?;
-    let is_base = matches!(receiver.kind, BoundExprKind::Base);
-    let opcode = if is_static || value_type_receiver || is_base {
-        Opcode::Call
-    } else {
-        Opcode::Callvirt
-    };
+    let opcode = accessor_call_opcode(is_static, value_type_receiver, receiver);
     out.push(Instruction::new(opcode, Operand::Token(token)));
     load_kept(kept, out);
     Ok(())
@@ -1861,18 +1905,12 @@ pub(crate) fn emit_indexer_store(
     let token = tokens
         .method(&setter.declaring_type, &setter.name, &setter.parameters)
         .ok_or(EmitError::Unsupported("indexer setter outside this module"))?;
-    let is_base = matches!(receiver.kind, BoundExprKind::Base);
-    let opcode = if value_type_receiver || is_base {
-        Opcode::Call
-    } else {
-        Opcode::Callvirt
-    };
+    let opcode = accessor_call_opcode(false, value_type_receiver, receiver);
     out.push(Instruction::new(opcode, Operand::Token(token)));
     load_kept(kept, out);
     Ok(())
 }
 
-/// The `get_`/`set_` accessor method name for a property.
 /// How an initializer's members reach the object they store into.
 ///
 /// **THE PATH IS RE-EMITTED FOR EVERY MEMBER RATHER THAN PUSHED ONCE, AND THAT IS WHAT MAKES THE
@@ -1991,6 +2029,9 @@ fn emit_initializer(
                     emit_expression(argument, frame, tokens, out)?;
                 }
                 out.push(Instruction::new(target.accessor_call(), Operand::Token(token)));
+                if !add.return_type.is_void() {
+                    out.push(Instruction::simple(Opcode::Pop));
+                }
             }
             Ok(())
         }
@@ -2086,6 +2127,7 @@ fn emit_member_initializer(
     }
 }
 
+/// The `get_`/`set_` accessor method name for a property.
 pub(crate) fn accessor_name(prefix: &str, property: &str) -> String {
     let mut name = String::from(prefix);
     name.push_str(property);
@@ -2214,6 +2256,32 @@ fn emit_cast(
     Err(EmitError::Unsupported("this cast is not lowered yet"))
 }
 
+/// Evaluates a [`BoundExprKind::Sequence`]'s spilled operands left to right into fresh locals, then
+/// opens the scope in which the sequence's value names them as `Temp`s. The caller emits the value,
+/// as an expression or as a statement, and then closes the scope with [`Frame::close_temp_scope`].
+///
+/// Every operand is evaluated before the scope opens, so an operand may name an OUTER sequence's
+/// temporaries and never its own sequence's.
+pub(crate) fn open_sequence(
+    spilled: &[BoundExpr],
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let mut slots = Vec::with_capacity(spilled.len());
+    for operand in spilled {
+        emit_expression(operand, frame, tokens, out)?;
+        let slot = frame.reserve_local(&operand.ty);
+        out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+        slots.push(slot);
+    }
+    frame.open_temp_scope();
+    for slot in slots {
+        frame.bind_temp(slot);
+    }
+    Ok(())
+}
+
 /// Emits `box !T` when `ty` is a bare type parameter of the body being emitted, and nothing
 /// otherwise. A reference comparison converts its operand to `object`, and for a type parameter
 /// that conversion is a box.
@@ -2320,11 +2388,6 @@ fn emit_conversion(
     }
 }
 
-/// Emits the `conv.*` that produces numeric `target` from a value of numeric `source` on the
-/// stack. An unsigned source widens to a wider integer without sign extension (`uint` to `long`
-/// is `conv.u8`, III.3.19) and reaches a floating-point type through `conv.r.un` -- which reads
-/// the source integer as unsigned (III.3.31) -- before narrowing; a signed source, and any
-/// same-or-narrowing integral target, use the plain width-keyed `conv.*` (III.3.17).
 /// The type a numeric conversion actually operates on: an enum's UNDERLYING integral type, and
 /// `ty` unchanged otherwise.
 ///
@@ -2340,12 +2403,30 @@ fn conversion_operand_type(ty: &TypeSymbol, tokens: &Tokens) -> TypeSymbol {
     }
 }
 
-fn emit_numeric_conversion(
+/// Emits the `conv.*` that produces numeric `target` from a value of numeric `source` on the
+/// stack. An unsigned source widens to a wider integer without sign extension (`uint` to `long`
+/// is `conv.u8`, III.3.19), and a `uint` or `ulong` reaches a floating-point type through
+/// `conv.r.un` -- which reads the source integer as unsigned (III.3.31) -- before narrowing; a
+/// signed source, and any same-or-narrowing integral target, use the plain width-keyed `conv.*`
+/// (III.3.17).
+///
+/// A `byte`, `ushort` or `char` reaches a floating-point type through the plain `conv.r4` or
+/// `conv.r8`, as csc emits it: the value sits on the stack zero-extended to `int32`, so its sign
+/// bit is clear and the signed reading gives the same number.
+///
+/// The one rule for a numeric conversion: a cast, an implicit conversion the binder inserts and the
+/// widened right-hand side of a compound assignment all reach it, so the source's signedness is
+/// asked in one place.
+pub(crate) fn emit_numeric_conversion(
     source: &TypeSymbol,
     target: &TypeSymbol,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     let unsigned_source = matches!(source, TypeSymbol::Special(s) if s.is_unsigned());
+    let top_bit_unsigned = matches!(
+        source,
+        TypeSymbol::Special(SpecialType::UInt32 | SpecialType::UInt64)
+    );
     if unsigned_source {
         if let TypeSymbol::Special(target) = target {
             match target {
@@ -2353,12 +2434,12 @@ fn emit_numeric_conversion(
                     out.push(Instruction::simple(Opcode::ConvU8));
                     return Ok(());
                 }
-                SpecialType::Single => {
+                SpecialType::Single if top_bit_unsigned => {
                     out.push(Instruction::simple(Opcode::ConvRUn));
                     out.push(Instruction::simple(Opcode::ConvR4));
                     return Ok(());
                 }
-                SpecialType::Double => {
+                SpecialType::Double if top_bit_unsigned => {
                     out.push(Instruction::simple(Opcode::ConvRUn));
                     out.push(Instruction::simple(Opcode::ConvR8));
                     return Ok(());

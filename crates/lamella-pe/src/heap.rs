@@ -89,6 +89,15 @@ impl StringHeapBuilder {
         self.bytes
     }
 
+    /// The string an offset returned by [`intern`](Self::intern) names, read back from the heap:
+    /// the bytes from `offset` up to the next NUL. `None` past the end of the heap.
+    #[must_use]
+    pub fn get(&self, offset: u32) -> Option<&str> {
+        let tail = self.bytes.get(offset as usize..)?;
+        let end = tail.iter().position(|&byte| byte == 0)?;
+        core::str::from_utf8(&tail[..end]).ok()
+    }
+
     /// The heap's current size in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -314,6 +323,18 @@ mod tests {
             heap.into_bytes(),
             [0, b'F', b'o', b'o', 0, b'B', b'a', b'r', 0]
         );
+    }
+
+    #[test]
+    fn a_string_reads_back_from_its_offset() {
+        let mut heap = StringHeapBuilder::new();
+        let foo = heap.intern("Foo");
+        let bar = heap.intern("Bar");
+        assert_eq!(heap.get(foo), Some("Foo"));
+        assert_eq!(heap.get(bar), Some("Bar"));
+        assert_eq!(heap.get(0), Some(""));
+        assert_eq!(heap.get(foo + 1), Some("oo"));
+        assert_eq!(heap.get(9), None);
     }
 
     #[test]

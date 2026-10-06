@@ -13,13 +13,13 @@ namespace System.Device.Spi
         private SpiMode _mode;
 
         /// <summary>Initializes a new instance of the settings for the device on
-        /// <paramref name="busId"/> with no chip-select line, for a raw bus whose chip
-        /// select is hardware-framed or externally managed.</summary>
+        /// <paramref name="busId"/> with no chip-select line (-1): the driver drives no select,
+        /// and selecting the device is the caller's.</summary>
         public SpiConnectionSettings(int busId) : this(busId, -1) { }
 
         /// <summary>Initializes a new instance of the settings for the device on
         /// <paramref name="busId"/> using <paramref name="chipSelectLine"/> as the
-        /// chip-select line (-1 for a raw bus / hardware-framed chip select).</summary>
+        /// chip-select line (-1 if not used).</summary>
         public SpiConnectionSettings(int busId, int chipSelectLine)
         {
             _busId = busId;
@@ -38,8 +38,10 @@ namespace System.Device.Spi
             set { _busId = value; }
         }
 
-        /// <summary>The chip select line used on the bus, or -1 when the bus runs raw
-        /// (hardware-framed or externally managed chip select).</summary>
+        /// <summary>The chip select line used on the bus: an index into the bus's chip selects, 0
+        /// being the first the board names, or -1 if not used, when the driver drives no select and
+        /// selecting the device is the caller's. A line that is neither is refused with an
+        /// <see cref="System.IO.IOException"/> at the device's first transfer, as on Linux.</summary>
         public int ChipSelectLine
         {
             get { return _chipSelectLine; }

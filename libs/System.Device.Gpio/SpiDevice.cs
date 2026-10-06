@@ -43,9 +43,21 @@ namespace System.Device.Spi
 
         /// <summary>Creates a communications channel to the device described by
         /// <paramref name="settings"/>, over the driver the board bound for
-        /// <see cref="SpiConnectionSettings.BusId"/>. Configures that driver with a private copy
-        /// of the settings. The driver is shared by every device on the bus, so disposing this
-        /// device does not dispose it.</summary>
+        /// <see cref="SpiConnectionSettings.BusId"/>, with a private copy of the settings. The
+        /// driver is shared by every device on the bus, so disposing this device does not dispose
+        /// it.</summary>
+        /// <remarks>
+        /// <para>Each device keeps its own chip select, mode and clock: before a transfer that follows
+        /// another device's, the device applies its own settings to the shared driver, and it holds
+        /// the bus from then until its chip select is released, so two threads' transfers never
+        /// interleave. Creating the device applies its settings once, which drives its chip select
+        /// idle before any other device's transfer.</para>
+        /// <para>A <see cref="SpiConnectionSettings.ChipSelectLine"/> that is neither -1 nor one of
+        /// the bus's chip selects is refused at the device's first transfer with an
+        /// <see cref="System.IO.IOException"/> that names the bus's chip selects, as dotnet/iot's
+        /// Linux device refuses it when it opens <c>/dev/spidev</c><i>B</i>.<i>C</i> at its first
+        /// transfer.</para>
+        /// </remarks>
         /// <exception cref="System.InvalidOperationException">No driver is bound for the
         /// settings' bus.</exception>
         public static SpiDevice Create(SpiConnectionSettings settings)
@@ -71,6 +83,7 @@ namespace System.Device.Spi
         private readonly SpiConnectionSettings _settings;
         private readonly SpiDriver _driver;
         private readonly bool _ownsDriver;
+        private readonly bool _selectable;
         private readonly byte[] _oneOut;
         private readonly byte[] _oneIn;
         private readonly byte[] _none;
@@ -83,7 +96,20 @@ namespace System.Device.Spi
             _oneOut = new byte[1];
             _oneIn = new byte[1];
             _none = new byte[0];
-            driver.Configure(settings);
+            int line = settings.ChipSelectLine;
+            _selectable = line == -1 || (line >= 0 && line < driver.ChipSelectCount);
+            if (_selectable)
+            {
+                EnterBus();
+                try
+                {
+                    Apply();
+                }
+                finally
+                {
+                    ExitBus();
+                }
+            }
         }
 
         public override SpiConnectionSettings ConnectionSettings
@@ -120,6 +146,7 @@ namespace System.Device.Spi
 
         public override void TransferFullDuplex(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer)
         {
+            RefuseUnlessSelectable();
             if (writeBuffer.Length != readBuffer.Length)
             {
                 throw new System.ArgumentException("The write and read buffers must be the same length.");
@@ -129,15 +156,25 @@ namespace System.Device.Spi
 
         private void Transfer(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer, int count)
         {
-            _driver.SetChipSelect(true);
+            RefuseUnlessSelectable();
             int status;
+            EnterBus();
             try
             {
-                status = _driver.TransferFullDuplex(writeBuffer, readBuffer, count);
+                Apply();
+                _driver.SetChipSelect(true);
+                try
+                {
+                    status = _driver.TransferFullDuplex(writeBuffer, readBuffer, count);
+                }
+                finally
+                {
+                    _driver.SetChipSelect(false);
+                }
             }
             finally
             {
-                _driver.SetChipSelect(false);
+                ExitBus();
             }
             if (status != 0)
             {
@@ -146,11 +183,67 @@ namespace System.Device.Spi
             }
         }
 
+        private void Apply()
+        {
+            if ((object)_driver.ConfiguredFor == (object)this) return;
+            _driver.ConfiguredFor = null;
+            _driver.Configure(_settings);
+            _driver.ConfiguredFor = this;
+        }
+
+        private void RefuseUnlessSelectable()
+        {
+            if (_selectable) return;
+            throw new System.IO.IOException(NotAChipSelect());
+        }
+
+        private string NotAChipSelect()
+        {
+            string text = "ChipSelectLine " + _settings.ChipSelectLine.ToString()
+                + " is not a chip select of SPI bus " + _settings.BusId.ToString();
+            int count = _driver.ChipSelectCount;
+            if (count <= 0)
+            {
+                return text + ", which has none: -1 is the only line";
+            }
+            text = text + ":";
+            for (int line = 0; line < count; line++)
+            {
+                text = text + " line " + line.ToString() + " is GPIO " + _driver.GetChipSelectPin(line).ToString() + ",";
+            }
+            return text + " and -1 is none";
+        }
+
+        private void EnterBus()
+        {
+#if LAMELLA_SURFACE_THREADS
+            System.Threading.Monitor.Enter(_driver);
+#endif
+        }
+
+        private void ExitBus()
+        {
+#if LAMELLA_SURFACE_THREADS
+            System.Threading.Monitor.Exit(_driver);
+#endif
+        }
+
         protected override void Dispose(bool disposing)
         {
-            if (disposing && _ownsDriver)
+            if (!disposing) return;
+            if (_ownsDriver)
             {
                 _driver.Dispose();
+                return;
+            }
+            EnterBus();
+            try
+            {
+                if ((object)_driver.ConfiguredFor == (object)this) _driver.ConfiguredFor = null;
+            }
+            finally
+            {
+                ExitBus();
             }
         }
     }

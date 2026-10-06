@@ -78,9 +78,11 @@ THREE VERBS PUT A PROGRAM SOMEWHERE, AND THEY DIFFER IN WHAT THEY TAKE AND WHERE
   deploy <file>         SOURCE -> a board.            Puts it there and RETURNS YOU TO YOUR SHELL.
   flash <image>         AN IMAGE -> a board's chip.   Writes bytes somebody already built.
 
-`run` and `deploy` differ only in whether the tool stays. `run --target` prints what the program
-prints, as it prints it, and waits for it to end -- which for a program written to loop forever
-means until you stop the tool. `deploy` starts it and leaves, which is what a production push wants.
+`run` and `deploy` differ only in whether the tool stays. Both put the program on the board, where
+it stays and runs at every reset. `run --target` then runs it under the board's scheduler --
+threads, locks and blocking calls included -- and prints what it prints, as it prints it, until it
+ends, which for a program written to loop forever means until you stop the tool. `deploy` starts
+it and leaves, which is what a production push wants.
 
 `build` is how you get an image WITHOUT deploying it -- `--format hex` or `bin` writes the
 bare-metal image for `--board`, which is exactly what `flash` then takes. So `build` produces what
@@ -88,13 +90,12 @@ bare-metal image for `--board`, which is exactly what `flash` then takes. So `bu
 
 `deploy` takes ONE of two destinations, and the option chooses the route. `--target <t>` is a live
 connection (what `devices` prints): the board's firmware stays put, only the program crosses, and a
-cycle is about a second. `--board <id>` is a board model (what `boards` lists): it writes the chip
+cycle takes seconds. `--board <id>` is a board model (what `boards` lists): it writes the chip
 over a probe and needs nothing on the board first, which is where a new board begins.
 
-NOTHING HERE NEEDS HARDWARE EXCEPT `devices`, `deploy` AND `flash`. `run` executes on this machine, and
-against a named board it serves that board's own generated `board` module -- so a program written
-for hardware that has not arrived yet runs today. `build` and `fit` answer from the board file and
-the part row; an attached board contributes nothing to the arithmetic.
+NOTHING HERE NEEDS HARDWARE EXCEPT `devices`, `deploy`, `flash` AND `run --target`. `run` without a
+target executes on this machine. `build` and `fit` answer from the board file and the part row; an
+attached board contributes nothing to the arithmetic.
 
 `build <file> --board <id>` also answers `fit` about what it just produced, which is the way to
 obtain the <n> that `fit` asks for.

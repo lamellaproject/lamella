@@ -26,8 +26,11 @@ pub mod target;
 
 mod regalloc;
 
-#[cfg(any(feature = "arm32", feature = "riscv32"))]
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
 mod parallel_moves;
+
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+mod struct_storage;
 
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
 mod dispatch;

@@ -33,6 +33,14 @@ namespace Lamella.Generated
         public const string PWM6_DRIVER_FAMILY = "rp2350-pwm";
         public const string PWM7_DRIVER_FAMILY = "rp2350-pwm";
 
+        /// chip selects: `SpiConnectionSettings.ChipSelectLine` is an index into a bus's chip
+        /// selects, as dotnet/iot means it on Linux. Line n selects the pin in the bus's
+        /// `_CHIP_SELECTn` constant, numbered as this family's GPIO driver numbers its pins; -1
+        /// selects none; and a line at or past the bus's `_CHIP_SELECT_COUNT` names no select. Entry
+        /// 0 is the chip select the binding names, and a binding that names none has no entries.
+        public const uint SPI0_CHIP_SELECT_COUNT = 1;
+        public const uint SPI0_CHIP_SELECT0 = 17;
+
         // -- UART0: a pl011 uart binding descriptor --
         public const uint UART0_BASE = 0x40070000;
         public const uint UART0_RESET_MASK = 0x4000240;

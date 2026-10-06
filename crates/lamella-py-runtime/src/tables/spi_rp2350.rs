@@ -7,12 +7,16 @@ use crate::spi::{SpiConfig, SpiConfigError, SpiFacts, SpiOp};
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[path = "../../../../csp/rp2350/rust/rp2350_xosc_layout.rs"]
+#[allow(dead_code)]
+mod xosc;
+
 /// The crystal + clk_peri bring-up (identical to uart_rp2350: SSPCLK is clk_peri).
 const XOSC_STARTUP: u32 = 0x4004_800C;
 const XOSC_CTRL: u32 = 0x4004_8000;
 const XOSC_STATUS: u32 = 0x4004_8004;
 const XOSC_ENABLE_1_15MHZ: u32 = 0x00FA_BAA0;
-const XOSC_STARTUP_1MS: u32 = 0xC4;
+const XOSC_STARTUP_DELAY: u32 = xosc::STARTUP_DELAY_RESET;
 const XOSC_STABLE: u32 = 1 << 31;
 const CLK_PERI_CTRL: u32 = 0x4001_0048;
 const CLK_PERI_DIV: u32 = 0x4001_004C;
@@ -141,7 +145,7 @@ pub(crate) fn reconfigure_ops(config: &SpiConfig) -> Result<(Vec<SpiOp>, u32), S
 pub(crate) fn open_ops(config: &SpiConfig) -> Result<(Vec<SpiOp>, u32), SpiConfigError> {
     let (cpsdvsr, cr0, realized) = ssp_config(config)?;
     let ops = vec![
-        SpiOp::Write { reg: XOSC_STARTUP, value: XOSC_STARTUP_1MS },
+        SpiOp::Write { reg: XOSC_STARTUP, value: XOSC_STARTUP_DELAY },
         SpiOp::Write { reg: XOSC_CTRL, value: XOSC_ENABLE_1_15MHZ },
         SpiOp::PollEq { reg: XOSC_STATUS, mask: XOSC_STABLE, want: XOSC_STABLE },
         SpiOp::Write { reg: CLK_PERI_CTRL, value: 0 },

@@ -25,6 +25,13 @@ namespace Lamella.Generated
         public const string VCP_DRIVER_FAMILY = "nrf51-uart";
         public const string SPI_DRIVER_FAMILY = "nrf51-spi";
 
+        /// chip selects: `SpiConnectionSettings.ChipSelectLine` is an index into a bus's chip
+        /// selects, as dotnet/iot means it on Linux. Line n selects the pin in the bus's
+        /// `_CHIP_SELECTn` constant, numbered as this family's GPIO driver numbers its pins; -1
+        /// selects none; and a line at or past the bus's `_CHIP_SELECT_COUNT` names no select. Entry
+        /// 0 is the chip select the binding names, and a binding that names none has no entries.
+        public const uint SPI_CHIP_SELECT_COUNT = 0;
+
         // -- I2C: an nrf-twi binding descriptor --
         public const uint I2C_TWI_BASE = 0x40003000;
         public const uint I2C_PSEL_SCL = 0x0;

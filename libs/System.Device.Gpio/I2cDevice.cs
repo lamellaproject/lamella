@@ -90,30 +90,55 @@ namespace System.Device.I2c
 
         public override void Read(System.Span<byte> buffer)
         {
-            Check(_driver.Read(_settings.DeviceAddress, buffer, buffer.Length), false);
+            int address = MessageAddress();
+            if (buffer.Length == 0) throw new System.ArgumentException("buffer cannot be empty.", "buffer");
+            RequireSevenBits(address);
+            Check(_driver.Read(address, buffer, buffer.Length), false);
         }
 
         public override byte ReadByte()
         {
-            Check(_driver.Read(_settings.DeviceAddress, new System.Span<byte>(_one), 1), false);
+            int address = MessageAddress();
+            RequireSevenBits(address);
+            Check(_driver.Read(address, new System.Span<byte>(_one), 1), false);
             return _one[0];
         }
 
         public override void Write(System.ReadOnlySpan<byte> buffer)
         {
-            Check(_driver.Write(_settings.DeviceAddress, buffer, buffer.Length), true);
+            int address = MessageAddress();
+            RequireSevenBits(address);
+            Check(_driver.Write(address, buffer, buffer.Length), true);
         }
 
         public override void WriteByte(byte value)
         {
+            int address = MessageAddress();
+            RequireSevenBits(address);
             _one[0] = value;
-            Check(_driver.Write(_settings.DeviceAddress, new System.ReadOnlySpan<byte>(_one), 1), true);
+            Check(_driver.Write(address, new System.ReadOnlySpan<byte>(_one), 1), true);
         }
 
         public override void WriteRead(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer)
         {
-            Check(_driver.WriteRead(_settings.DeviceAddress, writeBuffer, writeBuffer.Length,
+            int address = MessageAddress();
+            if (readBuffer.Length == 0) throw new System.ArgumentException("readBuffer cannot be empty.", "readBuffer");
+            RequireSevenBits(address);
+            Check(_driver.WriteRead(address, writeBuffer, writeBuffer.Length,
                 readBuffer, readBuffer.Length), true);
+        }
+
+        private int MessageAddress()
+        {
+            int address = _settings.DeviceAddress;
+            if (address < 0 || address > 0xFFFF) throw new System.ArgumentOutOfRangeException("deviceAddress");
+            return address;
+        }
+
+        private static void RequireSevenBits(int address)
+        {
+            if (address <= 0x7F) return;
+            throw new System.IO.IOException("address 0x" + address.ToString("X2") + " is not a 7-bit I2C address");
         }
 
         private void Check(int status, bool writing)
@@ -129,6 +154,18 @@ namespace System.Device.I2c
                 throw new System.IO.IOException(writing
                     ? "no acknowledgment while writing to " + address
                     : "no acknowledgment while reading from " + address);
+            }
+            if (status == I2cDriver.TimedOut)
+            {
+                throw new System.IO.IOException(
+                    "I2C transfer timed out for address " + address + " on bus " + _settings.BusId +
+                    ": a device held the clock low too long, or a line is stuck.");
+            }
+            if (status == I2cDriver.InvalidRequest)
+            {
+                throw new System.IO.IOException(
+                    "I2C transfer to address " + address + " on bus " + _settings.BusId +
+                    " was refused before it started.");
             }
             throw new System.IO.IOException(
                 "I2C transfer failed for address " + address + " on bus " + _settings.BusId +

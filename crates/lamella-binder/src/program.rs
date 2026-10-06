@@ -9339,8 +9339,8 @@ mod tests {
             []
         );
 
-        assert_eq!(codes("Next()[0] += 1;"), [131]);
-        assert_eq!(codes("C c = new C(); c[c[0]] += 1;"), [131]);
+        assert_eq!(codes("Next()[0] += 1;"), []);
+        assert_eq!(codes("C c = new C(); c[c[0]] += 1;"), []);
     }
 
     #[test]

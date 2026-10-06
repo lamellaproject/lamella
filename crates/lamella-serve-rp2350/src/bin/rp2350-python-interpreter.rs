@@ -283,7 +283,8 @@ mod python {
         use lamella_net_core::NetBackend;
 
         let before = arena_live();
-        pico_wifi::ensure_wifi(ticks_per_ms.saturating_mul(1000), &mut |line: &str| {
+        let settings = alloc::boxed::Box::new(lamella_wifi_cyw4343x_smoltcp::record::NoStore);
+        pico_wifi::ensure_wifi(ticks_per_ms.saturating_mul(1000), settings, &mut |line: &str| {
             uart::str(line);
             uart::str("\r\n");
         });

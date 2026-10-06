@@ -20,6 +20,9 @@ namespace System.Net
         internal WebException(string message, WebExceptionStatus status, WebResponse response)
             : base(message) { _status = status; _response = response; }
 
+        internal WebException(string message, Exception innerException, WebExceptionStatus status, WebResponse response)
+            : base(message, innerException) { _status = status; _response = response; }
+
         public WebExceptionStatus Status { get { return _status; } }
 
         public WebResponse Response { get { return _response; } }

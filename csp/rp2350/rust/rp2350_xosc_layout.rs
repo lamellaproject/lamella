@@ -25,4 +25,4 @@ pub const STARTUP_DELAY_LSB: u32 = 0;
 /// -- block constants --
 pub const CTRL_ENABLE_MAGIC: u32 = 0xFAB;
 pub const CTRL_FREQ_RANGE_1_15MHZ: u32 = 0xAA0;
-pub const STARTUP_DELAY_1MS: u32 = 0xC4;
+pub const STARTUP_DELAY_RESET: u32 = 0xC4;

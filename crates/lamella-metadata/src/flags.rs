@@ -10,6 +10,10 @@ pub mod type_attr {
     pub const CLASS_SEMANTICS_MASK: u32 = 0x0000_0020;
     /// The type is an interface.
     pub const INTERFACE: u32 = 0x0000_0020;
+    /// The layout sub-field: auto, sequential or explicit.
+    pub const LAYOUT_MASK: u32 = 0x0000_0018;
+    /// Explicit layout: each field at the offset its `FieldLayout` row states.
+    pub const EXPLICIT_LAYOUT: u32 = 0x0000_0010;
     /// The type is abstract.
     pub const ABSTRACT: u32 = 0x0000_0080;
     /// The type is sealed.
@@ -113,6 +117,12 @@ pub fn type_is_interface(flags: u32) -> bool {
 #[must_use]
 pub fn type_is_before_field_init(flags: u32) -> bool {
     flags & type_attr::BEFORE_FIELD_INIT != 0
+}
+
+/// Whether a type's flags give it explicit layout (`[StructLayout(LayoutKind.Explicit)]`).
+#[must_use]
+pub fn type_is_explicit_layout(flags: u32) -> bool {
+    flags & type_attr::LAYOUT_MASK == type_attr::EXPLICIT_LAYOUT
 }
 
 /// Whether a type's flags mark it abstract.

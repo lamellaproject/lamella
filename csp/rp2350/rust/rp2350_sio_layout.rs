@@ -7,6 +7,8 @@
 /// -- register offsets (block-relative) + access widths --
 pub const GPIO_IN_OFF: u32 = 0x4;
 pub const GPIO_IN_WIDTH: i32 = 32;
+pub const GPIO_HI_IN_OFF: u32 = 0x8;
+pub const GPIO_HI_IN_WIDTH: i32 = 32;
 pub const GPIO_OUT_SET_OFF: u32 = 0x18;
 pub const GPIO_OUT_SET_WIDTH: i32 = 32;
 pub const GPIO_OUT_CLR_OFF: u32 = 0x20;

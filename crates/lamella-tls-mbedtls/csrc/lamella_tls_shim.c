@@ -16,9 +16,11 @@
 #include <time.h> /* struct tm, for the libc-free mbedtls_platform_gmtime_r below */
 
 #include <mbedtls/aes.h>
+#include <mbedtls/asn1.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
+#include <mbedtls/oid.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/platform.h>
 #include <mbedtls/ssl.h>
@@ -191,10 +193,18 @@ typedef struct lam_tls {
     mbedtls_pk_context own_key;
     void *user;
     int have_ca;
+    /* Whether the clock-skip policy applies: the verify callback then tolerates the date window. */
+    int skip_dates;
     /* Set to 1 by the skip-with-warning verify callback when it cleared a date-window error
      * (expired / not-yet-valid) the clockless board could not check. Read post-handshake via
      * lam_tls_dates_skipped so the managed side surfaces it as a policy-error warning. */
     int dates_skipped;
+    /* The IP address the session was opened for, when it was opened for an address rather than a
+     * name: its text, and its bytes (4 or 16 of them). address_len is 0 for a name. An address is
+     * never sent as the server name, so the verify callback checks the certificate against it. */
+    char address_text[64];
+    uint32_t address[4];
+    size_t address_len;
     /* The description byte of the fatal alert the peer sent that ended the session, or -1. A
      * server refuses a client certificate this way (unknown_ca, certificate_required), so it is
      * what names the refusal. */
@@ -212,20 +222,76 @@ static void lam_note_alert(lam_tls *session, int rc)
     }
 }
 
-/* The verify callback for the surface.net.tls.clock=skip-with-warning policy: clears ONLY the
- * date-window failures (expired / not yet valid) while leaving every other flag (bad chain
- * signature, untrusted root, hostname mismatch) intact for mbedTLS to reject. Records that it
- * did, so the caveat is never silent. Runs per chain element; depth is unused (a date error at
- * any depth is equally unverifiable without a clock). */
-static int lam_vrfy_skip_dates(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
+/* Whether `field` spells `text`, ignoring ASCII case, as mbedTLS compares a name with a
+ * certificate's. */
+static int lam_field_spells(const mbedtls_x509_buf *field, const char *text, size_t text_len)
 {
-    (void)crt;
-    (void)depth;
+    if (field->len != text_len) {
+        return 0;
+    }
+    for (size_t i = 0; i < text_len; i++) {
+        unsigned char a = field->p[i];
+        unsigned char b = (unsigned char)text[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (unsigned char)(a + ('a' - 'A'));
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (unsigned char)(b + ('a' - 'A'));
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Whether the leaf names the session's address, by the rule mbedTLS applies to a name it was
+ * given: with a subjectAltName, an iPAddress entry holding the address's bytes or a dNSName
+ * spelling it; without one, a common name spelling it. A wildcard never matches an address. */
+static int lam_names_address(const lam_tls *session, const mbedtls_x509_crt *crt)
+{
+    size_t text_len = strlen(session->address_text);
+    if (mbedtls_x509_crt_has_ext_type(crt, MBEDTLS_X509_EXT_SUBJECT_ALT_NAME)) {
+        for (const mbedtls_x509_sequence *cur = &crt->subject_alt_names; cur != NULL; cur = cur->next) {
+            unsigned char kind = (unsigned char)(cur->buf.tag & MBEDTLS_ASN1_TAG_VALUE_MASK);
+            if (kind == MBEDTLS_X509_SAN_IP_ADDRESS && cur->buf.len == session->address_len
+                && memcmp(cur->buf.p, session->address, session->address_len) == 0) {
+                return 1;
+            }
+            if (kind == MBEDTLS_X509_SAN_DNS_NAME
+                && lam_field_spells(&cur->buf, session->address_text, text_len)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    for (const mbedtls_x509_name *name = &crt->subject; name != NULL; name = name->next) {
+        if (MBEDTLS_OID_CMP(MBEDTLS_OID_AT_CN, &name->oid) == 0
+            && lam_field_spells(&name->val, session->address_text, text_len)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The verify callback, for two jobs. Under the surface.net.tls.clock=skip-with-warning policy it
+ * clears ONLY the date-window failures (expired / not yet valid), leaving every other flag (bad
+ * chain signature, untrusted root, hostname mismatch) intact for mbedTLS to reject, and records
+ * that it did, so the caveat is never silent; a date error at any depth is equally unverifiable
+ * without a clock. And for a session opened for an IP address, it checks the leaf (depth 0)
+ * against that address, the check mbedTLS makes against a name, and flags a mismatch the same way. */
+static int lam_vrfy(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
+{
     lam_tls *session = (lam_tls *)ctx;
-    uint32_t dated = *flags & (MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE);
-    if (dated != 0) {
-        session->dates_skipped = 1;
-        *flags &= ~dated;
+    if (session->skip_dates) {
+        uint32_t dated = *flags & (MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE);
+        if (dated != 0) {
+            session->dates_skipped = 1;
+            *flags &= ~dated;
+        }
+    }
+    if (depth == 0 && session->address_len != 0 && !lam_names_address(session, crt)) {
+        *flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
     }
     return 0;
 }
@@ -393,6 +459,15 @@ lam_tls *lam_tls_client_new(
     session->have_ca = 0;
     session->dates_skipped = 0;
     session->peer_alert = -1;
+    session->skip_dates = skip_dates;
+    /* An IP address is not a server name: RFC 6066 permits only host names in that extension, so
+     * an address is kept here for the verify callback and the extension is left out. */
+    if (hostname != NULL && strlen(hostname) < sizeof(session->address_text)) {
+        session->address_len = mbedtls_x509_crt_parse_cn_inet_pton(hostname, session->address);
+        if (session->address_len != 0) {
+            memcpy(session->address_text, hostname, strlen(hostname) + 1);
+        }
+    }
 
     if (mbedtls_ctr_drbg_seed(
             &session->drbg, mbedtls_entropy_func, &session->entropy,
@@ -419,19 +494,11 @@ lam_tls *lam_tls_client_new(
         session->have_ca = 1;
         mbedtls_ssl_conf_ca_chain(&session->conf, &session->ca, NULL);
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-        if (skip_dates) {
-            /* Clock-skip policy: tolerate ONLY the date window; the callback still lets
-             * mbedTLS reject a bad signature / untrusted root / hostname mismatch. */
-            mbedtls_ssl_conf_verify(&session->conf, lam_vrfy_skip_dates, session);
-        }
     } else if (verify_mode == 2) {
         /* System-root trust: the lazy ca_cb supplies only the matching bundled root(s) per
          * chain, so the whole store never enters the pool. Still VERIFY_REQUIRED. */
         mbedtls_ssl_conf_ca_cb(&session->conf, lam_ca_cb, session);
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-        if (skip_dates) {
-            mbedtls_ssl_conf_verify(&session->conf, lam_vrfy_skip_dates, session);
-        }
     } else if (verify_mode == 3) {
         /* Verify-and-report: OPTIONAL authmode completes the handshake regardless of the
          * verification outcome; the findings are read post-handshake via lam_tls_report_flags
@@ -449,11 +516,15 @@ lam_tls *lam_tls_client_new(
             mbedtls_ssl_conf_ca_cb(&session->conf, lam_ca_cb, session);
         }
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
-        if (skip_dates) {
-            mbedtls_ssl_conf_verify(&session->conf, lam_vrfy_skip_dates, session);
-        }
     } else {
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
+    /* A verifying mode runs the callback when it has work: the clock-skip policy tolerates ONLY the
+     * date window, so mbedTLS still rejects a bad signature, an untrusted root or a name mismatch;
+     * and a session opened for an address has the certificate checked against it. */
+    if ((verify_mode == 0 || verify_mode == 2 || verify_mode == 3)
+        && (skip_dates || session->address_len != 0)) {
+        mbedtls_ssl_conf_verify(&session->conf, lam_vrfy, session);
     }
 
     if (own_chain != NULL) {
@@ -468,8 +539,10 @@ lam_tls *lam_tls_client_new(
         }
     }
 
+    /* For an address the hostname is NULL: no server name goes out, and mbedTLS checks no name,
+     * since the verify callback checks the address instead. */
     if (mbedtls_ssl_setup(&session->ssl, &session->conf) != 0
-        || mbedtls_ssl_set_hostname(&session->ssl, hostname) != 0) {
+        || mbedtls_ssl_set_hostname(&session->ssl, session->address_len != 0 ? NULL : hostname) != 0) {
         lam_tls_destroy(session);
         return NULL;
     }

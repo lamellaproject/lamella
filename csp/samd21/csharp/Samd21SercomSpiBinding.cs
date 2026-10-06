@@ -38,12 +38,19 @@ namespace Lamella.Boards
         /// PLAN fact. The driver derives BAUD from it and the requested clock, so the divisor is
         /// never a constant in either the driver or the board class.</summary>
         public readonly uint CoreClockHz;
+        /// <summary>The bus's chip selects in line order, each a PORT pin numbered as the GPIO
+        /// driver numbers them -- PA00 to PA31 as 0 to 31, PB00 to PB31 as 32 to 63: entry n is the
+        /// pin <c>SpiConnectionSettings.ChipSelectLine</c> n selects, and entry 0 is the chip select
+        /// the board names for this bus. Empty when the board names none.</summary>
+        public readonly int[] ChipSelectPins;
 
+        /// <param name="chipSelectPins">The bus's chip selects in line order; never null, and empty
+        /// when the board names none.</param>
         public Samd21SercomSpiBinding(uint sercomBase, uint gclkClkctrlValue, uint apbcMask,
             uint pmuxMosiReg, uint pmuxMosiShift, uint pincfgMosiReg,
             uint pmuxSckReg, uint pmuxSckShift, uint pincfgSckReg,
             uint pmuxMisoReg, uint pmuxMisoShift, uint pincfgMisoReg,
-            uint pmuxFunc, uint dopo, uint dipo, uint coreClockHz)
+            uint pmuxFunc, uint dopo, uint dipo, uint coreClockHz, int[] chipSelectPins)
         {
             SercomBase = sercomBase;
             GclkClkctrlValue = gclkClkctrlValue;
@@ -61,6 +68,7 @@ namespace Lamella.Boards
             Dopo = dopo;
             Dipo = dipo;
             CoreClockHz = coreClockHz;
+            ChipSelectPins = chipSelectPins;
         }
     }
 }

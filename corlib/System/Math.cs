@@ -139,7 +139,8 @@ namespace System
         /// <summary>Rounds a value to a whole number, settling a value halfway between two whole
         /// numbers as <paramref name="mode"/> says.</summary>
         /// <param name="value">The value to round.</param>
-        /// <param name="mode">How to round a value halfway between two whole numbers.</param>
+        /// <param name="mode">How to round a value halfway between two whole numbers, or, for a
+        /// directed mode, which way to round every value.</param>
         /// <returns>The whole number <paramref name="value"/> rounds to. NaN and the infinities come
         /// back unchanged, and a value that rounds to zero keeps its sign.</returns>
         /// <exception cref="ArgumentException"><paramref name="mode"/> is not a
@@ -153,7 +154,8 @@ namespace System
         /// candidates as <paramref name="mode"/> says.</summary>
         /// <param name="value">The value to round.</param>
         /// <param name="digits">How many decimal places to keep, from 0 to 15.</param>
-        /// <param name="mode">How to round a value halfway between two candidates.</param>
+        /// <param name="mode">How to round a value halfway between two candidates, or, for a directed
+        /// mode, which way to round every value.</param>
         /// <returns>The value with <paramref name="digits"/> decimal places that
         /// <paramref name="value"/> rounds to. NaN, the infinities and any value of magnitude 1e16 or
         /// more come back unchanged, and a value that rounds to zero keeps its sign.</returns>
@@ -172,15 +174,26 @@ namespace System
 
         private static void RequireMidpointRounding(MidpointRounding mode)
         {
-            if (mode != MidpointRounding.ToEven && mode != MidpointRounding.AwayFromZero)
+            if (mode < MidpointRounding.ToEven || mode > LastMidpointRounding)
             {
                 throw new ArgumentException("The value '" + Int32.Decimal((int)mode) + "' is not valid for this usage of the type MidpointRounding.", "mode");
             }
         }
 
+#if LAMELLA_SURFACE_NETCORE_3_0
+        private const MidpointRounding LastMidpointRounding = MidpointRounding.ToPositiveInfinity;
+#else
+        private const MidpointRounding LastMidpointRounding = MidpointRounding.AwayFromZero;
+#endif
+
         private static double RoundToWhole(double value, MidpointRounding mode)
         {
             if (mode == MidpointRounding.ToEven) return Round(value);
+#if LAMELLA_SURFACE_NETCORE_3_0
+            if (mode == MidpointRounding.ToZero) return Truncate(value);
+            if (mode == MidpointRounding.ToNegativeInfinity) return Floor(value);
+            if (mode == MidpointRounding.ToPositiveInfinity) return Ceiling(value);
+#endif
             double whole = Truncate(value);
             if (Abs(value - whole) >= 0.5) whole += value < 0 ? -1.0 : 1.0;
             return whole;

@@ -2498,7 +2498,15 @@ fn lower_inst(
 fn spilled_slot_offsets(func: &Function, out_args_bytes: i32) -> (Vec<i32>, i32) {
     let mut offsets: Vec<i32> = Vec::with_capacity(func.value_types.len());
     let mut used = out_args_bytes;
-    for ty in &func.value_types {
+    let storage = crate::struct_storage::StorageClasses::of(func);
+    for (value, ty) in func.value_types.iter().enumerate() {
+        if let Some(owner) = storage
+            .slot_owner(ValueId(value as u32))
+            .filter(|owner| owner.index() < value)
+        {
+            offsets.push(offsets[owner.index()]);
+            continue;
+        }
         offsets.push(used);
         used += ty.stack_slot_bytes() as i32;
     }
@@ -2521,7 +2529,10 @@ fn method_record_roots(
     let mut roots = Vec::new();
     for (v, ty) in func.value_types.iter().enumerate() {
         for (offset, kind) in crate::stackmaps::slot_roots(*ty, pinned[v]) {
-            roots.push((((offsets[v] + offset as i32) / 4) as u16) | (kind << 14));
+            let root = (((offsets[v] + offset as i32) / 4) as u16) | (kind << 14);
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
         }
     }
     roots

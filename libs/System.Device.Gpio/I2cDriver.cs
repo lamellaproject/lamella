@@ -17,6 +17,14 @@ namespace Lamella.Hardware
         /// <summary>The transfer failed some other way (arbitration loss, a bus fault); the
         /// chip-specific detail stays readable through the chip's own registers.</summary>
         public const int OtherError = 3;
+        /// <summary>The transfer did not finish within the bus's time limit: a device held the
+        /// clock low too long, or a line is stuck. The driver abandoned it, so no part of it runs
+        /// once the bus moves again.</summary>
+        public const int TimedOut = 4;
+        /// <summary>The request was refused before anything reached the bus, because the chip's
+        /// own datasheet rules it out: an address the controller does not support, or a transfer
+        /// it cannot make, such as one of no bytes.</summary>
+        public const int InvalidRequest = 5;
 
         /// <summary>Claims the bus's pins and runs the chip's initialization sequence at
         /// <paramref name="busHz"/>. A rate outside the chip's envelope is rejected loudly.
@@ -27,7 +35,8 @@ namespace Lamella.Hardware
         public abstract void Configure(int busHz);
 
         /// <summary>One write transaction: START, address+W, <paramref name="count"/> bytes
-        /// of <paramref name="buffer"/>, STOP. Returns a normalized status.</summary>
+        /// of <paramref name="buffer"/>, STOP. A count of zero sends the address alone. Returns
+        /// a normalized status.</summary>
         public abstract int Write(int address, System.ReadOnlySpan<byte> buffer, int count);
 
         /// <summary>One read transaction: START, address+R, <paramref name="count"/> bytes

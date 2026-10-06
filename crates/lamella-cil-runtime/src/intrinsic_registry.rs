@@ -350,6 +350,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(monitor_wait),
     entry!(monitor_wait_timed_out),
     entry!(monitor_wait_timeout),
+    entry!(net_change_count),
     entry!(net_iface_count),
     entry!(net_iface_flags),
     entry!(net_iface_gateway),
@@ -478,14 +479,17 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(aead_siv_decrypt),
     entry!(aead_siv_encrypt),
     entry!(tls_alpn_is),
+    entry!(tls_check_identity),
     entry!(tls_client_config),
     entry!(tls_client_config_alpn),
+    entry!(tls_client_config_identity),
     entry!(tls_client_new),
     entry!(tls_close),
     entry!(tls_close_notify),
     entry!(tls_default_stack),
     entry!(tls_drop_key),
     entry!(tls_exporter_key),
+    entry!(tls_peer_alert),
     entry!(tls_peer_cert),
     entry!(tls_process),
     entry!(tls_read_plain),
@@ -540,6 +544,24 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(weak_read_cell),
     #[cfg(feature = "gc")]
     entry!(weak_write_cell),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_disconnect),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_join_start),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_join_stored),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_radio),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_record_clear),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_record_read),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_record_set_boot),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_record_write),
+    #[cfg(feature = "wifi")]
+    entry!(wifi_state),
 ];
 
 /// The intrinsic-ABI LEVEL a target advertises in its Lamella Link profile identity. Bump it ONLY

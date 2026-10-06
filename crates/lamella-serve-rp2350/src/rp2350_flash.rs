@@ -19,8 +19,8 @@
 //!   mode/clkdiv it discovered at flash scan as a callable function at the start of boot RAM).
 //!
 //! The region: [`IMAGE_BASE`] (2 MB into the flash, clear of the firmware at `0x10000000`)
-//! running to [`FLASH_END`], the end of the board's flash -- every byte of the part the firmware
-//! does not occupy, so no capacity is declared away.
+//! running to [`SETTINGS_BASE`], the board's settings in the last two sectors of the flash -- every
+//! other byte of the part the firmware does not occupy, so no capacity is declared away.
 
 extern crate alloc;
 
@@ -48,13 +48,22 @@ include!(concat!(env!("OUT_DIR"), "/board_flash.rs"));
 /// is 2 MB, and 16 MB on the Pimoroni Pico Plus 2 and Plus 2 W, where it is 14 MB.
 pub const FLASH_END: usize = 0x1000_0000 + BOARD_FLASH_BYTES;
 
-/// The deploy window's length: from [`IMAGE_BASE`] to the end of the flash.
+/// The board's settings: the last [`SETTINGS_SECTORS`] sectors of the flash, each its own erase
+/// unit, so one can be erased while the other holds what it replaces. They hold the board's stored
+/// settings, such as the Wi-Fi network it joins. A deploy never reaches them, and a firmware update
+/// -- which writes only the firmware's own pages -- leaves them as they were.
+pub const SETTINGS_SECTORS: usize = 2;
+
+/// Where the settings begin: [`SETTINGS_SECTORS`] sectors below the end of the flash.
+pub const SETTINGS_BASE: usize = FLASH_END - SETTINGS_SECTORS * SECTOR_BYTES;
+
+/// The deploy window's length: from [`IMAGE_BASE`] to the board's settings.
 ///
-/// It is derived from the two rather than stated, so when the firmware outgrows the flash below
-/// the base and `IMAGE_BASE` moves up, the window shrinks to match. Nothing else uses the flash
-/// above the base: a Pico 2 W's radio images are built into the firmware image, below it, and no
-/// partition table or filesystem names these addresses.
-pub const IMAGE_LEN: usize = FLASH_END - IMAGE_BASE;
+/// It is derived rather than stated, so when the firmware outgrows the flash below the base and
+/// `IMAGE_BASE` moves up, the window shrinks to match. Nothing else uses the flash above the base:
+/// a Pico 2 W's radio images are built into the firmware image, below it, and no partition table or
+/// filesystem names these addresses.
+pub const IMAGE_LEN: usize = SETTINGS_BASE - IMAGE_BASE;
 
 /// QSPI flash geometry the bootrom API enforces (RP2350 datasheet 5.4.8.9).
 pub const SECTOR_BYTES: usize = 4096;
@@ -223,6 +232,64 @@ extern "C" fn range_erase_in_ram(
     flash_exit_xip();
     flash_range_erase(offset, len, BLOCK_BYTES, BLOCK_ERASE_CMD);
     flash_flush_cache();
+}
+
+impl Rp2350Flash {
+    /// Erases settings sector `sector` (0 or 1). Returns whether it then reads erased.
+    pub fn settings_erase(&self, sector: usize) -> bool {
+        if sector >= SETTINGS_SECTORS {
+            return false;
+        }
+        let at = SETTINGS_BASE + sector * SECTOR_BYTES;
+        let status = self.run_ops(at as u32, SECTOR_BYTES as u32, 0, 0, 0);
+        status == 0 && settings_sector(sector).iter().all(|&byte| byte == 0xFF)
+    }
+
+    /// Programs `bytes` (at most one page) at the start of settings sector `sector`, which reads
+    /// erased. Returns whether the flash then reads them back.
+    pub fn settings_program(&self, sector: usize, bytes: &[u8]) -> bool {
+        if sector >= SETTINGS_SECTORS || bytes.is_empty() || bytes.len() > PAGE_BYTES {
+            return false;
+        }
+        let staged = page_padded(bytes);
+        let at = SETTINGS_BASE + sector * SECTOR_BYTES;
+        let status = self.run_ops(0, 0, at as u32, staged.as_ptr() as u32, staged.len() as u32);
+        status == 0 && &settings_sector(sector)[..bytes.len()] == bytes
+    }
+}
+
+/// The board's settings as the store under its stored Wi-Fi network: one slot per sector.
+#[cfg(feature = "cyw43")]
+pub struct SettingsStore {
+    flash: Rp2350Flash,
+}
+
+#[cfg(feature = "cyw43")]
+impl SettingsStore {
+    /// The store over the bootrom's flash entry points.
+    pub fn new() -> Self {
+        SettingsStore { flash: Rp2350Flash::new() }
+    }
+}
+
+#[cfg(feature = "cyw43")]
+impl lamella_wifi_cyw4343x_smoltcp::record::RecordStore for SettingsStore {
+    fn read(&self, slot: usize) -> &[u8] {
+        &settings_sector(slot)[..lamella_wifi_cyw4343x_smoltcp::record::SLOT_SPAN]
+    }
+
+    fn erase(&mut self, slot: usize) -> bool {
+        self.flash.settings_erase(slot)
+    }
+
+    fn program(&mut self, slot: usize, bytes: &[u8]) -> bool {
+        self.flash.settings_program(slot, bytes)
+    }
+}
+
+/// Settings sector `sector` as the flash reads now.
+pub fn settings_sector(sector: usize) -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts((SETTINGS_BASE + sector * SECTOR_BYTES) as *const u8, SECTOR_BYTES) }
 }
 
 /// Whether the `len` bytes of the region at `offset` all read erased (`0xFF`).

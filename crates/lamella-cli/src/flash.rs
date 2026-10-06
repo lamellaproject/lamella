@@ -650,7 +650,7 @@ pub fn debug_elf_for_board(
         let libraries = project_libraries(&project, Tier::ClassLibrary, "build")?;
         let debuggable =
             crate::program::compile_project_for_debugging(&project, &libraries, "build")?;
-        debug_elf_from(&debuggable, &libraries, board_id, aot_target, "build", path)
+        debug_elf_from(&debuggable, board_id, aot_target, "build", path)
     } else {
         let debuggable = crate::program::compile_csharp_for_debugging(
             path,
@@ -659,7 +659,7 @@ pub fn debug_elf_for_board(
             libraries,
             "build",
         )?;
-        debug_elf_from(&debuggable, libraries, board_id, aot_target, "build", path)
+        debug_elf_from(&debuggable, board_id, aot_target, "build", path)
     }
 }
 
@@ -668,7 +668,6 @@ pub fn debug_elf_for_board(
 /// `path` is what the reader named, as for [`image_from_assembly`].
 fn debug_elf_from(
     debuggable: &crate::program::Debuggable,
-    libraries: &[Library],
     board_id: &str,
     aot_target: &str,
     verb: &str,
@@ -680,7 +679,7 @@ fn debug_elf_from(
             &debuggable.assembly,
             &debuggable.pdb,
             &debuggable.corlib,
-            libraries,
+            &debuggable.libraries,
             archive,
             aot_target,
         )
@@ -908,6 +907,30 @@ pub fn libraries_from(named: &[&str], tier: Tier, verb: &str) -> Result<Vec<Libr
     if tier != Tier::ClassLibrary {
         return Err(reference_without_the_tier(verb, named));
     }
+    read_libraries(named, verb)
+}
+
+/// The libraries `project`'s `<Reference>` elements name, read and in the order it declares them,
+/// for firmware already on a board: it is sent a baked image that carries the ones the program
+/// references, so no tier is chosen and none refuses them.
+///
+/// # Errors
+/// A reference that cannot be read, naming the path the project gave.
+#[cfg_attr(not(feature = "bake"), allow(dead_code))]
+pub fn project_references(
+    project: &crate::project::Project,
+    verb: &str,
+) -> Result<Vec<Library>, String> {
+    let named: Vec<&str> = project
+        .references
+        .iter()
+        .filter_map(|one| one.to_str())
+        .collect();
+    read_libraries(&named, verb)
+}
+
+/// Each of `named` read as a library, in the order given, or the first that cannot be read.
+fn read_libraries(named: &[&str], verb: &str) -> Result<Vec<Library>, String> {
     named
         .iter()
         .map(|named| {
@@ -965,7 +988,7 @@ fn build_image(
     libraries: &[Library],
     verb: &str,
 ) -> Result<Vec<u8>, String> {
-    let (assembly, corlib) = if compiles_as_debug_build(tier) {
+    let (assembly, corlib, link) = if compiles_as_debug_build(tier) {
         let compiled = crate::program::compile_csharp_for_debugging(
             path,
             source,
@@ -973,17 +996,18 @@ fn build_image(
             libraries,
             verb,
         )?;
-        (compiled.assembly, compiled.corlib)
+        (compiled.assembly, compiled.corlib, compiled.libraries)
     } else {
-        crate::program::compile_csharp_assembly_with_corlib(
+        let (assembly, corlib) = crate::program::compile_csharp_assembly_with_corlib(
             path,
             source,
             unsafe_code,
             libraries,
             verb,
-        )?
+        )?;
+        (assembly, corlib, Vec::new())
     };
-    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, libraries, verb, path)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path)
 }
 
 /// Whether a program built on `tier` is compiled as a debug build is, even for an image that is
@@ -1017,14 +1041,16 @@ fn build_project_image(
     path: &Path,
 ) -> Result<Vec<u8>, String> {
     let libraries = project_libraries(project, tier, verb)?;
-    let (assembly, corlib) = if compiles_as_debug_build(tier) {
+    let (assembly, corlib, link) = if compiles_as_debug_build(tier) {
         let compiled =
             crate::program::compile_project_for_debugging(project, &libraries, verb)?;
-        (compiled.assembly, compiled.corlib)
+        (compiled.assembly, compiled.corlib, compiled.libraries)
     } else {
-        crate::program::compile_project_assembly(project, &libraries, verb)?
+        let (assembly, corlib) =
+            crate::program::compile_project_assembly(project, &libraries, verb)?;
+        (assembly, corlib, Vec::new())
     };
-    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &libraries, verb, path)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path)
 }
 
 /// The class libraries `project` references, read and in the order it declares them.
@@ -1054,7 +1080,7 @@ fn image_from_assembly(
     board_id: &str,
     aot_target: &str,
     tier: Tier,
-    libraries: &[Library],
+    libraries: &[Vec<u8>],
     verb: &str,
     path: &Path,
 ) -> Result<Vec<u8>, String> {
@@ -1128,8 +1154,8 @@ fn class_library_build<T>(
 /// definition of a duplicated name the program binds, and it would do it with a successful build to
 /// hide it. Which order a project wants is the project's to say, and [`Project::references`] already
 /// keeps the order it was written in.
-fn library_bytes(libraries: &[Library]) -> Vec<&[u8]> {
-    libraries.iter().map(Library::bytes).collect()
+fn library_bytes(libraries: &[Vec<u8>]) -> Vec<&[u8]> {
+    libraries.iter().map(Vec::as_slice).collect()
 }
 
 /// The linked build itself, present only where the tier was compiled in.
@@ -1141,7 +1167,7 @@ fn library_bytes(libraries: &[Library]) -> Vec<&[u8]> {
 fn linked_build(
     assembly: &[u8],
     corlib: &[u8],
-    libraries: &[Library],
+    libraries: &[Vec<u8>],
     archive: &[u8],
     aot_target: &str,
 ) -> Result<Vec<u8>, String> {
@@ -1193,7 +1219,7 @@ fn wrapped(text: &str) -> String {
 fn linked_build(
     _assembly: &[u8],
     _corlib: &[u8],
-    _libraries: &[Library],
+    _libraries: &[Vec<u8>],
     _archive: &[u8],
     _aot_target: &str,
 ) -> Result<Vec<u8>, String> {
@@ -1208,7 +1234,7 @@ fn linked_debug_build(
     assembly: &[u8],
     pdb: &[u8],
     corlib: &[u8],
-    libraries: &[Library],
+    libraries: &[Vec<u8>],
     archive: &[u8],
     aot_target: &str,
 ) -> Result<Vec<u8>, String> {
@@ -1232,7 +1258,7 @@ fn linked_debug_build(
     _assembly: &[u8],
     _pdb: &[u8],
     _corlib: &[u8],
-    _libraries: &[Library],
+    _libraries: &[Vec<u8>],
     _archive: &[u8],
     _aot_target: &str,
 ) -> Result<Vec<u8>, String> {
@@ -2358,11 +2384,7 @@ class Program
     /// The capability exists now, so the refusal is gone and what needs holding is the hand-off.
     #[test]
     fn the_library_set_reaches_the_build_in_declaration_order() {
-        let libraries = vec![
-            Library { path: PathBuf::from("Bsp.dll"), bytes: vec![2] },
-            Library { path: PathBuf::from("Gpio.dll"), bytes: vec![1] },
-            Library { path: PathBuf::from("Bsp.dll"), bytes: vec![3] },
-        ];
+        let libraries = vec![vec![2u8], vec![1u8], vec![3u8]];
         assert_eq!(
             library_bytes(&libraries),
             vec![&[2u8][..], &[1u8][..], &[3u8][..]],

@@ -6,12 +6,26 @@
 
 public enum Rp2350IoBank0Layout {
     // -- register offsets (block-relative) + access widths --
+    public static let GPIO0_STATUS_OFF: UInt32 = 0x0
+    public static let GPIO0_STATUS_WIDTH: Int32 = 32
     public static let GPIO0_CTRL_OFF: UInt32 = 0x4
     public static let GPIO0_CTRL_WIDTH: Int32 = 32
+    public static let INTR0_OFF: UInt32 = 0x230
+    public static let INTR0_WIDTH: Int32 = 32
+    public static let PROC0_INTE0_OFF: UInt32 = 0x248
+    public static let PROC0_INTE0_WIDTH: Int32 = 32
+    public static let PROC0_INTS0_OFF: UInt32 = 0x278
+    public static let PROC0_INTS0_WIDTH: Int32 = 32
 
     // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
+    public static let GPIO0_STATUS_INFROMPAD: UInt32 = 0x20000
+    public static let GPIO0_STATUS_INFROMPAD_LSB: UInt32 = 17
     public static let GPIO0_CTRL_FUNCSEL: UInt32 = 0x1F
     public static let GPIO0_CTRL_FUNCSEL_LSB: UInt32 = 0
+    public static let GPIO0_CTRL_OUTOVER: UInt32 = 0x3000
+    public static let GPIO0_CTRL_OUTOVER_LSB: UInt32 = 12
+    public static let GPIO0_CTRL_OEOVER: UInt32 = 0xC000
+    public static let GPIO0_CTRL_OEOVER_LSB: UInt32 = 14
 
     // -- block constants --
     public static let GPIO_CTRL_STRIDE: UInt32 = 8
@@ -21,4 +35,12 @@ public enum Rp2350IoBank0Layout {
     public static let FUNCSEL_PWM: UInt32 = 4
     public static let FUNCSEL_SIO: UInt32 = 5
     public static let FUNCSEL_NULL: UInt32 = 0x1F
+    public static let OUTOVER_LOW: UInt32 = 2
+    public static let OEOVER_DISABLE: UInt32 = 2
+    public static let OEOVER_ENABLE: UInt32 = 3
+    public static let GPIO_INT_STRIDE: UInt32 = 4
+    public static let GPIO_INT_PINS: UInt32 = 8
+    public static let GPIO_INT_BITS: UInt32 = 4
+    public static let GPIO_INT_EDGE_LOW: UInt32 = 0x4
+    public static let GPIO_INT_EDGE_HIGH: UInt32 = 0x8
 }

@@ -148,6 +148,9 @@ fn embed_python_heap_size() {
 
 /// The stack's share of RAM, at its top. The C# firmware's heap takes what the statics leave below
 /// it, and the core's stack-limit register guards the line between the two.
+///
+/// A `resident-corlib` build, which loads a deployed program's PE on the board, keeps 96 KiB. Every
+/// other build runs baked images and keeps 64 KiB.
 fn stack_bytes() -> usize {
     if std::env::var_os("CARGO_FEATURE_RESIDENT_CORLIB").is_some() {
         96 * 1024

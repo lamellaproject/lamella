@@ -408,6 +408,91 @@ pub struct MethodParam {
     pub name: String,
 }
 
+/// Where one type's instance fields sit, in bytes, as the loader recorded it
+/// ([`Module::type_field_offsets`]), read in place so that a pointer walk over an object's fields
+/// allocates nothing.
+#[derive(Clone, Copy)]
+pub struct FieldOffsets<'m> {
+    words: OffsetWords<'m>,
+}
+
+/// A recorded offset run, `[end, alignment, offset of slot 0, ...]`: in a frozen module's arena,
+/// or still in the builder map.
+#[derive(Clone, Copy)]
+enum OffsetWords<'m> {
+    Arena {
+        arena: &'m TableArena,
+        offset: usize,
+        len: usize,
+    },
+    Live(&'m [u32]),
+}
+
+impl FieldOffsets<'_> {
+    fn word(&self, index: usize) -> Option<u32> {
+        match self.words {
+            OffsetWords::Arena { arena, offset, len } => {
+                if index < len {
+                    arena.read_u32(offset + index * 4)
+                } else {
+                    None
+                }
+            }
+            OffsetWords::Live(run) => run.get(index).copied(),
+        }
+    }
+
+    /// The offset just past the last field: a value type's size.
+    #[must_use]
+    pub fn end(&self) -> u32 {
+        self.word(0).unwrap_or(0)
+    }
+
+    /// The type's alignment.
+    #[must_use]
+    pub fn alignment(&self) -> u32 {
+        self.word(1).unwrap_or(1)
+    }
+
+    /// How many instance-field slots the record covers.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        let len = match self.words {
+            OffsetWords::Arena { len, .. } => len,
+            OffsetWords::Live(run) => run.len(),
+        };
+        len.saturating_sub(2)
+    }
+
+    /// The byte offset of slot `slot`, and [`end`](Self::end) for `slot == slot_count()`.
+    #[must_use]
+    pub fn offset_of(&self, slot: usize) -> Option<u32> {
+        match slot.cmp(&self.slot_count()) {
+            core::cmp::Ordering::Less => self.word(slot + 2),
+            core::cmp::Ordering::Equal => Some(self.end()),
+            core::cmp::Ordering::Greater => None,
+        }
+    }
+
+    /// The slot whose field starts at byte `offset`, and `slot_count()` for [`end`](Self::end).
+    /// `None` where no field starts: inside a field, in padding, or outside the fields. Also `None`
+    /// where two fields start at the same byte, which only an empty struct's field can cause, so
+    /// the answer is never a guess between them.
+    #[must_use]
+    pub fn slot_at(&self, offset: u32) -> Option<usize> {
+        let mut found = None;
+        for slot in 0..self.slot_count() {
+            if self.word(slot + 2) == Some(offset) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(slot);
+            }
+        }
+        found.or_else(|| (offset == self.end()).then_some(self.slot_count()))
+    }
+}
+
 /// A declared reference type's runtime shape: the zero value of each instance field
 /// (one per declaration-order slot, copied when allocating an instance) and its
 /// virtual method table.
@@ -930,6 +1015,12 @@ pub struct Module {
     /// (`start, end, type`), so a static-field access can find the type whose cctor it
     /// triggers. Loader-recorded, and frozen into a dense column indexed by slot.
     static_slot_types: Vec<(u32, u32, TypeId)>,
+    /// Where each type's instance fields sit, in bytes, for pointer arithmetic on a field's
+    /// address: the run `[end, alignment, offset of slot 0, offset of slot 1, ...]`, its slots in
+    /// the order [`Module::type_field_defaults`] lists them. Loader-recorded for each type whose
+    /// layout it can compute, and frozen into a trailing table. A type without one cannot have
+    /// its fields walked by a pointer.
+    field_offsets: BTreeMap<TypeId, Box<[u32]>>,
     /// A `TypeDef` token mapped to its [`TypeId`] (for `castclass` / `isinst`).
     type_tokens: BTreeMap<u64, TypeId>,
     /// The reverse of `type_tokens`: a [`TypeId`] mapped to its declaring type's asm-folded
@@ -1013,6 +1104,10 @@ pub struct Module {
     /// for `Box<int>::.ctor` -- and drops every other name silently. Recording it HERE, where the
     /// parent kind is actually known, is the only place the distinction still exists.
     unlowered_generics: BTreeSet<u64>,
+    /// For a token still marked in `unlowered_generics` once lowering finished, what it names and
+    /// why it was not lowered, as the loader worded it: the message of the `MissingMethodException`
+    /// a call through it raises. Never serialized, for the reason `unlowered_generics` is not.
+    unlowered_generic_names: BTreeMap<u64, Box<str>>,
     /// `newobj` tokens that construct a `System.Text.StringBuilder`, mapped to the
     /// constructor's parameter count -- newobj allocates a builder (seeded from a string arg).
     string_builder_ctors: BTreeMap<u64, u16>,
@@ -1561,6 +1656,10 @@ struct FrozenTables {
     /// column indexed by slot, so a static access on a baked image finds the type whose `.cctor`
     /// it triggers. Trailing, for the same reason.
     static_slot_types: DenseIdColumn,
+    /// The frozen `field_offsets`: per [`TypeId`] that has one, the arena offset and word count of
+    /// its offset run. Sparse, because only a type with a computed layout has an entry. Trailing:
+    /// an image baked before it existed has none, and a field address in it cannot be walked.
+    field_offset_runs: SortedWideTable,
     /// The frozen `enum_wide` (enum handles with a 64-bit underlying type).
     enum_wide: SortedTokenSet,
     /// The frozen `enum_flags` (enum handles carrying `[Flags]`).
@@ -2394,6 +2493,7 @@ impl FrozenTables {
         pair(out, self.cast_elems.offset, self.cast_elems.entries);
         pair(out, self.cctor_types.offset, self.cctor_types.entries);
         pair(out, self.static_slot_types.offset, self.static_slot_types.entries);
+        pair(out, self.field_offset_runs.offset, self.field_offset_runs.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
@@ -2506,6 +2606,7 @@ impl FrozenTables {
         trailing!(cast_elems, SortedWideTable);
         trailing!(cctor_types, SortedTokenTable);
         trailing!(static_slot_types, DenseIdColumn);
+        trailing!(field_offset_runs, SortedWideTable);
         Some((frozen, cursor))
     }
 }
@@ -2781,6 +2882,7 @@ impl Module {
         self.freeze_rva_blobs();
         self.freeze_sig_tables();
         self.freeze_type_shape();
+        self.freeze_field_offsets();
         self.freeze_strings();
         self.freeze_names();
         self.freeze_reflect_records();
@@ -3634,6 +3736,84 @@ impl Module {
         DenseU64Column { offset, entries }
     }
 
+    /// Drops, before a bake, the byte layout of every type whose fields no pointer can walk.
+    ///
+    /// A walk starts at a field's address, and only `ldflda` makes one, so a type keeps its
+    /// layout when a body the image carries takes the address of a field it declares or inherits.
+    /// A trimmed image's dropped bodies are empty, so they keep nothing.
+    #[cfg(feature = "code-in-place")]
+    fn drop_unaddressed_field_offsets(&mut self) {
+        if self.field_offsets.is_empty() {
+            return;
+        }
+        let mut addressed: BTreeSet<TypeId> = BTreeSet::new();
+        for (id, method) in self.methods.iter().enumerate() {
+            let Method::Managed { body, .. } = method else {
+                continue;
+            };
+            let Ok(code) = lamella_cil::decode(body.code()) else {
+                continue;
+            };
+            let asm = self.method_asm(id as MethodId);
+            for instruction in &code {
+                if let (lamella_cil::Opcode::Ldflda, lamella_cil::Operand::Token(token)) =
+                    (instruction.opcode, &instruction.operand)
+                {
+                    if let Some(owner) = self.field_type(asm, *token) {
+                        addressed.insert(owner);
+                    }
+                }
+            }
+        }
+        let walkable = |type_id: TypeId| {
+            let mut current = Some(type_id);
+            for _ in 0..=self.types.len() {
+                match current {
+                    Some(id) if addressed.contains(&id) => return true,
+                    Some(id) => current = self.type_base(id),
+                    None => return false,
+                }
+            }
+            false
+        };
+        let kept: BTreeSet<TypeId> = self
+            .field_offsets
+            .keys()
+            .copied()
+            .filter(|&type_id| walkable(type_id))
+            .collect();
+        self.field_offsets.retain(|type_id, _| kept.contains(type_id));
+    }
+
+    /// Drains `field_offsets` into one run of words per type, addressed by a sparse table keyed by
+    /// [`TypeId`], carrying an earlier table's entries forward on a re-freeze.
+    fn freeze_field_offsets(&mut self) {
+        if self.field_offsets.is_empty() {
+            return;
+        }
+        let mut records: BTreeMap<u64, (u32, u32)> = self
+            .frozen
+            .field_offset_runs
+            .entries_of(&self.arena)
+            .into_iter()
+            .map(|(key, offset, words)| (key, (offset, words)))
+            .collect();
+        for (type_id, run) in core::mem::take(&mut self.field_offsets) {
+            let offset = self.arena.bytes.len() as u32;
+            for word in run.iter() {
+                self.arena.push_u32(*word);
+            }
+            records.insert(u64::from(type_id), (offset, run.len() as u32));
+        }
+        self.frozen.field_offset_runs = SortedWideTable::write(
+            &mut self.arena,
+            records
+                .into_iter()
+                .map(|(key, (offset, words))| (key, offset, words))
+                .collect(),
+        );
+    }
+
     /// Drains `static_slot_types` into a dense column indexed by static slot, carrying an earlier
     /// column forward on a re-freeze. A run reaching past the slots this freeze covers stays in the
     /// builder, which [`Module::type_of_static_slot`] consults after the column.
@@ -4034,6 +4214,7 @@ impl Module {
     /// [`BakeError::UnregisteredIntrinsic`] if a bound intrinsic has no registry id.
     #[cfg(feature = "code-in-place")]
     pub fn write_baked(&mut self, entry: Option<MethodId>) -> Result<Vec<u8>, BakeError> {
+        self.drop_unaddressed_field_offsets();
         self.freeze();
 
         let method_count = self.methods.len();
@@ -4712,6 +4893,7 @@ impl Module {
         }
         self.type_tokens.retain(|_, id| type_kept(id));
         self.type_full_names.retain(|id, _| type_kept(id));
+        self.field_offsets.retain(|id, _| type_kept(id));
         self.vtable_slot_keys.retain(|id, _| type_kept(id));
         self.finalizers.retain(|id, _| type_kept(id));
         let by_token = core::mem::take(&mut self.by_token);
@@ -4930,6 +5112,8 @@ impl Module {
             ("cctor_types (frozen)", self.frozen.cctor_types.entries),
             ("static_slot_types", self.static_slot_types.len()),
             ("static slot owner column entries (frozen)", self.frozen.static_slot_types.entries),
+            ("field_offsets", self.field_offsets.len()),
+            ("field offset runs (frozen)", self.frozen.field_offset_runs.entries),
             ("enum_widths", self.enum_widths.len()),
             ("md_array_ctors", self.md_array_ctors.len()),
             ("delegate_ctor_types", self.delegate_ctor_types.len()),
@@ -5149,6 +5333,49 @@ impl Module {
             return self.baked_type_record(type_id)?.0.checked_sub(1);
         }
         self.types.get(type_id as usize)?.base
+    }
+
+    /// Records where `type_id`'s instance fields sit, in bytes: `offsets` holds each slot's offset,
+    /// in the order [`Module::type_field_defaults`] lists the slots, `end` the offset just past the
+    /// last field (a value type's size), and `alignment` the type's alignment, by which a value
+    /// type is placed inside another type's layout.
+    pub fn set_type_field_offsets(
+        &mut self,
+        type_id: TypeId,
+        end: u32,
+        alignment: u32,
+        offsets: &[u32],
+    ) {
+        let mut run = Vec::with_capacity(offsets.len() + 2);
+        run.push(end);
+        run.push(alignment);
+        run.extend_from_slice(offsets);
+        self.field_offsets.insert(type_id, run.into_boxed_slice());
+    }
+
+    /// Where `type_id`'s instance fields sit, in bytes, if the loader recorded it.
+    ///
+    /// A record can describe fewer slots than an instance has: an incremental REPL delta grows a
+    /// loaded type by a field after its layout was recorded. A caller compares
+    /// [`FieldOffsets::slot_count`] with the storage it is about to address.
+    #[must_use]
+    pub fn type_field_offsets(&self, type_id: TypeId) -> Option<FieldOffsets<'_>> {
+        if let Some(run) = self.field_offsets.get(&type_id) {
+            return Some(FieldOffsets {
+                words: OffsetWords::Live(run),
+            });
+        }
+        let (offset, len) = self
+            .frozen
+            .field_offset_runs
+            .get(&self.arena, u64::from(type_id))?;
+        Some(FieldOffsets {
+            words: OffsetWords::Arena {
+                arena: &self.arena,
+                offset: offset as usize,
+                len: len as usize,
+            },
+        })
     }
 
     /// Replaces `type_id`'s full instance-field layout (base fields first, then own),
@@ -6462,6 +6689,32 @@ impl Module {
     /// clears per token, after the bind, and leaves every token it refused marked.
     pub fn clear_unlowered_generic(&mut self, asm: u8, token: Token) {
         self.unlowered_generics.remove(&asm_key(asm, token.0));
+        self.unlowered_generic_names.remove(&asm_key(asm, token.0));
+    }
+
+    /// Every token still marked as reaching an unlowered generic instantiation, as
+    /// `(assembly, token)`.
+    #[must_use]
+    pub fn unlowered_generic_tokens(&self) -> Vec<(u8, Token)> {
+        self.unlowered_generics
+            .iter()
+            .map(|key| ((key >> 32) as u8, Token(*key as u32)))
+            .collect()
+    }
+
+    /// Records the message a call through the still-marked `token` raises: what the token names and
+    /// why it was not lowered, in the words of a `MissingMethodException`.
+    pub fn name_unlowered_generic(&mut self, asm: u8, token: Token, message: &str) {
+        self.unlowered_generic_names
+            .insert(asm_key(asm, token.0), message.into());
+    }
+
+    /// The message [`Module::name_unlowered_generic`] recorded for `token`, if any.
+    #[must_use]
+    pub fn unlowered_generic_name(&self, asm: u8, token: Token) -> Option<&str> {
+        self.unlowered_generic_names
+            .get(&asm_key(asm, token.0))
+            .map(|message| &**message)
     }
 
     /// Whether `token` reaches through an unlowered generic instantiation.
@@ -7380,6 +7633,25 @@ mod tests {
         {
             RawCil::Ram(bytes)
         }
+    }
+
+    #[test]
+    fn field_offsets_survive_the_freeze() {
+        let mut module = Module::new();
+        let pair = module.add_type(alloc::vec![Value::Int32(0), Value::Int32(0)]);
+        module.set_type_field_offsets(pair, 8, 4, &[0, 4]);
+        module.freeze();
+        let census: BTreeMap<&str, usize> = module.table_census().into_iter().collect();
+        assert_eq!(census["field_offsets"], 0, "freeze drains the builder map");
+        assert_eq!(census["field offset runs (frozen)"], 1);
+        let layout = module.type_field_offsets(pair).expect("the frozen run reads back");
+        assert_eq!((layout.end(), layout.alignment(), layout.slot_count()), (8, 4, 2));
+        assert_eq!(
+            [0, 1, 2, 3].map(|slot| layout.offset_of(slot)),
+            [Some(0), Some(4), Some(8), None]
+        );
+        assert_eq!([0, 4, 8, 2].map(|byte| layout.slot_at(byte)), [Some(0), Some(1), Some(2), None]);
+        assert!(module.type_field_offsets(pair + 1).is_none(), "no other type has a run");
     }
 
     #[test]

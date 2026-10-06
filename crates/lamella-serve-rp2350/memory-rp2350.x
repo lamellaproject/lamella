@@ -23,6 +23,11 @@ MEMORY
 ENTRY(reset)
 EXTERN(fault)
 EXTERN(IMAGE_DEF)
+/* IO_IRQ_BANK0's handler: the C# interpreter defines it, to deliver pin-change events. Any other
+   firmware linked with this script leaves it undefined, and the interrupt is answered as a fault, as
+   every interrupt these firmwares never enable is. */
+EXTERN(io_bank0_isr)
+PROVIDE(io_bank0_isr = fault);
 
 SECTIONS
 {
@@ -41,6 +46,14 @@ SECTIONS
     LONG(0);                                                    /* 13    reserved */
     LONG(fault | 1);                                            /* 14    PendSV */
     LONG(fault | 1);                                            /* 15    SysTick */
+    /* External interrupts 0-20, which these firmwares never enable. */
+    LONG(fault | 1); LONG(fault | 1); LONG(fault | 1); LONG(fault | 1);    /* IRQ 0-3 */
+    LONG(fault | 1); LONG(fault | 1); LONG(fault | 1); LONG(fault | 1);    /* IRQ 4-7 */
+    LONG(fault | 1); LONG(fault | 1); LONG(fault | 1); LONG(fault | 1);    /* IRQ 8-11 */
+    LONG(fault | 1); LONG(fault | 1); LONG(fault | 1); LONG(fault | 1);    /* IRQ 12-15 */
+    LONG(fault | 1); LONG(fault | 1); LONG(fault | 1); LONG(fault | 1);    /* IRQ 16-19 */
+    LONG(fault | 1);                                            /* IRQ 20 */
+    LONG(io_bank0_isr | 1);                                     /* IRQ 21 IO_IRQ_BANK0 */
   } > FLASH
 
   /* The PICOBIN IMAGE_DEF block, right after the vector table (well inside the first 4 KB). */

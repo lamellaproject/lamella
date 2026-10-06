@@ -38,3 +38,6 @@ fitted = "no"
 onboard = "none"
 recovery = "flash-bootloader"
 source = "The board carries no EDBG and no debug bridge; the wire is the chip's native USB and flashing takes an external SWD probe. The schematic states no debug connector position, so the signals are recorded as reaching pads rather than a header."
+
+[csharp_interpreter]
+optimization = "size"

@@ -5,6 +5,13 @@
 # The function-select values are the SVD-enumerated mux columns this family's consumers bind
 # (grown evidence-first): F1 = SPI, F2 = UART, F3 = I2C, F4 = PWM, F5 = SIO (the GPIO
 # driver's route), NULL = no digital function (the ADC's analogue pad prep).
+#
+# The output overrides and the pad's input level are the I2C driver's bus recovery: it clocks
+# SCL and drives SDA by overriding the I2C function's output and output enable, with FUNCSEL
+# left on I2C, and reads each line's level from the pad.
+#
+# The interrupt registers are pin-change events: the GPIO driver enables a pin's edges for
+# processor 0, and the firmware's handler for IO_IRQ_BANK0 reads which are pending and clears them.
 
 [table]
 kind = "block"
@@ -12,11 +19,32 @@ family = "rp2350"
 block = "io-bank0"
 sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet ch 9 (GPIO)"]
 
+[registers.GPIO0_STATUS]
+offset = 0x0
+width = 32
+fields = { INFROMPAD = [17, 1] }
+notes = "The array base pin's status (GPIO0); GPIOn_STATUS = 0x00 + 8*n. INFROMPAD is the pad's input level before filtering and before INOVER is applied, so it reads the line itself, whatever the peripheral is shown (datasheet 9.11.1, Table 650)."
+
 [registers.GPIO0_CTRL]
 offset = 0x4
 width = 32
-fields = { FUNCSEL = [0, 5] }
-notes = "The array base pin (GPIO0). Per-pin CTRL stride is 8 (GPIOn_CTRL = 0x04 + 8*n); STATUS sits at each pin's +0x00."
+fields = { FUNCSEL = [0, 5], OUTOVER = [12, 2], OEOVER = [14, 2] }
+notes = "The array base pin (GPIO0). Per-pin CTRL stride is 8 (GPIOn_CTRL = 0x04 + 8*n); STATUS sits at each pin's +0x00. OUTOVER and OEOVER override the selected function's output and output enable; both reset to 0, NORMAL (datasheet 9.11.1, Table 651)."
+
+[registers.INTR0]
+offset = 0x230
+width = 32
+notes = "Raw interrupts of GPIO0-7, a nibble per pin from bit 0: LEVEL_LOW, LEVEL_HIGH, EDGE_LOW, EDGE_HIGH; INTRn = 0x230 + 4*n covers GPIO 8n to 8n+7. An edge bit latches whether or not it is enabled, and stays latched until it is written 1; the level bits follow the pad (datasheet 9.11.1, Table 758)."
+
+[registers.PROC0_INTE0]
+offset = 0x248
+width = 32
+notes = "Processor 0's interrupt enables for GPIO0-7, the same nibble per pin; PROC0_INTEn = 0x248 + 4*n. An enabled event that is pending raises IO_IRQ_BANK0, interrupt 21, on processor 0."
+
+[registers.PROC0_INTS0]
+offset = 0x278
+width = 32
+notes = "Processor 0's interrupt status for GPIO0-7: each pin's events that are both pending and enabled, or forced; PROC0_INTSn = 0x278 + 4*n."
 
 [constants]
 GPIO_CTRL_STRIDE = 8
@@ -26,3 +54,11 @@ FUNCSEL_I2C = 3
 FUNCSEL_PWM = 4
 FUNCSEL_SIO = 5
 FUNCSEL_NULL = 0x1F
+OUTOVER_LOW = 2
+OEOVER_DISABLE = 2
+OEOVER_ENABLE = 3
+GPIO_INT_STRIDE = 4
+GPIO_INT_PINS = 8
+GPIO_INT_BITS = 4
+GPIO_INT_EDGE_LOW = 0x4
+GPIO_INT_EDGE_HIGH = 0x8

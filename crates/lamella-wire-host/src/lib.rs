@@ -1318,6 +1318,27 @@ pub fn deploy_image_blocking(
     timeout: Duration,
     session_caps: lamella_wire::Capabilities,
 ) -> Result<TransferAck, TransportError> {
+    deploy_image_with_progress(transport, seq, image, chunk_len, timeout, session_caps, &mut |_| {})
+}
+
+/// [`deploy_image_blocking`], telling `progress` how many bytes of the image the target has
+/// acknowledged each time another chunk's acknowledgement arrives -- so a host can show a deploy
+/// that takes seconds as one that is moving, rather than as silence.
+///
+/// `progress` hears only what the target ACKNOWLEDGED, never what was merely sent: a chunk on the
+/// wire is not yet in the target's flash.
+///
+/// # Errors
+/// As [`deploy_image_blocking`].
+pub fn deploy_image_with_progress(
+    transport: &mut impl Transport,
+    seq: u16,
+    image: &[u8],
+    chunk_len: usize,
+    timeout: Duration,
+    session_caps: lamella_wire::Capabilities,
+    progress: &mut dyn FnMut(usize),
+) -> Result<TransferAck, TransportError> {
     use lamella_wire::crc32;
     if let Some(refused) = refuse_if_larger_than_the_window(transport, seq, image.len(), timeout) {
         return Ok(refused);
@@ -1342,8 +1363,34 @@ pub fn deploy_image_blocking(
         }
         offset = end;
         chunk += 1;
+        progress(offset);
     }
     Ok(TransferAck::Accepted)
+}
+
+/// How many image bytes one deploy chunk carries to a target reached over `carrier`, on the session
+/// `session` negotiated.
+///
+/// **A target that said what one frame of its carrier can absorb is sent that much**, up to 8 KiB.
+/// One that said nothing is sent by what its carrier is:
+///
+/// - Over USB or TCP, 8 KiB. Both carriers hold back what the target has not taken yet, so a frame
+///   cannot outrun the target's buffer, and fewer round trips is the whole of the speed.
+/// - Over a serial line, 256 bytes. A serial target drains its line into a fixed ring, a full ring
+///   drops, and the rings in this tree run 256, 512 and 4,096 bytes.
+///
+/// The result is a multiple of 256 bytes whenever it is at least that, so each chunk starts on the
+/// flash write unit of every board whose unit is 256 bytes or a divisor of it.
+#[must_use]
+pub fn deploy_chunk_len(session: &lamella_wire::Negotiated, carrier: TargetKind) -> usize {
+    const ROOMY: usize = 8 * 1024;
+    const SERIAL: usize = 256;
+    let len = match session.max_inbound_payload {
+        Some(_) => session.max_chunk_data().min(ROOMY),
+        None if carrier == TargetKind::Serial => SERIAL,
+        None => ROOMY,
+    };
+    if len >= SERIAL { len - len % SERIAL } else { len }
 }
 
 /// The largest bundle slice one frame can carry: the frame's `u16` LEN cap, less the 8-byte
@@ -1802,8 +1849,9 @@ pub enum Aborted {
 /// `seq`. What a stopped program was still sending is skipped: it is being replaced.
 ///
 /// # Errors
-/// [`TransportError::Closed`] when neither answer arrives within `timeout`; otherwise a carrier
-/// [`TransportError`].
+/// [`TransportError::Refused`] at once when the target refuses the op by name -- a firmware that
+/// carries no debugger; [`TransportError::Closed`] when neither answer arrives within `timeout`;
+/// otherwise a carrier [`TransportError`].
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn abort_blocking(
     transport: &mut impl Transport,
@@ -1821,6 +1869,9 @@ pub fn abort_blocking(
                 (exec::EXEC_ACK, Some(exec::ack::IDLE)) => return Ok(Aborted::NothingWasRunning),
                 (debug::EVT_STOPPED, Some(debug::reason::ABORTED)) => {
                     return Ok(Aborted::StoppedAProgram);
+                }
+                (lamella_wire::msg::ERROR, _) => {
+                    return Err(lamella_wire::error::refusal(&frame.payload));
                 }
                 _ => {}
             }
@@ -2496,6 +2547,54 @@ mod tests {
         let frame = reader.next_frame().expect("a capped chunk is a well-formed frame");
         assert_eq!(frame.payload.len(), capped.len(), "a capped chunk must cross whole");
         assert_eq!(CHUNK_DATA_CAP % 512, 0, "a chunk must still start on a 512-byte flash page");
+    }
+
+    /// **A DEPLOY CHUNK IS SIZED FOR ITS CARRIER**: 8 KiB where the carrier holds back what the
+    /// target has not taken yet, 256 bytes on a serial line, and what the target advertised wherever
+    /// it advertised, in whole 256-byte units.
+    #[test]
+    fn a_deploy_chunk_is_sized_for_its_carrier() {
+        use lamella_wire::{Capabilities, HelloAck, TargetIdentity, host_finish};
+        let session = |max_inbound_payload| {
+            host_finish(
+                &HelloAck { chosen: 1, caps: Capabilities(0), identity: TargetIdentity::default(), max_inbound_payload },
+                Capabilities(0),
+            )
+        };
+        assert_eq!(deploy_chunk_len(&session(None), TargetKind::Usb), 8192);
+        assert_eq!(deploy_chunk_len(&session(None), TargetKind::Tcp), 8192);
+        assert_eq!(deploy_chunk_len(&session(None), TargetKind::Serial), 256);
+        assert_eq!(
+            deploy_chunk_len(&session(Some(4000)), TargetKind::Serial),
+            3840,
+            "what the target said it takes, less the chunk header, in whole 256-byte units"
+        );
+        assert_eq!(deploy_chunk_len(&session(Some(60_000)), TargetKind::Usb), 8192, "never above 8 KiB");
+        assert_eq!(
+            deploy_chunk_len(&session(Some(100)), TargetKind::Usb),
+            232,
+            "a target that under-declares is sent the floor's chunk"
+        );
+    }
+
+    /// **A DEPLOY's PROGRESS IS WHAT THE TARGET ACKNOWLEDGED**, once per chunk, ending at the whole
+    /// image.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn a_deploy_reports_each_acknowledged_chunk() {
+        let image = vec![7u8; 20_000];
+        let mut transport = MemTransport::new();
+        transport.feed(&holds_nothing_with_a_window_of(3, 1 << 20));
+        for _ in 0..3 {
+            transport.feed(&xfer_ack(3));
+        }
+        let mut heard = Vec::new();
+        let none = lamella_wire::Capabilities(0);
+        let ack = deploy_image_with_progress(&mut transport, 3, &image, 8192, Duration::from_secs(5), none, &mut |written| {
+            heard.push(written);
+        });
+        assert_eq!(ack, Ok(TransferAck::Accepted));
+        assert_eq!(heard, [8192, 16384, 20_000]);
     }
 
     /// The same defect through the REAL deploy loop, which is what the clamp is actually protecting.

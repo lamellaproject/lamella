@@ -24,9 +24,9 @@ fields = { STABLE = [31, 1] }
 offset = 0xC
 width = 32
 fields = { DELAY = [0, 14] }
-notes = "0xC4 = the datasheet's ~1 ms startup delay at 12 MHz."
+notes = "DELAY counts 256 crystal periods: a wait of t seconds is (f_crystal x t) / 256 (datasheet 2.16.3), so 1 ms with a 12 MHz crystal is 47. Its reset value, 0xC4, is 50,176 periods (Table 262: 'approx 50 000 cycles'): 4.18 ms with a 12 MHz crystal, within the 'few milliseconds' 2.16.2 gives a crystal to start."
 
 [constants]
 CTRL_ENABLE_MAGIC = 0xFAB
 CTRL_FREQ_RANGE_1_15MHZ = 0xAA0
-STARTUP_DELAY_1MS = 0xC4
+STARTUP_DELAY_RESET = 0xC4

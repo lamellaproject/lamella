@@ -369,3 +369,6 @@ fitted = "yes"
 onboard = "none"
 recovery = "mask-rom"
 source = "The pinout diagram lists a Debug connector among the board's connectors and gives its three positions as SWCLK, GND and SWDIO, so a probe cable lands on it with no tools; the schematic carries SWCLK and SWDIO from the MCU to it. There is no on-board debug probe. RP2350 datasheet section 4.1: the mask ROM is a physically immutable memory resource, so the recovery path is in silicon and no image written to flash can remove it."
+
+[csharp_interpreter]
+optimization = "speed"

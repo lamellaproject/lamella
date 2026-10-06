@@ -718,6 +718,135 @@ impl fmt::Display for Refusal {
     }
 }
 
+impl Refusal {
+    /// Whether this refusal is about the call site spelled `label`: one naming its instantiation
+    /// (or the generic definition behind it), or -- where `token` is a `MethodSpec` row of the
+    /// assembly the method axis walked -- one carrying that row's token.
+    fn concerns(&self, label: &str, token: Option<u32>) -> bool {
+        let names = |instantiation: &str| {
+            label
+                .strip_prefix(instantiation)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[', '<']))
+        };
+        let carries = |own: u32| token == Some(own);
+        match self {
+            Refusal::DefinitionNotHere { definition } => names(definition),
+            Refusal::StaticFieldNotSeparated { instantiation, .. }
+            | Refusal::MethodTypeParameter { instantiation, .. }
+            | Refusal::InstantiationNotInSet { instantiation, .. }
+            | Refusal::UnboundAfterSubstitution { instantiation, .. }
+            | Refusal::SubstitutedKeyCollision { instantiation, .. }
+            | Refusal::BodyUnreadable { instantiation, .. } => names(instantiation),
+            Refusal::NestedGenericMethodCall { owner, .. }
+            | Refusal::MethodSpecFromAnotherAssembly { owner, .. } => names(owner),
+            Refusal::ExceptionTagCollision { first, second, .. } => names(first) || names(second),
+            Refusal::OpenMethodInstantiation { token }
+            | Refusal::GenericMethodNotHere { token }
+            | Refusal::VirtualGenericInDuplicatedBody { token, .. }
+            | Refusal::VirtualGenericDeclarationUnreadable { token, .. }
+            | Refusal::VirtualGenericOverrideNotInThisProgram { token, .. }
+            | Refusal::VirtualGenericBodyNotEmitted { token, .. }
+            | Refusal::VirtualGenericDispatchDiverged { token, .. } => carries(*token),
+            Refusal::InterfaceMemberFallsToNonVirtual { .. } => false,
+        }
+    }
+}
+
+/// Records, for each call site still marked unlowered once the pass has run, the message a call
+/// through it raises ([`Module::name_unlowered_generic`]): what the site names, spelled as the pass
+/// spells what it lowers, and the refusal that kept it unlowered where one is about it.
+///
+/// A refusal is not a load error: the program loads, and the call that reaches what was not lowered
+/// is where it fails. Every load entry point drops the [`Lowering`] once the pass returns, so this is
+/// what lets that call name the instantiation, as a `MissingMethodException` the program can catch,
+/// rather than a bare token. `walked` is the assembly whose `MethodSpec` table the method axis
+/// walked, the only one a refusal's bare token is a row of.
+pub(crate) fn name_unlowered_sites(
+    module: &mut Module,
+    sources: &[DefinitionSource<'_>],
+    walked: u8,
+    lowering: &Lowering,
+) {
+    for (asm, token) in module.unlowered_generic_tokens() {
+        let Some(source) = sources.iter().find(|source| source.asm == asm) else {
+            continue;
+        };
+        let Some(label) = marked_site_label(&source.assembly, token) else {
+            continue;
+        };
+        let own_row = (asm == walked && token.table() == METHOD_SPEC).then_some(token.0);
+        let refusal = lowering
+            .refusals
+            .iter()
+            .find(|refusal| refusal.concerns(&label, own_row));
+        let message = match refusal {
+            Some(refusal) => alloc::format!(
+                "Method not found: '{label}'. Lamella did not lower this generic instantiation: \
+                 {refusal}."
+            ),
+            None => alloc::format!(
+                "Method not found: '{label}'. Lamella did not lower this generic instantiation."
+            ),
+        };
+        module.name_unlowered_generic(asm, token, &message);
+    }
+}
+
+/// What a marked call site names: a generic method's instantiation as the method axis labels its
+/// pairs (`G.Max<System.Int32>`), a member reached through an instantiated type
+/// (`Box`1[System.Int32].Get`), or the instantiated type itself. `None` when the token does not
+/// decode, which leaves the site the message that names its token.
+#[cfg(feature = "generics")]
+fn marked_site_label(assembly: &Assembly<'_>, token: Token) -> Option<String> {
+    let type_name = |parent: Token| -> Option<String> {
+        if parent.table() == TYPE_SPEC {
+            return lamella_generics::spell_sig(assembly, &assembly.type_spec_signature(parent)?);
+        }
+        let (namespace, name) = assembly.type_token_full_name(parent)?;
+        Some(if namespace.is_empty() {
+            name
+        } else {
+            alloc::format!("{namespace}.{name}")
+        })
+    };
+    match token.table() {
+        METHOD_SPEC => {
+            let definition = assembly.method_spec_method(token)?;
+            let arguments = assembly.method_spec_instantiation(token)?;
+            let (declaring, name) = match definition.table() {
+                METHOD_DEF => {
+                    let type_row = assembly.type_defs().position(|type_def| {
+                        type_def.methods().any(|method| method.rid() == definition.row())
+                    })? + 1;
+                    (
+                        definition_key(assembly, Token::new(TYPE_DEF, type_row as u32))?,
+                        String::from(assembly.method(definition.row())?.name()?),
+                    )
+                }
+                MEMBER_REF => {
+                    let member = assembly.member_ref(definition.row())?;
+                    (type_name(member.parent())?, String::from(member.name()?))
+                }
+                _ => return None,
+            };
+            method_pair_label(assembly, &declaring, &name, &arguments)
+        }
+        MEMBER_REF => {
+            let member = assembly.member_ref(token.row())?;
+            Some(alloc::format!("{}.{}", type_name(member.parent())?, member.name()?))
+        }
+        TYPE_SPEC => type_name(token),
+        _ => None,
+    }
+}
+
+/// Without the `generics` capability nothing decodes an instantiation, so a marked site keeps the
+/// message that names its token.
+#[cfg(not(feature = "generics"))]
+fn marked_site_label(_assembly: &Assembly<'_>, _token: Token) -> Option<String> {
+    None
+}
+
 /// What one run of the pass produced.
 pub struct Lowering {
     /// Each instantiation that was lowered, and the type identity it was lowered to. A loader that

@@ -21,8 +21,8 @@ use lamella_cil::{Opcode, Operand};
 #[cfg(feature = "exceptions")]
 use lamella_cil::EhKind;
 use lamella_metadata::{
-    Assembly, AttrArg, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeDef, TypeName,
-    decode_custom_attribute,
+    Assembly, AttrArg, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeDef,
+    TypeLayout, TypeName, decode_custom_attribute, layout_value_type,
 };
 #[cfg(feature = "exceptions")]
 use lamella_metadata::exception_tag_for_name;
@@ -84,8 +84,9 @@ use lamella_cil_runtime::intrinsics::{
     socket_udp_bind, socket_udp_send_to, socket_udp_recv_from, socket_udp_max_datagram,
     dns_resolve_host,
     net_is_available, net_iface_count, net_iface_oper_status, net_iface_type, net_iface_ipv4,
-    net_iface_subnet, net_iface_gateway, net_iface_flags,
-    tls_client_config, tls_server_config, tls_client_new, tls_server_new, tls_process,
+    net_iface_subnet, net_iface_gateway, net_iface_flags, net_change_count,
+    tls_client_config, tls_client_config_identity, tls_check_identity, tls_peer_alert,
+    tls_server_config, tls_client_new, tls_server_new, tls_process,
     tls_wants_write, tls_write_tls, tls_read_tls, tls_read_plain, tls_write_plain, tls_peer_cert,
     tls_session_flags, tls_close_notify, tls_close, tls_default_stack, tls_client_config_alpn, tls_alpn_is,
     tls_exporter_key, tls_drop_key, aead_siv_encrypt, aead_siv_decrypt, aead_import_key,
@@ -102,6 +103,11 @@ use lamella_cil_runtime::intrinsics::{
     intptr_from_raw_value, intptr_size, intptr_to_raw_value,
     mmio_read32, mmio_write32, mmio_read8, mmio_write8, mmio_read16, mmio_write16,
     value_type_equals, value_type_get_hash_code,
+};
+#[cfg(feature = "wifi")]
+use lamella_cil_runtime::intrinsics::{
+    wifi_disconnect, wifi_join_start, wifi_join_stored, wifi_radio, wifi_record_clear,
+    wifi_record_read, wifi_record_set_boot, wifi_record_write, wifi_state,
 };
 #[cfg(feature = "exceptions")]
 use lamella_cil_runtime::intrinsics::type_initialization_exception_runtime_type_name;
@@ -780,6 +786,7 @@ pub fn load_library<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Module, LoadE
                 &plan,
             );
             relink_generic_base_heirs(&mut module, &heirs, &lowering);
+            monomorphize::name_unlowered_sites(&mut module, &sources, 0, &lowering);
         }
     }
     #[cfg(not(feature = "generics"))]
@@ -1501,9 +1508,10 @@ pub fn load_bootstrap_lazy_corlib<'pe>(
     (module, index, type_index)
 }
 
-/// The assembly id a PROGRAM takes under lazy resolution -- 1, one past [`LAZY_CORLIB_ASM`], which
-/// is the same pair the eager [`load_with_corlib`] uses, so a program's tokens are keyed identically
-/// whichever tier loaded it.
+/// The assembly id a PROGRAM takes under lazy resolution when no library is loaded beside it -- 1,
+/// one past [`LAZY_CORLIB_ASM`], which is the same pair the eager [`load_with_corlib`] uses, so a
+/// program's tokens are keyed identically whichever tier loaded it. Libraries take the ids from here
+/// up and the program the one after the last of them, as on the eager tier.
 const LAZY_PROGRAM_ASM: u8 = 1;
 
 /// Why a program could not be loaded against a lazily-resolved resident corlib.
@@ -1514,9 +1522,9 @@ pub enum LazyLoadError {
     Load(LoadError),
     /// A `call` / `callvirt` / `newobj` in the program names a member -- typically a corlib member
     /// gated out of a constrained tier's resident corlib -- that neither the lazy resolver could
-    /// materialize nor an intrinsic provides. Left unbound it would trap at RUN as an opaque
-    /// `UnresolvedCall`, on a device with nobody watching; caught at load, it names the member while
-    /// the deploying host is still listening.
+    /// materialize, nor a library loaded beside it declares, nor an intrinsic provides. Left unbound
+    /// it would trap at RUN as an opaque `UnresolvedCall`, on a device with nobody watching; caught
+    /// at load, it names the member while the deploying host is still listening.
     UnresolvedMember(String),
 }
 
@@ -1532,7 +1540,8 @@ impl fmt::Display for LazyLoadError {
             LazyLoadError::Load(error) => error.fmt(formatter),
             LazyLoadError::UnresolvedMember(name) => write!(
                 formatter,
-                "cannot resolve {name} -- no such member in the resident corlib, and no intrinsic provides it"
+                "cannot resolve {name} -- no such member in the resident corlib or a library loaded \
+                 with it, and no intrinsic provides it"
             ),
         }
     }
@@ -1583,14 +1592,77 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
     corlib: &SourceAssembly<'c>,
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LazyLoadError> {
+    load_program_lazy_corlib_with_libraries_unfrozen(corlib, &[], program)
+}
+
+/// [`load_program_lazy_corlib`] with LIBRARY assemblies between the corlib and the program --
+/// `System.Device.Gpio`, the board assembly that binds a board's buses, any library a project
+/// references. The corlib is still materialized member by member; each library is loaded WHOLE, as
+/// the program is, after every library it references.
+///
+/// The assembly ids are [`load_with_corlib_and_libraries`]'s: the corlib 0, the libraries 1..=N in
+/// the order [`referenced_libraries`] returns them, the program N+1. So a token is keyed the same way
+/// on either tier, and the libraries bind each other and the corlib by name as they do there.
+///
+/// **THE CORLIB IS THE PART MATERIALIZED, BECAUSE IT IS THE PART A PROGRAM USES LEAST OF.** A program
+/// reaches a few hundred of the corlib's members, and a corlib loaded whole is most of a baked image
+/// whatever the trim keeps.
+///
+/// # Errors
+/// As [`load_program_lazy_corlib`], and [`LazyLoadError::Load`] when the libraries reference each
+/// other in a cycle or one demands what this runtime does not implement.
+///
+/// # Panics
+/// If given more than 253 libraries, as [`load_with_corlib_and_libraries`].
+pub fn load_program_lazy_corlib_with_libraries<'c, 'l, 'p>(
+    corlib: &SourceAssembly<'c>,
+    libraries: &[SourceAssembly<'l>],
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LazyLoadError> {
+    let mut loaded = load_program_lazy_corlib_with_libraries_unfrozen(corlib, libraries, program)?;
+    loaded.module.freeze();
+    Ok(loaded)
+}
+
+/// [`load_program_lazy_corlib_with_libraries`] WITHOUT the final freeze -- the bake's entry, as
+/// [`load_program_lazy_corlib_unfrozen`] is for a program alone.
+///
+/// # Errors
+/// As [`load_program_lazy_corlib_with_libraries`].
+///
+/// # Panics
+/// As [`load_program_lazy_corlib_with_libraries`].
+pub fn load_program_lazy_corlib_with_libraries_unfrozen<'c, 'l, 'p>(
+    corlib: &SourceAssembly<'c>,
+    libraries: &[SourceAssembly<'l>],
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LazyLoadError> {
+    assert!(
+        libraries.len() <= usize::from(u8::MAX) - 2,
+        "assembly ids are 8-bit: corlib + at most {} libraries + the program",
+        usize::from(u8::MAX) - 2
+    );
     if program.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint.into());
     }
+    let ordered: Vec<SourceAssembly<'l>> = {
+        let order = library_load_order(libraries)?;
+        order.into_iter().map(|position| libraries[position].clone()).collect()
+    };
+    let libraries: &[SourceAssembly<'l>] = &ordered;
+    {
+        let assemblies: Vec<&Assembly<'_>> = libraries.iter().collect();
+        refuse_unmet_demands(&assemblies)?;
+    }
+    let library_asm = |position: usize| LAZY_PROGRAM_ASM + position as u8;
+    let program_asm = library_asm(libraries.len());
     let mut module = Module::new();
     let mut resolution = CorlibResolution::new();
     #[cfg(feature = "generics")]
     let (instantiations, plans) = {
-        let references = [corlib.clone()];
+        let mut references: Vec<Assembly<'_>> = Vec::with_capacity(1 + libraries.len());
+        references.push(corlib.clone());
+        references.extend(libraries.iter().cloned());
         (
             monomorphize::collect_instantiations(program, &references),
             monomorphize::collect_reference_plans(program, &references),
@@ -1625,6 +1697,9 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
     };
     #[cfg(not(feature = "generics"))]
     let boxed_type_arguments: Vec<String> = Vec::new();
+    for library in libraries {
+        materialize_corlib_refs(&mut module, &mut resolution, library, corlib, &[], &[]);
+    }
     materialize_corlib_refs(
         &mut module,
         &mut resolution,
@@ -1633,13 +1708,28 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
         &generic_definitions,
         &boxed_type_arguments,
     );
-    let program_type_offset = module.type_count();
     let mut heirs: Vec<GenericBaseHeir<'_>> = Vec::new();
+    let mut library_type_offsets: Vec<usize> = Vec::with_capacity(libraries.len());
+    for (position, library) in libraries.iter().enumerate() {
+        library_type_offsets.push(module.type_count());
+        load_assembly_collecting(
+            &mut module,
+            library,
+            flash_cil,
+            library_asm(position),
+            &mut resolution.index,
+            &mut resolution.type_index,
+            &mut resolution.field_index,
+            true,
+            &mut heirs,
+        );
+    }
+    let program_type_offset = module.type_count();
     let entry = load_assembly_collecting(
         &mut module,
         program,
         flash_cil,
-        LAZY_PROGRAM_ASM,
+        program_asm,
         &mut resolution.index,
         &mut resolution.type_index,
         &mut resolution.field_index,
@@ -1648,10 +1738,10 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
     );
     #[cfg(feature = "generics")]
     {
-        let sources = alloc::vec![
+        let mut sources = alloc::vec![
             monomorphize::DefinitionSource {
                 assembly: program.clone(),
-                asm: LAZY_PROGRAM_ASM,
+                asm: program_asm,
                 type_offset: Some(program_type_offset),
             },
             monomorphize::DefinitionSource {
@@ -1660,10 +1750,17 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
                 type_offset: None,
             },
         ];
+        for (position, library) in libraries.iter().enumerate() {
+            sources.push(monomorphize::DefinitionSource {
+                assembly: library.clone(),
+                asm: library_asm(position),
+                type_offset: Some(library_type_offsets[position]),
+            });
+        }
         let lowering = monomorphize::monomorphize_with_reference_plans(
             &mut module,
             program,
-            LAZY_PROGRAM_ASM,
+            program_asm,
             &sources,
             &resolution.type_index,
             &resolution.field_index,
@@ -1678,11 +1775,12 @@ pub fn load_program_lazy_corlib_unfrozen<'c, 'p>(
             &lowering.copied_definitions,
         );
         relink_generic_base_heirs(&mut module, &heirs, &lowering);
+        monomorphize::name_unlowered_sites(&mut module, &sources, program_asm, &lowering);
     }
     #[cfg(not(feature = "generics"))]
-    let _ = (program_type_offset, &heirs);
+    let _ = (program_type_offset, &heirs, &library_type_offsets);
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
-    if let Some(name) = first_unresolved_call(&module, program, LAZY_PROGRAM_ASM, corlib) {
+    if let Some(name) = first_unresolved_call(&module, program, program_asm, corlib, libraries) {
         return Err(LazyLoadError::UnresolvedMember(name));
     }
     Ok(Program { module, entry })
@@ -1705,7 +1803,7 @@ pub fn load_delta_with_corlib<'d, 'c>(
     materialize_corlib_refs(module, &mut context.resolution, delta, corlib, &[], &[]);
     let delta_asm = context.next_delta_asm;
     let info = load_delta(module, context, delta)?;
-    if let Some(name) = first_unresolved_call(module, delta, delta_asm, corlib) {
+    if let Some(name) = first_unresolved_call(module, delta, delta_asm, corlib, &[]) {
         return Err(DeltaError::UnresolvedMember(name));
     }
     Ok(info)
@@ -1725,6 +1823,7 @@ fn first_unresolved_call(
     assembly: &Assembly,
     asm: u8,
     corlib: &Assembly,
+    libraries: &[SourceAssembly<'_>],
 ) -> Option<String> {
     for type_def in assembly.type_defs() {
         for method in type_def.methods() {
@@ -1754,7 +1853,8 @@ fn first_unresolved_call(
                     || module.is_delegate_ctor(asm, *token)
                     || module.delegate_invoke(asm, *token).is_some()
                     || module.pinvoke_target(asm, token.0).is_some()
-                    || corlib_declares_abstract(corlib, assembly, *token)
+                    || declares_abstract(corlib, assembly, *token)
+                    || libraries.iter().any(|library| declares_abstract(library, assembly, *token))
                 {
                     continue;
                 }
@@ -2227,8 +2327,11 @@ fn member_ref_identity<'a>(
     Some((parent, method_name, key))
 }
 
-/// Whether `corlib` declares the member this `MemberRef` names as an ABSTRACT or INTERFACE method:
-/// present, but with no IL body and no `[RuntimeProvided]` marking either.
+/// Whether `defining` -- the corlib, or a library loaded beside it -- declares the member this
+/// `MemberRef` names as an ABSTRACT or INTERFACE method: present, but with no IL body and no
+/// `[RuntimeProvided]` marking either. A library's abstract members are the same case:
+/// `I2cDevice.Write` is abstract in `System.Device.Gpio`, and a call to it dispatches through the
+/// device the program holds.
 ///
 /// Such a token is unbound after loading and that is CORRECT -- there is nothing to bind. The eager
 /// loader leaves it unbound too, and a `callvirt` on it reaches the implementation through the
@@ -2236,23 +2339,23 @@ fn member_ref_identity<'a>(
 /// case). It has to be told apart from a member the resident corlib genuinely LACKS, and from a
 /// `[RuntimeProvided]` seam whose intrinsic this build gated out -- both of those are real misses
 /// that will trap at run, and both keep a body-less declaration or none at all.
-fn corlib_declares_abstract(corlib: &Assembly, assembly: &Assembly, token: Token) -> bool {
+fn declares_abstract(defining: &Assembly, assembly: &Assembly, token: Token) -> bool {
     let Some((parent, method_name, key)) = member_ref_identity(assembly, token) else {
         return false;
     };
-    let Some(row) = find_corlib_method_row(corlib, parent.namespace, parent.name, method_name, &key)
+    let Some(row) = find_corlib_method_row(defining, parent.namespace, parent.name, method_name, &key)
     else {
         return false;
     };
     let mut method_row: u32 = 0;
-    for type_def in corlib.type_defs() {
+    for type_def in defining.type_defs() {
         for method in type_def.methods() {
             method_row += 1;
             if method_row != row {
                 continue;
             }
             let runtime_supplied = method.is_runtime_impl()
-                || has_runtime_provided_attribute(corlib, Token::new(METHOD_DEF, row));
+                || has_runtime_provided_attribute(defining, Token::new(METHOD_DEF, row));
             return method.body().is_none() && !runtime_supplied;
         }
     }
@@ -2806,6 +2909,13 @@ fn materialize_corlib_type<'c>(
         base.namespace == "System" && (base.name == "ValueType" || base.name == "Enum")
     });
     module.set_type_is_value_type(type_id, is_value_type);
+    if let Some(type_def) = corlib.type_def(type_row) {
+        let value_type_id = |token: Token| {
+            let named = corlib.type_token_name(token)?;
+            resolution.type_index.get(&type_name_key(named)).copied()
+        };
+        record_type_field_offsets(module, &type_def, type_id, &value_type_id);
+    }
     if is_value_type {
         walk.tokens.value_types.push(own_token);
     }
@@ -3160,6 +3270,35 @@ pub fn load_with_corlib_monomorphized<'c, 'p>(
     load_with_corlib_and_libraries_lowered(corlib, &[], program, instantiations)
 }
 
+/// The libraries among `available` that `program` references, directly or through another of them,
+/// as positions in `available`, in the order the loaders give them assembly ids: each one after
+/// every library it references, ties kept in `available`'s order.
+///
+/// **A REFERENCE IS MATCHED BY NAME, AS [`library_load_order`] MATCHES ONE**: a name is the one
+/// identity an `AssemblyRef` and the image it names both carry. Where two of `available` share a
+/// name the first is taken, because a compiler's reference set is first-declarer-wins, so the first
+/// is the one the program was compiled against.
+///
+/// **A NAME NOTHING ANSWERS ADDS NOTHING, AND IS NOT REFUSED HERE.** The corlib takes its own slot
+/// and is not among `available`. A library built by .NET's compiler names `System.Runtime` or
+/// `netstandard`, whose types the loaders resolve into the corlib by name, so a missing ASSEMBLY is
+/// not yet a missing MEMBER. Whether a member resolves is the load's question, and the load names
+/// the member it could not.
+///
+/// # Errors
+/// [`LoadError::CircularLibraryReferences`] if the referenced libraries reference each other in a
+/// cycle.
+pub fn referenced_libraries(
+    program: &Assembly<'_>,
+    available: &[SourceAssembly<'_>],
+) -> Result<Vec<usize>, LoadError> {
+    let taken = Assembly::referenced_assemblies(program, available);
+    let chosen: Vec<SourceAssembly<'_>> =
+        taken.iter().map(|&position| available[position].clone()).collect();
+    let order = library_load_order(&chosen)?;
+    Ok(order.into_iter().map(|index| taken[index]).collect())
+}
+
 /// The order to LOAD `libraries` in, so each one loads after every library it references.
 ///
 /// # Why the loader sorts instead of trusting the caller
@@ -3339,6 +3478,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         plans,
     );
     relink_generic_base_heirs(&mut module, &heirs, &lowering);
+    monomorphize::name_unlowered_sites(&mut module, &sources, program_asm, &lowering);
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     Ok((Program { module, entry }, lowering))
 }
@@ -4003,6 +4143,7 @@ fn load_assembly_collecting<'pe>(
         &type_interfaces,
     );
     record_custom_attributes(assembly, module, asm, type_index);
+    record_field_offsets(module, assembly, type_offset, type_index);
     if entry.is_some() {
         module.bind_entry_assembly(asm);
     }
@@ -4851,12 +4992,30 @@ fn bcl_intrinsic(
             "Ipv4Mask" => return Some(intrinsic!(net_iface_subnet)),
             "Ipv4Gateway" => return Some(intrinsic!(net_iface_gateway)),
             "IfaceFlags" => return Some(intrinsic!(net_iface_flags)),
+            "ChangeCount" => return Some(intrinsic!(net_change_count)),
+            _ => {}
+        }
+    }
+    #[cfg(feature = "wifi")]
+    if namespace == "Lamella.Net.WiFi" && type_name == "WiFiNative" {
+        match method {
+            "Radio" => return Some(intrinsic!(wifi_radio)),
+            "JoinStart" => return Some(intrinsic!(wifi_join_start)),
+            "JoinStored" => return Some(intrinsic!(wifi_join_stored)),
+            "Disconnect" => return Some(intrinsic!(wifi_disconnect)),
+            "State" => return Some(intrinsic!(wifi_state)),
+            "RecordRead" => return Some(intrinsic!(wifi_record_read)),
+            "RecordWrite" => return Some(intrinsic!(wifi_record_write)),
+            "RecordSetBoot" => return Some(intrinsic!(wifi_record_set_boot)),
+            "RecordClear" => return Some(intrinsic!(wifi_record_clear)),
             _ => {}
         }
     }
     if namespace == "System.Net.Security" && type_name == "TlsNative" {
         match method {
             "ClientConfig" => return Some(intrinsic!(tls_client_config)),
+            "ClientConfigIdentity" => return Some(intrinsic!(tls_client_config_identity)),
+            "CheckIdentity" => return Some(intrinsic!(tls_check_identity)),
             "ServerConfig" => return Some(intrinsic!(tls_server_config)),
             "ClientNew" => return Some(intrinsic!(tls_client_new)),
             "ServerNew" => return Some(intrinsic!(tls_server_new)),
@@ -4867,6 +5026,7 @@ fn bcl_intrinsic(
             "ReadPlain" => return Some(intrinsic!(tls_read_plain)),
             "WritePlain" => return Some(intrinsic!(tls_write_plain)),
             "PeerCert" => return Some(intrinsic!(tls_peer_cert)),
+            "PeerAlert" => return Some(intrinsic!(tls_peer_alert)),
             "SessionFlags" => return Some(intrinsic!(tls_session_flags)),
             "CloseNotify" => return Some(intrinsic!(tls_close_notify)),
             "CloseTls" => return Some(intrinsic!(tls_close)),
@@ -6346,12 +6506,190 @@ fn cast_elem_of_sig(asm: u8, sig: &SigType) -> CastElem {
     }
 }
 
+/// The data layout of the tier about to execute, in which `sizeof` and a field's byte offset are
+/// measured.
+fn executing_target_layout() -> TargetLayout {
+    if lamella_cil_runtime::native_pointer_size() >= 8 {
+        TargetLayout::lp64()
+    } else {
+        TargetLayout::ilp32()
+    }
+}
+
+/// What became of one type's field-offset record ([`record_field_offsets`]).
+enum OffsetRecord {
+    /// Recorded, or never to be: nothing changes for this type on another pass.
+    Settled,
+    /// A type it builds on -- its base, or a struct one of its fields holds -- has fields and no
+    /// record yet, which another pass over the same assembly may supply.
+    Waiting,
+}
+
+/// Records where each of `assembly`'s types keeps its instance fields, in bytes
+/// ([`Module::set_type_field_offsets`]), which is what pointer arithmetic on a field's address
+/// reads: `p[1]` after `fixed (int* p = &o.A)` is the field that starts four bytes past `A`.
+///
+/// Passes over the assembly until a pass records nothing new, because a type can build on one
+/// declared after it: its base, or a struct one of its fields holds.
+fn record_field_offsets(
+    module: &mut Module,
+    assembly: &Assembly,
+    type_offset: usize,
+    type_index: &TypeNameIndex,
+) {
+    let type_defs: Vec<TypeDef<'_>> = assembly.type_defs().collect();
+    let count = type_defs.len();
+    let value_type_id = |token: Token| match token.table() {
+        TYPE_DEF => (token.row() as usize)
+            .checked_sub(1)
+            .filter(|&row| row < count)
+            .map(|row| (type_offset + row) as TypeId),
+        TYPE_REF => type_index.get(&type_index_key(assembly, token)?).copied(),
+        _ => None,
+    };
+    let mut settled = alloc::vec![false; count];
+    loop {
+        let mut progressed = false;
+        for (local, type_def) in type_defs.iter().enumerate() {
+            if settled[local] {
+                continue;
+            }
+            let type_id = (type_offset + local) as TypeId;
+            if let OffsetRecord::Settled =
+                record_type_field_offsets(module, type_def, type_id, &value_type_id)
+            {
+                settled[local] = true;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+/// Records where one type keeps its instance fields, in bytes, when its layout can be computed.
+/// `value_type_id` names the type a `ValueType` token of the type's assembly resolves to.
+///
+/// The bytes are .NET's, in declaration order. A struct is laid out by the shared value-type rule
+/// ([`lamella_metadata::layout_value_type`]: each field at its natural alignment, the size rounded
+/// up to the largest). A class's own fields continue right after its base's last field, each at its
+/// natural alignment, with no rounding between the two, as .NET 8 places them on x64: a byte field
+/// of a class whose base holds one byte sits at byte 1, a short after a base of an int and a byte
+/// at byte 6, and a long after a base of three ints at byte 16. A struct field takes the size and
+/// alignment recorded for its type. .NET's auto layout may also reorder a class's fields of
+/// different sizes; this keeps their declaration order, as the AOT tier does.
+///
+/// A type is left without a record, and its fields cannot be walked, when its layout cannot be
+/// computed exactly: explicit layout, or a `[StructLayout]` packing or size, which are not modeled
+/// here; a generic base, whose fields are prepended only once it is lowered; a field whose type is
+/// generic or does not resolve; or a base or struct field that has fields and no record. A type
+/// with no instance fields gets none, because no field address can start a walk over it.
+fn record_type_field_offsets(
+    module: &mut Module,
+    type_def: &TypeDef<'_>,
+    type_id: TypeId,
+    value_type_id: &dyn Fn(Token) -> Option<TypeId>,
+) -> OffsetRecord {
+    if type_def.is_explicit_layout()
+        || type_def.class_layout().is_some()
+        || type_def.extends().table() == TYPE_SPEC
+    {
+        return OffsetRecord::Settled;
+    }
+    let Some(own) = type_def
+        .fields()
+        .filter(|field| !field.is_static())
+        .map(|field| field.signature())
+        .collect::<Option<Vec<SigType>>>()
+    else {
+        return OffsetRecord::Settled;
+    };
+    let slot_count = module.type_field_defaults(type_id).map_or(0, |defaults| defaults.len());
+    if slot_count == 0 {
+        return OffsetRecord::Settled;
+    }
+    let has_fields_unrecorded = |module: &Module, dependency: TypeId| {
+        module.type_field_offsets(dependency).is_none()
+            && module
+                .type_field_defaults(dependency)
+                .is_some_and(|defaults| !defaults.is_empty())
+    };
+    let (base_end, mut offsets) = match module.type_base(type_id) {
+        Some(base) => match module.type_field_offsets(base) {
+            Some(layout) => (
+                layout.end(),
+                (0..layout.slot_count())
+                    .filter_map(|slot| layout.offset_of(slot))
+                    .collect::<Vec<u32>>(),
+            ),
+            None if has_fields_unrecorded(module, base) => return OffsetRecord::Waiting,
+            None => (0, Vec::new()),
+        },
+        None => (0, Vec::new()),
+    };
+    let waiting = core::cell::Cell::new(false);
+    let target = executing_target_layout();
+    let resolve = |field: &SigType| {
+        let SigType::ValueType(token) = field else {
+            return None;
+        };
+        let nested = value_type_id(*token)?;
+        match module.type_field_offsets(nested) {
+            Some(layout) => Some(TypeLayout {
+                size: layout.end(),
+                alignment: layout.alignment(),
+                field_offsets: Vec::new(),
+                reference_offsets: Vec::new(),
+            }),
+            None => {
+                if has_fields_unrecorded(module, nested) {
+                    waiting.set(true);
+                }
+                None
+            }
+        }
+    };
+    let unresolved = || {
+        if waiting.get() {
+            OffsetRecord::Waiting
+        } else {
+            OffsetRecord::Settled
+        }
+    };
+    let (end, alignment) = if type_def.is_value_type() {
+        let Ok(layout) = layout_value_type(&own, &target, &resolve) else {
+            return unresolved();
+        };
+        offsets.extend(layout.field_offsets.iter().copied());
+        (layout.size, layout.alignment)
+    } else {
+        let mut cursor = base_end;
+        let mut alignment = 1;
+        for field in &own {
+            let Ok(shape) = layout_value_type(core::slice::from_ref(field), &target, &resolve)
+            else {
+                return unresolved();
+            };
+            let at = cursor.next_multiple_of(shape.alignment);
+            offsets.push(at);
+            cursor = at + shape.size;
+            alignment = alignment.max(shape.alignment);
+        }
+        (cursor, alignment)
+    };
+    if offsets.len() == slot_count {
+        module.set_type_field_offsets(type_id, end, alignment, &offsets);
+    }
+    OffsetRecord::Settled
+}
+
 /// Records the byte size of every type a `sizeof` operand names (III.4.25), and of every
 /// value type this assembly declares, so the interpreter's `sizeof` resolves the operand.
 ///
 /// A value type's size is its shared [`lamella_metadata::Assembly::value_type_layout`]
-/// (the one computation the AOT stack maps and the GC ref-map also consume) at the
-/// 32-bit target ([`TargetLayout::ilp32`] -- these targets use a 4-byte pointer). A `sizeof`
+/// (the one computation the AOT stack maps and the GC ref-map also consume) at the layout of the
+/// tier about to execute ([`executing_target_layout`]). A `sizeof`
 /// operand that names a primitive (a `TypeRef`/`TypeDef` to `System.Int32` etc., which csc
 /// emits only in hand-written IL since it constant-folds `sizeof(primitive)`) gets its fixed
 /// width; a struct operand is already covered by the value-type pass.
@@ -6362,11 +6700,7 @@ fn bind_type_sizes(
     value_type_tokens: &[Token],
     sizeof_tokens: &BTreeSet<Token>,
 ) {
-    let target = if lamella_cil_runtime::native_pointer_size() >= 8 {
-        TargetLayout::lp64()
-    } else {
-        TargetLayout::ilp32()
-    };
+    let target = executing_target_layout();
     for token in value_type_tokens {
         if let Ok(layout) = assembly.value_type_layout(*token, &target) {
             module.set_type_size(asm, *token, layout.size);

@@ -139,3 +139,6 @@ fitted = "unknown"
 onboard = "edbg"
 recovery = "probe"
 source = "UG 42220 section 4.3: the kit carries an EDBG that programs and debugs the part over SWD, and Table 4-9 gives the two SWD signals between the debugger and the target. THE EXPOSURE IS STILL UNKNOWN AND THE GUIDE IS NOW HELD, WHICH IS A NARROWER STATEMENT THAN IT WAS. Its connectors section, 4.1, has exactly two subsections -- the Xplained Pro standard extension headers and the current measurement header -- and the document has no Cortex Debug Connector section anywhere, unlike the SAM D20 Xplained Pro guide beside it, which gives that connector a numbered section and a pin table. A document that describes no external debug position is not a board that has none: an unpopulated footprint is exactly the thing a guide omits, so this stays unknown until somebody looks at the board. The board carries a debugger this toolchain speaks, so the recovery path after any deploy is that debugger: it reaches the part over SWD regardless of what the application image did, which is what distinguishes it from a bootloader that has to survive in flash."
+
+[csharp_interpreter]
+optimization = "size"

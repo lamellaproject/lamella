@@ -5,12 +5,26 @@
 //! (`base + *_OFF`) and the instance bases live in rp2350_instances.rs. Widths are access widths.
 
 /// -- register offsets (block-relative) + access widths --
+pub const GPIO0_STATUS_OFF: u32 = 0x0;
+pub const GPIO0_STATUS_WIDTH: i32 = 32;
 pub const GPIO0_CTRL_OFF: u32 = 0x4;
 pub const GPIO0_CTRL_WIDTH: i32 = 32;
+pub const INTR0_OFF: u32 = 0x230;
+pub const INTR0_WIDTH: i32 = 32;
+pub const PROC0_INTE0_OFF: u32 = 0x248;
+pub const PROC0_INTE0_WIDTH: i32 = 32;
+pub const PROC0_INTS0_OFF: u32 = 0x278;
+pub const PROC0_INTS0_WIDTH: i32 = 32;
 
 /// -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
+pub const GPIO0_STATUS_INFROMPAD: u32 = 0x20000;
+pub const GPIO0_STATUS_INFROMPAD_LSB: u32 = 17;
 pub const GPIO0_CTRL_FUNCSEL: u32 = 0x1F;
 pub const GPIO0_CTRL_FUNCSEL_LSB: u32 = 0;
+pub const GPIO0_CTRL_OUTOVER: u32 = 0x3000;
+pub const GPIO0_CTRL_OUTOVER_LSB: u32 = 12;
+pub const GPIO0_CTRL_OEOVER: u32 = 0xC000;
+pub const GPIO0_CTRL_OEOVER_LSB: u32 = 14;
 
 /// -- block constants --
 pub const GPIO_CTRL_STRIDE: u32 = 8;
@@ -20,3 +34,11 @@ pub const FUNCSEL_I2C: u32 = 3;
 pub const FUNCSEL_PWM: u32 = 4;
 pub const FUNCSEL_SIO: u32 = 5;
 pub const FUNCSEL_NULL: u32 = 0x1F;
+pub const OUTOVER_LOW: u32 = 2;
+pub const OEOVER_DISABLE: u32 = 2;
+pub const OEOVER_ENABLE: u32 = 3;
+pub const GPIO_INT_STRIDE: u32 = 4;
+pub const GPIO_INT_PINS: u32 = 8;
+pub const GPIO_INT_BITS: u32 = 4;
+pub const GPIO_INT_EDGE_LOW: u32 = 0x4;
+pub const GPIO_INT_EDGE_HIGH: u32 = 0x8;

@@ -22,7 +22,7 @@ lamella-generics = { path = "../lamella-generics", optional = true }
 # gates out the same bindings the interpreter does. The DEFAULT is the full desktop profile (the
 # differential's run-with-corlib runner = full ECMA-335 1st-ed compliance, incl. typed references);
 # a constrained target builds --no-default-features + an explicit subset.
-default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory", "debug-names", "generics"]
+default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory", "debug-names", "generics", "wifi"]
 # Bake-time monomorphization: a closed generic instantiation becomes its own type identity, so a
 # program naming `Pair<int,string>` runs instead of being refused. OFF turns the whole pass into the
 # refusal that preceded it -- `ProfileViolation::UnloweredGeneric` still names every call site, so a
@@ -31,6 +31,9 @@ default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transce
 # It is a capability rather than an always-on because it links the closure walk and the canonical
 # speller, and a profile with no use for generics should not carry them.
 generics = ["dep:lamella-generics", "lamella-cil-runtime/generics"]
+# The Lamella.Net.WiFi class library's seam: binds its WiFiNative methods to the runtime's radio
+# intrinsics, which this turns on. On by default, so every host that binds or bakes a program binds them.
+wifi = ["lamella-cil-runtime/wifi"]
 bcl = ["lamella-cil-runtime/bcl"]
 NETMFv4_4 = ["bcl", "reflection", "text", "collections", "lamella-cil-runtime/NETMFv4_4"]
 # The collection types beyond the array. See lamella-cil-runtime.

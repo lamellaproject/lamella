@@ -8,6 +8,8 @@ public enum Rp2350SioLayout {
     // -- register offsets (block-relative) + access widths --
     public static let GPIO_IN_OFF: UInt32 = 0x4
     public static let GPIO_IN_WIDTH: Int32 = 32
+    public static let GPIO_HI_IN_OFF: UInt32 = 0x8
+    public static let GPIO_HI_IN_WIDTH: Int32 = 32
     public static let GPIO_OUT_SET_OFF: UInt32 = 0x18
     public static let GPIO_OUT_SET_WIDTH: Int32 = 32
     public static let GPIO_OUT_CLR_OFF: UInt32 = 0x20

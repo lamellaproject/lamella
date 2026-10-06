@@ -114,31 +114,16 @@ pub(crate) fn instantiated_value_type_slot<'x>(
     references: &[&'x Assembly<'x>],
     target: &TargetLayout,
 ) -> Option<MirType> {
-    let SigType::GenericInst {
-        definition,
-        arguments,
-    } = sig
-    else {
+    let SigType::GenericInst { definition, .. } = sig else {
         return None;
     };
-    let SigType::ValueType(token) = definition.as_ref() else {
+    if !matches!(definition.as_ref(), SigType::ValueType(_)) {
         return None;
-    };
-    let (owner, type_def) = if token.table() == table::TYPE_DEF {
-        (assembly, assembly.type_def(token.row())?)
-    } else {
-        let (namespace, name) = assembly.type_token_full_name(*token)?;
-        let (ordinal, type_def) = Assembly::find_in_references(references, &namespace, &name)?;
-        (*references.get(ordinal)?, type_def)
-    };
-    let mut fields = Vec::new();
-    for field in type_def.fields().filter(|field| !field.is_static()) {
-        fields.push(crate::generics::substitute_sig(&field.signature()?, arguments)?);
     }
-    let layout = layout_value_type(&fields, target, &|token| {
-        owner.value_type_layout(token, target).ok()
-    })
-    .ok()?;
+    // The arguments are read in the assembly that spells the instantiation, and the definition's
+    // fields in the one that declares it: `Nullable<Reading>` in a program is corlib's fields over
+    // the program's `Reading`. See `value_layout_across`.
+    let layout = value_layout_across(sig, assembly, None, references, target)?;
     Some(MirType::ValueType {
         handle: crate::generics::instantiation_handle(&crate::generics::spell_sig(assembly, sig)?),
         size: layout.size,
@@ -1907,6 +1892,86 @@ impl<'a> MetadataResolver<'a> {
             })
             .map(|(name, _)| alloc::boxed::Box::from(name))
             .collect()
+    }
+
+    /// For an instantiation [`Self::undescribed_instantiations`] lists, the field that stops its
+    /// LAYOUT -- `(Namespace.Type::field, the field's type)` -- or `None` when it lays out and what
+    /// it lacks is a dispatch table.
+    #[must_use]
+    pub fn undescribed_instantiation_field(&self, name: &str) -> Option<(String, String)> {
+        let (_, spec) = self
+            .mono
+            .instantiations()
+            .into_iter()
+            .find(|(carried, _)| *carried == name)?;
+        if self
+            .instantiated_reference_layout_named(name, spec)
+            .is_some()
+        {
+            return None;
+        }
+        let (owner, type_def, arguments) = self.instantiated_parent_named(name, spec)?;
+        let arguments =
+            caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+        self.unlaid_chain_field(owner, type_def, &arguments)
+    }
+
+    /// The first instantiation the plan carries whose INTERFACE TABLE this tier cannot key, as
+    /// `(instantiation, interface, argument)`, or `None` when every planned instantiation's
+    /// interfaces can be keyed.
+    ///
+    /// **AN INTERFACE ENTRY IS FOUND BY THE INTERFACE's SPELLING, AND A REFERENCED GENERIC TYPE's
+    /// INTERFACES ARE SPELLED IN ITS OWN ASSEMBLY's TABLES.** A generic class another assembly
+    /// declares -- the corlib's `List<T>` and the `ListEnumerator<T>` its `GetEnumerator` returns --
+    /// implements `IEnumerator<T>` through a `TypeSpec` row of that assembly. Closed over a type that
+    /// assembly does not declare (a program's `Node`), the interface is spelled by reading the
+    /// argument in the wrong assembly's tables, so its entries are keyed under a name no call site
+    /// spells: a call through `IEnumerator<Node>` finds nothing and faults. Such an instantiation is
+    /// refused at build, naming the instantiation, the interface and the argument, rather than
+    /// built into an image that faults when the interface is called. The CLI's built-in types carry
+    /// no token, so an argument such as `int` or `string` is spelled the same in every assembly and
+    /// is never the cause.
+    #[must_use]
+    pub fn unkeyable_interface_instantiation(&self) -> Option<(String, String, String)> {
+        for (name, spec) in self.mono.instantiations() {
+            let Some((owner, type_def, arguments)) = self.instantiated_parent_named(name, spec)
+            else {
+                continue;
+            };
+            if core::ptr::eq(owner, self.assembly) {
+                continue;
+            }
+            let Some(argument) = argument_owner_does_not_declare(owner, name) else {
+                continue;
+            };
+            for (iface_token, _) in self.interface_closure(owner, type_def, &arguments) {
+                if iface_token.table() != table::TYPE_SPEC {
+                    continue;
+                }
+                let signature = owner.type_spec_signature(iface_token);
+                if signature
+                    .as_ref()
+                    .is_some_and(|sig| crate::generics::substitute_sig(sig, &[]).is_some())
+                {
+                    continue;
+                }
+                let interface = signature
+                    .and_then(|sig| match sig {
+                        SigType::GenericInst { definition, .. } => match *definition {
+                            SigType::Class(token) | SigType::ValueType(token) => {
+                                owner.type_token_full_name(token).map(|(namespace, name)| {
+                                    String::from(&*qualified_type_name(&namespace, &name))
+                                })
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| String::from("a generic interface"));
+                return Some((String::from(name), interface, argument));
+            }
+        }
+        None
     }
 
     /// ONE INSTANTIATION'S DISPATCH TABLES: its vtable in slot order and its itable keyed by
@@ -4588,14 +4653,8 @@ impl<'a> MetadataResolver<'a> {
                 arguments,
             )?);
         }
-        layout_value_type(&fields, &TargetLayout::ilp32(), &|token| {
-            value_type_layout_across(
-                owner,
-                Some(self.argument_world()),
-                token,
-                &self.references,
-                &TargetLayout::ilp32(),
-            )
+        layout_value_type(&fields, &TargetLayout::ilp32(), &|nested| {
+            self.link_nested_layout(owner, arguments, nested)
         })
         .ok()
     }
@@ -4720,16 +4779,109 @@ impl<'a> MetadataResolver<'a> {
             .filter(|field| !field.is_static())
             .filter_map(|field| field.signature())
             .collect();
-        layout_value_type(&fields, &TargetLayout::ilp32(), &|token| {
-            value_type_layout_across(
-                owner,
-                None,
-                token,
-                &self.references,
-                &TargetLayout::ilp32(),
-            )
+        layout_value_type(&fields, &TargetLayout::ilp32(), &|nested| {
+            self.link_nested_layout(owner, &[], nested)
         })
         .ok()
+    }
+
+    /// How one chain link lays out a value-type field: `arguments` are the link's own, empty for an
+    /// ordinary type. [`Self::own_block_layout`] and [`Self::instantiated_layout`] both lay their
+    /// blocks out through it, and so does [`Self::unlaid_chain_field`], so the field a refusal names
+    /// is the one the layout stopped at.
+    fn link_nested_layout(
+        &self,
+        owner: &'a Assembly<'a>,
+        arguments: &[SigType],
+        nested: &SigType,
+    ) -> Option<TypeLayout> {
+        let target = TargetLayout::ilp32();
+        if arguments.is_empty() {
+            return value_layout_across(nested, owner, None, &self.references, &target);
+        }
+        //
+        // An instantiation of a VALUE type is the one field whose tokens this cannot always place.
+        // The mark travels only on a struct argument itself, so an argument that is an instantiation
+        // (`Holder<int?>`) reaches here with its tokens unmarked, written by the caller -- and an
+        // unmarked token here means `owner`. Where the two are different assemblies such a field is
+        // refused rather than read in the owner's tables; where they are one assembly, or no argument
+        // is such an instantiation, every unmarked token is the owner's.
+        let argument_world = self.argument_world();
+        if crate::generics::is_value_type_instantiation(nested)
+            && !core::ptr::eq(owner, argument_world)
+            && arguments
+                .iter()
+                .any(crate::generics::is_value_type_instantiation)
+        {
+            return None;
+        }
+        value_layout_across(
+            nested,
+            owner,
+            Some(argument_world),
+            &self.references,
+            &target,
+        )
+    }
+
+    /// The first instance field along `type_def`'s class chain, base first, that this tier cannot
+    /// lay out -- as `(Namespace.Type::field, the field's type)` -- so a refusal caused by a layout
+    /// can say which declaration caused it. `arguments` are the LAYOUT arguments in force for
+    /// `type_def`, as [`Self::instantiated_reference_layout`] passes them; `None` when every field
+    /// lays out, or when the chain itself does not resolve.
+    pub(crate) fn unlaid_chain_field(
+        &self,
+        owner: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+        arguments: &[SigType],
+    ) -> Option<(String, String)> {
+        let target = TargetLayout::ilp32();
+        for link in self.cross_class_chain(owner, type_def, arguments) {
+            let type_name = link
+                .assembly
+                .type_token_full_name(link.type_def.token())
+                .map(|(namespace, name)| qualified_type_name(&namespace, &name))
+                .unwrap_or_default();
+            for field in link.type_def.fields().filter(|field| !field.is_static()) {
+                let field_name = alloc::format!("{type_name}::{}", field.name().unwrap_or("?"));
+                let Some(declared) = field.signature() else {
+                    if link.arguments.is_empty() {
+                        continue;
+                    }
+                    return Some((field_name, String::from("an undecodable signature")));
+                };
+                let spelled = || {
+                    if link.arguments.is_empty() {
+                        crate::generics::spell_sig(link.assembly, &declared)
+                    } else {
+                        crate::generics::spell_sig_across(
+                            link.assembly,
+                            self.argument_world(),
+                            &declared,
+                            &link.arguments,
+                        )
+                    }
+                    .or_else(|| crate::generics::spell_sig(link.assembly, &declared))
+                    .unwrap_or_else(|| alloc::format!("{declared:?}"))
+                };
+                let substituted = if link.arguments.is_empty() {
+                    Some(declared.clone())
+                } else {
+                    crate::generics::substitute_sig(&declared, &link.arguments)
+                };
+                let Some(substituted) = substituted else {
+                    return Some((field_name, spelled()));
+                };
+                let laid =
+                    layout_value_type(core::slice::from_ref(&substituted), &target, &|nested| {
+                        self.link_nested_layout(link.assembly, &link.arguments, nested)
+                    });
+                if laid.is_err() {
+                    return Some((field_name, spelled()));
+                }
+            }
+        }
+        None
     }
 
     /// [`Assembly::field_offset`] over [`Self::own_block_layout`]: the block-relative offset of
@@ -5257,6 +5409,60 @@ impl CallResolver for MetadataResolver<'_> {
             .value_type_layout(*token, &TargetLayout::ilp32())
             .ok()?;
         Some((layout.size, ref_words_of(&layout.reference_offsets)?))
+    }
+
+    fn unlaid_field(&self, operand: &Operand) -> Option<(String, String)> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        match token.table() {
+            table::MEMBER_REF => {
+                let parent = self.assembly.member_ref(token.row())?.parent();
+                match parent.table() {
+                    table::TYPE_SPEC => {
+                        let (owner, type_def, arguments) = self.instantiated_parent(parent)?;
+                        let arguments = caller_resolved_arguments(
+                            &arguments,
+                            self.argument_world(),
+                            &self.references,
+                        )?;
+                        self.unlaid_chain_field(owner, type_def, &arguments)
+                    }
+                    table::TYPE_DEF => self.unlaid_chain_field(
+                        self.assembly,
+                        self.assembly.type_def(parent.row())?,
+                        &[],
+                    ),
+                    _ => {
+                        let name = self.assembly.type_token_name(parent)?;
+                        let (_, owner, type_def) =
+                            self.find_reference_type(name.namespace, name.name)?;
+                        self.unlaid_chain_field(owner, type_def, &[])
+                    }
+                }
+            }
+            table::METHOD_DEF => {
+                let type_token = self.type_token_of(*token)?;
+                self.unlaid_chain_field(
+                    self.assembly,
+                    self.assembly.type_def(type_token.row())?,
+                    &[],
+                )
+            }
+            table::FIELD => {
+                let declaring = self
+                    .assembly
+                    .type_defs()
+                    .find(|type_def| type_def.fields().any(|field| field.token() == *token))?;
+                let arguments: &[SigType] = if is_generic_definition(self.assembly, &declaring) {
+                    &self.layout_arguments
+                } else {
+                    &[]
+                };
+                self.unlaid_chain_field(self.assembly, declaring, arguments)
+            }
+            _ => None,
+        }
     }
 
     fn field_on_reference_type(&self, operand: &Operand) -> bool {
@@ -6196,6 +6402,22 @@ impl CallResolver for MetadataResolver<'_> {
                 &TargetLayout::ilp32(),
             );
         }
+        // A value-type instantiation spelled closed already -- `initobj Pair<int>` in an ordinary
+        // method, where no instantiation is in force to close it -- is the substituted value type,
+        // or no answer at all. The name matches below cannot see a `TypeSpec`, and the reference
+        // answer they fall through to would type a struct as one traced word.
+        if token.table() == table::TYPE_SPEC
+            && let Some(spec) = self.assembly.type_spec_signature(*token)
+            && crate::generics::is_value_type_instantiation(&spec)
+        {
+            return mir_type_across(
+                &spec,
+                self.assembly,
+                self.argument_assembly,
+                self.references(),
+                &TargetLayout::ilp32(),
+            );
+        }
         if let Some(name) = self.assembly.type_token_name(*token) {
             if name.namespace == "System" {
                 match name.name {
@@ -6791,15 +7013,14 @@ pub(crate) fn type_init_thunk_symbol(assembly: &Assembly, type_row: u32) -> Opti
 }
 
 /// The word count one assembly's static region spans, INCLUDING the reserved words 0 and 1 -- the one
-/// derivation of its size, so a region and the offsets written into it come from the same walk.
-/// Gated with its only caller (`build::assembly_statics`): the WASM path places its statics at a
-/// fixed base and emits no region record, so a wasm-only build would carry this unused.
+/// derivation of its size, so a region and the offsets written into it come from the same walk. The
+/// ARM and RISC-V images size their statics band with it, and the WASM module lays its string
+/// literals where the region it measures ends.
 ///
 /// It spans the type-initializer flags as well as the fields. A region sized to the fields alone
 /// would place every flag past its end, where the next region's first words are -- so a type
 /// initializing itself would write into a neighbor's statics, and the two assemblies would disagree
 /// silently rather than fail to link.
-#[cfg(any(feature = "arm32", feature = "riscv32"))]
 pub(crate) fn static_region_words<'x>(
     assembly: &'x Assembly<'x>,
     plan: &crate::generics::MonoPlan,
@@ -6943,9 +7164,7 @@ pub(crate) fn generic_static_slots<'x>(
 /// The word count the FIELD and PRECISE-INIT bands span together -- where [`generic_static_slots`]
 /// begins. Factored out of [`static_region_words`] so the two cannot disagree about the boundary.
 ///
-/// **UNGATED, UNLIKE `static_region_words`, AND THE DIFFERENCE IS ITS CALLERS.** That one is gated
-/// with `build::assembly_statics`, the only thing that wants a region SIZE, and the wasm path places
-/// its statics at a fixed base and emits no region record. This one is also read by
+/// **UNGATED, AND A GATE HERE BREAKS A BUILD RATHER THAN SHRINKING ONE.** It is read by
 /// [`generic_static_slots`], which every code model reaches through `static_field_offset` -- so a
 /// `#[cfg]` here is not a smaller wasm build, it is a wasm build that does not compile. Measured by
 /// the code-model matrix the moment it was written that way.
@@ -7266,9 +7485,8 @@ pub(crate) fn enum_underlying_sig<'x>(
 /// that substitution nothing downstream needs to know which assembly the argument came from. A
 /// struct has no such form -- its size, its field offsets and its trace map only a row can supply,
 /// and the row number is the CALLER's while the tables are the OWNER's. The decision has to be
-/// CARRIED past substitution, and by the time it lands [`layout_value_type`]'s resolver is a bare
-/// `Fn(Token) -> Option<TypeLayout>` with no field context and so no access to the `Var(n)`
-/// provenance the deciding site held.
+/// CARRIED past substitution, and by the time it lands [`layout_value_type`]'s resolver holds only
+/// the substituted field signature, with no access to the `Var(n)` provenance the deciding site held.
 ///
 /// **IT IS SET IN THE TABLE BYTE, SO THE TOKEN KEEPS ITS OWN TABLE AND ITS OWN ROW.** ECMA-335's
 /// table tags run `0x00..=0x2B`, plus `0x70` for the user-string heap, so bit 7 of that byte is not
@@ -7356,13 +7574,276 @@ pub(crate) fn value_type_layout_across<'x>(
     references: &[&'x Assembly<'x>],
     target: &TargetLayout,
 ) -> Option<TypeLayout> {
-    let Some(argument) = argument_world_token(token) else {
-        let (declaring, type_def) = resolve_value_type_def(owner, token, references)?;
-        return declaring.value_type_layout(type_def.token(), target).ok();
+    value_layout_across(
+        &SigType::ValueType(token),
+        owner,
+        argument_world,
+        references,
+        target,
+    )
+}
+
+/// The CLI's built-in types, which a signature spells by element type rather than by a token (ECMA-335
+/// II.23.1.16), so an argument naming one reads the same in every assembly.
+const TOKENLESS_TYPE_NAMES: &[&str] = &[
+    "System.Boolean",
+    "System.Char",
+    "System.SByte",
+    "System.Byte",
+    "System.Int16",
+    "System.UInt16",
+    "System.Int32",
+    "System.UInt32",
+    "System.Int64",
+    "System.UInt64",
+    "System.Single",
+    "System.Double",
+    "System.IntPtr",
+    "System.UIntPtr",
+    "System.String",
+    "System.Object",
+    "System.TypedReference",
+];
+
+/// The first type a planned instantiation's spelled ARGUMENTS name that `owner` does not declare --
+/// `Node` in ``System.Collections.Generic.List`1[Node]`` read against the corlib -- or `None` when
+/// every one is `owner`'s own or a built-in type. A nested type is looked up through its outermost
+/// enclosing type.
+fn argument_owner_does_not_declare(owner: &Assembly<'_>, instantiation: &str) -> Option<String> {
+    let open = instantiation.find('[')?;
+    for part in instantiation[open..].split(['[', ']', ',']) {
+        let part = part.trim();
+        if part.is_empty() || TOKENLESS_TYPE_NAMES.contains(&part) {
+            continue;
+        }
+        let outermost = part.split('+').next().unwrap_or(part);
+        let (namespace, name) = outermost.rsplit_once('.').unwrap_or(("", outermost));
+        if owner.find_type(namespace, name).is_none() {
+            return Some(String::from(part));
+        }
+    }
+    None
+}
+
+/// How deeply value types may nest -- a struct field inside a struct field, or an instantiation's
+/// argument inside an instantiation -- before a layout is refused rather than followed. A value type
+/// cannot contain itself, so a well-formed assembly never comes near it; the bound turns a cyclic or
+/// hostile one into a refusal instead of a stack overflow.
+const VALUE_LAYOUT_DEPTH: u32 = 32;
+
+/// The layout of a value-type FIELD SIGNATURE -- a `ValueType` token, or a `GenericInst` whose
+/// definition is a value type (`int?`, `KeyValuePair<int, string>`) -- with every token read in the
+/// world it belongs to: an unmarked one in `world`, one carrying [`ARGUMENT_WORLD_BIT`] in
+/// `argument_world` (or `world` when there is none).
+///
+/// **THE LAYOUT IS THIS RESOLVER's ALL THE WAY DOWN.** A struct's own fields, and the fields of the
+/// structs inside it, are laid out by this function rather than by `Assembly::value_type_layout`,
+/// which reads a single assembly and performs no substitution -- so through it a struct holding a
+/// `DateTime` or an `int?` has no layout as a field of another struct.
+///
+/// **AN INSTANTIATION's ARGUMENTS ARE READ WHERE THE INSTANTIATION IS SPELLED, AND ITS DEFINITION's
+/// FIELDS WHERE THE DEFINITION IS DECLARED.** `Nullable<Reading>` in a program is corlib's
+/// `{ bool hasValue; T value; }` with `T` the PROGRAM's `Reading`, and the row that names `Reading`
+/// means something only in the program's tables. So the arguments are re-expressed before they are
+/// substituted: every token a layout reads is marked as an argument-world token, and the definition's
+/// fields are then laid out with `argument_world` set to the one assembly those tokens came from. An
+/// argument list whose tokens come from two different assemblies cannot be expressed with one mark,
+/// and is refused rather than read in either.
+///
+/// `None` wherever the layout cannot be computed exactly: a definition or field that does not
+/// resolve, a field that does not substitute, a type parameter still open, or nesting past
+/// [`VALUE_LAYOUT_DEPTH`].
+pub(crate) fn value_layout_across<'x>(
+    sig: &SigType,
+    world: &'x Assembly<'x>,
+    argument_world: Option<&'x Assembly<'x>>,
+    references: &[&'x Assembly<'x>],
+    target: &TargetLayout,
+) -> Option<TypeLayout> {
+    value_layout_at_depth(sig, world, argument_world, references, target, 0)
+}
+
+/// [`value_layout_across`] at a nesting depth, which bounds the recursion.
+fn value_layout_at_depth<'x>(
+    sig: &SigType,
+    world: &'x Assembly<'x>,
+    argument_world: Option<&'x Assembly<'x>>,
+    references: &[&'x Assembly<'x>],
+    target: &TargetLayout,
+    depth: u32,
+) -> Option<TypeLayout> {
+    if depth > VALUE_LAYOUT_DEPTH {
+        return None;
+    }
+    let read_in = |token: Token| match argument_world_token(token) {
+        Some(argument) => (argument_world.unwrap_or(world), argument),
+        None => (world, token),
     };
-    let (declaring, type_def) =
-        resolve_value_type_def(argument_world.unwrap_or(owner), argument, references)?;
-    declaring.value_type_layout(type_def.token(), target).ok()
+    match sig {
+        SigType::ValueType(token) => {
+            let (token_world, token) = read_in(*token);
+            let (declaring, type_def) = resolve_value_type_def(token_world, token, references)?;
+            let fields: Vec<SigType> = type_def
+                .fields()
+                .filter(|field| !field.is_static())
+                .filter_map(|field| field.signature())
+                .collect();
+            layout_value_type(&fields, target, &|nested| {
+                value_layout_at_depth(nested, declaring, None, references, target, depth + 1)
+            })
+            .ok()
+        }
+        SigType::GenericInst {
+            definition,
+            arguments,
+        } => {
+            let SigType::ValueType(token) = definition.as_ref() else {
+                return None;
+            };
+            let (token_world, token) = read_in(*token);
+            let (declaring, type_def) = resolve_generic_definition(token_world, token, references)?;
+            let mut arguments_world = None;
+            let located = arguments
+                .iter()
+                .map(|argument| located_layout_argument(argument, &read_in, &mut arguments_world))
+                .collect::<Option<Vec<_>>>()?;
+            let mut fields = Vec::new();
+            for field in type_def.fields().filter(|field| !field.is_static()) {
+                fields.push(crate::generics::substitute_sig(
+                    &field.signature()?,
+                    &located,
+                )?);
+            }
+            layout_value_type(&fields, target, &|nested| {
+                value_layout_at_depth(
+                    nested,
+                    declaring,
+                    arguments_world,
+                    references,
+                    target,
+                    depth + 1,
+                )
+            })
+            .ok()
+        }
+        _ => None,
+    }
+}
+
+/// One type argument of a value-type instantiation, re-expressed for LAYOUT so that it reads the same
+/// whichever assembly's fields it is substituted into -- or `None` when it cannot be.
+///
+/// A reference argument erases to `object`: a layout reads no token of a reference, whose shape is one
+/// traced word whatever it names. A value type, and an instantiation of one, keeps its tokens, each
+/// MARKED as an argument-world token, and `world` records the single assembly they belong to; a token
+/// from a second assembly refuses. A type parameter refuses too, since an open argument has no layout.
+fn located_layout_argument<'x>(
+    argument: &SigType,
+    read_in: &impl Fn(Token) -> (&'x Assembly<'x>, Token),
+    world: &mut Option<&'x Assembly<'x>>,
+) -> Option<SigType> {
+    Some(match argument {
+        SigType::Class(_)
+        | SigType::SzArray(_)
+        | SigType::Array { .. }
+        | SigType::String
+        | SigType::Object => SigType::Object,
+        SigType::GenericInst { definition, .. } if matches!(**definition, SigType::Class(_)) => {
+            SigType::Object
+        }
+        SigType::ValueType(token) => SigType::ValueType(located_token(*token, read_in, world)?),
+        SigType::GenericInst {
+            definition,
+            arguments,
+        } => {
+            let SigType::ValueType(token) = definition.as_ref() else {
+                return None;
+            };
+            let definition = SigType::ValueType(located_token(*token, read_in, world)?);
+            let mut inner = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                inner.push(located_layout_argument(argument, read_in, world)?);
+            }
+            SigType::GenericInst {
+                definition: Box::new(definition),
+                arguments: inner,
+            }
+        }
+        SigType::Var(_) | SigType::MVar(_) => return None,
+        other => other.clone(),
+    })
+}
+
+/// The definition a generic instantiation's `TypeSpec` names, read in `assembly`: its own row for a
+/// `TypeDef`, and through `references` for an imported `TypeRef` -- by namespace and name at the top
+/// level, and for a NESTED type (`Queue<T>.Enumerator`) as the type of that name nested in its
+/// resolved enclosing type.
+///
+/// **A NESTED TYPE IS FOUND THROUGH ITS ENCLOSING TYPE, NEVER BY NAME ALONE.** Its namespace column
+/// is empty (ECMA-335 II.22.37), so every nested type called `Enumerator` -- `Queue<T>`'s, `Stack<T>`'s,
+/// `Dictionary<TKey, TValue>`'s -- shares one key in a lookup by namespace and name, and the first of
+/// them would answer for all. The `TypeRef` says which type encloses it (II.22.38: its resolution
+/// scope is the enclosing type's `TypeRef`), and the `NestedClass` table says which `TypeDef` that
+/// encloses (II.22.32), so the answer is exact.
+fn resolve_generic_definition<'x>(
+    assembly: &'x Assembly<'x>,
+    token: Token,
+    references: &[&'x Assembly<'x>],
+) -> Option<(&'x Assembly<'x>, TypeDef<'x>)> {
+    resolve_generic_definition_at(assembly, token, references, 0)
+}
+
+/// [`resolve_generic_definition`] at a nesting depth, which bounds a cyclic resolution-scope chain
+/// in a malformed assembly.
+fn resolve_generic_definition_at<'x>(
+    assembly: &'x Assembly<'x>,
+    token: Token,
+    references: &[&'x Assembly<'x>],
+    depth: u32,
+) -> Option<(&'x Assembly<'x>, TypeDef<'x>)> {
+    if depth > 16 {
+        return None;
+    }
+    match token.table() {
+        table::TYPE_DEF => Some((assembly, assembly.type_def(token.row())?)),
+        table::TYPE_REF => {
+            let scope = assembly.type_ref(token.row())?.resolution_scope();
+            if scope.table() == table::TYPE_REF {
+                let (declaring, enclosing) =
+                    resolve_generic_definition_at(assembly, scope, references, depth + 1)?;
+                let name = assembly.type_token_name(token)?.name;
+                let nested = declaring.type_defs().find(|candidate| {
+                    candidate
+                        .name()
+                        .is_some_and(|candidate| candidate.name == name)
+                        && candidate
+                            .enclosing_type()
+                            .is_some_and(|outer| outer.token() == enclosing.token())
+                })?;
+                return Some((declaring, nested));
+            }
+            let name = assembly.type_token_name(token)?;
+            let (ordinal, type_def) =
+                Assembly::find_in_references(references, name.namespace, name.name)?;
+            Some((*references.get(ordinal)?, type_def))
+        }
+        _ => None,
+    }
+}
+
+/// `token` marked as an argument-world token, with the assembly it is read in recorded in `world` --
+/// or `None` when `world` already holds a different assembly.
+fn located_token<'x>(
+    token: Token,
+    read_in: &impl Fn(Token) -> (&'x Assembly<'x>, Token),
+    world: &mut Option<&'x Assembly<'x>>,
+) -> Option<Token> {
+    let (token_world, token) = read_in(token);
+    match *world {
+        Some(seen) if !core::ptr::eq(seen, token_world) => return None,
+        _ => *world = Some(token_world),
+    }
+    Some(in_argument_world(token))
 }
 
 /// A type ARGUMENT re-expressed so that reading it no longer depends on WHICH assembly reads it --
@@ -7628,12 +8109,14 @@ pub fn lower_methods_with_references<'a>(
         .map(|method| {
             let body = method.body().ok_or(CilError::MissingBody)?;
             let (arg_types, local_types) = slot_types(assembly, method, &target)?;
+            let returns = declared_return(assembly, method, &target)?;
             let (arg_narrow, local_narrow) = narrowing_of(assembly, method, references);
             lower_method_typed(
                 &body,
                 &resolver,
                 &arg_types,
                 &local_types,
+                returns,
                 crate::cil::Narrowing {
                     args: &arg_narrow,
                     locals: &local_narrow,
@@ -7661,12 +8144,14 @@ pub fn lower_methods_debug(
     for method in methods {
         let body = method.body().ok_or(CilError::MissingBody)?;
         let (arg_types, local_types) = slot_types(assembly, method, &target)?;
+        let returns = declared_return(assembly, method, &target)?;
         let (arg_narrow, local_narrow) = narrowing_of(assembly, method, &[]);
         let (func, map) = lower_method_typed(
             &body,
             &resolver,
             &arg_types,
             &local_types,
+            returns,
             crate::cil::Narrowing {
                 args: &arg_narrow,
                 locals: &local_narrow,
@@ -7702,17 +8187,7 @@ pub fn slot_types(
     method: &Method,
     target: &TargetLayout,
 ) -> Result<(Vec<MirType>, Vec<MirType>), CilError> {
-    let typed = |sig: &SigType| -> Result<MirType, CilError> {
-        if crate::generics::is_value_type_instantiation(sig) {
-            return instantiated_value_type_slot(sig, assembly, &[], target).ok_or_else(|| {
-                CilError::GenericValueTypeSlot(
-                    crate::generics::spell_sig(assembly, sig)
-                        .unwrap_or_else(|| String::from("an unnameable value-type instantiation")),
-                )
-            });
-        }
-        Ok(mir_type(sig, assembly, target).unwrap_or(MirType::I32))
-    };
+    let typed = |sig: &SigType| slot_type(sig, assembly, target);
     let mut arg_types = Vec::new();
     if let Some(signature) = method.signature() {
         if signature.has_this {
@@ -7728,6 +8203,36 @@ pub fn slot_types(
         .map(&typed)
         .collect::<Result<Vec<MirType>, CilError>>()?;
     Ok((arg_types, local_types))
+}
+
+/// The result type a method's signature declares, typed by [`slot_types`]' rule. Public for the
+/// reason that one is: a diagnostic that read the result off the body would report a method whose
+/// every path throws as returning nothing, which is not the program the build lowers.
+pub fn declared_return(
+    assembly: &Assembly,
+    method: &Method,
+    target: &TargetLayout,
+) -> Result<crate::cil::Returns, CilError> {
+    crate::cil::Returns::declared(method.signature().as_ref(), |sig| {
+        slot_type(sig, assembly, target)
+    })
+}
+
+/// One slot's MIR type, by [`slot_types`]' rule.
+fn slot_type(
+    sig: &SigType,
+    assembly: &Assembly,
+    target: &TargetLayout,
+) -> Result<MirType, CilError> {
+    if crate::generics::is_value_type_instantiation(sig) {
+        return instantiated_value_type_slot(sig, assembly, &[], target).ok_or_else(|| {
+            CilError::GenericValueTypeSlot(
+                crate::generics::spell_sig(assembly, sig)
+                    .unwrap_or_else(|| String::from("an unnameable value-type instantiation")),
+            )
+        });
+    }
+    Ok(mir_type(sig, assembly, target).unwrap_or(MirType::I32))
 }
 
 /// The ONE table of `call` targets this backend FOLDS into an [`Intrinsic`] instead of emitting a

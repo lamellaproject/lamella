@@ -24,6 +24,10 @@ lamella-heap = { path = "../lamella-heap", optional = true }
 # this crate. Optional, behind `usb`, so a firmware build without USB is unchanged.
 usb-device = { version = "0.3.2", optional = true }
 critical-section = { version = "1", optional = true, features = ["restore-state-bool"] }
+# The pin-change event queue IO_IRQ_BANK0's handler fills (rp2350_pin_events.rs, through the shared
+# pin_events.rs, which also takes the critical section). Behind `serve`, the firmware that runs
+# programs.
+lamella-pin-events = { path = "../lamella-pin-events", optional = true }
 # The on-board CYW43439 wireless (pico_wifi.rs): the driver with its RP2350 PIO engine, the station
 # that makes it one smoltcp device, smoltcp, and the NetBackend mapping for evaluations. Optional,
 # behind `cyw43`.
@@ -75,7 +79,7 @@ arena-trace = []
 # lamella-wire framing and the lamella-runner baked-image core. Combine with the part feature --
 # e.g. `serve,rp2350` (Pico 2), `serve,rp2350,usb,cyw43` (Pico 2 W),
 # `serve,rp2350,usb,pico-plus-2` (Pico Plus 2) or `serve,rp2350,usb,pico-plus-2-w` (Pico Plus 2 W).
-serve = ["dep:lamella-wire", "dep:lamella-runner"]
+serve = ["dep:lamella-wire", "dep:lamella-runner", "dep:critical-section", "dep:lamella-pin-events"]
 # The RP2350 part (Cortex-M33 / ARMv8-M, 520 KB SRAM; 4 MB of XIP flash on the Pico 2 and
 # Pico 2 W, 16 MB on the Pimoroni Pico Plus 2 and Plus 2 W): a firmware build takes the runner's
 # full profile and the reclaiming heap.
@@ -86,15 +90,18 @@ rp2350 = ["lamella-runner?/profile-full", "dep:lamella-heap"]
 usb = ["dep:usb-device", "dep:critical-section"]
 # The Pico 2 W's CYW43439 wireless (pico_wifi.rs, gSPI over PIO0): the board identity flips to
 # PICO2_W, the build downloads the radio's images and checks them against their pins, the
-# bring-up and the join (open, WPA2 or WPA3, named at build time) narrate into the first
-# evaluation's stdout, and evaluations get a smoltcp NetBackend over the chip's ethernet data
-# channel. Combine with `serve,rp2350,usb`.
+# bring-up and the join of the network the board stores (or, in a development build, the one named
+# at build time) narrate into the first evaluation's stdout, and evaluations get a smoltcp
+# NetBackend over the chip's ethernet data channel that lends the radio to a program's Wi-Fi
+# classes. Combine with `serve,rp2350,usb`.
 cyw43 = [
     "dep:smoltcp",
+    "dep:lamella-net-core",
     "dep:lamella-net-smoltcp",
     "dep:lamella-wifi-cyw4343x",
     "dep:lamella-wifi-cyw4343x-smoltcp",
     "dep:lamella-wifi-images",
+    "lamella-cil-runtime/wifi",
 ]
 # The Pimoroni Pico Plus 2 W: the same firmware and the same CYW43439 radio on the same four lines
 # (its RM2 module), with its own board file and its own identity (PICO_PLUS_2_W). Combine with

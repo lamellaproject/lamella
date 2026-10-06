@@ -15,6 +15,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use lamella_net_core::wifi::{WifiControl, WifiLink};
 use lamella_net_core::{
     IfaceKind, Interest, InterfaceInfo, NetBackend, NetResult, OperStatus, SocketHandle,
 };
@@ -147,6 +148,23 @@ pub struct SmoltcpNet<D: Device> {
     gateway: Option<[u8; 4]>,
     next_handle: SocketHandle,
     next_port: u16,
+    /// How to reach the radio inside the device, for a device that is a Wi-Fi radio.
+    wifi: Option<fn(&mut D) -> &mut dyn WifiControl>,
+    /// Whether the radio's link was up at the last pass; `None` before the first, and without a radio.
+    link_up: Option<bool>,
+    /// The availability and the interface's state as the last pass found them, and how often each
+    /// has changed: what [`NetBackend::change_counts`] reports.
+    seen: Seen,
+}
+
+/// What the passes have seen of the network's state, counted as it changes.
+#[derive(Clone, Copy, Debug, Default)]
+struct Seen {
+    available: bool,
+    oper_status: Option<OperStatus>,
+    ipv4: Option<[u8; 4]>,
+    availability_changes: u32,
+    addressing_changes: u32,
 }
 
 /// The `IpAddress` for 4 address bytes in network order; `None` for any other length
@@ -224,7 +242,20 @@ impl<D: Device> SmoltcpNet<D> {
             gateway: gateway_addr,
             next_handle: 1,
             next_port: EPHEMERAL_FIRST,
+            wifi: None,
+            link_up: None,
+            seen: Seen::default(),
         }
+    }
+
+    /// The backend over a device that is a Wi-Fi radio, which `view` reaches. The interface is then
+    /// Wi-Fi's: it reports the radio's link, a lease is dropped when the link is lost and sought again
+    /// when it returns, the radio is lent through [`NetBackend::wifi`], and a program's sleep is spent
+    /// servicing the radio ([`NetBackend::idle`]).
+    #[must_use]
+    pub fn with_wifi(mut self, view: fn(&mut D) -> &mut dyn WifiControl) -> Self {
+        self.wifi = Some(view);
+        self
     }
 
     /// The interface's current IPv4 address, once configured (static immediately; DHCP
@@ -257,9 +288,61 @@ impl<D: Device> SmoltcpNet<D> {
     fn drive(&mut self) {
         let timestamp = self.now();
         let _ = self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
+        self.follow_link();
         self.service_dhcp();
         self.top_up_listeners();
         self.reap_closed();
+        self.count_changes();
+    }
+
+    /// Counts a change of availability, and of the interface's state or address, since the last
+    /// pass. Every seam operation passes here, and a radio's sleeps are spent passing here, so a
+    /// state that lasts a moment is counted though no poller read it.
+    fn count_changes(&mut self) {
+        let ipv4 = self.iface.ipv4_addr().map(|addr| addr.octets());
+        let available = ipv4.is_some() && self.link_up != Some(false);
+        let oper_status = Some(self.oper_status(ipv4.is_some()));
+        if available != self.seen.available {
+            self.seen.available = available;
+            self.seen.availability_changes = self.seen.availability_changes.wrapping_add(1);
+        }
+        if oper_status != self.seen.oper_status || ipv4 != self.seen.ipv4 {
+            if self.seen.oper_status.is_some() {
+                self.seen.addressing_changes = self.seen.addressing_changes.wrapping_add(1);
+            }
+            self.seen.oper_status = oper_status;
+            self.seen.ipv4 = ipv4;
+        }
+    }
+
+    /// The interface's operational state, with or without an IPv4 address.
+    fn oper_status(&self, has_ipv4: bool) -> OperStatus {
+        if self.link_up == Some(false) {
+            OperStatus::Down
+        } else if has_ipv4 {
+            OperStatus::Up
+        } else if self.dhcp.is_some() {
+            OperStatus::Dormant
+        } else {
+            OperStatus::Down
+        }
+    }
+
+    /// Follows the radio's link, when the device is one: a lease belongs to the link it was taken on,
+    /// so a lost link takes the address, the route and the gateway with it, and the next link -- the
+    /// same network or another -- starts a fresh DHCP exchange at once. A static address is kept.
+    fn follow_link(&mut self) {
+        let Some(view) = self.wifi else { return };
+        let up = view(&mut self.device).link() == WifiLink::Connected;
+        if self.link_up == Some(up) {
+            return;
+        }
+        self.link_up = Some(up);
+        let Some(dhcp) = self.dhcp else { return };
+        self.iface.update_ip_addrs(|addrs| addrs.clear());
+        self.iface.routes_mut().remove_default_ipv4_route();
+        self.gateway = None;
+        self.sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
     }
 
     /// Applies a DHCP configure/deconfigure event to the interface, routes, and DNS list.
@@ -727,7 +810,7 @@ impl<D: Device> NetBackend for SmoltcpNet<D> {
 
     fn network_available(&mut self) -> bool {
         self.drive();
-        self.iface.ipv4_addr().is_some()
+        self.iface.ipv4_addr().is_some() && self.link_up != Some(false)
     }
 
     fn interface_count(&mut self) -> u32 {
@@ -745,19 +828,37 @@ impl<D: Device> NetBackend for SmoltcpNet<D> {
             .first()
             .map_or([0, 0, 0, 0], |cidr| prefix_to_mask(cidr.prefix_len()));
         Some(InterfaceInfo {
-            oper_status: if ipv4.is_some() {
-                OperStatus::Up
-            } else if self.dhcp.is_some() {
-                OperStatus::Dormant
-            } else {
-                OperStatus::Down
-            },
-            kind: IfaceKind::Ethernet,
+            oper_status: self.oper_status(ipv4.is_some()),
+            kind: if self.wifi.is_some() { IfaceKind::Wireless80211 } else { IfaceKind::Ethernet },
             ipv4: ipv4.unwrap_or([0, 0, 0, 0]),
             subnet,
             gateway: self.gateway.unwrap_or([0, 0, 0, 0]),
             dhcp_enabled: self.dhcp.is_some(),
         })
+    }
+
+    fn change_counts(&mut self) -> Option<(u32, u32)> {
+        self.drive();
+        Some((self.seen.availability_changes, self.seen.addressing_changes))
+    }
+
+    fn wifi(&mut self) -> Option<&mut dyn WifiControl> {
+        let view = self.wifi?;
+        self.drive();
+        Some(view(&mut self.device))
+    }
+
+    fn idle(&mut self, millis: u64) -> bool {
+        if self.wifi.is_none() {
+            return false;
+        }
+        let end = (self.now_ms)().saturating_add(millis);
+        loop {
+            self.drive();
+            if (self.now_ms)() >= end {
+                return true;
+            }
+        }
     }
 }
 

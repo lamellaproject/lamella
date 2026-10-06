@@ -461,68 +461,19 @@ fn close_brace_span(block: &BoundStmt) -> Span {
     Span::new(block.span.end.saturating_sub(1), block.span.end)
 }
 
-/// Whether `stmt` contains a `try` anywhere, so the body needs a return epilogue.
+/// Whether `stmt` contains a `try` anywhere, so the body needs a return epilogue: a `return`
+/// inside a protected region must `leave` to it, because `ret` may not leave a `try`, a `catch` or
+/// a `finally` (ECMA-335 III.3.57).
 fn contains_try(stmt: &BoundStmt) -> bool {
-    use BoundStmtKind as Kind;
-    match &stmt.kind {
-        Kind::Try { .. } => true,
-        Kind::Block(statements) => statements.iter().any(contains_try),
-        Kind::If {
-            then_branch,
-            else_branch,
-            ..
-        } => contains_try(then_branch) || else_branch.as_deref().is_some_and(contains_try),
-        Kind::While { body, .. }
-        | Kind::DoWhile { body, .. }
-        | Kind::For { body, .. }
-        | Kind::ForEach { body, .. }
-        | Kind::Lock { body, .. }
-        | Kind::Using { body, .. }
-        | Kind::Labeled { body, .. } => contains_try(body),
-        Kind::Checked(inner) | Kind::Unchecked(inner) => contains_try(inner),
-        Kind::Switch { sections, .. } => sections
-            .iter()
-            .any(|section| section.statements.iter().any(contains_try)),
-        _ => false,
-    }
+    matches!(stmt.kind, BoundStmtKind::Try { .. }) || stmt.children().into_iter().any(contains_try)
 }
 
 /// Whether `stmt` contains a `return` anywhere. A method can reach its epilogue ret (and
 /// so its closing brace) by routing a `return` there even when its body never falls
 /// through, so a method that returns somewhere is braced while one that only throws is not.
 fn contains_return(stmt: &BoundStmt) -> bool {
-    use BoundStmtKind as Kind;
-    match &stmt.kind {
-        Kind::Return(_) => true,
-        Kind::Block(statements) => statements.iter().any(contains_return),
-        Kind::If {
-            then_branch,
-            else_branch,
-            ..
-        } => contains_return(then_branch) || else_branch.as_deref().is_some_and(contains_return),
-        Kind::While { body, .. }
-        | Kind::DoWhile { body, .. }
-        | Kind::For { body, .. }
-        | Kind::ForEach { body, .. }
-        | Kind::Lock { body, .. }
-        | Kind::Using { body, .. }
-        | Kind::Fixed { body, .. }
-        | Kind::Labeled { body, .. } => contains_return(body),
-        Kind::Checked(inner) | Kind::Unchecked(inner) => contains_return(inner),
-        Kind::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            contains_return(body)
-                || catches.iter().any(|catch| contains_return(&catch.body))
-                || finally.as_deref().is_some_and(contains_return)
-        }
-        Kind::Switch { sections, .. } => sections
-            .iter()
-            .any(|section| section.statements.iter().any(contains_return)),
-        _ => false,
-    }
+    matches!(stmt.kind, BoundStmtKind::Return(_))
+        || stmt.children().into_iter().any(contains_return)
 }
 
 /// Whether control can fall through the end of `stmt` -- C#'s reachable-end-point
@@ -954,6 +905,7 @@ fn emit_statement(
         BoundStmtKind::ForEach {
             name,
             collection,
+            element_conversion,
             body,
             ..
         } => {
@@ -1001,6 +953,18 @@ fn emit_statement(
                 out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
             } else {
                 out.push(crate::expr::ldelem_instruction(element, tokens)?);
+            }
+            // The element converts to the iteration variable's type before the store: a cast that
+            // can throw `InvalidCastException`, a numeric conversion or a user-defined operator,
+            // written over `Temp(0)` as the element just read.
+            if let Some(conversion) = element_conversion {
+                let current = frame.reserve_local(element);
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(current)));
+                frame.open_temp_scope();
+                frame.bind_temp(current);
+                let converted = emit_expression(conversion, frame, tokens, out);
+                frame.close_temp_scope();
+                converted?;
             }
             store_to(frame, name, out)?;
 
@@ -1433,6 +1397,15 @@ fn emit_statement_expression(
             let user_step = user_step_method(operand, increment, tokens);
             return emit_compound(operand, step_operator(increment), None, user_step, None, *checked, frame, tokens, out, Leave::Discard);
         }
+        // A sequence in statement position evaluates its spilled operands, then its value AS A
+        // STATEMENT: a compound assignment whose target spilled a receiver stores without keeping
+        // the value it assigned, as `B[0] += 5` does in csc's build.
+        BoundExprKind::Sequence { spilled, value } => {
+            crate::expr::open_sequence(spilled, frame, tokens, out)?;
+            let result = emit_statement_expression(value, frame, tokens, out);
+            frame.close_temp_scope();
+            return result;
+        }
         _ => {}
     }
     emit_expression(expr, frame, tokens, out)?;
@@ -1612,11 +1585,7 @@ pub(crate) fn emit_compound(
                     core::slice::from_ref(&target.ty),
                 )
                 .ok_or(EmitError::Unsupported("property setter outside this module"))?;
-            let opcode = if is_static || value_type_receiver {
-                Opcode::Call
-            } else {
-                Opcode::Callvirt
-            };
+            let opcode = crate::expr::accessor_call_opcode(is_static, value_type_receiver, receiver);
             if !is_static {
                 if value_type_receiver {
                     crate::expr::emit_value_type_receiver(receiver, frame, tokens, out)?;
@@ -1811,6 +1780,12 @@ fn emit_combine(
     match rhs {
         Some(value) => {
             emit_expression(value, frame, tokens, out)?;
+            // Binary numeric promotion (ECMA-334 14.2.6.2): a target wider than `int` on the stack
+            // (`long`, `ulong`, `float`, `double`) widens a narrower value to its own type, so the
+            // operation and the store are well typed. The VALUE's type picks the instruction, as it
+            // does for every implicit numeric conversion: `long l; l += 4000000000u` zero-extends
+            // through `conv.u8`, and `double d; d += u` reads `u` as unsigned through `conv.r.un`.
+            // A target of `int` width or narrower shares `int`'s stack type and needs no conversion.
             if value.ty != *operand_ty
                 && matches!(
                     operand_ty,
@@ -1822,7 +1797,7 @@ fn emit_combine(
                     )
                 )
             {
-                out.push(Instruction::simple(crate::expr::numeric_conversion(operand_ty)?));
+                crate::expr::emit_numeric_conversion(&value.ty, operand_ty, out)?;
             }
         }
         None => {

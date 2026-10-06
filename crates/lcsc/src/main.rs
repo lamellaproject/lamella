@@ -296,9 +296,7 @@ fn compile(options: &Options) -> Result<bool, String> {
             None => {
                 if !result.diagnostics.iter().any(Diagnostic::is_error) {
                     if let Some(error) = result.emit_error {
-                        println!(
-                            "{source_path}: error: this construct is not yet supported by lcsc: {error}"
-                        );
+                        println!("{source_path}: error: {}: {error}", error.headline());
                     }
                 }
                 Ok(false)
@@ -342,8 +340,9 @@ fn compile(options: &Options) -> Result<bool, String> {
             if !any_error {
                 if let Some(error) = result.emit_error {
                     println!(
-                        "{}: error: this construct is not yet supported by lcsc: {error}",
-                        options.sources[0]
+                        "{}: error: {}: {error}",
+                        options.sources[0],
+                        error.headline()
                     );
                 }
             }

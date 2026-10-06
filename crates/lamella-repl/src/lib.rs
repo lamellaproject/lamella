@@ -1296,6 +1296,9 @@ fn format_diagnostics(
             Some(lamella_assemble::EmitError::UnsupportedIn { reason, method }) => {
                 format!("submission not lowered yet: {reason} (in {method})")
             }
+            Some(fault @ lamella_assemble::EmitError::MethodRowMismatch { .. }) => {
+                format!("{}: {fault}", fault.headline())
+            }
             None => "submission produced no delta and no diagnostics".to_owned(),
         };
     }

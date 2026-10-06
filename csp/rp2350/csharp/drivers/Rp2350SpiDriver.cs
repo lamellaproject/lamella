@@ -28,7 +28,7 @@ public sealed class Rp2350SpiDriver : SpiDriver
     private readonly uint _padIe;
     private readonly Rp2350SpiBinding _binding;
 
-    private int _chipSelectLine;
+    private int _chipSelectPin;
     private bool _chipSelectActiveHigh;
     private int _actualHz;
 
@@ -63,8 +63,9 @@ public sealed class Rp2350SpiDriver : SpiDriver
     /// (the UART's sequence), the reset release, pad de-isolation, pin routing, then the
     /// even-prescaler divisor with the port disabled (SSE last). Envelope rejects are LOUD, and
     /// come before any register is written: the PL022 is MSB-first only, this driver speaks
-    /// 8-bit frames, and a chip-select line is -1 for the hardware ss_n or one of GPIO0 to
-    /// GPIO31, the lines SIO's bank-0 registers drive.</summary>
+    /// 8-bit frames, and a chip select must be a pin SIO's bank-0 registers drive.</summary>
+    /// <exception cref="ArgumentException">The bit order is LSB first, the frames are not 8 bits,
+    /// or the binding's chip select for the line is past GPIO31.</exception>
     public override void Configure(SpiConnectionSettings settings)
     {
         if (settings.DataFlow != System.Device.Spi.DataFlow.MsbFirst)
@@ -75,12 +76,19 @@ public sealed class Rp2350SpiDriver : SpiDriver
         {
             throw new ArgumentException("this driver speaks 8-bit frames");
         }
-        if (settings.ChipSelectLine < -1 || settings.ChipSelectLine >= BankLines)
+        int line = settings.ChipSelectLine;
+        int pin = -1;
+        if (line >= 0)
         {
-            throw new ArgumentOutOfRangeException("settings");
+            pin = _binding.ChipSelectPins[line];
+            if ((uint)pin >= (uint)BankLines)
+            {
+                throw new ArgumentException("the binding's chip select " + line + " is GPIO" + pin
+                    + ", which SIO's bank-0 registers do not drive");
+            }
         }
 
-        Mmio.Write32(_xoscStartup, Rp2350XoscLayout.STARTUP_DELAY_1MS);
+        Mmio.Write32(_xoscStartup, Rp2350XoscLayout.STARTUP_DELAY_RESET);
         Mmio.Write32(_xoscCtrl,
             (Rp2350XoscLayout.CTRL_ENABLE_MAGIC << (int)Rp2350XoscLayout.CTRL_ENABLE_LSB)
             | Rp2350XoscLayout.CTRL_FREQ_RANGE_1_15MHZ);
@@ -107,20 +115,14 @@ public sealed class Rp2350SpiDriver : SpiDriver
         Mmio.Write32(_binding.IoSckCtrl, _binding.Funcsel);
         Mmio.Write32(_binding.IoMosiCtrl, _binding.Funcsel);
 
-        _chipSelectLine = settings.ChipSelectLine;
+        _chipSelectPin = pin;
         _chipSelectActiveHigh = settings.ChipSelectLineActiveState == PinValue.High;
-        if (_chipSelectLine < 0)
+        if (pin >= 0)
         {
-            Mmio.Write32(_binding.PadsCs, _padIe);
-            Mmio.Write32(_binding.IoCsCtrl, _binding.Funcsel);
-        }
-        else
-        {
-            uint pin = (uint)_chipSelectLine;
-            Mmio.Write32(_pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * pin, _padIe);
-            Mmio.Write32(_ioCtrl0 + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * pin, Rp2350IoBank0Layout.FUNCSEL_SIO);
+            Mmio.Write32(_pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)pin, _padIe);
+            Mmio.Write32(_ioCtrl0 + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * (uint)pin, Rp2350IoBank0Layout.FUNCSEL_SIO);
             SetChipSelect(false);
-            Mmio.Write32(_sioOeSet, 1u << _chipSelectLine);
+            Mmio.Write32(_sioOeSet, 1u << pin);
         }
 
         uint sspclk = _binding.SspclkHz;
@@ -172,15 +174,23 @@ public sealed class Rp2350SpiDriver : SpiDriver
     const int Ok = 0;
     const int OtherError = 3;
 
-    /// <summary>Drives the managed chip-select line; a no-op on the raw bus. Deassertion
-    /// waits for the shift register to go idle first, so CS never releases mid-frame.</summary>
+    /// <summary>Drives the managed chip-select line; a no-op when the settings name no chip
+    /// select. Deassertion waits for the shift register to go idle first, so CS never releases
+    /// mid-frame.</summary>
     public override void SetChipSelect(bool asserted)
     {
-        if (_chipSelectLine < 0) return;
+        if (_chipSelectPin < 0) return;
         if (!asserted) Flush();
         bool driveHigh = asserted == _chipSelectActiveHigh;
-        Mmio.Write32(driveHigh ? _sioOutSet : _sioOutClr, 1u << _chipSelectLine);
+        Mmio.Write32(driveHigh ? _sioOutSet : _sioOutClr, 1u << _chipSelectPin);
     }
+
+    /// <summary>The number of chip selects the binding names for this bus.</summary>
+    public override int ChipSelectCount { get { return _binding.ChipSelectPins.Length; } }
+
+    /// <summary>The GPIO chip-select line <paramref name="line"/> drives: the binding's table
+    /// entry.</summary>
+    public override int GetChipSelectPin(int line) { return _binding.ChipSelectPins[line]; }
 
     /// <summary>The realized bit rate: at or below the request, never above.</summary>
     public override int ActualClockFrequency { get { return _actualHz; } }

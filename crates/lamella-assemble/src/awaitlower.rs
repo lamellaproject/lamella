@@ -1080,6 +1080,7 @@ impl Rewriter {
                 name,
                 element_type,
                 collection,
+                element_conversion,
                 body,
             } => {
                 if stmt_contains_await(body) {
@@ -1103,6 +1104,7 @@ impl Rewriter {
                         name: name.clone(),
                         element_type: element_type.clone(),
                         collection,
+                        element_conversion: element_conversion.clone(),
                         body: Box::new(stmt(BoundStmtKind::Block(body.statements), span)),
                     },
                     span,

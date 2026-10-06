@@ -108,7 +108,8 @@ public sealed class Nrf52833I2cDriver : I2cDriver
     }
 
     /// <summary>The block's write sequence: START, address+W, the bytes register-per-byte
-    /// through TXD, STOP. Returns a status constant.</summary>
+    /// through TXD, STOP; a write of no bytes sends the address alone. Returns a status
+    /// constant.</summary>
     public override int Write(int address, System.ReadOnlySpan<byte> buffer, int count)
     {
         Mmio.Write32(_address, (uint)(address & 0x7F));
@@ -124,7 +125,7 @@ public sealed class Nrf52833I2cDriver : I2cDriver
             if (rc != Ok) return rc;
         }
         Mmio.Write32(_tasksStop, 1);
-        return WaitStopped();
+        return FinishWrite();
     }
 
     /// <summary>The block's read sequence: START, address+R, the bytes extracted through the
@@ -213,6 +214,24 @@ public sealed class Nrf52833I2cDriver : I2cDriver
             if (Mmio.Read32(_eventsStopped) != 0u)
             {
                 Mmio.Write32(_eventsStopped, 0);
+                return Ok;
+            }
+        }
+        return OtherError;
+    }
+
+    int FinishWrite()
+    {
+        for (int spin = 0; spin < SpinCap; spin++)
+        {
+            if (Mmio.Read32(_eventsStopped) != 0u)
+            {
+                Mmio.Write32(_eventsStopped, 0);
+                Mmio.Write32(_eventsError, 0);
+                uint source = Mmio.Read32(_errorsrc);
+                Mmio.Write32(_errorsrc, Nrf52833TwiLayout.ERRORSRC_ALL_W1C);
+                if ((source & _errAnack) != 0u) return AddressNack;
+                if ((source & _errDnack) != 0u) return DataNack;
                 return Ok;
             }
         }

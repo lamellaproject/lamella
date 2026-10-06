@@ -1047,7 +1047,8 @@ fn deploy_caps_with(
 ) -> lamella_wire::Capabilities {
     let live = if live_window_len == 0 { 0 } else { lamella_wire::Capabilities::LIVE_MEMORY };
     let deploy = lamella_wire::Capabilities::DEBUG_BOOT_DEPLOYED
-        | lamella_wire::Capabilities::DEPLOY_PREFIX_CRC;
+        | lamella_wire::Capabilities::DEPLOY_PREFIX_CRC
+        | lamella_wire::Capabilities::EXEC_NO_RESET;
     lamella_wire::Capabilities(base.0 | deploy | live)
 }
 
@@ -1138,14 +1139,6 @@ fn resident_surface_symbols() -> u64 {
     }
     u64::from(RESIDENT_SURFACE_LO.load(Ordering::Relaxed))
         | (u64::from(RESIDENT_SURFACE_HI.load(Ordering::Relaxed)) << 32)
-}
-
-#[cfg(feature = "baked-image")]
-fn hello_reply(
-    transport: &mut impl Transport,
-    frame: &lamella_wire::Frame,
-) -> Result<(), TransportError> {
-    hello_reply_caps(transport, frame, serve_caps())
 }
 
 #[cfg(feature = "baked-image")]
@@ -2305,6 +2298,14 @@ pub trait ImageResidence {
     /// refusal is reported to the host as a failed run rather than dropped, because an image that
     /// is too large for the board is a fact the person who sent it needs.
     fn admit(&mut self, image: Vec<u8>) -> Option<&'static [u8]>;
+
+    /// The transfer arena has let go of the image this residence placed last: a new transfer has
+    /// begun, or the host cleared the arena. Nothing borrows that image now, so a residence that
+    /// reuses memory may reclaim it here, before the next transfer reserves its own.
+    ///
+    /// Called with nothing executing, because an execution refuses every transfer while it exists.
+    /// A residence that never reclaims does nothing, which is the default.
+    fn release(&mut self) {}
 }
 
 /// A chunked artifact transfer into RAM, and the artifact it produces.
@@ -2365,6 +2366,9 @@ impl ArtifactLoad {
         let data = &payload[CHUNK_HEADER_LEN..];
         if offset == 0 {
             self.clear();
+            if self.bytes.try_reserve_exact(total).is_err() {
+                return xfer::WRITE_FAILED;
+            }
             self.kind = kind;
             self.total = total;
         } else if kind != self.kind || offset != self.bytes.len() || total != self.total {
@@ -2386,7 +2390,7 @@ impl ArtifactLoad {
     fn clear(&mut self) {
         self.kind = 0;
         self.total = 0;
-        self.bytes.clear();
+        self.bytes = Vec::new();
         self.complete = false;
         #[cfg(feature = "baked-image")]
         {
@@ -2463,8 +2467,14 @@ impl ArtifactLoad {
             return 0;
         };
         let crc = match self.deployed {
-            Some((end, crc)) if end == offset => lamella_wire::crc32::update(crc, &read_back[offset..]),
-            _ => lamella_wire::crc32::of(read_back),
+            Some((end, crc)) if end == offset => {
+                note_prefix_crc_read(read_back.len() - offset);
+                lamella_wire::crc32::update(crc, &read_back[offset..])
+            }
+            _ => {
+                note_prefix_crc_read(read_back.len());
+                lamella_wire::crc32::of(read_back)
+            }
         };
         self.deployed = Some((read_back.len(), crc));
         crc
@@ -2477,6 +2487,19 @@ impl ArtifactLoad {
         self.deployed = None;
     }
 }
+
+#[cfg(all(test, feature = "baked-image"))]
+std::thread_local! {
+    static PREFIX_CRC_READ: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "baked-image"))]
+fn note_prefix_crc_read(bytes: usize) {
+    PREFIX_CRC_READ.with(|read| read.set(read.get() + bytes));
+}
+
+#[cfg(all(not(test), feature = "baked-image"))]
+fn note_prefix_crc_read(_bytes: usize) {}
 
 /// One [`load::XFER_RESULT`]: `status(u8)`, `crc32(u32 LE)`.
 fn send_xfer_result(
@@ -2524,7 +2547,7 @@ pub fn serve_one_baked_with_residence(
     let Some(frame) = transport.poll()? else {
         return Ok(false);
     };
-    serve_frame_baked(transport, frame, None, configure, residence, load)?;
+    serve_frame_baked(transport, frame, None, configure, residence, load, serve_caps())?;
     Ok(true)
 }
 
@@ -2562,11 +2585,26 @@ fn exec_loaded(
     if halted {
         return run_debug_session_static(transport, image, corlib, frame.seq, caps, configure);
     }
-    match run_image_streaming(transport, image, corlib, configure)? {
-        PlainRun::Ended(result, reason) => {
-            send_stopped(transport, frame.seq, reason, (0, 0), Some(result.exit))
-        }
-        PlainRun::Aborted => Ok(()),
+    run_plain(transport, frame.seq, image, corlib, configure, caps)
+}
+
+/// Run `image` on the plain path for the request at `seq`, and report its end at that request.
+///
+/// ONE BODY FOR BOTH PLAIN STARTS, a LOADED artifact and a DEPLOYED one started without a reset,
+/// so a program behaves the same whichever memory it runs from: the same scheduler, the same
+/// mid-run contract, and its end reported at the request that started it.
+#[cfg(feature = "baked-image")]
+fn run_plain(
+    transport: &mut impl Transport,
+    seq: u16,
+    image: &'static [u8],
+    corlib: Option<&'static [u8]>,
+    configure: &mut dyn FnMut(&mut Vm),
+    caps: lamella_wire::Capabilities,
+) -> Result<(), TransportError> {
+    match run_image_streaming(transport, image, corlib, configure, caps)? {
+        PlainRun::Ended(result, reason) => send_stopped(transport, seq, reason, (0, 0), Some(result.exit)),
+        PlainRun::Aborted | PlainRun::TakenBack => Ok(()),
     }
 }
 
@@ -2579,10 +2617,69 @@ enum PlainRun {
     /// An [`debug::ABORT`] ended it, and the stop event has already gone out at the ABORT's own
     /// sequence -- so the caller must not send a second one at the request's.
     Aborted,
+    /// A `HELLO` took the board back, and has been answered. The host that sent it did not start
+    /// this run, so nothing more is said about it: the next frame that host reads answers its own
+    /// next request.
+    TakenBack,
 }
 
-/// Run an artifact to completion on the PLAIN path, streaming its output as it appears and
-/// answering a mid-run [`debug::ABORT`].
+/// What a frame that arrives while a scheduled program runs does to the run.
+#[cfg(feature = "baked-image")]
+enum MidRun {
+    /// The frame was answered, or is not for the run: keep going.
+    KeepGoing,
+    /// A `HELLO` took the board back, and its answer went out. The run ends.
+    TakenBack,
+    /// An [`debug::ABORT`] at this sequence number ends the run. Its stop has NOT gone out: the
+    /// run's last output goes first.
+    Aborted(u16),
+}
+
+/// The mid-run contract of every SCHEDULED run -- a stored program's boot run, and a plain run
+/// started over the wire -- for one frame that arrived while it runs.
+///
+/// A `HELLO` is answered and takes the board back; an [`debug::ABORT`] ends the run; an
+/// [`exec::EXEC_STATUS`] is answered [`exec::ack::RUNNING`] without disturbing it; a live memory
+/// request is served while the program keeps running. Anything else is dropped: the host contract
+/// is one in-flight execution, and a frame arriving mid-run is usually a type this target
+/// implements perfectly well, so refusing it would be a lie about the type rather than a fact about
+/// the moment.
+///
+/// One function for both kinds of run, because a host cannot tell them apart and must not have to:
+/// a board running a program it booted into and one running a program a host started answer the
+/// same requests the same way.
+#[cfg(feature = "baked-image")]
+fn serve_mid_run(
+    transport: &mut impl Transport,
+    frame: &lamella_wire::Frame,
+    caps: lamella_wire::Capabilities,
+) -> Result<MidRun, TransportError> {
+    match frame.msg_type {
+        lamella_wire::msg::HELLO => {
+            hello_reply_caps(transport, frame, caps)?;
+            Ok(MidRun::TakenBack)
+        }
+        debug::ABORT => Ok(MidRun::Aborted(frame.seq)),
+        exec::EXEC_STATUS => {
+            transport.send(exec::EXEC_ACK, frame.seq, &[exec::ack::RUNNING])?;
+            Ok(MidRun::KeepGoing)
+        }
+        msg_type if live::is_request(msg_type) => {
+            lamella_debug_agent::serve_live_frame(
+                transport,
+                frame,
+                live_window(),
+                &mut lamella_debug_agent::TargetMemory,
+            )?;
+            Ok(MidRun::KeepGoing)
+        }
+        _ => Ok(MidRun::KeepGoing),
+    }
+}
+
+/// Run an artifact to completion on the PLAIN path, streaming its output as it appears and keeping
+/// the mid-run contract ([`serve_mid_run`]). `caps` is what a `HELLO` that takes the board back is
+/// answered with.
 ///
 /// The terminal event carries no output, so streaming is the only way a program's output reaches a
 /// host -- on this path as much as on the debug one.
@@ -2592,20 +2689,34 @@ fn run_image_streaming(
     image: &'static [u8],
     corlib: Option<&'static [u8]>,
     configure: &mut dyn FnMut(&mut Vm),
+    caps: lamella_wire::Capabilities,
 ) -> Result<PlainRun, TransportError> {
     let mut carrier: Result<(), TransportError> = Ok(());
     let mut aborted = None;
+    let mut taken_back = false;
     let (result, fault) = run_image_reporting(image, corlib, configure, &mut |vm| {
         if let Err(error) = stream_output(transport, vm) {
             carrier = Err(error);
             return false;
         }
-        match transport.poll() {
-            Ok(Some(frame)) if frame.msg_type == debug::ABORT => {
-                aborted = Some(frame.seq);
+        let frame = match transport.poll() {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return true,
+            Err(error) => {
+                carrier = Err(error);
+                return false;
+            }
+        };
+        match serve_mid_run(transport, &frame, caps) {
+            Ok(MidRun::KeepGoing) => true,
+            Ok(MidRun::TakenBack) => {
+                taken_back = true;
                 false
             }
-            Ok(_) => true,
+            Ok(MidRun::Aborted(seq)) => {
+                aborted = Some(seq);
+                false
+            }
             Err(error) => {
                 carrier = Err(error);
                 false
@@ -2613,6 +2724,9 @@ fn run_image_streaming(
         }
     });
     carrier?;
+    if taken_back {
+        return Ok(PlainRun::TakenBack);
+    }
     stream_final(transport, &result)?;
     if let Some(text) = &fault {
         send_output(transport, debug::output::STDERR, text)?;
@@ -2678,6 +2792,10 @@ fn send_manifest(
 /// `LOAD_x` -> the transfer arena + `XFER_RESULT`, `EXEC` -> run it (halted, with a debug
 /// capability). Anything else is REFUSED by name. Split out so a deploy-capable serve loop can
 /// dispatch the deploy messages itself and delegate the rest here.
+///
+/// `caps` is the capability set of the serve that delegated the frame, and it is what every answer
+/// here advertises -- a `HELLO`, and one that takes the board back from a run started here. A serve
+/// that advertises more than the baked-only set must not have its runs answered with less.
 #[cfg(feature = "baked-image")]
 fn serve_frame_baked(
     transport: &mut impl Transport,
@@ -2686,12 +2804,17 @@ fn serve_frame_baked(
     configure: &mut dyn FnMut(&mut Vm),
     residence: &mut dyn ImageResidence,
     load: &mut ArtifactLoad,
+    caps: lamella_wire::Capabilities,
 ) -> Result<(), TransportError> {
     use lamella_wire::msg;
     note_resident_corlib(corlib);
     match frame.msg_type {
-        msg::HELLO => hello_reply(transport, &frame)?,
+        msg::HELLO => hello_reply_caps(transport, &frame, caps)?,
         load::LOAD_PE | load::LOAD_IMAGE | load::LOAD_BUNDLE => {
+            if frame.payload.get(..4) == Some(&[0u8; 4][..]) {
+                load.clear();
+                residence.release();
+            }
             let mut status = load.chunk(frame.msg_type, &frame.payload);
             if status == lamella_wire::msg::xfer::MATCHED && !load.place(residence) {
                 status = lamella_wire::msg::xfer::WRITE_FAILED;
@@ -2700,10 +2823,11 @@ fn serve_frame_baked(
         }
         load::LOAD_CLEAR => {
             load.clear();
+            residence.release();
             send_xfer_result(transport, frame.seq, lamella_wire::msg::xfer::MATCHED, 0)?;
         }
         exec::EXEC => {
-            exec_loaded(transport, &frame, corlib, configure, load, serve_caps())?;
+            exec_loaded(transport, &frame, corlib, configure, load, caps)?;
         }
         exec::EXEC_STATUS => {
             transport.send(exec::EXEC_ACK, frame.seq, &[exec::ack::IDLE])?;
@@ -2778,7 +2902,14 @@ fn scrub_window(flash: &mut impl FlashSink) -> Scrubbed {
 /// Serve one pending request on a DEPLOY-capable baked-image target: `DEPLOY_IMAGE`
 /// programs the image into `flash` and keeps it (boots on reset); `DEPLOY_CLEAR` erases
 /// it; every other frame is delegated to [`serve_frame_baked`]. A device firmware's serve
-/// loop is this call in a loop (plus its own arena reset between requests).
+/// loop is this call in a loop, with ONE `load` held across every iteration.
+///
+/// # The arena outlives the request, and a firmware that remakes it pays for it twice
+///
+/// A deploy is chunked, and each chunk's acknowledgement carries a CRC kept as a running value in
+/// `load`. An arena made afresh for each frame recomputes that CRC over everything written so far,
+/// so a deploy's cost grows with the square of the image, and a LOAD followed by its EXEC finds
+/// nothing to run.
 ///
 /// # Errors
 /// Propagates a [`TransportError`] from the carrier.
@@ -2806,10 +2937,31 @@ pub fn serve_one_deploy_with(
     winc: Option<&mut dyn WincFlasher>,
     load: &mut ArtifactLoad,
 ) -> Result<Served, TransportError> {
+    serve_one_deploy_with_residence(transport, flash, configure, winc, &mut LeakEachImage, load)
+}
+
+/// [`serve_one_deploy_with`] with the image-retention policy for a LOADED artifact named rather
+/// than assumed -- the deploy serve's counterpart of [`serve_one_baked_with_residence`].
+///
+/// A board whose serve loop keeps its [`ArtifactLoad`] across frames, as a chunked transfer needs,
+/// completes every LOAD it is sent, and the default policy then keeps every one of them. Such a
+/// board supplies a residence that reuses its memory, and holds one loaded artifact at a time.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn serve_one_deploy_with_residence(
+    transport: &mut impl Transport,
+    flash: &mut impl FlashSink,
+    configure: &mut dyn FnMut(&mut Vm),
+    winc: Option<&mut dyn WincFlasher>,
+    residence: &mut dyn ImageResidence,
+    load: &mut ArtifactLoad,
+) -> Result<Served, TransportError> {
     let Some(frame) = transport.poll()? else {
         return Ok(Served::Nothing);
     };
-    serve_deploy_frame(transport, frame, flash, configure, winc, load)
+    serve_deploy_frame(transport, frame, flash, configure, winc, residence, load)
 }
 
 /// Handle one ALREADY-POLLED frame on a DEPLOY-capable baked-image target: the deploy ops
@@ -2828,6 +2980,7 @@ fn serve_deploy_frame(
     flash: &mut impl FlashSink,
     configure: &mut dyn FnMut(&mut Vm),
     winc: Option<&mut dyn WincFlasher>,
+    residence: &mut dyn ImageResidence,
     load: &mut ArtifactLoad,
 ) -> Result<Served, TransportError> {
     use lamella_wire::msg::{CHUNK_HEADER_LEN, xfer};
@@ -2889,9 +3042,17 @@ fn serve_deploy_frame(
             serve_extended_frame(transport, &frame, winc)?;
         }
         exec::EXEC if exec_source_of(&frame) == exec::exec_source::DEPLOYED => {
-            let halted = frame.payload.get(1).copied().unwrap_or(0) & exec::exec_flags::START_HALTED != 0;
-            if !halted && lamella_cil_runtime::verified_image_checksum(flash.image_slice()).is_none()
+            let flags = frame.payload.get(1).copied().unwrap_or(0);
+            let halted = flags & exec::exec_flags::START_HALTED != 0;
+            let no_reset = flags & exec::exec_flags::NO_RESET != 0;
+            if !halted
+                && !no_reset
+                && lamella_cil_runtime::verified_image_checksum(flash.image_slice()).is_none()
             {
+                transport.send(exec::EXEC_ACK, frame.seq, &[exec::ack::NOTHING_TO_RUN])?;
+                return Ok(Served::Handled);
+            }
+            if no_reset && !halted && !matches!(flash.image_slice().get(..2), Some(b"LM" | b"MZ")) {
                 transport.send(exec::EXEC_ACK, frame.seq, &[exec::ack::NOTHING_TO_RUN])?;
                 return Ok(Served::Handled);
             }
@@ -2904,6 +3065,19 @@ fn serve_deploy_frame(
                     frame.seq,
                     deploy_caps(),
                     configure,
+                )?;
+                return Ok(Served::Handled);
+            }
+            if no_reset {
+                load.clear();
+                residence.release();
+                run_plain(
+                    transport,
+                    frame.seq,
+                    flash.image_slice(),
+                    flash.resident_corlib(),
+                    configure,
+                    deploy_caps(),
                 )?;
                 return Ok(Served::Handled);
             }
@@ -2921,14 +3095,7 @@ fn serve_deploy_frame(
                     &mut lamella_debug_agent::TargetMemory,
                 )?;
         }
-        _ => serve_frame_baked(
-            transport,
-            frame,
-            flash.resident_corlib(),
-            configure,
-            &mut LeakEachImage,
-            load,
-        )?,
+        _ => serve_frame_baked(transport, frame, flash.resident_corlib(), configure, residence, load, deploy_caps())?,
     }
     Ok(Served::Handled)
 }
@@ -3038,7 +3205,7 @@ pub fn serve_one_deploy_repl_with(
             hello_reply_caps(transport, &frame, deploy_repl_caps())?;
             Ok(Served::Handled)
         }
-        _ => serve_deploy_frame(transport, frame, flash, configure, winc, load),
+        _ => serve_deploy_frame(transport, frame, flash, configure, winc, &mut LeakEachImage, load),
     }
 }
 
@@ -3073,7 +3240,6 @@ pub fn run_deployed_with(
     entry: lamella_cil_runtime::MethodId,
     configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<Deployed, TransportError> {
-    use lamella_wire::msg;
     let mut vm = Vm::default();
     configure_machine(&mut vm, configure);
     publish_wall_clock(module, &mut vm);
@@ -3093,34 +3259,21 @@ pub fn run_deployed_with(
             carrier = Err(error);
             return false;
         }
-        match transport.poll() {
-            Ok(Some(frame)) if frame.msg_type == msg::HELLO => {
-                carrier = hello_reply_caps(transport, &frame, deploy_caps());
+        let frame = match transport.poll() {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return true,
+            Err(error) => {
+                carrier = Err(error);
+                return false;
+            }
+        };
+        match serve_mid_run(transport, &frame, deploy_caps()) {
+            Ok(MidRun::KeepGoing) => true,
+            Ok(MidRun::TakenBack) => false,
+            Ok(MidRun::Aborted(seq)) => {
+                aborted = Some(seq);
                 false
             }
-            Ok(Some(frame)) if frame.msg_type == debug::ABORT => {
-                aborted = Some(frame.seq);
-                false
-            }
-            Ok(Some(frame)) if frame.msg_type == exec::EXEC_STATUS => {
-                carrier = transport.send(exec::EXEC_ACK, frame.seq, &[exec::ack::RUNNING]);
-                carrier.is_ok()
-            }
-            Ok(Some(frame)) if live::is_request(frame.msg_type) => {
-                match lamella_debug_agent::serve_live_frame(
-                    transport,
-                    &frame,
-                    live_window(),
-                    &mut lamella_debug_agent::TargetMemory,
-                ) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        carrier = Err(error);
-                        false
-                    }
-                }
-            }
-            Ok(_) => true,
             Err(error) => {
                 carrier = Err(error);
                 false
@@ -3661,7 +3814,7 @@ fn serve_repl_frame(
             send_xfer_result(transport, frame.seq, lamella_wire::msg::xfer::MATCHED, 0)?;
         }
         #[cfg(feature = "baked-image")]
-        _ => serve_frame_baked(transport, frame, corlib, configure, &mut LeakEachImage, load)?,
+        _ => serve_frame_baked(transport, frame, corlib, configure, &mut LeakEachImage, load, serve_caps())?,
         #[cfg(not(feature = "baked-image"))]
         other => transport.send(
             lamella_wire::msg::ERROR,
@@ -5308,6 +5461,219 @@ mod tests {
         assert_eq!(stop.payload[0], debug::reason::TRAP);
     }
 
+    /// The fixture program `name`, baked and leaked for a test's flash or arena; `None` when the
+    /// fixture is absent.
+    #[cfg(feature = "baked-image")]
+    fn baked_fixture(name: &str) -> Option<&'static [u8]> {
+        let path = format!("{}/../lamella-wire-host/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let program: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+        Some(Box::leak(image.into_boxed_slice()))
+    }
+
+    /// A deploy region that already holds an image; programming is not under test.
+    #[cfg(feature = "baked-image")]
+    struct Holding(&'static [u8]);
+
+    #[cfg(feature = "baked-image")]
+    impl FlashSink for Holding {
+        fn image_slice(&self) -> &'static [u8] {
+            self.0
+        }
+        fn erase(&mut self) {}
+        fn program(&mut self, _image: &[u8]) -> bool {
+            false
+        }
+        fn program_chunk(&mut self, _offset: usize, _chunk: &[u8], _total: usize) -> bool {
+            false
+        }
+    }
+
+    /// Every frame `driver` has received, as `(type, seq, first payload byte)`.
+    #[cfg(feature = "baked-image")]
+    fn every_frame(driver: &mut lamella_wire::MemTransport) -> Vec<(u8, u16, Option<u8>)> {
+        let mut frames = Vec::new();
+        while let Some(frame) = driver.poll().unwrap() {
+            frames.push((frame.msg_type, frame.seq, frame.payload.first().copied()));
+        }
+        frames
+    }
+
+    /// **A STORED PROGRAM STARTED WITHOUT A RESET RUNS HERE, FOR THE HOST THAT ASKED.** Its output
+    /// and its end come back at the request that started it, and the serve asks the firmware for no
+    /// reset -- which a start without the flag still does.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_stored_program_started_without_a_reset_runs_here_and_ends_at_the_request() {
+        use lamella_wire::MemTransport;
+        let Some(image) = baked_fixture("hello.exe") else {
+            return;
+        };
+        let mut flash = Holding(image);
+        let (mut driver, mut runner, mut arena) = (MemTransport::new(), MemTransport::new(), ArtifactLoad::new());
+        driver.send(exec::EXEC, 4, &[exec::exec_source::DEPLOYED, exec::exec_flags::NO_RESET]).unwrap();
+        runner.feed(&driver.take_sent());
+        let served = serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap();
+        assert_eq!(served, Served::Handled, "the program ran here: no reset was asked for");
+        driver.feed(&runner.take_sent());
+        let mut run = RunCollector::new(4);
+        assert!(run.poll(&mut driver).unwrap(), "its end arrived, at the request that started it");
+        assert_eq!(run.finish(), Some(RunResult { exit: 7, stdout: String::from("hi\n") }));
+
+        driver.send(exec::EXEC, 5, &[exec::exec_source::DEPLOYED, 0]).unwrap();
+        runner.feed(&driver.take_sent());
+        let served = serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap();
+        assert_eq!(served, Served::RunRequested, "without the flag the start is still a reset");
+    }
+
+    /// **A START WITHOUT A RESET FINDS NOTHING IN A REGION THAT HOLDS NOTHING**, and says so in its
+    /// acknowledgement rather than reporting a program that trapped.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_start_without_a_reset_in_an_empty_region_has_nothing_to_run() {
+        use lamella_wire::MemTransport;
+        let mut flash = Holding(&[0xFF; 64]);
+        let (mut driver, mut runner, mut arena) = (MemTransport::new(), MemTransport::new(), ArtifactLoad::new());
+        driver.send(exec::EXEC, 4, &[exec::exec_source::DEPLOYED, exec::exec_flags::NO_RESET]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert_eq!(serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap(), Served::Handled);
+        driver.feed(&runner.take_sent());
+        assert_eq!(every_frame(&mut driver), [(exec::EXEC_ACK, 4, Some(exec::ack::NOTHING_TO_RUN))]);
+    }
+
+    /// **A PLAIN RUN KEEPS THE MID-RUN CONTRACT A BOOT RUN KEEPS.** Asked what is executing, it
+    /// answers RUNNING and carries on; a HELLO is answered and takes the board back, and no stop is
+    /// sent to a host that did not start the run. Before, a plain run dropped both, so the next host's
+    /// HELLO waited out its whole timeout against a board that looked deaf.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_plain_run_answers_what_is_running_and_a_hello_takes_the_board_back() {
+        use lamella_wire::{Capabilities, Hello, MemTransport, PROTOCOL_VERSION, ProtocolRange, msg};
+        let Some(image) = baked_fixture("spin.exe") else {
+            return;
+        };
+        let mut flash = Holding(image);
+        let (mut driver, mut runner, mut arena) = (MemTransport::new(), MemTransport::new(), ArtifactLoad::new());
+        driver.send(exec::EXEC, 4, &[exec::exec_source::DEPLOYED, exec::exec_flags::NO_RESET]).unwrap();
+        driver.send(exec::EXEC_STATUS, 5, &[]).unwrap();
+        let hello = Hello {
+            range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+            caps: Capabilities(Capabilities::BAKED_IMAGE),
+        };
+        driver.send(msg::HELLO, 6, &hello.encode()).unwrap();
+        runner.feed(&driver.take_sent());
+        assert_eq!(
+            serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap(),
+            Served::Handled,
+            "the HELLO ended a program that never returns"
+        );
+        driver.feed(&runner.take_sent());
+        let frames: Vec<(u8, u16, Option<u8>)> =
+            every_frame(&mut driver).into_iter().filter(|&(msg_type, ..)| msg_type != debug::EVT_OUTPUT).collect();
+        assert_eq!(
+            frames,
+            [
+                (exec::EXEC_ACK, 4, Some(exec::ack::STARTED)),
+                (exec::EXEC_ACK, 5, Some(exec::ack::RUNNING)),
+                (msg::HELLO_ACK, 6, frames.get(2).and_then(|frame| frame.2)),
+            ],
+            "the start, the answer to what is running, the HELLO's answer, and nothing after it"
+        );
+    }
+
+    /// **A HELLO THAT TAKES BACK A LOADED RUN ON A DEPLOY SERVE IS ANSWERED WITH THE DEPLOY SERVE's
+    /// CAPABILITIES**, EXEC_NO_RESET among them. A host taking the board back from a REPL evaluation
+    /// learns from that answer how it may start the stored program, and the baked-only set would send
+    /// it to the debugger.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_hello_during_a_loaded_run_on_a_deploy_serve_is_answered_with_the_deploy_capabilities() {
+        use lamella_wire::{Capabilities, Hello, HelloAck, MemTransport, PROTOCOL_VERSION, ProtocolRange, msg};
+        let Some(image) = baked_fixture("spin.exe") else {
+            return;
+        };
+        let mut flash = Holding(&[0xFF; 64]);
+        let (mut driver, mut runner, mut arena) = (MemTransport::new(), MemTransport::new(), ArtifactLoad::new());
+        load_then_exec(&mut driver, 4, load::LOAD_IMAGE, image, 0);
+        let hello = Hello {
+            range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+            caps: Capabilities(
+                Capabilities::BAKED_IMAGE | Capabilities::DEPLOY_PREFIX_CRC | Capabilities::EXEC_NO_RESET,
+            ),
+        };
+        driver.send(msg::HELLO, 5, &hello.encode()).unwrap();
+        runner.feed(&driver.take_sent());
+        while serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap() != Served::Nothing {}
+        driver.feed(&runner.take_sent());
+        let mut started = false;
+        let mut answer = None;
+        while let Some(frame) = driver.poll().unwrap() {
+            match (frame.msg_type, frame.seq) {
+                (exec::EXEC_ACK, 4) => started = frame.payload.first() == Some(&exec::ack::STARTED),
+                (msg::HELLO_ACK, 5) => answer = Some(frame),
+                (debug::EVT_STOPPED, 4) => panic!("a run taken back by a HELLO reports no stop"),
+                _ => {}
+            }
+        }
+        assert!(started, "the loaded program started");
+        let answer = answer.expect("the HELLO that took the board back was answered");
+        let ack = HelloAck::decode(&answer.payload).expect("the ack decodes");
+        assert!(ack.caps.has(Capabilities::EXEC_NO_RESET), "the deploy serve's start without a reset");
+        assert!(ack.caps.has(Capabilities::DEPLOY_PREFIX_CRC), "and its compared deploy CRC");
+    }
+
+    /// **A START WITHOUT A RESET RELEASES THE LOADED ARTIFACT FIRST**, so the stored program runs on
+    /// the heap a REPL evaluation's image was holding, and a later EXEC of the loaded artifact finds
+    /// nothing to run, as it would after the reset this start replaces.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_start_without_a_reset_releases_the_loaded_artifact_first() {
+        use lamella_wire::MemTransport;
+
+        #[derive(Default)]
+        struct Recording {
+            events: Vec<&'static str>,
+        }
+
+        impl ImageResidence for Recording {
+            fn admit(&mut self, image: Vec<u8>) -> Option<&'static [u8]> {
+                self.events.push("admit");
+                LeakEachImage.admit(image)
+            }
+
+            fn release(&mut self) {
+                self.events.push("release");
+            }
+        }
+
+        let Some(stored) = baked_fixture("hello.exe") else {
+            return;
+        };
+        let mut flash = Holding(stored);
+        let mut residence = Recording::default();
+        let (mut driver, mut runner, mut arena) = (MemTransport::new(), MemTransport::new(), ArtifactLoad::new());
+        send_artifact(&mut driver, 3, load::LOAD_IMAGE, &[7u8; 600]).unwrap();
+        driver.send(exec::EXEC, 4, &[exec::exec_source::DEPLOYED, exec::exec_flags::NO_RESET]).unwrap();
+        driver.send(exec::EXEC, 5, &[exec::exec_source::LOADED, 0]).unwrap();
+        runner.feed(&driver.take_sent());
+        while serve_one_deploy_with_residence(&mut runner, &mut flash, &mut |_vm| {}, None, &mut residence, &mut arena)
+            .unwrap()
+            != Served::Nothing
+        {}
+        assert_eq!(residence.events, ["release", "admit", "release"], "placed, then released by the start");
+        driver.feed(&runner.take_sent());
+        let answer =
+            every_frame(&mut driver).into_iter().find(|&(msg_type, seq, _)| msg_type == exec::EXEC_ACK && seq == 5);
+        assert_eq!(
+            answer,
+            Some((exec::EXEC_ACK, 5, Some(exec::ack::NOTHING_TO_RUN))),
+            "the loaded artifact went with the start"
+        );
+    }
+
     #[cfg(feature = "baked-image")]
     #[test]
     fn debug_session_steps_breaks_and_completes_over_the_wire() {
@@ -5770,8 +6136,8 @@ mod tests {
     }
 
     /// **A clear erases everything the window holds**, not only the first unit, so none of a stored
-    /// program's bytes -- the strings compiled into it included -- survive it. The reply says how many
-    /// bytes it erased, and units that already read erased are not erased again.
+    /// program's bytes -- the strings compiled into it included -- survive it. The reply says how
+    /// many bytes it erased, and units that already read erased are not erased again.
     #[cfg(feature = "baked-image")]
     #[test]
     fn a_clear_erases_everything_the_window_holds_and_says_how_much() {
@@ -5934,6 +6300,37 @@ mod tests {
             assert_eq!(status, deploy::xfer::MATCHED, "chunk {index}");
             assert_eq!(crc, lamella_wire::crc32::of(&image[..end]), "chunk {index} covers [0, {end})");
         }
+    }
+
+    /// **A DEPLOY's CRC WORK IS ITS IMAGE, READ ONCE**, when the serve keeps one arena across its
+    /// frames as a firmware's loop must -- and it grows with the square of the image when the arena
+    /// is made afresh for each frame.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_deploy_through_one_arena_reads_each_byte_once_for_its_crcs() {
+        let image: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut region = image.clone();
+        region.resize(131_072, 0xFF);
+        let mut flash = ReadsBack(Box::leak(region.into_boxed_slice()));
+        let chunks: Vec<(usize, &[u8])> =
+            image.chunks(8192).enumerate().map(|(index, chunk)| (index * 8192, chunk)).collect();
+
+        PREFIX_CRC_READ.with(|read| read.set(0));
+        let acks = deploy_chunks(&mut flash, image.len(), &chunks);
+        assert!(acks.iter().all(|&(status, _)| status == deploy::xfer::MATCHED));
+        assert_eq!(PREFIX_CRC_READ.with(core::cell::Cell::get), image.len(), "each byte once");
+
+        PREFIX_CRC_READ.with(|read| read.set(0));
+        for chunk in &chunks {
+            deploy_chunks(&mut flash, image.len(), core::slice::from_ref(chunk));
+        }
+        let prefixes: usize = chunks.iter().map(|&(offset, bytes)| offset + bytes.len()).sum();
+        assert_eq!(
+            PREFIX_CRC_READ.with(core::cell::Cell::get),
+            prefixes,
+            "an arena per frame reads every prefix again: {prefixes} bytes for a {}-byte image",
+            image.len()
+        );
     }
 
     #[cfg(feature = "baked-image")]

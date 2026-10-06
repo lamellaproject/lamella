@@ -277,11 +277,10 @@ namespace Lamella.Boards.Microchip
         /// on header pins 16, 17 and 18), as <c>SpiConnectionSettings</c> names it.</summary>
         public const int Ext1SpiBusId = 0;
 
-        /// <summary>The EXT1 header's chip select line, SPI_SS_A on pin 15, as
-        /// <c>SpiConnectionSettings.ChipSelectLine</c> takes it.</summary>
-        public static readonly int Ext1SpiChipSelectLine = Samd21GpioDriver.LogicalPin(
-            MicrochipSamd21XproBindings.EXT1_SPI_CS_PORT_BASE,
-            MicrochipSamd21XproBindings.EXT1_SPI_CS_PIN);
+        /// <summary>The EXT1 header's chip select line, SPI_SS_A on pin 15 (PA05), as
+        /// <c>SpiConnectionSettings.ChipSelectLine</c> takes it: 0, the first of the bus's chip
+        /// selects.</summary>
+        public static readonly int Ext1SpiChipSelectLine = 0;
 
         private static SpiDriver MakeExt1Spi() { return new Samd21SpiDriver(Ext1SpiBinding()); }
 
@@ -307,7 +306,8 @@ namespace Lamella.Boards.Microchip
                 MicrochipSamd21XproBindings.EXT1_SPI_PMUX_FUNC,
                 MicrochipSamd21XproBindings.EXT1_SPI_DOPO,
                 MicrochipSamd21XproBindings.EXT1_SPI_DIPO,
-                MicrochipSamd21XproBindings.EXT1_SPI_CORE_CLOCK_HZ);
+                MicrochipSamd21XproBindings.EXT1_SPI_CORE_CLOCK_HZ,
+                new int[] { (int)MicrochipSamd21XproBindings.EXT1_SPI_CHIP_SELECT0 });
         }
 
         /// <summary>The EXT1 header's SPI as the layer-1 driver the board's table binds for

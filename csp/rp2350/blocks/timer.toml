@@ -5,9 +5,9 @@
 kind = "block"
 family = "rp2350"
 block = "timer"
-# Rust only: the one reader is a board's native clock, which reads TIMER0 beneath every managed
-# clock read.
-emit = ["rust"]
+# A board's native clock reads TIMER0 beneath every managed clock read, and the I2C driver times
+# its waits on the bus against it.
+emit = ["csharp", "rust"]
 sources = ["RP2350 datasheet ch 12.8 (system timers)"]
 notes = [
     "TIMERAWH and TIMERAWL read the count without the TIMELR latch, so two readers cannot corrupt each other. Read H, then L, then H again, and read L again while the two H reads differ.",

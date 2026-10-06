@@ -26,5 +26,5 @@ public enum Rp2350XoscLayout {
     // -- block constants --
     public static let CTRL_ENABLE_MAGIC: UInt32 = 0xFAB
     public static let CTRL_FREQ_RANGE_1_15MHZ: UInt32 = 0xAA0
-    public static let STARTUP_DELAY_1MS: UInt32 = 0xC4
+    public static let STARTUP_DELAY_RESET: UInt32 = 0xC4
 }

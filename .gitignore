@@ -1,22 +1,23 @@
-# Build output
+# Build output.
 /target/
 
+# Build output of the separate Cargo workspaces under tools/, at any depth.
 /tools/**/target/
 
+# The assemblies that build-managed.ps1 and build-managed.sh write here by default. They are built
+# from the C# sources in this repository and are never committed.
 /managed/
 
-
-# Reference specifications
+# Reference specifications. They are fetched locally and never committed.
 /reference/*.pdf
 /reference/*.txt
 
-# OS and editor noise.
+# Operating-system and editor files.
 Thumbs.db
 desktop.ini
 .DS_Store
 
-# CPython's bytecode cache. The bundled Python stdlib is SOURCE inside a crate, and validating a
-# module against CPython means running CPython over those very files -- which drops a __pycache__
-# beside them. It is build output of another interpreter and must never be committed.
+# CPython's bytecode cache, written when the bundled Python standard library is checked against
+# CPython.
 __pycache__/
 *.pyc

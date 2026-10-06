@@ -46,6 +46,20 @@ codegen-units = 1
 panic = "abort"
 strip = "none"
 
+# The device-image profile for a C# interpreter firmware built for SPEED: `flash` above, with the
+# interpreter's own two crates -- its execution engine and its instruction decoder -- optimized for
+# speed. Everything else in the image stays optimized for size.
+#
+# Each board chooses between this and `flash` in the `[csharp_interpreter]` table of its board.toml.
+[profile.flash-speed]
+inherits = "flash"
+
+[profile.flash-speed.package.lamella-cil-runtime]
+opt-level = 2
+
+[profile.flash-speed.package.lamella-cil]
+opt-level = 2
+
 # The profile for host-side batch runs of the compiler over a whole corpus, where an unoptimized
 # build is the difference between a run you can repeat and one you cannot: measured at 109 s per
 # file unoptimized against 4.07 s here.

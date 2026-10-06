@@ -57,6 +57,13 @@ pub const TUPLES: u64 = 1 << 20;
 /// The .NET Core 2.0 members of types the base contract already carries: the rung above
 /// [`NETFX_4_5`].
 pub const NETCORE_2_0: u64 = 1 << 21;
+/// The .NET Core 2.1 members: the rung above [`NETCORE_2_0`]. Requires [`SPAN`], because .NET Core
+/// 2.1 never shipped without span types.
+pub const NETCORE_2_1: u64 = 1 << 22;
+/// The .NET Core 3.0 members: the rung above [`NETCORE_2_1`].
+pub const NETCORE_3_0: u64 = 1 << 23;
+/// The .NET 5.0 members: the rung above [`NETCORE_3_0`], which it requires.
+pub const NET_5_0: u64 = 1 << 24;
 
 /// The era bits together, so "which generation was this built against" is one mask rather than four
 /// tests.
@@ -95,6 +102,9 @@ pub const NAMED: &[(u64, &str)] = &[
     (SPAN, "LAMELLA_SURFACE_SPAN"),
     (TUPLES, "LAMELLA_SURFACE_TUPLES"),
     (NETCORE_2_0, "LAMELLA_SURFACE_NETCORE_2_0"),
+    (NETCORE_2_1, "LAMELLA_SURFACE_NETCORE_2_1"),
+    (NETCORE_3_0, "LAMELLA_SURFACE_NETCORE_3_0"),
+    (NET_5_0, "LAMELLA_SURFACE_NET_5_0"),
 ];
 
 /// The bit a compilation symbol stands for, or `None` when this build does not name it.

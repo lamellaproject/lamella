@@ -30,6 +30,6 @@ namespace Lamella.Generated
         // -- block constants --
         public const uint CTRL_ENABLE_MAGIC = 0xFAB;
         public const uint CTRL_FREQ_RANGE_1_15MHZ = 0xAA0;
-        public const uint STARTUP_DELAY_1MS = 0xC4;
+        public const uint STARTUP_DELAY_RESET = 0xC4;
     }
 }

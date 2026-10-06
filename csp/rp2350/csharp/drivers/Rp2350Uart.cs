@@ -50,7 +50,7 @@ public sealed class Rp2350Uart
     /// order).</summary>
     public void Init(int baud)
     {
-        Mmio.Write32(_xoscStartup, Rp2350XoscLayout.STARTUP_DELAY_1MS);
+        Mmio.Write32(_xoscStartup, Rp2350XoscLayout.STARTUP_DELAY_RESET);
         Mmio.Write32(_xoscCtrl,
             (Rp2350XoscLayout.CTRL_ENABLE_MAGIC << (int)Rp2350XoscLayout.CTRL_ENABLE_LSB)
             | Rp2350XoscLayout.CTRL_FREQ_RANGE_1_15MHZ);

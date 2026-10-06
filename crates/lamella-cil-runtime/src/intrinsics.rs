@@ -5,7 +5,7 @@ use crate::module::{AttrValue, BoxedPrimitive, CastElem, CastPrim, Module, TypeI
 #[cfg(feature = "reflection")]
 use crate::module::param_attr_key;
 use crate::net::{Interest, NetResult};
-use crate::tls::{TlsStack, VerifyMode};
+use crate::tls::{ClientIdentity, IdentityError, TlsStack, VerifyMode};
 use crate::object::{Object, ObjectRef, decode_string};
 use crate::trap::{RefusedWith, Trap};
 use crate::value::{Location, Value};
@@ -4589,6 +4589,26 @@ pub fn net_iface_gateway(
     Ok(Some(Value::Int32(packed)))
 }
 
+/// `NetworkInterface.ChangeCount(int which)` -> how many times availability (`which` 0) or an
+/// interface's state or address (`which` 1) has changed since the backend was made; `-1` when the
+/// backend does not count, or there is none.
+pub fn net_change_count(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(which)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let counts = vm.net_backend().and_then(|backend| backend.change_counts());
+    let count = match (counts, which) {
+        (Some((availability, _)), 0) => availability as i32 & i32::MAX,
+        (Some((_, addressing)), 1) => addressing as i32 & i32::MAX,
+        _ => -1,
+    };
+    Ok(Some(Value::Int32(count)))
+}
+
 /// `NetworkInterface.IfaceFlags(int index)` -> a bitfield: bit 0 = the address is DHCP-configured.
 pub fn net_iface_flags(
     vm: &mut Vm,
@@ -4597,6 +4617,249 @@ pub fn net_iface_flags(
 ) -> Result<Option<Value>, Trap> {
     let flags = iface_info_arg(vm, args).map_or(0, |info| i32::from(info.dhcp_enabled));
     Ok(Some(Value::Int32(flags)))
+}
+
+
+/// The bytes of a Wi-Fi state report: link, kind in force, source, flags (bit 0 a signal strength,
+/// bit 1 a channel, bit 2 an access point, bit 3 a last failure, bit 4 an ended join), the name's
+/// length, the channel, the signal (`i16`), the access point (6), the last failure's kind, the join's
+/// outcome, the join's number (`u32`), the detail line's length, the name (32), the detail line.
+#[cfg(feature = "wifi")]
+pub const WIFI_STATE_LEN: usize = 256;
+/// The longest detail line a report carries, in bytes of UTF-8.
+#[cfg(feature = "wifi")]
+pub const WIFI_DETAIL_MAX: usize = WIFI_STATE_LEN - 53;
+/// The bytes of a stored-network report: the kinds, the reconnection, the boot setting, the name's
+/// length, the name (32).
+#[cfg(feature = "wifi")]
+pub const WIFI_RECORD_LEN: usize = 36;
+
+/// The bytes of byte-array argument `index`, copied out; empty for a null array.
+#[cfg(feature = "wifi")]
+fn byte_array_arg(vm: &mut Vm, args: &[Value], index: usize) -> Result<Vec<u8>, Trap> {
+    match args.get(index) {
+        Some(Value::Null) => Ok(Vec::new()),
+        Some(&Value::Object(array)) => {
+            let heap = vm.heap_mut();
+            let len = heap.array_len(array).unwrap_or(0);
+            if let Some(bytes) = heap.array_u8_slice(array, 0, len) {
+                return Ok(bytes.to_vec());
+            }
+            Ok((0..len)
+                .map(|i| match heap.array_get(array, i) {
+                    Some(Value::Int32(byte)) => byte as u8,
+                    _ => 0,
+                })
+                .collect())
+        }
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// Overwrites a copy of a secret before it is freed.
+#[cfg(feature = "wifi")]
+fn wipe_bytes(bytes: &mut Vec<u8>) {
+    bytes.fill(0);
+    core::hint::black_box(&bytes);
+}
+
+/// Writes `bytes` into the byte array that argument `index` names, as far as it reaches. Returns the
+/// count written.
+#[cfg(feature = "wifi")]
+fn fill_byte_array(vm: &mut Vm, args: &[Value], index: usize, bytes: &[u8]) -> Result<usize, Trap> {
+    let Some(&Value::Object(array)) = args.get(index) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let heap = vm.heap_mut();
+    let count = bytes.len().min(heap.array_len(array).unwrap_or(0));
+    if let Some(slot) = heap.array_u8_slice_mut(array, 0, count) {
+        slot.copy_from_slice(&bytes[..count]);
+    } else {
+        for (i, &byte) in bytes[..count].iter().enumerate() {
+            heap.array_set(array, i, Value::Int32(i32::from(byte)));
+        }
+    }
+    Ok(count)
+}
+
+/// Integer argument `index`.
+#[cfg(feature = "wifi")]
+fn int_arg(args: &[Value], index: usize) -> Result<i32, Trap> {
+    match args.get(index) {
+        Some(&Value::Int32(value)) => Ok(value),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// The radio the backend lends, or `None`.
+#[cfg(feature = "wifi")]
+fn wifi_of(vm: &mut Vm) -> Option<&mut dyn crate::net::wifi::WifiControl> {
+    vm.net_backend()?.wifi()
+}
+
+/// `WiFiNative.Radio()` -> bit 0 a radio is present, bit 1 its firmware has said whether it runs
+/// WPA3, bit 2 it does; 0 with no radio.
+#[cfg(feature = "wifi")]
+pub fn wifi_radio(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    let bits = wifi_of(vm).map_or(0, |wifi| {
+        let radio = wifi.radio();
+        i32::from(radio.present) | radio.wpa3.map_or(0, |wpa3| 2 | (i32::from(wpa3) << 2))
+    });
+    Ok(Some(Value::Int32(bits)))
+}
+
+/// `WiFiNative.JoinStart(byte[] ssid, byte[] secret, int security, int reconnection)` -> the join's
+/// number, or 0 with no radio.
+#[cfg(feature = "wifi")]
+pub fn wifi_join_start(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let ssid = byte_array_arg(vm, args, 0)?;
+    let mut secret = byte_array_arg(vm, args, 1)?;
+    let security = int_arg(args, 2)?;
+    let reconnection = crate::net::wifi::Reconnection::from_code(int_arg(args, 3)?)
+        .unwrap_or(crate::net::wifi::Reconnection::Automatic);
+    let join = wifi_of(vm).map_or(0, |wifi| {
+        wifi.join_start(crate::net::wifi::JoinRequest {
+            ssid: &ssid,
+            secret: &secret,
+            security: security as u8,
+            reconnection,
+        })
+    });
+    wipe_bytes(&mut secret);
+    Ok(Some(Value::Int32(join as i32)))
+}
+
+/// `WiFiNative.JoinStored()` -> the join's number; 0 when no network is stored; -1 with no radio.
+#[cfg(feature = "wifi")]
+pub fn wifi_join_stored(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    let join = wifi_of(vm).map_or(-1, |wifi| wifi.join_stored().map_or(0, |join| join as i32));
+    Ok(Some(Value::Int32(join)))
+}
+
+/// `WiFiNative.Disconnect()`.
+#[cfg(feature = "wifi")]
+pub fn wifi_disconnect(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    if let Some(wifi) = wifi_of(vm) {
+        wifi.disconnect();
+    }
+    Ok(None)
+}
+
+/// `WiFiNative.State(byte[] report)` -> the bytes of the report written ([`WIFI_STATE_LEN`]), or 0
+/// with no radio.
+#[cfg(feature = "wifi")]
+pub fn wifi_state(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(state) = wifi_of(vm).map(|wifi| wifi.state()) else {
+        return Ok(Some(Value::Int32(0)));
+    };
+    let mut report = [0u8; WIFI_STATE_LEN];
+    report[0] = state.link as u8;
+    report[1] = state.security;
+    report[2] = state.source as u8;
+    let mut flags = 0u8;
+    if let Some(rssi) = state.rssi {
+        flags |= 1;
+        report[6..8].copy_from_slice(&rssi.to_le_bytes());
+    }
+    if let Some(channel) = state.channel {
+        flags |= 2;
+        report[5] = channel;
+    }
+    if let Some(bssid) = state.bssid {
+        flags |= 4;
+        report[8..14].copy_from_slice(&bssid);
+    }
+    let mut detail: &[u8] = &[];
+    if let Some(failure) = &state.last_failure {
+        flags |= 8;
+        report[14] = failure.status as u8;
+        let mut end = failure.detail.len().min(WIFI_DETAIL_MAX);
+        while !failure.detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail = &failure.detail.as_bytes()[..end];
+    }
+    if let Some(outcome) = state.join_outcome {
+        flags |= 16;
+        report[15] = outcome as u8;
+    }
+    report[3] = flags;
+    let ssid_len = state.ssid.len().min(crate::net::wifi::SSID_MAX);
+    report[4] = ssid_len as u8;
+    report[16..20].copy_from_slice(&state.join.to_le_bytes());
+    report[20] = detail.len() as u8;
+    report[21..21 + ssid_len].copy_from_slice(&state.ssid[..ssid_len]);
+    report[53..53 + detail.len()].copy_from_slice(detail);
+    let written = fill_byte_array(vm, args, 0, &report)?;
+    Ok(Some(Value::Int32(written as i32)))
+}
+
+/// `WiFiNative.RecordRead(byte[] report)` -> the bytes of the report written ([`WIFI_RECORD_LEN`]),
+/// or 0 when no network is stored or there is no radio. Never the secret.
+#[cfg(feature = "wifi")]
+pub fn wifi_record_read(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(stored) = wifi_of(vm).and_then(|wifi| wifi.record_read()) else {
+        return Ok(Some(Value::Int32(0)));
+    };
+    let mut report = [0u8; WIFI_RECORD_LEN];
+    report[0] = stored.security;
+    report[1] = stored.reconnection as u8;
+    report[2] = stored.boot as u8;
+    let ssid_len = stored.ssid.len().min(crate::net::wifi::SSID_MAX);
+    report[3] = ssid_len as u8;
+    report[4..4 + ssid_len].copy_from_slice(&stored.ssid[..ssid_len]);
+    let written = fill_byte_array(vm, args, 0, &report)?;
+    Ok(Some(Value::Int32(written as i32)))
+}
+
+/// A record write's outcome as the library reads it: 0 failed (and with no radio), 1 written,
+/// 2 unchanged, 3 no network stored.
+#[cfg(feature = "wifi")]
+fn record_write_code(write: crate::net::wifi::RecordWrite) -> i32 {
+    match write {
+        crate::net::wifi::RecordWrite::Failed => 0,
+        crate::net::wifi::RecordWrite::Written => 1,
+        crate::net::wifi::RecordWrite::Unchanged => 2,
+        crate::net::wifi::RecordWrite::NoRecord => 3,
+    }
+}
+
+/// `WiFiNative.RecordWrite(byte[] ssid, byte[] secret, int security, int reconnection)` -> the
+/// write's outcome code.
+#[cfg(feature = "wifi")]
+pub fn wifi_record_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let ssid = byte_array_arg(vm, args, 0)?;
+    let mut secret = byte_array_arg(vm, args, 1)?;
+    let security = int_arg(args, 2)?;
+    let reconnection = crate::net::wifi::Reconnection::from_code(int_arg(args, 3)?)
+        .unwrap_or(crate::net::wifi::Reconnection::Automatic);
+    let code = wifi_of(vm).map_or(0, |wifi| {
+        record_write_code(wifi.record_write(crate::net::wifi::JoinRequest {
+            ssid: &ssid,
+            secret: &secret,
+            security: security as u8,
+            reconnection,
+        }))
+    });
+    wipe_bytes(&mut secret);
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `WiFiNative.RecordSetBoot(int boot)` -> the write's outcome code.
+#[cfg(feature = "wifi")]
+pub fn wifi_record_set_boot(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(boot) = crate::net::wifi::BootConnection::from_code(int_arg(args, 0)?) else {
+        return Ok(Some(Value::Int32(0)));
+    };
+    let code = wifi_of(vm).map_or(0, |wifi| record_write_code(wifi.record_set_boot(boot)));
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `WiFiNative.RecordClear()` -> 1 once the storage holds no network, 0 otherwise.
+#[cfg(feature = "wifi")]
+pub fn wifi_record_clear(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    let cleared = wifi_of(vm).is_some_and(|wifi| wifi.record_clear());
+    Ok(Some(Value::Int32(i32::from(cleared))))
 }
 
 
@@ -5299,6 +5562,34 @@ pub fn serial_close(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
 const TLS_ERROR: i32 = -1;
 /// Returned by `tls_read_plain` when the peer has closed (no more plaintext).
 const TLS_CLOSED: i32 = -2;
+/// Returned by `tls_client_config_identity` when the engine cannot present a client certificate.
+const TLS_IDENTITY_UNSUPPORTED: i32 = -2;
+/// Returned by the two identity intrinsics when the certificate chain could not be read.
+const TLS_IDENTITY_CERTIFICATE: i32 = -3;
+/// Returned by the two identity intrinsics when the private key could not be read.
+const TLS_IDENTITY_KEY: i32 = -4;
+/// Returned by the two identity intrinsics when the private key is not the leaf certificate's.
+const TLS_IDENTITY_MISMATCH: i32 = -5;
+
+/// The managed code for an identity a backend could not use. [`IdentityError::Configuration`] is
+/// the plain [`TLS_ERROR`]: the identity was fine, and the configuration failed as `ClientConfig`
+/// does.
+fn identity_error_code(error: IdentityError) -> i32 {
+    match error {
+        IdentityError::Unsupported => TLS_IDENTITY_UNSUPPORTED,
+        IdentityError::Certificate => TLS_IDENTITY_CERTIFICATE,
+        IdentityError::Key => TLS_IDENTITY_KEY,
+        IdentityError::Mismatch => TLS_IDENTITY_MISMATCH,
+        IdentityError::Configuration => TLS_ERROR,
+    }
+}
+
+/// Overwrites a private key's copy before its memory goes back to the allocator. `fill` alone may
+/// be dropped as a write nothing reads; the fence keeps it.
+fn erase_key(key: &mut [u8]) {
+    key.fill(0);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
 
 /// Reads an entire managed `byte[]` into a Rust vector for the seam.
 fn read_whole_array(vm: &mut Vm, array: ObjectRef) -> alloc::vec::Vec<u8> {
@@ -5363,6 +5654,92 @@ pub fn tls_client_config(
         None => return Ok(Some(Value::Int32(TLS_ERROR))),
     };
     Ok(Some(Value::Int32(result.map_or(TLS_ERROR, |h| h as i32))))
+}
+
+/// `TlsNative.ClientConfigIdentity(int stack, int verifyMode, byte[] rootsPem, byte[] chain,
+/// byte[] key)`: a client config, as `ClientConfig` builds one, that also presents `chain` and its
+/// leaf's `key` when the server asks for a certificate. Returns the config handle (>= 0), or why
+/// not: `TLS_ERROR` (the configuration failed, or no backend), `-2` (the engine cannot present a
+/// client certificate), `-3` (the chain could not be read), `-4` (the key could not be read), `-5`
+/// (the key is not the leaf's).
+pub fn tls_client_config_identity(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(stack)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(verify)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let roots = match args.get(2) {
+        Some(&Value::Object(array)) => Some(read_whole_array(vm, array)),
+        _ => None,
+    };
+    let Some(&Value::Object(chain_array)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(key_array)) = args.get(4) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let chain = read_whole_array(vm, chain_array);
+    let mut key = read_whole_array(vm, key_array);
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.client_config_identity(
+            TlsStack::from_i32(stack),
+            VerifyMode::from_i32(verify),
+            roots.as_deref(),
+            ClientIdentity { chain: &chain, key: &key },
+        ),
+        None => Err(IdentityError::Configuration),
+    };
+    erase_key(&mut key);
+    Ok(Some(Value::Int32(match result {
+        Ok(handle) => handle as i32,
+        Err(error) => identity_error_code(error),
+    })))
+}
+
+/// `TlsNative.CheckIdentity(byte[] chain, byte[] key)`: whether the engine could present `chain`
+/// with `key` -- both read, and the key is the leaf's. Nothing is stored. Returns `1` (checked and
+/// usable), `0` (not checked: no backend, or one that cannot say), or `-3`, `-4`, `-5` as
+/// `ClientConfigIdentity` names them.
+pub fn tls_check_identity(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(chain_array)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(key_array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let chain = read_whole_array(vm, chain_array);
+    let mut key = read_whole_array(vm, key_array);
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.check_identity(ClientIdentity { chain: &chain, key: &key }),
+        None => Err(IdentityError::Unsupported),
+    };
+    erase_key(&mut key);
+    let code = match result {
+        Ok(()) => 1,
+        Err(IdentityError::Unsupported | IdentityError::Configuration) => 0,
+        Err(error) => identity_error_code(error),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `TlsNative.PeerAlert(int tls)`: the description byte of the fatal alert the peer sent that ended
+/// the session (`48` unknown_ca, `116` certificate_required, ...), or `-1` when it sent none.
+pub fn tls_peer_alert(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let alert = match vm.tls_backend() {
+        Some(backend) => backend.peer_alert(handle).map_or(-1, i32::from),
+        None => -1,
+    };
+    Ok(Some(Value::Int32(alert)))
 }
 
 /// `TlsNative.ServerConfig(int stack, byte[] pfx, string password)`: builds a server config from a
